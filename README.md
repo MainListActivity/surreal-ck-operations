@@ -1,41 +1,37 @@
-# Surreal CK 公司工作台
+# Surreal CK · AI 公司工作台
 
-这里是公司经营任务、验收决定和交接状态的唯一事实来源。代码和技术规格继续在 [产品仓库](https://github.com/MainListActivity/surreal_ck)维护。公司仓库为私有；客户原始材料、凭证和合同正文放在获授权的专用存储中，任务只记录受控链接和必要摘要。
+公司负责人是用户本人；其余岗位全部由真实创建的 AI agent 会话担任。外部律师用户和专业顾问由负责人对接。
 
-## 每个人每天只需这样工作
+## 员工领任务
 
-1. 打开[自己的全部任务](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20assignee%3A%40me)。先处理待验收，再处理进行中，最后领取就绪任务。
-2. 阅读任务的输入、验收条件和交接目标。缺材料就标记阻塞，写明需要谁提供什么；材料齐全才开始。
-3. 将就绪任务改为进行中。每人最多同时执行两项任务；按 P0、P1、P2，再按期限排序。
-4. 成果放到任务指定位置，在原任务评论中粘贴[交付单](docs/templates.md)。将任务转给指定验收人，状态改为待验收，岗位标签改成验收人岗位。
-5. 验收人通过后关闭原任务，并按[交接规则](docs/workflow.md)解锁下一项任务；不通过就在原任务退回。每个人通过自己的队列接到下一项工作。
+AI 员工先读 [执行协议](agents/PROTOCOL.md)，再读自己的岗位文件，使用 `scripts/queue.py` 从岗位队列领取。共用 GitHub 账号的 `assignee:@me` **不能区分员工**。
 
-员工无需看全公司看板，也无需从聊天记录寻找任务。通知只是提醒，任务队列是工作入口。
+| 岗位队列 | 稳定员工编号 | 执行入口 |
+|---|---|---|
+| [职业经理](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Agm) | gm-01 | [岗位说明](agents/gm.md) |
+| [产品交付](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Aproduct) | product-01 | [岗位说明](agents/product.md) |
+| [工程](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Aengineering) | eng-01、eng-02 | [岗位说明](agents/engineering.md) |
+| [AI 与内容](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Aai-content) | ai-01 | [岗位说明](agents/ai-content.md) |
+| [测试](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Aqa) | qa-01 | [岗位说明](agents/qa.md) |
+| [客户成功](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Acs) | cs-01 | [岗位说明](agents/cs.md) |
+| [负责人待办](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aopen+label%3Arole%3Aowner) | 用户本人 | 律师用户、顾问答复、资料与关键决策 |
 
-## 入口
+经理查询待验收和就绪任务后唤醒对应员工；员工实际读取队列并领取。执行 → 提交 → 独立验收 → 经理解锁后续。无任务或需真人输入时结束本轮，不空转。
 
-- [我的待验收](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20assignee%3A%40me%20label%3Astate%3Areview)
-- [我的进行中](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20assignee%3A%40me%20label%3Astate%3Adoing)
-- [我的就绪任务](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20assignee%3A%40me%20label%3Astate%3Aready)
-- [我的阻塞任务](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20assignee%3A%40me%20label%3Astate%3Ablocked)
-- [经理控制台](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20label%3Arole%3Agm)
-- [待分诊入口](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20label%3Astate%3Ainbox)
-- [全部待配员任务](https://github.com/MainListActivity/surreal-ck-operations/issues?q=is%3Aissue%20is%3Aopen%20label%3Astaffing%3Aneeded)
-- [新建任务](https://github.com/MainListActivity/surreal-ck-operations/issues/new/choose)
+## 岗位绑定与同岗协作
 
-## 按需阅读
+[员工登记表](agents/registry.json) 分开保存稳定员工 ID、岗位、实际会话 ID、状态和能力。一岗多人；一张子任务只有一个执行者。同一需求需要两位工程师时拆子任务并指定集成责任人；代码工作用不同 worktree。验收排除原员工 ID，换会话不能绕过。
 
-- [岗位职责与人员登记](docs/roles.md)：入职、代班、岗位领任务、权限与验收责任。
-- [状态与交接规则](docs/workflow.md)：领取、提交、验收、退回、阻塞、取消、紧急事故。
-- [公司业务流程](docs/playbooks.md)：从获客到续费，以及研发、内容供应、发布、招聘和财务。
-- [任务与交付模板](docs/templates.md)：复制即可使用。
-- [经理运行节奏](docs/management.md)：优先级、产能、例会、指标和上线边界。
-- [首批启动任务](docs/launch.md)：首轮工作依赖和负责人。
+[运行器](scripts/queue.py) 对单机领取加锁并记录任务租约。身份是可审计的调度约束；共用凭证不是安全权限隔离，也不是跨机器分布式锁。
 
-## 当前启用状态
+## 手册与进度
 
-工作台、标签、模板和首批任务已建立。员工姓名、账号、预算、营业时间和试点客户尚未确认，见启动任务。MainListActivity 仅作为启动协调和待配员任务的临时收件人，不代表已聘任五个岗位，也不代表 AI 在后台持续运行。
+- [AI 员工协议](agents/PROTOCOL.md)：领取、提交、验收、退回、接管。
+- [角色与多人协作](docs/roles.md)：职责、身份与工作边界。
+- [业务流程](docs/playbooks.md)：获客、交付、研发、发布、财务与续费。
+- [任务状态](docs/workflow.md)、[交付模板](docs/templates.md)、[经营节奏](docs/management.md)。
+- [启动任务](docs/launch.md)：原 16 张任务保留，v2 元数据取代待真人招聘假设；新增 AI 岗位首批任务。
 
-本版使用人工交接，GitHub 不会根据评论内容自动变更状态、解锁依赖或计时升级。验收人按清单操作，经理每天检查遗漏。后续只有出现实际交接量瓶颈时才建设自动化。
+本机工作目录：`/Users/y/IdeaProjects/surreal-ck-operations`。真实 ID 与运行状态看 registry / Paseo，不能从岗位名称推测员工在后台运行。巡检调度的实际启用情况以运行记录为准。
 
-GitHub 机制依据：[Issue 表单](https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms)、[任务筛选](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/filtering-and-searching-issues-and-pull-requests)。岗位、时限与验收制度是本公司的管理决策。
+技术规格与代码仍在 [产品仓库](https://github.com/MainListActivity/surreal_ck)。客户原件、凭证和合同正文留在授权存储，运营仓库只保留必要证据。

@@ -1,0 +1,72 @@
+{
+  "schema_version": 2,
+  "human_owner": "MainListActivity",
+  "provider": "codex/gpt-6-astra",
+  "max_concurrent_employees": 3,
+  "employees": {
+    "gm-01": {
+      "role": "gm",
+      "agent_id": "dcdabbed-c685-4299-878f-9b235d37f68b",
+      "status": "active",
+      "capabilities": [
+        "coordinate",
+        "review",
+        "manage-roster"
+      ]
+    },
+    "qa-01": {
+      "role": "qa",
+      "agent_id": "e65c81af-4f6f-43a4-8b2f-b35b90ffdbaf",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    },
+    "eng-01": {
+      "role": "engineering",
+      "agent_id": "690e5b7e-78cc-4869-94cf-141726145fc5",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    },
+    "product-01": {
+      "role": "product",
+      "agent_id": "d33308ae-d99d-4dc0-bcdd-7f2c75fc6dd5",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    },
+    "eng-02": {
+      "role": "engineering",
+      "agent_id": "f867c09a-a825-4fd9-a03f-76e609ff485d",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    },
+    "ai-01": {
+      "role": "ai-content",
+      "agent_id": "0c9992c0-1a68-45e3-bda3-09463ea64828",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    },
+    "cs-01": {
+      "role": "cs",
+      "agent_id": "6f12e1c5-6cec-4d94-aef1-2f6c57a9aad4",
+      "status": "active",
+      "capabilities": [
+        "execute",
+        "review"
+      ]
+    }
+  }
+}
