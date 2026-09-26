@@ -1,0 +1,20 @@
+name: 03 事故或紧急缺陷
+description: 创建后按值班安排联系负责人；表单不会自动呼叫或响应。
+title: "[事故] "
+labels: ["state:inbox", "role:gm", "kind:incident", "priority:P0"]
+assignees: ["MainListActivity"]
+body:
+  - type: textarea
+    id: impact
+    attributes:
+      label: 时间与影响
+      description: 首次发现时间、版本、受影响范围及是否仍在扩大。
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: 证据与已做处置
+      description: 脱敏复现、已保存证据、已执行隔离或恢复、需要的帮助。
+    validations:
+      required: true

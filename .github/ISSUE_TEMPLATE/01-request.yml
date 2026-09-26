@@ -1,0 +1,26 @@
+name: 01 新请求或客户问题
+description: 提交后由经理分诊；不要包含客户原文、凭证或合同正文。
+title: "[请求] "
+labels: ["state:inbox", "role:gm", "kind:request", "priority:P2"]
+assignees: ["MainListActivity"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题与业务影响
+      description: 谁遇到什么问题，影响什么结果；客户用代号。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 事实与证据
+      description: 复现步骤、环境、必要截图或受控资料链接。区分事实和推测。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果与时间约束
+    validations:
+      required: true

@@ -1,0 +1,28 @@
+name: 02 阶段任务
+description: 使用正文任务契约；分诊后配置真实执行人、状态和岗位标签。
+title: "[任务] "
+labels: ["state:inbox", "role:gm", "kind:task", "priority:P2"]
+assignees: ["MainListActivity"]
+body:
+  - type: textarea
+    id: contract
+    attributes:
+      label: 任务契约
+      description: 按 docs/templates.md 填写。未配员或依赖不完整不能进入 ready。
+      value: |
+        业务结果：
+        父目标：
+        原执行人及岗位：
+        验收人：
+        下一角色及后续任务：
+        截止时间（含时区）：
+        输入及版本：
+        依赖：
+        授权范围与预算：
+        范围：
+        成果保存位置：
+        验收条件：
+        - [ ]
+        当前阻塞及解除责任人：
+    validations:
+      required: true
