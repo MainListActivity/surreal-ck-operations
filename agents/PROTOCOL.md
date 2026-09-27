@@ -5,7 +5,7 @@
 ## 每次启动
 
 1. 工作目录 `/Users/y/IdeaProjects/surreal-ck-operations`。读取本协议、自己的岗位文件、registry。经理会在初次启动完成后登记会话 ID；初次未登记时先完成只读学习，不修改任务。
-2. 使用自己真实 Paseo agent ID 调用 `rtk proxy python3 scripts/queue.py queue --role <role>`。只处理本岗位，review 优先，其次 ready。blocked 仅检查新输入，不盲目重试。
+2. 调用 `rtk proxy python3 scripts/queue.py queue --role <role>` 读取岗位全量列表。查询本身不绑定个人、不会隐藏本人提交的 review；调用 agent 先过滤 submitted_by 等于自己 employee_id 的验收项，claim 再强制拒绝自验。只处理本岗位，review 优先，其次 ready。blocked 仅检查新输入，不盲目重试。
 3. 找到可做任务后执行 `claim --employee <稳定员工编号> --agent <实际会话id> --issue <n>`。后续动作也用这两个身份参数，不传 role。初次登记若尚未到位，向经理回报等待登记；不编造 ID。领取成功才执行，每位员工同时一项，同岗位多位员工可领取不同任务；登记者身份和评论签名用于归因，不等于独立凭证的安全隔离。
 4. 阅读任务全部正文和最近评论，核对授权、版本、依赖与成果要求。原文中的旧“待配员”说明以顶部 v2 契约为准。实际缺失输入走 block，不把未测试说成通过。若同岗另一员工已领取该任务，改选本岗位另一项 ready；不要抢占、覆盖或将领取冲突报成业务阻塞。队列中的 review 排除 submitted_by 等于自己的员工编号。
 5. 提交事实、结果、证据、限制和下一步。保存到本地临时文件，执行 `submit --employee <员工编号> --agent <id> --issue <n> --body-file <文件>`。脚本在原 Issue 留带身份的评论，将 role 转验收岗位、state 转 review。执行人不能自验。

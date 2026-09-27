@@ -26,6 +26,8 @@ AI 员工先读 [执行协议](agents/PROTOCOL.md)，再读自己的岗位文件
 
 ## 手册与进度
 
+- [自建/外部 agent 接入方案](docs/external-agent-integration.md)：v3 提案；HTTP/MCP、服务端身份与租约、Paseo 和外部 worker 互操作，尚未实现。
+
 - [AI 员工协议](agents/PROTOCOL.md)：领取、提交、验收、退回、接管。
 - [角色与多人协作](docs/roles.md)：职责、身份与工作边界。
 - [业务流程](docs/playbooks.md)：获客、交付、研发、发布、财务与续费。
