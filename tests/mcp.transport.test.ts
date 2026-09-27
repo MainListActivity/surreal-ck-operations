@@ -38,7 +38,7 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('get_context');
     expect(tools).toContain('claim_next');
     expect(tools).toContain('review');
-    const result = await connection.client.callTool({ name: 'get_context', arguments: {} });
+    const result = await connection.client.callTool({ name: 'get_context', arguments: { employeeId: 'gm-01', role: 'gm' } });
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });
     expect(claim.structuredContent).toMatchObject({ ok: true, data: { deliveryId: 'delivery-1', fence: 1 } });
