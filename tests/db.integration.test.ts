@@ -8,7 +8,11 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import type { LeaseProof } from '../src/contracts.ts';
 import type { OutboxEvent } from '../src/contracts.ts';
 
-const database = new CompanyDatabase(loadDatabaseConfig());
+const database = new CompanyDatabase({
+  ...loadDatabaseConfig(),
+  namespace: 'sck_agent_company_test',
+  database: 'control_plane',
+});
 setDefaultTimeout(30000);
 const core = new SurrealCompanyCore(database);
 const enrollment = new LocalEnrollmentAdmin(database);

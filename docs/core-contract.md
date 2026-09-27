@@ -12,7 +12,7 @@ adapter 负责 MCP initialize、工具 schema、错误映射和本地绑定；co
 
 在本分支 worktree 中执行 `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm run bootstrap`、`pnpm run test:db`。配置通过 `SCK_PRODUCT_ENV` 指向产品 `.env`，默认路径为 `/Users/y/IdeaProjects/surreal_ck/.env`；只读取 `SURREAL_URL`、`SURREAL_ROOT_USER`、`SURREAL_ROOT_PASS`，不读取或写入产品库数据。Namespace/database 默认 `sck_agent_company/control_plane`。更改目标需设置 `SCK_COMPANY_NS` / `SCK_COMPANY_DB`，bootstrap 会检查目标归属标记，拒绝已有无关资源。
 
-已登记员工的本机 token 位于本 worktree `.runtime/credentials/<employee-id>.token`，目录 0700、文件 0600、Git 忽略。adapter 从安全通道接收 token，不把文件内容放入日志、Issue 或响应。真实员工与测试员工在新库的 `employee` 表分离命名，测试数据留在新库中以供审查；可通过数据库审计记录和 outbox 核实。
+已登记员工的本机 token 位于本 worktree `.runtime/credentials/<employee-id>.token`，目录 0700、文件 0600、Git 忽略。adapter 从安全通道接收 token，不把文件内容放入日志、Issue 或响应。`test:db` 使用独立测试 Namespace `sck_agent_company_test/control_plane`，合成数据与服务目标库分离；可通过测试库审计记录和 outbox 复核。正式服务只连接 `sck_agent_company/control_plane`。
 
 `CompanyDatabase.connect()` 后先 `bootstrap()`，再创建 `SurrealCompanyCore`。adapter 每次调用 core 方法均传 credential。对于租约相关写入，从 `claim()` 返回的 `deliveryId`、`fence` 和 `task.version` 构造 `LeaseProof`；`checkpoint()` 等成功后用新版本更新 proof。`CompanyError` 的 `code` 和 `retryable` 映射为 MCP 工具错误，不返回数据库底层错误与凭证。代码包括 `unauthorized`、`forbidden`、`not_found`、`conflict`、`invalid`、`already_claimed`、`lease_expired`、`self_review`、`temporarily_unavailable`。只有最后一项表示数据库争用已在内部有限重试后仍失败，`retryable=true`。
 
