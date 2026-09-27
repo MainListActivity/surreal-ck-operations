@@ -1,0 +1,13 @@
+{
+  "name": "@surreal-ck/company-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:db": "bun test tests/db.integration.test.ts",
+    "bootstrap": "bun src/bootstrap.ts"
+  }
+}
