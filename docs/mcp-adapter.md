@@ -8,7 +8,7 @@
 
 工具：`get_context`、`claim_next`、`heartbeat`、`checkpoint`、`submit`、`report_blocker`、`review`、`create_task`、`resume_task`。`claim_next` 无 ID 时先考虑本人可验的 review，再考虑本岗位 ready；数据库内并发裁决仍以核心 `claim` 为准。`create_task` 与 `resume_task` 即使出现在工具列表，也只能由核心的 manage 权限执行。员工 enroll/revoke 遵循 #24 冻结契约 `EnrollmentAdmin`，由本机受控管理命令处理，不向普通 MCP tool 暴露。
 
-CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL`，执行 `pnpm run mcp:client -- list` 或 `pnpm run mcp:client -- call get_context '{}'`。客户端通过官方 `Client.connect` 初始化并使用 `listTools`/`callTool`；可用于已有员工真实领取、提交与独立验收。运行命令时不要在命令行参数或 shell 历史中直接写凭证。
+CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL_FILE`（仅文件 owner 可读），执行 `pnpm run mcp:client -- list` 或 `pnpm run mcp:client -- call get_context '{}'`。受控环境也可传 `SCK_EMPLOYEE_CREDENTIAL`；若同时提供，文件优先。客户端通过官方 `Client.connect` 初始化并使用 `listTools`/`callTool`；可用于已有员工真实领取、提交与独立验收。运行命令时不要在命令行参数或 shell 历史中直接写凭证。
 
 ## GitHub 投影
 
