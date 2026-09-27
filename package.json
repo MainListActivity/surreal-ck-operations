@@ -8,6 +8,16 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:db": "bun test tests/db.integration.test.ts",
-    "bootstrap": "bun src/bootstrap.ts"
+    "bootstrap": "bun src/bootstrap.ts",
+    "mcp:client": "bun src/mcp/client-cli.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.1.0",
+    "@modelcontextprotocol/server": "2.1.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }
