@@ -10,7 +10,7 @@ const task: TaskView = {
   state: 'ready', executorRole: 'ai-content', reviewerRole: 'engineering',
   dependencies: [], version: 1, fence: 0,
 };
-const event: OutboxEvent = { id: 'event-1', taskId: task.id, kind: 'created', payload: {}, createdAt: '2026-09-27T00:00:00Z' };
+const event: OutboxEvent = { id: 'event-1', sequence: 1, taskId: task.id, kind: 'created', payload: {}, createdAt: '2026-09-27T00:00:00Z' };
 const core = {
   async authenticate() { return { employeeId: 'gm-01', role: 'gm', capabilities: ['manage'] }; },
   async listOutbox() { return [event]; },
@@ -68,6 +68,7 @@ test('failed GitHub comment leaves event pending, retry reuses the managed issue
 
 test('reads beyond the first 1000 durable outbox events through the core cursor', async () => {
   const events = Array.from({ length: 1001 }, (_, index): OutboxEvent => ({
+    sequence: index + 1,
     id: `event-${String(index).padStart(4, '0')}`,
     taskId: task.id,
     kind: 'checkpoint',
