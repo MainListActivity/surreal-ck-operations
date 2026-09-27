@@ -1,0 +1,45 @@
+import { readFileSync } from 'node:fs';
+
+export interface DatabaseConfig {
+  url: string;
+  rootUser: string;
+  rootPassword: string;
+  namespace: string;
+  database: string;
+}
+
+function readProductEnv(): Record<string, string> {
+  const path = process.env.SCK_PRODUCT_ENV ?? '/Users/y/IdeaProjects/surreal_ck/.env';
+  const values: Record<string, string> = {};
+  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!match) continue;
+    let value = match[2];
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+export function loadDatabaseConfig(): DatabaseConfig {
+  const fromFile = readProductEnv();
+  const get = (name: string): string => {
+    const value = process.env[name] || fromFile[name];
+    if (!value) throw new Error(`Missing ${name}`);
+    return value;
+  };
+  const namespace = process.env.SCK_COMPANY_NS ?? 'sck_agent_company';
+  const database = process.env.SCK_COMPANY_DB ?? 'control_plane';
+  if (!/^[a-z][a-z0-9_]{2,62}$/.test(namespace) || !/^[a-z][a-z0-9_]{2,62}$/.test(database)) {
+    throw new Error('Invalid company namespace/database name');
+  }
+  return {
+    url: get('SURREAL_URL'),
+    rootUser: get('SURREAL_ROOT_USER'),
+    rootPassword: get('SURREAL_ROOT_PASS'),
+    namespace,
+    database,
+  };
+}

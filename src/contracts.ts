@@ -26,6 +26,7 @@ export interface TaskView {
   deliveryId?: DeliveryId;
   leaseExpiresAt?: string;
   fence: number;
+  blockedTo?: 'gm' | 'owner';
 }
 
 export interface CreateTask {
@@ -59,6 +60,7 @@ export interface Evidence {
 
 export interface OutboxEvent {
   id: string;
+  sequence: number;
   kind: string;
   taskId: TaskId;
   payload: Record<string, unknown>;
