@@ -31,13 +31,13 @@ test('outbox replay recovers from lost local checkpoint without duplicate GitHub
     async closeIssue(number) { issues.find(issue => issue.number === number)!.state = 'CLOSED'; },
   };
   const projector = createGithubProjector({ core, credential: 'opaque', github: gateway, statePath });
-  expect(await projector.runOnce()).toEqual({ projected: 1, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 1 });
   expect(issues).toHaveLength(1);
   expect(issues[0].comments).toHaveLength(1);
   expect(issues[0].body).not.toContain(task.context);
-  expect(await projector.runOnce()).toEqual({ projected: 0, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 0 });
   await unlink(statePath);
-  expect(await projector.runOnce()).toEqual({ projected: 1, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 1 });
   expect(issues).toHaveLength(1);
   expect(issues[0].comments).toHaveLength(1);
 });
@@ -61,7 +61,7 @@ test('failed GitHub comment leaves event pending, retry reuses the managed issue
   await expect(projector.runOnce()).rejects.toThrow('temporary GitHub outage');
   expect(issue?.number).toBe(102);
   fail = false;
-  expect(await projector.runOnce()).toEqual({ projected: 1, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 1 });
   expect(issue?.comments).toHaveLength(1);
   expect((await gateway.listIssues())).toHaveLength(1);
 });
@@ -93,8 +93,8 @@ test('reads beyond the first 1000 durable outbox events through the core cursor'
     async closeIssue() {},
   };
   const projector = createGithubProjector({ core: pagedCore, credential: 'opaque', github: gateway, statePath: join(dir, 'paged.json') });
-  expect(await projector.runOnce()).toEqual({ projected: 1001, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 1001 });
   expect(pageCalls).toEqual([undefined, 'event-0999']);
   expect(issue?.comments).toHaveLength(1001);
-  expect(await projector.runOnce()).toEqual({ projected: 0, remaining: 0 });
+  expect(await projector.runOnce()).toEqual({ projected: 0 });
 });

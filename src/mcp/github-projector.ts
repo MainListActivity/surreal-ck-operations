@@ -41,9 +41,9 @@ export function createGhCliGateway(repository: string): GithubGateway {
   };
   return {
     async listIssues() {
-      const rows = JSON.parse(await run(['issue', 'list', '-R', repository, '--state', 'all', '--limit', '1000', '--json', 'number,body,title'])) as GhIssue[];
-      if (rows.length >= 1000) throw new Error('GitHub issue scan reached its safety limit');
-      return rows;
+      const json = await run(['api', `repos/${repository}/issues?state=all&per_page=100`, '--paginate', '--slurp']);
+      const pages = JSON.parse(json) as Array<Array<GhIssue & { pull_request?: unknown }>>;
+      return pages.flat().filter(issue => !issue.pull_request);
     },
     async createIssue(title, body) {
       const url = await withBody(body, file => run(['issue', 'create', '-R', repository, '--title', title, '--body-file', file]));
@@ -52,7 +52,13 @@ export function createGhCliGateway(repository: string): GithubGateway {
       return Number(match[1]);
     },
     async getIssue(number) {
-      return JSON.parse(await run(['issue', 'view', String(number), '-R', repository, '--json', 'body,comments,state'])) as { body: string; comments: GhComment[]; state: 'OPEN' | 'CLOSED' };
+      const [issueJson, commentsJson] = await Promise.all([
+        run(['issue', 'view', String(number), '-R', repository, '--json', 'body,state']),
+        run(['api', `repos/${repository}/issues/${number}/comments?per_page=100`, '--paginate', '--slurp']),
+      ]);
+      const issue = JSON.parse(issueJson) as { body: string; state: 'OPEN' | 'CLOSED' };
+      const pages = JSON.parse(commentsJson) as GhComment[][];
+      return { ...issue, comments: pages.flat() };
     },
     async editIssue(number, body) {
       await withBody(body, file => run(['issue', 'edit', String(number), '-R', repository, '--body-file', file]));
@@ -145,7 +151,7 @@ export function createGithubProjector(input: {
     await saveState(statePath, state);
   };
   return {
-    async runOnce(): Promise<{ projected: number; remaining: number }> {
+    async runOnce(): Promise<{ projected: number }> {
       const principal = await core.authenticate(credential);
       if (!principal.capabilities.includes('manage')) throw new Error('outbox projection requires manage capability');
       const state = await loadState(statePath);
@@ -169,7 +175,7 @@ export function createGithubProjector(input: {
         if (!next || next === after) throw new Error('core outbox cursor did not advance');
         after = next;
       }
-      return { projected, remaining: 0 };
+      return { projected };
     },
   };
 }

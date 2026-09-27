@@ -83,13 +83,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
       const principal = await core.authenticate(credential);
       const tasks = await core.listTasks(credential);
       const candidates = tasks.filter((task: TaskView) =>
-        task.state === 'review' && task.reviewerRole === principal.role && task.submittedBy !== principal.employeeId ||
-        task.state === 'ready' && task.executorRole === principal.role,
+        (task.state === 'review' && task.reviewerRole === principal.role && task.submittedBy !== principal.employeeId) ||
+        (task.state === 'ready' && task.executorRole === principal.role),
       );
       candidates.sort((a, b) => (a.state === 'review' ? 0 : 1) - (b.state === 'review' ? 0 : 1) || a.id.localeCompare(b.id));
-      if (!candidates[0]) throw { code: 'NO_AVAILABLE_TASK' };
       // The core remains the sole authority for concurrent claims and dependencies.
-      return core.claim(credential, candidates[0].id);
+      for (const candidate of candidates) {
+        try {
+          return await core.claim(credential, candidate.id);
+        } catch (error) {
+          if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'conflict') throw error;
+        }
+      }
+      throw { code: 'no_available_task' };
     });
   });
 
@@ -157,8 +163,12 @@ export function createMcpHttpService(options: McpServiceOptions) {
       let principal;
       try {
         principal = await core.authenticate(credential);
-      } catch {
-        return new Response('Unauthorized', { status: 401 });
+      } catch (error) {
+        const invalidCredential = typeof error === 'object' && error !== null
+          && 'code' in error && error.code === 'unauthorized';
+        return new Response(invalidCredential ? 'Unauthorized' : 'Service unavailable', {
+          status: invalidCredential ? 401 : 503,
+        });
       }
       if (!principal) return new Response('Unauthorized', { status: 401 });
       return handler.fetch(request, { authInfo: { token: credential, clientId: principal.employeeId, scopes: [] } });

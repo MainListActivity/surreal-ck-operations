@@ -9,8 +9,10 @@ const task: TaskView = {
   executorRole: 'ai-content', reviewerRole: 'engineering', dependencies: [], version: 1, fence: 0,
 };
 let active = true;
+let unavailable = false;
 const core = {
   async authenticate(credential: string) {
+    if (unavailable) throw new Error('synthetic storage failure');
     if (credential !== 'sck_valid' || !active) throw { code: 'unauthorized' };
     return principal;
   },
@@ -44,6 +46,9 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
       title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'gm', idempotencyKey: 'one',
     } });
     expect(denied.structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
+    active = false;
+    await expect(connection.client.callTool({ name: 'get_context', arguments: {} })).rejects.toThrow();
+    active = true;
   } finally { await connection.close(); }
 });
 
@@ -57,4 +62,6 @@ test('every request rejects missing, wrong, revoked credential and foreign Host/
   expect((await fetch(url, { ...request, headers: { ...request.headers, Authorization: 'Bearer sck_valid', Origin: 'http://evil.example' } })).status).toBe(403);
   active = false;
   expect((await fetch(url, { ...request, headers: { ...request.headers, Authorization: 'Bearer sck_valid' } })).status).toBe(401);
+  unavailable = true;
+  expect((await fetch(url, { ...request, headers: { ...request.headers, Authorization: 'Bearer sck_valid' } })).status).toBe(503);
 });
