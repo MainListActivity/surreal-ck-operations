@@ -149,15 +149,25 @@ export function createGithubProjector(input: {
       const principal = await core.authenticate(credential);
       if (!principal.capabilities.includes('manage')) throw new Error('outbox projection requires manage capability');
       const state = await loadState(statePath);
-      const events = (await core.listOutbox(credential)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-      if (events.length >= 1000) throw new Error('outbox reached unpaged core limit; projection stopped to avoid silent loss');
       const completed = new Set(state.completedEvents);
       let projected = 0;
-      for (const event of events) {
-        if (completed.has(event.id)) continue;
-        await projectEvent(event, state);
-        completed.add(event.id);
-        projected++;
+      let after: string | undefined;
+      while (true) {
+        // Core orders by (at, id); each page starts after the previous event id.
+        // Every run starts from the beginning so concurrent inserts before a
+        // current scan's cursor are picked up in the next run.
+        const events = await core.listOutbox(credential, after);
+        if (events.length > 1000) throw new Error('core outbox page exceeds contract limit');
+        for (const event of events) {
+          if (completed.has(event.id)) continue;
+          await projectEvent(event, state);
+          completed.add(event.id);
+          projected++;
+        }
+        if (events.length < 1000) break;
+        const next = events.at(-1)?.id;
+        if (!next || next === after) throw new Error('core outbox cursor did not advance');
+        after = next;
       }
       return { projected, remaining: 0 };
     },

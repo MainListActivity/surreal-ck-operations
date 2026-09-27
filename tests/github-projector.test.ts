@@ -65,3 +65,36 @@ test('failed GitHub comment leaves event pending, retry reuses the managed issue
   expect(issue?.comments).toHaveLength(1);
   expect((await gateway.listIssues())).toHaveLength(1);
 });
+
+test('reads beyond the first 1000 durable outbox events through the core cursor', async () => {
+  const events = Array.from({ length: 1001 }, (_, index): OutboxEvent => ({
+    id: `event-${String(index).padStart(4, '0')}`,
+    taskId: task.id,
+    kind: 'checkpoint',
+    payload: {},
+    createdAt: new Date(Date.UTC(2026, 8, 27, 0, 0, index)).toISOString(),
+  }));
+  const pageCalls: Array<string | undefined> = [];
+  const pagedCore = {
+    ...core,
+    async listOutbox(_credential: string, after?: string) {
+      pageCalls.push(after);
+      const start = after ? events.findIndex(event => event.id === after) + 1 : 0;
+      return events.slice(start, start + 1000);
+    },
+  } as CompanyCore;
+  let issue: { body: string; comments: Array<{ body: string }> } | undefined;
+  const gateway: GithubGateway = {
+    async listIssues() { return issue ? [{ number: 103, title: task.title, body: issue.body }] : []; },
+    async createIssue(_title, body) { issue = { body, comments: [] }; return 103; },
+    async getIssue() { return { body: issue!.body, comments: issue!.comments, state: 'OPEN' }; },
+    async editIssue(_number, body) { issue!.body = body; },
+    async comment(_number, body) { issue!.comments.push({ body }); },
+    async closeIssue() {},
+  };
+  const projector = createGithubProjector({ core: pagedCore, credential: 'opaque', github: gateway, statePath: join(dir, 'paged.json') });
+  expect(await projector.runOnce()).toEqual({ projected: 1001, remaining: 0 });
+  expect(pageCalls).toEqual([undefined, 'event-0999']);
+  expect(issue?.comments).toHaveLength(1001);
+  expect(await projector.runOnce()).toEqual({ projected: 0, remaining: 0 });
+});

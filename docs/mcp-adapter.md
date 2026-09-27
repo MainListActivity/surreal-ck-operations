@@ -14,7 +14,7 @@ CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_
 
 GitHub 仅作为**本服务新建任务**的看板。投影器从核心持久 outbox 读取事件，先查询带 `sck-company-task` marker 的现有 Issue，再新建；每个事件评论有 `sck-company-outbox` marker。完成标记保存在 `.runtime` 下的本地文件；进程在 GitHub 写入后、标记前崩溃，重启时通过 Issue/评论 marker 去重。失败不会标为完成，下一轮重试。投影只写任务 ID、标题、状态、岗位、版本、依赖与事件类型/时间；任务 context、事件 payload 和员工凭证不进入 GitHub。任务完成时关闭相应 Issue。
 
-投影仅由具 manage 能力的凭证运行，`gh` 使用本机现有登录。投影器通过 `Bun.spawn(['gh', ...args])` 调用，不执行 shell，也不把任务文本插入命令。旧 v2 工单没有本服务 marker 且不在新库 outbox，不能被该投影器接管或覆盖。当前核心分页契约待 #24 最终交接；若扫描触及 1000 条上限，投影器显式停止，避免静默漏事件。
+投影仅由具 manage 能力的凭证运行，`gh` 使用本机现有登录。投影器通过 `Bun.spawn(['gh', ...args])` 调用，不执行 shell，也不把任务文本插入命令。旧 v2 工单没有本服务 marker 且不在新库 outbox，不能被该投影器接管或覆盖。按 #24 WIP 已修订的 `listOutbox(after)` 契约，投影器逐页读取 1000 条，以最后事件 ID 继续；每次启动从头扫描并跳过本地已完成事件，因此并发新增但在本轮游标之前的事件可在下一轮拾取。最终语义和真实数据库超过一页的回归仍须随 #24 固定交接验证。
 
 ## 验证范围
 
