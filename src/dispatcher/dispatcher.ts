@@ -317,6 +317,8 @@ export class Dispatcher {
       try { await work(); } catch (error) { this.log(`jev ${label} failed: ${(error as Error).message}`); }
     };
     for (const goal of await owner.triagePending()) {
+      // Once Jev was unsure and gm has been asked, gm owns the decision; do not re-ask Jev every tick.
+      if (await wf.lastDispatch(`goal:${goal.id}`, 0, 'triage')) continue;
       await attempt(`triage ${goal.id}`, async () => {
         const { tier, confidence } = await jevTriage(jev, goal);
         if (!tier || confidence < cfg.jevMinConfidence) {

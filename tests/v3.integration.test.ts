@@ -536,6 +536,9 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   expect(report.decisions.some(d => d.startsWith(`triage:${vague.id}`))).toBe(false);
   expect(report.woke.some(w => w.task === `goal:${vague.id}`)).toBe(true);
   expect([...paseo.agents.values()].some(a => a.spawn?.prompt.includes('【目标分级】') && a.spawn.prompt.includes(vague.id))).toBe(true);
+  const tierQuestions = asked.filter(q => q === 'tier').length;
+  await dispatcher.tick();
+  expect(asked.filter(q => q === 'tier').length).toBe(tierQuestions);
 
   // Release: confident go → Jev accepts and deploy unlocks; unsure → advice in history, product decides.
   const triaged = (await owner.brief()).goals.find(g => g.id === quick.id)!;
