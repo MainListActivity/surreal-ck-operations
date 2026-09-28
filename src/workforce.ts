@@ -164,9 +164,6 @@ export class Workforce {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!(PROVIDERS as readonly string[]).includes(input.provider)) throw new CompanyError('invalid', 'Unsupported provider');
-    // thinking is a per-provider option ID passed through to paseo; devin rejects 'low'
-    // (its levels live inside the model ID suffix) — verified empirically 2026-09-28.
-    if (input.provider === 'devin' && input.thinking === 'low') throw new CompanyError('invalid', 'devin does not support thinking=low');
     if (input.weight !== undefined && (!Number.isInteger(input.weight) || input.weight < 0 || input.weight > 1000)) {
       throw new CompanyError('invalid', 'Invalid weight');
     }
