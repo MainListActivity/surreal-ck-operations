@@ -65,3 +65,8 @@ test('every request rejects missing, wrong, revoked credential and foreign Host/
   unavailable = true;
   expect((await fetch(url, { ...request, headers: { ...request.headers, Authorization: 'Bearer sck_valid' } })).status).toBe(503);
 });
+
+test('health and readiness remain separate from MCP authentication', async () => {
+  expect((await fetch(new URL('/health', url))).status).toBe(200);
+  expect((await fetch(new URL('/ready', url))).status).toBe(503);
+});

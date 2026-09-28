@@ -19,6 +19,7 @@ export type McpServiceOptions = Readonly<{
   core: CompanyCore;
   hostname?: '127.0.0.1';
   port: number;
+  ready?: () => Promise<boolean>;
 }>;
 
 function toolError(error: unknown) {
@@ -158,7 +159,19 @@ export function createMcpHttpService(options: McpServiceOptions) {
       const rejected = hostHeaderValidationResponse(request, ['127.0.0.1'])
         ?? originValidationResponse(request, ['127.0.0.1']);
       if (rejected) return rejected;
-      if (new URL(request.url).pathname !== '/mcp') return new Response('Not found', { status: 404 });
+      const path = new URL(request.url).pathname;
+      if (path === '/health' && request.method === 'GET') {
+        return new Response('ok', { status: 200 });
+      }
+      if (path === '/ready' && request.method === 'GET') {
+        try {
+          const ready = await options.ready?.();
+          return new Response(ready ? 'ready' : 'unavailable', { status: ready ? 200 : 503 });
+        } catch {
+          return new Response('unavailable', { status: 503 });
+        }
+      }
+      if (path !== '/mcp') return new Response('Not found', { status: 404 });
       const authorization = request.headers.get('authorization');
       if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) return new Response('Unauthorized', { status: 401 });
       const credential = authorization.slice(7);

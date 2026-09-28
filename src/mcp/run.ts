@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../config';
 import { SurrealCompanyCore } from '../core';
 import { CompanyDatabase } from '../database';
@@ -19,7 +20,10 @@ const shutdown = new AbortController();
 try {
   await db.bootstrap();
   const core = new SurrealCompanyCore(db);
-  service = createMcpHttpService({ core, port });
+  service = createMcpHttpService({
+    core, port,
+    ready: async () => Boolean(await db.db.select(new RecordId('company_meta', 'installation'))),
+  });
   console.log(`MCP listening on 127.0.0.1:${service.port}`);
 
   const credentialFile = process.env.SCK_PROJECTOR_CREDENTIAL_FILE;
