@@ -7,7 +7,7 @@ import { createGithubProjector, type GithubGateway } from '../src/mcp/github-pro
 
 const task: TaskView = {
   id: 'task-new-1', title: 'Synthetic managed task', context: 'private task context',
-  state: 'ready', executorRole: 'ai-content', reviewerRole: 'engineering',
+  state: 'ready', executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task',
   dependencies: [], version: 1, fence: 0,
 };
 const event: OutboxEvent = { id: 'event-1', sequence: 1, taskId: task.id, kind: 'created', payload: {}, createdAt: '2026-09-27T00:00:00Z' };

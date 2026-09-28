@@ -1,6 +1,9 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'qa' | 'cs';
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done';
+/** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
+export type ReviewerRole = Role | 'owner';
+export type TaskKind = 'goal' | 'task' | 'gate';
 export type EmployeeId = string;
 export type TaskId = string;
 export type DeliveryId = string;
@@ -18,7 +21,9 @@ export interface TaskView {
   context: string;
   state: TaskState;
   executorRole: Role;
-  reviewerRole: Role;
+  reviewerRole: ReviewerRole;
+  kind: TaskKind;
+  goalId?: string;
   dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
@@ -27,13 +32,26 @@ export interface TaskView {
   leaseExpiresAt?: string;
   fence: number;
   blockedTo?: 'gm' | 'owner';
+  /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
+  handover?: boolean;
+  previousEmployee?: EmployeeId;
+}
+
+export interface HistoryEntry {
+  action: string;
+  actor: string;
+  evidence?: string;
+  version?: number;
+  at: string;
 }
 
 export interface CreateTask {
   title: string;
   context: string;
   executorRole: Role;
-  reviewerRole: Role;
+  reviewerRole: ReviewerRole;
+  kind?: Exclude<TaskKind, 'goal'>;
+  goalId?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
 }
@@ -43,6 +61,8 @@ export interface ClaimResult {
   deliveryId: DeliveryId;
   fence: number;
   leaseExpiresAt: string;
+  /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
+  history: HistoryEntry[];
 }
 
 /** deliveryId + fence are mandatory for every write after claim. */
@@ -81,6 +101,34 @@ export interface CompanyCore {
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
+  history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
+  companyBrief(credential: Credential): Promise<CompanyBrief>;
+  /** gm relays an owner instruction received in a direct conversation; audited as gm-relayed. */
+  relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<GoalView>;
+  relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
+  relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
+}
+
+export type OwnerDecision = 'approve' | 'reject' | 'reply';
+export interface OwnerDecisionInput {
+  taskId: TaskId;
+  decision: OwnerDecision;
+  note: string;
+  idempotencyKey: string;
+}
+
+export interface GoalView {
+  id: string;
+  title: string;
+  brief: string;
+  state: 'active' | 'done' | 'cancelled';
+  tasks: { intake: TaskId; plan: TaskId; manual: TaskId; acceptance: TaskId };
+}
+
+export interface CompanyBrief {
+  directions: { text: string; source: string; at: string }[];
+  goals: GoalView[];
+  paused: boolean;
 }
 
 /** Administrative enrollment is deliberately outside the MCP adapter. */

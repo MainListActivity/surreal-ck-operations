@@ -1,5 +1,7 @@
 {
   "schema_version": 2,
+  "status": "archived-v2",
+  "superseded_by": "SurrealDB sck_agent_company/control_plane: employee_def + employee (paseo_agent_id)",
   "human_owner": "MainListActivity",
   "provider": "codex/gpt-6-astra",
   "max_concurrent_employees": 3,

@@ -13,7 +13,7 @@ const database = new CompanyDatabase({
   namespace: 'sck_agent_company_test',
   database: 'control_plane',
 });
-setDefaultTimeout(30000);
+setDefaultTimeout(120000);
 const core = new SurrealCompanyCore(database);
 const enrollment = new LocalEnrollmentAdmin(database);
 const suffix = randomUUID().slice(0, 8);

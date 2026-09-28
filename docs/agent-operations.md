@@ -1,32 +1,81 @@
-# AI 员工运行与经理交接
+# 公司运行手册 v3
 
-## 已实际创建的团队
+## 组成
 
-2026-09-26，本公司由用户明确指定为“真人 owner + AI 经理及 AI 员工”。六位业务员工均已在独立 Paseo 会话读取协议并返回入职回执；经理沿用当前会话。真实会话标识在 agents/registry.json，不能将 GitHub 共用账号当成这七位员工。
+| 组件 | 位置 | 作用 |
+|---|---|---|
+| 任务服务 | launchd `org.surrealck.company-mcp`，`127.0.0.1:38473/mcp` | 任务、租约、审计、目标、关口；GitHub 投影 |
+| 调度器 | launchd `org.surrealck.company-dispatcher` | 不消耗模型 token：读队列、叫醒/新开员工、续租、收回并改派、订阅健康、老板通知 |
+| 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 领取、执行、交接 |
+| 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
 
-首批执行任务为 #17—#22；#2 汇集入职和队列机制的独立验收。旧 #1 的真人招聘假设已取消，#3—#16 是待核实条件的业务计划。经理不要自动把所有历史 ready-for-agent 规格变成当前已授权实现。
+服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认同时管理两个服务，用 `SCK_COMPONENTS=dispatcher` 只操作调度器。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；调度器以 `caffeinate -i` 运行，Mac 合盖或关机时公司暂停。
 
-## 恢复经理工作
+## 老板入口
 
-1. 读取 registry 与最新 Issue；核对 Paseo 实际会话状态，不依据上一次汇报猜测。
-2. 活动业务员工不超过三位；同岗两人可以同时执行不同任务，任务本机租约通过 queue.py 检查。
-3. 先唤醒有 review 的适任员工，排除 submitted_by 相同员工；其次唤醒有 ready 的员工。不要给 running 会话重复发送执行提示。
-4. 唤醒提示只指定身份、角色、执行边界，要求员工自己 queue/claim。运行器作用是领任务与归因，Paseo 的 send_agent_prompt 才是实际启动执行。
-5. 一个员工每轮最多交付或验收一项然后结束，通知经理继续调度。若员工因环境权限停住，处理实际 pending permission，不把“已发送 prompt”当作正在执行。
-6. #17—#22 完成并经过独立复核后，经理汇总可推进的工作和 owner 问题。产品修改、生产动作、真实客户联系和付费行为仍需要对应明确范围。
+三种方式等价，都会写入 `owner_command` 表，由调度器（或命令行本身）执行：
 
-## 任务领取的边界
+1. **命令行**（在发布目录 `~/Library/Application Support/SurrealCKCompany/active` 下）：
 
-本机一个 operations checkout 使用 fcntl 串行修改租约和 GitHub 状态。多个 agent 必须共用这一份队列运行器；产品代码使用各自 worktree，不能复制队列运行目录分开领任务。
+   ```
+   pnpm run company goal "我要一个 B2C 商城"
+   pnpm run company inbox
+   pnpm run company approve <任务ID> [意见]
+   pnpm run company reject <任务ID> <意见>
+   pnpm run company reply <任务ID> <回答>
+   pnpm run company direction "先服务律师团队"
+   pnpm run company pause | resume | status
+   ```
 
-租约记录执行者、会话、delivery ID 和到期时间。过期不是自动授权抢占；经理必须确认旧会话已停止或取消，然后 release 并安排恢复。GitHub API 失败按 pending 记录恢复；无法确认副作用时保持阻塞而非盲目重做。
+2. **直接写 SurrealDB**（`sck_agent_company/control_plane`）：
 
-首版不具备独立员工凭证、分布式锁或恶意 agent 沙箱；员工绑定是协作调度和审计约束。需要跨机器、多独立运行环境或更高安全隔离时，应迁移到服务端任务租约与按员工授权的工具网关。
+   ```sql
+   CREATE owner_command CONTENT { kind: 'goal', text: '我要一个 B2C 商城' };
+   CREATE owner_command CONTENT { kind: 'approve', task: '<任务ID>', text: '同意' };
+   CREATE owner_command CONTENT { kind: 'reject', task: '<任务ID>', text: '需要修改：…' };
+   CREATE owner_command CONTENT { kind: 'reply', task: '<任务ID>', text: '回答：…' };
+   CREATE owner_command CONTENT { kind: 'direction', text: '公司方向…' };
+   CREATE owner_command CONTENT { kind: 'pause' };   -- 或 'resume'
+   ```
 
-## 巡检
+   执行结果回写在同一行的 `status`（applied / failed）和 `result`。
 
-已启用首日巡检 `d747edb8`：`0 */2 * * *`，America/New_York，每两小时触发一次；最大 12 次，2026-09-27T14:17:28Z 到期。首次计划为 2026-09-26T16:00:00Z。仅唤醒已有经理处理 #2 与 #17—#22 的内部入职任务，不激活后续业务实现。已检查实际调度日志：16:00Z、18:00Z 两次因工作区额度不足失败；20:00Z 的巡检成功读取队列，但经理当时为 error，按规则未唤醒。20:00Z 日志存在重复触发记录，因此不能假定调度恰好一次；任务领取与交接仍须幂等。用户随后要求继续，经理已恢复并重新唤醒独立验收员工。定时器的完整自动推进链尚未据此判定通过。
+3. **在 Paseo 里直接和经理说**：经理用 `create_goal` / `set_direction` / `record_owner_decision` 转录，并逐字记录你的原话，审计来源为 `gm-relay:<经理编号>`。
 
-定时器只负责唤醒经理，不让六个员工一直轮询。启用时在此记录实际 schedule ID、时区、频率、到期与最大运行次数。巡检依赖本机 Paseo daemon、网络、模型服务与 GitHub 登录；不承诺设备关闭时仍运行。
+安全边界：本机所有 AI 员工都有完整权限，数据库 root 与老板命令行没有密码学隔离；老板身份靠审计来源和协议约束，不是防伪机制。
 
-每轮无 ready/review 时结束。有真人阻塞时保留 owner 队列，等待回答；不重复创建相同问题或频繁提醒。续期和提高并发应有实际任务与成本依据。
+## 员工编制（SurrealDB）
+
+- **员工定义** `employee_def`：`role`、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`priority`（越小越优先）、`enabled`。可直接写库，例如：
+
+  ```sql
+  UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', max_instances: 2, priority: 20 };
+  ```
+
+  或 `pnpm run admin def set|list|enable|disable`、`pnpm run admin seed-defs`（写入默认 18 个定义：六岗位 × 三订阅）。
+- **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成（身份 + 独立凭证 + Paseo 会话），`paseo_agent_id` 记录实际会话。会话报错或关闭即退役并撤销凭证；同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
+- 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
+
+## 运行参数
+
+`company_meta:config`（`pnpm run admin config <key> <json>` 或直接写库）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `max_running` | 4 | 同时运行的员工会话上限 |
+| `provider_max` | `{codex:3, grok:2, devin:2}` | 每个订阅同时运行上限 |
+| `poll_seconds` | 20 | 调度间隔 |
+| `stall_minutes` | 90 | 无 checkpoint 多久视为卡死 |
+| `redispatch_minutes` | 15 | 派工后多久未领取可改派 |
+| `paused` | false | 暂停派工（也可用 `company pause`） |
+
+## 排障
+
+- 调度日志：`logs/stdout-dispatcher.log`、`logs/stderr-dispatcher.log`；只在有变化时写入一行 `tick {...}`。
+- 订阅状态：`pnpm run company status`，或查询 `SELECT * FROM provider_health`。
+- 手动让某订阅立即重试：`UPDATE provider_health:<provider> SET until = 0;`（下一轮只派一个探测任务）。
+- 任务历史：经理员工 `get_task_history`，或查询 `SELECT * FROM audit WHERE task = task:<id> ORDER BY at`。
+
+## v2 归档
+
+`scripts/queue.py`、`agents/registry.json` 与 GitHub 标签队列只用于收尾 v2 旧工单（#23、#28 等），新工作一律进入任务服务。启动任务 #3—#16 已由老板决定取消。

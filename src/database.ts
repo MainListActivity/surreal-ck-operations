@@ -6,6 +6,7 @@ import type { DatabaseConfig } from './config.ts';
 const OWNER = 'surreal-ck-operations/issue-23/v1';
 const SCHEMA = readFileSync(fileURLToPath(new URL('../schema/001-control.surql', import.meta.url)), 'utf8');
 const OUTBOX_INDEX = readFileSync(fileURLToPath(new URL('../schema/002-outbox-sequence.surql', import.meta.url)), 'utf8');
+const WORKFORCE = readFileSync(fileURLToPath(new URL('../schema/003-workforce.surql', import.meta.url)), 'utf8');
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -38,8 +39,9 @@ export class CompanyDatabase {
       const tables = dbInfo.tables as Record<string, string> | undefined;
       const tableNames = Object.keys(tables ?? {});
       if (tableNames.length === 0) {
+        // 'quota' is server metadata reported by newer SurrealDB versions, not a user-defined resource.
         const otherDefinitions = Object.entries(dbInfo).filter(([kind, definitions]) =>
-          kind !== 'tables' && definitions !== null && typeof definitions === 'object' &&
+          kind !== 'tables' && kind !== 'quota' && definitions !== null && typeof definitions === 'object' &&
           Object.keys(definitions as Record<string, unknown>).length > 0
         );
         if (otherDefinitions.length > 0) {
@@ -68,6 +70,8 @@ export class CompanyDatabase {
     }
     await this.ensureOutboxSequence();
     await this.db.query(OUTBOX_INDEX);
+    await this.db.query(WORKFORCE);
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 3 WHERE schema_version < 3;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

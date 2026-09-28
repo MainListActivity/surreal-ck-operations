@@ -1,13 +1,53 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyCore, CreateTask, Credential, Evidence, LeaseProof, OutboxEvent, Principal, Role, TaskId, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import { OwnerDesk } from './owner.ts';
 
-const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'];
+export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'];
 const DEFAULT_LEASE_SECONDS = 600;
-const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
-const id = (table: string, value: string) => new RecordId(table, value);
-const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
+const HISTORY_LIMIT = 40;
+const HISTORY_EVIDENCE_CHARS = 6000;
+export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
+export const id = (table: string, value: string) => new RecordId(table, value);
+export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
+
+/**
+ * Unlocks blocked children of $task whose dependencies are all done, and closes the goal
+ * when its final owner acceptance gate is done. Requires $task and $actor in scope.
+ */
+export const UNLOCK_SQL = `
+  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND $task IN dependencies;
+  FOR $child IN $children {
+    LET $remaining = SELECT * FROM task WHERE id IN $child.dependencies AND state != 'done';
+    IF array::len($remaining) = 0 {
+      LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
+      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value, payload: { state: 'ready' }, at: time::now() };
+    };
+  };
+  UPDATE goal SET state = 'done', done_at = time::now() WHERE state = 'active' AND tasks.acceptance = $task;
+`;
+
+/**
+ * Adds $task as a dependency of the goal's first unfinished anchor (manual, then final
+ * acceptance) and re-blocks that anchor, dropping any lease on it. Requires $goal, $task.
+ */
+export const GOAL_ANCHOR_SQL = `
+  IF $goal != NONE {
+    LET $g = SELECT * FROM ONLY $goal;
+    IF $g = NONE OR $g.state != 'active' { THROW 'goal not found or closed' };
+    LET $open = array::filter($g.anchors, |$a| $a.state != 'done');
+    IF array::len($open) > 0 {
+      LET $anchor = SELECT * FROM ONLY $open[0];
+      UPDATE employee SET active_task = NONE WHERE active_task = $anchor.id;
+      UPDATE ONLY $anchor.id SET dependencies += $task, state = 'blocked', blocked_to = NONE,
+        resume_state = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        version += 1;
+    };
+  };
+`;
 
 export class CompanyError extends Error {
   constructor(
@@ -48,24 +88,33 @@ interface TaskRow {
   blocked_to?: 'gm' | 'owner';
   resume_role?: string;
   resume_state?: TaskState;
+  kind?: TaskKind;
+  goal?: RecordId;
+  handover?: boolean;
+  previous_employee?: string;
+  progress_at?: number;
 }
 
-interface IdempotencyRow { payload_digest: string; result: TaskRow }
+export interface IdempotencyRow { payload_digest: string; result: TaskRow }
+export type { TaskRow };
 
-function view(row: TaskRow): TaskView {
+export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
+    kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
     dependencies: (row.dependencies ?? []).map(asId), version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
+    handover: row.handover || undefined,
+    previousEmployee: row.previous_employee,
   };
 }
 
-function requireText(value: string, name: string, min = 1, max = 10000): void {
+export function requireText(value: string, name: string, min = 1, max = 10000): void {
   if (typeof value !== 'string' || value.trim().length < min || value.length > max) {
     throw new CompanyError('invalid', `Invalid ${name}`);
   }
@@ -73,6 +122,10 @@ function requireText(value: string, name: string, min = 1, max = 10000): void {
 
 function requireRole(role: string): asserts role is Role {
   if (!ROLES.includes(role as Role)) throw new CompanyError('invalid', 'Invalid role');
+}
+
+function requireReviewer(role: string): asserts role is ReviewerRole {
+  if (role !== 'owner') requireRole(role);
 }
 
 export class SurrealCompanyCore implements CompanyCore {
@@ -83,7 +136,9 @@ export class SurrealCompanyCore implements CompanyCore {
       throw new CompanyError('invalid', 'Invalid lease duration');
     }
     this.leaseSeconds = seconds;
+    this.owner = new OwnerDesk(database);
   }
+  private readonly owner: OwnerDesk;
   private get db() { return this.database.db; }
 
   async authenticate(credential: Credential): Promise<Principal> {
@@ -181,7 +236,10 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.title, 'title', 3, 200);
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
-    requireRole(input.reviewerRole);
+    requireReviewer(input.reviewerRole);
+    const kind = input.kind ?? 'task';
+    if (!['task', 'gate'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
+    if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
     const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
     const digest = HASH(JSON.stringify({ ...input, dependencies }));
@@ -194,6 +252,7 @@ export class SurrealCompanyCore implements CompanyCore {
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
+      kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -208,8 +267,9 @@ export class SurrealCompanyCore implements CompanyCore {
           dependencies: $dependencies, state: IF array::len($dependencies) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
-          created_at: time::now()
+          kind: $kind, goal: $goal, created_at: time::now()
         };
+        ${GOAL_ANCHOR_SQL}
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
@@ -250,6 +310,7 @@ export class SurrealCompanyCore implements CompanyCore {
         current_employee = $employee,
         delivery_id = IF $same THEN $t.delivery_id ELSE $delivery END,
         lease_expires_at = $now + $lease_seconds,
+        progress_at = IF $same THEN $t.progress_at ELSE $now END,
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
         version = IF $same THEN $t.version ELSE $t.version + 1 END
         RETURN AFTER;
@@ -267,7 +328,55 @@ export class SurrealCompanyCore implements CompanyCore {
     });
     const taskView = view(row);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
-      leaseExpiresAt: taskView.leaseExpiresAt! };
+      leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId) };
+  }
+
+  private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
+    type Row = { action: string; actor: unknown; evidence?: string; version?: number; at: unknown };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT action, actor, evidence, version, at FROM audit WHERE task = $task ORDER BY at DESC LIMIT $limit;',
+      { task: id('task', taskId), limit: HISTORY_LIMIT }
+    );
+    return rows.reverse().map(row => ({
+      action: row.action,
+      actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
+      evidence: row.evidence ? String(row.evidence).slice(0, HISTORY_EVIDENCE_CHARS) : undefined,
+      version: row.version, at: String(row.at),
+    }));
+  }
+
+  async history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]> {
+    await this.getTask(credential, taskId);
+    return this.readHistory(taskId);
+  }
+
+  async companyBrief(credential: Credential): Promise<CompanyBrief> {
+    await this.authorized(credential);
+    return this.owner.brief();
+  }
+
+  private async relayActor(credential: Credential, ownerQuote: string): Promise<string> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may relay owner instructions');
+    requireText(ownerQuote, 'owner quote', 2, 4000);
+    return `gm-relay:${actor.employeeId}`;
+  }
+
+  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<GoalView> {
+    const source = await this.relayActor(credential, input.ownerQuote);
+    return this.owner.createGoal({ text: input.text, source, key: `${source}:${input.idempotencyKey}`,
+      note: `老板原话：${input.ownerQuote}` });
+  }
+
+  async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
+    const source = await this.relayActor(credential, input.ownerQuote);
+    return this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
+      note: `${input.note}\n老板原话：${input.ownerQuote}` });
+  }
+
+  async relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void> {
+    const source = await this.relayActor(credential, input.ownerQuote);
+    await this.owner.addDirection({ text: input.text, source, key: `${source}:${input.idempotencyKey}` });
   }
 
   private async transition(
@@ -322,20 +431,15 @@ export class SurrealCompanyCore implements CompanyCore {
         resume_role = IF $block THEN $who.role ELSE $t.resume_role END,
         resume_state = IF $block THEN $t.state ELSE $t.resume_state END,
         blocked_to = IF $block THEN $to ELSE $t.blocked_to END,
+        progress_at = IF $checkpoint THEN $now ELSE $t.progress_at END,
+        handover = IF $heartbeat OR $checkpoint THEN $t.handover ELSE NONE END,
+        previous_employee = IF $heartbeat OR $checkpoint THEN $t.previous_employee ELSE NONE END,
+        accepted_by = IF $accept THEN $employee ELSE $t.accepted_by END,
         version = IF $heartbeat THEN $t.version ELSE $t.version + 1 END
         RETURN AFTER;
       IF !$heartbeat AND !$checkpoint { UPDATE ONLY $actor SET active_task = NONE };
       IF $accept {
-        LET $children = SELECT * FROM task WHERE state = 'blocked' AND $task IN dependencies;
-        FOR $child IN $children {
-          LET $remaining = SELECT * FROM task WHERE id IN $child.dependencies AND state != 'done';
-          IF array::len($remaining) = 0 {
-            LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
-            CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
-            LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-            CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value, payload: { state: 'ready' }, at: time::now() };
-          };
-        };
+        ${UNLOCK_SQL}
       };
       IF !$heartbeat {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now() };
@@ -365,7 +469,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async heartbeat(credential: Credential, proof: LeaseProof): Promise<ClaimResult> {
     const task = await this.transition(credential, proof, 'heartbeat');
-    return { task, deliveryId: task.deliveryId!, fence: task.fence, leaseExpiresAt: task.leaseExpiresAt! };
+    return { task, deliveryId: task.deliveryId!, fence: task.fence, leaseExpiresAt: task.leaseExpiresAt!, history: [] };
   }
   checkpoint(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'checkpoint', evidence); }
   submit(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'submit', evidence); }

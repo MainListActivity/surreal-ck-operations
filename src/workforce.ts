@@ -1,0 +1,277 @@
+import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { RecordId } from 'surrealdb';
+import type { CompanyDatabase } from './database.ts';
+import type { Principal, Role, TaskId } from './contracts.ts';
+import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
+import { LocalEnrollmentAdmin } from './enrollment.ts';
+
+/**
+ * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
+ * Never hand this object to the MCP adapter.
+ */
+export const PROVIDERS = ['codex', 'grok', 'devin'] as const;
+export type Provider = typeof PROVIDERS[number];
+
+export interface EmployeeDef {
+  id: string;
+  role: Role;
+  provider: string;
+  model: string;
+  thinking?: string;
+  enabled: boolean;
+  maxInstances: number;
+  priority: number;
+  errorStreak: number;
+}
+
+export interface EmployeeInst {
+  id: string;
+  role: Role;
+  def?: string;
+  provider?: string;
+  model?: string;
+  thinking?: string;
+  paseoAgentId?: string;
+  activeTask?: string;
+  credentialFile?: string;
+  lastWakeAt?: number;
+  onboarded?: boolean;
+}
+
+export interface ProviderHealth {
+  provider: string;
+  state: 'healthy' | 'exhausted';
+  until?: number;
+  failures: number;
+  lastError?: string;
+}
+
+export interface CompanyConfig {
+  paused: boolean;
+  maxRunning: number;
+  providerMax: Record<string, number>;
+  pollSeconds: number;
+  stallMinutes: number;
+  redispatchMinutes: number;
+  extendWithinSeconds: number;
+  handoverChars: number;
+}
+
+export const DEFAULT_CONFIG: CompanyConfig = {
+  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
+  pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
+};
+
+export interface SupervisedTask {
+  row: TaskRow;
+  id: TaskId;
+  state: TaskRow['state'];
+  version: number;
+  executorRole: Role;
+  reviewerRole: string;
+  currentEmployee?: string;
+  submittedBy?: string;
+  previousEmployee?: string;
+  leaseExpiresAt?: number;
+  progressAt?: number;
+  blockedTo?: 'gm' | 'owner';
+  kind: string;
+  title: string;
+}
+
+const COOLDOWN_BASE = 30 * 60;
+const COOLDOWN_MAX = 6 * 60 * 60;
+export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
+  role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+
+export class Workforce {
+  private readonly enrollment: LocalEnrollmentAdmin;
+  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string) {
+    this.enrollment = new LocalEnrollmentAdmin(database);
+  }
+  private get db() { return this.database.db; }
+  private async now(): Promise<number> {
+    const [[value]] = await this.db.query<[[number]]>('RETURN [time::unix(time::now())];');
+    return value;
+  }
+
+  async config(): Promise<CompanyConfig> {
+    const row = await this.db.select<Partial<Record<string, unknown>>>(new RecordId('company_meta', 'config'));
+    const pick = <K extends keyof CompanyConfig>(key: K, snake: string) =>
+      (row?.[snake] ?? row?.[key] ?? DEFAULT_CONFIG[key]) as CompanyConfig[K];
+    return {
+      paused: Boolean(row?.paused),
+      maxRunning: pick('maxRunning', 'max_running'),
+      providerMax: { ...DEFAULT_CONFIG.providerMax, ...(pick('providerMax', 'provider_max') as Record<string, number>) },
+      pollSeconds: pick('pollSeconds', 'poll_seconds'),
+      stallMinutes: pick('stallMinutes', 'stall_minutes'),
+      redispatchMinutes: pick('redispatchMinutes', 'redispatch_minutes'),
+      extendWithinSeconds: pick('extendWithinSeconds', 'extend_within_seconds'),
+      handoverChars: pick('handoverChars', 'handover_chars'),
+    };
+  }
+
+  // ---- employee definitions ----
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; maxInstances?: number; priority?: number; enabled?: boolean }): Promise<void> {
+    if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
+    if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
+    if (!(PROVIDERS as readonly string[]).includes(input.provider)) throw new CompanyError('invalid', 'Unsupported provider');
+    await this.db.query(`UPSERT $def MERGE {
+      role: $role, provider: $provider, model: $model, thinking: $thinking,
+      max_instances: $max, priority: $priority, enabled: $enabled };`, {
+      def: id('employee_def', defId), role: input.role, provider: input.provider, model: input.model,
+      thinking: input.thinking, max: input.maxInstances ?? 1, priority: input.priority ?? 100, enabled: input.enabled ?? true,
+    });
+  }
+
+  async defs(): Promise<EmployeeDef[]> {
+    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; enabled: boolean; max_instances: number; priority: number; error_streak?: number };
+    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY priority, id;');
+    return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
+      enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, errorStreak: r.error_streak ?? 0 }));
+  }
+
+  async defFailure(defId: string): Promise<number> {
+    const [[row]] = await this.db.query<[[{ error_streak: number }]]>(
+      'UPDATE $def SET error_streak = (error_streak ?? 0) + 1 RETURN error_streak;', { def: id('employee_def', defId) });
+    return row?.error_streak ?? 0;
+  }
+  async defHealthy(defId: string): Promise<void> {
+    await this.db.query('UPDATE $def SET error_streak = 0 WHERE error_streak > 0;', { def: id('employee_def', defId) });
+  }
+  async disableDef(defId: string, reason: string): Promise<void> {
+    await this.db.query('UPDATE $def SET enabled = false, disabled_reason = $reason, disabled_at = time::now();',
+      { def: id('employee_def', defId), reason });
+  }
+
+  // ---- employee instances ----
+  async insts(): Promise<EmployeeInst[]> {
+    type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; v3_onboarded?: boolean };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
+    return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
+      model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at,
+      onboarded: Boolean(r.v3_onboarded) }));
+  }
+
+  /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned. */
+  async spawnInst(def: EmployeeDef): Promise<EmployeeInst> {
+    const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
+    const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
+    mkdirSync(this.credentialDir, { recursive: true, mode: 0o700 });
+    const credentialFile = join(this.credentialDir, `${employeeId}.token`);
+    const fd = openSync(credentialFile, 'wx', 0o600);
+    try { writeSync(fd, credential); } finally { closeSync(fd); }
+    await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
+      credential_file: $file, retired: false, created_at: time::now() };`, {
+      e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
+      thinking: def.thinking, file: credentialFile,
+    });
+    return { id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credentialFile };
+  }
+
+  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string }): Promise<void> {
+    const [rows] = await this.db.query<[unknown[]]>(`UPDATE $e MERGE {
+      paseo_agent_id: $agent, def: $def ?? def, provider: $provider ?? provider, model: $model ?? model,
+      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, retired: false } RETURN AFTER;`, {
+      e: id('employee', employeeId), agent: input.agentId, def: input.def ? id('employee_def', input.def) : undefined,
+      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile,
+    });
+    if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
+  }
+
+  /** Retires an instance and revokes its credential, so a crashed session cannot act again. */
+  async retire(employeeId: string, reason: string): Promise<void> {
+    await this.db.query('UPDATE $e SET retired = true, retired_reason = $reason, retired_at = time::now();',
+      { e: id('employee', employeeId), reason });
+    await this.enrollment.revoke(employeeId);
+  }
+
+  async touchWake(employeeId: string): Promise<void> {
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true;', { e: id('employee', employeeId) });
+  }
+
+  // ---- provider health ----
+  async providerHealth(): Promise<Map<string, ProviderHealth>> {
+    type Row = { id: RecordId; state: ProviderHealth['state']; until?: number; failures?: number; last_error?: string };
+    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM provider_health;');
+    return new Map(rows.map(r => [asId(r.id), { provider: asId(r.id), state: r.state, until: r.until,
+      failures: r.failures ?? 0, lastError: r.last_error }]));
+  }
+
+  async markExhausted(provider: string, error: string): Promise<ProviderHealth> {
+    const current = (await this.providerHealth()).get(provider);
+    const failures = (current?.failures ?? 0) + 1;
+    const until = (await this.now()) + Math.min(COOLDOWN_BASE * 2 ** (failures - 1), COOLDOWN_MAX);
+    await this.db.query(`UPSERT $p CONTENT { state: 'exhausted', until: $until, failures: $failures,
+      last_error: $error, changed_at: time::now() };`, { p: id('provider_health', provider), until, failures, error: error.slice(0, 500) });
+    return { provider, state: 'exhausted', until, failures, lastError: error };
+  }
+
+  async markHealthy(provider: string): Promise<void> {
+    await this.db.query(`UPSERT $p CONTENT { state: 'healthy', failures: 0, changed_at: time::now() };`,
+      { p: id('provider_health', provider) });
+  }
+
+  // ---- lease supervision ----
+  async tasks(): Promise<SupervisedTask[]> {
+    const [rows] = await this.db.query<[TaskRow[]]>(
+      "SELECT * FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+    return rows.map(row => {
+      const v = view(row);
+      return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
+        currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
+        previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title };
+    });
+  }
+
+  /** Extends a live holder's lease without changing version, fence or delivery. */
+  async extendLease(taskId: TaskId, employeeId: string, seconds: number): Promise<boolean> {
+    const [rows] = await this.db.query<[unknown[]]>(`UPDATE $task SET lease_expires_at = time::unix(time::now()) + $seconds
+      WHERE current_employee = $employee AND delivery_id != NONE RETURN AFTER;`,
+      { task: id('task', taskId), employee: employeeId, seconds });
+    return Boolean(rows?.length);
+  }
+
+  /**
+   * Revokes the holder's lease. Execution returns to ready (review stays review) with a handover flag.
+   * The cleared delivery ID invalidates every later write from the old session; the next claim bumps the fence.
+   */
+  async revokeLease(taskId: TaskId, employeeId: string, reason: string, handover: string): Promise<boolean> {
+    const evidence = `原因：${reason}\n\n${handover}`.slice(0, 30000);
+    const responses = await this.db.query<unknown[]>(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE OR $t.current_employee != $employee { THROW 'lease changed' };
+      LET $next = UPDATE ONLY $task SET
+        state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
+      UPDATE employee SET active_task = NONE WHERE active_task = $task;
+      CREATE audit CONTENT { task: $task, actor: 'dispatcher', action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'revoked', sequence: $sequence.value, payload: { employee: $employee, state: $next.state }, at: time::now() };
+      COMMIT;`, { task: id('task', taskId), employee: employeeId, evidence }).responses();
+    return responses.every(r => r.success);
+  }
+
+  // ---- dispatch bookkeeping ----
+  private dispatchId(taskId: string, version: number, purpose: string) {
+    return id('dispatch', HASH(`${taskId}\0${version}\0${purpose}`).slice(0, 24));
+  }
+  async lastDispatch(taskId: string, version: number, purpose: string): Promise<{ employee: string; at: number } | undefined> {
+    const row = await this.db.select<{ employee: string; at: number }>(this.dispatchId(taskId, version, purpose));
+    return row ?? undefined;
+  }
+  async recordDispatch(taskId: string, version: number, purpose: string, employee: string): Promise<void> {
+    await this.db.query('UPSERT $d CONTENT { task: $task, version: $version, purpose: $purpose, employee: $employee, at: time::unix(time::now()) };',
+      { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee });
+  }
+
+  async serverNow(): Promise<number> { return this.now(); }
+  newKey(): string { return randomUUID(); }
+}

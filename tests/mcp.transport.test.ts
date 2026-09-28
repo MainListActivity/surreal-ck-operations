@@ -6,7 +6,7 @@ import { createMcpHttpService } from '../src/mcp/server';
 const principal: Principal = { employeeId: 'ai-01', role: 'ai-content', capabilities: ['execute', 'review'] };
 const task: TaskView = {
   id: 'task-test', title: 'Adapter smoke', context: 'Synthetic task', state: 'ready',
-  executorRole: 'ai-content', reviewerRole: 'engineering', dependencies: [], version: 1, fence: 0,
+  executorRole: 'ai-content', reviewerRole: 'engineering', kind: 'task', dependencies: [], version: 1, fence: 0,
 };
 let active = true;
 let unavailable = false;

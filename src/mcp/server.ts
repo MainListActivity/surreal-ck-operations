@@ -3,6 +3,7 @@ import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'] as const;
+const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done'] as const;
 const proofShape = {
   taskId: z.string().min(1),
@@ -72,6 +73,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     const credential = token(ctx);
     return run(credential, async () => ({
       principal: await core.authenticate(credential),
+      company: await core.companyBrief(credential),
       tasks: taskId ? [await core.getTask(credential, taskId)] : await core.listTasks(credential, state),
     }));
   });
@@ -85,17 +87,22 @@ function registerTools(server: McpServer, core: CompanyCore) {
       if (taskId) return core.claim(credential, taskId);
       const principal = await core.authenticate(credential);
       const tasks = await core.listTasks(credential);
+      const now = Date.now();
+      const abandoned = (task: TaskView) => task.state === 'doing' && task.executorRole === principal.role &&
+        task.currentEmployee !== principal.employeeId && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) <= now);
       const candidates = tasks.filter((task: TaskView) =>
         (task.state === 'review' && task.reviewerRole === principal.role && task.submittedBy !== principal.employeeId) ||
-        (task.state === 'ready' && task.executorRole === principal.role),
+        (task.state === 'ready' && task.executorRole === principal.role) || abandoned(task),
       );
-      candidates.sort((a, b) => (a.state === 'review' ? 0 : 1) - (b.state === 'review' ? 0 : 1) || a.id.localeCompare(b.id));
+      const rank = (task: TaskView) => task.state === 'review' ? 0 : task.state === 'doing' ? 1 : 2;
+      candidates.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
       // The core remains the sole authority for concurrent claims and dependencies.
       for (const candidate of candidates) {
         try {
           return await core.claim(credential, candidate.id);
         } catch (error) {
-          if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'conflict') throw error;
+          if (typeof error !== 'object' || error === null || !('code' in error) ||
+            !['conflict', 'already_claimed'].includes(String(error.code))) throw error;
         }
       }
       throw { code: 'no_available_task' };
@@ -133,10 +140,34 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'Create a managed company task; requires core manage capability.',
     inputSchema: z.object({
       title: z.string().min(1), context: z.string().min(1),
-      executorRole: z.enum(roles), reviewerRole: z.enum(roles),
+      executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
+      kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
+
+  server.registerTool('get_task_history', {
+    description: 'Read the audited history of a task: claims, checkpoints, submissions, returns, owner decisions and handover packets.',
+    inputSchema: z.object({ taskId: z.string().min(1) }),
+  }, async ({ taskId }, ctx) => run(token(ctx), () => core.history(token(ctx), taskId)));
+
+  const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
+  server.registerTool('create_goal', {
+    description: 'gm only: record a goal the owner gave in direct conversation. Creates the G1 scope gate, planning, acceptance manual and G3 final gate.',
+    inputSchema: z.object({ text: z.string().min(2), ...relayShape }),
+  }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
+
+  server.registerTool('record_owner_decision', {
+    description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
+    inputSchema: z.object({
+      taskId: z.string().min(1), decision: z.enum(['approve', 'reject', 'reply']), note: z.string(), ...relayShape,
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.relayOwnerDecision(token(ctx), input)));
+
+  server.registerTool('set_direction', {
+    description: 'gm only: record a company direction the owner gave in direct conversation; shown to every employee in get_context.',
+    inputSchema: z.object({ text: z.string().min(2), ...relayShape }),
+  }, async (input, ctx) => run(token(ctx), async () => { await core.relayDirection(token(ctx), input); return { recorded: true }; }));
 
   server.registerTool('resume_task', {
     description: 'Resume a blocked task; requires core manage capability.',
