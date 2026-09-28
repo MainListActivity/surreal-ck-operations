@@ -5,6 +5,7 @@ import { loadDatabaseConfig } from '../src/config';
 import type { ClaimResult, TaskView } from '../src/contracts';
 import { SurrealCompanyCore } from '../src/core';
 import { CompanyDatabase } from '../src/database';
+import { LocalEnrollmentAdmin } from '../src/enrollment';
 import { connectCompanyClient } from '../src/mcp/client';
 import { readPrivateCredential } from '../src/mcp/credential-file';
 import { createGhCliGateway, createGithubProjector } from '../src/mcp/github-projector';
@@ -25,6 +26,21 @@ try {
   const core = new SurrealCompanyCore(db);
   service = createMcpHttpService({ core, port: 0 });
   const url = new URL(`http://127.0.0.1:${service.port}/mcp`);
+  const initialize = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+    protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'live-negative', version: '1' },
+  } });
+  const request = (credential?: string) => fetch(url, { method: 'POST', headers: {
+    Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json',
+    ...(credential ? { Authorization: `Bearer ${credential}` } : {}),
+  }, body: initialize });
+  assert.equal((await request()).status, 401);
+  assert.equal((await request('sck_invalid')).status, 401);
+  const enrollment = new LocalEnrollmentAdmin(db);
+  const revokedId = `mcp-revoked-${crypto.randomUUID()}`;
+  const revokedCredential = await enrollment.enroll(revokedId, 'ai-content', ['execute']);
+  assert.equal((await request(revokedCredential)).status, 200);
+  await enrollment.revoke(revokedId);
+  assert.equal((await request(revokedCredential)).status, 401);
   const clients = await Promise.all(credentials.map((credential, index) =>
     connectCompanyClient({ url, credential, clientName: `live-check-${index}` })));
   try {
