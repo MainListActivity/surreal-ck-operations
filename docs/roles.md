@@ -4,7 +4,7 @@
 
 ## 员工定义与实例
 
-1. **岗位 role**：gm、product、engineering、ai-content、qa、cs 六个任务岗位；另设 **eval** 评审岗位（不领任务，只在任务完成后给员工打绩效分）。
+1. **岗位 role**：gm、product、engineering、ai-content、qa、cs 六个任务岗位；另设 **eval** 评审岗位（不领任务，只在任务完成后给员工打绩效分——默认由 Jev 决策模型在调度器内直评，eval 员工是低置信度或故障时的升级通道）。
 2. **员工定义 employee_def**：岗位 + 订阅（provider）+ 模型 + 思考强度 + `weight` 派工权重，存 SurrealDB。每个岗位在 codex、grok、devin 三个订阅上各有定义，互为备份；同岗位多个候选按 `weight × 绩效系数` 加权随机分配任务。
 3. **员工实例**：调度器按定义生成，拥有独立员工编号、凭证和 Paseo 会话（`paseo_agent_id`）。一个实例同一时间只持有一个任务租约；同岗位多个实例可并行处理不同任务。
 

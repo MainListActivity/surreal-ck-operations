@@ -3,6 +3,7 @@ import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, Supervis
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, wake, type PromptEnv } from './prompts.ts';
+import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|quota|usage limit|rate.?limit|too many requests|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
@@ -20,6 +21,8 @@ export interface DispatcherDeps {
   log?: (message: string) => void;
   /** Randomness source for weighted picks; injectable for tests. */
   rand?: () => number;
+  /** Jev System One decision model; undefined disables the Jev evaluation path. */
+  jev?: JevClient;
 }
 
 export interface TickReport {
@@ -203,10 +206,25 @@ export class Dispatcher {
       }
     }
 
-    // 5. Performance evaluation: a judge employee scores every participant of each finished task.
-    //    Lowest dispatch priority; silently skipped when no eval definition is enabled.
-    if (cfg.evalEnabled && defs.some(d => d.role === 'eval' && d.enabled)) {
+    // 5. Performance evaluation. Jev (System One decision model) scores the finished task in
+    //    one ~500ms round trip; low-confidence or repeated failures escalate to an LLM eval
+    //    employee, which stays the only path when Jev is not configured.
+    if (cfg.evalEnabled) {
+      const jevReady = this.deps.jev !== undefined && cfg.evalEngine !== 'llm';
+      const llmReady = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
       for (const task of await wf.pendingEvaluations(3)) {
+        if (jevReady && task.evalAttempts < 3) {
+          const outcome = await this.jevEvaluate(task, cfg, report);
+          if (outcome === 'done') { report.evals.push(task.id); continue; }
+          if (outcome === 'retry') continue;
+        }
+        if (!llmReady) {
+          if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
+            await this.notice(`eval-stuck:${task.id}`,
+              `任务 ${task.id} 的绩效评审无法完成：${cfg.evalEngine === 'jev' ? 'eval_engine=jev 且 Jev 连续失败' : 'Jev 不可用/连续失败且没有启用的 eval 员工定义'}。检查 JEV_API_KEY 或改用 eval_engine=llm。`, report);
+          }
+          continue;
+        }
         if (running >= cfg.maxRunning) break;
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
         if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
@@ -223,6 +241,48 @@ export class Dispatcher {
       }
     }
     return report;
+  }
+
+  /**
+   * One Jev round trip scores every participant of a finished task.
+   * Returns 'done' when scorecards were written, 'retry' to try again next tick,
+   * 'escalate' to hand the task to the LLM eval role.
+   */
+  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate'> {
+    const { workforce: wf, jev } = this.deps;
+    if (!jev) return 'escalate';
+    const attempts = await wf.bumpEvalAttempt(task.id);
+    let parsed: JevScoreAnswers;
+    try {
+      const state = await wf.evalState(task.id);
+      const questions = jevEvalQuestions(state.participants);
+      const result = Object.keys(questions).length
+        ? await jev.ask({
+          task: { id: task.id, title: state.title, context: state.context, executorRole: state.executorRole, reviewerRole: state.reviewerRole },
+          participants: state.participants,
+          metrics: state.metrics,
+          timeline: state.timeline,
+        }, questions)
+        : { model: jev.model, answers: {} };
+      parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
+      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev') {
+        const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +
+          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}`;
+        await wf.recordJevEvaluation(task.id, result.model, summary,
+          parsed.scores.map(s => ({ ...s, flagged: parsed.flagged.includes(s.employee) })), state, parsed.topPerformer);
+        for (const emp of parsed.flagged) {
+          await this.notice(`eval-flag:${task.id}:${emp}`,
+            `Jev 评审标记：任务 ${task.id} 中员工 ${emp} 的行为需要你关注（详见 scorecard）。`, report);
+        }
+        this.log(`jev evaluated ${task.id}: ${parsed.scores.length} scorecards, min confidence ${parsed.minConfidence.toFixed(2)}`);
+        return 'done';
+      }
+      this.log(`jev low confidence on ${task.id} (${parsed.minConfidence.toFixed(2)} < ${cfg.jevMinConfidence}); escalating to eval employee`);
+      return 'escalate';
+    } catch (error) {
+      this.log(`jev evaluation failed for ${task.id} (attempt ${attempts}): ${(error as Error).message}`);
+      return attempts >= 3 ? 'escalate' : 'retry';
+    }
   }
 
   private available(h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' {
@@ -339,9 +399,28 @@ export class Dispatcher {
   }
 
   private async notice(key: string, text: string, report: TickReport) {
-    if (await this.deps.owner.raiseNotice(key, text)) {
-      report.notices.push(key);
-      await this.deps.notify?.('Surreal CK 公司', text).catch(() => undefined);
+    if (!(await this.deps.owner.raiseNotice(key, text))) return;
+    report.notices.push(key);
+    if (!this.deps.notify) return;
+    // Jev triage: a calibrated noul decides whether this notice deserves an immediate
+    // desktop popup; the notice always lands in the owner inbox regardless. Fail-open.
+    const jev = this.deps.jev;
+    if (jev) {
+      try {
+        const cfg = await this.deps.workforce.config();
+        if (cfg.jevNotifyTriage) {
+          const pending = (await this.deps.owner.openNotices()).length;
+          const { answers } = await jev.ask(
+            { notice: { key, text }, pendingInOwnerInbox: pending },
+            { urgent: { type: 'noul', instructions: '这条公司系统提醒需要立即弹窗打扰老板吗？（充值、闸门决策、员工严重异常算紧急；常规状态汇报可等老板自己看收件箱）' } });
+          const noul = answers.urgent;
+          if (noul?.type === 'noul' && (noul.noul ?? 1) < 0.5) {
+            this.log(`jev triaged notice ${key} as non-urgent (${noul.noul?.toFixed(2)})`);
+            return;
+          }
+        }
+      } catch { /* fail-open: still popup */ }
     }
+    await this.deps.notify('Surreal CK 公司', text).catch(() => undefined);
   }
 }

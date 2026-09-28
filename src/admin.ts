@@ -6,6 +6,7 @@ import { CompanyDatabase } from './database.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
 import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
+import { jevFromEnv } from './dispatcher/jev.ts';
 import type { Role } from './contracts.ts';
 
 const usage = `Usage: pnpm run admin <command>
@@ -20,6 +21,7 @@ const usage = `Usage: pnpm run admin <command>
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
   retire <employee-id> <reason>           退役实例并撤销凭证
   scores [任务ID]                          查看绩效评分记录（默认最近 50 条）
+  jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）`;
 
 const [action, ...args] = process.argv.slice(2);
@@ -77,6 +79,18 @@ try {
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });
       } else throw new Error(usage);
       print(await workforce.defs());
+      break;
+    }
+    case 'jev-test': {
+      const jev = jevFromEnv();
+      if (!jev) { console.log('未配置 JEV_API_KEY / TYPESAFE_API_KEY（service.env）；Jev 评审通道未启用'); break; }
+      const started = Date.now();
+      const result = await jev.ask('公司今早的巡检一切正常。', {
+        ok: { type: 'noul', instructions: '这句话是不是一个肯定陈述' },
+        tone: { type: 'score', instructions: '这句话的正式程度', criteria: ['口语随意', '中性', '正式'] },
+      });
+      console.log(`jev ${result.model} 应答正常（${Date.now() - started}ms）:`);
+      print(result.answers);
       break;
     }
     case 'scores': {

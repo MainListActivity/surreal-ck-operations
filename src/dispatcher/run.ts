@@ -5,6 +5,7 @@ import { CompanyDatabase } from '../database.ts';
 import { OwnerDesk } from '../owner.ts';
 import { Workforce } from '../workforce.ts';
 import { Dispatcher } from './dispatcher.ts';
+import { jevFromEnv } from './jev.ts';
 import { createPaseoCli } from './paseo.ts';
 
 const required = (name: string) => {
@@ -33,8 +34,9 @@ try {
     env: { opsRepo: required('SCK_AGENT_CWD'), sckBin: required('SCK_TOOL_BIN') },
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
+    jev: jevFromEnv(),
   });
-  console.log(`${new Date().toISOString()} dispatcher started`);
+  console.log(`${new Date().toISOString()} dispatcher started${jevFromEnv() ? ' (jev enabled)' : ''}`);
   let failures = 0;
   while (!stop.signal.aborted) {
     let wait = (await workforce.config()).pollSeconds * 1000;
@@ -42,7 +44,7 @@ try {
       const report = await dispatcher.tick();
       failures = 0;
       const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-        report.exhausted.length || report.notices.length;
+        report.exhausted.length || report.notices.length || report.evals.length;
       if (changed) console.log(`${new Date().toISOString()} tick ${JSON.stringify(report)}`);
     } catch (error) {
       failures++;

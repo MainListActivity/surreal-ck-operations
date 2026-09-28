@@ -12,6 +12,7 @@ import { Workforce } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway, SpawnInput } from '../src/dispatcher/paseo.ts';
 import type { ClaimResult, TaskView } from '../src/contracts.ts';
+import type { JevClient } from '../src/dispatcher/jev.ts';
 
 const NS = 'sck_agent_company_test_v3';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -346,4 +347,107 @@ test('dispatcher assigns an eval judge for finished tasks and stops once evaluat
   expect(res.recorded).toBe(2);
   await database.db.query('UPDATE dispatch SET at = 0;');
   expect((await dispatcher.tick()).evals).toEqual([]);
+});
+
+test('dispatcher: jev scores finished tasks in one call; low confidence escalates to the llm judge', async () => {
+  await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  await database.db.query('UPDATE task SET evaluated_at = time::now() WHERE evaluated_at = NONE;');
+  await database.db.query('DELETE provider_health;');
+  const paseo = new FakePaseo();
+  const notices: string[] = [];
+  const questions: string[][] = [];
+  const jev: JevClient = {
+    model: 'jev-test',
+    async ask(_state: unknown, qs) {
+      questions.push(Object.keys(qs));
+      const answers: Record<string, unknown> = {};
+      for (const [q, spec] of Object.entries(qs)) {
+        if (spec.type === 'score') answers[q] = { type: 'score', score: 4.2, confidence: 0.93, probabilities: { '4': 0.9 } };
+        else if (q === 'urgent') answers[q] = { type: 'noul', noul: 0.2 };
+        else if (spec.type === 'noul') answers[q] = { type: 'noul', noul: q === 'p0_flag' ? 0.8 : 0.1 };
+        else answers[q] = { type: 'choice', choice: Object.keys(spec.criteria ?? {})[0], confidence: 0.9 };
+      }
+      return { model: 'jev-test', answers } as never;
+    },
+  };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+    rand: () => 0, jev, notify: async (_t, text) => { notices.push(text); } });
+
+  const t = await core.createTask(tokens.gm, { title: 'Jev judged task', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  await execute(tokens['eng-a'], t.id);
+  await review(tokens.qa, t.id);
+
+  const report = await dispatcher.tick();
+  expect(report.evals).toEqual([t.id]);
+  expect(report.woke).toHaveLength(0);                       // no LLM judge session needed
+  const evalCalls = questions.filter(keys => keys.includes('p0_quality'));
+  expect(evalCalls).toHaveLength(1);                         // one Jev round trip for the whole task
+  expect(evalCalls[0]).toEqual(expect.arrayContaining(['p0_quality', 'p0_overall', 'p0_flag', 'p1_flag', 'top']));
+
+  const [[row]] = await database.db.query<[[{ evaluated_at?: unknown; eval_via?: string }]]>(
+    'SELECT evaluated_at, eval_via FROM $t;', { t: new RecordId('task', t.id) });
+  expect(row.evaluated_at).toBeDefined();
+  expect(row.eval_via).toBe('jev');
+  const [cards] = await database.db.query<[Array<{ employee: string; judge?: string; confidence?: number; flagged?: boolean; overall: number }>]>(
+    'SELECT employee, judge, confidence, flagged, overall FROM scorecard WHERE task = $t;', { t: new RecordId('task', t.id) });
+  expect(cards).toHaveLength(3);                                  // gm created the task and is a participant too
+  expect(cards.every(c => c.judge === 'jev' && (c.confidence ?? 0) > 0.9 && c.overall === 4.2)).toBe(true);
+  expect(cards.find(c => c.employee === 't-eng-a')?.flagged).toBe(true);
+  // The flagged employee produced an owner inbox notice, but Jev triaged it as non-urgent: no desktop popup.
+  expect((await owner.openNotices()).some(n => n.key === `eval-flag:${t.id}:t-eng-a`)).toBe(true);
+  expect(notices).toHaveLength(0);
+  expect((await dispatcher.tick()).evals).toEqual([]);
+
+  // Low-confidence verdicts escalate to an LLM eval employee instead of recording.
+  const shaky: JevClient = { model: 'jev-test', ask: async (_s: unknown, qs) => {
+    const answers: Record<string, unknown> = {};
+    for (const [q, spec] of Object.entries(qs)) {
+      if (spec.type === 'score') answers[q] = { type: 'score', score: 3, confidence: 0.2 };
+      else if (spec.type === 'noul') answers[q] = { type: 'noul', noul: 0.1 };
+      else answers[q] = { type: 'choice', choice: 'x', confidence: 0.2 };
+    }
+    return { model: 'jev-test', answers } as never;
+  } };
+  const dispatcher2 = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+    rand: () => 0, jev: shaky });
+  await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
+  const t2 = await core.createTask(tokens.gm, { title: 'Hard to judge', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  await execute(tokens['eng-a'], t2.id);
+  await review(tokens.qa, t2.id);
+  const report2 = await dispatcher2.tick();
+  expect(report2.evals).toEqual([t2.id]);
+  expect(report2.woke[0].employee.startsWith('eval-')).toBe(true);   // escalated to the LLM judge
+  const [[row2]] = await database.db.query<[[{ evaluated_at?: unknown; eval_attempts?: number }]]>(
+    'SELECT evaluated_at, eval_attempts FROM $t;', { t: new RecordId('task', t2.id) });
+  expect(row2.evaluated_at).toBeUndefined();
+  expect(row2.eval_attempts).toBe(1);
+});
+
+test('dispatcher: jev api failures retry then fall back to the llm judge', async () => {
+  await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  await database.db.query('UPDATE task SET evaluated_at = time::now() WHERE evaluated_at = NONE;');
+  await database.db.query('DELETE provider_health;');
+  const paseo = new FakePaseo();
+  let attempts = 0;
+  const broken: JevClient = { model: 'jev-test', ask: async () => { attempts++; throw new Error('jev api down'); } };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+    rand: () => 0, jev: broken });
+  await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
+  await workforce.upsertDef('eval-codex', { role: 'eval', provider: 'codex', model: 'gpt-6-sol', thinking: 'low', weight: 30 });
+
+  const t = await core.createTask(tokens.gm, { title: 'Jev unreachable', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  await execute(tokens['eng-a'], t.id);
+  await review(tokens.qa, t.id);
+
+  for (let i = 0; i < 2; i++) {
+    const report = await dispatcher.tick();
+    expect(report.evals).toEqual([]);
+    expect(report.woke).toHaveLength(0);                     // still retrying, no LLM judge yet
+  }
+  const report3 = await dispatcher.tick();                   // attempt 3 fails → escalate immediately
+  expect(attempts).toBe(3);
+  expect(report3.woke[0].employee.startsWith('eval-')).toBe(true);
 });

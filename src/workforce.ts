@@ -6,6 +6,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { Principal, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
+import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -62,12 +63,20 @@ export interface CompanyConfig {
   extendWithinSeconds: number;
   handoverChars: number;
   evalEnabled: boolean;
+  /** auto: Jev 直评、低置信度升级 LLM 评审员；llm: 只走 LLM 评审员；jev: 只走 Jev（低置信度也记录）。 */
+  evalEngine: 'auto' | 'llm' | 'jev';
+  /** Jev 单题置信度下限，低于则升级 LLM 评审员（auto 模式）。 */
+  jevMinConfidence: number;
+  /** Jev 员工风险标记 noul 阈值，达到则给老板发提醒。 */
+  jevFlagThreshold: number;
+  /** 配置了 Jev 时，用 noul 决定系统提醒是否弹桌面通知（否则只进收件箱）。 */
+  jevNotifyTriage: boolean;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
-  evalEnabled: true,
+  evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -110,6 +119,7 @@ export interface SupervisedTask {
   blockedTo?: 'gm' | 'owner';
   kind: string;
   title: string;
+  evalAttempts: number;
 }
 
 const COOLDOWN_BASE = 30 * 60;
@@ -142,6 +152,10 @@ export class Workforce {
       extendWithinSeconds: pick('extendWithinSeconds', 'extend_within_seconds'),
       handoverChars: pick('handoverChars', 'handover_chars'),
       evalEnabled: row?.eval_enabled !== false,
+      evalEngine: (engine => (engine === 'llm' || engine === 'jev' ? engine : 'auto'))(String(row?.eval_engine ?? 'auto')),
+      jevMinConfidence: typeof row?.jev_min_confidence === 'number' ? row.jev_min_confidence : 0.7,
+      jevFlagThreshold: typeof row?.jev_flag_threshold === 'number' ? row.jev_flag_threshold : 0.65,
+      jevNotifyTriage: row?.jev_notify_triage !== false,
     };
   }
 
@@ -264,8 +278,29 @@ export class Workforce {
       return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
         currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
         previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title };
+        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
+        evalAttempts: row.eval_attempts ?? 0 };
     });
+  }
+
+  /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
+  async evalState(taskId: TaskId): Promise<EvalState> {
+    return collectEvalState(this.db, taskId);
+  }
+
+  /** Record a Jev-produced evaluation: scorecards + evaluated_at + audit/outbox + rolling averages. */
+  async recordJevEvaluation(
+    taskId: TaskId, judge: string, summary: string,
+    scores: ScoredEmployee[], state: EvalState, topPerformer?: string,
+  ): Promise<{ recorded: number; participants: string[] }> {
+    return writeScorecards(this.db, { taskId, summary, judge, judgeKind: 'jev', scores, state, topPerformer });
+  }
+
+  /** Count one Jev attempt so repeated API failures fall back to the LLM judge path. */
+  async bumpEvalAttempt(taskId: TaskId): Promise<number> {
+    const [row] = await this.db.query<[{ eval_attempts?: number }]>(
+      'UPDATE ONLY $t SET eval_attempts = (eval_attempts ?? 0) + 1 RETURN AFTER;', { t: new RecordId('task', taskId) });
+    return row?.eval_attempts ?? 1;
   }
 
   /** Done tasks not yet performance-evaluated, oldest first. */
@@ -277,7 +312,8 @@ export class Workforce {
       return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
         currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
         previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title };
+        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
+        evalAttempts: row.eval_attempts ?? 0 };
     });
   }
 
