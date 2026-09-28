@@ -10,6 +10,13 @@ action=${1:-}
 components=${SCK_COMPONENTS:-"mcp dispatcher"}
 
 label() { echo "org.surrealck.company-$1"; }
+
+# launchctl bootout is asynchronous; bootstrapping before the old job is gone fails with EIO.
+unload() {
+  launchctl bootout "$domain/$(label "$1")" 2>/dev/null || true
+  i=0
+  while launchctl print "$domain/$(label "$1")" >/dev/null 2>&1 && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+}
 plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 
 write_plist() {
@@ -49,7 +56,7 @@ case "$action" in
     mv -h -f "$service_home/active.next" "$service_home/active"
     for c in $components; do
       write_plist "$c"
-      launchctl bootout "$domain/$(label "$c")" 2>/dev/null || true
+      unload "$c"
       launchctl bootstrap "$domain" "$(plist "$c")"
     done
     ;;
@@ -57,7 +64,7 @@ case "$action" in
     for c in $components; do launchctl bootstrap "$domain" "$(plist "$c")"; done
     ;;
   stop)
-    for c in $components; do launchctl bootout "$domain/$(label "$c")" || true; done
+    for c in $components; do unload "$c"; done
     ;;
   restart)
     for c in $components; do launchctl kickstart -k "$domain/$(label "$c")"; done
@@ -70,7 +77,7 @@ case "$action" in
     ;;
   uninstall)
     for c in $components; do
-      launchctl bootout "$domain/$(label "$c")" 2>/dev/null || true
+      unload "$c"
       rm -f "$(plist "$c")"
     done
     ;;
