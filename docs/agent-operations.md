@@ -9,6 +9,8 @@
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 领取、执行、交接 |
 | 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
 
+数据位于**产品同一台自托管 SurrealDB**（连接地址与 root 凭证读自 `SCK_PRODUCT_ENV` 指向的产品 `.env`，当前 `wss://data.maplayer.top/rpc`）；公司数据独占 `sck_agent_company` namespace / `control_plane` database，与产品 `main` namespace 隔离。换库或换实例改 `service.env` 的 `SCK_COMPANY_NS` / `SCK_COMPANY_DB` 或 `SCK_PRODUCT_ENV`。
+
 服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认同时管理两个服务，用 `SCK_COMPONENTS=dispatcher` 只操作调度器。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；调度器以 `caffeinate -i` 运行，Mac 合盖或关机时公司暂停。
 
 ## 老板入口
@@ -46,13 +48,17 @@
 
 ## 员工编制（SurrealDB）
 
-- **员工定义** `employee_def`：`role`、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`priority`（越小越优先）、`enabled`。可直接写库，例如：
+- **员工定义** `employee_def`：`role`（六任务岗位 + `eval` 评审）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`。可直接写库，例如：
 
   ```sql
-  UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', max_instances: 2, priority: 20 };
+  UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', max_instances: 2, weight: 25 };
   ```
 
-  或 `pnpm run admin def set|list|enable|disable`、`pnpm run admin seed-defs`（写入默认 18 个定义：六岗位 × 三订阅）。
+  或 `pnpm run admin def set|list|weight|enable|disable`、`pnpm run admin seed-defs`（写入默认 21 个定义：七岗位 × 三订阅）。
+
+- **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight × 绩效系数` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。绩效系数 = `clamp(avg_score/3, 0.3, 2)`，尚无评分时为 1。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
+
+- **绩效评分**：任务进入 done 后，调度器派一位 `eval` 岗位员工读取该任务全部审计历史，给每位参与员工打 1–5 分（quality / evidence / discipline / timeliness / overall），写入 `scorecard` 表并滚动更新 `employee.avg_score` 与 `employee_def.avg_score`。任务标记 `evaluated_at` 后不再重复评审；评审中断会自动改派另一位评审。查看：`pnpm run admin scores [任务ID]`、`pnpm run company status`。关闭：`pnpm run admin config eval_enabled false`。
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成（身份 + 独立凭证 + Paseo 会话），`paseo_agent_id` 记录实际会话。会话报错或关闭即退役并撤销凭证；同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
 
@@ -66,8 +72,9 @@
 | `provider_max` | `{codex:3, grok:2, devin:2}` | 每个订阅同时运行上限 |
 | `poll_seconds` | 20 | 调度间隔 |
 | `stall_minutes` | 90 | 无 checkpoint 多久视为卡死 |
-| `redispatch_minutes` | 15 | 派工后多久未领取可改派 |
+| `redispatch_minutes` | 15 | 派工后多久未领取可改派（评审派工同样受该去重窗口约束） |
 | `paused` | false | 暂停派工（也可用 `company pause`） |
+| `eval_enabled` | true | 任务完成后是否自动派评审员打绩效分 |
 
 ## 排障
 
@@ -75,6 +82,8 @@
 - 订阅状态：`pnpm run company status`，或查询 `SELECT * FROM provider_health`。
 - 手动让某订阅立即重试：`UPDATE provider_health:<provider> SET until = 0;`（下一轮只派一个探测任务）。
 - 任务历史：经理员工 `get_task_history`，或查询 `SELECT * FROM audit WHERE task = task:<id> ORDER BY at`。
+- 绩效记录：`pnpm run admin scores [任务ID]`；员工定义均分 `SELECT id, weight, avg_score, scored FROM employee_def`；想给某任务重新评审：`UPDATE task:<id> SET evaluated_at = NONE;`。
+- 不想让某类员工再接任务但保留定义：`pnpm run admin def weight <id> 0`（软停用，全部候选为 0 时仍可能兜底）；彻底停用用 `def disable <id>`。
 
 ## v2 归档
 

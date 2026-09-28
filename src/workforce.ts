@@ -23,6 +23,10 @@ export interface EmployeeDef {
   enabled: boolean;
   maxInstances: number;
   priority: number;
+  /** 派工权重：同岗位候选中按 weight × 绩效系数 加权随机选取；0 = 永不主动选中。 */
+  weight: number;
+  scored: number;
+  avgScore?: number;
   errorStreak: number;
 }
 
@@ -57,12 +61,39 @@ export interface CompanyConfig {
   redispatchMinutes: number;
   extendWithinSeconds: number;
   handoverChars: number;
+  evalEnabled: boolean;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
+  evalEnabled: true,
 };
+
+/** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
+export const effectiveWeight = (def: EmployeeDef | undefined): number => {
+  const base = Math.max(0, def?.weight ?? 10);
+  const factor = def?.avgScore && def.avgScore > 0 ? Math.min(Math.max(def.avgScore / 3, 0.3), 2) : 1;
+  return base * factor;
+};
+
+/** 加权随机排序（不放回），rand 注入便于测试；权重全为 0 时退化为均匀随机。 */
+export function weightedOrder<T>(items: T[], weightOf: (item: T) => number, rand: () => number): T[] {
+  const pool = [...items];
+  const out: T[] = [];
+  while (pool.length) {
+    const weights = pool.map(i => Math.max(0, weightOf(i)));
+    const total = weights.reduce((s, w) => s + w, 0);
+    let r = rand() * (total || pool.length);
+    let index = pool.length - 1;
+    for (let i = 0; i < pool.length; i++) {
+      r -= total > 0 ? weights[i] : 1;
+      if (r < 0) { index = i; break; }
+    }
+    out.push(pool.splice(index, 1)[0]);
+  }
+  return out;
+}
 
 export interface SupervisedTask {
   row: TaskRow;
@@ -84,7 +115,7 @@ export interface SupervisedTask {
 const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
-  role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+  role === 'eval' ? [] : role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
 
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
@@ -110,27 +141,34 @@ export class Workforce {
       redispatchMinutes: pick('redispatchMinutes', 'redispatch_minutes'),
       extendWithinSeconds: pick('extendWithinSeconds', 'extend_within_seconds'),
       handoverChars: pick('handoverChars', 'handover_chars'),
+      evalEnabled: row?.eval_enabled !== false,
     };
   }
 
   // ---- employee definitions ----
-  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; maxInstances?: number; priority?: number; enabled?: boolean }): Promise<void> {
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!(PROVIDERS as readonly string[]).includes(input.provider)) throw new CompanyError('invalid', 'Unsupported provider');
+    if (input.weight !== undefined && (!Number.isInteger(input.weight) || input.weight < 0 || input.weight > 1000)) {
+      throw new CompanyError('invalid', 'Invalid weight');
+    }
     await this.db.query(`UPSERT $def MERGE {
       role: $role, provider: $provider, model: $model, thinking: $thinking,
-      max_instances: $max, priority: $priority, enabled: $enabled };`, {
+      max_instances: $max, priority: $priority, weight: $weight, enabled: $enabled };`, {
       def: id('employee_def', defId), role: input.role, provider: input.provider, model: input.model,
-      thinking: input.thinking, max: input.maxInstances ?? 1, priority: input.priority ?? 100, enabled: input.enabled ?? true,
+      thinking: input.thinking, max: input.maxInstances ?? 1, priority: input.priority ?? 100,
+      weight: input.weight ?? 10, enabled: input.enabled ?? true,
     });
   }
 
   async defs(): Promise<EmployeeDef[]> {
-    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; enabled: boolean; max_instances: number; priority: number; error_streak?: number };
-    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY priority, id;');
+    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; enabled: boolean;
+      max_instances: number; priority: number; weight?: number; scored?: number; avg_score?: number; error_streak?: number };
+    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
-      enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, errorStreak: r.error_streak ?? 0 }));
+      enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
+      weight: r.weight ?? 10, scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
   }
 
   async defFailure(defId: string): Promise<number> {
@@ -221,6 +259,19 @@ export class Workforce {
   async tasks(): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
       "SELECT * FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+    return rows.map(row => {
+      const v = view(row);
+      return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
+        currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
+        previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title };
+    });
+  }
+
+  /** Done tasks not yet performance-evaluated, oldest first. */
+  async pendingEvaluations(limit = 3): Promise<SupervisedTask[]> {
+    const [rows] = await this.db.query<[TaskRow[]]>(
+      "SELECT * FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
     return rows.map(row => {
       const v = view(row);
       return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,

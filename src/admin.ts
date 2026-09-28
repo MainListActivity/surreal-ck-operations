@@ -5,20 +5,22 @@ import { loadDatabaseConfig } from './config.ts';
 import { CompanyDatabase } from './database.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
-import { capabilitiesFor, Workforce } from './workforce.ts';
+import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
 import type { Role } from './contracts.ts';
 
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
   revoke <employee-id>                    撤销身份
-  def list                                列出员工定义
-  def set <id> <role> <provider> <model> [thinking] [max-instances] [priority]
+  def list                                列出员工定义（含权重与绩效均分）
+  def set <id> <role> <provider> <model> [thinking] [max-instances] [priority] [weight]
+  def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def enable|disable <id>
-  seed-defs                               写入默认员工定义（codex/grok/devin × 六岗位，已存在则不覆盖）
+  seed-defs                               写入默认员工定义（codex/grok/devin × 七岗位含 eval，已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
   retire <employee-id> <reason>           退役实例并撤销凭证
-  config <key> <json-value>               修改 company_meta:config（如 max_running 4）`;
+  scores [任务ID]                          查看绩效评分记录（默认最近 50 条）
+  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）`;
 
 const [action, ...args] = process.argv.slice(2);
 if (!action) throw new Error(usage);
@@ -52,17 +54,37 @@ try {
     }
     case 'def': {
       const [sub, defId, ...rest] = args;
-      if (sub === 'list') { print(await workforce.defs()); break; }
+      if (sub === 'list') {
+        print((await workforce.defs()).map(d => ({ id: d.id, role: d.role, provider: d.provider, model: d.model,
+          thinking: d.thinking, enabled: d.enabled, max: d.maxInstances, weight: d.weight,
+          effectiveWeight: Number(effectiveWeight(d).toFixed(2)),
+          avgScore: d.avgScore ? Number(d.avgScore.toFixed(2)) : undefined, scored: d.scored,
+          errorStreak: d.errorStreak })));
+        break;
+      }
       if (sub === 'set') {
-        const [role, provider, model, thinking, max, priority] = rest;
+        const [role, provider, model, thinking, max, priority, weight] = rest;
         if (!defId || !role || !provider || !model) throw new Error(usage);
         await workforce.upsertDef(defId, { role: role as Role, provider, model, thinking: thinking || undefined,
-          maxInstances: max ? Number(max) : undefined, priority: priority ? Number(priority) : undefined });
+          maxInstances: max ? Number(max) : undefined, priority: priority ? Number(priority) : undefined,
+          weight: weight ? Number(weight) : undefined });
+      } else if (sub === 'weight') {
+        if (!defId || rest[0] === undefined) throw new Error(usage);
+        await database.db.query('UPDATE $def SET weight = $weight;',
+          { def: new RecordId('employee_def', defId), weight: Number(rest[0]) });
       } else if (sub === 'enable' || sub === 'disable') {
         await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0;',
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });
       } else throw new Error(usage);
       print(await workforce.defs());
+      break;
+    }
+    case 'scores': {
+      const taskId = args[0];
+      print((await database.db.query<unknown[]>(
+        taskId ? 'SELECT * FROM scorecard WHERE task = $task ORDER BY at DESC LIMIT 50;'
+          : 'SELECT * FROM scorecard ORDER BY at DESC LIMIT 50;',
+        { task: taskId ? new RecordId('task', taskId) : undefined }))[0]);
       break;
     }
     case 'seed-defs': {

@@ -16,6 +16,7 @@ const core = {
     if (credential !== 'sck_valid' || !active) throw { code: 'unauthorized' };
     return principal;
   },
+  async companyBrief() { return { directions: [], goals: [], paused: false }; },
   async listTasks() { return [task]; },
   async getTask() { return task; },
   async claim() { return { task: { ...task, state: 'doing' as const, version: 2 }, deliveryId: 'delivery-1', fence: 1, leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() }; },

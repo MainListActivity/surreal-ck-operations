@@ -33,7 +33,7 @@ beforeAll(async () => {
   for (const [name, role, caps] of [
     ['gm', 'gm', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
     ['eng-a', 'engineering', ['execute', 'review']], ['eng-b', 'engineering', ['execute', 'review']],
-    ['qa', 'qa', ['execute', 'review']],
+    ['qa', 'qa', ['execute', 'review']], ['eval', 'eval', []],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
 });
 
@@ -187,7 +187,7 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   const paseo = new FakePaseo();
   const notices: string[] = [];
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
-    notify: async (_t, text) => { notices.push(text); } });
+    rand: () => 0, notify: async (_t, text) => { notices.push(text); } });
   const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
 
   const t = await core.createTask(tokens.gm, { title: 'Dispatch me', context: 'synthetic', executorRole: 'engineering',
@@ -259,7 +259,7 @@ test('dispatcher: owner gates raise one notification each and resolve once decid
   const paseo = new FakePaseo();
   const notified: string[] = [];
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
-    notify: async (_t, text) => { notified.push(text); } });
+    rand: () => 0, notify: async (_t, text) => { notified.push(text); } });
   const gate = await core.createTask(tokens.gm, { title: 'G2 购买域名', context: 'synthetic gate', kind: 'gate',
     executorRole: 'product', reviewerRole: 'owner', idempotencyKey: key() });
   await execute(tokens.product, gate.id, 'G2 申请：购买域名 example.test，年费 10 元，用于演示环境。');
@@ -269,4 +269,81 @@ test('dispatcher: owner gates raise one notification each and resolve once decid
   await owner.decide({ taskId: gate.id, decision: 'approve', note: '', source: 'owner:test', key: key() });
   await dispatcher.tick();
   expect((await owner.openNotices()).some(n => n.key.startsWith(`gate:${gate.id}`))).toBe(false);
+});
+
+test('eval role records scorecards for task participants and rolls them into def averages', async () => {
+  await database.db.query('UPDATE task SET evaluated_at = time::now() WHERE evaluated_at = NONE;');
+  await workforce.upsertDef('engineering-evaltarget', { role: 'engineering', provider: 'grok', model: 'grok-4.7',
+    thinking: 'medium', weight: 10 });
+  const def = (await workforce.defs()).find(d => d.id === 'engineering-evaltarget')!;
+  const inst = await workforce.spawnInst(def);
+  const instToken = readFileSync(join(credDir, `${inst.id}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: 'Scored task', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  const claim = await core.claim(instToken, t.id);
+  const cp = await core.checkpoint(instToken, proofOf(claim), { text: '完成了数据结构设计，下一步提交实现分支并自测。', idempotencyKey: key() });
+  await core.submit(instToken, proofOf(claim, cp.version), { text: '实现完毕，代码已提交到任务专属分支，等待独立验收。', idempotencyKey: key() });
+  await review(tokens.qa, t.id);
+  expect((await task(t.id)).state).toBe('done');
+
+  // Only the eval role may record scores; every scored employee must be a real participant.
+  await expect(core.recordScore(tokens.qa, { taskId: t.id, summary: 'x', scores: [] }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.recordScore(tokens.eval, { taskId: t.id, summary: 'x', scores: [
+    { employee: 'nobody', quality: 4, evidence: 4, discipline: 4, timeliness: 4, overall: 4 },
+  ] })).rejects.toMatchObject({ code: 'invalid' });
+
+  const res = await core.recordScore(tokens.eval, { taskId: t.id, summary: '执行顺畅，验收一次通过。', scores: [
+    { employee: inst.id, quality: 4, evidence: 4, discipline: 5, timeliness: 4, overall: 4.5, notes: 'checkpoint 及时' },
+    { employee: 't-qa', quality: 4, evidence: 4, discipline: 4, timeliness: 5, overall: 4, notes: '验收独立' },
+  ] });
+  expect(res.recorded).toBe(2);
+  expect(res.participants).toEqual(expect.arrayContaining([inst.id, 't-qa']));
+
+  const [[card]] = await database.db.query<[[{ overall: number; metrics: { checkpoints: number } }]]>(
+    'SELECT overall, metrics FROM scorecard WHERE task = $task AND employee = $emp;',
+    { task: new RecordId('task', t.id), emp: inst.id });
+  expect(card.overall).toBe(4.5);
+  expect(card.metrics.checkpoints).toBe(1);
+
+  const updated = (await workforce.defs()).find(d => d.id === 'engineering-evaltarget')!;
+  expect(updated.avgScore).toBe(4.5);
+  expect(updated.scored).toBe(1);
+  const [[marked]] = await database.db.query<[[{ evaluated_at?: unknown }]]>(
+    'SELECT evaluated_at FROM $t;', { t: new RecordId('task', t.id) });
+  expect(marked.evaluated_at).toBeDefined();
+});
+
+test('dispatcher assigns an eval judge for finished tasks and stops once evaluated', async () => {
+  await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  await database.db.query('UPDATE task SET evaluated_at = time::now() WHERE evaluated_at = NONE;');
+  await database.db.query('DELETE provider_health;');
+  await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+
+  const t = await core.createTask(tokens.gm, { title: 'Needs judging', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  await execute(tokens['eng-a'], t.id);
+  await review(tokens.qa, t.id);
+
+  const report = await dispatcher.tick();
+  expect(report.evals).toEqual([t.id]);
+  const evalInst = report.woke[0].employee;
+  expect(evalInst.startsWith('eval-grok-')).toBe(true);
+  const evalAgent = [...paseo.agents.keys()][0];
+  expect(paseo.agents.get(evalAgent)!.spawn!.prompt).toContain('绩效评审');
+  expect(paseo.agents.get(evalAgent)!.spawn!.prompt).toContain(t.id);
+
+  // Inside the redispatch window nothing is sent again; once scores land the task is done for good.
+  expect((await dispatcher.tick()).evals).toEqual([]);
+  const evalToken = readFileSync(join(credDir, `${evalInst}.token`), 'utf8');
+  const res = await core.recordScore(evalToken, { taskId: t.id, summary: '本轮顺畅。', scores: [
+    { employee: 't-eng-a', quality: 4, evidence: 4, discipline: 4, timeliness: 4, overall: 4 },
+    { employee: 't-qa', quality: 5, evidence: 5, discipline: 5, timeliness: 5, overall: 5 },
+  ] });
+  expect(res.recorded).toBe(2);
+  await database.db.query('UPDATE dispatch SET at = 0;');
+  expect((await dispatcher.tick()).evals).toEqual([]);
 });

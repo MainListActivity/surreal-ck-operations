@@ -9,6 +9,7 @@ const ROLE_NAMES: Record<string, string> = {
   'ai-content': 'AI 与内容',
   qa: '测试：独立验收，按手册实际操作验证',
   cs: '客户成功',
+  eval: '评审：任务完成后为参与员工打绩效分',
 };
 
 const tool = (inst: EmployeeInst, env: PromptEnv) =>
@@ -32,6 +33,21 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
    每完成一个有意义的步骤就 checkpoint（已完成、改动文件、下一步）。代码任务在任务专属分支/worktree 中工作，checkpoint 前先提交到该分支。
 3. 本轮只做这一项；完成交接后结束本轮，不要空转等待，不创建 agent 或定时器。
 若领取返回 already_claimed、no_available_task 或 forbidden，直接结束本轮。`;
+  return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
+}
+
+export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean): string {
+  const call = tool(inst, env);
+  const body = `【绩效评审】任务 ${task.id}「${task.title}」已完成，请为本轮所有参与员工打绩效分。
+1. 读取任务与历史：
+   ${call.replace('<工具名>', 'get_task_history').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
+   ${call.replace('<工具名>', 'get_context').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
+   history 里出现的员工编号（claim/checkpoint/submit/review/revoked 的 actor 或 payload）即参与者；dispatcher、owner、gm-relay 不是员工，不评分。
+2. 对每位参与者按 1–5 分打分（可以取 0.5 步进）：quality 交付质量、evidence 证据是否真实完整、discipline 流程纪律（是否及时 checkpoint、按协议操作、是否中断导致交接）、timeliness 推进效率，再加 overall 总分与 notes 评语。
+   被中断收回租约的员工 discipline/timeliness 应偏低；接手交接并完成好的员工可给高分。评审的是这一轮的行为，不看资历。你的评分会进入该员工定义的 avg_score，直接影响同类员工以后接到任务的概率，请客观。
+3. 上报（scores 覆盖全部参与者，缺一不可；若确实没有参与者就传空数组）：
+   ${call.replace('<工具名>', 'record_score').replace('<JSON参数>', `{"taskId":"${task.id}","summary":"<本轮一句话总结>","scores":[{"employee":"<员工编号>","quality":4,"evidence":4,"discipline":4,"timeliness":4,"overall":4,"notes":"<评语>"}]}`)}
+   调用成功（返回 recorded 数）即完成本轮，不要空转等待。`;
   return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
 }
 

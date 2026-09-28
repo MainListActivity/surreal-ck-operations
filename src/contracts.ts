@@ -1,5 +1,6 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
-export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'qa' | 'cs';
+/** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
+export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'qa' | 'cs' | 'eval';
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
 export type ReviewerRole = Role | 'owner';
@@ -107,6 +108,18 @@ export interface CompanyCore {
   relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<GoalView>;
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
+  /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
+  recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
+}
+
+export interface EmployeeScore {
+  employee: EmployeeId;
+  quality: number;
+  evidence: number;
+  discipline: number;
+  timeliness: number;
+  overall: number;
+  notes?: string;
 }
 
 export type OwnerDecision = 'approve' | 'reject' | 'reply';

@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 
-export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'];
+export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs', 'eval'];
 const DEFAULT_LEASE_SECONDS = 600;
 const HISTORY_LIMIT = 40;
 const HISTORY_EVIDENCE_CHARS = 6000;
@@ -176,7 +176,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const actor = await this.authorized(credential);
     const row = await this.db.select<TaskRow>(id('task', taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'gm') {
+    if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && actor.role !== 'gm' && actor.role !== 'eval') {
       throw new CompanyError('forbidden', 'Task access denied');
     }
     return view(row);
@@ -237,6 +237,9 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
     requireReviewer(input.reviewerRole);
+    if (input.executorRole === 'eval' || input.reviewerRole === 'eval') {
+      throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
+    }
     const kind = input.kind ?? 'task';
     if (!['task', 'gate'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
@@ -513,6 +516,109 @@ export class SurrealCompanyCore implements CompanyCore {
       if (replayed) return replayed;
       throw error;
     }
+  }
+
+  /**
+   * eval role only: scores the employees who participated in a finished task.
+   * Scorecards are idempotent per (task, employee); writing marks task.evaluated_at so the
+   * dispatcher stops dispatching judges, and rolls the average into employee and employee_def.
+   */
+  async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'eval') throw new CompanyError('forbidden', 'Only eval employees may record scores');
+    requireText(input.summary, 'summary', 1, 20000);
+    if (!Array.isArray(input.scores) || input.scores.length > 50) throw new CompanyError('invalid', 'Invalid scores');
+    const task = id('task', input.taskId);
+    const row = await this.db.select<TaskRow>(task);
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state !== 'done') throw new CompanyError('conflict', 'Task is not finished');
+
+    const [auditRows, revokedRows] = await this.db.query<[Array<{ action: string; actor: unknown }>, Array<{ employee?: string }>]>(
+      `SELECT action, actor, at FROM audit WHERE task = $task ORDER BY at ASC;
+       SELECT payload.employee AS employee FROM outbox WHERE task = $task AND kind = 'revoked';`,
+      { task });
+    const participants = new Set<string>();
+    const metrics = new Map<string, { claims: number; checkpoints: number; submits: number; reviews: number; returnsReceived: number; revocations: number }>();
+    const metric = (emp: string) => {
+      const m = metrics.get(emp) ?? { claims: 0, checkpoints: 0, submits: 0, reviews: 0, returnsReceived: 0, revocations: 0 };
+      metrics.set(emp, m);
+      return m;
+    };
+    let lastSubmitter: string | undefined;
+    for (const r of auditRows) {
+      if (!(r.actor instanceof RecordId) || r.actor.table.name !== 'employee' || r.action === 'evaluated') continue;
+      const emp = asId(r.actor);
+      participants.add(emp);
+      const m = metric(emp);
+      if (r.action === 'claim') m.claims++;
+      else if (r.action === 'checkpoint') m.checkpoints++;
+      else if (r.action === 'submit') { m.submits++; lastSubmitter = emp; }
+      else if (r.action === 'accept' || r.action === 'return') {
+        m.reviews++;
+        if (r.action === 'return' && lastSubmitter && lastSubmitter !== emp) metric(lastSubmitter).returnsReceived++;
+      }
+    }
+    for (const r of revokedRows) {
+      if (!r.employee) continue;
+      participants.add(String(r.employee));
+      metric(String(r.employee)).revocations++;
+    }
+    participants.delete(actor.employeeId);
+
+    const dims = ['quality', 'evidence', 'discipline', 'timeliness', 'overall'] as const;
+    for (const s of input.scores) {
+      if (!participants.has(s.employee)) throw new CompanyError('invalid', `Not a participant: ${s.employee}`);
+      for (const d of dims) {
+        if (typeof s[d] !== 'number' || !Number.isFinite(s[d]) || s[d] < 1 || s[d] > 5) {
+          throw new CompanyError('invalid', `Invalid ${d} score`);
+        }
+      }
+      if (s.notes !== undefined) requireText(s.notes, 'notes', 0, 4000);
+    }
+
+    const written = new Set<string>();
+    for (const s of input.scores) {
+      const emp = await this.db.select<{ role?: Role; def?: RecordId; provider?: string; model?: string }>(id('employee', s.employee));
+      await this.db.query(`UPSERT $card CONTENT { task: $task, goal: $goal, employee: $emp, role: $role, def: $def,
+        provider: $provider, model: $model, quality: $quality, evidence: $evidence, discipline: $discipline,
+        timeliness: $timeliness, overall: $overall, notes: $notes, metrics: $metrics, eval_by: $by, at: time::now() };`, {
+        card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0, 24)),
+        task, goal: row.goal, emp: s.employee, role: emp?.role ?? row.executor_role,
+        def: emp?.def ? asId(emp.def) : undefined, provider: emp?.provider, model: emp?.model,
+        quality: s.quality, evidence: s.evidence, discipline: s.discipline, timeliness: s.timeliness,
+        overall: s.overall, notes: s.notes, metrics: metrics.get(s.employee), by: actor.employeeId,
+      });
+      written.add(s.employee);
+    }
+
+    await this.db.query(`BEGIN;
+      UPDATE ONLY $task SET evaluated_at = IF evaluated_at = NONE THEN time::now() ELSE evaluated_at END;
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'evaluated', evidence: $summary, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'evaluated', sequence: $sequence.value,
+        payload: { by: $evalBy, employees: $count }, at: time::now() };
+      COMMIT;`, {
+      task, actor: id('employee', actor.employeeId), summary: input.summary,
+      evalBy: actor.employeeId, count: written.size,
+    });
+
+    // Refresh rolling averages on the employee and its definition (recomputed from scorecards,
+    // so re-scoring stays correct).
+    const defs = new Set<string>();
+    for (const empId of written) {
+      const emp = await this.db.select<{ def?: RecordId }>(id('employee', empId));
+      await this.rescore('employee', empId, 'employee');
+      if (emp?.def) { const defId = asId(emp.def); defs.add(defId); }
+    }
+    for (const defId of defs) await this.rescore('employee_def', defId, 'def');
+    return { recorded: written.size, participants: [...participants].sort() };
+  }
+
+  private async rescore(table: 'employee' | 'employee_def', key: string, scoreField: 'employee' | 'def'): Promise<void> {
+    const [[agg]] = await this.db.query<[[{ avg?: number; n?: number }]]>(
+      `SELECT math::mean(overall) AS avg, count() AS n FROM scorecard WHERE ${scoreField} = $key GROUP ALL;`, { key });
+    await this.db.query('UPDATE $r SET scored = $n, avg_score = $a;',
+      { r: id(table, key), n: agg?.n ?? 0, a: agg?.avg ?? undefined });
   }
 
   async listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]> {

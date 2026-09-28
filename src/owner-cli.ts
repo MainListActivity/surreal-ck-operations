@@ -52,14 +52,18 @@ try {
     if (other.length) console.log(`\n=== 系统提醒 ===\n${other.map(n => `- ${n.text}`).join('\n')}`);
   } else if (action === 'status') {
     const workforce = new Workforce(db, '/nonexistent');
-    const [brief, tasks, insts, health, config] = await Promise.all([
-      desk.brief(), workforce.tasks(), workforce.insts(), workforce.providerHealth(), workforce.config()]);
+    const [brief, tasks, insts, health, config, defs] = await Promise.all([
+      desk.brief(), workforce.tasks(), workforce.insts(), workforce.providerHealth(), workforce.config(), workforce.defs()]);
     const count = (state: string) => tasks.filter(t => t.state === state).length;
     console.log(`派工：${config.paused ? '已暂停' : '运行中'}（最多同时 ${config.maxRunning} 位员工）`);
     console.log(`任务：待办 ${count('ready')} · 进行中 ${count('doing')} · 待验收 ${count('review')} · 阻塞 ${count('blocked')}`);
     console.log(`在办目标：${brief.goals.map(g => `${g.title}（${g.id}）`).join('、') || '无'}`);
     console.log(`在职员工：${insts.map(i => `${i.id}@${i.provider ?? '?'}`).join('、') || '无'}`);
     console.log(`订阅：${[...health.values()].map(h => `${h.provider}=${h.state}${h.until ? `(至 ${new Date(h.until * 1000).toLocaleString('zh-CN')})` : ''}`).join('、') || '全部正常'}`);
+    const scored = defs.filter(d => d.scored > 0);
+    if (scored.length) {
+      console.log(`绩效均分：${scored.map(d => `${d.id}=${d.avgScore?.toFixed(1)}分/${d.scored}次`).join('、')}`);
+    }
     if (brief.directions.length) console.log(`公司方向：\n${brief.directions.map(d => `- ${d.text}`).join('\n')}`);
   } else {
     console.log(usage);

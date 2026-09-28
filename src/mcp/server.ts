@@ -173,6 +173,23 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'Resume a blocked task; requires core manage capability.',
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
+
+  server.registerTool('record_score', {
+    description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      summary: z.string().min(1).max(20000),
+      scores: z.array(z.object({
+        employee: z.string().min(1),
+        quality: z.number().min(1).max(5),
+        evidence: z.number().min(1).max(5),
+        discipline: z.number().min(1).max(5),
+        timeliness: z.number().min(1).max(5),
+        overall: z.number().min(1).max(5),
+        notes: z.string().max(4000).optional(),
+      })).max(50),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.recordScore(token(ctx), input)));
 }
 
 export function createMcpHttpService(options: McpServiceOptions) {

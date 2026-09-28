@@ -7,6 +7,7 @@ const OWNER = 'surreal-ck-operations/issue-23/v1';
 const SCHEMA = readFileSync(fileURLToPath(new URL('../schema/001-control.surql', import.meta.url)), 'utf8');
 const OUTBOX_INDEX = readFileSync(fileURLToPath(new URL('../schema/002-outbox-sequence.surql', import.meta.url)), 'utf8');
 const WORKFORCE = readFileSync(fileURLToPath(new URL('../schema/003-workforce.surql', import.meta.url)), 'utf8');
+const EVAL = readFileSync(fileURLToPath(new URL('../schema/004-eval.surql', import.meta.url)), 'utf8');
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -71,7 +72,8 @@ export class CompanyDatabase {
     await this.ensureOutboxSequence();
     await this.db.query(OUTBOX_INDEX);
     await this.db.query(WORKFORCE);
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 3 WHERE schema_version < 3;');
+    await this.db.query(EVAL);
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 4 WHERE schema_version < 4;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

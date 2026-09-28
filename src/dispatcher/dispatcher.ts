@@ -1,7 +1,8 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
-import { gmAttention, wake, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, wake, type PromptEnv } from './prompts.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|quota|usage limit|rate.?limit|too many requests|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
@@ -17,6 +18,8 @@ export interface DispatcherDeps {
   env: PromptEnv;
   notify?: (title: string, text: string) => Promise<void>;
   log?: (message: string) => void;
+  /** Randomness source for weighted picks; injectable for tests. */
+  rand?: () => number;
 }
 
 export interface TickReport {
@@ -27,6 +30,7 @@ export interface TickReport {
   retired: string[];
   exhausted: string[];
   notices: string[];
+  evals: string[];
   skipped?: 'paused' | 'budget';
 }
 
@@ -40,7 +44,7 @@ export class Dispatcher {
 
   async tick(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow()]);
@@ -148,20 +152,24 @@ export class Dispatcher {
       busyBy.set(inst.provider ?? '', (busyBy.get(inst.provider ?? '') ?? 0) + 1);
     }
     const assigned = new Set<string>();
+    const rand = this.deps.rand ?? Math.random;
     const pick = (role: string, task?: SupervisedTask, avoid?: string) => {
       const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
         (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
       const ok = (inst: EmployeeInst) => inst.role === role && ready(inst) && !assigned.has(inst.id) &&
         !holding.has(inst.id) && inst.id !== task?.submittedBy && this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
       const candidates = insts.filter(ok);
-      const priority = (inst: EmployeeInst) => defs.find(d => d.id === inst.def)?.priority ?? 1000;
-      candidates.sort((a, b) =>
-        Number(b.id === task?.previousEmployee) - Number(a.id === task?.previousEmployee) ||
-        Number(a.id === avoid) - Number(b.id === avoid) || priority(a) - priority(b));
-      return candidates[0];
+      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
+      // Continuity beats weights: the previous holder keeps the task when it is still available.
+      const previous = candidates.find(i => i.id === task?.previousEmployee);
+      if (previous) return previous;
+      const pool = candidates.filter(i => i.id !== avoid);
+      return weightedOrder(pool.length ? pool : candidates, weight, rand)[0];
     };
-    const spawnable = (role: string) => defs.filter(d => d.enabled && d.role === role &&
-      insts.filter(i => i.def === d.id).length < d.maxInstances && this.capacity(d.provider, cfg, health, busyBy, now));
+    const spawnable = (role: string) => weightedOrder(
+      defs.filter(d => d.enabled && d.role === role &&
+        insts.filter(i => i.def === d.id).length < d.maxInstances && this.capacity(d.provider, cfg, health, busyBy, now)),
+      effectiveWeight, rand);
 
     for (const item of work) {
       if (running >= cfg.maxRunning) break;
@@ -192,6 +200,26 @@ export class Dispatcher {
       if (result) {
         for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
         report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
+      }
+    }
+
+    // 5. Performance evaluation: a judge employee scores every participant of each finished task.
+    //    Lowest dispatch priority; silently skipped when no eval definition is enabled.
+    if (cfg.evalEnabled && defs.some(d => d.role === 'eval' && d.enabled)) {
+      for (const task of await wf.pendingEvaluations(3)) {
+        if (running >= cfg.maxRunning) break;
+        const last = await wf.lastDispatch(task.id, task.version, 'eval');
+        if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+        const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
+          (inst, first) => evalPrompt(inst, task, this.deps.env, first), report, insts);
+        if (result) {
+          await wf.recordDispatch(task.id, task.version, 'eval', result.id);
+          running++;
+          busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
+          assigned.add(result.id);
+          report.evals.push(task.id);
+          report.woke.push({ task: task.id, employee: result.id, spawned: result.spawned });
+        }
       }
     }
     return report;
