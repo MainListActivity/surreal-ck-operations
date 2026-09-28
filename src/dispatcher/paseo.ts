@@ -50,8 +50,9 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     },
     async status(agentId) {
       try {
-        const row = await json<{ Status: string; PendingPermissions?: unknown[] }>(['inspect', agentId]);
-        return { status: row.Status, pendingPermissions: row.PendingPermissions?.length ?? 0 };
+        const row = await json<{ Status: string; Archived?: boolean; PendingPermissions?: unknown[] }>(['inspect', agentId]);
+        // An archived session still reports its last status; it can no longer take work.
+        return { status: row.Archived ? 'archived' : row.Status, pendingPermissions: row.PendingPermissions?.length ?? 0 };
       } catch {
         return undefined;
       }
