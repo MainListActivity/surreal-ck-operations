@@ -407,8 +407,12 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
-      IF $heartbeat OR $checkpoint OR $submit {
+      IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
+      };
+      IF ($heartbeat OR $checkpoint) AND $t.state = 'review' {
+        IF $t.submitted_by = $employee { THROW 'self review denied' };
+        IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       };
       IF $accept OR $returning {
         IF $t.submitted_by = $employee { THROW 'self review denied' };

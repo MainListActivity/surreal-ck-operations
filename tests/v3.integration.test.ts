@@ -150,6 +150,12 @@ test('revoked lease hands over to a same-role employee with history; old session
   expect(second.history.find(h => h.action === 'revoked')?.evidence).toContain('tests/api.test.ts');
   const submitted = await core.submit(tokens['eng-b'], proofOf(second), { text: 'Continued from handover.', idempotencyKey: key() });
   expect(submitted.handover).toBeUndefined();
+  // A long review (e.g. walking through the acceptance manual) can checkpoint too, and hands over the same way.
+  const reviewer = await core.claim(tokens.qa, t.id);
+  const reviewCp = await core.checkpoint(tokens.qa, proofOf(reviewer), { text: '已按手册完成第 1-3 步，第 4 步待验证支付回调。', idempotencyKey: key() });
+  expect(reviewCp.state).toBe('review');
+  expect(await workforce.revokeLease(t.id, 't-qa', '验收员会话中断', '【交接包】停在第 4 步')).toBe(true);
+  expect((await task(t.id)).state).toBe('review');
 });
 
 class FakePaseo implements PaseoGateway {
