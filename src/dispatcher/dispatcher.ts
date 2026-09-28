@@ -213,7 +213,10 @@ export class Dispatcher {
       const jevReady = this.deps.jev !== undefined && cfg.evalEngine !== 'llm';
       const llmReady = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
       for (const task of await wf.pendingEvaluations(3)) {
-        if (jevReady && task.evalAttempts < 3) {
+        // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
+        const last = await wf.lastDispatch(task.id, task.version, 'eval');
+        const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
+        if (!dispatched && jevReady && task.evalAttempts < 3) {
           const outcome = await this.jevEvaluate(task, cfg, report);
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
@@ -225,9 +228,7 @@ export class Dispatcher {
           }
           continue;
         }
-        if (running >= cfg.maxRunning) break;
-        const last = await wf.lastDispatch(task.id, task.version, 'eval');
-        if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+        if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
           (inst, first) => evalPrompt(inst, task, this.deps.env, first), report, insts);
         if (result) {
