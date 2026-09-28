@@ -21,6 +21,7 @@
 
    ```
    pnpm run company goal "我要一个 B2C 商城"
+   pnpm run company goal --tier quick --project surreal_ck "导出按钮在 Safari 下无效"
    pnpm run company inbox
    pnpm run company approve <任务ID> [意见]
    pnpm run company reject <任务ID> <意见>
@@ -33,6 +34,7 @@
 
    ```sql
    CREATE owner_command CONTENT { kind: 'goal', text: '我要一个 B2C 商城' };
+   CREATE owner_command CONTENT { kind: 'goal', tier: 'quick', project: 'surreal_ck', text: '导出按钮在 Safari 下无效' };
    CREATE owner_command CONTENT { kind: 'approve', task: '<任务ID>', text: '同意' };
    CREATE owner_command CONTENT { kind: 'reject', task: '<任务ID>', text: '需要修改：…' };
    CREATE owner_command CONTENT { kind: 'reply', task: '<任务ID>', text: '回答：…' };
@@ -43,6 +45,22 @@
    执行结果回写在同一行的 `status`（applied / failed）和 `result`。
 
 3. **在 Paseo 里直接和经理说**：经理用 `create_goal` / `set_direction` / `record_owner_decision` 转录，并逐字记录你的原话，审计来源为 `gm-relay:<经理编号>`。
+
+不指定 `tier` 时目标先处于「待分级」：Jev 高置信时直接选定 quick / standard / program，否则经理 `triage_goal`。quick 目标完成后只记录结果，不进老板收件箱；standard / program 只在 G3 找老板。
+
+## 项目环境与凭证
+
+项目环境告诉员工一个仓库怎么发布、在哪验证、哪些是红线；领取任务时随 `project` 字段下发（目标创建时用 `--project` 关联）。
+
+```
+pnpm run admin project set project.json     # 写入或更新
+pnpm run admin project list                 # 查看（含凭证名，不含值）
+printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production QA_PASSWORD qa "生产实测账号"
+```
+
+`project.json` 结构：`{ id, name, repoPath, defaultBranch, release, rollback, redLines[], runbooks[], notes, envs: [{ name, url, healthUrl, verify }] }`。
+
+凭证存在 `env_secret` 表，值用 AES-256-GCM 加密；密钥只在本机登录钥匙串（服务 `surreal-ck-company`，账号 `env-secret-key`，首次写入凭证时自动生成）。员工只能在持有某个任务租约期间，用 `get_secret` 领取所属项目里授权给本岗位的凭证，每次领取写入审计（不含值）。部署密钥不放这里：代码发布走各仓库的 CI（例如 surreal_ck 的 SSH 部署密钥只在 GitHub `production` Environment）。
 
 安全边界：本机所有 AI 员工都有完整权限，数据库 root 与老板命令行没有密码学隔离；老板身份靠审计来源和协议约束，不是防伪机制。
 
@@ -84,6 +102,9 @@
 | `jev_min_confidence` | 0.7 | Jev 单题置信度下限，低于则升级 LLM 评审（auto） |
 | `jev_flag_threshold` | 0.65 | Jev 员工风险标记阈值，达到则提醒老板 |
 | `jev_notify_triage` | true | 系统提醒是否先经 Jev 分诊再决定弹窗（提醒始终进收件箱） |
+| `jev_decisions` | true | Jev 是否参与目标分级、上线决定、老板升级路由（拿不准时交经理/运营） |
+| `jev_release_threshold` | 0.8 | 上线申请「可以上线」概率 ≥ 该值且「触碰红线」≤ 1 − 该值时自动批准 |
+| `jev_owner_threshold` | 0.3 | 升级给老板的问题「必须老板决定」概率低于该值时改派经理（每任务一次） |
 
 ## 排障
 

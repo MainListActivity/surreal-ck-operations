@@ -44,7 +44,7 @@ try {
       const report = await dispatcher.tick();
       failures = 0;
       const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-        report.exhausted.length || report.notices.length || report.evals.length;
+        report.exhausted.length || report.notices.length || report.evals.length || report.decisions.length;
       if (changed) console.log(`${new Date().toISOString()} tick ${JSON.stringify(report)}`);
     } catch (error) {
       failures++;

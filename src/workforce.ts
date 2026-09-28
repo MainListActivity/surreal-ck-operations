@@ -4,7 +4,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, Role, TaskId } from './contracts.ts';
-import { asId, CompanyError, HASH, id, ROLES, view, type TaskRow } from './core.ts';
+import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 
@@ -71,12 +71,19 @@ export interface CompanyConfig {
   jevFlagThreshold: number;
   /** 配置了 Jev 时，用 noul 决定系统提醒是否弹桌面通知（否则只进收件箱）。 */
   jevNotifyTriage: boolean;
+  /** 配置了 Jev 时，由 Jev 做目标分级、上线决定和老板升级路由；拿不准交回经理/运营。 */
+  jevDecisions: boolean;
+  /** 上线申请：Jev「可以上线」概率达到该值且「触碰红线」概率不高于 1 - 该值时自动批准。 */
+  jevReleaseThreshold: number;
+  /** 升级给老板的问题：Jev「必须老板决定」概率低于该值时改派给经理。 */
+  jevOwnerThreshold: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
+  jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -120,7 +127,30 @@ export interface SupervisedTask {
   kind: string;
   title: string;
   evalAttempts: number;
+  jevReleaseVersion?: number;
+  jevRouteVersion?: number;
+  ownerRerouted: boolean;
 }
+
+/** What Jev reads for a release or escalation decision. */
+export interface JudgeInput {
+  title: string;
+  context: string;
+  submission?: string;
+  question?: string;
+  blockedBy?: string;
+  project?: { id: string; name: string; release?: string; redLines: string[] };
+}
+
+const supervised = (row: TaskRow): SupervisedTask => {
+  const v = view(row);
+  return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
+    currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
+    previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+    progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
+    evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
+    jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true };
+};
 
 const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
@@ -156,6 +186,9 @@ export class Workforce {
       jevMinConfidence: typeof row?.jev_min_confidence === 'number' ? row.jev_min_confidence : 0.7,
       jevFlagThreshold: typeof row?.jev_flag_threshold === 'number' ? row.jev_flag_threshold : 0.65,
       jevNotifyTriage: row?.jev_notify_triage !== false,
+      jevDecisions: row?.jev_decisions !== false,
+      jevReleaseThreshold: typeof row?.jev_release_threshold === 'number' ? row.jev_release_threshold : 0.8,
+      jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
     };
   }
 
@@ -273,14 +306,7 @@ export class Workforce {
   async tasks(): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
       "SELECT * FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
-    return rows.map(row => {
-      const v = view(row);
-      return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
-        currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-        previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
-        evalAttempts: row.eval_attempts ?? 0 };
-    });
+    return rows.map(supervised);
   }
 
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
@@ -307,17 +333,61 @@ export class Workforce {
   async pendingEvaluations(limit = 3): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
       "SELECT * FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
-    return rows.map(row => {
-      const v = view(row);
-      return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
-        currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-        previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-        progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
-        evalAttempts: row.eval_attempts ?? 0 };
-    });
+    return rows.map(supervised);
   }
 
   /** Extends a live holder's lease without changing version, fence or delivery. */
+  async judgeInput(taskId: TaskId): Promise<JudgeInput> {
+    const task = id('task', taskId);
+    const [rows, submits, blocks] = await this.db.query<[
+      Array<{ title: string; context: string; resume_role?: string; project?: { id: RecordId; name: string; release?: string; red_lines?: string[] } }>,
+      Array<{ evidence?: string }>, Array<{ evidence?: string }>,
+    ]>(`SELECT title, context, resume_role, goal.project.* AS project FROM $task;
+      SELECT evidence, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
+      SELECT evidence, at FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;`, { task });
+    const row = rows[0];
+    if (!row) throw new CompanyError('not_found', 'task not found');
+    const project = row.project?.id ? { id: asId(row.project.id), name: row.project.name, release: row.project.release, redLines: row.project.red_lines ?? [] } : undefined;
+    return { title: row.title, context: row.context.slice(0, 8000), submission: submits[0]?.evidence?.slice(0, 12000),
+      question: blocks[0]?.evidence?.slice(0, 8000), blockedBy: row.resume_role, project };
+  }
+
+  /** Records that Jev looked at this task version without deciding; the advice lands in history for the human-like reviewer. */
+  async jevAdvice(taskId: TaskId, field: 'jev_release_version' | 'jev_route_version', version: number, advice: string): Promise<void> {
+    await this.db.query(`UPDATE $task SET ${field} = $version WHERE version = $version;
+      CREATE audit CONTENT { task: $task, actor: 'jev', action: 'jev_advice', evidence: $advice, version: $version, at: time::now() };`,
+    { task: id('task', taskId), version, advice });
+  }
+
+  /** Jev approves a release request nobody is reviewing yet: done + dependency unlock, audited as jev. */
+  async jevAccept(taskId: TaskId, version: number, evidence: string): Promise<boolean> {
+    const responses = await this.db.query<unknown[]>(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE OR $t.state != 'review' OR $t.current_employee != NONE OR $t.version != $version { THROW 'task changed' };
+      LET $next = UPDATE ONLY $task SET state = 'done', accepted_by = 'jev', jev_release_version = $version,
+        delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1 RETURN AFTER;
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'accept', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'accepted', sequence: $sequence.value, payload: { state: 'done', by: 'jev' }, at: time::now() };
+      ${UNLOCK_SQL}
+      COMMIT;`, { task: id('task', taskId), version, evidence, actor: 'jev' }).responses();
+    return responses.every(r => r.success);
+  }
+
+  /** Moves an owner question that does not need the owner to the gm queue (once per task). */
+  async rerouteToGm(taskId: TaskId, version: number, evidence: string): Promise<boolean> {
+    const responses = await this.db.query<unknown[]>(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $version { THROW 'task changed' };
+      LET $next = UPDATE ONLY $task SET blocked_to = 'gm', owner_rerouted = true, jev_route_version = $version,
+        version = $t.version + 1 RETURN AFTER;
+      CREATE audit CONTENT { task: $task, actor: 'jev', action: 'jev_reroute', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'rerouted', sequence: $sequence.value, payload: { to: 'gm' }, at: time::now() };
+      COMMIT;`, { task: id('task', taskId), version, evidence }).responses();
+    return responses.every(r => r.success);
+  }
+
   async extendLease(taskId: TaskId, employeeId: string, seconds: number): Promise<boolean> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $task SET lease_expires_at = time::unix(time::now()) + $seconds
       WHERE current_employee = $employee AND delivery_id != NONE RETURN AFTER;`,

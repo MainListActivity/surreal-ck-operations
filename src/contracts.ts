@@ -4,7 +4,10 @@ export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'qa' | 'cs'
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
 export type ReviewerRole = Role | 'owner';
-export type TaskKind = 'goal' | 'task' | 'gate';
+/** release：上线申请，由运营（或 Jev）决定是否上线；deploy：合入部署，由 qa 在生产实测验收。 */
+export type TaskKind = 'goal' | 'task' | 'gate' | 'release' | 'deploy';
+/** quick：小开发任务，运营验收即结束；standard：经理拆解，老板终验；program：先做范围提案的大目标。 */
+export type GoalTier = 'quick' | 'standard' | 'program';
 export type EmployeeId = string;
 export type TaskId = string;
 export type DeliveryId = string;
@@ -64,6 +67,30 @@ export interface ClaimResult {
   leaseExpiresAt: string;
   /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
   history: HistoryEntry[];
+  /** Project environment of the task's goal: where it ships, how to verify, red lines, secret names. */
+  project?: ProjectView;
+}
+
+export interface ProjectView {
+  id: string;
+  name: string;
+  repoPath: string;
+  defaultBranch: string;
+  release: string;
+  rollback?: string;
+  redLines: string[];
+  runbooks: string[];
+  notes?: string;
+  envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
+}
+
+export interface CreateDelivery {
+  goalId: string;
+  title: string;
+  /** What to build and the acceptance criteria qa verifies in production. */
+  spec: string;
+  dependencies?: TaskId[];
+  idempotencyKey: string;
 }
 
 /** deliveryId + fence are mandatory for every write after claim. */
@@ -105,7 +132,13 @@ export interface CompanyCore {
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
   /** gm relays an owner instruction received in a direct conversation; audited as gm-relayed. */
-  relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<GoalView>;
+  relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string }): Promise<GoalView>;
+  /** gm: pick the flow template for a goal waiting in triage. */
+  triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
+  /** gm/product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
+  createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
+  /** Decrypts a project environment secret for the caller's currently held task. Audited, never stored in evidence. */
+  getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string>;
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
@@ -134,13 +167,17 @@ export interface GoalView {
   id: string;
   title: string;
   brief: string;
-  state: 'active' | 'done' | 'cancelled';
-  tasks: { intake: TaskId; plan: TaskId; manual: TaskId; acceptance: TaskId };
+  state: 'triage' | 'active' | 'done' | 'cancelled';
+  tier?: GoalTier;
+  project?: string;
+  /** manual is the 运营验收 anchor; acceptance closes the goal (G3 for standard/program, 运营验收 for quick). */
+  tasks: { intake?: TaskId; plan?: TaskId; manual?: TaskId; acceptance?: TaskId };
 }
 
 export interface CompanyBrief {
   directions: { text: string; source: string; at: string }[];
   goals: GoalView[];
+  projects: ProjectView[];
   paused: boolean;
 }
 

@@ -3,11 +3,11 @@ import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 export interface PromptEnv { opsRepo: string; sckBin: string }
 
 const ROLE_NAMES: Record<string, string> = {
-  gm: '经理：拆解目标、分派任务、处理阻塞与退回',
-  product: '运营/产品：澄清范围、写需求规格和真人验收操作手册',
-  engineering: '工程：实现与代码复核',
+  gm: '经理：目标分级与拆解、处理运营定不了的事、G3 汇总',
+  product: '运营/产品：范围提案、决定是否上线、运营验收',
+  engineering: '工程：实现、代码复核、合入部署',
   'ai-content': 'AI 与内容',
-  qa: '测试：独立验收，按手册实际操作验证',
+  qa: '测试：上线后在生产环境逐条实测',
   cs: '客户成功',
   eval: '评审：任务完成后为参与员工打绩效分',
 };
@@ -29,7 +29,7 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
   const body = `【派工】任务 ${task.id}「${task.title}」需要你${mode}。
 1. 领取：${tool(inst, env).replace('<工具名>', 'claim_next').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
    返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history。
-2. 按岗位协议完成：执行→submit；验收→review(accept/return)；缺老板信息→report_blocker(to=owner)；需要经理协调→report_blocker(to=gm)。
+2. 按岗位协议完成：执行→submit；验收→review(accept/return)；自己定不了→report_blocker(to=gm)；只有花钱、签约、对外联系、公司方向和项目红线才 report_blocker(to=owner)。
    每完成一个有意义的步骤就 checkpoint（已完成、改动文件、下一步）。代码任务在任务专属分支/worktree 中工作，checkpoint 前先提交到该分支。
 3. 本轮只做这一项；完成交接后结束本轮，不要空转等待，不创建 agent 或定时器。
 若领取返回 already_claimed、no_available_task 或 forbidden，直接结束本轮。`;
@@ -56,7 +56,21 @@ export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: Pr
   const body = `【经理待办】以下任务被员工阻塞并交给经理处理：
 ${list}
 逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
-需要老板决定的问题不要代答，改由原员工 report_blocker(to=owner) 或在恢复说明中写明。处理完结束本轮。
+你有决定权：技术方案、拆分、上线（运营定不了时）、查得到的事实都由你决定并写进恢复说明，不要转给老板。
+只有花钱、签约、对外联系、公司方向和项目红线才让原员工 report_blocker(to=owner)，并写明你已查过哪些来源。处理完结束本轮。
+调用方式：${tool(inst, env)}`;
+  return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
+}
+
+export function gmTriage(inst: EmployeeInst, goals: Array<{ id: string; title: string; brief: string }>, env: PromptEnv, firstContact: boolean): string {
+  const list = goals.map(g => `- goal=${g.id}「${g.title}」\n  ${g.brief.slice(0, 600).replace(/\n/g, '\n  ')}`).join('\n');
+  const body = `【目标分级】以下老板目标还没有选定流程（Jev 没有把握或未配置）：
+${list}
+逐个判断并调用 triage_goal({goalId, tier, reason})：
+- quick：单一仓库内范围明确的小改动或缺陷修复。流程是 实现 → 上线申请 → 合入部署与生产实测 → 运营验收，完成即记录结果，不通知老板。
+- standard：方向清楚但需要多个交付项；你来拆解，运营验收后交老板 G3。
+- program：方向性大目标；运营先写范围提案，再由你拆解，最后老板 G3。
+拿不准时选更轻的一级。处理完结束本轮。
 调用方式：${tool(inst, env)}`;
   return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
 }

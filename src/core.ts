@@ -1,9 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateTask, Credential, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
+import { deliveryChain } from './flows.ts';
+import { loadSecretKey, ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
+
+import { CompanyError } from './core-errors.ts';
+export { CompanyError };
 
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs', 'eval'];
 const DEFAULT_LEASE_SECONDS = 600;
@@ -50,17 +55,6 @@ export const GOAL_ANCHOR_SQL = `
   };
 `;
 
-export class CompanyError extends Error {
-  constructor(
-    readonly code: 'unauthorized' | 'forbidden' | 'not_found' | 'conflict' | 'invalid' |
-      'already_claimed' | 'lease_expired' | 'self_review' | 'temporarily_unavailable',
-    message: string,
-    readonly retryable = false,
-  ) {
-    super(message);
-    this.name = 'CompanyError';
-  }
-}
 
 interface EmployeeRow {
   id: RecordId;
@@ -97,6 +91,9 @@ interface TaskRow {
   evaluated_at?: string;
   eval_via?: string;
   eval_attempts?: number;
+  jev_release_version?: number;
+  jev_route_version?: number;
+  owner_rerouted?: boolean;
 }
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
@@ -141,8 +138,10 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     this.leaseSeconds = seconds;
     this.owner = new OwnerDesk(database);
+    this.projects = new ProjectStore(database.db);
   }
   private readonly owner: OwnerDesk;
+  private readonly projects: ProjectStore;
   private get db() { return this.database.db; }
 
   async authenticate(credential: Credential): Promise<Principal> {
@@ -245,7 +244,7 @@ export class SurrealCompanyCore implements CompanyCore {
       throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
     }
     const kind = input.kind ?? 'task';
-    if (!['task', 'gate'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
+    if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
     const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
@@ -335,7 +334,15 @@ export class SurrealCompanyCore implements CompanyCore {
     });
     const taskView = view(row);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
-      leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId) };
+      leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
+      project: await this.taskProject(taskId) };
+  }
+
+  private async taskProject(taskId: TaskId): Promise<ProjectView | undefined> {
+    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>(
+      'SELECT goal.project AS project FROM $task;', { task: id('task', taskId) });
+    const project = rows[0]?.project;
+    return project ? this.projects.get(String(project.id)) : undefined;
   }
 
   private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
@@ -369,10 +376,51 @@ export class SurrealCompanyCore implements CompanyCore {
     return `gm-relay:${actor.employeeId}`;
   }
 
-  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<GoalView> {
+  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string }): Promise<GoalView> {
     const source = await this.relayActor(credential, input.ownerQuote);
     return this.owner.createGoal({ text: input.text, source, key: `${source}:${input.idempotencyKey}`,
-      note: `老板原话：${input.ownerQuote}` });
+      note: `老板原话：${input.ownerQuote}`, tier: input.tier, project: input.project });
+  }
+
+  async triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may triage goals');
+    requireText(input.reason, 'reason', 4, 4000);
+    return this.owner.triage(input.goalId, input.tier, `${actor.employeeId}：${input.reason}`);
+  }
+
+  async createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]> {
+    requireText(input.goalId, 'goal', 1, 100);
+    requireText(input.title, 'title', 3, 160);
+    requireText(input.spec, 'spec', 20, 20000);
+    const specs = deliveryChain(input.title, input.spec);
+    const created: TaskView[] = [];
+    let dependencies = [...new Set(input.dependencies ?? [])];
+    for (const [index, spec] of specs.entries()) {
+      const task = await this.createTask(credential, {
+        ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
+      });
+      created.push(task);
+      dependencies = [task.id];
+    }
+    return created;
+  }
+
+  async getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string> {
+    const actor = await this.authorized(credential);
+    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
+      'SELECT current_employee, state, lease_expires_at, goal.project AS project FROM $task;', { task: id('task', input.taskId) });
+    const task = rows[0];
+    if (!task) throw new CompanyError('not_found', 'Task not found');
+    if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
+      (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
+      throw new CompanyError('forbidden', 'Secrets are only released to the current lease holder of the task');
+    }
+    if (!task.project) throw new CompanyError('invalid', 'Task goal has no project environment');
+    const value = await this.projects.readSecret(String(task.project.id), input.env, input.name, actor.role, loadSecretKey());
+    await this.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: \'secret_read\', evidence: $evidence, at: time::now() };',
+      { task: id('task', input.taskId), actor: id('employee', actor.employeeId), evidence: `读取环境凭证 ${input.env}/${input.name}（值不入库）` });
+    return value;
   }
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {

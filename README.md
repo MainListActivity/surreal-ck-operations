@@ -1,12 +1,12 @@
 # Surreal CK · AI 公司
 
-老板（用户本人）是唯一真人：提出目标、给出公司方向、在关口拍板、为订阅充值。其余岗位全部是 AI 员工，由调度器派工、在多个订阅之间互为备份，会话中断时自动接手续做。
+老板（用户本人）是唯一真人：给出公司方向和目标、做 G3 最终验收、为订阅充值。其余事项由运营、经理逐级决定。其余岗位全部是 AI 员工，由调度器派工、在多个订阅之间互为备份，会话中断时自动接手续做。
 
 ## 老板怎么用
 
 ```
 cd "$HOME/Library/Application Support/SurrealCKCompany/active"
-pnpm run company goal "我要一个 B2C 商城"    # 提出目标
+pnpm run company goal "我要一个 B2C 商城"    # 提出目标（可加 --tier quick|standard|program --project <项目>）
 pnpm run company inbox                        # 看待你决定的关口与提问
 pnpm run company approve <任务ID> [意见]      # 批准关口；reject/reply 同理
 pnpm run company status                       # 公司运行概况
@@ -14,7 +14,7 @@ pnpm run company status                       # 公司运行概况
 
 也可以直接在 SurrealDB 写 `owner_command`，或在 Paseo 里对经理说。完整说明见 [运行手册](docs/agent-operations.md#老板入口)。
 
-一个目标的流转：**G1 范围提案**（运营 → 老板批准）→ **任务拆解**（经理）→ 各岗位执行与独立验收 →（必要时 **G2 关口**）→ **真人验收操作手册**（运营写，测试按手册实际操作）→ **G3 最终验收**（老板）。详见 [任务流转](docs/workflow.md)。
+目标先分级（Jev 或经理）：**quick** 小开发任务走一条交付链（实现 → 上线申请 → 合入部署与生产实测）后由运营验收，完成即记录、不打扰老板；**standard** 由经理拆成多条交付链；**program** 先由运营做范围提案。standard / program 在运营验收后才到老板做 **G3 最终验收**，此时交付已经上线，G3 写明入口链接和验收步骤。是否上线由运营决定（Jev 高置信时自动批准），只有花钱、签约、对外联系、公司方向和项目红线才上报老板。详见 [员工协议](agents/PROTOCOL.md#决策权)。
 
 ## 员工与运行
 

@@ -152,10 +152,29 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async ({ taskId }, ctx) => run(token(ctx), () => core.history(token(ctx), taskId)));
 
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
+  const tiers = ['quick', 'standard', 'program'] as const;
   server.registerTool('create_goal', {
-    description: 'gm only: record a goal the owner gave in direct conversation. Creates the G1 scope gate, planning, acceptance manual and G3 final gate.',
-    inputSchema: z.object({ text: z.string().min(2), ...relayShape }),
+    description: 'gm only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev or gm picks quick/standard/program); project links a project environment.',
+    inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), ...relayShape }),
   }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
+
+  server.registerTool('triage_goal', {
+    description: 'gm only: choose the flow for a goal waiting in triage. quick = one delivery chain, product acceptance closes it, owner not involved; standard = gm plans deliveries, owner G3; program = product scope proposal first, then plan, owner G3.',
+    inputSchema: z.object({ goalId: z.string().min(1), tier: z.enum(tiers), reason: z.string().min(4) }),
+  }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
+
+  server.registerTool('create_delivery', {
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa).',
+    inputSchema: z.object({
+      goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
+      dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
+
+  server.registerTool('get_secret', {
+    description: 'Read a project environment credential (listed in claim result project.envs[].secrets) for the task you currently hold. Use it directly; never write the value into evidence, files or messages.',
+    inputSchema: z.object({ taskId: z.string().min(1), env: z.string().min(1), name: z.string().min(1) }),
+  }, async (input, ctx) => run(token(ctx), async () => ({ value: await core.getSecret(token(ctx), input) })));
 
   server.registerTool('record_owner_decision', {
     description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',

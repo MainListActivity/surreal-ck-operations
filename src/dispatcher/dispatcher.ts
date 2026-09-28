@@ -2,7 +2,8 @@ import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
-import { evalPrompt, gmAttention, wake, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
+import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
@@ -34,6 +35,8 @@ export interface TickReport {
   exhausted: string[];
   notices: string[];
   evals: string[];
+  /** Jev decisions taken this tick, e.g. "triage:<goal>=quick", "release:<task>", "reroute:<task>". */
+  decisions: string[];
   skipped?: 'paused' | 'budget';
 }
 
@@ -47,7 +50,7 @@ export class Dispatcher {
 
   async tick(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow()]);
@@ -121,6 +124,9 @@ export class Dispatcher {
       }
     }
     insts = insts.filter(i => !report.retired.includes(i.id));
+
+    // 2b. Jev decisions: goal triage, release go/no-go, owner-escalation routing. Undecided items stay with gm/product.
+    if (this.deps.jev && cfg.jevDecisions) await this.jevDecisions(cfg, report);
     const tasks = await wf.tasks();
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
@@ -206,6 +212,24 @@ export class Dispatcher {
       }
     }
 
+    const triage = await owner.triagePending();
+    if (triage.length && running < cfg.maxRunning) {
+      const due: typeof triage = [];
+      for (const goal of triage) {
+        const last = await wf.lastDispatch(`goal:${goal.id}`, 0, 'triage');
+        if (!last || now - last.at >= cfg.redispatchMinutes * 60) due.push(goal);
+      }
+      if (due.length) {
+        const result = await this.assign('gm', undefined, undefined, pick, spawnable,
+          (inst, first) => gmTriage(inst, due, this.deps.env, first), report, insts);
+        if (result) {
+          for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
+          running++;
+          report.woke.push(...due.map(g => ({ task: `goal:${g.id}`, employee: result.id, spawned: result.spawned })));
+        }
+      }
+    }
+
     // 5. Performance evaluation. Jev (System One decision model) scores the finished task in
     //    one ~500ms round trip; low-confidence or repeated failures escalate to an LLM eval
     //    employee, which stays the only path when Jev is not configured.
@@ -283,6 +307,60 @@ export class Dispatcher {
     } catch (error) {
       this.log(`jev evaluation failed for ${task.id} (attempt ${attempts}): ${(error as Error).message}`);
       return attempts >= 3 ? 'escalate' : 'retry';
+    }
+  }
+
+  private async jevDecisions(cfg: CompanyConfig, report: TickReport) {
+    const { workforce: wf, owner } = this.deps;
+    const jev = this.deps.jev!;
+    const attempt = async (label: string, work: () => Promise<void>) => {
+      try { await work(); } catch (error) { this.log(`jev ${label} failed: ${(error as Error).message}`); }
+    };
+    for (const goal of await owner.triagePending()) {
+      await attempt(`triage ${goal.id}`, async () => {
+        const { tier, confidence } = await jevTriage(jev, goal);
+        if (!tier || confidence < cfg.jevMinConfidence) {
+          this.log(`jev unsure about goal ${goal.id} (${tier ?? '?'} @${confidence.toFixed(2)}); leaving it to gm`);
+          return;
+        }
+        await owner.triage(goal.id, tier, `jev（${jev.model}，置信度 ${confidence.toFixed(2)}）`);
+        report.decisions.push(`triage:${goal.id}=${tier}`);
+        this.log(`jev triaged goal ${goal.id} as ${tier} (${confidence.toFixed(2)})`);
+      });
+    }
+    for (const task of await wf.tasks()) {
+      if (task.kind === 'release' && task.state === 'review' && !task.currentEmployee && task.jevReleaseVersion !== task.version) {
+        await attempt(`release ${task.id}`, async () => {
+          const input = await wf.judgeInput(task.id);
+          const { go, redLine } = await jevRelease(jev, input);
+          const verdict = `Jev 上线判断（${jev.model}）：可以上线 ${go.toFixed(2)}，触碰红线 ${redLine.toFixed(2)}，阈值 ${cfg.jevReleaseThreshold}。`;
+          if (go >= cfg.jevReleaseThreshold && redLine <= 1 - cfg.jevReleaseThreshold &&
+            await wf.jevAccept(task.id, task.version, `${verdict}
+结论：同意上线，工程可以合入并发布。`)) {
+            report.decisions.push(`release:${task.id}`);
+            this.log(`jev approved release ${task.id} (go ${go.toFixed(2)}, red line ${redLine.toFixed(2)})`);
+          } else {
+            await wf.jevAdvice(task.id, 'jev_release_version', task.version, `${verdict}
+结论：Jev 不自动批准，由运营决定。`);
+          }
+        });
+      }
+      if (task.state === 'blocked' && task.blockedTo === 'owner' && !task.ownerRerouted && task.jevRouteVersion !== task.version) {
+        await attempt(`route ${task.id}`, async () => {
+          const input = await wf.judgeInput(task.id);
+          const needs = await jevNeedsOwner(jev, input);
+          const verdict = `Jev 升级路由（${jev.model}）：必须老板决定的概率 ${needs.toFixed(2)}，阈值 ${cfg.jevOwnerThreshold}。`;
+          if (needs < cfg.jevOwnerThreshold && await wf.rerouteToGm(task.id, task.version,
+            `${verdict}
+这个问题不属于老板专属事项，改由经理决定。经理确实判断需要老板时，可让员工再次 report_blocker(to=owner)，不会再被改派。`)) {
+            report.decisions.push(`reroute:${task.id}`);
+            this.log(`jev rerouted owner question ${task.id} to gm (${needs.toFixed(2)})`);
+          } else {
+            await wf.jevAdvice(task.id, 'jev_route_version', task.version, `${verdict}
+结论：保留给老板。`);
+          }
+        });
+      }
     }
   }
 

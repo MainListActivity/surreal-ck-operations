@@ -9,6 +9,7 @@ const OUTBOX_INDEX = readFileSync(fileURLToPath(new URL('../schema/002-outbox-se
 const WORKFORCE = readFileSync(fileURLToPath(new URL('../schema/003-workforce.surql', import.meta.url)), 'utf8');
 const EVAL = readFileSync(fileURLToPath(new URL('../schema/004-eval.surql', import.meta.url)), 'utf8');
 const JEV = readFileSync(fileURLToPath(new URL('../schema/005-jev.surql', import.meta.url)), 'utf8');
+const FLOW = readFileSync(fileURLToPath(new URL('../schema/006-flow.surql', import.meta.url)), 'utf8');
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -75,7 +76,8 @@ export class CompanyDatabase {
     await this.db.query(WORKFORCE);
     await this.db.query(EVAL);
     await this.db.query(JEV);
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 5 WHERE schema_version < 5;');
+    await this.db.query(FLOW);
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 6 WHERE schema_version < 6;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

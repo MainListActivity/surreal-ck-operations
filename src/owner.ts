@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { CompanyBrief, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
+import type { CompanyBrief, GoalTier, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
+import { GOAL_TIERS, goalTemplate } from './flows.ts';
+import { ProjectStore } from './projects.ts';
 import { asId, CompanyError, HASH, id, requireText, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'pause' | 'resume';
@@ -9,6 +11,8 @@ export interface OwnerCommandRow {
   id: RecordId;
   kind: OwnerCommandKind;
   text?: string;
+  tier?: GoalTier;
+  project?: string;
   task?: string;
   source: string;
   status: 'pending' | 'applying' | 'applied' | 'failed';
@@ -29,15 +33,15 @@ interface GoalRow {
   title: string;
   brief: string;
   state: GoalView['state'];
-  tasks: { intake: RecordId; plan: RecordId; manual: RecordId; acceptance: RecordId };
+  tier?: GoalTier;
+  project?: RecordId;
+  tasks: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
 }
 
 const goalView = (row: GoalRow): GoalView => ({
-  id: asId(row.id), title: row.title, brief: row.brief, state: row.state,
-  tasks: {
-    intake: asId(row.tasks.intake), plan: asId(row.tasks.plan),
-    manual: asId(row.tasks.manual), acceptance: asId(row.tasks.acceptance),
-  },
+  id: asId(row.id), title: row.title, brief: row.brief, state: row.state, tier: row.tier,
+  project: row.project ? asId(row.project) : undefined,
+  tasks: Object.fromEntries(Object.entries(row.tasks ?? {}).filter(([, v]) => v).map(([k, v]) => [k, asId(v)])),
 });
 
 const EMIT_CREATED = (task: string) => `
@@ -45,69 +49,72 @@ const EMIT_CREATED = (task: string) => `
   LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
   CREATE outbox CONTENT { task: ${task}, kind: 'created', sequence: $seq.value, payload: { state: ${task}.state }, at: time::now() };`;
 
-function goalTaskContexts(title: string, brief: string, goalId: string) {
-  const head = `所属目标：${title}（goal=${goalId}）\n老板原始输入：\n${brief}\n`;
-  return {
-    intake: `${head}
-你是运营/产品。把老板的宽泛目标澄清为《目标澄清与范围提案》（模板见 operations 仓库 docs/templates.md「G1 范围提案」），写入 deliverables/${goalId}/G1-scope.md，并把全文作为 submit 证据。
-必须包含：目标用户与场景、最小可用版本功能清单（按优先级）、明确不做、成本/时间/外部依赖假设、需要老板拍板的问题（最多 5 个，每个给选项与推荐）。
-提交后由老板审批（G1 关口）；老板拒绝时会带意见退回给你修改。`,
-    plan: `${head}
-你是经理。G1 已由老板批准，先读本任务 history 里的 G1 提案与老板意见。
-把目标拆成可独立验收的任务图：用 create_task 逐个创建，必须带 goalId="${goalId}"、清晰的执行岗位/验收岗位（执行者与验收者不同岗位或不同员工）、依赖、验收标准、可写范围、代码分支名。
-涉及新增付费服务、注册外部账号、上生产、对外联系的节点，额外创建 kind="gate"、reviewerRole="owner" 的关口任务（G2）。
-全部创建后提交本任务，证据写任务清单（id、标题、执行/验收岗位、依赖）。验收手册和最终验收任务已存在，会自动等待你创建的所有任务完成。`,
-    manual: `${head}
-你是运营/产品。目标下全部任务已验收。编写《真人验收操作手册》（模板见 docs/templates.md「真人验收操作手册」），写入 deliverables/${goalId}/acceptance-manual.md，全文作为 submit 证据。
-写清：在哪里打开、需要什么账号/数据、逐步操作、每步预期结果、失败时如何判断与回退、已知限制。只写真实可操作的步骤。
-提交后由 qa 按手册实际操作一遍验收。`,
-    acceptance: `${head}
-你是经理。验收手册已由 qa 实际操作验证。汇总《G3 最终验收申请》：交付清单、手册路径、qa 验证结论、已知限制、需要老板决定的事项；全文作为 submit 证据，提交后由老板最终验收。
-若老板拒绝退回：读 history 中老板意见，用 create_task（带 goalId="${goalId}"）创建返工任务（必要时包含更新手册的任务）；创建返工任务会自动让本任务等待它们完成，随后结束本轮。`,
-  };
-}
-
 /** Owner-side operations. Used by the owner CLI, the dispatcher (owner_command table) and gm relay. */
 export class OwnerDesk {
   constructor(private readonly database: CompanyDatabase) {}
   private get db() { return this.database.db; }
 
-  async createGoal(input: { text: string; source: string; key: string; note?: string }): Promise<GoalView> {
+  async createGoal(input: { text: string; source: string; key: string; note?: string; tier?: GoalTier; project?: string }): Promise<GoalView> {
     requireText(input.text, 'goal text', 2, 20000);
+    if (input.tier !== undefined && !GOAL_TIERS.includes(input.tier)) throw new CompanyError('invalid', 'Invalid goal tier');
     const goalId = HASH(`goal\0${input.key}`).slice(0, 16);
     const goal = id('goal', goalId);
-    const existing = await this.db.select<GoalRow>(goal);
-    if (existing) return goalView(existing);
-    const title = input.text.trim().split(/\r?\n/)[0].slice(0, 60);
-    const ctx = goalTaskContexts(title, input.text.trim(), goalId);
-    const t = { intake: randomUUID(), plan: randomUUID(), manual: randomUUID(), acceptance: randomUUID() };
-    const vars = {
-      goal, title, brief: input.text.trim(), source: input.source, note: input.note ?? '',
-      intake: id('task', t.intake), plan: id('task', t.plan), manual: id('task', t.manual), acceptance: id('task', t.acceptance),
-      ctx,
-    };
-    const base = `version: 1, fence: 0, goal: $goal, resume_state: 'ready', created_at: time::now()`;
-    try {
-      await this.run(`BEGIN;
-        CREATE ONLY $goal CONTENT { title: $title, brief: $brief, state: 'active', source: $source, note: $note,
-          tasks: { intake: $intake, plan: $plan, manual: $manual, acceptance: $acceptance },
-          anchors: [$manual, $acceptance], created_at: time::now() };
-        CREATE ONLY $intake CONTENT { title: '[目标] ' + $title + ' · G1 范围提案', context: $ctx.intake, kind: 'gate',
-          executor_role: 'product', reviewer_role: 'owner', dependencies: [], state: 'ready', ${base} };
-        CREATE ONLY $plan CONTENT { title: '[目标] ' + $title + ' · 任务拆解与分派', context: $ctx.plan, kind: 'task',
-          executor_role: 'gm', reviewer_role: 'product', dependencies: [$intake], state: 'blocked', ${base} };
-        CREATE ONLY $manual CONTENT { title: '[目标] ' + $title + ' · 真人验收操作手册', context: $ctx.manual, kind: 'task',
-          executor_role: 'product', reviewer_role: 'qa', dependencies: [$plan], state: 'blocked', ${base} };
-        CREATE ONLY $acceptance CONTENT { title: '[目标] ' + $title + ' · G3 老板最终验收', context: $ctx.acceptance, kind: 'gate',
-          executor_role: 'gm', reviewer_role: 'owner', dependencies: [$manual], state: 'blocked', ${base} };
-        ${EMIT_CREATED('$intake')}${EMIT_CREATED('$plan')}${EMIT_CREATED('$manual')}${EMIT_CREATED('$acceptance')}
-        COMMIT;`, vars);
-    } catch (error) {
-      const raced = await this.db.select<GoalRow>(goal);
-      if (raced) return goalView(raced);
-      throw error;
+    let row = await this.db.select<GoalRow>(goal);
+    if (!row) {
+      const project = input.project ? id('project', input.project) : undefined;
+      if (project && !(await this.db.select(project))) throw new CompanyError('not_found', `project ${input.project} not found`);
+      const title = input.text.trim().split(/\r?\n/)[0].slice(0, 60);
+      try {
+        await this.db.query(`CREATE ONLY $goal CONTENT { title: $title, brief: $brief, state: 'triage', source: $source, note: $note,
+          project: $project, tasks: {}, anchors: [], created_at: time::now() };`,
+        { goal, title, brief: input.text.trim(), source: input.source, note: input.note ?? '', project });
+      } catch (error) {
+        if (!(await this.db.select<GoalRow>(goal))) throw error;
+      }
+      row = (await this.db.select<GoalRow>(goal))!;
     }
+    return input.tier && row.state === 'triage' ? this.triage(goalId, input.tier, `${input.source} 指定`) : goalView(row);
+  }
+
+  /** Instantiates the flow template of a goal waiting in triage. Idempotent: a triaged goal is returned as is. */
+  async triage(goalId: string, tier: GoalTier, via: string): Promise<GoalView> {
+    if (!GOAL_TIERS.includes(tier)) throw new CompanyError('invalid', 'Invalid goal tier');
+    const goal = id('goal', goalId);
+    const row = await this.db.select<GoalRow>(goal);
+    if (!row) throw new CompanyError('not_found', 'goal not found');
+    if (row.state !== 'triage') return goalView(row);
+    const template = goalTemplate(tier, row.title, row.brief, goalId);
+    const ids = Object.fromEntries(template.tasks.map(t => [t.ref, id('task', randomUUID())]));
+    const vars: Record<string, unknown> = { goal, tier, via, source: `triage:${via}`.slice(0, 200) };
+    const creates = template.tasks.map((t, i) => {
+      vars[`t${i}`] = ids[t.ref];
+      vars[`spec${i}`] = { title: `[目标] ${row.title} · ${t.title}`, context: t.context, kind: t.kind,
+        executor_role: t.executorRole, reviewer_role: t.reviewerRole, dependencies: t.deps.map(d => ids[d]) };
+      return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
+          executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies,
+          state: IF array::len($spec${i}.dependencies) = 0 THEN 'ready' ELSE 'blocked' END,
+          version: 1, fence: 0, goal: $goal, resume_state: 'ready', created_at: time::now() };
+        ${EMIT_CREATED(`$t${i}`)}`;
+    });
+    const refs = Object.fromEntries(Object.entries(template.refs).filter(([, ref]) => ref).map(([k, ref]) => [k, ids[ref!]]));
+    vars.refs = refs;
+    vars.anchors = template.anchors.map(ref => ids[ref]);
+    await this.run(`BEGIN;
+      LET $g = SELECT * FROM ONLY $goal;
+      IF $g.state != 'triage' { THROW 'goal already triaged' };
+      ${creates.join('\n')}
+      UPDATE ONLY $goal SET state = 'active', tier = $tier, triage_via = $via, tasks = $refs, anchors = $anchors;
+      COMMIT;`, vars).catch(async error => {
+      const again = await this.db.select<GoalRow>(goal);
+      if (again?.state !== 'triage') return [];
+      throw error;
+    });
     return goalView((await this.db.select<GoalRow>(goal))!);
+  }
+
+  async triagePending(): Promise<GoalView[]> {
+    const [rows] = await this.db.query<[GoalRow[]]>("SELECT * FROM goal WHERE state = 'triage' ORDER BY created_at;");
+    return rows.map(goalView);
   }
 
   /** approve/reject an owner-reviewed gate, or reply to a task blocked to the owner. */
@@ -164,11 +171,11 @@ export class OwnerDesk {
     const [directions, goals, config] = await this.db.query<[
       Array<{ text: string; source: string; at: unknown }>, GoalRow[], Array<{ paused?: boolean }>,
     ]>(`SELECT text, source, at FROM direction ORDER BY at DESC LIMIT 10;
-      SELECT * FROM goal WHERE state = 'active' ORDER BY created_at;
+      SELECT * FROM goal WHERE state IN ['triage', 'active'] ORDER BY created_at;
       SELECT paused FROM company_meta:config;`);
     return {
       directions: directions.map(d => ({ text: d.text, source: d.source, at: String(d.at) })),
-      goals: goals.map(goalView), paused: Boolean(config[0]?.paused),
+      goals: goals.map(goalView), projects: await new ProjectStore(this.db).list(), paused: Boolean(config[0]?.paused),
     };
   }
 
@@ -225,7 +232,7 @@ export class OwnerDesk {
       let status = 'applied', result = '';
       try {
         switch (row.kind) {
-          case 'goal': result = `goal=${(await this.createGoal({ text: row.text ?? '', source, key })).id}`; break;
+          case 'goal': result = `goal=${(await this.createGoal({ text: row.text ?? '', source, key, tier: row.tier, project: row.project })).id}`; break;
           case 'approve': case 'reject': case 'reply':
             if (!row.task) throw new CompanyError('invalid', 'task is required');
             result = `state=${(await this.decide({ taskId: row.task, decision: row.kind, note: row.text ?? '', source, key })).state}`;

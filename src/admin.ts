@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, openSync, writeSync, closeSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, openSync, readFileSync, writeSync, closeSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from './config.ts';
@@ -7,6 +7,7 @@ import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
 import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
+import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
 import type { Role } from './contracts.ts';
 
 const usage = `Usage: pnpm run admin <command>
@@ -22,6 +23,10 @@ const usage = `Usage: pnpm run admin <command>
   retire <employee-id> <reason>           退役实例并撤销凭证
   scores [任务ID]                          查看绩效评分记录（默认最近 50 条）
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
+  project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
+  project list                            列出项目环境与凭证名（不含值）
+  secret set <项目> <环境> <名称> <角色,角色> [用途]
+                                          从标准输入读取凭证值，加密后入库（值不回显、不进参数）
   config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）`;
 
 const [action, ...args] = process.argv.slice(2);
@@ -124,6 +129,23 @@ try {
     case 'retire': {
       await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual');
       print({ action, employeeId: args[0], ok: true });
+      break;
+    }
+    case 'project': {
+      const [sub, file] = args;
+      const store = new ProjectStore(database.db);
+      if (sub === 'list') print(await store.list());
+      else if (sub === 'set' && file) print(await store.upsert(JSON.parse(readFileSync(file, 'utf8')) as ProjectInput));
+      else throw new Error(usage);
+      break;
+    }
+    case 'secret': {
+      const [sub, project, env, name, roles, ...purpose] = args;
+      if (sub !== 'set' || !project || !env || !name || !roles) throw new Error(usage);
+      const value = readFileSync(0, 'utf8').replace(/\r?\n$/, '');
+      await new ProjectStore(database.db).setSecret({ project, env, name, value, roles: roles.split(',') as Role[],
+        purpose: purpose.join(' ') || undefined }, loadSecretKey(true));
+      print({ action, project, env, name, roles: roles.split(','), ok: true });
       break;
     }
     case 'config': {
