@@ -159,9 +159,8 @@ export function createGithubProjector(input: {
       let projected = 0;
       let after: string | undefined;
       while (true) {
-        // Core orders by (at, id); each page starts after the previous event id.
-        // Every run starts from the beginning so concurrent inserts before a
-        // current scan's cursor are picked up in the next run.
+        // Core orders by a durable global sequence. Each page starts after
+        // the previous event ID, which resolves to its sequence in the DB.
         const events = await core.listOutbox(credential, after);
         if (events.length > 1000) throw new Error('core outbox page exceeds contract limit');
         for (const event of events) {

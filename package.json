@@ -10,7 +10,9 @@
     "test:db": "bun test tests/db.integration.test.ts",
     "bootstrap": "bun src/bootstrap.ts",
     "admin": "bun src/admin.ts",
-    "mcp:client": "bun src/mcp/client-cli.ts"
+    "mcp:client": "bun src/mcp/client-cli.ts",
+    "mcp:serve": "bun src/mcp/run.ts",
+    "test:mcp:live": "bun scripts/live-mcp-check.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.1.0",

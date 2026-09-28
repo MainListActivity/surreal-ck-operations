@@ -24,10 +24,12 @@ export type McpServiceOptions = Readonly<{
 function toolError(error: unknown) {
   const raw = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
+  const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
+    && 'retryable' in error && error.retryable === true;
   return {
     isError: true,
     content: [{ type: 'text' as const, text: code }],
-    structuredContent: { ok: false, code },
+    structuredContent: { ok: false, code, retryable },
   };
 }
 
@@ -53,7 +55,7 @@ function proof(input: LeaseProof): LeaseProof {
 
 function registerTools(server: McpServer, core: CompanyCore) {
   const run = async (credential: Credential, action: () => Promise<unknown>) => {
-    if (!credential) return toolError({ code: 'UNAUTHENTICATED' });
+    if (!credential) return toolError({ code: 'unauthorized' });
     try {
       return toolResult(await action());
     } catch (error) {

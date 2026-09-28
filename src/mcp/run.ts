@@ -1,0 +1,54 @@
+import { resolve } from 'node:path';
+import { loadDatabaseConfig } from '../config';
+import { SurrealCompanyCore } from '../core';
+import { CompanyDatabase } from '../database';
+import { readPrivateCredential } from './credential-file';
+import { createGhCliGateway, createGithubProjector } from './github-projector';
+import { runProjectionWorker } from './projector-worker';
+import { createMcpHttpService } from './server';
+
+const rawPort = process.env.SCK_MCP_PORT;
+if (!rawPort || !/^[0-9]+$/.test(rawPort)) throw new Error('SCK_MCP_PORT is required');
+const port = Number(rawPort);
+if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error('invalid SCK_MCP_PORT');
+
+const db = new CompanyDatabase(loadDatabaseConfig());
+await db.connect();
+let service: ReturnType<typeof createMcpHttpService> | undefined;
+const shutdown = new AbortController();
+try {
+  await db.bootstrap();
+  const core = new SurrealCompanyCore(db);
+  service = createMcpHttpService({ core, port });
+  console.log(`MCP listening on 127.0.0.1:${service.port}`);
+
+  const credentialFile = process.env.SCK_PROJECTOR_CREDENTIAL_FILE;
+  const repository = process.env.SCK_GITHUB_REPOSITORY;
+  if (Boolean(credentialFile) !== Boolean(repository)) {
+    throw new Error('projection requires both SCK_PROJECTOR_CREDENTIAL_FILE and SCK_GITHUB_REPOSITORY');
+  }
+  if (credentialFile && repository) {
+    const credential = await readPrivateCredential(credentialFile);
+    const projector = createGithubProjector({
+      core, credential, github: createGhCliGateway(repository),
+      statePath: resolve(process.env.SCK_PROJECTION_STATE_FILE ?? '.runtime/gh-projection.json'),
+    });
+    const worker = runProjectionWorker({
+      projector, signal: shutdown.signal,
+      onResult: ({ projected }) => { if (projected) console.log(`Projected ${projected} outbox events`); },
+      onError: () => console.error('GitHub projection failed; retry scheduled'),
+    });
+    process.once('SIGINT', () => shutdown.abort());
+    process.once('SIGTERM', () => shutdown.abort());
+    await worker;
+  } else {
+    await new Promise<void>(done => {
+      process.once('SIGINT', done);
+      process.once('SIGTERM', done);
+    });
+  }
+} finally {
+  shutdown.abort();
+  await service?.close();
+  await db.close();
+}
