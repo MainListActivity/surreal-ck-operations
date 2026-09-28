@@ -254,7 +254,7 @@ export class Dispatcher {
         this.onboarded.add(existing.id);
         this.lastStatus.set(existing.paseoAgentId!, 'running');
         await wf.touchWake(existing.id);
-        this.log(`woke ${existing.id} for ${task?.id ?? 'gm-attention'}`);
+        this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
         return { ...existing, spawned: false };
       } catch (error) {
         this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
@@ -277,7 +277,7 @@ export class Dispatcher {
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
         await wf.touchWake(inst.id);
-        this.log(`spawned ${inst.id} (${def.provider}/${def.model}) for ${task?.id ?? 'gm-attention'}`);
+        this.log(`spawned ${inst.id} (${def.provider}/${def.model}) for ${task?.id ?? `dispatch:${role}`}`);
         return { ...bound, spawned: true };
       } catch (error) {
         this.log(`spawn ${inst.id} failed: ${(error as Error).message}`);
