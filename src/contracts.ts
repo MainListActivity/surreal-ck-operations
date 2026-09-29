@@ -139,6 +139,8 @@ export interface CompanyCore {
   createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
   /** Decrypts a project environment secret for the caller's currently held task. Audited, never stored in evidence. */
   getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string>;
+  /** Seals a credential the caller created for the task's project (e.g. a test account in the company's own IdP). */
+  putSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string; value: string; roles?: Role[]; purpose?: string }): Promise<{ stored: string }>;
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */

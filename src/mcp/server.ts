@@ -176,6 +176,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ taskId: z.string().min(1), env: z.string().min(1), name: z.string().min(1) }),
   }, async (input, ctx) => run(token(ctx), async () => ({ value: await core.getSecret(token(ctx), input) })));
 
+  server.registerTool('put_secret', {
+    description: 'Store a credential you created for the project of the task you hold (e.g. a production test account in the company IdP). roles defaults to your role plus qa. The value is encrypted; never repeat it in evidence.',
+    inputSchema: z.object({
+      taskId: z.string().min(1), env: z.string().min(1), name: z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]*$/),
+      value: z.string().min(1).max(20000), roles: z.array(z.enum(roles)).optional(), purpose: z.string().max(500).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.putSecret(token(ctx), input)));
+
   server.registerTool('record_owner_decision', {
     description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',
     inputSchema: z.object({
