@@ -14,13 +14,14 @@
 | surreal_ck `.scratch/legal-content-access` | LCA-04..14 共 11 张 ready（LCA-03 已生产上线、验收链在途，main 上 Status 待收口 PR 合入） | 实施票，簇内依赖链明确（PRD 路线图） |
 | surreal_ck `.scratch/claims-vertical` | 仅 PRD（ready-for-agent），**未拆票** | 需先拆票再实施 |
 | surreal_ck `.scratch/legal-data-product-wayfinder` | 09/10/11/12（in_progress/open） | **设计/决策票**，产出规格不是代码；其中 12 是内容采集管线规格（首期已定调：本地 agent 采集成品经 MCP 提交） |
-| surreal_ck `.scratch/legal-content-mcp` | LCM-07（open，标注 blocked on operations） | 实施票；其 IdP 前置 ma_hono `ops-mcp-oauth` 三票已全部 done，阻塞已解除 |
+| surreal_ck `.scratch/legal-content-mcp` | LCM-07（open；第三项验收「真实 DCR/PKCE/refresh 联测」已由 LCM-10 于 2026-09-11 生产实测完成并标 done/verified） | **证据收口票**：核实勾选与状态后关票，不重复实现 |
+| surreal_ck `.scratch/native-resource-quota` | 实施票全 done；剩余为**生产运维收口**（EXECUTION_PATH.md「Operations-only remainders」与 quota PRD 明确） | 非代码工作流，见批次 0 第 4 项 |
 | surreal_ck `.scratch/shadcn-migration` | SHADCN-04 ready | 小实施票 |
 | surreal_ck `.scratch/server-skeleton` | WP-B-06 ready-for-human（Dockerfile/.env.example/启动文档 sign-off） | 早于现行 systemd+Cloudflare 发布形态，疑似过时，需先判定 |
 | ma_hono `.scratch/` | ops-mcp-oauth 01–03 done；content-reader 已随 PR #2 上线 | 无剩余实施票 |
 | 其余 16 个簇 | 全部 done / wontfix | — |
 
-合计剩余：实施票 26 张（VER 6 + VO 6 + LCA 11 + LCM-07 + SHADCN-04 + WP-B-06）+ 规划侧 2 个未拆票条目（claims-vertical、内容采集管线）+ 决策票 4 张（wayfinder 09–12，其中 12 同时是待拆票规划）。
+合计剩余：实施票有效工作量 **25 张**（VER 6 + VO 6 + LCA-04..14 共 11 + SHADCN-04 + WP-B-06 判定）+ 证据收口票 1 张（LCM-07）+ 生产运维收口 1 条工作流（native quota 切换）+ 决策票 4 张（wayfinder 09–12）+ 待拆票规划 2 个（claims-vertical、内容采集管线=wayfinder-12）。
 
 ## 目标用户与场景
 
@@ -30,10 +31,11 @@
 
 ## 最小可用版本功能（按优先级分批）
 
-**批次 0：收尾与解锁（小票，先清）**
+**批次 0：收尾与解锁（小票与非代码收口，先清）**
 1. SHADCN-04 视觉对齐收尾。
 2. WP-B-06 判定：现行发布为 systemd + Cloudflare，非 Docker——若确认过时则标记关闭（wontfix 并记录理由），若仍需则交付。
-3. LCM-07 OAuth 保护的五工具 MCP：IdP 侧 ops-mcp-oauth 已 done，按真实 `ck` 租户做 DCR/PKCE/refresh 联调交付。
+3. LCM-07 证据收口：其第三项验收（真实 DCR/PKCE/scope/refresh 联测）已按票内转交约定由 SCK-LCM-10 在 2026-09-11 生产完成（未预注册客户端 DCR、PKCE、五工具、刷新/撤销成功，票标 done/verified）。本项只做窄收口：核对 LCM-10 证据覆盖后更新 07 的勾选与状态；只有核实出新缺口才补实现，不重复已完成的联调。
+4. **native quota 生产运维收口（非代码工作流）**：按 `docs/runbooks/native-quota-release-cutover.md` 与 `native-quota-legacy-migration.md` 执行——维护窗（停写+snapshot+隔离目录 restore drill）、migration-conductor 三命令（inventory/import/prepare/assert-reopen）、cohort 晋级（synthetic_internal→one_percent→ten_percent→fifty_percent→remainder）、24h/48h 观察窗、产品切换、30 日 delayed cleanup。验收证据为每阶段运行记录与 `native-quota-acceptance-matrix.md` 口径；观察期按 runbook 固定天数执行，不以工单关闭代替。**红线提示**：30 日 delayed cleanup 涉及删除/改写生产旧 event/table——属 `project.redLines`，届时单独报老板决定，未获批准前不执行该步骤。
 
 **批次 1：虚拟员工执行基础设施（VER-01..06）**
 共享执行上下文 seam（Router 零回归）→ 幂等员工生命周期 → 通用持久化触发接管每日债权风险员工 → 可恢复执行窗口与幂等副作用 → 预算/循环/重试/全局背压 → 连接监督与容量验收。理由：它是 VO 簇与后续一切自治员工的底座，且把现有专用 dispatcher 泛化——先做它防止基础设施散落到业务里（PRD 原话）。
@@ -60,7 +62,8 @@ wayfinder 09（运营控制面设计）/10（定价与单位经济实验设计�
 - 不承诺全量裁判文书覆盖；不向未授权来源获取内容；不把合成内容当真实法律内容。
 - 不在本目标内改 ma_hono（无剩余票）或 operations 仓库规则文件。
 - 不做定价实验的真实收费动作、不新增付费资源/订阅（红线）。
-- 不重做已完成票；不把设计票当实施票交付（wayfinder 09–11 交付物是规格）。
+- native quota 30 日 delayed cleanup 中删除/改写生产旧 event/table 的动作不在本范围默认执行——属红线事项，单独走老板关口。
+- 不重做已完成票；不把设计票当实施票交付（wayfinder 09–11 交付物是规格）；不把已由 LCM-10 生产联调覆盖的 LCM-07 剩余项当成新实现重做。
 
 ## 依赖与风险
 
@@ -74,5 +77,5 @@ wayfinder 09（运营控制面设计）/10（定价与单位经济实验设计�
 ## 成本假设
 
 - 全部在公司自有基建内完成：GitHub Actions 发布、surrealdb origin、Cloudflare、IdP——**零新增付费资源**（红线）。
-- 员工执行成本为既有订阅额度内的 agent 工时；规模约 26 实施票 + 2 拆票 + 3 设计票，属多交付链工程，按既有「实现→上线申请→合入部署→QA 实测」链逐条推进。
+- 员工执行成本为既有订阅额度内的 agent 工时；规模约 25 实施票 + 1 证据收口 + 1 条生产运维工作流（含固定观察期，墙钟约 30+ 天拖尾）+ 2 拆票 + 3 设计票，属多交付链工程，按既有「实现→上线申请→合入部署→QA 实测」链逐条推进。
 - 内容采集首期是本地 agent 运行成本，不建常驻爬虫基础设施。
