@@ -11,7 +11,7 @@
 
 | 要求 | 结果 |
 | --- | --- |
-| 发布到生产 | surreal_ck main `d9db533c9f44364c636a0e36dd3787b1d167d3f5`，Deploy production run `36538080967` success；IdP ma_hono PR #1（head `8edc9474`）部署为 Worker `2445b4aa` |
+| 发布到生产 | QA 实测基线 surreal_ck main `d9db533`（Deploy run `36538080967` success）；当前生产 `0024dbe453ce8e1fb2ed147ddbd6f3a1598054e3`（Deploy run `36562025056` success，多含 PR #43 权益指针回指修复）。IdP ma_hono PR #2（merge `f93441e`）CI 部署为 Worker `939d1c0f`（run `36538952172`），07:50Z 一次手动 wrangler 部署将当前版本切为 `7428d597` |
 | 获授权成员用独立短期凭证在真实页面打开已发布法律内容 | 实测通过（见下「本人复核」）：页面渲染、换票返回 `content_reader.v1` 短期 token（lease≤900s） |
 | 无权限成员不能直连数据库或伪造内容 ID 绕过 | 伪造内容 ID 换票 → 403 `content_not_published`；未认证 → 401；QA 实测非成员/移除成员/直连 DML·DDL 全拒 |
 | 票内全部验收标准 | QA 生产实测 8AC 逐项通过（见下） |
@@ -27,7 +27,7 @@
 - **修复**：成员重加索引双行 500、pointWorkspace 回指缺陷均已修复上线。
 - **IdP**：ma_hono `/scope` content_reader 签发（闭集 claims、三层 allowlist 默认拒绝、TTL≤900s、审计事件）。
 
-交付链：PR #30（merge `a31900e`）→ #38 迁移钩子可重入 → #39 成员重加修复 → #40 集合绑定 → #41 换票错误映射 → #43 权益指针回指 → ma_hono PR #1。关联核实文档：`content-authorization.md`（分支 task/b068f582，许可矩阵与专用样本方案）、`production-readiness.md`（就绪任务提交 ef8306a6）。
+交付链：PR #30（merge `a31900e`）→ #38 迁移钩子可重入 → #39 成员重加修复 → #40 集合绑定 → #41 换票错误映射 → #43 权益指针回指 → ma_hono PR #2（merge `f93441ec81bffc21b35e45616fc17ad1fa2a66b6`）。关联核实文档：`content-authorization.md`（分支 task/b068f582，许可矩阵与专用样本方案）、`production-readiness.md`（就绪任务提交 ef8306a6）。
 
 ## 生产入口与验收步骤
 
@@ -58,7 +58,7 @@
 - 持 workspace-scoped token（`db=ws_26d695c309e5`、`ac=participant`）调 `POST /api/session/content-reader`：
   - allow 样本 → 200，`contractId=content_reader.v1`、`database=platform_content`、`digest=sha256:0040f36899785ea7cafea014af12f18ca82bf2247cc6bf385e1696a53c580b02`（与 QA 投影记录一致）、lease 字段齐全。
   - 伪造 `contentPublicId` → 403 `content_not_published`；无 bearer → 401。
-- IdP discovery `https://o.maplayer.top/t/ck/.well-known/openid-configuration` → 200；IdP Worker 部署版本 `2445b4aa`（wrangler deployments 实测），回滚版本 `5f914aa8` 存在。
+- IdP discovery `https://o.maplayer.top/t/ck/.well-known/openid-configuration` → 200；IdP Worker 当前版本 `7428d597-42de-41a8-9abe-1b5a2ca84b34`（wrangler deployments 实测，100% 流量）。版本谱系：CI 对 PR #2 merge `f93441e` 部署 `939d1c0f`（run `36538952172`，07:49:54Z）；随后 07:50:08Z 一次手动 wrangler 部署把当前版本切为 `7428d597`。`7428d597` 与 CI 验收树的对应关系未见说明，本人 11:50 换票实测（allow 200 / 伪造 403）在该版本上行为实测等价；如需严格一致性可在返工项里核对版本构建产物。回滚目标 `5f914aa8`（更早稳定版本）仍在部署历史。
 - 注：用 `oidc.user` 里的原始登录 token（无 workspace 上下文）换票会得 `workspace_inactive` 403——这是正确拒绝，不是缺陷；应用走 `oidc.access_token` 中切换工作区后的 token。
 
 ## 已知限制
@@ -68,9 +68,10 @@
 - 换票失败经 Cloudflare 时 502 会丢 JSON——已改 503 + 应用层 JSON（PR #41）。
 - 内容库现有 1807 条迁移内容全部无集合绑定=继续拒绝（正确语义）；客户读取允许样本仅 `lca03_acceptance` 集合下的专用条目。
 - `research`/`generate` 动作按经理决定一律不登记（保留 AI 拒绝侧）。
+- `platform_content` 现有第 12 个来源 `qa.lca03.vocab.probe`（11 词、status=inactive）为 QA 词表探针残留，inactive 不产生任何授权。
 
 ## 回滚方式
 
 - 应用侧：Actions 手动运行 Deploy origin，sha 填上一通过 Quality gate 的提交，重跑该提交的 Deploy production 对齐前端。
-- IdP 侧：`wrangler rollback` 至 `5f914aa8`（或对 `af796251` 重发）。
+- IdP 侧：`wrangler rollback` 回上一版本（CI 版本 `939d1c0f`，即 PR #2 树）；更早可回 `5f914aa8`（构建 `af796251`）。
 - 数据库迁移为只新增结构（platform_content 表、access、复制数据），**不随代码回滚**；回退后旧代码仍可用既有结构。`_system` 源数据在复制迁移中未删除。
