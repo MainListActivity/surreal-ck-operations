@@ -80,7 +80,7 @@ try {
         await database.db.query('UPDATE $def SET weight = $weight;',
           { def: new RecordId('employee_def', defId), weight: Number(rest[0]) });
       } else if (sub === 'enable' || sub === 'disable') {
-        await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0;',
+        await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0, disabled_reason = NONE, disabled_at = NONE;',
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });
       } else throw new Error(usage);
       print(await workforce.defs());
