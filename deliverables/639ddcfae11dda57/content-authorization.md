@@ -1,13 +1,13 @@
 # SCK-LCA-03 真实内容读取授权与生产验收样本
 
-- 员工：product-devin-6d805e（接手 product-grok-202946 初版，按 gm-01 退回意见重写）
+- 员工：product-devin-016290（在 product-devin-6d805e 返工稿上落实 gm-devin-fc1b42 的经理决定；初版 product-grok-202946）
 - 任务：b068f582-dbef-4c97-8ce9-694fdb6104b4
 - 目标：639ddcfae11dda57
 - 分支：task/b068f582
 - 原票 8 条验收标准不改、不关闭。
 - 本轮只读核实并写下方案。没有新增许可、没有 UPDATE、没有复制、没有上线、没有对外联系、没有登记凭证、没有读取或打印任何凭证值。
 
-结论：现有已发布内容全部不能作为客户 search、read、cite、export、research、generate 的允许样本；未知权利按拒绝，合成正文不计入真实内容。缺的不是「等一份授权记录出现」，而是两个各有责任方的具体前置：① 注册接口的动作枚举写不进客户动作（工程交付缺口，见第 6 节，已随交接上报经理）；② 是否以许可修订已记录的《著作权法》第五条法定排除为依据登记客户动作，是公司决定（见第 5 节待决问题）。目标库 `platform_content` 今天没有任何表，本文件所有 public_id 都在源库 `_system`；生产验收前必须实建并核对，不能用本文件代替实建结果。
+结论：现有已发布内容全部不能作为客户 search、read、cite、export、research、generate 的允许样本；未知权利按拒绝，合成正文不计入真实内容。缺的不是「等一份授权记录出现」，而是两个各有责任方的具体前置，**两者均已由经理决定**（gm-devin-fc1b42，2026-09-29，见第 5 节）：① 注册接口的动作枚举写不进客户动作——已排入独立交付链，实现任务 12957854-3f47-4f8a-aa48-852c1208a968（工程缺口见第 6 节）；② 是否以许可修订已记录的《著作权法》第五条法定排除为依据登记客户动作——已批准，动作集固定为 browse/search/read/cite/export（research/generate 不登记）。目标库 `platform_content` 今天没有任何表，本文件所有 public_id 都在源库 `_system`；生产验收前必须实建并核对，不能用本文件代替实建结果。
 
 ## 1. 可复核证据（退回项 1）
 
@@ -106,19 +106,24 @@
 
 1. **允许样本**——锁定候选：国家法律法规数据库正式法律文本（source_url 级证据已在库，如 `https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557`，即著作权法 2020 官方页）。
    - 新专用 source_key：`flk.npc.gov.cn.legislation.lca03-allow`（不得复用 9 个现有 source_key——`registerSource` 对已有 key 会 UPDATE `content_source` 行并把全部条目改挂新修订，store.ts:253–300）。
-   - 修订 1：`license_kind=official-legislative-document-publication`，evidence_text 引用第五条记录并点名客户动作；建议动作集 `submit, publish, withdraw, restore, browse, search, read, cite, export`，**故意不含 `research`/`generate`**——同一来源内保留 AI 动作的拒绝侧用例，QA 可在同一正文上同时验证允许与拒绝边界（是否加 AI 动作由经理/老板定，本方案按不加写）。
+   - 修订 1：`license_kind=official-legislative-document-publication`，evidence_text 逐字引用第五条记录并点名客户动作；动作集固定为 `submit, publish, withdraw, restore, browse, search, read, cite, export`，**不含 `research`/`generate`**（经理已决定：一律不登记，保留 AI 动作的拒绝侧用例且偏保守）——同一来源内保留 AI 动作的拒绝侧用例，QA 可在同一正文上同时验证允许与拒绝边界。
    - 条目：经 `POST /api/content/batches`（submit_batch upsert）+ `POST /api/content/publications`（publish_batch）发布一篇专用条目，正文取该来源官方正式文本（与既有 flk 条目同性质但独立 public_id），`content_collection_binding` 绑定验收 collection。
    - 验收判据：授权成员在该条目上 search/read/cite/export 通过；research/generate 拒绝；非成员、无权益成员、错误 revision 均拒绝。
 2. **到期样本**——独立新 source_key：`flk.npc.gov.cn.legislation.lca03-expiry`。修订 1 带已过去的 `effective_until`（注册接口已支持该字段，service.ts:80–85 校验「结束不早于生效」）。门禁 `fn::content_reader_visible` 在 `license_until <= now()` 时拒绝（006-content-reader.surql），可隔离验证「许可过期」而非「无动作」的拒绝。同样只走平台发布管道建一篇专用条目。
 3. **撤回样本**——`lca03-allow` 来源下再发一篇专用条目，先 publish 再经 `POST /api/content/publications` 的 `operation=withdraw` 走正式发布管道撤回：管道在事务内 UPDATE 条目 `publication_status=withdrawn`、追加 `publication_event`、更新批次结果（store.ts:846–883），门禁按 `publication_status != "published"` 拒绝。**不得**手工 INSERT publication_event 了事——那不更新条目状态和投影。
 4. **通用约束**：修订一律 CREATE（`immutable-platform-content-record` 会拒 UPDATE/DELETE）；到期/撤回只用专用来源与专用条目；不动现有 9 个来源、不改写 `_system` 旧行、不碰客户数据；专用条目正文必须来自该来源官方正式文件，禁止用 fixture 或合成正文。
 
-**待决问题（写清边界，不冒充已定）**：
-- Q1（公司决定）：是否以 A 类来源修订 2 已记录的《著作权法》第五条第一项为依据，登记上述客户动作？若经理认为需持牌顾问或老板拍板，按协议转 owner；若确认，登记文本照实引用该记录，不自创法律结论。
-- Q2（工程排期）：见第 6 节枚举扩展，须纳入既有实现链。
-- Q3（库存范围）：允许样本拟用哪一篇官方文本作专用条目正文——建议著作权法 2020 或一部无争议的正式法规，由执行时从 flk 正式页面取正文，禁止回填合成文本。
+**经理决定（gm-devin-fc1b42，2026-09-29，原 Q1/Q2/Q3 均已定）**：
+- Q1（批准登记客户动作，经理可定事项，不转 owner）：以 A 类来源修订 2 已在库内登记的《著作权法》第五条第一项法定排除（官方法律/司法文件不产生著作权客体）为依据，在专用新来源上登记客户动作。这是确认公司已记录的自用法律依据——不扩大第三方许可、不签约、不对外联系、不花钱、不碰 project.redLines（不迁移改写生产数据、不动 surrealdb.service/root/数据目录、不买付费资源）。边界：
+  1. 动作集固定为 `submit/publish/withdraw/restore` + `browse/search/read/cite/export`，`research`/`generate` 一律不登记（保留 AI 拒绝侧用例且偏保守）；
+  2. 只限官方正式文本范围（正式正文、条文、官方译文与必要官方元数据，沿用修订 2 已写明的排除项）；
+  3. `evidence_text` 逐字引用 A 类修订 2 已登记的第五条记录，不自创法律结论；
+  4. 只用本节专用新 source_key（`lca03-allow` / `lca03-expiry`），不动现有 9 个来源及其修订；
+  5. B 类五个研究存档来源与合成来源继续全拒绝。
+- Q2（工程排期，已定）：枚举扩展开**独立小型交付链**，不并入在途链 fe3991c3（其实现已 done、上线申请 c4c80c02 在途，塞新范围会重开已验收实现）。已建交付链：实现 12957854-3f47-4f8a-aa48-852c1208a968（ready，engineering 可立即领取）→ 上线申请 c7dafcd9 → 合入部署与生产实测 bd3eddfc。排期约束：枚举扩展的部署必须在 7c9fb60c 阶段 B 建样之前完成；若 7c9fb60c 先推进到建样而枚举未部署，由该任务执行人核对本链部署状态后等待，禁止绕过接口手工写库。
+- Q3（允许样本正文，已定）：用《中华人民共和国著作权法（2020年修正）》官方正式文本（flk.npc.gov.cn 官方页，与库内既有锚点同源）；执行时若该页取正文失败，改取 flk 来源内另一篇无争议正式法规，并在证据写明实际取用页。禁止回填合成文本。
 
-## 6. 工程交付缺口（已随交接 report_blocker 给经理）
+## 6. 工程交付缺口（已排入交付链 12957854）
 
 读者链路本身无需改：`reader-projection.ts`（task/86b409f0）直接抄 `source_license_revision.allowed_actions` 进 `license_actions`，`fn::content_reader_action` 做集合相交。缺口只在写入侧三处过滤：
 
@@ -128,7 +133,7 @@
 | `shared/src/platform-content/contracts.ts:382` `ContractSourceSchema.allowedActions` | 对外契约同一枚举 | 同步扩展 |
 | `server/src/content/store.ts:111、132` `parseLicense`/`parseSource` | 维护侧读视图把非四动词动作过滤掉 | 同步放宽，否则注册后 API 读回丢字段 |
 
-建议并入实现交付 fe3991c3（PR #30 修复链）或开小型独立交付；由经理决定排期。缺口闭合前，第 5 节允许/到期样本不可建，QA 只能执行拒绝侧用例；第 4 节拒绝矩阵可立即用于拒绝侧验收。
+排期已由经理决定：独立小型交付链，实现任务 `12957854-3f47-4f8a-aa48-852c1208a968`（ready）→ 上线申请 `c7dafcd9` → 合入部署与生产实测 `bd3eddfc`；不并入 fe3991c3（在途链不重开已验收实现）。该链部署完成是第 5 节阶段 B 建样的前置。缺口闭合前，第 5 节允许/到期样本不可建，QA 只能执行拒绝侧用例；第 4 节拒绝矩阵可立即用于拒绝侧验收。
 
 ## 7. 复制后与建样后核验
 
