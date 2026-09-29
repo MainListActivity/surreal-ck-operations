@@ -21,7 +21,7 @@ type ProviderUsageEntry = {
   balances?: Array<{ id: string; label: string; remaining?: number | null; limit?: number | null; unit?: string; tone?: string }>;
 };
 
-function formatProviderUsage(entry: ProviderUsageEntry): string {
+function providerQuotaSummary(entry: ProviderUsageEntry): string {
   const parts: string[] = [];
   for (const w of entry.windows ?? []) {
     if (w.remainingPct == null) continue;
@@ -32,8 +32,37 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
     if (b.remaining == null) continue;
     parts.push(`${b.label} 剩 ${b.remaining}${b.limit != null ? `/${b.limit}` : ""} ${b.unit ?? ""}`);
   }
+  return parts.length ? parts.join("；") : `状态 ${entry.status}`;
+}
+
+function formatProviderUsage(entry: ProviderUsageEntry): string {
   const plan = entry.planLabel ? `（${entry.planLabel}）` : "";
-  return `${entry.providerId}${plan} 提交时额度：${parts.length ? parts.join("；") : `状态 ${entry.status}`}`;
+  return `${entry.providerId}${plan} 提交时额度：${providerQuotaSummary(entry)}`;
+}
+
+let quotaRefreshedAt = 0;
+
+/** Hooks carry the only paseo handle: persist latest quota to company_meta so the dispatcher can read it. */
+export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<ProviderUsageEntry[]> {
+  if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries(ctx);
+  quotaRefreshedAt = Date.now();
+  const usage = await paseo.providers.listUsage().catch(() => undefined);
+  const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
+  if (!providers.length) return [];
+  const { RecordId } = await import("surrealdb");
+  for (const entry of providers) {
+    await ctx.db.db.query(
+      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
+      { meta: new RecordId("company_meta", `quota_${entry.providerId}`), provider: entry.providerId,
+        summary: providerQuotaSummary(entry), status: entry.status, fetched: usage?.fetchedAt, entry });
+  }
+  return providers;
+}
+
+async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
+  const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
+    `SELECT payload FROM company_meta WHERE string::starts_with(string(id), 'company_meta:quota_');`);
+  return (rows ?? []).map(r => r.payload).filter((p): p is ProviderUsageEntry => !!p);
 }
 
 /** When an employee's turn ends right after submit, stamp the provider's remaining quota into the task audit. */
@@ -47,9 +76,9 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
     `SELECT id, version FROM task WHERE current_employee = $e AND state = 'review';`,
     { e: new RecordId("employee", employeeId) });
   if (!tasks?.length) return;
-  const usage = await paseo.providers.listUsage().catch(() => undefined);
-  const entry = (usage as { providers?: ProviderUsageEntry[] } | undefined)?.providers
-    ?.find(p => p.providerId === agent.provider);
+  const providers = await refreshQuota(paseo, ctx);
+  const fresh = providers.length ? providers : await readQuotaEntries(ctx);
+  const entry = fresh.find(p => p.providerId === agent.provider);
   if (!entry) {
     console.log(`usage snapshot skipped: no ${agent.provider} usage entry`);
     return;
@@ -106,6 +135,7 @@ export function startDispatch(server: PluginServerContext): () => void {
   const removers = [
     server.on("agent.turn_ended", (event, { paseo }) => {
       void isCompanyAgent(paseo, event.agent).then(async ok => {
+        console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
         try {
           await snapshotSubmitUsage(paseo, await company(), event.agent);
@@ -116,12 +146,17 @@ export function startDispatch(server: PluginServerContext): () => void {
       });
     }),
     server.on("agent.archived", (event, { paseo }) => {
-      void isCompanyAgent(paseo, event.agent).then(ok => ok && kick());
+      void isCompanyAgent(paseo, event.agent).then(async ok => {
+        if (!ok) return;
+        await refreshQuota(paseo, await company()).catch(() => {});
+        kick();
+      });
     }),
     server.on("workspace.archived", () => kick()),
     server.on("agent.permission_requested", (event, { paseo }) => {
-      void isCompanyAgent(paseo, event.agent).then(ok => {
+      void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
+        await refreshQuota(paseo, await company()).catch(() => {});
         console.log(`permission requested by ${event.agent.title ?? event.agent.id}: ${JSON.stringify(event.request).slice(0, 300)}`);
       });
     }),

@@ -167,6 +167,14 @@ export interface EmployeeScore {
   notes?: string;
 }
 
+export interface ProviderQuota {
+  provider: string;
+  /** Human-readable remaining quota, e.g. "5h 窗口剩 41%（15:00 重置）；余额 $3.2/$10 credits"。 */
+  summary: string;
+  status?: string;
+  fetchedAt?: string;
+}
+
 export type OwnerDecision = 'approve' | 'reject' | 'reply';
 export interface OwnerDecisionInput {
   taskId: TaskId;

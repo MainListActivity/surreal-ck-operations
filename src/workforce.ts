@@ -79,13 +79,15 @@ export interface CompanyConfig {
   jevReleaseThreshold: number;
   /** 升级给老板的问题：Jev「必须老板决定」概率低于该值时改派给经理。 */
   jevOwnerThreshold: number;
+  /** 派工选择候选员工时采信 Jev 答案的最低置信度；低于则回退权重随机。 */
+  jevPickConfidence: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
   paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
-  jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3,
+  jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -193,6 +195,7 @@ export class Workforce {
       jevDecisions: row?.jev_decisions !== false,
       jevReleaseThreshold: typeof row?.jev_release_threshold === 'number' ? row.jev_release_threshold : 0.8,
       jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
+      jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
     };
   }
 

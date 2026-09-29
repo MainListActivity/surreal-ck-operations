@@ -51,6 +51,16 @@ export function company(): Promise<Company> {
       log: message => console.log(message),
       jev: jevFromEnv(),
       git: createGitCli(),
+      // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
+      quota: async () => {
+        const [rows] = await db.db.query<[Array<{ provider?: string; summary?: string; status?: string; fetched_at?: string; at?: unknown }>]>(
+          `SELECT provider, summary, status, fetched_at, at FROM company_meta
+           WHERE string::starts_with(string(id), 'company_meta:quota_');`);
+        return (rows ?? []).map(r => ({
+          provider: r.provider ?? "", summary: r.summary ?? "", status: r.status,
+          fetchedAt: r.fetched_at ?? String(r.at ?? ""),
+        }));
+      },
     });
     return { db, owner, workforce, dispatcher };
   })();

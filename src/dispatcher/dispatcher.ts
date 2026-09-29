@@ -1,10 +1,11 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
+import type { ProviderQuota } from '../contracts.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
-import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
+import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
@@ -27,7 +28,12 @@ export interface DispatcherDeps {
   jev?: JevClient;
   /** Removes worktrees of finished tasks; undefined disables the sweep. */
   git?: GitGateway;
+  /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
+  quota?: () => Promise<ProviderQuota[]>;
 }
+
+/** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
+interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolean }
 
 export interface TickReport {
   commands: number;
@@ -167,15 +173,24 @@ export class Dispatcher {
     }
     const assigned = new Set<string>();
     const rand = this.deps.rand ?? Math.random;
+    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
+      (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
+    const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
+      inst.role === role && ready(inst) && !assigned.has(inst.id) &&
+      !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
+      this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
+    // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
+    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
+      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
+    // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
+    // a def at capacity in the ops repo can still spawn for a task in another repo.
+    const eligibleDefs = (role: string, home: string) =>
+      defs.filter(d => d.enabled && d.role === role &&
+        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
+        this.capacity(d.provider, cfg, health, busyBy, now));
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
-      const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
-        (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
-      const ok = (inst: EmployeeInst) => inst.role === role && ready(inst) && !assigned.has(inst.id) &&
-        !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
-        this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
-      // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
       const home = task?.repoPath ?? this.deps.env.opsRepo;
-      const candidates = insts.filter(i => ok(i) && (i.cwd ?? this.deps.env.opsRepo) === home);
+      const candidates = eligibleInsts(role, home, task, excludeSubmitter);
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
@@ -186,20 +201,53 @@ export class Dispatcher {
       const pool = usable.filter(i => i.id !== avoid);
       return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
     };
-    // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
-    // a def at capacity in the ops repo can still spawn for a task in another repo.
-    const spawnable = (role: string, home: string) => weightedOrder(
-      defs.filter(d => d.enabled && d.role === role &&
-        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
-        this.capacity(d.provider, cfg, health, busyBy, now)),
-      effectiveWeight, rand);
+    const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
+    // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
+    const quotaByProvider = new Map<string, ProviderQuota>();
+    for (const q of await this.deps.quota?.().catch(() => []) ?? []) quotaByProvider.set(q.provider, q);
+    const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
+      if (!this.deps.jev || !cfg.jevDecisions) return undefined;
+      const home = item.task.repoPath ?? this.deps.env.opsRepo;
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review');
+      const spawn = eligibleDefs(item.role, home);
+      if (reuse.length + spawn.length < 2) return undefined;
+      const describeHealth = (provider: string) => health.get(provider)?.state ?? 'ok';
+      const candidates: RouteCandidate[] = [
+        ...reuse.map(i => {
+          const def = defs.find(d => d.id === i.def);
+          return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: def?.model ?? '',
+            score: def?.avgScore, scored: def?.scored, quota: quotaByProvider.get(i.provider ?? def?.provider ?? '')?.summary,
+            health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee };
+        }),
+        ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: d.model,
+          score: d.avgScore, scored: d.scored, quota: quotaByProvider.get(d.provider)?.summary,
+          health: describeHealth(d.provider) })),
+      ];
+      const directions = (await owner.brief()).directions.map(d => d.text);
+      const verdict = await jevStaff(this.deps.jev, {
+        purpose: item.purpose, directions,
+        task: { id: item.task.id, title: item.task.title, kind: item.task.kind, state: item.task.state,
+          project: item.task.repoPath, context: item.task.row.context?.slice(0, 2000) },
+        candidates,
+      }).catch(error => { this.log(`jev staff failed: ${(error as Error).message}`); return { key: undefined, confidence: 0 }; });
+      const inst = reuse.find(i => i.id === verdict.key);
+      const def = spawn.find(d => `spawn:${d.id}` === verdict.key);
+      if ((!inst && !def) || verdict.confidence < cfg.jevPickConfidence) {
+        if (verdict.key) report.decisions.push(`staff:${item.task.id}=weighted(${verdict.confidence.toFixed(2)})`);
+        return undefined;
+      }
+      report.decisions.push(`staff:${item.task.id}=${verdict.key}@${verdict.confidence.toFixed(2)}`);
+      this.log(`jev picked ${verdict.key} for ${item.task.id} (${verdict.confidence.toFixed(2)})`);
+      return inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
+    };
 
     for (const item of work) {
       if (running >= cfg.maxRunning) break;
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      const prefer = await routeEmployee(item);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review');
+        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer);
       if (!result) {
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 当前没有可用员工（无空闲实例且无法新开：定义缺失、已停用、达到上限或订阅不可用），任务 ${item.task.id} 等待中。`, report);
         continue;
@@ -419,9 +467,11 @@ export class Dispatcher {
     spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
+    prefer?: AssignPreference,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env } = this.deps;
-    const existing = pick(role, task, avoid, forReview);
+    const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
+    const existing = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
     if (existing) {
       try {
         const first = !this.onboarded.has(existing.id) && !existing.onboarded;
@@ -436,7 +486,9 @@ export class Dispatcher {
         return undefined;
       }
     }
-    for (const def of spawnable(role, task?.repoPath ?? env.opsRepo)) {
+    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo);
+    if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
+    for (const def of defsOrdered) {
       const inst = await wf.spawnInst(def);
       try {
         const agentId = await paseo.spawn({
