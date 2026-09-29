@@ -1,0 +1,25 @@
+#V2
+SELECT id, plan_key, revision FROM quota_plan_revision; SELECT id, slug, status FROM workspace;
+LET $v = (SELECT id, item, source FROM content_version WHERE public_id = 'law-demo-1' LIMIT 1)[0];
+RETURN $v;
+RETURN (SELECT id, publication_status FROM content_item WHERE id = $v.item LIMIT 1)[0];
+RETURN (SELECT id, status FROM content_source WHERE id = $v.source LIMIT 1)[0];
+SELECT id, publication_status FROM content_item:demo1;
+SELECT id, publication_status FROM content_item;
+CREATE content_item:demo1 SET  public_id = 'law-demo-1', kind = 'legislation',  current_version = content_version:demo1, publication_status = 'published', publication_revision = 1,  created_at = time::now(), updated_at = time::now();
+CREATE content_collection_binding:demo1 SET item = content_item:demo1, collections = ['core'];
+SELECT id, publication_status FROM content_item;
+SELECT id, workspace_id, revision, allowed_subjects, status FROM content_authorization_projection;
+SELECT id, workspace_id, actions, ai_actions, status FROM content_read_gate;
+SELECT id, publication_status FROM content_item;
+SELECT id, public_id, item FROM content_version;
+SELECT id, item, collections FROM content_collection_binding;
+SELECT id, source, `revision` FROM source_license_revision;
+CREATE content_item:demo1 SET public_id = 'law-demo-1', kind = 'legislation', current_version = content_version:demo1, publication_status = 'published', publication_revision = 1, created_at = time::now(), updated_at = time::now();
+SELECT id, publication_status FROM content_item;
+SELECT id, workspace_id, revision, allowed_subjects, status FROM content_authorization_projection;
+SELECT id, workspace_id, actions, ai_actions, status FROM content_read_gate;
+SELECT id, publication_status FROM content_item;
+INFO FOR DB;
+SELECT id, ledger_state, usage_trusted, last_native_audit_at FROM workspace_quota_runtime;
+SELECT id, workspace_id, allowed_subjects, status, confirmed_until FROM content_authorization_projection; SELECT id, actions, ai_actions, status FROM content_read_gate;
