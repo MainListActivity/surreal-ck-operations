@@ -1,0 +1,638 @@
+{
+ "meta": {
+  "task": "b068f582-dbef-4c97-8ce9-694fdb6104b4",
+  "goal": "639ddcfae11dda57",
+  "employee": "product-devin-6d805e",
+  "sampled_at": "2026-09-29T01:59:38.083220+00:00",
+  "endpoint": "wss://data.maplayer.top/rpc",
+  "namespace": "main",
+  "database": "_system",
+  "method": "本机 surreal sql 3.2.3 只读会话（SELECT/INFO），root 凭证经产品 .env 注入子进程环境，值未打印；无写语句",
+  "surreal_ck_refs": {
+   "main_head": "15c49fb933dd473d25498799d5ac2425d959c743",
+   "reader_branch": "task/86b409f0 @ 5384fd69847080cd39fbea1902d676e6965bced9",
+   "prod_origin": "af8c8b3087ef4d033a40063fdb39c39da2325893"
+  }
+ },
+ "queries_file": "license-snapshot-queries.surql",
+ "results": [
+  null,
+  null,
+  null,
+  [
+   [
+    {
+     "n": 1807
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 1807,
+     "publication_status": "published"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "kind": "judicial_document",
+     "n": 1783,
+     "publication_status": "published"
+    },
+    {
+     "kind": "legislation",
+     "n": 24,
+     "publication_status": "published"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 1806
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 1808
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 1810
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "event_kind": "corrected",
+     "n": 1
+    },
+    {
+     "event_kind": "published",
+     "n": 1807
+    },
+    {
+     "event_kind": "restored",
+     "n": 1
+    },
+    {
+     "event_kind": "withdrawn",
+     "n": 1
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-12T05:13:06.838527193Z",
+     "id": "content_source:b9865fe6e5d54016b052c1acbfab9723",
+     "label": "最高人民法院公开指导性案例及司法文件",
+     "source_key": "court.gov.cn.guiding-cases",
+     "status": "active",
+     "updated_at": "2026-09-15T10:47:46.252411413Z"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T11:47:17.318919826Z",
+     "id": "content_source:89e441641ccc4aa5b57fb3a9d36e484c",
+     "label": "多元解纷案例库官方案例条目（研究存档）",
+     "source_key": "dyjfalk.court.gov.cn.case-summaries",
+     "status": "active",
+     "updated_at": "2026-09-13T11:47:17.318976346Z"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish",
+      "withdraw",
+      "restore"
+     ],
+     "created_at": "2026-09-11T22:37:42.845536273Z",
+     "id": "content_source:481052908afa41d58fd738e818df81bd",
+     "label": "SCK-LCM-10 合成验收来源（不可售）",
+     "source_key": "fixture.synthetic.cn",
+     "status": "active",
+     "updated_at": "2026-09-11T22:37:42.845590753Z"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-12T05:13:08.048878615Z",
+     "id": "content_source:4078cef8b0ec4dadac705723d51ad0a2",
+     "label": "国家法律法规数据库正式法律法规",
+     "source_key": "flk.npc.gov.cn.legislation",
+     "status": "active",
+     "updated_at": "2026-09-15T10:42:15.995414917Z"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T12:00:24.993201115Z",
+     "id": "content_source:47ad39199e534a4d904e4783058d68d0",
+     "label": "最高人民法院知识产权法庭入库案例官方条目（研究存档）",
+     "source_key": "ipc.court.gov.cn.case-entries",
+     "status": "active",
+     "updated_at": "2026-09-13T12:00:24.993264675Z"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-12T10:14:09.411011884Z",
+     "id": "content_source:fd29ca5a7a044485a4affa34e8c744ee",
+     "label": "最高人民法院知识产权法庭公开裁判文书",
+     "source_key": "ipc.court.gov.cn.judgments",
+     "status": "active",
+     "updated_at": "2026-09-15T10:48:04.309970005Z"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T09:49:48.147538069Z",
+     "id": "content_source:e308734cbb214aa49e0a23e13738cfb6",
+     "label": "人民法院案例库正式案例条目",
+     "source_key": "rmfyalk.court.gov.cn.case-entries",
+     "status": "active",
+     "updated_at": "2026-09-13T09:49:48.147598229Z"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-12T05:18:24.965443334Z",
+     "id": "content_source:b663a0ddfc3c490283451d50a403f599",
+     "label": "最高人民检察院正式指导性案例文件",
+     "source_key": "spp.gov.cn.guiding-cases",
+     "status": "active",
+     "updated_at": "2026-09-12T05:18:24.965635373Z"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T13:00:51.313720954Z",
+     "id": "content_source:7f2b1e173d734fd8a8b6788fbb3056e6",
+     "label": "最高人民检察院官方网站公开典型案例（研究存档）",
+     "source_key": "spp.gov.cn.typical-cases",
+     "status": "active",
+     "updated_at": "2026-09-13T13:00:51.313778193Z"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-12T05:13:08.049988414Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-12T05:13:07.170Z",
+     "effective_until": null,
+     "evidence_text": "依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法。仅采集官方正式法律及司法文件正文，排除网站新闻、评论、图片、页面设计与第三方作品。用户已明确授权本平台登记来源并采集入库。本修订仅允许提交审核，不声明任何站点授予了批量接口或商业转载许可。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:5011a5b3941d47ae87702181d4247a10",
+     "license_kind": "official-legislative-judicial-document",
+     "revision": 1,
+     "source": "content_source:4078cef8b0ec4dadac705723d51ad0a2"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-15T10:42:15.995616076Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-15T14:42:00Z",
+     "effective_until": null,
+     "evidence_text": "官方核验范围：国家法律法规数据库公布的《中华人民共和国著作权法》（2020年修正）第五条第一项规定，本法不适用于法律、法规，国家机关的决议、决定、命令和其他具有立法、行政、司法性质的文件及其官方正式译文。国家法律法规数据库该条目页面标注制定机关为全国人民代表大会常务委员会、公布日期为2020-11-11、施行日期为2021-06-01，并载明版权所有为全国人大常委会办公厅。\n\n本修订的 publish 许可仅适用于该来源中上述法定类型文件的正式正文、条文及官方正式译文/必要官方元数据，保留原始来源链接和归属；不包含网站页面设计、图片、新闻、评论、数据库编排、下载服务或第三方作品。采集内容如超出该范围，必须退回人工审核并暂停发布。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:082b35a6137448e4bd11b9ef9dd58fd2",
+     "license_kind": "official-legislative-document-publication",
+     "revision": 2,
+     "source": "content_source:4078cef8b0ec4dadac705723d51ad0a2"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T12:00:24.994208114Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-13T12:00:24.663Z",
+     "effective_until": null,
+     "evidence_text": "最高人民法院知识产权法庭官方网站“入库案例”栏目公开官方案例条目，页面页脚载明中华人民共和国最高人民法院版权所有。仅保存官方案例编号（如页面提供）、标题、案情、裁判结果及正文中明确列出的法律依据供研究审核；排除页面设计、图片、新闻评论和第三方作品，不作公开发布或商业转载。本登记不声称站点授予批量接口或转载许可。",
+     "evidence_url": "https://ipc.court.gov.cn/zh-cn/news/more-5-48.html",
+     "id": "source_license_revision:29a137187c36405fb9665424de516d61",
+     "license_kind": "official-court-case-summary-research-only",
+     "revision": 1,
+     "source": "content_source:47ad39199e534a4d904e4783058d68d0"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish",
+      "withdraw",
+      "restore"
+     ],
+     "created_at": "2026-09-11T22:37:42.846670712Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-01T00:00:00Z",
+     "effective_until": null,
+     "evidence_text": "仅用于 SCK-LCM-10 自动验收；不代表真实裁判文书、不可对外销售或作为法律内容提供。",
+     "evidence_url": "https://example.invalid/sck-lcm-10/license",
+     "id": "source_license_revision:3ce03fb458f34bf2bbd9a8744985cb33",
+     "license_kind": "synthetic-e2e-only",
+     "revision": 1,
+     "source": "content_source:481052908afa41d58fd738e818df81bd"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T13:00:51.314595793Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-13T13:00:50.489Z",
+     "effective_until": null,
+     "evidence_text": "本来源仅收录最高人民检察院官方网站公开的典型案例正式案例正文，排除新闻稿、评论、图片、页面设计与第三方作品。依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法；本登记仅允许提交审核，不代表网站授予批量接口或商业转载许可。对不属于上述排除范围的内容不得采集。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:6170c1d287a94f9ea5a0e8bf38285721",
+     "license_kind": "official-case-material-research-archive",
+     "revision": 1,
+     "source": "content_source:7f2b1e173d734fd8a8b6788fbb3056e6"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T11:47:17.319780105Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-13T11:47:17.879Z",
+     "effective_until": null,
+     "evidence_text": "多元解纷案例库版权声明明确其著作权受相关法律法规及国际条约保护，禁止侵权。仅在用户已登录并明确授权的平台内保存官方案例条目供研究审核，范围限定为案例编号、标题、案情、处理方式、处理结果、解纷依据和解纷要旨；不采集页面设计、图片、新闻或第三方作品，不作公开发布或商业转载。本登记不声称站点授予批量接口或转载许可。",
+     "evidence_url": "https://dyjfalk.court.gov.cn/site/copyright",
+     "id": "source_license_revision:45dec07abed24471b0dd1d2c8383b278",
+     "license_kind": "official-court-case-summary-research-only",
+     "revision": 1,
+     "source": "content_source:89e441641ccc4aa5b57fb3a9d36e484c"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-12T05:18:24.966527013Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-12T05:18:24.944Z",
+     "effective_until": null,
+     "evidence_text": "依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法。仅采集官方正式法律及司法文件正文，排除网站新闻、评论、图片、页面设计与第三方作品。用户已明确授权本平台登记来源并采集入库。本修订仅允许提交审核，不声明任何站点授予了批量接口或商业转载许可。 限最高检经检察委员会通过并正式印发的指导性案例司法文件，排除新闻稿及网站其他受保护作品。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:83307f4aefbf41c29568d4fc79a9ab3f",
+     "license_kind": "official-legislative-judicial-document",
+     "revision": 1,
+     "source": "content_source:b663a0ddfc3c490283451d50a403f599"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-12T05:13:06.839340512Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-12T05:13:07.169Z",
+     "effective_until": null,
+     "evidence_text": "依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法。仅采集官方正式法律及司法文件正文，排除网站新闻、评论、图片、页面设计与第三方作品。用户已明确授权本平台登记来源并采集入库。本修订仅允许提交审核，不声明任何站点授予了批量接口或商业转载许可。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:4093368bb7284e9a862aa57ef04abf46",
+     "license_kind": "official-legislative-judicial-document",
+     "revision": 1,
+     "source": "content_source:b9865fe6e5d54016b052c1acbfab9723"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-15T10:47:46.252621213Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-15T14:47:00Z",
+     "effective_until": null,
+     "evidence_text": "官方来源核验：最高人民法院官网“指导案例”栏目列示指导性案例标题、发布时间和正文入口，页面页脚载明“中华人民共和国最高人民法院 版权所有”。《中华人民共和国著作权法》（2020年修正）第五条第一项规定，本法不适用于法律、法规，国家机关的决议、决定、命令和其他具有立法、行政、司法性质的文件及其官方正式译文。\n\n本修订的 publish 范围仅限最高人民法院正式发布的指导性案例、司法文件等具有司法性质的正式文件正文及官方正式译文/必要官方元数据，保留来源链接和署名；不含网站页面设计、图片、新闻、评论、案例编排和第三方材料。对页面另有转载或授权限制的内容暂停发布并转人工。",
+     "evidence_url": "https://www.court.gov.cn/shenpan/gengduo/77.html",
+     "id": "source_license_revision:27d7cae3bb6748e6bc0e56dbfef20e9c",
+     "license_kind": "official-judicial-document-publication",
+     "revision": 2,
+     "source": "content_source:b9865fe6e5d54016b052c1acbfab9723"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-13T09:49:48.148407228Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-13T09:49:49.028Z",
+     "effective_until": null,
+     "evidence_text": "依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法。仅采集人民法院案例库中具备独立案例编号的正式案例条目的案情、裁判要旨、裁判理由及裁判结果，保留官方链接与来源归属；排除案例库索引、专题导语、网页设计、新闻评论、图片与第三方作品。该站版权声明已记录，所作依据并不表示网站授予批量接口、数据库复制或商业转载许可；本修订仅允许提交人工审核。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:4097160591c14fbab2fecc8f9a27e028",
+     "license_kind": "official-legislative-judicial-document",
+     "revision": 1,
+     "source": "content_source:e308734cbb214aa49e0a23e13738cfb6"
+    },
+    {
+     "allowed_actions": [
+      "submit"
+     ],
+     "created_at": "2026-09-12T10:14:09.412099043Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-12T10:14:10.039Z",
+     "effective_until": null,
+     "evidence_text": "依据国家法律法规数据库《中华人民共和国著作权法》（2020年修正）第五条第一项，法律、法规及其他具有立法、行政、司法性质的文件不适用著作权法。仅采集官方正式法律及司法文件正文，排除网站新闻、评论、图片、页面设计与第三方作品。用户已明确授权本平台登记来源并采集入库。本修订仅允许提交审核，不声明任何站点授予了批量接口或商业转载许可。 仅最高法知识产权法庭精品裁判栏目公开的正式裁判文书。",
+     "evidence_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "id": "source_license_revision:5740626605a2444798b5ca90aa6231ba",
+     "license_kind": "official-legislative-judicial-document",
+     "revision": 1,
+     "source": "content_source:fd29ca5a7a044485a4affa34e8c744ee"
+    },
+    {
+     "allowed_actions": [
+      "submit",
+      "publish"
+     ],
+     "created_at": "2026-09-15T10:48:04.310175965Z",
+     "created_by_subject": "a7edfa07-6852-4f17-aa18-d9ce760041e1",
+     "effective_from": "2026-09-15T14:48:00Z",
+     "effective_until": null,
+     "evidence_text": "官方来源核验：最高人民法院知识产权法庭官方网站“裁判资料—精品裁判”栏目公开正式裁判文书条目，页面页脚载明“中华人民共和国最高人民法院 版权所有”。《中华人民共和国著作权法》（2020年修正）第五条第一项规定，本法不适用于法律、法规，国家机关的决议、决定、命令和其他具有立法、行政、司法性质的文件及其官方正式译文。\n\n本修订的 publish 范围仅限该栏目正式公开的裁判文书正文及官方正式译文/必要官方元数据，保留来源链接和署名；不含网站页面设计、图片、新闻、案例分析、案例编排和第三方材料。对页面另有转载或授权限制的内容暂停发布并转人工。",
+     "evidence_url": "https://ipc.court.gov.cn/zh-cn/news/more-5-25.html",
+     "id": "source_license_revision:7382c605f1dc45fba7753810854667cd",
+     "license_kind": "official-judicial-document-publication",
+     "revision": 2,
+     "source": "content_source:fd29ca5a7a044485a4affa34e8c744ee"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 0
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "n": 0
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "current_version": "content_version:version_29b1f5f2b5904f6599aed917ac281133",
+     "id": "content_item:item_7f2161001cb94ad8868fcc02d089d44b",
+     "kind": "legislation",
+     "public_id": "item_7f2161001cb94ad8868fcc02d089d44b",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_383e8648f29143a89aa9747f5fc62a6e",
+     "id": "content_item:item_dfee35229a3949d485662e438c79eb99",
+     "kind": "legislation",
+     "public_id": "item_dfee35229a3949d485662e438c79eb99",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_000cfe210c26463cb6af5312c925ee7c",
+     "id": "content_item:item_8611b77897eb4198aed1870ed50161ff",
+     "kind": "legislation",
+     "public_id": "item_8611b77897eb4198aed1870ed50161ff",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_00143aeb0b654ffeb2dcac6fe05d300f",
+     "id": "content_item:item_fc41948315aa44489250eb75102f8a2f",
+     "kind": "judicial_document",
+     "public_id": "item_fc41948315aa44489250eb75102f8a2f",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_001afd656d164e72a2c8fce3664ead63",
+     "id": "content_item:item_63e576471cd346ffaff6a19de7647a78",
+     "kind": "judicial_document",
+     "public_id": "item_63e576471cd346ffaff6a19de7647a78",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_b67c0e19e3c54e0fb8ca7a5e6a9555d3",
+     "id": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "kind": "judicial_document",
+     "public_id": "item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "publication_revision": 4,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_545c21818b0e4bc19abac2c428cf2c6e",
+     "id": "content_item:item_0183b2e80b774190a858c8225511a3bd",
+     "kind": "judicial_document",
+     "public_id": "item_0183b2e80b774190a858c8225511a3bd",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_7b7492a29565490e8479c09d44eadf55",
+     "id": "content_item:item_f24ac023c8514e2b96f5feca7a868dc6",
+     "kind": "legislation",
+     "public_id": "item_f24ac023c8514e2b96f5feca7a868dc6",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:debug_publish_probe",
+     "id": "content_item:debug_publish_probe",
+     "kind": "judicial_document",
+     "public_id": "debug_publish_probe",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_f513fe781fc84f6fa6022caf3ec4da5c",
+     "id": "content_item:item_052c480ddfdf4755921cbb26e045e7a2",
+     "kind": "legislation",
+     "public_id": "item_052c480ddfdf4755921cbb26e045e7a2",
+     "publication_revision": 1,
+     "publication_status": "published"
+    },
+    {
+     "current_version": "content_version:version_e448dda5b727457bb5361e2bf146a5bf",
+     "id": "content_item:item_06982d29e23b4d2a9db1a5c4b88842a6",
+     "kind": "legislation",
+     "public_id": "item_06982d29e23b4d2a9db1a5c4b88842a6",
+     "publication_revision": 1,
+     "publication_status": "published"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "body_sha256": "2475e696fd813ebaa067424e23e9194bb40e372a46a4aed5272c5c3fd34624d3",
+     "id": "content_version:version_29b1f5f2b5904f6599aed917ac281133",
+     "item": "content_item:item_7f2161001cb94ad8868fcc02d089d44b",
+     "public_id": "version_29b1f5f2b5904f6599aed917ac281133",
+     "revision": 1,
+     "source": "content_source:4078cef8b0ec4dadac705723d51ad0a2",
+     "source_form": "full_text",
+     "source_url": "https://flk.npc.gov.cn/detail?id=2c909fdd678bf17901678bf70bc70587",
+     "title": "中华人民共和国著作权法",
+     "version_label": "2010年修正"
+    },
+    {
+     "body_sha256": "4b5157842ac2863588e715a7d8bccf9fedff579aa95373da4edd2c2052f46f83",
+     "id": "content_version:version_383e8648f29143a89aa9747f5fc62a6e",
+     "item": "content_item:item_dfee35229a3949d485662e438c79eb99",
+     "public_id": "version_383e8648f29143a89aa9747f5fc62a6e",
+     "revision": 1,
+     "source": "content_source:4078cef8b0ec4dadac705723d51ad0a2",
+     "source_form": "full_text",
+     "source_url": "https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557",
+     "title": "中华人民共和国著作权法",
+     "version_label": "2020年修正"
+    },
+    {
+     "body_sha256": "e810cc4726aaaa0103ec179fcbb839db946d7bfe62aeffa1349bc555e514be0a",
+     "id": "content_version:version_000cfe210c26463cb6af5312c925ee7c",
+     "item": "content_item:item_8611b77897eb4198aed1870ed50161ff",
+     "public_id": "version_000cfe210c26463cb6af5312c925ee7c",
+     "revision": 1,
+     "source": "content_source:b9865fe6e5d54016b052c1acbfab9723",
+     "source_form": "full_text",
+     "source_url": "https://www.court.gov.cn/fabu/xiangqing/351291.html",
+     "title": "最高人民法院关于适用《中华人民共和国反不正当竞争法》若干问题的解释",
+     "version_label": null
+    },
+    {
+     "body_sha256": "b0e9a1d6b79da93a2acedc9127ae2568aed41537e112ce443cb2b4943a38d4d2",
+     "id": "content_version:version_00143aeb0b654ffeb2dcac6fe05d300f",
+     "item": "content_item:item_fc41948315aa44489250eb75102f8a2f",
+     "public_id": "version_00143aeb0b654ffeb2dcac6fe05d300f",
+     "revision": 1,
+     "source": "content_source:b9865fe6e5d54016b052c1acbfab9723",
+     "source_form": "case_summary",
+     "source_url": "https://www.court.gov.cn/zixun/xiangqing/13335.html",
+     "title": "袁巧娥拒不支付劳动报酬案",
+     "version_label": null
+    },
+    {
+     "body_sha256": "2a002f2c80c56650df7b85f46cb66317229c8e8522f7a97f5c3ce8273756b13b",
+     "id": "content_version:version_001afd656d164e72a2c8fce3664ead63",
+     "item": "content_item:item_63e576471cd346ffaff6a19de7647a78",
+     "public_id": "version_001afd656d164e72a2c8fce3664ead63",
+     "revision": 1,
+     "source": "content_source:fd29ca5a7a044485a4affa34e8c744ee",
+     "source_form": "full_text",
+     "source_url": "https://ipc.court.gov.cn/zh-cn/news/view-5697.html",
+     "title": "（2023）最高法知民终2573号",
+     "version_label": null
+    },
+    {
+     "body_sha256": "c72a5c076fc30a83b6575804104d1223ffc3cd0e19f2d03ea77e72024d12071e",
+     "id": "content_version:version_88bb608a246b4c4fa8ec6b3b8896c39e",
+     "item": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "public_id": "version_88bb608a246b4c4fa8ec6b3b8896c39e",
+     "revision": 1,
+     "source": "content_source:481052908afa41d58fd738e818df81bd",
+     "source_form": "full_text",
+     "source_url": "https://example.invalid/fixture/judgment-5111bdfe842e489d",
+     "title": "合成民事判决书（契约测试）",
+     "version_label": null
+    },
+    {
+     "body_sha256": "2bae7d51fa50d3cd46f546eeb7e93f7183c0f56c690240ab4322bd1df8388f66",
+     "id": "content_version:version_b67c0e19e3c54e0fb8ca7a5e6a9555d3",
+     "item": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "public_id": "version_b67c0e19e3c54e0fb8ca7a5e6a9555d3",
+     "revision": 2,
+     "source": "content_source:481052908afa41d58fd738e818df81bd",
+     "source_form": "full_text",
+     "source_url": "https://example.invalid/fixture/judgment-5111bdfe842e489d",
+     "title": "合成民事判决书（契约测试）",
+     "version_label": null
+    },
+    {
+     "body_sha256": "c72a5c076fc30a83b6575804104d1223ffc3cd0e19f2d03ea77e72024d12071e",
+     "id": "content_version:version_545c21818b0e4bc19abac2c428cf2c6e",
+     "item": "content_item:item_0183b2e80b774190a858c8225511a3bd",
+     "public_id": "version_545c21818b0e4bc19abac2c428cf2c6e",
+     "revision": 1,
+     "source": "content_source:481052908afa41d58fd738e818df81bd",
+     "source_form": "full_text",
+     "source_url": "https://example.invalid/fixture/judgment-1",
+     "title": "合成民事判决书（契约测试）",
+     "version_label": null
+    },
+    {
+     "body_sha256": "1052ff99178c490e50ad158d4519ed06649ecba0bb0d87a725a49602855b5630",
+     "id": "content_version:version_7b7492a29565490e8479c09d44eadf55",
+     "item": "content_item:item_f24ac023c8514e2b96f5feca7a868dc6",
+     "public_id": "version_7b7492a29565490e8479c09d44eadf55",
+     "revision": 1,
+     "source": "content_source:481052908afa41d58fd738e818df81bd",
+     "source_form": "full_text",
+     "source_url": "https://example.invalid/fixture/legislation-177ca765bf383e7c",
+     "title": "SCK-LCM-10 合成法规（契约测试）",
+     "version_label": "fixture-v1"
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "event_kind": "corrected",
+     "id": "publication_event:04238zypetlcbom9n1dc",
+     "item": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "occurred_at": "2026-09-11T22:58:03.048411566Z",
+     "version": "content_version:version_b67c0e19e3c54e0fb8ca7a5e6a9555d3"
+    },
+    {
+     "event_kind": "restored",
+     "id": "publication_event:8ymijysx95q8bwiy1xt4",
+     "item": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "occurred_at": "2026-09-11T22:58:18.087930726Z",
+     "version": "content_version:version_b67c0e19e3c54e0fb8ca7a5e6a9555d3"
+    },
+    {
+     "event_kind": "withdrawn",
+     "id": "publication_event:ygw1gdg7hyy8setvzycz",
+     "item": "content_item:item_1ed1d85fab7843b0a91a95f82d02a32c",
+     "occurred_at": "2026-09-11T22:58:10.509939519Z",
+     "version": "content_version:version_b67c0e19e3c54e0fb8ca7a5e6a9555d3"
+    }
+   ]
+  ],
+  null,
+  null
+ ],
+ "platform_content_info": "[{ accesses: {  }, analyzers: {  }, apis: {  }, buckets: {  }, configs: {  }, functions: {  }, models: {  }, modules: {  }, params: {  }, quota: { defined: false, generation: NONE }, sequences: {  }, tables: {  }, users: {  } }]\n\n[\"The table 'content_item' does not exist\"]"
+}

@@ -1,109 +1,143 @@
 # SCK-LCA-03 真实内容读取授权与生产验收样本
 
-- 员工：product-grok-202946
+- 员工：product-devin-6d805e（接手 product-grok-202946 初版，按 gm-01 退回意见重写）
 - 任务：b068f582-dbef-4c97-8ce9-694fdb6104b4
 - 目标：639ddcfae11dda57
 - 分支：task/b068f582
 - 原票 8 条验收标准不改、不关闭。
-- 本轮只读核实并写下方案。没有新增许可、没有 UPDATE、没有复制、没有上线、没有对外联系、没有登记凭证。
+- 本轮只读核实并写下方案。没有新增许可、没有 UPDATE、没有复制、没有上线、没有对外联系、没有登记凭证、没有读取或打印任何凭证值。
 
-结论：现有已发布内容全部不能作为客户 search、read、cite、export、research、generate 的允许样本。未知权利按拒绝。合成正文不计入真实内容。目标库 `platform_content` 今天没有内容表，下面的 public_id 都在源库；复制后必须再核对同一 id，不能把本文件当成目标库已经存在的证明。
+结论：现有已发布内容全部不能作为客户 search、read、cite、export、research、generate 的允许样本；未知权利按拒绝，合成正文不计入真实内容。缺的不是「等一份授权记录出现」，而是两个各有责任方的具体前置：① 注册接口的动作枚举写不进客户动作（工程交付缺口，见第 6 节，已随交接上报经理）；② 是否以许可修订已记录的《著作权法》第五条法定排除为依据登记客户动作，是公司决定（见第 5 节待决问题）。目标库 `platform_content` 今天没有任何表，本文件所有 public_id 都在源库 `_system`；生产验收前必须实建并核对，不能用本文件代替实建结果。
 
-## 查过的来源
+## 1. 可复核证据（退回项 1）
 
-1. 原票 `.scratch/legal-content-access/issues/03-authorized-content-reader.md` 的 8 条验收标准。
-2. 就绪包 `deliverables/639ddcfae11dda57/production-readiness.md`（operations 提交 ef8306a6，任务 d5ba0dea）。
-3. 产品仓库现行契约：`shared/sql/platform-content/001-content-schema.surql` 的许可修订不可 UPDATE/DELETE；`shared/src/platform-content/contracts.ts` 把来源动作限制为 submit、publish、withdraw、restore。读者草案 `task/86b409f0` 的 `006-content-reader.surql` 要求客户动作与 `license_actions` 相交，相交为空则拒绝。该读者代码未在本轮部署，也未在生产执行。
-4. 仓库与 operations 交付物中没有另一份把客户读取动作写明的许可文件。
-5. 2026-09-29 对生产 SurrealDB 做只读查询。命名空间 `main`，源库 `_system`。没有打印凭证，没有写库。
+本次结论由我本人对生产 SurrealDB 重新执行只读查询得出，未沿用前任数字。
 
-就绪包写「`platform_content` 不存在」。本次 `INFO FOR NS` 已能看到库名 `platform_content`，`INFO FOR DB` 的 tables 为空。库名在，内容表和行不在。源库仍是 `main` / `_system`。
+- 采样时间：2026-09-29 UTC（文件内 meta.sampled_at 为精确时间戳）。
+- 入口：本机 `surreal sql 3.2.3`，端点 `wss://data.maplayer.top/rpc`，命名空间 `main`，数据库 `_system`；root 凭证由产品仓库 `.env` 注入子进程环境，值未打印、未落盘到证据；全程只发 SELECT/INFO，无写语句。
+- 复现命令（在 surreal_ck 仓库根目录执行，凭证同样不进入命令行）：
 
-## 源库事实
+  ```bash
+  env $(grep -E '^SURREAL_(URL|NS|ROOT_USER|ROOT_PASS)=' .env | xargs) sh -c \
+    'surreal sql --endpoint "$SURREAL_URL" --username "$SURREAL_ROOT_USER" --password "$SURREAL_ROOT_PASS" \
+       --namespace main --database _system --json < license-snapshot-queries.surql'
+  ```
 
-`_system`：content_item 1807，全部 publication_status=published（judicial_document 1783，legislation 24）。content_source_record 1806。content_source 9。source_license_revision 12。没有一条许可的 effective_until 有值。allowed_actions 里 search、read、cite、export、browse、research、generate 的条数为 0。
+- 查询语句全文：同目录 `license-snapshot-queries.surql`（19 条，全部只读）。
+- 原始结果：`license-snapshot-2026-09-29.json`（含每条语句的原始返回、platform_content 的 INFO 输出、采样元数据），UTF-8 SHA256 `035d90b2fba468b9a54c6339dd04cd547ec94d84aff298d17eb21d5e12de77b4`。注意 `surreal sql --json` 模式下 INFO 语句返回 null，库级 INFO 用文本模式单独执行，原文已并入该 JSON 的 `platform_content_info` 字段。
+- 固定代码版本：surreal_ck main HEAD `15c49fb933dd473d25498799d5ac2425d959c743`（下文行号均指该提交）；读者草案 `task/86b409f0` @ `5384fd69847080cd39fbea1902d676e6965bced9`；当前生产 origin `af8c8b3087ef4d033a40063fdb39c39da2325893`（已核实其上存在 `server/src/routes/content.ts`，即 `/api/content/*` 维护入口已在生产运行，指向 `_system`）。
+- 仓库许可搜索边界：surreal_ck 内 `grep -rn "许可|license" --include="*.md"` 命中 `docs/runbooks/platform-content-local-runner.md`、`ops/README.md`、`.scratch/legal-content-mcp/**`、`.scratch/legal-content-access/**`、`.scratch/legal-data-product-wayfinder/issues/05-content-catalog-licensing-lifecycle.md` 等；其中唯一把客户动作写进许可模型的是 wayfinder-05（见第 3 节）。operations 仓库 `deliverables/`、`docs/`、`agents/` 内除本文件与历史范围文档外，没有第二份把客户动作写明的许可文件。`evidence_url` 指向的外站页面本轮未重新打开核对，属「未验证」项。
 
-publication_event：published 1807，corrected 1，withdrawn 1，restored 1。后三件都是合成条目 `item_1ed1d85fab7843b0a91a95f82d02a32c`，发生在 2026-09-11T22:58Z，当前状态仍是 published。没有一篇真实内容处于撤回或许可到期。
+## 2. 源库事实（2026-09-29 独立复核，与前任报告一致）
 
-没有 content_source_record 的唯一条目是 `debug_publish_probe`，来源版本指向合成来源，published。它不是真实内容。
+命名空间 `main`，源库 `_system`：
 
-最高修订与来源行上的 allowed_actions 一致。登记实现会对已有 `content_source` 做 UPDATE，同时 CREATE 新的 `source_license_revision`。所以不能对下面 9 个来源再登记一版来改客户权利，否则会改动现有来源行，并让该来源下全部条目改挂新的最高修订。
+- `content_item` 1807，全部 `publication_status=published`（judicial_document 1783，legislation 24）。
+- `content_source_record` 1806；`content_version` 1808；`publication_event` 1810。
+- `content_source` 9；`source_license_revision` 12。
+- 12 条修订中 `allowed_actions` 含 `browse/search/read/cite/export/research/generate` 任一词的条数为 0；`effective_until` 非空的条数为 0。
+- `publication_event` 的 corrected/withdrawn/restored 各 1 件，全部落在合成条目 `item_1ed1d85fab7843b0a91a95f82d02a32c`（publication_revision=4，当前仍 published）。没有一篇真实内容处于撤回中或许可已到期。
+- `debug_publish_probe` 是唯一无 `content_source_record` 的条目（查询返回空集），合成探针。
+- `platform_content`：库名已存在（`INFO FOR DB` 的 `tables` 为空表、`quota.defined=false`），查询其 `content_item` 明确报 `The table 'content_item' does not exist`。库名在、表和行不在；本轮未创建任何东西。
 
-| source_key | 来源行 id | 最高修订 | 当前动作 | 已挂条目 |
-| --- | --- | --- | --- | --- |
-| flk.npc.gov.cn.legislation | content_source:4078cef8b0ec4dadac705723d51ad0a2 | 2，source_license_revision:082b35a6137448e4bd11b9ef9dd58fd2，2026-09-15T14:42:00Z | submit, publish | 法规 2 |
-| court.gov.cn.guiding-cases | content_source:b9865fe6e5d54016b052c1acbfab9723 | 2，source_license_revision:27d7cae3bb6748e6bc0e56dbfef20e9c，2026-09-15T14:47:00Z | submit, publish | 司法文书 1292，kind=legislation 21 |
-| ipc.court.gov.cn.judgments | content_source:fd29ca5a7a044485a4affa34e8c744ee | 2，source_license_revision:7382c605f1dc45fba7753810854667cd，2026-09-15T14:48:00Z | submit, publish | 司法文书 488 |
-| fixture.synthetic.cn | content_source:481052908afa41d58fd738e818df81bd | 1，source_license_revision:3ce03fb458f34bf2bbd9a8744985cb33 | submit, publish, withdraw, restore | 来源记录 3；另有合成探针 |
-| dyjfalk.court.gov.cn.case-summaries | content_source:89e441641ccc4aa5b57fb3a9d36e484c | 1，source_license_revision:45dec07abed24471b0dd1d2c8383b278 | submit | 0 |
-| ipc.court.gov.cn.case-entries | content_source:47ad39199e534a4d904e4783058d68d0 | 1，source_license_revision:29a137187c36405fb9665424de516d61 | submit | 0 |
-| rmfyalk.court.gov.cn.case-entries | content_source:e308734cbb214aa49e0a23e13738cfb6 | 1，source_license_revision:4097160591c14fbab2fecc8f9a27e028 | submit | 0 |
-| spp.gov.cn.guiding-cases | content_source:b663a0ddfc3c490283451d50a403f599 | 1，source_license_revision:83307f4aefbf41c29568d4fc79a9ab3f | submit | 0 |
-| spp.gov.cn.typical-cases | content_source:7f2b1e173d734fd8a8b6788fbb3056e6 | 1，source_license_revision:6170c1d287a94f9ea5a0e8bf38285721 | submit | 0 |
+最高许可修订 = 该来源 `source_license_revision` 按 `revision` 降序第一条（store.ts:239–248 实现此选择）。已核实各来源行 `allowed_actions` 与最高修订一致：
 
-## 许可证据实际说了什么
+| source_key | 来源行 id | 最高修订 | 动作 | effective_until | 已挂条目 |
+| --- | --- | --- | --- | --- | --- |
+| flk.npc.gov.cn.legislation | content_source:4078cef8b0ec4dadac705723d51ad0a2 | 2，082b35a6137448e4bd11b9ef9dd58fd2 | submit, publish | 无 | legislation 2 |
+| court.gov.cn.guiding-cases | content_source:b9865fe6e5d54016b052c1acbfab9723 | 2，27d7cae3bb6748e6bc0e56dbfef20e9c | submit, publish | 无 | judicial_document 1292 + kind=legislation 21（含民法典担保解释、刑法罪名补充规定六等） |
+| ipc.court.gov.cn.judgments | content_source:fd29ca5a7a044485a4affa34e8c744ee | 2，7382c605f1dc45fba7753810854667cd | submit, publish | 无 | judicial_document 488 |
+| fixture.synthetic.cn | content_source:481052908afa41d58fd738e818df81bd | 1，3ce03fb458f34bf2bbd9a8744985cb33 | submit, publish, withdraw, restore | 无 | 来源记录 3 + 合成探针 |
+| dyjfalk.court.gov.cn.case-summaries | content_source:89e441641ccc4aa5b57fb3a9d36e484c | 1，45dec07abed24471b0dd1d2c8383b278 | submit | 无 | 0 |
+| ipc.court.gov.cn.case-entries | content_source:47ad39199e534a4d904e4783058d68d0 | 1，29a137187c36405fb9665424de516d61 | submit | 无 | 0 |
+| rmfyalk.court.gov.cn.case-entries | content_source:e308734cbb214aa49e0a23e13738cfb6 | 1，4097160591c14fbab2fecc8f9a27e028 | submit | 无 | 0 |
+| spp.gov.cn.guiding-cases | content_source:b663a0ddfc3c490283451d50a403f599 | 1，83307f4aefbf41c29568d4fc79a9ab3f | submit | 无 | 0 |
+| spp.gov.cn.typical-cases | content_source:7f2b1e173d734fd8a8b6788fbb3056e6 | 1，6170c1d287a94f9ea5a0e8bf38285721 | submit | 无 | 0 |
 
-证据在 `source_license_revision.evidence_text` / `evidence_url`，不是单独的许可文件。本轮没有重新打开这些外站页面。
+## 3. 许可原文与「技术拒绝 / 权利缺口」区分（退回项 2）
 
-三个已发布真实来源的修订 2 都写明：平台 publish 只覆盖正式法律、司法文件或裁判文书正文、官方译文和必要官方元数据，保留来源链接；不包含页面设计、图片、新闻、评论、数据库编排或第三方作品。依据是记录中的《著作权法》（2020 年修正）第五条第一项，以及来源页脚或数据库页面。修订 1 还写「用户已明确授权本平台登记来源并采集入库」，并写明不声明站点授予了批量接口或商业转载许可。
+12 条修订的 `evidence_url` / `evidence_text` 全文在证据 JSON 内。逐来源分类如下，区分三种不同原因，不混为一谈：
 
-研究存档来源（多元解纷、知产法庭入库案例、人民法院案例库、最高检指导性案例和典型案例）只允许 submit。多元解纷的证据写明站点版权声明禁止侵权，登记不声称转载许可，且不作公开发布。这些来源当前没有条目。
+**A 类：法定排除依据已记录，但未登记客户动作、接口也不支持表达（「接口不支持表达」+「业务尚未登记」，非「事实依据缺失」）**
 
-合成来源的证据写明只用于 SCK-LCM-10 自动验收，不代表真实裁判文书，不可对外销售或作为法律内容提供。证据 URL 是 `https://example.invalid/sck-lcm-10/license`。
+- `flk.npc.gov.cn.legislation` 修订 2（license_kind `official-legislative-document-publication`）：evidence_url `https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557`。原文记录国家法律法规数据库所公布《著作权法》（2020 修正）第五条第一项——法律、法规及具有立法、行政、司法性质的文件及其官方正式译文不适用著作权法；publish 范围限正式正文、条文、官方译文与必要官方元数据，保留来源链接与归属，明确排除页面设计、图片、新闻、评论、数据库编排与第三方作品。
+- `court.gov.cn.guiding-cases` 修订 2（`official-judicial-document-publication`）：evidence_url `https://www.court.gov.cn/shenpan/gengduo/77.html`。同一第五条依据 + 页脚「中华人民共和国最高人民法院 版权所有」，publish 范围限正式指导性案例、司法文件正文及官方译文/必要元数据。
+- `ipc.court.gov.cn.judgments` 修订 2（`official-judicial-document-publication`）：evidence_url `https://ipc.court.gov.cn/zh-cn/news/more-5-25.html`。同一第五条依据 + 页脚版权声明，publish 范围限精品裁判栏目正式裁判文书正文。
 
-这些文字没有出现客户动作 browse、search、read、cite、export、research、generate。采集和平台发布许可不能推出客户读取、引用、导出或 AI 使用。本岗位不把第五条解释成客户权利，也不按本任务扩大第三方许可。
+这三份记录的意义：权利基础不是「站点授予的转载许可」，而是**已登记的法定排除判断**——该类文件依第五条第一项不产生著作权客体，因此客户侧读取/引用/导出正式文本不需要另行取得著作权人的许可。缺口在于：① 现有修订的 `allowed_actions` 只登记了运营动作，没有把这一依据延伸登记为客户动作（业务未登记）；② 注册接口的枚举写不进客户动作（技术不支持表达，见第 6 节）。是否以已记录的第五条判断为依据登记客户动作，是公司对自用法律依据的确认，不是对第三方许可的扩大解释——但这仍是公司决定，本岗位不擅自拍板，列为第 5 节待决问题。
 
-## 拒绝矩阵
+**B 类：事实依据缺失（来源方明示限制，不能作候选）**
 
-下列锚点都是源库 `_system` 的当前版本（`item.current_version` 等于该 version）。客户六项动作全部拒绝。browse 同样拒绝，因此连元数据也不构成允许样本。
+- `dyjfalk.court.gov.cn.case-summaries` 修订 1：evidence_url `https://dyjfalk.court.gov.cn/site/copyright`；原文记录该站版权声明禁止侵权，登记「不声称站点授予批量接口或转载许可」且「不作公开发布」。
+- `rmfyalk.court.gov.cn.case-entries`、`ipc.court.gov.cn.case-entries`、`spp.gov.cn.guiding-cases` 修订 1、`spp.gov.cn.typical-cases` 修订 1：均只挂 submit，原文写明仅供研究审核、不作公开发布或商业转载，不声明站点授予批量接口。
+- 这五个来源连 publish 都没有，当前 0 条目。对它们的客户动作拒绝属于「事实依据确实缺少」，继续拒绝，不列入任何候选。
 
-| 用途 | source_key | 许可修订 | item public_id | version public_id | 版本 | 标题 | search | read | cite | export | research | generate |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 真实法规锚点 | flk.npc.gov.cn.legislation | 082b35a6137448e4bd11b9ef9dd58fd2 修订 2 | item_7f2161001cb94ad8868fcc02d089d44b | version_29b1f5f2b5904f6599aed917ac281133 | revision 1，2010年修正，full_text | 中华人民共和国著作权法 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
-| 真实法规锚点 | flk.npc.gov.cn.legislation | 同上 | item_dfee35229a3949d485662e438c79eb99 | version_383e8648f29143a89aa9747f5fc62a6e | revision 1，2020年修正，full_text | 中华人民共和国著作权法 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
-| 真实司法文件锚点 | court.gov.cn.guiding-cases | 27d7cae3bb6748e6bc0e56dbfef20e9c 修订 2 | item_8611b77897eb4198aed1870ed50161ff | version_000cfe210c26463cb6af5312c925ee7c | revision 1，full_text，kind=legislation | 最高人民法院关于适用《中华人民共和国反不正当竞争法》若干问题的解释 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
-| 真实案例锚点 | court.gov.cn.guiding-cases | 同上 | item_fc41948315aa44489250eb75102f8a2f | version_00143aeb0b654ffeb2dcac6fe05d300f | revision 1，case_summary | 袁巧娥拒不支付劳动报酬案 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
-| 真实裁判锚点 | ipc.court.gov.cn.judgments | 7382c605f1dc45fba7753810854667cd 修订 2 | item_63e576471cd346ffaff6a19de7647a78 | version_001afd656d164e72a2c8fce3664ead63 | revision 1，full_text | （2023）最高法知民终2573号 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
+**C 类：合成来源（排除）**
 
-同一来源的其余已发布条目使用同一条最高许可，客户六项动作同样拒绝。这里不把 1803 个其余 id 逐条展开。
+- `fixture.synthetic.cn` 修订 1：证据写明仅用于 SCK-LCM-10 自动验收、不代表真实裁判文书、不可对外提供；evidence_url `https://example.invalid/sck-lcm-10/license`。其 3 条来源记录与 `debug_publish_probe` 探针均不得作真实内容或允许样本。
 
-排除，不能当真实内容，也不能当允许样本：
+**产品设计侧的一条正面事实**：`.scratch/legal-data-product-wayfinder/issues/05-content-catalog-licensing-lifecycle.md`（done）规定 `source_license_revision` 应逐项声明 metadata search、full-text read、quote/cite、AI 检索使用、派生报告、手工导出、批量/API、retention/attribution/territory 与有效期，并规定客户权益不得超过来源许可。即客户动作词表在产品设计里就是许可字段的本职，现行枚举只覆盖运营动词属于实现未完成，不是设计上不打算支持。
 
-| public_id | 说明 |
-| --- | --- |
-| debug_publish_probe | 合成探针，published，无 content_source_record |
-| item_0183b2e80b774190a858c8225511a3bd / version_545c21818b0e4bc19abac2c428cf2c6e | fixture.synthetic.cn |
-| item_f24ac023c8514e2b96f5feca7a868dc6 / version_7b7492a29565490e8479c09d44eadf55 | fixture.synthetic.cn，version_label=fixture-v1 |
-| item_1ed1d85fab7843b0a91a95f82d02a32c | 合成条目。修订 1 为 version_88bb608a246b4c4fa8ec6b3b8896c39e，当前修订 2 为 version_b67c0e19e3c54e0fb8ca7a5e6a9555d3。撤回后又恢复，现为 published |
+## 4. 拒绝矩阵（本人复核一致）
 
-允许样本：无。可撤回的真实样本：无。许可已到期的样本：无。
+下列锚点均为源库 `_system` 当前版本（已核实 `item.current_version` 与 version→source 关联）。客户七项动作（含 browse）全部拒绝：
 
-## 复制后的核验
+| 用途 | source_key | 许可修订 | item public_id | version public_id | 标题/版本 | search | read | cite | export | research | generate |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 真实法规锚点 | flk.npc.gov.cn.legislation | 082b35a6 修订2 | item_7f2161001cb94ad8868fcc02d089d44b | version_29b1f5f2b5904f6599aed917ac281133 | 中华人民共和国著作权法（2010年修正）rev1 full_text | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
+| 真实法规锚点 | flk.npc.gov.cn.legislation | 同上 | item_dfee35229a3949d485662e438c79eb99 | version_383e8648f29143a89aa9747f5fc62a6e | 中华人民共和国著作权法（2020年修正）rev1 full_text | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
+| 真实司法文件锚点 | court.gov.cn.guiding-cases | 27d7cae3 修订2 | item_8611b77897eb4198aed1870ed50161ff | version_000cfe210c26463cb6af5312c925ee7c | 最高法反不正当竞争法解释 rev1 full_text | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
+| 真实案例锚点 | court.gov.cn.guiding-cases | 同上 | item_fc41948315aa44489250eb75102f8a2f | version_00143aeb0b654ffeb2dcac6fe05d300f | 袁巧娥拒不支付劳动报酬案 rev1 case_summary | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
+| 真实裁判锚点 | ipc.court.gov.cn.judgments | 7382c605 修订2 | item_63e576471cd346ffaff6a19de7647a78 | version_001afd656d164e72a2c8fce3664ead63 | （2023）最高法知民终2573号 rev1 full_text | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 | 拒绝 |
 
-源库标识：命名空间 `main`，数据库 `_system`。目标库名 `platform_content` 已出现，但没有表。复制若按就绪包只 CREATE 缺失行，客户动作不会变多。
+同来源其余已发布条目共用同一最高修订，同样拒绝；不在此展开 1803 个 id。
 
-复制完成后，在 `platform_content` 核对，并且 `_system` 行数不得变少：
+排除项（不得当真实内容或允许样本）：`debug_publish_probe`（探针，无来源记录）；`item_0183b2e80b774190a858c8225511a3bd`、`item_f24ac023c8514e2b96f5feca7a868dc6`、`item_1ed1d85fab7843b0a91a95f82d02a32c`（fixture.synthetic.cn，后者经历过 publish→withdrawn→corrected→restored，现 published）。
 
-- 上表 4 个有条目的 source_key、最高修订 id、allowed_actions、evidence_url 与源库一致。
-- 五个真实锚点的 item public_id、version public_id、revision、publication_status 与本文件一致。
-- 合成 public_id 仍标为合成，不能改记成真实允许样本。
-- `content_migration_state` 若被写入，source_database 应为 `_system`。就绪包已说明源库没有删除语句；本轮未执行复制，也未在目标库看到内容表。
+允许样本、真实撤回样本、许可到期样本：**当前均无**。
 
-生产验收前若这些 id 在目标库不存在或修订不一致，不能用本文件代替实建结果。
+## 5. 允许/到期/撤回样本的可执行方案（退回项 3、4）
 
-## 以后才能新增的许可与专用样本
+方案分两个阶段，修正初版「切换后仍先写 `_system` 再复制」的时序错误：
 
-现在缺的事实：一份写明授予哪些客户动作、覆盖哪个来源、生效与截止时间的授权记录。现有 evidence_text 不是这份记录。要对外向全国人大、法院或检察院取得许可，或要公司作出法律承诺，才需要老板；本任务不需要，也不做。
+**阶段 A（切换前，冻结复制）**：按 `project.release`，Deploy production 先 Deploy origin；`origin-pre-start.sh`（PR #36，head 9641a3a，Quality gate 已通过）在 CI 停 surreal-ck-hono 后执行 `migrate-legacy-cli.ts --writes-frozen`，把 `_system` 18 张内容表只复制到 `platform_content`（已存在且一致则跳过、不一致则报错；`_system` 不删除）。此阶段产生的全部是拒绝样本，这本身是正确且需要的。发布一律走 CI，禁止 SSH 发布方式；数据库迁移不随代码回滚。
 
-在那份记录出现之前，工程不得把客户动作写进许可，也不得把现有 1807 篇改成允许样本。
+**阶段 B（切换后，在 platform_content 建专用样本）**：`platform_content` 上线后，内容维护入口 `POST /api/content/*`（platform operator 身份，routes/content.ts:55–115）指向隔离库。专用样本只在 `platform_content` 创建，不再写 `_system`、不再二次复制，避免双写。执行责任：engineering（持有任务与发布链）；QA 生产实测；本岗位只提供本方案。
 
-记录出现之后，只做新增，并且只动专用来源：
+1. **允许样本**——锁定候选：国家法律法规数据库正式法律文本（source_url 级证据已在库，如 `https://flk.npc.gov.cn/detail?id=ff808081752b7d430175e4766bab1557`，即著作权法 2020 官方页）。
+   - 新专用 source_key：`flk.npc.gov.cn.legislation.lca03-allow`（不得复用 9 个现有 source_key——`registerSource` 对已有 key 会 UPDATE `content_source` 行并把全部条目改挂新修订，store.ts:253–300）。
+   - 修订 1：`license_kind=official-legislative-document-publication`，evidence_text 引用第五条记录并点名客户动作；建议动作集 `submit, publish, withdraw, restore, browse, search, read, cite, export`，**故意不含 `research`/`generate`**——同一来源内保留 AI 动作的拒绝侧用例，QA 可在同一正文上同时验证允许与拒绝边界（是否加 AI 动作由经理/老板定，本方案按不加写）。
+   - 条目：经 `POST /api/content/batches`（submit_batch upsert）+ `POST /api/content/publications`（publish_batch）发布一篇专用条目，正文取该来源官方正式文本（与既有 flk 条目同性质但独立 public_id），`content_collection_binding` 绑定验收 collection。
+   - 验收判据：授权成员在该条目上 search/read/cite/export 通过；research/generate 拒绝；非成员、无权益成员、错误 revision 均拒绝。
+2. **到期样本**——独立新 source_key：`flk.npc.gov.cn.legislation.lca03-expiry`。修订 1 带已过去的 `effective_until`（注册接口已支持该字段，service.ts:80–85 校验「结束不早于生效」）。门禁 `fn::content_reader_visible` 在 `license_until <= now()` 时拒绝（006-content-reader.surql），可隔离验证「许可过期」而非「无动作」的拒绝。同样只走平台发布管道建一篇专用条目。
+3. **撤回样本**——`lca03-allow` 来源下再发一篇专用条目，先 publish 再经 `POST /api/content/publications` 的 `operation=withdraw` 走正式发布管道撤回：管道在事务内 UPDATE 条目 `publication_status=withdrawn`、追加 `publication_event`、更新批次结果（store.ts:846–883），门禁按 `publication_status != "published"` 拒绝。**不得**手工 INSERT publication_event 了事——那不更新条目状态和投影。
+4. **通用约束**：修订一律 CREATE（`immutable-platform-content-record` 会拒 UPDATE/DELETE）；到期/撤回只用专用来源与专用条目；不动现有 9 个来源、不改写 `_system` 旧行、不碰客户数据；专用条目正文必须来自该来源官方正式文件，禁止用 fixture 或合成正文。
 
-1. 使用新的 source_key。不要对现有 9 个 source_key 调用会 UPDATE `content_source` 的登记。`source_license_revision` 保持只 CREATE；UPDATE/DELETE 会被 `immutable-platform-content-record` 拒绝。
-2. 许可挂在来源上，最高修订对应该来源的全部条目。因此到期样本用单独的新来源，修订 1 就写上 effective_until，不要往最高人民法院或国家法律法规数据库来源上追加到期修订。
-3. 允许样本用另一个新来源。修订 1 的动作只填写那份授权记录点名的客户动作。现行发布接口的动作枚举仍是 submit、publish、withdraw、restore，写不进客户动作；数据库字段虽是普通字符串数组，也不能靠绕过接口把未授权动作塞进去。
-4. 撤回样本是允许来源上的另一篇专用条目，只追加 publication_event，并把该条目标成 withdrawn。不撤回源库里已有的 1807 篇。
-5. 专用条目的正文必须来自授权记录覆盖的真实文件。`fixture.synthetic.cn` 和任何合成正文都不能填进这个来源。
-6. 先在 `_system` 写完并读回 public_id、version、许可修订，再复制到 `platform_content`，用上一节的核对确认目标行。读者投影把该修订的动作抄进 `license_actions`；与客户动作不相交则继续拒绝。
+**待决问题（写清边界，不冒充已定）**：
+- Q1（公司决定）：是否以 A 类来源修订 2 已记录的《著作权法》第五条第一项为依据，登记上述客户动作？若经理认为需持牌顾问或老板拍板，按协议转 owner；若确认，登记文本照实引用该记录，不自创法律结论。
+- Q2（工程排期）：见第 6 节枚举扩展，须纳入既有实现链。
+- Q3（库存范围）：允许样本拟用哪一篇官方文本作专用条目正文——建议著作权法 2020 或一部无争议的正式法规，由执行时从 flk 正式页面取正文，禁止回填合成文本。
 
-8 条验收标准里，允许路径、许可到期和内容撤回仍然没有可执行的真实样本。本文件只确定现有数据的拒绝范围和以后的写法。
+## 6. 工程交付缺口（已随交接 report_blocker 给经理）
+
+读者链路本身无需改：`reader-projection.ts`（task/86b409f0）直接抄 `source_license_revision.allowed_actions` 进 `license_actions`，`fn::content_reader_action` 做集合相交。缺口只在写入侧三处过滤：
+
+| 位置（15c49fb） | 现状 | 需要 |
+| --- | --- | --- |
+| `server/src/content/service.ts:33` `ContentSourceActionSchema` | enum 仅 submit/publish/withdraw/restore，注册 API 边界拒绝客户动作 | 扩展词表（至少 browse/search/read/cite/export/research/generate），`.max(4)` 上限同步放宽 |
+| `shared/src/platform-content/contracts.ts:382` `ContractSourceSchema.allowedActions` | 对外契约同一枚举 | 同步扩展 |
+| `server/src/content/store.ts:111、132` `parseLicense`/`parseSource` | 维护侧读视图把非四动词动作过滤掉 | 同步放宽，否则注册后 API 读回丢字段 |
+
+建议并入实现交付 fe3991c3（PR #30 修复链）或开小型独立交付；由经理决定排期。缺口闭合前，第 5 节允许/到期样本不可建，QA 只能执行拒绝侧用例；第 4 节拒绝矩阵可立即用于拒绝侧验收。
+
+## 7. 复制后与建样后核验
+
+- 冻结复制完成后（阶段 A）：在 `platform_content` 核对 18 表行数与 `_system` 一致、`content_migration_state:legacy.source_database="_system"`、四个有条目来源的 source_key/最高修订/allowed_actions/evidence_url 一致、第 4 节五个锚点的 item/version public_id 与 revision 一致、合成条目仍标合成；`_system` 行数不得变少。
+- 样本创建完成后（阶段 B）：在 `platform_content` 核对两个新 source_key 及其修订 id、动作矩阵、`effective_until`、专用条目 public_id/version/publication_status；withdraw 后该条目 `publication_status="withdrawn"` 且存在对应 `publication_event`；`content_read_gate` 的 `license_actions` 与修订一致。
+- 任一核对失败：不以本文档代替实建结果，8AC 对应项不通过。
+
+## 8. 未验证与限制
+
+- `evidence_url` 指向的外站页面本轮未重新打开；第五条依据按库内已登记原文引用，未做独立法律核验。
+- 未在生产执行读者会话、未执行复制、未建任何样本；本任务仅核实与方案。
+- worktree/分支/提交信息见 checkpoint；证据文件哈希见第 1 节。
