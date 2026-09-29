@@ -65,7 +65,8 @@ export class Dispatcher {
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
-      this.deps.quota ? this.deps.quota().catch(() => [] as ProviderQuota[]) : Promise.resolve([] as ProviderQuota[])]);
+      this.deps.quota ? this.deps.quota().catch((error) => { this.log(`quota read failed: ${(error as Error).message}`); return [] as ProviderQuota[]; })
+        : Promise.resolve([] as ProviderQuota[])]);
     let insts = await wf.insts();
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();

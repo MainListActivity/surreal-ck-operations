@@ -51,9 +51,13 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
 }
 
 let quotaRefreshedAt = 0;
+// Lifecycle hooks and RPC handlers are the only places a paseo handle is handed out;
+// remember the latest one so the tick loop can also refresh quota during quiet periods.
+let paseoHandle: PaseoApi | undefined;
 
 /** Hooks carry the only paseo handle: persist latest quota to company_meta so the dispatcher can read it. */
 export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<ProviderUsageEntry[]> {
+  paseoHandle = paseo;
   if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries(ctx);
   quotaRefreshedAt = Date.now();
   const usage = await paseo.providers.listUsage().catch(() => undefined);
@@ -72,7 +76,7 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
 
 async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
   const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
-    `SELECT payload FROM company_meta WHERE string::starts_with(string(id), 'company_meta:quota_');`);
+    `SELECT payload FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
   return (rows ?? []).map(r => r.payload).filter((p): p is ProviderUsageEntry => !!p);
 }
 
@@ -126,6 +130,9 @@ export function startDispatch(server: PluginServerContext): () => void {
         wait = (await ctx.workforce.config()).pollSeconds * 1000;
         const report = await ctx.dispatcher.tick();
         failures = 0;
+        if (paseoHandle && Date.now() - quotaRefreshedAt > 300_000) {
+          await refreshQuota(paseoHandle, ctx).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
+        }
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0);
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
