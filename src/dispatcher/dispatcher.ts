@@ -182,9 +182,12 @@ export class Dispatcher {
       const pool = candidates.filter(i => i.id !== avoid);
       return weightedOrder(pool.length ? pool : candidates, weight, rand)[0];
     };
-    const spawnable = (role: string) => weightedOrder(
+    // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
+    // a def at capacity in the ops repo can still spawn for a task in another repo.
+    const spawnable = (role: string, home: string) => weightedOrder(
       defs.filter(d => d.enabled && d.role === role &&
-        insts.filter(i => i.def === d.id).length < d.maxInstances && this.capacity(d.provider, cfg, health, busyBy, now)),
+        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
+        this.capacity(d.provider, cfg, health, busyBy, now)),
       effectiveWeight, rand);
 
     for (const item of work) {
@@ -409,7 +412,7 @@ export class Dispatcher {
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string) => EmployeeInst | undefined,
-    spawnable: (role: string) => EmployeeDef[],
+    spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean) => string,
     report: TickReport, insts: EmployeeInst[],
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
@@ -429,7 +432,7 @@ export class Dispatcher {
         return undefined;
       }
     }
-    for (const def of spawnable(role)) {
+    for (const def of spawnable(role, task?.repoPath ?? env.opsRepo)) {
       const inst = await wf.spawnInst(def);
       try {
         const agentId = await paseo.spawn({
@@ -463,6 +466,7 @@ export class Dispatcher {
     const log = inst?.paseoAgentId ? await this.deps.paseo.logsTail(inst.paseoAgentId, LOG_TAIL_ENTRIES) : '';
     const handover = [
       '【交接包】前任员工未完成交接。以下是其会话最后的活动记录（自动截取，可能不完整）。',
+      `前任会话：${inst?.id ?? task.currentEmployee}${inst?.paseoAgentId ? `（Paseo agentId ${inst.paseoAgentId}；完整时间线：paseo logs ${inst.paseoAgentId}）` : ''}`,
       '先核对任务分支/工作目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。',
       log ? `\n---\n${log.slice(-cfg.handoverChars)}` : '（无可用会话日志）',
     ].join('\n');

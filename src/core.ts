@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { loadSecretKey, ProjectStore } from './projects.ts';
@@ -337,7 +337,29 @@ export class SurrealCompanyCore implements CompanyCore {
     const taskView = view(row);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
+      predecessors: await this.predecessors(taskId, actor.employeeId),
       project: await this.taskProject(taskId) };
+  }
+
+  /**
+   * Distinct employees that claimed this task before the current holder, in first-claim order.
+   * Their Paseo session IDs let a successor read the full transcript (`paseo logs <agentId>`)
+   * instead of relying on the truncated log tail stored in the handover packet.
+   */
+  private async predecessors(taskId: TaskId, exclude: string): Promise<SessionRef[]> {
+    const [claims] = await this.db.query<[Array<{ actor?: unknown }>]>(
+      `SELECT actor, at FROM audit WHERE task = $task AND action = 'claim' ORDER BY at ASC;`,
+      { task: id('task', taskId) });
+    const ids = [...new Set((claims ?? []).map(c => asId(c.actor)).filter(a => a && a !== exclude))];
+    if (!ids.length) return [];
+    const [rows] = await this.db.query<[Array<{ id: RecordId; paseo_agent_id?: string; provider?: string; role?: string; retired?: boolean }>]>(
+      `SELECT id, paseo_agent_id, provider, role, retired FROM employee WHERE id IN $ids;`,
+      { ids: ids.map(e => id('employee', e)) });
+    const byId = new Map((rows ?? []).map(r => [asId(r.id), r]));
+    return ids.slice(-6).map(emp => {
+      const r = byId.get(emp);
+      return { employee: emp, agentId: r?.paseo_agent_id ?? undefined, provider: r?.provider ?? undefined, role: r?.role ?? undefined, retired: r?.retired === true };
+    });
   }
 
   private async taskProject(taskId: TaskId): Promise<ProjectView | undefined> {

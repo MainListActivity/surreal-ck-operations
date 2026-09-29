@@ -67,8 +67,18 @@ export interface ClaimResult {
   leaseExpiresAt: string;
   /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
   history: HistoryEntry[];
+  /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
+  predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines, secret names. */
   project?: ProjectView;
+}
+
+export interface SessionRef {
+  employee: string;
+  agentId?: string;
+  provider?: string;
+  role?: string;
+  retired?: boolean;
 }
 
 export interface ProjectView {
