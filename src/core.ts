@@ -94,6 +94,7 @@ interface TaskRow {
   jev_release_version?: number;
   jev_route_version?: number;
   owner_rerouted?: boolean;
+  repo_path?: string;
 }
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }

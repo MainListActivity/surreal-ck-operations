@@ -601,3 +601,21 @@ test('a task whose dependencies are already done is created ready', async () => 
     reviewerRole: 'engineering', dependencies: [dep.id], idempotencyKey: key() });
   expect(child.state).toBe('ready');
 });
+
+test('dispatcher spawns instances in the workspace of the goal project and only reuses them for that project', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 4 });
+  await new ProjectStore(database.db).upsert({ id: 'wsproj', name: 'WS', repoPath: '/repo/wsproj', release: 'CI', envs: [{ name: 'production' }] });
+  const goal = await owner.createGoal({ text: '工作区归属测试', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj' });
+  const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+  const report = await dispatcher.tick();
+  expect(report.woke.find(w => w.task === impl.id)?.spawned).toBe(true);
+  const spawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(impl.id))!.spawn!;
+  expect(spawn).toMatchObject({ cwd: '/repo/wsproj', workspaceTitle: 'SCK · engineering-codex' });
+  const inst = (await workforce.insts()).find(i => i.cwd === '/repo/wsproj')!;
+  expect(inst.role).toBe('engineering');
+});
