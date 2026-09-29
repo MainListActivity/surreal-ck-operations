@@ -23,3 +23,4 @@ SELECT id, publication_status FROM content_item;
 INFO FOR DB;
 SELECT id, ledger_state, usage_trusted, last_native_audit_at FROM workspace_quota_runtime;
 SELECT id, workspace_id, allowed_subjects, status, confirmed_until FROM content_authorization_projection; SELECT id, actions, ai_actions, status FROM content_read_gate;
+SELECT at FROM company_meta:dispatcher_heartbeat;
