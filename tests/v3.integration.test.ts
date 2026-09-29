@@ -130,26 +130,30 @@ test('quick goal: one delivery chain, qa reads a sealed secret in production, pr
   expect(goal).toMatchObject({ state: 'active', tier: 'quick', project: 'demo' });
   expect(goal.tasks.manual).toBe(goal.tasks.acceptance);
   const pending = (await core.listTasks(tokens.gm)).filter(t => t.goalId === goal.id);
-  expect(pending.map(t => t.kind).sort()).toEqual(['deploy', 'release', 'task', 'task']);
+  // quick chain is merged: 实现+上线申请 (release) → 合入部署与生产实测 (deploy) → 运营验收 (task).
+  expect(pending.map(t => t.kind).sort()).toEqual(['deploy', 'release', 'task']);
   expect(pending.some(t => t.reviewerRole === 'owner' || ['ai-content', 'cs'].includes(t.executorRole))).toBe(false);
   const byKind = (kind: string) => pending.find(t => t.kind === kind && t.id !== goal.tasks.manual)!;
-  const [impl, release, deploy] = [byKind('task'), byKind('release'), byKind('deploy')];
+  const [ship, deploy] = [byKind('release'), byKind('deploy')];
+  expect(ship.executorRole).toBe('engineering');
+  expect(ship.reviewerRole).toBe('product');
 
-  const claim = await core.claim(tokens['eng-a'], impl.id);
+  const claim = await core.claim(tokens['eng-a'], ship.id);
   expect(claim.project).toMatchObject({ id: 'demo', repoPath: '/repo/demo', redLines: ['改写或删除已有数据的迁移'] });
   expect(claim.project!.envs[0].secrets).toEqual([{ name: 'QA_PASSWORD', roles: ['qa'] }]);
-  await expect(core.getSecret(tokens['eng-a'], { taskId: impl.id, env: 'production', name: 'QA_PASSWORD' }))
+  // The qa-only credential is not issued to engineering at claim, and get_secret still refuses.
+  expect(claim.secrets ?? []).toHaveLength(0);
+  await expect(core.getSecret(tokens['eng-a'], { taskId: ship.id, env: 'production', name: 'QA_PASSWORD' }))
     .rejects.toMatchObject({ code: 'forbidden' });
-  await core.submit(tokens['eng-a'], proofOf(claim), { text: '实现完成：PR、分支、提交、测试通过，无迁移。', idempotencyKey: key() });
-  await review(tokens['eng-b'], impl.id);
-  await execute(tokens['eng-a'], release.id, '上线申请：PR 已复核，无迁移，回滚为重发上一提交。');
-  await review(tokens.product, release.id);
+  await core.submit(tokens['eng-a'], proofOf(claim), { text: '实现+上线申请：PR、分支、提交、测试通过，无迁移，回滚为重发上一提交。', idempotencyKey: key() });
+  await review(tokens.product, ship.id);
   await execute(tokens['eng-a'], deploy.id, '已合入并由 CI 发布，生产 health 正常，版本为该提交。');
-  await expect(core.getSecret(tokens.qa, { taskId: deploy.id, env: 'production', name: 'QA_PASSWORD' }))
-    .rejects.toMatchObject({ code: 'forbidden' });
   const verify = await core.claim(tokens.qa, deploy.id);
+  // qa 的凭证随 claim 直接下发，不需要再逐个 get_secret；凭证值不进 history。
+  expect(verify.secrets).toEqual([{ env: 'production', name: 'QA_PASSWORD', value: 'hunter2' }]);
   expect(await core.getSecret(tokens.qa, { taskId: deploy.id, env: 'production', name: 'QA_PASSWORD' })).toBe('hunter2');
   const history = await core.history(tokens.gm, deploy.id);
+  expect(history.some(h => h.action === 'secret_issue' && !h.evidence?.includes('hunter2'))).toBe(true);
   expect(history.some(h => h.action === 'secret_read' && !h.evidence?.includes('hunter2'))).toBe(true);
   await core.accept(tokens.qa, proofOf(verify), { text: '生产实测：打开登录页 → 按钮对齐 → 登录成功。', idempotencyKey: key() });
 
@@ -215,12 +219,15 @@ test('revoked lease hands over to a same-role employee with history; old session
 });
 
 class FakePaseo implements PaseoGateway {
-  agents = new Map<string, { status: string; error: string; spawn?: SpawnInput }>();
+  agents = new Map<string, { status: string; error: string; spawn?: SpawnInput; inputTokens?: number }>();
   sent: Array<{ agentId: string; prompt: string }> = [];
+  archived: string[] = [];
   async list() { return new Map([...this.agents].map(([id, a]) => [id, { id, status: a.status }])); }
   async status(id: string) { const a = this.agents.get(id); return a ? { status: a.status, pendingPermissions: 0 } : undefined; }
   async lastError(id: string) { return this.agents.get(id)?.error ?? ''; }
   async logsTail(id: string) { return `[Shell] git commit -m wip (agent ${id})`; }
+  async lastInputTokens(id: string) { return this.agents.get(id)?.inputTokens; }
+  async archive(id: string) { this.archived.push(id); const a = this.agents.get(id); if (a) a.status = 'archived'; }
   async spawn(input: SpawnInput) {
     const id = `agent-${this.agents.size + 1}`;
     this.agents.set(id, { status: 'running', error: '', spawn: input });
@@ -550,15 +557,14 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   expect(asked.filter(q => q === 'tier').length).toBe(tierQuestions);
 
   // Release: confident go → Jev accepts and deploy unlocks; unsure → advice in history, product decides.
+  // quick 链已合并：实现+上线申请是同一个 release 任务，工程提交后 Jev 直接做上线判断。
   const triaged = (await owner.brief()).goals.find(g => g.id === quick.id)!;
   const chain = (await core.listTasks(tokens.gm)).filter(t => t.goalId === quick.id && t.id !== triaged.tasks.manual);
-  const impl = chain.find(t => t.kind === 'task')!, release = chain.find(t => t.kind === 'release')!, deploy = chain.find(t => t.kind === 'deploy')!;
-  await execute(tokens['eng-a'], impl.id, '实现完成：PR、分支、提交、测试通过，无迁移。');
-  await review(tokens['eng-b'], impl.id);
-  await execute(tokens['eng-a'], release.id, '上线申请：PR 已复核，无迁移，回滚为重发上一提交。');
+  const ship = chain.find(t => t.kind === 'release')!, deploy = chain.find(t => t.kind === 'deploy')!;
+  await execute(tokens['eng-a'], ship.id, '实现+上线申请：PR、分支、提交、测试通过，无迁移，回滚为重发上一提交。');
   report = await dispatcher.tick();
-  expect(report.decisions).toContain(`release:${release.id}`);
-  expect(await task(release.id)).toMatchObject({ state: 'done' });
+  expect(report.decisions).toContain(`release:${ship.id}`);
+  expect(await task(ship.id)).toMatchObject({ state: 'done' });
   expect((await task(deploy.id)).state).not.toBe('blocked');
 
   answers.go = 0.5;
@@ -598,7 +604,9 @@ test('a task blocked while doing returns to ready on resume so the dispatcher ca
   await core.block(tokens['eng-a'], proofOf(held), 'gm', { text: '缺少一个前置信息，需要经理协调补充后再恢复本任务继续执行。', idempotencyKey: key() });
   const resumed = await core.resume(tokens.gm, t.id, { text: '经理决定：按原方案继续执行，缺少的前置信息已经补充完整。', idempotencyKey: key() });
   expect(resumed.state).toBe('ready');
-  expect((await core.claim(tokens['eng-b'], t.id)).task.state).toBe('doing');
+  const reb = await core.claim(tokens['eng-b'], t.id);
+  expect(reb.task.state).toBe('doing');
+  await core.submit(tokens['eng-b'], proofOf(reb), { text: 'Resumed and delivered after the block.', idempotencyKey: key() });
 });
 
 test('a task whose dependencies are already done is created ready', async () => {
@@ -615,6 +623,7 @@ test('dispatcher spawns instances in the workspace of the goal project and only 
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await database.db.query("UPDATE employee_def SET enabled = false WHERE role = 'engineering';");
   await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 4 });
   await new ProjectStore(database.db).upsert({ id: 'wsproj', name: 'WS', repoPath: '/repo/wsproj', release: 'CI', envs: [{ name: 'production' }] });
   const goal = await owner.createGoal({ text: '工作区归属测试', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj' });
@@ -735,4 +744,117 @@ test('dispatcher: jev picks among eligible employees using quota and score conte
   expect(Object.keys(candidates)).toEqual(expect.arrayContaining([instA.id, instB.id, 'spawn:engineering-devin', 'spawn:engineering-grok']));
   expect(Object.values(candidates).join(' ')).toContain('剩余 90%');
   expect(Object.values(candidates).join(' ')).toContain('绩效');
+});
+
+test('dispatcher: quota below floor blocks a provider until the snapshot recovers', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 }, quota_floor_pct: 8 };");
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  let lowestPct: number | undefined = 3;
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, quota: async () => [{ provider: 'grok', summary: '余额剩 3%', lowestPct, status: 'available', fetchedAt: new Date().toISOString() }] });
+
+  const t = await core.createTask(tokens.gm, { title: '额度熔断', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  let report = await dispatcher.tick();
+  // grok reports 3% remaining: the only enabled provider is blocked, so dispatch pauses as 'budget'
+  // instead of spending a spawn attempt that would just 402.
+  expect(report.woke).toHaveLength(0);
+  expect(report.skipped).toBe('budget');
+  expect(report.notices).toContain('budget');
+  expect(paseo.agents.size).toBe(0);
+
+  // Quota recovers → the floor no longer blocks and the task dispatches normally.
+  lowestPct = 40;
+  await database.db.query('DELETE owner_notice;');
+  report = await dispatcher.tick();
+  expect(report.woke).toHaveLength(1);
+  expect(report.woke[0].task).toBe(t.id);
+});
+
+test('dispatcher: idle sessions past the wake/context limits are rotated out', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 }, session_max_wakes: 5, session_max_input_k: 150 };");
+  const defs = await workforce.defs();
+  const engDef = defs.find(d => d.role === 'engineering')!;
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+
+  const stale = await workforce.spawnInst(engDef);
+  await workforce.bind(stale.id, { agentId: 'rotate-stale', cwd: '/ops' });
+  await database.db.query('UPDATE $e SET wake_count = 6;', { e: new RecordId('employee', stale.id) });
+  const fat = await workforce.spawnInst(engDef);
+  await workforce.bind(fat.id, { agentId: 'rotate-fat', cwd: '/ops' });
+  await database.db.query('UPDATE $e SET wake_count = 4;', { e: new RecordId('employee', fat.id) });
+  const fresh = await workforce.spawnInst(engDef);
+  await workforce.bind(fresh.id, { agentId: 'rotate-fresh', cwd: '/ops' });
+  paseo.agents.set('rotate-stale', { status: 'idle', error: '' });
+  paseo.agents.set('rotate-fat', { status: 'idle', error: '', inputTokens: 220_000 });
+  paseo.agents.set('rotate-fresh', { status: 'idle', error: '', inputTokens: 30_000 });
+
+  const report = await dispatcher.tick();
+  // wake_count ≥ 5 retires on count alone; 4 wakes but 220k input retires on context size; fresh stays.
+  expect(report.retired).toEqual(expect.arrayContaining([stale.id, fat.id]));
+  expect(report.retired).not.toContain(fresh.id);
+  expect(paseo.archived).toEqual(expect.arrayContaining(['rotate-stale', 'rotate-fat']));
+  expect(paseo.archived).not.toContain('rotate-fresh');
+  const live = await workforce.insts();
+  expect(live.map(i => i.id)).toContain(fresh.id);
+  expect(live.map(i => i.id)).not.toContain(stale.id);
+});
+
+test('dispatcher: quick-goal task is scored by jev even at low confidence (no llm judge)', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('UPDATE task SET evaluated_at = time::now() WHERE evaluated_at = NONE;');
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: true, eval_engine: 'auto', provider_max: { codex: 8, grok: 8, devin: 8 }, session_max_wakes: 0, session_max_input_k: 0 };");
+  await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
+  await new ProjectStore(database.db).upsert({ id: 'quickproj', name: 'QP', repoPath: '/repo/quickproj', release: 'CI', envs: [{ name: 'production' }] });
+  const goal = await owner.createGoal({ text: 'quick 评审测试', source: 'owner:test', key: key(), tier: 'quick', project: 'quickproj' });
+  const ship = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.kind === 'release')!;
+  await execute(tokens['eng-a'], ship.id, '实现+上线申请：PR、分支、提交、测试通过，无迁移，回滚为重发上一提交。');
+  await review(tokens.product, ship.id);
+  await database.db.query('UPDATE $t SET evaluated_at = NONE;', { t: new RecordId('task', ship.id) });
+
+  const shaky: JevClient = { model: 'jev-test', ask: async (_s: unknown, qs) => {
+    const answers: Record<string, unknown> = {};
+    for (const [q, spec] of Object.entries(qs)) {
+      if (spec.type === 'score') answers[q] = { type: 'score', score: 3, confidence: 0.2 };
+      else if (spec.type === 'noul') answers[q] = { type: 'noul', noul: 0.1 };
+      else answers[q] = { type: 'choice', choice: 'x', confidence: 0.2 };
+    }
+    return { model: 'jev-test', answers } as never;
+  } };
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, jev: shaky });
+
+  const report = await dispatcher.tick();
+  expect(report.evals).toEqual([ship.id]);
+  expect(report.woke.filter(w => w.employee.startsWith('eval-'))).toHaveLength(0);   // no LLM judge session
+  const [[row]] = await database.db.query<[[{ evaluated_at?: unknown; eval_via?: string }]]>(
+    'SELECT evaluated_at, eval_via FROM $t;', { t: new RecordId('task', ship.id) });
+  expect(row.evaluated_at).toBeDefined();
+  expect(row.eval_via).toBe('jev');
+});
+
+test('checkpoint limit rejects chatter and heartbeat still renews the lease', async () => {
+  const t = await core.createTask(tokens.gm, { title: 'checkpoint 上限', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  const claim = await core.claim(tokens['eng-a'], t.id);
+  let proof = proofOf(claim);
+  for (let i = 0; i < 6; i++) {
+    const next = await core.checkpoint(tokens['eng-a'], proof, { text: `第 ${i + 1} 阶段进展记录，内容足够长以通过校验。`, idempotencyKey: key() });
+    proof = { taskId: t.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: next.version };
+  }
+  await expect(core.checkpoint(tokens['eng-a'], proof, { text: '第七次 checkpoint 应该被限额拒绝，要求改用 submit。', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'checkpoint_limit' });
+  const renewed = await core.heartbeat(tokens['eng-a'], proof);
+  expect(renewed.task.state).toBe('doing');
 });

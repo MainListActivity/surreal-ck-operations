@@ -53,11 +53,11 @@ export function company(): Promise<Company> {
       git: createGitCli(),
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: async () => {
-        const [rows] = await db.db.query<[Array<{ provider?: string; summary?: string; status?: string; fetched_at?: string; at?: unknown }>]>(
-          `SELECT provider, summary, status, fetched_at, at FROM company_meta
+        const [rows] = await db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
+          `SELECT provider, summary, lowest_pct, status, fetched_at, at FROM company_meta
            WHERE string::starts_with(string(id), 'company_meta:quota_');`);
         return (rows ?? []).map(r => ({
-          provider: r.provider ?? "", summary: r.summary ?? "", status: r.status,
+          provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct, status: r.status,
           fetchedAt: r.fetched_at ?? String(r.at ?? ""),
         }));
       },

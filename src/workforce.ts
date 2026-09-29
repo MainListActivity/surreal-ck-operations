@@ -45,6 +45,8 @@ export interface EmployeeInst {
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
+  /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
+  wakeCount?: number;
 }
 
 export interface ProviderHealth {
@@ -81,6 +83,14 @@ export interface CompanyConfig {
   jevOwnerThreshold: number;
   /** 派工选择候选员工时采信 Jev 答案的最低置信度；低于则回退权重随机。 */
   jevPickConfidence: number;
+  /** 订阅剩余额度（任一额度窗口或余额）低于该百分比时视为不可用，停止复用与新开；0 = 不熔断。 */
+  quotaFloorPct: number;
+  /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
+  sessionMaxWakes: number;
+  /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
+  sessionMaxInputK: number;
+  /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
+  evalQuickLlm: boolean;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -88,6 +98,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
+  quotaFloorPct: 8, sessionMaxWakes: 8, sessionMaxInputK: 150, evalQuickLlm: false,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -136,6 +147,8 @@ export interface SupervisedTask {
   ownerRerouted: boolean;
   /** Repository of the goal's project; where the employee's Paseo workspace should live. */
   repoPath?: string;
+  /** Tier of the goal this task belongs to (quick/standard/program); undefined for standalone tasks. */
+  goalTier?: string;
 }
 
 /** What Jev reads for a release or escalation decision. */
@@ -155,7 +168,8 @@ const supervised = (row: TaskRow): SupervisedTask => {
     previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
-    jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined };
+    jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
+    goalTier: row.goal_tier ?? undefined };
 };
 
 const COOLDOWN_BASE = 30 * 60;
@@ -196,6 +210,10 @@ export class Workforce {
       jevReleaseThreshold: typeof row?.jev_release_threshold === 'number' ? row.jev_release_threshold : 0.8,
       jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
       jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
+      quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
+      sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
+      sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
+      evalQuickLlm: row?.eval_quick_llm === true,
     };
   }
 
@@ -241,13 +259,14 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; v3_onboarded?: boolean; workspace_cwd?: string };
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number;
+      v3_onboarded?: boolean; workspace_cwd?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at,
-      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined }));
+      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, wakeCount: r.wake_count ?? 0 }));
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned. */
@@ -284,7 +303,8 @@ export class Workforce {
   }
 
   async touchWake(employeeId: string): Promise<void> {
-    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true;', { e: id('employee', employeeId) });
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
+      { e: id('employee', employeeId) });
   }
 
   // ---- provider health ----
@@ -312,7 +332,7 @@ export class Workforce {
   // ---- lease supervision ----
   async tasks(): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT *, goal.project.repo_path AS repo_path FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+      "SELECT *, goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
     return rows.map(supervised);
   }
 
@@ -339,7 +359,7 @@ export class Workforce {
   /** Done tasks not yet performance-evaluated, oldest first. */
   async pendingEvaluations(limit = 3): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT * FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
+      "SELECT *, goal.tier AS goal_tier FROM task WHERE state = 'done' AND evaluated_at = NONE ORDER BY created_at, id LIMIT $limit;", { limit });
     return rows.map(supervised);
   }
 

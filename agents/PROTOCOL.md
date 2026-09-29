@@ -12,8 +12,8 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 
 1. **领取**：`claim_next {"taskId": "<派工消息里的 ID>"}`。返回 `already_claimed`、`no_available_task` 或 `forbidden` 时，直接结束本轮。
    领取成功时记下 `deliveryId`、`fence`、`task.version`，后续每次写入都带上它们（`expectedVersion` 用最新版本）。
-2. **读上下文**：完整读 `task.context`、`project` 和返回的 `history`。`project` 是任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、可领取的凭证名；项目的部署事实以它和其中列出的 runbook 为准，不要再向别人要。history 里有前任的 checkpoint、交接包（`revoked`）、验收退回意见（`return`）、老板决定（`owner_*`）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
-3. **做事并存进度**：每完成一个有意义的步骤就 `checkpoint`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
+2. **读上下文**：完整读 `task.context`、`project` 和返回的 `history`。`project` 是任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、可领取的凭证名；项目的部署事实以它和其中列出的 runbook 为准，不要再向别人要。`secrets` 是已经为你解密好的任务凭证（按你的岗位过滤），直接使用、不要写入证据；列表里没有的才用 `get_secret` 领取。history 里有前任的 checkpoint、交接包（`revoked`）、验收退回意见（`return`）、老板决定（`owner_*`）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
+3. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，纯保活用 `heartbeat`，返回 `checkpoint_limit` 就直接 `submit` 或 `report_blocker`。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
    代码任务：在任务专属分支 `task/<任务ID前8位>` 的独立 worktree 里工作；checkpoint 前先把改动提交到该分支，并在 checkpoint 里写分支名和 worktree 路径。
 4. **交接**（本轮只做一项，做完即结束本轮）：
    - 执行完成 → `submit`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。
@@ -28,7 +28,7 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 - 验收独立：服务端拒绝你验收自己提交的成果；换会话、换订阅也一样。
 - 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。经理只在老板直接对话里明确表态时，用 `record_owner_decision` 转录，并逐字引用老板原话。
 - 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
-- 凭证：项目凭证只用 `get_secret` 在持有任务期间领取，直接使用；不写进证据、文件、提交或消息。
+- 凭证：claim 返回的 `secrets` 已包含你可用的凭证值，直接用；缺的才用 `get_secret` 在持有任务期间领取。不写进证据、文件、提交或消息。
 
 ## 决策权
 

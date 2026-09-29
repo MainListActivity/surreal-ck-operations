@@ -64,9 +64,24 @@ export class Dispatcher {
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
-    const [agents, defs, now] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow()]);
+    const [agents, defs, now, quotaRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
+      this.deps.quota ? this.deps.quota().catch(() => [] as ProviderQuota[]) : Promise.resolve([] as ProviderQuota[])]);
     let insts = await wf.insts();
     let health = await wf.providerHealth();
+    const quotaByProvider = new Map<string, ProviderQuota>();
+    for (const q of quotaRows) quotaByProvider.set(q.provider, q);
+    // Quota circuit breaker: a provider reporting nearly empty quota is treated as unavailable
+    // so we stop spending spawn/turn attempts on it before it actually 402s. Stale snapshots
+    // (>15min old) fail open rather than keeping a provider blocked forever.
+    const quotaBlocked = new Set<string>();
+    if (cfg.quotaFloorPct > 0) {
+      for (const q of quotaRows) {
+        if (q.lowestPct === undefined || q.lowestPct >= cfg.quotaFloorPct) continue;
+        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
+        if (age < 15 * 60_000) quotaBlocked.add(q.provider);
+      }
+      if (quotaBlocked.size) this.log(`quota below floor (${cfg.quotaFloorPct}%): ${[...quotaBlocked].join(', ')}`);
+    }
 
     // 1. Session health.
     const states = new Map<string, InstState>();
@@ -140,6 +155,30 @@ export class Dispatcher {
     if (this.deps.jev && cfg.jevDecisions) await this.jevDecisions(cfg, report);
     const tasks = await wf.tasks();
 
+    // 2c. Session rotation: a session that has run many turns carries an ever-growing context,
+    // so every further turn costs more input tokens. Retire idle instances past the configured
+    // size/count and let the next task spawn a fresh, cheap session.
+    {
+      const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+      let inspected = 0;
+      for (const inst of insts) {
+        if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || !inst.paseoAgentId) continue;
+        const overWakes = cfg.sessionMaxWakes > 0 && (inst.wakeCount ?? 0) >= cfg.sessionMaxWakes;
+        let inputK = 0;
+        if (!overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+          inspected++;
+          inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
+        }
+        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
+        const reason = overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        await wf.retire(inst.id, reason);
+        await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+        report.retired.push(inst.id);
+        this.log(`retired ${inst.id}: ${reason}`);
+      }
+      insts = insts.filter(i => !report.retired.includes(i.id));
+    }
+
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
 
@@ -153,10 +192,12 @@ export class Dispatcher {
     ];
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
     const usable = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))]
-      .filter(p => this.available(health.get(p), now) !== 'down');
+      .filter(p => this.available(health.get(p), now) !== 'down' && !quotaBlocked.has(p));
     if ((work.length || gmBlocked.length) && usable.length === 0) {
+      const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
+        .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
       const text = `所有订阅都已耗尽或限流，公司暂停派工。请为以下订阅充值或等待额度恢复：${
-        [...health.values()].filter(h => h.state === 'exhausted').map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`).join('、') || '全部'}`;
+        [...exhausted, ...[...quotaBlocked].map(p => `${p}（额度低于熔断线）`)].join('、') || '全部'}`;
       await this.notice('budget', text, report);
       report.skipped = 'budget';
       return report;
@@ -178,7 +219,7 @@ export class Dispatcher {
     const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
       inst.role === role && ready(inst) && !assigned.has(inst.id) &&
       !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
-      this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
+      this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
       insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
@@ -187,7 +228,7 @@ export class Dispatcher {
     const eligibleDefs = (role: string, home: string) =>
       defs.filter(d => d.enabled && d.role === role &&
         insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
-        this.capacity(d.provider, cfg, health, busyBy, now));
+        this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
       const home = task?.repoPath ?? this.deps.env.opsRepo;
       const candidates = eligibleInsts(role, home, task, excludeSubmitter);
@@ -203,8 +244,6 @@ export class Dispatcher {
     };
     const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
-    const quotaByProvider = new Map<string, ProviderQuota>();
-    for (const q of await this.deps.quota?.().catch(() => []) ?? []) quotaByProvider.set(q.provider, q);
     const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
@@ -299,7 +338,7 @@ export class Dispatcher {
     //    employee, which stays the only path when Jev is not configured.
     if (cfg.evalEnabled) {
       const jevReady = this.deps.jev !== undefined && cfg.evalEngine !== 'llm';
-      const llmReady = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
+      const llmCapable = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
       for (const task of await wf.pendingEvaluations(3)) {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
@@ -309,6 +348,10 @@ export class Dispatcher {
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
         }
+        // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
+        // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
+        // re-enables escalation for quick tasks.
+        const llmReady = llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
         if (!llmReady) {
           if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
             await this.notice(`eval-stuck:${task.id}`,
@@ -354,9 +397,11 @@ export class Dispatcher {
         }, questions)
         : { model: jev.model, answers: {} };
       parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
-      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev') {
+      const quickNoEscalate = task.goalTier === 'quick' && !cfg.evalQuickLlm;
+      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev' || quickNoEscalate) {
         const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +
-          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}`;
+          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}` +
+          (quickNoEscalate && parsed.minConfidence < cfg.jevMinConfidence ? '；置信度偏低，quick 目标按规则不升级 LLM 评审' : '');
         await wf.recordJevEvaluation(task.id, result.model, summary,
           parsed.scores.map(s => ({ ...s, flagged: parsed.flagged.includes(s.employee) })), state, parsed.topPerformer);
         for (const emp of parsed.flagged) {
@@ -454,7 +499,8 @@ export class Dispatcher {
   }
 
   /** A recovering provider gets a single probe session until a turn completes cleanly. */
-  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number): boolean {
+  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Set<string>): boolean {
+    if (quotaBlocked?.has(provider)) return false;
     const availability = this.available(health.get(provider), now);
     if (availability === 'down') return false;
     const busy = busyBy.get(provider) ?? 0;

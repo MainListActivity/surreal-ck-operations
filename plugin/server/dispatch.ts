@@ -35,6 +35,16 @@ function providerQuotaSummary(entry: ProviderUsageEntry): string {
   return parts.length ? parts.join("；") : `状态 ${entry.status}`;
 }
 
+/** Lowest remaining percentage across windows and balances; undefined when the provider reports no numbers. */
+function lowestRemainingPct(entry: ProviderUsageEntry): number | undefined {
+  const pcts: number[] = [];
+  for (const w of entry.windows ?? []) if (w.remainingPct != null) pcts.push(w.remainingPct);
+  for (const b of entry.balances ?? []) {
+    if (b.remaining != null && b.limit != null && b.limit > 0) pcts.push((b.remaining / b.limit) * 100);
+  }
+  return pcts.length ? Math.min(...pcts) : undefined;
+}
+
 function formatProviderUsage(entry: ProviderUsageEntry): string {
   const plan = entry.planLabel ? `（${entry.planLabel}）` : "";
   return `${entry.providerId}${plan} 提交时额度：${providerQuotaSummary(entry)}`;
@@ -52,9 +62,10 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   const { RecordId } = await import("surrealdb");
   for (const entry of providers) {
     await ctx.db.db.query(
-      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
+      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, lowest_pct: $lowest, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
       { meta: new RecordId("company_meta", `quota_${entry.providerId}`), provider: entry.providerId,
-        summary: providerQuotaSummary(entry), status: entry.status, fetched: usage?.fetchedAt, entry });
+        summary: providerQuotaSummary(entry), lowest: lowestRemainingPct(entry), status: entry.status,
+        fetched: usage?.fetchedAt, entry });
   }
   return providers;
 }
