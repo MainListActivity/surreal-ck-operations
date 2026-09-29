@@ -24,3 +24,7 @@ INFO FOR DB;
 SELECT id, ledger_state, usage_trusted, last_native_audit_at FROM workspace_quota_runtime;
 SELECT id, workspace_id, allowed_subjects, status, confirmed_until FROM content_authorization_projection; SELECT id, actions, ai_actions, status FROM content_read_gate;
 SELECT at FROM company_meta:dispatcher_heartbeat;
+SELECT id, state, current_employee, version FROM task WHERE state IN ['review','doing'] LIMIT 10;
+SELECT at FROM company_meta:dispatcher_heartbeat; SELECT id, state, current_employee FROM task WHERE state IN ["ready","doing","review"] LIMIT 8;
+SELECT action, actor, evidence, at FROM audit WHERE task = type::record('task','7c9fb60c-f38e-468d-b016-9c3fcc0e2f56') ORDER BY at DESC LIMIT 6;
+SELECT action, evidence, at FROM audit WHERE task = type::record('task','7c9fb60c-f38e-468d-b016-9c3fcc0e2f56') AND action = 'provider_usage';
