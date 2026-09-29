@@ -466,6 +466,7 @@ export class Dispatcher {
     const log = inst?.paseoAgentId ? await this.deps.paseo.logsTail(inst.paseoAgentId, LOG_TAIL_ENTRIES) : '';
     const handover = [
       '【交接包】前任员工未完成交接。以下是其会话最后的活动记录（自动截取，可能不完整）。',
+      `前任会话：${inst?.id ?? task.currentEmployee}${inst?.paseoAgentId ? `（Paseo agentId ${inst.paseoAgentId}；完整时间线：paseo logs ${inst.paseoAgentId}）` : ''}`,
       '先核对任务分支/工作目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。',
       log ? `\n---\n${log.slice(-cfg.handoverChars)}` : '（无可用会话日志）',
     ].join('\n');

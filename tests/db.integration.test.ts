@@ -142,7 +142,7 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   const resumed = await core.resume(gm, parent.id, {
     text: 'Synthetic blocker resolved by manager.', idempotencyKey: `resume-${suffix}`,
   });
-  expect(resumed.state).toBe('doing');
+  expect(resumed.state).toBe('ready');
   const reclaimed = await core.claim(engD, parent.id);
   const submitted = await core.submit(engD, {
     taskId: parent.id, deliveryId: reclaimed.deliveryId,

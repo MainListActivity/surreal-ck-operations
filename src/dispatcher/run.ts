@@ -32,7 +32,8 @@ try {
   const workforce = new Workforce(db, resolve(required('SCK_CREDENTIAL_DIR')));
   const dispatcher = new Dispatcher({
     workforce, owner: new OwnerDesk(db), paseo: createPaseoCli(),
-    env: { opsRepo: required('SCK_AGENT_CWD'), sckBin: required('SCK_TOOL_BIN') },
+    env: { opsRepo: required('SCK_AGENT_CWD'), sckBin: required('SCK_TOOL_BIN'),
+      paseoBin: process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo' },
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),

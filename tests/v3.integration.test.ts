@@ -187,12 +187,21 @@ test('revoked lease hands over to a same-role employee with history; old session
     reviewerRole: 'qa', idempotencyKey: key() });
   const first = await core.claim(tokens['eng-a'], t.id);
   const cp = await core.checkpoint(tokens['eng-a'], proofOf(first), { text: '已完成接口草稿与数据结构，下一步编写 tests/api.test.ts 的单元测试。', idempotencyKey: key() });
+  await database.db.query(`UPDATE employee SET paseo_agent_id = 'sess-eng-a', provider = 'codex' WHERE id = $e;`,
+    { e: new RecordId('employee', 't-eng-a') });
   expect(await workforce.revokeLease(t.id, 't-eng-a', '会话额度耗尽', '【交接包】最后日志：写到 tests/api.test.ts')).toBe(true);
   expect(await task(t.id)).toMatchObject({ state: 'ready', handover: true, previousEmployee: 't-eng-a' });
   await expect(core.submit(tokens['eng-a'], proofOf(first, cp.version), { text: 'Stale session writes must fail.', idempotencyKey: key() }))
     .rejects.toBeDefined();
   const second = await core.claim(tokens['eng-b'], t.id);
   expect(second.fence).toBe(first.fence + 1);
+  // Successor sees the predecessor's Paseo session id and can pull its full transcript.
+  expect(second.predecessors).toEqual(expect.arrayContaining([
+    expect.objectContaining({ employee: 't-eng-a', agentId: 'sess-eng-a', provider: 'codex' })]));
+  expect(second.predecessors?.map(p => p.employee)).not.toContain('t-eng-b');
+  // Restore invisibility: an agent id on a seeded employee would make the dispatcher adopt it as an instance.
+  await database.db.query(`UPDATE employee SET paseo_agent_id = NONE, provider = NONE WHERE id = $e;`,
+    { e: new RecordId('employee', 't-eng-a') });
   expect(second.history.map(h => h.action)).toEqual(expect.arrayContaining(['claim', 'checkpoint', 'revoked']));
   expect(second.history.find(h => h.action === 'revoked')?.evidence).toContain('tests/api.test.ts');
   const submitted = await core.submit(tokens['eng-b'], proofOf(second), { text: 'Continued from handover.', idempotencyKey: key() });
@@ -233,7 +242,7 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', priority: 20 });
   const paseo = new FakePaseo();
   const notices: string[] = [];
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, notify: async (_t, text) => { notices.push(text); } });
   const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
 
@@ -305,7 +314,7 @@ test('dispatcher: owner gates raise one notification each and resolve once decid
   await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
   const paseo = new FakePaseo();
   const notified: string[] = [];
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, notify: async (_t, text) => { notified.push(text); } });
   const gate = await core.createTask(tokens.gm, { title: 'G2 购买域名', context: 'synthetic gate', kind: 'gate',
     executorRole: 'product', reviewerRole: 'owner', idempotencyKey: key() });
@@ -368,7 +377,7 @@ test('dispatcher assigns an eval judge for finished tasks and stops once evaluat
   await database.db.query('DELETE provider_health;');
   await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
   const paseo = new FakePaseo();
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
 
   const t = await core.createTask(tokens.gm, { title: 'Needs judging', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
@@ -416,7 +425,7 @@ test('dispatcher: jev scores finished tasks in one call; low confidence escalate
       return { model: 'jev-test', answers } as never;
     },
   };
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, jev, notify: async (_t, text) => { notices.push(text); } });
 
   const t = await core.createTask(tokens.gm, { title: 'Jev judged task', context: 'synthetic', executorRole: 'engineering',
@@ -455,7 +464,7 @@ test('dispatcher: jev scores finished tasks in one call; low confidence escalate
     }
     return { model: 'jev-test', answers } as never;
   } };
-  const dispatcher2 = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+  const dispatcher2 = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, jev: shaky });
   await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
   const t2 = await core.createTask(tokens.gm, { title: 'Hard to judge', context: 'synthetic', executorRole: 'engineering',
@@ -478,7 +487,7 @@ test('dispatcher: jev api failures retry then fall back to the llm judge', async
   const paseo = new FakePaseo();
   let attempts = 0;
   const broken: JevClient = { model: 'jev-test', ask: async () => { attempts++; throw new Error('jev api down'); } };
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' },
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, jev: broken });
   await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
   await workforce.upsertDef('eval-codex', { role: 'eval', provider: 'codex', model: 'gpt-6-sol', thinking: 'low', weight: 30 });
@@ -523,7 +532,7 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
     },
   };
   const paseo = new FakePaseo();
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0, jev });
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, jev });
 
   // Triage: confident → template instantiated; unsure → goal waits and gm is woken with the triage prompt.
   const quick = await owner.createGoal({ text: '修复导出按钮', source: 'owner:test', key: key() });
@@ -611,7 +620,7 @@ test('dispatcher spawns instances in the workspace of the goal project and only 
   const goal = await owner.createGoal({ text: '工作区归属测试', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj' });
   const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
   const paseo = new FakePaseo();
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
   const report = await dispatcher.tick();
   expect(report.woke.find(w => w.task === impl.id)?.spawned).toBe(true);
   const spawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(impl.id))!.spawn!;
@@ -632,7 +641,7 @@ test('dispatcher still spawns for a project when the def is at capacity in anoth
   const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
   const paseo = new FakePaseo();
   paseo.agents.set('ops-eng-agent', { status: 'idle', error: '' });
-  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
   const report = await dispatcher.tick();
   expect(report.woke.find(w => w.task === impl.id)?.spawned).toBe(true);
   const spawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(impl.id))!.spawn!;
