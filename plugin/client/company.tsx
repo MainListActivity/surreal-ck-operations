@@ -2,7 +2,7 @@ import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as rpc from "../shared/rpc";
 import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Roster, TaskView } from "../shared/types";
 
@@ -66,6 +66,22 @@ function Section({ title, count, ctx, children }: { title: string; count?: numbe
   );
 }
 
+/** Clamped text with an inline expand toggle; long bodies no longer hide behind "…". */
+function ExpandableText({ text, lines, style, ctx }: { text: string; lines: number; style?: StyleProp<TextStyle>; ctx: Ctx }) {
+  const [open, setOpen] = useState(false);
+  const long = text.split("\n").length > lines || text.length > lines * 45;
+  return (
+    <View>
+      <Text style={style} numberOfLines={open ? undefined : lines}>{text}</Text>
+      {long && (
+        <Pressable accessibilityRole="button" onPress={() => setOpen(!open)} style={{ alignSelf: "flex-start" }}>
+          <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }}>{open ? "收起" : "展开全部"}</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
 function DecideCard({ taskId, kind, body, ctx, onDone }: {
   taskId: string; kind: "approve" | "reply"; body: string; ctx: Ctx; onDone: () => void;
 }) {
@@ -80,7 +96,7 @@ function DecideCard({ taskId, kind, body, ctx, onDone }: {
   return (
     <View style={s.card}>
       <Text style={s.text}>{taskId.slice(0, 8)}</Text>
-      <Text style={s.muted} numberOfLines={12}>{body}</Text>
+      <ExpandableText text={body} lines={12} style={s.muted} ctx={ctx} />
       <TextInput
         style={[s.input, { minHeight: 36 }]}
         placeholder={kind === "approve" ? "意见（驳回时必填）" : "回答内容"}
@@ -139,7 +155,7 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
       <Section title="提醒" count={box?.notices.length} ctx={ctx}>
         {box?.notices.map(n => (
           <View key={n.key} style={s.card}>
-            <Text style={s.text}>{n.text}</Text>
+            <ExpandableText text={n.text} lines={8} style={s.text} ctx={ctx} />
             <Text style={s.muted}>{n.at}</Text>
             <Pressable accessibilityRole="button" style={[s.buttonSecondary, { alignSelf: "flex-start" }]}
               onPress={async () => { await resolve({ key: n.key }); refresh(); }}>
@@ -293,17 +309,16 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
           </Pressable>
           {openGoal === g.id && (
             <View style={{ gap: 4 }}>
-              <Text style={s.muted} numberOfLines={6}>{g.brief}</Text>
+              <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
               {(tasksQuery.data?.tasks ?? []).map(t => (
                 <View key={t.id}>
                   <TaskRow task={t} ctx={ctx} depth={0} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />
                   {openTask === t.id && detailQuery.data && (
                     <View style={[s.card, { marginLeft: 14, backgroundColor: ctx.theme.colors.surface2 }]}>
-                      <Text style={s.muted}>{detailQuery.data.task.context.slice(0, 800)}</Text>
+                      <ExpandableText text={detailQuery.data.task.context} lines={8} style={s.muted} ctx={ctx} />
                       {detailQuery.data.audit.map((a, i) => (
-                        <Text key={i} style={s.mono} numberOfLines={4}>
-                          {a.at.slice(5, 16)} {a.action} · {a.actor}{a.evidence ? ` — ${a.evidence.slice(0, 160)}` : ""}
-                        </Text>
+                        <ExpandableText key={i} lines={4} style={s.mono} ctx={ctx}
+                          text={`${a.at.slice(5, 16)} ${a.action} · ${a.actor}${a.evidence ? ` — ${a.evidence}` : ""}`} />
                       ))}
                     </View>
                   )}
@@ -346,7 +361,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         {(perms.data?.items ?? []).map((p: PermissionRequest) => (
           <View key={`${p.agentId}:${p.request.id}`} style={s.card}>
             <Text style={s.text}>{p.employeeId ?? p.title ?? p.agentId}</Text>
-            <Text style={s.muted} numberOfLines={6}>{p.request.summary ?? p.request.kind ?? p.request.id}{p.request.detail ? `\n${p.request.detail}` : ""}</Text>
+            <ExpandableText text={`${p.request.summary ?? p.request.kind ?? p.request.id}${p.request.detail ? `\n${p.request.detail}` : ""}`} lines={6} style={s.muted} ctx={ctx} />
             <View style={s.row}>
               <Pressable accessibilityRole="button" style={s.button}
                 onPress={async () => { await answer({ agentId: p.agentId, requestId: p.request.id, behavior: "allow" }); refreshAll(); }}>
