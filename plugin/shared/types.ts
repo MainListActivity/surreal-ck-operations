@@ -69,8 +69,18 @@ export interface Brief {
   paused: boolean;
 }
 
+export interface ProviderUsageView {
+  providerId: string;
+  displayName: string;
+  planLabel?: string | null;
+  status: string;
+  windows: Array<{ label: string; remainingPct?: number | null; resetsAt?: string | null; tone?: string }>;
+  balances: Array<{ label: string; remaining?: number | null; limit?: number | null; unit?: string; tone?: string }>;
+}
+
 export interface Roster {
   paused: boolean;
+  usage: ProviderUsageView[];
   defs: Array<{ id: string; role: string; provider: string; model: string; enabled: boolean; maxInstances: number; weight?: number }>;
   instances: Array<{ id: string; def?: string; role: string; provider?: string; cwd?: string; agentId?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;

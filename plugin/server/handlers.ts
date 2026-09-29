@@ -72,8 +72,14 @@ export function registerHandlers(server: PluginServerContext): void {
     const agents = paseo ? await paseo.agents.list() : { entries: [] };
     const statusById = new Map<string, string>(
       (agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
+    const usageResult = paseo ? await paseo.providers.listUsage().catch(() => undefined) : undefined;
     return {
       paused: cfg.paused,
+      usage: (usageResult?.providers ?? []).map((u: any) => ({
+        providerId: u.providerId, displayName: u.displayName, planLabel: u.planLabel, status: u.status,
+        windows: (u.windows ?? []).map((w: any) => ({ label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt, tone: w.tone })),
+        balances: (u.balances ?? []).map((b: any) => ({ label: b.label, remaining: b.remaining, limit: b.limit, unit: b.unit, tone: b.tone })),
+      })),
       defs: (await workforce.defs()).map(d => ({
         id: d.id, role: d.role, provider: d.provider, model: d.model,
         enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
