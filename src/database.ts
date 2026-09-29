@@ -109,11 +109,12 @@ export class CompanyDatabase {
 
   private reconnecting: Promise<void> | undefined;
 
-  /** Probes the connection; on failure rebuilds it (the client does not recover from a dropped WS by itself). */
+  /** Probes the connection; on failure rebuilds it. The SDK may silently re-establish the WS
+   *  transport while dropping ns/db/auth session state, so the probe must require scope. */
   async ensureConnected(): Promise<void> {
     this.reconnecting ??= (async () => {
       try {
-        await this.db.query('SELECT true;');
+        await this.db.query('INFO FOR DB;');
       } catch {
         await this.db.close().catch(() => {});
         await this.connect();
