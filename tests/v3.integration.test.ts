@@ -245,7 +245,7 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect(codexInst).toMatchObject({ task: t.id, spawned: true });
   expect(codexInst.employee.startsWith('engineering-codex-')).toBe(true);
   const [codexAgent, spawned] = [...paseo.agents][0];
-  expect(spawned.spawn).toMatchObject({ provider: 'codex', model: 'gpt-6-sol', mode: 'full-access' });
+  expect(spawned.spawn).toMatchObject({ provider: 'codex', model: 'gpt-6-sol', mode: 'full-access', workspaceTitle: 'SCK · engineering-codex' });
   expect(spawned.spawn!.prompt).toContain(`"taskId":"${t.id}"`);
   expect(spawned.spawn!.prompt).not.toContain(tokenOf(codexInst.employee));
   expect((await dispatcher.tick()).woke).toHaveLength(0);
