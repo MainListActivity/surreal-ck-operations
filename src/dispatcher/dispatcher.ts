@@ -1,14 +1,15 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
+import type { ProviderQuota } from '../contracts.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
-import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
+import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|quota|usage limit|rate.?limit|too many requests|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
+export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 
@@ -27,7 +28,12 @@ export interface DispatcherDeps {
   jev?: JevClient;
   /** Removes worktrees of finished tasks; undefined disables the sweep. */
   git?: GitGateway;
+  /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
+  quota?: () => Promise<ProviderQuota[]>;
 }
+
+/** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
+interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolean }
 
 export interface TickReport {
   commands: number;
@@ -58,9 +64,25 @@ export class Dispatcher {
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
-    const [agents, defs, now] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow()]);
+    const [agents, defs, now, quotaRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
+      this.deps.quota ? this.deps.quota().catch((error) => { this.log(`quota read failed: ${(error as Error).message}`); return [] as ProviderQuota[]; })
+        : Promise.resolve([] as ProviderQuota[])]);
     let insts = await wf.insts();
     let health = await wf.providerHealth();
+    const quotaByProvider = new Map<string, ProviderQuota>();
+    for (const q of quotaRows) quotaByProvider.set(q.provider, q);
+    // Quota circuit breaker: a provider reporting nearly empty quota is treated as unavailable
+    // so we stop spending spawn/turn attempts on it before it actually 402s. Stale snapshots
+    // (>15min old) fail open rather than keeping a provider blocked forever.
+    const quotaBlocked = new Set<string>();
+    if (cfg.quotaFloorPct > 0) {
+      for (const q of quotaRows) {
+        if (q.lowestPct === undefined || q.lowestPct >= cfg.quotaFloorPct) continue;
+        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
+        if (age < 15 * 60_000) quotaBlocked.add(q.provider);
+      }
+      if (quotaBlocked.size) this.log(`quota below floor (${cfg.quotaFloorPct}%): ${[...quotaBlocked].join(', ')}`);
+    }
 
     // 1. Session health.
     const states = new Map<string, InstState>();
@@ -134,6 +156,30 @@ export class Dispatcher {
     if (this.deps.jev && cfg.jevDecisions) await this.jevDecisions(cfg, report);
     const tasks = await wf.tasks();
 
+    // 2c. Session rotation: a session that has run many turns carries an ever-growing context,
+    // so every further turn costs more input tokens. Retire idle instances past the configured
+    // size/count and let the next task spawn a fresh, cheap session.
+    {
+      const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+      let inspected = 0;
+      for (const inst of insts) {
+        if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || !inst.paseoAgentId) continue;
+        const overWakes = cfg.sessionMaxWakes > 0 && (inst.wakeCount ?? 0) >= cfg.sessionMaxWakes;
+        let inputK = 0;
+        if (!overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+          inspected++;
+          inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
+        }
+        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
+        const reason = overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        await wf.retire(inst.id, reason);
+        await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+        report.retired.push(inst.id);
+        this.log(`retired ${inst.id}: ${reason}`);
+      }
+      insts = insts.filter(i => !report.retired.includes(i.id));
+    }
+
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
 
@@ -147,10 +193,12 @@ export class Dispatcher {
     ];
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
     const usable = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))]
-      .filter(p => this.available(health.get(p), now) !== 'down');
+      .filter(p => this.available(health.get(p), now) !== 'down' && !quotaBlocked.has(p));
     if ((work.length || gmBlocked.length) && usable.length === 0) {
+      const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
+        .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
       const text = `所有订阅都已耗尽或限流，公司暂停派工。请为以下订阅充值或等待额度恢复：${
-        [...health.values()].filter(h => h.state === 'exhausted').map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`).join('、') || '全部'}`;
+        [...exhausted, ...[...quotaBlocked].map(p => `${p}（额度低于熔断线）`)].join('、') || '全部'}`;
       await this.notice('budget', text, report);
       report.skipped = 'budget';
       return report;
@@ -167,35 +215,79 @@ export class Dispatcher {
     }
     const assigned = new Set<string>();
     const rand = this.deps.rand ?? Math.random;
-    const pick = (role: string, task?: SupervisedTask, avoid?: string) => {
-      const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
-        (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
-      const ok = (inst: EmployeeInst) => inst.role === role && ready(inst) && !assigned.has(inst.id) &&
-        !holding.has(inst.id) && inst.id !== task?.submittedBy && this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
-      // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
-      const home = task?.repoPath ?? this.deps.env.opsRepo;
-      const candidates = insts.filter(i => ok(i) && (i.cwd ?? this.deps.env.opsRepo) === home);
-      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
-      // Continuity beats weights: the previous holder keeps the task when it is still available.
-      const previous = candidates.find(i => i.id === task?.previousEmployee);
-      if (previous) return previous;
-      const pool = candidates.filter(i => i.id !== avoid);
-      return weightedOrder(pool.length ? pool : candidates, weight, rand)[0];
-    };
+    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
+      (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
+    const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
+      inst.role === role && ready(inst) && !assigned.has(inst.id) &&
+      !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
+      this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
+    // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
+    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
+      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
-    const spawnable = (role: string, home: string) => weightedOrder(
+    const eligibleDefs = (role: string, home: string) =>
       defs.filter(d => d.enabled && d.role === role &&
         insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
-        this.capacity(d.provider, cfg, health, busyBy, now)),
-      effectiveWeight, rand);
+        this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
+    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
+      const home = task?.repoPath ?? this.deps.env.opsRepo;
+      const candidates = eligibleInsts(role, home, task, excludeSubmitter);
+      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
+      // Continuity beats weights: the previous holder keeps the task when it is still available.
+      const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
+      if (previous) return previous;
+      // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
+      const live = candidates.filter(i => states.get(i.id) === 'idle');
+      const usable = live.length ? live : candidates;
+      const pool = usable.filter(i => i.id !== avoid);
+      return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
+    };
+    const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
+    // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
+    const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
+      if (!this.deps.jev || !cfg.jevDecisions) return undefined;
+      const home = item.task.repoPath ?? this.deps.env.opsRepo;
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review');
+      const spawn = eligibleDefs(item.role, home);
+      if (reuse.length + spawn.length < 2) return undefined;
+      const describeHealth = (provider: string) => health.get(provider)?.state ?? 'ok';
+      const candidates: RouteCandidate[] = [
+        ...reuse.map(i => {
+          const def = defs.find(d => d.id === i.def);
+          return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: def?.model ?? '',
+            score: def?.avgScore, scored: def?.scored, quota: quotaByProvider.get(i.provider ?? def?.provider ?? '')?.summary,
+            health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee };
+        }),
+        ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: d.model,
+          score: d.avgScore, scored: d.scored, quota: quotaByProvider.get(d.provider)?.summary,
+          health: describeHealth(d.provider) })),
+      ];
+      const directions = (await owner.brief()).directions.map(d => d.text);
+      const verdict = await jevStaff(this.deps.jev, {
+        purpose: item.purpose, directions,
+        task: { id: item.task.id, title: item.task.title, kind: item.task.kind, state: item.task.state,
+          project: item.task.repoPath, context: item.task.row.context?.slice(0, 2000) },
+        candidates,
+      }).catch(error => { this.log(`jev staff failed: ${(error as Error).message}`); return { key: undefined, confidence: 0 }; });
+      const inst = reuse.find(i => i.id === verdict.key);
+      const def = spawn.find(d => `spawn:${d.id}` === verdict.key);
+      if ((!inst && !def) || verdict.confidence < cfg.jevPickConfidence) {
+        if (verdict.key) report.decisions.push(`staff:${item.task.id}=weighted(${verdict.confidence.toFixed(2)})`);
+        return undefined;
+      }
+      report.decisions.push(`staff:${item.task.id}=${verdict.key}@${verdict.confidence.toFixed(2)}`);
+      this.log(`jev picked ${verdict.key} for ${item.task.id} (${verdict.confidence.toFixed(2)})`);
+      return inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
+    };
 
     for (const item of work) {
       if (running >= cfg.maxRunning) break;
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      const prefer = await routeEmployee(item);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts);
+        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer);
       if (!result) {
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 当前没有可用员工（无空闲实例且无法新开：定义缺失、已停用、达到上限或订阅不可用），任务 ${item.task.id} 等待中。`, report);
         continue;
@@ -247,7 +339,7 @@ export class Dispatcher {
     //    employee, which stays the only path when Jev is not configured.
     if (cfg.evalEnabled) {
       const jevReady = this.deps.jev !== undefined && cfg.evalEngine !== 'llm';
-      const llmReady = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
+      const llmCapable = cfg.evalEngine !== 'jev' && defs.some(d => d.role === 'eval' && d.enabled);
       for (const task of await wf.pendingEvaluations(3)) {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
@@ -257,6 +349,10 @@ export class Dispatcher {
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
         }
+        // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
+        // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
+        // re-enables escalation for quick tasks.
+        const llmReady = llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
         if (!llmReady) {
           if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
             await this.notice(`eval-stuck:${task.id}`,
@@ -302,9 +398,11 @@ export class Dispatcher {
         }, questions)
         : { model: jev.model, answers: {} };
       parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
-      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev') {
+      const quickNoEscalate = task.goalTier === 'quick' && !cfg.evalQuickLlm;
+      if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev' || quickNoEscalate) {
         const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +
-          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}`;
+          `${parsed.scores.map(s => `${s.employee} 综合 ${s.overall.toFixed(1)} 置信 ${s.confidence.toFixed(2)}`).join('；') || '无参与者'}` +
+          (quickNoEscalate && parsed.minConfidence < cfg.jevMinConfidence ? '；置信度偏低，quick 目标按规则不升级 LLM 评审' : '');
         await wf.recordJevEvaluation(task.id, result.model, summary,
           parsed.scores.map(s => ({ ...s, flagged: parsed.flagged.includes(s.employee) })), state, parsed.topPerformer);
         for (const emp of parsed.flagged) {
@@ -402,7 +500,8 @@ export class Dispatcher {
   }
 
   /** A recovering provider gets a single probe session until a turn completes cleanly. */
-  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number): boolean {
+  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Set<string>): boolean {
+    if (quotaBlocked?.has(provider)) return false;
     const availability = this.available(health.get(provider), now);
     if (availability === 'down') return false;
     const busy = busyBy.get(provider) ?? 0;
@@ -411,13 +510,15 @@ export class Dispatcher {
 
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
-    pick: (role: string, task?: SupervisedTask, avoid?: string) => EmployeeInst | undefined,
+    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
     spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean) => string,
-    report: TickReport, insts: EmployeeInst[],
+    report: TickReport, insts: EmployeeInst[], forReview = false,
+    prefer?: AssignPreference,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env } = this.deps;
-    const existing = pick(role, task, avoid);
+    const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
+    const existing = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
     if (existing) {
       try {
         const first = !this.onboarded.has(existing.id) && !existing.onboarded;
@@ -432,7 +533,9 @@ export class Dispatcher {
         return undefined;
       }
     }
-    for (const def of spawnable(role, task?.repoPath ?? env.opsRepo)) {
+    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo);
+    if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
+    for (const def of defsOrdered) {
       const inst = await wf.spawnInst(def);
       try {
         const agentId = await paseo.spawn({
@@ -452,10 +555,18 @@ export class Dispatcher {
         this.log(`spawned ${inst.id} (${def.provider}/${def.model}) for ${task?.id ?? `dispatch:${role}`}`);
         return { ...bound, spawned: true };
       } catch (error) {
-        this.log(`spawn ${inst.id} failed: ${(error as Error).message}`);
-        await wf.retire(inst.id, `spawn failed: ${(error as Error).message.slice(0, 200)}`);
+        const message = (error as Error).message;
+        this.log(`spawn ${inst.id} failed: ${message}`);
+        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`);
         report.retired.push(inst.id);
-        await this.countDefFailure(def, report);
+        // A quota-flavored spawn failure is the provider's problem, not the def's:
+        // cool the provider down instead of eating a strike toward auto-disable.
+        if (EXHAUSTED_PATTERN.test(message)) {
+          await wf.markExhausted(def.provider, message);
+          if (!report.exhausted.includes(def.provider)) report.exhausted.push(def.provider);
+        } else {
+          await this.countDefFailure(def, report);
+        }
       }
     }
     return undefined;

@@ -360,6 +360,25 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
           </View>
         ))}
       </Section>
+      <Section title="订阅额度" ctx={ctx}>
+        <View style={s.card}>
+          {(r?.usage ?? []).map(u => {
+            const bits = [
+              ...u.windows.filter(w => w.remainingPct != null).map(w =>
+                `${w.label} 剩余 ${Math.round(w.remainingPct!)}%${w.resetsAt ? `（${w.resetsAt.slice(5, 16).replace("T", " ")} 重置）` : ""}`),
+              ...u.balances.filter(b => b.remaining != null).map(b =>
+                `${b.label} 剩 ${b.remaining}${b.limit != null ? `/${b.limit}` : ""} ${b.unit ?? ""}`),
+            ];
+            return (
+              <Text key={u.providerId} style={s.text}>
+                {u.displayName ?? u.providerId}{u.planLabel ? `（${u.planLabel}）` : ""}：
+                {bits.length ? bits.join("；") : `状态 ${u.status}`}
+              </Text>
+            );
+          })}
+          {(r?.usage.length ?? 0) === 0 && <Text style={s.muted}>暂无额度数据。</Text>}
+        </View>
+      </Section>
       <Section title="订阅健康度" ctx={ctx}>
         <View style={s.card}>
           {(r?.health.length ?? 0) === 0 && <Text style={s.muted}>各订阅正常。</Text>}

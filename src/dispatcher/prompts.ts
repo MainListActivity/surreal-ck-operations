@@ -29,11 +29,11 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
   const body = `【派工】任务 ${task.id}「${task.title}」需要你${mode}。
 1. 领取：${tool(inst, env).replace('<工具名>', 'claim_next').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
-   返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history。${task.row.handover ? `
+   返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history。secrets 字段是已为你解密的任务凭证，直接使用，不要写入证据；缺的才用 get_secret。${task.row.handover ? `
    返回的 predecessors 列出历任持有员工的 Paseo 会话；交接包只截取了最后几十条日志，需要更早或完整上下文时直接读前任完整时间线：
    '${env.paseoBin}' logs <agentId> --tail 400 --no-color（去掉 --tail 看全部）。` : ''}
 2. 按岗位协议完成：执行→submit；验收→review(accept/return)；自己定不了→report_blocker(to=gm)；只有花钱、签约、对外联系、公司方向和项目红线才 report_blocker(to=owner)。
-   每完成一个有意义的步骤就 checkpoint（已完成、改动文件、下一步）。代码任务在任务专属分支/worktree 中工作，checkpoint 前先提交到该分支。
+   每完成一个有意义的阶段就 checkpoint（已完成、改动文件、下一步），每个任务最多 6 次——把多个进展合并写，纯保活用 heartbeat；返回 checkpoint_limit 就直接 submit 或 report_blocker。代码任务在任务专属分支/worktree 中工作，checkpoint 前先提交到该分支。
 3. 本轮只做这一项；完成交接后结束本轮，不要空转等待，不创建 agent 或定时器。
 若领取返回 already_claimed、no_available_task 或 forbidden，直接结束本轮。`;
   return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;

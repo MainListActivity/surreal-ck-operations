@@ -115,7 +115,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.heartbeat(token(ctx), proof(input))));
 
   server.registerTool('checkpoint', {
-    description: 'Record resumable progress for the current delivery.',
+    description: 'Record resumable progress for the current delivery. Limited to a few per task per holder (checkpoint_limit); use heartbeat for liveness and merge progress notes.',
     inputSchema: z.object({ ...proofShape, ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.checkpoint(token(ctx), proof(input), evidence(input))));
 
@@ -172,7 +172,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
 
   server.registerTool('get_secret', {
-    description: 'Read a project environment credential (listed in claim result project.envs[].secrets) for the task you currently hold. Use it directly; never write the value into evidence, files or messages.',
+    description: 'Read a project environment credential for the task you currently hold. Credentials your role may use are already decrypted in the claim result secrets field — use those first. Use this only for names missing there. Never write values into evidence, files or messages.',
     inputSchema: z.object({ taskId: z.string().min(1), env: z.string().min(1), name: z.string().min(1) }),
   }, async (input, ctx) => run(token(ctx), async () => ({ value: await core.getSecret(token(ctx), input) })));
 

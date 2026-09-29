@@ -24,9 +24,13 @@ export interface PaseoGateway {
   status(agentId: string): Promise<{ status: string; pendingPermissions: number } | undefined>;
   lastError(agentId: string): Promise<string>;
   logsTail(agentId: string, entries: number): Promise<string>;
+  /** Input tokens of the agent's last turn; a proxy for how large its session context has grown. */
+  lastInputTokens(agentId: string): Promise<number | undefined>;
   spawn(input: SpawnInput): Promise<string>;
   send(agentId: string, prompt: string): Promise<void>;
   stop(agentId: string): Promise<void>;
+  /** Soft-delete the agent's session (its transcript stays in Paseo history). */
+  archive(agentId: string): Promise<void>;
 }
 
 /** Paseo mode needed for unattended work; grok exposes no modes. */
@@ -84,6 +88,13 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     },
     async logsTail(agentId, entries) {
       return run(['logs', agentId, '--tail', String(entries), '--no-color']).catch(error => `（无法读取会话日志：${error.message}）`);
+    },
+    async lastInputTokens(agentId) {
+      const row = await json<{ LastUsage?: { InputTokens?: number } }>(['agent', 'inspect', agentId]).catch(() => undefined);
+      return row?.LastUsage?.InputTokens;
+    },
+    async archive(agentId) {
+      await run(['archive', agentId]);
     },
     async spawn(input) {
       const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd);

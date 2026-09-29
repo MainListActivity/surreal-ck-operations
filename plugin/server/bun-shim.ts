@@ -1,6 +1,8 @@
 // The ops repo targets Bun; the plugin subprocess is Node. Provide the small surface it needs.
 import { spawn as nodeSpawn, type StdioOptions } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
+import { argon2id, argon2Verify } from "hash-wasm";
 
 interface SpawnedChild {
   exited: Promise<number>;
@@ -31,8 +33,13 @@ export function installBunShim(): void {
     spawn,
     sleep: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)),
     password: {
-      hash: () => Promise.reject(new Error("Bun.password is unavailable in the plugin runtime")),
-      verify: () => Promise.reject(new Error("Bun.password is unavailable in the plugin runtime")),
+      // Bun defaults to argon2id m=65536 t=2 p=1; PHC output stays verify-compatible either way.
+      hash: (pw: string) => argon2id({
+        password: pw, salt: randomBytes(16), parallelism: 1,
+        memorySize: 65536, iterations: 2, hashLength: 32, outputType: "encoded",
+      }),
+      verify: (pw: string, hash: string) =>
+        argon2Verify({ password: pw, hash }).catch(() => false),
     },
     serve: () => { throw new Error("Bun.serve is unavailable in the plugin runtime"); },
     argv: process.argv,

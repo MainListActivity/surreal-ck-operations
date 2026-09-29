@@ -12,6 +12,8 @@ export { CompanyError };
 
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs', 'eval'];
 const DEFAULT_LEASE_SECONDS = 600;
+/** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
+const DEFAULT_CHECKPOINT_LIMIT = 6;
 const HISTORY_LIMIT = 40;
 const HISTORY_EVIDENCE_CHARS = 6000;
 export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -95,6 +97,7 @@ interface TaskRow {
   jev_route_version?: number;
   owner_rerouted?: boolean;
   repo_path?: string;
+  goal_tier?: string;
 }
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
@@ -132,12 +135,14 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
 
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number }) {
+  readonly checkpointLimit: number;
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number }) {
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
     }
     this.leaseSeconds = seconds;
+    this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
   }
@@ -215,6 +220,7 @@ export class SurrealCompanyCore implements CompanyCore {
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
           if (/lease expired/i.test(cause)) throw new CompanyError('lease_expired', 'Lease expired');
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
+          if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/dependency not found|not found/i.test(cause)) throw new CompanyError('not_found', 'Referenced record not found');
           throw new CompanyError('conflict', 'Task changed or transaction conflicted');
         }
@@ -335,10 +341,36 @@ export class SurrealCompanyCore implements CompanyCore {
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     });
     const taskView = view(row);
+    const project = await this.taskProject(taskId);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
       predecessors: await this.predecessors(taskId, actor.employeeId),
-      project: await this.taskProject(taskId) };
+      project, secrets: await this.claimSecrets(taskId, project, actor) };
+  }
+
+  /**
+   * Decrypts every env credential the claimer's role may read, so a claim is one round trip
+   * instead of one get_secret call per credential. The issue is audited (names only); when the
+   * secret key is unavailable the employee simply falls back to get_secret.
+   */
+  private async claimSecrets(taskId: TaskId, project: ProjectView | undefined, actor: Principal): Promise<ClaimResult['secrets']> {
+    if (!project) return undefined;
+    const wanted = project.envs.flatMap(env =>
+      env.secrets.filter(s => s.roles.includes(actor.role)).map(s => ({ env: env.name, name: s.name })));
+    if (!wanted.length) return undefined;
+    try {
+      const key = loadSecretKey();
+      const secrets = [];
+      for (const s of wanted) {
+        secrets.push({ ...s, value: await this.projects.readSecret(project.id, s.env, s.name, actor.role, key) });
+      }
+      await this.db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'secret_issue', evidence: $evidence, at: time::now() };",
+        { task: id('task', taskId), actor: id('employee', actor.employeeId),
+          evidence: `随派工下发环境凭证：${wanted.map(s => `${s.env}/${s.name}`).join('、')}（值不入库）` });
+      return secrets;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -521,6 +553,10 @@ export class SurrealCompanyCore implements CompanyCore {
           IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'block denied' };
         };
       };
+      IF $checkpoint AND $checkpoint_limit > 0 {
+        LET $cpn = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'checkpoint' AND actor = $actor GROUP ALL;
+        IF ($cpn[0] ?? 0) >= $checkpoint_limit { THROW 'checkpoint limit reached' };
+      };
       LET $next = UPDATE ONLY $task SET
         state = IF $submit { 'review' } ELSE IF $accept { 'done' } ELSE IF $returning { 'ready' } ELSE IF $block { 'blocked' } ELSE { $t.state },
         submitted_by = IF $submit THEN $employee ELSE $t.submitted_by END,
@@ -553,7 +589,7 @@ export class SurrealCompanyCore implements CompanyCore {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, evidence: evidence?.text ?? '', to: to ?? '',
+        ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
       });
       return view(row);

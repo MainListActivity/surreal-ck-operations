@@ -71,6 +71,8 @@ export interface ClaimResult {
   predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines, secret names. */
   project?: ProjectView;
+  /** Decrypted env credentials whose declared roles include the claimer's role; saves a get_secret round trip per secret. Never write values into evidence. */
+  secrets?: Array<{ env: string; name: string; value: string }>;
 }
 
 export interface SessionRef {
@@ -165,6 +167,16 @@ export interface EmployeeScore {
   timeliness: number;
   overall: number;
   notes?: string;
+}
+
+export interface ProviderQuota {
+  provider: string;
+  /** Human-readable remaining quota, e.g. "5h 窗口剩 41%（15:00 重置）；余额 $3.2/$10 credits"。 */
+  summary: string;
+  /** Lowest remaining percentage across all usage windows and balances (0-100); undefined when the provider reports no numbers. */
+  lowestPct?: number;
+  status?: string;
+  fetchedAt?: string;
 }
 
 export type OwnerDecision = 'approve' | 'reject' | 'reply';
