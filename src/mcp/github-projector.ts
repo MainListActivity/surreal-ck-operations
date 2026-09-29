@@ -21,13 +21,18 @@ export function createGhCliGateway(repository: string): GithubGateway {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error('invalid GitHub repository');
   const run = async (args: string[]): Promise<string> => {
     const child = Bun.spawn(['gh', ...args], { stdout: 'pipe', stderr: 'pipe' });
-    const [output, , status] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited,
-    ]);
-    if (status !== 0) throw new Error(`gh operation failed (${args[0]}, exit ${status})`);
-    return output.trim();
+    const timeout = setTimeout(() => child.kill(), 60_000);
+    try {
+      const [output, stderr, status] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      if (status !== 0) throw new Error(`gh operation failed (${args[0]}, exit ${status}): ${stderr.slice(0, 300)}`);
+      return output.trim();
+    } finally {
+      clearTimeout(timeout);
+    }
   };
   const withBody = async (body: string, operation: (file: string) => Promise<string>) => {
     const dir = await mkdtemp(join(tmpdir(), 'sck-gh-projection-'));
@@ -163,12 +168,20 @@ export function createGithubProjector(input: {
         // the previous event ID, which resolves to its sequence in the DB.
         const events = await core.listOutbox(credential, after);
         if (events.length > 1000) throw new Error('core outbox page exceeds contract limit');
+        let failed = 0;
         for (const event of events) {
           if (completed.has(event.id)) continue;
-          await projectEvent(event, state);
-          completed.add(event.id);
-          projected++;
+          try {
+            await projectEvent(event, state);
+            completed.add(event.id);
+            projected++;
+          } catch (error) {
+            failed++;
+            // One poisoned event must not block the whole backlog; it retries next pass.
+            console.error(`projection skipped event ${String(event.id)} (${event.kind}): ${(error as Error).message}`);
+          }
         }
+        if (failed) console.error(`projection: ${failed} event(s) failed this pass`);
         if (events.length < 1000) break;
         const next = events.at(-1)?.id;
         if (!next || next === after) throw new Error('core outbox cursor did not advance');
