@@ -23,6 +23,7 @@ try {
   service = createMcpHttpService({
     core, port,
     ready: async () => Boolean(await db.db.select(new RecordId('company_meta', 'installation'))),
+    heal: () => db.ensureConnected(),
   });
   console.log(`MCP listening on 127.0.0.1:${service.port}`);
 

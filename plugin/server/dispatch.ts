@@ -141,6 +141,8 @@ export function startDispatch(server: PluginServerContext): () => void {
         failures++;
         wait = Math.min(wait * 2 ** Math.min(failures, 5), 300_000);
         console.error(`tick failed: ${(error as Error).message}`);
+        // A dropped SurrealDB socket never heals on its own; rebuild it so the next tick can run.
+        await company().then(c => c.db.ensureConnected()).catch(() => {});
       }
       await nap(wait);
     }

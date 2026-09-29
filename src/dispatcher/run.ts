@@ -53,6 +53,7 @@ try {
       failures++;
       wait = Math.min(wait * 2 ** Math.min(failures, 5), 300_000);
       console.error(`${new Date().toISOString()} tick failed: ${(error as Error).message}`);
+      await db.ensureConnected().catch(() => undefined);
     }
     await delay(wait, undefined, { signal: stop.signal }).catch(() => undefined);
   }
