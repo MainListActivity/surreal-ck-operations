@@ -858,3 +858,61 @@ test('checkpoint limit rejects chatter and heartbeat still renews the lease', as
   const renewed = await core.heartbeat(tokens['eng-a'], proof);
   expect(renewed.task.state).toBe('doing');
 });
+
+test('model slots: auto defs resolve to newest family model; stale idle instances rotate out before dispatch', async () => {
+  await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  await database.db.query('UPDATE employee_def SET enabled = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4, session_max_wakes: 0, session_max_input_k: 0 };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'auto:sol', thinking: 'medium', maxInstances: 2, priority: 10 });
+  const paseo = new FakePaseo();
+  const notices: string[] = [];
+  const slots: Record<string, string> = { 'codex:sol': 'gpt-6.1-sol' };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, notify: async (_t, text) => { notices.push(text); }, models: async () => ({ ...slots }) });
+  const mkTask = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+
+  // Phase 1: auto:sol resolves to the listed model; the instance records the concrete id.
+  await mkTask('slot 任务一');
+  let report = await dispatcher.tick();
+  expect(report.woke).toHaveLength(1);
+  const inst1 = report.woke[0].employee;
+  expect([...paseo.agents][0][1].spawn).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  const [[e1]] = await database.db.query<[[{ model?: string }]]>('SELECT model FROM $e;', { e: new RecordId('employee', inst1) });
+  expect(e1.model).toBe('gpt-6.1-sol');
+
+  // Phase 2: upstream publishes gpt-6.2-sol while inst1 is busy → it survives the tick
+  // and finishes its session; the next task spawns a fresh instance on 6.2.
+  slots['codex:sol'] = 'gpt-6.2-sol';
+  const agent1 = [...paseo.agents][0][0];
+  paseo.set(agent1, 'running');
+  await mkTask('slot 任务二');
+  report = await dispatcher.tick();
+  expect(report.retired).not.toContain(inst1);
+  expect(report.woke).toHaveLength(1);
+  const inst2 = report.woke[0].employee;
+  expect(inst2).not.toBe(inst1);
+  expect(paseo.agents.get([...paseo.agents][1][0])!.spawn).toMatchObject({ model: 'gpt-6.2-sol' });
+
+  // Phase 3: inst1 goes idle → next tick retires it BEFORE dispatch; task3 reuses inst2
+  // (already on the current model) rather than spawning again.
+  paseo.set(agent1, 'idle');
+  paseo.set([...paseo.agents][1][0], 'idle');
+  await mkTask('slot 任务三');
+  report = await dispatcher.tick();
+  expect(report.retired).toContain(inst1);
+  expect(paseo.archived).toContain(agent1);
+  expect(report.woke).toHaveLength(1);
+  expect(report.woke[0]).toMatchObject({ employee: inst2, spawned: false });
+  expect(notices.some(n => n.includes('gpt-6.2-sol'))).toBe(true);
+
+  // Phase 4: slot resolution disappears (provider listModels failing) → defs cannot spawn
+  // and the owner is told; the existing current-model instance still serves work.
+  paseo.set([...paseo.agents][1][0], 'idle');
+  delete slots['codex:sol'];
+  await mkTask('slot 任务四');
+  report = await dispatcher.tick();
+  expect(report.woke.filter(w => w.spawned)).toHaveLength(0);
+  expect(report.woke).toHaveLength(1); // inst2 still reusable on last-known model
+  expect(notices.some(n => n.includes('模型槽位无法解析'))).toBe(true);
+});

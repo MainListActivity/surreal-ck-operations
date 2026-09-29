@@ -1,7 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { RpcInput } from "@getpaseo/plugin";
 import { company } from "./company";
-import { refreshQuota } from "./dispatch";
+import { refreshModels, refreshQuota } from "./dispatch";
 import * as rpc from "../shared/rpc";
 
 const SOURCE = "owner:paseo-plugin";
@@ -74,6 +74,11 @@ export function registerHandlers(server: PluginServerContext): void {
     const statusById = new Map<string, string>(
       (agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
     const usageEntries = paseo ? await refreshQuota(paseo, await company()).catch(() => []) : [];
+    const modelSlots = paseo ? await refreshModels(paseo, await company()).catch(() => ({} as Record<string, string>)) : {};
+    const showModel = (d: { provider: string; model?: string }): string =>
+      d.model?.startsWith("auto:")
+        ? `${d.model} → ${modelSlots[`${d.provider}:${d.model.slice(5)}`] ?? "未解析"}`
+        : d.model ?? "";
     return {
       paused: cfg.paused,
       usage: usageEntries.map((u: any) => ({
@@ -82,7 +87,7 @@ export function registerHandlers(server: PluginServerContext): void {
         balances: (u.balances ?? []).map((b: any) => ({ label: b.label, remaining: b.remaining, limit: b.limit, unit: b.unit, tone: b.tone })),
       })),
       defs: (await workforce.defs()).map(d => ({
-        id: d.id, role: d.role, provider: d.provider, model: d.model,
+        id: d.id, role: d.role, provider: d.provider, model: showModel(d),
         enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
       })),
       instances: (await workforce.insts()).map(i => ({
