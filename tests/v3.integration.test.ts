@@ -245,7 +245,7 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   // Isolate from tasks created by earlier tests in this file.
   await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4 };");
-  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', priority: 10 });
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', priority: 10 });
   await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', priority: 20 });
   const paseo = new FakePaseo();
   const notices: string[] = [];
@@ -261,7 +261,7 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect(codexInst).toMatchObject({ task: t.id, spawned: true });
   expect(codexInst.employee.startsWith('engineering-codex-')).toBe(true);
   const [codexAgent, spawned] = [...paseo.agents][0];
-  expect(spawned.spawn).toMatchObject({ provider: 'codex', model: 'gpt-6-sol', mode: 'full-access', workspaceTitle: 'SCK · engineering-codex' });
+  expect(spawned.spawn).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', mode: 'full-access', workspaceTitle: 'SCK · engineering-codex' });
   expect(spawned.spawn!.prompt).toContain(`"taskId":"${t.id}"`);
   expect(spawned.spawn!.prompt).not.toContain(tokenOf(codexInst.employee));
   expect((await dispatcher.tick()).woke).toHaveLength(0);
@@ -497,7 +497,7 @@ test('dispatcher: jev api failures retry then fall back to the llm judge', async
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
     rand: () => 0, jev: broken });
   await workforce.upsertDef('eval-grok', { role: 'eval', provider: 'grok', model: 'grok-4.7', thinking: 'medium', weight: 60 });
-  await workforce.upsertDef('eval-codex', { role: 'eval', provider: 'codex', model: 'gpt-6-sol', thinking: 'low', weight: 30 });
+  await workforce.upsertDef('eval-codex', { role: 'eval', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'low', weight: 30 });
 
   const t = await core.createTask(tokens.gm, { title: 'Jev unreachable', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
@@ -519,8 +519,8 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   await database.db.query("UPDATE goal SET state = 'cancelled' WHERE state = 'triage';");
   await database.db.query('DELETE provider_health;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
-  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6-sol', thinking: 'high', maxInstances: 2 });
-  await workforce.upsertDef('product-codex', { role: 'product', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 2 });
+  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'high', maxInstances: 2 });
+  await workforce.upsertDef('product-codex', { role: 'product', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
   const answers = { tier: 'quick', tierConfidence: 0.92, go: 0.9, redLine: 0.05, needsOwner: 0.1 };
   const asked: string[] = [];
   const jev: JevClient = {
@@ -624,7 +624,7 @@ test('dispatcher spawns instances in the workspace of the goal project and only 
   await database.db.query('DELETE provider_health;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
   await database.db.query("UPDATE employee_def SET enabled = false WHERE role = 'engineering';");
-  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 4 });
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 4 });
   await new ProjectStore(database.db).upsert({ id: 'wsproj', name: 'WS', repoPath: '/repo/wsproj', release: 'CI', envs: [{ name: 'production' }] });
   const goal = await owner.createGoal({ text: '工作区归属测试', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj' });
   const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
@@ -663,8 +663,8 @@ test('dispatcher: a returned task goes back to its submitter for rework, review 
   await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
   await database.db.query('UPDATE employee_def SET enabled = true, error_streak = 0;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
-  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 1 });
-  await workforce.upsertDef('qa-codex', { role: 'qa', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('qa-codex', { role: 'qa', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
   const paseo = new FakePaseo();
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
   const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
