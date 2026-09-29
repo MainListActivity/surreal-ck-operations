@@ -567,7 +567,7 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND state != 'done';
         LET $next = UPDATE ONLY $task SET
-          state = IF array::len($remaining) = 0 THEN $t.resume_state ELSE 'blocked' END,
+          state = IF array::len($remaining) = 0 THEN (IF $t.resume_state = 'doing' THEN 'ready' ELSE $t.resume_state END) ELSE 'blocked' END,
           resume_role = NONE, resume_state = NONE, blocked_to = NONE, version = $t.version + 1 RETURN AFTER;
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;

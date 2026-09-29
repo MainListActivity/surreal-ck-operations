@@ -137,7 +137,7 @@ export class Dispatcher {
     const work = [
       ...tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
         .map(t => ({ task: t, role: t.reviewerRole, purpose: 'review' })),
-      ...tasks.filter(t => t.state === 'ready' && !t.currentEmployee)
+      ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' })),
     ];
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');

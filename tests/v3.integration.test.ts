@@ -581,3 +581,13 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   expect(report.decisions).not.toContain(`reroute:${ask.id}`);
   expect((await owner.inbox()).questions.map(q => q.task.id)).toContain(ask.id);
 });
+
+test('a task blocked while doing returns to ready on resume so the dispatcher can pick it up', async () => {
+  const t = await core.createTask(tokens.gm, { title: '阻塞后恢复', context: '验证恢复后重新可领取', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  const held = await core.claim(tokens['eng-a'], t.id);
+  await core.block(tokens['eng-a'], proofOf(held), 'gm', { text: '缺少一个前置信息，需要经理协调补充后再恢复本任务继续执行。', idempotencyKey: key() });
+  const resumed = await core.resume(tokens.gm, t.id, { text: '经理决定：按原方案继续执行，缺少的前置信息已经补充完整。', idempotencyKey: key() });
+  expect(resumed.state).toBe('ready');
+  expect((await core.claim(tokens['eng-b'], t.id)).task.state).toBe('doing');
+});
