@@ -1,15 +1,14 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
 
 const OWNER = 'surreal-ck-operations/issue-23/v1';
-const SCHEMA = readFileSync(fileURLToPath(new URL('../schema/001-control.surql', import.meta.url)), 'utf8');
-const OUTBOX_INDEX = readFileSync(fileURLToPath(new URL('../schema/002-outbox-sequence.surql', import.meta.url)), 'utf8');
-const WORKFORCE = readFileSync(fileURLToPath(new URL('../schema/003-workforce.surql', import.meta.url)), 'utf8');
-const EVAL = readFileSync(fileURLToPath(new URL('../schema/004-eval.surql', import.meta.url)), 'utf8');
-const JEV = readFileSync(fileURLToPath(new URL('../schema/005-jev.surql', import.meta.url)), 'utf8');
-const FLOW = readFileSync(fileURLToPath(new URL('../schema/006-flow.surql', import.meta.url)), 'utf8');
+
+// Lazy: runtimes that only query (e.g. the Paseo plugin subprocess) may not have schema/ beside the bundle.
+const loadSchema = (file: string) =>
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'schema', file), 'utf8');
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -67,16 +66,16 @@ export class CompanyDatabase {
       await this.db.query(`DEFINE DATABASE ${this.config.database};`);
       await this.db.use({ namespace: this.config.namespace, database: this.config.database });
     }
-    await this.db.query(SCHEMA);
+    await this.db.query(loadSchema('001-control.surql'));
     if (fresh) {
       await this.db.query('CREATE company_meta:installation CONTENT { owner: $owner, schema_version: 1 };', { owner: OWNER });
     }
     await this.ensureOutboxSequence();
-    await this.db.query(OUTBOX_INDEX);
-    await this.db.query(WORKFORCE);
-    await this.db.query(EVAL);
-    await this.db.query(JEV);
-    await this.db.query(FLOW);
+    await this.db.query(loadSchema('002-outbox-sequence.surql'));
+    await this.db.query(loadSchema('003-workforce.surql'));
+    await this.db.query(loadSchema('004-eval.surql'));
+    await this.db.query(loadSchema('005-jev.surql'));
+    await this.db.query(loadSchema('006-flow.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 6 WHERE schema_version < 6;');
   }
 
@@ -101,6 +100,11 @@ export class CompanyDatabase {
       counter, value: events.length,
     });
     await this.db.query('UPDATE company_meta:installation SET schema_version = 2;');
+  }
+
+  /** Selects the configured namespace/database without touching schema (runtimes that only query). */
+  async useDatabase(): Promise<void> {
+    await this.db.use({ namespace: this.config.namespace, database: this.config.database });
   }
 
   async close(): Promise<void> { await this.db.close(); }
