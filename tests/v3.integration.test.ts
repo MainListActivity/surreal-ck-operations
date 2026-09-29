@@ -619,3 +619,22 @@ test('dispatcher spawns instances in the workspace of the goal project and only 
   const inst = (await workforce.insts()).find(i => i.cwd === '/repo/wsproj')!;
   expect(inst.role).toBe('engineering');
 });
+
+test('dispatcher still spawns for a project when the def is at capacity in another project', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-devin', { role: 'engineering', provider: 'devin', model: 'swe-2-high', thinking: 'high', maxInstances: 1 });
+  const opsInst = await workforce.spawnInst((await workforce.defs()).find(d => d.id === 'engineering-devin')!);
+  await workforce.bind(opsInst.id, { agentId: 'ops-eng-agent', cwd: '/ops' });
+  await new ProjectStore(database.db).upsert({ id: 'wsproj2', name: 'WS2', repoPath: '/repo/wsproj2', release: 'CI', envs: [{ name: 'production' }] });
+  const goal = await owner.createGoal({ text: '跨项目编制', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj2' });
+  const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
+  const paseo = new FakePaseo();
+  paseo.agents.set('ops-eng-agent', { status: 'idle', error: '' });
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck' }, rand: () => 0 });
+  const report = await dispatcher.tick();
+  expect(report.woke.find(w => w.task === impl.id)?.spawned).toBe(true);
+  const spawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(impl.id))!.spawn!;
+  expect(spawn.cwd).toBe('/repo/wsproj2');
+});
