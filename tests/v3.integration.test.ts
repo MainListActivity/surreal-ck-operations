@@ -591,3 +591,13 @@ test('a task blocked while doing returns to ready on resume so the dispatcher ca
   expect(resumed.state).toBe('ready');
   expect((await core.claim(tokens['eng-b'], t.id)).task.state).toBe('doing');
 });
+
+test('a task whose dependencies are already done is created ready', async () => {
+  const dep = await core.createTask(tokens.gm, { title: '已完成的前置', context: '前置任务', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  await execute(tokens['eng-a'], dep.id, '前置任务已完成，提供足够长度的交付证据文本。');
+  await review(tokens['eng-b'], dep.id);
+  const child = await core.createTask(tokens.gm, { title: '依赖已完成的后续', context: '后续任务', executorRole: 'engineering',
+    reviewerRole: 'engineering', dependencies: [dep.id], idempotencyKey: key() });
+  expect(child.state).toBe('ready');
+});

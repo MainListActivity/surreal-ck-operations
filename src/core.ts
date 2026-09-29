@@ -268,9 +268,10 @@ export class SurrealCompanyCore implements CompanyCore {
           LET $d = SELECT * FROM ONLY $dep;
           IF $d = NONE { THROW 'dependency not found' };
         };
+        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dependencies AND state != 'done';
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          dependencies: $dependencies, state: IF array::len($dependencies) = 0 THEN 'ready' ELSE 'blocked' END,
+          dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
           kind: $kind, goal: $goal, created_at: time::now()
