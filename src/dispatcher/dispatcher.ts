@@ -167,7 +167,9 @@ export class Dispatcher {
         (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
       const ok = (inst: EmployeeInst) => inst.role === role && ready(inst) && !assigned.has(inst.id) &&
         !holding.has(inst.id) && inst.id !== task?.submittedBy && this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
-      const candidates = insts.filter(ok);
+      // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
+      const home = task?.repoPath ?? this.deps.env.opsRepo;
+      const candidates = insts.filter(i => ok(i) && (i.cwd ?? this.deps.env.opsRepo) === home);
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       const previous = candidates.find(i => i.id === task?.previousEmployee);
@@ -407,13 +409,14 @@ export class Dispatcher {
       try {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model: def.model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
+          mode: UNATTENDED_MODE[def.provider], cwd: task?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: { SCK_EMPLOYEE_CREDENTIAL_FILE: inst.credentialFile! },
           prompt: prompt(inst, true),
         });
-        await wf.bind(inst.id, { agentId });
-        const bound = { ...inst, paseoAgentId: agentId };
+        const cwd = task?.repoPath ?? env.opsRepo;
+        await wf.bind(inst.id, { agentId, cwd });
+        const bound = { ...inst, paseoAgentId: agentId, cwd };
         insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');

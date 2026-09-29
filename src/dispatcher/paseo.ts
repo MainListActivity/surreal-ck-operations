@@ -47,7 +47,8 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
   const json = async <T>(args: string[]): Promise<T> => JSON.parse(await run([...args, '--json'])) as T;
   const workspaces = new Map<string, Promise<string>>();
   const ensureWorkspace = (title: string, cwd: string): Promise<string> => {
-    const known = workspaces.get(title);
+    const key = `${title}\0${cwd}`;
+    const known = workspaces.get(key);
     if (known) return known;
     const found = (async () => {
       const rows = await json<Array<{ workspaceId: string; name: string; cwd: string }>>(['workspace', 'ls']);
@@ -58,8 +59,8 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
       if (!id) throw new Error('paseo workspace create did not return a workspace ID');
       return id;
     })();
-    workspaces.set(title, found);
-    found.catch(() => workspaces.delete(title));
+    workspaces.set(key, found);
+    found.catch(() => workspaces.delete(key));
     return found;
   };
   return {
