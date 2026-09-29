@@ -2,3 +2,5 @@ node_modules/
 .env
 .runtime/
 *.log
+plugin/node_modules/
+plugin/server/vendor/

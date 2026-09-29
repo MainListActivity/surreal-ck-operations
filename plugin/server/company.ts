@@ -1,0 +1,59 @@
+// Lazily boots the company stack inside the plugin's Node subprocess.
+// Repo modules live under server/vendor (copied by scripts/vendor.sh at install/update).
+import { installBunShim } from "./bun-shim";
+import { loadServiceEnv } from "./env";
+import { spawn } from "node:child_process";
+
+export interface Company {
+  db: import("./vendor/src/database").CompanyDatabase;
+  owner: import("./vendor/src/owner").OwnerDesk;
+  workforce: import("./vendor/src/workforce").Workforce;
+  dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
+}
+
+let boot: Promise<Company> | undefined;
+
+const notify = async (title: string, text: string) => {
+  const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 240);
+  const child = spawn("/usr/bin/osascript", ["-e", `display notification "${esc(text)}" with title "${esc(title)}"`],
+    { stdio: "ignore" });
+  await new Promise<void>(resolve => child.once("close", () => resolve()));
+};
+
+export function company(): Promise<Company> {
+  boot ??= (async () => {
+    installBunShim();
+    loadServiceEnv();
+    const { loadDatabaseConfig } = await import("./vendor/src/config.ts");
+    const { CompanyDatabase } = await import("./vendor/src/database.ts");
+    const { OwnerDesk } = await import("./vendor/src/owner.ts");
+    const { Workforce } = await import("./vendor/src/workforce.ts");
+    const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
+    const { createGitCli } = await import("./vendor/src/dispatcher/worktrees.ts");
+    const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
+
+    const db = new CompanyDatabase(loadDatabaseConfig());
+    await db.connect();
+    await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
+    const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
+    const owner = new OwnerDesk(db);
+    const dispatcher = new Dispatcher({
+      workforce,
+      owner,
+      paseo: createPaseoCli(),
+      env: {
+        opsRepo: process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations",
+        sckBin: process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`,
+        paseoBin: process.env.SCK_PASEO_BIN ?? "/Applications/Paseo.app/Contents/Resources/bin/paseo",
+      },
+      notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
+      log: message => console.log(message),
+      jev: jevFromEnv(),
+      git: createGitCli(),
+    });
+    return { db, owner, workforce, dispatcher };
+  })();
+  boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
+  return boot;
+}
