@@ -11,6 +11,8 @@ export interface SpawnInput {
   thinking?: string;
   mode?: string;
   cwd: string;
+  /** One Paseo workspace per employee definition; every instance of the definition runs as an agent inside it. */
+  workspaceTitle: string;
   labels: Record<string, string>;
   env: Record<string, string>;
   prompt: string;
@@ -43,6 +45,23 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     }
   };
   const json = async <T>(args: string[]): Promise<T> => JSON.parse(await run([...args, '--json'])) as T;
+  const workspaces = new Map<string, Promise<string>>();
+  const ensureWorkspace = (title: string, cwd: string): Promise<string> => {
+    const known = workspaces.get(title);
+    if (known) return known;
+    const found = (async () => {
+      const rows = await json<Array<{ workspaceId: string; name: string; cwd: string }>>(['workspace', 'ls']);
+      const existing = rows.find(w => w.name === title && w.cwd === cwd);
+      if (existing) return existing.workspaceId;
+      const created = await json<{ workspaceId?: string; id?: string }>(['workspace', 'create', '--isolation', 'local', '--path', cwd, '--title', title]);
+      const id = created.workspaceId ?? created.id;
+      if (!id) throw new Error('paseo workspace create did not return a workspace ID');
+      return id;
+    })();
+    workspaces.set(title, found);
+    found.catch(() => workspaces.delete(title));
+    return found;
+  };
   return {
     async list() {
       const rows = await json<Array<{ id: string; status: string }>>(['ls', '-g']);
@@ -66,7 +85,8 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
       return run(['logs', agentId, '--tail', String(entries), '--no-color']).catch(error => `（无法读取会话日志：${error.message}）`);
     },
     async spawn(input) {
-      const args = ['run', '-d', '--json', '--provider', `${input.provider}/${input.model}`, '--title', input.title, '--cwd', input.cwd];
+      const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd);
+      const args = ['run', '-d', '--json', '--provider', `${input.provider}/${input.model}`, '--title', input.title, '--workspace', workspace];
       if (input.thinking) args.push('--thinking', input.thinking);
       if (input.mode) args.push('--mode', input.mode);
       for (const [k, v] of Object.entries(input.labels)) args.push('--label', `${k}=${v}`);

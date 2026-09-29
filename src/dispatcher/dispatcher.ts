@@ -407,7 +407,7 @@ export class Dispatcher {
       try {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model: def.model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: env.opsRepo,
+          mode: UNATTENDED_MODE[def.provider], cwd: env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: { SCK_EMPLOYEE_CREDENTIAL_FILE: inst.credentialFile! },
           prompt: prompt(inst, true),
