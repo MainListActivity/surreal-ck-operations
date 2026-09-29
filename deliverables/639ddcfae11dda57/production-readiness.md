@@ -1,133 +1,87 @@
-# SCK-LCA-03 生产就绪包
+# SCK-LCA-03 发布准备方案
 
 - 员工：engineering-grok-4e9709
 - 任务：d5ba0dea-2ce3-40ed-8ea4-f27f3fd7d4fa
 - 目标：639ddcfae11dda57
 - 分支：task/d5ba0dea
-- 原票：surreal_ck `.scratch/legal-content-access/issues/03-authorized-content-reader.md`（8 条 AC，未关闭）
-- 本轮只读。没有停写、没有改 `/etc/surreal-ck/server.env`、没有执行复制、没有切换 `current`、没有合入 PR、没有登记 `env_secret`、没有打印任何凭证值。
+- 上一版：ef8306a6bbd0f270d3fe947c91b192a438349bf5
+- 经理恢复（version 6）后的边界：这是发布准备方案，不是读者已在生产可用的证明。本轮没有合入、没有停写、没有复制、没有切换 origin、没有改 ma_hono、没有用 root 冒充用户、没有改现有客户工作区。
 
-验收身份和客户读取许可在已查来源里不存在，8 条 AC 不能对应到可领取的生产测试身份。部署与复制步骤本身可以执行，且不需要改写或删除已有生产数据，也不碰 `surrealdb.service`、root 凭证或数据目录。缺项不能当成通过。
+产品可以按本文验收“步骤真实、责任明确”。文中凡写“待部署执行”的项都还不是生产通过。
 
-## 已核对的事实
+## 已完成
 
-### 远端工作流与回滚点
+### 发布链（只读）
 
-输入：claim 返回的 `project.release` / `project.rollback` / `project.notes`，以及 origin/main 上的工作流。操作：`git fetch` 后阅读 `origin/main`，并用 `gh run list` / `gh run view` / `gh api` 看检查结果；SSH 只读 `current`、发布目录名和服务状态。
+claim 返回的现行 `project.release`：Quality gate 后合入 main，GitHub Actions 的 Deploy production 先 Deploy origin，再发 Cloudflare。不允许 SSH 上主机发布。新的服务端环境变量用 `gh secret set ORIGIN_ENV_<NAME> --env production`，由 CI 写入 server.env。需要停写的一次性迁移放进 `scripts/deploy/origin-pre-start.sh`，CI 在停服务后执行。
 
-| 项 | 结果 |
+核对结果：
+
+| 项 | 证据 |
 | --- | --- |
-| origin/main | `e8e4a5aa8db99ca21813005a8dfd4a42ec27f9cb`。其上 4 个提交（#31–#34）都带 `[skip ci]`，该提交没有 Quality gate，只有一次手动 Deploy origin 的 job 成功。不能把这个 SHA 当作应用回滚点。 |
-| 本地产品共享检出 | 仍是 `15c49fb933dd473d25498799d5ac2425d959c743`，比 origin/main 落后 4 个提交，工作树另有无关改动。本任务未改共享检出。 |
-| 现行发布链 | `origin/main:.github/workflows/deploy-production.yml`：job `origin` 调用 `Deploy origin`，job `deploy`（Cloudflare）`needs: origin`。origin 不健康时 Cloudflare 不会发布。 |
-| 主机 | `ubuntu@129.146.179.37`。`surreal-ck-hono` 与 `surrealdb` 均为 active。 |
-| 当前 origin | `/home/ubuntu/surreal_ck/current` → `releases/af8c8b3-ci36491649136`。代码 SHA `af8c8b3087ef4d033a40063fdb39c39da2325893`（#28）。成功运行：https://github.com/MainListActivity/surreal_ck/actions/runs/36491649136 （2026-09-28T22:20:15Z）。日志：从 `releases/af8c8b3` 切到该目录后 healthy。 |
-| 自动回滚目标 | 同一次切换的上一目录是 `releases/af8c8b3`，与当前是同一提交。下一次失败部署会切回现在的 `af8c8b3-ci36491649136`。 |
-| 更早且通过 Quality gate 的提交 | `f1e5bf750698483548428b8635270049c1dcb878`（#27，其 Cloudflare Deploy production 已成功）。主机上还留有目录 `013023cad77720063c3d1febd453696fdae1d6d3`（#26）。手动 Deploy origin 只能填已经通过 Quality gate 的完整 SHA。 |
-| 生产健康 | `GET https://l.maplayer.top/health` 返回 `status=ok` 且 `surrealdb=up`。应用与营销站 HTTP 200。这只说明当前 af8c8b3 origin 活着，不说明 #29 或 PR #30 已上线。 |
+| origin/main | `e8e4a5aa8db99ca21813005a8dfd4a42ec27f9cb`。#31–#34 带 `[skip ci]`，没有 Quality gate，不能当应用回滚点。Deploy production 的 Cloudflare job `needs: origin`。 |
+| 本地产品检出 | 仍停在 `15c49fb`，其 `docs/runbooks/production-release.md` 只写 Cloudflare。origin/main 的同一文件已经写成先 origin。后续执行以 origin/main 和工作流为准，不能按这份旧手册漏发 origin。共享检出本轮未改。 |
+| 当前 origin | `af8c8b3087ef4d033a40063fdb39c39da2325893`，目录 `releases/af8c8b3-ci36491649136`。成功运行 https://github.com/MainListActivity/surreal_ck/actions/runs/36491649136 。自动回滚上一目录是同一提交的 `releases/af8c8b3`。更早且通过 Quality gate 的提交是 `f1e5bf750698483548428b8635270049c1dcb878`。 |
+| #29 | `15c49fb933dd473d25498799d5ac2425d959c743`，Quality gate https://github.com/MainListActivity/surreal_ck/actions/runs/36059850053 成功。当日 Cloudflare https://github.com/MainListActivity/surreal_ck/actions/runs/36060079192 成功，那时还没有 origin job。主机 current 不是这个 SHA。 |
+| 密钥名 | GitHub production secret `ORIGIN_ENV_CONTENT_PUBLISHER_SECRET` 已存在（更新时间 2026-09-29T00:50:42Z）。只核对了名称，没有读取值。 |
+| 迁移钩子 | PR https://github.com/MainListActivity/surreal_ck/pull/36 ，head `9641a3a046947e533890fc634d0e09f27bf37d2e`，Quality gate https://github.com/MainListActivity/surreal_ck/actions/runs/36505327347 成功，未合入。钩子在旧服务已停止后执行 `bun run --env-file="$ORIGIN_ENV_FILE" src/content/migrate-legacy-cli.ts --writes-frozen`。只复制，已有行只做一致性断言，不删除。 |
 
-#29 合并提交 `15c49fb933dd473d25498799d5ac2425d959c743` 的 Quality gate 成功：https://github.com/MainListActivity/surreal_ck/actions/runs/36059850053 。同日 Cloudflare Deploy production 成功：https://github.com/MainListActivity/surreal_ck/actions/runs/36060079192 。那次工作流还没有 origin job。主机 `current` 不是 15c49fb，发布目录列表里也没有 15c49fb。隔离内容库尚未进 origin。
+`15c49fb` 的 `migrate-legacy.ts` 对 `_system` 的 18 张表做 create-if-missing，不一致就抛错，然后写 `content_migration_state:legacy`。`startServer` 在没有该标记且 `_system` 已有内容时拒绝启动。因此钩子必须在切换 `current` 之前成功。代码回滚不删除已复制的行。
 
-### 运行手册差异
+此前只读计数（仍是准备基线，本轮没有再复制）：`platform_content` 不存在；`_system` 中 content_item 1807 且全部 published（legislation 24，judicial_document 1783）。18 表行数见上一版提交。许可动作只有 submit/publish/withdraw/restore。`source_license_revision` 的 UPDATE 会抛不可变错误。
 
-`15c49fb` 的 `docs/runbooks/production-release.md` 只写 Cloudflare，并写明 origin 由主机另行管理。`origin/main` 的同一文件已经改成：Deploy production 先 Deploy origin，90 秒内 `http://127.0.0.1:8080/health` 必须出现 `"status":"ok","surrealdb":"up"`，失败则切回上一 `current` 且不发布 Cloudflare。这与 claim 里的 `project.release` 一致。
+源库标识，只作定位，不表示客户可以读：
 
-后续执行不能按本地落后的 15c49fb 手册只发 Cloudflare。origin/main 的顺序已经对齐，不需要为这句话再改一份产品代码。后续代码任务只在工作流再次偏离 `project.release` 时修改手册。发布工具取自工作流所在分支，应用代码单独检出（#34）。
+| kind | publication_status | public_id |
+| --- | --- | --- |
+| legislation | published | item_052c480ddfdf4755921cbb26e045e7a2 |
+| legislation | published | item_06982d29e23b4d2a9db1a5c4b88842a6 |
+| judicial_document | published | debug_publish_probe |
 
-### 内容库与迁移入口
+这些 id 的动作矩阵、不可变新修订和可撤回/到期样本属于 product→gm 任务 `b068f582-dbef-4c97-8ce9-694fdb6104b4`。本方案不把 submit/publish 解释成 read，也不新增许可行。目标库里的 public_id 要等复制后再核对。
 
-输入：主机 `/etc/surreal-ck/server.env` 只判断键是否存在、值是否达到 32 字符；用现行 origin 自带的 bun（`/home/ubuntu/.bun/bin/bun --env-file=/etc/surreal-ck/server.env`）对 `main` 做计数。没有选出正文、邮箱、subject 或密钥。
+### 验收身份（IdP 已开通，工作区未激活）
 
-| 项 | 结果 |
-| --- | --- |
-| `CONTENT_PUBLISHER_SECRET` | 不存在。 |
-| `CONTENT_DATABASE` | 未设置。15c49fb 的代码默认 `platform_content`。 |
-| `platform_content` 库 | 不存在。 |
-| `content_migration_state` | `_system` 中不存在。 |
-| `content_authorization_projection` / `content_read_gate` | 不存在。 |
-| `workspace_product_entitlement`、`content_grant`、`product_plan`、`content_collection` | `_system` 中不存在。权益表随 #29 的 schema，尚未进这台 origin。 |
-| 命名空间 | `main`。另有库 `_system`、`control_plane`、`d`、`docs`、`main`、以及 1 个 `ws_` 工作区库。 |
+入口是现有租户 `https://o.maplayer.top/t/ck` 的自助注册 `POST https://auth.maplayer.top/api/t/ck/register`，以及 `POST https://auth.maplayer.top/api/login/ck/password`。没有改 ma_hono，没有伪造 token。密码只通过 `put_secret` 写入 production，角色 engineering、qa、product。值不在本文。
 
-`_system` 中待复制表的行数（2026-09-28 只读计数）：
+| 凭证名 | 邮箱 | subject | 角色 |
+| --- | --- | --- | --- |
+| LCA03_A_ADMIN_PASSWORD | sck-lca03-a-admin@maplayer.top | 014ac9c4-4423-4e03-9507-356733f6d405 | 工作区 A 管理员 |
+| LCA03_A_MEMBER_PASSWORD | sck-lca03-a-member@maplayer.top | 0a06e1a6-a01c-411e-a5a6-fc368da83770 | 工作区 A 普通成员 |
+| LCA03_A_REMOVABLE_PASSWORD | sck-lca03-a-removable@maplayer.top | e1a62e00-4228-4ee8-a2f3-2615d90b7b47 | 工作区 A 可移除成员 |
+| LCA03_B_ADMIN_PASSWORD | sck-lca03-b-admin@maplayer.top | a1f12bef-27a4-471c-9c76-4ef14e49217d | 工作区 B 管理员 |
+| LCA03_NONMEMBER_PASSWORD | sck-lca03-nonmember@maplayer.top | 56af5eff-b491-4278-baf3-508d1e471512 | 非成员 |
 
-| 表 | 行数 |
-| --- | --- |
-| content_source | 9 |
-| source_license_revision | 12 |
-| content_item | 1807 |
-| content_source_record | 1806 |
-| content_version | 1808 |
-| legal_article_version | 3670 |
-| content_citation | 9228 |
-| citation_resolution | 10818 |
-| cites_article | 2603 |
-| cites_legislation | 2801 |
-| ingestion_batch | 359 |
-| ingestion_entry | 10633 |
-| validation_revision | 0 |
-| publication_request | 153 |
-| publication_item_result | 1810 |
-| publication_event | 1810 |
-| content_publication_projection | 1807 |
-| platform_content_audit_event | 524 |
+`POST https://l.maplayer.top/api/workspaces` 用 A/B 管理员的登录态创建 `sck-lca03-a`、`sck-lca03-b`。两次都返回 503 `workspace-template-apply-failed`：`The access method 'employee' already exists`。只读复核：两行 status=`provisioning_error`，stage=`policy_applied`，库 `ws_26d695c309e5` 与 `ws_fdc9ddd0e47a`，schema_version=4，ACCESS 已有 admin、employee、participant。重试会再次撞上同一错误。没有手写剩余模板，也没有删除这两个库。成员接口因此返回 workspace-not-found。现有客户工作区未改。
 
-`content_item.publication_status`：published 1807，没有 unpublished 或 withdrawn。kind：judicial_document 1783，legislation 24。
+所以：五个 IdP 用户可以登录；两个专用工作区还不是 active，普通成员还没加进去，可移除成员也还没加入。这不是生产验收通过。
 
-`content_source.allowed_actions` 与 `source_license_revision.allowed_actions` 只有 `submit`、`publish`、`withdraw`、`restore`。12 条许可修订里：8 条仅 submit，3 条 submit+publish，1 条四动词齐全。没有 search、read、cite、export，也没有 AI 的 research/generate。`source_license_revision` 在 schema 里对 UPDATE 抛 `immutable-platform-content-record`。不能靠改写这些行给客户开阅读权。
+## 待部署执行
 
-迁移实现在 15c49fb 的 `server/src/content/migrate-legacy-cli.ts` 与 `migrate-legacy.ts`。现行 af8c8b3 发布目录没有这条命令。CLI 在缺少 `--writes-frozen` 时直接退出。复制只对目标缺行 `create`，已存在且字段一致则跳过，不一致则抛错；核对全部 18 张表的行数、字段（忽略 `updated_at` / `last_seen_at`）和引用，然后写入 `content_migration_state:legacy`。源库 `_system` 没有删除语句。`package.json` 的 `content:migrate` 固定 `--env-file=../.env`，不能用于生产。生产入口是：
+责任角色写成后续任务，不把它们记成已通过。
 
-```bash
-/home/ubuntu/.bun/bin/bun --env-file=/etc/surreal-ck/server.env \
-  server/src/content/migrate-legacy-cli.ts --writes-frozen
-```
+| 项 | 入口 | 输入 | 责任 | 阻断 |
+| --- | --- | --- | --- | --- |
+| 激活两个工作区并加入成员 | `POST /api/workspaces` 重试，成功后再 `POST /api/workspaces/sck-lca03-a/members` | 已登记的五个账号 | 上线后的工程任务。当前 origin 的模板重试不能定义已存在的 ACCESS employee | 在 503 消失前，QA 不能做成员、移除成员或换票 |
+| 复制内容库 | PR #36 的 `origin-pre-start.sh` | `ORIGIN_ENV_CONTENT_PUBLISHER_SECRET`、冻结后的 `_system` | CI，在上线申请 `c4c80c02` 批准并合入之后 | 未批准不得合入。合入即发布 |
+| 权益、投影、content_reader | #29 代码加 PR #30 | 复制完成且 origin 健康 | 工程实现/修 CI；上线仍看 `c4c80c02` | PR #30 head `5384fd69847080cd39fbea1902d676e6965bced9` 的 Quality gate https://github.com/MainListActivity/surreal_ck/actions/runs/36459246415 在 Test 失败：runner 没有 `/home/runner/.surrealdb/surreal`。`fe3991c3` 可先修 CI，不得据此上线 |
+| 客户读取动作和可撤回样本 | 任务 `b068f582-dbef-4c97-8ce9-694fdb6104b4` | 上面的源 public_id 与现有许可 | product→gm | 没有该项结论时，不能把任何 public_id 当成可读样本 |
+| 目标库 id 核对 | 复制后的 `platform_content` 计数和 public_id | 钩子成功日志与 18 表行数 | 部署任务 `7c9fb60c` | 源、目标不一致就停止，不删除任一侧 |
 
-工作目录必须是 15c49fb 的检出或归档，并且已经 `pnpm install --frozen-lockfile`，且该目录不是 `current`。
+8 条 AC 都留到 origin 健康、工作区 active、且 `b068f582` 给出动作矩阵之后，由 QA 在 `7c9fb60c` 用 `get_secret` 的真实身份逐条测。模拟和本地结果不能替代。
 
-`startServer` 在 publisher 会话之前调用 `assertLegacyContentMigrated`。`_system` 已有内容行，目标没有 `content_migration_state:legacy` 时，15c49fb 进程会拒绝启动。因此必须先复制并写上标记，再让 Deploy origin 切换 `current`。健康检查失败时，脚本只把 `current` 切回上一目录并重启；`platform_content` 里已复制的行会留下。数据库不能随代码回滚，回退时也不删除这些新行或 `_system` 旧行。
+## 停写、写入者与回滚
 
-## 尚未执行的发布顺序
+观察到的内容写入者只有 `surreal-ck-hono` 这一个进程：`/home/ubuntu/.bun/bin/bun run --env-file=/etc/surreal-ck/server.env .../server/src/index.ts`。它提供 `POST /api/content/sources`、`/api/content/batches`、`/api/content/publications`，进程内的引用对账也在这里。主机 timer 里没有内容导入。TiDB、Grafana、Prometheus 与内容库无关，不要动。没有第二个 bun 内容进程。
 
-下面是给后续交付链的步骤。本任务没有执行其中任何写操作。
+只停 Hono 不能证明持有 root 的人不会直连 SurrealDB。冻结证明应是：`surreal-ck-hono` 为 inactive，且不再有上述 bun 进程；`surrealdb.service` 保持 active。不要改该服务、root 凭证或数据目录。
 
-1. 在主机上幂等准备密钥。键已存在且长度至少 32 时保持原值。键不存在时用密码学随机数生成长度远大于 32 的值，以 root 追加到 `/etc/surreal-ck/server.env`，不打印、不写入仓库或任务证据。若键存在但短于 32，停止并交回经理，不要静默换值。当前是“不存在”。
-2. 短暂停写：`systemctl stop surreal-ck-hono`。不要 stop、disable 或改写 `surrealdb.service`。停写要一直保持到新 origin 健康；代码里没有单独的冻结开关，停应用进程是现成的停写办法。
-3. 把 `15c49fb933dd473d25498799d5ac2425d959c743` 解到 `current` 以外的目录，安装冻结依赖，执行上面的 bun 命令。成功日志只有计数摘要，不能含密钥或正文。
-4. 只读复核：`platform_content` 上述 18 表行数与 `_system` 一致，引用可解析，`content_migration_state:legacy` 的 `source_database` 为 `_system`。`_system` 行数不得变少。
-5. 立刻对同一 SHA 跑 Deploy origin（或合入后由 Deploy production 的 origin job 执行）。`server.env` 已含新键，systemd 的 `bun run --env-file=/etc/surreal-ck/server.env` 会在新进程读到它。90 秒健康失败则自动回到 `af8c8b3-ci36491649136`。
-6. origin 健康后才允许 Cloudflare。15c49fb 的前端已在 2026-09-24 发过；重新发布必须走现在这条“先 origin”的工作流，不能补一次只发 Cloudflare 的旧路径。
-7. 若 origin 回滚：立刻再次停写。回滚后的旧进程若又写入 `_system`，重复迁移会在不一致行上失败。失败后停止，不删除任一侧。只有新增且未改旧行时，同一命令可以续跑。
-8. PR #30（https://github.com/MainListActivity/surreal_ck/pull/30 ，head `5384fd69847080cd39fbea1902d676e6965bced9`）仍是草稿。Quality gate https://github.com/MainListActivity/surreal_ck/actions/runs/36459246415 在 Test 失败：runner 上没有 `/home/runner/.surrealdb/surreal`，`reader-projection.integration.test.ts` 与 `reader.integration.test.ts` 无法启动。读者代码不能随这次复制一起合入。
+不要为了等 CI 长时间停写。PR #36 的钩子是在 Actions 已经检出通过 Quality gate 的提交、上传到主机之后才停服务。恢复版本在停写前就定好：失败时脚本切回 `af8c8b3-ci36491649136`（`af8c8b3087ef4d033a40063fdb39c39da2325893`）。需要退到不同提交时，用已经通过 Quality gate 的 `f1e5bf750698483548428b8635270049c1dcb878` 手动跑 Deploy origin。
 
-复制本身是新增库和新增行，核对失败时不删除。这不触碰项目红线。真正要避开的是：UPDATE 已有许可行、删除 `_system` 内容、以及改 SurrealDB 服务或 root 凭证。
+回滚后的旧进程会继续写 `_system`，而 `platform_content` 里可能已有副本。阻止双边写入：origin 健康之前不要把旧进程留在运行；若已经回滚，立刻把“`_system` 仍是唯一活写入、副本已过期”写进部署记录，并再次停写后才能重跑钩子。重跑只接受新增行；已复制行不一致就停止。不用删除或改写旧数据来修冲突。
 
-## 生产验收身份
+## 交给后续任务的约束
 
-查过的来源：
-
-- claim 的 `project.envs[0].secrets` 为空。`project.notes` 写明生产实测账号尚未登记。
-- `docs/agent-operations.md` 有登记路径：`printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production <名称> <角色> <用途>`，员工之后用 `get_secret` 领取。没有已有合规账号的值，所以没有调用 `secret set`，也没有调用 `get_secret`。
-- 生产 `_system.workspace`：1 个，status=active，名称不像 test/qa/验收。`user_workspace_index`：1 行，role=admin，`disabled_at` 为空。对应工作区库里 1 个 human 且 `is_admin=true`，1 个 virtual 且非 admin，没有 disabled。没有第二个工作区，没有 participant，没有非成员，没有已移除成员。
-- `platform_operator` 2 行、`system_admin` 1 行。这是运营/系统种子，不是工作区成员，也不能代替 AC 要求的管理员、普通成员和非成员。`SYSTEM_ADMIN_SUBJECTS` 未设置。`PLATFORM_OPERATOR_SUBJECTS` 非空，值未读取。
-- 没有内部可领取的密码或 IdP 测试账号。按任务约束，不能改外部 IdP，也不能无依据注册外部账号。
-
-因此不指定任何生产 `public_id` 作为验收样本。1807 篇已发布内容都挂在现有许可上，而那些许可没有客户读取动作；把某一篇客户内容写成“可测样本”会假造可用性。
-
-8 条 AC 在生产上的对应关系：
-
-1. 换票校验成员与权益：origin 没有 #29/#30 代码，权益表不存在，也没有两个已登记测试身份。
-2. 投影与 digest：投影表不存在；许可动作与 search/read/cite/export/AI 没有交集。
-3. RECORD 权限与管理员不能 DDL/DML：代码未进 origin，生产未测。
-4. 阅读页、两角色共享范围：只有一个工作区管理员和一个虚拟用户，没有普通成员。
-5. 五种许可边界：生产许可动词是 submit/publish/withdraw/restore。
-6. 900 秒租约与撤权：未在生产配置或连接上验证。
-7. 受限控制面写入、root 不代客户读：复制命令会用 root 做一次性 schema 与复制，这是迁移控制面，不是客户查询。客户读取路径仍未上线。
-8. 两工作区、两角色、非成员、移除、错误 revision、过期 token、投影中断、许可过期、撤回、DDL/DML：身份和可撤回/过期样本都不存在。全部 1807 篇目前都是 published。
-
-## 交给经理的缺口
-
-登记路径是有的，可用身份和客户读取许可没有。需要经理在内部安排，而不是把缺项写成通过：
-
-- 两个专用工作区，以及管理员、普通成员、非成员；另给“移除成员”准备可禁用的成员。凭证用 `admin secret set` 按 engineering、qa、产品所需的最小角色登记，值不进仓库和任务正文。
-- 在不 UPDATE 现有 `source_license_revision` 的前提下，确定客户 search/read/cite/export 与 AI research/generate 如何以新增记录授权，并提供可过期、可撤回的真实已发布内容样本。
-- PR #30 的 CI 要能找到 SurrealDB 3.2.3，Quality gate 变绿之后，读者发布才能单独申请。本次复制只覆盖 #29。
+- `c4c80c02` 上线申请前必须确认：五个凭证仍能 `get_secret`，并且 `b068f582` 的授权审查已经有结论。工作区若仍是 provisioning_error，申请里要写明这个 503，不能写成成员验收已具备。未满足时只允许继续实现和修 CI。
+- `7c9fb60c` 在上线后按获准方案把工作区激活、加入普通成员和可移除成员，并核对复制后的 public_id。QA 逐条测 8 条 AC。样本或权限不够就阻塞。
+- 最终运营验收仍要等全部交付项，包括 `b068f582`，不能漏验。
