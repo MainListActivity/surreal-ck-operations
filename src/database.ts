@@ -107,5 +107,23 @@ export class CompanyDatabase {
     await this.db.use({ namespace: this.config.namespace, database: this.config.database });
   }
 
+  private reconnecting: Promise<void> | undefined;
+
+  /** Probes the connection; on failure rebuilds it (the client does not recover from a dropped WS by itself). */
+  async ensureConnected(): Promise<void> {
+    this.reconnecting ??= (async () => {
+      try {
+        await this.db.query('SELECT true;');
+      } catch {
+        await this.db.close().catch(() => {});
+        await this.connect();
+        await this.useDatabase();
+      } finally {
+        this.reconnecting = undefined;
+      }
+    })();
+    return this.reconnecting;
+  }
+
   async close(): Promise<void> { await this.db.close(); }
 }

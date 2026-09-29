@@ -21,6 +21,7 @@ export type McpServiceOptions = Readonly<{
   hostname?: '127.0.0.1';
   port: number;
   ready?: () => Promise<boolean>;
+  heal?: () => Promise<void>;
 }>;
 
 function toolError(error: unknown) {
@@ -250,6 +251,7 @@ export function createMcpHttpService(options: McpServiceOptions) {
       const authorization = request.headers.get('authorization');
       if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) return new Response('Unauthorized', { status: 401 });
       const credential = authorization.slice(7);
+      await options.heal?.().catch(() => {});
       let principal;
       try {
         principal = await core.authenticate(credential);

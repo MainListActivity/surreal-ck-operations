@@ -69,8 +69,10 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production QA_PASSWO
 - **员工定义** `employee_def`：`role`（六任务岗位 + `eval` 评审）、`provider`（codex / grok / devin）、`model`、`thinking`，可选 `max_instances`（默认 1）、`weight`（派工权重，默认 10）、`enabled`。可直接写库，例如：
 
   ```sql
-  UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', max_instances: 2, weight: 25 };
+  UPSERT employee_def:engineering-grok CONTENT { role: 'engineering', provider: 'grok', model: 'auto:grok', thinking: 'medium', max_instances: 2, weight: 25 };
   ```
+
+  `model` 是槽位而非钉子：`auto:<族>`（`auto:sol` / `auto:grok` / `auto:swe`）表示跟随该 provider 该模型族的最新版——Paseo 插件每 5 分钟经 `providers.listModels` 刷新 `company_meta:model_slots`，调度器在派工前把槽位解析成具体模型 id（如 `auto:sol → gpt-6.1-sol`）再 spawn。厂家发布 `gpt-6.2-sol` 后：槽位更新 → 当 tick 先退役空闲旧模型实例（忙碌中的跑完当前会话）→ 下一个任务用新模型起新会话，全过程零人工。字面量（如 `gpt-6.1-sol`）则 pin 死。跨族/改名（`gpt-7`、新命名线）不会被 auto 匹配，等人工决策；槽位解析失败时该 def 不可新开并给老板发通知，存量实例继续跑上次的模型。首次采用新版本时插件发一条告知通知（不需要批准）。
 
   或 `pnpm run admin def set|list|weight|enable|disable`、`pnpm run admin seed-defs`（写入默认 21 个定义：七岗位 × 三订阅）。
 

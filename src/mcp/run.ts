@@ -23,6 +23,7 @@ try {
   service = createMcpHttpService({
     core, port,
     ready: async () => Boolean(await db.db.select(new RecordId('company_meta', 'installation'))),
+    heal: () => db.ensureConnected(),
   });
   console.log(`MCP listening on 127.0.0.1:${service.port}`);
 
@@ -40,7 +41,7 @@ try {
     const worker = runProjectionWorker({
       projector, signal: shutdown.signal,
       onResult: ({ projected }) => { if (projected) console.log(`Projected ${projected} outbox events`); },
-      onError: () => console.error('GitHub projection failed; retry scheduled'),
+      onError: (error) => console.error(`GitHub projection failed: ${(error as Error)?.message ?? String(error)}; retry scheduled`),
     });
     process.once('SIGINT', () => shutdown.abort());
     process.once('SIGTERM', () => shutdown.abort());

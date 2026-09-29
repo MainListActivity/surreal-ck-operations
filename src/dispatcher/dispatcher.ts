@@ -1,7 +1,7 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ProviderQuota } from '../contracts.ts';
+import type { ModelSlots, ProviderQuota } from '../contracts.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -30,6 +30,8 @@ export interface DispatcherDeps {
   git?: GitGateway;
   /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
   quota?: () => Promise<ProviderQuota[]>;
+  /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
+  models?: () => Promise<ModelSlots>;
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
@@ -64,9 +66,14 @@ export class Dispatcher {
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
-    const [agents, defs, now, quotaRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
+    const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
       this.deps.quota ? this.deps.quota().catch((error) => { this.log(`quota read failed: ${(error as Error).message}`); return [] as ProviderQuota[]; })
-        : Promise.resolve([] as ProviderQuota[])]);
+        : Promise.resolve([] as ProviderQuota[]),
+      this.deps.models ? this.deps.models().catch((error) => { this.log(`model slots read failed: ${(error as Error).message}`); return {}; })
+        : Promise.resolve({} as ModelSlots)]);
+    const slotMap = new Map(Object.entries(slotRows));
+    /** `auto:<family>` defs resolve via the plugin-maintained slot map; literals pin. */
+    const resolveModel = (def: EmployeeDef): string | undefined => this.resolveModel(def, slotMap);
     let insts = await wf.insts();
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();
@@ -170,10 +177,21 @@ export class Dispatcher {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
-        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
-        const reason = overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
+        // Model staleness: an idle instance still on the previous resolved model would keep
+        // serving new tasks with it, so rotate it out before dispatch. Insts whose model we
+        // cannot read (undefined) stay; so do those of defs whose model is unresolvable now.
+        const def = defs.find(d => d.id === inst.def);
+        const target = def ? resolveModel(def) : undefined;
+        const staleModel = Boolean(target && inst.model && inst.model !== target);
+        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK) && !staleModel) continue;
+        const reason = staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
+          : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
         await wf.retire(inst.id, reason);
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+        if (staleModel && def) {
+          await this.notice(`model-upgrade:${def.id}:${target}`,
+            `编制 ${def.id} 的模型已升级到 ${target}（实例 ${inst.id} 等空闲旧模型会话已轮换，新任务将用新模型起会话）。`, report);
+        }
         report.retired.push(inst.id);
         this.log(`retired ${inst.id}: ${reason}`);
       }
@@ -217,9 +235,17 @@ export class Dispatcher {
     const rand = this.deps.rand ?? Math.random;
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
+    // An instance may only serve tasks on the model its def currently resolves to;
+    // otherwise a stale exhausted→probe instance could be reused for new work.
+    const currentModel = (inst: EmployeeInst): boolean => {
+      const def = defs.find(d => d.id === inst.def);
+      const target = def && resolveModel(def);
+      return !target || !inst.model || inst.model === target;
+    };
     const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
       inst.role === role && ready(inst) && !assigned.has(inst.id) &&
       !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
+      currentModel(inst) &&
       this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
@@ -227,9 +253,18 @@ export class Dispatcher {
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
     const eligibleDefs = (role: string, home: string) =>
-      defs.filter(d => d.enabled && d.role === role &&
+      defs.filter(d => d.enabled && d.role === role && resolveModel(d) !== undefined &&
         insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
         this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
+    // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
+    // starve their roles, so escalate once (clears automatically when resolution returns).
+    const unresolved = defs.filter(d => d.enabled && (d.model ?? '').startsWith('auto:') && resolveModel(d) === undefined);
+    if (unresolved.length) {
+      await this.notice('model-unresolved',
+        `员工编制 ${unresolved.map(d => `${d.id}（${d.provider}/${d.model}）`).join('、')} 的模型槽位无法解析，相关角色暂不可派工——检查 Paseo 插件的模型刷新或对应订阅。`, report);
+    } else {
+      await owner.resolveNotice('model-unresolved');
+    }
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
       const home = task?.repoPath ?? this.deps.env.opsRepo;
       const candidates = eligibleInsts(role, home, task, excludeSubmitter);
@@ -255,11 +290,11 @@ export class Dispatcher {
       const candidates: RouteCandidate[] = [
         ...reuse.map(i => {
           const def = defs.find(d => d.id === i.def);
-          return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: def?.model ?? '',
+          return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: i.model ?? def?.model ?? '',
             score: def?.avgScore, scored: def?.scored, quota: quotaByProvider.get(i.provider ?? def?.provider ?? '')?.summary,
             health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee };
         }),
-        ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: d.model,
+        ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: resolveModel(d) ?? d.model ?? '',
           score: d.avgScore, scored: d.scored, quota: quotaByProvider.get(d.provider)?.summary,
           health: describeHealth(d.provider) })),
       ];
@@ -287,7 +322,7 @@ export class Dispatcher {
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
       const prefer = await routeEmployee(item);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer);
+        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer, slotMap);
       if (!result) {
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 当前没有可用员工（无空闲实例且无法新开：定义缺失、已停用、达到上限或订阅不可用），任务 ${item.task.id} 等待中。`, report);
         continue;
@@ -307,7 +342,7 @@ export class Dispatcher {
     }
     if (pendingGm.length && running < cfg.maxRunning) {
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first), report, insts);
+        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first), report, insts, false, undefined, slotMap);
       if (result) {
         for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
         report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
@@ -323,7 +358,7 @@ export class Dispatcher {
       }
       if (due.length) {
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first) => gmTriage(inst, due, this.deps.env, first), report, insts);
+          (inst, first) => gmTriage(inst, due, this.deps.env, first), report, insts, false, undefined, slotMap);
         if (result) {
           for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
           running++;
@@ -362,7 +397,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first) => evalPrompt(inst, task, this.deps.env, first), report, insts);
+          (inst, first) => evalPrompt(inst, task, this.deps.env, first), report, insts, false, undefined, slotMap);
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -494,6 +529,12 @@ export class Dispatcher {
     }
   }
 
+  /** `auto:<family>` resolves through the plugin-maintained slot map; literal model ids pin. */
+  private resolveModel(def: EmployeeDef, slots: Map<string, string>): string | undefined {
+    const model = def.model ?? '';
+    return model.startsWith('auto:') ? slots.get(`${def.provider}:${model.slice(5)}`) : model || undefined;
+  }
+
   private available(h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' {
     if (!h || h.state === 'healthy') return 'ok';
     return now >= (h.until ?? 0) ? 'probe' : 'down';
@@ -514,7 +555,7 @@ export class Dispatcher {
     spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference,
+    prefer?: AssignPreference, slots?: Map<string, string>,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
@@ -536,23 +577,25 @@ export class Dispatcher {
     const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo);
     if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
+      const model = this.resolveModel(def, slots ?? new Map());
+      if (!model) continue;
       const inst = await wf.spawnInst(def);
       try {
         const agentId = await paseo.spawn({
-          title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model: def.model, thinking: def.thinking,
+          title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: task?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: { SCK_EMPLOYEE_CREDENTIAL_FILE: inst.credentialFile! },
           prompt: prompt(inst, true),
         });
         const cwd = task?.repoPath ?? env.opsRepo;
-        await wf.bind(inst.id, { agentId, cwd });
-        const bound = { ...inst, paseoAgentId: agentId, cwd };
+        await wf.bind(inst.id, { agentId, cwd, model });
+        const bound = { ...inst, paseoAgentId: agentId, cwd, model };
         insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
         await wf.touchWake(inst.id);
-        this.log(`spawned ${inst.id} (${def.provider}/${def.model}) for ${task?.id ?? `dispatch:${role}`}`);
+        this.log(`spawned ${inst.id} (${def.provider}/${model}${def.model?.startsWith('auto:') ? ` ← ${def.model}` : ''}) for ${task?.id ?? `dispatch:${role}`}`);
         return { ...bound, spawned: true };
       } catch (error) {
         const message = (error as Error).message;

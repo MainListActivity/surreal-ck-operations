@@ -61,6 +61,12 @@ export function company(): Promise<Company> {
           fetchedAt: r.fetched_at ?? String(r.at ?? ""),
         }));
       },
+      // `auto:<family>` model slots resolved by hooks/tick-loop via providers.listModels.
+      models: async () => {
+        const [rows] = await db.db.query<[Array<{ slots?: Record<string, string> }>]>(
+          `SELECT slots FROM company_meta:model_slots;`);
+        return rows?.[0]?.slots ?? {};
+      },
     });
     return { db, owner, workforce, dispatcher };
   })();

@@ -51,6 +51,85 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
 }
 
 let quotaRefreshedAt = 0;
+// Model family matchers: an `auto:<family>` def resolves to the newest id of that family
+// among the provider's selectable models. Families are deliberately narrow so a provider
+// publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
+const MODEL_FAMILY: Record<string, (id: string) => { family: string; version: string } | undefined> = {
+  codex: (id) => {
+    const m = /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/.exec(id);
+    return m ? { family: m[2]!, version: m[1]! } : undefined;
+  },
+  grok: (id) => {
+    const m = /^grok-(\d+(?:\.\d+)*)$/.exec(id);
+    return m ? { family: 'grok', version: m[1]! } : undefined;
+  },
+  devin: (id) => {
+    const m = /^swe-(\d+(?:-\d+)*)-[a-z-]+$/.exec(id);
+    return m ? { family: 'swe', version: m[1]!.replaceAll('-', '.') } : undefined;
+  },
+};
+
+const versionNewer = (a: string, b: string): boolean => {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+};
+
+type ListedModel = { id: string; isSelectable?: boolean; isDefault?: boolean };
+
+let modelsRefreshedAt = 0;
+
+/**
+ * Refreshes `auto:<family>` slot resolution: for every provider used by an auto def,
+ * ask Paseo which models it offers and keep the newest of each family. The result lands
+ * in company_meta:model_slots for the dispatcher; a failed provider keeps its previous
+ * slot so one provider's outage cannot unstaff every role.
+ */
+export async function refreshModels(paseo: PaseoApi, ctx: Company): Promise<Record<string, string>> {
+  paseoHandle = paseo;
+  if (Date.now() - modelsRefreshedAt < 45_000) return readModelSlots(ctx);
+  modelsRefreshedAt = Date.now();
+  const [defRows] = await ctx.db.db.query<[Array<{ provider?: string; model?: string }>]>(
+    `SELECT provider, model FROM employee_def WHERE string::starts_with(model ?? '', 'auto:');`);
+  const providers = [...new Set((defRows ?? []).map(d => d.provider).filter(Boolean))] as string[];
+  const slots: Record<string, string> = {};
+  for (const provider of providers) {
+    const match = MODEL_FAMILY[provider];
+    if (!match) continue;
+    const result = await paseo.providers.listModels(provider as never).catch(() => undefined);
+    for (const m of ((result?.models ?? []) as ListedModel[])) {
+      if (m.isSelectable === false) continue;
+      const parsed = match(m.id);
+      if (!parsed) continue;
+      const key = `${provider}:${parsed.family}`;
+      const cur = slots[key];
+      const curVer = cur ? match(cur)?.version : undefined;
+      if (!cur || (curVer && versionNewer(parsed.version, curVer))) slots[key] = m.id;
+    }
+  }
+  const [existing] = await ctx.db.db.query<[Array<{ slots?: Record<string, string> }>]>(
+    `SELECT slots FROM company_meta:model_slots;`);
+  const prev = existing?.[0]?.slots ?? {};
+  const merged = { ...prev, ...slots };
+  if (JSON.stringify(merged) !== JSON.stringify(prev)) {
+    await ctx.db.db.query(
+      `UPSERT company_meta:model_slots CONTENT { slots: $slots, fetched_at: $fetched, at: time::now() };`,
+      { slots: merged, fetched: new Date().toISOString() });
+    const changes = Object.entries(merged).filter(([k, v]) => prev[k] !== v).map(([k, v]) => `${k}=${v}${prev[k] ? `（原 ${prev[k]}）` : ''}`);
+    console.log(`model slots updated: ${changes.join('; ') || 'none'}`);
+  }
+  return merged;
+}
+
+export async function readModelSlots(ctx: Company): Promise<Record<string, string>> {
+  const [rows] = await ctx.db.db.query<[Array<{ slots?: Record<string, string> }>]>(
+    `SELECT slots FROM company_meta:model_slots;`);
+  return rows?.[0]?.slots ?? {};
+}
+
 // Lifecycle hooks and RPC handlers are the only places a paseo handle is handed out;
 // remember the latest one so the tick loop can also refresh quota during quiet periods.
 let paseoHandle: PaseoApi | undefined;
@@ -128,11 +207,17 @@ export function startDispatch(server: PluginServerContext): () => void {
       try {
         const ctx: Company = await company();
         wait = (await ctx.workforce.config()).pollSeconds * 1000;
-        const report = await ctx.dispatcher.tick();
-        failures = 0;
+        // Refresh quota and model slots BEFORE the tick so a newly published model is
+        // resolved, stale idle sessions are retired, and new work spawns on it in the
+        // same dispatch pass instead of lagging one poll behind.
         if (paseoHandle && Date.now() - quotaRefreshedAt > 300_000) {
           await refreshQuota(paseoHandle, ctx).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
         }
+        if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
+          await refreshModels(paseoHandle, ctx).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
+        }
+        const report = await ctx.dispatcher.tick();
+        failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0);
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
@@ -141,6 +226,8 @@ export function startDispatch(server: PluginServerContext): () => void {
         failures++;
         wait = Math.min(wait * 2 ** Math.min(failures, 5), 300_000);
         console.error(`tick failed: ${(error as Error).message}`);
+        // A dropped SurrealDB socket never heals on its own; rebuild it so the next tick can run.
+        await company().then(c => c.db.ensureConnected()).catch(() => {});
       }
       await nap(wait);
     }
@@ -166,7 +253,9 @@ export function startDispatch(server: PluginServerContext): () => void {
     server.on("agent.archived", (event, { paseo }) => {
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
-        await refreshQuota(paseo, await company()).catch(() => {});
+        const ctx = await company();
+        await refreshQuota(paseo, ctx).catch(() => {});
+        await refreshModels(paseo, ctx).catch(() => {});
         kick();
       });
     }),
@@ -174,7 +263,9 @@ export function startDispatch(server: PluginServerContext): () => void {
     server.on("agent.permission_requested", (event, { paseo }) => {
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
-        await refreshQuota(paseo, await company()).catch(() => {});
+        const ctx = await company();
+        await refreshQuota(paseo, ctx).catch(() => {});
+        await refreshModels(paseo, ctx).catch(() => {});
         console.log(`permission requested by ${event.agent.title ?? event.agent.id}: ${JSON.stringify(event.request).slice(0, 300)}`);
       });
     }),

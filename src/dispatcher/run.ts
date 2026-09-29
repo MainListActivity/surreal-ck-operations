@@ -38,6 +38,13 @@ try {
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),
     git: createGitCli(),
+    // `auto:<family>` defs resolve through the slot map the Paseo plugin maintains;
+    // without it this fallback dispatcher cannot spawn auto defs at all.
+    models: async () => {
+      const [rows] = await db.db.query<[{ slots?: Record<string, string> }[]]>(
+        'SELECT slots FROM company_meta:model_slots;');
+      return rows?.[0]?.slots ?? {};
+    },
   });
   console.log(`${new Date().toISOString()} dispatcher started${jevFromEnv() ? ' (jev enabled)' : ''}`);
   let failures = 0;
@@ -53,6 +60,7 @@ try {
       failures++;
       wait = Math.min(wait * 2 ** Math.min(failures, 5), 300_000);
       console.error(`${new Date().toISOString()} tick failed: ${(error as Error).message}`);
+      await db.ensureConnected().catch(() => undefined);
     }
     await delay(wait, undefined, { signal: stop.signal }).catch(() => undefined);
   }

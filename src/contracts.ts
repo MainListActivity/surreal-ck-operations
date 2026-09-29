@@ -169,6 +169,14 @@ export interface EmployeeScore {
   notes?: string;
 }
 
+/**
+ * Provider model slots: "<provider>:<family>" → concrete model id.
+ * The Paseo plugin refreshes this from providers.listModels; a def whose model
+ * is "auto:<family>" resolves through this map, so upstream version bumps reach
+ * new spawns without an edit. Literal model ids bypass the map (pinning).
+ */
+export type ModelSlots = Record<string, string>;
+
 export interface ProviderQuota {
   provider: string;
   /** Human-readable remaining quota, e.g. "5h 窗口剩 41%（15:00 重置）；余额 $3.2/$10 credits"。 */
