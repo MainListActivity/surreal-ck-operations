@@ -1,0 +1,42 @@
+import { randomUUID } from "node:crypto";
+import { loadDatabaseConfig } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/config.ts";
+import { CompanyDatabase } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/database.ts";
+import { SurrealCompanyCore } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/core.ts";
+import { LocalEnrollmentAdmin } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/enrollment.ts";
+import { createMcpHttpService } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/mcp/server.ts";
+import { connectCompanyClient } from "/Users/y/Library/Application Support/SurrealCKCompany/releases/73198e3adb9f6e5644fc97e4bf264131dc9a98a5/src/mcp/client.ts";
+const suffix=randomUUID().slice(0,8);
+const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:"sck_agent_company_test",database:"control_plane"});
+const check=(v:unknown,name:string)=>{if(!v)throw Error("FAIL "+name);console.log("PASS",name)};
+const value=(r:any,name:string)=>{if(!r.structuredContent?.ok)throw Error(name+" "+String(r.structuredContent?.code));return r.structuredContent.data};
+const denied=(r:any,name:string)=>check(r.structuredContent?.ok===false,name+" "+String(r.structuredContent?.code));
+const call=(c:any,name:string,args:Record<string,unknown>)=>c.client.callTool({name,arguments:args});
+await db.connect();let service;const clients:any[]=[];
+try{
+ await db.bootstrap();
+ const admin=new LocalEnrollmentAdmin(db);
+ const gm=await admin.enroll("test-qa28-fgm-"+suffix,"gm",["manage","execute","review"]);
+ const a=await admin.enroll("test-qa28-fa-"+suffix,"qa",["execute","review"]);
+ const b=await admin.enroll("test-qa28-fb-"+suffix,"qa",["execute","review"]);
+ service=createMcpHttpService({core:new SurrealCompanyCore(db,{leaseSeconds:1}),port:0});
+ const url=new URL("http://127.0.0.1:"+service.port+"/mcp");
+ for(const [token,name] of [[gm,"gm"],[a,"a"],[b,"b"]]) clients.push(await connectCompanyClient({url,credential:token,clientName:"qa28-fence-"+name}));
+ const [manager,first,second]=clients;
+ const task=value(await call(manager,"create_task",{title:"QA28 fence "+suffix,context:"Synthetic expiry at MCP transport.",executorRole:"qa",reviewerRole:"gm",idempotencyKey:"fcreate-"+suffix}),"create");
+ const claim=value(await call(first,"claim_next",{taskId:task.id}),"claim");
+ const old={taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version};
+ await Bun.sleep(1600);
+ denied(await call(first,"heartbeat",old),"B04 expired MCP heartbeat denied");
+ denied(await call(first,"checkpoint",{...old,text:"Old execution cannot checkpoint.",idempotencyKey:"foldcheck-"+suffix}),"B04 expired MCP checkpoint denied");
+ const replacement=value(await call(second,"claim_next",{taskId:task.id}),"replacement");
+ check(replacement.fence>old.fence,"B04 replacement advances fence");
+ denied(await call(first,"heartbeat",old),"B04 old fence MCP heartbeat denied after replacement");
+ denied(await call(first,"checkpoint",{...old,text:"Old execution cannot checkpoint after replacement.",idempotencyKey:"foldcheck2-"+suffix}),"B04 old fence MCP checkpoint denied after replacement");
+ denied(await call(first,"submit",{...old,text:"Old execution cannot submit after replacement.",idempotencyKey:"foldsubmit-"+suffix}),"B04 old fence MCP submit denied");
+ const current=value(await call(manager,"get_context",{taskId:task.id}),"context").tasks[0];
+ check(current.version===replacement.task.version,"B04 rejected old writes preserve version");
+ console.log("RESULT PASS; isolated namespace sck_agent_company_test; run "+suffix);
+}finally{
+ await Promise.allSettled(clients.map(c=>c.close()));
+ await service?.close();await db.close();
+}
