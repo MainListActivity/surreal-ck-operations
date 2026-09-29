@@ -37,9 +37,13 @@ try {
     const projector = createGithubProjector({
       core, credential, github: createGhCliGateway(repository),
       statePath: resolve(process.env.SCK_PROJECTION_STATE_FILE ?? '.runtime/gh-projection.json'),
+      heal: () => db.ensureConnected(),
     });
     const worker = runProjectionWorker({
-      projector, signal: shutdown.signal,
+      // Projection queries run between long gh calls, outside the healed /mcp path;
+      // probe-and-reconnect at the top of every pass so a scoped-out conn self-recovers.
+      projector: { runOnce: async () => { await db.ensureConnected(); return projector.runOnce(); } },
+      signal: shutdown.signal,
       onResult: ({ projected }) => { if (projected) console.log(`Projected ${projected} outbox events`); },
       onError: (error) => console.error(`GitHub projection failed: ${(error as Error)?.message ?? String(error)}; retry scheduled`),
     });
