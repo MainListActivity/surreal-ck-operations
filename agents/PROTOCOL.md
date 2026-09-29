@@ -27,6 +27,7 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 - 证据真实：读代码、本地测试、线上验证、客户确认分开表述；没有验证的写「未验证」。
 - 验收独立：服务端拒绝你验收自己提交的成果；换会话、换订阅也一样。
 - 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。经理只在老板直接对话里明确表态时，用 `record_owner_decision` 转录，并逐字引用老板原话。
+- 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
 - 凭证：项目凭证只用 `get_secret` 在持有任务期间领取，直接使用；不写进证据、文件、提交或消息。
 
 ## 决策权
@@ -35,7 +36,7 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 
 | 谁决定 | 事项 |
 |---|---|
-| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境） |
+| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境）；公司自有系统里的操作：代码、域名、Cloudflare、IdP（ma_hono）里创建测试账号和测试数据，创建后用 `put_secret` 登记。这些权限都已授予，**只要不新购买资源就不上报** |
 | 运营 | 范围取舍（大目标的范围提案）、**是否上线**、运营验收 |
 | 经理 | 目标分级与拆解、运营定不了的事、技术路线分歧、返工安排 |
 | 老板 | **老板专属事项**：花钱（充值、新增付费服务或订阅）、签约或法律承诺、以公司名义对外联系、公司方向与大目标取舍、`project.redLines` 里登记的红线；以及 standard/program 目标的 G3 最终验收 |

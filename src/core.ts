@@ -406,18 +406,34 @@ export class SurrealCompanyCore implements CompanyCore {
     return created;
   }
 
-  async getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string> {
+  async putSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string; value: string; roles?: Role[]; purpose?: string }): Promise<{ stored: string }> {
+    const { actor, project } = await this.leaseProject(credential, input.taskId);
+    if (actor.role === 'eval') throw new CompanyError('forbidden', 'eval may not store secrets');
+    const roles = [...new Set(input.roles?.length ? input.roles : [actor.role, 'qa' as Role])];
+    for (const role of roles) requireRole(role);
+    await this.projects.setSecret({ project, env: input.env, name: input.name, value: input.value, roles, purpose: input.purpose }, loadSecretKey(true));
+    await this.db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'secret_write', evidence: $evidence, at: time::now() };",
+      { task: id('task', input.taskId), actor: id('employee', actor.employeeId), evidence: `登记环境凭证 ${input.env}/${input.name}，可读岗位 ${roles.join(',')}（值不入库）` });
+    return { stored: `${project}/${input.env}/${input.name}` };
+  }
+
+  private async leaseProject(credential: Credential, taskId: TaskId): Promise<{ actor: Principal; project: string }> {
     const actor = await this.authorized(credential);
     const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
-      'SELECT current_employee, state, lease_expires_at, goal.project AS project FROM $task;', { task: id('task', input.taskId) });
+      'SELECT current_employee, state, lease_expires_at, goal.project AS project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
     if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
-      throw new CompanyError('forbidden', 'Secrets are only released to the current lease holder of the task');
+      throw new CompanyError('forbidden', 'Secrets are only available to the current lease holder of the task');
     }
     if (!task.project) throw new CompanyError('invalid', 'Task goal has no project environment');
-    const value = await this.projects.readSecret(String(task.project.id), input.env, input.name, actor.role, loadSecretKey());
+    return { actor, project: String(task.project.id) };
+  }
+
+  async getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string> {
+    const { actor, project } = await this.leaseProject(credential, input.taskId);
+    const value = await this.projects.readSecret(project, input.env, input.name, actor.role, loadSecretKey());
     await this.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: \'secret_read\', evidence: $evidence, at: time::now() };',
       { task: id('task', input.taskId), actor: id('employee', actor.employeeId), evidence: `读取环境凭证 ${input.env}/${input.name}（值不入库）` });
     return value;
