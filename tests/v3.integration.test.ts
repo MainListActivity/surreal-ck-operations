@@ -647,3 +647,43 @@ test('dispatcher still spawns for a project when the def is at capacity in anoth
   const spawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(impl.id))!.spawn!;
   expect(spawn.cwd).toBe('/repo/wsproj2');
 });
+
+test('dispatcher: a returned task goes back to its submitter for rework, review still skips the submitter', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = true, error_streak = 0;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('qa-codex', { role: 'qa', provider: 'codex', model: 'gpt-6-sol', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: '返工回到提交者', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  let report = await dispatcher.tick();
+  const execInst = report.woke.find(w => w.task === t.id)!;
+  expect(execInst.spawned).toBe(true);
+  const execAgent = [...paseo.agents.keys()][0];
+
+  const claim = await core.claim(tokenOf(execInst.employee), t.id);
+  await core.submit(tokenOf(execInst.employee), proofOf(claim), { text: '实现完成：功能已提交到任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
+  paseo.set(execAgent, 'idle');
+
+  // Review must be spawned/dispatched to someone other than the submitter.
+  report = await dispatcher.tick();
+  const reviewInst = report.woke.find(w => w.task === t.id)!;
+  expect(reviewInst.employee).not.toBe(execInst.employee);
+  expect(reviewInst.employee.startsWith('qa-')).toBe(true);
+  const qaAgent = [...paseo.agents.keys()][1];
+
+  const qaClaim = await core.claim(tokenOf(reviewInst.employee), t.id);
+  await core.returnTask(tokenOf(reviewInst.employee), proofOf(qaClaim), { text: '验收退回：仍有一项生产实测未执行，需要返工补齐后再交。', idempotencyKey: key() });
+  paseo.set(qaAgent, 'idle');
+
+  // The rework goes back to the submitter, who has the context; def is at capacity so nothing else could be picked.
+  report = await dispatcher.tick();
+  const rework = report.woke.find(w => w.task === t.id);
+  expect(rework?.employee).toBe(execInst.employee);
+});

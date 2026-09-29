@@ -8,7 +8,7 @@ import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|quota|usage limit|rate.?limit|too many requests|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
+export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 
@@ -167,20 +167,24 @@ export class Dispatcher {
     }
     const assigned = new Set<string>();
     const rand = this.deps.rand ?? Math.random;
-    const pick = (role: string, task?: SupervisedTask, avoid?: string) => {
+    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
       const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
         (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
       const ok = (inst: EmployeeInst) => inst.role === role && ready(inst) && !assigned.has(inst.id) &&
-        !holding.has(inst.id) && inst.id !== task?.submittedBy && this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
+        !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
+        this.capacity(inst.provider ?? '', cfg, health, busyBy, now);
       // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
       const home = task?.repoPath ?? this.deps.env.opsRepo;
       const candidates = insts.filter(i => ok(i) && (i.cwd ?? this.deps.env.opsRepo) === home);
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
       // Continuity beats weights: the previous holder keeps the task when it is still available.
-      const previous = candidates.find(i => i.id === task?.previousEmployee);
+      const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
       if (previous) return previous;
-      const pool = candidates.filter(i => i.id !== avoid);
-      return weightedOrder(pool.length ? pool : candidates, weight, rand)[0];
+      // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
+      const live = candidates.filter(i => states.get(i.id) === 'idle');
+      const usable = live.length ? live : candidates;
+      const pool = usable.filter(i => i.id !== avoid);
+      return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
     };
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
@@ -195,7 +199,7 @@ export class Dispatcher {
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts);
+        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review');
       if (!result) {
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 当前没有可用员工（无空闲实例且无法新开：定义缺失、已停用、达到上限或订阅不可用），任务 ${item.task.id} 等待中。`, report);
         continue;
@@ -411,13 +415,13 @@ export class Dispatcher {
 
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
-    pick: (role: string, task?: SupervisedTask, avoid?: string) => EmployeeInst | undefined,
+    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
     spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean) => string,
-    report: TickReport, insts: EmployeeInst[],
+    report: TickReport, insts: EmployeeInst[], forReview = false,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env } = this.deps;
-    const existing = pick(role, task, avoid);
+    const existing = pick(role, task, avoid, forReview);
     if (existing) {
       try {
         const first = !this.onboarded.has(existing.id) && !existing.onboarded;
@@ -452,10 +456,18 @@ export class Dispatcher {
         this.log(`spawned ${inst.id} (${def.provider}/${def.model}) for ${task?.id ?? `dispatch:${role}`}`);
         return { ...bound, spawned: true };
       } catch (error) {
-        this.log(`spawn ${inst.id} failed: ${(error as Error).message}`);
-        await wf.retire(inst.id, `spawn failed: ${(error as Error).message.slice(0, 200)}`);
+        const message = (error as Error).message;
+        this.log(`spawn ${inst.id} failed: ${message}`);
+        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`);
         report.retired.push(inst.id);
-        await this.countDefFailure(def, report);
+        // A quota-flavored spawn failure is the provider's problem, not the def's:
+        // cool the provider down instead of eating a strike toward auto-disable.
+        if (EXHAUSTED_PATTERN.test(message)) {
+          await wf.markExhausted(def.provider, message);
+          if (!report.exhausted.includes(def.provider)) report.exhausted.push(def.provider);
+        } else {
+          await this.countDefFailure(def, report);
+        }
       }
     }
     return undefined;
