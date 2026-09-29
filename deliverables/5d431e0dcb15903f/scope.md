@@ -35,7 +35,10 @@
 1. SHADCN-04 视觉对齐收尾。
 2. WP-B-06 判定：现行发布为 systemd + Cloudflare，非 Docker——若确认过时则标记关闭（wontfix 并记录理由），若仍需则交付。
 3. LCM-07 证据收口：其第三项验收（真实 DCR/PKCE/scope/refresh 联测）已按票内转交约定由 SCK-LCM-10 在 2026-09-11 生产完成（未预注册客户端 DCR、PKCE、五工具、刷新/撤销成功，票标 done/verified）。本项只做窄收口：核对 LCM-10 证据覆盖后更新 07 的勾选与状态；只有核实出新缺口才补实现，不重复已完成的联调。
-4. **native quota 生产运维收口（非代码工作流）**：按 `docs/runbooks/native-quota-release-cutover.md` 与 `native-quota-legacy-migration.md` 执行——维护窗（停写+snapshot+隔离目录 restore drill）、migration-conductor 三命令（inventory/import/prepare/assert-reopen）、cohort 晋级（synthetic_internal→one_percent→ten_percent→fifty_percent→remainder）、24h/48h 观察窗、产品切换、30 日 delayed cleanup。验收证据为每阶段运行记录与 `native-quota-acceptance-matrix.md` 口径；观察期按 runbook 固定天数执行，不以工单关闭代替。**红线提示**：30 日 delayed cleanup 涉及删除/改写生产旧 event/table——属 `project.redLines`，届时单独报老板决定，未获批准前不执行该步骤。
+4. **native quota 生产运维收口（非代码工作流）**：按 `docs/runbooks/native-quota-release-cutover.md` 与 `native-quota-legacy-migration.md` 执行——阶段一维护窗（停写+snapshot+隔离目录 restore drill）与 migration-conductor 四命令（inventory/import/prepare/assert-reopen）；阶段二 cohort 晋级（synthetic_internal→one_percent→ten_percent→fifty_percent→remainder，前两档各观察≥24h、后两档≥48h，remainder 过实时门禁后入全局 30 日稳定窗）；阶段三 30 日 delayed cleanup。验收证据为每阶段运行记录与 `native-quota-acceptance-matrix.md` 口径；观察期按 runbook 固定天数执行，不以工单关闭代替。**红线关口时序（必须在动作前逐个过老板关口，未获批准不得执行对应动作）**：
+   - 阶段一 exact digest fork 启动 RocksDB 并执行 format migration——涉及生产数据目录/surrealdb 服务变更，先过红线；
+   - **首次** cohort `quota:migration cutover`——runbook 明确其在事务内 reassert native policy 并**删除生产旧 event**，已属「改写或删除生产已有数据」红线，老板批准前不得执行任何含删改旧数据的 cutover；
+   - 阶段三 cleanup migration 删除旧 events/tables/installer——同样红线，按 `max(all_native_verified_at, product_stable_since)+30d` 门禁与老板批准双重前置。
 
 **批次 1：虚拟员工执行基础设施（VER-01..06）**
 共享执行上下文 seam（Router 零回归）→ 幂等员工生命周期 → 通用持久化触发接管每日债权风险员工 → 可恢复执行窗口与幂等副作用 → 预算/循环/重试/全局背压 → 连接监督与容量验收。理由：它是 VO 簇与后续一切自治员工的底座，且把现有专用 dispatcher 泛化——先做它防止基础设施散落到业务里（PRD 原话）。
@@ -62,7 +65,7 @@ wayfinder 09（运营控制面设计）/10（定价与单位经济实验设计�
 - 不承诺全量裁判文书覆盖；不向未授权来源获取内容；不把合成内容当真实法律内容。
 - 不在本目标内改 ma_hono（无剩余票）或 operations 仓库规则文件。
 - 不做定价实验的真实收费动作、不新增付费资源/订阅（红线）。
-- native quota 30 日 delayed cleanup 中删除/改写生产旧 event/table 的动作不在本范围默认执行——属红线事项，单独走老板关口。
+- native quota 收口工作流中所有删改生产旧数据/变更 surrealdb 服务的动作（阶段一 format migration、首次 cohort cutover 删旧 event、阶段三 cleanup migration）均不默认执行——属红线事项，逐个在动作前走老板关口，未批准即停在该步骤并保留运行记录。
 - 不重做已完成票；不把设计票当实施票交付（wayfinder 09–11 交付物是规格）；不把已由 LCM-10 生产联调覆盖的 LCM-07 剩余项当成新实现重做。
 
 ## 依赖与风险
