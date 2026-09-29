@@ -6,6 +6,7 @@ import { OwnerDesk } from '../owner.ts';
 import { Workforce } from '../workforce.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
+import { createGitCli } from './worktrees.ts';
 import { createPaseoCli } from './paseo.ts';
 
 const required = (name: string) => {
@@ -35,6 +36,7 @@ try {
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),
+    git: createGitCli(),
   });
   console.log(`${new Date().toISOString()} dispatcher started${jevFromEnv() ? ' (jev enabled)' : ''}`);
   let failures = 0;

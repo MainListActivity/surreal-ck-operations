@@ -341,6 +341,16 @@ export class Workforce {
   }
 
   /** Extends a live holder's lease without changing version, fence or delivery. */
+  async projectRepos(): Promise<string[]> {
+    const [rows] = await this.db.query<[Array<{ repo_path: string }>]>('SELECT repo_path FROM project;');
+    return rows.map(r => r.repo_path);
+  }
+
+  async doneTaskIds(): Promise<string[]> {
+    const [rows] = await this.db.query<[RecordId[]]>("SELECT VALUE id FROM task WHERE state = 'done';");
+    return rows.map(asId);
+  }
+
   async judgeInput(taskId: TaskId): Promise<JudgeInput> {
     const task = id('task', taskId);
     const [rows, submits, blocks] = await this.db.query<[
