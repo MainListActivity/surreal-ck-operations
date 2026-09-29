@@ -3,6 +3,7 @@ import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, Supervis
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
+import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
@@ -24,6 +25,8 @@ export interface DispatcherDeps {
   rand?: () => number;
   /** Jev System One decision model; undefined disables the Jev evaluation path. */
   jev?: JevClient;
+  /** Removes worktrees of finished tasks; undefined disables the sweep. */
+  git?: GitGateway;
 }
 
 export interface TickReport {
@@ -44,6 +47,8 @@ export class Dispatcher {
   /** Last observed Paseo status per agent; a busy→idle transition is the recovery signal for a provider. */
   private readonly lastStatus = new Map<string, string>();
   private readonly onboarded = new Set<string>();
+  private lastSweep = 0;
+  private readonly keptLogged = new Set<string>();
 
   constructor(private readonly deps: DispatcherDeps) {}
   private log(message: string) { this.deps.log?.(message); }
@@ -232,6 +237,8 @@ export class Dispatcher {
       }
     }
 
+    await this.sweep(now);
+
     // 5. Performance evaluation. Jev (System One decision model) scores the finished task in
     //    one ~500ms round trip; low-confidence or repeated failures escalate to an LLM eval
     //    employee, which stays the only path when Jev is not configured.
@@ -309,6 +316,24 @@ export class Dispatcher {
     } catch (error) {
       this.log(`jev evaluation failed for ${task.id} (attempt ${attempts}): ${(error as Error).message}`);
       return attempts >= 3 ? 'escalate' : 'retry';
+    }
+  }
+
+  /** Every 10 minutes, remove the git worktrees of tasks that are done. Dirty ones are kept and reported once. */
+  private async sweep(now: number) {
+    const { git, workforce: wf, env } = this.deps;
+    if (!git || now - this.lastSweep < 600) return;
+    this.lastSweep = now;
+    try {
+      const result = await sweepWorktrees(git, [env.opsRepo, ...(await wf.projectRepos())], await wf.doneTaskIds());
+      for (const path of result.removed) this.log(`removed worktree ${path}`);
+      for (const kept of result.kept) {
+        if (this.keptLogged.has(kept.path)) continue;
+        this.keptLogged.add(kept.path);
+        this.log(`kept worktree ${kept.path}: ${kept.reason}`);
+      }
+    } catch (error) {
+      this.log(`worktree sweep failed: ${(error as Error).message}`);
     }
   }
 
