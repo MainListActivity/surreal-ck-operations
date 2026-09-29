@@ -1,6 +1,6 @@
 # SCK-LCA-03 发布准备方案
 
-- 员工：engineering-grok-4e9709
+- 编写：engineering-grok-4e9709；退回修订：engineering-codex-06006c
 - 任务：d5ba0dea-2ce3-40ed-8ea4-f27f3fd7d4fa
 - 目标：639ddcfae11dda57
 - 分支：task/d5ba0dea
@@ -62,13 +62,36 @@ claim 返回的现行 `project.release`：Quality gate 后合入 main，GitHub A
 
 | 项 | 入口 | 输入 | 责任 | 阻断 |
 | --- | --- | --- | --- | --- |
-| 激活两个工作区并加入成员 | `POST /api/workspaces` 重试，成功后再 `POST /api/workspaces/sck-lca03-a/members` | 已登记的五个账号 | 上线后的工程任务。当前 origin 的模板重试不能定义已存在的 ACCESS employee | 在 503 消失前，QA 不能做成员、移除成员或换票 |
+| 修复后恢复两个预留工作区、加入成员 | 下文“工作区恢复门槛”；修复版本发布后以原 owner、原 slug 重试 `POST /api/workspaces`，再走成员接口 | 已登记的五个账号、原预留库及 schema_version | 经理安排独立产品代码修复任务；修复 PR 经 Quality gate、上线申请后由部署工程执行，QA 复核 | 当前代码直接重试必定再次 503；未修复、未部署、未达到 active 不得声称身份条件具备，也不得无条件申请上线 |
 | 复制内容库 | PR #36 的 `origin-pre-start.sh` | `ORIGIN_ENV_CONTENT_PUBLISHER_SECRET`、冻结后的 `_system` | CI，在上线申请 `c4c80c02` 批准并合入之后 | 未批准不得合入。合入即发布 |
 | 权益、投影、content_reader | #29 代码加 PR #30 | 复制完成且 origin 健康 | 工程实现/修 CI；上线仍看 `c4c80c02` | PR #30 head `5384fd69847080cd39fbea1902d676e6965bced9` 的 Quality gate https://github.com/MainListActivity/surreal_ck/actions/runs/36459246415 在 Test 失败：runner 没有 `/home/runner/.surrealdb/surreal`。`fe3991c3` 可先修 CI，不得据此上线 |
 | 客户读取动作和可撤回样本 | 任务 `b068f582-dbef-4c97-8ce9-694fdb6104b4` | 上面的源 public_id 与现有许可 | product→gm | 没有该项结论时，不能把任何 public_id 当成可读样本 |
 | 目标库 id 核对 | 复制后的 `platform_content` 计数和 public_id | 钩子成功日志与 18 表行数 | 部署任务 `7c9fb60c` | 源、目标不一致就停止，不删除任一侧 |
 
-8 条 AC 都留到 origin 健康、工作区 active、且 `b068f582` 给出动作矩阵之后，由 QA 在 `7c9fb60c` 用 `get_secret` 的真实身份逐条测。模拟和本地结果不能替代。
+### 工作区恢复门槛（当前阻断；需要经理安排产品代码任务）
+
+复现入口：用原 A/B 管理员登录态对原 slug 调 `POST /api/workspaces`，返回 HTTP 503 `workspace-template-apply-failed` / `The access method 'employee' already exists`。`_system.workspace` 已为两个 slug 预留 `ws_26d695c309e5`、`ws_fdc9ddd0e47a`，状态 `provisioning_error`、阶段 `policy_applied`、版本 4。`server/src/workspaces/create-workspace.ts:898-914` 对恢复的库仍从第一份模板重放；`shared/sql/workspace-template/001-access.surql:44` 的 `DEFINE ACCESS employee` 不能重复执行。代码路径在 `create-workspace.ts:974-990` 保存错误墓碑，scope gate 拒绝非 active 工作区。这里是代码分析加前任生产观察，尚未实施修复。
+
+经理须安排独立产品代码任务，修 `create-workspace.ts` 的恢复路径：先只读取得原预留库的 `schema_version:current`，核对 `_system` 记录的 slug、owner、db_name、quota policy 与物理库一致，再从**下一版本**连续应用未完成脚本；每一版成功后才推进版本记录。若已记录的版本与实际 schema 不一致，应停止并报错，不能靠 `OVERWRITE` 全量重放掩盖漂移。模板 pack 与 owner/index 阶段也须可重入。增加真实 SurrealDB 回归：从版本 4、三个 ACCESS 已存在的中断现场恢复，二次重试不产生新库或重复成员，失败时仍留 `provisioning_error` 且不签 scope。只改产品代码和测试，不直接手写这两个生产库的表、ACCESS、状态，不删除预留库，不触碰现有客户工作区。具体修复任务 ID 目前未分派，由 gm 登记；本任务不能替代它实施代码改动。
+
+修复 PR 经 Quality gate 且获运营上线批准后，工程以 A/B 原 owner 的真实 IdP 登录态重试原 slug，核对返回成功且仍指向上述原 db_name；只读核对两行状态 `active`、错误字段清除、`schema_version` 达发布版本、quota/entitlement 投影一致、scope gate 能给各自 owner 签本工作区 scope。再由 A 管理员用 `POST /api/workspaces/sck-lca03-a/members` 加普通成员和可移除成员；B 管理员须属于 B，非成员不得加入 A/B。记录成员接口返回和登录后 scope；故意移除可移除成员留给 QA 的 AC8 测试。任何一步失败，保留墓碑并阻止上线验收，交修复任务处理，不能绕过 gate。`c4c80c02` 上线申请在修复真实部署且上述身份判据成立前只能继续修 CI/代码，不能无条件批准。
+
+### 原票 8 AC 的生产核验清单（均待部署与 QA 执行）
+
+固定前置：#29/#30/#36 及工作区恢复修复均通过 Quality gate 和上线批准，origin 健康；两个工作区 active；五个身份从 `get_secret` 领取并经真实 IdP 登录；复制后核对目标 `platform_content` 的 public_id/版本；`b068f582` 出具逐动作读取许可及合法可撤回/到期样本。以下“允许”只对该项确认的动作、版本、工作区成立。发布前只把下表作为步骤，不把任何一格计为通过。入口以 PR #30 head `5384fd6` 的 `/api/session/content-reader`、网页“法律内容”入口/`/w/:slug/content/:publicId`、内容库 `content_reader` RECORD 会话为候选；合入版本若变更须重新核对路由和预期。
+
+| AC | 入口、身份与操作 | 通过判据、依赖与失败判据 |
+| --- | --- | --- |
+| 1 当前身份、成员、权益换票 | A 管理员与普通成员分别登录 A，调用 `/api/session/content-reader` 打开获准 ID；非成员、A 已移除成员、B 管理员对 A 重做；请求夹带自选 revision/authority；对比浏览器原 workspace token | 仅有效 A 成员且当前权益覆盖时换得短期独立票，原 token 不变；其余拒绝，客户端不能指定 revision。依赖 active 工作区、#30 与权益配置；接受自选 revision 或跨区票即失败。 |
+| 2 可核验投影和交集 | 用获准 A/B 样本先核对当前权益 revision/digest 与内容库投影完全一致，再用错误 revision/digest、未 published、无 read 许可、投影停止续期逐一请求 | 只在 revision/digest 完整匹配且来源动作、发布状态、权益均允许时有正文；未知/错误/中断拒绝。依赖 `b068f582` 许可矩阵和部署后的投影记录；不能用源库 published 代替。 |
+| 3 RECORD 与库权限 | 使用真实 `content_reader` RECORD 票对目标库执行授权 SELECT，再试 `DEFINE TABLE`、INSERT/UPDATE/DELETE 正文和投影；A 管理员的 workspace system role 试直连内容库 | SELECT 仅自身许可字段；DDL/DML 被拒或零行生效，复核前后摘要/计数无变化；workspace admin 不能凭原票进内容库。root 只做只读复核，绝不代客户查正文。 |
+| 4 网页阅读 | A 管理员、A 普通成员各自从“法律内容”入口打开获准 public_id，再切换工作区/注销；核对显示版本、来源、授权状态 | 两个角色都能在真实页面看到获准正文与准确版本/来源；切换或注销后旧正文不可继续展示。依赖复制后目标 ID 与许可；未激活工作区不测成通过。 |
+| 5 五动作及字段边界 | `b068f582` 给出 search/read/cite/AI use/export 分别允许与拒绝的样本；通过候选会话和数据库访问按动作、metadata-only、批量查询、直接 RecordId 分别测 | 仅逐动作许可的字段可见；metadata-only 无正文、摘录、法条全文、隐藏字段；批量与直接 ID 不扩大范围。某动作无合法样本即标未验证并阻断对应 AC，不借运营 publish 推断 read。 |
+| 6 lease 与失效收敛 | 查看发布配置/运维契约；真实 IdP 换票后核对票、lease、权益/许可截止；过期 token、投影停续期及保持已建立连接超过上限后重新读取 | 票/会话/lease 均不超过 900 秒且不超过权益/许可有效期；到期或投影中断后在契约上限内拒绝新读取，老连接不能无限读取。需记录墙钟和服务端拒绝结果。 |
+| 7 受限投影写入 | 使用客户成员票调用或直连尝试自授权益、修改 `content_authorization_projection`/`content_read_gate`；用受限同步身份走正式同步入口后只读核对 | 客户修改失败或零行生效，正式同步只产出与源事实一致的 revision/digest；日志无 token/secret/正文，客户查询链不用 root。依赖获授权同步能力，root 不用于读取正文。 |
+| 8 真实矩阵 | A/B active 且 B 有受控权益样本；A admin/member、B admin、非成员、A 可移除成员；依次测错误 revision、过期 token、停投影、许可到期、内容撤回、内容库 DDL/DML | 各项在真实库与浏览器按前七项预期允许或拒绝；移除成员后旧票在契约期限内失效；撤回/到期后正文不可读；DDL/DML 不改变库。每个负例需保留脱敏请求、状态/错误码、只读前后核对。缺 B 权益或合法到期/撤回样本就阻断，不用合成夹具代替。 |
+
+`7c9fb60c` 的 QA 逐格记录身份引用、workspace、目标 public_id 与版本、来源许可 revision、权益 revision/digest、操作、HTTP/数据库实际结果和时间；秘钥与正文不进任务证据。任一待部署条件缺失或实际结果不符，应退回，不得写“8AC 通过”。
 
 ## 停写、写入者与回滚
 
@@ -82,6 +105,6 @@ claim 返回的现行 `project.release`：Quality gate 后合入 main，GitHub A
 
 ## 交给后续任务的约束
 
-- `c4c80c02` 上线申请前必须确认：五个凭证仍能 `get_secret`，并且 `b068f582` 的授权审查已经有结论。工作区若仍是 provisioning_error，申请里要写明这个 503，不能写成成员验收已具备。未满足时只允许继续实现和修 CI。
+- `c4c80c02` 上线申请前必须确认：五个凭证仍能 `get_secret`，`b068f582` 的授权审查已有结论，两个工作区通过上面的修复与 active/成员核验。当前 `provisioning_error` 是明确阻断，不能当成可上线的身份准备。未满足时只允许继续实现和修 CI。
 - `7c9fb60c` 在上线后按获准方案把工作区激活、加入普通成员和可移除成员，并核对复制后的 public_id。QA 逐条测 8 条 AC。样本或权限不够就阻塞。
 - 最终运营验收仍要等全部交付项，包括 `b068f582`，不能漏验。
