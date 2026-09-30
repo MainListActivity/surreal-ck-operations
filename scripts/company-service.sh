@@ -33,7 +33,9 @@ payload = {
     'KeepAlive': True,
     'StandardOutPath': str(home / f'logs/stdout{suffix}.log'),
     'StandardErrorPath': str(home / f'logs/stderr{suffix}.log'),
-    'ProcessType': 'Background',
+    # Background QoS throttles Bun.password.verify (argon2) ~500x — every valid
+    # credential would take ~60s to authenticate and every request would hang.
+    'ProcessType': 'Adaptive',
 }
 path = Path(os.environ['PLIST'])
 path.write_bytes(plistlib.dumps(payload))
