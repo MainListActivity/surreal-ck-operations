@@ -109,17 +109,27 @@ export class CompanyDatabase {
 
   private reconnecting: Promise<void> | undefined;
 
+  /** Half-open WSS (peer gone, local socket still ESTABLISHED) makes a query hang forever;
+   *  bound every step so a dead connection fails fast and rebuilds instead of wedging callers. */
+  private static withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+      promise.then(v => { clearTimeout(timer); resolve(v); },
+        e => { clearTimeout(timer); reject(e); });
+    });
+  }
+
   /** Probes the connection; on failure rebuilds it. The SDK may silently re-establish the WS
    *  transport while dropping ns/db/auth session state, so the probe must require scope. */
   async ensureConnected(): Promise<void> {
     this.reconnecting ??= (async () => {
       try {
-        await this.db.query('INFO FOR DB;');
+        await CompanyDatabase.withTimeout(this.db.query('INFO FOR DB;'), 10_000, 'db probe');
       } catch (probeError) {
         try {
           await this.db.close().catch(() => {});
-          await this.connect();
-          await this.useDatabase();
+          await CompanyDatabase.withTimeout(this.connect(), 15_000, 'db connect');
+          await CompanyDatabase.withTimeout(this.useDatabase(), 10_000, 'db use');
           console.log(`database connection re-established (was: ${(probeError as Error).message.slice(0, 80)})`);
         } catch (error) {
           console.error(`database reconnect failed: ${(error as Error).message}`);
