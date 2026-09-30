@@ -382,6 +382,12 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
     onError: e => setResult(`失败：${e instanceof Error ? e.message : String(e)}`),
   });
 
+  const crumb = [
+    role ? (ROLE_LABEL[role] ?? role) : undefined,
+    provider ? (prov?.label ?? provider) : undefined,
+    model,
+  ].filter(Boolean).join(" / ");
+
   return (
     <View style={s.card}>
       {editing ? (
@@ -391,28 +397,33 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
         </>
       ) : (
         <>
-          <Text style={s.muted}>岗位</Text>
+          <Text style={s.muted}>{crumb ? `已选：${crumb}` : "① 先选岗位"}</Text>
           <View style={s.row}>
             {(options.data?.roles ?? []).map(r => (
-              <Pressable key={r} accessibilityRole="button" style={[s.chip, role === r && s.chipActive]} onPress={() => setRole(r)}>
+              <Pressable key={r} accessibilityRole="button" style={[s.chip, role === r && s.chipActive]}
+                onPress={() => { setRole(r); setProvider(undefined); setModel(undefined); setThinking(undefined); }}>
                 <Text style={[s.chipText, role === r && s.chipTextActive]}>{ROLE_LABEL[r] ?? r}</Text>
               </Pressable>
             ))}
           </View>
-          <Text style={s.muted}>订阅 provider{options.data ? `（${options.data.providers.length} 个已启用）` : "（加载中…）"}</Text>
-          <View style={s.row}>
-            {(options.data?.providers ?? []).map(p => (
-              <Pressable key={p.id} accessibilityRole="button" style={[s.chip, provider === p.id && s.chipActive]}
-                onPress={() => { setProvider(p.id); setModel(undefined); setThinking(undefined); }}>
-                <Text style={[s.chipText, provider === p.id && s.chipTextActive]}>{p.label}{p.status !== "ready" && p.status !== "available" ? ` · ${p.status}` : ""}</Text>
-              </Pressable>
-            ))}
-          </View>
+          {role && (
+            <>
+              <Text style={s.muted}>② 订阅 provider{options.data ? `（${options.data.providers.length} 个已启用）` : "（加载中…）"}</Text>
+              <View style={s.row}>
+                {(options.data?.providers ?? []).map(p => (
+                  <Pressable key={p.id} accessibilityRole="button" style={[s.chip, provider === p.id && s.chipActive]}
+                    onPress={() => { setProvider(p.id); setModel(undefined); setThinking(undefined); }}>
+                    <Text style={[s.chipText, provider === p.id && s.chipTextActive]}>{p.label}{p.status !== "ready" && p.status !== "available" ? ` · ${p.status}` : ""}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </>
+          )}
         </>
       )}
       {prov && (
         <>
-          <Text style={s.muted}>模型（auto 跟随上游最新版，pin 锁定版本）</Text>
+          <Text style={s.muted}>{editing ? "" : "③ "}模型（auto 跟随上游最新版，pin 锁定版本）</Text>
           <View style={s.row}>
             {visibleModels.map(m => (
               <Pressable key={m.id} accessibilityRole="button" style={[s.chip, model === m.id && s.chipActive]}
@@ -443,35 +454,40 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
           </View>
         </>
       )}
-      <View style={s.row}>
-        <Text style={s.muted}>实例上限</Text>
-        <TextInput style={[s.input, { width: 56, paddingVertical: 6 }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
-        <Text style={s.muted}>派工权重</Text>
-        <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
-        {editing && (
-          <>
-            <Text style={s.muted}>状态</Text>
-            <Pressable accessibilityRole="button" style={[s.chip, enabled && s.chipActive]} onPress={() => setEnabled(true)}>
-              <Text style={[s.chipText, enabled && s.chipTextActive]}>启用</Text>
+      {ready && (
+        <>
+          <View style={s.row}>
+            <Text style={s.muted}>实例上限</Text>
+            <TextInput style={[s.input, { width: 56, paddingVertical: 6 }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
+            <Text style={s.muted}>派工权重</Text>
+            <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
+            {editing && (
+              <>
+                <Text style={s.muted}>状态</Text>
+                <Pressable accessibilityRole="button" style={[s.chip, enabled && s.chipActive]} onPress={() => setEnabled(true)}>
+                  <Text style={[s.chipText, enabled && s.chipTextActive]}>启用</Text>
+                </Pressable>
+                <Pressable accessibilityRole="button" style={[s.chip, !enabled && s.chipActive]} onPress={() => setEnabled(false)}>
+                  <Text style={[s.chipText, !enabled && s.chipTextActive]}>停用</Text>
+                </Pressable>
+              </>
+            )}
+          </View>
+          <View style={s.row}>
+            <Pressable accessibilityRole="button" style={s.button} disabled={submit.isPending}
+              onPress={() => { setResult(undefined); submit.mutate(); }}>
+              <Text style={s.buttonText}>{submit.isPending ? "提交中…" : editing ? `保存 ${editing.id}` : `注册 ${role}-${provider}`}</Text>
             </Pressable>
-            <Pressable accessibilityRole="button" style={[s.chip, !enabled && s.chipActive]} onPress={() => setEnabled(false)}>
-              <Text style={[s.chipText, !enabled && s.chipTextActive]}>停用</Text>
-            </Pressable>
-          </>
-        )}
-      </View>
-      <View style={s.row}>
-        <Pressable accessibilityRole="button" style={s.button} disabled={!ready || submit.isPending}
-          onPress={() => { setResult(undefined); submit.mutate(); }}>
-          <Text style={s.buttonText}>{submit.isPending ? "提交中…" : editing ? `保存 ${editing.id}` : ready ? `注册 ${role}-${provider}` : "选择岗位/provider/模型"}</Text>
-        </Pressable>
-        {editing && onCancel && (
-          <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={onCancel}>
-            <Text style={s.buttonSecondaryText}>取消编辑</Text>
-          </Pressable>
-        )}
-        {result && <Text style={result.startsWith("失败") ? s.buttonDangerText : s.muted}>{result}</Text>}
-      </View>
+            {editing && onCancel && (
+              <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={onCancel}>
+                <Text style={s.buttonSecondaryText}>取消编辑</Text>
+              </Pressable>
+            )}
+            {result && <Text style={result.startsWith("失败") ? s.buttonDangerText : s.muted}>{result}</Text>}
+          </View>
+        </>
+      )}
+      {!ready && result && <Text style={result.startsWith("失败") ? s.buttonDangerText : s.muted}>{result}</Text>}
     </View>
   );
 }
