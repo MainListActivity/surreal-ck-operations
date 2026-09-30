@@ -262,8 +262,10 @@ export function createMcpHttpService(options: McpServiceOptions) {
           resolve(new Response('Service unavailable', { status: 503 }));
         }, 55_000);
       });
+      const work = respond(request, credential);
+      work.catch(() => {}); // a rejection after the budget wins must not become an unhandled rejection
       try {
-        return await Promise.race([respond(request, credential), budget]);
+        return await Promise.race([work, budget]);
       } finally {
         clearTimeout(budgetTimer);
       }

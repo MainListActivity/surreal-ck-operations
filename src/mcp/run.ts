@@ -18,7 +18,18 @@ await db.connect();
 let service: ReturnType<typeof createMcpHttpService> | undefined;
 const shutdown = new AbortController();
 try {
-  await db.bootstrap();
+  // A wedged bootstrap must not leave a silent idle process; fail and let launchd retry.
+  let bootTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      db.bootstrap(),
+      new Promise<never>((_, reject) => {
+        bootTimer = setTimeout(() => reject(new Error('bootstrap timed out after 90s')), 90_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(bootTimer);
+  }
   const core = new SurrealCompanyCore(db);
   service = createMcpHttpService({
     core, port,

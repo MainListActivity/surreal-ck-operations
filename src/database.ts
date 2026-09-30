@@ -15,9 +15,13 @@ export class CompanyDatabase {
   constructor(readonly config: DatabaseConfig) {}
 
   async connect(): Promise<void> {
-    await this.db.connect(this.config.url, {
-      authentication: { username: this.config.rootUser, password: this.config.rootPassword },
-    });
+    // The WS engine resolves its open promise only on socket 'close'; a connect that
+    // stalls without ever firing close would wedge startup/reconnect forever.
+    await CompanyDatabase.withTimeout(
+      this.db.connect(this.config.url, {
+        authentication: { username: this.config.rootUser, password: this.config.rootPassword },
+      }),
+      15_000, 'db connect');
   }
 
   async bootstrap(): Promise<void> {
