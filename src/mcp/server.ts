@@ -231,6 +231,8 @@ export function createMcpHttpService(options: McpServiceOptions) {
   const server = Bun.serve({
     hostname,
     port: options.port,
+    // Remote DB roundtrips make heavy calls (record_score etc.) exceed Bun's 10s default.
+    idleTimeout: 120,
     async fetch(request) {
       const rejected = hostHeaderValidationResponse(request, ['127.0.0.1'])
         ?? originValidationResponse(request, ['127.0.0.1']);
