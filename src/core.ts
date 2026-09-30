@@ -154,11 +154,15 @@ export class SurrealCompanyCore implements CompanyCore {
     if (typeof credential !== 'string' || !credential.startsWith('sck_') || credential.length > 200) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
+    const t0 = Date.now();
     const [rows] = await this.db.query<[EmployeeRow[]]>(
       'SELECT * FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
     );
+    const queryMs = Date.now() - t0;
     const row = rows?.[0];
-    if (!row || row.revoked || !(await Bun.password.verify(credential, row.credential_hash))) {
+    const verified = row && !row.revoked ? await Bun.password.verify(credential, row.credential_hash) : false;
+    console.log(`auth timing: query=${queryMs}ms verify=${Date.now() - t0 - queryMs}ms`);
+    if (!row || row.revoked || !verified) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
     return { employeeId: asId(row.id), role: row.role, capabilities: row.capabilities };
