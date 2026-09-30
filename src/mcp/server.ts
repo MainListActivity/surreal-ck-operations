@@ -253,19 +253,40 @@ export function createMcpHttpService(options: McpServiceOptions) {
       const authorization = request.headers.get('authorization');
       if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) return new Response('Unauthorized', { status: 401 });
       const credential = authorization.slice(7);
-      await options.heal?.().catch(() => {});
-      let principal;
+      // A half-open DB socket wedges queries forever; the MCP client gives up at 60s,
+      // so cap the whole request below that and answer 503 instead of hanging.
+      let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+      const budget = new Promise<Response>(resolve => {
+        budgetTimer = setTimeout(() => {
+          void options.heal?.().catch(() => {});
+          resolve(new Response('Service unavailable', { status: 503 }));
+        }, 55_000);
+      });
       try {
-        principal = await core.authenticate(credential);
-      } catch (error) {
-        const invalidCredential = typeof error === 'object' && error !== null
-          && 'code' in error && error.code === 'unauthorized';
-        return new Response(invalidCredential ? 'Unauthorized' : 'Service unavailable', {
-          status: invalidCredential ? 401 : 503,
-        });
+        return await Promise.race([respond(request, credential), budget]);
+      } finally {
+        clearTimeout(budgetTimer);
       }
-      if (!principal) return new Response('Unauthorized', { status: 401 });
-      return handler.fetch(request, { authInfo: { token: credential, clientId: principal.employeeId, scopes: [] } });
+
+      async function respond(req: Request, cred: Credential): Promise<Response> {
+        try {
+          await options.heal?.();
+        } catch {
+          return new Response('Service unavailable', { status: 503 });
+        }
+        let principal;
+        try {
+          principal = await core.authenticate(cred);
+        } catch (error) {
+          const invalidCredential = typeof error === 'object' && error !== null
+            && 'code' in error && error.code === 'unauthorized';
+          return new Response(invalidCredential ? 'Unauthorized' : 'Service unavailable', {
+            status: invalidCredential ? 401 : 503,
+          });
+        }
+        if (!principal) return new Response('Unauthorized', { status: 401 });
+        return handler.fetch(req, { authInfo: { token: cred, clientId: principal.employeeId, scopes: [] } });
+      }
     },
   });
   return {

@@ -108,6 +108,15 @@ export class CompanyDatabase {
   }
 
   private reconnecting: Promise<void> | undefined;
+  private keepalive: ReturnType<typeof setInterval> | undefined;
+
+  /** Remote WSS rots silently while idle (peer times out, local socket stays ESTABLISHED);
+   *  probe periodically so a dead connection is rebuilt before a request walks into it. */
+  private ensureKeepalive(): void {
+    if (this.keepalive) return;
+    this.keepalive = setInterval(() => { void this.ensureConnected().catch(() => {}); }, 25_000);
+    this.keepalive.unref?.();
+  }
 
   /** Half-open WSS (peer gone, local socket still ESTABLISHED) makes a query hang forever;
    *  bound every step so a dead connection fails fast and rebuilds instead of wedging callers. */
@@ -122,6 +131,7 @@ export class CompanyDatabase {
   /** Probes the connection; on failure rebuilds it. The SDK may silently re-establish the WS
    *  transport while dropping ns/db/auth session state, so the probe must require scope. */
   async ensureConnected(): Promise<void> {
+    this.ensureKeepalive();
     this.reconnecting ??= (async () => {
       try {
         await CompanyDatabase.withTimeout(this.db.query('INFO FOR DB;'), 10_000, 'db probe');
@@ -142,5 +152,9 @@ export class CompanyDatabase {
     return this.reconnecting;
   }
 
-  async close(): Promise<void> { await this.db.close(); }
+  async close(): Promise<void> {
+    clearInterval(this.keepalive);
+    this.keepalive = undefined;
+    await this.db.close();
+  }
 }

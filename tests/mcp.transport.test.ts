@@ -67,6 +67,24 @@ test('every request rejects missing, wrong, revoked credential and foreign Host/
   expect((await fetch(url, { ...request, headers: { ...request.headers, Authorization: 'Bearer sck_valid' } })).status).toBe(503);
 });
 
+test('failed connection heal answers 503 instead of authenticating on a broken socket', async () => {
+  const broken = createMcpHttpService({ core, port: 0, heal: () => Promise.reject(new Error('db dead')) });
+  try {
+    const response = await fetch(new URL(`http://127.0.0.1:${broken.port}/mcp`), {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json',
+        Authorization: 'Bearer sck_valid',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+      }),
+    });
+    expect(response.status).toBe(503);
+  } finally { await broken.close(); }
+});
+
 test('health and readiness remain separate from MCP authentication', async () => {
   expect((await fetch(new URL('/health', url))).status).toBe(200);
   expect((await fetch(new URL('/ready', url))).status).toBe(503);
