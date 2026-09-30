@@ -659,6 +659,9 @@ export class SurrealCompanyCore implements CompanyCore {
     const row = await this.db.select<TaskRow>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
     if (row.state !== 'done') throw new CompanyError('conflict', 'Task is not finished');
+    // Response timeouts can cut the reply after writes landed; retries must not
+    // duplicate the evaluated audit/outbox events (scorecards themselves upsert).
+    if (row.evaluated_at) return { recorded: 0, participants: [] };
 
     const state = await collectEvalState(this.db, input.taskId, actor.employeeId);
     const invalid = validateScores(state, input.scores);
