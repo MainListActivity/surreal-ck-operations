@@ -7,3 +7,5 @@
 证据写进任务服务（checkpoint / submit / review），只在任务授权的范围写文件。员工不修改公司规则，不在共享 checkout 执行 commit/push，不创建 agent 或定时器；派工与编制由调度器和经理负责。产品仓库默认只读，代码任务在任务专属分支的独立 worktree 中进行，遵守该仓库 AGENTS/技能。
 
 凭证文件只以路径使用。原始客户资料、密钥、token、.env 不进入任务证据、Issue 或输出。AI 不代替真人客户回执、老板授权或持牌专业意见。
+
+SurrealDB 依赖约定：本地测试与任何本地实例只使用公司 fork（`mainlistactivity/surrealdb`，镜像 `ghcr.io/mainlistactivity/surrealdb-native-quota`；本机二进制 `~/.surrealdb/surreal` 为 fork `1171dd01` 本地构建）。禁止用上游官方 surrealdb 跑测试或起本地实例，避免行为差异污染结论。
