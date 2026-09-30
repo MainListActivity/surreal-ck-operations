@@ -141,7 +141,7 @@ export class CompanyDatabase {
         await CompanyDatabase.withTimeout(this.db.query('INFO FOR DB;'), 10_000, 'db probe');
       } catch (probeError) {
         try {
-          await this.db.close().catch(() => {});
+          await CompanyDatabase.withTimeout(this.db.close().catch(() => {}), 5_000, 'db close').catch(() => {});
           await CompanyDatabase.withTimeout(this.connect(), 15_000, 'db connect');
           await CompanyDatabase.withTimeout(this.useDatabase(), 10_000, 'db use');
           console.log(`database connection re-established (was: ${(probeError as Error).message.slice(0, 80)})`);
@@ -159,6 +159,8 @@ export class CompanyDatabase {
   async close(): Promise<void> {
     clearInterval(this.keepalive);
     this.keepalive = undefined;
-    await this.db.close();
+    // engine.close() awaits a 'disconnected' event that never arrives when the peer
+    // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
+    await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});
   }
 }

@@ -33,7 +33,11 @@ try {
   const core = new SurrealCompanyCore(db);
   service = createMcpHttpService({
     core, port,
-    ready: async () => Boolean(await db.db.select(new RecordId('company_meta', 'installation'))),
+    ready: async () => {
+      const probe = db.db.select(new RecordId('company_meta', 'installation'));
+      const timeout = new Promise<false>(resolve => setTimeout(() => resolve(false), 8_000));
+      return Boolean(await Promise.race([probe, timeout]));
+    },
     heal: () => db.ensureConnected(),
   });
   console.log(`MCP listening on 127.0.0.1:${service.port}`);
