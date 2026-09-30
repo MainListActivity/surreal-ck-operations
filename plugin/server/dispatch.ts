@@ -153,21 +153,28 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 let paseoHandle: PaseoApi | undefined;
 
 /** Hooks carry the only paseo handle: persist latest quota to company_meta so the dispatcher can read it. */
+let quotaEmptyLoggedAt = 0;
 export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<ProviderUsageEntry[]> {
   paseoHandle = paseo;
   if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries(ctx);
   quotaRefreshedAt = Date.now();
-  const usage = await paseo.providers.listUsage().catch(() => undefined);
+  const usage = await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; });
   const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
-  if (!providers.length) return [];
+  if (!providers.length) {
+    if (Date.now() - quotaEmptyLoggedAt > 300_000) {
+      quotaEmptyLoggedAt = Date.now();
+      console.log(`quota refresh: no provider usage entries${usage ? ` (keys: ${Object.keys(usage).join(',')})` : ' (no response)'}`);
+    }
+    return [];
+  }
   const { RecordId } = await import("surrealdb");
   for (const entry of providers) {
     const split = splitLowestPct(entry);
     await ctx.db.db.query(
-      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, lowest_pct: $lowest, session_pct: $session, weekly_pct: $weekly, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
+      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, lowest_pct: $lowest, session_pct: $sessionPct, weekly_pct: $weeklyPct, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
       { meta: new RecordId("company_meta", `quota_${entry.providerId}`), provider: entry.providerId,
         summary: providerQuotaSummary(entry), lowest: lowestRemainingPct(entry),
-        session: split.session, weekly: split.weekly, status: entry.status,
+        sessionPct: split.session, weeklyPct: split.weekly, status: entry.status,
         fetched: usage?.fetchedAt, entry });
   }
   return providers;
@@ -259,6 +266,7 @@ export function startDispatch(server: PluginServerContext): () => void {
   const kick = () => { if (!stopped && running) wake?.(); };
   const removers = [
     server.on("agent.turn_ended", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
@@ -271,6 +279,7 @@ export function startDispatch(server: PluginServerContext): () => void {
       });
     }),
     server.on("agent.archived", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();
@@ -281,6 +290,7 @@ export function startDispatch(server: PluginServerContext): () => void {
     }),
     server.on("workspace.archived", () => kick()),
     server.on("agent.permission_requested", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();

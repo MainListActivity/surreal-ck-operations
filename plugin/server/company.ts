@@ -59,7 +59,10 @@ export function company(): Promise<Company> {
         return (rows ?? []).map(r => ({
           provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
           sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
-          fetchedAt: r.fetched_at ?? String(r.at ?? ""),
+          // Freshness = when WE last verified the row, not the upstream snapshot time:
+          // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
+          // the circuit breaker would fail open on dead data.
+          fetchedAt: String(r.at ?? "") || r.fetched_at,
         }));
       },
       // `auto:<family>` model slots resolved by hooks/tick-loop via providers.listModels.

@@ -86,7 +86,11 @@ export class Dispatcher {
       for (const q of quotaRows) {
         const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
         if (age >= 15 * 60_000) continue;
-        const session = q.sessionPct ?? q.lowestPct;
+        // Rows written before split fields existed carry only lowestPct: judge it under the
+        // short-window floor. Once session/weekly are written, a missing short-window value
+        // means the provider simply has none — don't reinterpret the long-window low as short.
+        const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
+        const session = hasSplit ? q.sessionPct : q.lowestPct;
         const hits: string[] = [];
         if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
         if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
