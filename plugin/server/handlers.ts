@@ -120,6 +120,7 @@ export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.providerOptions, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { ROLES } = await import("./vendor/src/core.ts");
     const { MODEL_FAMILY } = await import("./dispatch.ts");
+    if (paseo) await refreshQuota(paseo, await company()).catch(() => []);
     const snapshot = paseo
       ? await paseo.providers.waitForReady({ timeoutMs: 15_000 }).catch(() => paseo.providers.snapshot()).catch(() => ({ entries: [] }))
       : { entries: [] };
@@ -161,6 +162,7 @@ export function registerHandlers(server: PluginServerContext): void {
 
   server.handle(rpc.registerDef, async (input: RpcInput<typeof rpc.registerDef>, { paseo }: { paseo: any }) => {
     const { workforce } = await company();
+    if (paseo) await refreshQuota(paseo, await company()).catch(() => []);
     const snapshot = paseo ? await paseo.providers.snapshot().catch(() => ({ entries: [] })) : { entries: [] };
     const entry = (snapshot.entries ?? []).find((e: any) => e.provider === input.provider && e.enabled !== false);
     if (!entry) throw new Error(`provider ${input.provider} 未在 Paseo 中启用`);

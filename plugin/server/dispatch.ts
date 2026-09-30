@@ -259,6 +259,7 @@ export function startDispatch(server: PluginServerContext): () => void {
   const kick = () => { if (!stopped && running) wake?.(); };
   const removers = [
     server.on("agent.turn_ended", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
@@ -271,6 +272,7 @@ export function startDispatch(server: PluginServerContext): () => void {
       });
     }),
     server.on("agent.archived", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();
@@ -281,6 +283,7 @@ export function startDispatch(server: PluginServerContext): () => void {
     }),
     server.on("workspace.archived", () => kick()),
     server.on("agent.permission_requested", (event, { paseo }) => {
+      paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();
