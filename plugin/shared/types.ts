@@ -81,7 +81,7 @@ export interface ProviderUsageView {
 export interface Roster {
   paused: boolean;
   usage: ProviderUsageView[];
-  defs: Array<{ id: string; role: string; provider: string; model: string; enabled: boolean; maxInstances: number; weight?: number }>;
+  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number }>;
   instances: Array<{ id: string; def?: string; role: string; provider?: string; cwd?: string; agentId?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
 }

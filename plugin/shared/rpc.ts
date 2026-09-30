@@ -96,8 +96,15 @@ export const registerDef = defineRpc({
     thinking: z.string().optional(),
     maxInstances: z.number().int().min(1).optional(),
     weight: z.number().int().min(0).optional(),
+    enabled: z.boolean().optional(),
   }),
   output: z.object({ id: z.string() }),
+});
+
+export const setDefEnabled = defineRpc({
+  name: "company.def.enabled",
+  input: z.object({ defId: z.string().min(1), enabled: z.boolean() }),
+  output: z.object({ ok: z.boolean() }),
 });
 
 export const pendingPermissions = defineRpc({

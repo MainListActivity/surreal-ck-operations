@@ -94,10 +94,10 @@ export function registerHandlers(server: PluginServerContext): void {
       (agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
     const usageEntries = paseo ? await refreshQuota(paseo, await company()).catch(() => []) : [];
     const modelSlots = paseo ? await refreshModels(paseo, await company()).catch(() => ({} as Record<string, string>)) : {};
-    const showModel = (d: { provider: string; model?: string }): string =>
+    const resolveDisplay = (d: { provider: string; model?: string }): string | undefined =>
       d.model?.startsWith("auto:")
-        ? `${d.model} → ${modelSlots[`${d.provider}:${d.model.slice(5)}`] ?? "未解析"}`
-        : d.model ?? "";
+        ? modelSlots[`${d.provider}:${d.model.slice(5)}`] ?? "未解析"
+        : undefined;
     return {
       paused: cfg.paused,
       usage: usageEntries.map((u: any) => ({
@@ -106,8 +106,8 @@ export function registerHandlers(server: PluginServerContext): void {
         balances: (u.balances ?? []).map((b: any) => ({ label: b.label, remaining: b.remaining, limit: b.limit, unit: b.unit, tone: b.tone })),
       })),
       defs: (await workforce.defs()).map(d => ({
-        id: d.id, role: d.role, provider: d.provider, model: showModel(d),
-        enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
+        id: d.id, role: d.role, provider: d.provider, model: d.model, resolved: resolveDisplay(d),
+        thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
       })),
       instances: (await workforce.insts()).map(i => ({
         id: i.id, def: i.def, role: i.role, provider: i.provider, cwd: i.cwd,
@@ -192,8 +192,18 @@ export function registerHandlers(server: PluginServerContext): void {
     await workforce.upsertDef(defId, {
       role: input.role as any, provider: input.provider, model: input.model,
       thinking: input.thinking, maxInstances: input.maxInstances, weight: input.weight,
+      enabled: input.enabled,
     });
     return { id: defId };
+  });
+
+  server.handle(rpc.setDefEnabled, async (input: RpcInput<typeof rpc.setDefEnabled>) => {
+    const { db } = await company();
+    const { id } = await import("./vendor/src/core.ts");
+    await db.db.query(
+      "UPDATE $def SET enabled = $enabled, error_streak = 0, disabled_reason = NONE, disabled_at = NONE;",
+      { def: id("employee_def", input.defId), enabled: input.enabled });
+    return { ok: true };
   });
 
   server.handle(rpc.pendingPermissions, async (_input: unknown, { paseo }: { paseo: any }) => {
