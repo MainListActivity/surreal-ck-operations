@@ -270,8 +270,16 @@ export function startDispatch(server: PluginServerContext): () => void {
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         console.log(`turn_ended ${event.agent.title ?? event.agent.id} company=${ok}`);
         if (!ok) return;
+        const ctx = await company();
+        // The sidecar ingests report.md/blocker.md and lands submit/block before
+        // the usage snapshot looks for freshly-reviewed tasks.
         try {
-          await snapshotSubmitUsage(paseo, await company(), event.agent);
+          await ctx.sidecar.settle(event.agent.id);
+        } catch (error) {
+          console.warn(`sidecar settle failed: ${(error as Error).message}`);
+        }
+        try {
+          await snapshotSubmitUsage(paseo, ctx, event.agent);
         } catch (error) {
           console.warn(`usage snapshot failed: ${(error as Error).message}`);
         }
@@ -283,6 +291,7 @@ export function startDispatch(server: PluginServerContext): () => void {
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
         const ctx = await company();
+        ctx.sidecar.detachAgent(event.agent.id);
         await refreshQuota(paseo, ctx).catch(() => {});
         await refreshModels(paseo, ctx).catch(() => {});
         kick();

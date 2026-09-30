@@ -1,26 +1,26 @@
-# 员工执行协议 v3.1
+# 员工执行协议 v3.2
 
-公司任务服务是唯一事实来源。调度器（普通后台进程）负责派工：它从 SurrealDB 读队列，先按角色/项目/容量过滤出合格候选，再由 Jev 结合绩效、订阅额度与健康度挑人（Jev 拿不准时回退权重随机），通过 Paseo 叫醒。你被叫醒时，派工消息里会写明任务 ID 和调用命令：
+公司任务服务是唯一事实来源。调度器（Paseo 插件内的后台进程）负责派工：它从 SurrealDB 读队列，先按角色/项目/容量过滤出合格候选，再由 Jev 结合绩效、订阅额度与健康度挑人（Jev 拿不准时回退权重随机），通过 Paseo 叫醒。
+
+你的身份绑定在 Paseo 会话上：插件为你的员工实例登记并代持凭证，任务的领取、续租、提交由插件里的会话通道（sidecar）程序化完成——你没有也不需要任何凭证文件。调用公司任务服务：
 
 ```
-SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具> '<JSON>'
+'<sck 路径>' call <工具> '<JSON>'
 ```
 
-你的身份（员工编号、岗位、能力）由凭证在服务端确定。凭证只以路径使用。
+`checkpoint`、`submit`、`review`、`report_blocker` 的租约证明由通道自动补齐，参数里只写业务字段；`claim_next` 不存在于你这一侧——任务在你被叫醒前已领好。
 
 ## 每次被唤醒
 
-1. **领取**：`claim_next {"taskId": "<派工消息里的 ID>"}`。返回 `already_claimed`、`no_available_task` 或 `forbidden` 时，直接结束本轮。
-   领取成功时记下 `deliveryId`、`fence`、`task.version`，后续每次写入都带上它们（`expectedVersion` 用最新版本）。
-2. **读上下文**：完整读 `task.context`、`project` 和返回的 `history`。`project` 是任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、可领取的凭证名；项目的部署事实以它和其中列出的 runbook 为准，不要再向别人要。`secrets` 是已经为你解密好的任务凭证（按你的岗位过滤），直接使用、不要写入证据；列表里没有的才用 `get_secret` 领取。history 里有前任的 checkpoint、交接包（`revoked`）、验收退回意见（`return`）、老板决定（`owner_*`）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
-3. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，纯保活用 `heartbeat`，返回 `checkpoint_limit` 就直接 `submit` 或 `report_blocker`。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
+1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、可用凭证名）、`secrets`（按你岗位解密好的任务凭证，直接用、禁止写进证据或转抄到其他文件）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
+2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
    代码任务：在任务专属分支 `task/<任务ID前8位>` 的独立 worktree 里工作；checkpoint 前先把改动提交到该分支，并在 checkpoint 里写分支名和 worktree 路径。
-4. **交接**（本轮只做一项，做完即结束本轮）：
-   - 执行完成 → `submit`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。
-   - 验收 → `review`（`decision=accept` 或 `return`）：独立复核，写逐项检查结果；退回写复现方式和期望结果。
-   - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → `report_blocker to=gm`。
+3. **交接**（本轮只做一项，做完即结束本轮）：
+   - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
+   - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
+   - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "gm", "text": "...", "idempotencyKey": "..."}`。
    - 只有下面「老板专属事项」才 `report_blocker to=owner`：写清要老板决定什么、可选项与推荐、你已经查过哪些来源、决定后从哪里继续。
-5. **结束本轮**：用一两句话汇报任务 ID 与交接结果，然后停止。下一项工作由调度器再派。
+4. **结束本轮**：用一两句话汇报任务 ID 与交接结果，然后停止。下一项工作由调度器再派。
 
 ## 边界
 
@@ -28,7 +28,7 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 - 验收独立：服务端拒绝你验收自己提交的成果；换会话、换订阅也一样。
 - 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。经理只在老板直接对话里明确表态时，用 `record_owner_decision` 转录，并逐字引用老板原话。
 - 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
-- 凭证：claim 返回的 `secrets` 已包含你可用的凭证值，直接用；缺的才用 `get_secret` 在持有任务期间领取。不写进证据、文件、提交或消息。
+- 凭证：`claim.json` 的 `secrets` 已包含你可用的凭证值，直接用；缺的才用 `get_secret` 在持有任务期间领取。不写进证据、文件、提交或消息。
 
 ## 决策权
 
@@ -62,13 +62,14 @@ SCK_EMPLOYEE_CREDENTIAL_FILE='<你的凭证路径>' '<sck 路径>' call <工具>
 G3 交给老板时交付已经上线：写清入口链接和验收步骤，不请老板决定是否部署。
 - 阅读或修改 Mastra 前加载产品仓库 mastra skill；写 SurrealQL 前加载 surrealql skill；shell 命令遵循本机 RTK 规则。
 
-## 调度器会替你做的事
+## 通道会替你做的事
 
-- 你的会话在运行时，调度器自动续租；会话中断、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
+- 任务在你被叫醒前已由通道领取；租约证明（`deliveryId`、`fence`、`expectedVersion`）由通道代持并在每次写入时自动注入。
+- 你的会话在运行时，通道自动续租；会话归档、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
 - 任务 `done` 后，调度器每 10 分钟清理该任务的 git worktree（分支 `task/<id8>`）：有未提交或未跟踪改动时 git 会拒绝，就保留并记录。所以要保留的东西请先提交并推送分支；分支本身不删除（已合并的除外）。
-- 你被收回的租约立即失效：之后用旧 `deliveryId` 的写入都会被拒绝。
+- 你被收回的租约立即失效：之后旧 `deliveryId` 的写入都会被拒绝。
 - 任务完成后进入绩效评审：默认由 **Jev**（TypeSafe System One 决策模型）在调度器进程内一次调用完成——按审计时间线给每位参与员工打五个维度的校准分并写入 `scorecard`，任务标记 `evaluated_at`。Jev 未配置、连续失败或置信度不足时，调度器改派 `eval` 岗位的 LLM 评审员接手。分数滚动更新员工定义的 `avg_score`，直接影响同类员工接到任务的概率。
 
 ## eval 评审员（派工消息以「绩效评审」开头）
 
-eval 岗位不领取任务。收到评审派工后按 `agents/eval.md` 读任务历史并调 `record_score` 提交全部参与者的评分。eval 凭证不能领任务、不能验收，只能读任务历史与写评分。收到评审派工意味着 Jev 对该任务置信不足或不可用，请按完整 rubric 深审并给出理由充分的评语。
+eval 岗位不领取任务。收到评审派工后按 `agents/eval.md` 读任务历史并调 `record_score` 提交全部参与者的评分。eval 不能领任务、不能验收，只能读任务历史与写评分。收到评审派工意味着 Jev 对该任务置信不足或不可用，请按完整 rubric 深审并给出理由充分的评语。

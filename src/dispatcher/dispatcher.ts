@@ -1,7 +1,7 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ModelSlots, ProviderQuota } from '../contracts.ts';
+import type { ClaimResult, ModelSlots, ProviderQuota } from '../contracts.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -32,6 +32,24 @@ export interface DispatcherDeps {
   quota?: () => Promise<ProviderQuota[]>;
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
   models?: () => Promise<ModelSlots>;
+  /**
+   * Plugin sidecar mode: when set, the dispatcher never hands credentials to
+   * agents. The bridge injects comm env at spawn, claims tasks on the
+   * instance's behalf, and records the agentId↔instance binding.
+   */
+  sidecar?: SidecarBridge;
+}
+
+/** Narrow seam the Paseo plugin's per-agent supervisor implements. */
+export interface SidecarBridge {
+  /** Environment for a fresh spawn: comm dir + key, never credentials. */
+  env(inst: EmployeeInst): Record<string, string>;
+  /** Claims the task as the instance and stages claim.json; undefined = lost the race. */
+  claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
+  /** Records the freshly spawned Paseo agentId for this instance. */
+  bindAgent(instId: string, agentId: string): void;
+  /** A spawn that succeeded but whose pre-claim is now orphaned. */
+  releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
@@ -364,7 +382,7 @@ export class Dispatcher {
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
       const prefer = await routeEmployee(item);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer, slotMap);
+        (inst, first, claim) => wake(inst, item.task, this.deps.env, first, { comm: !!this.deps.sidecar, claim }), report, insts, item.purpose === 'review', prefer, slotMap);
       if (!result) {
         const home = item.task.repoPath ?? this.deps.env.opsRepo;
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}。任务 ${item.task.id} 等待中。`, report);
@@ -385,7 +403,7 @@ export class Dispatcher {
     }
     if (pendingGm.length && running < cfg.maxRunning) {
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first), report, insts, false, undefined, slotMap);
+        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
       if (result) {
         for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
         report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
@@ -401,7 +419,7 @@ export class Dispatcher {
       }
       if (due.length) {
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first) => gmTriage(inst, due, this.deps.env, first), report, insts, false, undefined, slotMap);
+          (inst, first) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
         if (result) {
           for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
           running++;
@@ -440,7 +458,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first) => evalPrompt(inst, task, this.deps.env, first), report, insts, false, undefined, slotMap);
+          (inst, first) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -596,17 +614,28 @@ export class Dispatcher {
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
     spawnable: (role: string, home: string) => EmployeeDef[],
-    prompt: (inst: EmployeeInst, firstContact: boolean) => string,
+    prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     prefer?: AssignPreference, slots?: Map<string, string>,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
-    const { workforce: wf, paseo, env } = this.deps;
+    const { workforce: wf, paseo, env, sidecar } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const existing = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
+    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
+    // A legacy credential-file session can't be sidecar-claimed for new work; let
+    // it finish what it holds and fall through to spawning a comm-mode instance.
+    const existing = picked && !(sidecar && task && picked.credentialFile) ? picked : undefined;
     if (existing) {
+      const first = !this.onboarded.has(existing.id) && !existing.onboarded;
+      let claim: ClaimResult | undefined;
       try {
-        const first = !this.onboarded.has(existing.id) && !existing.onboarded;
-        await paseo.send(existing.paseoAgentId!, prompt(existing, first));
+        if (sidecar && task) {
+          claim = await sidecar.claim(existing, task);
+          if (!claim) {
+            this.log(`claim ${task.id} as ${existing.id} lost; skipping`);
+            return undefined;
+          }
+        }
+        await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim));
         this.onboarded.add(existing.id);
         this.lastStatus.set(existing.paseoAgentId!, 'running');
         await wf.touchWake(existing.id);
@@ -614,6 +643,7 @@ export class Dispatcher {
         return { ...existing, spawned: false };
       } catch (error) {
         this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
+        if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, `wake failed: ${(error as Error).message.slice(0, 120)}`);
         return undefined;
       }
     }
@@ -623,16 +653,24 @@ export class Dispatcher {
       const model = this.resolveModel(def, slots ?? new Map());
       if (!model) continue;
       const inst = await wf.spawnInst(def);
+      const spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
+      const claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
+      if (sidecar && task && !claim) {
+        await wf.retire(inst.id, 'claim race lost');
+        report.retired.push(inst.id);
+        return undefined;
+      }
       try {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: task?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
-          env: { SCK_EMPLOYEE_CREDENTIAL_FILE: inst.credentialFile! },
-          prompt: prompt(inst, true),
+          env: spawnEnv,
+          prompt: prompt(inst, true, claim),
         });
         const cwd = task?.repoPath ?? env.opsRepo;
         await wf.bind(inst.id, { agentId, cwd, model });
+        sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, model };
         insts.push(bound);
         this.onboarded.add(inst.id);
@@ -643,6 +681,7 @@ export class Dispatcher {
       } catch (error) {
         const message = (error as Error).message;
         this.log(`spawn ${inst.id} failed: ${message}`);
+        if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
         await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`);
         report.retired.push(inst.id);
         // A quota-flavored spawn failure is the provider's problem, not the def's:

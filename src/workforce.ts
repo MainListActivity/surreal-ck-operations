@@ -1,6 +1,6 @@
 import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, Role, TaskId } from './contracts.ts';
@@ -41,6 +41,8 @@ export interface EmployeeInst {
   paseoAgentId?: string;
   activeTask?: string;
   credentialFile?: string;
+  /** Minted at spawnInst or re-issued by rotate(); held by the caller (plugin sidecar) only. */
+  credential?: string;
   lastWakeAt?: number;
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
@@ -271,20 +273,39 @@ export class Workforce {
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, wakeCount: r.wake_count ?? 0 }));
   }
 
-  /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned. */
+  /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
+   *  The credential is returned in memory only — file delivery is the caller's choice
+   *  (writeCredentialFile for the legacy standalone dispatcher; plugin sidecar keeps it in RAM). */
   async spawnInst(def: EmployeeDef): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
+    await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
+      retired: false, created_at: time::now() };`, {
+      e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
+      thinking: def.thinking,
+    });
+    return { id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
+  }
+
+  /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
+  writeCredentialFile(inst: EmployeeInst, credential: string): string {
     mkdirSync(this.credentialDir, { recursive: true, mode: 0o700 });
-    const credentialFile = join(this.credentialDir, `${employeeId}.token`);
+    const credentialFile = join(this.credentialDir, `${inst.id}.token`);
     const fd = openSync(credentialFile, 'wx', 0o600);
     try { writeSync(fd, credential); } finally { closeSync(fd); }
-    await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      credential_file: $file, retired: false, created_at: time::now() };`, {
-      e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
-      thinking: def.thinking, file: credentialFile,
+    return credentialFile;
+  }
+
+  /** Re-issues the instance credential and returns it; the old one dies with the digest swap. */
+  async rotate(employeeId: string): Promise<string> {
+    const token = `sck_${randomBytes(32).toString('base64url')}`;
+    const [rows] = await this.db.query<[unknown[]]>(
+      'UPDATE $e SET credential_digest = $digest WHERE revoked != true AND retired != true RETURN AFTER;', {
+      e: id('employee', employeeId),
+      digest: createHash('sha256').update(token).digest('hex'),
     });
-    return { id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credentialFile };
+    if (!rows?.length) throw new CompanyError('unauthorized', 'Employee retired or revoked');
+    return token;
   }
 
   async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string }): Promise<void> {

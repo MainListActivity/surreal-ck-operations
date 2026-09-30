@@ -1,7 +1,38 @@
+import { randomBytes } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { readJsonFile, reqDir, resDir, writeFileAtomic, type CommResponse } from '../comm.ts';
 import { connectCompanyClient } from './client';
 import { readPrivateCredential } from './credential-file';
 
 const [command, name, json] = Bun.argv.slice(2);
+if (!['list', 'call'].includes(command ?? '')) throw new Error('usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
+if (command === 'call' && !name) throw new Error('tool name is required');
+
+// Comm mode: the plugin sidecar owns the credential; the agent relays requests
+// through its private comm directory and never sees any auth material.
+const comm = process.env.SCK_COMM_DIR;
+if (comm) {
+  const key = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  writeFileAtomic(join(reqDir(comm), `${key}.json`), JSON.stringify({
+    key: process.env.SCK_COMM_KEY ?? '', tool: command === 'list' ? '__list__' : name!,
+    args: json ? JSON.parse(json) : {},
+  }));
+  const resFile = join(resDir(comm), `${key}.json`);
+  const deadline = Date.now() + 120_000;
+  for (;;) {
+    const res = readJsonFile<CommResponse>(resFile);
+    if (res) {
+      try { unlinkSync(resFile); } catch { /* consumed race */ }
+      if (!res.ok) { process.stderr.write(`${res.error ?? 'comm request failed'}\n`); process.exit(1); }
+      process.stdout.write(`${JSON.stringify(res.data ?? null)}\n`);
+      process.exit(0);
+    }
+    if (Date.now() > deadline) { process.stderr.write('comm request timed out\n'); process.exit(1); }
+    await Bun.sleep(200);
+  }
+}
+
 const url = process.env.SCK_MCP_URL;
 const credential = process.env.SCK_EMPLOYEE_CREDENTIAL_FILE
   ? await readPrivateCredential(process.env.SCK_EMPLOYEE_CREDENTIAL_FILE)
@@ -9,8 +40,6 @@ const credential = process.env.SCK_EMPLOYEE_CREDENTIAL_FILE
 
 if (!url) throw new Error('SCK_MCP_URL is required');
 if (!credential) throw new Error('SCK_EMPLOYEE_CREDENTIAL_FILE or SCK_EMPLOYEE_CREDENTIAL is required');
-if (!['list', 'call'].includes(command ?? '')) throw new Error('usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
-if (command === 'call' && !name) throw new Error('tool name is required');
 
 const connection = await connectCompanyClient({
   url: new URL(url), credential, clientName: 'sck-employee-cli',

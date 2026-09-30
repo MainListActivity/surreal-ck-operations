@@ -4,9 +4,10 @@
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| 任务服务 | launchd `org.surrealck.company-mcp`，`127.0.0.1:38473/mcp` | 任务、租约、审计、目标、关口；GitHub 投影 |
-| 调度器 | launchd `org.surrealck.company-dispatcher` | 不消耗模型 token：读队列、叫醒/新开员工、续租、收回并改派、订阅健康、老板通知 |
-| 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 领取、执行、交接 |
+| 任务服务 | 远端 `data.maplayer.top/sck-mcp`（Caddy→`127.0.0.1:38473`，gate token），本机 launchd `org.surrealck.company-mcp` 兜底并兼跑 GitHub 投影 | 任务、租约、审计、目标、关口；admin/owner 通道 |
+| 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
+| 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞 |
+| 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证 |
 | 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
 
 数据位于**产品同一台自托管 SurrealDB**（连接地址与 root 凭证读自 `SCK_PRODUCT_ENV` 指向的产品 `.env`，当前 `wss://data.maplayer.top/rpc`）；公司数据独占 `sck_agent_company` namespace / `control_plane` database，与产品 `main` namespace 隔离。换库或换实例改 `service.env` 的 `SCK_COMPANY_NS` / `SCK_COMPANY_DB` 或 `SCK_PRODUCT_ENV`。
@@ -84,7 +85,8 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production QA_PASSWO
   - `eval_engine`：`auto`（默认，Jev 优先、LLM 兜底）/ `llm`（只用 LLM 评审员）/ `jev`（只用 Jev，低置信度也记录）。
   - 没有 Jev key 时整条 Jev 通道自动关闭，行为与原来一致（LLM 评审员兜底）。
   - 查看：`pnpm run admin scores [任务ID]`、`pnpm run company status`。关闭评审：`pnpm run admin config eval_enabled false`。
-- **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成（身份 + 独立凭证 + Paseo 会话），`paseo_agent_id` 记录实际会话。会话报错或关闭即退役并撤销凭证；同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
+- **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
+  旧的凭证文件会话（`credential_file` 非空的实例）继续按原方式收尾，但不再被通道代领新任务，自然淘汰。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
 
 ## 运行参数

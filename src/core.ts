@@ -65,6 +65,7 @@ interface EmployeeRow {
   credential_digest: string;
   credential_hash: string;
   revoked: boolean;
+  retired?: boolean;
   active_task?: RecordId;
 }
 
@@ -163,7 +164,9 @@ export class SurrealCompanyCore implements CompanyCore {
     // memory-hard KDF is throttled ~500x — it was the 50s stall per request.
     console.log(`auth timing: query=${Date.now() - t0}ms`);
     const row = rows?.[0];
-    if (!row || row.revoked) {
+    // retired = the registered instance (Paseo agent binding) is gone; a credential
+    // that outlives its instance is treated as leaked and dies with it.
+    if (!row || row.revoked || row.retired) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
     return { employeeId: asId(row.id), role: row.role, capabilities: row.capabilities };

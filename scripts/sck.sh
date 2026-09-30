@@ -8,6 +8,14 @@ if [ "${1:-}" = "sync-gate" ]; then
   cd "$service_home/active"
   exec "$BUN" src/mcp/sync-gate.ts
 fi
+# Comm mode: the plugin sidecar owns the credential; the agent relays through
+# $SCK_COMM_DIR and carries no auth material at all.
+if [ -n "${SCK_COMM_DIR:-}" ]; then
+  BUN="${SCK_BUN:-$service_home/runtime-bun/bin/bun}"
+  [ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
+  cd "$service_home/active"
+  exec "$BUN" src/mcp/client-cli.ts "$@"
+fi
 : "${SCK_EMPLOYEE_CREDENTIAL_FILE:?SCK_EMPLOYEE_CREDENTIAL_FILE is required}"
 port=$(/usr/bin/sed -n 's/^SCK_MCP_PORT=//p' "$service_home/private/service.env" | /usr/bin/tr -d "\"'")
 # Remote endpoint override: written by `sck sync-gate` (private/mcp-remote.env, mode 600);

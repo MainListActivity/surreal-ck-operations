@@ -9,6 +9,8 @@ export interface Company {
   owner: import("./vendor/src/owner").OwnerDesk;
   workforce: import("./vendor/src/workforce").Workforce;
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
+  core: import("./vendor/src/contracts").CompanyCore;
+  sidecar: import("./sidecar").SidecarPool;
 }
 
 let boot: Promise<Company> | undefined;
@@ -28,6 +30,8 @@ export function company(): Promise<Company> {
     const { CompanyDatabase } = await import("./vendor/src/database.ts");
     const { OwnerDesk } = await import("./vendor/src/owner.ts");
     const { Workforce } = await import("./vendor/src/workforce.ts");
+    const { SurrealCompanyCore } = await import("./vendor/src/core.ts");
+    const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
     const { createGitCli } = await import("./vendor/src/dispatcher/worktrees.ts");
@@ -38,6 +42,12 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
+    const core = new SurrealCompanyCore(db);
+    const sidecar = new SidecarPool({
+      core, workforce,
+      runDir: process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`,
+      log: message => console.log(message),
+    });
     const dispatcher = new Dispatcher({
       workforce,
       owner,
@@ -51,6 +61,7 @@ export function company(): Promise<Company> {
       log: message => console.log(message),
       jev: jevFromEnv(),
       git: createGitCli(),
+      sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: async () => {
         const [rows] = await db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
@@ -72,7 +83,9 @@ export function company(): Promise<Company> {
         return rows?.[0]?.slots ?? {};
       },
     });
-    return { db, owner, workforce, dispatcher };
+    // Rebuild agent↔instance bindings and live leases after a plugin restart.
+    await sidecar.adopt(await workforce.insts());
+    return { db, owner, workforce, dispatcher, core, sidecar };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;
