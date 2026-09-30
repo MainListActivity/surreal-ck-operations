@@ -183,6 +183,10 @@ export interface ProviderQuota {
   summary: string;
   /** Lowest remaining percentage across all usage windows and balances (0-100); undefined when the provider reports no numbers. */
   lowestPct?: number;
+  /** Lowest remaining percentage among short windows (e.g. session/5h) and balances. */
+  sessionPct?: number;
+  /** Lowest remaining percentage among long windows (week/month/billing cycle). */
+  weeklyPct?: number;
   status?: string;
   fetchedAt?: string;
 }

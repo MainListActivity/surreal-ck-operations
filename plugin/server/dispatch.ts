@@ -37,12 +37,30 @@ function providerQuotaSummary(entry: ProviderUsageEntry): string {
 
 /** Lowest remaining percentage across windows and balances; undefined when the provider reports no numbers. */
 function lowestRemainingPct(entry: ProviderUsageEntry): number | undefined {
-  const pcts: number[] = [];
-  for (const w of entry.windows ?? []) if (w.remainingPct != null) pcts.push(w.remainingPct);
-  for (const b of entry.balances ?? []) {
-    if (b.remaining != null && b.limit != null && b.limit > 0) pcts.push((b.remaining / b.limit) * 100);
-  }
+  const pcts = windowPcts(entry, "all");
   return pcts.length ? Math.min(...pcts) : undefined;
+}
+
+/** Long billing windows get a much lower circuit-breaker floor than the 5h/session window. */
+const isLongWindow = (id: string) => /week|month|billing|cycle/i.test(id);
+
+function windowPcts(entry: ProviderUsageEntry, scope: "short" | "long" | "all"): number[] {
+  const pcts: number[] = [];
+  for (const w of entry.windows ?? []) {
+    if (w.remainingPct == null) continue;
+    if (scope === "all" || isLongWindow(w.id) === (scope === "long")) pcts.push(w.remainingPct);
+  }
+  if (scope !== "long") {
+    for (const b of entry.balances ?? []) {
+      if (b.remaining != null && b.limit != null && b.limit > 0) pcts.push((b.remaining / b.limit) * 100);
+    }
+  }
+  return pcts;
+}
+
+function splitLowestPct(entry: ProviderUsageEntry): { session: number | undefined; weekly: number | undefined } {
+  const s = windowPcts(entry, "short"), w = windowPcts(entry, "long");
+  return { session: s.length ? Math.min(...s) : undefined, weekly: w.length ? Math.min(...w) : undefined };
 }
 
 function formatProviderUsage(entry: ProviderUsageEntry): string {
@@ -144,10 +162,12 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   if (!providers.length) return [];
   const { RecordId } = await import("surrealdb");
   for (const entry of providers) {
+    const split = splitLowestPct(entry);
     await ctx.db.db.query(
-      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, lowest_pct: $lowest, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
+      `UPSERT $meta CONTENT { provider: $provider, summary: $summary, lowest_pct: $lowest, session_pct: $session, weekly_pct: $weekly, status: $status, fetched_at: $fetched, payload: $entry, at: time::now() };`,
       { meta: new RecordId("company_meta", `quota_${entry.providerId}`), provider: entry.providerId,
-        summary: providerQuotaSummary(entry), lowest: lowestRemainingPct(entry), status: entry.status,
+        summary: providerQuotaSummary(entry), lowest: lowestRemainingPct(entry),
+        session: split.session, weekly: split.weekly, status: entry.status,
         fetched: usage?.fetchedAt, entry });
   }
   return providers;
