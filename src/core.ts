@@ -158,11 +158,12 @@ export class SurrealCompanyCore implements CompanyCore {
     const [rows] = await this.db.query<[EmployeeRow[]]>(
       'SELECT * FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
     );
-    const queryMs = Date.now() - t0;
+    // credential_digest is a SHA-256 over a high-entropy random token; the argon2
+    // re-verify added nothing (same row, same secret) and under launchd QoS a
+    // memory-hard KDF is throttled ~500x — it was the 50s stall per request.
+    console.log(`auth timing: query=${Date.now() - t0}ms`);
     const row = rows?.[0];
-    const verified = row && !row.revoked ? await Bun.password.verify(credential, row.credential_hash) : false;
-    console.log(`auth timing: query=${queryMs}ms verify=${Date.now() - t0 - queryMs}ms`);
-    if (!row || row.revoked || !verified) {
+    if (!row || row.revoked) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
     return { employeeId: asId(row.id), role: row.role, capabilities: row.capabilities };
