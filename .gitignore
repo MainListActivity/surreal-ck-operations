@@ -4,3 +4,4 @@ node_modules/
 *.log
 plugin/node_modules/
 plugin/server/vendor/
+history.txt
