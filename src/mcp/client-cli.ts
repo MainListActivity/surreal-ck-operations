@@ -12,7 +12,10 @@ if (!credential) throw new Error('SCK_EMPLOYEE_CREDENTIAL_FILE or SCK_EMPLOYEE_C
 if (!['list', 'call'].includes(command ?? '')) throw new Error('usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
 if (command === 'call' && !name) throw new Error('tool name is required');
 
-const connection = await connectCompanyClient({ url: new URL(url), credential, clientName: 'sck-employee-cli' });
+const connection = await connectCompanyClient({
+  url: new URL(url), credential, clientName: 'sck-employee-cli',
+  gateToken: process.env.SCK_MCP_TOKEN || undefined,
+});
 try {
   const result = command === 'list'
     ? await connection.client.listTools()

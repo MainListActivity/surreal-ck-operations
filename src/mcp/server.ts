@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
@@ -20,9 +21,21 @@ export type McpServiceOptions = Readonly<{
   core: CompanyCore;
   hostname?: '127.0.0.1';
   port: number;
+  // Public hostname accepted in Host/Origin when the service sits behind a reverse proxy.
+  publicHost?: string;
+  // Shared gate token provider (DB-backed); when set, /mcp demands ?token= or X-SCK-Token
+  // before employee Bearer auth. Absent => loopback-only deployment, no gate.
+  gateToken?: () => Promise<string | undefined>;
   ready?: () => Promise<boolean>;
   heal?: () => Promise<void>;
 }>;
+
+function tokenEqual(provided: string, expected: string): boolean {
+  return timingSafeEqual(
+    createHash('sha256').update(provided).digest(),
+    createHash('sha256').update(expected).digest(),
+  );
+}
 
 function toolError(error: unknown) {
   const raw = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
@@ -228,14 +241,15 @@ export function createMcpHttpService(options: McpServiceOptions) {
     return server;
   });
   const hostname = options.hostname ?? '127.0.0.1';
+  const allowedHosts = options.publicHost ? ['127.0.0.1', options.publicHost] : ['127.0.0.1'];
   const server = Bun.serve({
     hostname,
     port: options.port,
     // Remote DB roundtrips make heavy calls (record_score etc.) exceed Bun's 10s default.
     idleTimeout: 120,
     async fetch(request) {
-      const rejected = hostHeaderValidationResponse(request, ['127.0.0.1'])
-        ?? originValidationResponse(request, ['127.0.0.1']);
+      const rejected = hostHeaderValidationResponse(request, allowedHosts)
+        ?? originValidationResponse(request, allowedHosts);
       if (rejected) return rejected;
       const path = new URL(request.url).pathname;
       if (path === '/health' && request.method === 'GET') {
@@ -279,6 +293,22 @@ export function createMcpHttpService(options: McpServiceOptions) {
         } catch {
           mark('heal failed');
           return new Response('Service unavailable', { status: 503 });
+        }
+        if (options.gateToken) {
+          let expected: string | undefined;
+          try {
+            expected = await options.gateToken();
+            mark('gate');
+          } catch {
+            mark('gate lookup failed');
+            return new Response('Service unavailable', { status: 503 });
+          }
+          const provided = req.headers.get('x-sck-token')
+            ?? new URL(req.url).searchParams.get('token') ?? '';
+          if (!expected || !tokenEqual(provided, expected)) {
+            mark('gate denied');
+            return new Response('Unauthorized', { status: 401 });
+          }
         }
         let principal;
         try {

@@ -85,6 +85,39 @@ test('failed connection heal answers 503 instead of authenticating on a broken s
   } finally { await broken.close(); }
 });
 
+test('gate token guards the public endpoint before bearer auth', async () => {
+  active = true;
+  unavailable = false;
+  const gated = createMcpHttpService({
+    core, port: 0, publicHost: 'mcp.example',
+    gateToken: async () => 'gate-secret',
+  });
+  try {
+    const u = new URL(`http://127.0.0.1:${gated.port}/mcp`);
+    const init = {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json',
+        Authorization: 'Bearer sck_valid',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+      }),
+    };
+    expect((await fetch(u, init)).status).toBe(401);
+    const gatedHeaders = { ...init.headers, 'X-SCK-Token': 'wrong' };
+    expect((await fetch(u, { ...init, headers: gatedHeaders })).status).toBe(401);
+    const okHeaders = { ...init.headers, 'X-SCK-Token': 'gate-secret' };
+    expect((await fetch(u, { ...init, headers: okHeaders })).status).toBe(200);
+    expect((await fetch(`${u}?token=gate-secret`, init)).status).toBe(200);
+    const publicHostHeaders = { ...okHeaders, Host: 'mcp.example' };
+    expect((await fetch(u, { ...init, headers: publicHostHeaders })).status).toBe(200);
+    const foreignHostHeaders = { ...okHeaders, Host: 'evil.example' };
+    expect((await fetch(u, { ...init, headers: foreignHostHeaders })).status).toBe(403);
+  } finally { await gated.close(); }
+});
+
 test('health and readiness remain separate from MCP authentication', async () => {
   expect((await fetch(new URL('/health', url))).status).toBe(200);
   expect((await fetch(new URL('/ready', url))).status).toBe(503);
