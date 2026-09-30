@@ -755,8 +755,10 @@ test('dispatcher: quota below floor blocks a provider until the snapshot recover
   await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
   const paseo = new FakePaseo();
   let lowestPct: number | undefined = 3;
+  let sessionPct: number | undefined;
+  let weeklyPct: number | undefined;
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
-    rand: () => 0, quota: async () => [{ provider: 'grok', summary: '余额剩 3%', lowestPct, status: 'available', fetchedAt: new Date().toISOString() }] });
+    rand: () => 0, quota: async () => [{ provider: 'grok', summary: '余额剩 3%', lowestPct, sessionPct, weeklyPct, status: 'available', fetchedAt: new Date().toISOString() }] });
 
   const t = await core.createTask(tokens.gm, { title: '额度熔断', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
@@ -774,6 +776,28 @@ test('dispatcher: quota below floor blocks a provider until the snapshot recover
   report = await dispatcher.tick();
   expect(report.woke).toHaveLength(1);
   expect(report.woke[0].task).toBe(t.id);
+
+  // Split floors: a low WEEKLY window does not block under the 2% weekly floor,
+  // while a low SESSION window still blocks under the 8% floor.
+  for (const [id, a] of paseo.agents) paseo.agents.set(id, { ...a, status: 'idle' });
+  lowestPct = undefined;
+  sessionPct = 100; weeklyPct = 7;
+  const t2 = await core.createTask(tokens.gm, { title: '周额度低于8但高于2不阻断', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).toContain(t2.id);
+
+  weeklyPct = 1;
+  const t3 = await core.createTask(tokens.gm, { title: '周额度低于2阻断', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t3.id);
+
+  sessionPct = 5; weeklyPct = 50;
+  const t4 = await core.createTask(tokens.gm, { title: '短窗口低于8阻断', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t4.id);
 });
 
 test('dispatcher: idle sessions past the wake/context limits are rotated out', async () => {

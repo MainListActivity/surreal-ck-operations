@@ -85,6 +85,7 @@ export interface CompanyConfig {
   jevPickConfidence: number;
   /** 订阅剩余额度（任一额度窗口或余额）低于该百分比时视为不可用，停止复用与新开；0 = 不熔断。 */
   quotaFloorPct: number;
+  quotaWeeklyFloorPct: number;
   /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
   sessionMaxWakes: number;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
@@ -98,7 +99,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, sessionMaxWakes: 8, sessionMaxInputK: 150, evalQuickLlm: false,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 8, sessionMaxInputK: 150, evalQuickLlm: false,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -211,6 +212,7 @@ export class Workforce {
       jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
       jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
+      quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : 2,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
       evalQuickLlm: row?.eval_quick_llm === true,

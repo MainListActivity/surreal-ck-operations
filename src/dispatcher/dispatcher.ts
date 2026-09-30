@@ -78,17 +78,21 @@ export class Dispatcher {
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();
     for (const q of quotaRows) quotaByProvider.set(q.provider, q);
-    // Quota circuit breaker: a provider reporting nearly empty quota is treated as unavailable
-    // so we stop spending spawn/turn attempts on it before it actually 402s. Stale snapshots
-    // (>15min old) fail open rather than keeping a provider blocked forever.
-    const quotaBlocked = new Set<string>();
-    if (cfg.quotaFloorPct > 0) {
+    // Quota circuit breaker: separate floors for short windows (session/5h + balances)
+    // and long windows (week/month). Stale snapshots (>15min) fail open rather than
+    // keeping a provider blocked forever.
+    const quotaBlocked = new Map<string, string>();
+    if (cfg.quotaFloorPct > 0 || cfg.quotaWeeklyFloorPct > 0) {
       for (const q of quotaRows) {
-        if (q.lowestPct === undefined || q.lowestPct >= cfg.quotaFloorPct) continue;
         const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
-        if (age < 15 * 60_000) quotaBlocked.add(q.provider);
+        if (age >= 15 * 60_000) continue;
+        const session = q.sessionPct ?? q.lowestPct;
+        const hits: string[] = [];
+        if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
+        if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
+        if (hits.length) quotaBlocked.set(q.provider, `额度不足（${hits.join('，')}）`);
       }
-      if (quotaBlocked.size) this.log(`quota below floor (${cfg.quotaFloorPct}%): ${[...quotaBlocked].join(', ')}`);
+      if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
     }
 
     // 1. Session health.
@@ -216,7 +220,7 @@ export class Dispatcher {
       const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
         .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
       const text = `所有订阅都已耗尽或限流，公司暂停派工。请为以下订阅充值或等待额度恢复：${
-        [...exhausted, ...[...quotaBlocked].map(p => `${p}（额度低于熔断线）`)].join('、') || '全部'}`;
+        [...exhausted, ...[...quotaBlocked].map(([p, r]) => `${p}（${r}）`)].join('、') || '全部'}`;
       await this.notice('budget', text, report);
       report.skipped = 'budget';
       return report;
@@ -316,6 +320,40 @@ export class Dispatcher {
       return inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
     };
 
+    const explainStaffing = (role: string, home: string): string => {
+      const parts: string[] = [];
+      const roleDefs = defs.filter(d => d.role === role);
+      if (!roleDefs.length) parts.push('无该岗位编制');
+      for (const d of roleDefs) {
+        const name = `${d.provider}(${d.id})`;
+        if (!d.enabled) { parts.push(`${name} 编制停用`); continue; }
+        if (resolveModel(d) === undefined) { parts.push(`${name}/${d.model} 模型槽位未解析`); continue; }
+        const qb = quotaBlocked.get(d.provider);
+        if (qb) { parts.push(`${name} ${qb}`); continue; }
+        const avail = this.available(health.get(d.provider), now);
+        if (avail === 'down') {
+          const until = health.get(d.provider)?.until;
+          parts.push(`${name} 订阅冷却${until ? `至 ${new Date(until * 1000).toLocaleTimeString('zh-CN')}` : '中'}`);
+          continue;
+        }
+        const busy = busyBy.get(d.provider) ?? 0;
+        const cap = cfg.providerMax[d.provider] ?? 1;
+        if (avail === 'probe' && busy > 0) { parts.push(`${name} 订阅待探测恢复，当前 ${busy} 个占用`); continue; }
+        if (busy >= cap) {
+          parts.push(`${name} 并发 ${busy}/${cap} 已满${d.provider in cfg.providerMax ? '' : '（provider_max 未配置该 provider，默认 1）'}`);
+          continue;
+        }
+        const inRepo = insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length;
+        if (inRepo >= d.maxInstances) { parts.push(`${name} 实例 ${inRepo}/${d.maxInstances} 已满且忙碌`); continue; }
+        parts.push(`${name} 可新开但唤醒/创建失败`);
+      }
+      const count = (st: InstState) => insts.filter(i =>
+        i.role === role && states.get(i.id) === st && (i.cwd ?? this.deps.env.opsRepo) === home).length;
+      const pool = `实例池：空闲 ${count('idle')}、忙碌 ${count('busy')}` +
+        (count('exhausted') ? `、限流 ${count('exhausted')}` : '') + (count('down') ? `、异常 ${count('down')}` : '');
+      return `${pool}；${parts.join('；') || '无该岗位编制'}`;
+    };
+
     for (const item of work) {
       if (running >= cfg.maxRunning) break;
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
@@ -324,7 +362,8 @@ export class Dispatcher {
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
         (inst, first) => wake(inst, item.task, this.deps.env, first), report, insts, item.purpose === 'review', prefer, slotMap);
       if (!result) {
-        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 当前没有可用员工（无空闲实例且无法新开：定义缺失、已停用、达到上限或订阅不可用），任务 ${item.task.id} 等待中。`, report);
+        const home = item.task.repoPath ?? this.deps.env.opsRepo;
+        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}。任务 ${item.task.id} 等待中。`, report);
         continue;
       }
       await owner.resolveNotice(`staff:${item.role}`);
@@ -541,7 +580,7 @@ export class Dispatcher {
   }
 
   /** A recovering provider gets a single probe session until a turn completes cleanly. */
-  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Set<string>): boolean {
+  private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Map<string, string>): boolean {
     if (quotaBlocked?.has(provider)) return false;
     const availability = this.available(health.get(provider), now);
     if (availability === 'down') return false;
