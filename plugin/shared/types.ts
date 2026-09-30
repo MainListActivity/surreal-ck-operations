@@ -86,6 +86,26 @@ export interface Roster {
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
 }
 
+export interface ModelOption {
+  id: string;
+  label: string;
+  isDefault?: boolean;
+  thinkingOptions: Array<{ id: string; label: string; isDefault?: boolean }>;
+}
+
+export interface ProviderOption {
+  id: string;
+  label: string;
+  status: string;
+  families: Array<{ slot: string; resolvesTo: string }>;
+  models: ModelOption[];
+}
+
+export interface ProviderOptionsResult {
+  roles: string[];
+  providers: ProviderOption[];
+}
+
 export interface PermissionRequest {
   agentId: string;
   title?: string;
