@@ -567,32 +567,49 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
           onDone={() => { setEditDef(undefined); refreshAll(); }} onCancel={() => setEditDef(undefined)} />
       </Section>
-      <Section title="员工编制" ctx={ctx}>
+      <Section title="员工编制" count={r?.defs.length} ctx={ctx}>
         <View style={s.card}>
-          {r?.defs.map(d => {
-            const insts = r.instances.filter(i => i.def === d.id);
-            return (
-              <View key={d.id} style={{ gap: 2 }}>
-                <View style={s.row}>
-                  <Text style={[s.text, { flex: 1 }]}>
-                    {d.id} · {d.provider}/{d.model}{d.resolved ? ` → ${d.resolved}` : ""}{d.thinking ? ` · ${d.thinking}` : ""} · 上限 {d.maxInstances} · 权 {d.weight}{d.enabled ? "" : " · 已停用"}
-                  </Text>
-                  <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
-                    <Text style={s.chipText}>编辑</Text>
-                  </Pressable>
-                  <Pressable accessibilityRole="button" style={s.chip}
-                    onPress={async () => { await toggleDef({ defId: d.id, enabled: !d.enabled }); refreshAll(); }}>
-                    <Text style={s.chipText}>{d.enabled ? "停用" : "启用"}</Text>
-                  </Pressable>
-                </View>
-                {insts.map(i => (
-                  <Text key={i.id} style={s.muted}>
-                    {"  "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.cwd?.split("/").pop() ?? "运营仓库"}{i.agentStatus ? ` · ${i.agentStatus}` : ""}
-                  </Text>
-                ))}
+          {(() => {
+            const defs = r?.defs ?? [];
+            const insts = r?.instances ?? [];
+            const groups = Object.keys(ROLE_LABEL)
+              .map(role => ({ role, defs: defs.filter(d => d.role === role) }))
+              .concat(defs.some(d => !(d.role in ROLE_LABEL))
+                ? [{ role: "", defs: defs.filter(d => !(d.role in ROLE_LABEL)) }]
+                : [])
+              .filter(g => g.defs.length > 0);
+            return groups.map(g => (
+              <View key={g.role || "other"} style={{ gap: 4 }}>
+                <Text style={s.muted}>
+                  {g.role ? `${ROLE_LABEL[g.role]}（${g.role}）` : "其他"} · {g.defs.length} 编制 · {g.defs.reduce((n, d) => n + insts.filter(i => i.def === d.id).length, 0)} 实例
+                </Text>
+                {[...g.defs].sort((a, b) => a.provider.localeCompare(b.provider) || (b.weight ?? 0) - (a.weight ?? 0)).map(d => {
+                  const defInsts = insts.filter(i => i.def === d.id);
+                  return (
+                    <View key={d.id} style={{ gap: 2 }}>
+                      <View style={s.row}>
+                        <Text style={[s.text, { flex: 1 }]}>
+                          {"  "}{d.provider}/{d.model}{d.resolved ? ` → ${d.resolved}` : ""}{d.thinking ? ` · ${d.thinking}` : ""} · 上限 {d.maxInstances} · 权 {d.weight}{d.enabled ? "" : " · 已停用"}
+                        </Text>
+                        <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
+                          <Text style={s.chipText}>编辑</Text>
+                        </Pressable>
+                        <Pressable accessibilityRole="button" style={s.chip}
+                          onPress={async () => { await toggleDef({ defId: d.id, enabled: !d.enabled }); refreshAll(); }}>
+                          <Text style={s.chipText}>{d.enabled ? "停用" : "启用"}</Text>
+                        </Pressable>
+                      </View>
+                      {defInsts.map(i => (
+                        <Text key={i.id} style={s.muted}>
+                          {"    "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.cwd?.split("/").pop() ?? "运营仓库"}{i.agentStatus ? ` · ${i.agentStatus}` : ""}
+                        </Text>
+                      ))}
+                    </View>
+                  );
+                })}
               </View>
-            );
-          })}
+            ));
+          })()}
         </View>
       </Section>
     </View>
