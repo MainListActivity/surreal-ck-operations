@@ -271,15 +271,21 @@ export function createMcpHttpService(options: McpServiceOptions) {
       }
 
       async function respond(req: Request, cred: Credential): Promise<Response> {
+        const t0 = Date.now();
+        const mark = (stage: string) => console.log(`req ${req.method} ${stage} +${Date.now() - t0}ms`);
         try {
           await options.heal?.();
+          mark('heal');
         } catch {
+          mark('heal failed');
           return new Response('Service unavailable', { status: 503 });
         }
         let principal;
         try {
           principal = await core.authenticate(cred);
+          mark('auth');
         } catch (error) {
+          mark(`auth failed: ${(error as Error)?.message ?? String(error)}`.slice(0, 120));
           const invalidCredential = typeof error === 'object' && error !== null
             && 'code' in error && error.code === 'unauthorized';
           return new Response(invalidCredential ? 'Unauthorized' : 'Service unavailable', {
@@ -287,7 +293,9 @@ export function createMcpHttpService(options: McpServiceOptions) {
           });
         }
         if (!principal) return new Response('Unauthorized', { status: 401 });
-        return handler.fetch(req, { authInfo: { token: cred, clientId: principal.employeeId, scopes: [] } });
+        const response = await handler.fetch(req, { authInfo: { token: cred, clientId: principal.employeeId, scopes: [] } });
+        mark('handler');
+        return response;
       }
     },
   });
