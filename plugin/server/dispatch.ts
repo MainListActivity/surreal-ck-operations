@@ -54,7 +54,7 @@ let quotaRefreshedAt = 0;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
-const MODEL_FAMILY: Record<string, (id: string) => { family: string; version: string } | undefined> = {
+export const MODEL_FAMILY: Record<string, (id: string) => { family: string; version: string } | undefined> = {
   codex: (id) => {
     const m = /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/.exec(id);
     return m ? { family: m[2]!, version: m[1]! } : undefined;

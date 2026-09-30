@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, Brief, Inbox, PermissionRequest, Roster, TaskView } from "./types";
+import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Roster, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -79,6 +79,25 @@ export const roster = defineRpc({
   name: "company.roster",
   input: z.object({}),
   output: record<Roster>(),
+});
+
+export const providerOptions = defineRpc({
+  name: "company.provider.options",
+  input: z.object({}),
+  output: record<ProviderOptionsResult>(),
+});
+
+export const registerDef = defineRpc({
+  name: "company.def.register",
+  input: z.object({
+    role: z.string().min(1),
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    thinking: z.string().optional(),
+    maxInstances: z.number().int().min(1).optional(),
+    weight: z.number().int().min(0).optional(),
+  }),
+  output: z.object({ id: z.string() }),
 });
 
 export const pendingPermissions = defineRpc({

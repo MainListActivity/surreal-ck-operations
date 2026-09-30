@@ -74,7 +74,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production QA_PASSWO
 
   `model` 是槽位而非钉子：`auto:<族>`（`auto:sol` / `auto:grok` / `auto:swe`）表示跟随该 provider 该模型族的最新版——Paseo 插件每 5 分钟经 `providers.listModels` 刷新 `company_meta:model_slots`，调度器在派工前把槽位解析成具体模型 id（如 `auto:sol → gpt-6.1-sol`）再 spawn。厂家发布 `gpt-6.2-sol` 后：槽位更新 → 当 tick 先退役空闲旧模型实例（忙碌中的跑完当前会话）→ 下一个任务用新模型起新会话，全过程零人工。字面量（如 `gpt-6.1-sol`）则 pin 死。跨族/改名（`gpt-7`、新命名线）不会被 auto 匹配，等人工决策；槽位解析失败时该 def 不可新开并给老板发通知，存量实例继续跑上次的模型。首次采用新版本时插件发一条告知通知（不需要批准）。
 
-  或 `pnpm run admin def set|list|weight|enable|disable`、`pnpm run admin seed-defs`（写入默认 21 个定义：七岗位 × 三订阅）。
+  或 `pnpm run admin def set|list|weight|enable|disable`、`pnpm run admin seed-defs`（写入默认 21 个定义：七岗位 × 三订阅）。也可在 Paseo 编制页用「注册员工」表单——岗位/provider/模型/thinking 全部下拉自 Paseo 实时数据（`providers.snapshot` + `listModels`），服务端注册前再校验一遍，杜绝手填错字。def id 自动取 `<role>-<provider>`。
 
 - **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight × 绩效系数` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。绩效系数 = `clamp(avg_score/3, 0.3, 2)`，尚无评分时为 1。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
 

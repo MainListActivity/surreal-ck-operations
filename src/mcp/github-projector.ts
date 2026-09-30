@@ -130,6 +130,7 @@ export function createGithubProjector(input: {
   credential: string;
   github: GithubGateway;
   statePath: string;
+  heal?: () => Promise<void>;
 }) {
   const { core, credential, github, statePath } = input;
   const ensureIssue = async (task: TaskView, state: ProjectionState): Promise<number> => {
@@ -179,6 +180,8 @@ export function createGithubProjector(input: {
             failed++;
             // One poisoned event must not block the whole backlog; it retries next pass.
             console.error(`projection skipped event ${String(event.id)} (${event.kind}): ${(error as Error).message}`);
+            // If the conn lost its session scope mid-pass, heal before the next event.
+            await input.heal?.().catch(() => {});
           }
         }
         if (failed) console.error(`projection: ${failed} event(s) failed this pass`);

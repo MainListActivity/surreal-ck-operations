@@ -333,6 +333,116 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
+const ROLE_LABEL: Record<string, string> = { gm: "总经理", product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", qa: "测试", cs: "客户成功", eval: "评审" };
+const MODEL_PREVIEW = 10;
+
+function RegisterDefCard({ ctx, onDone }: { ctx: Ctx; onDone: () => void }) {
+  const s = makeStyles(ctx);
+  const optsRpc = useRpc(rpc.providerOptions);
+  const regRpc = useRpc(rpc.registerDef);
+  const options = useQuery({ queryKey: ["providerOptions"], queryFn: () => optsRpc({}), staleTime: 60_000 });
+  const [role, setRole] = useState<string>();
+  const [provider, setProvider] = useState<string>();
+  const [model, setModel] = useState<string>();
+  const [thinking, setThinking] = useState<string>();
+  const [maxInstances, setMaxInstances] = useState("1");
+  const [weight, setWeight] = useState("10");
+  const [showAllModels, setShowAllModels] = useState(false);
+  const [result, setResult] = useState<string>();
+
+  const prov = options.data?.providers.find(p => p.id === provider);
+  const modelChoices = prov
+    ? [
+        ...prov.families.map(f => ({ id: f.slot, label: `${f.slot} → ${f.resolvesTo}`, hint: "自动跟随新版" })),
+        ...prov.models.map(m => ({ id: m.id, label: m.label || m.id, hint: m.isDefault ? "pin · 默认" : "pin" })),
+      ]
+    : [];
+  const selected = modelChoices.find(m => m.id === model);
+  const resolvedId = model?.startsWith("auto:") ? prov?.families.find(f => f.slot === model)?.resolvesTo : model;
+  const resolvedModel = prov?.models.find(m => m.id === resolvedId);
+  const thinkingOpts = resolvedModel?.thinkingOptions ?? [];
+  const visibleModels = showAllModels ? modelChoices : modelChoices.slice(0, MODEL_PREVIEW);
+  const ready = !!role && !!provider && !!model;
+
+  const submit = useMutation({
+    mutationFn: () => regRpc({
+      role: role!, provider: provider!, model: model!, thinking,
+      maxInstances: Number.parseInt(maxInstances, 10) || undefined,
+      weight: Number.parseInt(weight, 10) || undefined,
+    }),
+    onSuccess: r => { setResult(`已注册 ${r.id}`); setModel(undefined); setThinking(undefined); onDone(); },
+    onError: e => setResult(`失败：${e instanceof Error ? e.message : String(e)}`),
+  });
+
+  return (
+    <View style={s.card}>
+      <Text style={s.muted}>岗位</Text>
+      <View style={s.row}>
+        {(options.data?.roles ?? []).map(r => (
+          <Pressable key={r} accessibilityRole="button" style={[s.chip, role === r && s.chipActive]} onPress={() => setRole(r)}>
+            <Text style={[s.chipText, role === r && s.chipTextActive]}>{ROLE_LABEL[r] ?? r}</Text>
+          </Pressable>
+        ))}
+      </View>
+      <Text style={s.muted}>订阅 provider{options.data ? `（${options.data.providers.length} 个已启用）` : "（加载中…）"}</Text>
+      <View style={s.row}>
+        {(options.data?.providers ?? []).map(p => (
+          <Pressable key={p.id} accessibilityRole="button" style={[s.chip, provider === p.id && s.chipActive]}
+            onPress={() => { setProvider(p.id); setModel(undefined); setThinking(undefined); }}>
+            <Text style={[s.chipText, provider === p.id && s.chipTextActive]}>{p.label}{p.status !== "ready" && p.status !== "available" ? ` · ${p.status}` : ""}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {prov && (
+        <>
+          <Text style={s.muted}>模型（auto 跟随上游最新版，pin 锁定版本）</Text>
+          <View style={s.row}>
+            {visibleModels.map(m => (
+              <Pressable key={m.id} accessibilityRole="button" style={[s.chip, model === m.id && s.chipActive]}
+                onPress={() => { setModel(m.id); setThinking(undefined); }}>
+                <Text style={[s.chipText, model === m.id && s.chipTextActive]}>{m.label}</Text>
+              </Pressable>
+            ))}
+            {modelChoices.length > MODEL_PREVIEW && (
+              <Pressable accessibilityRole="button" onPress={() => setShowAllModels(v => !v)}>
+                <Text style={s.muted}>{showAllModels ? "收起" : `展开全部 ${modelChoices.length} 个`}</Text>
+              </Pressable>
+            )}
+          </View>
+        </>
+      )}
+      {prov && thinkingOpts.length > 0 && model && (
+        <>
+          <Text style={s.muted}>Thinking{selected && resolvedId ? `（${resolvedId}）` : ""}</Text>
+          <View style={s.row}>
+            <Pressable accessibilityRole="button" style={[s.chip, thinking === undefined && s.chipActive]} onPress={() => setThinking(undefined)}>
+              <Text style={[s.chipText, thinking === undefined && s.chipTextActive]}>默认</Text>
+            </Pressable>
+            {thinkingOpts.map(t => (
+              <Pressable key={t.id} accessibilityRole="button" style={[s.chip, thinking === t.id && s.chipActive]} onPress={() => setThinking(t.id)}>
+                <Text style={[s.chipText, thinking === t.id && s.chipTextActive]}>{t.label}{t.isDefault ? " ·默认" : ""}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </>
+      )}
+      <View style={s.row}>
+        <Text style={s.muted}>实例上限</Text>
+        <TextInput style={[s.input, { width: 56, paddingVertical: 6 }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
+        <Text style={s.muted}>派工权重</Text>
+        <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
+      </View>
+      <View style={s.row}>
+        <Pressable accessibilityRole="button" style={s.button} disabled={!ready || submit.isPending}
+          onPress={() => { setResult(undefined); submit.mutate(); }}>
+          <Text style={s.buttonText}>{submit.isPending ? "注册中…" : ready ? `注册 ${role}-${provider}` : "选择岗位/provider/模型"}</Text>
+        </Pressable>
+        {result && <Text style={result.startsWith("失败") ? s.buttonDangerText : s.muted}>{result}</Text>}
+      </View>
+    </View>
+  );
+}
+
 function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -401,6 +511,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
             <Text key={h.provider} style={s.text}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
           ))}
         </View>
+      </Section>
+      <Section title="注册员工" ctx={ctx}>
+        <RegisterDefCard ctx={ctx} onDone={refreshAll} />
       </Section>
       <Section title="员工编制" ctx={ctx}>
         <View style={s.card}>

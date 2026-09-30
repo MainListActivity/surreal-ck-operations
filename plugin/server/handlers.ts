@@ -6,6 +6,25 @@ import * as rpc from "../shared/rpc";
 
 const SOURCE = "owner:paseo-plugin";
 
+const compareVersion = (a: string, b: string): number => {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+
+const resolveSlot = (entry: any, match: (id: string) => { family: string; version: string } | undefined, family: string): string | undefined => {
+  let best: { version: string; id: string } | undefined;
+  for (const m of entry.models ?? []) {
+    if (m.isSelectable === false) continue;
+    const hit = match(m.id);
+    if (hit?.family === family && (!best || compareVersion(hit.version, best.version) > 0)) best = { version: hit.version, id: m.id };
+  }
+  return best?.id;
+};
+
 export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.inbox, async () => (await company()).owner.inbox());
   server.handle(rpc.brief, async () => (await company()).owner.brief());
@@ -96,6 +115,85 @@ export function registerHandlers(server: PluginServerContext): void {
       })),
       health: health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until })),
     };
+  });
+
+  server.handle(rpc.providerOptions, async (_input: unknown, { paseo }: { paseo: any }) => {
+    const { ROLES } = await import("./vendor/src/core.ts");
+    const { MODEL_FAMILY } = await import("./dispatch.ts");
+    const snapshot = paseo
+      ? await paseo.providers.waitForReady({ timeoutMs: 15_000 }).catch(() => paseo.providers.snapshot()).catch(() => ({ entries: [] }))
+      : { entries: [] };
+    if (paseo) {
+      await Promise.allSettled((snapshot.entries ?? [])
+        .filter((e: any) => e.enabled !== false && !(e.models ?? []).length)
+        .map(async (e: any) => {
+          const listed = await paseo.providers.listModels(e.provider).catch(() => undefined);
+          if (listed?.models?.length) e.models = listed.models;
+        }));
+    }
+    const providers = (snapshot.entries ?? [])
+      .filter((e: any) => e.enabled !== false)
+      .map((e: any) => {
+        const models = (e.models ?? [])
+          .filter((m: any) => m.isSelectable !== false)
+          .map((m: any) => ({
+            id: m.id, label: m.label, isDefault: m.isDefault ?? false,
+            thinkingOptions: (m.thinkingOptions ?? []).map((t: any) => ({ id: t.id, label: t.label, isDefault: t.isDefault ?? false })),
+          }));
+        const match = MODEL_FAMILY[e.provider];
+        const newest = new Map<string, { version: string; id: string }>();
+        if (match) {
+          for (const m of models) {
+            const hit = match(m.id);
+            if (hit && (!newest.has(hit.family) || compareVersion(hit.version, newest.get(hit.family)!.version) > 0)) {
+              newest.set(hit.family, { version: hit.version, id: m.id });
+            }
+          }
+        }
+        return {
+          id: e.provider, label: e.label ?? e.provider, status: e.status ?? "unknown",
+          families: [...newest.entries()].map(([family, v]) => ({ slot: `auto:${family}`, resolvesTo: v.id })),
+          models,
+        };
+      });
+    return { roles: [...ROLES], providers };
+  });
+
+  server.handle(rpc.registerDef, async (input: RpcInput<typeof rpc.registerDef>, { paseo }: { paseo: any }) => {
+    const { workforce } = await company();
+    const snapshot = paseo ? await paseo.providers.snapshot().catch(() => ({ entries: [] })) : { entries: [] };
+    const entry = (snapshot.entries ?? []).find((e: any) => e.provider === input.provider && e.enabled !== false);
+    if (!entry) throw new Error(`provider ${input.provider} 未在 Paseo 中启用`);
+    if (!(entry.models ?? []).length && paseo) {
+      const listed = await paseo.providers.listModels(input.provider).catch(() => undefined);
+      if (listed?.models?.length) entry.models = listed.models;
+    }
+    const modelIds = new Set((entry.models ?? []).map((m: any) => m.id));
+    const { MODEL_FAMILY } = await import("./dispatch.ts");
+    const match = MODEL_FAMILY[input.provider];
+    const isAuto = input.model.startsWith("auto:");
+    if (isAuto) {
+      const family = input.model.slice(5);
+      const ok = match && (entry.models ?? []).some((m: any) => match(m.id)?.family === family);
+      if (!ok) throw new Error(`provider ${input.provider} 没有 ${input.model} 可解析的模型族`);
+    } else if (!modelIds.has(input.model)) {
+      throw new Error(`provider ${input.provider} 没有模型 ${input.model}`);
+    }
+    if (input.thinking) {
+      const resolved = isAuto
+        ? (entry.models ?? []).find((m: any) => m.id === resolveSlot(entry, match!, input.model.slice(5)))
+        : (entry.models ?? []).find((m: any) => m.id === input.model);
+      const options = (resolved?.thinkingOptions ?? []).map((t: any) => t.id);
+      if (options.length > 0 && !options.includes(input.thinking)) {
+        throw new Error(`模型 ${resolved?.id ?? input.model} 不支持 thinking=${input.thinking}`);
+      }
+    }
+    const defId = `${input.role}-${input.provider}`;
+    await workforce.upsertDef(defId, {
+      role: input.role as any, provider: input.provider, model: input.model,
+      thinking: input.thinking, maxInstances: input.maxInstances, weight: input.weight,
+    });
+    return { id: defId };
   });
 
   server.handle(rpc.pendingPermissions, async (_input: unknown, { paseo }: { paseo: any }) => {

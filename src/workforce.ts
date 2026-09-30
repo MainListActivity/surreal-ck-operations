@@ -221,7 +221,7 @@ export class Workforce {
   async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
-    if (!(PROVIDERS as readonly string[]).includes(input.provider)) throw new CompanyError('invalid', 'Unsupported provider');
+    if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
     if (input.weight !== undefined && (!Number.isInteger(input.weight) || input.weight < 0 || input.weight > 1000)) {
       throw new CompanyError('invalid', 'Invalid weight');
     }

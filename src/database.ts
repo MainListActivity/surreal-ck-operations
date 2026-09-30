@@ -115,10 +115,16 @@ export class CompanyDatabase {
     this.reconnecting ??= (async () => {
       try {
         await this.db.query('INFO FOR DB;');
-      } catch {
-        await this.db.close().catch(() => {});
-        await this.connect();
-        await this.useDatabase();
+      } catch (probeError) {
+        try {
+          await this.db.close().catch(() => {});
+          await this.connect();
+          await this.useDatabase();
+          console.log(`database connection re-established (was: ${(probeError as Error).message.slice(0, 80)})`);
+        } catch (error) {
+          console.error(`database reconnect failed: ${(error as Error).message}`);
+          throw error;
+        }
       } finally {
         this.reconnecting = undefined;
       }
