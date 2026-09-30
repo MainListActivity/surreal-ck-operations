@@ -9,9 +9,19 @@ export interface DatabaseConfig {
 }
 
 function readProductEnv(): Record<string, string> {
-  const path = process.env.SCK_PRODUCT_ENV ?? '/Users/y/IdeaProjects/surreal_ck/.env';
+  const explicit = process.env.SCK_PRODUCT_ENV;
+  const path = explicit ?? '/Users/y/IdeaProjects/surreal_ck/.env';
+  // The default path is a Mac dev-machine convention; on servers everything comes
+  // from the environment. Only an explicitly-set but missing file is an error.
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    if (explicit) throw error;
+    return {};
+  }
   const values: Record<string, string> = {};
-  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+  for (const line of text.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (!match) continue;
     let value = match[2];
