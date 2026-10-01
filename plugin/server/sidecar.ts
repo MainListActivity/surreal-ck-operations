@@ -90,10 +90,29 @@ export class SidecarPool {
   private async credentialFor(instId: string): Promise<string> {
     const held = this.creds.get(instId);
     if (held) return held;
+    return this.rotateCredential(instId);
+  }
+
+  private async rotateCredential(instId: string): Promise<string> {
     // Plugin restart or adoption: re-issue. Retired instances fail here (revoked + retired row).
     const rotated = await this.deps.workforce.rotate(instId);
     this.creds.set(instId, rotated);
     return rotated;
+  }
+
+  private static isAuthError(error: unknown): boolean {
+    return error instanceof Error && /invalid credential|unauthorized|forbidden/i.test(error.message);
+  }
+
+  /** Retry once with a re-issued credential when a call rejects auth — a concurrent adopter may have rotated it. */
+  private async callWithCred<T>(instId: string, fn: (cred: string) => Promise<T>): Promise<T> {
+    const cred = await this.credentialFor(instId);
+    try {
+      return await fn(cred);
+    } catch (error) {
+      if (!SidecarPool.isAuthError(error)) throw error;
+      return await fn(await this.rotateCredential(instId));
+    }
   }
 
   /** Claims the task as the instance and stages claim.json in its comm dir. */
@@ -241,8 +260,7 @@ export class SidecarPool {
       if (!live) { this.stopBeat(instId); return; }
       void (async () => {
         try {
-          const cred = await this.credentialFor(instId);
-          const result = await this.deps.core.heartbeat(cred, live.proof);
+          const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
           live.proof.expectedVersion = result.task.version;
         } catch (error) {
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
@@ -261,13 +279,13 @@ export class SidecarPool {
   }
 
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
-  private async dispatch(instId: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
+  private async dispatch(instId: string, tool: string, args: Record<string, unknown>, forceRotate = false): Promise<unknown> {
     const core = this.deps.core;
     const ops = this.deps.ops;
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
-    const cred = await this.credentialFor(instId);
+    const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
@@ -344,6 +362,10 @@ export class SidecarPool {
       : this.keys.get(instId) !== undefined && req.key !== this.keys.get(instId)
         ? { ok: false, error: "stale comm key; this session predates a plugin restart" }
         : await this.dispatch(instId, req.tool, req.args ?? {})
+            .catch((error: unknown) => SidecarPool.isAuthError(error)
+              // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
+              ? this.dispatch(instId, req.tool, req.args ?? {}, true)
+              : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));
