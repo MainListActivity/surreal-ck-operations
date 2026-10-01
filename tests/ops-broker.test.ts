@@ -607,6 +607,50 @@ describe('operator sessions', () => {
     expectNoLeaks(r);
   });
 
+  test('an operator session reaches /api/content/* but stays off every other path', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops', ['quota.read', 'content.source.manage']);
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+
+    const created = await call(r, 'ops_request', {
+      session: op.session, method: 'POST', path: '/api/content/sources',
+      body: { name: 'qa-synth', license: { url: 'https://example.invalid/lic' } },
+    });
+    // The fake source endpoint echoes the parsed body back, proving method, path and payload all arrived.
+    expect(created).toMatchObject({ status: 201, ok: true, body: { source: { name: 'qa-synth', license: { url: 'https://example.invalid/lic' } } } });
+    const posted = r.world.requests.find(x => x.url.endsWith('/api/content/sources'))!;
+    expect(posted.method).toBe('POST');
+
+    // The product's own capability gate still applies: without content.source.manage it is a 403.
+    const uid = r.world.user('sck-qa-ops')!.id;
+    r.world.operatorCaps.set(uid, ['quota.read']);
+    const denied = await call(r, 'ops_request', { session: op.session, method: 'POST', path: '/api/content/sources', body: {} });
+    expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
+
+    // Anything off /api/ops/* + /api/content/* is still refused at the proxy.
+    for (const path of ['/api/chat', '/api/session/workspaces', '/api/contentx/sources', '/api/contentious']) {
+      const error = await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path }));
+      expect(error.code, path).toBe('invalid');
+    }
+    expect(r.world.requests.filter(x => x.url.includes('/api/chat') || x.url.includes('/api/session/'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('an ops audience session reaches /api/content/*; a customer session is still refused on /api/ops/*', async () => {
+    const r = rig({ idp: { issuer: 'https://idp.test/t/ck', clientId: 'client-ck-1234', audience: 'https://auth.test', redirectUri: 'https://app.test/auth/callback', ops: { clientId: OPS_DIRECT_CLIENT, audience: OPS_RESOURCE, redirectUri: OPS_DIRECT_REDIRECT } } });
+    await opsUser(r, 'qa-ops', ['content.read']);
+    const ops = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    expect(ops.kind).toBe('ops');
+    const contract = await call(r, 'ops_request', { session: ops.session, method: 'GET', path: '/api/content/contract' });
+    expect(contract).toMatchObject({ status: 200, ok: true });
+
+    const customer = await call(r, 'ops_login', { alias: 'qa-one' });
+    const wrong = await failure(call(r, 'ops_request', { session: customer.session, method: 'GET', path: '/api/ops/quota/context' }));
+    expect(wrong.code).toBe('invalid');
+    expect(wrong.message).toContain('ops_operator_login');
+    expectNoLeaks(r);
+  });
+
   test('reauth keeps an operator session on the ops channel', async () => {
     const r = rig(opsPatch);
     await opsUser(r, 'qa-ops');

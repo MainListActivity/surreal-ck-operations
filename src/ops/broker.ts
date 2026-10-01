@@ -566,10 +566,13 @@ export class OpsBroker {
     const session = this.session(ctx, args);
     const method = text(args, 'method', 10).toUpperCase();
     const path = text(args, 'path', 2000);
-    // Sessions stay in their lane: an operator or ops token only serves ops endpoints, and a
-    // customer token is never sent to them at all (the product would answer 401 for the wrong audience).
+    // Sessions stay in their lane: an operator or ops token only serves the ops surface
+    // (/api/ops/* plus /api/content/*, which the product gates on requirePlatformOperator), and a
+    // customer token is never sent to ops endpoints at all (the product would answer 401 for the
+    // wrong audience; /api/content/* needs no proxy-side block since the same gate covers it).
     const opsPath = /^\/api\/ops(\/|$|\?)/.test(path);
-    if (session.kind !== 'customer' && !opsPath) throw invalid(`an ${session.kind} session can only call /api/ops/* paths`);
+    const contentPath = /^\/api\/content(\/|$|\?)/.test(path);
+    if (session.kind !== 'customer' && !opsPath && !contentPath) throw invalid(`an ${session.kind} session can only call /api/ops/* or /api/content/* paths`);
     if (session.kind === 'customer' && opsPath) throw invalid('a customer session cannot call /api/ops/*; call ops_operator_login, or ops_login with audience "ops", for an ops session');
     const res = await this.product(ctx, session, method, path, args.body);
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
