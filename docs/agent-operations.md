@@ -88,7 +88,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 }
 ```
 
-`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。
+`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。 运营 client 由 IdP 的受管资源动态注册端点 `POST {issuer}/connect/mcp/register` 自助登记（公开 client、`token_endpoint_auth_method=none`、`scope=openid`），返回的 `client_id` 与 `resource` 填入此块；registration token 不入库。
 
 控制措施：
 - **租约门**：每次调用由 `core.opsScope` 重新核验调用者的在手租约，项目取自任务所属目标；通道丢弃员工自带的 `taskId`，只用租约里的任务。任务所属目标没有关联项目返回 `invalid`，项目环境没配置运维代理返回 `not_configured`。
