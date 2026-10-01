@@ -72,6 +72,38 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
   }
 }
 
+/** The `user_session` cookie the IdP's password route just set, bound to the consent POST. */
+function browserSessionCookie(headers: Headers): string | undefined {
+  const getAll = (headers as { getSetCookie?: () => string[] }).getSetCookie;
+  const entries = typeof getAll === 'function' ? getAll.call(headers) : [headers.get('set-cookie')].filter((v): v is string => v !== null);
+  return entries.map(entry => entry.split(';', 1)[0].trim()).find(entry => entry.startsWith('user_session='));
+}
+
+/**
+ * DCR-registered public clients carry consent_policy `require`, so the password route answers
+ * with the IdP's consent page URL (`?consent_challenge=`) instead of the client callback. The
+ * broker approves on behalf of the held credential (the IdP records
+ * `oidc.authorization.consent.granted`) and follows the 302 to the real code-bearing callback.
+ */
+async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Promise<URL> {
+  const challenge = consentUrl.searchParams.get('consent_challenge');
+  if (!challenge) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
+  const cookie = browserSessionCookie(loginHeaders);
+  const { response, body } = await request('IdP consent', io, consentUrl.toString(), {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
+    body: new URLSearchParams({ consent_challenge: challenge, decision: 'approve' }).toString(),
+  }, true);
+  if (response.status >= 500) throw new Unavailable('IdP consent', `HTTP ${response.status}`);
+  const location = response.headers.get('location');
+  if (location) return new URL(location, consentUrl.toString());
+  const reason = typeof (body as { error?: unknown } | undefined)?.error === 'string'
+    ? ((body as { error: string }).error).replace(/[^\w.-]/g, '').slice(0, 60)
+    : `http_${response.status}`;
+  throw new LoginError(reason, `IdP consent was refused (${reason})`);
+}
+
 /** Follows authorize redirects by hand until one carries the IdP's login challenge. */
 async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ challenge: string; loginApi: string }> {
   let current = authorizeUrl;
@@ -211,10 +243,13 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
   }
 
   const callback = new URL(loginBody.redirect_uri);
-  const oauthError = callback.searchParams.get('error');
+  const settled = callback.searchParams.has('consent_challenge')
+    ? await settleConsent(callback, login.headers, io)
+    : callback;
+  const oauthError = settled.searchParams.get('error');
   if (oauthError) throw new LoginError(oauthError, `IdP returned an authorization error (${oauthError})`);
-  const code = callback.searchParams.get('code');
-  if (!code || callback.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
+  const code = settled.searchParams.get('code');
+  if (!code || settled.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
 
   const { response: exchange, body: tokenRaw } = await request('token exchange', io, channel.tokenUrl, {
     method: 'POST',
