@@ -5,8 +5,8 @@
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { createHash, randomBytes } from "node:crypto";
-import { readdirSync, renameSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
   writeFileAtomic, type CommRequest, type CommResponse,
@@ -113,7 +113,12 @@ export class SidecarPool {
     this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
-    writeFileAtomic(join(dir, "claim.json"), JSON.stringify(result));
+    // Evidence attachments (screenshots, exported reports, acceptance manuals) live
+    // under the service home, keyed by task so handovers and reviewers share one
+    // directory — deliberately outside any git repo so audits never bloat it.
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir }));
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id,
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
