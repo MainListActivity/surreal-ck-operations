@@ -15,7 +15,7 @@ import { cloudflareD1, type D1Client } from './d1.ts';
 import type { Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
-import { productRequest, type ProductResult } from './product.ts';
+import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
 
@@ -99,6 +99,14 @@ function productFailure(what: string, res: ProductResult, specific: Partial<Reco
   const code = specific[res.status] ?? (res.status === 401 ? 'login_failed' : res.status >= 500 ? 'upstream_error' : 'invalid');
   return new CompanyError(code, `${what} failed: HTTP ${res.status} ${errorCode(res.body)}`, res.status >= 500);
 }
+
+/**
+ * The product provisions a workspace in many steps and resumes an interrupted one when the same
+ * owner asks for the same slug again, so an unanswered or 5xx creation is settled by repeating it,
+ * never by picking another slug (that leaves a half-built workspace behind and burns the daily limit).
+ */
+const unfinishedCreation = (slug: string, detail: string) => new CompanyError('upstream_error',
+  `workspace ${slug} may not be fully created yet (${detail}); call ops_workspace_ensure again with the same slug and name to reuse or finish it, and do not switch to another slug`, true);
 
 export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
@@ -393,8 +401,14 @@ export class OpsBroker {
     if (!listing.canCreate) throw new CompanyError('forbidden', `${session.username} may not create workspaces`);
     const used = await this.deps.core.opsCount(ctx.scope.project, 'ops_workspace_create', DAY_SECONDS);
     if (used >= ctx.cfg.limits.workspacesPerDay) throw new CompanyError('limit_reached', `workspace creation limit reached (${ctx.cfg.limits.workspacesPerDay} per day); reuse an existing one`);
-    const res = await this.product(ctx, session, 'POST', '/api/workspaces', { name, slug });
-    if (!res.ok) throw productFailure(`creating workspace ${slug}`, res, { 403: 'forbidden', 409: 'conflict', 400: 'invalid' });
+    const res = await this.product(ctx, session, 'POST', '/api/workspaces', { name, slug }).catch((error: unknown) => {
+      throw error instanceof ProductUnreachable ? unfinishedCreation(slug, error.message) : error;
+    });
+    if (res.status >= 500) throw unfinishedCreation(slug, `HTTP ${res.status} ${errorCode(res.body)}`);
+    if (res.status === 409) {
+      throw new CompanyError('conflict', `creating workspace ${slug} failed: HTTP 409 ${errorCode(res.body)}; the slug belongs to another account, or an earlier creation of it just finished: call ops_workspace_ensure again, and take a different slug only if it is still not listed for ${session.username}`);
+    }
+    if (!res.ok) throw productFailure(`creating workspace ${slug}`, res, { 403: 'forbidden', 400: 'invalid' });
     const created = (res.body ?? {}) as { slug?: string; dbName?: string };
     if (typeof created.dbName !== 'string') throw new CompanyError('upstream_error', 'workspace was created but the product returned no database name');
     session.workspace = { slug, dbName: created.dbName };

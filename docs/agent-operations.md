@@ -96,6 +96,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **审计**：账号创建/修复、workspace 创建/进入、成员增删、登录、浏览器登录、失败都写 `audit`（证据文本脱敏、限长）；只读调用、`ops_request`、`ops_query` 记为 `ops_call`，不进交接历史（其余进）。
 - **脱敏**：返回给员工和写进审计的文本，都先抹掉会话 token、密码，以及 JWT/Bearer/密码形态的字符串；上游错误只透出错误码。
 - **会话**：只在内存，按（员工、项目、环境）隔离，每个员工最多 8 个、最长 6 小时；token 临近过期时代理自动重新登录。租约结束、会话归档、插件重启即丢，下次重新 `ops_login`。
+- **超时与重试**：IdP 与产品之间是跨公网链路，单个请求 5–10s 属于常态。登录流程每个 HTTP 步骤限 25s、全程预算 75s，遇超时/断连/5xx 从头重试一次（challenge 和 code 一次性，绝不重放单步）；拒绝类错误（密码错、MFA、回调不符）不重试。产品请求限 30s，只有 `POST /api/workspaces` 放宽到 90s（provisioning 是长任务；Cloudflare 边缘 120s 无响应即断，员工侧 `sck call` 120s 放弃，代理要在此之前给出结论）。写请求超时/断连的报错会注明「可能已生效，重复前先查」；workspace 创建类失败（超时、断连、5xx）统一提示用同一 slug 重试——产品在 owner+slug 相同的 provisioning/provisioning_error 记录上会断点续跑（见 surreal_ck `provisioning-saga.ts`），409 则说明 slug 归别人或恰好刚建完，再调一次 `ops_workspace_ensure` 即可分辨。
 - **账号密码**：由代理随机生成，先密封入库再交给 IdP；IdP 里只存 pbkdf2 哈希。若 IdP 里的密码被带外改动，`ops_login` 会自动修复一次。
 - **控制面凭证**：Cloudflare 令牌与账号 ID 取自插件进程的环境变量；想用权限更窄的令牌，在守护进程环境设 `SCK_OPS_CLOUDFLARE_API_TOKEN` / `SCK_OPS_CLOUDFLARE_ACCOUNT_ID`（优先于 `CLOUDFLARE_*`）。
 - **环境清理**：员工会话是 Paseo 守护进程的子进程，会继承它的环境变量。插件的 `agent.session_open` 钩子（`plugin/server/scrub.ts`）在公司员工会话启动前（含 resume / refresh）把继承来的基础设施凭证变量（`CLOUDFLARE_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV` 等）覆盖成空串。provider 自己的登录变量（`OPENAI_API_KEY` 之类）不动，否则会弄坏会话；`SSH_AUTH_SOCK` 和 `gh` 的本机登录也不动，工程要靠它们推分支、开 PR。要多清哪些名字或前缀，在 `private/service.env` 设 `SCK_SCRUB_ENV`（逗号分隔）后 `plugin reload`。老板自己的非公司会话不受影响。

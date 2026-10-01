@@ -10,7 +10,7 @@ import type { BrowserInjector } from '../../src/ops/browser.ts';
 import type { D1Client } from '../../src/ops/d1.ts';
 import type { Fetcher } from '../../src/ops/fetcher.ts';
 import type { QueryAsUser } from '../../src/ops/data.ts';
-import { verifyPassword } from '../../src/ops/password.ts';
+import { hashPassword, verifyPassword } from '../../src/ops/password.ts';
 import type { EnvBrokerRow } from '../../src/projects.ts';
 
 export const TENANT = 'tenant-ck-0001';
@@ -34,6 +34,11 @@ const apiError = (status: number, code: string) => json(status, { error: { code,
 interface Member { id: string; email: string; displayName: string; isAdmin: boolean; subject?: string; disabled: boolean }
 interface Workspace { slug: string; name: string; dbName: string; members: Member[] }
 interface Grant { userId: string; db?: string; expiresAt: number }
+
+/** `timeout` and `reset` throw like a flaky WAN; a number is an HTTP status the edge answers instead of the service. */
+export type Fault = 'timeout' | 'reset' | number;
+type RequestMatcher = (method: string, url: URL) => boolean;
+interface FaultRule { match: RequestMatcher; how: Fault; times: number; afterEffect: boolean }
 
 export class FakeWorld {
   clock = Date.UTC(2026, 0, 1);
@@ -98,15 +103,41 @@ export class FakeWorld {
     return [[{ ok: 1 }]];
   };
 
+  private readonly faults: FaultRule[] = [];
+
+  /**
+   * The next `times` requests matching `match` fail like a bad network day. With `afterEffect` the
+   * service does its work first and only the answer is lost, as when a creation outlives its client.
+   */
+  fault(match: RequestMatcher, how: Fault, options: { times?: number; afterEffect?: boolean } = {}) {
+    this.faults.push({ match, how, times: options.times ?? 1, afterEffect: options.afterEffect ?? false });
+  }
+
   readonly fetch: Fetcher = async (input, init) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
     const method = (init?.method ?? 'GET').toUpperCase();
     this.requests.push({ method, url: url.toString() });
+    const fault = this.faults.find(rule => rule.times > 0 && rule.match(method, url));
+    if (!fault) return this.route(url, method, init);
+    fault.times--;
+    if (fault.afterEffect) await this.route(url, method, init);
+    if (typeof fault.how === 'number') return new Response('', { status: fault.how });
+    throw fault.how === 'timeout' ? new DOMException('The operation timed out.', 'TimeoutError') : new TypeError('fetch failed');
+  };
+
+  private route(url: URL, method: string, init?: RequestInit): Promise<Response> | Response {
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
     return new Response('unreachable host', { status: 502 });
-  };
+  }
+
+  /** An active IdP account whose password is known to the test. */
+  async addAccount(username: string, password: string) {
+    this.insertUser(username, `${username}@example.test`);
+    this.sqlite.run('INSERT INTO user_password_credentials (id, tenant_id, user_id, password_hash) VALUES (?, ?, (SELECT id FROM users WHERE username = ?), ?)',
+      [randomUUID(), TENANT, username, await hashPassword(password)]);
+  }
 
   /** Direct row access for assertions about what the IdP stored. */
   user(username: string): { id: string; status: string; email: string } | undefined {

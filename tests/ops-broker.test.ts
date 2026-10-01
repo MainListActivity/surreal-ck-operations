@@ -407,6 +407,90 @@ describe('ops request, query and browser', () => {
   });
 });
 
+describe('ops on a flaky network', () => {
+  const creation = (method: string, url: URL) => method === 'POST' && url.pathname === '/api/workspaces';
+  const exchange = (_method: string, url: URL) => url.pathname === '/api/auth/token';
+  const loginPage = (_method: string, url: URL) => url.pathname === '/api/login/ck/password';
+  const listing = (_method: string, url: URL) => url.pathname === '/api/session/workspaces';
+  const creations = (r: Rig) => r.world.requests.filter(q => q.method === 'POST' && q.url.endsWith('/api/workspaces')).length;
+
+  test('a login survives one lost request without leaving an error behind', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    r.world.fault(exchange, 524);
+    const login = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(login.session).toMatch(/^s_/);
+    expect(r.world.requests.filter(q => q.url.endsWith('/api/auth/token'))).toHaveLength(2);
+    expect(r.company.audits.filter(a => a.action === 'ops_error')).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('an IdP outage is upstream trouble and never mistaken for a drifted password', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    const statements = r.world.sql.length;
+    r.world.fault(loginPage, 503, { times: 5 });
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-one' }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('gave up after 2 attempts');
+    expect(r.world.sql).toHaveLength(statements);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+  });
+
+  test('an ordinary product call that stalls names its limit and leaves the session usable', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    r.world.fault(listing, 'timeout');
+    const error = await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }));
+    expect(error).toMatchObject({ code: 'upstream_error', retryable: true });
+    expect(error.message).toBe('product request timed out after 30s');
+    expect((await call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' })).status).toBe(200);
+  });
+
+  test('a creation the product never answers is settled by repeating it with the same slug', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    r.world.fault(creation, 'timeout', { afterEffect: true }); // the product finishes the job; only the answer is lost
+    const error = await failure(call(r, 'ops_workspace_ensure', { session, slug: 'sck-slow', name: 'Slow' }));
+    expect(error).toMatchObject({ code: 'upstream_error', retryable: true });
+    expect(error.message).toContain('product request timed out after 90s');
+    expect(error.message).toContain('same slug');
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(r.company.audits.map(a => a.action)).not.toContain('ops_workspace_create');
+
+    expect(await call(r, 'ops_workspace_ensure', { session, slug: 'sck-slow', name: 'Slow' }))
+      .toMatchObject({ slug: 'sck-slow', created: false, role: 'admin' });
+    expect(creations(r)).toBe(1);
+    expectNoLeaks(r);
+  });
+
+  test('a 5xx or an edge timeout on creation reads the same way, and repeating it finishes the job', async () => {
+    for (const status of [502, 503, 524]) {
+      const r = rig();
+      const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+      r.world.fault(creation, status);
+      const error = await failure(call(r, 'ops_workspace_ensure', { session, slug: 'sck-edge', name: 'Edge' }));
+      expect(error.code, String(status)).toBe('upstream_error');
+      expect(error.message).toContain(`HTTP ${status}`);
+      expect(error.message).toContain('same slug');
+      expect(await call(r, 'ops_workspace_ensure', { session, slug: 'sck-edge', name: 'Edge' })).toMatchObject({ created: true });
+      expect(creations(r)).toBe(2);
+    }
+  });
+
+  test('a slug conflict names its two possible causes', async () => {
+    const r = rig();
+    const owner = await call(r, 'ops_login', { alias: 'owner' });
+    await call(r, 'ops_workspace_ensure', { session: owner.session, slug: 'sck-taken', name: 'Taken' });
+    const other = await call(r, 'ops_login', { alias: 'other' });
+    const error = await failure(call(r, 'ops_workspace_ensure', { session: other.session, slug: 'sck-taken', name: 'Mine' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('HTTP 409 workspace-slug-conflict');
+    expect(error.message).toContain('another account');
+    expect(error.message).toContain('sck-other');
+  });
+});
+
 describe('ops audit trail', () => {
   test('failures are audited without secrets; plain input mistakes stay quiet', async () => {
     const r = rig();

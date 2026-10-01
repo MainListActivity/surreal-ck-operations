@@ -8,7 +8,7 @@ import { cloudflareD1 } from '../src/ops/d1.ts';
 import type { Fetcher } from '../src/ops/fetcher.ts';
 import { LoginError, jwtExpiry, passwordLogin } from '../src/ops/idp.ts';
 import { generatePassword, hashPassword, verifyPassword } from '../src/ops/password.ts';
-import { assertProductPath } from '../src/ops/product.ts';
+import { ProductUnreachable, assertProductPath, productRequest, productTimeoutMs } from '../src/ops/product.ts';
 import { clip, redactJson, redactText } from '../src/ops/redact.ts';
 import { SessionStore } from '../src/ops/sessions.ts';
 import { brokerConfig, FakeWorld } from './support/ops-world.ts';
@@ -137,6 +137,53 @@ describe('product paths', () => {
   });
 });
 
+describe('product request limits', () => {
+  const config = parseBrokerConfig(brokerConfig());
+  const hang: Fetcher = (_input, init) => new Promise((_resolve, reject) => {
+    init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason));
+  });
+
+  test('only workspace creation may take longer than an ordinary call', () => {
+    expect(productTimeoutMs('GET', '/api/session/workspaces')).toBe(30_000);
+    expect(productTimeoutMs('POST', '/api/workspaces')).toBe(90_000);
+    expect(productTimeoutMs('post', '/api/workspaces?x=1')).toBe(90_000);
+    for (const [method, path] of [['GET', '/api/workspaces'], ['POST', '/api/workspaces/sck-x/members'], ['POST', '/api/workspaces-other'], ['POST', '/api/session/switch-workspace']]) {
+      expect(productTimeoutMs(method!, path!), `${method} ${path}`).toBe(30_000);
+    }
+  });
+
+  test('a request nobody answers fails as unreachable, naming the limit and warning about writes', async () => {
+    const read = await failure(productRequest(config, 'tok', { method: 'GET', path: '/api/x' }, { fetch: hang, timeoutMs: 20 }));
+    expect(read).toBeInstanceOf(ProductUnreachable);
+    expect((read as ProductUnreachable).timedOut).toBe(true);
+    expect(read.code).toBe('upstream_error');
+    expect(read.message).toBe('product request timed out after 20ms');
+
+    const write = await failure(productRequest(config, 'tok', { method: 'POST', path: '/api/x', body: {} }, { fetch: hang, timeoutMs: 20 }));
+    expect(write.message).toBe('product request timed out after 20ms; it may still have taken effect, so check before repeating it');
+  });
+
+  test('other transport failures are unreachable but not timeouts, and carry no request details', async () => {
+    const reset: Fetcher = async () => { throw new TypeError('connect ECONNRESET Bearer secret-token'); };
+    const error = await failure(productRequest(config, 'secret-token', { method: 'GET', path: '/api/x' }, { fetch: reset }));
+    expect(error).toBeInstanceOf(ProductUnreachable);
+    expect((error as ProductUnreachable).timedOut).toBe(false);
+    expect(error.message).toBe('product request failed (TypeError)');
+  });
+
+  test('a body that stalls after the headers is a timeout; an unreadable one just leaves the status', async () => {
+    const stalled: Fetcher = async (_input, init) => new Response(new ReadableStream({
+      start(controller) { init!.signal!.addEventListener('abort', () => controller.error(init!.signal!.reason)); },
+    }), { status: 200 });
+    const error = await failure(productRequest(config, 'tok', { method: 'GET', path: '/api/x' }, { fetch: stalled, timeoutMs: 20 }));
+    expect(error).toBeInstanceOf(ProductUnreachable);
+
+    const broken: Fetcher = async () => new Response(new ReadableStream({ start(controller) { controller.error(new Error('reset')); } }), { status: 502 });
+    expect(await productRequest(config, 'tok', { method: 'GET', path: '/api/x' }, { fetch: broken }))
+      .toMatchObject({ status: 502, ok: false, body: null });
+  });
+});
+
 describe('cloudflare d1 client', () => {
   const options = (fetcher: Fetcher) => ({ accountId: 'acct 1', databaseId: 'db/1', token: 'cf-secret', baseUrl: 'https://cf.test/v4/', fetch: fetcher });
 
@@ -208,7 +255,8 @@ describe('idp password login', () => {
     expect((await failure(run(flow(() => json(200, { redirect_uri: `${config.idp.redirectUri}?error=access_denied` }))))).reason).toBe('access_denied');
     expect((await failure(run(flow(() => json(200, { redirect_uri: `${config.idp.redirectUri}?code=c&state=wrong` }))))).reason).toBe('bad_callback');
     expect((await failure(run(flow(() => json(403, { error: 'password_login_disabled' }))))).reason).toBe('password_login_disabled');
-    expect((await failure(run(flow(() => json(500, 'oops'))))).reason).toBe('http_500');
+    expect((await failure(run(flow(() => json(429, { error: 'rate_limited' }))))).reason).toBe('rate_limited');
+    expect((await failure(run(flow(() => json(200, 'not an object'))))).reason).toBe('http_200');
   });
 
   test('a rejected token exchange is an upstream error without any token material', async () => {
@@ -222,6 +270,90 @@ describe('idp password login', () => {
     const error = await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'sck-nobody', 'pw', { fetch: broken }));
     expect(error.code).toBe('upstream_error');
     expect(error.message).toContain('HTTP 400');
+  });
+
+  describe('on a flaky network', () => {
+    const authorizes = (world: FakeWorld) => world.requests.filter(q => q.url.includes('/authorize')).length;
+    const logins = (world: FakeWorld) => world.requests.filter(q => q.url.includes('/api/login/')).length;
+    const idp = (_method: string, url: URL) => url.origin === 'https://idp.test';
+    const loginPage = (_method: string, url: URL) => url.pathname === '/api/login/ck/password';
+    const exchange = (_method: string, url: URL) => url.pathname === '/api/auth/token';
+    const hang: Fetcher = (_input, init) => new Promise((_resolve, reject) => {
+      init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason));
+    });
+
+    const account = async () => {
+      const world = new FakeWorld();
+      await world.addAccount('sck-nobody', 'pw');
+      return world;
+    };
+    const run = (world: FakeWorld, options: { budgetMs?: number } = {}) =>
+      passwordLogin(parseBrokerConfig(brokerConfig()), 'sck-nobody', 'pw', { fetch: world.fetch, now: world.now, ...options });
+
+    test('a lost request at any step earns one more attempt from a fresh challenge', async () => {
+      const cases: Array<[string, (method: string, url: URL) => boolean, 'timeout' | 'reset' | number]> = [
+        ['authorize timeout', idp, 'timeout'], ['login reset', loginPage, 'reset'],
+        ['login 502', loginPage, 502], ['exchange 524', exchange, 524],
+      ];
+      for (const [label, match, how] of cases) {
+        const world = await account();
+        world.fault(match, how);
+        const tokens = await run(world);
+        expect(tokens.accessToken.split('.'), label).toHaveLength(3);
+        expect(authorizes(world), label).toBe(2);
+      }
+    });
+
+    test('a refusal is final: nothing is replayed', async () => {
+      const unknown = new FakeWorld();
+      expect((await failure(run(unknown))).reason).toBe('invalid_credentials');
+      expect(authorizes(unknown)).toBe(1);
+      expect(logins(unknown)).toBe(1);
+
+      const world = await account();
+      const rejected: Fetcher = async (input, init) => String(input).endsWith('/api/auth/token')
+        ? new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 })
+        : world.fetch(input, init);
+      await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'sck-nobody', 'pw', { fetch: rejected }));
+      expect(authorizes(world)).toBe(1);
+    });
+
+    test('a second failure is reported as upstream trouble that took two attempts, never as a refusal', async () => {
+      const world = await account();
+      world.fault(loginPage, 503, { times: 5 });
+      const error = await failure(run(world));
+      expect(error.code).toBe('upstream_error');
+      expect(error).not.toBeInstanceOf(LoginError);
+      expect(error.message).toBe('IdP login failed (HTTP 503); gave up after 2 attempts');
+      expect(authorizes(world)).toBe(2);
+    });
+
+    test('a request nobody answers is cut off at the step limit, then retried once', async () => {
+      const started = Date.now();
+      const error = await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'u', 'p', { fetch: hang, stepTimeoutMs: 20 }));
+      expect(error.code).toBe('upstream_error');
+      expect(error.message).toBe('IdP authorize failed (timed out after 20ms); gave up after 2 attempts');
+      expect(Date.now() - started).toBeLessThan(2_000);
+    });
+
+    test('a body that stalls after the headers counts as a timeout too', async () => {
+      const stalled: Fetcher = async (_input, init) => new Response(new ReadableStream({
+        start(controller) { init!.signal!.addEventListener('abort', () => controller.error(init!.signal!.reason)); },
+      }), { status: 200 });
+      const error = await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'u', 'p', { fetch: async (input, init) => (
+        String(input).includes('/authorize') ? new Response(null, { status: 302, headers: { location: 'https://auth.test/login/ck?login_challenge=abc' } }) : stalled(input, init)
+      ), stepTimeoutMs: 20 }));
+      expect(error.message).toBe('IdP login failed (timed out after 20ms); gave up after 2 attempts');
+    });
+
+    test('without room for a whole second flow the first failure is final', async () => {
+      const world = await account();
+      world.fault(idp, 'timeout');
+      const error = await failure(run(world, { budgetMs: 10_000 }));
+      expect(error.code).toBe('upstream_error');
+      expect(error.message).not.toContain('gave up');
+      expect(authorizes(world)).toBe(1);
+    });
   });
 });
 

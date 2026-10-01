@@ -40,7 +40,7 @@
 | `ops_health` | — | 探测环境的健康地址 |
 | `ops_account_ensure` | `alias` | 确保公司 IdP 里有这个测试账号：没有就创建，密码由代理生成并密封；你看不到密码 |
 | `ops_login` | `alias`, `workspace?` | 以该账号登录，返回会话句柄 `session`（不是 token）和该账号能进入的 workspace；账号不存在会先创建 |
-| `ops_workspace_ensure` | `session`, `slug`, `name?` | 进入已有 workspace；不存在且给了 `name` 时创建（slug 要以项目配置的前缀开头，每天有创建上限，能复用就复用） |
+| `ops_workspace_ensure` | `session`, `slug`, `name?` | 进入已有 workspace；不存在且给了 `name` 时创建（slug 要以项目配置的前缀开头，每天有创建上限，能复用就复用）。创建是产品侧的多步 provisioning，可能要一两分钟；调用若报 `upstream_error`（超时或 5xx），说明结果未定，用**同一个 slug 和 name** 再调一次即可复用或补完，不要换新 slug |
 | `ops_member_list` / `ops_member_add` / `ops_member_remove` | `session`, `slug`, `alias`, `admin?` | 查看、添加、移除 workspace 成员（`alias` 是账号别名，加入前先 `ops_account_ensure`） |
 | `ops_request` | `session`, `method`, `path`, `body?` | 以会话身份调用产品 HTTP 接口，返回状态与已脱敏的响应体 |
 | `ops_query` | `session`, `sql`, `vars?`, `slug?` | 以会话身份在所选 workspace 的数据库里执行 SurrealQL |
