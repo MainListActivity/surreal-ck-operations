@@ -635,10 +635,12 @@ export class SurrealCompanyCore implements CompanyCore {
    * gm only: rewrite an unfinished task's dependency set. Every added dependency must
    * exist; the post-update graph is walked transitively inside the transaction, so an
    * edge that would close a cycle (or is already implied by the remaining edges) never
-   * lands. A task under a live lease (doing/review) cannot be re-edged mid-delivery.
-   * An effective change bumps the version and writes deps_updated audit + outbox rows;
-   * a dependency-blocked task whose remaining deps are all done unlocks to ready in the
-   * same transaction, reusing UNLOCK_SQL's dependency_unlocked audit/outbox vocabulary.
+   * lands — edges already in the set are no-ops, not errors. A task under a live lease
+   * (current_employee set, lease unexpired) cannot be re-edged mid-delivery; an unleased
+   * task that ends up waiting on unfinished deps becomes dependency-blocked regardless
+   * of its previous state, and a dependency-blocked task whose remaining deps are all
+   * done unlocks to ready in the same transaction (UNLOCK_SQL vocabulary).
+   * An effective change bumps the version and writes deps_updated audit + outbox rows.
    */
   async updateTaskDependencies(credential: Credential, input: UpdateTaskDependencies): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
@@ -661,34 +663,42 @@ export class SurrealCompanyCore implements CompanyCore {
           IF array::len($all) > array::len($ids) { RETURN fn::sck_deps_closure($all); };
           RETURN $all;
         };
+        LET $now = time::unix(time::now());
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
         IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'deps update denied' };
         IF $t = NONE { THROW 'task not found' };
         IF $t.state = 'done' { THROW 'task already done' };
-        IF $t.state IN ['doing', 'review'] { THROW 'task has a live lease' };
+        IF $t.current_employee != NONE AND $t.lease_expires_at != NONE AND $t.lease_expires_at > $now { THROW 'task has a live lease' };
         IF array::len(array::intersect($add, $remove)) > 0 { THROW 'dependency in both add and remove' };
         LET $before = $t.dependencies ?? [];
         LET $deps = array::distinct(array::concat(array::difference($before, $remove), $add));
         FOR $dep IN $add {
           IF array::len(SELECT VALUE id FROM task WHERE id = $dep) = 0 { THROW 'dependency not found' };
-          IF $task IN fn::sck_deps_closure([$dep]) { THROW 'circular dependency' };
-          IF $dep IN fn::sck_deps_closure(array::difference($deps, [$dep])) { THROW 'dependency already implied' };
+          IF $dep NOT IN $before {
+            IF $task IN fn::sck_deps_closure([$dep]) { THROW 'circular dependency' };
+            IF $dep IN fn::sck_deps_closure(array::difference($deps, [$dep])) { THROW 'dependency already implied' };
+          };
         };
         LET $unchanged = array::len(array::difference($deps, $before)) = 0 AND array::len($deps) = array::len($before);
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $deps AND state != 'done';
         LET $dep_blocked = $t.state = 'blocked' AND $t.blocked_to = NONE;
-        LET $new_state = IF $t.state = 'ready' OR $dep_blocked { IF array::len($unfinished) > 0 { 'blocked' } ELSE { 'ready' } } ELSE { $t.state };
-        LET $unlocked = $dep_blocked AND array::len($unfinished) = 0;
+        LET $dep_wait = array::len($unfinished) > 0;
+        LET $new_state = IF $dep_wait { 'blocked' } ELSE IF $dep_blocked { 'ready' } ELSE { $t.state };
+        LET $unlocked = $dep_blocked AND !$dep_wait;
+        LET $reblocked = $t.state != 'blocked' AND $new_state = 'blocked';
         LET $changed = !$unchanged OR $new_state != $t.state;
-        LET $new_resume = IF $unlocked { NONE } ELSE IF $t.state = 'ready' AND $new_state = 'blocked' { 'ready' } ELSE { $t.resume_state };
         LET $next = UPDATE ONLY $task SET
           dependencies = $deps,
           state = $new_state,
-          blocked_to = IF $t.state = 'ready' OR $dep_blocked { NONE } ELSE { $t.blocked_to },
-          resume_state = $new_resume,
+          blocked_to = IF $new_state = 'blocked' { $t.blocked_to } ELSE { NONE },
+          resume_state = IF $unlocked { NONE } ELSE IF $reblocked { 'ready' } ELSE { $t.resume_state },
+          current_employee = IF $reblocked { NONE } ELSE { $t.current_employee },
+          delivery_id = IF $reblocked { NONE } ELSE { $t.delivery_id },
+          lease_expires_at = IF $reblocked { NONE } ELSE { $t.lease_expires_at },
           version = IF $changed { $t.version + 1 } ELSE { $t.version }
           RETURN AFTER;
+        IF $reblocked { UPDATE employee SET active_task = NONE WHERE active_task = $task; };
         IF $changed {
           CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deps_updated', evidence: $evidence, version: $next.version, before: $before, after: $deps, at: time::now() };
           LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;

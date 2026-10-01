@@ -25,7 +25,7 @@ beforeAll(async () => {
   await database.bootstrap();
   for (const [name, role, caps] of [
     ['gm', 'gm', ['execute', 'review', 'manage']], ['product', 'product', ['execute', 'review', 'manage']],
-    ['eng-a', 'engineering', ['execute', 'review']], ['qa', 'qa', ['execute', 'review']],
+    ['eng-a', 'engineering', ['execute', 'review']], ['eng-b', 'engineering', ['execute', 'review']], ['qa', 'qa', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`d-${name}`, role, caps);
 });
 
@@ -124,6 +124,63 @@ test('missing target or dependency, done target, leased task: all rejected', asy
     taskId: live.id, add: [dep.id], remove: [], evidence: ev('任务持有有效租约时不能直接改依赖，应先回收租约。'),
   })).rejects.toMatchObject({ code: 'conflict' });
   expect(await depsOf(live.id)).toEqual([]);
+});
+
+test('lease, not state, gates the update: unleased review task is re-edged, leased review is rejected', async () => {
+  const dep = await mk('等待的依赖');
+  // Unleased review: submitted, awaiting a reviewer to claim (no current_employee/delivery_id).
+  const unleased = await mk('未领取的评审任务');
+  const unleasedClaim = await core.claim(tokens['eng-b'], unleased.id);
+  await core.submit(tokens['eng-b'], proofOf(unleasedClaim), ev('提交评审的合成交付证据，等待验收人领取。'));
+  expect(await core.getTask(tokens.gm, unleased.id)).toMatchObject({ state: 'review', currentEmployee: undefined });
+  // Adding an unfinished dep expresses real waiting: the task re-blocks and clears stale lease fields.
+  const reblocked = await core.updateTaskDependencies(tokens.gm, {
+    taskId: unleased.id, add: [dep.id], remove: [], evidence: ev('评审中发现提交物依赖未完成的返工，转为依赖阻塞等待。'),
+  });
+  expect(reblocked.state).toBe('blocked');
+  expect(reblocked.currentEmployee).toBeUndefined();
+  expect(reblocked.dependencies).toEqual([dep.id]);
+  // When its dep finishes the blocked task unlocks to ready via the normal accept path.
+  await markDone(dep.id);
+  await core.updateTaskDependencies(tokens.gm, {
+    taskId: unleased.id, add: [], remove: [], evidence: ev('依赖已完成，空更新应同事务解锁为 ready。'),
+  });
+  expect((await core.getTask(tokens.gm, unleased.id)).state).toBe('ready');
+  // Leased review: a reviewer holding a live lease cannot have the edges moved mid-review.
+  const leased = await mk('持租的评审任务');
+  const leasedClaim = await core.claim(tokens['eng-b'], leased.id);
+  await core.submit(tokens['eng-b'], proofOf(leasedClaim), ev('提交评审的合成交付证据，等待验收人领取。'));
+  await core.claim(tokens.qa, leased.id);
+  await expect(core.updateTaskDependencies(tokens.gm, {
+    taskId: leased.id, add: [dep.id], remove: [], evidence: ev('验收人持有活租约期间不能移动依赖边，应先结束租约。'),
+  })).rejects.toMatchObject({ code: 'conflict' });
+  // An abandoned doing task (lease expired) is unleased again and may be re-edged.
+  const staleDep = await mk('仍未完成的依赖');
+  const stale = await mk('过期租约的在制任务');
+  await core.claim(tokens['eng-b'], stale.id);
+  await database.db.query('UPDATE $t SET lease_expires_at = 1;', { t: new RecordId('task', stale.id) });
+  const revived = await core.updateTaskDependencies(tokens.gm, {
+    taskId: stale.id, add: [staleDep.id], remove: [], evidence: ev('租约已过期任务视为无租约，可重新挂依赖边。'),
+  });
+  expect(revived.state).toBe('blocked');
+  expect(revived.currentEmployee).toBeUndefined();
+});
+
+test('re-adding an edge already in the set is a no-op even when it is also implied transitively', async () => {
+  const b = await mk('底层依赖 B');
+  const a = await mk('中间依赖 A', [b.id]);
+  // createTask allows stating an already-implied edge: C depends on [A,B] with A -> B.
+  const c = await mk('双依赖任务 C', [a.id, b.id]);
+  const again = await core.updateTaskDependencies(tokens.gm, {
+    taskId: c.id, add: [b.id], remove: [], evidence: ev('重复追加已存在的依赖边，应无副作用返回原视图。'),
+  });
+  expect(again.version).toBe(c.version);
+  expect(again.dependencies.sort()).toEqual([a.id, b.id].sort());
+  expect((await auditRows(c.id)).filter(r => r.action === 'deps_updated')).toHaveLength(0);
+  // A genuinely new edge that is implied transitively is still rejected.
+  await expect(core.updateTaskDependencies(tokens.gm, {
+    taskId: a.id, add: [], remove: [], evidence: ev('占位：同任务无操作调用，验证幂等不写行。'),
+  })).resolves.toMatchObject({ version: a.version });
 });
 
 test('only gm may update dependencies; other roles and capabilities are rejected', async () => {
