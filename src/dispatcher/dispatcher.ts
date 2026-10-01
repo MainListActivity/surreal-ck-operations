@@ -103,6 +103,9 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     return !target || !inst.model || inst.model === target;
   };
   const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  /** Distinguish quota circuit-break from full seats in the owner-facing reason. */
+  const capReason = (provider: string): string | undefined =>
+    p.quotaBlocked.get(provider) ?? (cap(provider) ? undefined : 'provider 无可用容量');
   const entries: StaffingEntry[] = [];
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;
@@ -115,7 +118,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.excludeSubmitter && inst.id === p.task?.submittedBy) ? '提交者回避' :
       (p.sidecar && inst.credentialFile) ? '凭证文件实例不可接新任务' :
       !currentModel(inst) ? '模型槽位已漂移' :
-      !cap(inst.provider ?? '') ? 'provider 无可用容量' : undefined;
+      capReason(inst.provider ?? '');
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
       weight: effectiveWeight(def), share: 0, eligible: !reason, reason });
@@ -128,7 +131,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       !def.enabled ? '编制停用' :
       resolved === undefined ? '模型槽位未解析' :
       seats >= def.maxInstances ? `实例数 ${seats}/${def.maxInstances} 已满` :
-      !cap(def.provider) ? 'provider 无可用容量' : undefined;
+      capReason(def.provider);
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: effectiveWeight(def), share: 0, eligible: !reason, reason });

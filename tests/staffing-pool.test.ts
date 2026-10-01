@@ -84,9 +84,10 @@ test('pool: provider capacity and quota block both reuse and spawn', () => {
   const full = staffingPool(base({ defs: [d], insts: [i],
     states: new Map([['i1', 'idle']]), providerMax: { codex: 1 }, busyBy: new Map([['codex', 1]]) }));
   expect(full.every(e => e.reason === 'provider 无可用容量')).toBe(true);
+  // Quota circuit-break reports the quota reason itself, not the generic capacity one.
   const quota = staffingPool(base({ defs: [d], insts: [i],
-    states: new Map([['i1', 'idle']]), quotaBlocked: new Map([['codex', '额度不足']]) }));
-  expect(quota.every(e => e.reason === 'provider 无可用容量')).toBe(true);
+    states: new Map([['i1', 'idle']]), quotaBlocked: new Map([['codex', '额度不足（周/月额度 0%<2%）']]) }));
+  expect(quota.every(e => e.reason === '额度不足（周/月额度 0%<2%）')).toBe(true);
 });
 
 test('pool: exhausted inst is reusable only while the provider is in probe window', () => {
