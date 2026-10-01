@@ -1,10 +1,22 @@
-import { describe, expect, test } from 'bun:test';
-import { blockedPatterns, registerScrub, scrubEnv } from '../plugin/server/scrub.ts';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { blockedPatterns, externalPatterns, installZdot, registerScrub, scrubEnv, userZshDir, zdotFiles } from '../plugin/server/scrub.ts';
 
 const daemonEnv = {
   PATH: '/usr/bin', HOME: '/Users/x', SSH_AUTH_SOCK: '/tmp/agent.sock', OPENAI_API_KEY: 'provider-login',
   CLOUDFLARE_API_TOKEN: 'cf-secret', CLOUDFLARE_ACCOUNT_ID: 'acct', JEV_API_KEY: 'jev-secret',
   SURREAL_ROOT_PASS: 'root-pass', SCK_PRODUCT_ENV: '/p/.env',
+};
+
+const scratch = mkdtempSync(join(tmpdir(), 'sck-scrub-test-'));
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+let counter = 0;
+const fresh = (name: string) => {
+  const dir = join(scratch, `${name}-${counter++}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
 };
 
 describe('scrubEnv', () => {
@@ -29,14 +41,123 @@ describe('scrubEnv', () => {
     const env = scrubEnv({}, { MY_VENDOR_KEY: 'x', NPM_TOKEN: 'y', PATH: '/bin' }, patterns);
     expect(env).toEqual({ MY_VENDOR_KEY: '', NPM_TOKEN: '' });
   });
+
+  test('the shell-startup patterns leave out the company\'s own plumbing variables but keep the extras', () => {
+    const external = externalPatterns('NPM_TOKEN');
+    expect(external).toContain('CLOUDFLARE_');
+    expect(external).toContain('NPM_TOKEN');
+    expect(external.some(pattern => pattern.startsWith('SCK_'))).toBe(false);
+    expect(blockedPatterns('NPM_TOKEN')).toEqual(expect.arrayContaining([...external, 'SCK_OPS_', 'SCK_PRODUCT_ENV']));
+  });
+});
+
+describe('zsh startup shim files', () => {
+  test('every zsh startup file sources the user\'s own file first, then unsets the credential names', () => {
+    const files = zdotFiles('/Users/x', ['CLOUDFLARE_', 'JEV_']);
+    expect(Object.keys(files).sort()).toEqual(['.zlogin', '.zprofile', '.zshenv', '.zshrc']);
+    for (const [file, text] of Object.entries(files)) {
+      const lines = text.split('\n');
+      expect(lines[0]).toBe(`[ -r '/Users/x/${file}' ] && . '/Users/x/${file}'`);
+      expect(text).toContain('(CLOUDFLARE_|JEV_)*');
+      expect(text.indexOf('. \'/Users/x')).toBeLessThan(text.indexOf('unset "$_sck_name"'));
+    }
+  });
+
+  test('a user directory with quotes in its name stays one shell word', () => {
+    const [line] = zdotFiles(`/Users/o'neil`, ['JEV_'])['.zshrc'].split('\n');
+    expect(line).toBe(`[ -r '/Users/o'\\''neil/.zshrc' ] && . '/Users/o'\\''neil/.zshrc'`);
+  });
+
+  test('only plain names reach the shell; anything else is left to the launch env', () => {
+    const text = zdotFiles('/h', ['JEV_', 'bad name;', '$(x)', 'NPM_TOKEN'])['.zshrc'];
+    expect(text).toContain('(JEV_|NPM_TOKEN)*');
+    expect(text).not.toContain('bad name');
+    expect(text).not.toContain('$(x)');
+    expect(zdotFiles('/h', [])['.zshrc']).not.toContain('unset');
+  });
+
+  test('installZdot writes private files and rewrites them on the next start', () => {
+    const dir = join(fresh('install'), 'zdot');
+    installZdot(dir, '/h', ['JEV_']);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(dir, '.zshrc')).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(dir, '.zshrc'), 'utf8')).toContain('(JEV_)*');
+    installZdot(dir, '/h2', ['JEV_', 'NPM_TOKEN']);
+    expect(readFileSync(join(dir, '.zshrc'), 'utf8')).toContain('/h2/.zshrc');
+    expect(readFileSync(join(dir, '.zshrc'), 'utf8')).toContain('(JEV_|NPM_TOKEN)*');
+  });
+
+  test('the user\'s zsh directory is ZDOTDIR if they set one, else HOME, and never the shim itself', () => {
+    expect(userZshDir('/shim', { HOME: '/h' })).toBe('/h');
+    expect(userZshDir('/shim', { HOME: '/h', ZDOTDIR: '/h/.config/zsh' })).toBe('/h/.config/zsh');
+    expect(userZshDir('/shim', { HOME: '/h', ZDOTDIR: '/shim/' })).toBe('/h');
+  });
+});
+
+const zsh = Bun.which('zsh');
+const FIELDS = ['CLOUDFLARE_API_TOKEN', 'CF_API_SHELLVAR', 'SURREAL_PASS', 'TYPESAFE_X', 'JEV_API_KEY'] as const;
+const KEPT = ['KEEP_RC', 'KEEP_ENV', 'KEEP_PROFILE'] as const;
+
+describe.skipIf(!zsh)('zsh startup shim in a real zsh', () => {
+  function userHome(name: string) {
+    const home = fresh(name);
+    writeFileSync(join(home, '.zshenv'), 'export TYPESAFE_X=leak-env KEEP_ENV=env\n');
+    writeFileSync(join(home, '.zprofile'), 'export SURREAL_PASS=leak-profile KEEP_PROFILE=profile\n');
+    writeFileSync(join(home, '.zshrc'), 'export CLOUDFLARE_API_TOKEN=leak-rc JEV_API_KEY=leak-rc KEEP_RC=rc\nCF_API_SHELLVAR=leak-unexported\n');
+    return home;
+  }
+
+  function run(flag: string, env: Record<string, string>): Record<string, string> {
+    const names = [...FIELDS, ...KEPT];
+    const script = `print -r -- "RESULT:${names.map(name => `${name}=[$${name}]`).join(' ')}"`;
+    const proc = Bun.spawnSync([zsh!, flag, script], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env }, stdout: 'pipe', stderr: 'pipe' });
+    const line = proc.stdout.toString().split('\n').reverse().find(item => item.startsWith('RESULT:'));
+    expect(line, `zsh ${flag}: ${proc.stderr.toString()}`).toBeDefined();
+    return Object.fromEntries([...line!.slice('RESULT:'.length).matchAll(/(\w+)=\[([^\]]*)\]/g)].map(match => [match[1], match[2]]));
+  }
+
+  for (const flag of ['-c', '-lc', '-ic', '-lic']) {
+    test(`zsh ${flag}: credentials the user's startup files export are gone, the rest of the setup survives`, () => {
+      const home = userHome('user');
+      const shim = fresh('shim');
+      installZdot(shim, home, externalPatterns());
+
+      const baseline = run(flag, { HOME: home, ZDOTDIR: home });
+      const shimmed = run(flag, { HOME: home, ZDOTDIR: shim });
+
+      for (const name of FIELDS) expect(shimmed[name], `${name} under ${flag}`).toBe('');
+      for (const name of KEPT) expect(shimmed[name], `${name} under ${flag}`).toBe(baseline[name]);
+      if (flag.includes('i')) expect(baseline.CLOUDFLARE_API_TOKEN).toBe('leak-rc'); // the control: without the shim this really leaks
+      if (flag === '-c') expect(baseline.TYPESAFE_X).toBe('leak-env');
+    });
+  }
+
+  test('a user who keeps their zsh files under their own ZDOTDIR is covered too', () => {
+    const home = fresh('home');
+    const userDir = userHome('userdir');
+    const shim = fresh('shim');
+    installZdot(shim, userZshDir(shim, { HOME: home, ZDOTDIR: userDir }), externalPatterns());
+    const shimmed = run('-ic', { HOME: home, ZDOTDIR: shim });
+    expect(shimmed.CLOUDFLARE_API_TOKEN).toBe('');
+    expect(shimmed.KEEP_RC).toBe('rc');
+  });
+
+  test('names added through SCK_SCRUB_ENV are stripped from startup files as well', () => {
+    const home = fresh('extra');
+    writeFileSync(join(home, '.zshrc'), 'export NPM_TOKEN=leak MY_VENDOR_KEY=leak KEEP_RC=rc\n');
+    const shim = fresh('shim');
+    installZdot(shim, home, externalPatterns('NPM_TOKEN,MY_VENDOR_'));
+    const proc = Bun.spawnSync([zsh!, '-ic', 'print -r -- "RESULT:[$NPM_TOKEN][$MY_VENDOR_KEY][$KEEP_RC]"'], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, ZDOTDIR: shim }, stdout: 'pipe', stderr: 'pipe' });
+    expect(proc.stdout.toString()).toContain('RESULT:[][][rc]');
+  });
 });
 
 type Handler = (input: { request: Record<string, unknown> }, ctx: { paseo: unknown; signal: AbortSignal }) => Promise<unknown>;
 
-function hook(labels: Record<string, string> | 'fails' | 'hangs' = {}) {
+function hook(labels: Record<string, string> | 'fails' | 'hangs' = {}, options: Parameters<typeof registerScrub>[2] = {}, inherited: Record<string, string> = daemonEnv) {
   let handler!: Handler;
   const server = { before: (_name: string, fn: Handler) => { handler = fn; return () => {}; } };
-  registerScrub(server as never, daemonEnv);
+  registerScrub(server as never, inherited, options);
   let lookups = 0;
   const paseo = {
     agents: {
@@ -96,4 +217,50 @@ describe('agent.session_open hook', () => {
     expect(await hook('hangs').open({ ...base, reason: 'import', env: {} })).toBeUndefined();
     expect(Date.now() - started).toBeLessThan(4_000);
   }, 6_000);
+});
+
+describe('agent.session_open hook with the zsh startup shim', () => {
+  const launch = { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' };
+
+  test('company sessions start zsh from the shim directory, which the hook writes', async () => {
+    const zdotdir = join(fresh('hook'), 'zdot');
+    const out = await hook({}, { zdotdir }).open({ ...base, reason: 'create', env: launch });
+    expect(out?.env.ZDOTDIR).toBe(zdotdir);
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.zshrc'`);
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_)*');
+  });
+
+  test('the shim sources the user\'s ZDOTDIR when they have one, and never itself', async () => {
+    const zdotdir = join(fresh('hook'), 'zdot');
+    hook({}, { zdotdir }, { ...daemonEnv, ZDOTDIR: '/Users/x/.config/zsh' });
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.config/zsh/.zshrc'`);
+    hook({}, { zdotdir }, { ...daemonEnv, ZDOTDIR: zdotdir });
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.zshrc'`);
+  });
+
+  test('a ZDOTDIR the launch sets itself wins, and other people\'s agents get none', async () => {
+    const zdotdir = join(fresh('hook'), 'zdot');
+    const h = hook({}, { zdotdir });
+    expect((await h.open({ ...base, reason: 'create', env: { ...launch, ZDOTDIR: '/mine' } }))?.env.ZDOTDIR).toBe('/mine');
+    expect(await h.open({ ...base, agentId: 'a2', reason: 'create', env: {} })).toBeUndefined();
+  });
+
+  test('without a shim directory nothing is added to the environment', async () => {
+    const out = await hook().open({ ...base, reason: 'create', env: launch });
+    expect(out?.env.ZDOTDIR).toBeUndefined();
+  });
+
+  test('a shim directory that cannot be written is logged and the environment scrub still applies', async () => {
+    const blocker = join(fresh('blocked'), 'file');
+    writeFileSync(blocker, '');
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await hook({}, { zdotdir: join(blocker, 'zdot') }).open({ ...base, reason: 'create', env: launch });
+      expect(out?.env.ZDOTDIR).toBeUndefined();
+      expect(out?.env.CLOUDFLARE_API_TOKEN).toBe('');
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

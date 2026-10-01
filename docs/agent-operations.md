@@ -98,7 +98,10 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **会话**：只在内存，按（员工、项目、环境）隔离，每个员工最多 8 个、最长 6 小时；token 临近过期时代理自动重新登录。租约结束、会话归档、插件重启即丢，下次重新 `ops_login`。
 - **账号密码**：由代理随机生成，先密封入库再交给 IdP；IdP 里只存 pbkdf2 哈希。若 IdP 里的密码被带外改动，`ops_login` 会自动修复一次。
 - **控制面凭证**：Cloudflare 令牌与账号 ID 取自插件进程的环境变量；想用权限更窄的令牌，在守护进程环境设 `SCK_OPS_CLOUDFLARE_API_TOKEN` / `SCK_OPS_CLOUDFLARE_ACCOUNT_ID`（优先于 `CLOUDFLARE_*`）。
-- **环境清理**：员工会话是 Paseo 守护进程的子进程，会继承它的环境变量。插件的 `agent.session_open` 钩子（`plugin/server/scrub.ts`）在公司员工会话启动前（含 resume / refresh）把继承来的基础设施凭证变量（`CLOUDFLARE_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV` 等）覆盖成空串。provider 自己的登录变量（`OPENAI_API_KEY` 之类）不动，否则会弄坏会话；`SSH_AUTH_SOCK` 和 `gh` 的本机登录也不动，工程要靠它们推分支、开 PR。要多清哪些名字或前缀，在 `private/service.env` 设 `SCK_SCRUB_ENV`（逗号分隔）后 `plugin reload`。老板自己的非公司会话不受影响。验证：新开一个员工会话，在它的进程环境里应看到这些变量为空（`ps eww <pid>`）。
+- **环境清理**：员工会话是 Paseo 守护进程的子进程，会继承它的环境变量。插件的 `agent.session_open` 钩子（`plugin/server/scrub.ts`）在公司员工会话启动前（含 resume / refresh）把继承来的基础设施凭证变量（`CLOUDFLARE_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV` 等）覆盖成空串。provider 自己的登录变量（`OPENAI_API_KEY` 之类）不动，否则会弄坏会话；`SSH_AUTH_SOCK` 和 `gh` 的本机登录也不动，工程要靠它们推分支、开 PR。要多清哪些名字或前缀，在 `private/service.env` 设 `SCK_SCRUB_ENV`（逗号分隔）后 `plugin reload`。老板自己的非公司会话不受影响。
+- **zsh 启动文件垫片**：只清启动环境不够。老板在 `~/.zshrc` 里 `export` 的 token 会在每个交互式 zsh 里重新出现，而 codex 正是通过交互式 zsh 的 shell snapshot 执行命令（实测：只清环境时，codex 员工的 shell 里 token 仍然在；factory-droid、devin 走非交互 shell，不受影响）。所以钩子同时把公司员工会话的 `ZDOTDIR` 指到插件在 `<服务目录>/zdot` 生成的垫片目录：垫片里的 `.zshenv`、`.zprofile`、`.zshrc`、`.zlogin` 先原样 source 老板自己的同名文件（老板设了 `ZDOTDIR` 就用那个目录），再 `unset` 外部凭证名（上面的 `CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*` 和 `SCK_SCRUB_ENV`；`SCK_OPS_*` 这类公司自己的变量不会出现在启动文件里，不列入），PATH 等个人配置照常生效。垫片在每次插件启动时重写（先读 `private/service.env`，所以那里的 `SCK_SCRUB_ENV` 也生效）；写不出来只记警告，环境变量清理照常。
+- **边界**：这两层是去掉员工环境里“顺手就有”的凭证，不是硬隔离。员工与老板是同一个系统用户，能直接读 `~/.zshrc`，也能 `ZDOTDIR= zsh -i` 绕开垫片；bash 的启动文件（`.bashrc`、`.bash_profile`）不在垫片范围内。要根治，就别把 token 明文写进任何 shell 启动文件，broker 要用的令牌放进 `private/service.env`，最好是权限更窄的 `SCK_OPS_CLOUDFLARE_*`。
+- **环境清理的验证**：新开一个员工会话，在它的进程环境里应看到这些变量为空、`ZDOTDIR` 指向垫片目录（`ps eww <pid>`）；codex 员工的 shell 里 `zsh -ic 'echo ${CLOUDFLARE_API_TOKEN:+set}'` 应无输出。`tests/scrub.test.ts` 用真实 zsh 覆盖了 `-c`、`-lc`、`-ic`、`-lic` 四种启动方式。
 
 ## 员工编制（SurrealDB）
 
