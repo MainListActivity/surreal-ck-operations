@@ -64,6 +64,15 @@ export class FakeWorld {
   private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
   /** Third-party clients park the login on the consent screen; keyed by consent_challenge. */
   private readonly consents = new Map<string, { userId: string; state: string; codeChallenge: string; redirectUri: string; client: string }>();
+  /**
+   * Clients whose consent_policy is `require`, like the production DCR'd operator client:
+   * the password route parks the flow on the consent URL instead of returning code+state.
+   */
+  readonly consentClients = new Set<string>([OPS_CLIENT]);
+  /** Deny mode: the consent endpoint answers with an `access_denied` redirect back to the client. */
+  denyConsents = false;
+  /** Missing-cookie mode: the password route omits the `user_session` cookie the consent POST needs. */
+  omitSessionCookie = false;
 
   constructor() {
     this.sqlite.run(`CREATE TABLE users (
@@ -196,15 +205,19 @@ export class FakeWorld {
       const form = new URLSearchParams(String(init?.body ?? ''));
       const consent = this.consents.get(form.get('consent_challenge') ?? '');
       const cookie = new Headers(init?.headers).get('cookie') ?? '';
-      if (!consent || form.get('decision') !== 'approve' || !cookie.includes('user_session=')) {
+      if (!consent || !cookie.includes(`user_session=session-${consent.userId}`)) {
         return json(400, { error: 'invalid_consent_challenge' });
       }
       this.consents.delete(form.get('consent_challenge')!);
+      const redirect = new URL(consent.redirectUri);
+      redirect.searchParams.set('state', consent.state);
+      if (this.denyConsents || form.get('decision') !== 'approve') {
+        redirect.searchParams.set('error', 'access_denied');
+        return new Response(null, { status: 302, headers: { location: redirect.toString() } });
+      }
       const code = `code-${randomBytes(8).toString('hex')}`;
       this.codes.set(code, { userId: consent.userId, codeChallenge: consent.codeChallenge, redirectUri: consent.redirectUri, client: consent.client });
-      const redirect = new URL(consent.redirectUri);
       redirect.searchParams.set('code', code);
-      redirect.searchParams.set('state', consent.state);
       return new Response(null, { status: 302, headers: { location: redirect.toString() } });
     }
     if (method !== 'POST' || url.pathname !== '/api/login/ck/password') return json(404, { error: 'not_found' });
@@ -217,14 +230,17 @@ export class FakeWorld {
     if (!user || user.status !== 'active' || !credential || !(await verifyPassword(form.get('password') ?? '', credential.password_hash))) {
       return json(401, { error: 'invalid_credentials' });
     }
-    // The DCR'd direct client carries consent_policy `require` like the production IdP: the
-    // password route parks the flow on the consent URL and sets the browser session cookie.
-    if (challenge.client === OPS_DIRECT_CLIENT) {
+    // Clients with consent_policy `require` (the production DCR'd operator client) park the
+    // flow on the consent URL and set the browser session cookie the consent POST needs.
+    if (this.consentClients.has(challenge.client)) {
       const consentId = randomBytes(8).toString('hex');
       this.consents.set(consentId, { userId: user.id, ...challenge });
       return new Response(JSON.stringify({ redirect_uri: `https://auth.test/api/consent/ck?consent_challenge=${consentId}` }), {
         status: 200,
-        headers: { 'content-type': 'application/json', 'set-cookie': `user_session=session-${user.id}; Path=/; HttpOnly` },
+        headers: {
+          'content-type': 'application/json',
+          ...(this.omitSessionCookie ? {} : { 'set-cookie': `user_session=session-${user.id}; Path=/; HttpOnly` }),
+        },
       });
     }
     const code = `code-${randomBytes(8).toString('hex')}`;

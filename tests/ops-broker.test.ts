@@ -547,6 +547,9 @@ describe('operator sessions', () => {
     expect(authorize.searchParams.get('resource')).toBe(OPS_RESOURCE);
     expect(authorize.searchParams.get('redirect_uri')).toBe(OPS_REDIRECT);
     expect(authorize.searchParams.get('audience')).toBeNull();
+    // The DCR'd operator client carries consent_policy `require`: the login parked on the consent
+    // page and the broker approved it with the password response's `user_session` cookie.
+    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(1);
     // The code was redeemed at the public ops token endpoint; the confidential proxy was not used.
     expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(1);
     expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
@@ -557,6 +560,43 @@ describe('operator sessions', () => {
     expect(res).toMatchObject({ status: 200, ok: true, body: { slug: 'qa-ws', entitlement: { revision: 3 } } });
     expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create', 'ops_operator_login', 'ops_call']);
     expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('an IdP consent denial fails the operator login as access_denied', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    r.world.denyConsents = true;
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('access_denied');
+    // The broker did POST the approval; the IdP's deny redirect carried the error, and no token was minted.
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('a consent hop without the login session cookie is refused and leaks nothing', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    r.world.omitSessionCookie = true;
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('invalid_consent_challenge');
+    expect(error.message).not.toContain('session-');
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('a consent challenge on the customer client is refused outright, never approved', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    r.world.consentClients.add('client-ck-1234');
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-one' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('consent');
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
     expectNoLeaks(r);
   });
 
@@ -664,8 +704,8 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     // The code went to the IdP's own /token; neither product proxy was touched.
     expect(idpTokenCalls(r)).toHaveLength(1);
     expect(r.world.requests.filter(x => x.url.includes('/api/auth/token') || x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
-    // Third-party public clients go through the IdP consent hop before the code is issued.
-    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(1);
+    // This client is not consent-gated, so no consent hop happens; gated clients are covered below.
+    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(0);
     // No workspace listing happens for an ops session.
     expect(r.world.requests.filter(x => x.url.includes('/api/session/'))).toHaveLength(0);
     expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_login' });
@@ -674,6 +714,19 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     const res = await call(r, 'ops_request', { session: login.session, method: 'GET', path: '/api/ops/quota/context' });
     expect(res).toMatchObject({ status: 200, ok: true });
     expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('a consent challenge on the ops audience client is refused, not approved', async () => {
+    const r = rig(idpOps);
+    await opsUser(r, 'qa-ops');
+    r.world.consentClients.add(OPS_DIRECT_CLIENT);
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('consent');
+    // The refusal happens before any consent POST or token exchange: never auto-approve others' clients.
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
+    expect(idpTokenCalls(r)).toHaveLength(0);
     expectNoLeaks(r);
   });
 
