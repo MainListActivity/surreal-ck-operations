@@ -174,6 +174,8 @@ export interface SidecarBridge {
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
   /** Records the freshly spawned Paseo agentId for this instance. */
   bindAgent(instId: string, agentId: string): void;
+  /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
+  commDirFor(instId: string): string;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
 }
@@ -505,7 +507,8 @@ export class Dispatcher {
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
       const prefer = await routeEmployee(item);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first, claim) => wake(inst, item.task, this.deps.env, first, { comm: !!this.deps.sidecar, claim }), report, insts, item.purpose === 'review', prefer, slotMap);
+        (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap);
       if (!result) {
         if (prefer) {
           // Jev's pick just failed in assign; stop re-picking the same candidate
@@ -538,7 +541,8 @@ export class Dispatcher {
     }
     if (pendingGm.length && running < cfg.maxRunning) {
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
+        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first,
+          { comm: !!this.deps.sidecar, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap);
       if (result) {
         for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
         report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));

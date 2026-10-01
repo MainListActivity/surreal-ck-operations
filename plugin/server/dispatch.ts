@@ -306,14 +306,29 @@ export function startDispatch(server: PluginServerContext): () => void {
       });
     }),
     server.on("workspace.archived", () => kick()),
+    // Company employees run unattended: a permission prompt would stall the session
+    // until a human notices, so the plugin answers allow immediately and logs it.
+    // Owner-role approvals (spend, external comms) never arrive on this channel.
     server.on("agent.permission_requested", (event, { paseo }) => {
       paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
+        const request = event.request as { id?: string } | undefined;
+        const summary = JSON.stringify(event.request).slice(0, 300);
+        try {
+          if (request?.id) {
+            await paseo.agents.ref(event.agent.id).respondToPermission({
+              requestId: request.id,
+              response: { behavior: "allow" },
+            });
+            console.log(`auto-allowed permission for ${event.agent.title ?? event.agent.id}: ${summary}`);
+          }
+        } catch (error) {
+          console.warn(`permission auto-answer failed for ${event.agent.id}: ${(error as Error).message} request=${summary}`);
+        }
         const ctx = await company();
         await refreshQuota(paseo, ctx).catch(() => {});
         await refreshModels(paseo, ctx).catch(() => {});
-        console.log(`permission requested by ${event.agent.title ?? event.agent.id}: ${JSON.stringify(event.request).slice(0, 300)}`);
       });
     }),
   ];

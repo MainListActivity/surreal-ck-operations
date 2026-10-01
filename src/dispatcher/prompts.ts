@@ -4,7 +4,7 @@ import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
 /** comm = 插件 sidecar 已代领任务、凭证不进 agent；否则为旧的凭证文件模式。 */
-export interface PromptCtx { comm: boolean; claim?: ClaimResult }
+export interface PromptCtx { comm: boolean; claim?: ClaimResult; commDir?: string }
 
 const ROLE_NAMES: Record<string, string> = {
   gm: '经理：目标分级与拆解、处理运营定不了的事、G3 汇总',
@@ -21,12 +21,12 @@ const tool = (inst: EmployeeInst, env: PromptEnv, comm: boolean) => comm
   ? `'${env.sckBin}' call <工具名> '<JSON参数>'`
   : `SCK_EMPLOYEE_CREDENTIAL_FILE='${inst.credentialFile ?? '<见岗位登记>'}' '${env.sckBin}' call <工具名> '<JSON参数>'`;
 
-export function onboarding(inst: EmployeeInst, env: PromptEnv, comm = false): string {
+export function onboarding(inst: EmployeeInst, env: PromptEnv, comm = false, commDir = '$SCK_COMM_DIR'): string {
   const channel = comm
     ? `公司任务系统是唯一事实来源，调用方式：
   ${tool(inst, env, true)}
 凭证与本会话绑定由通道持有，你不需要也不会看到它；工具结果从同一通道返回。
-交付约定：把交付说明写入 $SCK_COMM_DIR/report.md 即视为提交评审（内容就是证据文本）。
+交付约定：把交付说明写入 ${commDir}/report.md 即视为提交评审（内容就是证据文本）。
 checkpoint/report_blocker/review 的租约证明由通道自动补齐，只需传业务字段。
 账号、workspace、成员、生产登录这类要凭证的事用运维工具 ops_*，先看当前项目能做什么：
   '${env.sckBin}' call ops_info '{}'
@@ -36,7 +36,7 @@ checkpoint/report_blocker/review 的租约证明由通道自动补齐，只需�
 凭证文件只能以路径使用，禁止读取、打印或转述其内容。`;
   return `你是 Surreal CK AI 公司的员工，员工编号 ${inst.id}，岗位 ${inst.role}（${ROLE_NAMES[inst.role] ?? inst.role}）。
 公司唯一真人是老板（用户本人）；其他同事都是 AI 员工。你被当作真实员工对待：对结果负责、证据真实、不越权。
-公司运营仓库（协议、岗位说明、deliverables/ 等相对路径都指这里）：${env.opsRepo}。你的 Paseo 工作区在任务所属项目的仓库；代码工作按 project.repoPath 和任务分支 worktree 进行，公司文件用运营仓库的绝对路径读写。
+公司运营仓库（协议、岗位说明等制度文件只读）：${env.opsRepo}。你的 Paseo 工作区在任务所属项目的仓库；代码工作按 project.repoPath 和任务分支 worktree 进行。不要往运营仓库写任何交付物或证据文件——证据文本进任务服务，附件文件（截图、导出报告、验收手册）写到 claim.json 给出的 evidenceDir 目录。
 每次被唤醒，先读 ${env.opsRepo}/AGENTS.md、${env.opsRepo}/agents/PROTOCOL.md、${env.opsRepo}/agents/${inst.role}.md，所有 shell 命令按本机 RTK 规则执行。
 ${channel}`;
 }
@@ -44,12 +44,13 @@ ${channel}`;
 export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
   if (ctx?.comm) {
+    const commDir = ctx.commDir ?? '$SCK_COMM_DIR';
     const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。
-先读 $SCK_COMM_DIR/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
-完成后：把交付说明写入 $SCK_COMM_DIR/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
+先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
+完成后：把交付说明写入 ${commDir}/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
 中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。
 本轮只做这一项；写完 report.md 或报阻塞后结束本轮，不空转、不建 agent/定时器。`;
-    return firstContact ? `${onboarding(inst, env, true)}\n\n${body}` : body;
+    return firstContact ? `${onboarding(inst, env, true, commDir)}\n\n${body}` : body;
   }
   const body = `【派工】任务 ${task.id}「${task.title}」需要你${mode}。
 1. 领取：${tool(inst, env, false).replace('<工具名>', 'claim_next').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
