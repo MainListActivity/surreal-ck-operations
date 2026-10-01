@@ -1,0 +1,440 @@
+import { describe, expect, test } from 'bun:test';
+import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
+import { verifyPassword } from '../src/ops/password.ts';
+import { brokerConfig, FakeCompany, FakeWorld } from './support/ops-world.ts';
+
+interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
+
+function rig(patch: Record<string, unknown> = {}, hasEnv = true): Rig {
+  const world = new FakeWorld();
+  const company = new FakeCompany();
+  if (hasEnv) company.env('demo', 'production', brokerConfig(patch), { healthUrl: 'https://app.test/health' });
+  const broker = new OpsBroker({
+    core: company.core, projects: company.projects as never, secretKey: () => Buffer.alloc(32),
+    controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+    fetch: world.fetch, now: world.now, d1: () => world.d1, queryAsUser: world.queryAsUser, browser: world.browser,
+  });
+  return { world, company, broker, qa: company.lease('qa-1', 'qa', 'task-1'), outputs: [] };
+}
+
+/** Every value returned to the employee is collected so leak checks can scan them all. */
+async function call(r: Rig, tool: string, args: Record<string, unknown> = {}, as: { cred?: string; task?: string } = {}) {
+  const value = await r.broker.call(as.cred ?? r.qa, as.task ?? 'task-1', tool, args);
+  r.outputs.push(value);
+  return value as Record<string, any>;
+}
+
+const failure = async (promise: Promise<unknown>) => {
+  try { await promise; } catch (error) { return error as Error & { code: string }; }
+  throw new Error('expected the call to fail');
+};
+
+const sealedPassword = (r: Rig, alias: string) => r.company.sealed.get(`demo/production/${alias}_PASSWORD`)!;
+
+function expectNoLeaks(r: Rig, extra: string[] = []) {
+  const haystack = JSON.stringify([r.outputs, r.company.audits]);
+  const secrets = [...r.world.tokens, ...r.company.sealed.values(), 'cf-token-value', ...extra];
+  expect(secrets.length).toBeGreaterThan(0);
+  for (const secret of secrets) expect(haystack).not.toContain(secret);
+}
+
+describe('ops gate', () => {
+  test('every ops tool is exercised by this suite', () => {
+    expect([...OPS_TOOLS].sort()).toEqual([
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info', 'ops_login', 'ops_logout', 'ops_member_add',
+      'ops_member_list', 'ops_member_remove', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+    ]);
+  });
+
+  test('unknown tools are refused before anything else happens', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_drop_database'));
+    expect(error.code).toBe('invalid');
+    expect(r.world.requests).toHaveLength(0);
+  });
+
+  test('without the live task lease nothing runs and nothing reaches the services', async () => {
+    const r = rig();
+    r.company.endLease('qa-1');
+    expect((await failure(call(r, 'ops_info'))).code).toBe('forbidden');
+    expect((await failure(call(r, 'ops_login', { alias: 'a' }))).code).toBe('forbidden');
+    expect(r.world.requests).toHaveLength(0);
+    expect(r.company.audits).toHaveLength(0);
+  });
+
+  test('the lease is task-bound: another task id is refused', async () => {
+    const r = rig();
+    expect((await failure(call(r, 'ops_info', {}, { task: 'task-other' }))).code).toBe('forbidden');
+  });
+
+  test('a role outside the environment role list is refused', async () => {
+    const r = rig();
+    const cs = r.company.lease('cs-1', 'cs', 'task-9');
+    const error = await failure(call(r, 'ops_info', {}, { cred: cs, task: 'task-9' }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('cs');
+  });
+
+  test('a project without a broker environment is not configured', async () => {
+    const r = rig({}, false);
+    expect((await failure(call(r, 'ops_info'))).code).toBe('not_configured');
+  });
+
+  test('environments are chosen by name; the default is the only one or production', async () => {
+    const r = rig({}, false);
+    r.company.env('demo', 'staging', brokerConfig());
+    r.company.env('demo', 'preview', brokerConfig());
+    expect((await failure(call(r, 'ops_info'))).code).toBe('not_configured');
+    expect((await call(r, 'ops_info', { env: 'staging' })).env).toBe('staging');
+    expect((await failure(call(r, 'ops_info', { env: 'nope' }))).code).toBe('not_configured');
+    expect((await failure(call(r, 'ops_info', { env: 7 }))).code).toBe('invalid');
+  });
+});
+
+describe('ops info and health', () => {
+  test('info lists accounts by alias and never a secret', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    const info = await call(r, 'ops_info');
+    expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
+    expect(info.tools).toEqual([...OPS_TOOLS]);
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true });
+    expectNoLeaks(r);
+  });
+
+  test('health reports reachability without credentials', async () => {
+    const r = rig();
+    const health = await call(r, 'ops_health');
+    expect(health).toMatchObject({ reachable: true, status: 200, ok: true, body: { ok: true } });
+  });
+});
+
+describe('ops accounts', () => {
+  test('ensure creates the IdP account with a sealed, verifiable password and says nothing secret', async () => {
+    const r = rig();
+    const result = await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    expect(result).toEqual({ alias: 'QA_ONE', username: 'sck-qa-one', email: 'sck-qa-one@example.test', result: 'created' });
+    const password = sealedPassword(r, 'QA_ONE');
+    expect(password.length).toBeGreaterThanOrEqual(24);
+    expect(await verifyPassword(password, r.world.credentialHash('sck-qa-one')!)).toBe(true);
+    expect(r.world.user('sck-qa-one')).toMatchObject({ status: 'active', email: 'sck-qa-one@example.test' });
+    expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create']);
+    expect(r.company.audits[0]!.evidence).toContain('sck-qa-one');
+    // Fixed statements with bound parameters: identity values never appear in the SQL text.
+    for (const { sql } of r.world.sql) expect(sql).not.toContain('sck-qa-one');
+    expectNoLeaks(r);
+  });
+
+  test('ensure is idempotent and quiet, and treats alias spellings as one account', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    const again = await call(r, 'ops_account_ensure', { alias: 'QA_ONE' });
+    expect(again.result).toBe('exists');
+    expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create', 'ops_call']);
+    expect(r.company.sealed.size).toBe(1);
+  });
+
+  test('ensure repairs a credential that drifted out of band', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    const before = sealedPassword(r, 'QA_ONE');
+    r.world.corruptCredential('sck-qa-one');
+    expect((await call(r, 'ops_account_ensure', { alias: 'qa-one' })).result).toBe('repaired');
+    const after = sealedPassword(r, 'QA_ONE');
+    expect(after).not.toBe(before);
+    expect(await verifyPassword(after, r.world.credentialHash('sck-qa-one')!)).toBe(true);
+    expect(r.company.audits.at(-1)!.action).toBe('ops_account_repair');
+  });
+
+  test('an email held by another account, or a disabled account, is a conflict', async () => {
+    const r = rig();
+    r.world.insertUser('someone-else', 'sck-taken@example.test');
+    expect((await failure(call(r, 'ops_account_ensure', { alias: 'taken' }))).code).toBe('conflict');
+    await call(r, 'ops_account_ensure', { alias: 'frozen' });
+    r.world.setStatus('sck-frozen', 'disabled');
+    const error = await failure(call(r, 'ops_account_ensure', { alias: 'frozen' }));
+    expect(error.code).toBe('conflict');
+    expect(error.message).toContain('disabled');
+  });
+
+  test('the daily account quota stops runaway creation', async () => {
+    const r = rig();
+    for (const alias of ['a1', 'a2', 'a3']) await call(r, 'ops_account_ensure', { alias });
+    const error = await failure(call(r, 'ops_account_ensure', { alias: 'a4' }));
+    expect(error.code).toBe('limit_reached');
+    expect(r.world.user('sck-a4')).toBeUndefined();
+    expect((await call(r, 'ops_account_ensure', { alias: 'a1' })).result).toBe('exists');
+  });
+
+  test('bad aliases are rejected', async () => {
+    const r = rig();
+    for (const alias of ['', 'bad alias!', '../x', 'a'.repeat(41), 5]) {
+      expect((await failure(call(r, 'ops_account_ensure', { alias }))).code).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(0);
+  });
+
+  test('without an IdP database the broker cannot create accounts and says so', async () => {
+    const r = rig({ d1: undefined });
+    expect((await failure(call(r, 'ops_account_ensure', { alias: 'qa-one' }))).code).toBe('not_configured');
+    expect((await call(r, 'ops_info')).can.createAccounts).toBe(false);
+  });
+});
+
+describe('ops login and sessions', () => {
+  test('login creates the account on demand and returns a handle, never a token', async () => {
+    const r = rig();
+    const login = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(login).toMatchObject({ alias: 'QA_ONE', username: 'sck-qa-one', accountResult: 'created', canCreate: true, workspaces: [] });
+    expect(login.session).toMatch(/^s_[0-9a-f]{16}$/);
+    expect(r.world.requests.filter(q => q.url.endsWith('/api/auth/token'))).toHaveLength(1);
+    expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create', 'ops_login']);
+    expectNoLeaks(r);
+  });
+
+  test('a known account logs in without touching the IdP database', async () => {
+    const r = rig();
+    await call(r, 'ops_login', { alias: 'qa-one' });
+    const statements = r.world.sql.length;
+    const again = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(again.accountResult).toBeUndefined();
+    expect(r.world.sql).toHaveLength(statements);
+  });
+
+  test('a drifted password is repaired once and the login still succeeds', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    r.world.corruptCredential('sck-qa-one');
+    const login = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(login.accountResult).toBe('repaired');
+    expect(login.session).toMatch(/^s_/);
+    expectNoLeaks(r);
+  });
+
+  test('a rejected login surfaces the IdP reason only, not the password', async () => {
+    const r = rig({ d1: undefined });
+    r.company.sealed.set('demo/production/GHOST_PASSWORD', 'wrong-password-123');
+    const error = await failure(call(r, 'ops_login', { alias: 'ghost' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('invalid_credentials');
+    expect(error.message).not.toContain('wrong-password-123');
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(r.company.audits.at(-1)!.evidence).not.toContain('wrong-password-123');
+  });
+
+  test('sessions belong to one employee; release and logout kill them', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const other = r.company.lease('qa-2', 'qa', 'task-2');
+    const stolen = await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }, { cred: other, task: 'task-2' }));
+    expect(stolen.code).toBe('not_found');
+
+    await call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' });
+    r.broker.release('qa-1');
+    expect((await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('not_found');
+
+    const second = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_logout', { session: second.session })).toEqual({ closed: true });
+    expect((await failure(call(r, 'ops_logout', { session: second.session }))).code).toBe('not_found');
+  });
+
+  test('login can enter a workspace the account belongs to, and refuses one it does not', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo', name: 'Demo' });
+    const again = await call(r, 'ops_login', { alias: 'qa-one', workspace: 'sck-demo' });
+    expect(again.workspace).toEqual({ slug: 'sck-demo', dbName: 'ws_sck_demo' });
+    expect(again.workspaces).toEqual([{ slug: 'sck-demo', name: 'Demo', role: 'admin' }]);
+    expect((await failure(call(r, 'ops_login', { alias: 'qa-one', workspace: 'sck-nope' }))).code).toBe('not_found');
+  });
+
+  test('tokens are refreshed before expiry and after a 401, keeping the workspace scope', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo', name: 'Demo' });
+    const exchanges = () => r.world.requests.filter(q => q.url.endsWith('/api/auth/token')).length;
+    const before = exchanges();
+
+    r.world.advance(14.5 * 60_000); // inside the refresh margin: proactive login
+    expect((await call(r, 'ops_query', { session, sql: 'SELECT 1' })).slug).toBe('sck-demo');
+    expect(exchanges()).toBe(before + 1);
+
+    r.world.expireTokens(); // token dies early: 401, re-login, retry
+    expect((await call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' })).status).toBe(200);
+    expect(exchanges()).toBe(before + 2);
+    expect((await call(r, 'ops_query', { session, sql: 'SELECT 1' })).slug).toBe('sck-demo');
+    expectNoLeaks(r);
+  });
+});
+
+describe('ops workspaces and members', () => {
+  test('ensure creates once, reuses afterwards, and keeps to the naming convention', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo', name: 'Demo' }))
+      .toEqual({ slug: 'sck-demo', name: 'Demo', dbName: 'ws_sck_demo', role: 'admin', created: true });
+    expect(await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo' }))
+      .toMatchObject({ slug: 'sck-demo', created: false, role: 'admin' });
+    expect(r.company.audits.map(a => a.action)).toContain('ops_workspace_create');
+    expect(r.company.audits.map(a => a.action)).toContain('ops_workspace_use');
+
+    expect((await failure(call(r, 'ops_workspace_ensure', { session, slug: 'acme', name: 'Acme' }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_workspace_ensure', { session, slug: 'Bad_Slug', name: 'x' }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_workspace_ensure', { session, slug: 'sck-missing' }))).code).toBe('not_found');
+  });
+
+  test('the daily workspace quota and the product permission are both enforced', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-one', name: 'One' });
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-two', name: 'Two' });
+    const limited = await failure(call(r, 'ops_workspace_ensure', { session, slug: 'sck-three', name: 'Three' }));
+    expect(limited.code).toBe('limit_reached');
+    expect(r.world.workspaces.has('sck-three')).toBe(false);
+
+    const denied = rig();
+    denied.world.canCreate = false;
+    const login = await call(denied, 'ops_login', { alias: 'qa-one' });
+    expect((await failure(call(denied, 'ops_workspace_ensure', { session: login.session, slug: 'sck-one', name: 'One' }))).code).toBe('forbidden');
+  });
+
+  test('add, list and remove members by alias, with the join state visible', async () => {
+    const r = rig();
+    const admin = await call(r, 'ops_login', { alias: 'owner' });
+    await call(r, 'ops_workspace_ensure', { session: admin.session, slug: 'sck-team', name: 'Team' });
+
+    expect(await call(r, 'ops_member_add', { session: admin.session, slug: 'sck-team', alias: 'guest' }))
+      .toEqual({ slug: 'sck-team', alias: 'GUEST', username: 'sck-guest', admin: false, added: true });
+    const listed = await call(r, 'ops_member_list', { session: admin.session, slug: 'sck-team' });
+    expect(listed.members).toEqual([
+      expect.objectContaining({ email: 'sck-owner@example.test', isAdmin: true, joined: true }),
+      expect.objectContaining({ email: 'sck-guest@example.test', isAdmin: false, joined: false }),
+    ]);
+
+    const guest = await call(r, 'ops_login', { alias: 'guest', workspace: 'sck-team' });
+    expect(guest.workspace.slug).toBe('sck-team');
+    const joined = await call(r, 'ops_member_list', { session: admin.session, slug: 'sck-team' });
+    expect(joined.members.find((m: any) => m.email === 'sck-guest@example.test').joined).toBe(true);
+
+    expect(await call(r, 'ops_member_remove', { session: admin.session, slug: 'sck-team', alias: 'guest' }))
+      .toMatchObject({ removed: true, username: 'sck-guest' });
+    expect((await call(r, 'ops_member_list', { session: admin.session, slug: 'sck-team' })).members).toHaveLength(1);
+    expect((await failure(call(r, 'ops_member_remove', { session: admin.session, slug: 'sck-team', alias: 'guest' }))).code).toBe('not_found');
+    expect((await failure(call(r, 'ops_login', { alias: 'guest', workspace: 'sck-team' }))).code).toBe('not_found');
+    expect(r.company.audits.map(a => a.action)).toEqual(expect.arrayContaining(['ops_member_add', 'ops_member_remove']));
+    expectNoLeaks(r);
+  });
+
+  test('a non-admin member cannot manage members', async () => {
+    const r = rig();
+    const admin = await call(r, 'ops_login', { alias: 'owner' });
+    await call(r, 'ops_workspace_ensure', { session: admin.session, slug: 'sck-team', name: 'Team' });
+    await call(r, 'ops_member_add', { session: admin.session, slug: 'sck-team', alias: 'guest' });
+    const guest = await call(r, 'ops_login', { alias: 'guest', workspace: 'sck-team' });
+    const error = await failure(call(r, 'ops_member_add', { session: guest.session, slug: 'sck-team', alias: 'third' }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('member-admin-forbidden');
+    expect((await failure(call(r, 'ops_member_add', { session: admin.session, slug: 'sck-ghost', alias: 'third' }))).code).toBe('not_found');
+  });
+});
+
+describe('ops request, query and browser', () => {
+  test('request relays product API calls for the session account and hides tokens', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const listing = await call(r, 'ops_request', { session, method: 'get', path: '/api/session/workspaces?x=1' });
+    expect(listing).toMatchObject({ status: 200, ok: true, body: { canCreate: true, workspaces: [] } });
+
+    const echoed = await call(r, 'ops_request', { session, method: 'GET', path: '/api/echo' });
+    expect(echoed).toMatchObject({ status: 400, ok: false });
+    const boom = await call(r, 'ops_request', { session, method: 'GET', path: '/api/boom' });
+    expect(boom).toMatchObject({ status: 500, ok: false });
+    expectNoLeaks(r);
+    expect(r.company.audits.at(-1)!.evidence).toContain('/api/boom → 500');
+  });
+
+  test('request can only reach product API paths, and never the token proxy', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const before = r.world.requests.length;
+    for (const path of ['/api/auth/token', '/api/auth', 'https://evil.test/api/x', '/other', '/api/../admin', '//evil.test/api/x', '/api/a//b']) {
+      expect((await failure(call(r, 'ops_request', { session, method: 'GET', path }))).code).toBe('invalid');
+    }
+    expect((await failure(call(r, 'ops_request', { session, method: 'TRACE', path: '/api/x' }))).code).toBe('invalid');
+    expect(r.world.requests).toHaveLength(before);
+  });
+
+  test('a token the product mints is adopted by the session and stripped from the answer', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo', name: 'Demo' });
+    const switched = await call(r, 'ops_request', { session, method: 'POST', path: '/api/session/switch-workspace', body: { workspaceSlug: 'sck-demo' } });
+    expect(switched.body).toEqual({ ok: true, expiresIn: 900 });
+    expect((await call(r, 'ops_query', { session, sql: 'SELECT 1' })).slug).toBe('sck-demo');
+    expectNoLeaks(r);
+  });
+
+  test('query runs as the session user inside one workspace and redacts what comes back', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect((await failure(call(r, 'ops_query', { session, sql: 'SELECT 1' }))).code).toBe('invalid');
+    await call(r, 'ops_workspace_ensure', { session, slug: 'sck-demo', name: 'Demo' });
+    const result = await call(r, 'ops_query', { session, sql: 'SELECT * FROM leak' });
+    expect(result.slug).toBe('sck-demo');
+    expect(JSON.stringify(result)).toContain('"ok":1');
+    expect(JSON.stringify(result)).not.toContain('raw-secret-value');
+    expectNoLeaks(r, ['raw-secret-value']);
+
+    expect((await failure(call(r, 'ops_query', { session, slug: 'sck-other', sql: 'SELECT 1' }))).code).toBe('not_found');
+    expect((await failure(call(r, 'ops_query', { session, sql: 'SELECT 1', vars: [1] }))).code).toBe('invalid');
+  });
+
+  test('browser login hands the token to the injector only, and validates the target page', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const result = await call(r, 'ops_browser_login', { session, spaceId: 3 });
+    expect(result).toEqual({ signedInAs: 'sck-qa-one', url: 'https://app.test/', title: 'Fixture App' });
+    expect(r.world.browserLogins).toHaveLength(1);
+    expect(r.world.browserLogins[0]).toMatchObject({ spaceId: 3, page: 'p1', probeUrl: 'https://app.test/health' });
+    expect(r.world.tokens).toContain(r.world.browserLogins[0]!.token);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_browser_login' });
+    expectNoLeaks(r);
+
+    for (const args of [{ spaceId: -1 }, { spaceId: 'x' }, { spaceId: 1, page: 'main; rm -rf /' }, {}]) {
+      expect((await failure(call(r, 'ops_browser_login', { session, ...args }))).code).toBe('invalid');
+    }
+    expect(r.world.browserLogins).toHaveLength(1);
+  });
+});
+
+describe('ops audit trail', () => {
+  test('failures are audited without secrets; plain input mistakes stay quiet', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_request', { session, method: 'GET', path: '/api/boom' }); // value, not an error
+    await failure(call(r, 'ops_workspace_ensure', { session, slug: 'acme', name: 'x' })); // invalid → quiet
+    expect(r.company.audits.filter(a => a.action === 'ops_error')).toHaveLength(0);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_call' });
+
+    const r2 = rig({ d1: undefined });
+    r2.company.sealed.set('demo/production/QA_ONE_PASSWORD', 'stale-sealed-pass');
+    await failure(call(r2, 'ops_login', { alias: 'qa-one' }));
+    expect(r2.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(JSON.stringify(r2.company.audits)).not.toContain('stale-sealed-pass');
+  });
+
+  test('a whole scenario leaves no token, password or control-plane credential in outputs or audit', async () => {
+    const r = rig();
+    const owner = await call(r, 'ops_login', { alias: 'owner' });
+    await call(r, 'ops_workspace_ensure', { session: owner.session, slug: 'sck-all', name: 'All' });
+    await call(r, 'ops_member_add', { session: owner.session, slug: 'sck-all', alias: 'guest' });
+    await call(r, 'ops_login', { alias: 'guest', workspace: 'sck-all' });
+    await call(r, 'ops_member_list', { session: owner.session, slug: 'sck-all' });
+    await call(r, 'ops_query', { session: owner.session, sql: 'SELECT * FROM leak' });
+    await call(r, 'ops_request', { session: owner.session, method: 'GET', path: '/api/echo' });
+    await call(r, 'ops_browser_login', { session: owner.session, spaceId: 1 });
+    await call(r, 'ops_info');
+    expect(r.world.tokens.length).toBeGreaterThanOrEqual(4);
+    expectNoLeaks(r, ['raw-secret-value']);
+  });
+});

@@ -12,7 +12,7 @@
 
 ## 每次被唤醒
 
-1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、可用凭证名）、`secrets`（按你岗位解密好的任务凭证，直接用、禁止写进证据或转抄到其他文件）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
+1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
 2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
    代码任务：在任务专属分支 `task/<任务ID前8位>` 的独立 worktree 里工作；checkpoint 前先把改动提交到该分支，并在 checkpoint 里写分支名和 worktree 路径。
 3. **交接**（本轮只做一项，做完即结束本轮）：
@@ -27,8 +27,32 @@
 - 证据真实：读代码、本地测试、线上验证、客户确认分开表述；没有验证的写「未验证」。
 - 验收独立：服务端拒绝你验收自己提交的成果；换会话、换订阅也一样。
 - 老板决定只来自老板：关口（`reviewerRole=owner` 的任务）只能由老板批准或驳回。经理只在老板直接对话里明确表态时，用 `record_owner_decision` 转录，并逐字引用老板原话。
-- 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
-- 凭证：`claim.json` 的 `secrets` 已包含你可用的凭证值，直接用；缺的才用 `get_secret` 在持有任务期间领取。不写进证据、文件、提交或消息。
+- 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。账号、workspace、成员、登录用下面的运维工具 `ops_*`；环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
+- 凭证：你不持有任何凭证，也不要去找。密码、token、API key 只在插件的运维代理里；`get_secret` / `put_secret` 已下线。需要凭证才能做的事，用 `ops_*` 让代理替你做。不要读取 `.env`、钥匙串或其他员工的会话目录，也不要把代理返回的会话句柄以外的任何登录信息写进证据、文件、提交或消息。
+
+## 运维工具（ops_*）
+
+需要凭证才能做的事，由通道里的运维代理替你做：它在插件里持有密钥，按你当前任务的租约和岗位放行，每次调用写入审计，返回里不含密钥。调用方式同其他工具：`sck call ops_<名字> '<JSON>'`；先 `ops_info` 看当前项目能做什么、有哪些账号别名和配额。项目配置了多个环境时用 `env` 参数指定（缺省：只有一个就用它，否则用 `production`）。
+
+| 工具 | 参数 | 作用 |
+|---|---|---|
+| `ops_info` | — | 项目与环境、可用工具、已登记的账号别名、配额、代理当前具备的能力 |
+| `ops_health` | — | 探测环境的健康地址 |
+| `ops_account_ensure` | `alias` | 确保公司 IdP 里有这个测试账号：没有就创建，密码由代理生成并密封；你看不到密码 |
+| `ops_login` | `alias`, `workspace?` | 以该账号登录，返回会话句柄 `session`（不是 token）和该账号能进入的 workspace；账号不存在会先创建 |
+| `ops_workspace_ensure` | `session`, `slug`, `name?` | 进入已有 workspace；不存在且给了 `name` 时创建（slug 要以项目配置的前缀开头，每天有创建上限，能复用就复用） |
+| `ops_member_list` / `ops_member_add` / `ops_member_remove` | `session`, `slug`, `alias`, `admin?` | 查看、添加、移除 workspace 成员（`alias` 是账号别名，加入前先 `ops_account_ensure`） |
+| `ops_request` | `session`, `method`, `path`, `body?` | 以会话身份调用产品 HTTP 接口，返回状态与已脱敏的响应体 |
+| `ops_query` | `session`, `sql`, `vars?`, `slug?` | 以会话身份在所选 workspace 的数据库里执行 SurrealQL |
+| `ops_browser_login` | `session`, `spaceId`, `page?` | 把会话注入你的 ego-browser 任务空间（`page` 缺省 `p1`），浏览器里直接是已登录状态，不用输入密码 |
+| `ops_logout` | `session` | 关闭会话 |
+
+规则：
+- 会话句柄只属于你持有的这一个任务：交付、阻塞、被收回租约都会让它失效，不跨任务复用；需要时重新 `ops_login`。
+- 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
+- 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
+- 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
+- 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
 
 ## 决策权
 
@@ -36,7 +60,7 @@
 
 | 谁决定 | 事项 |
 |---|---|
-| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境）；公司自有系统里的操作：代码、域名、Cloudflare、IdP（ma_hono）里创建测试账号和测试数据，创建后用 `put_secret` 登记。这些权限都已授予，**只要不新购买资源就不上报** |
+| 执行者自己 | 实现细节、测试方式、查得到的事实（仓库、runbook、`project`、线上环境）；公司自有系统里的操作：用 `ops_*` 在 IdP（ma_hono）与产品里创建测试账号、workspace、成员和测试数据，账号密码由运维代理代管。这些权限都已授予，**只要不新购买资源就不上报**；运维工具没有的能力才 `report_blocker to=gm` 请求新增 |
 | 运营 | 范围取舍（大目标的范围提案）、**是否上线**、运营验收 |
 | 经理 | 目标分级与拆解、运营定不了的事、技术路线分歧、返工安排 |
 | 老板 | **老板专属事项**：花钱（充值、新增付费服务或订阅）、签约或法律承诺、以公司名义对外联系、公司方向与大目标取舍、`project.redLines` 里登记的红线；以及 standard/program 目标的 G3 最终验收 |

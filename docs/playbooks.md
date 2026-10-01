@@ -30,7 +30,7 @@
 | 执行发布 | engineering / 批准发布单 | 实际版本、执行记录、健康与恢复证据 | qa 检查生产关键流程；异常进入事故路径 |
 | 客户启用 | CS / 生产验收通过 | 变更说明、试用安排、帮助记录 | product 验客户结果，再关客户目标 |
 
-授权读取、共享 AI 额度等按现有依赖推进。IdP（ma_hono）是公司自有系统，仓库在 /Users/y/IdeaProjects/ma_hono，Cloudflare 权限已授予员工：测试租户、测试账号、测试 workspace 由测试和工程自己创建，属于生产实测的一环，不找老板。产品已存在的能力先验基线，不重复开发。
+授权读取、共享 AI 额度等按现有依赖推进。IdP（ma_hono）是公司自有系统，仓库在 /Users/y/IdeaProjects/ma_hono。员工不持有 Cloudflare 或 IdP 凭证，测试账号、测试 workspace、成员由测试和工程通过运维工具（`ops_account_ensure`、`ops_workspace_ensure`、`ops_member_add`，由插件里的运维代理代做）自己创建，属于生产实测的一环，不找老板；运维工具没有的能力请经理安排工程增加。产品已存在的能力先验基线，不重复开发。
 
 ## 3. 法律内容与 AI 质量
 

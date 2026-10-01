@@ -6,9 +6,15 @@ type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRol
 
 const AUTHORITY = '决策边界：能在公司内决定的事不找老板。技术方案与拆分由经理定，是否上线由运营定，运营定不了交经理；只有花钱/充值、签约、对外联系、公司方向和项目红线才 report_blocker to=owner，并写明已查过哪些来源。';
 
+const OPS_HINT = '你不持有任何凭证：测试账号、workspace、成员、生产登录一律用运维工具 ops_*（sck call ops_info \'{}\' 看当前项目能做什么）；运维工具没有的能力用 report_blocker to=gm 说明要补什么工具。';
+
+function chainHead(title: string, spec: string): string {
+  return `交付项：${title}\n需求与验收标准：\n${spec}\n\n项目环境（仓库、发布方式、生产地址、红线）见 claim.json 的 project。${OPS_HINT}\n`;
+}
+
 /** 实现 → 上线申请 → 合入部署与生产实测. Used by standard/program plans via the create_delivery tool. */
 export function deliveryChain(title: string, spec: string): Spec[] {
-  const head = `交付项：${title}\n需求与验收标准：\n${spec}\n\n项目环境（仓库、发布方式、生产地址、红线）与已下发凭证见 claim 返回的 project 和 secrets；缺的凭证用 get_secret 领取。\n`;
+  const head = chainHead(title, spec);
   return [
     {
       title: `${title} · 实现`, kind: 'task', executorRole: 'engineering', reviewerRole: 'engineering',
@@ -32,7 +38,7 @@ ${AUTHORITY}`,
 你是工程。上线申请已批准。按 project.release 发布：合入 PR、等待 CI 发布完成、确认生产运行的就是该提交（health、版本或页面）。
 发布失败或自动回滚：先按 project.rollback 恢复生产，再修复后重新发布；修不好就 report_blocker to=gm。
 submit 证据：合入提交、CI 运行链接与结论、生产健康检查结果。
-验收者 qa：在生产环境按上面的验收标准逐条实测。可领取的凭证已随 claim 下发在 secrets 字段（缺的才用 get_secret），凭证不写入任何证据。
+验收者 qa：在生产环境按上面的验收标准逐条实测。测试账号、workspace、登录用运维工具（ops_login、ops_workspace_ensure、ops_browser_login 等）；你拿不到也不需要密码或 token，证据里只写账号别名和 workspace slug。
 accept 证据逐条写：入口链接 → 操作 → 实际结果（截图路径或响应摘要）。任何一条不通过就 return 给工程。`,
     },
   ];
@@ -43,7 +49,7 @@ accept 证据逐条写：入口链接 → 操作 → 实际结果（截图路径
  * → 合入部署与生产实测。比标准链少一轮复核与派工；quick 即小改动，不再走独立的工程互审。
  */
 export function quickChain(title: string, spec: string): Spec[] {
-  const head = `交付项：${title}\n需求与验收标准：\n${spec}\n\n项目环境（仓库、发布方式、生产地址、红线）与已下发凭证见 claim 返回的 project 和 secrets；缺的凭证用 get_secret 领取。\n`;
+  const head = chainHead(title, spec);
   return [
     {
       title: `${title} · 实现与上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product',

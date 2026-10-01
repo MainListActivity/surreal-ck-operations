@@ -1,13 +1,14 @@
 #!/bin/sh
 set -eu
 
-# Manages two user launchd services from one immutable release:
-#   org.surrealck.company-mcp         MCP task service + GitHub projection
-#   org.surrealck.company-dispatcher  Paseo dispatcher (no LLM polling)
+# Manages user launchd services from one immutable release:
+#   org.surrealck.company-mcp         MCP task service + GitHub projection (the default)
+#   org.surrealck.company-dispatcher  legacy standalone dispatcher; the Paseo plugin `sck-company`
+#                                     now runs dispatching, so installing it too double-dispatches
 service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}
 domain="gui/$(id -u)"
 action=${1:-}
-components=${SCK_COMPONENTS:-"mcp dispatcher"}
+components=${SCK_COMPONENTS:-mcp}
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -84,7 +85,7 @@ case "$action" in
     done
     ;;
   *)
-    echo 'usage: company-service.sh install <release> | start | stop | restart | status | uninstall  (SCK_COMPONENTS="mcp dispatcher")' >&2
+    echo 'usage: company-service.sh install <release> | start | stop | restart | status | uninstall  (SCK_COMPONENTS=mcp by default; "mcp dispatcher" only for the legacy standalone dispatcher)' >&2
     exit 1
     ;;
 esac

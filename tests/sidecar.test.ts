@@ -37,7 +37,6 @@ const core = {
   history: async () => [],
   createTask: async () => taskView('new'),
   relayGoal: async () => ({}), triageGoal: async () => ({}), createDelivery: async () => [],
-  getSecret: async () => 'v', putSecret: async () => ({ stored: 'x' }),
   relayOwnerDecision: async () => taskView('x'), relayDirection: async () => {},
   resume: async () => taskView('x'), recordScore: async () => ({ recorded: 1, participants: [] }),
   listOutbox: async () => [],
@@ -54,13 +53,33 @@ const until = async (fn: () => boolean, ms = 3000) => {
   throw new Error('condition not met');
 };
 
+interface OpsCall { credential: string; taskId: string; tool: string; args: Record<string, unknown> }
+const opsCalls: OpsCall[] = [];
+const released: string[] = [];
+const ops = {
+  tools: ['ops_info', 'ops_login'] as const,
+  call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+    opsCalls.push({ credential, taskId, tool, args });
+    return { ok: true, tool };
+  },
+  release: (employeeId: string) => { released.push(employeeId); },
+};
+
+const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown>) => {
+  writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
+  await until(() => existsSync(join(resDir(envDir), `${name}.json`)));
+  return readJsonFile<{ ok: boolean; data?: unknown; error?: string }>(join(resDir(envDir), `${name}.json`))!;
+};
+
 let runDir: string;
 let pool: SidecarPool;
 beforeEach(() => {
   calls.length = 0;
+  opsCalls.length = 0;
+  released.length = 0;
   employeeForGetTask = 'eng-x';
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
-  pool = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20 });
 });
 afterEach(() => { rmSync(runDir, { recursive: true, force: true }); });
 
@@ -173,6 +192,51 @@ describe('sidecar', () => {
     pool.bindAgent('e8', 'agent-8');
     await pool.settle('agent-8');
     expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
+  });
+
+  test('ops tools are relayed under the lease holder task id; the credential never leaves the plugin', async () => {
+    const i = inst('e10');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-10'));
+    const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'o1', 'ops_login', { alias: 'QA1', taskId: 'someone-elses-task', env: 'production' });
+    expect(res).toEqual({ ok: true, data: { ok: true, tool: 'ops_login' } });
+    expect(opsCalls).toEqual([{ credential: 'tok-e10', taskId: 'task-10', tool: 'ops_login', args: { alias: 'QA1', env: 'production' } }]);
+    expect(JSON.stringify(res)).not.toContain('tok-e10');
+  });
+
+  test('ops tools are listed, need a live lease, and the old secret tools are gone', async () => {
+    const i = inst('e11');
+    const env = pool.env(i);
+    const refused = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'o2', 'ops_info', {});
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('no_lease');
+    expect(opsCalls).toHaveLength(0);
+
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'o3', '__list__', {});
+    const tools = (listed.data as { tools: string[] }).tools;
+    expect(tools).toEqual(expect.arrayContaining(['ops_info', 'ops_login', 'checkpoint']));
+    expect(tools).not.toContain('get_secret');
+    expect(tools).not.toContain('put_secret');
+
+    await pool.claim(i, task('task-11'));
+    for (const [name, tool] of [['o4', 'get_secret'], ['o5', 'put_secret']] as const) {
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, name, tool, { name: 'X' });
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain('unknown_tool');
+    }
+  });
+
+  test('ops sessions are dropped when the lease ends and when the agent is archived', async () => {
+    const i = inst('e12');
+    const env = pool.env(i);
+    pool.bindAgent('e12', 'agent-12');
+    await pool.claim(i, task('task-12'));
+    released.length = 0; // claim clears leftovers from a previous lease first
+    const submitted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'o6', 'submit', { text: 'done' });
+    expect(submitted.ok).toBe(true);
+    expect(released).toEqual(['e12']);
+    pool.detachAgent('agent-12');
+    expect(released).toEqual(['e12', 'e12']);
   });
 
   test('adopt rebuilds the lease proof for a live comm instance', async () => {

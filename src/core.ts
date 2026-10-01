@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
-import { loadSecretKey, ProjectStore } from './projects.ts';
+import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -15,7 +15,9 @@ const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;
 const HISTORY_LIMIT = 40;
+const OPS_HISTORY_LIMIT = 15;
 const HISTORY_EVIDENCE_CHARS = 6000;
+const OPS_EVIDENCE_CHARS = 600;
 export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
 export const id = (table: string, value: string) => new RecordId(table, value);
 export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
@@ -353,32 +355,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
       predecessors: await this.predecessors(taskId, actor.employeeId),
-      project, secrets: await this.claimSecrets(taskId, project, actor) };
-  }
-
-  /**
-   * Decrypts every env credential the claimer's role may read, so a claim is one round trip
-   * instead of one get_secret call per credential. The issue is audited (names only); when the
-   * secret key is unavailable the employee simply falls back to get_secret.
-   */
-  private async claimSecrets(taskId: TaskId, project: ProjectView | undefined, actor: Principal): Promise<ClaimResult['secrets']> {
-    if (!project) return undefined;
-    const wanted = project.envs.flatMap(env =>
-      env.secrets.filter(s => s.roles.includes(actor.role)).map(s => ({ env: env.name, name: s.name })));
-    if (!wanted.length) return undefined;
-    try {
-      const key = loadSecretKey();
-      const secrets = [];
-      for (const s of wanted) {
-        secrets.push({ ...s, value: await this.projects.readSecret(project.id, s.env, s.name, actor.role, key) });
-      }
-      await this.db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'secret_issue', evidence: $evidence, at: time::now() };",
-        { task: id('task', taskId), actor: id('employee', actor.employeeId),
-          evidence: `随派工下发环境凭证：${wanted.map(s => `${s.env}/${s.name}`).join('、')}（值不入库）` });
-      return secrets;
-    } catch {
-      return undefined;
-    }
+      project };
   }
 
   /**
@@ -411,10 +388,14 @@ export class SurrealCompanyCore implements CompanyCore {
 
   private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
     type Row = { action: string; actor: unknown; evidence?: string; version?: number; at: unknown };
-    const [rows] = await this.db.query<[Row[]]>(
-      'SELECT action, actor, evidence, version, at FROM audit WHERE task = $task ORDER BY at DESC LIMIT $limit;',
-      { task: id('task', taskId), limit: HISTORY_LIMIT }
+    // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the
+    // handover history; routine `ops_call` reads are never shown.
+    const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
+      `SELECT action, actor, evidence, version, at FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT $limit;
+       SELECT action, actor, evidence, version, at FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC LIMIT $ops_limit;`,
+      { task: id('task', taskId), limit: HISTORY_LIMIT, ops_limit: OPS_HISTORY_LIMIT }
     );
+    const rows = [...protocol, ...ops].sort((a, b) => (String(a.at) < String(b.at) ? 1 : String(a.at) > String(b.at) ? -1 : 0));
     return rows.reverse().map(row => ({
       action: row.action,
       actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
@@ -470,37 +451,32 @@ export class SurrealCompanyCore implements CompanyCore {
     return created;
   }
 
-  async putSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string; value: string; roles?: Role[]; purpose?: string }): Promise<{ stored: string }> {
-    const { actor, project } = await this.leaseProject(credential, input.taskId);
-    if (actor.role === 'eval') throw new CompanyError('forbidden', 'eval may not store secrets');
-    const roles = [...new Set(input.roles?.length ? input.roles : [actor.role, 'qa' as Role])];
-    for (const role of roles) requireRole(role);
-    await this.projects.setSecret({ project, env: input.env, name: input.name, value: input.value, roles, purpose: input.purpose }, loadSecretKey(true));
-    await this.db.query("CREATE audit CONTENT { task: $task, actor: $actor, action: 'secret_write', evidence: $evidence, at: time::now() };",
-      { task: id('task', input.taskId), actor: id('employee', actor.employeeId), evidence: `登记环境凭证 ${input.env}/${input.name}，可读岗位 ${roles.join(',')}（值不入库）` });
-    return { stored: `${project}/${input.env}/${input.name}` };
-  }
-
-  private async leaseProject(credential: Credential, taskId: TaskId): Promise<{ actor: Principal; project: string }> {
+  async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {
     const actor = await this.authorized(credential);
+    requireText(taskId, 'task', 1, 200);
     const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
       'SELECT current_employee, state, lease_expires_at, goal.project AS project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
     if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
-      throw new CompanyError('forbidden', 'Secrets are only available to the current lease holder of the task');
+      throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
     }
     if (!task.project) throw new CompanyError('invalid', 'Task goal has no project environment');
-    return { actor, project: String(task.project.id) };
+    return { actor, taskId, project: String(task.project.id) };
   }
 
-  async getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string> {
-    const { actor, project } = await this.leaseProject(credential, input.taskId);
-    const value = await this.projects.readSecret(project, input.env, input.name, actor.role, loadSecretKey());
-    await this.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: \'secret_read\', evidence: $evidence, at: time::now() };',
-      { task: id('task', input.taskId), actor: id('employee', actor.employeeId), evidence: `读取环境凭证 ${input.env}/${input.name}（值不入库）` });
-    return value;
+  async auditOps(scope: OpsScope, action: string, evidence: string): Promise<void> {
+    if (!/^ops_[a-z_]{1,40}$/.test(action)) throw new CompanyError('invalid', 'Invalid ops audit action');
+    await this.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, at: time::now() };',
+      { task: id('task', scope.taskId), actor: id('employee', scope.actor.employeeId), action, evidence: evidence.slice(0, OPS_EVIDENCE_CHARS) });
+  }
+
+  async opsCount(project: string, action: string, windowSeconds: number): Promise<number> {
+    const [rows] = await this.db.query<[Array<{ n: number }>]>(
+      'SELECT count() AS n FROM audit WHERE action = $action AND at > time::now() - <duration>$window AND task.goal.project = $project GROUP ALL;',
+      { action, project: id('project', project), window: `${Math.max(1, Math.floor(windowSeconds))}s` });
+    return rows[0]?.n ?? 0;
   }
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {

@@ -10,10 +10,12 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { Workforce } from '../src/workforce.ts';
 import { ProjectStore } from '../src/projects.ts';
+import { OpsBroker } from '../src/ops/broker.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway, SpawnInput } from '../src/dispatcher/paseo.ts';
 import type { ClaimResult, TaskView } from '../src/contracts.ts';
 import type { JevClient } from '../src/dispatcher/jev.ts';
+import { brokerConfig, FakeWorld } from './support/ops-world.ts';
 
 const NS = 'sck_agent_company_test_v3';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -140,22 +142,60 @@ test('quick goal: one delivery chain, qa reads a sealed secret in production, pr
 
   const claim = await core.claim(tokens['eng-a'], ship.id);
   expect(claim.project).toMatchObject({ id: 'demo', repoPath: '/repo/demo', redLines: ['改写或删除已有数据的迁移'] });
+  // Employees see the inventory of sealed credential names, never a value; claim carries no secrets and no broker settings.
   expect(claim.project!.envs[0].secrets).toEqual([{ name: 'QA_PASSWORD', roles: ['qa'] }]);
-  // The qa-only credential is not issued to engineering at claim, and get_secret still refuses.
-  expect(claim.secrets ?? []).toHaveLength(0);
-  await expect(core.getSecret(tokens['eng-a'], { taskId: ship.id, env: 'production', name: 'QA_PASSWORD' }))
-    .rejects.toMatchObject({ code: 'forbidden' });
+  expect('secrets' in claim).toBe(false);
+  expect(JSON.stringify(claim)).not.toContain('hunter2');
+  expect(JSON.stringify(claim)).not.toContain('client-ck-1234');
   await core.submit(tokens['eng-a'], proofOf(claim), { text: '实现+上线申请：PR、分支、提交、测试通过，无迁移，回滚为重发上一提交。', idempotencyKey: key() });
   await review(tokens.product, ship.id);
   await execute(tokens['eng-a'], deploy.id, '已合入并由 CI 发布，生产 health 正常，版本为该提交。');
   const verify = await core.claim(tokens.qa, deploy.id);
-  // qa 的凭证随 claim 直接下发，不需要再逐个 get_secret；凭证值不进 history。
-  expect(verify.secrets).toEqual([{ env: 'production', name: 'QA_PASSWORD', value: 'hunter2' }]);
-  expect(await core.getSecret(tokens.qa, { taskId: deploy.id, env: 'production', name: 'QA_PASSWORD' })).toBe('hunter2');
+  expect('secrets' in verify).toBe(false);
+  expect(JSON.stringify(verify)).not.toContain('hunter2');
+
+  // The ops broker acts for the lease holder only, opens the legacy sealed password itself and audits every step.
+  const world = new FakeWorld();
+  const broker = new OpsBroker({
+    core, projects: store, secretKey: () => Buffer.alloc(32, 7), controlEnv: () => ({ cloudflareToken: 'cf', cloudflareAccountId: 'acct' }),
+    fetch: world.fetch, now: world.now, d1: () => world.d1, queryAsUser: world.queryAsUser,
+  });
+  await expect(broker.call(tokens.qa, deploy.id, 'ops_info')).rejects.toMatchObject({ code: 'not_configured' }); // no broker settings yet
+  await store.setBroker('demo', 'production', brokerConfig({ limits: { workspacesPerDay: 1, accountsPerDay: 5 } }));
+  await expect(broker.call(tokens['eng-a'], deploy.id, 'ops_info')).rejects.toMatchObject({ code: 'forbidden' }); // not the holder
+  await expect(broker.call(tokens.qa, ship.id, 'ops_info')).rejects.toMatchObject({ code: 'forbidden' }); // not this task's lease
+  const info = await broker.call(tokens.qa, deploy.id, 'ops_info') as { accounts: Array<{ alias: string; username: string }> };
+  expect(info.accounts).toEqual([{ alias: 'QA', username: 'sck-qa' }]);
+
+  const login = await broker.call(tokens.qa, deploy.id, 'ops_login', { alias: 'qa' }) as { session: string; username: string; accountResult?: string };
+  // The legacy sealed QA_PASSWORD became the IdP account's password: the fake IdP verified it during this login.
+  expect(login).toMatchObject({ username: 'sck-qa', accountResult: 'created' });
+  expect(await store.readSealed('demo', 'production', 'QA_PASSWORD', Buffer.alloc(32, 7))).toBe('hunter2');
+  await broker.call(tokens.qa, deploy.id, 'ops_workspace_ensure', { session: login.session, slug: 'sck-demo', name: 'Demo' });
+  // Quota counted from real audit rows across the project's tasks.
+  await expect(broker.call(tokens.qa, deploy.id, 'ops_workspace_ensure', { session: login.session, slug: 'sck-demo-2', name: 'Demo 2' }))
+    .rejects.toMatchObject({ code: 'limit_reached' });
+  await broker.call(tokens.qa, deploy.id, 'ops_member_list', { session: login.session, slug: 'sck-demo' });
+  expect(await core.opsCount('demo', 'ops_workspace_create', 3600)).toBe(1);
+  expect(await core.opsCount('other-project', 'ops_workspace_create', 3600)).toBe(0);
+
+  const scope = await core.opsScope(tokens.qa, deploy.id);
+  expect(scope).toMatchObject({ taskId: deploy.id, project: 'demo', actor: { employeeId: 't-qa', role: 'qa' } });
+  await expect(core.auditOps(scope, 'checkpoint', 'forged')).rejects.toMatchObject({ code: 'invalid' });
+  await core.auditOps(scope, 'ops_note', 'x'.repeat(2000));
+
   const history = await core.history(tokens.gm, deploy.id);
-  expect(history.some(h => h.action === 'secret_issue' && !h.evidence?.includes('hunter2'))).toBe(true);
-  expect(history.some(h => h.action === 'secret_read' && !h.evidence?.includes('hunter2'))).toBe(true);
+  expect(history.map(h => h.action)).toEqual(expect.arrayContaining(['ops_account_create', 'ops_login', 'ops_workspace_create', 'ops_error', 'ops_note']));
+  expect(history.map(h => h.action)).not.toContain('ops_call'); // routine reads stay out of handover history
+  const [[quiet]] = await database.db.query<[[{ n: number }]]>("SELECT count() AS n FROM audit WHERE task = $task AND action = 'ops_call' GROUP ALL;", { task: new RecordId('task', deploy.id) });
+  expect(quiet.n).toBeGreaterThanOrEqual(1);
+  expect(history.find(h => h.action === 'ops_note')!.evidence!.length).toBeLessThanOrEqual(600);
+  const trail = JSON.stringify(history);
+  for (const secret of ['hunter2', ...world.tokens]) expect(trail).not.toContain(secret);
+
   await core.accept(tokens.qa, proofOf(verify), { text: '生产实测：打开登录页 → 按钮对齐 → 登录成功。', idempotencyKey: key() });
+  // The lease is gone, so the broker is too.
+  await expect(broker.call(tokens.qa, deploy.id, 'ops_info')).rejects.toMatchObject({ code: 'forbidden' });
 
   await execute(tokens.product, goal.tasks.manual!, '验收记录：生产入口、验收步骤、qa 实测结论、回滚方式。');
   await review(tokens.gm, goal.tasks.manual!);
@@ -340,7 +380,7 @@ test('eval role records scorecards for task participants and rolls them into def
     thinking: 'medium', weight: 10 });
   const def = (await workforce.defs()).find(d => d.id === 'engineering-evaltarget')!;
   const inst = await workforce.spawnInst(def);
-  const instToken = readFileSync(join(credDir, `${inst.id}.token`), 'utf8');
+  const instToken = inst.credential!; // credential-less sessions: minted in memory, never written to a file
 
   const t = await core.createTask(tokens.gm, { title: 'Scored task', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });

@@ -40,7 +40,7 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
     Array<{ action: string; actor: unknown; at?: unknown; evidence?: string }>,
     Array<{ employee?: string }>,
   ]>(
-    `SELECT action, actor, at, evidence FROM audit WHERE task = $task ORDER BY at ASC;
+    `SELECT action, actor, at, evidence FROM audit WHERE task = $task AND action != 'ops_call' ORDER BY at ASC;
      SELECT payload.employee AS employee FROM outbox WHERE task = $task AND kind = 'revoked';`,
     { task });
 

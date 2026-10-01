@@ -3,14 +3,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import { company, type Company } from "./company";
-
-const COMPANY_TITLE = "SCK · ";
-
-async function isCompanyAgent(paseo: PaseoApi, agent: { id: string; title?: string | null }): Promise<boolean> {
-  if (agent.title?.startsWith(COMPANY_TITLE)) return true;
-  const detail = await paseo.agents.ref(agent.id).refresh().catch(() => undefined);
-  return (detail as { agent?: { labels?: Record<string, string> } } | null | undefined)?.agent?.labels?.company === "surreal-ck";
-}
+import { isCompanyAgent } from "./company-agent";
 
 type ProviderUsageEntry = {
   providerId: string;

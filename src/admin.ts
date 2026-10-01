@@ -25,8 +25,11 @@ const usage = `Usage: pnpm run admin <command>
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
   project list                            列出项目环境与凭证名（不含值）
-  secret set <项目> <环境> <名称> <角色,角色> [用途]
-                                          从标准输入读取凭证值，加密后入库（值不回显、不进参数）
+  project broker <项目> <环境> <file.json>
+                                          写入该环境的运维代理（ops broker）配置；只放非敏感项，校验不过不入库
+  secret set <项目> <环境> <名称> <角色,角色|-> [用途]
+                                          从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
+                                          凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
   config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）`;
 
 const [action, ...args] = process.argv.slice(2);
@@ -132,20 +135,24 @@ try {
       break;
     }
     case 'project': {
-      const [sub, file] = args;
+      const [sub, first, second, third] = args;
       const store = new ProjectStore(database.db);
       if (sub === 'list') print(await store.list());
-      else if (sub === 'set' && file) print(await store.upsert(JSON.parse(readFileSync(file, 'utf8')) as ProjectInput));
-      else throw new Error(usage);
+      else if (sub === 'set' && first) print(await store.upsert(JSON.parse(readFileSync(first, 'utf8')) as ProjectInput));
+      else if (sub === 'broker' && first && second && third) {
+        await store.setBroker(first, second, JSON.parse(readFileSync(third, 'utf8')));
+        print({ action: 'project broker', project: first, env: second, ok: true });
+      } else throw new Error(usage);
       break;
     }
     case 'secret': {
       const [sub, project, env, name, roles, ...purpose] = args;
       if (sub !== 'set' || !project || !env || !name || !roles) throw new Error(usage);
+      const labels = roles === '-' ? [] : roles.split(',') as Role[];
       const value = readFileSync(0, 'utf8').replace(/\r?\n$/, '');
-      await new ProjectStore(database.db).setSecret({ project, env, name, value, roles: roles.split(',') as Role[],
+      await new ProjectStore(database.db).setSecret({ project, env, name, value, roles: labels,
         purpose: purpose.join(' ') || undefined }, loadSecretKey(true));
-      print({ action, project, env, name, roles: roles.split(','), ok: true });
+      print({ action, project, env, name, roles: labels, ok: true });
       break;
     }
     case 'config': {

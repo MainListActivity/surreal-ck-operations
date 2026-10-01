@@ -16,17 +16,30 @@ import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workf
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
-const TOOL_LIST = [
+const BASE_TOOLS = [
   "get_context", "get_task_history", "checkpoint", "submit", "review", "report_blocker",
-  "create_task", "create_goal", "triage_goal", "create_delivery", "get_secret", "put_secret",
+  "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "record_score", "heartbeat",
 ];
 
+/** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
+const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
+
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
+
+/** Capability broker behind the `ops_*` tools (OpsBroker). Credentials and login tokens stay on its side. */
+export interface OpsGateway {
+  readonly tools: readonly string[];
+  call(credential: string, taskId: string, tool: string, args: Record<string, unknown>): Promise<unknown>;
+  /** The employee instance is done with its lease or gone: drop every session opened for it. */
+  release(employeeId: string): void;
+}
 
 export interface SidecarDeps {
   core: CompanyCore;
   workforce: Workforce;
+  /** Absent in tests that do not exercise ops; `ops_*` tools are then unknown. */
+  ops?: OpsGateway;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
   log?: (message: string) => void;
@@ -97,6 +110,7 @@ export class SidecarPool {
       if (["already_claimed", "forbidden", "no_available_task", "not_found"].includes(code)) return undefined;
       throw error;
     }
+    this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify(result));
@@ -114,8 +128,7 @@ export class SidecarPool {
   /** Spawn failed after a pre-claim: hand the lease back so the task returns to ready. */
   async releaseClaim(instId: string, _taskId: string, reason: string): Promise<void> {
     const live = this.claims.get(instId);
-    this.stopBeat(instId);
-    this.claims.delete(instId);
+    this.endLease(instId);
     if (!live) return;
     try {
       const cred = await this.credentialFor(instId);
@@ -161,12 +174,19 @@ export class SidecarPool {
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
       this.archive(path, "done");
-      this.claims.delete(instId);
+      this.endLease(instId);
     } catch (error) {
       this.log(`sidecar finish ${live.taskId} for ${instId} failed: ${(error as Error).message}`);
       this.archive(path, "failed");
-      this.claims.delete(instId); // lease is already gone or foreign; do not retry
+      this.endLease(instId); // lease is already gone or foreign; do not retry
     }
+  }
+
+  /** The instance no longer holds a lease: stop keepalive and drop every ops session opened under it. */
+  private endLease(instId: string): void {
+    this.stopBeat(instId);
+    this.claims.delete(instId);
+    this.deps.ops?.release(instId);
   }
 
   private archive(path: string, tag: string): void {
@@ -179,8 +199,7 @@ export class SidecarPool {
     this.instByAgent.delete(agentId);
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
-    this.stopBeat(instId);
-    this.claims.delete(instId);
+    this.endLease(instId);
     this.creds.delete(instId);
     this.keys.delete(instId);
     this.active.delete(instId);
@@ -227,8 +246,7 @@ export class SidecarPool {
           live.proof.expectedVersion = result.task.version;
         } catch (error) {
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
-          this.stopBeat(instId);
-          this.claims.delete(instId);
+          this.endLease(instId);
         }
       })();
     }, this.deps.heartbeatMs ?? HEARTBEAT_MS);
@@ -245,7 +263,8 @@ export class SidecarPool {
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
   private async dispatch(instId: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
     const core = this.deps.core;
-    if (tool === "__list__") return { tools: TOOL_LIST };
+    const ops = this.deps.ops;
+    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
     const cred = await this.credentialFor(instId);
@@ -261,10 +280,15 @@ export class SidecarPool {
     const writeOp = async (op: (proof: LeaseProof) => Promise<TaskView>, consume = false): Promise<TaskView> => {
       const claim = live();
       const view = await op(claim.proof);
-      if (consume) { this.claims.delete(instId); this.stopBeat(instId); }
+      if (consume) this.endLease(instId);
       else claim.proof.expectedVersion = view.version;
       return view;
     };
+    if (ops?.tools.includes(tool)) {
+      // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
+      const { taskId: _requested, ...rest } = args;
+      return ops.call(cred, live().taskId, tool, rest);
+    }
     switch (tool) {
       case "get_context":
         return {
@@ -281,13 +305,13 @@ export class SidecarPool {
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);
       case "create_delivery": return core.createDelivery(cred, args as never);
-      case "get_secret": return { value: await core.getSecret(cred, args as never) };
-      case "put_secret": return core.putSecret(cred, args as never);
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, String(args.taskId), evidence());
       case "record_score": return core.recordScore(cred, args as never);
-      default: throw Object.assign(new Error(`unknown tool: ${tool}`), { code: "unknown_tool" });
+      default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
+        ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
+        : `unknown tool: ${tool}`), { code: "unknown_tool" });
     }
   }
 

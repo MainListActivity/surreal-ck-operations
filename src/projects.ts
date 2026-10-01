@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { ProjectView, Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
+import { parseBrokerConfig } from './ops/config.ts';
 
 const KEYCHAIN_SERVICE = 'surreal-ck-company';
 const KEYCHAIN_ACCOUNT = 'env-secret-key';
@@ -54,19 +55,21 @@ export interface ProjectInput {
   redLines?: string[];
   runbooks?: string[];
   notes?: string;
-  envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string }>;
+  /** `broker` is the non-secret ops-broker configuration (see src/ops/config.ts); it is never part of ProjectView. */
+  envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; broker?: Record<string, unknown> }>;
 }
 
 interface ProjectRow {
   id: RecordId; name: string; repo_path: string; default_branch?: string; release: string; rollback?: string;
   red_lines: string[]; runbooks?: string[]; notes?: string;
 }
-interface EnvRow { id: RecordId; name: string; url?: string; health_url?: string; verify?: string }
+interface EnvRow { id: RecordId; name: string; url?: string; health_url?: string; verify?: string; broker?: unknown }
+export interface EnvBrokerRow { name: string; url?: string; healthUrl?: string; broker?: unknown }
 
 const PROJECT_ID = /^[a-z][a-z0-9_-]{0,40}$/;
 const secretAad = (project: string, env: string, name: string) => `${project}\0${env}\0${name}`;
 
-/** Project environments and their sealed credentials. Values never leave this module except via readSecret. */
+/** Project environments and their sealed credentials. Values never leave this module except via readSealed, which only the ops broker calls. */
 export class ProjectStore {
   constructor(private readonly db: Surreal) {}
 
@@ -77,11 +80,19 @@ export class ProjectStore {
         name: $p.name, repo_path: $p.repoPath, default_branch: $p.defaultBranch ?? 'main', release: $p.release,
         rollback: $p.rollback, red_lines: $p.redLines ?? [], runbooks: $p.runbooks ?? [], notes: $p.notes, updated_at: time::now() };`,
     { project, p: input });
-    for (const env of input.envs) {
+    for (const { broker, ...env } of input.envs) {
       await this.db.query(`INSERT INTO project_env { project: $project, name: $e.name, url: $e.url, health_url: $e.healthUrl, verify: $e.verify }
         ON DUPLICATE KEY UPDATE url = $input.url, health_url = $input.health_url, verify = $input.verify;`, { project, e: env });
+      // Omitted broker config is left alone so re-running `project set` never wipes it; `project broker` owns it.
+      if (broker !== undefined) await this.setBroker(input.id, env.name, broker);
     }
     return (await this.get(input.id))!;
+  }
+
+  /** Stores the non-secret ops broker settings of one environment after checking they parse. */
+  async setBroker(project: string, envName: string, broker: unknown): Promise<void> {
+    parseBrokerConfig(broker);
+    await this.db.query('UPDATE $env SET broker = $broker;', { env: await this.envId(project, envName), broker });
   }
 
   async list(): Promise<ProjectView[]> {
@@ -108,7 +119,11 @@ export class ProjectStore {
     };
   }
 
-  async setSecret(input: { project: string; env: string; name: string; value: string; roles: Role[]; purpose?: string }, key: Buffer): Promise<void> {
+  /**
+   * Seals a credential. Employees never read env_secret rows: only trusted control-plane code
+   * (the ops broker) opens them. `roles` is kept as an inventory label for legacy rows.
+   */
+  async setSecret(input: { project: string; env: string; name: string; value: string; roles?: Role[]; purpose?: string }, key: Buffer): Promise<void> {
     if (!input.value) throw new CompanyError('invalid', 'secret value is empty');
     const env = await this.envId(input.project, input.env);
     const sealed = sealSecret(key, input.value, secretAad(input.project, input.env, input.name));
@@ -116,18 +131,30 @@ export class ProjectStore {
         ciphertext: $s.ciphertext, iv: $s.iv, tag: $s.tag, updated_at: time::now() }
       ON DUPLICATE KEY UPDATE roles = $input.roles, purpose = $input.purpose, ciphertext = $input.ciphertext,
         iv = $input.iv, tag = $input.tag, updated_at = time::now();`,
-    { env, name: input.name, roles: input.roles, purpose: input.purpose, s: sealed });
+    { env, name: input.name, roles: input.roles ?? [], purpose: input.purpose, s: sealed });
   }
 
-  /** Decrypts one secret. Callers must have authorized the reader for this project and role. */
-  async readSecret(project: string, envName: string, name: string, role: Role, key: Buffer): Promise<string> {
+  /** Decrypts one secret; undefined when it was never sealed. Trusted callers only. */
+  async readSealed(project: string, envName: string, name: string, key: Buffer): Promise<string | undefined> {
     const env = await this.envId(project, envName);
-    const [rows] = await this.db.query<[Array<{ roles: string[]; ciphertext: string; iv: string; tag: string }>]>(
-      'SELECT roles, ciphertext, iv, tag FROM env_secret WHERE env = $env AND name = $name LIMIT 1;', { env, name });
+    const [rows] = await this.db.query<[Array<{ ciphertext: string; iv: string; tag: string }>]>(
+      'SELECT ciphertext, iv, tag FROM env_secret WHERE env = $env AND name = $name LIMIT 1;', { env, name });
     const row = rows[0];
-    if (!row) throw new CompanyError('not_found', `secret ${project}/${envName}/${name} not found`);
-    if (!row.roles.includes(role)) throw new CompanyError('forbidden', `role ${role} may not read ${name}`);
-    return openSecret(key, row, secretAad(project, envName, name));
+    return row ? openSecret(key, row, secretAad(project, envName, name)) : undefined;
+  }
+
+  /** Raw environment rows including the broker config; for trusted control-plane code only. */
+  async brokerEnvs(project: string): Promise<EnvBrokerRow[]> {
+    const [rows] = await this.db.query<[EnvRow[]]>(
+      'SELECT * FROM project_env WHERE project = $project ORDER BY name;', { project: new RecordId('project', project) });
+    return rows.map(row => ({ name: row.name, url: row.url, healthUrl: row.health_url, broker: row.broker }));
+  }
+
+  /** Names of sealed credentials in one environment (no values). */
+  async sealedNames(project: string, envName: string): Promise<string[]> {
+    const env = await this.envId(project, envName);
+    const [rows] = await this.db.query<[Array<{ name: string }>]>('SELECT name FROM env_secret WHERE env = $env ORDER BY name;', { env });
+    return rows.map(row => row.name);
   }
 
   private async envId(project: string, env: string): Promise<RecordId> {

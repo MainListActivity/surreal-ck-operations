@@ -69,10 +69,15 @@ export interface ClaimResult {
   history: HistoryEntry[];
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];
-  /** Project environment of the task's goal: where it ships, how to verify, red lines, secret names. */
+  /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
   project?: ProjectView;
-  /** Decrypted env credentials whose declared roles include the claimer's role; saves a get_secret round trip per secret. Never write values into evidence. */
-  secrets?: Array<{ env: string; name: string; value: string }>;
+}
+
+/** Result of the ops broker gate; `project` is the id of the project the task's goal belongs to. */
+export interface OpsScope {
+  actor: Principal;
+  taskId: TaskId;
+  project: string;
 }
 
 export interface SessionRef {
@@ -149,10 +154,12 @@ export interface CompanyCore {
   triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
   /** gm/product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
   createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
-  /** Decrypts a project environment secret for the caller's currently held task. Audited, never stored in evidence. */
-  getSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string }): Promise<string>;
-  /** Seals a credential the caller created for the task's project (e.g. a test account in the company's own IdP). */
-  putSecret(credential: Credential, input: { taskId: TaskId; env: string; name: string; value: string; roles?: Role[]; purpose?: string }): Promise<{ stored: string }>;
+  /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
+  opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope>;
+  /** Appends a secret-free `ops_*` record to the task's audit trail. Only `ops_call` rows stay out of handover history. */
+  auditOps(scope: OpsScope, action: string, evidence: string): Promise<void>;
+  /** How many `action` audit rows tasks of this project wrote in the last `windowSeconds`; backs broker quotas. */
+  opsCount(project: string, action: string, windowSeconds: number): Promise<number>;
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */

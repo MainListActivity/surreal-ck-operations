@@ -31,6 +31,8 @@ export function company(): Promise<Company> {
     const { OwnerDesk } = await import("./vendor/src/owner.ts");
     const { Workforce } = await import("./vendor/src/workforce.ts");
     const { SurrealCompanyCore } = await import("./vendor/src/core.ts");
+    const { ProjectStore, loadSecretKey } = await import("./vendor/src/projects.ts");
+    const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
@@ -43,8 +45,14 @@ export function company(): Promise<Company> {
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
     const core = new SurrealCompanyCore(db);
+    // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
+    // reach them through the sidecar relay as named, audited, lease-gated operations.
+    const ops = new OpsBroker({
+      core, projects: new ProjectStore(db.db), secretKey: loadSecretKey,
+      log: message => console.log(message),
+    });
     const sidecar = new SidecarPool({
-      core, workforce,
+      core, workforce, ops,
       runDir: process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`,
       log: message => console.log(message),
     });
