@@ -16,8 +16,12 @@ export interface LoginTokens {
   expiresAt: number;
 }
 
-/** `customer` rides the product web app's client; `operator` the dedicated ops public client. */
-export type LoginChannel = 'customer' | 'operator';
+/**
+ * `customer` rides the product web app's client, `operator` the dedicated ops public client
+ * redeemed at the product's token proxy, and `ops` a public client redeemed straight at the
+ * IdP's own `/token` endpoint (no product hop, no client secret).
+ */
+export type LoginChannel = 'customer' | 'operator' | 'ops';
 
 export interface LoginOptions {
   fetch?: Fetcher;
@@ -103,11 +107,11 @@ interface Channel {
   clientId: string;
   redirectUri: string;
   scope: string;
-  /** Extra authorize params: the customer client sends `audience`, the ops client RFC 8707 `resource`. */
+  /** Extra authorize params: the customer client sends `audience`, the ops clients RFC 8707 `resource`. */
   authorize: Record<string, string>;
-  /** Where on the product the authorization code is redeemed. */
-  tokenPath: string;
-  /** Public clients authenticate to the product's token proxy with `client_id` in the form body. */
+  /** Where the authorization code is redeemed: the product's token proxy, or the IdP directly. */
+  tokenUrl: string;
+  /** Public clients name themselves with `client_id` in the token request's form body. */
   sendsClientId: boolean;
 }
 
@@ -117,7 +121,19 @@ function channelFor(config: BrokerConfig, kind: LoginChannel = 'customer'): Chan
     return {
       clientId: config.idp.clientId, redirectUri: config.idp.redirectUri, scope: config.idp.scope,
       authorize: config.idp.audience ? { audience: config.idp.audience } : {},
-      tokenPath: '/api/auth/token', sendsClientId: false,
+      tokenUrl: `${config.product.url}/api/auth/token`, sendsClientId: false,
+    };
+  }
+  if (kind === 'ops') {
+    const ops = config.idp.ops;
+    if (!ops) {
+      throw new CompanyError('not_configured', 'this environment has no ops login configured (broker idp.ops)');
+    }
+    // The IdP picks the token audience off RFC 8707 `resource`; it never reads `audience`.
+    return {
+      clientId: ops.clientId, redirectUri: ops.redirectUri, scope: 'openid',
+      authorize: { resource: ops.audience },
+      tokenUrl: `${config.idp.issuer}/token`, sendsClientId: true,
     };
   }
   const ops = config.ops;
@@ -127,14 +143,14 @@ function channelFor(config: BrokerConfig, kind: LoginChannel = 'customer'): Chan
   return {
     clientId: ops.clientId, redirectUri: ops.redirectUri, scope: ops.scope,
     authorize: ops.resource ? { resource: ops.resource } : {},
-    tokenPath: '/api/auth/ops/token', sendsClientId: true,
+    tokenUrl: `${config.product.url}/api/auth/ops/token`, sendsClientId: true,
   };
 }
 
 /**
  * The same authorization-code + PKCE dance the product's web app performs, driven by the
- * password route of the IdP login page; the code is redeemed at the product's token proxy
- * (`channel` picks the customer proxy or the ops public-client one). Failure messages carry
+ * password route of the IdP login page; the code is redeemed at the channel's token endpoint
+ * (the customer or ops proxy on the product, or the IdP's own `/token` for `ops`). Failure messages carry
  * status codes and IdP error codes only, so they are safe to relay to employees.
  *
  * A timeout, a dropped connection or a 5xx anywhere in the flow earns one more attempt from a
@@ -200,7 +216,7 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
   const code = callback.searchParams.get('code');
   if (!code || callback.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
 
-  const { response: exchange, body: tokenRaw } = await request('token exchange', io, `${config.product.url}${channel.tokenPath}`, {
+  const { response: exchange, body: tokenRaw } = await request('token exchange', io, channel.tokenUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({

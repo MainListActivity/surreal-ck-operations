@@ -188,7 +188,7 @@ export class OpsBroker {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops },
       },
     };
   }
@@ -265,6 +265,10 @@ export class OpsBroker {
   private async login(ctx: Ctx, args: Args): Promise<Outcome> {
     const alias = canonicalAlias(args.alias);
     const username = accountUsername(alias, ctx.cfg.accounts.prefix);
+    if (args.audience !== undefined && args.audience !== 'ops') {
+      throw invalid('audience must be "ops" when given; omit it for a customer login');
+    }
+    if (args.audience === 'ops') return this.opsLogin(ctx, args, alias, username);
     let password = await this.sealedPassword(ctx, alias);
     let ensured: EnsureAccountResult['result'] | undefined;
     if (!password) {
@@ -303,6 +307,36 @@ export class OpsBroker {
         workspaces: listing.workspaces.map(({ slug, name, role }) => ({ slug, name, role })),
       },
       audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}` },
+    };
+  }
+
+  /**
+   * `ops_login` with `audience:"ops"`: the alias logs in through the public client registered
+   * at the IdP for the ops audience, redeeming the code at the IdP's own `/token` endpoint.
+   * An ops session never lists or enters workspaces (the product's session routes do not
+   * accept that audience) and never auto-creates an account — a fresh account is not an
+   * operator, so a missing sealed password is a plain not_found.
+   */
+  private async opsLogin(ctx: Ctx, args: Args, alias: string, username: string): Promise<Outcome> {
+    if (!ctx.cfg.idp.ops) {
+      throw new CompanyError('not_configured', 'this environment has no ops login configured (broker idp.ops)');
+    }
+    if (args.workspace !== undefined) throw invalid('an ops session cannot enter a workspace');
+    const password = await this.sealedPassword(ctx, alias);
+    if (!password) {
+      throw new CompanyError('not_found', `no sealed password for ${alias}; ops logins never auto-create accounts`);
+    }
+    const tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'ops' });
+    const session = this.sessions.create({
+      employeeId: ctx.scope.actor.employeeId, project: ctx.scope.project, env: ctx.env, alias, username,
+      kind: 'ops', token: tokens.accessToken, expiresAt: tokens.expiresAt,
+    });
+    return {
+      value: {
+        session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
+        audience: 'ops',
+      },
+      audit: { action: 'ops_login', evidence: `login as ${username}（audience=ops）` },
     };
   }
 
@@ -364,7 +398,7 @@ export class OpsBroker {
   private customerSession(ctx: Ctx, args: Args): OpsSession {
     const session = this.session(ctx, args);
     if (session.kind !== 'customer') {
-      throw invalid('this session is an operator session; it can only be used with ops_request on /api/ops/* paths');
+      throw invalid(`this session is an ${session.kind} session; it can only be used with ops_request on /api/ops/* paths`);
     }
     return session;
   }
@@ -532,16 +566,16 @@ export class OpsBroker {
     const session = this.session(ctx, args);
     const method = text(args, 'method', 10).toUpperCase();
     const path = text(args, 'path', 2000);
-    // Sessions stay in their lane: an operator token only serves ops endpoints, and a customer
-    // token is never sent to them at all (the product would answer 401 for the wrong audience).
+    // Sessions stay in their lane: an operator or ops token only serves ops endpoints, and a
+    // customer token is never sent to them at all (the product would answer 401 for the wrong audience).
     const opsPath = /^\/api\/ops(\/|$|\?)/.test(path);
-    if (session.kind === 'operator' && !opsPath) throw invalid('an operator session can only call /api/ops/* paths');
-    if (session.kind === 'customer' && opsPath) throw invalid('a customer session cannot call /api/ops/*; call ops_operator_login for an operator session');
+    if (session.kind !== 'customer' && !opsPath) throw invalid(`an ${session.kind} session can only call /api/ops/* paths`);
+    if (session.kind === 'customer' && opsPath) throw invalid('a customer session cannot call /api/ops/*; call ops_operator_login, or ops_login with audience "ops", for an ops session');
     const res = await this.product(ctx, session, method, path, args.body);
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
     return {
       value: { status: res.status, ok: res.ok, body: clipJson(redactJson(res.body, known)) },
-      audit: { action: 'ops_call', evidence: `${method} ${path.split('?')[0]} → ${res.status}（${session.kind === 'operator' ? '运营 ' : ''}${session.username}）` },
+      audit: { action: 'ops_call', evidence: `${method} ${path.split('?')[0]} → ${res.status}（${session.kind !== 'customer' ? '运营 ' : ''}${session.username}）` },
     };
   }
 

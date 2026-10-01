@@ -18,6 +18,9 @@ export const REDIRECT = 'https://app.test/auth/callback';
 export const OPS_CLIENT = 'ops-client-0001';
 export const OPS_REDIRECT = 'https://ops.test/auth/callback';
 export const OPS_RESOURCE = 'https://app.test/api/ops/mcp';
+/** The `idp.ops` public client redeemed straight at the IdP's own `/token` endpoint. */
+export const OPS_DIRECT_CLIENT = 'ops-direct-0001';
+export const OPS_DIRECT_REDIRECT = 'http://127.0.0.1:43124/auth/callback.html';
 
 export const brokerConfig = (patch: Record<string, unknown> = {}) => ({
   roles: ['qa', 'engineering'],
@@ -131,6 +134,7 @@ export class FakeWorld {
   };
 
   private route(url: URL, method: string, init?: RequestInit): Promise<Response> | Response {
+    if (url.origin === 'https://idp.test' && url.pathname === '/t/ck/token') return this.idpToken(method, init);
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
@@ -165,12 +169,14 @@ export class FakeWorld {
   private idpAuthorize(url: URL): Response {
     const q = url.searchParams;
     const client = q.get('client_id') ?? '';
-    // The customer client asks for `audience`, the ops public client for RFC 8707 `resource`.
+    // The customer client asks for `audience`, the ops public clients for RFC 8707 `resource`.
     const validClient = client === 'client-ck-1234'
       ? q.get('redirect_uri') === REDIRECT && q.get('audience') === 'https://auth.test' && !q.get('resource')
       : client === OPS_CLIENT
         ? q.get('redirect_uri') === OPS_REDIRECT && q.get('resource') === OPS_RESOURCE && !q.get('audience')
-        : false;
+        : client === OPS_DIRECT_CLIENT
+          ? q.get('redirect_uri') === OPS_DIRECT_REDIRECT && q.get('resource') === OPS_RESOURCE && !q.get('audience')
+          : false;
     if (url.pathname !== '/t/ck/authorize' || q.get('response_type') !== 'code' || !validClient
       || q.get('code_challenge_method') !== 'S256' || !q.get('code_challenge') || !q.get('state')) {
       return json(400, { error: 'invalid_request' });
@@ -200,6 +206,23 @@ export class FakeWorld {
     redirect.searchParams.set('code', code);
     redirect.searchParams.set('state', challenge.state);
     return json(200, { redirect_uri: redirect.toString() });
+  }
+
+  /**
+   * The IdP's own token endpoint: only the public ops client may redeem here, naming itself
+   * with `client_id` in the form body and proving the code with `code_verifier` (no secret).
+   */
+  private idpToken(method: string, init?: RequestInit): Response {
+    if (method !== 'POST') return json(405, { error: 'method_not_allowed' });
+    const form = new URLSearchParams(String(init?.body ?? ''));
+    const code = this.codes.get(form.get('code') ?? '');
+    this.codes.delete(form.get('code') ?? '');
+    const challenge = createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url');
+    if (!code || code.client !== OPS_DIRECT_CLIENT || form.get('client_id') !== OPS_DIRECT_CLIENT
+      || form.get('grant_type') !== 'authorization_code' || form.get('redirect_uri') !== code.redirectUri || challenge !== code.codeChallenge) {
+      return json(400, { error: 'invalid_grant' });
+    }
+    return json(200, { access_token: this.mint(code.userId, undefined, true), token_type: 'Bearer', expires_in: 900 });
   }
 
   // ---------- product ----------

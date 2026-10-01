@@ -13,7 +13,16 @@ const DEFAULT_SCOPE = 'openid profile email offline_access';
  */
 export interface BrokerConfig {
   roles: Role[];
-  idp: { issuer: string; clientId: string; audience?: string; redirectUri: string; scope: string };
+  idp: {
+    issuer: string; clientId: string; audience?: string; redirectUri: string; scope: string;
+    /**
+     * Optional ops-audience login: a public OIDC client redeemed straight at the IdP's own
+     * `/token` endpoint (`ops_login` with `audience:"ops"`). `audience` is the ops resource
+     * URI the product's `/api/ops/*` routes demand; it travels on authorize as RFC 8707
+     * `resource` (the only audience selector the IdP honours).
+     */
+    ops?: { clientId: string; audience: string; redirectUri: string };
+  };
   /**
    * The operator channel: a separate public OIDC client whose tokens carry the ops audience
    * the product's `/api/ops/*` routes demand. Customer sessions can never reach them.
@@ -90,6 +99,14 @@ export function parseBrokerConfig(raw: unknown): BrokerConfig {
       audience: idp.audience === undefined ? undefined : text(idp, 'audience', 'idp'),
       redirectUri: text(idp, 'redirectUri', 'idp', /^https?:\/\/\S+$/),
       scope: text(idp, 'scope', 'idp', undefined, DEFAULT_SCOPE),
+      ops: idp.ops === undefined ? undefined : (() => {
+        const ops = record(idp.ops, 'idp.ops');
+        return {
+          clientId: text(ops, 'clientId', 'idp.ops', /^[A-Za-z0-9._-]{4,100}$/),
+          audience: url(ops, 'audience', 'idp.ops', true),
+          redirectUri: text(ops, 'redirectUri', 'idp.ops', /^https?:\/\/\S+$/),
+        };
+      })(),
     },
     product: { url: url(product, 'url', 'product') },
     accounts: {

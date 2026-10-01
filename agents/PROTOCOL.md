@@ -39,7 +39,7 @@
 | `ops_info` | — | 项目与环境、可用工具、已登记的账号别名、配额、代理当前具备的能力 |
 | `ops_health` | — | 探测环境的健康地址 |
 | `ops_account_ensure` | `alias` | 确保公司 IdP 里有这个测试账号：没有就创建，密码由代理生成并密封；你看不到密码 |
-| `ops_login` | `alias`, `workspace?` | 以该账号登录，返回会话句柄 `session`（不是 token）和该账号能进入的 workspace；账号不存在会先创建 |
+| `ops_login` | `alias`, `workspace?`, `audience?` | 以该账号登录，返回会话句柄 `session`（不是 token）和该账号能进入的 workspace；账号不存在会先创建。`audience:"ops"` 时经 IdP 公共客户端直连换出运营 audience 的会话（`kind=ops`），不列 workspace、不自动建账号（无密封密码即 not_found），只能配 `ops_request` 调 `/api/ops/*`——不能进 workspace、不能浏览器登录 |
 | `ops_workspace_ensure` | `session`, `slug`, `name?` | 进入已有 workspace；不存在且给了 `name` 时创建（slug 要以项目配置的前缀开头，每天有创建上限，能复用就复用）。创建是产品侧的多步 provisioning，可能要一两分钟；调用若报 `upstream_error`（超时或 5xx），说明结果未定，用**同一个 slug 和 name** 再调一次即可复用或补完，不要换新 slug |
 | `ops_member_list` / `ops_member_add` / `ops_member_remove` | `session`, `slug`, `alias`, `admin?` | 查看、添加、移除 workspace 成员（`alias` 是账号别名，加入前先 `ops_account_ensure`） |
 | `ops_operator_login` | `alias` | 以该账号登录运营通道（独立 OIDC client、运营 audience），返回 `kind=operator` 的会话句柄；登录时即验证运营身份是否仍然有效 |
@@ -49,7 +49,7 @@
 | `ops_logout` | `session` | 关闭会话 |
 
 规则：
-- 会话分两种：`ops_login` 的客户会话走产品 API 与 workspace 数据；`ops_operator_login` 的运营会话只用于 `ops_request` 调 `/api/ops/*`（运营台、内容、套餐与额度运营接口），产品侧每次请求都按平台运营身份实时校验，撤权立即生效。
+- 会话分两种：`ops_login` 的客户会话走产品 API 与 workspace 数据；`ops_operator_login` 与 `ops_login`（`audience:"ops"`）的运营会话只用于 `ops_request` 调 `/api/ops/*`（运营台、内容、套餐与额度运营接口），产品侧每次请求都按平台运营身份实时校验，撤权立即生效。
 - 会话句柄只属于你持有的这一个任务：交付、阻塞、被收回租约都会让它失效，不跨任务复用；需要时重新 `ops_login` / `ops_operator_login`。
 - 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。

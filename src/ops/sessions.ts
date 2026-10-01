@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 
-/** `customer` sessions drive the product's app API and workspace data; `operator` sessions only `/api/ops/*`. */
-export type SessionKind = 'customer' | 'operator';
+/** `customer` sessions drive the product's app API and workspace data; `operator` and `ops` sessions only `/api/ops/*`. */
+export type SessionKind = 'customer' | 'operator' | 'ops';
 
 export interface OpsSession {
   id: string;

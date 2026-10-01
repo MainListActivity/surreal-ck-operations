@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
@@ -98,7 +98,7 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false });
     expectNoLeaks(r);
   });
 
@@ -629,5 +629,118 @@ describe('operator sessions', () => {
     r.world.operatorCaps.set(subject, ['content.read']);
     const denied = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
     expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
+  });
+});
+
+describe('ops audience sessions (ops_login audience:"ops")', () => {
+  const idpOps = {
+    idp: {
+      issuer: 'https://idp.test/t/ck', clientId: 'client-ck-1234', audience: 'https://auth.test', redirectUri: 'https://app.test/auth/callback',
+      ops: { clientId: OPS_DIRECT_CLIENT, audience: OPS_RESOURCE, redirectUri: OPS_DIRECT_REDIRECT },
+    },
+  };
+  const idpTokenCalls = (r: Rig) => r.world.requests.filter(q => q.url === 'https://idp.test/t/ck/token');
+
+  /** Ensures + seals the alias through the customer path, then marks its IdP subject an operator. */
+  const opsUser = async (r: Rig, alias: string, caps: string[] = ['quota.read']): Promise<string> => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+
+  test('an ops login redeems the code at the IdP token endpoint and serves ops endpoints', async () => {
+    const r = rig(idpOps);
+    await opsUser(r, 'qa-ops');
+    const login = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    expect(login).toMatchObject({ kind: 'ops', alias: 'QA_OPS', username: 'sck-qa-ops', audience: 'ops' });
+
+    // Authorize ran under the public ops client with RFC 8707 resource, never the customer audience.
+    const authorize = r.world.requests.map(x => new URL(x.url)).find(u => u.pathname === '/t/ck/authorize')!;
+    expect(authorize.searchParams.get('client_id')).toBe(OPS_DIRECT_CLIENT);
+    expect(authorize.searchParams.get('resource')).toBe(OPS_RESOURCE);
+    expect(authorize.searchParams.get('redirect_uri')).toBe(OPS_DIRECT_REDIRECT);
+    expect(authorize.searchParams.get('audience')).toBeNull();
+    // The code went to the IdP's own /token; neither product proxy was touched.
+    expect(idpTokenCalls(r)).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/token') || x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    // No workspace listing happens for an ops session.
+    expect(r.world.requests.filter(x => x.url.includes('/api/session/'))).toHaveLength(0);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_login' });
+    expect(r.company.audits.at(-1)!.evidence).toContain('audience=ops');
+
+    const res = await call(r, 'ops_request', { session: login.session, method: 'GET', path: '/api/ops/quota/context' });
+    expect(res).toMatchObject({ status: 200, ok: true });
+    expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('without idp.ops the login fails closed before any network call', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' }));
+    expect(error.code).toBe('not_configured');
+    expect(r.world.requests).toHaveLength(0);
+    expect((await call(rig(idpOps), 'ops_info')).can).toMatchObject({ opsAudienceLogin: true });
+  });
+
+  test('an ops login never auto-creates the account: a missing sealed password is not_found', async () => {
+    const r = rig(idpOps);
+    const error = await failure(call(r, 'ops_login', { alias: 'ghost', audience: 'ops' }));
+    expect(error.code).toBe('not_found');
+    expect(r.world.user('sck-ghost')).toBeUndefined();
+    expect(r.world.requests).toHaveLength(0);
+    expect(r.company.audits.map(a => a.action)).not.toContain('ops_account_create');
+  });
+
+  test('bad audience values and a workspace target are rejected before any network call', async () => {
+    const r = rig(idpOps);
+    for (const audience of ['customer', 'bogus', 5]) {
+      expect((await failure(call(r, 'ops_login', { alias: 'qa-ops', audience }))).code).toBe('invalid');
+    }
+    expect((await failure(call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops', workspace: 'sck-x' }))).code).toBe('invalid');
+    expect(r.world.requests).toHaveLength(0);
+  });
+
+  test('an ops session is refused by workspace, member, query and browser tools and off-ops paths', async () => {
+    const r = rig(idpOps);
+    await opsUser(r, 'qa-ops');
+    const { session } = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    for (const [tool, extra] of [
+      ['ops_workspace_ensure', { slug: 'sck-x' }],
+      ['ops_member_list', { slug: 'sck-x' }],
+      ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
+      ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
+      ['ops_query', { sql: 'SELECT 1' }],
+      ['ops_browser_login', { spaceId: 1 }],
+    ] as const) {
+      const err = await failure(call(r, tool, { session, ...extra }));
+      expect(err.code, tool).toBe('invalid');
+      expect(err.message).toContain('ops session');
+    }
+    expect((await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('invalid');
+    // Only the login happened: the refusals never reached the product.
+    expect(r.world.requests.filter(x => new URL(x.url).origin === 'https://app.test')).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('reauth keeps an ops session on the direct IdP channel', async () => {
+    const r = rig(idpOps);
+    await opsUser(r, 'qa-ops');
+    const { session } = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    r.world.advance(15 * 60_000); // token lifetime elapsed
+    const res = await call(r, 'ops_request', { session, method: 'GET', path: '/api/ops/quota/context' });
+    expect(res).toMatchObject({ status: 200, ok: true });
+    expect(idpTokenCalls(r)).toHaveLength(2);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/token') || x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('a non-operator account can log in but the product still gates every ops call', async () => {
+    const r = rig(idpOps);
+    await call(r, 'ops_account_ensure', { alias: 'qa-ops' }); // never registered as an operator
+    const { session } = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    const res = await call(r, 'ops_request', { session, method: 'GET', path: '/api/ops/quota/context' });
+    expect(res).toMatchObject({ status: 403, ok: false, body: { error: { code: 'platform-operator-inactive' } } });
+    expectNoLeaks(r);
   });
 });
