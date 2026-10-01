@@ -118,6 +118,15 @@ describe('broker config', () => {
     expect(parseBrokerConfig({ ...base, roles: ['qa', 'qa'] }).roles).toEqual(['qa']);
   });
 
+  test('the ops block is optional and validated like the rest', () => {
+    const base = brokerConfig();
+    expect(parseBrokerConfig(base).ops).toBeUndefined();
+    const cfg = parseBrokerConfig({ ...base, ops: { clientId: 'ops-client-1', redirectUri: 'https://ops.test/cb', resource: 'https://app.test/api/ops/mcp' } });
+    expect(cfg.ops).toEqual({ clientId: 'ops-client-1', redirectUri: 'https://ops.test/cb', resource: 'https://app.test/api/ops/mcp', scope: 'openid' });
+    expect(() => parseBrokerConfig({ ...base, ops: { clientId: 'x', redirectUri: 'https://ops.test/cb' } })).toThrow(/ops/);
+    expect(() => parseBrokerConfig({ ...base, ops: { clientId: 'ops-1', redirectUri: 'https://ops.test/cb', resource: 'http://app.test/x' } })).toThrow(/https/);
+  });
+
   test('control-plane credentials: a dedicated ops token wins over the developer token', () => {
     expect(controlPlaneEnv({ CLOUDFLARE_API_TOKEN: 'dev', CLOUDFLARE_ACCOUNT_ID: 'a1' }))
       .toMatchObject({ cloudflareToken: 'dev', cloudflareAccountId: 'a1' });
@@ -169,6 +178,13 @@ describe('product request limits', () => {
     expect(error).toBeInstanceOf(ProductUnreachable);
     expect((error as ProductUnreachable).timedOut).toBe(false);
     expect(error.message).toBe('product request failed (TypeError)');
+  });
+
+  test('the errno-style cause code is relayed while the possibly sensitive message stays hidden', async () => {
+    const reset: Fetcher = async () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNRESET 10.0.0.1:443'), { code: 'ECONNRESET' }) }); };
+    const error = await failure(productRequest(config, 'secret-token', { method: 'POST', path: '/api/x', body: {} }, { fetch: reset }));
+    expect((error as ProductUnreachable).timedOut).toBe(false);
+    expect(error.message).toBe('product request failed (TypeError ECONNRESET); it may still have taken effect, so check before repeating it');
   });
 
   test('a body that stalls after the headers is a timeout; an unreadable one just leaves the status', async () => {
@@ -361,7 +377,7 @@ describe('sessions', () => {
   test('capped per employee, private to project and environment, and short-lived', () => {
     let clock = 1_000;
     const store = new SessionStore(() => clock);
-    const make = (employeeId: string) => store.create({ employeeId, project: 'demo', env: 'production', alias: 'A', username: 'sck-a', token: `tok-${employeeId}-${clock}-${Math.random()}`, expiresAt: clock + 900_000 });
+    const make = (employeeId: string) => store.create({ employeeId, project: 'demo', env: 'production', alias: 'A', username: 'sck-a', kind: 'customer', token: `tok-${employeeId}-${clock}-${Math.random()}`, expiresAt: clock + 900_000 });
     const first = make('e1');
     for (let i = 0; i < 8; i++) { clock += 1; make('e1'); }
     expect(() => store.get(first.id, 'e1', 'demo', 'production')).toThrow(/unknown session/); // oldest evicted
@@ -401,6 +417,29 @@ describe('ego-browser injector', () => {
     expect(stdin).toContain('"exp":1800000000');
     expect(stdin).toContain('taskSpace(4)');
     expect(readFileSync(join(dir!, 'argv.txt'), 'utf8').trim()).toBe('nodejs');
+  });
+
+  test('the real CLI writes the result line to stderr, mixed with notices; stdout stays empty', async () => {
+    // The exact output observed from ego-browser 0.5.0.x in production: console.log from the
+    // script goes to stderr behind its own notices, and parsing stdout alone lost the result.
+    const bin = fakeCli(`cat >/dev/null; echo '[ego-browser:notice] Ego Lite update is available (current 0.5.0.32). Finish the current browser task, then ask the user before running \`ego-browser upgrade\`; re-read the ego-browser Skill afterward.' >&2; echo 'SCK_RESULT {"url":"https://app.test/","title":"Fixture App"}' >&2`);
+    const landed = await egoBrowserInjector(input(bin));
+    expect(landed).toEqual({ url: 'https://app.test/', title: 'Fixture App' });
+  });
+
+  test('a malformed result line is an upstream error with the CLI output attached', async () => {
+    const bin = fakeCli(`cat >/dev/null; echo 'SCK_RESULT {"url":"https://app.test/"}' >&2; exit 0`);
+    const error = await failure(egoBrowserInjector(input(bin)));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('exit 0');
+    expect(error.message).toContain('SCK_RESULT');
+  });
+
+  test('a non-zero exit with a result line still reports failure', async () => {
+    const bin = fakeCli(`cat >/dev/null; echo 'SCK_RESULT {"url":"https://app.test/","title":"Late"}' >&2; exit 1`);
+    const error = await failure(egoBrowserInjector(input(bin)));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('exit 1');
   });
 
   test('failures are reported with the token scrubbed from the CLI output', async () => {

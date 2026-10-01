@@ -73,6 +73,12 @@ export class Dispatcher {
   /** Last observed Paseo status per agent; a busy→idle transition is the recovery signal for a provider. */
   private readonly lastStatus = new Map<string, string>();
   private readonly onboarded = new Set<string>();
+  // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
+  // identical answers, so re-asking every tick only burns tokens. Re-ask only
+  // when the candidate fingerprint changes, and drop candidates whose last
+  // assign attempt failed for a cooldown window.
+  private readonly staffCache = new Map<string, { fp: string; prefer?: AssignPreference }>();
+  private readonly staffAvoid = new Map<string, Map<string, number>>();
   private lastSweep = 0;
   private readonly keptLogged = new Set<string>();
 
@@ -197,9 +203,13 @@ export class Dispatcher {
       let inspected = 0;
       for (const inst of insts) {
         if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || !inst.paseoAgentId) continue;
+        // Sidecar mode: a credential-file instance can never take new work (the pool
+        // refuses to claim for it), so an idle one only wastes a provider seat and
+        // misleads Jev's staffing picks. Retire it on sight.
+        const legacyEol = Boolean(this.deps.sidecar && inst.credentialFile);
         const overWakes = cfg.sessionMaxWakes > 0 && (inst.wakeCount ?? 0) >= cfg.sessionMaxWakes;
         let inputK = 0;
-        if (!overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+        if (!legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
@@ -209,8 +219,9 @@ export class Dispatcher {
         const def = defs.find(d => d.id === inst.def);
         const target = def ? resolveModel(def) : undefined;
         const staleModel = Boolean(target && inst.model && inst.model !== target);
-        if (!overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK) && !staleModel) continue;
-        const reason = staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
+        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK) && !staleModel) continue;
+        const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
+          : staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
         await wf.retire(inst.id, reason);
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
@@ -271,6 +282,9 @@ export class Dispatcher {
     const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
       inst.role === role && ready(inst) && !assigned.has(inst.id) &&
       !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
+      // A credential-file instance can only finish what it already holds; the sidecar
+      // refuses new claims for it, so it must not appear as a reuse candidate.
+      !(this.deps.sidecar && inst.credentialFile) &&
       currentModel(inst) &&
       this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
@@ -278,9 +292,11 @@ export class Dispatcher {
       insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
+    // Credential-file stragglers do not consume seats: they cannot serve new work.
     const eligibleDefs = (role: string, home: string) =>
       defs.filter(d => d.enabled && d.role === role && resolveModel(d) !== undefined &&
-        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length < d.maxInstances &&
+        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home &&
+          !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
         this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
     // starve their roles, so escalate once (clears automatically when resolution returns).
@@ -309,9 +325,17 @@ export class Dispatcher {
     const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
-      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review');
-      const spawn = eligibleDefs(item.role, home);
+      const cacheKey = `${item.purpose}:${item.task.id}`;
+      const avoided = this.staffAvoid.get(cacheKey);
+      const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review').filter(i => !dodged(i.id));
+      const spawn = eligibleDefs(item.role, home).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
+      // Same candidate set → same verdict; only call Jev when the fingerprint moved.
+      const fp = `${item.role}|${item.task.version}|` +
+        [...reuse.map(i => i.id), ...spawn.map(d => `spawn:${d.id}`)].sort().join(',');
+      const hit = this.staffCache.get(cacheKey);
+      if (hit?.fp === fp) return hit.prefer;
       const describeHealth = (provider: string) => health.get(provider)?.state ?? 'ok';
       const candidates: RouteCandidate[] = [
         ...reuse.map(i => {
@@ -335,11 +359,14 @@ export class Dispatcher {
       const def = spawn.find(d => `spawn:${d.id}` === verdict.key);
       if ((!inst && !def) || verdict.confidence < cfg.jevPickConfidence) {
         if (verdict.key) report.decisions.push(`staff:${item.task.id}=weighted(${verdict.confidence.toFixed(2)})`);
+        this.staffCache.set(cacheKey, { fp });
         return undefined;
       }
       report.decisions.push(`staff:${item.task.id}=${verdict.key}@${verdict.confidence.toFixed(2)}`);
       this.log(`jev picked ${verdict.key} for ${item.task.id} (${verdict.confidence.toFixed(2)})`);
-      return inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
+      const prefer = inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
+      this.staffCache.set(cacheKey, { fp, prefer });
+      return prefer;
     };
 
     const explainStaffing = (role: string, home: string): string => {
@@ -384,11 +411,23 @@ export class Dispatcher {
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first, { comm: !!this.deps.sidecar, claim }), report, insts, item.purpose === 'review', prefer, slotMap);
       if (!result) {
+        if (prefer) {
+          // Jev's pick just failed in assign; stop re-picking the same candidate
+          // while the rest of the pool stays eligible.
+          const cacheKey = `${item.purpose}:${item.task.id}`;
+          this.staffCache.delete(cacheKey);
+          const key = prefer.instId ?? `spawn:${prefer.defId}`;
+          const map = this.staffAvoid.get(cacheKey) ?? new Map<string, number>();
+          map.set(key, now + 30 * 60 * 1000);
+          this.staffAvoid.set(cacheKey, map);
+        }
         const home = item.task.repoPath ?? this.deps.env.opsRepo;
         await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}。任务 ${item.task.id} 等待中。`, report);
         continue;
       }
       await owner.resolveNotice(`staff:${item.role}`);
+      this.staffCache.delete(`${item.purpose}:${item.task.id}`);
+      this.staffAvoid.delete(`${item.purpose}:${item.task.id}`);
       await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id);
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);

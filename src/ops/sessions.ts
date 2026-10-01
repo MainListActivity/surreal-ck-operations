@@ -1,6 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 
+/** `customer` sessions drive the product's app API and workspace data; `operator` and `ops` sessions only `/api/ops/*`. */
+export type SessionKind = 'customer' | 'operator' | 'ops';
+
 export interface OpsSession {
   id: string;
   employeeId: string;
@@ -8,6 +11,7 @@ export interface OpsSession {
   env: string;
   alias: string;
   username: string;
+  kind: SessionKind;
   /** Held in broker memory only; never serialised into any response. */
   token: string;
   /** Epoch ms. */
