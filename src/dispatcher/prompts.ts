@@ -82,7 +82,7 @@ export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: Pr
   const list = tasks.map(t => `- ${t.id}「${t.title}」（执行岗位 ${t.executorRole}）`).join('\n');
   const body = `【经理待办】以下任务被员工阻塞并交给经理处理：
 ${list}
-逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
+逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、用 update_task_dependencies 调整依赖边）后用 resume_task 恢复。
 你有决定权：技术方案、拆分、上线（运营定不了时）、查得到的事实都由你决定并写进恢复说明，不要转给老板。
 只有花钱、签约、对外联系、公司方向和项目红线才让原员工 report_blocker(to=owner)，并写明你已查过哪些来源。处理完结束本轮。
 调用方式：${tool(inst, env, ctx?.comm ?? false)}`;

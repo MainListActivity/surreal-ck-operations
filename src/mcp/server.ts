@@ -202,6 +202,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
+  server.registerTool('update_task_dependencies', {
+    description: 'gm only: add/remove dependency edges on an unfinished, unleased task. Rejects cycles and already-implied edges; unlocks a dependency-blocked task whose remaining deps are all done.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      add: z.array(z.string().min(1)).max(100).optional(),
+      remove: z.array(z.string().min(1)).max(100).optional(),
+      evidence: z.object(evidenceShape),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.updateTaskDependencies(token(ctx), input)));
+
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
     inputSchema: z.object({
