@@ -664,6 +664,8 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     // The code went to the IdP's own /token; neither product proxy was touched.
     expect(idpTokenCalls(r)).toHaveLength(1);
     expect(r.world.requests.filter(x => x.url.includes('/api/auth/token') || x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    // Third-party public clients go through the IdP consent hop before the code is issued.
+    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(1);
     // No workspace listing happens for an ops session.
     expect(r.world.requests.filter(x => x.url.includes('/api/session/'))).toHaveLength(0);
     expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_login' });
