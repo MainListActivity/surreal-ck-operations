@@ -1,7 +1,8 @@
 #!/bin/sh
 # Deploys the company MCP service to the remote host (Ubuntu/ARM64):
 # dedicated sckcompany user, pinned bun runtime, systemd unit, Caddy path prefix
-# on the existing domain. Idempotent; safe to re-run per release.
+# on the existing domain. Idempotent; safe to re-run per release: it restarts the service
+# onto the given commit and fails unless the new release answers /ready.
 #
 #   scripts/deploy-mcp-remote.sh [commit]
 #
@@ -100,8 +101,22 @@ ProtectHome=true
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now sck-company-mcp.service
+systemctl enable sck-company-mcp.service
 REMOTE_UNIT
+
+# --- remote: restart onto the new release ------------------------------------
+# The process reads its code once at start, so moving the `current` symlink is not enough
+# (`enable --now` leaves a running unit alone). Fail the deploy if the new release is not ready.
+ssh "$host" bash -s -- "$port" <<'REMOTE_RESTART'
+set -eu
+sudo systemctl restart sck-company-mcp.service
+for _ in $(seq 1 45); do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/ready")" = 200 ] && exit 0
+  sleep 2
+done
+echo 'sck-company-mcp not ready 90s after restart' >&2
+exit 1
+REMOTE_RESTART
 
 # --- remote: caddy route -----------------------------------------------------
 ssh "$host" 'sudo bash -s' <<REMOTE_CADDY
