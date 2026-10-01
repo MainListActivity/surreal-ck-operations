@@ -78,12 +78,38 @@ export interface ProviderUsageView {
   balances: Array<{ label: string; remaining?: number | null; limit?: number | null; unit?: string; tone?: string }>;
 }
 
+/** One candidate row in a staffing pool: an existing instance (reuse) or a def that could spawn. */
+export interface StaffingEntryView {
+  kind: "reuse" | "spawn";
+  /** inst id for reuse, def id for spawn. */
+  ref: string;
+  /** effectiveWeight — the exact number weightedOrder picks by. */
+  weight: number;
+  /** Share of this candidate's weight among eligible candidates in the same pool (0..1). */
+  share: number;
+  eligible: boolean;
+  reason?: string;
+  model?: string;
+}
+
+/** The candidate pool for one role in one project, evaluated by the same staffingPool the tick uses. */
+export interface StaffingPoolView {
+  role: string;
+  /** Repository path the pool is scoped to. */
+  home: string;
+  entries: StaffingEntryView[];
+}
+
 export interface Roster {
   paused: boolean;
+  /** The operations repo; pools whose home equals this render as the default project. */
+  opsRepo: string;
   usage: ProviderUsageView[];
-  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number }>;
+  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; avgScore?: number }>;
   instances: Array<{ id: string; def?: string; role: string; provider?: string; cwd?: string; agentId?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
+  /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
+  pools: StaffingPoolView[];
 }
 
 export interface ModelOption {

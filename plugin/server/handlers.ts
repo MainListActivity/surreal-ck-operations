@@ -86,7 +86,9 @@ export function registerHandlers(server: PluginServerContext): void {
   });
 
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
-    const { db, workforce } = await company();
+    const { db, workforce, opsRepo } = await company();
+    const { staffingPool, quotaBlockedProviders } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { readProviderQuotas } = await import("./dispatch.ts");
     const cfg = await workforce.config();
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
     const agents = paseo ? await paseo.agents.list() : { entries: [] };
@@ -98,22 +100,59 @@ export function registerHandlers(server: PluginServerContext): void {
       d.model?.startsWith("auto:")
         ? modelSlots[`${d.provider}:${d.model.slice(5)}`] ?? "未解析"
         : undefined;
+    const defs = await workforce.defs();
+    const insts = await workforce.insts();
+    const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
+
+    // Staffing preview: recompute the exact inputs the tick derives, then call the same
+    // staffingPool — the numbers the owner sees are the numbers dispatch picks by.
+    type InstState = import("./vendor/src/dispatcher/dispatcher").InstState;
+    const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
+    const states = new Map<string, InstState>();
+    for (const inst of insts) {
+      const st = inst.paseoAgentId ? statusById.get(inst.paseoAgentId) ?? "missing" : "missing";
+      states.set(inst.id,
+        st === "running" || st === "initializing" ? "busy" :
+        st === "idle" ? "idle" :
+        st === "error" && healthMap.get(inst.provider ?? "")?.state === "exhausted" ? "exhausted" : "down");
+    }
+    const tasks = await workforce.tasks();
+    const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+    const busyBy = new Map<string, number>();
+    for (const inst of insts) {
+      if (states.get(inst.id) !== "busy") continue;
+      busyBy.set(inst.provider ?? "", (busyBy.get(inst.provider ?? "") ?? 0) + 1);
+    }
+    const quotaBlocked = quotaBlockedProviders(await readProviderQuotas({ db }), cfg, Date.now());
+    const slots = new Map(Object.entries(modelSlots));
+    const homes = [...new Set([opsRepo, ...insts.map(i => i.cwd ?? opsRepo), ...tasks.map(t => t.repoPath ?? opsRepo)])];
+    const roles = [...new Set([...defs.map(d => d.role), ...insts.map(i => i.role)])];
+    const now = Math.floor(Date.now() / 1000);
+    const pools = roles.flatMap(role => homes.map(home => ({
+      role, home,
+      entries: staffingPool({ role, home, defs, insts, states, holding, health: healthMap,
+        quotaBlocked, busyBy, providerMax: cfg.providerMax, slots, opsRepo, sidecar: true, now })
+        .map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share, eligible: e.eligible, reason: e.reason, model: e.model })),
+    })).filter(p => p.entries.length));
+
     return {
       paused: cfg.paused,
+      opsRepo,
       usage: usageEntries.map((u: any) => ({
         providerId: u.providerId, displayName: u.displayName, planLabel: u.planLabel, status: u.status,
         windows: (u.windows ?? []).map((w: any) => ({ label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt, tone: w.tone })),
         balances: (u.balances ?? []).map((b: any) => ({ label: b.label, remaining: b.remaining, limit: b.limit, unit: b.unit, tone: b.tone })),
       })),
-      defs: (await workforce.defs()).map(d => ({
+      defs: defs.map(d => ({
         id: d.id, role: d.role, provider: d.provider, model: d.model, resolved: resolveDisplay(d),
-        thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight,
+        thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight, avgScore: d.avgScore,
       })),
-      instances: (await workforce.insts()).map(i => ({
+      instances: insts.map(i => ({
         id: i.id, def: i.def, role: i.role, provider: i.provider, cwd: i.cwd,
         agentId: i.paseoAgentId, agentStatus: i.paseoAgentId ? statusById.get(i.paseoAgentId) : undefined,
       })),
-      health: health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until })),
+      health: healthView,
+      pools,
     };
   });
 

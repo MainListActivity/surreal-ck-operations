@@ -13,7 +13,130 @@ export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usag
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 
-type InstState = 'busy' | 'idle' | 'down' | 'exhausted';
+export type InstState = 'busy' | 'idle' | 'down' | 'exhausted';
+
+/** 'ok' healthy / 'probe' single trial session allowed / 'down' cooling off. */
+const availabilityOf = (h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' =>
+  !h || h.state === 'healthy' ? 'ok' : now >= (h.until ?? 0) ? 'probe' : 'down';
+
+/** Quota circuit breaker, shared by the tick and the roster staffing preview. */
+export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyConfig, 'quotaFloorPct' | 'quotaWeeklyFloorPct'>, now: number): Map<string, string> {
+  const blocked = new Map<string, string>();
+  if (cfg.quotaFloorPct <= 0 && cfg.quotaWeeklyFloorPct <= 0) return blocked;
+  for (const q of rows) {
+    const age = q.fetchedAt ? now - Date.parse(q.fetchedAt) : 0;
+    if (age >= 15 * 60_000) continue;
+    const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
+    const session = hasSplit ? q.sessionPct : q.lowestPct;
+    const hits: string[] = [];
+    if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
+    if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
+    if (hits.length) blocked.set(q.provider, `额度不足（${hits.join('，')}）`);
+  }
+  return blocked;
+}
+
+/** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
+export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>): boolean {
+  if (quotaBlocked?.has(provider)) return false;
+  const availability = availabilityOf(health.get(provider), now);
+  if (availability === 'down') return false;
+  const busy = busyBy.get(provider) ?? 0;
+  return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
+}
+
+/** One row of the staffing preview: an instance that could be reused, or a def that could spawn. */
+export interface StaffingEntry {
+  kind: 'reuse' | 'spawn';
+  /** inst.id for reuse, `spawn:<defId>` for spawn. */
+  key: string;
+  ref: string;
+  role: string;
+  provider: string;
+  model?: string;
+  def?: EmployeeDef;
+  inst?: EmployeeInst;
+  /** effectiveWeight — exactly what weightedOrder picks by. */
+  weight: number;
+  /** Share of this candidate's weight among all eligible candidates in the same role+home pool. */
+  share: number;
+  eligible: boolean;
+  reason?: string;
+}
+
+export interface StaffingInput {
+  role: string;
+  home: string;
+  task?: SupervisedTask;
+  /** Review work never goes to the submitter. */
+  excludeSubmitter?: boolean;
+  defs: EmployeeDef[];
+  insts: EmployeeInst[];
+  states: ReadonlyMap<string, InstState>;
+  holding: ReadonlySet<string>;
+  assigned?: ReadonlySet<string>;
+  health: ReadonlyMap<string, ProviderHealth>;
+  quotaBlocked: ReadonlyMap<string, string>;
+  busyBy: ReadonlyMap<string, number>;
+  providerMax: Record<string, number>;
+  slots: ReadonlyMap<string, string>;
+  opsRepo: string;
+  sidecar: boolean;
+  now: number;
+}
+
+/**
+ * The role+home candidate pool, evaluated with the exact predicates the tick uses.
+ * Eligible entries carry weight + normalized share; ineligible ones carry `reason`.
+ * The dispatcher consumes this for picks; the roster surfaces it verbatim, so the
+ * owner page always previews the same numbers dispatch would use.
+ */
+export function staffingPool(p: StaffingInput): StaffingEntry[] {
+  const resolveSlot = (def: EmployeeDef): string | undefined =>
+    (def.model ?? '').startsWith('auto:') ? p.slots.get(`${def.provider}:${(def.model ?? '').slice(5)}`) : (def.model || undefined);
+  const ready = (inst: EmployeeInst) =>
+    p.states.get(inst.id) === 'idle' ||
+    (p.states.get(inst.id) === 'exhausted' && availabilityOf(p.health.get(inst.provider ?? ''), p.now) === 'probe');
+  const currentModel = (inst: EmployeeInst): boolean => {
+    const def = p.defs.find(d => d.id === inst.def);
+    const target = def && resolveSlot(def);
+    return !target || !inst.model || inst.model === target;
+  };
+  const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  const entries: StaffingEntry[] = [];
+  for (const inst of p.insts) {
+    if (inst.role !== p.role) continue;
+    if ((inst.cwd ?? p.opsRepo) !== p.home) continue;
+    const def = p.defs.find(d => d.id === inst.def);
+    const reason =
+      !ready(inst) ? '会话占用中/异常' :
+      p.assigned?.has(inst.id) ? '本轮已分配' :
+      p.holding.has(inst.id) ? '持有在办任务' :
+      (p.excludeSubmitter && inst.id === p.task?.submittedBy) ? '提交者回避' :
+      (p.sidecar && inst.credentialFile) ? '凭证文件实例不可接新任务' :
+      !currentModel(inst) ? '模型槽位已漂移' :
+      !cap(inst.provider ?? '') ? 'provider 无可用容量' : undefined;
+    entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
+      provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
+      weight: effectiveWeight(def), share: 0, eligible: !reason, reason });
+  }
+  for (const def of p.defs) {
+    if (def.role !== p.role) continue;
+    const resolved = resolveSlot(def);
+    const seats = p.insts.filter(i => i.def === def.id && (i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
+    const reason =
+      !def.enabled ? '编制停用' :
+      resolved === undefined ? '模型槽位未解析' :
+      seats >= def.maxInstances ? `实例数 ${seats}/${def.maxInstances} 已满` :
+      !cap(def.provider) ? 'provider 无可用容量' : undefined;
+    entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
+      provider: def.provider, model: resolved ?? def.model, def,
+      weight: effectiveWeight(def), share: 0, eligible: !reason, reason });
+  }
+  const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
+  for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
+  return entries;
+}
 
 export interface DispatcherDeps {
   workforce: Workforce;
@@ -105,23 +228,8 @@ export class Dispatcher {
     // Quota circuit breaker: separate floors for short windows (session/5h + balances)
     // and long windows (week/month). Stale snapshots (>15min) fail open rather than
     // keeping a provider blocked forever.
-    const quotaBlocked = new Map<string, string>();
-    if (cfg.quotaFloorPct > 0 || cfg.quotaWeeklyFloorPct > 0) {
-      for (const q of quotaRows) {
-        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
-        if (age >= 15 * 60_000) continue;
-        // Rows written before split fields existed carry only lowestPct: judge it under the
-        // short-window floor. Once session/weekly are written, a missing short-window value
-        // means the provider simply has none — don't reinterpret the long-window low as short.
-        const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
-        const session = hasSplit ? q.sessionPct : q.lowestPct;
-        const hits: string[] = [];
-        if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
-        if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
-        if (hits.length) quotaBlocked.set(q.provider, `额度不足（${hits.join('，')}）`);
-      }
-      if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
-    }
+    const quotaBlocked = quotaBlockedProviders(quotaRows, cfg, Date.now());
+    if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
 
     // 1. Session health.
     const states = new Map<string, InstState>();
@@ -270,34 +378,19 @@ export class Dispatcher {
     }
     const assigned = new Set<string>();
     const rand = this.deps.rand ?? Math.random;
-    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
-      (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
-    // An instance may only serve tasks on the model its def currently resolves to;
-    // otherwise a stale exhausted→probe instance could be reused for new work.
-    const currentModel = (inst: EmployeeInst): boolean => {
-      const def = defs.find(d => d.id === inst.def);
-      const target = def && resolveModel(def);
-      return !target || !inst.model || inst.model === target;
-    };
-    const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      inst.role === role && ready(inst) && !assigned.has(inst.id) &&
-      !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
-      // A credential-file instance can only finish what it already holds; the sidecar
-      // refuses new claims for it, so it must not appear as a reuse candidate.
-      !(this.deps.sidecar && inst.credentialFile) &&
-      currentModel(inst) &&
-      this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
-    // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
+    // The candidate pool is evaluated by staffingPool — the same function the owner
+    // page previews — so dispatch gating and the roster can never drift apart.
+    const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
+      providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
+      sidecar: !!this.deps.sidecar, now };
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
-    // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
-    // a def at capacity in the ops repo can still spawn for a task in another repo.
-    // Credential-file stragglers do not consume seats: they cannot serve new work.
+      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, assigned })
+        .flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
     const eligibleDefs = (role: string, home: string) =>
-      defs.filter(d => d.enabled && d.role === role && resolveModel(d) !== undefined &&
-        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home &&
-          !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
-        this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
+      staffingPool({ ...poolBase, insts, role, home })
+        .flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
+      (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
     // starve their roles, so escalate once (clears automatically when resolution returns).
     const unresolved = defs.filter(d => d.enabled && (d.model ?? '').startsWith('auto:') && resolveModel(d) === undefined);
@@ -636,17 +729,12 @@ export class Dispatcher {
   }
 
   private available(h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' {
-    if (!h || h.state === 'healthy') return 'ok';
-    return now >= (h.until ?? 0) ? 'probe' : 'down';
+    return availabilityOf(h, now);
   }
 
   /** A recovering provider gets a single probe session until a turn completes cleanly. */
   private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Map<string, string>): boolean {
-    if (quotaBlocked?.has(provider)) return false;
-    const availability = this.available(health.get(provider), now);
-    if (availability === 'down') return false;
-    const busy = busyBy.get(provider) ?? 0;
-    return availability === 'probe' ? busy === 0 : busy < (cfg.providerMax[provider] ?? 1);
+    return providerCapacity(provider, cfg.providerMax, health, busyBy, now, quotaBlocked);
   }
 
   private async assign(

@@ -173,6 +173,21 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   return providers;
 }
 
+/** ProviderQuota rows the dispatcher's circuit breaker consumes; shared with the roster preview. */
+export async function readProviderQuotas(ctx: Pick<Company, "db">): Promise<import("./vendor/src/contracts").ProviderQuota[]> {
+  const [rows] = await ctx.db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
+    `SELECT provider, summary, lowest_pct, session_pct, weekly_pct, status, fetched_at, at FROM company_meta
+     WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
+  return (rows ?? []).map(r => ({
+    provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
+    sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
+    // Freshness = when WE last verified the row, not the upstream snapshot time:
+    // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
+    // the circuit breaker would fail open on dead data.
+    fetchedAt: String(r.at ?? "") || r.fetched_at,
+  }));
+}
+
 async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
   const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
     `SELECT payload FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
