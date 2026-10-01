@@ -15,6 +15,9 @@ import type { EnvBrokerRow } from '../../src/projects.ts';
 
 export const TENANT = 'tenant-ck-0001';
 export const REDIRECT = 'https://app.test/auth/callback';
+export const OPS_CLIENT = 'ops-client-0001';
+export const OPS_REDIRECT = 'https://ops.test/auth/callback';
+export const OPS_RESOURCE = 'https://app.test/api/ops/mcp';
 
 export const brokerConfig = (patch: Record<string, unknown> = {}) => ({
   roles: ['qa', 'engineering'],
@@ -33,7 +36,7 @@ const apiError = (status: number, code: string) => json(status, { error: { code,
 
 interface Member { id: string; email: string; displayName: string; isAdmin: boolean; subject?: string; disabled: boolean }
 interface Workspace { slug: string; name: string; dbName: string; members: Member[] }
-interface Grant { userId: string; db?: string; expiresAt: number }
+interface Grant { userId: string; db?: string; expiresAt: number; ops?: boolean }
 
 /** `timeout` and `reset` throw like a flaky WAN; a number is an HTTP status the edge answers instead of the service. */
 export type Fault = 'timeout' | 'reset' | number;
@@ -51,9 +54,11 @@ export class FakeWorld {
   /** Every access token the world ever minted, for leak assertions. */
   readonly minted: string[] = [];
   readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string }> = [];
+  /** IdP subject → active platform-operator capabilities, like the product's capability table. */
+  readonly operatorCaps = new Map<string, string[]>();
   private readonly grants = new Map<string, Grant>();
-  private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string }>();
-  private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string }>();
+  private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string; client: string }>();
+  private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
 
   constructor() {
     this.sqlite.run(`CREATE TABLE users (
@@ -159,13 +164,19 @@ export class FakeWorld {
 
   private idpAuthorize(url: URL): Response {
     const q = url.searchParams;
-    if (url.pathname !== '/t/ck/authorize' || q.get('response_type') !== 'code' || q.get('client_id') !== 'client-ck-1234'
-      || q.get('redirect_uri') !== REDIRECT || q.get('code_challenge_method') !== 'S256' || !q.get('code_challenge')
-      || q.get('audience') !== 'https://auth.test' || !q.get('state')) {
+    const client = q.get('client_id') ?? '';
+    // The customer client asks for `audience`, the ops public client for RFC 8707 `resource`.
+    const validClient = client === 'client-ck-1234'
+      ? q.get('redirect_uri') === REDIRECT && q.get('audience') === 'https://auth.test' && !q.get('resource')
+      : client === OPS_CLIENT
+        ? q.get('redirect_uri') === OPS_REDIRECT && q.get('resource') === OPS_RESOURCE && !q.get('audience')
+        : false;
+    if (url.pathname !== '/t/ck/authorize' || q.get('response_type') !== 'code' || !validClient
+      || q.get('code_challenge_method') !== 'S256' || !q.get('code_challenge') || !q.get('state')) {
       return json(400, { error: 'invalid_request' });
     }
     const id = randomBytes(8).toString('hex');
-    this.challenges.set(id, { state: q.get('state')!, codeChallenge: q.get('code_challenge')!, redirectUri: q.get('redirect_uri')! });
+    this.challenges.set(id, { state: q.get('state')!, codeChallenge: q.get('code_challenge')!, redirectUri: q.get('redirect_uri')!, client });
     return new Response(null, { status: 302, headers: { location: `https://auth.test/step?c=${id}` } });
   }
 
@@ -184,7 +195,7 @@ export class FakeWorld {
       return json(401, { error: 'invalid_credentials' });
     }
     const code = `code-${randomBytes(8).toString('hex')}`;
-    this.codes.set(code, { userId: user.id, codeChallenge: challenge.codeChallenge, redirectUri: challenge.redirectUri });
+    this.codes.set(code, { userId: user.id, codeChallenge: challenge.codeChallenge, redirectUri: challenge.redirectUri, client: challenge.client });
     const redirect = new URL(challenge.redirectUri);
     redirect.searchParams.set('code', code);
     redirect.searchParams.set('state', challenge.state);
@@ -193,10 +204,10 @@ export class FakeWorld {
 
   // ---------- product ----------
 
-  private mint(userId: string, db?: string): string {
-    const payload = Buffer.from(JSON.stringify({ sub: userId, db, jti: randomUUID(), exp: Math.floor((this.clock + 900_000) / 1000) })).toString('base64url');
+  private mint(userId: string, db?: string, ops = false): string {
+    const payload = Buffer.from(JSON.stringify({ sub: userId, db, aud: ops ? OPS_RESOURCE : 'https://auth.test', jti: randomUUID(), exp: Math.floor((this.clock + 900_000) / 1000) })).toString('base64url');
     const token = `eyJhbGciOiJSUzI1NiJ9.${payload}.${randomBytes(12).toString('base64url')}`;
-    this.grants.set(token, { userId, db, expiresAt: this.clock + 900_000 });
+    this.grants.set(token, { userId, db, expiresAt: this.clock + 900_000, ops });
     this.minted.push(token);
     return token;
   }
@@ -220,7 +231,8 @@ export class FakeWorld {
 
   private async product(url: URL, method: string, init?: RequestInit): Promise<Response> {
     if (url.pathname === '/health') return json(200, { ok: true });
-    if (url.pathname === '/api/auth/token') return this.exchange(init);
+    if (url.pathname === '/api/auth/token') return this.exchange(init, false);
+    if (url.pathname === '/api/auth/ops/token') return this.exchange(init, true);
     const header = new Headers(init?.headers).get('authorization') ?? '';
     const grant = this.grant(header.replace(/^Bearer /, ''));
     if (!grant) return apiError(401, 'oidc-expired');
@@ -271,20 +283,39 @@ export class FakeWorld {
         return json(200, { ok: true });
       }
     }
+    // Ops endpoints verify the ops audience and re-read the caller's capabilities per request,
+    // mirroring the product's requirePlatformOperator middleware.
+    if (url.pathname.startsWith('/api/ops/')) {
+      if (!grant.ops) return apiError(401, 'oidc-ops-audience-invalid');
+      const caps = this.operatorCaps.get(grant.userId) ?? [];
+      if (!caps.length) return apiError(403, 'platform-operator-inactive');
+      if (method === 'GET' && url.pathname === '/api/ops/quota/context') {
+        return json(200, { subject: grant.userId, capabilities: caps });
+      }
+      const entitlement = /^\/api\/ops\/product-entitlements\/workspaces\/[^/]+$/.exec(url.pathname);
+      if (method === 'GET' && entitlement) {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        return json(200, { slug: decodeURIComponent(url.pathname.split('/').pop()!), entitlement: { revision: 3 } });
+      }
+      return apiError(404, 'not-found');
+    }
     if (url.pathname === '/api/echo') return json(400, { error: { code: 'echo', message: `you sent ${header}` }, token: header.replace(/^Bearer /, '') });
     if (url.pathname === '/api/boom') return json(500, { error: { code: 'internal', message: 'boom' } });
     return apiError(404, 'not-found');
   }
 
-  private exchange(init?: RequestInit): Response {
+  private exchange(init: RequestInit | undefined, ops: boolean): Response {
     const form = new URLSearchParams(String(init?.body ?? ''));
     const code = this.codes.get(form.get('code') ?? '');
     this.codes.delete(form.get('code') ?? '');
     const challenge = createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url');
-    if (!code || form.get('grant_type') !== 'authorization_code' || form.get('redirect_uri') !== code.redirectUri || challenge !== code.codeChallenge) {
+    // The confidential customer proxy keeps its client to itself; the ops public client must name itself.
+    const clientOk = ops ? form.get('client_id') === OPS_CLIENT : form.get('client_id') === null;
+    if (!code || !clientOk || code.client !== (ops ? OPS_CLIENT : 'client-ck-1234')
+      || form.get('grant_type') !== 'authorization_code' || form.get('redirect_uri') !== code.redirectUri || challenge !== code.codeChallenge) {
       return json(400, { error: 'invalid_grant' });
     }
-    return json(200, { access_token: this.mint(code.userId), token_type: 'Bearer', expires_in: 900 });
+    return json(200, { access_token: this.mint(code.userId, undefined, ops), token_type: 'Bearer', expires_in: 900 });
   }
 }
 

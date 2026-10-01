@@ -20,7 +20,7 @@ import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
 
 export const OPS_TOOLS = [
-  'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_logout', 'ops_workspace_ensure',
+  'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
@@ -122,6 +122,7 @@ export class OpsBroker {
       ops_health: (ctx) => this.health(ctx),
       ops_account_ensure: (ctx, args) => this.accountEnsure(ctx, args),
       ops_login: (ctx, args) => this.login(ctx, args),
+      ops_operator_login: (ctx, args) => this.operatorLogin(ctx, args),
       ops_logout: (ctx, args) => this.logout(ctx, args),
       ops_workspace_ensure: (ctx, args) => this.workspaceEnsure(ctx, args),
       ops_member_list: (ctx, args) => this.memberList(ctx, args),
@@ -187,7 +188,7 @@ export class OpsBroker {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops },
       },
     };
   }
@@ -271,16 +272,16 @@ export class OpsBroker {
     }
     let tokens: LoginTokens;
     try {
-      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now });
+      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'customer' });
     } catch (error) {
       // A sealed password the IdP no longer accepts is drift (someone reset it out of band): repair once.
       if (!(error instanceof LoginError) || error.reason !== 'invalid_credentials' || ensured || !this.canEnsure(ctx)) throw error;
       ({ password, result: ensured } = await this.ensure(ctx, alias));
-      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now });
+      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'customer' });
     }
     const session = this.sessions.create({
       employeeId: ctx.scope.actor.employeeId, project: ctx.scope.project, env: ctx.env, alias, username,
-      token: tokens.accessToken, expiresAt: tokens.expiresAt,
+      kind: 'customer', token: tokens.accessToken, expiresAt: tokens.expiresAt,
     });
     let listing: { workspaces: WorkspaceItem[]; canCreate: boolean };
     try {
@@ -297,11 +298,55 @@ export class OpsBroker {
     }
     return {
       value: {
-        session: session.id, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
+        session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
         accountResult: ensured, workspace: session.workspace, canCreate: listing.canCreate,
         workspaces: listing.workspaces.map(({ slug, name, role }) => ({ slug, name, role })),
       },
       audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}` },
+    };
+  }
+
+  /**
+   * Logs the alias in through the dedicated ops OIDC client so the session's token carries the
+   * ops audience, then probes the product's operator middleware (`/api/ops/quota/context` needs
+   * an active platform operator and no specific capability) so a wrong-audience token, an
+   * account that is not an operator, or one whose ops client is misconfigured fails here with
+   * a clear error instead of inside somebody's workflow.
+   */
+  private async operatorLogin(ctx: Ctx, args: Args): Promise<Outcome> {
+    if (!ctx.cfg.ops) throw new CompanyError('not_configured', 'this environment has no operator channel; set broker.ops (clientId, redirectUri, resource) to enable it');
+    const alias = canonicalAlias(args.alias);
+    const username = accountUsername(alias, ctx.cfg.accounts.prefix);
+    let password = await this.sealedPassword(ctx, alias);
+    let ensured: EnsureAccountResult['result'] | undefined;
+    if (!password) {
+      ({ password, result: ensured } = await this.ensure(ctx, alias));
+    }
+    let tokens: LoginTokens;
+    try {
+      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'operator' });
+    } catch (error) {
+      // A sealed password the IdP no longer accepts is drift (someone reset it out of band): repair once.
+      if (!(error instanceof LoginError) || error.reason !== 'invalid_credentials' || ensured || !this.canEnsure(ctx)) throw error;
+      ({ password, result: ensured } = await this.ensure(ctx, alias));
+      tokens = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'operator' });
+    }
+    const session = this.sessions.create({
+      employeeId: ctx.scope.actor.employeeId, project: ctx.scope.project, env: ctx.env, alias, username,
+      kind: 'operator', token: tokens.accessToken, expiresAt: tokens.expiresAt,
+    });
+    const probe = await productRequest(ctx.cfg, session.token, { method: 'GET', path: '/api/ops/quota/context' }, { fetch: this.deps.fetch });
+    if (!probe.ok) {
+      this.sessions.drop(session.id);
+      throw productFailure('operator access check', probe, { 401: 'login_failed', 403: 'forbidden' });
+    }
+    const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    return {
+      value: {
+        session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
+        accountResult: ensured, operator: clipJson(redactJson(probe.body, known)),
+      },
+      audit: { action: 'ops_operator_login', evidence: `operator login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}` },
     };
   }
 
@@ -315,6 +360,15 @@ export class OpsBroker {
     return this.sessions.get(args.session, ctx.scope.actor.employeeId, ctx.scope.project, ctx.env);
   }
 
+  /** Every session tool but `ops_request` only makes sense for a customer session. */
+  private customerSession(ctx: Ctx, args: Args): OpsSession {
+    const session = this.session(ctx, args);
+    if (session.kind !== 'customer') {
+      throw invalid('this session is an operator session; it can only be used with ops_request on /api/ops/* paths');
+    }
+    return session;
+  }
+
   private adopt(session: OpsSession, token: { accessToken: string; expiresIn?: number }): void {
     session.token = token.accessToken;
     session.expiresAt = token.expiresIn !== undefined ? this.now() + token.expiresIn * 1000
@@ -325,7 +379,7 @@ export class OpsBroker {
   private async reauth(ctx: Ctx, session: OpsSession): Promise<void> {
     const password = await this.sealedPassword(ctx, session.alias);
     if (!password) throw new CompanyError('not_found', `no sealed password for ${session.alias}; call ops_account_ensure`);
-    const tokens = await passwordLogin(ctx.cfg, session.username, password, { fetch: this.deps.fetch, now: this.now });
+    const tokens = await passwordLogin(ctx.cfg, session.username, password, { fetch: this.deps.fetch, now: this.now, channel: session.kind });
     session.token = tokens.accessToken;
     session.expiresAt = tokens.expiresAt;
     const workspace = session.workspace;
@@ -383,7 +437,7 @@ export class OpsBroker {
   }
 
   private async workspaceEnsure(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const slug = slugOf(args);
     const listing = await this.listWorkspaces(ctx, session);
     const existing = listing.workspaces.find(w => w.slug === slug);
@@ -432,7 +486,7 @@ export class OpsBroker {
   }
 
   private async memberList(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const slug = slugOf(args);
     return {
       value: { slug, members: await this.members(ctx, session, slug) },
@@ -441,7 +495,7 @@ export class OpsBroker {
   }
 
   private async memberAdd(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const slug = slugOf(args);
     const alias = canonicalAlias(args.alias);
     const username = accountUsername(alias, ctx.cfg.accounts.prefix);
@@ -457,7 +511,7 @@ export class OpsBroker {
   }
 
   private async memberRemove(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const slug = slugOf(args);
     const alias = canonicalAlias(args.alias);
     const username = accountUsername(alias, ctx.cfg.accounts.prefix);
@@ -478,11 +532,16 @@ export class OpsBroker {
     const session = this.session(ctx, args);
     const method = text(args, 'method', 10).toUpperCase();
     const path = text(args, 'path', 2000);
+    // Sessions stay in their lane: an operator token only serves ops endpoints, and a customer
+    // token is never sent to them at all (the product would answer 401 for the wrong audience).
+    const opsPath = /^\/api\/ops(\/|$|\?)/.test(path);
+    if (session.kind === 'operator' && !opsPath) throw invalid('an operator session can only call /api/ops/* paths');
+    if (session.kind === 'customer' && opsPath) throw invalid('a customer session cannot call /api/ops/*; call ops_operator_login for an operator session');
     const res = await this.product(ctx, session, method, path, args.body);
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
     return {
       value: { status: res.status, ok: res.ok, body: clipJson(redactJson(res.body, known)) },
-      audit: { action: 'ops_call', evidence: `${method} ${path.split('?')[0]} → ${res.status}（${session.username}）` },
+      audit: { action: 'ops_call', evidence: `${method} ${path.split('?')[0]} → ${res.status}（${session.kind === 'operator' ? '运营 ' : ''}${session.username}）` },
     };
   }
 
@@ -493,7 +552,7 @@ export class OpsBroker {
   }
 
   private async query(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const sql = text(args, 'sql', 20_000);
     if (args.vars !== undefined && (typeof args.vars !== 'object' || args.vars === null || Array.isArray(args.vars))) throw invalid('vars must be an object');
     const workspace = args.slug !== undefined ? await this.useWorkspace(ctx, session, slugOf(args)) : session.workspace;
@@ -507,7 +566,7 @@ export class OpsBroker {
   }
 
   private async browserLogin(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.session(ctx, args);
+    const session = this.customerSession(ctx, args);
     const spaceId = Number(args.spaceId);
     if (!Number.isInteger(spaceId) || spaceId < 0) throw invalid('spaceId must be the numeric id of your ego-browser task space');
     const page = args.page === undefined ? 'p1' : text(args, 'page', 8);

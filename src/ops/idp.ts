@@ -16,6 +16,9 @@ export interface LoginTokens {
   expiresAt: number;
 }
 
+/** `customer` rides the product web app's client; `operator` the dedicated ops public client. */
+export type LoginChannel = 'customer' | 'operator';
+
 export interface LoginOptions {
   fetch?: Fetcher;
   now?: () => number;
@@ -23,6 +26,7 @@ export interface LoginOptions {
   stepTimeoutMs?: number;
   /** Limit for all attempts together; tests shrink it. */
   budgetMs?: number;
+  channel?: LoginChannel;
 }
 
 const MAX_HOPS = 8;
@@ -95,11 +99,43 @@ export function jwtExpiry(token: string): number | undefined {
   } catch { return undefined; }
 }
 
+interface Channel {
+  clientId: string;
+  redirectUri: string;
+  scope: string;
+  /** Extra authorize params: the customer client sends `audience`, the ops client RFC 8707 `resource`. */
+  authorize: Record<string, string>;
+  /** Where on the product the authorization code is redeemed. */
+  tokenPath: string;
+  /** Public clients authenticate to the product's token proxy with `client_id` in the form body. */
+  sendsClientId: boolean;
+}
+
+/** Resolves the OIDC client profile for a channel; missing config fails before any network call. */
+function channelFor(config: BrokerConfig, kind: LoginChannel = 'customer'): Channel {
+  if (kind === 'customer') {
+    return {
+      clientId: config.idp.clientId, redirectUri: config.idp.redirectUri, scope: config.idp.scope,
+      authorize: config.idp.audience ? { audience: config.idp.audience } : {},
+      tokenPath: '/api/auth/token', sendsClientId: false,
+    };
+  }
+  const ops = config.ops;
+  if (!ops) {
+    throw new CompanyError('not_configured', 'this environment has no operator OIDC client configured (broker.ops)');
+  }
+  return {
+    clientId: ops.clientId, redirectUri: ops.redirectUri, scope: ops.scope,
+    authorize: ops.resource ? { resource: ops.resource } : {},
+    tokenPath: '/api/auth/ops/token', sendsClientId: true,
+  };
+}
+
 /**
  * The same authorization-code + PKCE dance the product's web app performs, driven by the
- * password route of the IdP login page; the code is redeemed at the product's own
- * confidential proxy, which holds the client secret. Failure messages carry status codes and
- * IdP error codes only, so they are safe to relay to employees.
+ * password route of the IdP login page; the code is redeemed at the product's token proxy
+ * (`channel` picks the customer proxy or the ops public-client one). Failure messages carry
+ * status codes and IdP error codes only, so they are safe to relay to employees.
  *
  * A timeout, a dropped connection or a 5xx anywhere in the flow earns one more attempt from a
  * fresh challenge: the challenge and the code are single-use, so single steps are never replayed.
@@ -108,6 +144,7 @@ export function jwtExpiry(token: string): number | undefined {
 export async function passwordLogin(
   config: BrokerConfig, username: string, password: string, options: LoginOptions = {},
 ): Promise<LoginTokens> {
+  const channel = channelFor(config, options.channel);
   const started = Date.now();
   const budgetMs = options.budgetMs ?? BUDGET_MS;
   const stepMs = options.stepTimeoutMs ?? STEP_TIMEOUT_MS;
@@ -121,7 +158,7 @@ export async function passwordLogin(
   };
   for (let attempt = 1; ; attempt++) {
     try {
-      return await signIn(config, username, password, io, options.now ?? Date.now);
+      return await signIn(config, username, password, channel, io, options.now ?? Date.now);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       if (attempt >= MAX_ATTEMPTS || left() < RETRY_MIN_LEFT_MS) {
@@ -131,15 +168,15 @@ export async function passwordLogin(
   }
 }
 
-async function signIn(config: BrokerConfig, username: string, password: string, io: Io, now: () => number): Promise<LoginTokens> {
+async function signIn(config: BrokerConfig, username: string, password: string, channel: Channel, io: Io, now: () => number): Promise<LoginTokens> {
   const verifier = randomBytes(32).toString('base64url');
   const state = randomBytes(12).toString('base64url');
   const authorize = new URL(`${config.idp.issuer}/authorize`);
   for (const [key, value] of Object.entries({
-    response_type: 'code', client_id: config.idp.clientId, redirect_uri: config.idp.redirectUri,
-    scope: config.idp.scope, state, nonce: randomBytes(12).toString('base64url'),
+    response_type: 'code', client_id: channel.clientId, redirect_uri: channel.redirectUri,
+    scope: channel.scope, state, nonce: randomBytes(12).toString('base64url'),
     code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256',
-    ...(config.idp.audience ? { audience: config.idp.audience } : {}),
+    ...channel.authorize,
   })) authorize.searchParams.set(key, value);
 
   const { challenge, loginApi } = await findLoginChallenge(authorize.toString(), io);
@@ -163,11 +200,12 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
   const code = callback.searchParams.get('code');
   if (!code || callback.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
 
-  const { response: exchange, body: tokenRaw } = await request('token exchange', io, `${config.product.url}/api/auth/token`, {
+  const { response: exchange, body: tokenRaw } = await request('token exchange', io, `${config.product.url}${channel.tokenPath}`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: 'authorization_code', code, redirect_uri: config.idp.redirectUri, code_verifier: verifier,
+      grant_type: 'authorization_code', code, redirect_uri: channel.redirectUri, code_verifier: verifier,
+      ...(channel.sendsClientId ? { client_id: channel.clientId } : {}),
     }).toString(),
   }, true);
   if (exchange.status >= 500) throw new Unavailable('token exchange', `HTTP ${exchange.status}`);

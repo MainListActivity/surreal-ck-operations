@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { brokerConfig, FakeCompany, FakeWorld } from './support/ops-world.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
@@ -42,7 +42,7 @@ describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
       'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info', 'ops_login', 'ops_logout', 'ops_member_add',
-      'ops_member_list', 'ops_member_remove', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
@@ -98,7 +98,7 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false });
     expectNoLeaks(r);
   });
 
@@ -520,5 +520,114 @@ describe('ops audit trail', () => {
     await call(r, 'ops_info');
     expect(r.world.tokens.length).toBeGreaterThanOrEqual(4);
     expectNoLeaks(r, ['raw-secret-value']);
+  });
+});
+
+describe('operator sessions', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+  const entitlementPath = '/api/ops/product-entitlements/workspaces/qa-ws';
+
+  /** Creates the account and registers it as an active platform operator (like an IdP subject row + capability rows). */
+  const opsUser = async (r: Rig, alias: string, caps: string[] = ['quota.read']): Promise<string> => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+
+  test('an operator login rides the ops OIDC client and the session serves ops endpoints', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const login = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    expect(login).toMatchObject({ kind: 'operator', alias: 'QA_OPS', username: 'sck-qa-ops', operator: { subject, capabilities: ['quota.read'] } });
+
+    // The authorize hit the ops client with RFC 8707 resource, never the customer audience.
+    const authorize = r.world.requests.map(x => new URL(x.url)).find(u => u.pathname === '/t/ck/authorize')!;
+    expect(authorize.searchParams.get('client_id')).toBe(OPS_CLIENT);
+    expect(authorize.searchParams.get('resource')).toBe(OPS_RESOURCE);
+    expect(authorize.searchParams.get('redirect_uri')).toBe(OPS_REDIRECT);
+    expect(authorize.searchParams.get('audience')).toBeNull();
+    // The code was redeemed at the public ops token endpoint; the confidential proxy was not used.
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
+    // And the login finished with a live operator check.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/quota/context'))).toHaveLength(1);
+
+    const res = await call(r, 'ops_request', { session: login.session, method: 'GET', path: entitlementPath });
+    expect(res).toMatchObject({ status: 200, ok: true, body: { slug: 'qa-ws', entitlement: { revision: 3 } } });
+    expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create', 'ops_operator_login', 'ops_call']);
+    expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('a missing ops config fails closed before any network call', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('not_configured');
+    expect(r.world.requests).toHaveLength(0);
+    expect((await call(rig(opsPatch), 'ops_info')).can).toMatchObject({ operatorLogin: true });
+  });
+
+  test('an account that is not a platform operator fails the login probe and keeps no session', async () => {
+    const r = rig(opsPatch);
+    await call(r, 'ops_account_ensure', { alias: 'qa-ops' }); // never registered as an operator
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('platform-operator-inactive');
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expectNoLeaks(r);
+  });
+
+  test('a customer session is refused on ops paths; an operator session off them and off every other tool', async () => {
+    const r = rig(opsPatch);
+    const customer = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(customer.kind).toBe('customer');
+    const wrong = await failure(call(r, 'ops_request', { session: customer.session, method: 'GET', path: '/api/ops/quota/context' }));
+    expect(wrong.code).toBe('invalid');
+    expect(wrong.message).toContain('ops_operator_login');
+
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('invalid');
+    for (const [tool, extra] of [
+      ['ops_workspace_ensure', { slug: 'sck-x' }],
+      ['ops_member_list', { slug: 'sck-x' }],
+      ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
+      ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
+      ['ops_query', { sql: 'SELECT 1' }],
+      ['ops_browser_login', { spaceId: 1 }],
+    ] as const) {
+      const err = await failure(call(r, tool, { session: op.session, ...extra }));
+      expect(err.code, tool).toBe('invalid');
+      expect(err.message).toContain('operator session');
+    }
+    // The only /api/ops traffic so far is the login probe; the refusals never reached the product.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/'))).toHaveLength(1);
+    expect(await call(r, 'ops_logout', { session: op.session })).toEqual({ closed: true });
+    expectNoLeaks(r);
+  });
+
+  test('reauth keeps an operator session on the ops channel', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.advance(15 * 60_000); // token lifetime elapsed
+    const res = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
+    expect(res).toMatchObject({ status: 200, ok: true });
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(2);
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('capabilities are re-read on every call: revoking the operator takes effect immediately', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.operatorCaps.set(subject, []);
+    const res = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
+    expect(res).toMatchObject({ status: 403, ok: false, body: { error: { code: 'platform-operator-inactive' } } });
+    r.world.operatorCaps.set(subject, ['content.read']);
+    const denied = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
+    expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
   });
 });

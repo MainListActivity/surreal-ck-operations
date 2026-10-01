@@ -53,9 +53,19 @@ console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ url: await page.
     });
     child.once('close', code => {
       clearTimeout(timer);
-      const line = stdout.split(/\r?\n/).find(l => l.startsWith(RESULT_PREFIX));
+      // The CLI reports script output (console.log) on stderr, not stdout, and notices can
+      // land on either stream: scan both for the result line instead of one fixed stream.
+      const line = [stdout, stderr].map(text => text.split(/\r?\n/).find(l => l.startsWith(RESULT_PREFIX))).find(Boolean);
       if (code === 0 && line) {
-        try { resolve(JSON.parse(line.slice(RESULT_PREFIX.length)) as { url: string; title: string }); return; } catch { /* fall through */ }
+        try {
+          const parsed: unknown = JSON.parse(line.slice(RESULT_PREFIX.length));
+          if (parsed && typeof parsed === 'object'
+            && typeof (parsed as { url?: unknown }).url === 'string'
+            && typeof (parsed as { title?: unknown }).title === 'string') {
+            resolve(parsed as { url: string; title: string });
+            return;
+          }
+        } catch { /* fall through */ }
       }
       const detail = redactText(`${stderr}\n${stdout}`, [input.token]).trim().split(/\r?\n/).slice(-4).join(' | ').slice(0, 300);
       reject(new CompanyError('upstream_error', `browser login failed (exit ${code}): ${detail}`));
