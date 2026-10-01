@@ -314,7 +314,7 @@ export class OpsBroker {
    * `ops_login` with `audience:"ops"`: the alias logs in through the public client registered
    * at the IdP for the ops audience, redeeming the code at the IdP's own `/token` endpoint.
    * An ops session never lists or enters workspaces (the product's session routes do not
-   * accept that audience) and never auto-creates an account — a fresh account is not an
+   * accept that audience) and never auto-creates an account: a fresh account is not an
    * operator, so a missing sealed password is a plain not_found.
    */
   private async opsLogin(ctx: Ctx, args: Args, alias: string, username: string): Promise<Outcome> {
