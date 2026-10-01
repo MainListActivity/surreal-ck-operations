@@ -365,6 +365,23 @@ export class FakeWorld {
       }
       return apiError(404, 'not-found');
     }
+    // Platform content REST is operator-gated too (requirePlatformOperator + per-route capability),
+    // so the same audience/capability model applies before any route answers.
+    if (url.pathname.startsWith('/api/content/')) {
+      if (!grant.ops) return apiError(401, 'oidc-ops-audience-invalid');
+      const caps = this.operatorCaps.get(grant.userId) ?? [];
+      if (!caps.length) return apiError(403, 'platform-operator-inactive');
+      if (method === 'POST' && url.pathname === '/api/content/sources') {
+        if (!caps.includes('content.source.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        return json(201, { source: { publicId: `src-${randomBytes(4).toString('hex')}`, ...body } });
+      }
+      if (method === 'GET' && url.pathname === '/api/content/contract') {
+        if (!caps.includes('content.read')) return apiError(403, 'platform-operator-capability-missing');
+        return json(200, { contract: { version: 'v1' } });
+      }
+      return apiError(404, 'not-found');
+    }
     if (url.pathname === '/api/echo') return json(400, { error: { code: 'echo', message: `you sent ${header}` }, token: header.replace(/^Bearer /, '') });
     if (url.pathname === '/api/boom') return json(500, { error: { code: 'internal', message: 'boom' } });
     return apiError(404, 'not-found');
