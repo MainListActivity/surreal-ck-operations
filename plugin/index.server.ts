@@ -6,6 +6,16 @@ import { startDispatch } from "./server/dispatch";
 import { loadServiceEnv, serviceHome } from "./server/env";
 import { registerScrub } from "./server/scrub";
 
+// The company DB lives on a remote WSS; when it drops, the SDK rejects every
+// in-flight call. A stray floating promise becoming an unhandled rejection would
+// kill the plugin process (Node default) — log and survive instead.
+process.on("unhandledRejection", (reason) => {
+  console.error(`unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+});
+process.on("uncaughtException", (error) => {
+  console.error(`uncaught exception: ${error.stack ?? error.message}`);
+});
+
 export default function contribute(server: PluginServerContext) {
   installBunShim();
   loadServiceEnv(); // SCK_SCRUB_ENV lives there, and the zsh shim is written below, before the company stack boots

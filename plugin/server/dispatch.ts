@@ -292,7 +292,7 @@ export function startDispatch(server: PluginServerContext): () => void {
           console.warn(`usage snapshot failed: ${(error as Error).message}`);
         }
         kick();
-      });
+      }).catch((error: unknown) => console.warn(`turn_ended handler failed: ${(error as Error).message}`));
     }),
     server.on("agent.archived", (event, { paseo }) => {
       paseoHandle = paseo;
@@ -303,7 +303,7 @@ export function startDispatch(server: PluginServerContext): () => void {
         await refreshQuota(paseo, ctx).catch(() => {});
         await refreshModels(paseo, ctx).catch(() => {});
         kick();
-      });
+      }).catch((error: unknown) => console.warn(`archived handler failed: ${(error as Error).message}`));
     }),
     server.on("workspace.archived", () => kick()),
     // Company employees run unattended: a permission prompt would stall the session
@@ -329,7 +329,7 @@ export function startDispatch(server: PluginServerContext): () => void {
         const ctx = await company();
         await refreshQuota(paseo, ctx).catch(() => {});
         await refreshModels(paseo, ctx).catch(() => {});
-      });
+      }).catch((error: unknown) => console.warn(`permission handler failed: ${(error as Error).message}`));
     }),
   ];
 

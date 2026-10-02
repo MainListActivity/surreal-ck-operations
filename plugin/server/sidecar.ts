@@ -358,7 +358,9 @@ export class SidecarPool {
       for (const file of files) {
         if (!file.endsWith(".json") || this.processing.has(file)) continue;
         this.processing.add(file);
-        void this.handle(instId, file).finally(() => this.processing.delete(file));
+        void this.handle(instId, file)
+          .catch((error: unknown) => this.log(`handle ${file} failed: ${(error as Error).message}`))
+          .finally(() => this.processing.delete(file));
       }
     }
   }
