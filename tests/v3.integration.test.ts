@@ -343,13 +343,16 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect((await dispatcher.tick()).notices).not.toContain('budget');
   expect(notices.filter(n => n.includes('所有订阅')).length).toBe(1);
 
-  // Codex cooldown passes: the exhausted codex instance is probed with the review, and a clean turn heals codex.
+  // Codex cooldown passes. The review of t can no longer probe the exhausted codex instance:
+  // it claimed this task earlier, so contributor recusal keeps former executors out of review
+  // candidates (both defs are full, so nothing can spawn either). The review waits in queue,
+  // and probe recovery happens through the queued execute work (bump) instead.
   await database.db.query("UPDATE provider_health:codex SET until = 0;");
   report = await dispatcher.tick();
   expect(report.skipped).toBeUndefined();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
   expect(report.woke.map(w => w.employee)).toEqual([codexInst.employee]);
-  expect(report.woke[0].task).toBe(t.id);
-  expect(paseo.sent.at(-1)!.prompt).toContain('独立验收');
+  expect(report.woke[0].task).toBe(bump.id);
   paseo.set(codexAgent, 'idle');
   await dispatcher.tick();
   expect((await workforce.providerHealth()).get('codex')?.state).toBe('healthy');
@@ -735,6 +738,54 @@ test('dispatcher: a returned task goes back to its submitter for rework, review 
   report = await dispatcher.tick();
   const rework = report.woke.find(w => w.task === t.id);
   expect(rework?.employee).toBe(execInst.employee);
+});
+
+test('dispatcher: review skips every task contributor and waits in queue when everyone contributed', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('DELETE owner_notice;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  // 先停用全部编制：早前测试留下的 enabled def（空位）会让「全员贡献者」场景新开出非贡献者实例。
+  await database.db.query('UPDATE employee_def SET enabled = false, error_streak = 0;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  const notified: string[] = [];
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, notify: async (_t, text) => { notified.push(text); } });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: '贡献者回避验收', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  // E1 实现并提交：audit 记下 claim + submit，E1 成为贡献者与提交者。
+  let report = await dispatcher.tick();
+  const exec = report.woke.find(w => w.task === t.id)!;
+  expect(exec.spawned).toBe(true);
+  const execAgent = [...paseo.agents.keys()][0];
+  const claim = await core.claim(tokenOf(exec.employee), t.id);
+  await core.submit(tokenOf(exec.employee), proofOf(claim), { text: '实现完成：代码在任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
+  paseo.set(execAgent, 'idle');
+
+  // Review 派给非贡献者 E2（另一编制新开）；E1（提交者+作者）被排除。
+  report = await dispatcher.tick();
+  const reviewer = report.woke.find(w => w.task === t.id)!;
+  expect(reviewer.employee).not.toBe(exec.employee);
+  expect(reviewer.spawned).toBe(true);
+  const reviewerAgent = [...paseo.agents.keys()][1];
+
+  // E2 领取复核（audit 记下 claim，E2 也成为贡献者）；租约被收回后 review 仍在队列。
+  const reviewClaim = await core.claim(tokenOf(reviewer.employee), t.id);
+  await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
+  paseo.set(reviewerAgent, 'idle');
+
+  // Review 再派工：E1（提交者+作者）与 E2（复核过的前持有人、非提交人）都被回避，
+  // 两个编制均满员无法新开非贡献者 → 任务留在队列，通知里写明回避原因。
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
+  const staffNotice = (await owner.openNotices()).find(n => n.key === 'staff:engineering');
+  expect(staffNotice?.text).toContain('任务贡献者已回避');
+  expect((await task(t.id)).state).toBe('review');
 });
 
 test('dispatcher: jev picks among eligible employees using quota and score context', async () => {

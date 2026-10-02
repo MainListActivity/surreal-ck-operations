@@ -70,6 +70,12 @@ export interface StaffingInput {
   task?: SupervisedTask;
   /** Review work never goes to the submitter. */
   excludeSubmitter?: boolean;
+  /**
+   * Employee ids that ever claimed or submitted this task (authors and former
+   * lease holders). Only passed for review dispatch: reviewing own delivery is
+   * an independence violation even when the submitter field moved to a rework session.
+   */
+  contributors?: ReadonlySet<string>;
   defs: EmployeeDef[];
   insts: EmployeeInst[];
   states: ReadonlyMap<string, InstState>;
@@ -115,6 +121,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       !ready(inst) ? '会话占用中/异常' :
       p.assigned?.has(inst.id) ? '本轮已分配' :
       p.holding.has(inst.id) ? '持有在办任务' :
+      p.contributors?.has(inst.id) ? '任务贡献者回避' :
       (p.excludeSubmitter && inst.id === p.task?.submittedBy) ? '提交者回避' :
       (p.sidecar && inst.credentialFile) ? '凭证文件实例不可接新任务' :
       !currentModel(inst) ? '模型槽位已漂移' :
@@ -388,8 +395,9 @@ export class Dispatcher {
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
       providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
-    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, assigned })
+    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
+      contributors?: ReadonlySet<string>) =>
+      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, contributors, assigned })
         .flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
     const eligibleDefs = (role: string, home: string) =>
       staffingPool({ ...poolBase, insts, role, home })
@@ -405,11 +413,13 @@ export class Dispatcher {
     } else {
       await owner.resolveNotice('model-unresolved');
     }
-    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
+    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
+      contributors?: ReadonlySet<string>) => {
       const home = task?.repoPath ?? this.deps.env.opsRepo;
-      const candidates = eligibleInsts(role, home, task, excludeSubmitter);
+      const candidates = eligibleInsts(role, home, task, excludeSubmitter, contributors);
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
       // Continuity beats weights: the previous holder keeps the task when it is still available.
+      // Review work never hits this: any former holder is a contributor and already left the pool.
       const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
       if (previous) return previous;
       // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
@@ -420,13 +430,15 @@ export class Dispatcher {
     };
     const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
-    const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
+    // Review 派工的贡献者在进 Jev 前就已从 reuse 候选剔除（见 eligibleInsts 入参）；
+    // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
+    const routeEmployee = async (item: (typeof work)[number], contributors?: ReadonlySet<string>): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       const cacheKey = `${item.purpose}:${item.task.id}`;
       const avoided = this.staffAvoid.get(cacheKey);
       const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
-      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review').filter(i => !dodged(i.id));
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', contributors).filter(i => !dodged(i.id));
       const spawn = eligibleDefs(item.role, home).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
       // Same candidate set → same verdict; only call Jev when the fingerprint moved.
@@ -505,10 +517,14 @@ export class Dispatcher {
       if (running >= cfg.maxRunning) break;
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
-      const prefer = await routeEmployee(item);
+      // 验收独立性：review 派工先取本任务全部贡献者（audit 中 claim/submit 过的员工，
+      // 即作者与前持有人），进 pick/Jev/assign 前统一剔除。读失败按空集放行——
+      // 提交者仍由 task.submittedBy 的服务端与派工侧双重拦截兜底。
+      const contributors = item.purpose === 'review' ? await this.reviewContributors(item.task) : undefined;
+      const prefer = await routeEmployee(item, contributors);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, contributors);
       if (!result) {
         if (prefer) {
           // Jev's pick just failed in assign; stop re-picking the same candidate
@@ -521,7 +537,11 @@ export class Dispatcher {
           this.staffAvoid.set(cacheKey, map);
         }
         const home = item.task.repoPath ?? this.deps.env.opsRepo;
-        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}。任务 ${item.task.id} 等待中。`, report);
+        // 全员贡献者或无容量时任务留在队列，绝不回退派给贡献者；原因进 owner 收件箱可预览。
+        const recused = item.purpose === 'review' && contributors?.size
+          ? `；任务贡献者已回避：${[...contributors].sort().join('、')} 参与过本任务（领取/提交），验收在等未参与的员工`
+          : '';
+        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}${recused}。任务 ${item.task.id} 等待中。`, report);
         continue;
       }
       await owner.resolveNotice(`staff:${item.role}`);
@@ -744,17 +764,29 @@ export class Dispatcher {
     return providerCapacity(provider, cfg.providerMax, health, busyBy, now, quotaBlocked);
   }
 
+  /** Employee ids that ever claimed or submitted this task — the recusal set for review dispatch. */
+  private async reviewContributors(task: SupervisedTask): Promise<ReadonlySet<string>> {
+    try {
+      const state = await this.deps.workforce.evalState(task.id);
+      return new Set(state.participants.filter(e =>
+        (state.metrics[e]?.claims ?? 0) > 0 || (state.metrics[e]?.submits ?? 0) > 0));
+    } catch (error) {
+      this.log(`contributors read failed for ${task.id}: ${(error as Error).message}`);
+      return new Set();
+    }
+  }
+
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
-    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
+    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, contributors?: ReadonlySet<string>) => EmployeeInst | undefined,
     spawnable: (role: string, home: string) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference, slots?: Map<string, string>,
+    prefer?: AssignPreference, slots?: Map<string, string>, contributors?: ReadonlySet<string>,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
+    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview, contributors);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const existing = picked && !(sidecar && task && picked.credentialFile) ? picked : undefined;
