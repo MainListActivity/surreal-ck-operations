@@ -534,6 +534,19 @@ describe('ego-browser injector', () => {
     expect(error.message).not.toContain('eyJtoken.payload-part.signature');
   });
 
+  test('failures scrub the token even when it arrived inside an oidcUser record', async () => {
+    const bin = fakeCli(`cat >/dev/null; echo 'boom eyJtoken.payload-part.signature leaked' >&2; exit 3`);
+    const user = oidcUserEntry({
+      authority: 'https://idp.test/t/ck', clientId: 'ops-client-0001',
+      token: 'eyJtoken.payload-part.signature', expiresAt: 1_800_000_000_000,
+      scope: 'openid', profile: { sub: 'sub-1' },
+    });
+    const error = await failure(egoBrowserInjector({ ...input(bin), oidcUser: user }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).not.toContain('eyJtoken.payload-part.signature');
+    expect(error.message).not.toContain('sub-1');
+  });
+
   test('a missing CLI is a configuration problem, not a crash', async () => {
     const error = await failure(egoBrowserInjector({ ...input('/nonexistent/ego-browser') }));
     expect(error.code).toBe('not_configured');
