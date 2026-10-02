@@ -87,7 +87,7 @@ export function registerHandlers(server: PluginServerContext): void {
 
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo } = await company();
-    const { staffingPool, quotaBlockedProviders } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { staffingPool, quotaBlockedProviders, reviewStaffingPreviews } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const cfg = await workforce.config();
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
@@ -128,12 +128,16 @@ export function registerHandlers(server: PluginServerContext): void {
     const homes = [...new Set([opsRepo, ...insts.map(i => i.cwd ?? opsRepo), ...tasks.map(t => t.repoPath ?? opsRepo)])];
     const roles = [...new Set([...defs.map(d => d.role), ...insts.map(i => i.role)])];
     const now = Math.floor(Date.now() / 1000);
+    const poolBase = { defs, insts, states, holding, health: healthMap,
+      quotaBlocked, busyBy, providerMax: cfg.providerMax, slots, opsRepo, sidecar: true, now };
+    const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
+      entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,
+        eligible: e.eligible, reason: e.reason, model: e.model }));
     const pools = roles.flatMap(role => homes.map(home => ({
-      role, home,
-      entries: staffingPool({ role, home, defs, insts, states, holding, health: healthMap,
-        quotaBlocked, busyBy, providerMax: cfg.providerMax, slots, opsRepo, sidecar: true, now })
-        .map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share, eligible: e.eligible, reason: e.reason, model: e.model })),
+      role, home, entries: entriesView(staffingPool({ ...poolBase, role, home })),
     })).filter(p => p.entries.length));
+    const reviewPools = (await reviewStaffingPreviews(tasks, poolBase, workforce))
+      .map(p => ({ ...p, entries: entriesView(p.entries) }));
 
     return {
       paused: cfg.paused,
@@ -153,6 +157,7 @@ export function registerHandlers(server: PluginServerContext): void {
       })),
       health: healthView,
       pools,
+      reviewPools,
     };
   });
 

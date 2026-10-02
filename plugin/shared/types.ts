@@ -100,6 +100,13 @@ export interface StaffingPoolView {
   entries: StaffingEntryView[];
 }
 
+export interface ReviewStaffingPoolView extends StaffingPoolView {
+  taskId: string;
+  title: string;
+  purpose: "review";
+  status: "ready" | "history_unavailable";
+}
+
 export interface Roster {
   paused: boolean;
   /** The operations repo; pools whose home equals this render as the default project. */
@@ -110,6 +117,7 @@ export interface Roster {
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
   /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
   pools: StaffingPoolView[];
+  reviewPools: ReviewStaffingPoolView[];
 }
 
 export interface ModelOption {

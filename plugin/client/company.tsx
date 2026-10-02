@@ -567,6 +567,29 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
           onDone={() => { setEditDef(undefined); refreshAll(); }} onCancel={() => setEditDef(undefined)} />
       </Section>
+      <Section title="待验收任务候选预览" count={r?.reviewPools?.length} ctx={ctx}>
+        <View style={s.card}>
+          <Text style={s.muted}>当前候选估算；最终派工由调度器执行。回避仅用于对应任务的 review。</Text>
+          {(r?.reviewPools?.length ?? 0) === 0 && <Text style={s.muted}>暂无等待派工的验收任务。</Text>}
+          {r?.reviewPools?.map(p => (
+            <View key={p.taskId} style={{ gap: 4 }}>
+              <Text style={s.text}>{p.title} · {p.taskId} · review · {p.role}</Text>
+              <Text style={s.muted}>项目：{p.home}</Text>
+              {p.status === "history_unavailable" && (
+                <Text style={s.text}>贡献者历史读取失败：候选不可派，中选率 0%，等待安全候选。</Text>
+              )}
+              {p.entries.length === 0 && <Text style={s.muted}>暂无候选，任务继续等待。</Text>}
+              {p.entries.map(e => (
+                <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
+                  {e.kind === "spawn" ? "新开" : "复用"} · {e.ref} · {e.eligible
+                    ? `可派 · 权重 ${Math.round(e.weight * 10) / 10} · 中选率 ${Math.round(e.share * 100)}%`
+                    : `不可派（${e.reason ?? "未知"}） · 中选率 0%`}
+                </Text>
+              ))}
+            </View>
+          ))}
+        </View>
+      </Section>
       <Section title="员工编制" count={r?.defs.length} ctx={ctx}>
         <View style={s.card}>
           {(() => {
