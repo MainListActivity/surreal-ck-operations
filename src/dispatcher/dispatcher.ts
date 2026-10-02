@@ -518,9 +518,16 @@ export class Dispatcher {
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
       // 验收独立性：review 派工先取本任务全部贡献者（audit 中 claim/submit 过的员工，
-      // 即作者与前持有人），进 pick/Jev/assign 前统一剔除。读失败按空集放行——
-      // 提交者仍由 task.submittedBy 的服务端与派工侧双重拦截兜底。
+      // 即作者与前持有人），进 pick/Jev/assign 前统一剔除。历史读失败时回避名单未知，
+      // fail-closed：本轮跳过该 review 让任务留在队列，绝不按空集放行——submittedBy
+      // 拦截只覆盖当前提交人，挡不住非提交人的作者/前持有人；读取恢复后自动继续。
       const contributors = item.purpose === 'review' ? await this.reviewContributors(item.task) : undefined;
+      if (item.purpose === 'review' && contributors === undefined) {
+        await this.notice(`contributors:${item.task.id}`,
+          `任务 ${item.task.id} 继续等待验收：贡献者历史读取失败，回避名单未知，本轮不派复核，防止历史贡献者被重复派入验收。`, report);
+        continue;
+      }
+      if (item.purpose === 'review') await owner.resolveNotice(`contributors:${item.task.id}`);
       const prefer = await routeEmployee(item, contributors);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
@@ -764,15 +771,19 @@ export class Dispatcher {
     return providerCapacity(provider, cfg.providerMax, health, busyBy, now, quotaBlocked);
   }
 
-  /** Employee ids that ever claimed or submitted this task — the recusal set for review dispatch. */
-  private async reviewContributors(task: SupervisedTask): Promise<ReadonlySet<string>> {
+  /**
+   * Employee ids that ever claimed or submitted this task — the recusal set for review dispatch.
+   * Returns undefined when the history read fails: the recusal set is unknown then, and the
+   * caller must keep the review queued (fail-closed) instead of treating it as an empty set.
+   */
+  private async reviewContributors(task: SupervisedTask): Promise<ReadonlySet<string> | undefined> {
     try {
       const state = await this.deps.workforce.evalState(task.id);
       return new Set(state.participants.filter(e =>
         (state.metrics[e]?.claims ?? 0) > 0 || (state.metrics[e]?.submits ?? 0) > 0));
     } catch (error) {
       this.log(`contributors read failed for ${task.id}: ${(error as Error).message}`);
-      return new Set();
+      return undefined;
     }
   }
 

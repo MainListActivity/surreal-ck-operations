@@ -788,6 +788,88 @@ test('dispatcher: review skips every task contributor and waits in queue when ev
   expect((await task(t.id)).state).toBe('review');
 });
 
+test('dispatcher: review stays queued while contributor history read fails and resumes when it recovers', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('DELETE owner_notice;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = false, error_streak = 0;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  // Jev 派工咨询记录：异常读取期间 review 不得进入 Jev 选人（fail-closed）；恢复后候选也不得含贡献者。
+  const jevDispatches: Array<{ purpose?: string; taskId?: string; candidates?: Record<string, string> }> = [];
+  const jev: JevClient = {
+    model: 'jev-test',
+    async ask(state: unknown) {
+      const d = (state as { dispatch?: { purpose?: string; task?: { id?: string }; candidates?: Record<string, string> } }).dispatch;
+      if (d) jevDispatches.push({ purpose: d.purpose, taskId: d.task?.id, candidates: d.candidates });
+      return { model: 'jev-test', answers: {} } as never; // 无有效 pick → 加权兜底
+    },
+  };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, jev, notify: async () => {} });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: '历史读取失败验收', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  // E1 实现并提交：作者+提交者。
+  let report = await dispatcher.tick();
+  const exec = report.woke.find(w => w.task === t.id)!;
+  expect(exec.spawned).toBe(true);
+  const execAgent = [...paseo.agents.keys()][0];
+  const claim = await core.claim(tokenOf(exec.employee), t.id);
+  await core.submit(tokenOf(exec.employee), proofOf(claim), { text: '实现完成：代码在任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
+  paseo.set(execAgent, 'idle');
+
+  // Review 派给非贡献者 E2；E2 领取（audit 记下 claim，成为非提交人贡献者）后租约被收回。
+  report = await dispatcher.tick();
+  const reviewer = report.woke.find(w => w.task === t.id)!;
+  expect(reviewer.spawned).toBe(true);
+  const reviewerAgent = [...paseo.agents.keys()][1];
+  const reviewClaim = await core.claim(tokenOf(reviewer.employee), t.id);
+  await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
+  paseo.set(reviewerAgent, 'idle');
+
+  // 贡献者历史读取失败：回避名单未知 → fail-closed。E2（非提交人前持有人）不得被重新唤醒，
+  // review 留在队列，owner 收件箱通知说明读取失败；Jev 不参与该 review 的选人；execute 派工不受影响。
+  const savedEvalState = workforce.evalState.bind(workforce);
+  workforce.evalState = async () => { throw new Error('synthetic contributor history read failure'); };
+  try {
+    const t2 = await core.createTask(tokens.gm, { title: '执行连续性', context: 'synthetic', executorRole: 'engineering',
+      reviewerRole: 'qa', idempotencyKey: key() });
+    report = await dispatcher.tick();
+    expect(report.woke.map(w => w.task)).not.toContain(t.id);
+    expect(report.woke.map(w => w.task)).toContain(t2.id);
+    expect(report.notices).toContain(`contributors:${t.id}`);
+    expect(jevDispatches.filter(d => d.purpose === 'review' && d.taskId === t.id)).toHaveLength(0);
+  } finally {
+    workforce.evalState = savedEvalState;
+  }
+  expect((await task(t.id)).state).toBe('review');
+
+  // 读取恢复：失败通知自动清除，回避名单重新生效——两个编制均满员，任务继续等待非贡献者。
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
+  expect((await owner.openNotices()).some(n => n.key === `contributors:${t.id}`)).toBe(false);
+  const staffNotice = (await owner.openNotices()).find(n => n.key === 'staff:engineering');
+  expect(staffNotice?.text).toContain('任务贡献者已回避');
+
+  // 有空位可新开非贡献者实例时恢复正常派工；Jev 若参与选人，候选里也不出现贡献者。
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 2 });
+  report = await dispatcher.tick();
+  const safe = report.woke.find(w => w.task === t.id);
+  expect(safe?.spawned).toBe(true);
+  expect([exec.employee, reviewer.employee]).not.toContain(safe!.employee);
+  for (const d of jevDispatches.filter(d => d.taskId === t.id)) {
+    expect(Object.keys(d.candidates ?? [])).not.toContain(exec.employee);
+    expect(Object.keys(d.candidates ?? [])).not.toContain(reviewer.employee);
+  }
+  expect((await task(t.id)).state).toBe('review');
+});
+
 test('dispatcher: jev picks among eligible employees using quota and score context', async () => {
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');
