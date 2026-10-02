@@ -202,6 +202,17 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
+  server.registerTool('defer_task_until', {
+    description: 'gm only: turn a gm-blocked execute-phase task into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it auto-resumes when every dependency is done; with all dependencies already done it resumes immediately.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      dependencies: z.array(z.string().min(1)).min(1).max(20),
+      text: z.string().min(20).max(8000),
+      idempotencyKey: z.string().min(1),
+      expectedVersion: z.number().int().positive().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
+
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
     inputSchema: z.object({
