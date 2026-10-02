@@ -126,13 +126,24 @@ async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ chall
   throw new LoginError('authorize_loop', 'IdP authorize redirected too many times');
 }
 
-export function jwtExpiry(token: string): number | undefined {
+function jwtPayload(token: string): Record<string, unknown> | undefined {
   const payload = token.split('.')[1];
   if (!payload) return undefined;
   try {
-    const exp = (JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { exp?: unknown }).exp;
-    return typeof exp === 'number' ? exp * 1000 : undefined;
+    const parsed: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : undefined;
   } catch { return undefined; }
+}
+
+export function jwtExpiry(token: string): number | undefined {
+  const exp = jwtPayload(token)?.exp;
+  return typeof exp === 'number' ? exp * 1000 : undefined;
+}
+
+/** The `sub` claim, for the ops console's stored user profile when a session is browser-injected. */
+export function jwtSubject(token: string): string | undefined {
+  const sub = jwtPayload(token)?.sub;
+  return typeof sub === 'string' && sub ? sub : undefined;
 }
 
 interface Channel {

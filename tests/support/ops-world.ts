@@ -56,7 +56,7 @@ export class FakeWorld {
   readonly workspaces = new Map<string, Workspace>();
   /** Every access token the world ever minted, for leak assertions. */
   readonly minted: string[] = [];
-  readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string }> = [];
+  readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string; oidcUser?: { key: string; value: string } }> = [];
   /** IdP subject → active platform-operator capabilities, like the product's capability table. */
   readonly operatorCaps = new Map<string, string[]>();
   private readonly grants = new Map<string, Grant>();
@@ -114,7 +114,7 @@ export class FakeWorld {
   };
 
   readonly browser: BrowserInjector = async input => {
-    this.browserLogins.push({ spaceId: input.spaceId, page: input.page, token: input.token, probeUrl: input.probeUrl, landingUrl: input.landingUrl });
+    this.browserLogins.push({ spaceId: input.spaceId, page: input.page, token: input.token, probeUrl: input.probeUrl, landingUrl: input.landingUrl, oidcUser: input.oidcUser });
     return { url: input.landingUrl, title: 'Fixture App' };
   };
 
@@ -183,6 +183,30 @@ export class FakeWorld {
   }
   insertUser(username: string, email: string) {
     this.sqlite.run('INSERT INTO users (id, tenant_id, email, username, display_name, status) VALUES (?, ?, ?, ?, ?, ?)', [randomUUID(), TENANT, email, username, username, 'active']);
+  }
+
+  /**
+   * Seeds an oidc_clients row like the production DCR'd `sck-ops-console` public client
+   * (`consent_policy require`, no secret hash), for client-alignment assertions.
+   */
+  seedOidcClient(row: {
+    clientId: string; clientName?: string; redirectUris?: string[]; audience?: string;
+    consentPolicy?: string; authMethod?: string; secretHash?: string;
+  }) {
+    const stamp = new Date(this.clock).toISOString();
+    this.sqlite.run(`INSERT INTO oidc_clients (
+      id, tenant_id, client_id, client_secret_hash, client_name, application_type,
+      trust_level, consent_policy, client_profile, access_token_audience, allowed_scopes,
+      initiate_login_uri, claim_hook_url, claim_hook_auth_header_name, claim_hook_auth_header_value,
+      token_endpoint_auth_method, redirect_uris, grant_types, response_types, created_by,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'web', 'first_party_trusted', ?, 'spa', ?, NULL,
+      NULL, NULL, NULL, NULL, ?, ?, '["authorization_code"]', '["code"]', 'ops_broker', ?, ?)`,
+      [
+        randomUUID(), TENANT, row.clientId, row.secretHash ?? null, row.clientName ?? 'sck-ops-console',
+        row.consentPolicy ?? 'require', row.audience ?? OPS_RESOURCE,
+        row.authMethod ?? 'none', JSON.stringify(row.redirectUris ?? [OPS_REDIRECT]), stamp, stamp,
+      ]);
   }
 
   /** Direct row access for assertions about a registered OIDC client. */

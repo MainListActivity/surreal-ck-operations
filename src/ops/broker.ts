@@ -9,13 +9,13 @@ import {
   accountEmail, accountUsername, aliasFromSecretName, canonicalAlias, ensureAccount, passwordSecretName,
   type EnsureAccountResult,
 } from './accounts.ts';
-import { egoBrowserInjector, type BrowserInjector } from './browser.ts';
+import { egoBrowserInjector, oidcUserEntry, type BrowserInjector } from './browser.ts';
 import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlaneEnv } from './config.ts';
 import { cloudflareD1, type D1Client } from './d1.ts';
 import type { Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
-import { jwtExpiry, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
-import { audienceUrl, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
+import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
+import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -23,7 +23,7 @@ import { SessionStore, type OpsSession } from './sessions.ts';
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
-  'ops_idp_client_register',
+  'ops_idp_client_info', 'ops_idp_client_register',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -133,6 +133,7 @@ export class OpsBroker {
       ops_request: (ctx, args) => this.request(ctx, args),
       ops_query: (ctx, args) => this.query(ctx, args),
       ops_browser_login: (ctx, args) => this.browserLogin(ctx, args),
+      ops_idp_client_info: (ctx, args) => this.idpClientInfo(ctx, args),
       ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
     };
   }
@@ -191,6 +192,13 @@ export class OpsBroker {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
+        // Public client identifiers only (never secrets), so employees can align the channels
+        // with what the IdP has registered (ops_idp_client_info) and the product hard-binds.
+        clients: {
+          customer: { clientId: ctx.cfg.idp.clientId, redirectUri: ctx.cfg.idp.redirectUri },
+          ...(ctx.cfg.ops ? { operator: { clientId: ctx.cfg.ops.clientId, redirectUri: ctx.cfg.ops.redirectUri, resource: ctx.cfg.ops.resource ?? null } } : {}),
+          ...(ctx.cfg.idp.ops ? { opsAudience: { clientId: ctx.cfg.idp.ops.clientId, audience: ctx.cfg.idp.ops.audience, redirectUri: ctx.cfg.idp.ops.redirectUri } } : {}),
+        },
         can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops },
       },
     };
@@ -260,6 +268,36 @@ export class OpsBroker {
     return {
       value: { alias, username, email, result },
       audit: result === 'exists' ? { action: 'ops_call', evidence: `ops_account_ensure ${alias} → exists` } : undefined,
+    };
+  }
+
+  /**
+   * Read-only view of a registered IdP client plus how it lines up with this environment's
+   * configured channels — the diagnosis half of a client-id mismatch. Only public registration
+   * metadata leaves; `describeSpaClient` never selects the secret hash itself.
+   */
+  private async idpClientInfo(ctx: Ctx, args: Args): Promise<Outcome> {
+    const byName = args.client_name !== undefined;
+    const byId = args.client_id !== undefined;
+    if (byName === byId) throw invalid('pass exactly one of client_name or client_id');
+    const key = byName ? { clientName: spaClientName(args.client_name) } : { clientId: clientId(args.client_id) };
+    const info = await describeSpaClient(this.d1(ctx), ctx.cfg.d1!.tenantId, key);
+    if (!info) throw new CompanyError('not_found', `no IdP client registered for ${byName ? `client_name ${key.clientName}` : `client_id ${key.clientId}`}`);
+    const ops = ctx.cfg.ops;
+    return {
+      value: {
+        ...info,
+        alignment: {
+          customerClient: info.clientId === ctx.cfg.idp.clientId,
+          operatorClient: ops !== undefined && info.clientId === ops.clientId,
+          opsAudienceClient: ctx.cfg.idp.ops !== undefined && info.clientId === ctx.cfg.idp.ops.clientId,
+          ...(ops ? {
+            operatorRedirectRegistered: info.redirectUris.includes(ops.redirectUri),
+            operatorAudienceMatch: ops.resource === undefined || info.accessTokenAudience === ops.resource,
+          } : {}),
+        },
+      },
+      audit: { action: 'ops_call', evidence: `ops_idp_client_info ${info.clientName} → ${info.clientId}` },
     };
   }
 
@@ -629,23 +667,58 @@ export class OpsBroker {
     };
   }
 
+  /**
+   * Injects the session's token into the employee's ego-browser page. Customer sessions keep the
+   * app's flat sessionStorage keys and land on `/`; operator sessions land on `/ops/` and are
+   * written as the serialized `oidc-client-ts` `User` record the ops console's `UserManager`
+   * reads. An `ops` audience session is API-only and is refused before anything else.
+   */
   private async browserLogin(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.customerSession(ctx, args);
+    const session = this.session(ctx, args);
+    if (session.kind === 'ops') {
+      throw invalid('an ops session is API-only and cannot be injected into a browser; use a customer or operator session');
+    }
     const spaceId = Number(args.spaceId);
     if (!Number.isInteger(spaceId) || spaceId < 0) throw invalid('spaceId must be the numeric id of your ego-browser task space');
     const page = args.page === undefined ? 'p1' : text(args, 'page', 8);
     if (!/^p\d{1,3}$/.test(page)) throw invalid('page must be a page label such as p1');
+    // An expiring session re-logs through its own channel: the operator keeps riding the ops
+    // client, never the customer login.
     if (this.now() >= session.expiresAt - REFRESH_MARGIN_MS) await this.reauth(ctx, session);
     const product = new URL(ctx.cfg.product.url);
     const health = ctx.row.healthUrl ? new URL(ctx.row.healthUrl) : undefined;
     const probeUrl = health && health.origin === product.origin ? health.toString() : `${product.origin}/health`;
+
+    let landingUrl = `${product.origin}/`;
+    let oidcUser: { key: string; value: string } | undefined;
+    if (session.kind === 'operator') {
+      const ops = ctx.cfg.ops;
+      if (!ops) throw new CompanyError('not_configured', 'this environment no longer has an operator channel configured');
+      // Re-probe the operator gate right before the token leaves the broker: a revoked or
+      // demoted operator fails here instead of inside the injected page.
+      const probe = await this.product(ctx, session, 'GET', '/api/ops/quota/context');
+      if (!probe.ok) {
+        this.sessions.drop(session.id);
+        throw productFailure('operator access check', probe, { 401: 'login_failed', 403: 'forbidden' });
+      }
+      landingUrl = `${product.origin}/ops/`;
+      oidcUser = oidcUserEntry({
+        authority: ctx.cfg.idp.issuer, clientId: ops.clientId,
+        token: session.token, expiresAt: session.expiresAt, scope: ops.scope,
+        profile: {
+          sub: jwtSubject(session.token) ?? session.username,
+          email: accountEmail(session.username, ctx.cfg.accounts.emailDomain),
+        },
+      });
+    }
+
     const landed = await (this.deps.browser ?? egoBrowserInjector)({
-      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl: `${product.origin}/`,
-      token: session.token, expiresAt: session.expiresAt,
+      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl,
+      token: session.token, expiresAt: session.expiresAt, oidcUser,
     });
     return {
       value: { signedInAs: session.username, url: landed.url, title: landed.title },
-      audit: { action: 'ops_browser_login', evidence: `ego-browser 任务空间 ${spaceId}/${page} 以 ${session.username} 登录` },
+      audit: { action: 'ops_browser_login', evidence: `ego-browser 任务空间 ${spaceId}/${page} 以 ${session.username} 登录${session.kind === 'operator' ? '（运营控制台 /ops/）' : ''}` },
     };
   }
 }
