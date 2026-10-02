@@ -630,7 +630,9 @@ export class OpsBroker {
   }
 
   private async browserLogin(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.customerSession(ctx, args);
+    const session = this.session(ctx, args);
+    const ops = session.kind !== 'customer';
+    if (ops && !ctx.cfg.ops) throw new CompanyError('not_configured', 'ops browser login requires the product ops SPA client (broker ops)');
     const spaceId = Number(args.spaceId);
     if (!Number.isInteger(spaceId) || spaceId < 0) throw invalid('spaceId must be the numeric id of your ego-browser task space');
     const page = args.page === undefined ? 'p1' : text(args, 'page', 8);
@@ -640,8 +642,9 @@ export class OpsBroker {
     const health = ctx.row.healthUrl ? new URL(ctx.row.healthUrl) : undefined;
     const probeUrl = health && health.origin === product.origin ? health.toString() : `${product.origin}/health`;
     const landed = await (this.deps.browser ?? egoBrowserInjector)({
-      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl: `${product.origin}/`,
+      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl: `${product.origin}/${ops ? 'ops/' : ''}`,
       token: session.token, expiresAt: session.expiresAt,
+      auth: session.kind === 'customer' ? { kind: 'customer' } : { kind: session.kind, authority: ctx.cfg.idp.issuer.replace(/\/$/u, ''), clientId: ctx.cfg.ops!.clientId },
     });
     return {
       value: { signedInAs: session.username, url: landed.url, title: landed.title },

@@ -564,6 +564,26 @@ describe('operator sessions', () => {
     expectNoLeaks(r);
   });
 
+  test('operator browser injection targets the SPA client and retains workspace isolation after renewal', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    const customer = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_browser_login', { session: customer.session, spaceId: 3 });
+    r.world.advance(15 * 60_000);
+    await call(r, 'ops_browser_login', { session: op.session, spaceId: 3 });
+    expect(r.world.browserLogins.at(-1)).toMatchObject({
+      landingUrl: 'https://app.test/ops/', probeUrl: 'https://app.test/health',
+      auth: { kind: 'operator', authority: 'https://idp.test/t/ck', clientId: OPS_CLIENT },
+    });
+    expect(r.world.browserLogins.at(-1)!.token).not.toBe(r.world.browserLogins[0]!.token);
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(2);
+    expect((await failure(call(r, 'ops_workspace_ensure', { session: op.session, slug: 'sck-forbidden' }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_query', { session: op.session, sql: 'SELECT 1' }))).code).toBe('invalid');
+    expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('invalid');
+    expectNoLeaks(r);
+  });
+
   test('an IdP consent denial fails the operator login as access_denied', async () => {
     const r = rig(opsPatch);
     await opsUser(r, 'qa-ops');
@@ -619,7 +639,7 @@ describe('operator sessions', () => {
     expectNoLeaks(r);
   });
 
-  test('a customer session is refused on ops paths; an operator session off them and off every other tool', async () => {
+  test('a customer session is refused on ops paths; an operator session off customer paths and workspace tools', async () => {
     const r = rig(opsPatch);
     const customer = await call(r, 'ops_login', { alias: 'qa-one' });
     expect(customer.kind).toBe('customer');
@@ -636,7 +656,6 @@ describe('operator sessions', () => {
       ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_query', { sql: 'SELECT 1' }],
-      ['ops_browser_login', { spaceId: 1 }],
     ] as const) {
       const err = await failure(call(r, tool, { session: op.session, ...extra }));
       expect(err.code, tool).toBe('invalid');
@@ -762,6 +781,23 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     expectNoLeaks(r);
   });
 
+  test('ops audience browser injection uses the configured product SPA client, not the direct IdP client', async () => {
+    const r = rig({ ...idpOps, ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } });
+    await opsUser(r, 'qa-ops');
+    const login = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    await call(r, 'ops_browser_login', { session: login.session, spaceId: 4, page: 'p2' });
+    expect(r.world.browserLogins.at(-1)).toMatchObject({
+      landingUrl: 'https://app.test/ops/', page: 'p2',
+      auth: { kind: 'ops', authority: 'https://idp.test/t/ck', clientId: OPS_CLIENT },
+    });
+    expectNoLeaks(r);
+    const missing = rig(idpOps);
+    await opsUser(missing, 'qa-ops');
+    const other = await call(missing, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    expect((await failure(call(missing, 'ops_browser_login', { session: other.session, spaceId: 4 }))).code).toBe('not_configured');
+    expect(missing.world.browserLogins).toHaveLength(0);
+  });
+
   test('a consent challenge on the ops audience client is refused, not approved', async () => {
     const r = rig(idpOps);
     await opsUser(r, 'qa-ops');
@@ -801,7 +837,7 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     expect(r.world.requests).toHaveLength(0);
   });
 
-  test('an ops session is refused by workspace, member, query and browser tools and off-ops paths', async () => {
+  test('an ops session is refused by workspace, member, query tools and off-ops paths', async () => {
     const r = rig(idpOps);
     await opsUser(r, 'qa-ops');
     const { session } = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
@@ -811,7 +847,6 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
       ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_query', { sql: 'SELECT 1' }],
-      ['ops_browser_login', { spaceId: 1 }],
     ] as const) {
       const err = await failure(call(r, tool, { session, ...extra }));
       expect(err.code, tool).toBe('invalid');

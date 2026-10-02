@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { egoBrowserInjector } from '../src/ops/browser.ts';
+import { browserLoginScript, egoBrowserInjector } from '../src/ops/browser.ts';
 import { controlPlaneEnv, parseBrokerConfig } from '../src/ops/config.ts';
 import { cloudflareD1 } from '../src/ops/d1.ts';
 import type { Fetcher } from '../src/ops/fetcher.ts';
@@ -468,7 +468,7 @@ describe('ego-browser injector', () => {
     chmodSync(bin, 0o755);
     return bin;
   };
-  const input = (bin: string) => ({ bin, spaceId: 4, page: 'p2', probeUrl: 'https://app.test/health', landingUrl: 'https://app.test/', token: 'eyJtoken.payload-part.signature', expiresAt: 1_800_000_000_000 });
+  const input = (bin: string) => ({ bin, spaceId: 4, page: 'p2', probeUrl: 'https://app.test/health', landingUrl: 'https://app.test/', token: 'eyJtoken.payload-part.signature', expiresAt: 1_800_000_000_000, auth: { kind: 'customer' as const } });
 
   test('the script, token included, travels over stdin and argv carries only the subcommand', async () => {
     const bin = fakeCli(`cat > "${'$'}(dirname "${'$'}0")/stdin.txt"; echo "${'$'}*" > "${'$'}(dirname "${'$'}0")/argv.txt"; echo 'SCK_RESULT {"url":"https://app.test/","title":"Fixture"}'`);
@@ -477,9 +477,42 @@ describe('ego-browser injector', () => {
     const stdin = readFileSync(join(dir!, 'stdin.txt'), 'utf8');
     expect(stdin).toContain('"eyJtoken.payload-part.signature"');
     expect(stdin).toContain('oidc.access_token');
-    expect(stdin).toContain('"exp":1800000000');
+    expect(stdin).toContain('"oidc.exp":"1800000000"');
     expect(stdin).toContain('taskSpace(4)');
     expect(readFileSync(join(dir!, 'argv.txt'), 'utf8').trim()).toBe('nodejs');
+  });
+
+  test('executed injection script installs oidc User and clears the previous lane in both directions', async () => {
+    const storage: Record<string, string> = { 'oidc.access_token': 'old-customer', 'oidc.exp': '1', 'oidc.user:old:client': 'old-ops', unrelated: 'keep' };
+    Object.defineProperties(storage, {
+      setItem: { value: (key: string, value: string) => { storage[key] = value; } },
+      removeItem: { value: (key: string) => { delete storage[key]; } },
+    });
+    const navigation: string[] = [];
+    const page = {
+      goto: async (url: string) => { navigation.push(url); },
+      evaluate: async (callback: (entries: Record<string, string>) => void, entries: Record<string, string>) => { callback(entries); },
+      url: async () => navigation.at(-1)!, title: async () => 'Fixture',
+    };
+    const taskSpace = async (id: number) => { expect(id).toBe(4); return { page: (label: string) => { expect(label).toBe('p2'); return page; } }; };
+    const run = async (script: string) => {
+      const execute = new Function('taskSpace', 'sessionStorage', 'console', `return (async () => {${script}})()`) as (task: typeof taskSpace, store: typeof storage, output: { log: () => void }) => Promise<void>;
+      await execute(taskSpace, storage, { log: () => {} });
+    };
+    for (const kind of ['operator', 'ops'] as const) {
+      const token = `header.${Buffer.from(JSON.stringify({ sub: 'real-subject' })).toString('base64url')}.signature`;
+      await run(browserLoginScript({ ...input('unused'), token, landingUrl: 'https://app.test/ops/', auth: { kind, authority: 'https://idp.test/t/ck', clientId: 'spa-client' } }));
+      const user = JSON.parse(storage['oidc.user:https://idp.test/t/ck:spa-client']!);
+      expect(user).toEqual({ access_token: token, token_type: 'Bearer', scope: 'openid', profile: { sub: 'real-subject' }, expires_at: 1800000000 });
+      expect(storage['oidc.access_token']).toBeUndefined();
+      expect(storage['oidc.user:old:client']).toBeUndefined();
+      expect(navigation.slice(-2)).toEqual(['https://app.test/health', 'https://app.test/ops/']);
+    }
+    await run(browserLoginScript(input('unused')));
+    expect(storage['oidc.access_token']).toBe(input('unused').token);
+    expect(storage['oidc.exp']).toBe('1800000000');
+    expect(Object.keys(storage).filter(key => key.startsWith('oidc.user:'))).toEqual([]);
+    expect(storage.unrelated).toBe('keep');
   });
 
   test('the real CLI writes the result line to stderr, mixed with notices; stdout stays empty', async () => {

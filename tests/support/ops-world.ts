@@ -56,7 +56,7 @@ export class FakeWorld {
   readonly workspaces = new Map<string, Workspace>();
   /** Every access token the world ever minted, for leak assertions. */
   readonly minted: string[] = [];
-  readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string }> = [];
+  readonly browserLogins: Parameters<BrowserInjector>[0][] = [];
   /** IdP subject → active platform-operator capabilities, like the product's capability table. */
   readonly operatorCaps = new Map<string, string[]>();
   private readonly grants = new Map<string, Grant>();
@@ -114,7 +114,7 @@ export class FakeWorld {
   };
 
   readonly browser: BrowserInjector = async input => {
-    this.browserLogins.push({ spaceId: input.spaceId, page: input.page, token: input.token, probeUrl: input.probeUrl, landingUrl: input.landingUrl });
+    this.browserLogins.push(input);
     return { url: input.landingUrl, title: 'Fixture App' };
   };
 

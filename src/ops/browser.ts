@@ -13,14 +13,51 @@ export interface BrowserLoginInput {
   probeUrl: string;
   landingUrl: string;
   token: string;
+  auth: { kind: 'customer' } | { kind: 'operator' | 'ops'; authority: string; clientId: string };
   /** Epoch ms; the product stores epoch seconds. */
   expiresAt: number;
 }
 
 export type BrowserInjector = (input: BrowserLoginInput) => Promise<{ url: string; title: string }>;
 
+/** Matches the installed oidc-client-ts User.toStorageString / WebStorageStateStore contract. */
+export function browserSessionStorage(input: BrowserLoginInput): Record<string, string> {
+  const expiresAt = Math.floor(input.expiresAt / 1000);
+  if (input.auth.kind === 'customer') {
+    return { 'oidc.access_token': input.token, 'oidc.exp': String(expiresAt) };
+  }
+  // Profile is display metadata, never an authorization decision; product APIs validate the token.
+  let profile: Record<string, unknown> = {};
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(input.token.split('.')[1] ?? '', 'base64url').toString());
+    if (claims && typeof claims === 'object' && 'sub' in claims && typeof claims.sub === 'string') profile = { sub: claims.sub };
+  } catch { /* Opaque access tokens have no JWT profile. */ }
+  return {
+    [`oidc.user:${input.auth.authority}:${input.auth.clientId}`]: JSON.stringify({
+      access_token: input.token, token_type: 'Bearer', scope: 'openid', profile, expires_at: expiresAt,
+    }),
+  };
+}
+
 const TIMEOUT_MS = 60_000;
 const RESULT_PREFIX = 'SCK_RESULT ';
+
+export function browserLoginScript(input: BrowserLoginInput): string {
+  return `
+const task = await taskSpace(${JSON.stringify(input.spaceId)});
+const page = task.page(${JSON.stringify(input.page)});
+await page.goto(${JSON.stringify(input.probeUrl)});
+await page.evaluate(entries => {
+  // Remove the previous lane, including any prior ops client, before installing this session.
+  for (const key of Object.keys(sessionStorage)) {
+    if (key === 'oidc.access_token' || key === 'oidc.exp' || key.startsWith('oidc.user:')) sessionStorage.removeItem(key);
+  }
+  for (const [key, value] of Object.entries(entries)) sessionStorage.setItem(key, value);
+}, ${JSON.stringify(browserSessionStorage(input))});
+await page.goto(${JSON.stringify(input.landingUrl)});
+console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ url: await page.url(), title: await page.title() }));
+`;
+}
 
 /**
  * Signs the agent's ego-browser page in as a test account without the agent ever holding the
@@ -29,17 +66,7 @@ const RESULT_PREFIX = 'SCK_RESULT ';
  */
 export const egoBrowserInjector: BrowserInjector = input => {
   const bin = input.bin ?? process.env.SCK_EGO_BROWSER_BIN ?? join(homedir(), '.local/bin/ego-browser');
-  const script = `
-const task = await taskSpace(${JSON.stringify(input.spaceId)});
-const page = task.page(${JSON.stringify(input.page)});
-await page.goto(${JSON.stringify(input.probeUrl)});
-await page.evaluate(({ token, exp }) => {
-  sessionStorage.setItem('oidc.access_token', token);
-  sessionStorage.setItem('oidc.exp', String(exp));
-}, ${JSON.stringify({ token: input.token, exp: Math.floor(input.expiresAt / 1000) })});
-await page.goto(${JSON.stringify(input.landingUrl)});
-console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ url: await page.url(), title: await page.title() }));
-`;
+  const script = browserLoginScript(input);
   return new Promise((resolve, reject) => {
     const child = spawn(bin, ['nodejs'], { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
