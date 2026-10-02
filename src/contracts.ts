@@ -110,6 +110,16 @@ export interface CreateDelivery {
   idempotencyKey: string;
 }
 
+/** gm only: rewrite an existing task's dependency set. Edges point dependent -> dependency. */
+export interface UpdateTaskDependencies {
+  taskId: TaskId;
+  /** Task IDs to add; each must exist and must not already be implied by the remaining graph. */
+  add?: TaskId[];
+  /** Task IDs to drop; absent members are ignored. */
+  remove?: TaskId[];
+  evidence: Evidence;
+}
+
 /** deliveryId + fence are mandatory for every write after claim. */
 export interface LeaseProof {
   taskId: TaskId;
@@ -145,6 +155,8 @@ export interface CompanyCore {
   returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
+  /** gm with manage: add/remove dependency edges on a non-done, unleased task; rejects dependency cycles. */
+  updateTaskDependencies(credential: Credential, input: UpdateTaskDependencies): Promise<TaskView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
