@@ -781,21 +781,22 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     expectNoLeaks(r);
   });
 
-  test('ops audience browser injection uses the configured product SPA client, not the direct IdP client', async () => {
+  test('ops audience sessions are refused browser injection (operator-only policy); the not_configured guard protects the operator lane', async () => {
     const r = rig({ ...idpOps, ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } });
     await opsUser(r, 'qa-ops');
     const login = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
-    await call(r, 'ops_browser_login', { session: login.session, spaceId: 4, page: 'p2' });
-    expect(r.world.browserLogins.at(-1)).toMatchObject({
-      landingUrl: 'https://app.test/ops/', page: 'p2',
-      auth: { kind: 'ops', authority: 'https://idp.test/t/ck', clientId: OPS_CLIENT },
-    });
+    const err = await failure(call(r, 'ops_browser_login', { session: login.session, spaceId: 4, page: 'p2' }));
+    expect(err.code).toBe('invalid');
+    expect(err.message).toContain('operator-only');
+    expect(r.world.browserLogins).toHaveLength(0);
     expectNoLeaks(r);
-    const missing = rig(idpOps);
-    await opsUser(missing, 'qa-ops');
-    const other = await call(missing, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
-    expect((await failure(call(missing, 'ops_browser_login', { session: other.session, spaceId: 4 }))).code).toBe('not_configured');
-    expect(missing.world.browserLogins).toHaveLength(0);
+    // broker.ops can vanish between calls (admin project broker rewrite): the operator
+    // lane then refuses with not_configured instead of injecting a mis-keyed identity.
+    const operator = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.company.envs['demo']![0].broker = brokerConfig(idpOps);
+    const missing = await failure(call(r, 'ops_browser_login', { session: operator.session, spaceId: 4 }));
+    expect(missing.code).toBe('not_configured');
+    expect(r.world.browserLogins).toHaveLength(0);
   });
 
   test('a consent challenge on the ops audience client is refused, not approved', async () => {
@@ -837,7 +838,7 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     expect(r.world.requests).toHaveLength(0);
   });
 
-  test('an ops session is refused by workspace, member, query tools and off-ops paths', async () => {
+  test('an ops session is refused by workspace, member, query and browser tools and off-ops paths', async () => {
     const r = rig(idpOps);
     await opsUser(r, 'qa-ops');
     const { session } = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
@@ -847,6 +848,7 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
       ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_query', { sql: 'SELECT 1' }],
+      ['ops_browser_login', { spaceId: 1 }],
     ] as const) {
       const err = await failure(call(r, tool, { session, ...extra }));
       expect(err.code, tool).toBe('invalid');

@@ -71,7 +71,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 
 员工需要账号、workspace、登录这类凭证才能做的事，不自己动手，向插件里的运维代理（`src/ops/broker.ts`）提出请求：员工 `sck call ops_*` → 会话私有通道（req/res 文件）→ 通道把请求绑定到当前租约的任务 → `OpsBroker` 校验后执行 → 脱敏结果原路返回。员工用法见 [协议](../agents/PROTOCOL.md) 的「运维工具」，通道细节见 [sidecar 通道](sidecar-channel.md)。
 
-能力：`ops_info`、`ops_health`、`ops_account_ensure`（建/修测试账号）、`ops_login`（按账号别名登录，得客户会话句柄；`audience:"ops"` 时经 `idp.ops` 公共客户端直连 IdP `/token` 换出运营会话，不列 workspace、不自动建账号）、`ops_operator_login`（按别名登录运营通道：独立 OIDC client、运营 audience、PKCE 公开客户端经 `/api/auth/ops/token` 兑换；登录时以 `GET /api/ops/quota/context` 实时校验运营身份）、`ops_workspace_ensure`、`ops_member_list|add|remove`、`ops_request`（以会话调产品 HTTP 接口；运营会话只许 `/api/ops/*`，客户会话不许 `/api/ops/*`）、`ops_query`（以会话在 workspace 库里查询）、`ops_browser_login`（将 customer 会话注入产品首页，operator/ops 会话注入 `/ops/`；运营会话按 `broker.ops.clientId` 与 `idp.issuer` 写入 oidc-client-ts User 存储）、`ops_logout`。新增能力只需：在 `src/ops/` 实现，登记到 `OPS_TOOLS` 与 `OpsBroker` 的处理表，补测试（`tests/ops-broker.test.ts`，用 `tests/support/ops-world.ts` 的假 IdP/产品/D1），在协议表里加一行，再 `sh plugin/scripts/vendor.sh` 并 `plugin reload`；通道不用改，工具清单自动并入。
+能力：`ops_info`、`ops_health`、`ops_account_ensure`（建/修测试账号）、`ops_login`（按账号别名登录，得客户会话句柄；`audience:"ops"` 时经 `idp.ops` 公共客户端直连 IdP `/token` 换出运营会话，不列 workspace、不自动建账号）、`ops_operator_login`（按别名登录运营通道：独立 OIDC client、运营 audience、PKCE 公开客户端经 `/api/auth/ops/token` 兑换；登录时以 `GET /api/ops/quota/context` 实时校验运营身份）、`ops_workspace_ensure`、`ops_member_list|add|remove`、`ops_request`（以会话调产品 HTTP 接口；运营会话只许 `/api/ops/*`，客户会话不许 `/api/ops/*`）、`ops_query`（以会话在 workspace 库里查询）、`ops_browser_login`（将 customer 会话注入产品首页，operator 会话注入 `/ops/`（需配置与运营 SPA 一致的 `broker.ops.clientId`）；kind=ops 直连会话不接受浏览器注入，仍只走受控 API；运营会话按 `broker.ops.clientId` 与 `idp.issuer` 写入 oidc-client-ts User 存储）、`ops_logout`。新增能力只需：在 `src/ops/` 实现，登记到 `OPS_TOOLS` 与 `OpsBroker` 的处理表，补测试（`tests/ops-broker.test.ts`，用 `tests/support/ops-world.ts` 的假 IdP/产品/D1），在协议表里加一行，再 `sh plugin/scripts/vendor.sh` 并 `plugin reload`；通道不用改，工具清单自动并入。
 
 每个环境的配置（`admin project broker`，只放非敏感项，校验不过不入库）：
 
@@ -93,9 +93,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 
 ### 浏览器运营会话
 
-`ops_browser_login` 在同源非 SPA 探测页写入 sessionStorage，再进入 `/ops/`。运营 SPA 的 OIDC client 必须与 `broker.ops.clientId` 一致；存储键为 `oidc.user:<issuer>:<clientId>`，User 含 Bearer access_token、openid scope、profile 与秒级 expires_at。客户通道仍使用 `oidc.access_token` / `oidc.exp`。切换会话清除旧两类登录存储，API 通道隔离不变。token 只经 ego-browser stdin 传递，不进入 argv、响应或审计。注入不包含 refresh token；过期后重新调用工具，代理按原会话通道重认证，再注入。完成验收关闭任务空间。
-
-
+`ops_browser_login` 在同源非 SPA 探测页写入 sessionStorage，再进入 `/ops/`。浏览器注入仅限 customer 与 operator 会话：customer 落产品首页（沿用 `oidc.access_token` / `oidc.exp`），operator 落运营台；kind=ops 直连 audience 会话不接受注入（仍只走受控 API）。运营 SPA 的 OIDC client 必须与 `broker.ops.clientId` 一致；存储键为 `oidc.user:<issuer>:<clientId>`，User 含 Bearer access_token、openid scope、profile 与秒级 expires_at。切换会话清除旧两类登录存储，API 通道隔离不变。token 只经 ego-browser stdin 传递，不进入 argv、响应或审计。注入不包含 refresh token；过期后重新调用工具，代理按原会话通道重认证，再注入。完成验收关闭任务空间。
 
 控制措施：
 - **租约门**：每次调用由 `core.opsScope` 重新核验调用者的在手租约，项目取自任务所属目标；通道丢弃员工自带的 `taskId`，只用租约里的任务。任务所属目标没有关联项目返回 `invalid`，项目环境没配置运维代理返回 `not_configured`。

@@ -13,7 +13,7 @@ export interface BrowserLoginInput {
   probeUrl: string;
   landingUrl: string;
   token: string;
-  auth: { kind: 'customer' } | { kind: 'operator' | 'ops'; authority: string; clientId: string };
+  auth: { kind: 'customer' } | { kind: 'operator'; authority: string; clientId: string };
   /** Epoch ms; the product stores epoch seconds. */
   expiresAt: number;
 }

@@ -631,6 +631,9 @@ export class OpsBroker {
 
   private async browserLogin(ctx: Ctx, args: Args): Promise<Outcome> {
     const session = this.session(ctx, args);
+    // 运营台浏览器注入仅限 operator 会话；kind=ops 直连 audience 会话仍只走受控 API，
+    // 不为两个 client 混用伪造 userStore 身份（经理裁定 c8ecbb54 resume）。
+    if (session.kind === 'ops') throw invalid('an ops session stays on the controlled API channel; browser injection is operator-only (ops_operator_login)');
     const ops = session.kind !== 'customer';
     if (ops && !ctx.cfg.ops) throw new CompanyError('not_configured', 'ops browser login requires the product ops SPA client (broker ops)');
     const spaceId = Number(args.spaceId);
@@ -644,7 +647,7 @@ export class OpsBroker {
     const landed = await (this.deps.browser ?? egoBrowserInjector)({
       bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl: `${product.origin}/${ops ? 'ops/' : ''}`,
       token: session.token, expiresAt: session.expiresAt,
-      auth: session.kind === 'customer' ? { kind: 'customer' } : { kind: session.kind, authority: ctx.cfg.idp.issuer.replace(/\/$/u, ''), clientId: ctx.cfg.ops!.clientId },
+      auth: session.kind === 'customer' ? { kind: 'customer' } : { kind: 'operator', authority: ctx.cfg.idp.issuer.replace(/\/$/u, ''), clientId: ctx.cfg.ops!.clientId },
     });
     return {
       value: { signedInAs: session.username, url: landed.url, title: landed.title },

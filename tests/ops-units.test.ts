@@ -499,7 +499,7 @@ describe('ego-browser injector', () => {
       const execute = new Function('taskSpace', 'sessionStorage', 'console', `return (async () => {${script}})()`) as (task: typeof taskSpace, store: typeof storage, output: { log: () => void }) => Promise<void>;
       await execute(taskSpace, storage, { log: () => {} });
     };
-    for (const kind of ['operator', 'ops'] as const) {
+    for (const kind of ['operator'] as const) {
       const token = `header.${Buffer.from(JSON.stringify({ sub: 'real-subject' })).toString('base64url')}.signature`;
       await run(browserLoginScript({ ...input('unused'), token, landingUrl: 'https://app.test/ops/', auth: { kind, authority: 'https://idp.test/t/ck', clientId: 'spa-client' } }));
       const user = JSON.parse(storage['oidc.user:https://idp.test/t/ck:spa-client']!);
