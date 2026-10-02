@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DeferTaskUntil, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { ProjectStore } from './projects.ts';
@@ -628,6 +628,122 @@ export class SurrealCompanyCore implements CompanyCore {
       if (replayed) return replayed;
       throw error;
     }
+  }
+
+  /**
+   * gm only: re-point an execute-phase gm block at the dependency graph. The task keeps
+   * state 'blocked' — it never re-enters the dispatcher's gm-attention loop or the work
+   * queues — but `blocked_to` clears, which is exactly what UNLOCK_SQL needs to flip it
+   * 'ready' the moment the last dependency finishes. Owner gates, review blocks, live
+   * leases and closed goals are refused, not guessed; with every dependency already done
+   * the task resumes immediately under the same safe execute semantics as resume.
+   */
+  async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may defer blocked tasks');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.text, 'text', 20, 8000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    if (input.expectedVersion !== undefined && !Number.isSafeInteger(input.expectedVersion)) {
+      throw new CompanyError('invalid', 'Invalid expectedVersion');
+    }
+    const dependencies = [...new Set(input.dependencies ?? [])];
+    if (!dependencies.length || dependencies.length > 20) {
+      throw new CompanyError('invalid', 'defer requires 1-20 dependencies');
+    }
+    if (dependencies.includes(input.taskId)) throw new CompanyError('invalid', 'A task cannot wait on itself');
+    const idem = this.idemId(actor.employeeId, 'defer', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion }));
+    const replayed = await this.replay(idem, digest);
+    if (replayed) return replayed;
+
+    // Query results may carry record ids as `task:⟨uuid⟩` (the fork's escaped rendering):
+    // strip the quoting so client-side uuids compare equal against server-side ids.
+    const norm = (value: unknown): string => {
+      const raw = value instanceof RecordId ? String(value.id) : asId(value);
+      return raw.startsWith('⟨') && raw.endsWith('⟩') ? raw.slice(1, -1) : raw;
+    };
+    const depIds = dependencies.map(dep => id('task', dep));
+    const taskRef = id('task', input.taskId);
+
+    // Fast-fail with a readable reason plus the audit snapshot; the transaction re-checks
+    // every guard atomically, so a stale pre-read can never turn into a wrong write.
+    type DeferredRow = {
+      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; current_employee?: string;
+      lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string;
+    };
+    // `FROM ONLY` yields the record itself (or NONE), not a list.
+    const [before] = await this.db.query<[DeferredRow | undefined]>('SELECT state, blocked_to, resume_state, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
+      { task: taskRef });
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready'].includes(before.resume_state ?? '')) {
+      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute-phase tasks');
+    }
+    if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
+    if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
+      throw new CompanyError('conflict', 'Task version moved');
+    }
+    const beforeDeps = (before.dependencies ?? []).map(norm);
+    const after = [...new Set([...beforeDeps, ...dependencies])];
+    const phase = before.resume_state ?? 'ready';
+    const evidence = `${input.text}\n[defer] 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
+
+    const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
+      'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
+    const depById = new Map((depRows ?? []).map(row => [norm(row.id), row]));
+    for (const dep of dependencies) {
+      const row = depById.get(dep);
+      if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
+      // norm maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
+      if (norm(row.goal) !== norm(before.goal)) {
+        throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
+      }
+    }
+    // The deferred task must not be reachable from its own new dependencies: walk the
+    // dependency closure of the proposed deps and refuse a path back to the task.
+    const seen = new Set(dependencies);
+    let frontier = [...dependencies];
+    for (let depth = 0; frontier.length && depth < 32; depth++) {
+      const [closure] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
+        'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(d => id('task', d)) });
+      const next = [...new Set((closure ?? []).flatMap(row => (row.dependencies ?? []).map(norm)))].filter(d => !seen.has(d));
+      if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
+      for (const n of next) seen.add(n);
+      frontier = next;
+    }
+
+    const row = await this.txTask(`BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $who = NONE OR $who.revoked = true OR $who.role != 'gm' OR $t = NONE { THROW 'defer denied' };
+      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready'] { THROW 'defer denied: only execute-phase gm blocks can wait on dependencies' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'defer denied: the task still holds an active lease' };
+      LET $g = SELECT * FROM ONLY $t.goal;
+      IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
+      IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
+      FOR $dep IN $dependencies {
+        LET $d = SELECT * FROM ONLY $dep;
+        IF $d = NONE OR $d.goal != $t.goal { THROW 'defer denied: dependency missing or outside the task goal' };
+      };
+      LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
+      LET $remaining = SELECT VALUE id FROM task WHERE id IN $merged AND state != 'done';
+      LET $next = UPDATE ONLY $task SET
+        dependencies = $merged,
+        state = IF array::len($remaining) = 0 THEN 'ready' ELSE 'blocked' END,
+        blocked_to = NONE, resume_role = NONE, resume_state = NONE,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        version = $t.version + 1 RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value, payload: { state: $next.state, added: $added }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`, {
+      actor: id('employee', actor.employeeId), task: taskRef, expected: input.expectedVersion,
+      dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
+      idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+    });
+    return view(row);
   }
 
   /**
