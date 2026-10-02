@@ -48,6 +48,7 @@
 | `ops_query` | `session`, `sql`, `vars?`, `slug?` | 以会话身份在所选 workspace 的数据库里执行 SurrealQL |
 | `ops_browser_login` | `session`, `spaceId`, `page?` | 把会话注入你的 ego-browser 任务空间（`page` 缺省 `p1`），浏览器里直接是已登录状态，不用输入密码 |
 | `ops_logout` | `session` | 关闭会话 |
+| `ops_idp_client_register` | `client_name`, `redirect_uris`, `access_token_audience` | 在 IdP 登记一个公开 SPA client（Authorization Code+PKCE、无 secret、`consent_policy=skip`）；redirect 与 audience 限产品域名下的 https 地址；同名幂等，只回公开 `clientId` |
 
 规则：
 - 会话分两种：`ops_login` 的客户会话走产品 API 与 workspace 数据；`ops_operator_login` 与 `ops_login`（`audience:"ops"`）的运营会话只用于 `ops_request` 调 `/api/ops/*`（运营台、内容、套餐与额度运营接口），产品侧每次请求都按平台运营身份实时校验，撤权立即生效。

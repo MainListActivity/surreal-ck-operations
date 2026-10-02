@@ -82,6 +82,16 @@ export class FakeWorld {
     this.sqlite.run(`CREATE TABLE user_password_credentials (
       id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id),
       password_hash TEXT NOT NULL, created_at TEXT, updated_at TEXT)`);
+    this.sqlite.run(`CREATE TABLE oidc_clients (
+      id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      client_secret_hash TEXT, client_name TEXT NOT NULL, application_type TEXT NOT NULL,
+      trust_level TEXT NOT NULL, consent_policy TEXT NOT NULL, client_profile TEXT NOT NULL,
+      access_token_audience TEXT, allowed_scopes TEXT, initiate_login_uri TEXT,
+      claim_hook_url TEXT, claim_hook_auth_header_name TEXT, claim_hook_auth_header_value TEXT,
+      token_endpoint_auth_method TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+      grant_types TEXT NOT NULL, response_types TEXT NOT NULL, created_by TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE (tenant_id, client_id))`);
   }
 
   advance(ms: number) { this.clock += ms; }
@@ -173,6 +183,14 @@ export class FakeWorld {
   }
   insertUser(username: string, email: string) {
     this.sqlite.run('INSERT INTO users (id, tenant_id, email, username, display_name, status) VALUES (?, ?, ?, ?, ?, ?)', [randomUUID(), TENANT, email, username, username, 'active']);
+  }
+
+  /** Direct row access for assertions about a registered OIDC client. */
+  oidcClient(clientName: string): Record<string, unknown> | undefined {
+    return (this.sqlite.query('SELECT * FROM oidc_clients WHERE client_name = ?').get(clientName) ?? undefined) as never;
+  }
+  oidcClientCount(): number {
+    return (this.sqlite.query('SELECT COUNT(*) AS n FROM oidc_clients').get() as { n: number }).n;
   }
 
   // ---------- IdP ----------

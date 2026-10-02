@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
@@ -41,8 +41,9 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info', 'ops_login', 'ops_logout', 'ops_member_add',
-      'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_client_register', 'ops_info', 'ops_login',
+      'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query',
+      'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
@@ -841,5 +842,68 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     const res = await call(r, 'ops_request', { session, method: 'GET', path: '/api/ops/quota/context' });
     expect(res).toMatchObject({ status: 403, ok: false, body: { error: { code: 'platform-operator-inactive' } } });
     expectNoLeaks(r);
+  });
+});
+
+describe('ops_idp_client_register', () => {
+  const REDIRECTS = ['https://app.test/ops/auth/callback.html'];
+
+  test('registers a public SPA client row in the IdP database', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    });
+    expect(res.result).toBe('created');
+    expect(res.clientId).toMatch(/^[0-9a-f-]{36}$/);
+    const row = r.world.oidcClient('sck-ops-console')!;
+    expect(row).toMatchObject({
+      tenant_id: TENANT, client_id: res.clientId, client_name: 'sck-ops-console',
+      application_type: 'web', client_profile: 'spa', token_endpoint_auth_method: 'none',
+      client_secret_hash: null, trust_level: 'first_party_trusted', consent_policy: 'skip',
+      access_token_audience: 'https://app.test/api/ops/mcp',
+      grant_types: '["authorization_code"]', response_types: '["code"]',
+    });
+    expect(JSON.parse(String(row.redirect_uris))).toEqual(REDIRECTS);
+    expectNoLeaks(r);
+  });
+
+  test('a replayed registration returns the existing client_id instead of a second row', async () => {
+    const r = rig();
+    const args = {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    };
+    const first = await call(r, 'ops_idp_client_register', args);
+    const again = await call(r, 'ops_idp_client_register', args);
+    expect(again).toMatchObject({ clientId: first.clientId, result: 'exists' });
+    expect(r.world.oidcClientCount()).toBe(1);
+  });
+
+  test('redirect_uris off the product host or off https are refused before any write', async () => {
+    const r = rig();
+    for (const redirect_uris of [
+      ['https://evil.example/callback'],
+      ['http://app.test/ops/auth/callback.html'],
+      ['app.test/ops/callback.html'],
+      ['https://sub.app.test.evil.example/callback'],
+    ]) {
+      const error = await failure(call(r, 'ops_idp_client_register', {
+        client_name: 'sck-ops-console', redirect_uris,
+        access_token_audience: 'https://app.test/api/ops/mcp',
+      }));
+      expect(error.code).toBe('invalid');
+    }
+    expect(r.world.oidcClientCount()).toBe(0);
+  });
+
+  test('an audience off the product host is refused before any write', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://attacker.example/api/ops/mcp',
+    }));
+    expect(error.code).toBe('invalid');
+    expect(r.world.oidcClientCount()).toBe(0);
   });
 });
