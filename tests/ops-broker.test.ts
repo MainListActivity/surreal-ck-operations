@@ -41,9 +41,9 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_client_register', 'ops_info', 'ops_login',
-      'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query',
-      'ops_request', 'ops_workspace_ensure',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_client_info', 'ops_idp_client_register',
+      'ops_info', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
+      'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
@@ -100,6 +100,8 @@ describe('ops info and health', () => {
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
     expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false });
+    // Public client metadata is listed for alignment checks; never secret material.
+    expect(info.clients).toEqual({ customer: { clientId: 'client-ck-1234', redirectUri: 'https://app.test/auth/callback' } });
     expectNoLeaks(r);
   });
 
@@ -397,6 +399,8 @@ describe('ops request, query and browser', () => {
     expect(result).toEqual({ signedInAs: 'sck-qa-one', url: 'https://app.test/', title: 'Fixture App' });
     expect(r.world.browserLogins).toHaveLength(1);
     expect(r.world.browserLogins[0]).toMatchObject({ spaceId: 3, page: 'p1', probeUrl: 'https://app.test/health' });
+    // Customer injection is unchanged: the flat oidc.access_token/oidc.exp keys, no User record.
+    expect(r.world.browserLogins[0]!.oidcUser).toBeUndefined();
     expect(r.world.tokens).toContain(r.world.browserLogins[0]!.token);
     expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_browser_login' });
     expectNoLeaks(r);
@@ -609,6 +613,32 @@ describe('operator sessions', () => {
     expect((await call(rig(opsPatch), 'ops_info')).can).toMatchObject({ operatorLogin: true });
   });
 
+  test('a broker client id that is not the registered console client fails at authorize', async () => {
+    // The production failure shape: the authorize URL carried a client the IdP never registered
+    // (or the proxy hard-binding would override). No retry, no consent hop, no token minted.
+    const r = rig({ ops: { clientId: 'ops-client-WRONG', redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } });
+    await opsUser(r, 'qa-ops');
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('HTTP 400');
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('the operator client id travels on authorize and token exchange exactly as configured', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const authorize = () => r.world.requests.map(x => new URL(x.url)).find(u => u.pathname === '/t/ck/authorize')!;
+    await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    expect(authorize().searchParams.get('client_id')).toBe(OPS_CLIENT);
+    const exchange = r.world.requests.find(x => x.url.endsWith('/api/auth/ops/token'))!;
+    expect(exchange.method).toBe('POST');
+    // PKCE S256 was offered on authorize and proven at exchange (the fake rejects otherwise).
+    expect(authorize().searchParams.get('code_challenge_method')).toBe('S256');
+    expect(authorize().searchParams.get('code_challenge')).toBeTruthy();
+  });
+
   test('an account that is not a platform operator fails the login probe and keeps no session', async () => {
     const r = rig(opsPatch);
     await call(r, 'ops_account_ensure', { alias: 'qa-ops' }); // never registered as an operator
@@ -630,13 +660,13 @@ describe('operator sessions', () => {
     await opsUser(r, 'qa-ops');
     const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
     expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('invalid');
+    // ops_browser_login is intentionally absent: an operator session may inject into /ops/.
     for (const [tool, extra] of [
       ['ops_workspace_ensure', { slug: 'sck-x' }],
       ['ops_member_list', { slug: 'sck-x' }],
       ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_query', { sql: 'SELECT 1' }],
-      ['ops_browser_login', { spaceId: 1 }],
     ] as const) {
       const err = await failure(call(r, tool, { session: op.session, ...extra }));
       expect(err.code, tool).toBe('invalid');
@@ -714,6 +744,72 @@ describe('operator sessions', () => {
     r.world.operatorCaps.set(subject, ['content.read']);
     const denied = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
     expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
+  });
+
+  test('an operator session injects into /ops/ as the console\'s oidc-client-ts User record', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    const result = await call(r, 'ops_browser_login', { session: op.session, spaceId: 7, page: 'p3' });
+    expect(result).toEqual({ signedInAs: 'sck-qa-ops', url: 'https://app.test/ops/', title: 'Fixture App' });
+
+    const login = r.world.browserLogins[0]!;
+    expect(login).toMatchObject({ spaceId: 7, page: 'p3', probeUrl: 'https://app.test/health', landingUrl: 'https://app.test/ops/' });
+    // The UserManager userStore key is `oidc.user:<authority>:<client_id>` with the issuer's
+    // trailing slash stripped — never the customer app's flat oidc.access_token/oidc.exp keys.
+    expect(login.oidcUser?.key).toBe(`oidc.user:https://idp.test/t/ck:${OPS_CLIENT}`);
+    const record = JSON.parse(login.oidcUser!.value) as Record<string, unknown>;
+    expect(record).toMatchObject({
+      access_token: login.token, token_type: 'Bearer', scope: 'openid',
+      profile: { sub: subject, email: 'sck-qa-ops@example.test' },
+    });
+    expect(record.expires_at).toBe(Math.floor((r.world.clock + 900_000) / 1000));
+    // The operator gate was re-probed before the token was handed to the browser.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/quota/context'))).toHaveLength(2);
+    expect(r.company.audits.at(-1)!.evidence).toContain('/ops/');
+    expectNoLeaks(r);
+  });
+
+  test('an operator browser login re-probes the gate: revocation refuses and drops the session', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.operatorCaps.set(subject, []);
+    const error = await failure(call(r, 'ops_browser_login', { session: op.session, spaceId: 1 }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('platform-operator-inactive');
+    expect(r.world.browserLogins).toHaveLength(0);
+    // The dead session is dropped, so a stray retry cannot smuggle a revoked token anywhere.
+    expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/ops/quota/context' }))).code).toBe('not_found');
+    expectNoLeaks(r);
+  });
+
+  test('an operator browser login whose token died re-auths on the ops channel first', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.expireTokens(); // the stored token dies: reauth mints a fresh ops-audience one
+    const result = await call(r, 'ops_browser_login', { session: op.session, spaceId: 1 });
+    expect(result.signedInAs).toBe('sck-qa-ops');
+    // Reauth stayed on the operator channel — a second /api/auth/ops/token, no customer exchange.
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(2);
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
+    // And the injected record carries the fresh ops-audience token, not the stale one.
+    const record = JSON.parse(r.world.browserLogins[0]!.oidcUser!.value) as Record<string, unknown>;
+    expect(record.access_token).toBe(r.world.tokens.at(-1));
+    expectNoLeaks(r);
+  });
+
+  test('a browser login with bad page args never reaches the injector for an operator either', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    for (const args of [{ spaceId: -1 }, { spaceId: 1, page: 'x;rm' }]) {
+      expect((await failure(call(r, 'ops_browser_login', { session: op.session, ...args }))).code).toBe('invalid');
+    }
+    expect(r.world.browserLogins).toHaveLength(0);
+    // No re-probe ran for invalid args: validation precedes the operator gate check.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/quota/context'))).toHaveLength(1);
   });
 });
 
@@ -905,5 +1001,65 @@ describe('ops_idp_client_register', () => {
     }));
     expect(error.code).toBe('invalid');
     expect(r.world.oidcClientCount()).toBe(0);
+  });
+});
+
+describe('ops_idp_client_info', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+
+  test('reports the registered client and its alignment with the broker config', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info).toMatchObject({
+      clientName: 'sck-ops-console', clientId: OPS_CLIENT, redirectUris: [OPS_REDIRECT],
+      accessTokenAudience: OPS_RESOURCE, consentPolicy: 'require', clientProfile: 'spa',
+      tokenEndpointAuthMethod: 'none', grantTypes: ['authorization_code'], responseTypes: ['code'],
+      hasSecret: false,
+      alignment: {
+        customerClient: false, operatorClient: true, opsAudienceClient: false,
+        operatorRedirectRegistered: true, operatorAudienceMatch: true,
+      },
+    });
+    expectNoLeaks(r);
+  });
+
+  test('looks up by client_id and flags a drifted redirect or audience', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT, redirectUris: ['https://app.test/old/cb'], audience: 'https://app.test/api/ops/old' });
+    const info = await call(r, 'ops_idp_client_info', { client_id: OPS_CLIENT });
+    expect(info.clientName).toBe('sck-ops-console');
+    expect(info.alignment).toMatchObject({ operatorClient: true, operatorRedirectRegistered: false, operatorAudienceMatch: false });
+  });
+
+  test('a client other than the configured operator client is flagged as mismatched', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: 'ops-client-9999' });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info.alignment).toMatchObject({ operatorClient: false, customerClient: false });
+  });
+
+  test('the secret hash is reported as a boolean and never leaves the broker', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT, secretHash: 'deadbeef-secret-hash' });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info.hasSecret).toBe(true);
+    expect(JSON.stringify(info)).not.toContain('deadbeef-secret-hash');
+    expectNoLeaks(r, ['deadbeef-secret-hash']);
+  });
+
+  test('unknown clients are not_found; bad args are invalid; nothing reaches the database', async () => {
+    const r = rig(opsPatch);
+    expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'ghost-client' }))).code).toBe('not_found');
+    const sqlCalls = r.world.sql.length;
+    for (const args of [{}, { client_name: 'a', client_id: 'b' }, { client_name: 'Bad Name!' }, { client_id: 'x;drop' }]) {
+      expect((await failure(call(r, 'ops_idp_client_info', args))).code).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(sqlCalls);
+  });
+
+  test('without an IdP database configured the tool reports not_configured', async () => {
+    const r = rig({ ...opsPatch, d1: undefined });
+    expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' }))).code).toBe('not_configured');
   });
 });

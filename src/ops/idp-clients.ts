@@ -46,6 +46,74 @@ export function audienceUrl(raw: unknown, allowedHost: string): string {
   return urlOnHost(raw, allowedHost, 'access_token_audience');
 }
 
+/** Public-client identifiers are UUIDs; anything else is rejected before it reaches SQL. */
+export function clientId(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!/^[A-Za-z0-9._-]{4,100}$/.test(value)) throw invalid('client_id must be 4-100 chars of letters, digits, ., _ or -');
+  return value;
+}
+
+export interface SpaClientInfo {
+  clientId: string;
+  clientName: string;
+  redirectUris: string[];
+  accessTokenAudience: string | null;
+  consentPolicy: string;
+  clientProfile: string;
+  tokenEndpointAuthMethod: string;
+  grantTypes: string[];
+  responseTypes: string[];
+  /** Whether a secret hash exists at all; the hash itself is never selected. */
+  hasSecret: boolean;
+}
+
+interface ClientInfoRow {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string;
+  access_token_audience: string | null;
+  consent_policy: string;
+  client_profile: string;
+  token_endpoint_auth_method: string;
+  grant_types: string;
+  response_types: string;
+  has_secret: number;
+}
+
+const INFO_COLUMNS = `client_id, client_name, redirect_uris, access_token_audience, consent_policy,
+  client_profile, token_endpoint_auth_method, grant_types, response_types,
+  client_secret_hash IS NOT NULL AS has_secret`;
+
+const jsonList = (raw: string | null): string[] => {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+  } catch { return []; }
+};
+
+/**
+ * Read-only client lookup for alignment diagnosis: every column returned is public registration
+ * metadata — the secret hash column appears only inside `IS NOT NULL`, so no secret material can
+ * leave this function.
+ */
+export async function describeSpaClient(
+  d1: D1Client, tenantId: string, key: { clientName?: string; clientId?: string },
+): Promise<SpaClientInfo | undefined> {
+  const rows = key.clientName !== undefined
+    ? await d1.query<ClientInfoRow>(`SELECT ${INFO_COLUMNS} FROM oidc_clients WHERE tenant_id = ? AND client_name = ? LIMIT 1`, [tenantId, key.clientName])
+    : await d1.query<ClientInfoRow>(`SELECT ${INFO_COLUMNS} FROM oidc_clients WHERE tenant_id = ? AND client_id = ? LIMIT 1`, [tenantId, key.clientId]);
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    clientId: row.client_id, clientName: row.client_name,
+    redirectUris: jsonList(row.redirect_uris), accessTokenAudience: row.access_token_audience ?? null,
+    consentPolicy: row.consent_policy, clientProfile: row.client_profile,
+    tokenEndpointAuthMethod: row.token_endpoint_auth_method,
+    grantTypes: jsonList(row.grant_types), responseTypes: jsonList(row.response_types),
+    hasSecret: !!row.has_secret,
+  };
+}
+
 export interface RegisterSpaClientInput {
   d1: D1Client;
   tenantId: string;

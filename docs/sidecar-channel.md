@@ -59,7 +59,8 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 | `ops_account_ensure` / `ops_login` / `ops_logout` | 密码由代理生成、密封入库、只在代理侧使用；`ops_login` 返回的是不透明会话句柄 `s_<16hex>`，不是 token |
 | `ops_workspace_ensure` / `ops_member_*` | slug 必须以项目 `workspacePrefix` 开头；成员按账号别名解析 |
 | `ops_request` / `ops_query` | 以会话身份调产品 HTTP / 在 workspace 库执行 SurrealQL；响应经脱敏与限长（100K） |
-| `ops_browser_login` | 把会话注入员工自己的 ego-browser 任务空间 |
+| `ops_browser_login` | 把会话注入员工自己的 ego-browser 任务空间：客户会话落产品 `/`（原 `oidc.access_token`/`oidc.exp` 键）；运营会话落 `/ops/` 并按 ops 控制台 oidc-client-ts `UserManager` 契约写序列化 `User` 记录，注入前重探运营身份；`ops` audience 会话禁止注入 |
+| `ops_idp_client_info` | 只读查看 IdP 已登记公开 client 的公开元数据（client_id、redirect、audience、consent_policy 等）及与代理配置的一致性；不返回任何密钥材料 |
 
 - **会话**：仅存内存，按（员工、项目、环境）隔离，每员工最多 8 个、最长 6 小时；token 临过期自动重登。租约结束、会话归档、插件重启即全部失效，跨任务不复用。代理没有删除账号/workspace 的能力。
 - **配额**：项目内按审计行统计最近 24h 新建数，超限回 `limit_reached`。
