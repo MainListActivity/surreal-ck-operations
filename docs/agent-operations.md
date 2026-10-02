@@ -6,7 +6,7 @@
 |---|---|---|
 | 任务服务 | 远端 `data.maplayer.top/sck-mcp`（Caddy→`127.0.0.1:38473`，gate token），本机 launchd `org.surrealck.company-mcp` 兜底并兼跑 GitHub 投影 | 任务、租约、审计、目标、关口；admin/owner 通道 |
 | 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
-| 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理 |
+| 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
 | 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
 | 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
@@ -69,7 +69,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 
 ## 运维代理（ops broker）
 
-员工需要账号、workspace、登录这类凭证才能做的事，不自己动手，向插件里的运维代理（`src/ops/broker.ts`）提出请求：员工 `sck call ops_*` → 会话私有通道（req/res 文件）→ 通道把请求绑定到当前租约的任务 → `OpsBroker` 校验后执行 → 脱敏结果原路返回。员工用法见 [协议](../agents/PROTOCOL.md) 的「运维工具」。
+员工需要账号、workspace、登录这类凭证才能做的事，不自己动手，向插件里的运维代理（`src/ops/broker.ts`）提出请求：员工 `sck call ops_*` → 会话私有通道（req/res 文件）→ 通道把请求绑定到当前租约的任务 → `OpsBroker` 校验后执行 → 脱敏结果原路返回。员工用法见 [协议](../agents/PROTOCOL.md) 的「运维工具」，通道细节见 [sidecar 通道](sidecar-channel.md)。
 
 能力：`ops_info`、`ops_health`、`ops_account_ensure`（建/修测试账号）、`ops_login`（按账号别名登录，得客户会话句柄；`audience:"ops"` 时经 `idp.ops` 公共客户端直连 IdP `/token` 换出运营会话，不列 workspace、不自动建账号）、`ops_operator_login`（按别名登录运营通道：独立 OIDC client、运营 audience、PKCE 公开客户端经 `/api/auth/ops/token` 兑换；登录时以 `GET /api/ops/quota/context` 实时校验运营身份）、`ops_workspace_ensure`、`ops_member_list|add|remove`、`ops_request`（以会话调产品 HTTP 接口；运营会话只许 `/api/ops/*`，客户会话不许 `/api/ops/*`）、`ops_query`（以会话在 workspace 库里查询）、`ops_browser_login`（把客户会话注入员工的 ego-browser 任务空间）、`ops_logout`。新增能力只需：在 `src/ops/` 实现，登记到 `OPS_TOOLS` 与 `OpsBroker` 的处理表，补测试（`tests/ops-broker.test.ts`，用 `tests/support/ops-world.ts` 的假 IdP/产品/D1），在协议表里加一行，再 `sh plugin/scripts/vendor.sh` 并 `plugin reload`；通道不用改，工具清单自动并入。
 
@@ -89,7 +89,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 }
 ```
 
-`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。 运营 client 由 IdP 的受管资源动态注册端点 `POST {issuer}/connect/mcp/register` 自助登记（公开 client、`token_endpoint_auth_method=none`、`scope=openid`），返回的 `client_id` 与 `resource` 填入此块；registration token 不入库。`idp.ops` 缺省则 `ops_login` 的 `audience:"ops"` 返回 `not_configured`：该块配置的公开客户端走 authorize（`resource`=`audience` 值）→ login → 回调 code → 直连 `POST {issuer}/token`（`client_id`+`code_verifier`，无 client_secret），不走产品 `/api/auth/token`；`idp.ops.audience` 即 IdP 侧该 client 的 `access_token_audience`（须等于产品运营 audience）。DCR 登记的公开 client 带 `consent_policy=require`：login 返回的是 IdP consent 页 URL，代理携 login 设置的 `user_session` cookie 自动 approve（IdP 审计 `oidc.authorization.consent.granted`），再跟随 302 拿到 code。
+`roles` 是可用 ops 工具的岗位（缺省 qa / engineering / product）；`accounts` 决定命名：用户名 `<prefix><别名小写>`、邮箱 `<用户名>@<emailDomain>`，新 workspace 的 slug 必须以 `workspacePrefix` 开头；`d1` 缺省则不能建/修账号；`data` 缺省则不能 `ops_query` 与列成员；`browser.bin` 指定 ego-browser 路径（缺省 `~/.local/bin/ego-browser`）；`ops` 缺省则没有运营通道，`ops_operator_login` 返回 `not_configured`。`ops.resource` 是产品运营 audience（IdP 运营 client 的 `access_token_audience` 与之对应）。 运营 client 由 IdP 的受管资源动态注册端点 `POST {issuer}/connect/mcp/register` 自助登记（公开 client、`token_endpoint_auth_method=none`、`scope=openid`），返回的 `client_id` 与 `resource` 填入此块；registration token 不入库。`idp.ops` 缺省则 `ops_login` 的 `audience:"ops"` 返回 `not_configured`：该块配置的公开客户端走 authorize（`resource`=`audience` 值）→ login → 回调 code → 直连 `POST {issuer}/token`（`client_id`+`code_verifier`，无 client_secret），不走产品 `/api/auth/token`；`idp.ops.audience` 即 IdP 侧该 client 的 `access_token_audience`（须等于产品运营 audience）。DCR 登记的运营 client 带 `consent_policy=require`：login 返回的是 IdP consent 页 URL，代理携 login 设置的 `user_session` cookie 自动 approve（IdP 审计 `oidc.authorization.consent.granted`），再跟随 302 拿到 code。自动批准只对 `ops.clientId`（公司自有运营 client）生效；其它 client 或 customer 通道遇到 consent 要求一律 `login_failed(consent_required)`，绝不自动同意。
 
 控制措施：
 - **租约门**：每次调用由 `core.opsScope` 重新核验调用者的在手租约，项目取自任务所属目标；通道丢弃员工自带的 `taskId`，只用租约里的任务。任务所属目标没有关联项目返回 `invalid`，项目环境没配置运维代理返回 `not_configured`。

@@ -275,6 +275,69 @@ describe('idp password login', () => {
     expect((await failure(run(flow(() => json(200, 'not an object'))))).reason).toBe('http_200');
   });
 
+  test('the operator channel approves the consent hop carrying the login session cookie', async () => {
+    const config = parseBrokerConfig(brokerConfig({
+      ops: { clientId: 'ops-client-x', redirectUri: 'https://ops.test/cb', resource: 'https://app.test/api/ops/mcp' },
+    }));
+    let state = '';
+    let consentCookie: string | null = null;
+    let consentBody = '';
+    const redirectTo = (location: string) => new Response(null, { status: 302, headers: { location } });
+    const fetcher: Fetcher = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/authorize')) {
+        state = url.searchParams.get('state')!;
+        return redirectTo('https://auth.test/login/ck?login_challenge=abc');
+      }
+      if (url.pathname === '/api/login/ck/password') {
+        return new Response(JSON.stringify({ redirect_uri: 'https://auth.test/api/consent/ck?consent_challenge=ch-1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'set-cookie': 'user_session=s-1; Path=/; HttpOnly' },
+        });
+      }
+      if (url.pathname === '/api/consent/ck') {
+        consentCookie = new Headers(init?.headers).get('cookie');
+        consentBody = String(init?.body);
+        return redirectTo(`https://ops.test/cb?code=code-1&state=${state}`);
+      }
+      if (url.pathname === '/api/auth/ops/token') {
+        return new Response(JSON.stringify({ access_token: 'tok-1', expires_in: 60 }), { status: 200 });
+      }
+      return new Response('', { status: 500 });
+    };
+    const tokens = await passwordLogin(config, 'u', 'p', { fetch: fetcher, channel: 'operator' });
+    expect(tokens.accessToken).toBe('tok-1');
+    expect(consentCookie ?? '').toContain('user_session=s-1');
+    const consentForm = new URLSearchParams(consentBody);
+    expect(consentForm.get('consent_challenge')).toBe('ch-1');
+    expect(consentForm.get('decision')).toBe('approve');
+  });
+
+  test('a consent challenge for a non-operator client fails instead of approving', async () => {
+    // Customer channel: no ops block configured, so no client may auto-approve at all.
+    const config = parseBrokerConfig(brokerConfig());
+    let consentPosts = 0;
+    const fetcher: Fetcher = async input => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/authorize')) {
+        return new Response(null, { status: 302, headers: { location: 'https://auth.test/login/ck?login_challenge=abc' } });
+      }
+      if (url.pathname === '/api/consent/ck') {
+        consentPosts++;
+        return new Response('', { status: 500 });
+      }
+      if (url.pathname === '/api/login/ck/password') {
+        return new Response(JSON.stringify({ redirect_uri: 'https://auth.test/api/consent/ck?consent_challenge=ch-1' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('', { status: 500 });
+    };
+    const error = await failure(passwordLogin(config, 'u', 'p', { fetch: fetcher }));
+    expect(error).toMatchObject({ code: 'login_failed', reason: 'consent_required' });
+    expect(consentPosts).toBe(0);
+  });
+
   test('a rejected token exchange is an upstream error without any token material', async () => {
     const world = new FakeWorld();
     world.insertUser('sck-nobody', 'sck-nobody@example.test');

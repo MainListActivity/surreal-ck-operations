@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
@@ -41,8 +41,9 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info', 'ops_login', 'ops_logout', 'ops_member_add',
-      'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_client_register', 'ops_info', 'ops_login',
+      'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query',
+      'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
@@ -547,6 +548,9 @@ describe('operator sessions', () => {
     expect(authorize.searchParams.get('resource')).toBe(OPS_RESOURCE);
     expect(authorize.searchParams.get('redirect_uri')).toBe(OPS_REDIRECT);
     expect(authorize.searchParams.get('audience')).toBeNull();
+    // The DCR'd operator client carries consent_policy `require`: the login parked on the consent
+    // page and the broker approved it with the password response's `user_session` cookie.
+    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(1);
     // The code was redeemed at the public ops token endpoint; the confidential proxy was not used.
     expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(1);
     expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
@@ -557,6 +561,43 @@ describe('operator sessions', () => {
     expect(res).toMatchObject({ status: 200, ok: true, body: { slug: 'qa-ws', entitlement: { revision: 3 } } });
     expect(r.company.audits.map(a => a.action)).toEqual(['ops_account_create', 'ops_operator_login', 'ops_call']);
     expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('an IdP consent denial fails the operator login as access_denied', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    r.world.denyConsents = true;
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('access_denied');
+    // The broker did POST the approval; the IdP's deny redirect carried the error, and no token was minted.
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('a consent hop without the login session cookie is refused and leaks nothing', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    r.world.omitSessionCookie = true;
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('invalid_consent_challenge');
+    expect(error.message).not.toContain('session-');
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(1);
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('a consent challenge on the customer client is refused outright, never approved', async () => {
+    const r = rig();
+    await call(r, 'ops_account_ensure', { alias: 'qa-one' });
+    r.world.consentClients.add('client-ck-1234');
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-one' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('consent');
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
     expectNoLeaks(r);
   });
 
@@ -604,6 +645,50 @@ describe('operator sessions', () => {
     // The only /api/ops traffic so far is the login probe; the refusals never reached the product.
     expect(r.world.requests.filter(x => x.url.includes('/api/ops/'))).toHaveLength(1);
     expect(await call(r, 'ops_logout', { session: op.session })).toEqual({ closed: true });
+    expectNoLeaks(r);
+  });
+
+  test('an operator session reaches /api/content/* but stays off every other path', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops', ['quota.read', 'content.source.manage']);
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+
+    const created = await call(r, 'ops_request', {
+      session: op.session, method: 'POST', path: '/api/content/sources',
+      body: { name: 'qa-synth', license: { url: 'https://example.invalid/lic' } },
+    });
+    // The fake source endpoint echoes the parsed body back, proving method, path and payload all arrived.
+    expect(created).toMatchObject({ status: 201, ok: true, body: { source: { name: 'qa-synth', license: { url: 'https://example.invalid/lic' } } } });
+    const posted = r.world.requests.find(x => x.url.endsWith('/api/content/sources'))!;
+    expect(posted.method).toBe('POST');
+
+    // The product's own capability gate still applies: without content.source.manage it is a 403.
+    const uid = r.world.user('sck-qa-ops')!.id;
+    r.world.operatorCaps.set(uid, ['quota.read']);
+    const denied = await call(r, 'ops_request', { session: op.session, method: 'POST', path: '/api/content/sources', body: {} });
+    expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
+
+    // Anything off /api/ops/* + /api/content/* is still refused at the proxy.
+    for (const path of ['/api/chat', '/api/session/workspaces', '/api/contentx/sources', '/api/contentious']) {
+      const error = await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path }));
+      expect(error.code, path).toBe('invalid');
+    }
+    expect(r.world.requests.filter(x => x.url.includes('/api/chat') || x.url.includes('/api/session/'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('an ops audience session reaches /api/content/*; a customer session is still refused on /api/ops/*', async () => {
+    const r = rig({ idp: { issuer: 'https://idp.test/t/ck', clientId: 'client-ck-1234', audience: 'https://auth.test', redirectUri: 'https://app.test/auth/callback', ops: { clientId: OPS_DIRECT_CLIENT, audience: OPS_RESOURCE, redirectUri: OPS_DIRECT_REDIRECT } } });
+    await opsUser(r, 'qa-ops', ['content.read']);
+    const ops = await call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' });
+    expect(ops.kind).toBe('ops');
+    const contract = await call(r, 'ops_request', { session: ops.session, method: 'GET', path: '/api/content/contract' });
+    expect(contract).toMatchObject({ status: 200, ok: true });
+
+    const customer = await call(r, 'ops_login', { alias: 'qa-one' });
+    const wrong = await failure(call(r, 'ops_request', { session: customer.session, method: 'GET', path: '/api/ops/quota/context' }));
+    expect(wrong.code).toBe('invalid');
+    expect(wrong.message).toContain('ops_operator_login');
     expectNoLeaks(r);
   });
 
@@ -664,8 +749,8 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     // The code went to the IdP's own /token; neither product proxy was touched.
     expect(idpTokenCalls(r)).toHaveLength(1);
     expect(r.world.requests.filter(x => x.url.includes('/api/auth/token') || x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
-    // Third-party public clients go through the IdP consent hop before the code is issued.
-    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(1);
+    // This client is not consent-gated, so no consent hop happens; gated clients are covered below.
+    expect(r.world.requests.filter(x => x.method === 'POST' && x.url.startsWith('https://auth.test/api/consent/'))).toHaveLength(0);
     // No workspace listing happens for an ops session.
     expect(r.world.requests.filter(x => x.url.includes('/api/session/'))).toHaveLength(0);
     expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_login' });
@@ -674,6 +759,19 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     const res = await call(r, 'ops_request', { session: login.session, method: 'GET', path: '/api/ops/quota/context' });
     expect(res).toMatchObject({ status: 200, ok: true });
     expect(r.company.audits.at(-1)!.evidence).toContain('运营 sck-qa-ops');
+    expectNoLeaks(r);
+  });
+
+  test('a consent challenge on the ops audience client is refused, not approved', async () => {
+    const r = rig(idpOps);
+    await opsUser(r, 'qa-ops');
+    r.world.consentClients.add(OPS_DIRECT_CLIENT);
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-ops', audience: 'ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('consent');
+    // The refusal happens before any consent POST or token exchange: never auto-approve others' clients.
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
+    expect(idpTokenCalls(r)).toHaveLength(0);
     expectNoLeaks(r);
   });
 
@@ -744,5 +842,68 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     const res = await call(r, 'ops_request', { session, method: 'GET', path: '/api/ops/quota/context' });
     expect(res).toMatchObject({ status: 403, ok: false, body: { error: { code: 'platform-operator-inactive' } } });
     expectNoLeaks(r);
+  });
+});
+
+describe('ops_idp_client_register', () => {
+  const REDIRECTS = ['https://app.test/ops/auth/callback.html'];
+
+  test('registers a public SPA client row in the IdP database', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    });
+    expect(res.result).toBe('created');
+    expect(res.clientId).toMatch(/^[0-9a-f-]{36}$/);
+    const row = r.world.oidcClient('sck-ops-console')!;
+    expect(row).toMatchObject({
+      tenant_id: TENANT, client_id: res.clientId, client_name: 'sck-ops-console',
+      application_type: 'web', client_profile: 'spa', token_endpoint_auth_method: 'none',
+      client_secret_hash: null, trust_level: 'first_party_trusted', consent_policy: 'skip',
+      access_token_audience: 'https://app.test/api/ops/mcp',
+      grant_types: '["authorization_code"]', response_types: '["code"]',
+    });
+    expect(JSON.parse(String(row.redirect_uris))).toEqual(REDIRECTS);
+    expectNoLeaks(r);
+  });
+
+  test('a replayed registration returns the existing client_id instead of a second row', async () => {
+    const r = rig();
+    const args = {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    };
+    const first = await call(r, 'ops_idp_client_register', args);
+    const again = await call(r, 'ops_idp_client_register', args);
+    expect(again).toMatchObject({ clientId: first.clientId, result: 'exists' });
+    expect(r.world.oidcClientCount()).toBe(1);
+  });
+
+  test('redirect_uris off the product host or off https are refused before any write', async () => {
+    const r = rig();
+    for (const redirect_uris of [
+      ['https://evil.example/callback'],
+      ['http://app.test/ops/auth/callback.html'],
+      ['app.test/ops/callback.html'],
+      ['https://sub.app.test.evil.example/callback'],
+    ]) {
+      const error = await failure(call(r, 'ops_idp_client_register', {
+        client_name: 'sck-ops-console', redirect_uris,
+        access_token_audience: 'https://app.test/api/ops/mcp',
+      }));
+      expect(error.code).toBe('invalid');
+    }
+    expect(r.world.oidcClientCount()).toBe(0);
+  });
+
+  test('an audience off the product host is refused before any write', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://attacker.example/api/ops/mcp',
+    }));
+    expect(error.code).toBe('invalid');
+    expect(r.world.oidcClientCount()).toBe(0);
   });
 });

@@ -173,6 +173,21 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   return providers;
 }
 
+/** ProviderQuota rows the dispatcher's circuit breaker consumes; shared with the roster preview. */
+export async function readProviderQuotas(ctx: Pick<Company, "db">): Promise<import("./vendor/src/contracts").ProviderQuota[]> {
+  const [rows] = await ctx.db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
+    `SELECT provider, summary, lowest_pct, session_pct, weekly_pct, status, fetched_at, at FROM company_meta
+     WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
+  return (rows ?? []).map(r => ({
+    provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
+    sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
+    // Freshness = when WE last verified the row, not the upstream snapshot time:
+    // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
+    // the circuit breaker would fail open on dead data.
+    fetchedAt: String(r.at ?? "") || r.fetched_at,
+  }));
+}
+
 async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
   const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
     `SELECT payload FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
@@ -291,14 +306,29 @@ export function startDispatch(server: PluginServerContext): () => void {
       });
     }),
     server.on("workspace.archived", () => kick()),
+    // Company employees run unattended: a permission prompt would stall the session
+    // until a human notices, so the plugin answers allow immediately and logs it.
+    // Owner-role approvals (spend, external comms) never arrive on this channel.
     server.on("agent.permission_requested", (event, { paseo }) => {
       paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (!ok) return;
+        const request = event.request as { id?: string } | undefined;
+        const summary = JSON.stringify(event.request).slice(0, 300);
+        try {
+          if (request?.id) {
+            await paseo.agents.ref(event.agent.id).respondToPermission({
+              requestId: request.id,
+              response: { behavior: "allow" },
+            });
+            console.log(`auto-allowed permission for ${event.agent.title ?? event.agent.id}: ${summary}`);
+          }
+        } catch (error) {
+          console.warn(`permission auto-answer failed for ${event.agent.id}: ${(error as Error).message} request=${summary}`);
+        }
         const ctx = await company();
         await refreshQuota(paseo, ctx).catch(() => {});
         await refreshModels(paseo, ctx).catch(() => {});
-        console.log(`permission requested by ${event.agent.title ?? event.agent.id}: ${JSON.stringify(event.request).slice(0, 300)}`);
       });
     }),
   ];

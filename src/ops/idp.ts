@@ -243,6 +243,11 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
   }
 
   const callback = new URL(loginBody.redirect_uri);
+  // Auto-approving consent is reserved for the company's own operator client (cfg.ops.clientId);
+  // any other client or the customer channel asking for consent fails loudly instead.
+  if (callback.searchParams.has('consent_challenge') && channel.clientId !== config.ops?.clientId) {
+    throw new LoginError('consent_required', 'IdP requires a consent decision for this client; refusing to approve automatically');
+  }
   const settled = callback.searchParams.has('consent_challenge')
     ? await settleConsent(callback, login.headers, io)
     : callback;

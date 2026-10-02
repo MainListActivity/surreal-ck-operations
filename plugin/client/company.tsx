@@ -578,6 +578,17 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 ? [{ role: "", defs: defs.filter(d => !(d.role in ROLE_LABEL)) }]
                 : [])
               .filter(g => g.defs.length > 0);
+            const pools = r?.pools ?? [];
+            const homeLabel = (home: string) => home === r?.opsRepo ? "运营仓库" : home.split("/").pop() ?? home;
+            const fmtW = (w: number) => String(Math.round(w * 10) / 10);
+            const spawnCands = (defId: string) =>
+              pools.flatMap(p => p.entries.filter(e => e.kind === "spawn" && e.ref === defId)
+                .map(e => ({ home: p.home, ...e })));
+            const reuseCand = (instId: string, home: string) =>
+              pools.flatMap(p => p.home === home ? p.entries : [])
+                .find(e => e.kind === "reuse" && e.ref === instId);
+            const candText = (e: { weight: number; share: number; eligible: boolean; reason?: string }) =>
+              e.eligible ? `权重 ${fmtW(e.weight)} · 中选率 ${Math.round(e.share * 100)}%` : `不可派（${e.reason ?? "未知"}）`;
             return groups.map(g => (
               <View key={g.role || "other"} style={{ gap: 4 }}>
                 <Text style={s.muted}>
@@ -585,11 +596,12 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 </Text>
                 {[...g.defs].sort((a, b) => a.provider.localeCompare(b.provider) || (b.weight ?? 0) - (a.weight ?? 0)).map(d => {
                   const defInsts = insts.filter(i => i.def === d.id);
+                  const cands = spawnCands(d.id);
                   return (
                     <View key={d.id} style={{ gap: 2 }}>
                       <View style={s.row}>
                         <Text style={[s.text, { flex: 1 }]}>
-                          {"  "}{d.provider}/{d.model}{d.resolved ? ` → ${d.resolved}` : ""}{d.thinking ? ` · ${d.thinking}` : ""} · 上限 {d.maxInstances} · 权 {d.weight}{d.enabled ? "" : " · 已停用"}
+                          {"  "}{d.provider}/{d.model}{d.resolved ? ` → ${d.resolved}` : ""}{d.thinking ? ` · ${d.thinking}` : ""} · 上限 {d.maxInstances} · 权 {d.weight}{d.avgScore ? ` × 绩效 ${d.avgScore.toFixed(1)}` : ""}{cands[0] ? ` → 有效 ${fmtW(cands[0].weight)}` : ""}{d.enabled ? "" : " · 已停用"}
                         </Text>
                         <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
                           <Text style={s.chipText}>编辑</Text>
@@ -599,11 +611,19 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                           <Text style={s.chipText}>{d.enabled ? "停用" : "启用"}</Text>
                         </Pressable>
                       </View>
-                      {defInsts.map(i => (
-                        <Text key={i.id} style={s.muted}>
-                          {"    "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.cwd?.split("/").pop() ?? "运营仓库"}{i.agentStatus ? ` · ${i.agentStatus}` : ""}
+                      {cands.map(c => (
+                        <Text key={c.home} style={s.muted}>
+                          {"    "}▸ 新开@{homeLabel(c.home)}：{candText(c)}
                         </Text>
                       ))}
+                      {defInsts.map(i => {
+                        const c = reuseCand(i.id, i.cwd ?? r?.opsRepo ?? "");
+                        return (
+                          <Text key={i.id} style={s.muted}>
+                            {"    "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.cwd?.split("/").pop() ?? "运营仓库"}{i.agentStatus ? ` · ${i.agentStatus}` : ""}{c ? ` · ${candText(c)}` : ""}
+                          </Text>
+                        );
+                      })}
                     </View>
                   );
                 })}

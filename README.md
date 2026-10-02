@@ -22,6 +22,7 @@ pnpm run company status                       # 公司运行概况
 - [岗位与员工](docs/roles.md)：员工定义（SurrealDB `employee_def`）与动态实例。
 - [运行手册](docs/agent-operations.md)：服务组成、员工编制、运行参数、排障。
 - [模板](docs/templates.md)：G1 范围提案、真人验收操作手册、G3、checkpoint 与通用交付/验收单。
+- [员工通道](docs/sidecar-channel.md)：sidecar 架构、零凭证模型、comm 文件协议与 `ops_*` 运维工具边界。
 - [任务服务运维](docs/company-service-operations.md)、[核心契约](docs/core-contract.md)、[MCP 接入](docs/mcp-adapter.md)。
 - [业务流程](docs/playbooks.md)、[经营节奏](docs/management.md)。
 

@@ -15,6 +15,7 @@ import { cloudflareD1, type D1Client } from './d1.ts';
 import type { Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
+import { audienceUrl, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -22,6 +23,7 @@ import { SessionStore, type OpsSession } from './sessions.ts';
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
+  'ops_idp_client_register',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -131,6 +133,7 @@ export class OpsBroker {
       ops_request: (ctx, args) => this.request(ctx, args),
       ops_query: (ctx, args) => this.query(ctx, args),
       ops_browser_login: (ctx, args) => this.browserLogin(ctx, args),
+      ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
     };
   }
 
@@ -257,6 +260,30 @@ export class OpsBroker {
     return {
       value: { alias, username, email, result },
       audit: result === 'exists' ? { action: 'ops_call', evidence: `ops_account_ensure ${alias} → exists` } : undefined,
+    };
+  }
+
+  /**
+   * Registers an IdP public SPA client (a shape the dynamic-registration endpoint cannot
+   * express). Redirect URIs and the token audience are confined to the product host, the
+   * row carries no secret, and the answer is only the public `client_id`.
+   */
+  private async idpClientRegister(ctx: Ctx, args: Args): Promise<Outcome> {
+    const clientName = spaClientName(args.client_name);
+    const allowedHost = new URL(ctx.cfg.product.url).hostname;
+    const redirectUris = redirectUriList(args.redirect_uris, allowedHost);
+    const { clientId, result } = await registerSpaClient({
+      d1: this.d1(ctx), tenantId: ctx.cfg.d1!.tenantId,
+      clientName, redirectUris,
+      accessTokenAudience: audienceUrl(args.access_token_audience, allowedHost),
+      now: () => new Date(this.now()),
+    });
+    return {
+      value: { clientName, clientId, result },
+      audit: {
+        action: result === 'created' ? 'ops_idp_client_create' : 'ops_call',
+        evidence: `ops_idp_client_register ${clientName} → ${result} ${clientId}`,
+      },
     };
   }
 
@@ -566,10 +593,13 @@ export class OpsBroker {
     const session = this.session(ctx, args);
     const method = text(args, 'method', 10).toUpperCase();
     const path = text(args, 'path', 2000);
-    // Sessions stay in their lane: an operator or ops token only serves ops endpoints, and a
-    // customer token is never sent to them at all (the product would answer 401 for the wrong audience).
+    // Sessions stay in their lane: an operator or ops token only serves the ops surface
+    // (/api/ops/* plus /api/content/*, which the product gates on requirePlatformOperator), and a
+    // customer token is never sent to ops endpoints at all (the product would answer 401 for the
+    // wrong audience; /api/content/* needs no proxy-side block since the same gate covers it).
     const opsPath = /^\/api\/ops(\/|$|\?)/.test(path);
-    if (session.kind !== 'customer' && !opsPath) throw invalid(`an ${session.kind} session can only call /api/ops/* paths`);
+    const contentPath = /^\/api\/content(\/|$|\?)/.test(path);
+    if (session.kind !== 'customer' && !opsPath && !contentPath) throw invalid(`an ${session.kind} session can only call /api/ops/* or /api/content/* paths`);
     if (session.kind === 'customer' && opsPath) throw invalid('a customer session cannot call /api/ops/*; call ops_operator_login, or ops_login with audience "ops", for an ops session');
     const res = await this.product(ctx, session, method, path, args.body);
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
