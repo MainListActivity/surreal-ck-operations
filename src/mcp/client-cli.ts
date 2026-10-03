@@ -13,6 +13,10 @@ if (command === 'call' && !name) throw new Error('tool name is required');
 // through its private comm directory and never sees any auth material.
 const comm = process.env.SCK_COMM_DIR;
 if (comm) {
+  if (!process.env.SCK_COMM_KEY) {
+    process.stderr.write('SCK_COMM_KEY is not set — comm requests cannot be authenticated; check the dispatch environment\n');
+    process.exit(1);
+  }
   const key = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
   writeFileAtomic(join(reqDir(comm), `${key}.json`), JSON.stringify({
     key: process.env.SCK_COMM_KEY ?? '', tool: command === 'list' ? '__list__' : name!,

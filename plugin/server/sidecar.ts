@@ -216,6 +216,8 @@ export class SidecarPool {
     this.stopBeat(instId);
     this.claims.delete(instId);
     this.deps.ops?.release(instId);
+    // claim.json describes a dead lease — remove it so a re-used/woken agent knows it holds nothing.
+    try { unlinkSync(join(commDir(this.deps.runDir, instId), "claim.json")); } catch { /* already gone */ }
   }
 
   private archive(path: string, tag: string): void {
@@ -352,17 +354,31 @@ export class SidecarPool {
   }
 
   private sweep(): void {
-    for (const instId of this.active) {
+    // Scan every comm dir, not just live leases: requests filed after a lease ended
+    // must still get an answer or the caller blocks for the full 120s client timeout.
+    let instIds: string[];
+    try { instIds = readdirSync(this.deps.runDir); } catch { return; }
+    for (const instId of instIds) {
+      const live = this.active.has(instId);
       let files: string[];
       try { files = readdirSync(reqDir(commDir(this.deps.runDir, instId))); } catch { continue; }
       for (const file of files) {
         if (!file.endsWith(".json") || this.processing.has(file)) continue;
         this.processing.add(file);
-        void this.handle(instId, file)
+        void Promise.resolve(live ? this.handle(instId, file) : this.rejectOrphan(instId, file))
           .catch((error: unknown) => this.log(`handle ${file} failed: ${(error as Error).message}`))
           .finally(() => this.processing.delete(file));
       }
     }
+  }
+
+  /** Drains a request written after the instance's lease ended — the caller gets an
+   *  explicit refusal instead of waiting out its timeout on a dead mailbox. */
+  private rejectOrphan(instId: string, file: string): void {
+    const dir = commDir(this.deps.runDir, instId);
+    try { unlinkSync(join(reqDir(dir), file)); } catch { return; }
+    const res: CommResponse = { ok: false, error: "本实例没有有效租约：任务已提交、被收回或已移交，等新的派工再操作" };
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));
   }
 
   private async handle(instId: string, file: string): Promise<void> {
