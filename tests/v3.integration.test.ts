@@ -226,6 +226,22 @@ test('gm may relay owner conversation; other roles may not', async () => {
   expect(history.at(-1)).toMatchObject({ action: 'owner_approve', actor: 'gm-relay:t-gm' });
 });
 
+test('instruct owner_command lands as a ready gm task carrying the owner text, idempotent on replay', async () => {
+  await database.db.query("CREATE owner_command CONTENT { kind: 'instruct', text: '盘一下上周的交付质量，给我一份简报' };");
+  const applied = await owner.applyPending();
+  const instruct = applied.find(r => r.kind === 'instruct');
+  expect(instruct).toMatchObject({ status: 'applied' });
+  expect(instruct!.result).toMatch(/^task=/);
+  const taskId = instruct!.result!.slice(5);
+  const t = await core.getTask(tokens.gm, taskId);
+  expect(t).toMatchObject({ state: 'ready', executorRole: 'gm', reviewerRole: 'product' });
+  expect(t.context).toContain('盘一下上周的交付质量');
+  // Re-apply of the same command id must not duplicate the task.
+  await database.db.query("UPDATE owner_command SET status = 'pending' WHERE kind = 'instruct';");
+  const again = await owner.applyPending();
+  expect(again.find(r => r.kind === 'instruct')!.result).toBe(`task=${taskId}`);
+});
+
 test('revoked lease hands over to a same-role employee with history; old session is fenced out', async () => {
   const t = await core.createTask(tokens.gm, { title: 'Handover task', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
