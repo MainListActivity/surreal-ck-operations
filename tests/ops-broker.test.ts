@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
@@ -41,7 +42,8 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_client_info', 'ops_idp_client_register',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_info',
+      'ops_idp_client_register', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
       'ops_info', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
       'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
@@ -99,7 +101,7 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true });
     // Public client metadata is listed for alignment checks; never secret material.
     expect(info.clients).toEqual({ customer: { clientId: 'client-ck-1234', redirectUri: 'https://app.test/auth/callback' } });
     expectNoLeaks(r);
@@ -1061,5 +1063,203 @@ describe('ops_idp_client_info', () => {
   test('without an IdP database configured the tool reports not_configured', async () => {
     const r = rig({ ...opsPatch, d1: undefined });
     expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' }))).code).toBe('not_configured');
+  });
+});
+
+describe('ops_idp_principal_mint', () => {
+  test('mints a revocable principal row, seals the token, and audits the mint in the IdP', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify' });
+    expect(res).toMatchObject({ label: 'qa-verify', scopes: ['tenant.read', 'user.read', 'user.provision'], status: 'active' });
+    const token = res.token as string;
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    // The D1 row mirrors the IdP's own mint: hash only, fixed scopes, ops caller attributed.
+    const row = r.world.principal(res.id)!;
+    expect(row).toMatchObject({ label: 'qa-verify', status: 'active', revoked_at: null, created_by: 'ops:qa-1' });
+    expect(row.token_hash).toBe(createHash('sha256').update(token).digest('base64url'));
+    expect(JSON.parse(String(row.scopes))).toEqual(['tenant.read', 'user.read', 'user.provision']);
+
+    // The IdP-side compensating audit attributes the mint to the calling employee's machine channel.
+    const minted = r.world.auditRows('admin.service_principal.minted');
+    expect(minted).toHaveLength(1);
+    expect(minted[0]).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1', target_type: 'service_principal', target_id: res.id });
+    expect(JSON.parse(String(minted[0]!.payload))).toMatchObject({ label: 'qa-verify', via: 'ops_broker' });
+
+    // The token is sealed under the principal id so ops_idp_admin_request can resolve it later.
+    const sealName = `IDP_SP_${res.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(r.company.sealed.get(`demo/production/${sealName}`)).toBe(token);
+    expect(JSON.stringify(r.company.sealed.keys())).not.toContain('_PASSWORD');
+
+    // The broker audit names the principal id, never the token; SQL carried the hash only.
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_principal_mint' });
+    expect(JSON.stringify(r.company.audits)).not.toContain(token);
+    for (const { sql } of r.world.sql) expect(sql).not.toContain(token);
+  });
+
+  test('sealAs returns the alias seal name and never the token value', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' });
+    expect(res).toMatchObject({ label: 'qa-verify', sealed: 'IDP_SP_QA_VERIFY', status: 'active' });
+    expect(res.token).toBeUndefined();
+    const token = r.company.sealed.get('demo/production/IDP_SP_QA_VERIFY')!;
+    expect(token).toBeTruthy();
+    const sealName = `IDP_SP_${res.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(r.company.sealed.get(`demo/production/${sealName}`)).toBe(token);
+    expect(r.world.principal(res.id)!.token_hash).toBe(createHash('sha256').update(token).digest('base64url'));
+    expectNoLeaks(r);
+  });
+
+  test('bad arguments are refused before any write', async () => {
+    const r = rig();
+    for (const args of [{}, { label: '' }, { label: 'x'.repeat(90) }, { label: 'ok', sealAs: 'bad seal!' }]) {
+      expect((await failure(call(r, 'ops_idp_principal_mint', args))).code).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(0);
+    expect(r.company.sealed.size).toBe(0);
+  });
+
+  test('without an IdP database configured the tool reports not_configured', async () => {
+    const r = rig({ d1: undefined });
+    expect((await failure(call(r, 'ops_idp_principal_mint', { label: 'x' }))).code).toBe('not_configured');
+  });
+});
+
+describe('ops_idp_principal_revoke', () => {
+  test('revokes once, writes the IdP-side audit row, and stays idempotent', async () => {
+    const r = rig();
+    const mint = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' });
+    const res = await call(r, 'ops_idp_principal_revoke', { principalId: mint.id });
+    expect(res).toMatchObject({ id: mint.id, status: 'revoked', alreadyRevoked: false });
+    expect(res.revokedAt).toBeTruthy();
+    expect(r.world.principal(mint.id)).toMatchObject({ status: 'revoked', revoked_at: res.revokedAt });
+    const revoked = r.world.auditRows('admin.service_principal.revoked');
+    expect(revoked).toHaveLength(1);
+    expect(revoked[0]).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1', target_id: mint.id });
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_principal_revoke' });
+
+    const again = await call(r, 'ops_idp_principal_revoke', { principalId: mint.id });
+    expect(again).toMatchObject({ alreadyRevoked: true, revokedAt: res.revokedAt });
+    expect(r.world.auditRows('admin.service_principal.revoked')).toHaveLength(1);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_call' });
+    expectNoLeaks(r);
+  });
+
+  test('unknown and malformed ids fail before any write', async () => {
+    const r = rig();
+    expect((await failure(call(r, 'ops_idp_principal_revoke', { principalId: randomUUID() }))).code).toBe('not_found');
+    for (const args of [{}, { principalId: 'x;drop' }]) {
+      expect((await failure(call(r, 'ops_idp_principal_revoke', args))).code).toBe('invalid');
+    }
+  });
+});
+
+describe('ops_idp_admin_request', () => {
+  const mintSealed = async (r: Rig) =>
+    (await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' })) as { id: string };
+  const usersPath = `/admin/tenants/${TENANT}/users`;
+
+  test('relays the sealed token to the scoped routes and resolves the tenant', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const tenants = await call(r, 'ops_idp_admin_request', { principalId: id, method: 'GET', path: '/admin/tenants' });
+    expect(tenants).toMatchObject({ status: 200, ok: true });
+    expect(tenants.body.tenants[0]).toMatchObject({ id: TENANT, slug: 'ck' });
+    const sent = r.world.requests.find(q => q.url === 'https://idp.test/admin/tenants')!;
+    expect(sent.method).toBe('GET');
+    expectNoLeaks(r);
+  });
+
+  test('provisions a user, masks the one-time credentials, and attributes the audit to the principal', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const created = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(created).toMatchObject({ status: 201, ok: true });
+    expect(created.body.user).toMatchObject({ email: 'invite-1@example.test', display_name: 'Invite One', status: 'active' });
+    // invitation_token and activation_url are usable credentials: masked in the relayed body.
+    const text = JSON.stringify(created.body);
+    expect(text).toContain('[redacted]');
+    expect(text).not.toContain('inv-');
+    const provisioned = r.world.auditRows('user.provisioned');
+    expect(provisioned.at(-1)).toMatchObject({ actor_type: 'service_principal', actor_id: id, tenant_id: TENANT });
+
+    const again = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(again.status).toBe(409);
+    expect(r.world.auditRows('user.provision.failed').at(-1)).toMatchObject({ actor_type: 'service_principal', actor_id: id });
+    expectNoLeaks(r);
+  });
+
+  test('a revoked principal reaches the IdP and is answered 403 without creating users', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const before = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(before.status).toBe(201);
+    await call(r, 'ops_idp_principal_revoke', { principalId: id });
+    const after = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-2@example.test', display_name: 'Invite Two' },
+    });
+    expect(after).toMatchObject({ status: 403, ok: false });
+    expect(r.world.sqlite.query('SELECT COUNT(*) AS n FROM users WHERE email = ?').get('invite-2@example.test')).toMatchObject({ n: 0 });
+    expect(r.world.auditRows('user.provisioned')).toHaveLength(1);
+    expectNoLeaks(r);
+  });
+
+  test('only the three scoped routes pass the proxy gate; nothing else reaches the IdP', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const before = r.world.requests.length;
+    for (const [method, path] of [
+      ['GET', `/admin/tenants/${TENANT}`],
+      ['GET', '/admin/service-principals'],
+      ['POST', '/admin/service-principals'],
+      ['GET', '/admin/login'],
+      ['POST', '/admin/tenants'],
+      ['DELETE', usersPath],
+      ['GET', `${usersPath}?email=x`],
+      ['GET', '/admin/tenants/../users'],
+      ['GET', '/api/tenants'],
+      ['GET', '/admin/tenants//users'],
+    ] as const) {
+      expect((await failure(call(r, 'ops_idp_admin_request', { principalId: id, method, path }))).code, `${method} ${path}`).toBe('invalid');
+    }
+    expect(r.world.requests).toHaveLength(before);
+  });
+
+  test('a principal without a broker-sealed token is not_found', async () => {
+    const r = rig();
+    r.world.sqlite.run(
+      `INSERT INTO admin_service_principals (id, label, token_hash, scopes, status, created_at, revoked_at, created_by)
+       VALUES (?, 'foreign', 'hash-of-unknown-token', '["tenant.read"]', 'active', ?, NULL, 'admin_user:owner')`,
+      ['11111111-2222-3333-4444-555555555555', new Date().toISOString()]);
+    const error = await failure(call(r, 'ops_idp_admin_request', {
+      principalId: '11111111-2222-3333-4444-555555555555', method: 'GET', path: '/admin/tenants',
+    }));
+    expect(error.code).toBe('not_found');
+    expect(r.world.requests.filter(q => q.url.includes('/admin/'))).toHaveLength(0);
+  });
+
+  test('the IdP verdict for an unsealed-hash principal is surfaced, not hidden', async () => {
+    const r = rig();
+    // Row exists (so minting side worked) but a different token is sealed — the IdP answers 401.
+    const id = randomUUID();
+    r.world.sqlite.run(
+      `INSERT INTO admin_service_principals (id, label, token_hash, scopes, status, created_at, revoked_at, created_by)
+       VALUES (?, 'drifted', 'different-hash', '["tenant.read"]', 'active', ?, NULL, 'ops:other')`,
+      [id, new Date().toISOString()]);
+    const sealName = `IDP_SP_${id.toUpperCase().replaceAll('-', '_')}`;
+    r.company.sealed.set(`demo/production/${sealName}`, 'sealed-but-stale-token');
+    const res = await call(r, 'ops_idp_admin_request', { principalId: id, method: 'GET', path: '/admin/tenants' });
+    expect(res).toMatchObject({ status: 401, ok: false });
+    expectNoLeaks(r, ['sealed-but-stale-token']);
   });
 });
