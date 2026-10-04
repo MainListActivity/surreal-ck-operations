@@ -279,12 +279,17 @@ export class Dispatcher {
       const target = def && resolveModel(def);
       return !target || !inst.model || inst.model === target;
     };
+    // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
+    // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
+    const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
+      !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
     const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
       inst.role === role && ready(inst) && !assigned.has(inst.id) &&
       !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
       // A credential-file instance can only finish what it already holds; the sidecar
       // refuses new claims for it, so it must not appear as a reuse candidate.
       !(this.deps.sidecar && inst.credentialFile) &&
+      trackOk(task, defs.find(d => d.id === inst.def)?.tracks) &&
       currentModel(inst) &&
       this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
@@ -293,8 +298,8 @@ export class Dispatcher {
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
     // Credential-file stragglers do not consume seats: they cannot serve new work.
-    const eligibleDefs = (role: string, home: string) =>
-      defs.filter(d => d.enabled && d.role === role && resolveModel(d) !== undefined &&
+    const eligibleDefs = (role: string, home: string, task?: SupervisedTask) =>
+      defs.filter(d => d.enabled && d.role === role && trackOk(task, d.tracks) && resolveModel(d) !== undefined &&
         insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home &&
           !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
         this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
@@ -320,7 +325,7 @@ export class Dispatcher {
       const pool = usable.filter(i => i.id !== avoid);
       return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
     };
-    const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
+    const spawnable = (role: string, home: string, task?: SupervisedTask) => weightedOrder(eligibleDefs(role, home, task), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
     const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
@@ -329,7 +334,7 @@ export class Dispatcher {
       const avoided = this.staffAvoid.get(cacheKey);
       const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
       const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review').filter(i => !dodged(i.id));
-      const spawn = eligibleDefs(item.role, home).filter(d => !dodged(`spawn:${d.id}`));
+      const spawn = eligibleDefs(item.role, home, item.task).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
       // Same candidate set → same verdict; only call Jev when the fingerprint moved.
       const fp = `${item.role}|${item.task.version}|` +
@@ -652,7 +657,7 @@ export class Dispatcher {
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
-    spawnable: (role: string, home: string) => EmployeeDef[],
+    spawnable: (role: string, home: string, task?: SupervisedTask) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     prefer?: AssignPreference, slots?: Map<string, string>,
@@ -686,7 +691,7 @@ export class Dispatcher {
         return undefined;
       }
     }
-    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo);
+    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo, task);
     if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());

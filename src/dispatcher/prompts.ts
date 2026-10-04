@@ -81,7 +81,7 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
 }
 
 export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
-  const list = tasks.map(t => `- ${t.id}「${t.title}」（执行岗位 ${t.executorRole}）`).join('\n');
+  const list = tasks.map(t => `- ${t.id}「${t.title}」（执行岗位 ${t.executorRole}${t.discipline ? `/${t.discipline}` : ''}）`).join('\n');
   const body = `【经理待办】以下任务被员工阻塞并交给经理处理：
 ${list}
 逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。

@@ -16,6 +16,7 @@ const usage = `Usage: pnpm run admin <command>
   def list                                列出员工定义（含权重与绩效均分）
   def set <id> <role> <provider> <model> [thinking] [max-instances] [priority] [weight]
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
+  def tracks <id> <轨,轨|->               限定编制的岗位轨（- 或空 = 全接；非空则只接 discipline 在列的任务）
   def enable|disable <id>
   seed-defs                               写入默认员工定义（codex/grok/devin × 九岗位含 eval，已存在则不覆盖）
   inst list                               列出在职员工实例
@@ -66,7 +67,7 @@ try {
       const [sub, defId, ...rest] = args;
       if (sub === 'list') {
         print((await workforce.defs()).map(d => ({ id: d.id, role: d.role, provider: d.provider, model: d.model,
-          thinking: d.thinking, enabled: d.enabled, max: d.maxInstances, weight: d.weight,
+          thinking: d.thinking, tracks: d.tracks ?? [], enabled: d.enabled, max: d.maxInstances, weight: d.weight,
           effectiveWeight: Number(effectiveWeight(d).toFixed(2)),
           avgScore: d.avgScore ? Number(d.avgScore.toFixed(2)) : undefined, scored: d.scored,
           errorStreak: d.errorStreak })));
@@ -82,6 +83,11 @@ try {
         if (!defId || rest[0] === undefined) throw new Error(usage);
         await database.db.query('UPDATE $def SET weight = $weight;',
           { def: new RecordId('employee_def', defId), weight: Number(rest[0]) });
+      } else if (sub === 'tracks') {
+        if (!defId || rest[0] === undefined) throw new Error(usage);
+        const tracks = rest[0] === '-' ? [] : rest.join(' ').split(/[,，、]/).map(t => t.trim()).filter(Boolean);
+        await database.db.query('UPDATE $def SET tracks = $tracks;',
+          { def: new RecordId('employee_def', defId), tracks });
       } else if (sub === 'enable' || sub === 'disable') {
         await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0, disabled_reason = NONE, disabled_at = NONE;',
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });

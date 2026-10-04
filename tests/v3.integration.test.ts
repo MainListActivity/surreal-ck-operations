@@ -1029,3 +1029,68 @@ test('content line roles: concept-design / asset-production tasks only reach the
   const submitted = await core.submit(tokenOf(protoEmployee), proofOf(claim, cp.version), { text: '原型交付：demo 入口与素材清单见证据。', idempotencyKey: key() });
   expect(submitted.state).toBe('review');
 });
+
+test('discipline tracks: project vocabulary, dispatch filter, cross-track claim denial', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+
+  // Project vocabulary: 编剧/角色设计/分镜 as the project's own track names.
+  const store = new ProjectStore(database.db);
+  await store.upsert({ id: 'anime', name: 'Anime line', repoPath: '/repo/anime', release: '合入即发布',
+    disciplines: [{ name: '编剧', description: '剧本与对白' }, { name: '角色设计' }, { name: '分镜' }], envs: [] });
+  expect((await store.get('anime'))!.disciplines!.map(d => d.name)).toEqual(['编剧', '角色设计', '分镜']);
+  const goal = await owner.createGoal({ text: '产线试点目标', source: 'owner:test', key: key(), tier: 'standard', project: 'anime' });
+  // Triage instantiates flow tasks under the goal; park them so they do not enter the dispatch assertions below.
+  await database.db.query("UPDATE task SET state = 'done' WHERE goal = $goal;", { goal: new RecordId('goal', goal.id) });
+
+  // Non-vocabulary discipline is rejected only when the project defines a vocabulary.
+  await expect(core.createTask(tokens.gm, { title: '错轨任务', context: 'synthetic', executorRole: 'ai-content',
+    reviewerRole: 'gm', discipline: '配音', goalId: goal.id, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  // No goal/project: free-form value is allowed.
+  const free = await core.createTask(tokens.gm, { title: '自由轨任务', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', discipline: '自定义轨', idempotencyKey: key() });
+  expect(free.discipline).toBe('自定义轨');
+
+  // Delivery chain: only the implementation leg carries the discipline.
+  const chain = await core.createDelivery(tokens.gm, { goalId: goal.id, title: '产线交付链',
+    spec: '二十字以上的交付规格说明：剧本、角色、分镜', discipline: '编剧', idempotencyKey: key() });
+  expect(chain.map(t => t.discipline)).toEqual(['编剧', undefined, undefined]);
+
+  // Defs: writer covers 编剧, artist covers 角色设计/分镜 (2 seats), any accepts everything.
+  await workforce.upsertDef('content-writer', { role: 'ai-content', provider: 'codex', model: 'gpt-6.1-sol', tracks: ['编剧'], priority: 10 });
+  await workforce.upsertDef('content-artist', { role: 'ai-content', provider: 'grok', model: 'grok-4.7', tracks: ['角色设计', '分镜'], maxInstances: 2, priority: 20 });
+  await workforce.upsertDef('content-any', { role: 'ai-content', provider: 'devin', model: 'swe-2', priority: 30 });
+
+  const mk = (title: string, discipline?: string) => core.createTask(tokens.gm, { title, context: 'synthetic',
+    executorRole: 'ai-content', reviewerRole: 'gm', discipline, goalId: goal.id, idempotencyKey: key() });
+  const writerTask = await mk('写剧本', '编剧');
+  const storyboardTask = await mk('画分镜', '分镜');
+  const designTask = await mk('角色设定', '角色设计');
+  const untrackedTask = await mk('无轨任务');
+
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, notify: async () => {} });
+  const report = await dispatcher.tick();
+  const byTask = new Map(report.woke.map(w => [w.task, w.employee]));
+  // Track-covered tasks go to their own defs; the untracked task falls through to the all-tracks def.
+  expect(byTask.get(writerTask.id)!.startsWith('content-writer-')).toBe(true);
+  expect(byTask.get(storyboardTask.id)!.startsWith('content-artist-')).toBe(true);
+  expect(byTask.get(designTask.id)!.startsWith('content-artist-')).toBe(true);
+  expect(byTask.get(untrackedTask.id)!.startsWith('content-any-')).toBe(true);
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  // Cross-track direct claim is explicitly refused; the same task is claimable by its own track.
+  await expect(core.claim(tokenOf(byTask.get(storyboardTask.id)!), writerTask.id))
+    .rejects.toMatchObject({ code: 'forbidden', message: 'Employee definition does not cover the task discipline' });
+  const claim = await core.claim(tokenOf(byTask.get(writerTask.id)!), writerTask.id);
+  expect(claim.task.discipline).toBe('编剧');
+  // Empty tracks accept any discipline; employees without a def (fixed identities) are unrestricted.
+  await core.claim(tokenOf(byTask.get(untrackedTask.id)!), storyboardTask.id);
+  const aiToken = await enrollment.enroll('t-ai-anytrack', 'ai-content', ['execute', 'review']);
+  await core.claim(aiToken, designTask.id);
+});
