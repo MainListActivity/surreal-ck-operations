@@ -92,6 +92,32 @@ export class FakeWorld {
       grant_types TEXT NOT NULL, response_types TEXT NOT NULL, created_by TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE (tenant_id, client_id))`);
+    this.sqlite.run(`CREATE TABLE admin_service_principals (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL, scopes TEXT NOT NULL,
+      status TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, created_by TEXT NOT NULL)`);
+    this.sqlite.run(`CREATE TABLE audit_events (
+      id TEXT PRIMARY KEY, actor_type TEXT NOT NULL, actor_id TEXT, tenant_id TEXT,
+      event_type TEXT NOT NULL, target_type TEXT, target_id TEXT, payload TEXT, occurred_at TEXT NOT NULL)`);
+    this.sqlite.run(`CREATE TABLE tenants (
+      id TEXT PRIMARY KEY, slug TEXT NOT NULL, display_name TEXT NOT NULL, issuer TEXT NOT NULL)`);
+    this.insertTenant({ id: TENANT, slug: 'ck' });
+  }
+
+  /** Seeds a tenants row like the production `ck` tenant the IdP admin routes resolve by slug. */
+  insertTenant(row: { id: string; slug: string; displayName?: string }) {
+    this.sqlite.run('INSERT INTO tenants (id, slug, display_name, issuer) VALUES (?, ?, ?, ?)',
+      [row.id, row.slug, row.displayName ?? row.slug, `https://idp.test/t/${row.slug}`]);
+  }
+
+  /** Direct row access for assertions about what the broker stored on a principal. */
+  principal(id: string): Record<string, unknown> | undefined {
+    return (this.sqlite.query('SELECT * FROM admin_service_principals WHERE id = ?').get(id) ?? undefined) as never;
+  }
+  auditRows(eventType?: string): Array<Record<string, unknown>> {
+    const rows = eventType
+      ? this.sqlite.query('SELECT * FROM audit_events WHERE event_type = ?').all(eventType)
+      : this.sqlite.query('SELECT * FROM audit_events').all();
+    return rows as Array<Record<string, unknown>>;
   }
 
   advance(ms: number) { this.clock += ms; }
@@ -156,10 +182,71 @@ export class FakeWorld {
 
   private route(url: URL, method: string, init?: RequestInit): Promise<Response> | Response {
     if (url.origin === 'https://idp.test' && url.pathname === '/t/ck/token') return this.idpToken(method, init);
+    if (url.origin === 'https://idp.test' && url.pathname.startsWith('/admin/')) return this.idpAdmin(url, method, init);
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
     return new Response('unreachable host', { status: 502 });
+  }
+
+  /**
+   * The IdP's three service-principal-scoped admin routes, mirroring ma_hono app.ts: a bearer is
+   * looked up by token hash, 401 when unknown, 403 when revoked or the route is outside its scopes
+   * (every other /admin/* route, including GET /admin/tenants/<id>, is human-admin-only for a
+   * principal). Provision writes `user.provisioned`/`user.provision.failed` audit rows with
+   * actorType `service_principal` and the principal id, like the real route.
+   */
+  private idpAdmin(url: URL, method: string, init?: RequestInit): Response {
+    const header = new Headers(init?.headers).get('authorization') ?? '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    const hash = token ? createHash('sha256').update(token).digest('base64url') : '';
+    const principal = this.sqlite.query('SELECT * FROM admin_service_principals WHERE token_hash = ?').get(hash) as Record<string, unknown> | null;
+    if (!principal) return json(401, { error: 'unauthorized' });
+    if (principal.status === 'revoked') return json(403, { error: 'forbidden' });
+    const scopes = JSON.parse(String(principal.scopes)) as string[];
+    const usersPath = /^\/admin\/tenants\/([^/]+)\/users$/.exec(url.pathname);
+    const need = method === 'GET' && url.pathname === '/admin/tenants' ? 'tenant.read'
+      : method === 'GET' && usersPath ? 'user.read'
+        : method === 'POST' && usersPath ? 'user.provision' : null;
+    if (!need || !scopes.includes(need)) return json(403, { error: 'forbidden' });
+
+    const audit = (eventType: string, payload: Record<string, unknown>, targetId: string | null = null, tenantId: string | null = null) => {
+      this.sqlite.run(`INSERT INTO audit_events (id, actor_type, actor_id, tenant_id, event_type, target_type, target_id, payload, occurred_at)
+        VALUES (?, 'service_principal', ?, ?, ?, 'user', ?, ?, ?)`,
+        [randomUUID(), String(principal.id), tenantId, eventType, targetId, JSON.stringify(payload), new Date(this.clock).toISOString()]);
+    };
+
+    if (need === 'tenant.read') {
+      const tenants = this.sqlite.query('SELECT id, slug, display_name, issuer FROM tenants').all() as Array<Record<string, unknown>>;
+      return json(200, { tenants: tenants.map(t => ({ id: t.id, slug: t.slug, display_name: t.display_name, issuer: t.issuer })) });
+    }
+    const tenantId = usersPath![1]!;
+    const tenant = this.sqlite.query('SELECT id FROM tenants WHERE id = ?').get(tenantId) as { id: string } | null;
+    if (!tenant) return json(404, { error: 'tenant_not_found' });
+    if (need === 'user.read') {
+      const users = this.sqlite.query('SELECT id, email, display_name, status FROM users WHERE tenant_id = ?').all(tenantId) as Array<Record<string, unknown>>;
+      return json(200, { users });
+    }
+    const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+    const email = String(body.email ?? '').trim();
+    const displayName = String(body.display_name ?? '').trim();
+    if (!email || !displayName) return json(400, { error: 'invalid_request' });
+    const existing = this.sqlite.query('SELECT id FROM users WHERE tenant_id = ? AND email = ?').get(tenantId, email);
+    if (existing) {
+      audit('user.provision.failed', { error: 'conflict', email }, null, tenantId);
+      return json(409, { error: 'conflict' });
+    }
+    const userId = randomUUID();
+    this.sqlite.run(`INSERT INTO users (id, tenant_id, email, email_verified, username, display_name, status, created_at, updated_at)
+      VALUES (?, ?, ?, 0, NULL, ?, 'active', ?, ?)`,
+      [userId, tenantId, email, displayName, new Date(this.clock).toISOString(), new Date(this.clock).toISOString()]);
+    const invitationToken = `inv-${randomBytes(16).toString('hex')}`;
+    audit('user.provisioned', { email }, userId, tenantId);
+    return json(201, {
+      user: { id: userId, tenant_id: tenantId, email, username: null, display_name: displayName, status: 'active', email_verified: false },
+      invitation_token: invitationToken,
+      activation_url: `https://idp.test/activate-account?token=${invitationToken}`,
+    });
   }
 
   /** An active IdP account whose password is known to the test. */

@@ -2,6 +2,7 @@
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
 // on the caller's live task lease, role-checked against the project environment, and audited.
+import { randomUUID } from 'node:crypto';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import type { EnvBrokerRow, ProjectStore } from '../projects.ts';
@@ -16,6 +17,11 @@ import type { Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
+import {
+  adminRequestTarget, idpAdminRequest, insertServicePrincipal, mintServicePrincipalToken,
+  principalAliasSecretName, principalId, principalTokenSecretName, recordIdpAuditBestEffort,
+  revokeServicePrincipal, sha256Base64Url,
+} from './idp-principals.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -24,6 +30,7 @@ export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
   'ops_idp_client_info', 'ops_idp_client_register',
+  'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_admin_request',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -135,6 +142,9 @@ export class OpsBroker {
       ops_browser_login: (ctx, args) => this.browserLogin(ctx, args),
       ops_idp_client_info: (ctx, args) => this.idpClientInfo(ctx, args),
       ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
+      ops_idp_principal_mint: (ctx, args) => this.idpPrincipalMint(ctx, args),
+      ops_idp_principal_revoke: (ctx, args) => this.idpPrincipalRevoke(ctx, args),
+      ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
     };
   }
 
@@ -199,7 +209,7 @@ export class OpsBroker {
           ...(ctx.cfg.ops ? { operator: { clientId: ctx.cfg.ops.clientId, redirectUri: ctx.cfg.ops.redirectUri, resource: ctx.cfg.ops.resource ?? null } } : {}),
           ...(ctx.cfg.idp.ops ? { opsAudience: { clientId: ctx.cfg.idp.ops.clientId, audience: ctx.cfg.idp.ops.audience, redirectUri: ctx.cfg.idp.ops.redirectUri } } : {}),
         },
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx) },
       },
     };
   }
@@ -322,6 +332,93 @@ export class OpsBroker {
         action: result === 'created' ? 'ops_idp_client_create' : 'ops_call',
         evidence: `ops_idp_client_register ${clientName} → ${result} ${clientId}`,
       },
+    };
+  }
+
+  // ---------- IdP service principals ----------
+  //
+  // The IdP gates mint/revoke on a human admin session, so the broker performs the same writes
+  // its D1 access already makes for account provisioning: the row carries only the token hash,
+  // the value is sealed in env_secret before the insert, and a compensating audit_events row keeps
+  // the IdP-side trail intact. The human bootstrap password is never touched.
+
+  /** Reads a minted token back from its sealed name; only trusted broker code may do this. */
+  private async sealedPrincipalToken(ctx: Ctx, id: string): Promise<string | undefined> {
+    return this.deps.projects.readSealed(ctx.scope.project, ctx.env, principalTokenSecretName(id), this.deps.secretKey());
+  }
+
+  private async idpPrincipalMint(ctx: Ctx, args: Args): Promise<Outcome> {
+    const label = text(args, 'label', 80);
+    const sealAs = args.sealAs === undefined ? undefined : canonicalAlias(args.sealAs);
+    const d1 = this.d1(ctx);
+    // The token is sealed before the D1 write so a failed insert can never strand a live
+    // credential the broker cannot reach (the leftover seal belongs to no existing row).
+    const id = randomUUID();
+    const token = mintServicePrincipalToken();
+    const tokenHash = await sha256Base64Url(token);
+    await this.deps.projects.setSecret(
+      { project: ctx.scope.project, env: ctx.env, name: principalTokenSecretName(id), value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+      this.deps.secretKey(true));
+    const minted = await insertServicePrincipal({
+      d1, id, label, tokenHash, createdBy: `ops:${ctx.scope.actor.employeeId}`, now: () => new Date(this.now()),
+    });
+    let sealedAlias: string | undefined;
+    if (sealAs !== undefined) {
+      sealedAlias = principalAliasSecretName(sealAs);
+      await this.deps.projects.setSecret(
+        { project: ctx.scope.project, env: ctx.env, name: sealedAlias, value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+        this.deps.secretKey(true));
+    }
+    await recordIdpAuditBestEffort(d1, {
+      actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+      eventType: 'admin.service_principal.minted', targetType: 'service_principal', targetId: minted.id,
+      payload: { label, scopes: minted.scopes, via: 'ops_broker' }, occurredAt: minted.createdAt,
+    });
+    return {
+      value: {
+        id: minted.id, label, scopes: minted.scopes, status: minted.status, createdAt: minted.createdAt,
+        ...(sealedAlias ? { sealed: sealedAlias } : { token }),
+      },
+      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}${sealedAlias ? `（密封 ${sealedAlias}）` : ''}` },
+    };
+  }
+
+  private async idpPrincipalRevoke(ctx: Ctx, args: Args): Promise<Outcome> {
+    const id = principalId(args.principalId);
+    const d1 = this.d1(ctx);
+    const { principal, alreadyRevoked } = await revokeServicePrincipal({ d1, principalId: id, now: () => new Date(this.now()) });
+    if (!alreadyRevoked) {
+      await recordIdpAuditBestEffort(d1, {
+        actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+        eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: id,
+        payload: { label: principal.label, via: 'ops_broker' }, occurredAt: principal.revokedAt ?? new Date(this.now()).toISOString(),
+      });
+    }
+    return {
+      value: { id, status: 'revoked', revokedAt: principal.revokedAt, alreadyRevoked },
+      audit: alreadyRevoked
+        ? { action: 'ops_call', evidence: `ops_idp_principal_revoke ${id} → 已吊销` }
+        : { action: 'ops_idp_principal_revoke', evidence: `ops_idp_principal_revoke ${id}` },
+    };
+  }
+
+  /**
+   * Relays one request to the IdP's service-principal-scoped admin routes with the principal's
+   * sealed token as the bearer — the token is read, sent and redacted inside the broker only.
+   * Revoked principals still reach the IdP on purpose: a 403 there is exactly what a revocation
+   * check needs to observe.
+   */
+  private async idpAdminRequest(ctx: Ctx, args: Args): Promise<Outcome> {
+    const id = principalId(args.principalId);
+    const { method, path } = adminRequestTarget(args.method, args.path);
+    const token = await this.sealedPrincipalToken(ctx, id);
+    if (!token) throw new CompanyError('not_found', `no sealed token for principal ${id}; only broker-minted principals can be called through ops_idp_admin_request`);
+    const origin = new URL(ctx.cfg.idp.issuer).origin;
+    const res = await idpAdminRequest(origin, token, { method, path, body: args.body }, { fetch: this.deps.fetch });
+    const known = [token, ...this.sessions.secrets(ctx.scope.actor.employeeId)];
+    return {
+      value: { status: res.status, ok: res.ok, body: clipJson(redactJson(res.body, known)) },
+      audit: { action: 'ops_call', evidence: `ops_idp_admin_request ${method} ${path} → ${res.status}（principal ${id}）` },
     };
   }
 
