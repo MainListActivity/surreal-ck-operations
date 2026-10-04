@@ -39,6 +39,7 @@
 - P 段（原型/概念设计）：`executorRole=concept-design`、`reviewerRole=owner`——收口为老板 demo 验收，交付证据须附老板可直接打开的产物（静帧 PNG、可直接打开的页面或样片路径）。
 - M 段（量产制作）：`executorRole=asset-production`、`reviewerRole=gm` 或 `qa`——变体、铺量镜头、配音、渲染等批量产出走 GM/QA 验收，不过老板。
 - P→M 依赖：量产任务的 `dependencies` 须含对应原型任务，老板 approve 前量产任务不得解锁、不得开工；任何新增内容角色必须先过 demo 关再立项量产。
+- 项目级岗位轨（`discipline`/`tracks`）：项目内更细的产线分工（如动漫产线的 编剧/角色设计/分镜）不进全局岗位枚举。项目词表与各轨说明见 `project.disciplines`（`project set` 写入）；经理拆产线任务时按项目 AGENTS.md 的轨表给任务标 `discipline=<轨名>`——词表非空时取值必须在词表内，无项目或空词表可自由取值。编制 `tracks` 非空则只接对口轨任务（派工与 claim 双端强制，跨轨 claim 显式拒绝）；编制无轨或任务无轨则按岗位正常匹配。交付链里 discipline 只标在实现腿上，上线/部署腿不带轨。
 
 ## 运维工具（ops_*）
 
