@@ -21,6 +21,11 @@ export interface EmployeeDef {
   provider: string;
   model: string;
   thinking?: string;
+  /**
+   * Discipline tracks this def covers (e.g. 编剧/分镜). Empty or absent accepts every
+   * discipline; a non-empty list only claims tasks whose `discipline` is in it.
+   */
+  tracks?: string[];
   enabled: boolean;
   maxInstances: number;
   priority: number;
@@ -136,6 +141,7 @@ export interface SupervisedTask {
   version: number;
   executorRole: Role;
   reviewerRole: string;
+  discipline?: string;
   currentEmployee?: string;
   submittedBy?: string;
   previousEmployee?: string;
@@ -167,6 +173,7 @@ export interface JudgeInput {
 const supervised = (row: TaskRow): SupervisedTask => {
   const v = view(row);
   return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
+    discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
     previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
@@ -222,7 +229,7 @@ export class Workforce {
   }
 
   // ---- employee definitions ----
-  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
@@ -236,13 +243,19 @@ export class Workforce {
       thinking: input.thinking, max: input.maxInstances ?? 1, priority: input.priority ?? 100,
       weight: input.weight ?? 10, enabled: input.enabled ?? true,
     });
+    // Tracks are written separately so an upsert without the field keeps the stored list;
+    // pass [] to clear (a def then accepts every discipline again).
+    if (input.tracks !== undefined) {
+      await this.db.query('UPDATE $def SET tracks = $tracks;', { def: id('employee_def', defId), tracks: input.tracks });
+    }
   }
 
   async defs(): Promise<EmployeeDef[]> {
-    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; enabled: boolean;
+    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
       max_instances: number; priority: number; weight?: number; scored?: number; avg_score?: number; error_streak?: number };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
+      tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
       weight: r.weight ?? 10, scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
   }

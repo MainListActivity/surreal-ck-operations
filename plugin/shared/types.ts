@@ -12,6 +12,7 @@ export interface TaskView {
   state: TaskState;
   executorRole: Role;
   reviewerRole: Role | "owner";
+  discipline?: string;
   kind: TaskKind;
   goalId?: string;
   dependencies: string[];

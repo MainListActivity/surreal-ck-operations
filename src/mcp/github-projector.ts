@@ -88,7 +88,7 @@ function managedBody(task: TaskView): string {
     taskMarker(task.id),
     `# ${task.title}`,
     `状态：${task.state}`,
-    `执行岗位：${task.executorRole}；验收岗位：${task.reviewerRole}`,
+    `执行岗位：${task.executorRole}${task.discipline ? `/${task.discipline}` : ''}；验收岗位：${task.reviewerRole}`,
     `任务版本：${task.version}`,
     `依赖：${task.dependencies.join(', ') || '无'}`,
     '任务上下文与交付证据以本机公司任务服务为准。',

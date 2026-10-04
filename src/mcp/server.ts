@@ -104,7 +104,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
       const now = Date.now();
       const abandoned = (task: TaskView) => task.state === 'doing' && task.executorRole === principal.role &&
         task.currentEmployee !== principal.employeeId && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) <= now);
-      const candidates = tasks.filter((task: TaskView) =>
+      // Track filter mirrors the claim check: defs with a tracks list only see covered disciplines.
+      const trackOk = (task: TaskView) =>
+        !task.discipline || !principal.tracks?.length || principal.tracks.includes(task.discipline);
+      const candidates = tasks.filter((task: TaskView) => trackOk(task) &&
         (task.state === 'review' && task.reviewerRole === principal.role && task.submittedBy !== principal.employeeId) ||
         (task.state === 'ready' && task.executorRole === principal.role) || abandoned(task),
       );
@@ -155,6 +158,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
+      discipline: z.string().min(1).max(60).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
@@ -181,6 +185,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa).',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
+      discipline: z.string().min(1).max(60).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
