@@ -11,6 +11,8 @@ const ROLE_NAMES: Record<string, string> = {
   product: '运营/产品：范围提案、决定是否上线、运营验收',
   engineering: '工程：实现、代码复核、合入部署',
   'ai-content': 'AI 与内容',
+  'concept-design': '原型/概念设计（内容产线 P 段）',
+  'asset-production': '量产制作（内容产线 M 段）',
   qa: '测试：上线后在生产环境逐条实测',
   cs: '客户成功',
   eval: '评审：任务完成后为参与员工打绩效分',

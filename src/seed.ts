@@ -8,7 +8,7 @@ import type { Role } from './contracts.ts';
 // family reported by the provider (refreshed by the Paseo plugin). Spawn resolves
 // the slot to a concrete id at dispatch time, so upstream version bumps need no edits.
 export const SEED_DEFS: Array<{ id: string; role: Role; provider: string; model: string; thinking?: string; maxInstances: number; priority: number; weight: number }> =
-  [...(['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'] as Role[]).flatMap(role => [
+  [...(['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs'] as Role[]).flatMap(role => [
     { id: `${role}-codex`, role, provider: 'codex', model: 'auto:sol', thinking: role === 'gm' ? 'high' : 'medium',
       maxInstances: role === 'engineering' ? 2 : 1, priority: 10, weight: 60 },
     { id: `${role}-grok`, role, provider: 'grok', model: 'auto:grok', thinking: role === 'gm' ? 'high' : 'medium',

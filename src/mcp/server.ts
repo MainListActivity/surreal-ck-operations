@@ -3,7 +3,7 @@ import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValida
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 
-const roles = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs'] as const;
+const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done'] as const;
 const proofShape = {
