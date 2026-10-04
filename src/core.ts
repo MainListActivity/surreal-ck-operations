@@ -69,6 +69,7 @@ interface EmployeeRow {
   revoked: boolean;
   retired?: boolean;
   active_task?: RecordId;
+  tracks?: string[];
 }
 
 interface TaskRow {
@@ -78,6 +79,7 @@ interface TaskRow {
   state: TaskState;
   executor_role: Role;
   reviewer_role: Role;
+  discipline?: string;
   dependencies: RecordId[];
   version: number;
   submitted_by?: string;
@@ -110,6 +112,7 @@ export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
+    discipline: row.discipline ?? undefined,
     kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
     dependencies: (row.dependencies ?? []).map(asId), version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
@@ -159,7 +162,7 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     const t0 = Date.now();
     const [rows] = await this.db.query<[EmployeeRow[]]>(
-      'SELECT * FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
+      'SELECT *, def.tracks AS tracks FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
     );
     // credential_digest is a SHA-256 over a high-entropy random token; the argon2
     // re-verify added nothing (same row, same secret) and under launchd QoS a
@@ -171,7 +174,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!row || row.revoked || row.retired) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
-    return { employeeId: asId(row.id), role: row.role, capabilities: row.capabilities };
+    return { employeeId: asId(row.id), role: row.role, capabilities: row.capabilities, tracks: row.tracks ?? undefined };
   }
 
   private async authorized(credential: Credential, capability?: 'execute' | 'review' | 'manage'): Promise<Principal> {
@@ -227,6 +230,7 @@ export class SurrealCompanyCore implements CompanyCore {
           }
           if (/conflict/i.test(cause)) throw new CompanyError('temporarily_unavailable', 'Database contention; retry request', true);
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
+          if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
           if (/lease expired/i.test(cause)) throw new CompanyError('lease_expired', 'Lease expired');
           if (/denied|forbidden|revoked/i.test(cause)) throw new CompanyError('forbidden', 'Action forbidden');
@@ -257,6 +261,13 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
     requireReviewer(input.reviewerRole);
+    if (input.discipline !== undefined) {
+      requireText(input.discipline, 'discipline', 1, 60);
+      const vocab = await this.disciplineVocab(input.goalId);
+      if (vocab && !vocab.has(input.discipline)) {
+        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
+      }
+    }
     if (input.executorRole === 'eval' || input.reviewerRole === 'eval') {
       throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
     }
@@ -276,6 +287,7 @@ export class SurrealCompanyCore implements CompanyCore {
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
+      discipline: input.discipline,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -288,6 +300,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dependencies AND state != 'done';
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
+          discipline: $discipline,
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
@@ -323,6 +336,7 @@ export class SurrealCompanyCore implements CompanyCore {
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
       };
+      IF $t.discipline != NONE AND array::len($who.def.tracks ?? []) > 0 AND $t.discipline NOT IN $who.def.tracks { THROW 'discipline track denied' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > $now AND $t.current_employee != $employee { THROW 'leased by another employee' };
       IF $who.active_task != NONE AND $who.active_task != $task {
         LET $active = SELECT * FROM ONLY $who.active_task;
@@ -377,6 +391,18 @@ export class SurrealCompanyCore implements CompanyCore {
       const r = byId.get(emp);
       return { employee: emp, agentId: r?.paseo_agent_id ?? undefined, provider: r?.provider ?? undefined, role: r?.role ?? undefined, retired: r?.retired === true };
     });
+  }
+
+  /**
+   * Discipline vocabulary of the goal's project: a Set of track names when the project
+   * defines a non-empty `disciplines` list, else undefined (free-form values allowed).
+   */
+  private async disciplineVocab(goalId?: string): Promise<Set<string> | undefined> {
+    if (!goalId) return undefined;
+    const [rows] = await this.db.query<[Array<{ disciplines?: Array<{ name?: string }> }>]>(
+      'SELECT project.disciplines AS disciplines FROM $goal;', { goal: id('goal', goalId) });
+    const names = (rows[0]?.disciplines ?? []).map(d => d?.name).filter((n): n is string => typeof n === 'string' && n.length > 0);
+    return names.length ? new Set(names) : undefined;
   }
 
   private async taskProject(taskId: TaskId): Promise<ProjectView | undefined> {
@@ -438,12 +464,21 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 3, 160);
     requireText(input.spec, 'spec', 20, 20000);
+    if (input.discipline !== undefined) {
+      requireText(input.discipline, 'discipline', 1, 60);
+      const vocab = await this.disciplineVocab(input.goalId);
+      if (vocab && !vocab.has(input.discipline)) {
+        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
+      }
+    }
     const specs = deliveryChain(input.title, input.spec);
     const created: TaskView[] = [];
     let dependencies = [...new Set(input.dependencies ?? [])];
     for (const [index, spec] of specs.entries()) {
       const task = await this.createTask(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
+        // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
+        discipline: index === 0 ? input.discipline : undefined,
       });
       created.push(task);
       dependencies = [task.id];

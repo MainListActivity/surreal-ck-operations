@@ -112,6 +112,10 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   /** Distinguish quota circuit-break from full seats in the owner-facing reason. */
   const capReason = (provider: string): string | undefined =>
     p.quotaBlocked.get(provider) ?? (cap(provider) ? undefined : 'provider 无可用容量');
+  // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
+  // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
+  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
+    !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
   const entries: StaffingEntry[] = [];
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;
@@ -124,6 +128,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       p.contributors?.has(inst.id) ? '任务贡献者回避' :
       (p.excludeSubmitter && inst.id === p.task?.submittedBy) ? '提交者回避' :
       (p.sidecar && inst.credentialFile) ? '凭证文件实例不可接新任务' :
+      !trackOk(p.task, def?.tracks) ? '岗位轨不匹配' :
       !currentModel(inst) ? '模型槽位已漂移' :
       capReason(inst.provider ?? '');
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
@@ -136,6 +141,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
     const reason =
       !def.enabled ? '编制停用' :
+      !trackOk(p.task, def.tracks) ? '岗位轨不匹配' :
       resolved === undefined ? '模型槽位未解析' :
       seats >= def.maxInstances ? `实例数 ${seats}/${def.maxInstances} 已满` :
       capReason(def.provider);
@@ -445,8 +451,8 @@ export class Dispatcher {
       contributors?: ReadonlySet<string>) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, contributors, assigned })
         .flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
-    const eligibleDefs = (role: string, home: string) =>
-      staffingPool({ ...poolBase, insts, role, home })
+    const eligibleDefs = (role: string, home: string, task?: SupervisedTask) =>
+      staffingPool({ ...poolBase, insts, role, home, task })
         .flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
@@ -474,7 +480,7 @@ export class Dispatcher {
       const pool = usable.filter(i => i.id !== avoid);
       return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
     };
-    const spawnable = (role: string, home: string) => weightedOrder(eligibleDefs(role, home), effectiveWeight, rand);
+    const spawnable = (role: string, home: string, task?: SupervisedTask) => weightedOrder(eligibleDefs(role, home, task), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
     // Review 派工的贡献者在进 Jev 前就已从 reuse 候选剔除（见 eligibleInsts 入参）；
     // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
@@ -485,7 +491,7 @@ export class Dispatcher {
       const avoided = this.staffAvoid.get(cacheKey);
       const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
       const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', contributors).filter(i => !dodged(i.id));
-      const spawn = eligibleDefs(item.role, home).filter(d => !dodged(`spawn:${d.id}`));
+      const spawn = eligibleDefs(item.role, home, item.task).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
       // Same candidate set → same verdict; only call Jev when the fingerprint moved.
       const fp = `${item.role}|${item.task.version}|` +
@@ -820,7 +826,7 @@ export class Dispatcher {
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, contributors?: ReadonlySet<string>) => EmployeeInst | undefined,
-    spawnable: (role: string, home: string) => EmployeeDef[],
+    spawnable: (role: string, home: string, task?: SupervisedTask) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     prefer?: AssignPreference, slots?: Map<string, string>, contributors?: ReadonlySet<string>,
@@ -854,7 +860,7 @@ export class Dispatcher {
         return undefined;
       }
     }
-    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo);
+    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo, task);
     if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());

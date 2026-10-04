@@ -17,6 +17,8 @@ export interface Principal {
   employeeId: EmployeeId;
   role: Role;
   capabilities: readonly ('execute' | 'review' | 'manage')[];
+  /** Discipline tracks of the employee's definition; empty/absent accepts every track. */
+  tracks?: string[];
 }
 
 export interface TaskView {
@@ -26,6 +28,8 @@ export interface TaskView {
   state: TaskState;
   executorRole: Role;
   reviewerRole: ReviewerRole;
+  /** Project-scoped discipline track (e.g. 编剧/分镜): only defs whose `tracks` list covers it may claim. */
+  discipline?: string;
   kind: TaskKind;
   goalId?: string;
   dependencies: TaskId[];
@@ -54,6 +58,8 @@ export interface CreateTask {
   context: string;
   executorRole: Role;
   reviewerRole: ReviewerRole;
+  /** Optional discipline track; when the goal's project defines a non-empty `disciplines` vocabulary the value must be in it. */
+  discipline?: string;
   kind?: Exclude<TaskKind, 'goal'>;
   goalId?: string;
   dependencies?: TaskId[];
@@ -96,6 +102,8 @@ export interface ProjectView {
   release: string;
   rollback?: string;
   redLines: string[];
+  /** Discipline tracks this project uses (e.g. 编剧/角色设计); non-empty means task.discipline is validated against it. */
+  disciplines?: Array<{ name: string; description?: string }>;
   runbooks: string[];
   notes?: string;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
@@ -106,6 +114,8 @@ export interface CreateDelivery {
   title: string;
   /** What to build and the acceptance criteria qa verifies in production. */
   spec: string;
+  /** Optional discipline track; carried by the implementation leg only, release/deploy legs stay untracked. */
+  discipline?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
 }

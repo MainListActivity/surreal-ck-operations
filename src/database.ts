@@ -82,8 +82,9 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('006-flow.surql'));
     await this.db.query(loadSchema('007-gate.surql'));
     await this.db.query(loadSchema('008-content-roles.surql'));
-    await this.db.query(loadSchema('009-instruct.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 9 WHERE schema_version < 9;');
+    await this.db.query(loadSchema('009-discipline-tracks.surql'));
+    await this.db.query(loadSchema('010-instruct.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 10 WHERE schema_version < 10;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

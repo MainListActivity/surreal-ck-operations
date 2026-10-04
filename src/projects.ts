@@ -53,6 +53,8 @@ export interface ProjectInput {
   release: string;
   rollback?: string;
   redLines?: string[];
+  /** Project discipline-track vocabulary (e.g. 编剧/角色设计/分镜) with optional per-track notes. */
+  disciplines?: Array<{ name: string; description?: string }>;
   runbooks?: string[];
   notes?: string;
   /** `broker` is the non-secret ops-broker configuration (see src/ops/config.ts); it is never part of ProjectView. */
@@ -61,7 +63,7 @@ export interface ProjectInput {
 
 interface ProjectRow {
   id: RecordId; name: string; repo_path: string; default_branch?: string; release: string; rollback?: string;
-  red_lines: string[]; runbooks?: string[]; notes?: string;
+  red_lines: string[]; disciplines?: Array<{ name: string; description?: string }>; runbooks?: string[]; notes?: string;
 }
 interface EnvRow { id: RecordId; name: string; url?: string; health_url?: string; verify?: string; broker?: unknown }
 export interface EnvBrokerRow { name: string; url?: string; healthUrl?: string; broker?: unknown }
@@ -75,10 +77,14 @@ export class ProjectStore {
 
   async upsert(input: ProjectInput): Promise<ProjectView> {
     if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
+    const names = (input.disciplines ?? []).map(d => d?.name);
+    if (names.some(n => typeof n !== 'string' || !n.trim()) || new Set(names).size !== names.length) {
+      throw new CompanyError('invalid', 'disciplines must be unique non-empty track names');
+    }
     const project = new RecordId('project', input.id);
     await this.db.query(`UPSERT $project CONTENT {
         name: $p.name, repo_path: $p.repoPath, default_branch: $p.defaultBranch ?? 'main', release: $p.release,
-        rollback: $p.rollback, red_lines: $p.redLines ?? [], runbooks: $p.runbooks ?? [], notes: $p.notes, updated_at: time::now() };`,
+        rollback: $p.rollback, red_lines: $p.redLines ?? [], disciplines: $p.disciplines, runbooks: $p.runbooks ?? [], notes: $p.notes, updated_at: time::now() };`,
     { project, p: input });
     for (const { broker, ...env } of input.envs) {
       await this.db.query(`INSERT INTO project_env { project: $project, name: $e.name, url: $e.url, health_url: $e.healthUrl, verify: $e.verify }
@@ -111,7 +117,9 @@ export class ProjectStore {
        SELECT env.name AS env, name, roles FROM env_secret WHERE env.project = $project ORDER BY name;`, { project: row.id });
     return {
       id: String(row.id.id), name: row.name, repoPath: row.repo_path, defaultBranch: row.default_branch ?? 'main',
-      release: row.release, rollback: row.rollback, redLines: row.red_lines ?? [], runbooks: row.runbooks ?? [], notes: row.notes,
+      release: row.release, rollback: row.rollback, redLines: row.red_lines ?? [],
+      disciplines: row.disciplines?.map(d => ({ name: d.name, description: d.description })),
+      runbooks: row.runbooks ?? [], notes: row.notes,
       envs: envs.map(e => ({
         name: e.name, url: e.url, healthUrl: e.health_url, verify: e.verify,
         secrets: secrets.filter(s => s.env === e.name).map(s => ({ name: s.name, roles: s.roles as Role[] })),
