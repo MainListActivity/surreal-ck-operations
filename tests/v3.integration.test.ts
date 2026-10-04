@@ -8,6 +8,7 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
+import { SEED_DEFS } from '../src/seed.ts';
 import { Workforce } from '../src/workforce.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
@@ -979,4 +980,52 @@ test('model slots: auto defs resolve to newest family model; stale idle instance
   expect(report.woke.filter(w => w.spawned)).toHaveLength(0);
   expect(report.woke).toHaveLength(1); // inst2 still reusable on last-known model
   expect(notices.some(n => n.includes('模型槽位无法解析'))).toBe(true);
+});
+
+test('content line roles: concept-design / asset-production tasks only reach their own defs; cross-role claims denied', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  // Both new roles plus an ai-content def that must never be picked for their tasks.
+  await workforce.upsertDef('concept-design-grok', { role: 'concept-design', provider: 'grok', model: 'grok-4.7', thinking: 'medium' });
+  await workforce.upsertDef('asset-production-grok', { role: 'asset-production', provider: 'grok', model: 'grok-4.7', thinking: 'medium' });
+  await workforce.upsertDef('ai-content-grok', { role: 'ai-content', provider: 'grok', model: 'grok-4.7', thinking: 'medium' });
+  // Seed rows cover the new roles on all three subscriptions, same shape as ai-content.
+  expect(SEED_DEFS.filter(d => d.role === 'concept-design').map(d => d.provider).sort()).toEqual(['codex', 'devin', 'grok']);
+  expect(SEED_DEFS.filter(d => d.role === 'asset-production').map(d => d.provider).sort()).toEqual(['codex', 'devin', 'grok']);
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const proto = await core.createTask(tokens.gm, { title: '概念原型 demo', context: 'synthetic',
+    executorRole: 'concept-design', reviewerRole: 'gm', idempotencyKey: key() });
+  const mass = await core.createTask(tokens.gm, { title: '量产素材批次', context: 'synthetic',
+    executorRole: 'asset-production', reviewerRole: 'qa', idempotencyKey: key() });
+  // eval is still not a taskable role.
+  await expect(core.createTask(tokens.gm, { title: '评审伪装任务', context: 'synthetic',
+    executorRole: 'eval', reviewerRole: 'qa', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+
+  const report = await dispatcher.tick();
+  const byTask = new Map(report.woke.map(w => [w.task, w.employee]));
+  expect(byTask.get(proto.id)!.startsWith('concept-design-')).toBe(true);
+  expect(byTask.get(mass.id)!.startsWith('asset-production-')).toBe(true);
+  const protoSpawn = [...paseo.agents.values()].find(a => a.spawn?.prompt.includes(proto.id))!.spawn!;
+  expect(protoSpawn.prompt).toContain('agents/concept-design.md');
+  expect(protoSpawn.labels?.role).toBe('concept-design');
+
+  // 互不错派：原型任务拒绝量产岗与 ai-content 员工领取，量产任务同样拒绝原型岗。
+  const aiToken = await enrollment.enroll('t-ai-content-x', 'ai-content', ['execute', 'review']);
+  await expect(core.claim(aiToken, proto.id)).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.claim(tokenOf(byTask.get(mass.id)!), proto.id)).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.claim(tokenOf(byTask.get(proto.id)!), mass.id)).rejects.toMatchObject({ code: 'forbidden' });
+
+  // The assigned prototype employee runs the normal claim → checkpoint → submit path.
+  const protoEmployee = byTask.get(proto.id)!;
+  const claim = await core.claim(tokenOf(protoEmployee), proto.id);
+  expect(claim.task.state).toBe('doing');
+  const cp = await core.checkpoint(tokenOf(protoEmployee), proofOf(claim), { text: '原型首页与样张已出，下一步补 demo 录屏。', idempotencyKey: key() });
+  const submitted = await core.submit(tokenOf(protoEmployee), proofOf(claim, cp.version), { text: '原型交付：demo 入口与素材清单见证据。', idempotencyKey: key() });
+  expect(submitted.state).toBe('review');
 });

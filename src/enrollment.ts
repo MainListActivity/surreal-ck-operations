@@ -4,7 +4,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
 import { CompanyError } from './core.ts';
 
-const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs', 'eval'];
+const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs', 'eval'];
 
 /** Local root-only enrollment API. Never pass this object to the MCP adapter. */
 export class LocalEnrollmentAdmin implements EnrollmentAdmin {

@@ -1,7 +1,7 @@
 import type { Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 
-const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'qa', 'cs', 'eval'];
+const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs', 'eval'];
 /** Roles that may drive ops tools unless the environment narrows or widens the list. */
 const DEFAULT_ROLES: Role[] = ['qa', 'engineering', 'product'];
 const DEFAULT_SCOPE = 'openid profile email offline_access';
