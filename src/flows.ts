@@ -82,7 +82,7 @@ function plan(goalId: string, head: string, afterScope: boolean): Spec {
     context: `${head}
 你是经理。${afterScope ? '先读依赖任务里运营的《范围提案》。' : ''}把目标拆成可独立交付的任务，全部带 goalId="${goalId}"：
 - 每个代码改动用 create_delivery（自动生成 实现 → 上线申请 → 合入部署与生产实测，上线由运营决定、qa 在生产实测）。
-- 非代码工作用 create_task，执行者与验收者不同岗位；小需求不要拉 ai-content、cs 参与。
+- 非代码工作用 create_task，执行者与验收者不同岗位；小需求不要拉 ai-content、cs 参与。内容产线按段派工：原型/概念设计（P 段，老板 demo 验收）→ executorRole=concept-design、reviewerRole=owner；量产制作（M 段，GM/QA 验收）→ executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies（老板 approve 前量产任务不解锁）。
 submit 证据：任务清单（id、标题、执行/验收岗位、依赖）。运营验收和 G3 会自动等待全部任务完成。
 ${AUTHORITY}`,
   };

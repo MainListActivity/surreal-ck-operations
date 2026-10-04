@@ -1,6 +1,6 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
-export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'qa' | 'cs' | 'eval';
+export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'qa' | 'cs' | 'eval';
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
 export type ReviewerRole = Role | 'owner';

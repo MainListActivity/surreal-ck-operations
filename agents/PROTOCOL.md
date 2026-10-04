@@ -31,6 +31,16 @@
 - 缺什么先自己补：缺账号、缺测试数据、缺环境变量都是任务的一部分。账号、workspace、成员、登录用下面的运维工具 `ops_*`；环境变量用 GitHub `production` Environment 的 `ORIGIN_ENV_<NAME>` secret（`gh secret set`），发布后由 CI 写入主机，**不要 SSH 主机**；停写迁移放进仓库 `scripts/deploy/origin-pre-start.sh`。
 - 凭证：你不持有任何凭证，也不要去找。密码、token、API key 只在插件的运维代理里；`get_secret` / `put_secret` 已下线。需要凭证才能做的事，用 `ops_*` 让代理替你做。不要读取 `.env`、钥匙串或其他员工的会话目录，也不要把代理返回的会话句柄以外的任何登录信息写进证据、文件、提交或消息。
 
+## 岗位
+
+任务岗位：gm（总经理）、product（运营/产品）、engineering（工程）、ai-content（AI 与内容，存量/通用岗）、concept-design（原型/概念设计，内容产线 P 段）、asset-production（量产制作，内容产线 M 段）、qa（测试）、cs（客户成功）；另设 eval 评审岗位（不领任务、不验收，只写绩效分，见文末）。各岗位职责见 `agents/<role>.md`。
+
+**内容产线两段规则**（老板既定方向）：原型/概念设计与量产制作是内容产线的专属执行岗位，与 ai-content 互不错派。
+
+- P 段（原型/概念设计）：`executorRole=concept-design`、`reviewerRole=owner`——收口为老板 demo 验收，交付证据须附老板可直接打开的产物（静帧 PNG、可直接打开的页面或样片路径）。
+- M 段（量产制作）：`executorRole=asset-production`、`reviewerRole=gm` 或 `qa`——变体、铺量镜头、配音、渲染等批量产出走 GM/QA 验收，不过老板。
+- P→M 依赖：量产任务的 `dependencies` 须含对应原型任务，老板 approve 前量产任务不得解锁、不得开工；任何新增内容角色必须先过 demo 关再立项量产。
+
 ## 运维工具（ops_*）
 
 需要凭证才能做的事，由通道里的运维代理替你做：它在插件里持有密钥，按你当前任务的租约和岗位放行，每次调用写入审计，返回里不含密钥。调用方式同其他工具：`sck call ops_<名字> '<JSON>'`；先 `ops_info` 看当前项目能做什么、有哪些账号别名和配额。项目配置了多个环境时用 `env` 参数指定（缺省：只有一个就用它，否则用 `production`）。

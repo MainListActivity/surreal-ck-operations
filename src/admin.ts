@@ -17,7 +17,7 @@ const usage = `Usage: pnpm run admin <command>
   def set <id> <role> <provider> <model> [thinking] [max-instances] [priority] [weight]
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def enable|disable <id>
-  seed-defs                               写入默认员工定义（codex/grok/devin × 七岗位含 eval，已存在则不覆盖）
+  seed-defs                               写入默认员工定义（codex/grok/devin × 九岗位含 eval，已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
   retire <employee-id> <reason>           退役实例并撤销凭证
