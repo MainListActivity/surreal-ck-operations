@@ -22,6 +22,19 @@ rtk proxy sh scripts/company-service.sh uninstall
 
 `GET http://127.0.0.1:<port>/health` 是进程存活探针；`GET /ready` 检查实际目标库 ownership marker 可读，200 为 ready、503 为不可用。两者仅本机可访问，且同样应用 Host/Origin 检查；MCP `/mcp` 仍须每次 Bearer 鉴权。检查时用 `rtk proxy curl --fail http://127.0.0.1:<port>/ready`，`rtk proxy lsof -nP -iTCP:<port> -sTCP:LISTEN`，`rtk proxy sh scripts/company-service.sh status`。日志在 `logs/stdout.log` 和 `logs/stderr.log`（调度器为 `logs/stdout-dispatcher.log`、`logs/stderr-dispatcher.log`），只记录监听端口、投影数量和不含原始错误的重试消息；不要把完整日志上传到 Issue。启动失败先检查私有配置路径、文件权限、端口占用、现有 SurrealDB 可达性与本机 gh 登录。回滚到前一固定目录：在前一版本运行同一 `install <previous-release>`；卸载如上。
 
+**插件面同步（每次 release install 必做）**：任务系统是双部署面——launchd `org.surrealck.company-mcp` 跑 `active` 指向的 release，而员工 comm 通道（sck → sidecar → vendored core）与调度器跑在 Paseo 插件 `sck-company` 进程内，插件加载自 `/Users/y/IdeaProjects/surreal-ck-operations-v3/plugin`（分支 `ops/v3-paseo-dispatch`），其 `plugin/server/vendor/` 是 `src/`+`schema/` 的**手工生成拷贝**，不随仓库提交自动更新。只切 active 不同步插件面会导致通道用旧 core 校验（曾出现新岗位 create_task 被旧 ROLES 拒 `invalid: Invalid role`）。每次发布执行：
+
+```sh
+cd /Users/y/IdeaProjects/surreal-ck-operations-v3
+git fetch origin && git status          # 确认工作树干净、识别未推送/在途提交（不得丢）
+git merge origin/main                    # 把 release 基线并入插件分支并推送
+sh plugin/scripts/vendor.sh              # 重新生成 server/vendor/src 与 server/vendor/schema
+paseo plugin reload sck-company          # 重载插件（短暂中断派工循环，避开密集时段）
+paseo plugin ls                          # 确认 sck-company running、无 error
+```
+
+reload 后用 `sck call get_context` 与实际派工各验证一次恢复。其它生成物：`plugin/node_modules` 由 `cd plugin && npm install` 管理，仅当 `plugin/package.json` 依赖变化时才需重装，无其它需同步的生成物。
+
 ## 员工客户端
 
 > **v3 更新（sidecar/comm 通道）**：员工实例由 Paseo 插件 `sck-company` 注册代管，agent 进程零凭证——spawn env 只注入 `SCK_COMM_DIR` 和 `SCK_COMM_KEY`，实例凭证与租约证明留在插件进程内。claim/heartbeat/submit/review/blocker 由 sidecar 程序化代执行，租约证明自动注入，员工参数只写业务字段，`claim_next` 在员工侧不可用。comm 文件协议：`claim.json` 下发任务上下文，`report.md` 落盘即提交，`blocker.md` 上报阻塞（回合结束时由 sidecar 回收为 submit/report_blocker），`req/`+`res/` 原子转发 `sck call`。`get_secret`/`put_secret` 等凭证工具已下线，需要账号、workspace、生产登录走 `ops_*` 运维工具（先 `ops_info` 查能力清单）。legacy `credential_file` 实例不再被代领新任务，自然淘汰。架构、调用路径、安全边界与排障详见 [sidecar 通道](./sidecar-channel.md)；本节下述的凭证文件方式（`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`）仅为旧部署与 legacy 实例保留。
