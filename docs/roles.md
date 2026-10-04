@@ -4,7 +4,7 @@
 
 ## 员工定义与实例
 
-1. **岗位 role**：gm、product、engineering、ai-content、concept-design、asset-production、qa、cs 八个任务岗位；另设 **eval** 评审岗位（不领任务，只在任务完成后给员工打绩效分，默认由 Jev 决策模型在调度器内直评，eval 员工是低置信度或故障时的升级通道）。其中 concept-design（原型/概念设计）与 asset-production（量产制作）是内容产线的专属执行岗位：P 段原型类任务派给 concept-design、由老板 demo 验收；M 段量产类任务派给 asset-production、由经理或 qa 验收，两者与 ai-content 互不错派。
+1. **岗位 role**：gm、product、engineering、ai-content、concept-design、asset-production、qa、cs 八个任务岗位；另设 **eval** 评审岗位（不领任务，只在任务完成后给员工打绩效分，默认由 Jev 决策模型在调度器内直评，eval 员工是低置信度或故障时的升级通道）。其中 concept-design（原型/概念设计）与 asset-production（量产制作）是内容产线的专属执行岗位：P 段原型类任务派给 concept-design、由老板 demo 验收（reviewerRole=owner，交付证据须附老板可直接打开的产物）；M 段量产类任务派给 asset-production、由经理或 qa 验收，其 dependencies 须含对应原型任务——老板 approve 前不得解锁开工；两岗与 ai-content 互不错派。
 2. **员工定义 employee_def**：岗位 + 订阅（provider）+ 模型 + 思考强度 + `weight` 派工权重，存 SurrealDB。每个岗位在 codex、grok、devin 三个订阅上各有定义，互为备份；同岗位多个候选按 `weight × 绩效系数` 加权随机分配任务。
 3. **员工实例**：调度器按定义生成，拥有独立员工编号、凭证和 Paseo 会话（`paseo_agent_id`）。一个实例同一时间只持有一个任务租约；同岗位多个实例可并行处理不同任务。
 
