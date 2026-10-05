@@ -50,6 +50,8 @@ export interface OpsDeps {
   controlEnv?: () => ControlPlaneEnv;
   fetch?: Fetcher;
   now?: () => number;
+  /** Test seam: defaults to real timers; tests advance the fake clock instead of waiting. */
+  sleep?: (ms: number) => Promise<void>;
   log?: (message: string) => void;
   /** Test seams; production wires Cloudflare D1, the SurrealDB SDK and ego-browser. */
   d1?: (config: BrokerConfig, env: ControlPlaneEnv) => D1Client;
@@ -76,6 +78,13 @@ const DAY_SECONDS = 86_400;
 const REFRESH_MARGIN_MS = 60_000;
 const DEFAULT_TOKEN_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 100_000;
+
+// Invitation issuance is asynchronous on the product: POST answers 202 within ~60s when
+// the saga overruns; the broker then polls GET and re-POSTs once past the product's stale
+// threshold (CAS-resumable) until the row settles as completed/failed.
+const INVITE_POLL_MS = 10_000;
+const INVITE_RESUME_AFTER_MS = 290_000; // product stale threshold is 240s; wait past it
+const INVITE_WAIT_MS = 480_000;         // total budget per tool call; a same-key retry continues
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
@@ -127,10 +136,12 @@ export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
   private readonly sessions: SessionStore;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly handlers: Record<OpsTool, Handler>;
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.sessions = new SessionStore(this.now);
     this.handlers = {
       ops_info: (ctx) => this.info(ctx),
@@ -608,7 +619,10 @@ export class OpsBroker {
 
   /**
    * G2 邀请签发（运营代办开通）：转发产品 POST /api/ops/invitations。
-   * 一次性 activation_url 不回给员工——产品只在首响应下发一次、broker 落盘到
+   * 产品侧为异步契约：POST 在同步窗内完成 → 201/200 直接带结果；超时回 202
+   * processing（任务不脱管继续跑）→ 本工具轮询 GET，僵死则同键重发触发续跑，
+   * 完成后经 collect-delivery 一次性收取激活链接。
+   * 一次性 activation_url 不回给员工——broker 落盘到
    * <serviceHome>/handoff/invite-<key>.txt（0600，不进 evidence/deliverables
    * 这两个 LAN 预览面），由老板本机取阅转交。重放/复用路径无新链接、不写文件。
    */
@@ -639,10 +653,32 @@ export class OpsBroker {
       throw productFailure('issuing the invitation', res, { 400: 'invalid', 403: 'forbidden', 409: 'conflict', 503: 'upstream_error' });
     }
 
-    const resBody = (res.body ?? {}) as Record<string, unknown>;
-    const delivery = (resBody.delivery ?? {}) as Record<string, unknown>;
-    const activationUrl = typeof delivery.activationUrl === 'string' && delivery.activationUrl.length > 0
+    let resBody = (res.body ?? {}) as Record<string, unknown>;
+    if (resBody.status === 'processing') {
+      resBody = await this.awaitInvitation(ctx, session, idempotencyKey, body);
+    }
+    if (resBody.status === 'failed') {
+      const code = typeof resBody.errorCode === 'string' ? resBody.errorCode : 'invite-failed';
+      const detail = typeof resBody.errorMessage === 'string' ? resBody.errorMessage : '';
+      throw new CompanyError('upstream_error', `invitation ${idempotencyKey} failed on the product: ${code} ${detail}`.trim(), false);
+    }
+
+    let delivery = (resBody.delivery ?? {}) as Record<string, unknown>;
+    let activationUrl = typeof delivery.activationUrl === 'string' && delivery.activationUrl.length > 0
       ? delivery.activationUrl : undefined;
+
+    // 后台完成/续跑路径：行已 completed 但响应不携带链接 → 一次性收取（已收则回空）。
+    if (resBody.status === 'completed' && !activationUrl && delivery.pendingCollect === true) {
+      const col = await this.product(ctx, session, 'POST', `/api/ops/invitations/${encodeURIComponent(idempotencyKey)}/collect-delivery`);
+      if (col.ok) {
+        const collected = (col.body ?? {}) as Record<string, unknown>;
+        if (typeof collected.activationUrl === 'string' && collected.activationUrl.length > 0) {
+          activationUrl = collected.activationUrl;
+          delivery = { ...delivery, channel: 'activation_url' };
+          resBody = { ...resBody, delivery };
+        }
+      }
+    }
 
     let handoff: { file: string; note: string } | undefined;
     if (activationUrl) {
@@ -665,9 +701,43 @@ export class OpsBroker {
       value: { status: res.status, ok: res.ok, body: clipJson(redactJson(resBody, known)), ...(handoff ? { handoff } : {}) },
       audit: {
         action: 'ops_invitation_issue',
-        evidence: `ops_invitation_issue ${email} ws=${body.workspaceSlug} → ${res.status}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
+        evidence: `ops_invitation_issue ${email} ws=${body.workspaceSlug} → ${resBody.status ?? res.status}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
       },
     };
+  }
+
+  /**
+   * 邀请任务轮询：GET 到 completed/failed 为止。产品在 processing 超 240s 后允许
+   * 同参重发续跑（CAS 幂等，仅一个执行者）；这里越过阈值即发一次重发。
+   * 超时上限只约束本次工具调用——行不脱管，以同幂等键重发本工具可继续等。
+   */
+  private async awaitInvitation(ctx: Ctx, session: OpsSession, key: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const deadline = this.now() + INVITE_WAIT_MS;
+    const resumeAfter = this.now() + INVITE_RESUME_AFTER_MS;
+    let resumed = false;
+    for (;;) {
+      if (this.now() >= deadline) {
+        throw new CompanyError('upstream_error',
+          `invitation ${key} is still processing after ${Math.round(INVITE_WAIT_MS / 60000)}min; the task is not lost — call ops_invitation_issue again with the same idempotencyKey to keep waiting/resume it`, true);
+      }
+      await this.sleep(INVITE_POLL_MS);
+      const res = await this.product(ctx, session, 'GET', `/api/ops/invitations/${encodeURIComponent(key)}`);
+      if (res.ok) {
+        const polled = (res.body ?? {}) as Record<string, unknown>;
+        if (polled.status === 'completed' || polled.status === 'failed') return polled;
+      } else if (res.status >= 400 && res.status < 500) {
+        throw productFailure('polling the invitation', res, { 403: 'forbidden', 404: 'not_found' });
+      }
+      // 5xx 轮询失败当瞬断继续等。
+      if (!resumed && this.now() >= resumeAfter) {
+        resumed = true;
+        const re = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
+        if (re.ok) {
+          const rb = (re.body ?? {}) as Record<string, unknown>;
+          if (rb.status === 'completed' || rb.status === 'failed') return rb;
+        }
+      }
+    }
   }
 
   /** 一次性凭证的落地处：老板本机目录（0600），刻意不进 LAN 预览面。 */

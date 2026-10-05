@@ -62,6 +62,18 @@ export class FakeWorld {
   /** The provision token hash the fake product sealed at the last rotate call (null = env fallback). */
   liveProvisionToken: { hash: string; principalId: string } | null = null;
 readonly issuedInvites = new Map<string, Record<string, unknown>>();
+  /** 行级暂存的一次性激活链接——GET/POST 读路径永不回显，仅 collect-delivery 一次性下发。 */
+  readonly inviteUrls = new Map<string, string>();
+  readonly inviteDeliveredAt = new Map<string, string>();
+  /** 异步模式：POST 返回 202 processing，GET 轮询该次数后翻 completed。 */
+  inviteAsyncPolls: number | null = null;
+  /** 僵死模拟：GET 永不推进，直到同键重发 POST 续跑（inviteResumeCalls++）。 */
+  inviteNeedsResume = false;
+  inviteResumeCalls = 0;
+  /** 异步完成时翻为 failed（带 errorCode/errorMessage）而非 completed。 */
+  inviteFailOnComplete = false;
+  private readonly invitePendingPolls = new Map<string, number>();
+  private inviteResumed = new Set<string>();
   private readonly grants = new Map<string, Grant>();
   private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string; client: string }>();
   private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
@@ -523,25 +535,86 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
           idp: { reachable: true, status: null, error: null },
         });
       }
-      // Mirrors POST /api/ops/invitations: subscription.manage capability, one-time
-      // activation_url only on first issuance, replay/reuse returns it as null.
+      // Mirrors POST /api/ops/invitations: subscription.manage capability; async contract —
+      // fast path 201+URL（同步窗内完成即记为已收取），inviteAsyncPolls 模式回 202 processing
+      // 供 GET 轮询；僵死（inviteNeedsResume）行须同键重发续跑。
       if (method === 'POST' && url.pathname === '/api/ops/invitations') {
         if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
         const key = String(body.idempotencyKey ?? '');
         const existing = this.issuedInvites.get(key);
         if (existing) {
-          return json(200, { ...existing, replayed: true, delivery: { channel: 'activation_url', activationUrl: null, note: '重放返回既有结果；激活链接仅在首次调用时下发一次' } });
+          if (existing.status === 'processing') {
+            this.inviteResumeCalls += 1;
+            if (this.inviteNeedsResume && !this.inviteResumed.has(key)) {
+              this.inviteResumed.add(key); // 续跑成功：恢复推进
+            }
+          }
+          const delivery = { ...(existing.delivery as Record<string, unknown>), activationUrl: null };
+          return json(existing.status === 'processing' ? 200 : 200, { ...existing, replayed: true, delivery });
         }
-        const result = {
-          idempotencyKey: key, status: 'completed', replayed: false,
+        const url = `https://idp.test/activate-account?token=onetime-${randomUUID()}`;
+        this.inviteUrls.set(key, url);
+        const base = {
+          idempotencyKey: key, replayed: false,
           user: { id: `uid-${key.slice(0, 8)}`, email: String(body.email ?? ''), status: 'provisioned', outcome: 'created' },
           workspace: { slug: String(body.workspaceSlug ?? ''), dbName: 'ws_fake', outcome: 'created' },
           entitlement: { planKey: String(body.planKey ?? 'pro'), productPlanRevisionId: 'product_plan_revision:x', billingAccountKey: 'personal:x' },
           aiAllowance: { kind: 'compensation', amount: (body.aiAllowance as Record<string, unknown> | undefined)?.amount ?? 0, periodKey: `invite:${key}`, expiresAt: '2026-12-31T23:59:59.000Z', bucket: 'ai_allowance_bucket:fake' },
-          delivery: { channel: 'activation_url', activationUrl: `https://idp.test/activate-account?token=onetime-${randomUUID()}`, note: 'invite note' },
         };
-        this.issuedInvites.set(key, result);
-        return json(201, result);
+        const asyncPolls = this.inviteAsyncPolls ?? 0;
+        if (asyncPolls > 0) {
+          const processing = { ...base, status: 'processing',
+            delivery: { channel: 'none', activationUrl: null, pendingCollect: false, note: '开通仍在进行' } };
+          this.issuedInvites.set(key, processing);
+          this.invitePendingPolls.set(key, asyncPolls);
+          return json(202, processing);
+        }
+        const completed = { ...base, status: 'completed',
+          delivery: { channel: 'activation_url', activationUrl: url, pendingCollect: false, note: 'invite note' } };
+        this.issuedInvites.set(key, completed);
+        this.inviteDeliveredAt.set(key, new Date(this.clock).toISOString()); // 同步窗内下发即收取
+        return json(201, completed);
+      }
+      // GET /api/ops/invitations/:key — quota.read，读路径永不含 URL 本体。
+      const inviteGet = /^\/api\/ops\/invitations\/([^/]+)$/.exec(url.pathname);
+      if (method === 'GET' && inviteGet) {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(inviteGet[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        if (row.status === 'processing' && (!this.inviteNeedsResume || this.inviteResumed.has(key))) {
+          const left = this.invitePendingPolls.get(key) ?? 0;
+          if (left <= 1) {
+            this.invitePendingPolls.delete(key);
+            if (this.inviteFailOnComplete) {
+              row.status = 'failed';
+              row.errorCode = 'invite-slug-taken';
+              row.errorMessage = 'workspace slug 已被占用';
+            } else {
+              row.status = 'completed';
+              row.delivery = { channel: 'activation_url', activationUrl: null, pendingCollect: this.inviteUrls.has(key), note: '完成后经 collect-delivery 收取' };
+            }
+          } else {
+            this.invitePendingPolls.set(key, left - 1);
+          }
+        }
+        return json(200, { ...row, replayed: true });
+      }
+      // POST /api/ops/invitations/:key/collect-delivery — subscription.manage，一次性收取。
+      const collect = /^\/api\/ops\/invitations\/([^/]+)\/collect-delivery$/.exec(url.pathname);
+      if (method === 'POST' && collect) {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(collect[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        const deliveredAt = this.inviteDeliveredAt.get(key) ?? null;
+        if (row.status !== 'completed' || deliveredAt || !this.inviteUrls.has(key)) {
+          return json(200, { idempotencyKey: key, status: row.status, activationUrl: null, deliveredAt });
+        }
+        const now = new Date(this.clock).toISOString();
+        this.inviteDeliveredAt.set(key, now);
+        row.delivery = { ...(row.delivery as Record<string, unknown>), pendingCollect: false };
+        return json(200, { idempotencyKey: key, status: 'completed', activationUrl: this.inviteUrls.get(key), deliveredAt: now });
       }
       return apiError(404, 'not-found');
     }
