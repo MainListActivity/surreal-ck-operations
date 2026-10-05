@@ -71,7 +71,13 @@ export function publishDeliverables(input: PublishInput): PublishResult {
   if (files.length === 0) throw new Error('files 为空：给绝对路径的文件或目录');
 
   // 先全量校验再落盘：任一输入非法即整体报错，不产生半截交付包。
-  const bad = files.filter((f) => typeof f !== 'string' || !isAbsolute(f) || !existsSync(f));
+  // basename 须归一化为单一安全段名——"/" 这类输入 basename 为空或仍为分隔符，
+  // 放行会让 rel="" → join(dir,"")=dir → 把根文件系统递归拷进交付包。
+  const safeBase = (f: string) => {
+    const b = basename(f);
+    return b !== '' && b !== '.' && b !== '..' && !b.includes('/') && !b.includes('\\');
+  };
+  const bad = files.filter((f) => typeof f !== 'string' || !isAbsolute(f) || !existsSync(f) || !safeBase(f));
   if (bad.length) throw new Error(`路径无效或不存在（未产生任何交付）：${bad.join(', ')}`);
 
   const dir = join(home, 'deliverables', taskId);

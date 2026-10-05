@@ -66,6 +66,13 @@ describe('publishDeliverables', () => {
     expect(() => publishDeliverables({ home, taskId: TID, files: [] })).toThrow(/files 为空/);
   });
 
+  test('根路径等无安全段名的输入整体拒绝（防 basename 为空把根文件系统拷进交付包）', () => {
+    for (const f of ['/', '/.', '/..', '/tmp/../']) {
+      expect(() => publishDeliverables({ home, taskId: TID, files: [f] })).toThrow(/未产生任何交付/);
+    }
+    expect(existsSync(join(home, 'deliverables', TID))).toBe(false);
+  });
+
   test('隐藏名跳过且进 skipped；同名冲突覆盖', () => {
     writeFileSync(join(src, '.hidden'), 'h');
     mkdirSync(join(src, 'pkg'), { recursive: true });

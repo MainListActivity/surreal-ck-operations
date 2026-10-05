@@ -66,12 +66,12 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - **配额**：项目内按审计行统计最近 24h 新建数，超限回 `limit_reached`。
 - **审计**：账号创建/修复、workspace 创建/进入、成员增删、登录、浏览器登录写实名 `audit` 行并进交接历史；只读调用与 `ops_request`/`ops_query` 记 `ops_call`，不进交接历史。
 - **脱敏**：返回与审计文本都抹掉 token 字段名、JWT/Bearer/密码形态串，以及该员工全部在存会话 token；上游错误只透出机器码。
+- **错误码**：`invalid`（参数）、`forbidden`（岗位/权限）、`not_configured`（环境未配代理或缺 D1/data/Cloudflare 凭证）、`not_found`、`limit_reached`、`conflict`、`login_failed`、`upstream_error`（超时/断连/5xx，`retryable`）。
+- **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，`sh plugin/scripts/vendor.sh` 后 `plugin reload`；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
 
 ## deliverables/ 交付包约定
 
 员工用 `deliverable_publish` 发布给老板看的产物，落点为 `$SCK_SERVICE_HOME/deliverables/<taskId>/`，经插件内嵌预览服务 `/d/<taskId>/…` 路由以 LAN URL 呈现（无鉴权，局域网口径）；`evidence/<taskId>/` 则对应 `/e/` 路由（收件箱附件自动枚举呈现）。证据文本里给老板点开的链接必须来自 `deliverable_publish` 的返回 `urls`，本地路径与 `file://` 不算交付。
-- **错误码**：`invalid`（参数）、`forbidden`（岗位/权限）、`not_configured`（环境未配代理或缺 D1/data/Cloudflare 凭证）、`not_found`、`limit_reached`、`conflict`、`login_failed`、`upstream_error`（超时/断连/5xx，`retryable`）。
-- **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，`sh plugin/scripts/vendor.sh` 后 `plugin reload`；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
 
 ## 排障
 
