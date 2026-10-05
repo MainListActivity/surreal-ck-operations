@@ -17,6 +17,7 @@ function rig(patch: Record<string, unknown> = {}, hasEnv = true): Rig {
     core: company.core, projects: company.projects as never, secretKey: () => Buffer.alloc(32),
     controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
     fetch: world.fetch, now: world.now, d1: () => world.d1, queryAsUser: world.queryAsUser, browser: world.browser,
+    sleep: async (ms) => { world.clock += ms; },
   });
   return { world, company, broker, qa: company.lease('qa-1', 'qa', 'task-1'), outputs: [] };
 }
@@ -1505,5 +1506,80 @@ describe('ops_invitation_issue（G2 邀请签发 + 老板交接文件）', () =>
     const session = await opsSession(r, ['quota.read']);
     const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
     expect(error.code).toBe('forbidden');
+  });
+
+  test('异步路径：POST 202 → 轮询 GET 完成 → collect-delivery 一次性收取 → handoff 落盘', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      r.world.inviteAsyncPolls = 3; // POST 回 202，三次 GET 后 completed
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+
+      // GET 轮询 + collect-delivery 确实走过
+      const inviteCalls = r.world.requests.filter((q) => q.url.includes('/api/ops/invitations'));
+      expect(inviteCalls.filter((q) => q.method === 'GET').length).toBeGreaterThanOrEqual(3);
+      expect(inviteCalls.some((q) => q.method === 'POST' && q.url.endsWith('/collect-delivery'))).toBe(true);
+
+      const handoff = res.handoff as { file: string };
+      const url = r.world.inviteUrls.get('invite-key-001')!;
+      const file = readFileSync(handoff.file, 'utf8');
+      expect(file).toContain(url);
+      // 员工侧响应/审计不回显 URL
+      expect(JSON.stringify(res)).not.toContain(url);
+      expectNoLeaks(r, [url]);
+      // 收取后产品侧不再二次下发
+      const row = r.world.issuedInvites.get('invite-key-001')!;
+      expect((row.delivery as Record<string, unknown>).pendingCollect).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('僵死续跑：轮询超阈值后同键重发 POST 触发产品侧续跑', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      r.world.inviteAsyncPolls = 1;
+      r.world.inviteNeedsResume = true; // GET 永不推进，须同键重发
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      expect(r.world.inviteResumeCalls).toBe(1);
+      expect(res.handoff).toBeDefined();
+      const url = r.world.inviteUrls.get('invite-key-001')!;
+      expect(readFileSync((res.handoff as { file: string }).file, 'utf8')).toContain(url);
+      expectNoLeaks(r, [url]);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('产品侧翻 failed：如实报出错误码与原因', async () => {
+    const r = rig(opsPatch);
+    r.world.inviteAsyncPolls = 1;
+    r.world.inviteFailOnComplete = true;
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('invite-slug-taken');
+    expect(error.message).toContain('invite-key-001');
+  });
+
+  test('久不完成：抛带恢复指引的 upstream_error（同键重发继续等）', async () => {
+    const r = rig(opsPatch);
+    r.world.inviteAsyncPolls = 999; // 单次调用预算内跑不完
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('still processing');
+    expect(error.message).toContain('invite-key-001');
+    // 行仍在 processing——任务未丢
+    expect(r.world.issuedInvites.get('invite-key-001')!.status).toBe('processing');
   });
 });
