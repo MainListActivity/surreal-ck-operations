@@ -156,6 +156,8 @@ describe('product request limits', () => {
     expect(productTimeoutMs('GET', '/api/session/workspaces')).toBe(30_000);
     expect(productTimeoutMs('POST', '/api/workspaces')).toBe(90_000);
     expect(productTimeoutMs('post', '/api/workspaces?x=1')).toBe(90_000);
+    expect(productTimeoutMs('POST', '/api/ops/invitations')).toBe(105_000);
+    expect(productTimeoutMs('GET', '/api/ops/invitations/k')).toBe(30_000);
     for (const [method, path] of [['GET', '/api/workspaces'], ['POST', '/api/workspaces/sck-x/members'], ['POST', '/api/workspaces-other'], ['POST', '/api/session/switch-workspace']]) {
       expect(productTimeoutMs(method!, path!), `${method} ${path}`).toBe(30_000);
     }
