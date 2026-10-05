@@ -35,29 +35,38 @@ paseo plugin ls                          # 确认 sck-company running、无 erro
 
 reload 后用 `sck call get_context` 与实际派工各验证一次恢复。其它生成物：`plugin/node_modules` 由 `cd plugin && npm install` 管理，仅当 `plugin/package.json` 依赖变化时才需重装，无其它需同步的生成物。
 
-## 交付预览服务（签名 URL）
+## 交付预览服务（插件内嵌正式版 · LAN/公网双面）
 
-`org.surrealck.deliverable-preview`（launchd，用户级）跑 `$SCK_SERVICE_HOME/bin/deliverable-preview.ts`，监听 `0.0.0.0:18777`，提供 `evidence/`(`/e/`）与 `deliverables/`(`/d/`）只读静态服务：文件、目录列表页、视频 `Range`/`206`。所有内容请求必须带 HMAC 签名参数 `exp`+`sig`：未签或签名不符 401、过期 403、未配置密钥 503（fail closed）；`GET /healthz` 免签名。隐藏文件、目录穿越、逃逸符号链接一律拒绝。
+交付预览 HTTP 服务正式版内嵌在 sck-company 插件 server 进程（`plugin/server/preview.ts` 生命周期层 + vendor 的 `src/preview-core.ts` 路由/安全），随插件启动、随 reload/卸载停止，不另起 daemon。**两个监听面分工明确**：
 
-**部署/更新**：`src/preview-server.ts` 依赖同目录的 `attachments.ts` 与 `preview-sign.ts`，更新时三个文件一并 `cp src/{preview-server,attachments,preview-sign}.ts` 到 `$SCK_SERVICE_HOME/bin/`（服务器文件命名 `deliverable-preview.ts`），然后 `launchctl kickstart -k gui/<uid>/org.surrealck.deliverable-preview`。服务进程自动加载 `private/service.env`，plist 无需改。
+- **LAN 面** `0.0.0.0:$SCK_PREVIEW_PORT`（缺省 18777，保持已公布 URL）：无鉴权、无白名单，仅老板 Mac 局域网设备可达
+- **签名面** `127.0.0.1:$SCK_PREVIEW_SIGNED_PORT`（缺省 18778）：仅当 `SCK_PREVIEW_SECRET` 已配置才起，所有 `/e/`、`/d/` 请求强制 `exp`+`sig` HMAC 签名（未签/坏签 401、过期 403）；本机回环绑定，公网只能经 VPS→SSH 反向隧道到达，LAN 侧无法直连
+
+两面共用同一路由/安全核心：`/e/<taskId>[/<file>]`→`evidence/`、`/d/<taskId>[/<file>]`→`deliverables/`、目录/任务根可点击列表页（`../` 可回上级；签名面链接由服务端同密钥签发）、`/healthz`→`{ok,port,uptime}` 免签；mp4 等视频 Range/206 支持拖放。`..`/隐藏段/符号链接逃逸一律 403（词法 resolve + realpath 双重）。
 
 **`private/service.env` 需配**（0600，不进仓库）：
-- `SCK_PREVIEW_SECRET`：HMAC-SHA256 密钥（如 `openssl rand -hex 32`），预览服务与插件 `company.attachments.url` 签发方共享
-- `SCK_PREVIEW_PUBLIC_BASE`：公网可达的 https base，插件校验必须 `https://` 前缀，否则签发报错；示例 `https://data.maplayer.top/pv`
-- `SCK_PREVIEW_TTL_MS`（可选）：签名有效期，默认 3600000
+- `SCK_PREVIEW_SECRET`：HMAC-SHA256 密钥（如 `openssl rand -hex 32`），签名面与插件 `company.attachments.url` 签发方共享；不配置则签名面不起（LAN 面不受影响）
+- `SCK_PREVIEW_PUBLIC_BASE`：公网可达的 https base，插件校验必须 `https://` 前缀，示例 `https://data.maplayer.top/pv`
+- `SCK_PREVIEW_TTL_MS`（可选）：签名有效期，默认 3600000；`SCK_PREVIEW_PORT`/`SCK_PREVIEW_SIGNED_PORT` 可选改端口
 
-**公网暴露（推荐：复用现有 VPS + 域名，零新增付费）**：本机向远端主机开持久反向隧道，把本地 :18777 暴露为 VPS loopback 端口，再由 Caddy 路径前缀对外：
+**公网暴露（推荐：复用现有 VPS + 域名，零新增付费）**：本机向远端主机开持久反向隧道，把本地**签名面** :18778 暴露为 VPS loopback 端口，再由 Caddy 路径前缀对外——公网流量必经签名门控，永远打不到无鉴权的 LAN 面：
 
 ```sh
 # 本机（launchd 或 autossh 持久化，复用 deploy 用 SSH 通道）
-ssh -N -R 127.0.0.1:18777:127.0.0.1:18777 ubuntu@<remote-host>
+ssh -N -R 127.0.0.1:18778:127.0.0.1:18778 ubuntu@<remote-host>
 # VPS Caddyfile（data.maplayer.top 站点内追加）
-handle_path /pv/* { reverse_proxy 127.0.0.1:18777 }
+handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 ```
 
-签名只覆盖 `pathname`（如 `/e/<taskId>/<file>`），Caddy 去前缀后一致，`SCK_PREVIEW_PUBLIC_BASE=https://data.maplayer.top/pv`。备选：cloudflared named tunnel 直指 :18777（需 CF 凭证经 ops_* 申请）。
+签名只覆盖 `pathname`（如 `/e/<taskId>/<file>`），Caddy 去前缀后一致，`SCK_PREVIEW_PUBLIC_BASE=https://data.maplayer.top/pv`。备选：cloudflared named tunnel 直指 :18778（需 CF 凭证经 ops_* 申请）。
 
 签发链路：收件箱附件行按下 → 插件 `company.attachments.url` 校验文件确在 `evidence/<taskId>` 内 → 返回 `base+签名路径` → `openExternalUrl` 打开；老板任意设备浏览器直接消费，图片仍走 `attachments.read` data-URI 内联。
+
+**部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走「插件面同步」流程（v3 merge + vendor.sh + `paseo plugin reload`）——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
+
+**状态观测**：`ops_info` 响应含 `preview` 段 `{lan:{running,port,lanUrl,uptime,lastError}, signed:{configured,running,port,uptime,lastError}, roots, lastError}`——loopback 探测 healthz 为准，失败回读插件写的 `$SCK_SERVICE_HOME/preview-status.json`。插件日志前缀 `[preview]`。
+
+**应急兜底**：`src/preview-server.ts` 为同 core 的 bun 独立脚本（`bun src/preview-server.ts`，双监听与插件一致），插件整体不可用时可用 launchd 临时顶回；复制到 `bin/` 时连同 `preview-core.ts`、`preview-sign.ts` 一起（`cp src/{preview-server,preview-core,preview-sign}.ts $SCK_SERVICE_HOME/bin/`）。
 
 ## 员工客户端
 
