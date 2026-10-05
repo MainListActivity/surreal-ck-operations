@@ -63,6 +63,14 @@ export interface Inbox {
   pendingCommands: number;
 }
 
+/** One regular file inside a task's evidenceDir (<serviceHome>/evidence/<taskId>). */
+export interface TaskAttachment {
+  name: string;
+  relPath: string;
+  sizeBytes: number;
+  kind: "image" | "video" | "html" | "audio" | "other";
+}
+
 export interface Brief {
   directions: Array<{ text: string; source: string; at: string }>;
   goals: GoalView[];

@@ -1,10 +1,11 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { useRpc } from "@getpaseo/plugin/client";
+import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
+import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Roster, TaskView } from "../shared/types";
+import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -82,6 +83,97 @@ function ExpandableText({ text, lines, style, ctx }: { text: string; lines: numb
   );
 }
 
+/** Hosts may ship a narrow react-native subset; probe Image instead of assuming it. */
+const RNImage = (RN as Record<string, unknown>).Image as React.ComponentType<{
+  source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
+}> | undefined;
+
+const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
+
+const formatSize = (bytes: number): string =>
+  bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
+
+function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttachment; label: string; ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const open = useRpc(rpc.openAttachment);
+  const m = useMutation({ mutationFn: () => open({ taskId, name: a.relPath }) });
+  return (
+    <Pressable accessibilityRole="button" style={s.row} disabled={m.isPending} onPress={() => m.mutate()}>
+      <Text style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{label}</Text>
+      <Text style={[s.text, { flexShrink: 1 }]} numberOfLines={1}>{a.name}</Text>
+      <Text style={s.muted}>{formatSize(a.sizeBytes)}</Text>
+      {m.isError && <Text style={s.muted}>{String((m.error as Error).message).slice(0, 80)}</Text>}
+    </Pressable>
+  );
+}
+
+function InlineImage({ taskId, a, ctx }: { taskId: string; a: TaskAttachment; ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const read = useRpc(rpc.readAttachment);
+  const previewable = !!RNImage && a.sizeBytes <= IMAGE_INLINE_MAX;
+  const q = useQuery({
+    queryKey: ["attachmentImage", taskId, a.relPath],
+    queryFn: () => read({ taskId, name: a.relPath }),
+    enabled: previewable,
+    staleTime: 300_000,
+    retry: false,
+  });
+  const uri = q.data?.dataUri;
+  return (
+    <View style={{ gap: 4 }}>
+      {previewable && uri ? (
+        <RNImage source={{ uri }} accessibilityLabel={a.name} resizeMode="contain"
+          style={{ width: "100%", height: 200, borderRadius: 8, backgroundColor: ctx.theme.colors.surface2 }} />
+      ) : null}
+      <AttachmentRow taskId={taskId} a={a} label="打开" ctx={ctx} />
+      {previewable && q.isError && <Text style={s.muted}>预览不可用，可点打开查看。</Text>}
+    </View>
+  );
+}
+
+const ATTACH_ACTION: Record<TaskAttachment["kind"], string> = {
+  image: "打开", video: "播放", html: "在浏览器打开", audio: "播放", other: "打开",
+};
+
+/** Evidence-attachment section for an owner-facing card; renders nothing when empty. */
+function Attachments({ taskId, ctx }: { taskId: string; ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const list = useRpc(rpc.taskAttachments);
+  const q = useQuery({
+    queryKey: ["taskAttachments", taskId],
+    queryFn: () => list({ taskId }),
+    staleTime: 30_000,
+  });
+  const items = q.data?.attachments ?? [];
+  if (!q.data || items.length === 0) return null;
+  return (
+    <View style={{ gap: 6 }}>
+      <Text style={s.muted}>附件 {items.length}</Text>
+      {items.map(a => a.kind === "image"
+        ? <InlineImage key={a.relPath} taskId={taskId} a={a} ctx={ctx} />
+        : <AttachmentRow key={a.relPath} taskId={taskId} a={a} label={ATTACH_ACTION[a.kind]} ctx={ctx} />)}
+    </View>
+  );
+}
+
+const LINK_RE = /https?:\/\/[^\s"'<>）)】\]，。；、]+/g;
+
+/** One-click external links harvested from a submission/question body. */
+function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const links = useMemo(() => [...new Set(text.match(LINK_RE) ?? [])].slice(0, 5), [text]);
+  if (links.length === 0) return null;
+  return (
+    <View style={{ gap: 2 }}>
+      {links.map(u => (
+        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalUrl(u)}>
+          <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
 function DecideCard({ taskId, kind, body, ctx, onDone }: {
   taskId: string; kind: "approve" | "reply"; body: string; ctx: Ctx; onDone: () => void;
 }) {
@@ -97,6 +189,8 @@ function DecideCard({ taskId, kind, body, ctx, onDone }: {
     <View style={s.card}>
       <Text style={s.text}>{taskId.slice(0, 8)}</Text>
       <ExpandableText text={body} lines={12} style={s.muted} ctx={ctx} />
+      <LinkRows text={body} ctx={ctx} />
+      <Attachments taskId={taskId} ctx={ctx} />
       <TextInput
         style={[s.input, { minHeight: 36 }]}
         placeholder={kind === "approve" ? "意见（驳回时必填）" : "回答内容"}

@@ -1,7 +1,10 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { RpcInput } from "@getpaseo/plugin";
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { company } from "./company";
 import { refreshModels, refreshQuota } from "./dispatch";
+import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
 
 const SOURCE = "owner:paseo-plugin";
@@ -83,6 +86,32 @@ export function registerHandlers(server: PluginServerContext): void {
       task: view(task as Parameters<typeof view>[0]),
       audit: audit.map(a => ({ action: a.action, actor: asId(a.actor), evidence: a.evidence, version: a.version, at: String(a.at) })),
     };
+  });
+
+  server.handle(rpc.taskAttachments, async (input: RpcInput<typeof rpc.taskAttachments>) => {
+    const { listTaskAttachments } = await import("./vendor/src/attachments.ts");
+    return { attachments: await listTaskAttachments(serviceHome(), input.taskId) };
+  });
+
+  server.handle(rpc.openAttachment, async (input: RpcInput<typeof rpc.openAttachment>) => {
+    const { isOpenBlocked, resolveTaskAttachment } = await import("./vendor/src/attachments.ts");
+    if (isOpenBlocked(input.name)) throw new Error("该文件类型不允许一键打开");
+    const abs = await resolveTaskAttachment(serviceHome(), input.taskId, input.name);
+    if (!abs) throw new Error("附件不存在或越界");
+    spawn("/usr/bin/open", [abs], { detached: true, stdio: "ignore" }).unref();
+    return { ok: true };
+  });
+
+  server.handle(rpc.readAttachment, async (input: RpcInput<typeof rpc.readAttachment>) => {
+    const {
+      ATTACHMENT_READ_MAX_BYTES, attachmentKind, attachmentMime, resolveTaskAttachment,
+    } = await import("./vendor/src/attachments.ts");
+    const abs = await resolveTaskAttachment(serviceHome(), input.taskId, input.name);
+    if (!abs) throw new Error("附件不存在或越界");
+    if (attachmentKind(input.name) !== "image") throw new Error("仅图片附件支持内联读取");
+    const buf = await readFile(abs);
+    if (buf.byteLength > ATTACHMENT_READ_MAX_BYTES) throw new Error("图片超过 5MB 内联上限，请用打开查看");
+    return { dataUri: `data:${attachmentMime(input.name)};base64,${buf.toString("base64")}`, mime: attachmentMime(input.name), sizeBytes: buf.byteLength };
   });
 
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
