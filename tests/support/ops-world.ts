@@ -61,6 +61,7 @@ export class FakeWorld {
   readonly operatorCaps = new Map<string, string[]>();
   /** The provision token hash the fake product sealed at the last rotate call (null = env fallback). */
   liveProvisionToken: { hash: string; principalId: string } | null = null;
+readonly issuedInvites = new Map<string, Record<string, unknown>>();
   private readonly grants = new Map<string, Grant>();
   private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string; client: string }>();
   private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
@@ -521,6 +522,26 @@ export class FakeWorld {
           },
           idp: { reachable: true, status: null, error: null },
         });
+      }
+      // Mirrors POST /api/ops/invitations: subscription.manage capability, one-time
+      // activation_url only on first issuance, replay/reuse returns it as null.
+      if (method === 'POST' && url.pathname === '/api/ops/invitations') {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = String(body.idempotencyKey ?? '');
+        const existing = this.issuedInvites.get(key);
+        if (existing) {
+          return json(200, { ...existing, replayed: true, delivery: { channel: 'activation_url', activationUrl: null, note: '重放返回既有结果；激活链接仅在首次调用时下发一次' } });
+        }
+        const result = {
+          idempotencyKey: key, status: 'completed', replayed: false,
+          user: { id: `uid-${key.slice(0, 8)}`, email: String(body.email ?? ''), status: 'provisioned', outcome: 'created' },
+          workspace: { slug: String(body.workspaceSlug ?? ''), dbName: 'ws_fake', outcome: 'created' },
+          entitlement: { planKey: String(body.planKey ?? 'pro'), productPlanRevisionId: 'product_plan_revision:x', billingAccountKey: 'personal:x' },
+          aiAllowance: { kind: 'compensation', amount: (body.aiAllowance as Record<string, unknown> | undefined)?.amount ?? 0, periodKey: `invite:${key}`, expiresAt: '2026-12-31T23:59:59.000Z', bucket: 'ai_allowance_bucket:fake' },
+          delivery: { channel: 'activation_url', activationUrl: `https://idp.test/activate-account?token=onetime-${randomUUID()}`, note: 'invite note' },
+        };
+        this.issuedInvites.set(key, result);
+        return json(201, result);
       }
       return apiError(404, 'not-found');
     }
