@@ -952,6 +952,9 @@ export class Dispatcher {
 
   private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true) {
     await this.deps.workforce.retire(inst.id, reason);
+    // The dead session is useless and its red "error" entry confuses the roster —
+    // archive it (soft-delete, timeline kept) like session rotation already does.
+    if (inst.paseoAgentId) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
     report.retired.push(inst.id);
     this.log(`retired ${inst.id}: ${reason}`);
     const def = defs.find(d => d.id === inst.def);
