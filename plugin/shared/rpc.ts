@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Roster, TaskView } from "./types";
+import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Roster, TaskAttachment, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -73,6 +73,24 @@ export const taskDetail = defineRpc({
   name: "company.task.detail",
   input: z.object({ taskId: z.string().min(1) }),
   output: z.object({ task: record<TaskView>(), audit: z.array(record<AuditEntry>()) }),
+});
+
+export const taskAttachments = defineRpc({
+  name: "company.task.attachments",
+  input: z.object({ taskId: z.string().min(1).max(128) }),
+  output: z.object({ attachments: z.array(record<TaskAttachment>()) }),
+});
+
+export const openAttachment = defineRpc({
+  name: "company.attachments.open",
+  input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
+  output: z.object({ ok: z.boolean() }),
+});
+
+export const readAttachment = defineRpc({
+  name: "company.attachments.read",
+  input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
+  output: z.object({ dataUri: z.string(), mime: z.string(), sizeBytes: z.number() }),
 });
 
 export const roster = defineRpc({
