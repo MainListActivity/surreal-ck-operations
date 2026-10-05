@@ -873,7 +873,7 @@ test('dispatcher: a returned task goes back to its submitter for rework, review 
   expect(rework?.employee).toBe(execInst.employee);
 });
 
-test('dispatcher: review skips every task contributor and waits in queue when everyone contributed', async () => {
+test('dispatcher: review hard-excludes authors but falls back to claim-only prior holders', async () => {
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');
   await database.db.query('DELETE owner_notice;');
@@ -912,12 +912,12 @@ test('dispatcher: review skips every task contributor and waits in queue when ev
   await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
   paseo.set(reviewerAgent, 'idle');
 
-  // Review 再派工：E1（提交者+作者）与 E2（复核过的前持有人、非提交人）都被回避，
-  // 两个编制均满员无法新开非贡献者 → 任务留在队列，通知里写明回避原因。
+  // Review 再派工：E1（提交者+作者）硬回避，E2（复核过的前持有人、仅 claim 未提交）
+  // 降为兜底候选——两个编制满员无法新开时，E2 以降权身份接住复核而非死等。
   report = await dispatcher.tick();
-  expect(report.woke.map(w => w.task)).not.toContain(t.id);
-  const staffNotice = (await owner.openNotices()).find(n => n.key === 'staff:engineering');
-  expect(staffNotice?.text).toContain('任务贡献者已回避');
+  const rewoke = report.woke.find(w => w.task === t.id)!;
+  expect(rewoke.employee).toBe(reviewer.employee);
+  expect(rewoke.spawned).toBe(false);
   expect((await task(t.id)).state).toBe('review');
 });
 
@@ -982,23 +982,16 @@ test('dispatcher: review stays queued while contributor history read fails and r
   }
   expect((await task(t.id)).state).toBe('review');
 
-  // 读取恢复：失败通知自动清除，回避名单重新生效——两个编制均满员，任务继续等待非贡献者。
+  // 读取恢复：失败通知自动清除，回避名单生效——E1（作者）硬回避；
+  // E2（复核过的前持有人、仅 claim 未提交）降权兜底，复核派回 E2 继续而非死等。
   report = await dispatcher.tick();
-  expect(report.woke.map(w => w.task)).not.toContain(t.id);
   expect((await owner.openNotices()).some(n => n.key === `contributors:${t.id}`)).toBe(false);
-  const staffNotice = (await owner.openNotices()).find(n => n.key === 'staff:engineering');
-  expect(staffNotice?.text).toContain('任务贡献者已回避');
-
-  // 有空位可新开非贡献者实例时恢复正常派工；Jev 若参与选人，候选里也不出现贡献者。
-  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
-  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 2 });
-  report = await dispatcher.tick();
-  const safe = report.woke.find(w => w.task === t.id);
-  expect(safe?.spawned).toBe(true);
-  expect([exec.employee, reviewer.employee]).not.toContain(safe!.employee);
+  const rewoke = report.woke.find(w => w.task === t.id)!;
+  expect(rewoke.employee).toBe(reviewer.employee);
+  expect(rewoke.spawned).toBe(false);
+  // Jev 若参与选人，候选里不出现作者；经手人可保留（带 prior 标记）。
   for (const d of jevDispatches.filter(d => d.taskId === t.id)) {
     expect(Object.keys(d.candidates ?? [])).not.toContain(exec.employee);
-    expect(Object.keys(d.candidates ?? [])).not.toContain(reviewer.employee);
   }
   expect((await task(t.id)).state).toBe('review');
 });

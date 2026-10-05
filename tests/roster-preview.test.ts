@@ -16,7 +16,7 @@ const evalState: Workforce['evalState'] = async () => {
   historyCalls++;
   if (historyFails) throw new Error('synthetic read failure');
   return { taskId: task.id, title: task.title, context: 'synthetic', state: 'review', executorRole: 'engineering', reviewerRole: 'engineering', timeline: [], participants: emptyHistory ? [] : ['author', 'rework-submitter'], metrics: {
-    author: { claims: 1, submits: 0, checkpoints: 0, reviews: 0, returnsReceived: 0, revocations: 0 }, 'rework-submitter': { claims: 0, submits: 1, checkpoints: 0, reviews: 0, returnsReceived: 0, revocations: 0 },
+    author: { claims: 1, submits: 1, checkpoints: 0, reviews: 0, returnsReceived: 0, revocations: 0 }, 'rework-submitter': { claims: 0, submits: 1, checkpoints: 0, reviews: 0, returnsReceived: 0, revocations: 0 },
   } }; 
 };
 mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
@@ -46,7 +46,7 @@ test('roster RPC: task author recused, fresh eligible, public execute pool remai
   expect(historyCalls).toBeGreaterThan(0);
   const p = response.reviewPools[0]!;
   expect(p).toMatchObject({ taskId: task.id, title: task.title, purpose: 'review', status: 'ready', home: '/ops' });
-  expect(p.entries.find(e => e.ref === 'author')).toMatchObject({ eligible: false, share: 0, reason: '任务贡献者回避' });
+  expect(p.entries.find(e => e.ref === 'author')).toMatchObject({ eligible: false, share: 0, reason: '提交过本任务，验收回避' });
   expect(p.entries.find(e => e.ref === 'fresh')?.eligible).toBe(true);
   expect(response.pools[0]!.entries.find(e => e.ref === 'author')?.eligible).toBe(true);
 });
@@ -63,7 +63,7 @@ test('roster RPC: unknown history blocks all candidates at zero share; recovery 
   const recovered = await callRoster();
   expect(recovered.reviewPools[0]?.status).toBe('ready');
   expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'fresh')?.eligible).toBe(true);
-  expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'author')?.reason).toBe('任务贡献者回避');
+  expect(recovered.reviewPools[0]!.entries.find(e => e.ref === 'author')?.reason).toBe('提交过本任务，验收回避');
 });
 
 // Compile and render the actual roster JSX section with wire responses, without a host UI runtime.
@@ -93,7 +93,7 @@ test('roster page JSX displays task, review recusal and unknown history at zero 
   expect(ready).toContain(task.title);
   expect(ready).toContain(task.id);
   expect(ready).toContain('review');
-  expect(ready).toContain('任务贡献者回避');
+  expect(ready).toContain('提交过本任务，验收回避');
   expect(ready).toContain('当前候选估算');
   historyFails = true;
   const unknown = renderText(await callRoster());

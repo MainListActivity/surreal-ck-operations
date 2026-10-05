@@ -111,34 +111,40 @@ test('pool: submitter excluded only for review work', () => {
   expect(impl.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
-test('pool: review recuses every task contributor, including an author who is not the submitter', () => {
-  const d = def('d1');
-  const author = inst('eng-author');   // 写过实现（audit 有 claim），但提交字段在换人续办后指向别人
+test('pool: review hard-excludes submitters while claim-only hands stay eligible at demoted weight', () => {
+  const d = def('d1', { weight: 10 });
+  const author = inst('eng-author');   // submits>0：交付作者，硬回避
+  const hand = inst('eng-hand');       // 仅 claim 未提交：降权兜底
   const fresh = inst('eng-fresh');
   const task = { submittedBy: 'eng-rework' } as StaffingInput['task'];
   const pool = staffingPool(base({
-    defs: [d], insts: [author, fresh],
-    states: new Map([['eng-author', 'idle'], ['eng-fresh', 'idle']]),
+    defs: [d], insts: [author, hand, fresh],
+    states: new Map([['eng-author', 'idle'], ['eng-hand', 'idle'], ['eng-fresh', 'idle']]),
     task, excludeSubmitter: true,
-    contributors: new Set(['eng-author', 'eng-rework']),
+    recusal: { authors: new Set(['eng-author', 'eng-rework']), hands: new Set(['eng-hand']) },
   }));
   const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
   expect(by.get('eng-author')!.eligible).toBe(false);
-  expect(by.get('eng-author')!.reason).toBe('任务贡献者回避');
+  expect(by.get('eng-author')!.reason).toBe('提交过本任务，验收回避');
   expect(by.get('eng-fresh')!.eligible).toBe(true);
+  // 经手人仍可派（不硬阻断），但权重降到 15%，share 明显低于干净候选。
+  expect(by.get('eng-hand')!.eligible).toBe(true);
+  expect(by.get('eng-hand')!.note).toBe('经手过本任务，降权兜底');
+  expect(by.get('eng-hand')!.weight).toBeCloseTo(by.get('eng-fresh')!.weight * 0.15);
+  expect(by.get('eng-hand')!.share).toBeLessThan(by.get('eng-fresh')!.share);
 });
 
-test('pool: without a contributor set (execute path or read failure) recusal is unchanged', () => {
+test('pool: without a recusal set (execute path or read failure) recusal is unchanged', () => {
   const d = def('d1');
   const author = inst('eng-author');
   const task = { submittedBy: 'eng-author' } as StaffingInput['task'];
-  // 执行派工：不带 contributors，贡献者不回避（previousEmployee 连续性保留）。
+  // 执行派工：不带 recusal，贡献者不回避（previousEmployee 连续性保留）。
   const impl = staffingPool(base({ defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]), task }));
   expect(impl.find(e => e.kind === 'reuse')!.eligible).toBe(true);
   // review 且贡献者读取失败（空集）：提交者仍由 excludeSubmitter 兜底拦住。
   const review = staffingPool(base({
     defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]),
-    task, excludeSubmitter: true, contributors: new Set<string>(),
+    task, excludeSubmitter: true, recusal: { authors: new Set<string>(), hands: new Set<string>() },
   }));
   expect(review.find(e => e.kind === 'reuse')!.reason).toBe('提交者回避');
 });
