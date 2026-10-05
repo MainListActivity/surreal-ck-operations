@@ -2,8 +2,12 @@
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
 // on the caller's live task lease, role-checked against the project environment, and audited.
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { lanIPv4 } from '../preview-core.ts';
 import type { EnvBrokerRow, ProjectStore } from '../projects.ts';
 import {
   accountEmail, accountUsername, aliasFromSecretName, canonicalAlias, ensureAccount, passwordSecretName,
@@ -189,7 +193,45 @@ export class OpsBroker {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
         can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops },
+        preview: await this.previewStatus(),
       },
+    };
+  }
+
+  /**
+   * 插件内嵌交付预览的运行状态：loopback 探测 127.0.0.1:<port>/healthz 为准（权威存活），
+   * 失败时回读插件写的 <serviceHome>/preview-status.json 取 lastError（如 EADDRINUSE）。
+   * 双面结构：lan 面（0.0.0.0:18777 无鉴权）+ signed 面（127.0.0.1:18778 签名门控，
+   * 供 VPS→隧道公网访问）。不 import plugin/server/*（vendor 边界），通道只靠 loopback + 状态文件。
+   */
+  private async previewStatus(): Promise<Record<string, unknown>> {
+    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
+    const lanPort = Number(process.env.SCK_PREVIEW_PORT ?? 18777);
+    const sigPort = Number(process.env.SCK_PREVIEW_SIGNED_PORT ?? 18778);
+    const doFetch = this.deps.fetch ?? fetch;
+    const probe = async (port: number): Promise<{ running: boolean; uptime?: number; error?: string }> => {
+      try {
+        const res = await doFetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(800) });
+        if (!res.ok) return { running: false, error: `healthz HTTP ${res.status}` };
+        const body = await res.json().catch(() => ({})) as { uptime?: number };
+        return { running: true, uptime: body.uptime };
+      } catch (error) {
+        return { running: false, error: (error as Error).message };
+      }
+    };
+    let statusFile: { lastError?: string; signed?: { configured?: boolean } } = {};
+    try {
+      statusFile = JSON.parse(readFileSync(join(home, 'preview-status.json'), 'utf8'));
+    } catch { /* 状态文件缺席正常 */ }
+    const [lan, signed] = await Promise.all([probe(lanPort), probe(sigPort)]);
+    return {
+      lan: { running: lan.running, port: lanPort, lanUrl: `http://${lanIPv4()}:${lanPort}`, uptime: lan.uptime, lastError: lan.error },
+      signed: {
+        configured: statusFile.signed?.configured ?? Boolean(process.env.SCK_PREVIEW_SECRET),
+        running: signed.running, port: sigPort, uptime: signed.uptime, lastError: signed.error,
+      },
+      roots: { e: join(home, 'evidence'), d: join(home, 'deliverables') },
+      lastError: statusFile.lastError,
     };
   }
 
