@@ -93,7 +93,7 @@ const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 const formatSize = (bytes: number): string =>
   bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
 
-/** 附件行：按下时向插件取签名 URL（公网可达）并交给宿主浏览器/播放器打开。 */
+/** 附件行：按下时向插件取预览 URL（LAN 免鉴权 http://<lanIP>:<port>/e/…）并交给宿主浏览器/播放器打开。 */
 function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttachment; label: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
   const getUrl = useRpc(rpc.attachmentUrl);

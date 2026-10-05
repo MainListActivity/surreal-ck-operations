@@ -32,6 +32,7 @@ export function onboarding(inst: EmployeeInst, env: PromptEnv, comm = false): st
 checkpoint/report_blocker/review 的租约证明由通道自动补齐，只需传业务字段。
 账号、workspace、成员、生产登录这类要凭证的事用运维工具 ops_*，先看当前项目能做什么：
   '${env.sckBin}' call ops_info '{}'
+交付给老板看的文件用 deliverable_publish 发布：'${env.sckBin}' call deliverable_publish '{"files":["/绝对路径/a.png","/绝对路径/目录"]}'——复制进交付包并返回 http://<局域网IP>:18777/d/<任务ID>/… 可点链接，证据里贴这些 URL，本地路径不算交付。
 密码和 token 只在通道里，不会交给你，也不要自己去找。`
     : `公司任务系统是唯一事实来源，调用方式：
   ${tool(inst, env, false)}
