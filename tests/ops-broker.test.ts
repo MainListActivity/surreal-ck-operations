@@ -1582,4 +1582,90 @@ describe('ops_invitation_issue（G2 邀请签发 + 老板交接文件）', () =>
     // 行仍在 processing——任务未丢
     expect(r.world.issuedInvites.get('invite-key-001')!.status).toBe('processing');
   });
+
+  test('resend:true：断链重签发 → collect 新链接 → 覆写同一 handoff 文件，员工不回显', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      const oldUrl = r.world.inviteUrls.get('invite-key-001')!;
+
+      const res = await call(r, 'ops_invitation_issue', {
+        session, idempotencyKey: 'invite-key-001', resend: true,
+      });
+      expect(res).toMatchObject({ status: 200, ok: true });
+      const body = res.body as Record<string, any>;
+      expect(body.delivery.activationUrl).toBeNull();
+      const handoff = res.handoff as { file: string };
+      expect(handoff.file).toContain('/handoff/invite-invite-key-001.txt');
+      const file = readFileSync(handoff.file, 'utf8');
+      const newUrl = r.world.inviteUrls.get('invite-key-001')!;
+      expect(newUrl).not.toBe(oldUrl);
+      expect(file).toContain(newUrl);
+      expect(file).not.toContain(oldUrl);
+      expect(file).toContain('lawyer@firm.test');
+      expect(statSync(handoff.file).mode & 0o777).toBe(0o600);
+      expect(r.world.inviteResendCalls).toBe(1);
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+      expectNoLeaks(r, [oldUrl, newUrl]);
+      expect(r.company.audits.at(-1)!.evidence).toContain('resend');
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resend 重放：24h 有效期内不重复铸链、不产第二文件', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      await call(r, 'ops_invitation_issue', { session, idempotencyKey: 'invite-key-001', resend: true });
+      const first = readFileSync(join(dir, 'handoff', 'invite-invite-key-001.txt'), 'utf8');
+
+      const replay = await call(r, 'ops_invitation_issue', {
+        session, idempotencyKey: 'invite-key-001', resend: true,
+      });
+      expect(replay).toMatchObject({ status: 200, ok: true });
+      expect(replay.handoff).toBeUndefined();
+      expect(r.world.inviteResendCalls).toBe(1); // 未再铸链
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+      expect(readFileSync(join(dir, 'handoff', 'invite-invite-key-001.txt'), 'utf8')).toBe(first);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resend 错误面：不存在 → not_found；行在 processing → conflict；IdP 已激活 → conflict', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+
+    const missing = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'no-such-key', resend: true,
+    }));
+    expect(missing.code).toBe('not_found');
+
+    await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+    r.world.issuedInvites.get('invite-key-001')!.status = 'processing';
+    const processing = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'invite-key-001', resend: true,
+    }));
+    expect(processing.code).toBe('conflict');
+    expect(processing.message).toContain('invite-resend-while-processing');
+
+    r.world.issuedInvites.get('invite-key-001')!.status = 'completed';
+    r.world.inviteActivatedUsers.add('uid-invite-k'); // uid = `uid-${key.slice(0,8)}`
+    const activated = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'invite-key-001', resend: true,
+    }));
+    expect(activated.code).toBe('conflict');
+    expect(activated.message).toContain('invite-already-activated');
+  });
 });
