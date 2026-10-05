@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { company } from "./company";
 import { refreshModels, refreshQuota } from "./dispatch";
-import { serviceHome } from "./env";
+import { loadServiceEnv, serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
 
 const SOURCE = "owner:paseo-plugin";
@@ -91,6 +91,20 @@ export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.taskAttachments, async (input: RpcInput<typeof rpc.taskAttachments>) => {
     const { listTaskAttachments } = await import("./vendor/src/attachments.ts");
     return { attachments: await listTaskAttachments(serviceHome(), input.taskId) };
+  });
+
+  server.handle(rpc.attachmentUrl, async (input: RpcInput<typeof rpc.attachmentUrl>) => {
+    const { resolveTaskAttachment } = await import("./vendor/src/attachments.ts");
+    const { previewSignedPath } = await import("./vendor/src/preview-sign.ts");
+    const abs = await resolveTaskAttachment(serviceHome(), input.taskId, input.name);
+    if (!abs) throw new Error("附件不存在或越界");
+    loadServiceEnv();
+    const base = (process.env.SCK_PREVIEW_PUBLIC_BASE ?? "").replace(/\/+$/, "");
+    const secret = process.env.SCK_PREVIEW_SECRET;
+    if (!/^https:\/\//.test(base) || !secret) throw new Error("远程预览未接线（缺 SCK_PREVIEW_PUBLIC_BASE/SCK_PREVIEW_SECRET）");
+    const ttl = Number(process.env.SCK_PREVIEW_TTL_MS ?? 3_600_000);
+    const { path, exp } = previewSignedPath(secret, "e", input.taskId, input.name, ttl);
+    return { url: base + path, expiresAt: new Date(exp).toISOString() };
   });
 
   server.handle(rpc.openAttachment, async (input: RpcInput<typeof rpc.openAttachment>) => {

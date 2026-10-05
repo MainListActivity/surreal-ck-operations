@@ -64,6 +64,31 @@ export function evidenceDirFor(serviceHome: string, taskId: string): string | un
 }
 
 /**
+ * Resolve `<root>/<relPath>` to a canonical path, or undefined when unsafe
+ * (traversal, absolute, symlink escaping the root, missing). relPath '' resolves
+ * to the root itself; allowDir admits directory targets, otherwise only regular
+ * files pass. Generic confinement shared by attachments and the preview server.
+ */
+export async function resolveInsideChecked(
+  root: string, relPath: string, { allowDir = false }: { allowDir?: boolean } = {},
+): Promise<string | undefined> {
+  if (typeof relPath !== 'string' || relPath.length > 512) return undefined;
+  if (relPath.startsWith('/') || relPath.split('/').includes('..')) return undefined;
+  const rootAbs = resolve(root);
+  const abs = resolve(rootAbs, relPath);
+  if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) return undefined;
+  try {
+    const [realRoot, realAbs] = await Promise.all([realpath(rootAbs), realpath(abs)]);
+    if (realAbs !== realRoot && !realAbs.startsWith(realRoot + sep)) return undefined;
+    const st = await stat(realAbs);
+    if (st.isFile() || (allowDir && st.isDirectory())) return realAbs;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve `<evidenceDir>/<relPath>` to a canonical regular-file path, or undefined
  * when the path is unsafe (traversal, symlink escaping the dir, non-regular file,
  * missing). The returned path is the realpath, safe to hand to `open`.
@@ -72,18 +97,8 @@ export async function resolveTaskAttachment(
   serviceHome: string, taskId: string, relPath: string,
 ): Promise<string | undefined> {
   const dir = evidenceDirFor(serviceHome, taskId);
-  if (!dir || typeof relPath !== 'string' || relPath.length === 0 || relPath.length > 512) return undefined;
-  if (relPath.startsWith('/') || relPath.split('/').includes('..')) return undefined;
-  const abs = resolve(dir, relPath);
-  if (abs !== dir && !abs.startsWith(dir + sep)) return undefined;
-  try {
-    const [realDir, realAbs] = await Promise.all([realpath(dir), realpath(abs)]);
-    if (realAbs !== realDir && !realAbs.startsWith(realDir + sep)) return undefined;
-    const st = await stat(realAbs);
-    return st.isFile() ? realAbs : undefined;
-  } catch {
-    return undefined;
-  }
+  if (!dir || relPath.length === 0) return undefined;
+  return resolveInsideChecked(dir, relPath);
 }
 
 /**

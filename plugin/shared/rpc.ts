@@ -87,6 +87,12 @@ export const openAttachment = defineRpc({
   output: z.object({ ok: z.boolean() }),
 });
 
+export const attachmentUrl = defineRpc({
+  name: "company.attachments.url",
+  input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
+  output: z.object({ url: z.string(), expiresAt: z.string() }),
+});
+
 export const readAttachment = defineRpc({
   name: "company.attachments.read",
   input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
