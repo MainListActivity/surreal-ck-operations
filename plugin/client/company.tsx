@@ -1,5 +1,5 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
@@ -100,7 +100,7 @@ function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttac
   const m = useMutation({
     mutationFn: async () => {
       const { url } = await getUrl({ taskId, name: a.relPath });
-      await openExternalUrl(url);
+      await RN.Linking.openURL(url);
     },
   });
   return (
@@ -172,7 +172,7 @@ function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   return (
     <View style={{ gap: 2 }}>
       {links.map(u => (
-        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalUrl(u)}>
+        <Pressable key={u} accessibilityRole="button" onPress={() => void RN.Linking.openURL(u)}>
           <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}
