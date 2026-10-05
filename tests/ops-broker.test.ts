@@ -43,7 +43,8 @@ describe('ops gate', () => {
   test('every ops tool is exercised by this suite', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
       'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_info',
-      'ops_idp_client_register', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
+      'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
+      'ops_idp_provision_rotate',
       'ops_info', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
       'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
@@ -101,7 +102,7 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true, idpProvisionRotate: false });
     // Public client metadata is listed for alignment checks; never secret material.
     expect(info.clients).toEqual({ customer: { clientId: 'client-ck-1234', redirectUri: 'https://app.test/auth/callback' } });
     expectNoLeaks(r);
@@ -1261,5 +1262,165 @@ describe('ops_idp_admin_request', () => {
     const res = await call(r, 'ops_idp_admin_request', { principalId: id, method: 'GET', path: '/admin/tenants' });
     expect(res).toMatchObject({ status: 401, ok: false });
     expectNoLeaks(r, ['sealed-but-stale-token']);
+  });
+});
+
+describe('ops_idp_principal_list', () => {
+  test('列出 principal 元数据（id/label/status），可按 status 过滤，不含 token', async () => {
+    const r = rig();
+    const a = await call(r, 'ops_idp_principal_mint', { label: 'qa-a', sealAs: 'qa-a' });
+    const b = await call(r, 'ops_idp_principal_mint', { label: 'qa-b', sealAs: 'qa-b' });
+    await call(r, 'ops_idp_principal_revoke', { principalId: a.id });
+
+    const all = await call(r, 'ops_idp_principal_list', {});
+    expect(all.principals).toHaveLength(2);
+    expect(all.principals.map((p: { id: string }) => p.id).sort()).toEqual([a.id, b.id].sort());
+    const active = await call(r, 'ops_idp_principal_list', { status: 'active' });
+    expect(active.principals).toHaveLength(1);
+    expect(active.principals[0]).toMatchObject({ id: b.id, label: 'qa-b', status: 'active', createdBy: 'ops:qa-1' });
+    expect(JSON.stringify(active)).not.toContain('token_hash');
+    expect((await failure(call(r, 'ops_idp_principal_list', { status: 'weird' }))).code).toBe('invalid');
+    expectNoLeaks(r);
+  });
+});
+
+describe('ops_idp_provision_rotate（一键轮换）', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+  const opsUser = async (r: Rig, alias: string, caps: string[]) => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+  const opsSession = async (r: Rig, caps = ['quota.read', 'subscription.manage']) => {
+    await opsUser(r, 'qa-ops', caps);
+    return String((await call(r, 'ops_operator_login', { alias: 'qa-ops' })).session);
+  };
+
+  test('一条命令跑完「吊销旧 → 签新 → 注入密封仓 → 双探针验证」，明文不出 broker', async () => {
+    const r = rig(opsPatch);
+    const old = await call(r, 'ops_idp_principal_mint', { label: 'qa-old', sealAs: 'qa-old' }) as { id: string };
+    const session = await opsSession(r);
+
+    const res = await call(r, 'ops_idp_provision_rotate', { session, label: 'sck-provisioner' }) as {
+      rotated: boolean; newPrincipal: { id: string; label: string; scopes: string[] };
+      revoked: { id: string; alreadyRevoked: boolean };
+      product: { rotate: number; statusOk: boolean; source: string; storeEntry: boolean };
+      probes: { newToken: { status: number; ok: boolean }; oldToken: { status: number; ok: boolean } };
+    };
+
+    // 结果：旧吊销、新签、密封仓生效、双探针符合预期
+    expect(res.rotated).toBe(true);
+    expect(res.revoked).toMatchObject({ id: old.id, alreadyRevoked: false });
+    expect(res.newPrincipal).toMatchObject({ label: 'sck-provisioner', scopes: ['tenant.read', 'user.read', 'user.provision'] });
+    expect(res.newPrincipal.id).not.toBe(old.id);
+    expect(res.product).toMatchObject({ rotate: 200, statusOk: true, source: 'store', storeEntry: true });
+    expect(res.probes.newToken).toMatchObject({ status: 200, ok: true });
+    expect(res.probes.oldToken).toMatchObject({ status: 403, ok: false });
+
+    // IdP 侧行状态：旧 revoked + revoked_at；新 active、hash-only
+    expect(r.world.principal(old.id)).toMatchObject({ status: 'revoked' });
+    expect(String(r.world.principal(old.id)!.revoked_at)).toBeTruthy();
+    const newRow = r.world.principal(res.newPrincipal.id)!;
+    expect(newRow).toMatchObject({ label: 'sck-provisioner', status: 'active', created_by: 'ops:qa-1' });
+    const sealedNew = `demo/production/IDP_SP_${res.newPrincipal.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(newRow.token_hash).toBe(createHash('sha256').update(String(r.company.sealed.get(sealedNew))).digest('base64url'));
+
+    // 产品确实收到了 rotate 调用（携带新 token 进密封仓模型）
+    const rotateCall = r.world.requests.find(q => q.method === 'POST' && q.url.endsWith('/api/ops/idp-provision-token/rotate'));
+    expect(rotateCall).toBeTruthy();
+    expect(r.world.liveProvisionToken?.principalId).toBe(res.newPrincipal.id);
+
+    // IdP 审计归因：revoked + minted 均记 management_token/ops:qa-1 且带轮换标记
+    const revokedAudit = r.world.auditRows('admin.service_principal.revoked').find(x => x.target_id === old.id);
+    expect(revokedAudit).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1' });
+    const mintedAudit = r.world.auditRows('admin.service_principal.minted').find(x => x.target_id === res.newPrincipal.id);
+    expect(JSON.parse(String(mintedAudit!.payload))).toMatchObject({ via: 'ops_broker', rotation: true });
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_provision_rotate' });
+
+    // 明文泄漏检查：新/旧 token 不出现在返回值、审计、SQL 之外（SQL 只含 hash）
+    const newToken = r.company.sealed.get(`demo/production/IDP_SP_${res.newPrincipal.id.toUpperCase().replaceAll('-', '_')}`)!;
+    expect(JSON.stringify(r.outputs)).not.toContain(newToken);
+    expect(JSON.stringify(r.company.audits)).not.toContain(newToken);
+    for (const { sql } of r.world.sql) expect(sql).not.toContain(newToken);
+    expectNoLeaks(r);
+  });
+
+  test('省略 revokePrincipalId 时恰好一个 active 自动认领；多个则 invalid 并要求显式指定', async () => {
+    const r = rig(opsPatch);
+    const only = await call(r, 'ops_idp_principal_mint', { label: 'qa-only', sealAs: 'qa-only' }) as { id: string };
+    const session = await opsSession(r);
+    const res = await call(r, 'ops_idp_provision_rotate', { session }) as { revoked: { id: string } };
+    expect(res.revoked.id).toBe(only.id);
+
+    const r2 = rig(opsPatch);
+    await call(r2, 'ops_idp_principal_mint', { label: 'a', sealAs: 'a' });
+    const second = await call(r2, 'ops_idp_principal_mint', { label: 'b', sealAs: 'b' }) as { id: string };
+    const session2 = await opsSession(r2);
+    const error = await failure(call(r2, 'ops_idp_provision_rotate', { session: session2 }));
+    expect(error.code).toBe('invalid');
+    expect(error.message).toContain(second.id);
+    // 歧义失败发生在任何写之前
+    expect(r2.world.principal(second.id)).toMatchObject({ status: 'active' });
+    expect(r2.world.liveProvisionToken).toBeNull();
+  });
+
+  test('无 active principal 时等同首次激活（revoked=null）；显式指定已吊销 id 报 alreadyRevoked', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+    const res = await call(r, 'ops_idp_provision_rotate', { session }) as { revoked: null; product: { source: string } };
+    expect(res.revoked).toBeNull();
+    expect(res.product.source).toBe('store');
+
+    const r2 = rig(opsPatch);
+    const dead = await call(r2, 'ops_idp_principal_mint', { label: 'dead', sealAs: 'dead' }) as { id: string };
+    await call(r2, 'ops_idp_principal_revoke', { principalId: dead.id });
+    const session2 = await opsSession(r2);
+    const res2 = await call(r2, 'ops_idp_provision_rotate', { session: session2, revokePrincipalId: dead.id }) as { revoked: { alreadyRevoked: boolean } };
+    expect(res2.revoked.alreadyRevoked).toBe(true);
+    expect(r2.world.liveProvisionToken?.principalId).not.toBe(dead.id);
+  });
+
+  test('revokePrincipalId 指向不存在的 principal → not_found，不产生任何写', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session, revokePrincipalId: 'ghost-id' }));
+    expect(error.code).toBe('not_found');
+    expect(r.world.liveProvisionToken).toBeNull();
+  });
+
+  test('客户会话不可用（需运营会话）；rotate 端点失败则补偿吊销新 principal', async () => {
+    const r = rig(opsPatch);
+    await call(r, 'ops_account_ensure', { alias: 'qa-user' });
+    const customer = String((await call(r, 'ops_login', { alias: 'qa-user' })).session);
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session: customer }));
+    expect(error.code).toBe('invalid');
+    expect(error.message).toContain('ops_operator_login');
+
+    // rotate 返回 400（IdP 探测拒绝）时：新 principal 被补偿吊销，密封仓保持 env 兜底
+    const r2 = rig(opsPatch);
+    const old2 = await call(r2, 'ops_idp_principal_mint', { label: 'qa-old2', sealAs: 'qa-old2' }) as { id: string };
+    const session2 = await opsSession(r2);
+    r2.world.fault(
+      (method, url) => method === 'POST' && url.pathname === '/api/ops/idp-provision-token/rotate',
+      400,
+    );
+    const error2 = await failure(call(r2, 'ops_idp_provision_rotate', { session: session2 }));
+    expect(error2.code).toBe('invalid');
+    // 旧已吊销（spec 顺序），新也被补偿吊销——不留任何 active principal
+    expect(r2.world.principal(old2.id)).toMatchObject({ status: 'revoked' });
+    const actives = r2.world.sqlite.query(`SELECT id FROM admin_service_principals WHERE status = 'active'`).all();
+    expect(actives).toHaveLength(0);
+    expect(r2.world.liveProvisionToken).toBeNull();
+    expectNoLeaks(r2);
+  });
+
+  test('产品侧缺 subscription.manage 时 rotate 403 → invalid/forbidden 且补偿吊销', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r, ['quota.read']); // 没有 subscription.manage
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session }));
+    expect(error.code).toBe('forbidden');
+    const actives = r.world.sqlite.query(`SELECT id FROM admin_service_principals WHERE status = 'active'`).all();
+    expect(actives).toHaveLength(0);
   });
 });

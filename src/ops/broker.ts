@@ -18,9 +18,10 @@ import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
 import {
-  adminRequestTarget, idpAdminRequest, insertServicePrincipal, mintServicePrincipalToken,
+  adminRequestTarget, findServicePrincipal, idpAdminRequest, insertServicePrincipal,
+  listServicePrincipals, mintServicePrincipalToken,
   principalAliasSecretName, principalId, principalTokenSecretName, recordIdpAuditBestEffort,
-  revokeServicePrincipal, sha256Base64Url,
+  revokeServicePrincipal, sha256Base64Url, type ServicePrincipal,
 } from './idp-principals.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
@@ -30,7 +31,8 @@ export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
   'ops_idp_client_info', 'ops_idp_client_register',
-  'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_admin_request',
+  'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
+  'ops_idp_provision_rotate',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -144,7 +146,9 @@ export class OpsBroker {
       ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
       ops_idp_principal_mint: (ctx, args) => this.idpPrincipalMint(ctx, args),
       ops_idp_principal_revoke: (ctx, args) => this.idpPrincipalRevoke(ctx, args),
+      ops_idp_principal_list: (ctx, args) => this.idpPrincipalList(ctx, args),
       ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
+      ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
     };
   }
 
@@ -209,7 +213,7 @@ export class OpsBroker {
           ...(ctx.cfg.ops ? { operator: { clientId: ctx.cfg.ops.clientId, redirectUri: ctx.cfg.ops.redirectUri, resource: ctx.cfg.ops.resource ?? null } } : {}),
           ...(ctx.cfg.idp.ops ? { opsAudience: { clientId: ctx.cfg.idp.ops.clientId, audience: ctx.cfg.idp.ops.audience, redirectUri: ctx.cfg.idp.ops.redirectUri } } : {}),
         },
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx) },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx), idpProvisionRotate: this.canEnsure(ctx) && !!ctx.cfg.ops },
       },
     };
   }
@@ -419,6 +423,143 @@ export class OpsBroker {
     return {
       value: { status: res.status, ok: res.ok, body: clipJson(redactJson(res.body, known)) },
       audit: { action: 'ops_call', evidence: `ops_idp_admin_request ${method} ${path} → ${res.status}（principal ${id}）` },
+    };
+  }
+
+  /** Read-only principal inventory (ids, labels, status) so callers can name a revokePrincipalId without SQL access. */
+  private async idpPrincipalList(ctx: Ctx, args: Args): Promise<Outcome> {
+    const status = args.status === undefined ? undefined
+      : args.status === 'active' || args.status === 'revoked' ? args.status
+        : undefined;
+    if (args.status !== undefined && status === undefined) throw invalid('status must be "active" or "revoked"');
+    const principals = await listServicePrincipals(this.d1(ctx), status);
+    return {
+      value: {
+        principals: principals.map(p => ({
+          id: p.id, label: p.label, scopes: p.scopes, status: p.status,
+          createdAt: p.createdAt, revokedAt: p.revokedAt, createdBy: p.createdBy,
+        })),
+      },
+      audit: { action: 'ops_call', evidence: `ops_idp_principal_list → ${principals.length} 个` },
+    };
+  }
+
+  /**
+   * 一键轮换 provision token：吊销旧 principal → mint 新 principal（token 密封留在 broker）→
+   * 经运营会话调产品 rotate 端点把新 token 封进 _system 密封仓 → 双探针验证（新 token 活、
+   * 旧 token 403）。token 明文全程不出 broker 进程；产品侧懒解析使下一次调用即生效，无需
+   * 重部署、不碰 GitHub secrets、不登任何 console。
+   *
+   * 顺序语义：先吊销后注入——旧凭证先死，新凭证后生，永远不存在两枚同时在线的 provision
+   * token；注入失败时补偿吊销新 principal，避免留下 broker 之外的悬空活凭证。
+   */
+  private async idpProvisionRotate(ctx: Ctx, args: Args): Promise<Outcome> {
+    const session = this.session(ctx, args);
+    if (session.kind === 'customer') {
+      throw invalid('a customer session cannot rotate the provision token; call ops_operator_login for an operator session');
+    }
+    const label = args.label === undefined ? 'sck-provisioner' : text(args, 'label', 80);
+    const d1 = this.d1(ctx);
+    const origin = new URL(ctx.cfg.idp.issuer).origin;
+
+    // 1. 解析要吊销的旧 principal：显式指定，或恰好一个 active 时自动认领。
+    let oldPrincipal: ServicePrincipal | undefined;
+    if (args.revokePrincipalId !== undefined) {
+      const id = principalId(args.revokePrincipalId);
+      oldPrincipal = await findServicePrincipal(d1, id);
+      if (!oldPrincipal) throw new CompanyError('not_found', `no IdP service principal ${id}`);
+    } else {
+      const actives = await listServicePrincipals(d1, 'active');
+      if (actives.length > 1) {
+        throw invalid(`多个 active principal（${actives.map(p => p.id).join(', ')}）；请显式传 revokePrincipalId`);
+      }
+      oldPrincipal = actives[0];
+    }
+    // 旧 token 的 broker 密封副本只用于吊销后的 403 探针；非 broker mint 的旧凭证跳过探针。
+    const oldToken = oldPrincipal ? await this.sealedPrincipalToken(ctx, oldPrincipal.id) : undefined;
+
+    // 2. 吊销旧（spec 顺序：旧先死）
+    let revoked: { id: string; alreadyRevoked: boolean } | null = null;
+    if (oldPrincipal && oldPrincipal.status === 'active') {
+      const { alreadyRevoked } = await revokeServicePrincipal({ d1, principalId: oldPrincipal.id, now: () => new Date(this.now()) });
+      revoked = { id: oldPrincipal.id, alreadyRevoked };
+      if (!alreadyRevoked) {
+        await recordIdpAuditBestEffort(d1, {
+          actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+          eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: oldPrincipal.id,
+          payload: { label: oldPrincipal.label, via: 'ops_broker', reason: 'provision token rotation' },
+          occurredAt: new Date(this.now()).toISOString(),
+        });
+      }
+    } else if (oldPrincipal) {
+      revoked = { id: oldPrincipal.id, alreadyRevoked: true };
+    }
+
+    // 3. 签新：密封先于建行，token 不出 broker
+    const newId = randomUUID();
+    const token = mintServicePrincipalToken();
+    const tokenHash = await sha256Base64Url(token);
+    await this.deps.projects.setSecret(
+      { project: ctx.scope.project, env: ctx.env, name: principalTokenSecretName(newId), value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+      this.deps.secretKey(true));
+    const minted = await insertServicePrincipal({
+      d1, id: newId, label, tokenHash, createdBy: `ops:${ctx.scope.actor.employeeId}`, now: () => new Date(this.now()),
+    });
+    await recordIdpAuditBestEffort(d1, {
+      actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+      eventType: 'admin.service_principal.minted', targetType: 'service_principal', targetId: minted.id,
+      payload: { label, scopes: minted.scopes, via: 'ops_broker', rotation: true }, occurredAt: minted.createdAt,
+    });
+
+    // 4. 注入消费侧：经运营会话调产品 rotate 端点（subscription.manage 由产品侧强制）。
+    //    失败则补偿吊销新 principal——旧已吊销，不留悬空活凭证。
+    const rotate = await this.product(ctx, session, 'POST', '/api/ops/idp-provision-token/rotate', { token });
+    if (!rotate.ok) {
+      await revokeServicePrincipal({ d1, principalId: minted.id, now: () => new Date(this.now()) }).catch(() => undefined);
+      await recordIdpAuditBestEffort(d1, {
+        actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+        eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: minted.id,
+        payload: { label, via: 'ops_broker', reason: 'rotation aborted: product rotate failed' },
+        occurredAt: new Date(this.now()).toISOString(),
+      });
+      throw productFailure('rotating the provision token into the sealed store', rotate, { 400: 'invalid', 403: 'forbidden' });
+    }
+
+    // 5. 验证：产品 status 应为 store 源；新 token IdP 探针 200；旧 token（若 broker 持有密封副本）403。
+    //    探针是证据不是闸门：注入成功后探针失败只降级为报告字段，不把已生效的轮换报成失败。
+    const status = await this.product(ctx, session, 'GET', '/api/ops/idp-provision-token/status');
+    const statusBody = (status.body ?? {}) as Record<string, unknown>;
+    const probe = async (probeToken: string) => {
+      try {
+        const res = await idpAdminRequest(origin, probeToken, { method: 'GET', path: '/admin/tenants' }, { fetch: this.deps.fetch });
+        return { status: res.status, ok: res.ok };
+      } catch (error) {
+        return { status: null, ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    const newProbe = await probe(token);
+    const oldProbe = oldToken === undefined ? undefined : await probe(oldToken);
+
+    return {
+      value: {
+        rotated: true,
+        newPrincipal: { id: minted.id, label, scopes: minted.scopes, createdAt: minted.createdAt },
+        revoked,
+        product: {
+          rotate: rotate.status,
+          statusOk: status.ok,
+          source: typeof statusBody.source === 'string' ? statusBody.source : null,
+          storeEntry: (statusBody.store as Record<string, unknown> | undefined)?.entry != null,
+        },
+        probes: {
+          newToken: newProbe,
+          oldToken: oldProbe ?? 'skipped（旧 token 非 broker mint，无密封副本可探测）',
+        },
+      },
+      audit: {
+        action: 'ops_idp_provision_rotate',
+        evidence: `ops_idp_provision_rotate ${revoked ? `吊销 ${revoked.id} → ` : ''}签发 ${minted.id} → 注入密封仓（rotate ${rotate.status}）→ 新探针 ${newProbe.status}${oldProbe ? `、旧探针 ${oldProbe.status}` : ''}`,
+      },
     };
   }
 

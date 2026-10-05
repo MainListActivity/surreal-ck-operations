@@ -59,6 +59,8 @@ export class FakeWorld {
   readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string; oidcUser?: { key: string; value: string } }> = [];
   /** IdP subject → active platform-operator capabilities, like the product's capability table. */
   readonly operatorCaps = new Map<string, string[]>();
+  /** The provision token hash the fake product sealed at the last rotate call (null = env fallback). */
+  liveProvisionToken: { hash: string; principalId: string } | null = null;
   private readonly grants = new Map<string, Grant>();
   private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string; client: string }>();
   private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
@@ -491,6 +493,34 @@ export class FakeWorld {
       if (method === 'GET' && entitlement) {
         if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
         return json(200, { slug: decodeURIComponent(url.pathname.split('/').pop()!), entitlement: { revision: 3 } });
+      }
+      // Mirrors POST /api/ops/idp-provision-token/rotate: subscription.manage capability, the
+      // candidate token is probed against the IdP (here: the D1 principal rows themselves), then
+      // sealed into the product's store — modelled as the live hash for later status reads.
+      if (method === 'POST' && url.pathname === '/api/ops/idp-provision-token/rotate') {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const token = String(body.token ?? '');
+        if (!token) return apiError(400, 'idp-provision-token-invalid-request');
+        const hash = createHash('sha256').update(token).digest('base64url');
+        const principal = this.sqlite.query(`SELECT * FROM admin_service_principals WHERE token_hash = ?`).get(hash) as Record<string, unknown> | null;
+        if (!principal || principal.status !== 'active') return apiError(400, 'idp-provision-token-invalid');
+        this.liveProvisionToken = { hash, principalId: String(principal.id) };
+        return json(200, { rotated: true, source: 'store', updatedAt: new Date(this.clock).toISOString(), updatedBy: grant.userId });
+      }
+      if (method === 'GET' && url.pathname === '/api/ops/idp-provision-token/status') {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        const live = this.liveProvisionToken;
+        return json(200, {
+          configured: true,
+          source: live ? 'store' : 'env',
+          env: { configured: true },
+          store: {
+            sealKeyConfigured: true,
+            entry: live ? { updatedAt: new Date(this.clock).toISOString(), updatedBy: 'ops:test', purpose: 'provision token' } : null,
+            unsealError: null,
+          },
+          idp: { reachable: true, status: null, error: null },
+        });
       }
       return apiError(404, 'not-found');
     }

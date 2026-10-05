@@ -66,6 +66,16 @@ export async function findServicePrincipal(d1: D1Client, id: string): Promise<Se
   return row ? toPrincipal(row) : undefined;
 }
 
+/** All principals in creation order — ids/labels/status only, never token material. */
+export async function listServicePrincipals(d1: D1Client, status?: 'active' | 'revoked'): Promise<ServicePrincipal[]> {
+  const rows = status
+    ? await d1.query<PrincipalRow>(
+      'SELECT id, label, scopes, status, created_at, revoked_at, created_by FROM admin_service_principals WHERE status = ? ORDER BY created_at', [status])
+    : await d1.query<PrincipalRow>(
+      'SELECT id, label, scopes, status, created_at, revoked_at, created_by FROM admin_service_principals ORDER BY created_at');
+  return rows.map(toPrincipal);
+}
+
 /**
  * Inserts the principal row exactly as the IdP's own mint would (`active`, JSON scope list,
  * `created_by` naming the ops caller). The IdP trusts the row itself; who wrote it is attributed
