@@ -21,7 +21,7 @@
    - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
    - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "gm", "text": "...", "idempotencyKey": "..."}`。
    - 只有下面「老板专属事项」才 `report_blocker to=owner`：写清要老板决定什么、可选项与推荐、你已经查过哪些来源、决定后从哪里继续。
-   - 附件呈现：任务 `evidenceDir` 下的图片/视频/音频/HTML 等媒体附件会自动呈现在老板收件箱的对应卡片上，任意设备点开即可看图/播视频/走 HTML（公网签名 URL，有时效）；交付演示包直接把成品文件放进 evidenceDir 即可，不要只交本地路径。
+   - 附件呈现：任务 `evidenceDir` 下的图片/视频/音频/HTML 等媒体附件会自动呈现在老板收件箱的对应卡片上，局域网内点开即可看图/播视频/走 HTML；进老板审核的交付，证据里预览链接一律用 `sck call deliverable_publish '{"files":["/abs/a.png","/abs/dir"]}'` 返回的 `http://<lanIP>:<port>/d/<任务ID>/…` URL——本地路径与 file:// 不算交付。
 4. **结束本轮**：用一两句话汇报任务 ID 与交接结果，然后停止。下一项工作由调度器再派。
 
 ## 边界

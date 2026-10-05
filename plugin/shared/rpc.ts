@@ -90,7 +90,8 @@ export const openAttachment = defineRpc({
 export const attachmentUrl = defineRpc({
   name: "company.attachments.url",
   input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
-  output: z.object({ url: z.string(), expiresAt: z.string() }),
+  // LAN URL 无时效，expiresAt 仅在签名 URL 形态下存在（保留字段兼容旧客户端）。
+  output: z.object({ url: z.string(), expiresAt: z.string().optional() }),
 });
 
 export const readAttachment = defineRpc({

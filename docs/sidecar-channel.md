@@ -45,6 +45,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - **消耗租约的写**：`submit`、`review`、`report_blocker` 成功后 `endLease`——停止续租、删除 live claim、释放该实例全部 ops 会话。`checkpoint` 不消耗。
 - **读与管理工具**：`get_context`、`get_task_history`、`create_task`、`create_goal`、`triage_goal`、`create_delivery`、`record_owner_decision`、`set_direction`、`resume_task`、`record_score` 直接转发 `CompanyCore`，权限仍在服务端按凭证的岗位能力裁决。
 - **`ops_*`**：转运维代理，见下节。
+- **`deliverable_publish`**：本地实现不转 core——把 `{files:[绝对路径…]}` 的文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/`（目录递归保结构、隐藏名跳过、同名覆盖、symlink 解引用），返回 `{taskId,dir,baseUrl,urls,skipped,conflictPolicy}`，`urls` 为 `http://<lanIP>:<port>/d/<taskId>/…` 可点链接（lanIP/端口取 `preview-status.json` 实际监听，缺省 `SCK_PREVIEW_PORT`/18777）。taskId 缺省取在手租约任务，显式传值供经理代发/补发（免租约）；任一输入路径无效即整体报错，不产生半截交付包。
 - **特殊**：`claim_next` 回 `forbidden`（任务已代领）；`heartbeat` 回 `{ok:true}`；`get_secret`/`put_secret` 已下线，回 `unknown_tool` 并提示改用 `ops_*`；其余未知名回 `unknown_tool`。请求 JSON 解析失败回 `malformed request`；无在手租约时写工具回 `no_lease`。
 
 交付物回收：回合结束钩子调 `settle`，把 `report.md`/`blocker.md` 内容哈希与 claim 时记下的哈希对比——**领取前已存在的陈旧文件永远不会被当成提交**；一致或未变则不动作。提交成功后文件改名 `report.md.done-<ts>`；失败改 `.failed-<ts>`；无租约时残留的交付物改 `.orphaned-<ts>`。blocker 优先于 report；`blocker.md` 只能阻塞到 gm，要 owner 须显式 `sck call report_blocker '{"to":"owner",...}'`。spawn/wake 失败时调度器调 `releaseClaim` 以「【通道回滚】」退回任务；员工会话被归档时 `detachAgent` 丢弃绑定与内存凭证，租约自行到期。
@@ -68,6 +69,10 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - **脱敏**：返回与审计文本都抹掉 token 字段名、JWT/Bearer/密码形态串，以及该员工全部在存会话 token；上游错误只透出机器码。
 - **错误码**：`invalid`（参数）、`forbidden`（岗位/权限）、`not_configured`（环境未配代理或缺 D1/data/Cloudflare 凭证）、`not_found`、`limit_reached`、`conflict`、`login_failed`、`upstream_error`（超时/断连/5xx，`retryable`）。
 - **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，`sh plugin/scripts/vendor.sh` 后 `plugin reload`；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
+
+## deliverables/ 交付包约定
+
+员工用 `deliverable_publish` 发布给老板看的产物，落点为 `$SCK_SERVICE_HOME/deliverables/<taskId>/`，经插件内嵌预览服务 `/d/<taskId>/…` 路由以 LAN URL 呈现（无鉴权，局域网口径）；`evidence/<taskId>/` 则对应 `/e/` 路由（收件箱附件自动枚举呈现）。证据文本里给老板点开的链接必须来自 `deliverable_publish` 的返回 `urls`，本地路径与 `file://` 不算交付。
 
 ## 排障
 

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { company } from "./company";
 import { refreshModels, refreshQuota } from "./dispatch";
-import { loadServiceEnv, serviceHome } from "./env";
+import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
 
 const SOURCE = "owner:paseo-plugin";
@@ -94,17 +94,15 @@ export function registerHandlers(server: PluginServerContext): void {
   });
 
   server.handle(rpc.attachmentUrl, async (input: RpcInput<typeof rpc.attachmentUrl>) => {
+    // 老板亲定 LAN 口径：附件打开路径统一为内嵌预览服务 URL（/e/ 路由，无时效）。
+    // 公网签名链路（preview-sign + 签名面 :18778）保留给远程可达链路的部署腿。
     const { resolveTaskAttachment } = await import("./vendor/src/attachments.ts");
-    const { previewSignedPath } = await import("./vendor/src/preview-sign.ts");
+    const { previewLanBase } = await import("./vendor/src/deliverables.ts");
     const abs = await resolveTaskAttachment(serviceHome(), input.taskId, input.name);
     if (!abs) throw new Error("附件不存在或越界");
-    loadServiceEnv();
-    const base = (process.env.SCK_PREVIEW_PUBLIC_BASE ?? "").replace(/\/+$/, "");
-    const secret = process.env.SCK_PREVIEW_SECRET;
-    if (!/^https:\/\//.test(base) || !secret) throw new Error("远程预览未接线（缺 SCK_PREVIEW_PUBLIC_BASE/SCK_PREVIEW_SECRET）");
-    const ttl = Number(process.env.SCK_PREVIEW_TTL_MS ?? 3_600_000);
-    const { path, exp } = previewSignedPath(secret, "e", input.taskId, input.name, ttl);
-    return { url: base + path, expiresAt: new Date(exp).toISOString() };
+    const rel = input.name.split("/").map(encodeURIComponent).join("/");
+    const url = `${previewLanBase(serviceHome())}/e/${encodeURIComponent(input.taskId)}/${rel}`;
+    return { url };
   });
 
   server.handle(rpc.openAttachment, async (input: RpcInput<typeof rpc.openAttachment>) => {
