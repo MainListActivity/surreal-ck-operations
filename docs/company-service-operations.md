@@ -35,6 +35,30 @@ paseo plugin ls                          # 确认 sck-company running、无 erro
 
 reload 后用 `sck call get_context` 与实际派工各验证一次恢复。其它生成物：`plugin/node_modules` 由 `cd plugin && npm install` 管理，仅当 `plugin/package.json` 依赖变化时才需重装，无其它需同步的生成物。
 
+## 交付预览服务（签名 URL）
+
+`org.surrealck.deliverable-preview`（launchd，用户级）跑 `$SCK_SERVICE_HOME/bin/deliverable-preview.ts`，监听 `0.0.0.0:18777`，提供 `evidence/`(`/e/`）与 `deliverables/`(`/d/`）只读静态服务：文件、目录列表页、视频 `Range`/`206`。所有内容请求必须带 HMAC 签名参数 `exp`+`sig`：未签或签名不符 401、过期 403、未配置密钥 503（fail closed）；`GET /healthz` 免签名。隐藏文件、目录穿越、逃逸符号链接一律拒绝。
+
+**部署/更新**：`src/preview-server.ts` 依赖同目录的 `attachments.ts` 与 `preview-sign.ts`，更新时三个文件一并 `cp src/{preview-server,attachments,preview-sign}.ts` 到 `$SCK_SERVICE_HOME/bin/`（服务器文件命名 `deliverable-preview.ts`），然后 `launchctl kickstart -k gui/<uid>/org.surrealck.deliverable-preview`。服务进程自动加载 `private/service.env`，plist 无需改。
+
+**`private/service.env` 需配**（0600，不进仓库）：
+- `SCK_PREVIEW_SECRET`：HMAC-SHA256 密钥（如 `openssl rand -hex 32`），预览服务与插件 `company.attachments.url` 签发方共享
+- `SCK_PREVIEW_PUBLIC_BASE`：公网可达的 https base，插件校验必须 `https://` 前缀，否则签发报错；示例 `https://data.maplayer.top/pv`
+- `SCK_PREVIEW_TTL_MS`（可选）：签名有效期，默认 3600000
+
+**公网暴露（推荐：复用现有 VPS + 域名，零新增付费）**：本机向远端主机开持久反向隧道，把本地 :18777 暴露为 VPS loopback 端口，再由 Caddy 路径前缀对外：
+
+```sh
+# 本机（launchd 或 autossh 持久化，复用 deploy 用 SSH 通道）
+ssh -N -R 127.0.0.1:18777:127.0.0.1:18777 ubuntu@<remote-host>
+# VPS Caddyfile（data.maplayer.top 站点内追加）
+handle_path /pv/* { reverse_proxy 127.0.0.1:18777 }
+```
+
+签名只覆盖 `pathname`（如 `/e/<taskId>/<file>`），Caddy 去前缀后一致，`SCK_PREVIEW_PUBLIC_BASE=https://data.maplayer.top/pv`。备选：cloudflared named tunnel 直指 :18777（需 CF 凭证经 ops_* 申请）。
+
+签发链路：收件箱附件行按下 → 插件 `company.attachments.url` 校验文件确在 `evidence/<taskId>` 内 → 返回 `base+签名路径` → `openExternalUrl` 打开；老板任意设备浏览器直接消费，图片仍走 `attachments.read` data-URI 内联。
+
 ## 员工客户端
 
 > **v3 更新（sidecar/comm 通道）**：员工实例由 Paseo 插件 `sck-company` 注册代管，agent 进程零凭证——spawn env 只注入 `SCK_COMM_DIR` 和 `SCK_COMM_KEY`，实例凭证与租约证明留在插件进程内。claim/heartbeat/submit/review/blocker 由 sidecar 程序化代执行，租约证明自动注入，员工参数只写业务字段，`claim_next` 在员工侧不可用。comm 文件协议：`claim.json` 下发任务上下文，`report.md` 落盘即提交，`blocker.md` 上报阻塞（回合结束时由 sidecar 回收为 submit/report_blocker），`req/`+`res/` 原子转发 `sck call`。`get_secret`/`put_secret` 等凭证工具已下线，需要账号、workspace、生产登录走 `ops_*` 运维工具（先 `ops_info` 查能力清单）。legacy `credential_file` 实例不再被代领新任务，自然淘汰。架构、调用路径、安全边界与排障详见 [sidecar 通道](./sidecar-channel.md)；本节下述的凭证文件方式（`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`）仅为旧部署与 legacy 实例保留。

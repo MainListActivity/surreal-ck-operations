@@ -93,10 +93,16 @@ const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 const formatSize = (bytes: number): string =>
   bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
 
+/** 附件行：按下时向插件取签名 URL（公网可达）并交给宿主浏览器/播放器打开。 */
 function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttachment; label: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
-  const open = useRpc(rpc.openAttachment);
-  const m = useMutation({ mutationFn: () => open({ taskId, name: a.relPath }) });
+  const getUrl = useRpc(rpc.attachmentUrl);
+  const m = useMutation({
+    mutationFn: async () => {
+      const { url } = await getUrl({ taskId, name: a.relPath });
+      await openExternalUrl(url);
+    },
+  });
   return (
     <Pressable accessibilityRole="button" style={s.row} disabled={m.isPending} onPress={() => m.mutate()}>
       <Text style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{label}</Text>
@@ -132,7 +138,7 @@ function InlineImage({ taskId, a, ctx }: { taskId: string; a: TaskAttachment; ct
 }
 
 const ATTACH_ACTION: Record<TaskAttachment["kind"], string> = {
-  image: "打开", video: "播放", html: "在浏览器打开", audio: "播放", other: "打开",
+  image: "打开", video: "播放", html: "在浏览器打开", audio: "播放", other: "下载",
 };
 
 /** Evidence-attachment section for an owner-facing card; renders nothing when empty. */
