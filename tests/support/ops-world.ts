@@ -72,6 +72,12 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
   inviteResumeCalls = 0;
   /** 异步完成时翻为 failed（带 errorCode/errorMessage）而非 completed。 */
   inviteFailOnComplete = false;
+  /** resend 铸链计数（断言「重放不重复发」用）。 */
+  inviteResendCalls = 0;
+  /** key → 最近一次重签发时刻（24h 内重放去重）。 */
+  readonly inviteResentAt = new Map<string, number>();
+  /** resend 时 IdP 侧用户已激活 → 409。 */
+  readonly inviteActivatedUsers = new Set<string>();
   private readonly invitePendingPolls = new Map<string, number>();
   private inviteResumed = new Set<string>();
   private readonly grants = new Map<string, Grant>();
@@ -599,6 +605,32 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
           }
         }
         return json(200, { ...row, replayed: true });
+      }
+      // POST /api/ops/invitations/:key/resend — subscription.manage，镜像产品语义：
+      // completed 行铸新链暂存回行（pendingCollect）；processing/failed 409；
+      // 未收取或上次重签发仍在 24h 有效期内的重放不重复铸链。
+      const resend = /^\/api\/ops\/invitations\/([^/]+)\/resend$/.exec(url.pathname);
+      if (method === 'POST' && resend) {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(resend[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        if (row.status === 'processing') return apiError(409, 'invite-resend-while-processing');
+        if (row.status !== 'completed') return apiError(409, 'invite-resend-invalid-state');
+        const pendingCollect = this.inviteUrls.has(key) && !this.inviteDeliveredAt.has(key);
+        const resentAt = this.inviteResentAt.get(key);
+        const withinTtl = resentAt !== undefined && this.clock - resentAt < 24 * 60 * 60 * 1000;
+        if (!pendingCollect && !withinTtl) {
+          const u = row.user as Record<string, unknown> | null;
+          if (u && this.inviteActivatedUsers.has(String(u.id))) return apiError(409, 'invite-already-activated');
+          this.inviteResendCalls += 1;
+          this.inviteUrls.set(key, `https://idp.test/activate-account?token=resent-${randomUUID()}`);
+          this.inviteDeliveredAt.delete(key);
+          this.inviteResentAt.set(key, this.clock);
+        }
+        const nowPending = this.inviteUrls.has(key) && !this.inviteDeliveredAt.has(key);
+        row.delivery = { channel: 'activation_url', activationUrl: null, pendingCollect: nowPending, note: 'collect-delivery 一次性收取' };
+        return json(200, { ...row, replayed: true, delivery: row.delivery });
       }
       // POST /api/ops/invitations/:key/collect-delivery — subscription.manage，一次性收取。
       const collect = /^\/api\/ops\/invitations\/([^/]+)\/collect-delivery$/.exec(url.pathname);

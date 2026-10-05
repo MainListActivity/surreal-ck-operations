@@ -622,41 +622,66 @@ export class OpsBroker {
    * 产品侧为异步契约：POST 在同步窗内完成 → 201/200 直接带结果；超时回 202
    * processing（任务不脱管继续跑）→ 本工具轮询 GET，僵死则同键重发触发续跑，
    * 完成后经 collect-delivery 一次性收取激活链接。
+   * resend:true = 断链/24h 过期补救：调产品 resend 端点重铸链接（其余参数
+   * 沿用行内已存值，只需 idempotencyKey），收取与交接走同一凭证卫生路径。
    * 一次性 activation_url 不回给员工——broker 落盘到
    * <serviceHome>/handoff/invite-<key>.txt（0600，不进 evidence/deliverables
    * 这两个 LAN 预览面），由老板本机取阅转交。重放/复用路径无新链接、不写文件。
+   * 纪律：邀请签发与重发一律走本工具；禁止 ops_request 裸调
+   * /api/ops/invitations*（裸调拿到的一次性链接不经 handoff 落盘，断链即丢）。
    */
   private async invitationIssue(ctx: Ctx, args: Args): Promise<Outcome> {
     const session = this.session(ctx, args);
     if (session.kind === 'customer') {
       throw invalid('a customer session cannot issue invitations; call ops_operator_login for an operator session');
     }
-    const email = text(args, 'email', 200);
     const idempotencyKey = text(args, 'idempotencyKey', 200);
-    const body: Record<string, unknown> = {
-      email,
-      displayName: text(args, 'displayName', 80),
-      workspaceSlug: text(args, 'workspaceSlug', 40),
-      reason: text(args, 'reason', 500),
-      idempotencyKey,
-    };
-    if (args.aiAllowance === undefined || args.aiAllowance === null || typeof args.aiAllowance !== 'object' || Array.isArray(args.aiAllowance)) {
-      throw invalid('aiAllowance {amount,expiresAt,label?} is required');
-    }
-    body.aiAllowance = args.aiAllowance;
-    if (args.workspaceName !== undefined) body.workspaceName = text(args, 'workspaceName', 80);
-    if (args.planKey !== undefined) body.planKey = text(args, 'planKey', 64);
-    if (args.productPlanRevisionId !== undefined) body.productPlanRevisionId = text(args, 'productPlanRevisionId', 80);
+    const resend = args.resend === true;
 
-    const res = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
-    if (!res.ok) {
-      throw productFailure('issuing the invitation', res, { 400: 'invalid', 403: 'forbidden', 409: 'conflict', 503: 'upstream_error' });
+    let res: ProductResult;
+    let resBody: Record<string, unknown>;
+    let email: string;
+    let workspaceSlug: string;
+
+    if (resend) {
+      res = await this.product(ctx, session, 'POST', `/api/ops/invitations/${encodeURIComponent(idempotencyKey)}/resend`);
+      if (!res.ok) {
+        throw productFailure('resending the invitation activation link', res, { 400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 503: 'upstream_error' });
+      }
+      resBody = (res.body ?? {}) as Record<string, unknown>;
+      const u = resBody.user as Record<string, unknown> | null;
+      const w = resBody.workspace as Record<string, unknown> | null;
+      email = typeof u?.email === 'string' ? u.email : '';
+      workspaceSlug = typeof w?.slug === 'string' ? w.slug : '';
+    } else {
+      email = text(args, 'email', 200);
+      const body: Record<string, unknown> = {
+        email,
+        displayName: text(args, 'displayName', 80),
+        workspaceSlug: text(args, 'workspaceSlug', 40),
+        reason: text(args, 'reason', 500),
+        idempotencyKey,
+      };
+      if (args.aiAllowance === undefined || args.aiAllowance === null || typeof args.aiAllowance !== 'object' || Array.isArray(args.aiAllowance)) {
+        throw invalid('aiAllowance {amount,expiresAt,label?} is required');
+      }
+      body.aiAllowance = args.aiAllowance;
+      if (args.workspaceName !== undefined) body.workspaceName = text(args, 'workspaceName', 80);
+      if (args.planKey !== undefined) body.planKey = text(args, 'planKey', 64);
+      if (args.productPlanRevisionId !== undefined) body.productPlanRevisionId = text(args, 'productPlanRevisionId', 80);
+
+      res = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
+      if (!res.ok) {
+        throw productFailure('issuing the invitation', res, { 400: 'invalid', 403: 'forbidden', 409: 'conflict', 503: 'upstream_error' });
+      }
+
+      resBody = (res.body ?? {}) as Record<string, unknown>;
+      if (resBody.status === 'processing') {
+        resBody = await this.awaitInvitation(ctx, session, idempotencyKey, body);
+      }
+      workspaceSlug = String(body.workspaceSlug);
     }
 
-    let resBody = (res.body ?? {}) as Record<string, unknown>;
-    if (resBody.status === 'processing') {
-      resBody = await this.awaitInvitation(ctx, session, idempotencyKey, body);
-    }
     if (resBody.status === 'failed') {
       const code = typeof resBody.errorCode === 'string' ? resBody.errorCode : 'invite-failed';
       const detail = typeof resBody.errorMessage === 'string' ? resBody.errorMessage : '';
@@ -684,12 +709,12 @@ export class OpsBroker {
     if (activationUrl) {
       let file: string;
       try {
-        file = this.writeOwnerHandoff(idempotencyKey, activationUrl, email, String(body.workspaceSlug));
+        file = this.writeOwnerHandoff(idempotencyKey, activationUrl, email, workspaceSlug);
       } catch (error) {
         // 链接一次性、不可重取；写失败即丢链——如实报出恢复路径，不回显 URL。
         const detail = error instanceof Error ? error.message : String(error);
         throw new CompanyError('upstream_error',
-          `邀请已签发（idempotencyKey=${idempotencyKey}），但交接文件写入失败：${detail}。activation_url 不可重取——恢复路径：用户先自注册再以同邮箱邀请幂等复用，或 IdP 侧补重签发`, true);
+          `邀请${resend ? '重签发' : '已签发'}（idempotencyKey=${idempotencyKey}），但交接文件写入失败：${detail}。activation_url 不可重取——恢复路径：换环境修复后重发同键 resend，或 IdP 侧补重签发`, true);
       }
       delivery.activationUrl = null;
       delivery.note = 'activation_url 已写老板本机交接文件，员工侧不回显';
@@ -697,11 +722,12 @@ export class OpsBroker {
     }
 
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    const resStatus = resBody.status ?? res.status;
     return {
       value: { status: res.status, ok: res.ok, body: clipJson(redactJson(resBody, known)), ...(handoff ? { handoff } : {}) },
       audit: {
         action: 'ops_invitation_issue',
-        evidence: `ops_invitation_issue ${email} ws=${body.workspaceSlug} → ${resBody.status ?? res.status}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
+        evidence: `ops_invitation_issue ${resend ? 'resend ' : ''}${email} ws=${workspaceSlug} → ${resStatus}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
       },
     };
   }

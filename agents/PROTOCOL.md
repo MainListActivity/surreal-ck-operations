@@ -61,11 +61,13 @@
 | `ops_browser_login` | `session`, `spaceId`, `page?` | 把会话注入你的 ego-browser 任务空间（`page` 缺省 `p1`），浏览器里直接是已登录状态，不用输入密码 |
 | `ops_logout` | `session` | 关闭会话 |
 | `ops_idp_client_register` | `client_name`, `redirect_uris`, `access_token_audience` | 在 IdP 登记一个公开 SPA client（Authorization Code+PKCE、无 secret、`consent_policy=skip`）；redirect 与 audience 限产品域名下的 https 地址；同名幂等，只回公开 `clientId` |
+| `ops_invitation_issue` | `email`, `displayName`, `workspaceSlug`, `aiAllowance`, `reason`, `idempotencyKey`, `resend?` | 运营代办邀请开通（IdP 用户 + workspace bootstrap + 免费权益 + AI 额度），同幂等键重放安全；`resend:true` + 同一 `idempotencyKey` 为断链/过期重签发。一次性激活链接不回显——写老板本机 `handoff/invite-<key>.txt`（0600）由老板转交 |
 
 规则：
 - 会话分两种：`ops_login` 的客户会话走产品 API 与 workspace 数据；`ops_operator_login` 与 `ops_login`（`audience:"ops"`）的运营会话只用于 `ops_request` 调 `/api/ops/*`（运营台、内容、套餐与额度运营接口），产品侧每次请求都按平台运营身份实时校验，撤权立即生效。
 - `ops_operator_login` 的运营 client 是 IdP 动态登记的公开客户端（`consent_policy=require`）：代理在口令登录后携 `user_session` cookie 自动完成 IdP 的授权同意步再拿 code。自动同意只限公司自有运营 client；其它 client 或 customer 通道遇到 consent 要求一律 `login_failed(consent_required)`。
 - 会话句柄只属于你持有的这一个任务：交付、阻塞、被收回租约都会让它失效，不跨任务复用；需要时重新 `ops_login` / `ops_operator_login`。
+- 邀请签发与重发一律走 `ops_invitation_issue`；禁止用 `ops_request` 裸调 `/api/ops/invitations*`——裸调拿到的一次性激活链接不经 handoff 文件落盘，响应一丢链接即不可恢复。
 - 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
 - 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
