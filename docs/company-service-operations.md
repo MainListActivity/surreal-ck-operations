@@ -60,7 +60,9 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 签名只覆盖 `pathname`（如 `/e/<taskId>/<file>`），Caddy 去前缀后一致，`SCK_PREVIEW_PUBLIC_BASE=https://data.maplayer.top/pv`。备选：cloudflared named tunnel 直指 :18778（需 CF 凭证经 ops_* 申请）。
 
-签发链路：收件箱附件行按下 → 插件 `company.attachments.url` 校验文件确在 `evidence/<taskId>` 内 → 返回 `base+签名路径` → `openExternalUrl` 打开；老板任意设备浏览器直接消费，图片仍走 `attachments.read` data-URI 内联。
+签发链路：收件箱附件行按下 → 插件 `company.attachments.url` 校验文件确在 `evidence/<taskId>` 内 → 返回预览 URL → `openExternalUrl` 打开；老板任意设备浏览器直接消费，图片仍走 `attachments.read` data-URI 内联。URL 形态按老板口径为 LAN `http://<lanIP>:<port>/e/…`（无签名、无时效）；公网签名 URL 通道保留待用（签名面 :18778 + 隧道/Caddy），激活后此 RPC 如需恢复 `base+签名路径` 形态只需切回签发分支。
+
+**员工交付发布工具 `deliverable_publish`**（sidecar 基础工具，`sck call deliverable_publish '{"files":[绝对路径…],"taskId"?}'`）：把文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/` 并返回 `/d/` 路由的 LAN 可点 URL；taskId 缺省取在手租约。同名覆盖、隐藏名跳过、symlink 解引用；任一输入路径无效即整体报错不落半截包。员工证据里的预览链接一律用它返回的 URL。收件箱 `attachments.url` 当前按老板 LAN 口径直接返回 `/e/` 无签名 URL；公网签名通道（preview-sign + 签名面 :18778 + 隧道/Caddy）保留待用，配置 `SCK_PREVIEW_SECRET` 后插件 reload 即激活签名面。
 
 **部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走「插件面同步」流程（v3 merge + vendor.sh + `paseo plugin reload`）——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
 

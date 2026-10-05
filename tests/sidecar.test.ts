@@ -254,3 +254,73 @@ describe('sidecar', () => {
     expect(submits[0]!.proof).toEqual({ taskId: 'task-9', deliveryId: 'd-task-9', fence: 1, expectedVersion: 1 });
   });
 });
+
+describe('deliverable_publish 工具', () => {
+  const PUB_HOME = () => process.env.SCK_SERVICE_HOME!;
+  const withHome = async (fn: (home: string) => Promise<void>) => {
+    const home = mkdtempSync(join(tmpdir(), 'pub-sidecar-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    try { await fn(home); } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
+  };
+
+  test('__list__ 含 deliverable_publish；缺省 taskId 落租约任务；显式 taskId 可用', async () => {
+    await withHome(async (home) => {
+      const i = inst('e20');
+      const env = pool.env(i);
+      const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'l9', '__list__', {});
+      expect((listed.data as { tools: string[] }).tools).toContain('deliverable_publish');
+
+      await pool.claim(i, task('task-20'));
+      const srcDir = mkdtempSync(join(tmpdir(), 'pub-src-'));
+      writeFileSync(join(srcDir, 'shot.png'), 'png');
+      writeFileSync(join(srcDir, '剪 辑.mp4'), 'mp4');
+      try {
+        // 缺省 taskId = 租约任务 task-20
+        const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'p1', 'deliverable_publish',
+          { files: [join(srcDir, 'shot.png'), join(srcDir, '剪 辑.mp4')] });
+        expect(res.ok).toBe(true);
+        const data = res.data as { taskId: string; dir: string; baseUrl: string; urls: string[] };
+        expect(data.taskId).toBe('task-20');
+        expect(data.dir).toBe(join(home, 'deliverables', 'task-20'));
+        expect(readFileSync(join(data.dir, 'shot.png'), 'utf8')).toBe('png');
+        expect(data.urls).toContain(`${data.baseUrl}/d/task-20/shot.png`);
+        expect(data.urls).toContain(`${data.baseUrl}/d/task-20/${encodeURIComponent('剪 辑.mp4')}`);
+        // 显式 taskId（经理代发/补发）
+        const res2 = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'p2', 'deliverable_publish',
+          { taskId: 'task-other', files: [join(srcDir, 'shot.png')] });
+        expect((res2.data as { taskId: string }).taskId).toBe('task-other');
+        expect(existsSync(join(home, 'deliverables', 'task-other', 'shot.png'))).toBe(true);
+      } finally { rmSync(srcDir, { recursive: true, force: true }); }
+    });
+  });
+
+  test('坏路径拒绝且不落半截包；无租约无显式 taskId 报 no_lease', async () => {
+    await withHome(async (home) => {
+      const i = inst('e21');
+      const env = pool.env(i);
+      await pool.claim(i, task('task-21'));
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'p3', 'deliverable_publish',
+        { files: ['/definitely/not/here.bin'] });
+      expect(res.ok).toBe(false);
+      expect(res.error).toContain('未产生任何交付');
+      expect(existsSync(join(home, 'deliverables', 'task-21'))).toBe(false);
+
+      const i2 = inst('e22'); // 未 claim、无租约
+      const env2 = pool.env(i2);
+      const noLease = await relay(env2.SCK_COMM_DIR, env2.SCK_COMM_KEY!, 'p4', 'deliverable_publish',
+        { files: ['/tmp/x.txt'] });
+      expect(noLease.ok).toBe(false);
+      expect(noLease.error).toContain('no_lease');
+      // 但显式 taskId 免租约（经理补发）
+      writeFileSync('/tmp/x.txt', 'x');
+      const okExplicit = await relay(env2.SCK_COMM_DIR, env2.SCK_COMM_KEY!, 'p5', 'deliverable_publish',
+        { taskId: 'task-resend', files: ['/tmp/x.txt'] });
+      expect(okExplicit.ok).toBe(true);
+      expect(existsSync(join(home, 'deliverables', 'task-resend', 'x.txt'))).toBe(true);
+    });
+  });
+});
