@@ -68,8 +68,8 @@ describe('preview-server 鉴权', () => {
 
   test('隐藏文件与符号链接逃逸不可达', async () => {
     expect((await fetch(fileUrl('.hidden'))).status).toBe(403);
-    // 逃逸 symlink：resolveInsideChecked realpath 校验 → 404
-    expect((await fetch(fileUrl('escape.txt'))).status).toBe(404);
+    // 逃逸 symlink：resolveInsideChecked realpath 校验 → 403
+    expect((await fetch(fileUrl('escape.txt'))).status).toBe(403);
     // 编码穿越：直接对原始编码路径签发，服务端解码出 .. 仍被拒 → 404/403
     const exp = Date.now() + 60_000;
     const rawPath = `/e/${TASK}/..%2F..%2Fetc%2Fpasswd`;

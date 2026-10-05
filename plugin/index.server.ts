@@ -4,6 +4,7 @@ import { installBunShim } from "./server/bun-shim";
 import { registerHandlers } from "./server/handlers";
 import { startDispatch } from "./server/dispatch";
 import { loadServiceEnv, serviceHome } from "./server/env";
+import { startPreview } from "./server/preview";
 import { registerScrub } from "./server/scrub";
 
 export default function contribute(server: PluginServerContext) {
@@ -12,8 +13,10 @@ export default function contribute(server: PluginServerContext) {
   registerHandlers(server);
   const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot") });
   const stopDispatch = startDispatch(server);
+  const preview = startPreview();
   return () => {
     stopDispatch();
+    void preview.stop();
     stopScrub();
   };
 }
