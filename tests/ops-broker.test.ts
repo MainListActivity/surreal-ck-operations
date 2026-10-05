@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
@@ -45,7 +48,7 @@ describe('ops gate', () => {
       'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_info',
       'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
       'ops_idp_provision_rotate',
-      'ops_info', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
+      'ops_info', 'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
       'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
   });
@@ -1422,5 +1425,85 @@ describe('ops_idp_provision_rotate（一键轮换）', () => {
     expect(error.code).toBe('forbidden');
     const actives = r.world.sqlite.query(`SELECT id FROM admin_service_principals WHERE status = 'active'`).all();
     expect(actives).toHaveLength(0);
+  });
+});
+
+describe('ops_invitation_issue（G2 邀请签发 + 老板交接文件）', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+  const opsUser = async (r: Rig, alias: string, caps: string[]) => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+  const opsSession = async (r: Rig, caps = ['quota.read', 'subscription.manage']) => {
+    await opsUser(r, 'qa-ops', caps);
+    return String((await call(r, 'ops_operator_login', { alias: 'qa-ops' })).session);
+  };
+  const inviteArgs = {
+    email: 'lawyer@firm.test', displayName: '张律师', workspaceSlug: 'firm-alpha',
+    aiAllowance: { amount: 200, expiresAt: '2026-12-31T23:59:59.000Z' },
+    reason: 'G2 试点开通', idempotencyKey: 'invite-key-001',
+  };
+
+  test('签发邀请：activation_url 落 handoff 文件（0600）不回显，员工只见指针', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+
+      expect(res).toMatchObject({ status: 201, ok: true });
+      const body = res.body as Record<string, any>;
+      expect(body.delivery.activationUrl).toBeNull();
+      expect(body.user).toMatchObject({ email: 'lawyer@firm.test', outcome: 'created' });
+      const handoff = res.handoff as { file: string };
+      expect(handoff.file).toContain('/handoff/invite-invite-key-001.txt');
+
+      // 交接文件在本机含完整链接与收件上下文，0600。
+      const file = readFileSync(handoff.file, 'utf8');
+      const issued = r.world.issuedInvites.get('invite-key-001')!;
+      const url = (issued.delivery as Record<string, unknown>).activationUrl as string;
+      expect(file).toContain(url);
+      expect(file).toContain('lawyer@firm.test');
+      expect(file).toContain('firm-alpha');
+      expect(statSync(handoff.file).mode & 0o777).toBe(0o600);
+
+      // 员工侧输出与审计不含 URL 明文。
+      expectNoLeaks(r, [url]);
+      expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_invitation_issue' });
+      expect(r.company.audits.at(-1)!.evidence).not.toContain(url);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('同幂等键重放：无新链接、不写新文件', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      const replay = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      expect(replay).toMatchObject({ status: 200, ok: true });
+      expect((replay.body as Record<string, any>).replayed).toBe(true);
+      expect(replay.handoff).toBeUndefined();
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('缺 subscription.manage 的运营身份被产品侧 403', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r, ['quota.read']);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('forbidden');
   });
 });

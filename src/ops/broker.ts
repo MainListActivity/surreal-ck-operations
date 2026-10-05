@@ -3,7 +3,7 @@
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
 // on the caller's live task lease, role-checked against the project environment, and audited.
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
@@ -36,7 +36,7 @@ export const OPS_TOOLS = [
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
   'ops_idp_client_info', 'ops_idp_client_register',
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
-  'ops_idp_provision_rotate',
+  'ops_idp_provision_rotate', 'ops_invitation_issue',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -153,6 +153,7 @@ export class OpsBroker {
       ops_idp_principal_list: (ctx, args) => this.idpPrincipalList(ctx, args),
       ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
+      ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
     };
   }
 
@@ -603,6 +604,92 @@ export class OpsBroker {
         evidence: `ops_idp_provision_rotate ${revoked ? `吊销 ${revoked.id} → ` : ''}签发 ${minted.id} → 注入密封仓（rotate ${rotate.status}）→ 新探针 ${newProbe.status}${oldProbe ? `、旧探针 ${oldProbe.status}` : ''}`,
       },
     };
+  }
+
+  /**
+   * G2 邀请签发（运营代办开通）：转发产品 POST /api/ops/invitations。
+   * 一次性 activation_url 不回给员工——产品只在首响应下发一次、broker 落盘到
+   * <serviceHome>/handoff/invite-<key>.txt（0600，不进 evidence/deliverables
+   * 这两个 LAN 预览面），由老板本机取阅转交。重放/复用路径无新链接、不写文件。
+   */
+  private async invitationIssue(ctx: Ctx, args: Args): Promise<Outcome> {
+    const session = this.session(ctx, args);
+    if (session.kind === 'customer') {
+      throw invalid('a customer session cannot issue invitations; call ops_operator_login for an operator session');
+    }
+    const email = text(args, 'email', 200);
+    const idempotencyKey = text(args, 'idempotencyKey', 200);
+    const body: Record<string, unknown> = {
+      email,
+      displayName: text(args, 'displayName', 80),
+      workspaceSlug: text(args, 'workspaceSlug', 40),
+      reason: text(args, 'reason', 500),
+      idempotencyKey,
+    };
+    if (args.aiAllowance === undefined || args.aiAllowance === null || typeof args.aiAllowance !== 'object' || Array.isArray(args.aiAllowance)) {
+      throw invalid('aiAllowance {amount,expiresAt,label?} is required');
+    }
+    body.aiAllowance = args.aiAllowance;
+    if (args.workspaceName !== undefined) body.workspaceName = text(args, 'workspaceName', 80);
+    if (args.planKey !== undefined) body.planKey = text(args, 'planKey', 64);
+    if (args.productPlanRevisionId !== undefined) body.productPlanRevisionId = text(args, 'productPlanRevisionId', 80);
+
+    const res = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
+    if (!res.ok) {
+      throw productFailure('issuing the invitation', res, { 400: 'invalid', 403: 'forbidden', 409: 'conflict', 503: 'upstream_error' });
+    }
+
+    const resBody = (res.body ?? {}) as Record<string, unknown>;
+    const delivery = (resBody.delivery ?? {}) as Record<string, unknown>;
+    const activationUrl = typeof delivery.activationUrl === 'string' && delivery.activationUrl.length > 0
+      ? delivery.activationUrl : undefined;
+
+    let handoff: { file: string; note: string } | undefined;
+    if (activationUrl) {
+      let file: string;
+      try {
+        file = this.writeOwnerHandoff(idempotencyKey, activationUrl, email, String(body.workspaceSlug));
+      } catch (error) {
+        // 链接一次性、不可重取；写失败即丢链——如实报出恢复路径，不回显 URL。
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new CompanyError('upstream_error',
+          `邀请已签发（idempotencyKey=${idempotencyKey}），但交接文件写入失败：${detail}。activation_url 不可重取——恢复路径：用户先自注册再以同邮箱邀请幂等复用，或 IdP 侧补重签发`, true);
+      }
+      delivery.activationUrl = null;
+      delivery.note = 'activation_url 已写老板本机交接文件，员工侧不回显';
+      handoff = { file, note: '请老板在本机打开该文件，把激活链接转交收件人' };
+    }
+
+    const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    return {
+      value: { status: res.status, ok: res.ok, body: clipJson(redactJson(resBody, known)), ...(handoff ? { handoff } : {}) },
+      audit: {
+        action: 'ops_invitation_issue',
+        evidence: `ops_invitation_issue ${email} ws=${body.workspaceSlug} → ${res.status}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
+      },
+    };
+  }
+
+  /** 一次性凭证的落地处：老板本机目录（0600），刻意不进 LAN 预览面。 */
+  private writeOwnerHandoff(key: string, activationUrl: string, email: string, workspace: string): string {
+    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
+    const dir = join(home, 'handoff');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const name = `invite-${key.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 120)}.txt`;
+    const file = join(dir, name);
+    writeFileSync(file, [
+      'G2 邀请激活链接 —— 一次性凭证，仅供老板转交收件人，勿再分发。',
+      `收件邮箱: ${email}`,
+      `workspace: ${workspace}`,
+      `幂等键: ${key}`,
+      `签发时间: ${new Date(this.now()).toISOString()}`,
+      '有效期: 签发后 24 小时，激活成功即失效。',
+      '',
+      '激活链接（整行复制转交收件人）:',
+      activationUrl,
+      '',
+    ].join('\n'), { mode: 0o600 });
+    return file;
   }
 
   // ---------- sessions ----------
