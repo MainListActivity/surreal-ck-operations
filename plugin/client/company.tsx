@@ -18,7 +18,7 @@ const STATE_COLOR: Record<string, string> = {
 const TIER_LABEL: Record<string, string> = { quick: "quick 小需求", standard: "standard 常规", program: "program 大项目" };
 const KIND_LABEL: Record<string, string> = { goal: "范围", task: "任务", gate: "关口", release: "上线申请", deploy: "部署实测" };
 
-type Ctx = { theme: PluginSurfaceProps["theme"]; compact: boolean };
+type Ctx = { theme: PluginSurfaceProps["theme"]; compact: boolean; navigation?: NavApi };
 
 function makeStyles({ theme, compact }: Ctx) {
   const c = theme.colors;
@@ -98,19 +98,32 @@ const RNImage = (() => {
 
 const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 
-/** 打开外部链接：web 宿主走 window.open，其余走 Linking.openURL；宿主缺能力时返回 false。 */
-function openExternal(url: string): boolean {
-  const win = (globalThis as { window?: { open?: (u: string, t?: string, f?: string) => unknown } }).window;
-  if ((RN as { Platform?: { OS?: string } }).Platform?.OS === "web" && typeof win?.open === "function") {
-    win.open(url, "_blank", "noopener");
-    return true;
-  }
+type NavApi = NonNullable<PluginSurfaceProps["navigation"]>;
+
+/** 在当前设备上打开链接：宿主内嵌浏览器 → Linking → window.open；都不行则由 remote(daemon 机器)兜底，返回落点。 */
+async function openExternalAnywhere(
+  url: string,
+  nav: NavApi | undefined,
+  remote: (input: { url: string }) => Promise<unknown>,
+): Promise<"local" | "remote"> {
+  try {
+    if (typeof nav?.openBrowser === "function") {
+      nav.openBrowser({ url, workspaceId: "" });
+      return "local";
+    }
+  } catch { /* 宿主拒绝内嵌浏览器时继续降级 */ }
   const linking = (RN as { Linking?: { openURL?: (u: string) => Promise<unknown> } }).Linking;
   if (linking && typeof linking.openURL === "function") {
-    void linking.openURL(url);
-    return true;
+    await linking.openURL(url);
+    return "local";
   }
-  return false;
+  const win = (globalThis as { window?: { open?: (u: string, t?: string, f?: string) => unknown } }).window;
+  if (typeof win?.open === "function") {
+    win.open(url, "_blank", "noopener");
+    return "local";
+  }
+  await remote({ url });
+  return "remote";
 }
 
 const formatSize = (bytes: number): string =>
@@ -124,7 +137,7 @@ function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttac
   const m = useMutation({
     mutationFn: async () => {
       const { url } = await getUrl({ taskId, name: a.relPath });
-      if (!openExternal(url)) await openRpc({ url });
+      await openExternalAnywhere(url, ctx.navigation, openRpc);
     },
   });
   return (
@@ -197,7 +210,7 @@ function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   return (
     <View style={{ gap: 2 }}>
       {links.map(u => (
-        <Pressable key={u} accessibilityRole="button" onPress={() => { if (!openExternal(u)) void openRpc({ url: u }); }}>
+        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalAnywhere(u, ctx.navigation, openRpc)}>
           <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}
@@ -785,7 +798,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 }
 
 export function CompanySurface(props: PluginSurfaceProps) {
-  const ctx: Ctx = { theme: props.theme, compact: props.layout.compact };
+  const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });
