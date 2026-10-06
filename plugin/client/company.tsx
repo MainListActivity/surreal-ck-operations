@@ -83,10 +83,18 @@ function ExpandableText({ text, lines, style, ctx }: { text: string; lines: numb
   );
 }
 
-/** Hosts may ship a narrow react-native subset; probe Image instead of assuming it. */
-const RNImage = (RN as Record<string, unknown>).Image as React.ComponentType<{
-  source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
-}> | undefined;
+/** Hosts may ship a narrow react-native subset; probe Image instead of assuming it.
+ *  A real component is a function/class or a React object (forwardRef/memo/lazy) that
+ *  carries $$typeof; native-module stubs are plain objects and must not reach JSX. */
+const RNImage = (() => {
+  const candidate = (RN as Record<string, unknown>).Image as unknown;
+  return (typeof candidate === "function" ||
+    (typeof candidate === "object" && candidate !== null && "$$typeof" in candidate))
+    ? candidate as React.ComponentType<{
+        source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
+      }>
+    : undefined;
+})();
 
 const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 
