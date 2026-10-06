@@ -233,16 +233,18 @@ async function atts(el,tid){
     el.innerHTML=(r.attachments||[]).map(a=>'<a class="att" target="_blank" href="'+a.url+'">'+esc(a.name)+' · '+((a.sizeBytes/1024).toFixed(1))+'KB · '+esc(a.kind)+'</a>').join('')||'';
   }catch(e){}
 }
+const newKey=()=>'k'+Date.now().toString(36)+Math.random().toString(36).slice(2,14);
 async function decide(tid,dec){
-  const noteEl=document.getElementById('n-'+tid),note=noteEl?noteEl.value:'';
-  if(dec!=='approve'&&note.trim().length<2){alert('退回/回复需要写明说明');return}
-  const key=crypto.randomUUID();
-  try{await api('decide',{taskId:tid,decision:dec,note,key});await load()}catch(e){alert(e.message)}
+  try{
+    const noteEl=document.getElementById('n-'+tid),note=noteEl?noteEl.value:'';
+    if(dec!=='approve'&&note.trim().length<2){alert('退回/回复需要写明说明');return}
+    await api('decide',{taskId:tid,decision:dec,note,key:newKey()});await load();
+  }catch(e){alert(e.message)}
 }
 async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
 async function instruct(){
   const t=document.getElementById('gm-text');if(!t.value.trim())return;
-  try{await api('instruct',{text:t.value,key:crypto.randomUUID()});t.value='';document.getElementById('gm-ok').textContent='已下达，经理稍后处理';await load()}catch(e){alert(e.message)}
+  try{await api('instruct',{text:t.value,key:newKey()});t.value='';document.getElementById('gm-ok').textContent='已下达，经理稍后处理';await load()}catch(e){alert(e.message)}
 }
 async function openDoc(name,el){
   if(el.dataset.open){el.dataset.open='';el.nextSibling.remove();return}
