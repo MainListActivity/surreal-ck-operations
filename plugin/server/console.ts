@@ -89,6 +89,9 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
     if (url.pathname !== prefix && !url.pathname.startsWith(prefix + "/")) {
       return text("not found", 404);
     }
+    // 浏览器相对地址以父路径为基：/o/<tok> 下 fetch('api/x') 会落到 /o/api/x。
+    // 302 到带尾斜杠形态，让页面内相对请求都留在 /o/<tok>/ 前缀内。
+    if (url.pathname === prefix) return new Response(null, { status: 302, headers: { Location: `${prefix}/` } });
     const sub = url.pathname.slice(prefix.length) || "/";
 
     try {
