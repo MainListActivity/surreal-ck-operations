@@ -98,6 +98,21 @@ const RNImage = (() => {
 
 const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 
+/** 打开外部链接：web 宿主走 window.open，其余走 Linking.openURL；宿主缺能力时返回 false。 */
+function openExternal(url: string): boolean {
+  const win = (globalThis as { window?: { open?: (u: string, t?: string, f?: string) => unknown } }).window;
+  if ((RN as { Platform?: { OS?: string } }).Platform?.OS === "web" && typeof win?.open === "function") {
+    win.open(url, "_blank", "noopener");
+    return true;
+  }
+  const linking = (RN as { Linking?: { openURL?: (u: string) => Promise<unknown> } }).Linking;
+  if (linking && typeof linking.openURL === "function") {
+    void linking.openURL(url);
+    return true;
+  }
+  return false;
+}
+
 const formatSize = (bytes: number): string =>
   bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
 
@@ -108,7 +123,7 @@ function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttac
   const m = useMutation({
     mutationFn: async () => {
       const { url } = await getUrl({ taskId, name: a.relPath });
-      await RN.Linking.openURL(url);
+      if (!openExternal(url)) throw new Error("宿主不支持打开外部链接");
     },
   });
   return (
@@ -180,7 +195,7 @@ function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   return (
     <View style={{ gap: 2 }}>
       {links.map(u => (
-        <Pressable key={u} accessibilityRole="button" onPress={() => void RN.Linking.openURL(u)}>
+        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternal(u)}>
           <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}
