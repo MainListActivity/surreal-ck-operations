@@ -120,10 +120,11 @@ const formatSize = (bytes: number): string =>
 function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttachment; label: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
   const getUrl = useRpc(rpc.attachmentUrl);
+  const openRpc = useRpc(rpc.openExternal);
   const m = useMutation({
     mutationFn: async () => {
       const { url } = await getUrl({ taskId, name: a.relPath });
-      if (!openExternal(url)) throw new Error("宿主不支持打开外部链接");
+      if (!openExternal(url)) await openRpc({ url });
     },
   });
   return (
@@ -190,12 +191,13 @@ const LINK_RE = /https?:\/\/[^\s"'<>）)】\]，。；、]+/g;
 /** One-click external links harvested from a submission/question body. */
 function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
+  const openRpc = useRpc(rpc.openExternal);
   const links = useMemo(() => [...new Set(text.match(LINK_RE) ?? [])].slice(0, 5), [text]);
   if (links.length === 0) return null;
   return (
     <View style={{ gap: 2 }}>
       {links.map(u => (
-        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternal(u)}>
+        <Pressable key={u} accessibilityRole="button" onPress={() => { if (!openExternal(u)) void openRpc({ url: u }); }}>
           <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}

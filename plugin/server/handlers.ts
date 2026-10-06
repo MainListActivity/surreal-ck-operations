@@ -114,6 +114,16 @@ export function registerHandlers(server: PluginServerContext): void {
     return { ok: true };
   });
 
+  server.handle(rpc.openExternal, async (input: RpcInput<typeof rpc.openExternal>) => {
+    const url = input.url.trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error("只允许 http(s) 链接");
+    const [bin, args] = process.platform === "darwin" ? ["/usr/bin/open", [url]]
+      : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]]
+      : ["xdg-open", [url]];
+    spawn(bin, args, { detached: true, stdio: "ignore" }).unref();
+    return { ok: true };
+  });
+
   server.handle(rpc.readAttachment, async (input: RpcInput<typeof rpc.readAttachment>) => {
     const {
       ATTACHMENT_READ_MAX_BYTES, attachmentKind, attachmentMime, resolveTaskAttachment,
