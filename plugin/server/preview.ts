@@ -71,6 +71,8 @@ export interface StartPreviewOptions {
   secret?: string;
   /** 测试注入：core 工厂（缺省 lazy import vendor 的 preview-core）。 */
   coreFactory?: CoreFactory;
+  /** 老板审核台 handler：/o/ 前缀的请求先走它（自带 token 门控），不进核心文件路由。 */
+  consoleFetch?: FetchHandler;
   log?: (msg: string) => void;
 }
 
@@ -116,8 +118,9 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
 
   const listen = (L: Listener, host: string, port: number, handlerFor: () => FetchHandler | undefined) => {
     if (stopped || L.dead) return;
+    const consoleHandler = opts.consoleFetch;
     const server = createServer((req, res) => {
-      const handler = handlerFor();
+      const handler = (consoleHandler && req.url?.startsWith("/o/")) ? consoleHandler : handlerFor();
       if (!handler) { res.writeHead(503).end("preview core unavailable"); return; }
       Promise.resolve().then(() => handler(toRequest(req))).then((out) => send(res, out)).catch((err) => {
         lastError = (err as Error).message;

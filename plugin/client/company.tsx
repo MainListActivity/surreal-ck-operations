@@ -272,12 +272,22 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   const queryClient = useQueryClient();
   const inboxRpc = useRpc(rpc.inbox);
   const resolve = useRpc(rpc.resolveNotice);
+  const consoleRpc = useRpc(rpc.consoleUrl);
+  const openRpc = useRpc(rpc.openExternal);
+  const consoleQ = useQuery({ queryKey: ["consoleUrl"], queryFn: () => consoleRpc({}), staleTime: 300_000 });
   const data = useQuery({ queryKey: ["inbox"], queryFn: () => inboxRpc({}), refetchInterval: 10_000 });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["inbox"] });
   const box: Inbox | undefined = data.data;
   const empty = box && box.gates.length + box.questions.length + box.notices.length === 0;
   return (
     <View style={{ gap: 12 }}>
+      {consoleQ.data?.url ? (
+        <Pressable accessibilityRole="button" style={s.card}
+          onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
+          <Text style={s.muted}>网页审核台（手机浏览器打开，可审待办/看手册）</Text>
+          <Text selectable style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{consoleQ.data.url}</Text>
+        </Pressable>
+      ) : null}
       <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
         {box?.gates.map(g => (
           <DecideCard key={g.task.id} taskId={g.task.id} kind="approve" ctx={ctx} onDone={refresh}

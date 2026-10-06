@@ -124,6 +124,12 @@ export function registerHandlers(server: PluginServerContext): void {
     return { ok: true };
   });
 
+  server.handle(rpc.consoleUrl, async () => {
+    const { consoleUrl } = await import("./console.ts");
+    const { previewLanBase } = await import("./vendor/src/deliverables.ts");
+    return { url: consoleUrl(serviceHome(), () => previewLanBase(serviceHome())) };
+  });
+
   server.handle(rpc.readAttachment, async (input: RpcInput<typeof rpc.readAttachment>) => {
     const {
       ATTACHMENT_READ_MAX_BYTES, attachmentKind, attachmentMime, resolveTaskAttachment,
