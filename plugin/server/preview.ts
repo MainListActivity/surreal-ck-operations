@@ -51,7 +51,13 @@ const toRequest = (req: IncomingMessage): Request => {
     if (v === undefined) continue;
     headers.set(k, Array.isArray(v) ? v.join(", ") : v);
   }
-  return new Request(`http://preview.local${req.url ?? "/"}`, { method: req.method, headers });
+  const init: RequestInit = { method: req.method, headers };
+  // POST/PUT 必须把 node 请求体接上，否则 handler 里 req.json() 读到空流报 unexpected end of JSON。
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    (init as RequestInit & { duplex: string }).duplex = "half";
+    (init as { body?: unknown }).body = Readable.toWeb(req);
+  }
+  return new Request(`http://preview.local${req.url ?? "/"}`, init);
 };
 
 const send = async (res: ServerResponse, out: Response): Promise<void> => {
