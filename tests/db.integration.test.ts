@@ -410,4 +410,54 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
   await expect(core.retireTask(gm, {
     taskId: 'no-such-task', text: '不存在任务', idempotencyKey: `retire-missing-${suffix}`,
   })).rejects.toMatchObject({ code: 'not_found' });
+
+  // --- owner 关口保护：作废未获批原型不得放行量产下游 ---
+  const proto = await core.createTask(gm, {
+    title: `Retire proto ${suffix}`, context: 'Concept-design prototype awaiting owner demo.',
+    executorRole: 'concept-design', reviewerRole: 'owner', kind: 'task',
+    idempotencyKey: `retire-proto-${suffix}`,
+  });
+  const mass = await core.createTask(gm, {
+    title: `Retire mass ${suffix}`, context: 'Mass production gated on the owner demo.',
+    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [proto.id],
+    idempotencyKey: `retire-mass-${suffix}`,
+  });
+  expect(mass.state).toBe('blocked');
+  // 有存活下游时拒绝退役原型
+  await expect(core.retireTask(gm, {
+    taskId: proto.id, text: '绕过 owner 关口退役原型', idempotencyKey: `retire-proto-do-${suffix}`,
+  })).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('dependents') });
+  expect((await core.getTask(gm, proto.id)).state).toBe('ready');
+  expect((await core.getTask(gm, mass.id)).state).toBe('blocked');
+  // 正确顺序：先退役下游，再退役原型
+  await core.retireTask(gm, {
+    taskId: mass.id, text: '先收尾废弃下游量产。', idempotencyKey: `retire-mass-do-${suffix}`,
+  });
+  const voidedProto = await core.retireTask(gm, {
+    taskId: proto.id, text: '下游已清，退役原型。', idempotencyKey: `retire-proto-do2-${suffix}`,
+  });
+  expect(voidedProto.state).toBe('void');
+  // 新建量产引用 void 原型不得视为 demo 已批准 → 保持 blocked
+  const lateMass = await core.createTask(gm, {
+    title: `Retire late mass ${suffix}`, context: 'New mass task referencing a voided prototype.',
+    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [proto.id],
+    idempotencyKey: `retire-latemass-${suffix}`,
+  });
+  expect(lateMass.state).toBe('blocked');
+
+  // --- 并发同 key 同载荷：两笔都按幂等重放返回同一结果 ---
+  const raceTarget = await core.createTask(gm, {
+    title: `Retire race ${suffix}`, context: 'Concurrent identical retire calls must both succeed.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-race-${suffix}`,
+  });
+  const raceInput = {
+    taskId: raceTarget.id, text: '并发相同请求幂等测试。', idempotencyKey: `retire-race-do-${suffix}`,
+  };
+  const [r1, r2] = await Promise.allSettled([core.retireTask(gm, raceInput), core.retireTask(gm, raceInput)]);
+  expect(r1.status).toBe('fulfilled');
+  expect(r2.status).toBe('fulfilled');
+  if (r1.status === 'fulfilled' && r2.status === 'fulfilled') {
+    expect(r1.value.state).toBe('void');
+    expect(r2.value.version).toBe(r1.value.version);
+  }
 });
