@@ -20,8 +20,8 @@ const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
-  "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "record_score", "heartbeat",
-  "deliverable_publish",
+  "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
+  "record_score", "heartbeat", "deliverable_publish",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -341,6 +341,7 @@ export class SidecarPool {
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, String(args.taskId), evidence());
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
+      case "retire_task": return core.retireTask(cred, args as never);
       case "record_score": return core.recordScore(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。

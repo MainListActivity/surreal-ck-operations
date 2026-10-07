@@ -256,3 +256,158 @@ test('real DB: different tasks can be claimed concurrently by same-role workers'
   const events = await allOutbox();
   expect(events.every((event, index) => index === 0 || event.sequence > events[index - 1]!.sequence)).toBe(true);
 });
+
+test('real DB: retire_task voids work, unblocks dependents, idempotent, releases leases', async () => {
+  const engX = await enrollment.enroll(`test-engx-${suffix}`, 'engineering', ['execute', 'review']);
+  const qaManage = await enrollment.enroll(`test-qam-${suffix}`, 'qa', ['execute', 'review', 'manage']);
+
+  // --- capability + role gate ---
+  const gateTask = await core.createTask(gm, {
+    title: `Retire gate target ${suffix}`, context: 'Synthetic target for capability denial.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-gate-${suffix}`,
+  });
+  await expect(core.retireTask(engX, {
+    taskId: gateTask.id, text: 'no manage cap', idempotencyKey: `retire-nocap-${suffix}`,
+  })).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.retireTask(qaManage, {
+    taskId: gateTask.id, text: 'manage cap but wrong role', idempotencyKey: `retire-role-${suffix}`,
+  })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // --- retire a blocked dependency: dependent chain unlocks ---
+  const dep = await core.createTask(gm, {
+    title: `Retire dep ${suffix}`, context: 'Duplicate-chain member to be voided.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-dep-${suffix}`,
+  });
+  const child = await core.createTask(gm, {
+    title: `Retire child ${suffix}`, context: 'Blocked on the soon-voided dep.',
+    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id],
+    idempotencyKey: `retire-child-${suffix}`,
+  });
+  const grandchild = await core.createTask(gm, {
+    title: `Retire grandchild ${suffix}`, context: 'Two hops downstream of the voided dep.',
+    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [child.id],
+    idempotencyKey: `retire-grandchild-${suffix}`,
+  });
+  // 下游只被作废依赖卡住的任务当场解锁；被别的未完依赖卡住的按兵不动。
+  const otherDep = await core.createTask(gm, {
+    title: `Retire other dep ${suffix}`, context: 'A second still-pending dependency.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-otherdep-${suffix}`,
+  });
+  const mixedChild = await core.createTask(gm, {
+    title: `Retire mixed child ${suffix}`, context: 'Blocked on voided dep AND a live dep.',
+    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id, otherDep.id],
+    idempotencyKey: `retire-mixed-${suffix}`,
+  });
+  expect(child.state).toBe('blocked');
+  expect(mixedChild.state).toBe('blocked');
+
+  const retired = await core.retireTask(gm, {
+    taskId: dep.id, text: '撞车产生的重复链成员，作废。', idempotencyKey: `retire-dep-do-${suffix}`,
+  });
+  expect(retired.state).toBe('void');
+  expect(retired.currentEmployee).toBeUndefined();
+  // 依赖清理：child 只剩 void 依赖 → ready；mixedChild 仍有未满足依赖 → 保持 blocked
+  expect((await core.getTask(gm, child.id)).state).toBe('ready');
+  expect((await core.getTask(gm, grandchild.id)).state).toBe('blocked'); // 还在等 child
+  expect((await core.getTask(gm, mixedChild.id)).state).toBe('blocked');
+
+  // 幂等：同 key 重放返回原结果；新 key 对 void 任务为空操作（version 不动）
+  const replayed = await core.retireTask(gm, {
+    taskId: dep.id, text: '撞车产生的重复链成员，作废。', idempotencyKey: `retire-dep-do-${suffix}`,
+  });
+  expect(replayed.version).toBe(retired.version);
+  const again = await core.retireTask(gm, {
+    taskId: dep.id, text: '重复作废应为幂等空操作。', idempotencyKey: `retire-dep-again-${suffix}`,
+  });
+  expect(again.state).toBe('void');
+  expect(again.version).toBe(retired.version);
+  await expect(core.retireTask(gm, {
+    taskId: dep.id, text: '同 key 不同载荷必须冲突。', idempotencyKey: `retire-dep-do-${suffix}`,
+  })).rejects.toMatchObject({ code: 'conflict' });
+
+  // void 任务不可领取/恢复/延期
+  await expect(core.claim(engX, dep.id)).rejects.toBeInstanceOf(CompanyError);
+  await expect(core.resume(gm, dep.id, {
+    text: 'Resume a void task must be denied.', idempotencyKey: `resume-void-${suffix}`,
+  })).rejects.toBeInstanceOf(CompanyError);
+  await expect(core.deferTaskUntil(gm, {
+    taskId: dep.id, dependencies: [otherDep.id], text: 'defer a void task must be denied',
+    idempotencyKey: `defer-void-${suffix}`,
+  })).rejects.toBeInstanceOf(CompanyError);
+
+  // 新任务依赖 void 任务视为已满足 → 直接 ready
+  const freeChild = await core.createTask(gm, {
+    title: `Retire free child ${suffix}`, context: 'Created after the dep was voided.',
+    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [dep.id],
+    idempotencyKey: `retire-freechild-${suffix}`,
+  });
+  expect(freeChild.state).toBe('ready');
+
+  // 全链路验收：child 正常走完 → grandchild 由常规 accept 解锁
+  const childClaim = await core.claim(engX, child.id);
+  const childProof: LeaseProof = { taskId: child.id, deliveryId: childClaim.deliveryId,
+    fence: childClaim.fence, expectedVersion: childClaim.task.version };
+  await core.submit(engX, childProof, {
+    text: 'Chain leg after retire completes normally.', idempotencyKey: `retire-child-submit-${suffix}`,
+  });
+  const childReview = await core.claim(qa, child.id);
+  await core.accept(qa, { taskId: child.id, deliveryId: childReview.deliveryId,
+    fence: childReview.fence, expectedVersion: childReview.task.version }, {
+    text: 'Accept unlocks the grandchild.', idempotencyKey: `retire-child-accept-${suffix}`,
+  });
+  expect((await core.getTask(gm, grandchild.id)).state).toBe('ready');
+
+  // --- 在执任务作废：释放租约、清 active_task、持有人续写被拒、下游解锁 ---
+  const doingDep = await core.createTask(gm, {
+    title: `Retire in-flight dep ${suffix}`, context: 'Claimed and then voided mid-flight.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-inflight-${suffix}`,
+  });
+  const doingChild = await core.createTask(gm, {
+    title: `Retire in-flight child ${suffix}`, context: 'Blocked on the in-flight dep.',
+    executorRole: 'engineering', reviewerRole: 'qa', dependencies: [doingDep.id],
+    idempotencyKey: `retire-inflight-child-${suffix}`,
+  });
+  const engY = await enrollment.enroll(`test-engy-${suffix}`, 'engineering', ['execute', 'review']);
+  const liveClaim = await core.claim(engY, doingDep.id);
+  expect(liveClaim.task.state).toBe('doing');
+  const voided = await core.retireTask(gm, {
+    taskId: doingDep.id, text: '在执任务作废：释放租约。', idempotencyKey: `retire-inflight-do-${suffix}`,
+  });
+  expect(voided.state).toBe('void');
+  expect(voided.currentEmployee).toBeUndefined();
+  expect(voided.leaseExpiresAt).toBeUndefined();
+  // 持有人旧租约的一切写操作被拒（'task retired' → conflict）
+  const staleProof: LeaseProof = { taskId: doingDep.id, deliveryId: liveClaim.deliveryId,
+    fence: liveClaim.fence, expectedVersion: liveClaim.task.version };
+  await expect(core.checkpoint(engY, staleProof, {
+    text: 'Lease released by retire must refuse writes.', idempotencyKey: `retire-stale-${suffix}`,
+  })).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('retired') });
+  // active_task 已清：同一员工可立即领取别的任务（unblocked 下游此时 ready）
+  const nextClaim = await core.claim(engY, doingChild.id);
+  expect(nextClaim.task.state).toBe('doing');
+  expect(nextClaim.task.id).toBe(doingChild.id);
+
+  // --- done 任务拒绝作废；expectedVersion 乐观并发 ---
+  const finished = await core.createTask(gm, {
+    title: `Retire finished ${suffix}`, context: 'Done tasks refuse retirement.',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `retire-fin-${suffix}`,
+  });
+  const finClaim = await core.claim(engX, finished.id);
+  await core.submit(engX, { taskId: finished.id, deliveryId: finClaim.deliveryId,
+    fence: finClaim.fence, expectedVersion: finClaim.task.version },
+    { text: 'Finishing before retire attempt.', idempotencyKey: `retire-fin-submit-${suffix}` });
+  const finReview = await core.claim(qa, finished.id);
+  await core.accept(qa, { taskId: finished.id, deliveryId: finReview.deliveryId,
+    fence: finReview.fence, expectedVersion: finReview.task.version },
+    { text: 'Accepting this task to done state.', idempotencyKey: `retire-fin-accept-${suffix}` });
+  await expect(core.retireTask(gm, {
+    taskId: finished.id, text: 'done 任务不可作废', idempotencyKey: `retire-fin-do-${suffix}`,
+  })).rejects.toMatchObject({ code: 'conflict' });
+  await expect(core.retireTask(gm, {
+    taskId: gateTask.id, text: 'version 漂移拒绝', idempotencyKey: `retire-ver-${suffix}`,
+    expectedVersion: 999,
+  })).rejects.toMatchObject({ code: 'conflict' });
+  await expect(core.retireTask(gm, {
+    taskId: 'no-such-task', text: '不存在任务', idempotencyKey: `retire-missing-${suffix}`,
+  })).rejects.toMatchObject({ code: 'not_found' });
+});
