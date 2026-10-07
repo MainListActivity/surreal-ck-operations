@@ -152,7 +152,7 @@ export function createGithubProjector(input: {
     if (!issue.comments.some(comment => comment.body.includes(marker))) {
       await github.comment(number, `${marker}\n事件：${event.kind}\n任务版本：${task.version}\n时间：${event.createdAt}\n详情以本机持久审计为准。`);
     }
-    if (task.state === 'done' && issue.state !== 'CLOSED') await github.closeIssue(number);
+    if ((task.state === 'done' || task.state === 'void') && issue.state !== 'CLOSED') await github.closeIssue(number);
     state.completedEvents.push(event.id);
     await saveState(statePath, state);
   };

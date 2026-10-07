@@ -1,5 +1,5 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
@@ -18,7 +18,7 @@ const STATE_COLOR: Record<string, string> = {
 const TIER_LABEL: Record<string, string> = { quick: "quick 小需求", standard: "standard 常规", program: "program 大项目" };
 const KIND_LABEL: Record<string, string> = { goal: "范围", task: "任务", gate: "关口", release: "上线申请", deploy: "部署实测" };
 
-type Ctx = { theme: PluginSurfaceProps["theme"]; compact: boolean };
+type Ctx = { theme: PluginSurfaceProps["theme"]; compact: boolean; navigation?: NavApi };
 
 function makeStyles({ theme, compact }: Ctx) {
   const c = theme.colors;
@@ -83,12 +83,48 @@ function ExpandableText({ text, lines, style, ctx }: { text: string; lines: numb
   );
 }
 
-/** Hosts may ship a narrow react-native subset; probe Image instead of assuming it. */
-const RNImage = (RN as Record<string, unknown>).Image as React.ComponentType<{
-  source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
-}> | undefined;
+/** Hosts may ship a narrow react-native subset; probe Image instead of assuming it.
+ *  A real component is a function/class or a React object (forwardRef/memo/lazy) that
+ *  carries $$typeof; native-module stubs are plain objects and must not reach JSX. */
+const RNImage = (() => {
+  const candidate = (RN as Record<string, unknown>).Image as unknown;
+  return (typeof candidate === "function" ||
+    (typeof candidate === "object" && candidate !== null && "$$typeof" in candidate))
+    ? candidate as React.ComponentType<{
+        source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
+      }>
+    : undefined;
+})();
 
 const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
+
+type NavApi = NonNullable<PluginSurfaceProps["navigation"]>;
+
+/** 在当前设备上打开链接：宿主内嵌浏览器 → Linking → window.open；都不行则由 remote(daemon 机器)兜底，返回落点。 */
+async function openExternalAnywhere(
+  url: string,
+  nav: NavApi | undefined,
+  remote: (input: { url: string }) => Promise<unknown>,
+): Promise<"local" | "remote"> {
+  try {
+    if (typeof nav?.openBrowser === "function") {
+      nav.openBrowser({ url, workspaceId: "" });
+      return "local";
+    }
+  } catch { /* 宿主拒绝内嵌浏览器时继续降级 */ }
+  const linking = (RN as { Linking?: { openURL?: (u: string) => Promise<unknown> } }).Linking;
+  if (linking && typeof linking.openURL === "function") {
+    await linking.openURL(url);
+    return "local";
+  }
+  const win = (globalThis as { window?: { open?: (u: string, t?: string, f?: string) => unknown } }).window;
+  if (typeof win?.open === "function") {
+    win.open(url, "_blank", "noopener");
+    return "local";
+  }
+  await remote({ url });
+  return "remote";
+}
 
 const formatSize = (bytes: number): string =>
   bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)}KB` : `${bytes}B`;
@@ -97,10 +133,11 @@ const formatSize = (bytes: number): string =>
 function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttachment; label: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
   const getUrl = useRpc(rpc.attachmentUrl);
+  const openRpc = useRpc(rpc.openExternal);
   const m = useMutation({
     mutationFn: async () => {
       const { url } = await getUrl({ taskId, name: a.relPath });
-      await openExternalUrl(url);
+      await openExternalAnywhere(url, ctx.navigation, openRpc);
     },
   });
   return (
@@ -167,12 +204,13 @@ const LINK_RE = /https?:\/\/[^\s"'<>）)】\]，。；、]+/g;
 /** One-click external links harvested from a submission/question body. */
 function LinkRows({ text, ctx }: { text: string; ctx: Ctx }) {
   const s = makeStyles(ctx);
+  const openRpc = useRpc(rpc.openExternal);
   const links = useMemo(() => [...new Set(text.match(LINK_RE) ?? [])].slice(0, 5), [text]);
   if (links.length === 0) return null;
   return (
     <View style={{ gap: 2 }}>
       {links.map(u => (
-        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalUrl(u)}>
+        <Pressable key={u} accessibilityRole="button" onPress={() => void openExternalAnywhere(u, ctx.navigation, openRpc)}>
           <Text style={{ color: ctx.theme.colors.accent, fontSize: 12 }} numberOfLines={1}>打开链接 {u}</Text>
         </Pressable>
       ))}
@@ -234,12 +272,22 @@ function InboxTab({ ctx }: { ctx: Ctx }) {
   const queryClient = useQueryClient();
   const inboxRpc = useRpc(rpc.inbox);
   const resolve = useRpc(rpc.resolveNotice);
+  const consoleRpc = useRpc(rpc.consoleUrl);
+  const openRpc = useRpc(rpc.openExternal);
+  const consoleQ = useQuery({ queryKey: ["consoleUrl"], queryFn: () => consoleRpc({}), staleTime: 300_000 });
   const data = useQuery({ queryKey: ["inbox"], queryFn: () => inboxRpc({}), refetchInterval: 10_000 });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["inbox"] });
   const box: Inbox | undefined = data.data;
   const empty = box && box.gates.length + box.questions.length + box.notices.length === 0;
   return (
     <View style={{ gap: 12 }}>
+      {consoleQ.data?.url ? (
+        <Pressable accessibilityRole="button" style={s.card}
+          onPress={() => void openExternalAnywhere(consoleQ.data!.url, ctx.navigation, openRpc)}>
+          <Text style={s.muted}>网页审核台（手机浏览器打开，可审待办/看手册）</Text>
+          <Text selectable style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{consoleQ.data.url}</Text>
+        </Pressable>
+      ) : null}
       <Section title="待批关口" count={box?.gates.length} ctx={ctx}>
         {box?.gates.map(g => (
           <DecideCard key={g.task.id} taskId={g.task.id} kind="approve" ctx={ctx} onDone={refresh}
@@ -760,7 +808,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 }
 
 export function CompanySurface(props: PluginSurfaceProps) {
-  const ctx: Ctx = { theme: props.theme, compact: props.layout.compact };
+  const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });

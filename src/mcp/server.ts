@@ -5,7 +5,7 @@ import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '..
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
-const states = ['blocked', 'ready', 'doing', 'review', 'done'] as const;
+const states = ['blocked', 'ready', 'doing', 'review', 'done', 'void'] as const;
 const proofShape = {
   taskId: z.string().min(1),
   deliveryId: z.string().min(1),
@@ -217,6 +217,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
       expectedVersion: z.number().int().positive().optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
+
+  server.registerTool('retire_task', {
+    description: 'gm/product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      text: z.string().min(4).max(8000),
+      idempotencyKey: z.string().min(1),
+      expectedVersion: z.number().int().positive().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
 
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',

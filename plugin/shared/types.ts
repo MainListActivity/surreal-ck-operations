@@ -1,7 +1,7 @@
 // Plain JSON shapes mirroring the company DB views. Kept self-contained: shared/ cannot import the repo.
 
 export type GoalTier = "quick" | "standard" | "program";
-export type TaskState = "blocked" | "ready" | "doing" | "review" | "done";
+export type TaskState = "blocked" | "ready" | "doing" | "review" | "done" | "void";
 export type Role = "gm" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "qa" | "cs" | "eval";
 export type TaskKind = "goal" | "task" | "gate" | "release" | "deploy";
 
