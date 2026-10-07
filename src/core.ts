@@ -25,9 +25,14 @@ export const asId = (value: unknown): string => value instanceof RecordId ? Stri
 /**
  * A dependency counts as satisfied when it is 'done', or when it is 'void' and not an
  * owner gate. Voiding an owner-reviewed task (prototype demo, acceptance gate) must not
- * stand in for the owner's approval, so dependents on it stay blocked.
+ * stand in for the owner's approval, so dependents on it stay blocked. Exemption: a
+ * dependent that is a goal anchor (member of its goal's anchors list) is rollup
+ * bookkeeping, not gated work. For anchors every 'void' dependency counts as satisfied,
+ * or retiring a gated task could never unblock the goal's acceptance anchor.
  */
 const DEP_UNSATISFIED = `state != 'done' AND (state != 'void' OR reviewer_role = 'owner')`;
+const depUnsatisfiedFor = (holder: string) =>
+  `state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND (${holder}.goal = NONE OR ${holder}.id NOT IN (${holder}.goal.anchors ?? []))))`;
 
 /**
  * Unlocks blocked children of $task whose dependencies are all finished ('done' or 'void')
@@ -37,7 +42,7 @@ const DEP_UNSATISFIED = `state != 'done' AND (state != 'void' OR reviewer_role =
 const UNLOCK_CHILDREN_SQL = `
   LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND $task IN dependencies;
   FOR $child IN $children {
-    LET $remaining = SELECT * FROM task WHERE id IN $child.dependencies AND ${DEP_UNSATISFIED};
+    LET $remaining = SELECT * FROM task WHERE id IN $child.dependencies AND ${depUnsatisfiedFor('$child')};
     IF array::len($remaining) = 0 {
       LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
       CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
@@ -665,7 +670,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
-        LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND ${DEP_UNSATISFIED};
+        LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND ${depUnsatisfiedFor('$t')};
         LET $next = UPDATE ONLY $task SET
           state = IF array::len($remaining) = 0 THEN (IF $t.resume_state = 'doing' THEN 'ready' ELSE $t.resume_state END) ELSE 'blocked' END,
           resume_role = NONE, resume_state = NONE, blocked_to = NONE, version = $t.version + 1 RETURN AFTER;
@@ -782,7 +787,7 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $d = NONE OR $d.goal != $t.goal { THROW 'defer denied: dependency missing or outside the task goal' };
       };
       LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
-      LET $remaining = SELECT VALUE id FROM task WHERE id IN $merged AND ${DEP_UNSATISFIED};
+      LET $remaining = SELECT VALUE id FROM task WHERE id IN $merged AND ${depUnsatisfiedFor('$t')};
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
         state = IF array::len($remaining) = 0 THEN 'ready' ELSE 'blocked' END,
@@ -834,8 +839,9 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     if (before.state === 'void') return view(before); // already terminal, idempotent no-op
     if (before.reviewer_role === 'owner') {
+      // Goal anchors are rollup bookkeeping; they never block retiring the gate itself.
       const [liveDependents] = await this.db.query<[RecordId[]]>(
-        'SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN [$done, $void];',
+        'SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN [$done, $void] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));',
         { task: id('task', input.taskId), done: 'done', void: 'void' });
       if (liveDependents.length > 0) {
         throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
@@ -855,7 +861,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
       IF $t.reviewer_role = 'owner' {
-        LET $live_dependents = SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN ['done', 'void'];
+        LET $live_dependents = SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
         IF array::len($live_dependents) > 0 { THROW 'retire refused: live owner-gate dependents' };
       };
       LET $next = UPDATE ONLY $task SET

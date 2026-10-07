@@ -3,8 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
-import { CompanyError, SurrealCompanyCore } from '../src/core.ts';
+import { CompanyError, SurrealCompanyCore, asId, id } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { OwnerDesk } from '../src/owner.ts';
 import type { LeaseProof } from '../src/contracts.ts';
 import type { OutboxEvent } from '../src/contracts.ts';
 
@@ -460,4 +461,48 @@ test('real DB: retire_task voids work, unblocks dependents, idempotent, releases
     expect(r1.value.state).toBe('void');
     expect(r2.value.version).toBe(r1.value.version);
   }
+
+  // --- 锚点死锁回归：owner 关口下游只剩锚点簿记时可退役，锚点不再被该 dep 卡住 ---
+  // quick 目标模板：链 d0(release)→d1(deploy)，锚点 manual 依赖 d1；
+  // GOAL_ANCHOR_SQL 会把每个新任务追加进锚点 dependencies，原型因此必有锚点下游。
+  const owner = new OwnerDesk(database);
+  const goal = await owner.createGoal({ text: `退役锚点回归 ${suffix}`, source: 'test', key: `retire-goal-${suffix}`, tier: 'quick' });
+  const protoG = await core.createTask(gm, {
+    title: `Goal proto ${suffix}`, context: 'Owner-gated prototype inside a goal.',
+    executorRole: 'concept-design', reviewerRole: 'owner', goalId: goal.id,
+    idempotencyKey: `retire-protoG-${suffix}`,
+  });
+  const massG = await core.createTask(gm, {
+    title: `Goal mass ${suffix}`, context: 'Mass production gated on the prototype.',
+    executorRole: 'asset-production', reviewerRole: 'gm', dependencies: [protoG.id], goalId: goal.id,
+    idempotencyKey: `retire-massG-${suffix}`,
+  });
+  const [anchorIds] = await database.db.query<[RecordId[]]>(
+    'SELECT VALUE anchors FROM ONLY $g;', { g: id('goal', goal.id) });
+  expect(anchorIds.length).toBeGreaterThan(0);
+  const anchorId = asId(anchorIds[0]);
+  const anchorDeps = (await core.getTask(gm, anchorId)).dependencies;
+  expect(anchorDeps).toContain(protoG.id);
+  expect(anchorDeps).toContain(massG.id);
+  // 锚点之外还有存活量产下游：退役原型仍被拒
+  await expect(core.retireTask(gm, {
+    taskId: protoG.id, text: '锚点豁免不该放行量产下游', idempotencyKey: `retire-protoG-do-${suffix}`,
+  })).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('dependents') });
+  // 先退役量产下游，再退役原型：此时下游只剩锚点簿记，退役放行
+  await core.retireTask(gm, {
+    taskId: massG.id, text: '退役量产后清原型。', idempotencyKey: `retire-massG-do-${suffix}`,
+  });
+  expect((await core.retireTask(gm, {
+    taskId: protoG.id, text: '下游仅剩锚点，退役原型。', idempotencyKey: `retire-protoG-do2-${suffix}`,
+  })).state).toBe('void');
+  // 锚点（簿记）把 void 一律视为已满足：清掉模板链剩余节点后锚点解锁为 ready
+  const [chainIds] = await database.db.query<[RecordId[]]>(
+    `SELECT VALUE id FROM task WHERE goal = $g AND state NOT IN ['done','void'] AND id NOT IN $anchors;`,
+    { g: id('goal', goal.id), anchors: anchorIds });
+  for (const tid of chainIds) {
+    await core.retireTask(gm, {
+      taskId: asId(tid), text: '清模板链剩余节点。', idempotencyKey: `retire-chain-${asId(tid)}-${suffix}`,
+    });
+  }
+  expect((await core.getTask(gm, anchorId)).state).toBe('ready');
 });
