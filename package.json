@@ -14,7 +14,8 @@
     "mcp:serve": "bun src/mcp/run.ts",
     "test:mcp:live": "bun scripts/live-mcp-check.ts",
     "company": "bun src/owner-cli.ts",
-    "dispatcher": "bun src/dispatcher/run.ts"
+    "dispatcher": "bun src/dispatcher/run.ts",
+    "test:channel": "bun test tests/dispatcher-sidecar.test.ts tests/dispatcher-sidecar.fork.test.ts tests/sidecar.test.ts tests/credential-file.test.ts tests/scrub.test.ts tests/weighted-order.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.1.0",

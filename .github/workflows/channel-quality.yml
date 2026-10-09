@@ -1,0 +1,25 @@
+name: Channel quality
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir plugin install --frozen-lockfile --ignore-scripts
+      - run: sh plugin/scripts/vendor.sh
+      - run: pnpm typecheck
+      - run: pnpm --dir plugin typecheck
+      - run: pnpm test:channel

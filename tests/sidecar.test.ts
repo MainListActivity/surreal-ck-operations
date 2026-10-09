@@ -239,19 +239,16 @@ describe('sidecar', () => {
     expect(released).toEqual(['e12', 'e12']);
   });
 
-  test('adopt rebuilds the lease proof for a live comm instance', async () => {
+  test('adopt quarantines unverifiable sessions without restoring a lease or consuming artifacts', async () => {
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
-    const legacy = inst('old', { credentialFile: '/tmp/x', paseoAgentId: 'a-old', activeTask: 't-x', credential: undefined });
     const live = inst('e9', { paseoAgentId: 'a-9', activeTask: 'task-9', credential: undefined });
-    employeeForGetTask = 'e9';
-    await fresh.adopt([legacy, live]);
-    const envDir = join(runDir, 'e9');
-    writeFileSync(reportPath(envDir), '重启后补交');
+    await fresh.adopt([live]);
+    writeFileSync(reportPath(join(runDir, 'e9')), '陈旧补交');
     await fresh.settle('a-9');
-    const submits = calls.filter(c => c.tool === 'submit');
-    expect(submits).toHaveLength(1);
-    // Proof rebuilt from getTask: deliveryId/fence/version from the task row.
-    expect(submits[0]!.proof).toEqual({ taskId: 'task-9', deliveryId: 'd-task-9', fence: 1, expectedVersion: 1 });
+    expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
+    expect(fresh.canReuse(live)).toBe(false);
+    await expect(fresh.claim(live, task('other'))).rejects.toMatchObject({ code: 'stale_channel' });
+    fresh.detachAgent('a-9');
   });
 });
 
