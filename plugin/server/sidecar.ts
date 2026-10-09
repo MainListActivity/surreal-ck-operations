@@ -201,12 +201,12 @@ export class SidecarPool {
       if (to) await this.deps.core.block(cred, live.proof, to, evidence);
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
-      this.archive(path, "done");
-      this.endLease(instId);
+      this.archiveIngested(path, text, "done");
+      if (this.claims.get(instId) === live) this.endLease(instId);
     } catch (error) {
       this.log(`sidecar finish ${live.taskId} for ${instId} failed: ${(error as Error).message}`);
-      this.archive(path, "failed");
-      this.endLease(instId); // lease is already gone or foreign; do not retry
+      this.archiveIngested(path, text, "failed");
+      if (this.claims.get(instId) === live) this.endLease(instId); // lease is already gone or foreign; do not retry
     }
   }
 
@@ -219,6 +219,14 @@ export class SidecarPool {
 
   private archive(path: string, tag: string): void {
     try { renameSync(path, `${path}.${tag}-${Date.now().toString(36)}`); } catch { /* already gone */ }
+  }
+
+  /** Archive only the exact artifact that was ingested: a file rewritten meanwhile
+   * (new turn, maybe a new lease) is not ours to move and stays for the next settle. */
+  private archiveIngested(path: string, ingested: string, tag: string): void {
+    const current = readTextFile(path);
+    if (current === undefined || current !== ingested) return;
+    this.archive(path, tag);
   }
 
   /** Agent archived: drop the binding and credential; any live lease expires on its own. */
@@ -263,10 +271,11 @@ export class SidecarPool {
         try {
           const cred = await this.credentialFor(instId);
           const result = await this.deps.core.heartbeat(cred, live.proof);
-          live.proof.expectedVersion = result.task.version;
+          // A late-settling beat must only touch the lease it was started for.
+          if (this.claims.get(instId) === live) live.proof.expectedVersion = result.task.version;
         } catch (error) {
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
-          this.endLease(instId);
+          if (this.claims.get(instId) === live) this.endLease(instId);
         }
       })();
     }, this.deps.heartbeatMs ?? HEARTBEAT_MS);
