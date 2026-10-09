@@ -60,6 +60,8 @@ interface LiveClaim {
 }
 
 export class SidecarPool {
+  private readonly launched = new Set<string>();
+  private readonly quarantined = new Set<string>();
   private readonly creds = new Map<string, string>();
   private readonly keys = new Map<string, string>();
   private readonly claims = new Map<string, LiveClaim>();
@@ -74,8 +76,14 @@ export class SidecarPool {
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
   env(inst: EmployeeInst): Record<string, string> {
+    if (this.quarantined.has(inst.id) || (inst.paseoAgentId && !this.canReuse(inst))) {
+      throw Object.assign(new Error("session channel cannot be restored; retire the instance"), { code: "stale_channel" });
+    }
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
+    const held = this.keys.get(inst.id);
+    if (held) return { SCK_COMM_DIR: dir, SCK_COMM_KEY: held };
+    this.launched.add(inst.id);
     const key = randomBytes(16).toString("hex");
     this.keys.set(inst.id, key);
     this.active.add(inst.id);
@@ -84,7 +92,14 @@ export class SidecarPool {
     return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key };
   }
 
+  /** Only a launch bound in this process can be reused, including management wakes. */
+  canReuse(inst: EmployeeInst): boolean {
+    return !this.quarantined.has(inst.id) && this.launched.has(inst.id) && this.keys.has(inst.id) &&
+      !!inst.paseoAgentId && this.instByAgent.get(inst.paseoAgentId) === inst.id;
+  }
+
   bindAgent(instId: string, agentId: string): void {
+    if (!this.launched.has(instId) || this.quarantined.has(instId)) throw new Error("channel was not launched in this process");
     for (const [agent, inst] of this.instByAgent) if (inst === instId) this.instByAgent.delete(agent);
     this.instByAgent.set(agentId, instId);
   }
@@ -103,6 +118,11 @@ export class SidecarPool {
     // Legacy instances still carry a credential file their agent reads directly;
     // rotating it here would kill their in-flight work. They phase out naturally.
     if (inst.credentialFile) return undefined;
+    if (this.quarantined.has(inst.id) || !this.launched.has(inst.id) || !this.keys.has(inst.id) ||
+        (inst.paseoAgentId && !this.canReuse(inst))) {
+      throw Object.assign(new Error("unhealthy session channel cannot claim"), { code: "stale_channel" });
+    }
+    if (this.claims.has(inst.id)) throw Object.assign(new Error("session already holds a lease"), { code: "already_claimed" });
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
     try {
@@ -115,6 +135,12 @@ export class SidecarPool {
     this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
+    // Requests queued under the previous/no lease cannot consume this new one.
+    for (const file of readdirSync(reqDir(dir))) {
+      if (!file.endsWith(".json")) continue;
+      try { unlinkSync(join(reqDir(dir), file)); } catch { continue; }
+      writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: false, error: "no_lease: request predates current claim" }));
+    }
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify(result));
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id,
@@ -169,18 +195,22 @@ export class SidecarPool {
     instId: string, live: LiveClaim, to: "gm" | undefined,
     text: string, path: string,
   ): Promise<void> {
-    const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${hash(text)}` };
+    const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) await this.deps.core.block(cred, live.proof, to, evidence);
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
-      this.archive(path, "done");
-      this.endLease(instId);
+      if (this.claims.get(instId) === live) {
+        this.archiveIngested(path, text, "done");
+        this.endLease(instId);
+      }
     } catch (error) {
       this.log(`sidecar finish ${live.taskId} for ${instId} failed: ${(error as Error).message}`);
-      this.archive(path, "failed");
-      this.endLease(instId); // lease is already gone or foreign; do not retry
+      if (this.claims.get(instId) === live) {
+        this.archiveIngested(path, text, "failed");
+        this.endLease(instId); // lease is already gone or foreign; do not retry
+      }
     }
   }
 
@@ -195,6 +225,14 @@ export class SidecarPool {
     try { renameSync(path, `${path}.${tag}-${Date.now().toString(36)}`); } catch { /* already gone */ }
   }
 
+  /** Caller must still own the captured lease. Also preserve content rewritten
+   * within that lease so the next settle can ingest it. */
+  private archiveIngested(path: string, ingested: string, tag: string): void {
+    const current = readTextFile(path);
+    if (current === undefined || current !== ingested) return;
+    this.archive(path, tag);
+  }
+
   /** Agent archived: drop the binding and credential; any live lease expires on its own. */
   detachAgent(agentId: string): void {
     const instId = this.instByAgent.get(agentId);
@@ -202,36 +240,28 @@ export class SidecarPool {
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
+    this.launched.delete(instId);
+    this.quarantined.add(instId);
     this.creds.delete(instId);
     this.keys.delete(instId);
     this.active.delete(instId);
   }
 
-  /** Plugin boot: rebuild bindings and live claims for comm-mode instances. */
+  /** Restart cannot authenticate the environment of an already-created Paseo session.
+   * Keep a deny-only binding until dispatcher retirement; never rotate credentials,
+   * rebuild a lease or ingest artifacts from an unverifiable session. */
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
-      if (inst.credentialFile || !inst.paseoAgentId) continue; // legacy token-file sessions keep their own path
+      if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
+      this.endLease(inst.id);
+      this.launched.delete(inst.id);
+      this.keys.delete(inst.id);
+      this.creds.delete(inst.id);
+      this.quarantined.add(inst.id);
       this.instByAgent.set(inst.paseoAgentId, inst.id);
       this.active.add(inst.id);
-      const dir = commDir(this.deps.runDir, inst.id);
-      ensureCommDirs(dir);
-      if (!inst.activeTask) continue;
-      try {
-        const cred = await this.credentialFor(inst.id); // rotates; old in-memory cred died with the process
-        const task = await this.deps.core.getTask(cred, inst.activeTask);
-        if (task.currentEmployee === inst.id && task.deliveryId && (task.state === "doing" || task.state === "review")) {
-          this.claims.set(inst.id, {
-            instId: inst.id, taskId: task.id,
-            proof: { taskId: task.id, deliveryId: task.deliveryId, fence: task.fence, expectedVersion: task.version },
-            reportHash: hash(readTextFile(reportPath(dir))),
-            blockerHash: hash(readTextFile(blockerPath(dir))),
-          });
-          this.startBeat(inst.id);
-          this.log(`sidecar adopted ${inst.id} on ${task.id}`);
-        }
-      } catch (error) {
-        this.log(`adopt ${inst.id} failed: ${(error as Error).message}`);
-      }
+      ensureCommDirs(commDir(this.deps.runDir, inst.id));
+      this.log(`sidecar quarantined ${inst.id}: channel binding unavailable after restart`);
     }
     this.ensureSweeper();
   }
@@ -245,10 +275,11 @@ export class SidecarPool {
         try {
           const cred = await this.credentialFor(instId);
           const result = await this.deps.core.heartbeat(cred, live.proof);
-          live.proof.expectedVersion = result.task.version;
+          // A late-settling beat must only touch the lease it was started for.
+          if (this.claims.get(instId) === live) live.proof.expectedVersion = result.task.version;
         } catch (error) {
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
-          this.endLease(instId);
+          if (this.claims.get(instId) === live) this.endLease(instId);
         }
       })();
     }, this.deps.heartbeatMs ?? HEARTBEAT_MS);
@@ -264,6 +295,7 @@ export class SidecarPool {
 
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
   private async dispatch(instId: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
+    const requestLease = this.claims.get(instId);
     const core = this.deps.core;
     const ops = this.deps.ops;
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? [])] };
@@ -276,14 +308,16 @@ export class SidecarPool {
     });
     const live = () => {
       const claim = this.claims.get(instId);
-      if (!claim) throw Object.assign(new Error("no active lease for this session"), { code: "no_lease" });
+      if (!claim || claim !== requestLease) throw Object.assign(new Error("no matching active lease for this request"), { code: "no_lease" });
       return claim;
     };
     const writeOp = async (op: (proof: LeaseProof) => Promise<TaskView>, consume = false): Promise<TaskView> => {
       const claim = live();
       const view = await op(claim.proof);
-      if (consume) this.endLease(instId);
-      else claim.proof.expectedVersion = view.version;
+      if (this.claims.get(instId) === claim) {
+        if (consume) this.endLease(instId);
+        else claim.proof.expectedVersion = view.version;
+      }
       return view;
     };
     if (ops?.tools.includes(tool)) {
@@ -352,7 +386,7 @@ export class SidecarPool {
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
       ? { ok: false, error: "malformed request" }
-      : this.keys.get(instId) !== undefined && req.key !== this.keys.get(instId)
+      : this.quarantined.has(instId) || !this.keys.has(instId) || req.key !== this.keys.get(instId)
         ? { ok: false, error: "stale comm key; this session predates a plugin restart" }
         : await this.dispatch(instId, req.tool, req.args ?? {})
             .then(data => ({ ok: true as const, data }))
