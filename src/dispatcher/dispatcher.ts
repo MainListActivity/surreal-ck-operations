@@ -251,6 +251,10 @@ export interface DispatcherDeps {
 export interface SidecarBridge {
   /** Environment for a fresh spawn: comm dir + key, never credentials. */
   env(inst: EmployeeInst): Record<string, string>;
+  /** A live launch binding in this plugin process; false after restart or detach. */
+  canReuse(inst: EmployeeInst): boolean;
+  /** Releases a session binding and all of its ops sessions. */
+  detachAgent(agentId: string): void;
   /** Claims the task as the instance and stages claim.json; undefined = lost the race. */
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
   /** Records the freshly spawned Paseo agentId for this instance. */
@@ -323,6 +327,14 @@ export class Dispatcher {
       if (!inst.paseoAgentId) {
         await wf.retire(inst.id, 'spawn did not bind a Paseo agent');
         report.retired.push(inst.id);
+        continue;
+      }
+      if (this.deps.sidecar && !inst.credentialFile && !this.deps.sidecar.canReuse(inst)) {
+        // Infrastructure failure, not a model/provider or employee performance failure.
+        states.set(inst.id, 'down');
+        await this.retireBroken(inst, '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false);
+        await paseo.stop(inst.paseoAgentId).catch(() => undefined);
+        await paseo.archive(inst.paseoAgentId).catch(() => undefined);
         continue;
       }
       const status = agents.get(inst.paseoAgentId)?.status ?? (await paseo.status(inst.paseoAgentId))?.status ?? 'missing';
@@ -861,7 +873,7 @@ export class Dispatcher {
     const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview, recusal);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
-    const existing = picked && !(sidecar && task && picked.credentialFile) ? picked : undefined;
+    const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
     if (existing) {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
@@ -952,6 +964,7 @@ export class Dispatcher {
 
   private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true) {
     await this.deps.workforce.retire(inst.id, reason);
+    if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
     if (inst.paseoAgentId) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
