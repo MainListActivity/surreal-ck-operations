@@ -15,6 +15,7 @@ import { writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { company } from "./company";
 import { loadServiceEnv, serviceHome } from "./env";
 
 /** 与 src/preview-core.ts 的 lanIPv4 等价：本层本地化，避免 vendor 缺席时模块加载即失败。 */
@@ -128,7 +129,11 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
     const server = createServer((req, res) => {
       const handler = (consoleHandler && req.url?.startsWith("/o/")) ? consoleHandler : handlerFor();
       if (!handler) { res.writeHead(503).end("preview core unavailable"); return; }
-      Promise.resolve().then(() => handler(toRequest(req))).then((out) => send(res, out)).catch((err) => {
+      Promise.resolve().then(async () => {
+        const request = toRequest(req);
+        if (new URL(request.url).pathname === "/internal-ai/status") return (await company()).ops.proofStatus(request);
+        return handler(request);
+      }).then((out) => send(res, out)).catch((err) => {
         lastError = (err as Error).message;
         res.writeHead(500).end("preview error");
       });

@@ -30,6 +30,11 @@ import {
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
+import { InternalAiProofBridge } from './proof-bridge.ts';
+import type { CompanyProofStore } from './proof-store.ts';
+import { ProofSigner } from './proof-signer.ts';
+import { identitySchema, sha256, proofToolContracts, proofToolSchemas, type ProofIdentity, type ProofTool } from './proof-contract.ts';
+import type { ProofFiles } from './proof-files.ts';
 
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
@@ -37,6 +42,7 @@ export const OPS_TOOLS = [
   'ops_idp_client_info', 'ops_idp_client_register',
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
+  'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -44,7 +50,9 @@ type Args = Record<string, unknown>;
 
 export interface OpsDeps {
   core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'>;
-  projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'>;
+  projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'> & Partial<Pick<ProjectStore, 'ensureSealed' | 'rotateSealed'>>;
+  proofStore?: CompanyProofStore;
+  serviceHome?: string;
   /** Sealing key; `create` lets the first seal mint one. */
   secretKey: (create?: boolean) => Buffer;
   controlEnv?: () => ControlPlaneEnv;
@@ -138,11 +146,35 @@ export class OpsBroker {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly handlers: Record<OpsTool, Handler>;
+  private readonly proofBridge?: InternalAiProofBridge;
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.sessions = new SessionStore(this.now);
+    if (deps.proofStore) this.proofBridge = new InternalAiProofBridge({
+      store: deps.proofStore, home: deps.serviceHome ?? process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany'), key: () => deps.secretKey(), now: this.now,
+      signer: async (project, env) => {
+        if (!deps.projects.ensureSealed) throw new CompanyError('not_configured', 'proof sealed storage unavailable');
+        const pem = await deps.projects.ensureSealed(project, env, 'INTERNAL_AI_PROOF_ED25519', ProofSigner.generate, deps.secretKey(true));
+        return new ProofSigner(pem);
+      },
+      rotate: async (project, env, kid) => {
+        if (!deps.projects.rotateSealed) throw new CompanyError('not_configured', 'issuer rotation unavailable');
+        const prior = await deps.projects.readSealed(project, env, 'INTERNAL_AI_PROOF_ED25519', deps.secretKey());
+        if (!prior || new ProofSigner(prior).kid !== kid) throw new CompanyError('conflict', 'issuer key changed');
+        const next = ProofSigner.generate();
+        await deps.projects.rotateSealed(project, env, 'INTERNAL_AI_PROOF_ED25519', prior, next, deps.secretKey());
+        return new ProofSigner(next);
+      },
+      identities: (scope, env, files) => this.proofIdentities(scope, env, files),
+      deliver: async (jwt, scope, env, handle) => {
+        const ctx = await this.context(scope, env); const session = this.session(ctx, { session: handle });
+        if (session.kind === 'customer') throw new CompanyError('forbidden', 'proof delivery requires ops audience');
+        const result = await this.product(ctx, session, 'POST', '/api/ops/internal-ai/company-proof', { proof: jwt });
+        return { status: result.status, ok: result.ok };
+      },
+    });
     this.handlers = {
       ops_info: (ctx) => this.info(ctx),
       ops_health: (ctx) => this.health(ctx),
@@ -165,6 +197,7 @@ export class OpsBroker {
       ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
+      ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
 
@@ -181,6 +214,55 @@ export class OpsBroker {
     } catch (error) {
       throw await this.failed(ctx, tool, error);
     }
+  }
+
+  private async internalProof(ctx: Ctx, tool: ProofTool, args: Args): Promise<Outcome> {
+    if (!this.proofBridge) throw new CompanyError('not_configured', 'internal AI proof bridge unavailable');
+    // Bridge upstream errors must never echo subjects, file bodies, signed capabilities or passwords.
+    try {
+      const value = await this.proofBridge.call(ctx.scope, ctx.env, tool, args);
+      const keyId = value && typeof value === 'object' && 'kid' in value ? String(value.kid) : value && typeof value === 'object' && 'keyId' in value ? String(value.keyId) : 'unchanged';
+      const digest = value && typeof value === 'object' && 'configurationDigest' in value ? String(value.configurationDigest) : value && typeof value === 'object' && 'digest' in value ? String(value.digest) : 'none';
+      const handleRef = typeof args.proofHandle === 'string' ? sha256(args.proofHandle) : value && typeof value === 'object' && 'proofHandle' in value ? sha256(String(value.proofHandle)) : 'none';
+      return { value, audit: { action: 'ops_proof', evidence: `${tool} keyId=${keyId} digest=${digest} proofRef=${handleRef}` } };
+    } catch (error) {
+      throw new CompanyError(error instanceof CompanyError ? error.code : 'upstream_error', 'internal AI proof request denied or unavailable');
+    }
+  }
+
+  async proofStatus(request: Request): Promise<Response> {
+    return this.proofBridge ? this.proofBridge.status(request) : new Response('status unavailable', { status: 503 });
+  }
+
+  /** Credentials originate in the sealed alias mapping; this path never ensures/repairs accounts or members. */
+  private async proofIdentities(scope: OpsScope, env: string, files: ProofFiles): Promise<ProofIdentity[]> {
+    const ctx = await this.context(scope, env);
+    const result: ProofIdentity[] = [];
+    for (const expected of files.manifest.identities) {
+      const password = await this.sealedPassword(ctx, expected.alias);
+      if (!password) throw new CompanyError('not_found', 'approved alias is not registered');
+      const username = accountUsername(expected.alias, ctx.cfg.accounts.prefix);
+      const login = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'customer' });
+      const session = this.sessions.create({ employeeId: scope.actor.employeeId, project: scope.project, env, alias: expected.alias, username, kind: 'customer', token: login.accessToken, expiresAt: login.expiresAt });
+      try {
+        const slug = files.manifest.workspaceSlug;
+        const item = (await this.listWorkspaces(ctx, session)).workspaces.find(w => w.slug === slug);
+        if (!item || item.role !== expected.workspaceRole) throw new CompanyError('forbidden', 'approved workspace membership unavailable');
+        await this.switchTo(ctx, session, item);
+        const response = await this.product(ctx, session, 'GET', '/api/internal-ai/identity?workspaceSlug=' + encodeURIComponent(slug));
+        if (!response.ok) throw new CompanyError('not_configured', 'trusted billing identity capability unavailable');
+        const parsed = identitySchema.safeParse(response.body);
+        if (!parsed.success) throw new CompanyError('upstream_error', 'trusted identity response unavailable');
+        const identity = parsed.data;
+        const tokenPayload: unknown = JSON.parse(Buffer.from(session.token.split('.')[1] ?? '', 'base64url').toString());
+        const subject = tokenPayload && typeof tokenPayload === 'object' && 'sub' in tokenPayload ? tokenPayload.sub : undefined;
+        const [users] = await this.runQuery(ctx, session, item.dbName, "SELECT subject, is_admin FROM user WHERE kind = 'human' AND disabled_at = NONE AND subject = $subject", { subject: identity.subject }) as [Array<{ subject: string; is_admin: boolean }>];
+        if (identity.subject !== subject || identity.database !== item.dbName || identity.workspaceRole !== expected.workspaceRole || identity.billingRole !== expected.billingRole || users?.length !== 1 || users[0]?.subject !== identity.subject || users[0]?.is_admin !== (expected.workspaceRole === 'admin')) throw new CompanyError('forbidden', 'trusted identity membership mismatch');
+        result.push({ ...identity, alias: expected.alias });
+      } finally { this.sessions.drop(session.id); }
+    }
+    if (result[0]?.spaceId !== result[1]?.spaceId || result[0]?.database !== result[1]?.database || result[0]?.billingAccountRef !== result[1]?.billingAccountRef || result[0]?.subject === result[1]?.subject) throw new CompanyError('forbidden', 'approved identities do not share the current workspace/account');
+    return result;
   }
 
   /** An instance is gone: its sessions go with it. */
@@ -221,7 +303,7 @@ export class OpsBroker {
     return {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
-        tools: OPS_TOOLS, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
+        tools: OPS_TOOLS, internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
         // Public client identifiers only (never secrets), so employees can align the channels
         // with what the IdP has registered (ops_idp_client_info) and the product hard-binds.
         clients: {

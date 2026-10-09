@@ -142,6 +142,32 @@ export class ProjectStore {
     { env, name: input.name, roles: input.roles ?? [], purpose: input.purpose, s: sealed });
   }
 
+  /** Concurrent issuer initialization never overwrites an existing sealed key. Trusted broker only. */
+  async ensureSealed(project: string, envName: string, name: string, create: () => string, key: Buffer): Promise<string> {
+    const existing = await this.readSealed(project, envName, name, key);
+    if (existing) return existing;
+    const env = await this.envId(project, envName);
+    const sealed = sealSecret(key, create(), secretAad(project, envName, name));
+    await this.db.query(`INSERT INTO env_secret { env: $env, name: $name, roles: [], purpose: "internal AI proof signing", ciphertext: $s.ciphertext, iv: $s.iv, tag: $s.tag, updated_at: time::now() }
+      ON DUPLICATE KEY UPDATE name = $input.name;`, { env, name, s: sealed });
+    const value = await this.readSealed(project, envName, name, key);
+    if (!value) throw new CompanyError('temporarily_unavailable', 'issuer key unavailable');
+    return value;
+  }
+
+  /** Compare-and-swap rotation; approval and old key identity are checked by the trusted issuer. */
+  async rotateSealed(project: string, envName: string, name: string, expected: string, replacement: string, key: Buffer): Promise<void> {
+    const env = await this.envId(project, envName);
+    const [rows] = await this.db.query<[Array<{ ciphertext: string; iv: string; tag: string }>]>(
+      'SELECT ciphertext, iv, tag FROM env_secret WHERE env = $env AND name = $name LIMIT 1;', { env, name });
+    const prior = rows[0];
+    if (!prior || openSecret(key, prior, secretAad(project, envName, name)) !== expected) throw new CompanyError('conflict', 'issuer key changed');
+    const next = sealSecret(key, replacement, secretAad(project, envName, name));
+    const [changed] = await this.db.query<[unknown[]]>(
+      'UPDATE env_secret SET ciphertext = $s.ciphertext, iv = $s.iv, tag = $s.tag, updated_at = time::now() WHERE env = $env AND name = $name AND ciphertext = $old.ciphertext AND tag = $old.tag RETURN AFTER;', { env, name, old: prior, s: next });
+    if (changed.length !== 1) throw new CompanyError('conflict', 'issuer key changed');
+  }
+
   /** Decrypts one secret; undefined when it was never sealed. Trusted callers only. */
   async readSealed(project: string, envName: string, name: string, key: Buffer): Promise<string | undefined> {
     const env = await this.envId(project, envName);
