@@ -5,12 +5,14 @@ export const PROOF_AUDIENCE = 'urn:surreal-ck:surreal_ck:production:internal-ai:
 export const PROOF_GOAL = '2e2a6e41c1193595';
 export const APPROVAL_MARKER = 'company-internal-ai-approve:v1:';
 const ref = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+// 仅 model 允许非空版本片段；绝对末尾断言同时拒绝尾部换行。
+const model = z.string().max(128).regex(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*(?![\s\S])/);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const endpoint = z.string().url().refine(v => { const u = new URL(v); return u.protocol === 'https:' && !u.username && !u.password && !u.search && !u.hash && !u.port; });
 export const manifestSchema = z.object({
   schemaVersion: z.literal(1), goalId: z.literal(PROOF_GOAL), project: z.literal('surreal_ck'), env: z.literal('production'),
   activityId: ref, workspaceSlug: z.string().regex(/^[a-z0-9-]{1,40}$/), documentHash: hash,
-  service: z.object({ accountRef: ref, endpoint, model: ref, priceRevision: ref }).strict(),
+  service: z.object({ accountRef: ref, endpoint, model, priceRevision: ref }).strict(),
   budget: z.object({ currency: z.literal('USD'), totalNanoUsd: z.number().int().positive().max(1_000_000_000), perAttemptNanoUsd: z.number().int().positive().max(100_000_000), maxAttempts: z.number().int().positive().max(30), autoTopupDisabled: z.literal(true) }).strict(),
   identities: z.tuple([
     z.object({ alias: z.literal('LCA04_REMOVABLE'), workspaceRole: z.literal('admin'), billingRole: z.literal('owner') }).strict(),
@@ -20,7 +22,7 @@ export const manifestSchema = z.object({
 export type ProofManifest = z.infer<typeof manifestSchema>;
 export const evidenceSchema = z.object({
   schemaVersion: z.literal(1), type: z.enum(['development-disabled', 'reviewed-service']), accountRef: ref,
-  endpoint, model: ref, priceRevision: ref, currency: z.literal('USD'), balanceNanoUsd: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  endpoint, model, priceRevision: ref, currency: z.literal('USD'), balanceNanoUsd: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   sampledAt: z.string().datetime(), expiresAt: z.string().datetime(), autoTopupDisabled: z.literal(true), serviceApproved: z.boolean(),
 }).strict();
 export type ServiceEvidence = z.infer<typeof evidenceSchema>;
