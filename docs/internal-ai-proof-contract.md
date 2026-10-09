@@ -14,6 +14,8 @@
 
 manifest（严格JSON，不接受未知字段）含schemaVersion=1、goalId=2e2a6e41c1193595、project=surreal_ck、env=production、activityId、service.accountRef/endpoint/model/priceRevision、budget.currency=USD/totalNanoUsd<=1e9/perAttemptNanoUsd<=1e8/maxAttempts<=30/autoTopupDisabled=true、documentHash、角色固定LCA04_REMOVABLE admin+owner与LCA04_MEMBER participant+member、workspaceSlug（当前ui01实际slug）、configurationDigest（上述规范JSON计算）。文件只允许对应审批任务evidenceDir或已发布deliverables根，普通文件、无隐藏/secret路径、无symlink，读取同一已打开fd，前后inode/size/mtime/ctime核对，最多256KiB；documentHash由代理实际字节校验，正文不落日志或证明。
 
+仅 `manifest.service.model` 与资料 `evidence.model` 使用版本模型标识：长度 1..128，由 ASCII 字母、数字、下划线、连字符构成的非空片段，以单个点号分隔。接受 `sensenova-6.8-flash-lite` 及原无点号模型；拒绝首尾/连续点号、空白（含尾部换行）、Unicode、URL/路径/query/fragment/百分号。其余通用 ref、nonce、task、activityId、accountRef、priceRevision、idempotencyKey 保持原规则，不因模型点号放宽。格式合法不代表模型、供应商账户、余额或价格已受审；跨文件模型必须相同，摘要、独立批准、disabled/enable 与其它门禁继续生效。当前 SenseNova 缺真实证书仍 unsupported、dataReady=false、paidCallsAllowed=0。
+
 正常身份来源：代理读取自己密封alias密码，正常customer PKCE登录（不ensure、不修复、不建账号成员，consent不绕过），从当前产品正常workspace/member通道核对subject/database。产品消费链提供只读 `GET /api/internal-ai/identity?workspaceSlug=...`，响应仅本调用者subject、spaceId、database、workspaceRole、billingRole、billingAccountRef；产品以正常workspace/成员/计费索引实时计算，不能回显body自报值。代理再比对正常workspace列表、scope切换和workspace user查询subject/is_admin，未知/不匹配拒签。该只读契约补齐计费身份；现有quota/邮箱不能推断owner/member。此消费端就绪前身份资料unavailable，不伪造ready。
 
 Proof claims绑定project/env/goal、requestTask/员工+delivery+fence、approvalTask/version/action/auditId、documentHash、完整manifest/digest、映射与映射digest、scope、jti、nonce、iat/exp、type、paidCallsAllowed、status能力。用途 `sck-internal-ai-proof+jwt`。nonce与idempotencyKey同scope同digest可复用同结果；改变任何activity/env/身份/用途冲突，不跨任务复用。
