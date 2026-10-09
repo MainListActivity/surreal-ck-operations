@@ -23,3 +23,13 @@ Proof claims绑定project/env/goal、requestTask/员工+delivery+fence、approva
 当前生产preview signed未配置，公网可达状态地址需按已有runbook复用公司发布面，由上线/部署阶段核定，不新购或SSH。本实现公开固定相对路径与pin契约，不能宣称origin已能访问。proofHandle最长300秒且租约结束失效；生产无真实审批/资料仍paidCallsAllowed=0。
 
 文件资料严格限制为最多256KiB的脱敏JSON白名单（不是通用PDF/账单读取器）；字段详见src/ops/proof-contract.ts evidenceSchema。不可变候选一任务一份，修改后须重新独立审批。所有响应和审核日志不含document正文、登录token、签名证明或真实subject。
+
+## 独立复核和发布交接
+
+本机（公司fork已安装）执行 `rtk proxy env RUN_COMPANY_PROOF_FORK_TESTS=1 pnpm test:bridge`，该测试自行启动隔离RocksDB，使用实际CompanyCore claim/submit/独立accept事件、正常IdP/客户接口合成fixture；不加载产品.env、不访问生产、不操作真实账号或模型。CI Quality gate执行公司/插件类型检查和无凭证相关单测，fork项显式skip，不能替代本机fork证据。
+
+发布仍需另一工程复核、独立上线申请。固定release安装按docs/company-service-operations.md，先从批准提交打包、根 `pnpm install --frozen-lockfile` 并由现有脚本安装固定release，schema010随MCP bootstrap新增；插件必须来自同一批准基线的独立打包worktree（保留并整合operations-v3的在途提交），`rtk proxy pnpm --dir plugin install --frozen-lockfile --ignore-scripts`、`rtk proxy sh plugin/scripts/vendor.sh`、公司和插件typecheck后reload现有sck-company，不新建dispatcher。vendor同时拷贝src和schema；不要把本开发worktree直接作为active或覆盖共享插件源码。
+
+部署核对 `/health`、`/ready`、ops_info六工具+JSON schema、公开keyId、公司固定release SHA和插件vendor基线SHA。使用真实已登记alias的只读通道验证映射；产品identity接口未就绪不得推断角色。公网状态地址由既有发布面配置，固定origin信任锚由产品CI消费，不把caller URL带进proof。先用development-disabled证明验证验签/撤回/expiry，再验证无审批enable拒绝、未知资料拒绝、nonce和跨scope拒绝；不调用模型，不充值。
+
+回滚：恢复此前固定公司release和对应独立插件包（包括其在途提交），reload同一插件。产品内部活动保持disabled/paidCallsAllowed=0；状态不可达、证明过期或key不匹配均拒绝。保留候选/proof/撤回记录及密封key，不删除历史、不重置预算；新表可留在库内。

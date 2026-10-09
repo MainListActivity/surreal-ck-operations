@@ -27,7 +27,7 @@ export type ServiceEvidence = z.infer<typeof evidenceSchema>;
 export const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
-  if (value && typeof value === 'object') return '{' + Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => JSON.stringify(k) + ':' + canonical(v)).join(',') + '}';
+  if (value && typeof value === 'object') return '{' + Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => JSON.stringify(k) + ':' + canonical(v)).join(',') + '}';
   return JSON.stringify(value);
 }
 export function configurationDigest(manifest: Omit<ProofManifest, 'configurationDigest'>): string { return sha256(canonical(manifest)); }

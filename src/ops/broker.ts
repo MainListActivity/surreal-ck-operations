@@ -25,7 +25,7 @@ import { SessionStore, type OpsSession } from './sessions.ts';
 import { InternalAiProofBridge } from './proof-bridge.ts';
 import type { CompanyProofStore } from './proof-store.ts';
 import { ProofSigner } from './proof-signer.ts';
-import { identitySchema, proofToolContracts, proofToolSchemas, type ProofIdentity, type ProofTool } from './proof-contract.ts';
+import { identitySchema, sha256, proofToolContracts, proofToolSchemas, type ProofIdentity, type ProofTool } from './proof-contract.ts';
 import type { ProofFiles } from './proof-files.ts';
 
 export const OPS_TOOLS = [
@@ -192,7 +192,9 @@ export class OpsBroker {
     try {
       const value = await this.proofBridge.call(ctx.scope, ctx.env, tool, args);
       const keyId = value && typeof value === 'object' && 'kid' in value ? String(value.kid) : value && typeof value === 'object' && 'keyId' in value ? String(value.keyId) : 'unchanged';
-      return { value, audit: { action: 'ops_proof', evidence: `${tool} completed keyId=${keyId} (task-scoped)` } };
+      const digest = value && typeof value === 'object' && 'configurationDigest' in value ? String(value.configurationDigest) : value && typeof value === 'object' && 'digest' in value ? String(value.digest) : 'none';
+      const handleRef = typeof args.proofHandle === 'string' ? sha256(args.proofHandle) : value && typeof value === 'object' && 'proofHandle' in value ? sha256(String(value.proofHandle)) : 'none';
+      return { value, audit: { action: 'ops_proof', evidence: `${tool} keyId=${keyId} digest=${digest} proofRef=${handleRef}` } };
     } catch (error) {
       throw new CompanyError(error instanceof CompanyError ? error.code : 'upstream_error', 'internal AI proof request denied or unavailable');
     }
