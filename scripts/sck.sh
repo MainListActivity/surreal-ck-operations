@@ -8,6 +8,13 @@ if [ "${1:-}" = "sync-gate" ]; then
   cd "$service_home/active"
   exec "$BUN" src/mcp/sync-gate.ts
 fi
+# Spawn env is one-shot: Paseo strips SCK_COMM_* on session resume/refresh, but
+# always re-injects PASEO_AGENT_ID. Re-enter comm mode via the sidecar's pointer.
+if [ -z "${SCK_COMM_DIR:-}" ] && [ -n "${PASEO_AGENT_ID:-}" ] && [ -f "$service_home/comm-agents/$PASEO_AGENT_ID" ]; then
+  SCK_COMM_DIR=$(/usr/bin/sed -n '1p' "$service_home/comm-agents/$PASEO_AGENT_ID")
+  SCK_COMM_KEY=$(/usr/bin/sed -n '2p' "$service_home/comm-agents/$PASEO_AGENT_ID")
+  export SCK_COMM_DIR SCK_COMM_KEY
+fi
 # Comm mode: the plugin sidecar owns the credential; the agent relays through
 # $SCK_COMM_DIR and carries no auth material at all.
 if [ -n "${SCK_COMM_DIR:-}" ]; then

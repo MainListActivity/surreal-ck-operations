@@ -5,7 +5,7 @@
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
@@ -89,9 +89,44 @@ export class SidecarPool {
     return commDir(this.deps.runDir, instId);
   }
 
+  /**
+   * Paseo injects spawn env only at session create — resume/refresh opens get
+   * env=undefined, which silently strips SCK_COMM_DIR/SCK_COMM_KEY from the
+   * process. Every open does carry PASEO_AGENT_ID though, so sck can re-enter
+   * comm mode through this pointer file (dir + key, no auth material).
+   */
+  private bindDir(): string {
+    return join(dirname(this.deps.runDir), "comm-agents");
+  }
+
+  private keyFor(instId: string): string {
+    const held = this.keys.get(instId);
+    if (held) return held;
+    const key = randomBytes(16).toString("hex");
+    this.keys.set(instId, key);
+    return key;
+  }
+
+  private writeBinding(agentId: string, instId: string): void {
+    try {
+      mkdirSync(this.bindDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(join(this.bindDir(), agentId), `${commDir(this.deps.runDir, instId)}\n${this.keyFor(instId)}\n`, { mode: 0o600 });
+    } catch (error) {
+      this.log(`bind file ${agentId} failed: ${(error as Error).message}`);
+    }
+  }
+
+  private dropBinding(agentId: string): void {
+    try { unlinkSync(join(this.bindDir(), agentId)); } catch { /* already gone */ }
+  }
+
   bindAgent(instId: string, agentId: string): void {
-    for (const [agent, inst] of this.instByAgent) if (inst === instId) this.instByAgent.delete(agent);
+    for (const [agent, inst] of this.instByAgent) if (inst === instId) {
+      this.instByAgent.delete(agent);
+      this.dropBinding(agent);
+    }
     this.instByAgent.set(agentId, instId);
+    this.writeBinding(agentId, instId);
   }
 
   private async credentialFor(instId: string): Promise<string> {
@@ -230,6 +265,7 @@ export class SidecarPool {
   detachAgent(agentId: string): void {
     const instId = this.instByAgent.get(agentId);
     this.instByAgent.delete(agentId);
+    this.dropBinding(agentId);
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
@@ -244,6 +280,7 @@ export class SidecarPool {
       if (inst.credentialFile || !inst.paseoAgentId) continue; // legacy token-file sessions keep their own path
       this.instByAgent.set(inst.paseoAgentId, inst.id);
       this.active.add(inst.id);
+      this.writeBinding(inst.paseoAgentId, inst.id);
       const dir = commDir(this.deps.runDir, inst.id);
       ensureCommDirs(dir);
       if (!inst.activeTask) continue;
