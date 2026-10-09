@@ -15,6 +15,7 @@ import { PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofMan
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
 import { loadProofFiles } from '../src/ops/proof-files.ts';
 import { brokerConfig, FakeWorld, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const enabled = process.env.RUN_COMPANY_PROOF_FORK_TESTS === '1';
 const check = test.skipIf(!enabled);
 let dir: string, url: string, child: ReturnType<typeof Bun.spawn>, database: CompanyDatabase;
@@ -109,6 +110,31 @@ beforeAll(async () => {
   trusted=await request('ops_internal_ai_trust') as ReturnType<ProofSigner['trust']>;
 },20_000);
 afterAll(async()=>{if(enabled){await stop();world.sqlite.close();await rm(dir,{recursive:true,force:true});}});
+check('actual versioned SenseNova disabled files prepare an immutable candidate across fork restart without identity or model calls', async () => {
+  const preparer = await new LocalEnrollmentAdmin(database).enroll('test-disabled-preparer', 'engineering', ['execute', 'review']);
+  const task = await core.createTask(gm, { title: 'Synthetic disabled SenseNova preparation', context: 'No supplier evidence or paid calls', executorRole: 'engineering', reviewerRole: 'qa', goalId: PROOF_GOAL, idempotencyKey: randomUUID() });
+  await core.claim(preparer, task.id);
+  const fixture = disabledSenseNovaFixture();
+  const root = join(dir, 'evidence', task.id); await mkdir(root, { recursive: true });
+  const mp = join(root, 'manifest.json'), dp = join(root, 'evidence.json');
+  await writeFile(mp, JSON.stringify(fixture.manifest)); await writeFile(dp, fixture.documentBytes);
+  const files = await loadProofFiles(dir, task.id, mp, dp);
+  const requestsBefore = world.requests.length;
+  const prepare = () => ops.call(preparer, task.id, 'ops_internal_ai_prepare', { manifestPath: mp, documentPath: dp });
+  expect(await prepare()).toMatchObject({ documentHash: files.documentHash, digest: fixture.manifest.configurationDigest, paidCallsAllowed: 0 });
+  const stored = await new CompanyProofStore(database.db, now).candidate(task.id);
+  expect(stored?.document_hash).toBe(files.documentHash);
+  expect(stored?.manifest_hash).toBe(files.manifestHash);
+  expect(world.requests.length).toBe(requestsBefore);
+  await stop(); await start(); await connect(); broker();
+  expect(await new CompanyProofStore(database.db, now).candidate(task.id)).toEqual(stored);
+  expect(await prepare()).toMatchObject({ paidCallsAllowed: 0 });
+  // 无审批/未核定资料即使模型格式合法也不签 enable。
+  await expect(ops.call(preparer, task.id, 'ops_internal_ai_prove', { mode: 'enable', manifestPath: mp, documentPath: dp, activityId: fixture.manifest.activityId, nonce: 'synthetic-sensenova-nonce', idempotencyKey: 'synthetic-enable' })).rejects.toBeDefined();
+  await writeFile(mp, JSON.stringify({ ...fixture.manifest, configurationDigest: '0'.repeat(64) }));
+  await expect(prepare()).rejects.toBeDefined();
+  expect(world.requests.length).toBe(requestsBefore);
+});
 check('real approval, byte hashes, normal alias mapping, encrypted proof and public signature',async()=>{
   await new CompanyProofStore(database.db,now).approval(approvalTask,'production',await loadProofFiles(dir,approvalTask,manifestPath,documentPath));
   const a=await request('ops_internal_ai_prove',proofArgs());

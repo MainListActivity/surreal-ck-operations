@@ -2,10 +2,76 @@ import { expect, test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readProofFile } from '../src/ops/proof-files.ts';
+import { createHash } from 'node:crypto';
+import { readProofFile, loadProofFiles } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
-import { proofToolSchemas, PROOF_AUDIENCE } from '../src/ops/proof-contract.ts';
+import { proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest } from '../src/ops/proof-contract.ts';
+import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const now=Date.now(),sec=Math.floor(now/1000);
+test('actual SenseNova version model parses in both fields and full development-disabled documents', () => {
+  const { manifest, evidence } = disabledSenseNovaFixture();
+  expect(manifestSchema.shape.service.shape.model.safeParse('sensenova-6.8-flash-lite').success).toBe(true);
+  expect(evidenceSchema.shape.model.safeParse('sensenova-6.8-flash-lite').success).toBe(true);
+  expect(manifestSchema.safeParse(manifest).success).toBe(true);
+  expect(evidenceSchema.safeParse(evidence).success).toBe(true);
+});
+test('model keeps legacy identifiers and the 128-character bound; unsafe version segments reject', () => {
+  for (const schema of [manifestSchema.shape.service.shape.model, evidenceSchema.shape.model]) {
+    for (const value of ['sensenova-flash-lite', 'gpt-4o-mini-2024-07-18', 'jev-1.13.0', 'A_B-9', 'a'.repeat(128), 'a'.repeat(126) + '.b']) {
+      expect(schema.safeParse(value).success).toBe(true);
+    }
+    for (const value of ['', 'a'.repeat(129), ' a', 'a ', 'a b', 'a\n', 'a\r\n', 'a\nb', 'a\tb', '/a', 'a/b', 'a\\b', 'https://token.sensenova.cn', 'a?b', 'a#b', 'a%2eb', '模型', 'aé', '.a', 'a.', 'a..b', '.', '..']) {
+      expect(schema.safeParse(value).success).toBe(false);
+    }
+  }
+});
+test('model dots do not widen any other ref or allow unknown document fields', () => {
+  const { manifest, evidence } = disabledSenseNovaFixture();
+  expect(manifestSchema.safeParse({ ...manifest, activityId: 'activity.v1' }).success).toBe(false);
+  for (const field of ['accountRef', 'priceRevision'] as const) {
+    expect(manifestSchema.safeParse({ ...manifest, service: { ...manifest.service, [field]: 'ref.v1' } }).success).toBe(false);
+    expect(evidenceSchema.safeParse({ ...evidence, [field]: 'ref.v1' }).success).toBe(false);
+  }
+  const request = { mode: 'register-disabled', manifestPath: '/fixture.json', documentPath: '/evidence.json', activityId: 'fixture', nonce: 'synthetic-nonce-1234', idempotencyKey: 'request', approvalTask: 'approved-task' };
+  for (const field of ['activityId', 'approvalTask', 'idempotencyKey', 'nonce']) {
+    expect(proofToolSchemas.ops_internal_ai_prove.safeParse({ ...request, [field]: 'synthetic-identifier.v1' }).success).toBe(false);
+  }
+  expect(manifestSchema.safeParse({ ...manifest, callerSubject: 'untrusted' }).success).toBe(false);
+  expect(manifestSchema.safeParse({ ...manifest, service: { ...manifest.service, price: 0 } }).success).toBe(false);
+  expect(evidenceSchema.safeParse({ ...evidence, tokenPlan: 'unreviewed' }).success).toBe(false);
+});
+test('real disabled SenseNova JSON bytes load; model mismatch and document/hash/configuration tampering reject', async () => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'proof-model-unit-')));
+  const task = 'synthetic-task';
+  const root = join(home, 'evidence', task); await mkdir(root, { recursive: true });
+  const manifestPath = join(root, 'manifest.json'), documentPath = join(root, 'evidence.json');
+  const fixture = disabledSenseNovaFixture();
+  const restore = async () => { await writeFile(documentPath, fixture.documentBytes); await writeFile(manifestPath, JSON.stringify(fixture.manifest)); };
+  try {
+    await restore();
+    const files = await loadProofFiles(home, task, manifestPath, documentPath);
+    expect(files.manifest.service.model).toBe('sensenova-6.8-flash-lite');
+    expect(files.evidence.model).toBe('sensenova-6.8-flash-lite');
+    expect(files.evidence.type).toBe('development-disabled');
+    expect(files.evidence.balanceNanoUsd).toBe(0); expect(files.evidence.serviceApproved).toBe(false);
+    expect(files.documentHash).toBe(createHash('sha256').update(fixture.documentBytes).digest('hex'));
+    await writeFile(documentPath, fixture.documentBytes + '\n');
+    await expect(loadProofFiles(home, task, manifestPath, documentPath)).rejects.toBeDefined();
+    await restore();
+    await writeFile(manifestPath, JSON.stringify({ ...fixture.manifest, documentHash: 'a'.repeat(64) }));
+    await expect(loadProofFiles(home, task, manifestPath, documentPath)).rejects.toBeDefined();
+    await restore();
+    await writeFile(manifestPath, JSON.stringify({ ...fixture.manifest, budget: { ...fixture.manifest.budget, maxAttempts: 29 } }));
+    await expect(loadProofFiles(home, task, manifestPath, documentPath)).rejects.toBeDefined();
+    // 两份文件都各自合法，摘要也同步更新，仍不能混用不同模型。
+    const bytes = JSON.stringify({ ...fixture.evidence, model: 'sensenova-6.8-other' });
+    const { configurationDigest: _digest, ...rest } = fixture.manifest;
+    const changed = { ...rest, documentHash: createHash('sha256').update(bytes).digest('hex') };
+    await writeFile(documentPath, bytes);
+    await writeFile(manifestPath, JSON.stringify({ ...changed, configurationDigest: configurationDigest(changed) }));
+    await expect(loadProofFiles(home, task, manifestPath, documentPath)).rejects.toBeDefined();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
 test('pinned Ed25519 signature rejects alteration, other key/kid/audience/type, expiry and stale status',()=>{
   const signer=new ProofSigner(ProofSigner.generate()), trust=signer.trust();
   const jwt=signer.sign('proof',{iat:sec,exp:sec+300,jti:'fixture'});
