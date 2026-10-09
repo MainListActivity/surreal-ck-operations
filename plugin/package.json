@@ -28,6 +28,6 @@
   },
   "dependencies": {
     "hash-wasm": "^4.12.0",
-    "surrealdb": "^2.0.8"
+    "surrealdb": "2.0.8"
   }
 }

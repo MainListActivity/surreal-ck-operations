@@ -11,6 +11,7 @@ export interface Company {
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
   core: import("./vendor/src/contracts").CompanyCore;
   sidecar: import("./sidecar").SidecarPool;
+  ops: import("./vendor/src/ops/broker").OpsBroker;
 }
 
 let boot: Promise<Company> | undefined;
@@ -32,6 +33,7 @@ export function company(): Promise<Company> {
     const { Workforce } = await import("./vendor/src/workforce.ts");
     const { SurrealCompanyCore } = await import("./vendor/src/core.ts");
     const { ProjectStore, loadSecretKey } = await import("./vendor/src/projects.ts");
+    const { CompanyProofStore } = await import("./vendor/src/ops/proof-store.ts");
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
@@ -48,7 +50,7 @@ export function company(): Promise<Company> {
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
-      core, projects: new ProjectStore(db.db), secretKey: loadSecretKey,
+      core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db),
       log: message => console.log(message),
     });
     const sidecar = new SidecarPool({
@@ -93,7 +95,7 @@ export function company(): Promise<Company> {
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
     await sidecar.adopt(await workforce.insts());
-    return { db, owner, workforce, dispatcher, core, sidecar };
+    return { db, owner, workforce, dispatcher, core, sidecar, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;
