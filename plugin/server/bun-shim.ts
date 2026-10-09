@@ -20,8 +20,8 @@ const spawn = (cmd: string[], opts: { stdout: string; stderr: string; stdin: str
   });
   return {
     exited,
-    stdout: Readable.toWeb(child.stdout!) as ReadableStream,
-    stderr: Readable.toWeb(child.stderr!) as ReadableStream,
+    stdout: Readable.toWeb(child.stdout!) as unknown as ReadableStream,
+    stderr: Readable.toWeb(child.stderr!) as unknown as ReadableStream,
     kill: () => child.kill(),
   };
 };

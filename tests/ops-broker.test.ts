@@ -39,10 +39,11 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 }
 
 describe('ops gate', () => {
-  test('every ops tool is exercised by this suite', () => {
+  test('ops tools are enumerated (proof tools exercised by independent fork suite)', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info', 'ops_login', 'ops_logout', 'ops_member_add',
-      'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info',
+      'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
+      'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
