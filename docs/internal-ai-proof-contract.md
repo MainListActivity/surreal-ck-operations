@@ -9,6 +9,7 @@
 - `ops_internal_ai_prove {env?, mode:"register-disabled"|"enable", approvalTask?, manifestPath, documentPath, activityId, nonce, idempotencyKey}`：enable必须找到同goal/project独立review的真实done/accept（或owner approve）审计，接受证据含精确 `company-internal-ai-approve:v1:<digest>`，且已prepare候选完全一致。普通taskRef/version、subscription.manage、GM拆链文字不算审批。disabled从当前任务读取，证明类型development-disabled、paidCallsAllowed=0，不冒充余额ready。仅返回task-bound proofHandle及脱敏摘要。
 - `ops_internal_ai_deliver {env?, proofHandle, session}`：运营会话调用固定产品POST `/api/ops/internal-ai/company-proof`；原始JWS、subject、状态认证能力仅代理→产品内部传送，员工响应仅状态/非敏感摘要。消费端未部署时准确报告不可用。
 - `ops_internal_ai_revoke {env?, proofHandle}`：持久撤回并审计；同scope可跨重试撤回，不能越租约/环境/身份。
+- `ops_internal_ai_rotate_key {env?, approvalTask, expectedKid}`：必须有真实独立done/accept或owner批准，接受证据单独含 `company-internal-ai-key-rotation:v1:surreal_ck:production:<当前kid>`；代理CAS轮换密封私钥，只返回新公开信任锚。旧证明立即失效；产品CI先pin新锚后才恢复受控活动。
 - `ops_internal_ai_trust {env?}`：仅公开issuer/audience/alg/kid/JWK/契约与状态路径。
 
 manifest（严格JSON，不接受未知字段）含schemaVersion=1、goalId=2e2a6e41c1193595、project=surreal_ck、env=production、activityId、service.accountRef/endpoint/model/priceRevision、budget.currency=USD/totalNanoUsd<=1e9/perAttemptNanoUsd<=1e8/maxAttempts<=30/autoTopupDisabled=true、documentHash、角色固定LCA04_REMOVABLE admin+owner与LCA04_MEMBER participant+member、workspaceSlug（当前ui01实际slug）、configurationDigest（上述规范JSON计算）。文件只允许对应审批任务evidenceDir或已发布deliverables根，普通文件、无隐藏/secret路径、无symlink，读取同一已打开fd，前后inode/size/mtime/ctime核对，最多256KiB；documentHash由代理实际字节校验，正文不落日志或证明。
@@ -20,3 +21,5 @@ Proof claims绑定project/env/goal、requestTask/员工+delivery+fence、approva
 状态复用现有preview发布面 `GET /internal-ai/status`，仅Bearer专用随机status能力（proof内交产品）与`x-sck-nonce`，不使用preview HMAC。答复为EdDSA签名 `sck-internal-ai-status+jwt`，只含指定jti/valid/版本/checkedAt/expiry/nonce。私有task/history/文件不开放。每次状态请求重新查审批事件/任务版本、实际文件hash、当前租约、employee撤权及真实身份映射；失败、未知或变更均拒绝/invalid。新登记/enable必取当前状态；新的模型调用/续跑状态年龄<=60秒、exp有效，否则fail-closed。无后台timer。
 
 当前生产preview signed未配置，公网可达状态地址需按已有runbook复用公司发布面，由上线/部署阶段核定，不新购或SSH。本实现公开固定相对路径与pin契约，不能宣称origin已能访问。proofHandle最长300秒且租约结束失效；生产无真实审批/资料仍paidCallsAllowed=0。
+
+文件资料严格限制为最多256KiB的脱敏JSON白名单（不是通用PDF/账单读取器）；字段详见src/ops/proof-contract.ts evidenceSchema。不可变候选一任务一份，修改后须重新独立审批。所有响应和审核日志不含document正文、登录token、签名证明或真实subject。
