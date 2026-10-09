@@ -192,3 +192,34 @@ describe('迟到收尾与新租约交错', () => {
     } finally { h.cleanup(); }
   });
 });
+
+for (const artifact of ["report", "blocker"] as const) {
+  for (const outcome of ["success", "failure"] as const) {
+    test(`old ${artifact} late ${outcome} preserves identical-text new lease artifact`, async () => {
+      const h = harness({ hang: artifact === "report" ? "submit" : "block" });
+      const path = artifact === "report" ? reportPath(h.dir) : blockerPath(h.dir);
+      try {
+        await h.claim("A");
+        writeFileSync(path, "repeatable synthetic evidence");
+        const settling = h.pool.settle("synthetic-agent");
+        await h.entered.promise;
+        expect((await h.relay("submit")).ok).toBe(true);
+        // B receives a distinct baseline, then writes its own same-text artifact.
+        writeFileSync(path, "prior artifact baseline");
+        await h.claim("B");
+        writeFileSync(path, "repeatable synthetic evidence");
+        if (outcome === "success") h.pending.resolve({ task: { id: "A", version: 3, state: "review" } });
+        else h.pending.reject(Object.assign(Error("stale lease A"), { code: "stale_lease" }));
+        await settling;
+        expect((await h.relay("ops_info")).ok).toBe(true);
+        expect(existsSync(path)).toBe(true);
+        expect(readFileSync(path, "utf8")).toBe("repeatable synthetic evidence");
+        expect(readdirSync(h.dir).some(n => n.startsWith(`${artifact}.md.done-`) || n.startsWith(`${artifact}.md.failed-`))).toBe(false);
+        await h.pool.settle("synthetic-agent");
+        expect(existsSync(path)).toBe(false);
+        expect(readdirSync(h.dir).some(n => n.startsWith(`${artifact}.md.done-`))).toBe(true);
+        expect((await h.relay("ops_info")).ok).toBe(false);
+      } finally { h.cleanup(); }
+    });
+  }
+}

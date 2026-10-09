@@ -201,12 +201,16 @@ export class SidecarPool {
       if (to) await this.deps.core.block(cred, live.proof, to, evidence);
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
-      this.archiveIngested(path, text, "done");
-      if (this.claims.get(instId) === live) this.endLease(instId);
+      if (this.claims.get(instId) === live) {
+        this.archiveIngested(path, text, "done");
+        this.endLease(instId);
+      }
     } catch (error) {
       this.log(`sidecar finish ${live.taskId} for ${instId} failed: ${(error as Error).message}`);
-      this.archiveIngested(path, text, "failed");
-      if (this.claims.get(instId) === live) this.endLease(instId); // lease is already gone or foreign; do not retry
+      if (this.claims.get(instId) === live) {
+        this.archiveIngested(path, text, "failed");
+        this.endLease(instId); // lease is already gone or foreign; do not retry
+      }
     }
   }
 
@@ -221,8 +225,8 @@ export class SidecarPool {
     try { renameSync(path, `${path}.${tag}-${Date.now().toString(36)}`); } catch { /* already gone */ }
   }
 
-  /** Archive only the exact artifact that was ingested: a file rewritten meanwhile
-   * (new turn, maybe a new lease) is not ours to move and stays for the next settle. */
+  /** Caller must still own the captured lease. Also preserve content rewritten
+   * within that lease so the next settle can ingest it. */
   private archiveIngested(path: string, ingested: string, tag: string): void {
     const current = readTextFile(path);
     if (current === undefined || current !== ingested) return;
