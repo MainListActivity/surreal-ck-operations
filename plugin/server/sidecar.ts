@@ -180,11 +180,13 @@ export class SidecarPool {
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
     writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir }));
+    // A new lease must not inherit a previous turn's artifacts: archive them so an
+    // identical-looking new report still submits instead of matching a stale hash.
+    this.archive(reportPath(dir), "stale");
+    this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id,
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
-      reportHash: hash(readTextFile(reportPath(dir))),
-      blockerHash: hash(readTextFile(blockerPath(dir))),
     });
     this.startBeat(inst.id);
     this.log(`sidecar claimed ${task.id} for ${inst.id}`);
@@ -226,7 +228,9 @@ export class SidecarPool {
     }
     if (report !== undefined && hash(report) !== live.reportHash) {
       await this.finish(instId, live, undefined, report, reportPath(dir));
+      return;
     }
+    this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId}`);
   }
 
   private async finish(
@@ -291,11 +295,17 @@ export class SidecarPool {
           this.claims.set(inst.id, {
             instId: inst.id, taskId: task.id,
             proof: { taskId: task.id, deliveryId: task.deliveryId, fence: task.fence, expectedVersion: task.version },
-            reportHash: hash(readTextFile(reportPath(dir))),
-            blockerHash: hash(readTextFile(blockerPath(dir))),
           });
           this.startBeat(inst.id);
           this.log(`sidecar adopted ${inst.id} on ${task.id}`);
+          // The agent may have finished while the plugin was down — a report sitting
+          // here belongs to this still-open lease, so ingest it rather than waiting
+          // for a turn_ended event that already fired and was never seen.
+          const live = this.claims.get(inst.id);
+          const blocker = readTextFile(blockerPath(dir));
+          const report = readTextFile(reportPath(dir));
+          if (live && blocker !== undefined) await this.finish(inst.id, live, "gm", blocker, blockerPath(dir));
+          else if (live && report !== undefined) await this.finish(inst.id, live, undefined, report, reportPath(dir));
         }
       } catch (error) {
         this.log(`adopt ${inst.id} failed: ${(error as Error).message}`);
@@ -314,6 +324,20 @@ export class SidecarPool {
           const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
           live.proof.expectedVersion = result.task.version;
         } catch (error) {
+          // Version drift (a concurrent write bumped the task) must not kill the
+          // lease: re-read the task and resync the proof. End it only when the
+          // lease is genuinely dead — wrong holder, wrong delivery, or expired.
+          try {
+            const cred = await this.credentialFor(instId);
+            const task = await this.deps.core.getTask(cred, live.taskId);
+            if (task.currentEmployee === instId && task.deliveryId === live.proof.deliveryId
+                && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
+              live.proof.expectedVersion = task.version;
+              live.proof.fence = task.fence;
+              this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
+              return;
+            }
+          } catch { /* getTask failed too — the lease is gone */ }
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
           this.endLease(instId);
         }
