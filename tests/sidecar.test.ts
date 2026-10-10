@@ -284,16 +284,31 @@ describe('sidecar', () => {
     expect(released).toEqual(['e12', 'e12']);
   });
 
-  test('adopt quarantines unverifiable sessions without restoring a lease or consuming artifacts', async () => {
+  test('adopt re-keys a live binding: channel stays usable, stale artifacts orphaned', async () => {
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     const live = inst('e9', { paseoAgentId: 'a-9', activeTask: 'task-9', credential: undefined });
     await fresh.adopt([live]);
+    // workforce.rotate proves the instance is alive — the channel is re-keyed, not quarantined.
+    expect(fresh.canReuse(live)).toBe(true);
+    // No live server-side lease (listTasks is empty): a leftover report is orphaned, never submitted.
     writeFileSync(reportPath(join(runDir, 'e9')), '陈旧补交');
     await fresh.settle('a-9');
     expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
-    expect(fresh.canReuse(live)).toBe(false);
-    await expect(fresh.claim(live, task('other'))).rejects.toMatchObject({ code: 'stale_channel' });
+    await expect(fresh.claim(live, task('other'))).resolves.toBeTruthy();
     fresh.detachAgent('a-9');
+  });
+
+  test('claim drops a stale local claim when the server lease is already dead', async () => {
+    const i = inst('e-stale');
+    pool.env(i); pool.bindAgent('e-stale', 'agent-stale');
+    await pool.claim(i, task('task-held'));
+    // The same live lease still blocks a second claim.
+    employeeForGetTask = 'e-stale';
+    await expect(pool.claim(i, task('task-next'))).rejects.toMatchObject({ code: 'already_claimed' });
+    // Once the server-side lease is gone (revoked, expired or re-claimed), the
+    // stale remnant is dropped and the new claim goes through.
+    employeeForGetTask = 'someone-else';
+    await expect(pool.claim(i, task('task-next'))).resolves.toBeTruthy();
   });
 });
 

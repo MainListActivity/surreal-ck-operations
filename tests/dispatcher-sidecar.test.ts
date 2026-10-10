@@ -106,18 +106,18 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.woke[0]?.spawned).toBe(true); expect(w.events).not.toContain('performance-failure');
     expect(w.events.filter(e => e === `ops-release:${old.id}`).length).toBeGreaterThan(1);
   });
-  test('restart denies old requests and artifacts, retires before claim/wake and releases capacity', async () => {
+  test('restart re-keys the channel: pre-restart requests die, the instance keeps its seat', async () => {
     const w = world(); w.addTask('resume'); await w.dispatcher().tick();
     const old = w.instances[0]!, env = w.envs.get(old.paseoAgentId!)!; await w.restart();
+    // Requests written under the pre-restart key are refused — the channel was re-keyed, not killed.
     for (const tool of ['get_task_history', 'ops_info', 'review']) expect((await w.relay(env, tool, { taskId: 'resume' })).ok).toBe(false);
+    // Adoption rotated the credential and bound the same agent, so the instance stays reusable.
+    expect(w.events).toContain(`rotate:${old.id}`); expect(w.pool.canReuse(old)).toBe(true);
     writeFileSync(reportPath(env.SCK_COMM_DIR!), 'stale report'); writeFileSync(blockerPath(env.SCK_COMM_DIR!), 'stale blocker'); await w.pool.settle(old.paseoAgentId!);
+    // claim.json died with the old lease — these artifacts are orphaned, never submitted.
     expect(w.events).not.toContain('submit:resume'); expect(w.events).not.toContain('block:resume');
-    const r = await w.dispatcher().tick(); expect(r.retired).toContain(old.id); expect(r.revoked).toContain('resume');
-    expect(w.instances).toHaveLength(2); expect(r.woke).toHaveLength(1); expect(w.events).not.toContain(`send:${old.paseoAgentId}`);
-    expect(w.events).not.toContain('performance-failure'); expect(w.events.indexOf(`retire:${old.id}`)).toBeLessThan(w.events.indexOf('claim:employee-2:resume'));
-    const fresh = w.instances[1]!, newEnv = w.envs.get(fresh.paseoAgentId!)!;
-    expect((await w.relay(newEnv, 'get_task_history', { taskId: 'resume' })).ok).toBe(true);
-    expect((await w.relay(newEnv, 'ops_info')).ok).toBe(true);
-    expect((await w.relay(newEnv, 'review', { decision: 'accept', text: 'fixture' })).ok).toBe(true);
+    const r = await w.dispatcher().tick();
+    expect(r.retired).not.toContain(old.id); expect(w.instances).toHaveLength(1);
+    expect(w.events).not.toContain('performance-failure');
   });
 });

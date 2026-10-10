@@ -360,16 +360,14 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect((await dispatcher.tick()).notices).not.toContain('budget');
   expect(notices.filter(n => n.includes('所有订阅')).length).toBe(1);
 
-  // Codex cooldown passes. The review of t can no longer probe the exhausted codex instance:
-  // it claimed this task earlier, so contributor recusal keeps former executors out of review
-  // candidates (both defs are full, so nothing can spawn either). The review waits in queue,
-  // and probe recovery happens through the queued execute work (bump) instead.
+  // Codex only claimed/checkpointed the task; the production baseline permits
+  // claim-only hands as demoted review fallback while excluding the submitter.
+  // With no fresh candidate available, probe recovery can review t.
   await database.db.query("UPDATE provider_health:codex SET until = 0;");
   report = await dispatcher.tick();
   expect(report.skipped).toBeUndefined();
-  expect(report.woke.map(w => w.task)).not.toContain(t.id);
   expect(report.woke.map(w => w.employee)).toEqual([codexInst.employee]);
-  expect(report.woke[0].task).toBe(bump.id);
+  expect(report.woke[0].task).toBe(t.id);
   paseo.set(codexAgent, 'idle');
   await dispatcher.tick();
   expect((await workforce.providerHealth()).get('codex')?.state).toBe('healthy');
