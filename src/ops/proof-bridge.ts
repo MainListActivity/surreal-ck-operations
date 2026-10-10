@@ -21,7 +21,16 @@ export class InternalAiProofBridge {
   constructor(private readonly deps: BridgeDeps) { this.now = deps.now ?? Date.now; }
   private assertFiles(files: ProofFiles, mode: 'register-disabled' | 'enable'): void {
     const e = files.evidence;
-    if (mode === 'enable' && (e.type !== 'reviewed-service' || !e.serviceApproved || e.balanceNanoUsd < files.manifest.budget.totalNanoUsd || Date.parse(e.sampledAt) > this.now() || Date.parse(e.expiresAt) <= this.now())) throw new CompanyError('forbidden', 'reviewed service evidence unavailable');
+    if (mode !== 'enable') return;
+    // 时间窗对全部受审类型一致：采样不晚于 now，expiresAt 未过。
+    const fresh = Date.parse(e.sampledAt) <= this.now() && Date.parse(e.expiresAt) > this.now();
+    // reviewed-service 分支行为不变（USD 余额须覆盖预算）；配额型改查配额语义，不要求 USD 余额。
+    const ok = e.type === 'reviewed-service'
+      ? e.serviceApproved && e.balanceNanoUsd >= files.manifest.budget.totalNanoUsd
+      : e.type === 'reviewed-token-plan'
+        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.noPaymentInstrument === true && e.autoTopupDisabled === true
+        : false;
+    if (!ok || !fresh) throw new CompanyError('forbidden', 'reviewed service evidence unavailable');
   }
   async call(scope: OpsScope, env: string, tool: ProofTool, raw: Record<string, unknown>): Promise<unknown> {
     const schema = proofToolSchemas[tool]; const parsed = schema.safeParse(raw);

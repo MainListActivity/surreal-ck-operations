@@ -26,6 +26,8 @@ Proof claims绑定project/env/goal、requestTask/员工+delivery+fence、approva
 
 文件资料严格限制为最多256KiB的脱敏JSON白名单（不是通用PDF/账单读取器）；字段详见src/ops/proof-contract.ts evidenceSchema。不可变候选一任务一份，修改后须重新独立审批。所有响应和审核日志不含document正文、登录token、签名证明或真实subject。
 
+evidenceSchema 是按 `type` 判别的冻结联合，与产品侧 `reviewedEvidenceSchema`（surreal_ck `shared/src/internal-ai-proof.ts`）逐字一致：`development-disabled`/`reviewed-service` 沿用 USD-only 余额契约（currency=USD、balanceNanoUsd 非负）；`reviewed-token-plan` 为配额型供应商证据，无 USD 现金价目/余额语义，必填 planName（无控制字符短文本）、planSourceUrl（与 endpoint 同规则的 https 出处）、quotaUnit（points/requests）、quotaAmount（正整数）、quotaWindowSeconds（正整数）、noPaymentInstrument=true，quotaRemaining 可空、存在时非负。两族字段互不混入：配额文档写 currency/balanceNanoUsd、USD 文档写配额字段、未知字段均拒绝。`ops_internal_ai_prove(mode=enable)` 对 reviewed-service 分支不变（serviceApproved 且 balanceNanoUsd 覆盖 manifest.budget.totalNanoUsd）；对 reviewed-token-plan 改查配额语义：serviceApproved、quotaAmount>0、quotaRemaining 存在时>0、noPaymentInstrument 与 autoTopupDisabled 为 true、sampledAt 不晚于签发时刻、expiresAt 未过，不再要求 USD 余额覆盖预算。证明绑定/租约/独立审批检查不因证据类型放宽。
+
 ## 独立复核和发布交接
 
 本机（公司fork已安装）执行 `rtk proxy env RUN_COMPANY_PROOF_FORK_TESTS=1 pnpm test:bridge`，该测试自行启动隔离RocksDB，使用实际CompanyCore claim/submit/独立accept事件、正常IdP/客户接口合成fixture；不加载产品.env、不访问生产、不操作真实账号或模型。CI Quality gate执行公司/插件类型检查和无凭证相关单测，fork项显式skip，不能替代本机fork证据。

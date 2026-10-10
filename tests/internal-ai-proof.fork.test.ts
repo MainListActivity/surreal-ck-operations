@@ -59,15 +59,27 @@ function broker() {
     },
   });
 }
-async function files(task: string, type: 'reviewed-service'|'development-disabled' = 'reviewed-service') {
+type EvidenceDoc = Record<string, unknown>;
+async function files(task: string, type: 'reviewed-service'|'development-disabled'|'reviewed-token-plan' = 'reviewed-service') {
   const root = join(dir, 'evidence', task); await mkdir(root,{recursive:true});
-  const evidence = {schemaVersion:1,type,accountRef:'existing-service-opaque',endpoint:'https://api.openai.com/v1',model:'gpt-4o-mini-2024-07-18',priceRevision:'openai-mini-2026-10-09',currency:'USD',balanceNanoUsd:1_000_000_000,sampledAt:new Date(clock-1000).toISOString(),expiresAt:new Date(clock+3_600_000).toISOString(),autoTopupDisabled:true,serviceApproved:type==='reviewed-service'};
+  const base = {schemaVersion:1,type,accountRef:'existing-service-opaque',endpoint:'https://api.openai.com/v1',model:'gpt-4o-mini-2024-07-18',priceRevision:'openai-mini-2026-10-09',sampledAt:new Date(clock-1000).toISOString(),expiresAt:new Date(clock+3_600_000).toISOString(),autoTopupDisabled:true};
+  const evidence = type === 'reviewed-token-plan'
+    ? {...base,serviceApproved:true,planName:'SenseNova Token Plan 公测档',planSourceUrl:'https://www.sensenova.cn/token-plan',quotaUnit:'points',quotaAmount:100_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,noPaymentInstrument:true}
+    : {...base,serviceApproved:type==='reviewed-service',currency:'USD',balanceNanoUsd:1_000_000_000};
   const bytes = JSON.stringify(evidence);
   const rest = {schemaVersion:1 as const,goalId:PROOF_GOAL as typeof PROOF_GOAL,project:'surreal_ck' as const,env:'production' as const,activityId:'ui01-internal',workspaceSlug:'sck-ui01',documentHash:sha256(bytes),service:{accountRef:evidence.accountRef,endpoint:evidence.endpoint,model:evidence.model,priceRevision:evidence.priceRevision},budget:{currency:'USD' as const,totalNanoUsd:1_000_000_000,perAttemptNanoUsd:100_000_000,maxAttempts:30,autoTopupDisabled:true as const},identities:[{alias:'LCA04_REMOVABLE' as const,workspaceRole:'admin' as const,billingRole:'owner' as const},{alias:'LCA04_MEMBER' as const,workspaceRole:'participant' as const,billingRole:'member' as const}] as ProofManifest['identities']};
   const m = {...rest,configurationDigest:configurationDigest(rest)};
   const mp=join(root,'internal-ai-manifest.json'),dp=join(root,'internal-ai-evidence.json');
   await writeFile(dp, bytes); await writeFile(mp, JSON.stringify(m));
-  return {manifestPath:mp,documentPath:dp,manifest:m};
+  return {manifestPath:mp,documentPath:dp,manifest:m,evidence};
+}
+/** 以同一审批任务重写文档字节并保持 manifest 摘要一致：逐层区分契约拒与配额断言拒。 */
+async function rewrite(f: {manifestPath:string,documentPath:string,manifest:ProofManifest}, evidence: EvidenceDoc) {
+  const bytes = JSON.stringify(evidence);
+  const {configurationDigest:_d, ...rest} = f.manifest;
+  const changed = {...rest, documentHash: sha256(bytes)};
+  await writeFile(f.documentPath, bytes);
+  await writeFile(f.manifestPath, JSON.stringify({...changed, configurationDigest: configurationDigest(changed)}));
 }
 const proofArgs = (id = 'initial') => ({mode:'enable',approvalTask,manifestPath,documentPath,activityId:'ui01-internal',nonce:'nonce-for-product-'+id,idempotencyKey:id});
 async function request(tool:string,args:Record<string,unknown>={}) { return ops.call(consumer,consumerTask,tool,args) as Promise<Record<string,unknown>>; }
@@ -150,6 +162,48 @@ check('real approval, byte hashes, normal alias mapping, encrypted proof and pub
   const [rows]=await database.db.query<[Array<{sealed:unknown}>]>('SELECT sealed FROM internal_ai_proof;');
   expect(JSON.stringify(rows)).not.toContain(delivered!);
   expect(JSON.stringify(a)).not.toContain('PRIVATE KEY');
+});
+check('reviewed-token-plan quota evidence signs approved-service; quota, schema and USD-balance violations reject',async()=>{
+  const task=await core.createTask(gm,{title:'Synthetic token-plan approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const claim=await core.claim(author,task.id);
+  const f=await files(task.id,'reviewed-token-plan');
+  const prepared=await ops.call(author,task.id,'ops_internal_ai_prepare',{manifestPath:f.manifestPath,documentPath:f.documentPath}) as {approvalMarker:string};
+  await core.submit(author,{taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed token-plan files',idempotencyKey:randomUUID()});
+  const review=await core.claim(reviewer,task.id);
+  await core.accept(reviewer,{taskId:task.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
+  const args=(id:string)=>({mode:'enable',approvalTask:task.id,manifestPath:f.manifestPath,documentPath:f.documentPath,activityId:f.manifest.activityId,nonce:'token-plan-nonce-'+id,idempotencyKey:'token-plan-'+id});
+  const a=await request('ops_internal_ai_prove',args('enable'));
+  expect(a.type).toBe('approved-service'); expect(a.paidCallsAllowed).toBe(1);
+  const priorDelivered=delivered;
+  const login=await request('ops_login',{alias:'LCA04_OPS',audience:'ops'});
+  await request('ops_internal_ai_deliver',{proofHandle:a.proofHandle,session:login.session});
+  const payload=verifyCompanyProof(delivered!,trusted,'proof',clock);
+  delivered=priorDelivered;
+  expect(payload.type).toBe('approved-service'); expect(payload.paidCallsAllowed).toBe(1); expect(payload.documentHash).toBe(f.manifest.documentHash);
+  // 断言层拒绝：文档契约合法但配额语义不满足 enable（剩余为 0、未批准、采样在未来、已过期）。
+  const assertViolations:Array<[string,EvidenceDoc]>=[
+    ['empty',{...f.evidence,quotaRemaining:0}],
+    ['unapproved',{...f.evidence,serviceApproved:false}],
+    ['future',{...f.evidence,sampledAt:new Date(clock+60_000).toISOString()}],
+    ['expired',{...f.evidence,expiresAt:new Date(clock-60_000).toISOString()}],
+  ];
+  for(const [id,bad] of assertViolations){await rewrite(f,bad);await expect(request('ops_internal_ai_prove',args(id))).rejects.toMatchObject({code:'forbidden'});}
+  // 契约层拒绝：缺配额字段、noPaymentInstrument 缺失或为 false、quotaAmount 非正、USD 字段混入配额文档。
+  const {noPaymentInstrument:_np,...withoutPayment}=f.evidence as EvidenceDoc;
+  const {planName:_pn,...withoutPlan}=f.evidence as EvidenceDoc;
+  const schemaViolations:Array<[string,EvidenceDoc]>=[
+    ['nopay',withoutPayment],
+    ['payfalse',{...f.evidence,noPaymentInstrument:false}],
+    ['noplan',withoutPlan],
+    ['zeroamount',{...f.evidence,quotaAmount:0}],
+    ['usdmix',{...f.evidence,currency:'USD',balanceNanoUsd:1}],
+  ];
+  for(const [id,bad] of schemaViolations){await rewrite(f,bad);await expect(request('ops_internal_ai_prove',args(id))).rejects.toBeDefined();}
+  // USD 余额分支行为不变：余额低于预算仍拒签，不放宽余额检查。
+  const {planName:_1,planSourceUrl:_2,quotaUnit:_3,quotaAmount:_4,quotaWindowSeconds:_5,quotaRemaining:_6,noPaymentInstrument:_7,...shared}=f.evidence as EvidenceDoc;
+  await rewrite(f,{...shared,type:'reviewed-service',currency:'USD',balanceNanoUsd:0});
+  await expect(request('ops_internal_ai_prove',args('lowbalance'))).rejects.toMatchObject({code:'forbidden'});
+  await files(task.id,'reviewed-token-plan');
 });
 check('missing approval, wrong manifest/hash/activity/scope and idempotency conflicts reject',async()=>{
   await expect(request('ops_internal_ai_prove',{...proofArgs('none'),approvalTask:consumerTask})).rejects.toBeDefined();

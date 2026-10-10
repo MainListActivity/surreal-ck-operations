@@ -103,6 +103,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 
+内部AI证明契约（`src/ops/proof-*.ts`，含 `reviewed-token-plan` 配额型证据类型，字段契约见 [internal-ai-proof-contract.md](./internal-ai-proof-contract.md)）同样只经 vendor 拷贝进入员工通道面与调度器：契约变更随固定 release 安装上线，但 `vendor.sh` 重新生成 + `paseo plugin reload sck-company` 完成前，员工侧仍按旧契约校验证据文档与 enable 配额语义，不能跳过插件面同步。
+
 ## 交付预览服务（插件内嵌正式版 · LAN/公网双面）
 
 交付预览 HTTP 服务正式版内嵌在 sck-company 插件 server 进程（`plugin/server/preview.ts` 生命周期层 + vendor 的 `src/preview-core.ts` 路由/安全），随插件启动、随 reload/卸载停止，不另起 daemon。**两个监听面分工明确**：
