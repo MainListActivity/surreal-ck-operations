@@ -2,7 +2,8 @@
 // this trusted code (running inside the Paseo plugin, next to the sealed secrets and the
 // Cloudflare token) performs it, and only a secret-free result goes back. Every call is gated
 // on the caller's live task lease, role-checked against the project environment, and audited.
-import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
@@ -13,12 +14,19 @@ import {
   accountEmail, accountUsername, aliasFromSecretName, canonicalAlias, ensureAccount, passwordSecretName,
   type EnsureAccountResult,
 } from './accounts.ts';
-import { egoBrowserInjector, type BrowserInjector } from './browser.ts';
+import { egoBrowserInjector, oidcUserEntry, type BrowserInjector } from './browser.ts';
 import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlaneEnv } from './config.ts';
 import { cloudflareD1, type D1Client } from './d1.ts';
 import type { Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
-import { jwtExpiry, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
+import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
+import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
+import {
+  adminRequestTarget, findServicePrincipal, idpAdminRequest, insertServicePrincipal,
+  listServicePrincipals, mintServicePrincipalToken,
+  principalAliasSecretName, principalId, principalTokenSecretName, recordIdpAuditBestEffort,
+  revokeServicePrincipal, sha256Base64Url, type ServicePrincipal,
+} from './idp-principals.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
@@ -31,6 +39,9 @@ import type { ProofFiles } from './proof-files.ts';
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
+  'ops_idp_client_info', 'ops_idp_client_register',
+  'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
+  'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
@@ -47,6 +58,8 @@ export interface OpsDeps {
   controlEnv?: () => ControlPlaneEnv;
   fetch?: Fetcher;
   now?: () => number;
+  /** Test seam: defaults to real timers; tests advance the fake clock instead of waiting. */
+  sleep?: (ms: number) => Promise<void>;
   log?: (message: string) => void;
   /** Test seams; production wires Cloudflare D1, the SurrealDB SDK and ego-browser. */
   d1?: (config: BrokerConfig, env: ControlPlaneEnv) => D1Client;
@@ -73,6 +86,13 @@ const DAY_SECONDS = 86_400;
 const REFRESH_MARGIN_MS = 60_000;
 const DEFAULT_TOKEN_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 100_000;
+
+// Invitation issuance is asynchronous on the product: POST answers 202 within ~60s when
+// the saga overruns; the broker then polls GET and re-POSTs once past the product's stale
+// threshold (CAS-resumable) until the row settles as completed/failed.
+const INVITE_POLL_MS = 10_000;
+const INVITE_RESUME_AFTER_MS = 290_000; // product stale threshold is 240s; wait past it
+const INVITE_WAIT_MS = 480_000;         // total budget per tool call; a same-key retry continues
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
@@ -124,11 +144,13 @@ export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
   private readonly sessions: SessionStore;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly handlers: Record<OpsTool, Handler>;
   private readonly proofBridge?: InternalAiProofBridge;
 
   constructor(private readonly deps: OpsDeps) {
     this.now = deps.now ?? Date.now;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.sessions = new SessionStore(this.now);
     if (deps.proofStore) this.proofBridge = new InternalAiProofBridge({
       store: deps.proofStore, home: deps.serviceHome ?? process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany'), key: () => deps.secretKey(), now: this.now,
@@ -167,6 +189,14 @@ export class OpsBroker {
       ops_request: (ctx, args) => this.request(ctx, args),
       ops_query: (ctx, args) => this.query(ctx, args),
       ops_browser_login: (ctx, args) => this.browserLogin(ctx, args),
+      ops_idp_client_info: (ctx, args) => this.idpClientInfo(ctx, args),
+      ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
+      ops_idp_principal_mint: (ctx, args) => this.idpPrincipalMint(ctx, args),
+      ops_idp_principal_revoke: (ctx, args) => this.idpPrincipalRevoke(ctx, args),
+      ops_idp_principal_list: (ctx, args) => this.idpPrincipalList(ctx, args),
+      ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
+      ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
+      ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -274,7 +304,14 @@ export class OpsBroker {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops },
+        // Public client identifiers only (never secrets), so employees can align the channels
+        // with what the IdP has registered (ops_idp_client_info) and the product hard-binds.
+        clients: {
+          customer: { clientId: ctx.cfg.idp.clientId, redirectUri: ctx.cfg.idp.redirectUri },
+          ...(ctx.cfg.ops ? { operator: { clientId: ctx.cfg.ops.clientId, redirectUri: ctx.cfg.ops.redirectUri, resource: ctx.cfg.ops.resource ?? null } } : {}),
+          ...(ctx.cfg.idp.ops ? { opsAudience: { clientId: ctx.cfg.idp.ops.clientId, audience: ctx.cfg.idp.ops.audience, redirectUri: ctx.cfg.idp.ops.redirectUri } } : {}),
+        },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx), idpProvisionRotate: this.canEnsure(ctx) && !!ctx.cfg.ops },
         preview: await this.previewStatus(),
       },
     };
@@ -382,6 +419,455 @@ export class OpsBroker {
       value: { alias, username, email, result },
       audit: result === 'exists' ? { action: 'ops_call', evidence: `ops_account_ensure ${alias} → exists` } : undefined,
     };
+  }
+
+  /**
+   * Read-only view of a registered IdP client plus how it lines up with this environment's
+   * configured channels — the diagnosis half of a client-id mismatch. Only public registration
+   * metadata leaves; `describeSpaClient` never selects the secret hash itself.
+   */
+  private async idpClientInfo(ctx: Ctx, args: Args): Promise<Outcome> {
+    const byName = args.client_name !== undefined;
+    const byId = args.client_id !== undefined;
+    if (byName === byId) throw invalid('pass exactly one of client_name or client_id');
+    const key = byName ? { clientName: spaClientName(args.client_name) } : { clientId: clientId(args.client_id) };
+    const info = await describeSpaClient(this.d1(ctx), ctx.cfg.d1!.tenantId, key);
+    if (!info) throw new CompanyError('not_found', `no IdP client registered for ${byName ? `client_name ${key.clientName}` : `client_id ${key.clientId}`}`);
+    const ops = ctx.cfg.ops;
+    return {
+      value: {
+        ...info,
+        alignment: {
+          customerClient: info.clientId === ctx.cfg.idp.clientId,
+          operatorClient: ops !== undefined && info.clientId === ops.clientId,
+          opsAudienceClient: ctx.cfg.idp.ops !== undefined && info.clientId === ctx.cfg.idp.ops.clientId,
+          ...(ops ? {
+            operatorRedirectRegistered: info.redirectUris.includes(ops.redirectUri),
+            operatorAudienceMatch: ops.resource === undefined || info.accessTokenAudience === ops.resource,
+          } : {}),
+        },
+      },
+      audit: { action: 'ops_call', evidence: `ops_idp_client_info ${info.clientName} → ${info.clientId}` },
+    };
+  }
+
+  /**
+   * Registers an IdP public SPA client (a shape the dynamic-registration endpoint cannot
+   * express). Redirect URIs and the token audience are confined to the product host, the
+   * row carries no secret, and the answer is only the public `client_id`.
+   */
+  private async idpClientRegister(ctx: Ctx, args: Args): Promise<Outcome> {
+    const clientName = spaClientName(args.client_name);
+    const allowedHost = new URL(ctx.cfg.product.url).hostname;
+    const redirectUris = redirectUriList(args.redirect_uris, allowedHost);
+    const { clientId, result } = await registerSpaClient({
+      d1: this.d1(ctx), tenantId: ctx.cfg.d1!.tenantId,
+      clientName, redirectUris,
+      accessTokenAudience: audienceUrl(args.access_token_audience, allowedHost),
+      now: () => new Date(this.now()),
+    });
+    return {
+      value: { clientName, clientId, result },
+      audit: {
+        action: result === 'created' ? 'ops_idp_client_create' : 'ops_call',
+        evidence: `ops_idp_client_register ${clientName} → ${result} ${clientId}`,
+      },
+    };
+  }
+
+  // ---------- IdP service principals ----------
+  //
+  // The IdP gates mint/revoke on a human admin session, so the broker performs the same writes
+  // its D1 access already makes for account provisioning: the row carries only the token hash,
+  // the value is sealed in env_secret before the insert, and a compensating audit_events row keeps
+  // the IdP-side trail intact. The human bootstrap password is never touched.
+
+  /** Reads a minted token back from its sealed name; only trusted broker code may do this. */
+  private async sealedPrincipalToken(ctx: Ctx, id: string): Promise<string | undefined> {
+    return this.deps.projects.readSealed(ctx.scope.project, ctx.env, principalTokenSecretName(id), this.deps.secretKey());
+  }
+
+  private async idpPrincipalMint(ctx: Ctx, args: Args): Promise<Outcome> {
+    const label = text(args, 'label', 80);
+    const sealAs = args.sealAs === undefined ? undefined : canonicalAlias(args.sealAs);
+    const d1 = this.d1(ctx);
+    // The token is sealed before the D1 write so a failed insert can never strand a live
+    // credential the broker cannot reach (the leftover seal belongs to no existing row).
+    const id = randomUUID();
+    const token = mintServicePrincipalToken();
+    const tokenHash = await sha256Base64Url(token);
+    await this.deps.projects.setSecret(
+      { project: ctx.scope.project, env: ctx.env, name: principalTokenSecretName(id), value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+      this.deps.secretKey(true));
+    const minted = await insertServicePrincipal({
+      d1, id, label, tokenHash, createdBy: `ops:${ctx.scope.actor.employeeId}`, now: () => new Date(this.now()),
+    });
+    let sealedAlias: string | undefined;
+    if (sealAs !== undefined) {
+      sealedAlias = principalAliasSecretName(sealAs);
+      await this.deps.projects.setSecret(
+        { project: ctx.scope.project, env: ctx.env, name: sealedAlias, value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+        this.deps.secretKey(true));
+    }
+    await recordIdpAuditBestEffort(d1, {
+      actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+      eventType: 'admin.service_principal.minted', targetType: 'service_principal', targetId: minted.id,
+      payload: { label, scopes: minted.scopes, via: 'ops_broker' }, occurredAt: minted.createdAt,
+    });
+    return {
+      value: {
+        id: minted.id, label, scopes: minted.scopes, status: minted.status, createdAt: minted.createdAt,
+        ...(sealedAlias ? { sealed: sealedAlias } : { token }),
+      },
+      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}${sealedAlias ? `（密封 ${sealedAlias}）` : ''}` },
+    };
+  }
+
+  private async idpPrincipalRevoke(ctx: Ctx, args: Args): Promise<Outcome> {
+    const id = principalId(args.principalId);
+    const d1 = this.d1(ctx);
+    const { principal, alreadyRevoked } = await revokeServicePrincipal({ d1, principalId: id, now: () => new Date(this.now()) });
+    if (!alreadyRevoked) {
+      await recordIdpAuditBestEffort(d1, {
+        actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+        eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: id,
+        payload: { label: principal.label, via: 'ops_broker' }, occurredAt: principal.revokedAt ?? new Date(this.now()).toISOString(),
+      });
+    }
+    return {
+      value: { id, status: 'revoked', revokedAt: principal.revokedAt, alreadyRevoked },
+      audit: alreadyRevoked
+        ? { action: 'ops_call', evidence: `ops_idp_principal_revoke ${id} → 已吊销` }
+        : { action: 'ops_idp_principal_revoke', evidence: `ops_idp_principal_revoke ${id}` },
+    };
+  }
+
+  /**
+   * Relays one request to the IdP's service-principal-scoped admin routes with the principal's
+   * sealed token as the bearer — the token is read, sent and redacted inside the broker only.
+   * Revoked principals still reach the IdP on purpose: a 403 there is exactly what a revocation
+   * check needs to observe.
+   */
+  private async idpAdminRequest(ctx: Ctx, args: Args): Promise<Outcome> {
+    const id = principalId(args.principalId);
+    const { method, path } = adminRequestTarget(args.method, args.path);
+    const token = await this.sealedPrincipalToken(ctx, id);
+    if (!token) throw new CompanyError('not_found', `no sealed token for principal ${id}; only broker-minted principals can be called through ops_idp_admin_request`);
+    const origin = new URL(ctx.cfg.idp.issuer).origin;
+    const res = await idpAdminRequest(origin, token, { method, path, body: args.body }, { fetch: this.deps.fetch });
+    const known = [token, ...this.sessions.secrets(ctx.scope.actor.employeeId)];
+    return {
+      value: { status: res.status, ok: res.ok, body: clipJson(redactJson(res.body, known)) },
+      audit: { action: 'ops_call', evidence: `ops_idp_admin_request ${method} ${path} → ${res.status}（principal ${id}）` },
+    };
+  }
+
+  /** Read-only principal inventory (ids, labels, status) so callers can name a revokePrincipalId without SQL access. */
+  private async idpPrincipalList(ctx: Ctx, args: Args): Promise<Outcome> {
+    const status = args.status === undefined ? undefined
+      : args.status === 'active' || args.status === 'revoked' ? args.status
+        : undefined;
+    if (args.status !== undefined && status === undefined) throw invalid('status must be "active" or "revoked"');
+    const principals = await listServicePrincipals(this.d1(ctx), status);
+    return {
+      value: {
+        principals: principals.map(p => ({
+          id: p.id, label: p.label, scopes: p.scopes, status: p.status,
+          createdAt: p.createdAt, revokedAt: p.revokedAt, createdBy: p.createdBy,
+        })),
+      },
+      audit: { action: 'ops_call', evidence: `ops_idp_principal_list → ${principals.length} 个` },
+    };
+  }
+
+  /**
+   * 一键轮换 provision token：吊销旧 principal → mint 新 principal（token 密封留在 broker）→
+   * 经运营会话调产品 rotate 端点把新 token 封进 _system 密封仓 → 双探针验证（新 token 活、
+   * 旧 token 403）。token 明文全程不出 broker 进程；产品侧懒解析使下一次调用即生效，无需
+   * 重部署、不碰 GitHub secrets、不登任何 console。
+   *
+   * 顺序语义：先吊销后注入——旧凭证先死，新凭证后生，永远不存在两枚同时在线的 provision
+   * token；注入失败时补偿吊销新 principal，避免留下 broker 之外的悬空活凭证。
+   */
+  private async idpProvisionRotate(ctx: Ctx, args: Args): Promise<Outcome> {
+    const session = this.session(ctx, args);
+    if (session.kind === 'customer') {
+      throw invalid('a customer session cannot rotate the provision token; call ops_operator_login for an operator session');
+    }
+    const label = args.label === undefined ? 'sck-provisioner' : text(args, 'label', 80);
+    const d1 = this.d1(ctx);
+    const origin = new URL(ctx.cfg.idp.issuer).origin;
+
+    // 1. 解析要吊销的旧 principal：显式指定，或恰好一个 active 时自动认领。
+    let oldPrincipal: ServicePrincipal | undefined;
+    if (args.revokePrincipalId !== undefined) {
+      const id = principalId(args.revokePrincipalId);
+      oldPrincipal = await findServicePrincipal(d1, id);
+      if (!oldPrincipal) throw new CompanyError('not_found', `no IdP service principal ${id}`);
+    } else {
+      const actives = await listServicePrincipals(d1, 'active');
+      if (actives.length > 1) {
+        throw invalid(`多个 active principal（${actives.map(p => p.id).join(', ')}）；请显式传 revokePrincipalId`);
+      }
+      oldPrincipal = actives[0];
+    }
+    // 旧 token 的 broker 密封副本只用于吊销后的 403 探针；非 broker mint 的旧凭证跳过探针。
+    const oldToken = oldPrincipal ? await this.sealedPrincipalToken(ctx, oldPrincipal.id) : undefined;
+
+    // 2. 吊销旧（spec 顺序：旧先死）
+    let revoked: { id: string; alreadyRevoked: boolean } | null = null;
+    if (oldPrincipal && oldPrincipal.status === 'active') {
+      const { alreadyRevoked } = await revokeServicePrincipal({ d1, principalId: oldPrincipal.id, now: () => new Date(this.now()) });
+      revoked = { id: oldPrincipal.id, alreadyRevoked };
+      if (!alreadyRevoked) {
+        await recordIdpAuditBestEffort(d1, {
+          actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+          eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: oldPrincipal.id,
+          payload: { label: oldPrincipal.label, via: 'ops_broker', reason: 'provision token rotation' },
+          occurredAt: new Date(this.now()).toISOString(),
+        });
+      }
+    } else if (oldPrincipal) {
+      revoked = { id: oldPrincipal.id, alreadyRevoked: true };
+    }
+
+    // 3. 签新：密封先于建行，token 不出 broker
+    const newId = randomUUID();
+    const token = mintServicePrincipalToken();
+    const tokenHash = await sha256Base64Url(token);
+    await this.deps.projects.setSecret(
+      { project: ctx.scope.project, env: ctx.env, name: principalTokenSecretName(newId), value: token, purpose: 'IdP admin service principal token (sealed for ops_idp_admin_request)' },
+      this.deps.secretKey(true));
+    const minted = await insertServicePrincipal({
+      d1, id: newId, label, tokenHash, createdBy: `ops:${ctx.scope.actor.employeeId}`, now: () => new Date(this.now()),
+    });
+    await recordIdpAuditBestEffort(d1, {
+      actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+      eventType: 'admin.service_principal.minted', targetType: 'service_principal', targetId: minted.id,
+      payload: { label, scopes: minted.scopes, via: 'ops_broker', rotation: true }, occurredAt: minted.createdAt,
+    });
+
+    // 4. 注入消费侧：经运营会话调产品 rotate 端点（subscription.manage 由产品侧强制）。
+    //    失败则补偿吊销新 principal——旧已吊销，不留悬空活凭证。
+    const rotate = await this.product(ctx, session, 'POST', '/api/ops/idp-provision-token/rotate', { token });
+    if (!rotate.ok) {
+      await revokeServicePrincipal({ d1, principalId: minted.id, now: () => new Date(this.now()) }).catch(() => undefined);
+      await recordIdpAuditBestEffort(d1, {
+        actorType: 'management_token', actorId: `ops:${ctx.scope.actor.employeeId}`,
+        eventType: 'admin.service_principal.revoked', targetType: 'service_principal', targetId: minted.id,
+        payload: { label, via: 'ops_broker', reason: 'rotation aborted: product rotate failed' },
+        occurredAt: new Date(this.now()).toISOString(),
+      });
+      throw productFailure('rotating the provision token into the sealed store', rotate, { 400: 'invalid', 403: 'forbidden' });
+    }
+
+    // 5. 验证：产品 status 应为 store 源；新 token IdP 探针 200；旧 token（若 broker 持有密封副本）403。
+    //    探针是证据不是闸门：注入成功后探针失败只降级为报告字段，不把已生效的轮换报成失败。
+    const status = await this.product(ctx, session, 'GET', '/api/ops/idp-provision-token/status');
+    const statusBody = (status.body ?? {}) as Record<string, unknown>;
+    const probe = async (probeToken: string) => {
+      try {
+        const res = await idpAdminRequest(origin, probeToken, { method: 'GET', path: '/admin/tenants' }, { fetch: this.deps.fetch });
+        return { status: res.status, ok: res.ok };
+      } catch (error) {
+        return { status: null, ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    const newProbe = await probe(token);
+    const oldProbe = oldToken === undefined ? undefined : await probe(oldToken);
+
+    return {
+      value: {
+        rotated: true,
+        newPrincipal: { id: minted.id, label, scopes: minted.scopes, createdAt: minted.createdAt },
+        revoked,
+        product: {
+          rotate: rotate.status,
+          statusOk: status.ok,
+          source: typeof statusBody.source === 'string' ? statusBody.source : null,
+          storeEntry: (statusBody.store as Record<string, unknown> | undefined)?.entry != null,
+        },
+        probes: {
+          newToken: newProbe,
+          oldToken: oldProbe ?? 'skipped（旧 token 非 broker mint，无密封副本可探测）',
+        },
+      },
+      audit: {
+        action: 'ops_idp_provision_rotate',
+        evidence: `ops_idp_provision_rotate ${revoked ? `吊销 ${revoked.id} → ` : ''}签发 ${minted.id} → 注入密封仓（rotate ${rotate.status}）→ 新探针 ${newProbe.status}${oldProbe ? `、旧探针 ${oldProbe.status}` : ''}`,
+      },
+    };
+  }
+
+  /**
+   * G2 邀请签发（运营代办开通）：转发产品 POST /api/ops/invitations。
+   * 产品侧为异步契约：POST 在同步窗内完成 → 201/200 直接带结果；超时回 202
+   * processing（任务不脱管继续跑）→ 本工具轮询 GET，僵死则同键重发触发续跑，
+   * 完成后经 collect-delivery 一次性收取激活链接。
+   * resend:true = 断链/24h 过期补救：调产品 resend 端点重铸链接（其余参数
+   * 沿用行内已存值，只需 idempotencyKey），收取与交接走同一凭证卫生路径。
+   * 一次性 activation_url 不回给员工——broker 落盘到
+   * <serviceHome>/handoff/invite-<key>.txt（0600，不进 evidence/deliverables
+   * 这两个 LAN 预览面），由老板本机取阅转交。重放/复用路径无新链接、不写文件。
+   * 纪律：邀请签发与重发一律走本工具；禁止 ops_request 裸调
+   * /api/ops/invitations*（裸调拿到的一次性链接不经 handoff 落盘，断链即丢）。
+   */
+  private async invitationIssue(ctx: Ctx, args: Args): Promise<Outcome> {
+    const session = this.session(ctx, args);
+    if (session.kind === 'customer') {
+      throw invalid('a customer session cannot issue invitations; call ops_operator_login for an operator session');
+    }
+    const idempotencyKey = text(args, 'idempotencyKey', 200);
+    const resend = args.resend === true;
+
+    let res: ProductResult;
+    let resBody: Record<string, unknown>;
+    let email: string;
+    let workspaceSlug: string;
+
+    if (resend) {
+      res = await this.product(ctx, session, 'POST', `/api/ops/invitations/${encodeURIComponent(idempotencyKey)}/resend`);
+      if (!res.ok) {
+        throw productFailure('resending the invitation activation link', res, { 400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict', 503: 'upstream_error' });
+      }
+      resBody = (res.body ?? {}) as Record<string, unknown>;
+      const u = resBody.user as Record<string, unknown> | null;
+      const w = resBody.workspace as Record<string, unknown> | null;
+      email = typeof u?.email === 'string' ? u.email : '';
+      workspaceSlug = typeof w?.slug === 'string' ? w.slug : '';
+    } else {
+      email = text(args, 'email', 200);
+      const body: Record<string, unknown> = {
+        email,
+        displayName: text(args, 'displayName', 80),
+        workspaceSlug: text(args, 'workspaceSlug', 40),
+        reason: text(args, 'reason', 500),
+        idempotencyKey,
+      };
+      if (args.aiAllowance === undefined || args.aiAllowance === null || typeof args.aiAllowance !== 'object' || Array.isArray(args.aiAllowance)) {
+        throw invalid('aiAllowance {amount,expiresAt,label?} is required');
+      }
+      body.aiAllowance = args.aiAllowance;
+      if (args.workspaceName !== undefined) body.workspaceName = text(args, 'workspaceName', 80);
+      if (args.planKey !== undefined) body.planKey = text(args, 'planKey', 64);
+      if (args.productPlanRevisionId !== undefined) body.productPlanRevisionId = text(args, 'productPlanRevisionId', 80);
+
+      res = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
+      if (!res.ok) {
+        throw productFailure('issuing the invitation', res, { 400: 'invalid', 403: 'forbidden', 409: 'conflict', 503: 'upstream_error' });
+      }
+
+      resBody = (res.body ?? {}) as Record<string, unknown>;
+      if (resBody.status === 'processing') {
+        resBody = await this.awaitInvitation(ctx, session, idempotencyKey, body);
+      }
+      workspaceSlug = String(body.workspaceSlug);
+    }
+
+    if (resBody.status === 'failed') {
+      const code = typeof resBody.errorCode === 'string' ? resBody.errorCode : 'invite-failed';
+      const detail = typeof resBody.errorMessage === 'string' ? resBody.errorMessage : '';
+      throw new CompanyError('upstream_error', `invitation ${idempotencyKey} failed on the product: ${code} ${detail}`.trim(), false);
+    }
+
+    let delivery = (resBody.delivery ?? {}) as Record<string, unknown>;
+    let activationUrl = typeof delivery.activationUrl === 'string' && delivery.activationUrl.length > 0
+      ? delivery.activationUrl : undefined;
+
+    // 后台完成/续跑路径：行已 completed 但响应不携带链接 → 一次性收取（已收则回空）。
+    if (resBody.status === 'completed' && !activationUrl && delivery.pendingCollect === true) {
+      const col = await this.product(ctx, session, 'POST', `/api/ops/invitations/${encodeURIComponent(idempotencyKey)}/collect-delivery`);
+      if (col.ok) {
+        const collected = (col.body ?? {}) as Record<string, unknown>;
+        if (typeof collected.activationUrl === 'string' && collected.activationUrl.length > 0) {
+          activationUrl = collected.activationUrl;
+          delivery = { ...delivery, channel: 'activation_url' };
+          resBody = { ...resBody, delivery };
+        }
+      }
+    }
+
+    let handoff: { file: string; note: string } | undefined;
+    if (activationUrl) {
+      let file: string;
+      try {
+        file = this.writeOwnerHandoff(idempotencyKey, activationUrl, email, workspaceSlug);
+      } catch (error) {
+        // 链接一次性、不可重取；写失败即丢链——如实报出恢复路径，不回显 URL。
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new CompanyError('upstream_error',
+          `邀请${resend ? '重签发' : '已签发'}（idempotencyKey=${idempotencyKey}），但交接文件写入失败：${detail}。activation_url 不可重取——恢复路径：换环境修复后重发同键 resend，或 IdP 侧补重签发`, true);
+      }
+      delivery.activationUrl = null;
+      delivery.note = 'activation_url 已写老板本机交接文件，员工侧不回显';
+      handoff = { file, note: '请老板在本机打开该文件，把激活链接转交收件人' };
+    }
+
+    const known = this.sessions.secrets(ctx.scope.actor.employeeId);
+    const resStatus = resBody.status ?? res.status;
+    return {
+      value: { status: res.status, ok: res.ok, body: clipJson(redactJson(resBody, known)), ...(handoff ? { handoff } : {}) },
+      audit: {
+        action: 'ops_invitation_issue',
+        evidence: `ops_invitation_issue ${resend ? 'resend ' : ''}${email} ws=${workspaceSlug} → ${resStatus}${handoff ? '（激活链接→handoff 文件）' : ''}（${session.username}）`,
+      },
+    };
+  }
+
+  /**
+   * 邀请任务轮询：GET 到 completed/failed 为止。产品在 processing 超 240s 后允许
+   * 同参重发续跑（CAS 幂等，仅一个执行者）；这里越过阈值即发一次重发。
+   * 超时上限只约束本次工具调用——行不脱管，以同幂等键重发本工具可继续等。
+   */
+  private async awaitInvitation(ctx: Ctx, session: OpsSession, key: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const deadline = this.now() + INVITE_WAIT_MS;
+    const resumeAfter = this.now() + INVITE_RESUME_AFTER_MS;
+    let resumed = false;
+    for (;;) {
+      if (this.now() >= deadline) {
+        throw new CompanyError('upstream_error',
+          `invitation ${key} is still processing after ${Math.round(INVITE_WAIT_MS / 60000)}min; the task is not lost — call ops_invitation_issue again with the same idempotencyKey to keep waiting/resume it`, true);
+      }
+      await this.sleep(INVITE_POLL_MS);
+      const res = await this.product(ctx, session, 'GET', `/api/ops/invitations/${encodeURIComponent(key)}`);
+      if (res.ok) {
+        const polled = (res.body ?? {}) as Record<string, unknown>;
+        if (polled.status === 'completed' || polled.status === 'failed') return polled;
+      } else if (res.status >= 400 && res.status < 500) {
+        throw productFailure('polling the invitation', res, { 403: 'forbidden', 404: 'not_found' });
+      }
+      // 5xx 轮询失败当瞬断继续等。
+      if (!resumed && this.now() >= resumeAfter) {
+        resumed = true;
+        const re = await this.product(ctx, session, 'POST', '/api/ops/invitations', body);
+        if (re.ok) {
+          const rb = (re.body ?? {}) as Record<string, unknown>;
+          if (rb.status === 'completed' || rb.status === 'failed') return rb;
+        }
+      }
+    }
+  }
+
+  /** 一次性凭证的落地处：老板本机目录（0600），刻意不进 LAN 预览面。 */
+  private writeOwnerHandoff(key: string, activationUrl: string, email: string, workspace: string): string {
+    const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
+    const dir = join(home, 'handoff');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const name = `invite-${key.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 120)}.txt`;
+    const file = join(dir, name);
+    writeFileSync(file, [
+      'G2 邀请激活链接 —— 一次性凭证，仅供老板转交收件人，勿再分发。',
+      `收件邮箱: ${email}`,
+      `workspace: ${workspace}`,
+      `幂等键: ${key}`,
+      `签发时间: ${new Date(this.now()).toISOString()}`,
+      '有效期: 签发后 24 小时，激活成功即失效。',
+      '',
+      '激活链接（整行复制转交收件人）:',
+      activationUrl,
+      '',
+    ].join('\n'), { mode: 0o600 });
+    return file;
   }
 
   // ---------- sessions ----------
@@ -726,23 +1212,58 @@ export class OpsBroker {
     };
   }
 
+  /**
+   * Injects the session's token into the employee's ego-browser page. Customer sessions keep the
+   * app's flat sessionStorage keys and land on `/`; operator sessions land on `/ops/` and are
+   * written as the serialized `oidc-client-ts` `User` record the ops console's `UserManager`
+   * reads. An `ops` audience session is API-only and is refused before anything else.
+   */
   private async browserLogin(ctx: Ctx, args: Args): Promise<Outcome> {
-    const session = this.customerSession(ctx, args);
+    const session = this.session(ctx, args);
+    if (session.kind === 'ops') {
+      throw invalid('an ops session is API-only and cannot be injected into a browser; use a customer or operator session');
+    }
     const spaceId = Number(args.spaceId);
     if (!Number.isInteger(spaceId) || spaceId < 0) throw invalid('spaceId must be the numeric id of your ego-browser task space');
     const page = args.page === undefined ? 'p1' : text(args, 'page', 8);
     if (!/^p\d{1,3}$/.test(page)) throw invalid('page must be a page label such as p1');
+    // An expiring session re-logs through its own channel: the operator keeps riding the ops
+    // client, never the customer login.
     if (this.now() >= session.expiresAt - REFRESH_MARGIN_MS) await this.reauth(ctx, session);
     const product = new URL(ctx.cfg.product.url);
     const health = ctx.row.healthUrl ? new URL(ctx.row.healthUrl) : undefined;
     const probeUrl = health && health.origin === product.origin ? health.toString() : `${product.origin}/health`;
+
+    let landingUrl = `${product.origin}/`;
+    let oidcUser: { key: string; value: string } | undefined;
+    if (session.kind === 'operator') {
+      const ops = ctx.cfg.ops;
+      if (!ops) throw new CompanyError('not_configured', 'this environment no longer has an operator channel configured');
+      // Re-probe the operator gate right before the token leaves the broker: a revoked or
+      // demoted operator fails here instead of inside the injected page.
+      const probe = await this.product(ctx, session, 'GET', '/api/ops/quota/context');
+      if (!probe.ok) {
+        this.sessions.drop(session.id);
+        throw productFailure('operator access check', probe, { 401: 'login_failed', 403: 'forbidden' });
+      }
+      landingUrl = `${product.origin}/ops/`;
+      oidcUser = oidcUserEntry({
+        authority: ctx.cfg.idp.issuer, clientId: ops.clientId,
+        token: session.token, expiresAt: session.expiresAt, scope: ops.scope,
+        profile: {
+          sub: jwtSubject(session.token) ?? session.username,
+          email: accountEmail(session.username, ctx.cfg.accounts.emailDomain),
+        },
+      });
+    }
+
     const landed = await (this.deps.browser ?? egoBrowserInjector)({
-      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl: `${product.origin}/`,
-      token: session.token, expiresAt: session.expiresAt,
+      bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl,
+      token: session.token, expiresAt: session.expiresAt, oidcUser,
     });
     return {
       value: { signedInAs: session.username, url: landed.url, title: landed.title },
-      audit: { action: 'ops_browser_login', evidence: `ego-browser 任务空间 ${spaceId}/${page} 以 ${session.username} 登录` },
+      audit: { action: 'ops_browser_login', evidence: `ego-browser 任务空间 ${spaceId}/${page} 以 ${session.username} 登录${session.kind === 'operator' ? '（运营控制台 /ops/）' : ''}` },
     };
   }
 }

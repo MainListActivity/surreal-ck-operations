@@ -3,6 +3,7 @@
 import { installBunShim } from "./bun-shim";
 import { loadServiceEnv } from "./env";
 import { spawn } from "node:child_process";
+import { readProviderQuotas } from "./dispatch";
 
 export interface Company {
   db: import("./vendor/src/database").CompanyDatabase;
@@ -11,6 +12,8 @@ export interface Company {
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
   core: import("./vendor/src/contracts").CompanyCore;
   sidecar: import("./sidecar").SidecarPool;
+  /** Agent home repo — the default project staffing pools are scoped to. */
+  opsRepo: string;
   ops: import("./vendor/src/ops/broker").OpsBroker;
 }
 
@@ -60,12 +63,13 @@ export function company(): Promise<Company> {
       runDir: process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`,
       log: message => console.log(message),
     });
+    const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,
       owner,
       paseo: createPaseoCli(),
       env: {
-        opsRepo: process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations",
+        opsRepo,
         sckBin: process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`,
         paseoBin: process.env.SCK_PASEO_BIN ?? "/Applications/Paseo.app/Contents/Resources/bin/paseo",
       },
@@ -76,19 +80,7 @@ export function company(): Promise<Company> {
       // No git sweeper is injected while managed allocation is enabled.
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
-      quota: async () => {
-        const [rows] = await db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
-          `SELECT provider, summary, lowest_pct, session_pct, weekly_pct, status, fetched_at, at FROM company_meta
-           WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
-        return (rows ?? []).map(r => ({
-          provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
-          sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
-          // Freshness = when WE last verified the row, not the upstream snapshot time:
-          // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
-          // the circuit breaker would fail open on dead data.
-          fetchedAt: String(r.at ?? "") || r.fetched_at,
-        }));
-      },
+      quota: () => readProviderQuotas({ db }),
       // `auto:<family>` model slots resolved by hooks/tick-loop via providers.listModels.
       models: async () => {
         const [rows] = await db.db.query<[Array<{ slots?: Record<string, string> }>]>(
@@ -98,7 +90,7 @@ export function company(): Promise<Company> {
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
     await sidecar.adopt(await workforce.insts());
-    return { db, owner, workforce, dispatcher, core, sidecar, ops };
+    return { db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

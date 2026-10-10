@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { egoBrowserInjector } from '../src/ops/browser.ts';
+import { egoBrowserInjector, oidcUserEntry } from '../src/ops/browser.ts';
 import { controlPlaneEnv, parseBrokerConfig } from '../src/ops/config.ts';
 import { cloudflareD1 } from '../src/ops/d1.ts';
 import type { Fetcher } from '../src/ops/fetcher.ts';
@@ -156,6 +156,8 @@ describe('product request limits', () => {
     expect(productTimeoutMs('GET', '/api/session/workspaces')).toBe(30_000);
     expect(productTimeoutMs('POST', '/api/workspaces')).toBe(90_000);
     expect(productTimeoutMs('post', '/api/workspaces?x=1')).toBe(90_000);
+    expect(productTimeoutMs('POST', '/api/ops/invitations')).toBe(105_000);
+    expect(productTimeoutMs('GET', '/api/ops/invitations/k')).toBe(30_000);
     for (const [method, path] of [['GET', '/api/workspaces'], ['POST', '/api/workspaces/sck-x/members'], ['POST', '/api/workspaces-other'], ['POST', '/api/session/switch-workspace']]) {
       expect(productTimeoutMs(method!, path!), `${method} ${path}`).toBe(30_000);
     }
@@ -477,9 +479,30 @@ describe('ego-browser injector', () => {
     const stdin = readFileSync(join(dir!, 'stdin.txt'), 'utf8');
     expect(stdin).toContain('"eyJtoken.payload-part.signature"');
     expect(stdin).toContain('oidc.access_token');
-    expect(stdin).toContain('"exp":1800000000');
+    expect(stdin).toContain('"oidc.exp","value":"1800000000"');
     expect(stdin).toContain('taskSpace(4)');
     expect(readFileSync(join(dir!, 'argv.txt'), 'utf8').trim()).toBe('nodejs');
+  });
+
+  test('an oidcUser entry writes the User record under its key instead of the customer keys', async () => {
+    const bin = fakeCli(`cat > "${'$'}(dirname "${'$'}0")/stdin.txt"; echo 'SCK_RESULT {"url":"https://app.test/ops/","title":"Ops"}'`);
+    const user = oidcUserEntry({
+      authority: 'https://idp.test/t/ck', clientId: 'ops-client-0001',
+      token: 'eyJtoken.payload-part.signature', expiresAt: 1_800_000_000_000,
+      scope: 'openid', profile: { sub: 'sub-1', email: 'ops@example.test' },
+    });
+    const landed = await egoBrowserInjector({ ...input(bin), landingUrl: 'https://app.test/ops/', oidcUser: user });
+    expect(landed.url).toBe('https://app.test/ops/');
+    const stdin = readFileSync(join(dir!, 'stdin.txt'), 'utf8');
+    expect(stdin).toContain('"oidc.user:https://idp.test/t/ck:ops-client-0001"');
+    // The serialized User record travels as one JSON-encoded sessionStorage value.
+    expect(stdin).toContain('eyJtoken.payload-part.signature');
+    expect(stdin).toContain('expires_at');
+    expect(stdin).toContain('1800000000');
+    expect(stdin).toContain('sub-1');
+    // The customer keys never appear in an operator injection.
+    expect(stdin).not.toContain('oidc.access_token');
+    expect(stdin).not.toContain('"oidc.exp"');
   });
 
   test('the real CLI writes the result line to stderr, mixed with notices; stdout stays empty', async () => {
@@ -511,6 +534,19 @@ describe('ego-browser injector', () => {
     expect(error.code).toBe('upstream_error');
     expect(error.message).toContain('exit 3');
     expect(error.message).not.toContain('eyJtoken.payload-part.signature');
+  });
+
+  test('failures scrub the token even when it arrived inside an oidcUser record', async () => {
+    const bin = fakeCli(`cat >/dev/null; echo 'boom eyJtoken.payload-part.signature leaked' >&2; exit 3`);
+    const user = oidcUserEntry({
+      authority: 'https://idp.test/t/ck', clientId: 'ops-client-0001',
+      token: 'eyJtoken.payload-part.signature', expiresAt: 1_800_000_000_000,
+      scope: 'openid', profile: { sub: 'sub-1' },
+    });
+    const error = await failure(egoBrowserInjector({ ...input(bin), oidcUser: user }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).not.toContain('eyJtoken.payload-part.signature');
+    expect(error.message).not.toContain('sub-1');
   });
 
   test('a missing CLI is a configuration problem, not a crash', async () => {

@@ -7,6 +7,6 @@
 - **经理待办**（员工 `report_blocker to=gm`，或 Jev 从老板那里改派回来的问题）：读 history，自己决定并写进恢复说明，然后 `resume_task`。技术路线、拆分、上线、查得到的事实都由你决定。只有老板专属事项（见 PROTOCOL「决策权」）才让员工 `report_blocker to=owner`，并写明已查过哪些来源。
 - **运营验收复核**：确认验收记录里有生产入口、可操作的验收步骤和 qa 实测证据。
 - **G3 最终验收**（standard/program）：按任务里的固定格式写：结论、已上线提交与入口链接、老板验收步骤、qa 与运营结论、已知限制与回滚方式。交付已经上线，不请老板决定是否部署。老板驳回时按意见返工，然后结束本轮。
-- **老板直接对话**：老板给目标、方向或关口决定时，分别用 `create_goal`（可带 `tier`、`project`）、`set_direction`、`record_owner_decision` 转录，`ownerQuote` 逐字引用老板原话。
+- **老板直接对话**：老板给目标、方向或关口决定时，分别用 `create_goal`（可带 `tier`、`project`）、`set_direction`、`record_owner_decision` 转录，`ownerQuote` 逐字引用老板原话。标题以「老板指示：」开头的任务是老板经指令通道直达你的自由文本——先判断意图再执行：是目标就 `create_goal`，是政策就 `set_direction`，是问题就查清后 submit 答复。
 
 - **工作目录**：按 `claim.json.worktree` 使用调度通道登记的 shared 现场，默认只读代码；资产写入须有 `intent.kind=assets` 与授权相对目录，重叠写等待调度。活动引用期间不自行 checkout/reset/pull，不向集成/main 分支提交。附件写 `evidenceDir`。

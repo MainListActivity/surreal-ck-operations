@@ -43,7 +43,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 
 - **写工具注入租约证明**：`checkpoint` / `submit` / `review` / `report_blocker` 不需要、也不接受员工传租约字段；sidecar 用在手租约组装 `LeaseProof`（`taskId`、`deliveryId`、`fence`、`expectedVersion`），每次写成功后用返回的任务 `version` 刷新 `expectedVersion`（乐观并发）。
 - **消耗租约的写**：`submit`、`review`、`report_blocker` 成功后 `endLease`——停止续租、删除 live claim、释放该实例全部 ops 会话。`checkpoint` 不消耗。
-- **读与管理工具**：`get_context`、`get_task_history`、`create_task`、`create_goal`、`triage_goal`、`create_delivery`、`record_owner_decision`、`set_direction`、`resume_task`、`record_score` 直接转发 `CompanyCore`，权限仍在服务端按凭证的岗位能力裁决。
+- **读与管理工具**：`get_context`、`get_task_history`、`create_task`、`create_goal`、`triage_goal`、`create_delivery`、`record_owner_decision`、`set_direction`、`resume_task`、`defer_task_until`、`retire_task`、`record_score` 直接转发 `CompanyCore`，权限仍在服务端按凭证的岗位能力裁决。`retire_task`（gm/product，manage 能力）把任务置为终态 `void`：释放任何在持租约、清掉持有人的 `active_task`，并在同一事务内让 blocked 的下游重新评估依赖（`void` 视为已满足），只等被作废任务的链条当场解锁；重复作废幂等，`done` 任务拒绝。owner 关口例外：`reviewer_role='owner'` 的任务（原型 demo、验收 gate）作废不算批准，其下游不解锁且新建引用它的依赖仍视为未满足；该任务还有存活下游时退役被拒，须先把下游退役。锚点豁免：goal `anchors` 里的汇总锚点（运营验收/终验 gate）不算存活下游、其就绪评估把任何 `void` 依赖都视为已满足，否则退役 owner 关口原型会被锚点依赖永久锁死。
 - **`ops_*`**：转运维代理，见下节。
 - **`deliverable_publish`**：本地实现不转 core——把 `{files:[绝对路径…]}` 的文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/`（目录递归保结构、隐藏名跳过、同名覆盖、symlink 解引用），返回 `{taskId,dir,baseUrl,urls,skipped,conflictPolicy}`，`urls` 为 `http://<lanIP>:<port>/d/<taskId>/…` 可点链接（lanIP/端口取 `preview-status.json` 实际监听，缺省 `SCK_PREVIEW_PORT`/18777）。taskId 缺省取在手租约任务，显式传值供经理代发/补发（免租约）；任一输入路径无效即整体报错，不产生半截交付包。
 - **特殊**：`claim_next` 回 `forbidden`（任务已代领）；`heartbeat` 回 `{ok:true}`；`get_secret`/`put_secret` 已下线，回 `unknown_tool` 并提示改用 `ops_*`；其余未知名回 `unknown_tool`。请求 JSON 解析失败回 `malformed request`；无在手租约时写工具回 `no_lease`。
@@ -60,7 +60,8 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 | `ops_account_ensure` / `ops_login` / `ops_logout` | 密码由代理生成、密封入库、只在代理侧使用；`ops_login` 返回的是不透明会话句柄 `s_<16hex>`，不是 token |
 | `ops_workspace_ensure` / `ops_member_*` | slug 必须以项目 `workspacePrefix` 开头；成员按账号别名解析 |
 | `ops_request` / `ops_query` | 以会话身份调产品 HTTP / 在 workspace 库执行 SurrealQL；响应经脱敏与限长（100K） |
-| `ops_browser_login` | 把会话注入员工自己的 ego-browser 任务空间 |
+| `ops_browser_login` | 把会话注入员工自己的 ego-browser 任务空间：客户会话落产品 `/`（原 `oidc.access_token`/`oidc.exp` 键）；运营会话落 `/ops/` 并按 ops 控制台 oidc-client-ts `UserManager` 契约写序列化 `User` 记录，注入前重探运营身份；`ops` audience 会话禁止注入 |
+| `ops_idp_client_info` | 只读查看 IdP 已登记公开 client 的公开元数据（client_id、redirect、audience、consent_policy 等）及与代理配置的一致性；不返回任何密钥材料 |
 
 - **会话**：仅存内存，按（员工、项目、环境）隔离，每员工最多 8 个、最长 6 小时；token 临过期自动重登。租约结束、会话归档、插件重启即全部失效，跨任务不复用。代理没有删除账号/workspace 的能力。
 - **配额**：项目内按审计行统计最近 24h 新建数，超限回 `limit_reached`。

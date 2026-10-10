@@ -5,8 +5,8 @@
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { createHash, randomBytes } from "node:crypto";
-import { readdirSync, renameSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
   writeFileAtomic, type CommRequest, type CommResponse,
@@ -20,8 +20,8 @@ const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
-  "record_owner_decision", "set_direction", "resume_task", "record_score", "heartbeat",
-  "deliverable_publish",
+  "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
+  "record_score", "heartbeat", "deliverable_publish",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -92,6 +92,40 @@ export class SidecarPool {
     return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key };
   }
 
+  /** Absolute comm dir path for prompts — agents must never need to resolve env vars. */
+  commDirFor(instId: string): string {
+    return commDir(this.deps.runDir, instId);
+  }
+
+  /**
+   * Paseo injects spawn env only at session create — resume/refresh opens get
+   * env=undefined, which silently strips SCK_COMM_DIR/SCK_COMM_KEY from the
+   * process. Every open does carry PASEO_AGENT_ID though, so sck can re-enter
+   * comm mode through this pointer file (dir + key, no auth material).
+   */
+  private bindDir(): string {
+    return join(dirname(this.deps.runDir), "comm-agents");
+  }
+
+  private keyFor(instId: string): string {
+    const held = this.keys.get(instId);
+    if (held) return held;
+    throw new Error("channel binding requires an existing launch key");
+  }
+
+  private writeBinding(agentId: string, instId: string): void {
+    try {
+      mkdirSync(this.bindDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(join(this.bindDir(), agentId), `${commDir(this.deps.runDir, instId)}\n${this.keyFor(instId)}\n`, { mode: 0o600 });
+    } catch (error) {
+      this.log(`bind file ${agentId} failed: ${(error as Error).message}`);
+    }
+  }
+
+  private dropBinding(agentId: string): void {
+    try { unlinkSync(join(this.bindDir(), agentId)); } catch { /* already gone */ }
+  }
+
   /** Only a launch bound in this process can be reused, including management wakes. */
   canReuse(inst: EmployeeInst): boolean {
     return !this.quarantined.has(inst.id) && this.launched.has(inst.id) && this.keys.has(inst.id) &&
@@ -100,13 +134,21 @@ export class SidecarPool {
 
   bindAgent(instId: string, agentId: string): void {
     if (!this.launched.has(instId) || this.quarantined.has(instId)) throw new Error("channel was not launched in this process");
-    for (const [agent, inst] of this.instByAgent) if (inst === instId) this.instByAgent.delete(agent);
+    for (const [agent, inst] of this.instByAgent) if (inst === instId) {
+      this.instByAgent.delete(agent);
+      this.dropBinding(agent);
+    }
     this.instByAgent.set(agentId, instId);
+    this.writeBinding(agentId, instId);
   }
 
   private async credentialFor(instId: string): Promise<string> {
     const held = this.creds.get(instId);
     if (held) return held;
+    return this.rotateCredential(instId);
+  }
+
+  private async rotateCredential(instId: string): Promise<string> {
     // Plugin restart or adoption: re-issue. Retired instances fail here (revoked + retired row).
     const rotated = await this.deps.workforce.rotate(instId);
     this.creds.set(instId, rotated);
@@ -120,6 +162,21 @@ export class SidecarPool {
   }
   async releaseWorkspace(inst: EmployeeInst): Promise<void> {
     await this.deps.core.releaseWorkspace?.(await this.credentialFor(inst.id));
+  }
+
+  private static isAuthError(error: unknown): boolean {
+    return error instanceof Error && /invalid credential|unauthorized|forbidden/i.test(error.message);
+  }
+
+  /** Retry once with a re-issued credential when a call rejects auth — a concurrent adopter may have rotated it. */
+  private async callWithCred<T>(instId: string, fn: (cred: string) => Promise<T>): Promise<T> {
+    const cred = await this.credentialFor(instId);
+    try {
+      return await fn(cred);
+    } catch (error) {
+      if (!SidecarPool.isAuthError(error)) throw error;
+      return await fn(await this.rotateCredential(instId));
+    }
   }
 
   /** Claims the task as the instance and stages claim.json in its comm dir. */
@@ -150,12 +207,19 @@ export class SidecarPool {
       try { unlinkSync(join(reqDir(dir), file)); } catch { continue; }
       writeFileAtomic(join(resDir(dir), file), JSON.stringify({ ok: false, error: "no_lease: request predates current claim" }));
     }
-    writeFileAtomic(join(dir, "claim.json"), JSON.stringify(result));
+    // Evidence attachments (screenshots, exported reports, acceptance manuals) live
+    // under the service home, keyed by task so handovers and reviewers share one
+    // directory — deliberately outside any git repo so audits never bloat it.
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir }));
+    // A new lease must not inherit a previous turn's artifacts: archive them so an
+    // identical-looking new report still submits instead of matching a stale hash.
+    this.archive(reportPath(dir), "stale");
+    this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id,
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
-      reportHash: hash(readTextFile(reportPath(dir))),
-      blockerHash: hash(readTextFile(blockerPath(dir))),
     });
     this.startBeat(inst.id);
     this.log(`sidecar claimed ${task.id} for ${inst.id}`);
@@ -198,7 +262,9 @@ export class SidecarPool {
     }
     if (report !== undefined && hash(report) !== live.reportHash) {
       await this.finish(instId, live, undefined, report, reportPath(dir));
+      return;
     }
+    this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId}`);
   }
 
   private async finish(
@@ -229,6 +295,8 @@ export class SidecarPool {
     this.stopBeat(instId);
     this.claims.delete(instId);
     this.deps.ops?.release(instId);
+    // claim.json describes a dead lease — remove it so a re-used/woken agent knows it holds nothing.
+    try { unlinkSync(join(commDir(this.deps.runDir, instId), "claim.json")); } catch { /* already gone */ }
   }
 
   private archive(path: string, tag: string): void {
@@ -247,6 +315,7 @@ export class SidecarPool {
   detachAgent(agentId: string): void {
     const instId = this.instByAgent.get(agentId);
     this.instByAgent.delete(agentId);
+    this.dropBinding(agentId);
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
@@ -270,6 +339,7 @@ export class SidecarPool {
       this.quarantined.add(inst.id);
       this.instByAgent.set(inst.paseoAgentId, inst.id);
       this.active.add(inst.id);
+      this.dropBinding(inst.paseoAgentId);
       ensureCommDirs(commDir(this.deps.runDir, inst.id));
       this.log(`sidecar quarantined ${inst.id}: channel binding unavailable after restart`);
     }
@@ -283,11 +353,24 @@ export class SidecarPool {
       if (!live) { this.stopBeat(instId); return; }
       void (async () => {
         try {
-          const cred = await this.credentialFor(instId);
-          const result = await this.deps.core.heartbeat(cred, live.proof);
-          // A late-settling beat must only touch the lease it was started for.
+          const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
           if (this.claims.get(instId) === live) live.proof.expectedVersion = result.task.version;
         } catch (error) {
+          // Version drift (a concurrent write bumped the task) must not kill the
+          // lease: re-read the task and resync the proof. End it only when the
+          // lease is genuinely dead — wrong holder, wrong delivery, or expired.
+          if (this.claims.get(instId) !== live) return;
+          try {
+            const cred = await this.credentialFor(instId);
+            const task = await this.deps.core.getTask(cred, live.taskId);
+            if (this.claims.get(instId) === live && task.currentEmployee === instId && task.deliveryId === live.proof.deliveryId
+                && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
+              live.proof.expectedVersion = task.version;
+              live.proof.fence = task.fence;
+              this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
+              return;
+            }
+          } catch { /* getTask failed too — the lease is gone */ }
           this.log(`heartbeat ${instId} failed: ${(error as Error).message}`);
           if (this.claims.get(instId) === live) this.endLease(instId);
         }
@@ -304,14 +387,17 @@ export class SidecarPool {
   }
 
   /** Injected-proof write tools plus identity-scoped reads; capability enforcement stays in core. */
-  private async dispatch(instId: string, tool: string, args: Record<string, unknown>): Promise<unknown> {
-    const requestLease = this.claims.get(instId);
+  private async dispatch(
+    instId: string, tool: string, args: Record<string, unknown>, forceRotate: boolean,
+    request: { lease: LiveClaim | undefined },
+  ): Promise<unknown> {
+    const requestLease = request.lease;
     const core = this.deps.core;
     const ops = this.deps.ops;
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
-    const cred = await this.credentialFor(instId);
+    const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
@@ -355,6 +441,8 @@ export class SidecarPool {
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, String(args.taskId), evidence());
+      case "defer_task_until": return core.deferTaskUntil(cred, args as never);
+      case "retire_task": return core.retireTask(cred, args as never);
       case "record_score": return core.recordScore(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。
@@ -379,27 +467,46 @@ export class SidecarPool {
   }
 
   private sweep(): void {
-    for (const instId of this.active) {
+    // Keep answering our ended/detached channels, but do not drain directories
+    // owned by another pool (e.g. the replacement process during a restart).
+    for (const instId of new Set([...this.active, ...this.quarantined])) {
+      const live = this.active.has(instId);
       let files: string[];
       try { files = readdirSync(reqDir(commDir(this.deps.runDir, instId))); } catch { continue; }
       for (const file of files) {
         if (!file.endsWith(".json") || this.processing.has(file)) continue;
         this.processing.add(file);
-        void this.handle(instId, file).finally(() => this.processing.delete(file));
+        void Promise.resolve(live ? this.handle(instId, file) : this.rejectOrphan(instId, file))
+          .catch((error: unknown) => this.log(`handle ${file} failed: ${(error as Error).message}`))
+          .finally(() => this.processing.delete(file));
       }
     }
+  }
+
+  /** Drains a request written after the instance's lease ended — the caller gets an
+   *  explicit refusal instead of waiting out its timeout on a dead mailbox. */
+  private rejectOrphan(instId: string, file: string): void {
+    const dir = commDir(this.deps.runDir, instId);
+    try { unlinkSync(join(reqDir(dir), file)); } catch { return; }
+    const res: CommResponse = { ok: false, error: "本实例没有有效租约：任务已提交、被收回或已移交，等新的派工再操作" };
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));
   }
 
   private async handle(instId: string, file: string): Promise<void> {
     const dir = commDir(this.deps.runDir, instId);
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
+    const request = { lease: this.claims.get(instId) };
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
       ? { ok: false, error: "malformed request" }
       : this.quarantined.has(instId) || !this.keys.has(instId) || req.key !== this.keys.get(instId)
         ? { ok: false, error: "stale comm key; this session predates a plugin restart" }
-        : await this.dispatch(instId, req.tool, req.args ?? {})
+        : await this.dispatch(instId, req.tool, req.args ?? {}, false, request)
+            .catch((error: unknown) => SidecarPool.isAuthError(error)
+              // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
+              ? this.dispatch(instId, req.tool, req.args ?? {}, true, request)
+              : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
     writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));

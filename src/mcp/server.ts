@@ -5,7 +5,7 @@ import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '..
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
-const states = ['blocked', 'ready', 'doing', 'review', 'done'] as const;
+const states = ['blocked', 'ready', 'doing', 'review', 'done', 'void'] as const;
 const proofShape = {
   taskId: z.string().min(1),
   deliveryId: z.string().min(1),
@@ -212,6 +212,27 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'Resume a blocked task; requires core manage capability.',
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
+
+  server.registerTool('defer_task_until', {
+    description: 'gm only: turn a gm-blocked execute-phase task into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it auto-resumes when every dependency is done; with all dependencies already done it resumes immediately.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      dependencies: z.array(z.string().min(1)).min(1).max(20),
+      text: z.string().min(20).max(8000),
+      idempotencyKey: z.string().min(1),
+      expectedVersion: z.number().int().positive().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.deferTaskUntil(token(ctx), input)));
+
+  server.registerTool('retire_task', {
+    description: 'gm/product only: retire a task to the terminal void state. Releases any live lease, and blocked dependents waiting on it re-evaluate (void counts as satisfied) so downstream chains unlock. Repeating on a void task is a no-op; done tasks refuse.',
+    inputSchema: z.object({
+      taskId: z.string().min(1),
+      text: z.string().min(4).max(8000),
+      idempotencyKey: z.string().min(1),
+      expectedVersion: z.number().int().positive().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
 
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
