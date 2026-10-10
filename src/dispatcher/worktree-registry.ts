@@ -13,6 +13,7 @@ import {
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
 export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}`);
+export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number }
 export interface RegistryOptions {
   opsRepo: string;
   strategy?: 'shared' | 'legacy';
@@ -21,6 +22,12 @@ export interface RegistryOptions {
   orphanGraceDays?: number;
   /** Injectable clock for orphan grace tests. */
   now?: () => Date;
+  /**
+   * Paseo-side scene teardown, run under the repo lock at the delete transaction point just
+   * before the git tree is removed. Throwing keeps the tree and its row: cleanup_todo is
+   * recorded and the next event point or sweep retries the whole point idempotently.
+   */
+  sceneCleaner?: (treePath: string) => Promise<SceneCleanupResult | void>;
 }
 export interface ReclaimResult {
   scanId: string;
@@ -243,6 +250,9 @@ export class WorktreeRegistry {
   }
   async releaseWorkspace(employeeId: string) {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
+    // Event point: the released session ref may have been the tree's last reference.
+    const ref = await this.db.select<{ tree?: RecordId }>(record('worktree_session_ref', employeeId)).catch(() => undefined);
+    if (ref?.tree) await this.reclaimEvent(String(ref.tree.id), 'release').catch(() => undefined);
   }
 
   private async policy(): Promise<{ enabled: boolean; orphanGraceMs: number; now: Date }> {
@@ -451,6 +461,31 @@ export class WorktreeRegistry {
               continue;
             }
 
+            // Three layers die at this one transaction point: Paseo workspaces → project → git tree.
+            // A scene failure keeps the git tree and its row so the next event point or sweep retries.
+            if (this.options.sceneCleaner) {
+              try {
+                const scene = (await this.options.sceneCleaner(row.path)) ?? {};
+                await this.audit({
+                  scanId, repo, path: row.path, tree: row.id, event: 'scene_release', trigger: input.trigger,
+                  ownership: { mode: row.mode }, decision: 'delete', result: 'success',
+                  reason: `paseo-workspaces-archived:${scene.workspacesArchived ?? 0};paseo-projects-deleted:${scene.projectsDeleted ?? 0}`,
+                });
+                result.audited++;
+              } catch (error) {
+                const reason = `scene-cleanup-failed:${(error instanceof Error ? error.message : String(error)).slice(0, 180)}`;
+                result.kept.push({ path: row.path, reason });
+                await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo: reason.slice(0, 200) });
+                row.cleanup_todo = reason.slice(0, 200);
+                await this.audit({
+                  scanId, repo, path: row.path, tree: row.id, event: 'fail', trigger: input.trigger,
+                  ownership: { mode: row.mode }, decision: 'delete', result: 'failed', reason,
+                });
+                result.audited++;
+                continue;
+              }
+            }
+
             const removed = await this.removeTree(repo, row.path);
             if (!removed.ok) {
               const reason = removed.reason ?? 'git-remove-failed';
@@ -521,10 +556,17 @@ export class WorktreeRegistry {
     return result;
   }
 
+  /** Single-tree reclaim at a reference-release event point; resolves the tree's repo itself. */
+  async reclaimEvent(treeId: string | undefined, trigger: ReclaimTrigger): Promise<ReclaimResult | undefined> {
+    if (!treeId) return undefined;
+    const row = await this.db.select<{ repo?: string }>(record('worktree', treeId)).catch(() => undefined);
+    return this.reclaimAll({ trigger, treeId, repos: [row?.repo ?? this.options.opsRepo] });
+  }
+
   /** Event-triggered reclaim for a task that just reached a terminal done state. */
   async reclaimAfterTerminal(task: TaskView, trigger: ReclaimTrigger = 'accept'): Promise<ReclaimResult | undefined> {
     if (!task.worktree || task.state !== 'done') return undefined;
-    return this.reclaimAll({ trigger, treeId: task.worktree.id, repos: [task.worktree.repo] });
+    return this.reclaimEvent(task.worktree.id, trigger);
   }
 
   async listAudits(limit = 100): Promise<Array<Record<string, unknown>>> {

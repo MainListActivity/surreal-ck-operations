@@ -1,8 +1,12 @@
+import { realpathSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 export interface AgentInfo { id: string; status: string }
+export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
+export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
+export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number }
 
 export interface SpawnInput {
   title: string;
@@ -31,6 +35,14 @@ export interface PaseoGateway {
   stop(agentId: string): Promise<void>;
   /** Soft-delete the agent's session (its transcript stays in Paseo history). */
   archive(agentId: string): Promise<void>;
+  /** Active workspaces; archived ones no longer appear. */
+  listWorkspaces(): Promise<PaseoWorkspaceInfo[]>;
+  /** Registered projects; each maps a directory to the workspaces under it. */
+  listProjects(): Promise<PaseoProjectInfo[]>;
+  /** Archive a workspace and everything it owns; the transcript stays in history. */
+  archiveWorkspace(workspaceId: string): Promise<void>;
+  /** Delete a project and its workspaces. */
+  deleteProject(projectId: string): Promise<void>;
 }
 
 /** Paseo mode needed for unattended work; grok exposes no modes. */
@@ -96,6 +108,18 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     async archive(agentId) {
       await run(['archive', agentId]);
     },
+    async listWorkspaces() {
+      return json<PaseoWorkspaceInfo[]>(['workspace', 'ls']);
+    },
+    async listProjects() {
+      return json<PaseoProjectInfo[]>(['project', 'ls']);
+    },
+    async archiveWorkspace(workspaceId) {
+      await run(['workspace', 'archive', workspaceId]);
+    },
+    async deleteProject(projectId) {
+      await run(['project', 'delete', projectId]);
+    },
     async spawn(input) {
       const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd);
       const args = ['run', '-d', '--json', '--provider', `${input.provider}/${input.model}`, '--title', input.title, '--workspace', workspace];
@@ -121,5 +145,57 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     async stop(agentId) {
       await run(['stop', agentId]);
     },
+  };
+}
+
+const canonicalPath = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+const withinTree = (candidate: string, root: string) => candidate === root || candidate.startsWith(root + sep);
+/**
+ * "Already gone" is success for an idempotent teardown; anything else must surface for retry.
+ * Only phrases that reliably mean the object no longer exists classify as gone — usage errors
+ * ("unknown flag", "missing required argument") must stay real failures, or a CLI misuse would
+ * pass for success, leave the scene behind, and destroy the retry anchor with the tree.
+ */
+const goneSceneError = (error: unknown) =>
+  /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
+
+/**
+ * Release the Paseo side of a task scene: archive every workspace whose cwd points at the
+ * tree, then delete each project rooted at the tree that no longer hosts a live workspace.
+ * Both steps are idempotent — a missing object counts as done. Every object is attempted so
+ * one failure does not mask the others; the collected failures throw so the caller can keep
+ * the scene and retry at the next event point.
+ */
+export function createSceneCleaner(
+  paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject'>,
+): (treePath: string) => Promise<SceneCleanupResult> {
+  return async (treePath) => {
+    const target = canonicalPath(treePath);
+    const failures: string[] = [];
+    const workspaces = await paseo.listWorkspaces();
+    const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));
+    let workspacesArchived = 0;
+    for (const w of doomed) {
+      try { await paseo.archiveWorkspace(w.workspaceId); workspacesArchived++; }
+      catch (error) {
+        if (goneSceneError(error)) workspacesArchived++;
+        else failures.push(`workspace ${w.workspaceId}: ${(error instanceof Error ? error.message : String(error)).slice(0, 120)}`);
+      }
+    }
+    // A project dies only when no live workspace remains under it; re-list after archiving,
+    // and on re-list failure keep the pre-archive list so projects err on the retained side.
+    const remaining = doomed.length ? await paseo.listWorkspaces().catch(() => workspaces) : workspaces;
+    const projects = (await paseo.listProjects()).filter(p => withinTree(canonicalPath(p.path), target));
+    let projectsDeleted = 0;
+    for (const p of projects) {
+      if (remaining.some(w => w.project === p.name || w.project === p.projectId)) continue;
+      try { await paseo.deleteProject(p.projectId); projectsDeleted++; }
+      catch (error) {
+        if (goneSceneError(error)) projectsDeleted++;
+        else failures.push(`project ${p.projectId}: ${(error instanceof Error ? error.message : String(error)).slice(0, 120)}`);
+      }
+    }
+    if (failures.length) throw new Error(failures.join('; ').slice(0, 280));
+    return { workspacesArchived, projectsDeleted };
   };
 }

@@ -193,7 +193,8 @@ run('actual dispatcher and sidecar stage one registry source in claim.json, prom
   const pool = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], runDir: join(dir, 'comm') });
   let seen: { cwd: string; prompt: string; env: Record<string, string> } | undefined;
   const paseo: PaseoGateway = { list: async () => new Map(), status: async () => undefined, lastError: async () => '', logsTail: async () => '', lastInputTokens: async () => 0,
-    spawn: async input => { seen = input; return 'fixture-agent'; }, send: async () => {}, stop: async () => {}, archive: async () => {} };
+    spawn: async input => { seen = input; return 'fixture-agent'; }, send: async () => {}, stop: async () => {}, archive: async () => {},
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
   try {
     const dispatcher = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool, env: { opsRepo: path, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
     const result = await dispatcher.tick(); expect(result.woke).toHaveLength(1); expect(seen).toBeDefined();
@@ -442,6 +443,92 @@ run('WT02: reclaim disabled switch and concurrent claim under lock keep scene', 
   expect(inv.find(w => w.id === second.worktree!.id)!.reasons).toContain('reclaim-disabled');
   await submit(core, eng, first);
 }, 20000);
+
+run('WT03: done event releases paseo scene and git tree at one point; scene failure keeps tree for retry', async () => {
+  const path = repo();
+  const calls: Array<{ path: string; existed: boolean }> = [];
+  let fail = true;
+  const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, sceneCleaner: async (p) => {
+    calls.push({ path: p, existed: existsSync(p) });
+    if (fail) throw new Error('fixture paseo daemon down');
+    return { workspacesArchived: 2, projectsDeleted: 1 };
+  } } });
+  const eng = await employee('engineering'), peer = await employee('engineering');
+  await core.claim(eng, (await task(core, 'engineering')).id); // shared writer forces peer's exclusive tree
+  const claim = await core.claim(peer, (await task(core, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const scene = claim.worktree!.worktreePath;
+
+  // Paseo side down: the delete point aborts atomically — git tree and row survive with a todo.
+  await acceptDone(core, peer, claim);
+  expect(existsSync(scene)).toBe(true);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual({ path: scene, existed: true }); // scene teardown ran before any git remove
+  const kept = (await core.listWorktrees(gm)).find(w => w.worktreePath === scene)!;
+  expect(kept.reasons.some(r => r.includes('cleanup-todo:scene-cleanup-failed'))).toBe(true);
+  expect((await core.listWorktreeAudits(gm, 50)).some(a => a.event === 'fail' && String(a.reason).includes('scene-cleanup-failed'))).toBe(true);
+
+  // Paseo side back: the next event/sweep retries the whole point; all three layers die together.
+  fail = false;
+  const retried = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(retried.removed).toContain(scene);
+  expect(existsSync(scene)).toBe(false);
+  expect(calls).toHaveLength(2);
+  expect(calls[1]).toEqual({ path: scene, existed: true });
+  const audits = await core.listWorktreeAudits(gm, 50);
+  expect(audits.some(a => a.event === 'scene_release' && a.result === 'success' && String(a.reason).includes('paseo-workspaces-archived:2'))).toBe(true);
+  expect(audits.some(a => a.event === 'delete' && a.result === 'success')).toBe(true);
+}, 30000);
+
+run('WT03: return and releaseWorkspace evaluate their tree in place without harming live scenes', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng1 = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng1, (await task(core, 'engineering')).id); // keeps shared writer active
+  const claim = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const scene = claim.worktree!.worktreePath;
+  await submit(core, eng2, claim);
+  const review = await core.claim(qa, claim.task.id);
+  const returned = await core.returnTask(qa, proof(review), { text: 'Return event point keeps recovery scene', idempotencyKey: `event-return-${++count}` });
+  expect(returned.state).toBe('ready');
+  // The returned scene still has a recovery ref: evaluated in place, kept on disk.
+  expect(existsSync(scene)).toBe(true);
+  expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'return' && a.event === 'skip' && String(a.reason).includes('unfinished-scene'))).toBe(true);
+
+  // Session release runs the same single-tree evaluation; the shared tree is protected anyway.
+  const judge = await employee('eval');
+  const workspace = await core.readWorkspace(judge, claim.task.id);
+  await core.releaseWorkspace(judge);
+  expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'release' && a.event === 'skip' && String(a.reason).includes('shared-retained'))).toBe(true);
+  expect((await core.listWorktrees(gm)).find(w => w.id === workspace!.id)).toBeTruthy();
+  await submit(core, eng1, holder);
+}, 30000);
+
+run('WT03: channel rollback via core.release() keeps the scene for the next holder; terminal done still releases all three layers', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng, (await task(core, 'engineering')).id); // keeps shared writer active
+  const claim = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const scene = claim.worktree!.worktreePath;
+
+  // Channel-side claim rollback (sidecar.releaseClaim → core.release()): the rolled-back task
+  // keeps its worktree reference, so the release event evaluates the scene in place and keeps it.
+  const released = await core.release(eng2, proof(claim), { text: 'Fixture channel rollback without reviewer verdict', idempotencyKey: `event-release-${++count}` });
+  expect(released.state).toBe('ready');
+  expect(existsSync(scene)).toBe(true);
+  expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'release' && a.event === 'skip' && String(a.path) === scene)).toBe(true);
+
+  // The rolled-back task is claimable again on the same scene; the terminal done event is where
+  // all three layers die together.
+  const resumed = await core.claim(eng2, claim.task.id);
+  expect(resumed.worktree!.worktreePath).toBe(scene);
+  await submit(core, eng2, resumed);
+  const review = await core.claim(qa, resumed.task.id);
+  await core.accept(qa, proof(review), { text: 'Accept after channel rollback fixture', idempotencyKey: `event-release-accept-${++count}` });
+  expect(existsSync(scene)).toBe(false);
+  await submit(core, eng, holder);
+}, 30000);
 
 run('WT02: inventory no longer hard-disables deletion and exposes grace reasons', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), peer = await employee('engineering');

@@ -7,6 +7,7 @@ import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
+import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
@@ -242,8 +243,12 @@ export interface DispatcherDeps {
   jev?: JevClient;
   /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
-  /** WT02 ownership reclaim on the existing 10-minute sweep cadence. Undefined disables reclaim. */
-  reclaimWorktrees?: () => Promise<ReclaimResult>;
+  /**
+   * WT02 ownership reclaim. Called bare on the existing 10-minute sweep cadence; called with
+   * treeId+repo+trigger at event points (lease revoke/expire) to evaluate a single tree.
+   * Undefined disables reclaim.
+   */
+  reclaimWorktrees?: (input?: { trigger?: ReclaimTrigger; treeId?: string; repo?: string }) => Promise<ReclaimResult>;
   /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
   quota?: () => Promise<ProviderQuota[]>;
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
@@ -405,7 +410,7 @@ export class Dispatcher {
       if (state === 'down' || state === 'exhausted') {
         await this.revoke(task, `员工 ${inst!.id} 的会话${state === 'exhausted' ? '所在订阅额度耗尽/限流' : '已中断'}`, inst, report);
       } else if (expired) {
-        await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report);
+        await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
       }
     }
     insts = insts.filter(i => !report.retired.includes(i.id));
@@ -1018,7 +1023,7 @@ export class Dispatcher {
     return undefined;
   }
 
-  private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport) {
+  private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport, trigger: 'revoke' | 'expire' = 'revoke') {
     const cfg = await this.deps.workforce.config();
     const log = inst?.paseoAgentId ? await this.deps.paseo.logsTail(inst.paseoAgentId, LOG_TAIL_ENTRIES) : '';
     const handover = [
@@ -1033,6 +1038,10 @@ export class Dispatcher {
       // The sidecar may still hold a local claim whose heartbeat died first;
       // drop it or the instance stays un-claimable until the next restart.
       if (holder) this.deps.sidecar?.dropLease?.(holder, task.id);
+      // Event point: a revoke/expire that released the scene's last reference reclaims it in
+      // place; a recovery ref keeps the scene for the next holder. Never block the tick.
+      const scene = task.row.worktree;
+      if (scene) await this.deps.reclaimWorktrees?.({ trigger, treeId: scene.id, repo: scene.repo }).catch(() => undefined);
       this.log(`revoked ${task.id} from ${task.currentEmployee}: ${reason}`);
     }
   }

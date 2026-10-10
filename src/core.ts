@@ -826,7 +826,15 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     return task;
   }
-  returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'return', evidence); }
+  async returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) {
+    const task = await this.transition(credential, proof, 'return', evidence);
+    // Same event point as accept: a return that leaves the scene with zero effective refs
+    // reclaims it in place; a recovery ref keeps the scene for the next holder.
+    if (task.worktree && this.worktrees) {
+      await this.worktrees.reclaimEvent(task.worktree.id, 'return').catch(() => undefined);
+    }
+    return task;
+  }
   /**
    * Channel-side claim rollback (spawn/wake failure, workspace handoff): the holder's lease is
    * dropped without a reviewer verdict — a review task stays in review awaiting a fresh claim,
@@ -870,7 +878,14 @@ export class SurrealCompanyCore implements CompanyCore {
         fence: proof.fence, expected: proof.expectedVersion, evidence: evidence.text,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
       });
-      return view(row);
+      const task = view(row);
+      // Same event point as return: a released claim may have been the scene's last reference.
+      // decideReclaim keeps anything still referenced (e.g. a review task awaiting a fresh
+      // claim) or unsafe to delete; never block the rollback itself.
+      if (task.worktree && this.worktrees) {
+        await this.worktrees.reclaimEvent(task.worktree.id, 'release').catch(() => undefined);
+      }
+      return task;
     } catch (error) {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
