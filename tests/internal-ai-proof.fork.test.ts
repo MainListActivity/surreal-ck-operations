@@ -26,6 +26,9 @@ let clock = Date.now(); const now = () => clock;
 const key = Buffer.alloc(32, 19); // synthetic sealing key, no real service credentials
 let delivered: string | undefined;
 let identityAvailable = true;
+// Trusted-identity read counters at the product boundary: one full identities resolution reads
+// /api/internal-ai/identity once per manifest alias (two aliases → two reads).
+let identityReads = 0, identityFailAfter = 0;
 async function connect() {
   database = new CompanyDatabase({url: url + '/rpc', rootUser:'root', rootPassword:'root', namespace:'proof_test', database:'control_plane'});
   await database.connect(); await database.bootstrap(); core = new SurrealCompanyCore(database); projects = new ProjectStore(database.db);
@@ -42,6 +45,8 @@ function broker() {
     fetch: async (input, init) => {
       const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
       if (u.pathname === '/api/internal-ai/identity') {
+        identityReads++;
+        if (identityFailAfter > 0 && identityReads > identityFailAfter) return Response.json({}, {status:503});
         if (!identityAvailable) return Response.json({}, {status:404});
         const token = new Headers(init?.headers).get('authorization')!.slice(7);
         const payload = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString()) as {sub:string};
@@ -162,6 +167,35 @@ check('real approval, byte hashes, normal alias mapping, encrypted proof and pub
   const [rows]=await database.db.query<[Array<{sealed:unknown}>]>('SELECT sealed FROM internal_ai_proof;');
   expect(JSON.stringify(rows)).not.toContain(delivered!);
   expect(JSON.stringify(a)).not.toContain('PRIVATE KEY');
+});
+check('prove resolves identities once per request; IdP failure after the first resolution cannot fail prove; digest comparison retained',async()=>{
+  // a) 新签发路径：两 alias 各读一次身份 = 单请求恰一次完整解析（修复前 valid 里会再来两次读）。
+  const before=identityReads;
+  const v=await request('ops_internal_ai_prove',proofArgs('reuse'));
+  expect(identityReads-before).toBe(2);
+  // a) 重放路径：同一幂等键重放同样只解析一次，结果一致。
+  const replay=await request('ops_internal_ai_prove',proofArgs('reuse'));
+  expect(replay).toEqual(v);
+  expect(identityReads-before).toBe(4);
+  // b) 首次解析成功后 IdP 一直 503（IdP 抖动场景）：prove 仍返回 handle——不再有第二次解析。
+  const flake=identityReads;
+  identityFailAfter=flake+2;
+  const p=await request('ops_internal_ai_prove',proofArgs('flake'));
+  expect(p.proofHandle).toBeString();
+  expect(identityReads).toBe(identityFailAfter); // 故障窗口从未被越过：单请求只有首次解析
+  identityFailAfter=0;
+  // c) 身份快照比对保留：行内 digest 与请求内解析 digest 不同 → forbidden（复用不跳过比对）。
+  const rowId=new RecordId('internal_ai_proof',sha256(String(p.proofHandle)));
+  const [digest]=await database.db.query<[Array<{identities_digest:string}>]>('SELECT identities_digest FROM $id;',{id:rowId});
+  const original=digest[0]!.identities_digest;
+  await database.db.query('UPDATE $id SET identities_digest=$d;',{id:rowId,d:'f'.repeat(64)});
+  await expect(request('ops_internal_ai_prove',proofArgs('flake'))).rejects.toMatchObject({code:'forbidden'});
+  await database.db.query('UPDATE $id SET identities_digest=$d;',{id:rowId,d:original});
+  // c) identities 解析失败（IdP 不可用）在重放路径同样失败：复用不跳过实时解析本身。
+  identityAvailable=false;
+  await expect(request('ops_internal_ai_prove',proofArgs('flake'))).rejects.toBeDefined();
+  identityAvailable=true;
+  expect(await request('ops_internal_ai_prove',proofArgs('flake'))).toEqual(p);
 });
 check('reviewed-token-plan quota evidence signs approved-service; quota, schema and USD-balance violations reject',async()=>{
   const task=await core.createTask(gm,{title:'Synthetic token-plan approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
