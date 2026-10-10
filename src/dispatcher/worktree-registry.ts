@@ -111,7 +111,11 @@ export class WorktreeRegistry {
   private async reconcile(repo: string, list: Tree[], project?: string) {
     const rows = await this.rows(repo);
     for (const t of list) {
-      if (rows.some(r => r.path === t.path)) continue;
+      const existing = rows.find(r => r.path === t.path);
+      if (existing) {
+        if (project && !existing.project) await this.db.query('UPDATE ONLY $tree SET project = $project;', { tree: existing.id, project });
+        continue;
+      }
       const managedRead = t.path === join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-shared`) && t.branch === `sck/shared-${hash(repo).slice(0, 12)}`;
       const protection = managedRead ? undefined : t.main ? 'repository-main' : 'legacy-or-release: manual adoption required';
       await this.db.query(`CREATE ONLY $tree CONTENT { repo: $repo, project: $project, path: $path,
@@ -196,11 +200,11 @@ export class WorktreeRegistry {
         : intent.kind === 'assets' ? '仅写授权目录；不得 checkout/reset/pull 或 commit/push；附件写 evidenceDir。'
           : '只读代码；不得 checkout/reset/pull、commit/push 或写资产；附件写 evidenceDir。' };
   }
-  async readWorkspace(repoPath: string, actor: Principal): Promise<WorktreeAssignment> {
+  async readWorkspace(repoPath: string, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
     return this.locked(repoPath, async (repo, list) => {
       const task: TaskView = { id: `session-${actor.employeeId}`, title: 'Read workspace', context: '', state: 'ready',
         executorRole: actor.role, reviewerRole: 'qa', kind: 'task', dependencies: [], version: 0, fence: 0, workIntent: { kind: 'read' } };
-      const assignment = await this.allocate(repo, list, task, actor);
+      const assignment = await this.allocate(repo, list, task, actor, project);
       await this.db.query(`BEGIN;
         LET $who = SELECT * FROM ONLY $holder;
         IF $who = NONE OR $who.revoked = true OR $who.retired = true { THROW 'workspace identity revoked' };
@@ -217,6 +221,10 @@ export class WorktreeRegistry {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
   }
   async inventory(repo?: string): Promise<WorktreeView[]> {
+    const known = await this.rows(repo);
+    for (const path of new Set(repo ? [repo] : known.map(r => r.repo))) {
+      await this.locked(path, (canonical, list) => this.reconcile(canonical, list)).catch(() => undefined);
+    }
     const rows = await this.rows(repo), refs = await this.refs(repo);
     const cache = new Map<string, Tree[]>();
     const result: WorktreeView[] = [];

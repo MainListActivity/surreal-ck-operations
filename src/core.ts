@@ -364,7 +364,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!this.worktrees) return undefined;
     if (taskId) await this.getTask(credential, taskId);
     const project = taskId ? await this.taskProject(taskId) : undefined;
-    return this.worktrees.readWorkspace(project?.repoPath ?? this.worktrees.options.opsRepo, actor);
+    return this.worktrees.readWorkspace(project?.repoPath ?? this.worktrees.options.opsRepo, actor, project);
   }
   async releaseWorkspace(credential: Credential): Promise<void> {
     const actor = await this.authorized(credential);

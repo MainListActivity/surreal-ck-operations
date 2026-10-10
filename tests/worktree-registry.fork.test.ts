@@ -6,6 +6,7 @@ import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { ProjectStore } from '../src/projects.ts';
 import { Workforce } from '../src/workforce.ts';
 import type { ClaimResult, LeaseProof, Role, WorkIntent } from '../src/contracts.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
@@ -165,7 +166,9 @@ run('failed authorization/claim and symlink scopes never leave effective referen
   symlinkSync(dir, join(first.worktree!.worktreePath, 'outside'));
   await expect(core.claim(assets, (await task(core, 'asset-production', { kind: 'assets', paths: ['outside/assets'] })).id)).rejects.toMatchObject({ code: 'invalid' });
   git(first.worktree!.worktreePath, 'checkout', '-b', 'manual-drift');
+  const external = join(dir, `external-${++count}`); git(path, 'worktree', 'add', '-b', `external-${count}`, external);
   const inv = await core.listWorktrees(gm); expect(inv.find(w => w.id === first.worktree!.id)!.status).toBe('drift');
+  expect(inv.find(w => w.worktreePath === external)!.mode).toBe('protected');
   const isolated = await core.claim(eng, (await task(core, 'engineering')).id);
   expect(isolated.worktree!.worktreePath).not.toBe(first.worktree!.worktreePath);
   expect(git(first.worktree!.worktreePath, 'branch', '--show-current')).toBe('manual-drift');
@@ -258,4 +261,18 @@ run('managed allocator keeps expired-lease takeover semantics and preserves scen
   expect(readFileSync(join(b.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('expired dirty scene');
   await expect(core.checkpoint(eng, proof(a), { text: 'stale after takeover', idempotencyKey: 'managed-expired-stale' })).rejects.toBeDefined();
   await submit(recovery, next, b);
+});
+
+run('project-bound non-lease eval uses project repo and carries persistent project/default branch metadata', async () => {
+  const path = repo(), opsPath = repo(), core = coreFor(opsPath), judge = await employee('eval');
+  git(path, 'checkout', '-b', 'project-default'); writeFileSync(join(path, 'source.txt'), 'project baseline');
+  git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'project baseline'); git(path, 'checkout', 'main');
+  const project = await new ProjectStore(db.db).upsert({ id: `fixture-project-${++count}`, name: 'Isolated worktree project', repoPath: path, defaultBranch: 'project-default', release: 'Fixture only', envs: [] });
+  const goal = await core.relayGoal(gm, { text: 'Synthetic isolated project-scoped worktree verification goal', ownerQuote: 'Synthetic fixture owner instruction', project: project.id, tier: 'quick', idempotencyKey: `project-goal-${count}` });
+  const t = await core.createTask(gm, { title: 'Project-scoped fixture', context: 'Local fixture only', executorRole: 'qa', reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: `project-task-${count}` });
+  const workspace = await core.readWorkspace(judge, t.id);
+  expect(workspace!.repo).toBe(path); expect(workspace!.project).toBe(project.id); expect(workspace!.repo).not.toBe(opsPath);
+  expect(readFileSync(join(workspace!.worktreePath, 'source.txt'), 'utf8')).toBe('project baseline');
+  expect((await core.listWorktrees(gm)).find(w => w.id === workspace!.id)!.project).toBe(project.id);
+  await core.releaseWorkspace(judge);
 });

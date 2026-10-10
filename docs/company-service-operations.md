@@ -96,6 +96,6 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 1. 记录 MCP active release 提交、插件分支提交、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
 2. 按上文双面流程切 fixed release、同步 `/Users/y/IdeaProjects/surreal-ck-operations-v3/plugin` 的受控源码与 vendor/schema，reload **现有** `sck-company`；保留插件在途提交，不另起 dispatcher。
 3. 验证 MCP `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复；记录两面实际提交/时间。经理安排真实串行 QA/工程及并行代码写手演练，QA 用普通通道读登记，不取得凭证、不自行建员工。证据含任务 ID、实际路径/branch、audit ID/时间、登记/有效引用 before/after，区分本地与生产。
-4. 分配策略需要回退时，两面同时设置 `SCK_WORKTREE_STRATEGY=legacy`（只对后续新分配恢复独占，已有 assignment 优先），restart MCP + reload 现有插件。保留 schema 011、登记与在办现场，不运行旧清理、不降级到不认识 worktree 的旧 core。两面代码回滚也须保留 WT01 登记兼容版本。
+4. 分配策略需要回退时，两面同时设置 `SCK_WORKTREE_STRATEGY=legacy`（只对后续新代码分配恢复独占，已有 assignment 优先），restart MCP + reload 现有插件。保留 schema 011、登记与在办现场，不运行旧清理、不降级到不认识 worktree 的旧 core。两面代码回滚也须保留 WT01 登记兼容版本。
 
 新业务环境变量：无。可选策略开关仅用于受控回退；系统 Python 和现有 Git 是本机准备项。
