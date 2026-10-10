@@ -9,8 +9,10 @@ export interface DatabaseConfig {
 }
 
 function readProductEnv(): Record<string, string> {
+  // `||` not `??`: the spawn env can inject SCK_PRODUCT_ENV set-but-empty, and '' must
+  // still fall back to the default path (an explicit-but-empty value is meaningless).
   const explicit = process.env.SCK_PRODUCT_ENV;
-  const path = explicit ?? '/Users/y/IdeaProjects/surreal_ck/.env';
+  const path = explicit || '/Users/y/IdeaProjects/surreal_ck/.env';
   // The default path is a Mac dev-machine convention; on servers everything comes
   // from the environment. Only an explicitly-set but missing file is an error.
   let text: string;

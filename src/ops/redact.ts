@@ -1,6 +1,6 @@
 // Everything the broker returns or logs passes through here: employees must never see
 // tokens or passwords, even when an upstream response echoes one.
-const SECRET_KEY = /^(access_?token|refresh_?token|id_?token|token|password|passwd|secret|client_?secret|authorization|code_?verifier|login_?challenge)$/i;
+const SECRET_KEY = /^(access_?token|refresh_?token|id_?token|token|password|passwd|secret|client_?secret|authorization|code_?verifier|login_?challenge|activation_?url|activation_?token|invitation_?token|token_?hash)$/i;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g;
 const MASK = '[redacted]';
 

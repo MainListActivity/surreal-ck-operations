@@ -52,7 +52,13 @@ const toRequest = (req: IncomingMessage): Request => {
     if (v === undefined) continue;
     headers.set(k, Array.isArray(v) ? v.join(", ") : v);
   }
-  return new Request(`http://preview.local${req.url ?? "/"}`, { method: req.method, headers });
+  const init: RequestInit = { method: req.method, headers };
+  // POST/PUT 必须把 node 请求体接上，否则 handler 里 req.json() 读到空流报 unexpected end of JSON。
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    (init as RequestInit & { duplex: string }).duplex = "half";
+    (init as { body?: unknown }).body = Readable.toWeb(req);
+  }
+  return new Request(`http://preview.local${req.url ?? "/"}`, init);
 };
 
 const send = async (res: ServerResponse, out: Response): Promise<void> => {
@@ -72,6 +78,8 @@ export interface StartPreviewOptions {
   secret?: string;
   /** 测试注入：core 工厂（缺省 lazy import vendor 的 preview-core）。 */
   coreFactory?: CoreFactory;
+  /** 老板审核台 handler：/o/ 前缀的请求先走它（自带 token 门控），不进核心文件路由。 */
+  consoleFetch?: FetchHandler;
   log?: (msg: string) => void;
 }
 
@@ -117,8 +125,9 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
 
   const listen = (L: Listener, host: string, port: number, handlerFor: () => FetchHandler | undefined) => {
     if (stopped || L.dead) return;
+    const consoleHandler = opts.consoleFetch;
     const server = createServer((req, res) => {
-      const handler = handlerFor();
+      const handler = (consoleHandler && req.url?.startsWith("/o/")) ? consoleHandler : handlerFor();
       if (!handler) { res.writeHead(503).end("preview core unavailable"); return; }
       Promise.resolve().then(async () => {
         const request = toRequest(req);

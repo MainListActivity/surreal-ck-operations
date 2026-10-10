@@ -94,6 +94,18 @@ export const attachmentUrl = defineRpc({
   output: z.object({ url: z.string(), expiresAt: z.string().optional() }),
 });
 
+export const openExternal = defineRpc({
+  name: "company.shell.open-external",
+  input: z.object({ url: z.string().min(1).max(2048) }),
+  output: z.object({ ok: z.boolean() }),
+});
+
+export const consoleUrl = defineRpc({
+  name: "company.console.url",
+  input: z.object({}),
+  output: z.object({ url: z.string() }),
+});
+
 export const readAttachment = defineRpc({
   name: "company.attachments.read",
   input: z.object({ taskId: z.string().min(1).max(128), name: z.string().min(1).max(512) }),
