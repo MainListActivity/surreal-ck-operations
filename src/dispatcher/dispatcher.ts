@@ -462,13 +462,27 @@ export class Dispatcher {
       const last = await wf.lastDispatch(task.id, task.version, 'gm-attention');
       if (!last || now - last.at >= cfg.redispatchMinutes * 60) pendingGm.push(task);
     }
-    if (pendingGm.length && running < cfg.maxRunning) {
+    // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
+    // per repo: the group's readTask anchors pick home, per-project spawn quota,
+    // readWorkspace resolution and the cwd/repoHome fallback on the repo the blocked
+    // tasks actually belong to — a single anchorless assign would pin every project's
+    // gm batch onto the ops repo tree.
+    const gmGroups = new Map<string, SupervisedTask[]>();
+    for (const task of pendingGm) {
+      const home = task.repoPath ?? this.deps.env.opsRepo;
+      const group = gmGroups.get(home);
+      if (group) group.push(task); else gmGroups.set(home, [task]);
+    }
+    for (const group of gmGroups.values()) {
+      if (running >= cfg.maxRunning) break;
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, pendingGm, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap);
-      if (result) {
-        for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
-        report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
-      }
+        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap, group[0]);
+      if (!result) continue;
+      for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
+      running++;
+      busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
+      assigned.add(result.id);
+      report.woke.push(...group.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
     }
 
     const triage = await owner.triagePending();
