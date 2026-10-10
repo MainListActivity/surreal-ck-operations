@@ -285,6 +285,10 @@ class FakePaseo implements PaseoGateway {
   async logsTail(id: string) { return `[Shell] git commit -m wip (agent ${id})`; }
   async lastInputTokens(id: string) { return this.agents.get(id)?.inputTokens; }
   async archive(id: string) { this.archived.push(id); const a = this.agents.get(id); if (a) a.status = 'archived'; }
+  async listWorkspaces() { return []; }
+  async listProjects() { return []; }
+  async archiveWorkspace(_id: string) {}
+  async deleteProject(_id: string) {}
   async spawn(input: SpawnInput) {
     const id = `agent-${this.agents.size + 1}`;
     this.agents.set(id, { status: 'running', error: '', spawn: input });

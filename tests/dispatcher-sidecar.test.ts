@@ -55,6 +55,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); events.push(`spawn:${id}`); return id; },
     send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });

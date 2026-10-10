@@ -40,7 +40,7 @@ export function company(): Promise<Company> {
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
-    const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
+    const { createPaseoCli, createSceneCleaner } = await import("./vendor/src/dispatcher/paseo.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
 
     const db = new CompanyDatabase(loadDatabaseConfig());
@@ -49,9 +49,12 @@ export function company(): Promise<Company> {
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
+    const paseo = createPaseoCli();
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
+      // Three-layer same-death: a task worktree's Paseo workspaces/project die with the tree.
+      sceneCleaner: createSceneCleaner(paseo),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
         ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
       reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'
@@ -75,7 +78,7 @@ export function company(): Promise<Company> {
     const dispatcher = new Dispatcher({
       workforce,
       owner,
-      paseo: createPaseoCli(),
+      paseo,
       env: {
         opsRepo,
         sckBin: process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`,
@@ -84,8 +87,10 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
-      // WT02: ownership reclaim on the existing dispatcher sweep cadence (no new timers).
-      reclaimWorktrees: () => core.worktrees!.reclaimAll({ trigger: 'sweep' }),
+      // WT02: bare call = 10-minute sweep (crash-orphan fallback); treeId+repo = event point.
+      reclaimWorktrees: (input) => core.worktrees!.reclaimAll({
+        trigger: input?.trigger ?? 'sweep', treeId: input?.treeId,
+        repos: input?.repo ? [input.repo] : undefined }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: () => readProviderQuotas({ db }),

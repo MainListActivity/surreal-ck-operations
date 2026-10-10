@@ -49,7 +49,8 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
       lastError: async () => '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
       spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
       send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
-      archive: async id => { agentRows.get(id)!.status = 'archived'; pool!.detachAgent(id); } };
+      archive: async id => { agentRows.get(id)!.status = 'archived'; pool!.detachAgent(id); },
+      listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     const makeDispatcher = () => new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
       env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
     let counter = 0;

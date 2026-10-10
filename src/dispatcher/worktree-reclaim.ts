@@ -9,7 +9,7 @@ const SHARED_BRANCH = /^sck\/shared-[0-9a-f]+$/i;
 const RELEASE_MARKER = /\/SurrealCKCompany\/releases\//i;
 const EXTERNAL_TOOL = /\/\.codex\/worktrees\//i;
 
-export type ReclaimTrigger = 'accept' | 'sweep' | 'manual' | 'expire' | 'retire' | 'dry_run';
+export type ReclaimTrigger = 'accept' | 'sweep' | 'manual' | 'expire' | 'retire' | 'dry_run' | 'return' | 'revoke' | 'release';
 export type ReclaimAction = 'delete' | 'skip' | 'wait_grace' | 'retain_branch';
 
 export interface ReclaimDecision {

@@ -106,6 +106,7 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     send: async id => { agents.get(id)!.status = 'running'; },
     stop: async () => {},
     archive: async () => {},
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
 
   const sidecar: SidecarBridge = {

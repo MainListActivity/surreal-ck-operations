@@ -799,7 +799,15 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     return task;
   }
-  returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'return', evidence); }
+  async returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) {
+    const task = await this.transition(credential, proof, 'return', evidence);
+    // Same event point as accept: a return that leaves the scene with zero effective refs
+    // reclaims it in place; a recovery ref keeps the scene for the next holder.
+    if (task.worktree && this.worktrees) {
+      await this.worktrees.reclaimEvent(task.worktree.id, 'return').catch(() => undefined);
+    }
+    return task;
+  }
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence) { return this.transition(credential, proof, 'block', evidence, to); }
 
   /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
