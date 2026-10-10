@@ -186,3 +186,20 @@ test('quotaBlockedProviders: split-window floors and stale fail-open', () => {
   expect(blocked.has('stale')).toBe(false);
   expect(blocked.get('legacy-row')).toContain('短窗口');
 });
+
+
+test('pool: screenwriter requires 编剧 on task and covering def for reuse and spawn', () => {
+  for (const tracks of [undefined, [], ['角色设计'], ['编剧']]) {
+    for (const discipline of [undefined, '角色设计', '编剧']) {
+      const d = def('d1', { role: 'screenwriter', tracks });
+      const i = inst('i1', { role: 'screenwriter' });
+      const pool = staffingPool(base({ role: 'screenwriter', defs: [d], insts: [i],
+        states: new Map([['i1', 'idle']]), task: { discipline } as StaffingInput['task'] }));
+      expect(pool).toHaveLength(2);
+      expect(pool.every(e => e.eligible === (discipline === '编剧' && !!tracks?.includes('编剧')))).toBe(true);
+    }
+  }
+  const pool = staffingPool(base({ defs: [def('d1', { tracks: ['编剧'] })], insts: [inst('i1')],
+    states: new Map([['i1', 'idle']]), task: {} as StaffingInput['task'] }));
+  expect(pool.every(e => e.eligible)).toBe(true);
+});

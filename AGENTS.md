@@ -1,6 +1,6 @@
 # AI 员工执行入口
 
-所有输出使用 zh_CN。公司唯一真人是老板（用户本人）；经理、运营/产品、工程、AI 内容、原型/概念设计、量产制作、测试和客户成功均为 AI 员工。外部客户与专业顾问通过老板对接。项目内更细的产线分工（岗位轨 `discipline`）以项目 AGENTS.md 与 `project.disciplines` 词表为准，不进此名单。
+所有输出使用 zh_CN。公司唯一真人是老板（用户本人）；经理、运营/产品、工程、AI 内容、原型/概念设计、量产制作、专职编剧、测试和客户成功均为 AI 员工。外部客户与专业顾问通过老板对接。项目内更细的产线分工（岗位轨 `discipline`）以项目 AGENTS.md 与 `project.disciplines` 词表为准，不进此名单。
 
 被派工、领任务、提交、验收或接手时：先读 `agents/PROTOCOL.md`，再读 `agents/<role>.md`。任务、身份、租约、交接历史都在本机公司任务服务（SurrealDB），通过派工消息里给出的 `sck` 命令调用；GitHub Issue 只是看板投影。`scripts/queue.py` 与 `agents/registry.json` 属于已归档的 v2 流程，仅用于收尾旧工单。
 

@@ -48,6 +48,7 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
+    // Workforce also powers the manage-only def_* tools exposed through the sidecar.
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
@@ -58,7 +59,7 @@ export function company(): Promise<Company> {
         : process.env.SCK_WORKTREE_RECLAIM === '1' || process.env.SCK_WORKTREE_RECLAIM === 'true'
           ? true : undefined,
     };
-    const core = new SurrealCompanyCore(db, { worktrees: worktreeOpts });
+    const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({

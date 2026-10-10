@@ -1,8 +1,9 @@
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../config';
 import { SurrealCompanyCore } from '../core';
 import { CompanyDatabase } from '../database';
+import { Workforce } from '../workforce';
 import { readPrivateCredential } from './credential-file';
 import { createGhCliGateway, createGithubProjector } from './github-projector';
 import { runProjectionWorker } from './projector-worker';
@@ -30,7 +31,9 @@ try {
   } finally {
     clearTimeout(bootTimer);
   }
-  const core = new SurrealCompanyCore(db, { worktrees: {
+  // Workforce powers the manage-only def_* tools; its credential dir is unused by def writes.
+  const workforce = new Workforce(db, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '..', '.runtime', 'credentials')));
+  const core = new SurrealCompanyCore(db, { workforce, worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       strategy: process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared',
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS

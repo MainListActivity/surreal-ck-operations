@@ -1,18 +1,25 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DeferTaskUntil, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, EnsureDef, DeferTaskUntil, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
+import type { EmployeeDef, Workforce } from './workforce.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView } from './contracts.ts';
 export { CompanyError };
 
-export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs', 'eval'];
+export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs', 'eval'];
+/**
+ * 岗位→必配轨常量表：executorRole 在表内的任务必须带指定 discipline——createTask
+ * 缺轨/错轨显式拒绝；claim/dispatch 双端要求任务轨等于必配轨且编制 tracks 显式含该轨
+ * （这些岗位的空 tracks 不再视为全接）。当前仅编剧岗，未来同类岗位在此扩展。
+ */
+export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: '编剧' };
 const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;
@@ -167,13 +174,14 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; worktrees?: RegistryOptions }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions }) {
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
     }
     this.leaseSeconds = seconds;
     this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
+    this.workforce = options?.workforce;
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
@@ -181,6 +189,8 @@ export class SurrealCompanyCore implements CompanyCore {
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
   private readonly projects: ProjectStore;
+  /** Manage tools reuse the workforce writer; absent in processes that never wire one. */
+  private readonly workforce?: Workforce;
   private get db() { return this.database.db; }
 
   async authenticate(credential: Credential): Promise<Principal> {
@@ -304,6 +314,11 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     validateIntent(input.workIntent);
     if (input.workIntent?.kind === 'code' && input.executorRole !== 'engineering') throw new CompanyError('invalid', 'Code writes require engineering');
+    // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
+    const requiredTrack = REQUIRED_TRACKS[input.executorRole];
+    if (requiredTrack !== undefined && input.discipline !== requiredTrack) {
+      throw new CompanyError('invalid', `executorRole ${input.executorRole} requires discipline=${requiredTrack}`);
+    }
     const kind = input.kind ?? 'task';
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
@@ -423,8 +438,10 @@ export class SurrealCompanyCore implements CompanyCore {
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
       };
-      IF $t.discipline != NONE AND array::len($who.def.tracks ?? []) > 0 AND $t.discipline NOT IN $who.def.tracks { THROW 'discipline track denied' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > $now AND $t.current_employee != $employee { THROW 'leased by another employee' };
+      LET $def_tracks = $who.def.tracks ?? [];
+      IF $t.discipline != NONE AND array::len($def_tracks) > 0 AND $t.discipline NOT IN $def_tracks { THROW 'discipline track denied' };
+      IF $has_req AND ($t.discipline != $req OR $req NOT IN $def_tracks) { THROW 'discipline track denied' };
       IF $who.active_task != NONE AND $who.active_task != $task {
         LET $active = SELECT * FROM ONLY $who.active_task;
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
@@ -457,6 +474,9 @@ export class SurrealCompanyCore implements CompanyCore {
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
       assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      // 必配轨岗位（screenwriter）：要求任务轨恰为必配轨且编制 tracks 显式覆盖——
+      // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
+      req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
     });
     const taskView = view(row);
     const project = await this.taskProject(taskId);
@@ -578,6 +598,54 @@ export class SurrealCompanyCore implements CompanyCore {
       dependencies = [task.id];
     }
     return created;
+  }
+
+  // ---- 受控编制管理工具（manage = gm/product） ----
+  // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
+
+  private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight'>): DefView {
+    return { id: d.id, role: d.role, provider: d.provider, model: d.model, thinking: d.thinking,
+      tracks: d.tracks, enabled: d.enabled, maxInstances: d.maxInstances, priority: d.priority, weight: d.weight };
+  }
+
+  private async auditManage(actor: Principal, action: 'def_ensure' | 'project_disciplines_update', summary: Record<string, unknown>): Promise<void> {
+    await this.db.query(
+      'CREATE audit CONTENT { actor: $actor, action: $action, evidence: $evidence, at: time::now() };',
+      { actor: id('employee', actor.employeeId), action, evidence: JSON.stringify(summary).slice(0, OPS_EVIDENCE_CHARS) });
+  }
+
+  async listDefs(credential: Credential): Promise<DefView[]> {
+    await this.authorized(credential, 'manage');
+    type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[];
+      enabled?: boolean; max_instances?: number; priority?: number; weight?: number };
+    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY id;');
+    return (rows ?? []).map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model,
+      thinking: r.thinking ?? undefined, tracks: r.tracks ?? undefined, enabled: r.enabled !== false,
+      maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, weight: r.weight ?? 10 }));
+  }
+
+  async ensureDef(credential: Credential, input: EnsureDef): Promise<DefView> {
+    const actor = await this.authorized(credential, 'manage');
+    requireText(input.id, 'def id', 1, 60);
+    if (!this.workforce) throw new CompanyError('temporarily_unavailable', 'Workforce writer is not wired into this process', true);
+    // upsertDef owns validation (id/provider shape, role enum, weight range) and the write;
+    // tracks [] clears the list, undefined keeps it; enabled=false retires the def.
+    await this.workforce.upsertDef(input.id, input);
+    await this.auditManage(actor, 'def_ensure', { def: input.id, role: input.role, provider: input.provider,
+      model: input.model, thinking: input.thinking, tracks: input.tracks, maxInstances: input.maxInstances,
+      priority: input.priority, weight: input.weight, enabled: input.enabled });
+    const def = (await this.workforce.defs()).find(d => d.id === input.id);
+    if (!def) throw new CompanyError('conflict', 'Definition write did not land');
+    return SurrealCompanyCore.defView(def);
+  }
+
+  async updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string }> }): Promise<ProjectView> {
+    const actor = await this.authorized(credential, 'manage');
+    // Only the vocabulary field is rewritten; every other project field is untouched.
+    const view = await this.projects.setDisciplines(input.project, input.disciplines);
+    await this.auditManage(actor, 'project_disciplines_update',
+      { project: input.project, disciplines: (input.disciplines ?? []).map(d => d?.name) });
+    return view;
   }
 
   async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {

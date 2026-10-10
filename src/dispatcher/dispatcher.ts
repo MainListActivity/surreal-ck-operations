@@ -1,7 +1,8 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota } from '../contracts.ts';
+import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
+import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -122,8 +123,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     p.quotaBlocked.get(provider) ?? (cap(provider) ? undefined : 'provider 无可用容量');
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
-  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
-    !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) => {
+    const required = REQUIRED_TRACKS[p.role as Role];
+    if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
+    return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+  };
   const entries: StaffingEntry[] = [];
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;

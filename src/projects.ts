@@ -71,16 +71,21 @@ export interface EnvBrokerRow { name: string; url?: string; healthUrl?: string; 
 const PROJECT_ID = /^[a-z][a-z0-9_-]{0,40}$/;
 const secretAad = (project: string, env: string, name: string) => `${project}\0${env}\0${name}`;
 
+/** disciplines vocabulary rule shared by upsert and setDisciplines: unique non-empty names. */
+function assertDisciplines(disciplines?: Array<{ name: string; description?: string }>): void {
+  const names = (disciplines ?? []).map(d => d?.name);
+  if (names.some(n => typeof n !== 'string' || !n.trim()) || new Set(names).size !== names.length) {
+    throw new CompanyError('invalid', 'disciplines must be unique non-empty track names');
+  }
+}
+
 /** Project environments and their sealed credentials. Values never leave this module except via readSealed, which only the ops broker calls. */
 export class ProjectStore {
   constructor(private readonly db: Surreal) {}
 
   async upsert(input: ProjectInput): Promise<ProjectView> {
     if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
-    const names = (input.disciplines ?? []).map(d => d?.name);
-    if (names.some(n => typeof n !== 'string' || !n.trim()) || new Set(names).size !== names.length) {
-      throw new CompanyError('invalid', 'disciplines must be unique non-empty track names');
-    }
+    assertDisciplines(input.disciplines);
     const project = new RecordId('project', input.id);
     await this.db.query(`UPSERT $project CONTENT {
         name: $p.name, repo_path: $p.repoPath, default_branch: $p.defaultBranch ?? 'main', release: $p.release,
@@ -93,6 +98,16 @@ export class ProjectStore {
       if (broker !== undefined) await this.setBroker(input.id, env.name, broker);
     }
     return (await this.get(input.id))!;
+  }
+
+  /** Rewrites only the disciplines vocabulary (unique non-empty names); other project fields stay untouched. */
+  async setDisciplines(projectId: string, disciplines: Array<{ name: string; description?: string }>): Promise<ProjectView> {
+    if (!PROJECT_ID.test(projectId)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
+    assertDisciplines(disciplines);
+    const project = new RecordId('project', projectId);
+    if (!(await this.db.select<ProjectRow>(project))) throw new CompanyError('not_found', 'project not found');
+    await this.db.query('UPDATE $project SET disciplines = $d, updated_at = time::now();', { project, d: disciplines });
+    return (await this.get(projectId))!;
   }
 
   /** Stores the non-secret ops broker settings of one environment after checking they parse. */

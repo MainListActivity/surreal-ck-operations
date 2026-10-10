@@ -1,6 +1,6 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
-export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'qa' | 'cs' | 'eval';
+export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'qa' | 'cs' | 'eval';
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
@@ -219,6 +219,12 @@ export interface CompanyCore {
   triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
   /** gm/product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
   createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
+  /** manage (gm/product): list every employee_def row for workforce review. */
+  listDefs(credential: Credential): Promise<DefView[]>;
+  /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */
+  ensureDef(credential: Credential, input: EnsureDef): Promise<DefView>;
+  /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
+  updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string }> }): Promise<ProjectView>;
   /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
   opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope>;
   /** Appends a secret-free `ops_*` record to the task's audit trail. Only `ops_call` rows stay out of handover history. */
@@ -229,6 +235,38 @@ export interface CompanyCore {
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
+}
+
+/** Employee definition as returned by the manage tools (score internals stay server-side). */
+export interface DefView {
+  id: string;
+  role: Role;
+  provider: string;
+  model: string;
+  thinking?: string;
+  tracks?: string[];
+  enabled: boolean;
+  maxInstances: number;
+  priority: number;
+  weight: number;
+}
+
+/**
+ * def_ensure input. `tracks` sent as [] clears the track list, omitted leaves it untouched;
+ * `enabled: false` disables the def (retire/track-revocation requests). `role` must be a
+ * valid Role including eval; other omitted fields reuse the workforce upsert defaults.
+ */
+export interface EnsureDef {
+  id: string;
+  role: Role;
+  provider: string;
+  model: string;
+  thinking?: string;
+  tracks?: string[];
+  maxInstances?: number;
+  priority?: number;
+  weight?: number;
+  enabled?: boolean;
 }
 
 export interface EmployeeScore {
