@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, symlink, rm, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, stat, symlink, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -189,5 +189,67 @@ test('deliver resolves identities before the freshness window; status never reso
     const statusClaims=verifyCompanyProof((await response.json() as {status:string}).status,signer.trust(),'status',clock);
     expect(statusClaims).toMatchObject({valid:true,nonce:'synthetic-nonce-0002'});
     expect(identityCalls).toBe(statusBefore);
+  }finally{await rm(home,{recursive:true,force:true});}
+});
+test('status requests append sanitized audit lines; deliver relays product errorCode',async()=>{
+  const home=await realpath(await mkdtemp(join(tmpdir(),'proof-audit-unit-')));
+  const taskId='synthetic-audit';
+  try {
+    const root=join(home,'evidence',taskId);await mkdir(root,{recursive:true});
+    const fixture=disabledSenseNovaFixture();
+    const manifestPath=join(root,'manifest.json'),documentPath=join(root,'evidence.json');
+    await writeFile(manifestPath,JSON.stringify(fixture.manifest));await writeFile(documentPath,fixture.documentBytes);
+    const scope:OpsScope={taskId,project:'surreal_ck',actor:{employeeId:'synthetic-employee',role:'engineering',capabilities:[]}};
+    const leaseStamp={taskId,employee:'synthetic-employee',delivery:'synthetic-delivery',fence:1,goal:'synthetic-goal',project:'surreal_ck',role:'engineering' as const};
+    const rows=new Map<string,ProofRow>();
+    const store={
+      lease:async()=>leaseStamp, leaseValid:async()=>true,
+      get:async(handleHash:string)=>rows.get(handleHash),
+      put:async(row:ProofRow)=>{rows.set(String(row.id.id),row);return row;},
+      status:async(hash:string)=>[...rows.values()].find(r=>r.status_hash===hash),
+    } as unknown as CompanyProofStore;
+    const signer=new ProofSigner(ProofSigner.generate()), key=Buffer.alloc(32,9);
+    const identities:ProofIdentity[]=[
+      {alias:'LCA04_REMOVABLE',subject:'user:synthetic-owner',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'admin',billingRole:'owner',billingAccountRef:'billing_account:synthetic'},
+      {alias:'LCA04_MEMBER',subject:'user:synthetic-member',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'participant',billingRole:'member',billingAccountRef:'billing_account:synthetic'},
+    ];
+    const clock=1_700_000_000_000;let deliveredJwt:string|undefined;
+    const bridge=new InternalAiProofBridge({
+      store,home,key:()=>key,now:()=>clock,signer:async()=>signer,
+      identities:async()=>identities,
+      rotate:async()=>{throw new Error('unused');},
+      deliver:async(jwt)=>{deliveredJwt=jwt;return{status:422,ok:false,errorCode:'company-status-unavailable'};},
+    });
+    const prove=await bridge.call(scope,'production','ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:fixture.manifest.activityId,nonce:'synthetic-nonce-2001',idempotencyKey:'audit-flow'}) as {proofHandle:string};
+    const result=await bridge.call(scope,'production','ops_internal_ai_deliver',{proofHandle:prove.proofHandle,session:'synthetic-session'}) as {status:number,ok:boolean,errorCode?:string};
+    expect(result).toMatchObject({status:422,ok:false,errorCode:'company-status-unavailable',paidCallsAllowed:0});
+    const claims=verifyCompanyProof(deliveredJwt!,signer.trust(),'proof',clock);
+    const bearer=(claims.status as {bearer:string}).bearer;
+    const hashPrefix=(v:string)=>createHash('sha256').update(v).digest('hex').slice(0,8);
+    const unknown='A'.repeat(43);
+    const req=(init?:RequestInit)=>bridge.status(new Request('http://test.local/internal-ai/status',init));
+    expect((await req({method:'POST'})).status).toBe(401);
+    expect((await req({headers:{'x-sck-nonce':'synthetic-nonce-2002'}})).status).toBe(401);
+    expect((await req({headers:{authorization:'Bearer '+bearer}})).status).toBe(401);
+    expect((await req({headers:{authorization:'Bearer '+unknown,'x-sck-nonce':'synthetic-nonce-2002'}})).status).toBe(401);
+    expect((await req({headers:{authorization:'Bearer '+bearer,'x-sck-nonce':'synthetic-nonce-2002'}})).status).toBe(200);
+    [...rows.values()][0]!.revoked=true;
+    expect((await req({headers:{authorization:'Bearer '+bearer,'x-sck-nonce':'synthetic-nonce-2003'}})).status).toBe(200);
+    const auditFile=join(home,'logs','internal-ai-status.jsonl');
+    expect((await stat(auditFile)).mode&0o777).toBe(0o600);
+    const raw=await readFile(auditFile,'utf8');
+    const lines=raw.trim().split('\n').map(l=>JSON.parse(l));
+    expect(lines).toHaveLength(6);
+    expect(lines[0]).toMatchObject({method:'POST',format:'bad-method',rowFound:false,valid:null,failReason:null,httpStatus:401,statusHashPrefix:null});
+    expect(lines[1]).toMatchObject({method:'GET',format:'bad-bearer',rowFound:false,valid:null,failReason:null,httpStatus:401,statusHashPrefix:null});
+    expect(lines[2]).toMatchObject({format:'bad-nonce',rowFound:false,valid:null,httpStatus:401,statusHashPrefix:hashPrefix(bearer)});
+    expect(lines[3]).toMatchObject({format:'ok',rowFound:false,valid:null,httpStatus:401,statusHashPrefix:hashPrefix(unknown)});
+    expect(lines[4]).toMatchObject({format:'ok',rowFound:true,valid:true,failReason:null,httpStatus:200,statusHashPrefix:hashPrefix(bearer),payloadSummary:{valid:true,version:1}});
+    expect(lines[5]).toMatchObject({format:'ok',rowFound:true,valid:false,failReason:'proof expired or revoked',httpStatus:200,payloadSummary:{valid:false}});
+    for(const line of raw.trim().split('\n')) expect(line.length).toBeLessThanOrEqual(2048);
+    expect(lines.every(l=>typeof l.at==='string'&&!Number.isNaN(Date.parse(l.at)))).toBe(true);
+    // 审计行绝不携带 bearer/JWT/subject/nonce 值/文件内容。
+    for(const secret of [bearer,'synthetic-nonce-2002','synthetic-nonce-2003',deliveredJwt!,claims.jti as string,'user:synthetic-owner','user:synthetic-member','synthetic-session',fixture.manifest.documentHash]) expect(raw).not.toContain(secret);
+    expect(raw).not.toContain(fixture.documentBytes);
   }finally{await rm(home,{recursive:true,force:true});}
 });

@@ -1,4 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { appendFile, chmod, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
@@ -13,7 +15,7 @@ export interface BridgeDeps {
   signer: (project: string, env: string) => Promise<ProofSigner>;
   identities: IdentityResolver;
   rotate: (project: string, env: string, kid: string) => Promise<ProofSigner>;
-  deliver: (jwt: string, scope: OpsScope, env: string, session: string) => Promise<{ status: number; ok: boolean }>;
+  deliver: (jwt: string, scope: OpsScope, env: string, session: string) => Promise<{ status: number; ok: boolean; errorCode?: string }>;
   now?: () => number;
 }
 export class InternalAiProofBridge {
@@ -89,7 +91,7 @@ export class InternalAiProofBridge {
     await this.valid(row, signer, await this.liveIdentitiesDigest(row));
     const content = this.content(row);
     const response = await this.deps.deliver(content.jwt, scope, env, proofToolSchemas.ops_internal_ai_deliver.parse(raw).session);
-    return { status: response.status, ok: response.ok, configurationDigest: row.files.manifest.configurationDigest, paidCallsAllowed: content.mode === 'enable' ? 1 : 0 };
+    return { status: response.status, ok: response.ok, ...(response.errorCode ? { errorCode: response.errorCode } : {}), configurationDigest: row.files.manifest.configurationDigest, paidCallsAllowed: content.mode === 'enable' ? 1 : 0 };
   }
   private summary(handle: string, row: ProofRow) {
     const mode = this.content(row).mode;
@@ -127,16 +129,40 @@ export class InternalAiProofBridge {
   async status(request: Request): Promise<Response> {
     const bearer = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.get('authorization') ?? '')?.[1];
     const nonce = request.headers.get('x-sck-nonce') ?? '';
-    if (request.method !== 'GET' || !bearer || !/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) return new Response('unauthorized', {status: 401});
+    const format = request.method !== 'GET' ? 'bad-method' : !bearer ? 'bad-bearer' : !/^[A-Za-z0-9_-]{16,64}$/.test(nonce) ? 'bad-nonce' : 'ok';
+    const audit: Record<string, unknown> = { at: new Date(this.now()).toISOString(), method: request.method, format, rowFound: false, valid: null, failReason: null, httpStatus: 401, statusHashPrefix: bearer ? sha256(bearer).slice(0, 8) : null };
     try {
-      const row = await this.deps.store.status(sha256(bearer));
+      if (format !== 'ok') return new Response('unauthorized', {status: 401});
+      const row = await this.deps.store.status(sha256(bearer!));
+      audit.rowFound = !!row;
       if (!row) return new Response('unauthorized', {status: 401});
       const signer = await this.deps.signer(row.lease.project, row.files.manifest.env);
       const checkedAt = Math.floor(this.now() / 1000);
       let valid = true;
-      try { await this.valid(row, signer, row.identities_digest); } catch { valid = false; }
+      try { await this.valid(row, signer, row.identities_digest); } catch (e) { valid = false; audit.failReason = statusFailReason(e); }
+      audit.valid = valid;
       const at = Math.floor(this.now() / 1000);
+      audit.httpStatus = 200;
+      audit.payloadSummary = { valid, version: row.version, approvalVersion: row.approval?.version ?? null };
       return Response.json({ status: signer.sign('status', { jti: this.content(row).jti, valid, version: row.version, approvalVersion: row.approval?.version ?? null, checkedAt, iat: at, exp: Math.min(at + 60, checkedAt + 60), nonce }) }, { headers: { 'cache-control': 'no-store' } });
-    } catch { return new Response('status unavailable', {status: 503}); }
+    } catch { audit.httpStatus = 503; return new Response('status unavailable', {status: 503}); }
+    finally { await this.statusAudit(audit); }
+  }
+  /** One sanitized JSONL line per status request under <home>/logs; audit failures never change the response. */
+  private async statusAudit(line: Record<string, unknown>): Promise<void> {
+    try {
+      let text = JSON.stringify(line);
+      if (text.length > 2048) text = JSON.stringify({ at: line.at, method: line.method, format: line.format, httpStatus: line.httpStatus });
+      const file = join(this.deps.home, 'logs', 'internal-ai-status.jsonl');
+      await mkdir(join(this.deps.home, 'logs'), { recursive: true, mode: 0o700 });
+      await appendFile(file, text + '\n', { mode: 0o600 });
+      await chmod(file, 0o600).catch(() => undefined);
+    } catch { /* observability must not affect the status response */ }
   }
 }
+/** failReason admits only short machine-word reasons (CompanyError messages are already fixed non-sensitive strings). */
+const STATUS_REASON = /^[a-z0-9 _:-]{1,80}$/i;
+const statusFailReason = (e: unknown): string => {
+  const reason = e instanceof CompanyError ? e.message : e instanceof Error ? e.name : 'unknown';
+  return STATUS_REASON.test(reason) ? reason : 'redacted';
+};
