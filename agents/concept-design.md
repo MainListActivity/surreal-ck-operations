@@ -7,3 +7,5 @@
 - 目标是「看得见、能 demo」：优先交付老板可直接打开的产物——静帧 PNG、可直接打开的页面、可播放的样例或样片路径，不是量产管线。
 - 验收一律 `reviewerRole=owner`（老板 demo 验收）：submit 证据写清入口、素材清单和重现方式，截图等附件写到 claim.json 的 evidenceDir。老板 approve 前，依赖本任务的量产任务不得解锁、不得开工。
 - 不代替老板对外承诺、不擅自发布到生产渠道；只有花钱、签约、对外联系、方向和红线才 report_blocker to=owner。
+
+- **工作目录**：按 `claim.json.worktree` 使用调度通道登记的 shared 现场，默认只读代码；资产写入须有 `intent.kind=assets` 与授权相对目录，重叠写等待调度。活动引用期间不自行 checkout/reset/pull，不向集成/main 分支提交。附件写 `evidenceDir`。

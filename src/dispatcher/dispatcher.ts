@@ -1,11 +1,12 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ClaimResult, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
+import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
+import type { ReclaimResult } from './worktree-registry.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
@@ -27,8 +28,10 @@ export interface DispatcherDeps {
   rand?: () => number;
   /** Jev System One decision model; undefined disables the Jev evaluation path. */
   jev?: JevClient;
-  /** Removes worktrees of finished tasks; undefined disables the sweep. */
+  /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
+  /** WT02 ownership reclaim on the existing 10-minute sweep cadence. Undefined disables reclaim. */
+  reclaimWorktrees?: () => Promise<ReclaimResult>;
   /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
   quota?: () => Promise<ProviderQuota[]>;
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
@@ -52,6 +55,8 @@ export interface SidecarBridge {
   /** Claims the task as the instance and stages claim.json; undefined = lost the race. */
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
   /** Records the freshly spawned Paseo agentId for this instance. */
+  readWorkspace?(inst: EmployeeInst, taskId?: string): Promise<WorktreeAssignment | undefined>;
+  releaseWorkspace?(inst: EmployeeInst): Promise<void>;
   bindAgent(instId: string, agentId: string): void;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
@@ -312,13 +317,13 @@ export class Dispatcher {
       this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.cwd ?? this.deps.env.opsRepo) === home);
+      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home);
     // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
     // a def at capacity in the ops repo can still spawn for a task in another repo.
     // Credential-file stragglers do not consume seats: they cannot serve new work.
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask) =>
       defs.filter(d => d.enabled && d.role === role && trackOk(role, task, d.tracks) && resolveModel(d) !== undefined &&
-        insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home &&
+        insts.filter(i => i.def === d.id && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home &&
           !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
         this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -415,12 +420,12 @@ export class Dispatcher {
           parts.push(`${name} 并发 ${busy}/${cap} 已满${d.provider in cfg.providerMax ? '' : '（provider_max 未配置该 provider，默认 1）'}`);
           continue;
         }
-        const inRepo = insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home).length;
+        const inRepo = insts.filter(i => i.def === d.id && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home).length;
         if (inRepo >= d.maxInstances) { parts.push(`${name} 实例 ${inRepo}/${d.maxInstances} 已满且忙碌`); continue; }
         parts.push(`${name} 可新开但唤醒/创建失败`);
       }
       const count = (st: InstState) => insts.filter(i =>
-        i.role === role && states.get(i.id) === st && (i.cwd ?? this.deps.env.opsRepo) === home).length;
+        i.role === role && states.get(i.id) === st && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home).length;
       const pool = `实例池：空闲 ${count('idle')}、忙碌 ${count('busy')}` +
         (count('exhausted') ? `、限流 ${count('exhausted')}` : '') + (count('down') ? `、异常 ${count('down')}` : '');
       return `${pool}；${parts.join('；') || '无该岗位编制'}`;
@@ -465,7 +470,7 @@ export class Dispatcher {
     }
     if (pendingGm.length && running < cfg.maxRunning) {
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first) => gmAttention(inst, pendingGm, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
+        (inst, first, claim, worktree) => gmAttention(inst, pendingGm, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap);
       if (result) {
         for (const task of pendingGm) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
         report.woke.push(...pendingGm.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
@@ -481,7 +486,7 @@ export class Dispatcher {
       }
       if (due.length) {
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
+          (inst, first, claim, worktree) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap);
         if (result) {
           for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
           running++;
@@ -520,7 +525,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar }), report, insts, false, undefined, slotMap);
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap, task);
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -578,13 +583,26 @@ export class Dispatcher {
     }
   }
 
-  /** Every 10 minutes, remove the git worktrees of tasks that are done. Dirty ones are kept and reported once. */
+  /** Every 10 minutes: ownership reclaim (WT02) or legacy done-branch sweep. Dirty / protected trees stay with reasons. */
   private async sweep(now: number) {
-    const { git, workforce: wf, env } = this.deps;
-    if (!git || now - this.lastSweep < 600) return;
+    const { git, workforce: wf, env, reclaimWorktrees } = this.deps;
+    if (now - this.lastSweep < 600) return;
+    if (!reclaimWorktrees && !git) return;
     this.lastSweep = now;
     try {
-      const result = await sweepWorktrees(git, [env.opsRepo, ...(await wf.projectRepos())], await wf.doneTaskIds());
+      if (reclaimWorktrees) {
+        const result = await reclaimWorktrees();
+        for (const path of result.removed) this.log(`reclaimed worktree ${path} scan=${result.scanId}`);
+        for (const kept of result.kept) {
+          if (this.keptLogged.has(kept.path + kept.reason)) continue;
+          this.keptLogged.add(kept.path + kept.reason);
+          this.log(`kept worktree ${kept.path}: ${kept.reason}`);
+        }
+        for (const branch of result.branchesDeleted) this.log(`deleted merged branch ${branch}`);
+        for (const retained of result.branchesRetained) this.log(`retained branch ${retained.branch}: ${retained.reason}`);
+        return;
+      }
+      const result = await sweepWorktrees(git!, [env.opsRepo, ...(await wf.projectRepos())], await wf.doneTaskIds());
       for (const path of result.removed) this.log(`removed worktree ${path}`);
       for (const kept of result.kept) {
         if (this.keptLogged.has(kept.path)) continue;
@@ -676,20 +694,22 @@ export class Dispatcher {
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
     spawnable: (role: string, home: string, task?: SupervisedTask) => EmployeeDef[],
-    prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult) => string,
+    prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference, slots?: Map<string, string>,
+    prefer?: AssignPreference, slots?: Map<string, string>, readTask?: SupervisedTask,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task, avoid, forReview);
+    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? readTask, avoid, forReview);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
     if (existing) {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
+      let workspace: WorktreeAssignment | undefined;
       try {
+        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(existing, readTask?.id);
         if (sidecar && task) {
           claim = await sidecar.claim(existing, task);
           if (!claim) {
@@ -697,7 +717,17 @@ export class Dispatcher {
             return undefined;
           }
         }
-        await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim));
+        if ((claim?.worktree ?? workspace) && existing.cwd !== (claim?.worktree ?? workspace)!.worktreePath) {
+          if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
+          else await sidecar?.releaseWorkspace?.(existing);
+          claim = undefined;
+          await wf.retire(existing.id, 'managed worktree workspace changed');
+          await paseo.archive(existing.paseoAgentId!);
+          sidecar!.detachAgent(existing.paseoAgentId!);
+          report.retired.push(existing.id);
+          return undefined;
+        }
+        await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
         this.onboarded.add(existing.id);
         this.lastStatus.set(existing.paseoAgentId!, 'running');
         await wf.touchWake(existing.id);
@@ -705,18 +735,31 @@ export class Dispatcher {
         return { ...existing, spawned: false };
       } catch (error) {
         this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
+        if (workspace) await sidecar?.releaseWorkspace?.(existing);
         if (claim && task) await sidecar!.releaseClaim(existing.id, task.id, `wake failed: ${(error as Error).message.slice(0, 120)}`);
         return undefined;
       }
     }
-    const defsOrdered = spawnable(role, task?.repoPath ?? env.opsRepo, task);
+    const defsOrdered = spawnable(role, task?.repoPath ?? readTask?.repoPath ?? env.opsRepo, task);
     if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());
       if (!model) continue;
       const inst = await wf.spawnInst(def);
       const spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
-      const claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
+      let claim: ClaimResult | undefined;
+      let workspace: WorktreeAssignment | undefined;
+      try {
+        claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
+        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, readTask?.id);
+      }
+      catch (error) {
+        await wf.retire(inst.id, 'allocation unavailable');
+        sidecar?.detachAgent(inst.paseoAgentId ?? '');
+        report.retired.push(inst.id);
+        this.log(`allocation ${task?.id} waiting: ${(error as Error).message}`);
+        return undefined;
+      }
       if (sidecar && task && !claim) {
         await wf.retire(inst.id, 'claim race lost');
         report.retired.push(inst.id);
@@ -725,15 +768,16 @@ export class Dispatcher {
       try {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: task?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
+          mode: UNATTENDED_MODE[def.provider], cwd: (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? readTask?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: spawnEnv,
-          prompt: prompt(inst, true, claim),
+          prompt: prompt(inst, true, claim, workspace),
         });
-        const cwd = task?.repoPath ?? env.opsRepo;
-        await wf.bind(inst.id, { agentId, cwd, model });
+        const cwd = (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? readTask?.repoPath ?? env.opsRepo;
+        const repoHome = task?.repoPath ?? readTask?.repoPath ?? env.opsRepo;
+        await wf.bind(inst.id, { agentId, cwd, repoHome, model });
         sidecar?.bindAgent(inst.id, agentId);
-        const bound = { ...inst, paseoAgentId: agentId, cwd, model };
+        const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model };
         insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
@@ -743,6 +787,7 @@ export class Dispatcher {
       } catch (error) {
         const message = (error as Error).message;
         this.log(`spawn ${inst.id} failed: ${message}`);
+        if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
         await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`);
         report.retired.push(inst.id);

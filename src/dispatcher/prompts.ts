@@ -1,10 +1,10 @@
-import type { ClaimResult } from '../contracts.ts';
+import type { ClaimResult, WorktreeAssignment } from '../contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
 /** comm = 插件 sidecar 已代领任务、凭证不进 agent；否则为旧的凭证文件模式。 */
-export interface PromptCtx { comm: boolean; claim?: ClaimResult }
+export interface PromptCtx { comm: boolean; claim?: ClaimResult; worktree?: WorktreeAssignment }
 
 const ROLE_NAMES: Record<string, string> = {
   gm: '经理：目标分级与拆解、处理运营定不了的事、G3 汇总',
@@ -40,7 +40,7 @@ checkpoint/report_blocker/review 的租约证明由通道自动补齐，只需�
 凭证文件只能以路径使用，禁止读取、打印或转述其内容。`;
   return `你是 Surreal CK AI 公司的员工，员工编号 ${inst.id}，岗位 ${inst.role}（${ROLE_NAMES[inst.role] ?? inst.role}）。
 公司唯一真人是老板（用户本人）；其他同事都是 AI 员工。你被当作真实员工对待：对结果负责、证据真实、不越权。
-公司运营仓库（协议、岗位说明、deliverables/ 等相对路径都指这里）：${env.opsRepo}。你的 Paseo 工作区在任务所属项目的仓库；代码工作按 project.repoPath 和任务分支 worktree 进行，公司文件用运营仓库的绝对路径读写。
+公司运营仓库（协议与岗位说明只读）：${env.opsRepo}。工作目录以 claim.json 的 worktree 登记为准；不得自行新建/切换/reset/pull worktree，代码提交只在授予写权的任务分支。附件写 evidenceDir，不往运营共享 checkout 写交付物。
 每次被唤醒，先读 ${env.opsRepo}/AGENTS.md、${env.opsRepo}/agents/PROTOCOL.md、${env.opsRepo}/agents/${inst.role}.md，所有 shell 命令按本机 RTK 规则执行。
 ${channel}`;
 }
@@ -48,7 +48,9 @@ ${channel}`;
 export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
   if (ctx?.comm) {
-    const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。
+    const allocation = ctx.claim?.worktree;
+    const usage = allocation ? `\n登记工作区：${allocation.worktreePath}；mode=${allocation.mode}；branch=${allocation.branch ?? 'detached'}；授权=${JSON.stringify(allocation.intent)}。${allocation.discipline}旧任务 context 若仍要求手动新建独立树，以本次登记路径与写权为准。` : '';
+    const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。${usage}
 先读 $SCK_COMM_DIR/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
 完成后：把交付说明写入 $SCK_COMM_DIR/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
 中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。
@@ -61,7 +63,7 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
    返回的 predecessors 列出历任持有员工的 Paseo 会话；交接包只截取了最后几十条日志，需要更早或完整上下文时直接读前任完整时间线：
    '${env.paseoBin}' logs <agentId> --tail 400 --no-color（去掉 --tail 看全部）。` : ''}
 2. 按岗位协议完成：执行→submit；验收→review(accept/return)；自己定不了→report_blocker(to=gm)；只有花钱、签约、对外联系、公司方向和项目红线才 report_blocker(to=owner)。
-   每完成一个有意义的阶段就 checkpoint（已完成、改动文件、下一步），每个任务最多 6 次——把多个进展合并写，纯保活用 heartbeat；返回 checkpoint_limit 就直接 submit 或 report_blocker。代码任务在任务专属分支/worktree 中工作，checkpoint 前先提交到该分支。
+   每完成一个有意义的阶段就 checkpoint（已完成、改动文件、下一步），每个任务最多 6 次——把多个进展合并写，纯保活用 heartbeat；返回 checkpoint_limit 就直接 submit 或 report_blocker。以 claim 返回的登记 worktree 为准；工程仅在授予 code 写权的 task 分支提交，禁止自行 checkout/reset/pull；checkpoint 前先提交。
 3. 本轮只做这一项；完成交接后结束本轮，不要空转等待，不创建 agent 或定时器。
 若领取返回 already_claimed、no_available_task 或 forbidden，直接结束本轮。`;
   return firstContact ? `${onboarding(inst, env)}\n\n${body}` : body;
@@ -69,7 +71,8 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
 
 export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const call = tool(inst, env, ctx?.comm ?? false);
-  const body = `【绩效评审】任务 ${task.id}「${task.title}」已完成，请为本轮所有参与员工打绩效分。
+  const workspace = ctx?.worktree ? `只读登记工作区：${ctx.worktree.worktreePath}；mode=${ctx.worktree.mode}；branch=${ctx.worktree.branch}。${ctx.worktree.discipline}\n` : '';
+  const body = `${workspace}【绩效评审】任务 ${task.id}「${task.title}」已完成，请为本轮所有参与员工打绩效分。
 1. 读取任务与历史：
    ${call.replace('<工具名>', 'get_task_history').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
    ${call.replace('<工具名>', 'get_context').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
@@ -84,7 +87,8 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
 
 export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const list = tasks.map(t => `- ${t.id}「${t.title}」（执行岗位 ${t.executorRole}${t.discipline ? `/${t.discipline}` : ''}）`).join('\n');
-  const body = `【经理待办】以下任务被员工阻塞并交给经理处理：
+  const workspace = ctx?.worktree ? `只读登记工作区：${ctx.worktree.worktreePath}；${ctx.worktree.discipline}\n` : '';
+  const body = `${workspace}【经理待办】以下任务被员工阻塞并交给经理处理：
 ${list}
 逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
 你有决定权：技术方案、拆分、上线（运营定不了时）、查得到的事实都由你决定并写进恢复说明，不要转给老板。
@@ -95,7 +99,8 @@ ${list}
 
 export function gmTriage(inst: EmployeeInst, goals: Array<{ id: string; title: string; brief: string }>, env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
   const list = goals.map(g => `- goal=${g.id}「${g.title}」\n  ${g.brief.slice(0, 600).replace(/\n/g, '\n  ')}`).join('\n');
-  const body = `【目标分级】以下老板目标还没有选定流程（Jev 没有把握或未配置）：
+  const workspace = ctx?.worktree ? `只读登记工作区：${ctx.worktree.worktreePath}；${ctx.worktree.discipline}\n` : '';
+  const body = `${workspace}【目标分级】以下老板目标还没有选定流程（Jev 没有把握或未配置）：
 ${list}
 逐个判断并调用 triage_goal({goalId, tier, reason})：
 - quick：单一仓库内范围明确的小改动或缺陷修复。流程是 实现 → 上线申请 → 合入部署与生产实测 → 运营验收，完成即记录结果，不通知老板。

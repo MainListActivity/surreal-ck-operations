@@ -38,7 +38,6 @@ export function company(): Promise<Company> {
     const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
-    const { createGitCli } = await import("./vendor/src/dispatcher/worktrees.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
 
     const db = new CompanyDatabase(loadDatabaseConfig());
@@ -47,7 +46,17 @@ export function company(): Promise<Company> {
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
-    const core = new SurrealCompanyCore(db, { workforce });
+    const worktreeOpts = {
+      opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
+      strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
+      orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
+        ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
+      reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'
+        ? false
+        : process.env.SCK_WORKTREE_RECLAIM === '1' || process.env.SCK_WORKTREE_RECLAIM === 'true'
+          ? true : undefined,
+    };
+    const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
@@ -71,7 +80,8 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
-      git: createGitCli(),
+      // WT02: ownership reclaim on the existing dispatcher sweep cadence (no new timers).
+      reclaimWorktrees: () => core.worktrees!.reclaimAll({ trigger: 'sweep' }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: async () => {

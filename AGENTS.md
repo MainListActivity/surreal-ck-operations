@@ -4,7 +4,7 @@
 
 被派工、领任务、提交、验收或接手时：先读 `agents/PROTOCOL.md`，再读 `agents/<role>.md`。任务、身份、租约、交接历史都在本机公司任务服务（SurrealDB），通过派工消息里给出的 `sck` 命令调用；GitHub Issue 只是看板投影。`scripts/queue.py` 与 `agents/registry.json` 属于已归档的 v2 流程，仅用于收尾旧工单。
 
-证据写进任务服务（checkpoint / submit / review），只在任务授权的范围写文件。员工不修改公司规则，不在共享 checkout 执行 commit/push，不创建 agent 或定时器；派工与编制由调度器和经理负责。产品仓库默认只读，代码任务在任务专属分支的独立 worktree 中进行，遵守该仓库 AGENTS/技能。
+证据写进任务服务（checkpoint / submit / review），只在任务授权的范围写文件。员工不修改公司规则，不在共享集成/main checkout 执行 commit/push，不创建 agent 或定时器；派工与编制由调度器和经理负责。产品仓库默认只读，工作目录以 claim.json 的 worktree 登记为准：共享物理树与任务分支分开管理，串行工程可复用物理树，并行代码写手由调度器隔离。仅在授予 code 写权的 task 分支 commit/push，遵守该仓库 AGENTS/技能。
 
 凭证文件只以路径使用。原始客户资料、密钥、token、.env 不进入任务证据、Issue 或输出。AI 不代替真人客户回执、老板授权或持牌专业意见。
 

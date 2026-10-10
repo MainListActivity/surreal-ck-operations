@@ -13,6 +13,20 @@ export type TaskId = string;
 export type DeliveryId = string;
 export type Credential = string;
 
+/** Managed authorization; supplied by task creation, never inferred from prose. */
+export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]; lane?: string }
+export interface WorktreeAssignment {
+  id: string; repo: string; project?: string; worktreePath: string;
+  mode: 'shared' | 'exclusive' | 'protected'; branch?: string;
+  intent: WorkIntent; discipline: string;
+}
+export interface WorktreeView extends Omit<WorktreeAssignment, 'intent' | 'discipline'> {
+  createdAt: string; lastUsedAt: string; status: 'present' | 'missing' | 'drift';
+  references: Array<{ taskId: string; employee: string; deliveryId: string; fence: number;
+    intent: WorkIntent; state: 'active' | 'recovery' | 'released'; at: string }>;
+  deletable: boolean; reasons: string[];
+}
+
 export interface Principal {
   employeeId: EmployeeId;
   role: Role;
@@ -43,6 +57,8 @@ export interface TaskView {
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
+  workIntent?: WorkIntent;
+  worktree?: WorktreeAssignment;
 }
 
 export interface HistoryEntry {
@@ -64,6 +80,7 @@ export interface CreateTask {
   goalId?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
+  workIntent?: WorkIntent;
 }
 
 export interface ClaimResult {
@@ -77,6 +94,7 @@ export interface ClaimResult {
   predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
   project?: ProjectView;
+  worktree?: WorktreeAssignment;
 }
 
 /** Result of the ops broker gate; `project` is the id of the project the task's goal belongs to. */
@@ -148,6 +166,16 @@ export interface CompanyCore {
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;
   createTask(credential: Credential, input: CreateTask): Promise<TaskView>;
   claim(credential: Credential, taskId: TaskId): Promise<ClaimResult>;
+  /** Optional for old adapters; production cores expose authenticated inventory. */
+  readWorkspace?(credential: Credential, taskId?: TaskId): Promise<WorktreeAssignment | undefined>;
+  releaseWorkspace?(credential: Credential): Promise<void>;
+  listWorktrees?(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]>;
+  /** GM: ownership reclaim or dry-run across registered repos (WT02). */
+  reclaimWorktrees?(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }): Promise<{
+    scanId: string; removed: string[]; kept: Array<{ path: string; reason: string }>;
+    branchesDeleted: string[]; branchesRetained: Array<{ branch: string; reason: string }>; audited: number;
+  }>;
+  listWorktreeAudits?(credential: Credential, limit?: number): Promise<Array<Record<string, unknown>>>;
   heartbeat(credential: Credential, proof: LeaseProof): Promise<ClaimResult>;
   checkpoint(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   submit(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;

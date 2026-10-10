@@ -12,13 +12,13 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView } from "./vendor/src/contracts.ts";
+import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
-  "get_context", "get_task_history", "checkpoint", "submit", "review", "report_blocker",
+  "get_context", "get_task_history", "list_worktrees", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "record_score", "heartbeat",
   "deliverable_publish",
@@ -115,6 +115,15 @@ export class SidecarPool {
     return rotated;
   }
 
+  async readWorkspace(inst: EmployeeInst, taskId?: string): Promise<WorktreeAssignment | undefined> {
+    const workspace = await this.deps.core.readWorkspace?.(await this.credentialFor(inst.id), taskId);
+    if (workspace) writeFileAtomic(join(commDir(this.deps.runDir, inst.id), 'workspace.json'), JSON.stringify(workspace));
+    return workspace;
+  }
+  async releaseWorkspace(inst: EmployeeInst): Promise<void> {
+    await this.deps.core.releaseWorkspace?.(await this.credentialFor(inst.id));
+  }
+
   /** Claims the task as the instance and stages claim.json in its comm dir. */
   async claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined> {
     // Legacy instances still carry a credential file their agent reads directly;
@@ -131,7 +140,7 @@ export class SidecarPool {
       result = await this.deps.core.claim(cred, task.id);
     } catch (error) {
       const code = (error as { code?: string }).code ?? "";
-      if (["already_claimed", "forbidden", "no_available_task", "not_found"].includes(code)) return undefined;
+      if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) return undefined;
       throw error;
     }
     this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under
@@ -178,6 +187,7 @@ export class SidecarPool {
     const report = readTextFile(reportPath(dir));
     const live = this.claims.get(instId);
     if (!live) {
+      await this.deps.core.releaseWorkspace?.(await this.credentialFor(instId)).catch(() => undefined);
       // No lease to act on; rename stale artifacts so they are not retried forever.
       for (const [text, path] of [[blocker, blockerPath(dir)], [report, reportPath(dir)]] as const) {
         if (text !== undefined) this.archive(path, "orphaned");
@@ -328,6 +338,7 @@ export class SidecarPool {
       return ops.call(cred, live().taskId, tool, rest);
     }
     switch (tool) {
+      case "list_worktrees": return core.listWorktrees ? core.listWorktrees(cred, args.taskId === undefined ? live().taskId : String(args.taskId)) : [];
       case "get_context":
         return {
           principal: await core.authenticate(cred),

@@ -52,6 +52,7 @@ export interface EmployeeInst {
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
+  repoHome?: string;
   /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
   wakeCount?: number;
 }
@@ -277,13 +278,13 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; wake_count?: number };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at,
-      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, wakeCount: r.wake_count ?? 0 }));
+      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0 }));
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
@@ -321,12 +322,12 @@ export class Workforce {
     return token;
   }
 
-  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string }): Promise<void> {
+  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string }): Promise<void> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $e MERGE {
       paseo_agent_id: $agent, def: $def ?? def, provider: $provider ?? provider, model: $model ?? model,
-      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, retired: false } RETURN AFTER;`, {
+      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, retired: false } RETURN AFTER;`, {
       e: id('employee', employeeId), agent: input.agentId, def: input.def ? id('employee_def', input.def) : undefined,
-      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd,
+      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome,
     });
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }

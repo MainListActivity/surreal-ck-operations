@@ -84,8 +84,10 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('008-content-roles.surql'));
     await this.db.query(loadSchema('009-discipline-tracks.surql'));
     await this.db.query(loadSchema('010-internal-ai-proof.surql'));
-    await this.db.query(loadSchema('011-screenwriter-role.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 11 WHERE schema_version < 11;');
+    await this.db.query(loadSchema('011-worktrees.surql'));
+    await this.db.query(loadSchema('012-worktree-lifecycle.surql'));
+    await this.db.query(loadSchema('013-screenwriter-role.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 13 WHERE schema_version < 13;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

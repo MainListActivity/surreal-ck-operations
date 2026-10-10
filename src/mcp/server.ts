@@ -95,6 +95,26 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }));
   });
 
+  server.registerTool('reclaim_worktrees', {
+    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees.',
+    inputSchema: z.object({
+      dryRun: z.boolean().optional(),
+      repos: z.array(z.string()).optional(),
+    }),
+  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => core.reclaimWorktrees
+    ? core.reclaimWorktrees(token(ctx), { dryRun, repos })
+    : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 })));
+  server.registerTool('list_worktree_audits', {
+    description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(500).optional() }),
+  }, async ({ limit }, ctx) => run(token(ctx), () => core.listWorktreeAudits
+    ? core.listWorktreeAudits(token(ctx), limit)
+    : Promise.resolve([])));
+  server.registerTool('list_worktrees', {
+    description: 'Authenticated persistent worktree inventory and git reconciliation; task-scoped reads or gm global reads.',
+    inputSchema: z.object({ taskId: z.string().min(1).optional() }),
+  }, async ({ taskId }, ctx) => run(token(ctx), () => core.listWorktrees ? core.listWorktrees(token(ctx), taskId) : Promise.resolve([])));
+
   server.registerTool('claim_next', {
     description: 'Atomically claim a task from the authenticated employee queue.',
     inputSchema: z.object({ taskId: z.string().min(1).optional() }),
@@ -125,7 +145,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
           return await core.claim(credential, candidate.id);
         } catch (error) {
           if (typeof error !== 'object' || error === null || !('code' in error) ||
-            !['conflict', 'already_claimed'].includes(String(error.code))) throw error;
+            !['conflict', 'already_claimed', 'worktree_busy'].includes(String(error.code))) throw error;
         }
       }
       throw { code: 'no_available_task' };
@@ -165,6 +185,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
+      workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
