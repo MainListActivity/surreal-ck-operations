@@ -4,7 +4,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { CompanyBrief, GoalTier, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
 import { GOAL_TIERS, goalTemplate } from './flows.ts';
 import { ProjectStore } from './projects.ts';
-import { asId, CompanyError, HASH, id, requireText, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
+import { asId, CompanyError, depUnsatisfiedFor, HASH, id, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -137,7 +137,8 @@ export class OwnerDesk {
       IF $t = NONE { THROW 'task not found' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
       IF $decision = 'reply' AND ($t.state != 'blocked' OR $t.blocked_to != 'owner') { THROW 'task is not waiting for an owner answer' };
-      LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND (state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND ($t.goal = NONE OR $t.id NOT IN ($t.goal.anchors ?? [])))));
+      ${RESOLVE_DEP_SQL('$t.dependencies', '$od')}
+      LET $remaining = SELECT * FROM task WHERE id IN $od_resolved AND ${depUnsatisfiedFor('$t')};
       LET $next = UPDATE ONLY $task SET
         state = IF $decision = 'approve' THEN 'done'
           ELSE IF $decision = 'reject' THEN 'ready'

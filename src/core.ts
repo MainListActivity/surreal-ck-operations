@@ -40,18 +40,43 @@ export const asId = (value: unknown): string => value instanceof RecordId ? Stri
  * or retiring a gated task could never unblock the goal's acceptance anchor.
  */
 const DEP_UNSATISFIED = `state != 'done' AND (state != 'void' OR reviewer_role = 'owner')`;
-const depUnsatisfiedFor = (holder: string) =>
+export const depUnsatisfiedFor = (holder: string) =>
   `state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND (${holder}.goal = NONE OR ${holder}.id NOT IN (${holder}.goal.anchors ?? []))))`;
+
+/**
+ * Resolves a raw dependency id list through superseded_by chains: every superseded draft
+ * maps to the tip of its shared `lineage` (superseded_by = NONE) in O(1) — bounded, no
+ * traversal. Binds `${p}_resolved` to the resolved id set. Resolution rules:
+ *  - un-superseded deps (superseded_by = NONE, including tips) resolve to themselves;
+ *  - a superseded dep whose lineage has exactly the visible tip resolves to that tip;
+ *  - corrupt data (superseded but missing lineage, or a lineage with no tip) resolves the
+ *    dep to itself — the void+owner rule then keeps it conservatively blocked.
+ * The unchanged satisfaction rule is applied to the resolved rows by the caller.
+ */
+export const RESOLVE_DEP_SQL = (deps: string, p: string) => `
+  LET ${p}_lns = SELECT VALUE lineage FROM task WHERE id IN ${deps} AND superseded_by != NONE AND lineage != NONE;
+  LET ${p}_ok = SELECT VALUE lineage FROM task WHERE lineage != NONE AND lineage IN ${p}_lns AND superseded_by = NONE;
+  LET ${p}_resolved = array::distinct(array::concat(
+    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by = NONE),
+    (SELECT VALUE id FROM task WHERE lineage != NONE AND lineage IN ${p}_ok AND superseded_by = NONE),
+    (SELECT VALUE id FROM task WHERE id IN ${deps} AND superseded_by != NONE AND (lineage = NONE OR lineage NOT IN ${p}_ok))));
+`;
 
 /**
  * Unlocks blocked children of $task whose dependencies are all finished ('done' or 'void')
  * (retired tasks count as satisfied so downstream chains unblock on retire). Requires
  * $task and $actor in scope. Retire reuses this block without the goal-close below.
+ * When the finished task is a screenplay-chain tip, dependents on ANY earlier version of
+ * the same lineage are re-evaluated too — their dependency resolves through superseded_by
+ * to the finished tip.
  */
 const UNLOCK_CHILDREN_SQL = `
-  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND $task IN dependencies;
+  LET $done_row = SELECT * FROM ONLY $task;
+  LET $task_chain = IF ($done_row.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $done_row.lineage) END;
+  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
   FOR $child IN $children {
-    LET $remaining = SELECT * FROM task WHERE id IN $child.dependencies AND ${depUnsatisfiedFor('$child')};
+    ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
+    LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
     IF array::len($remaining) = 0 {
       LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
       CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
@@ -136,6 +161,11 @@ interface TaskRow {
   worktree?: WorktreeAssignment;
   repo_path?: string;
   goal_tier?: string;
+  /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
+  revises?: RecordId;
+  superseded_by?: RecordId;
+  lineage?: RecordId;
+  revision_no?: number;
 }
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
@@ -157,6 +187,10 @@ export function view(row: TaskRow): TaskView {
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     workIntent: row.work_intent, worktree: row.worktree,
+    revises: row.revises ? asId(row.revises) : undefined,
+    supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
+    lineage: row.lineage ? asId(row.lineage) : undefined,
+    revisionNo: row.revision_no ?? undefined,
   };
 }
 
@@ -277,6 +311,8 @@ export class SurrealCompanyCore implements CompanyCore {
           if (/checkpoint limit/i.test(cause)) throw new CompanyError('checkpoint_limit', 'Checkpoint limit reached');
           if (/task retired/i.test(cause)) throw new CompanyError('conflict', 'Task has been retired');
           if (/live owner-gate dependents/i.test(cause)) throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
+          if (/not a screenplay draft/i.test(cause)) throw new CompanyError('forbidden', 'Revision edge is limited to owner-reviewed screenplay drafts on the 编剧 track');
+          if (/revises|superseded|supersede|revision lineage|real owner rejection/i.test(cause)) throw new CompanyError('conflict', 'Revision edge conflicted; refresh and retry');
           if (/already terminal/i.test(cause)) throw new CompanyError('conflict', 'Task already in a terminal state');
           if (/version moved/i.test(cause)) throw new CompanyError('conflict', 'Task version moved');
           if (/dependency not found|not found/i.test(cause)) throw new CompanyError('not_found', 'Referenced record not found');
@@ -331,6 +367,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
+    if (input.revises !== undefined) return this.createRevision(actor, input, dependencies);
     const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
     const digest = HASH(JSON.stringify({ ...input, dependencies }));
     const prior = await this.replay(idem, digest);
@@ -354,7 +391,8 @@ export class SurrealCompanyCore implements CompanyCore {
           LET $d = SELECT * FROM ONLY $dep;
           IF $d = NONE { THROW 'dependency not found' };
         };
-        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dependencies AND ${DEP_UNSATISFIED};
+        ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
+        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
           discipline: $discipline, work_intent: $work_intent, project: $project,
@@ -367,6 +405,167 @@ export class SurrealCompanyCore implements CompanyCore {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $created };
+        RETURN $created;
+        COMMIT;`, vars);
+      return view(row);
+    } catch (error) {
+      const replay = await this.replay(idem, digest);
+      if (replay) return replay;
+      throw error;
+    }
+  }
+
+  /**
+   * Controlled screenplay-revision edge (create_task with `revises`): gm/product replaces an
+   * owner-rejected screenplay draft with its legal next version in one transaction — the old
+   * draft voids with a superseded_by pointer, the new draft inherits the lineage and may start
+   * once its own normal dependencies are satisfied. The edge is never a general approval
+   * exemption: it only exists between two owner-reviewed screenwriter 编剧 drafts in the same
+   * goal and project, the target must be the unapproved chain tip whose latest submission drew
+   * a real owner_reject, and normal downstreams keep resolving to the chain tip.
+   *
+   * The checks below run twice: once here for readable fast-fail errors, once inside the
+   * transaction where a concurrent approve/submit/claim/supersede can't slip past.
+   */
+  private async createRevision(actor: Principal, input: CreateTask, dependencies: string[]): Promise<TaskView> {
+    const taskId = randomUUID();
+    const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ ...input, dependencies }));
+    // Idempotent replay comes first: a retried call must return the same revision even though
+    // the old draft is already void, which the live checks below would reject.
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    requireText(input.revises!, 'revises', 1, 200);
+    if (input.executorRole !== 'screenwriter' || input.reviewerRole !== 'owner' ||
+        input.discipline !== REQUIRED_TRACKS.screenwriter || (input.kind ?? 'task') !== 'task') {
+      throw new CompanyError('forbidden', 'revises is limited to owner-reviewed screenplay drafts on the 编剧 track');
+    }
+    // The caller writes the itemized revision points; the service stamps the lineage and the
+    // real rejection audit reference itself so context can never fake the gate.
+    requireText(input.context, 'context', 20, 20000);
+    const targetId = input.revises!;
+    if (dependencies.includes(targetId)) {
+      throw new CompanyError('invalid', 'revises target must not also be a normal dependency');
+    }
+    type TargetRow = {
+      id: RecordId; state: TaskState; executor_role: Role; reviewer_role: ReviewerRole;
+      discipline?: string; kind?: TaskKind; goal?: RecordId; project?: RecordId;
+      superseded_by?: RecordId; lineage?: RecordId; revision_no?: number;
+    };
+    const [target] = await this.db.query<[TargetRow | undefined]>(
+      'SELECT id, state, executor_role, reviewer_role, discipline, kind, goal, project, superseded_by, lineage, revision_no FROM ONLY $task;',
+      { task: id('task', targetId) });
+    if (!target) throw new CompanyError('not_found', 'revises target not found');
+    const isDraft = target.executor_role === 'screenwriter' && target.reviewer_role === 'owner'
+      && target.discipline === REQUIRED_TRACKS.screenwriter && (target.kind ?? 'task') === 'task';
+    if (!isDraft) throw new CompanyError('forbidden', 'revises target is not a screenplay draft');
+    if (target.superseded_by) throw new CompanyError('conflict', 'revises target is already superseded');
+    // review = newest submission still awaiting the owner; done = approved (an approved draft
+    // may never be superseded — in-flight mass production keeps its authorized version).
+    if (!['ready', 'doing', 'blocked'].includes(target.state)) {
+      throw new CompanyError('conflict', 'revises target must be an unapproved draft not awaiting review');
+    }
+    if ((target.goal ? asId(target.goal) : undefined) !== input.goalId) {
+      throw new CompanyError('invalid', 'revises target is in another goal');
+    }
+    if ((target.project ? asId(target.project) : undefined) !== input.project) {
+      throw new CompanyError('invalid', 'revises target is in another project');
+    }
+    const lineageId = target.lineage ? asId(target.lineage) : targetId;
+    // Normal dependencies must stay outside the revision lineage: a dep that resolves into
+    // this chain would wait on the draft being created — a self-dependency.
+    const [chainRows] = await this.db.query<[RecordId[]]>(
+      'SELECT VALUE id FROM task WHERE lineage = $lineage OR id = $revises;',
+      { lineage: id('task', lineageId), revises: id('task', targetId) });
+    const chainIds = new Set((chainRows ?? []).map(asId));
+    const lineageDep = dependencies.find(dep => chainIds.has(dep));
+    if (lineageDep) throw new CompanyError('invalid', `dependency ${lineageDep} is inside the revision lineage`);
+    // A real rejection means the draft's LATEST submission drew an owner_reject afterwards:
+    // pre-seeded opinions, employee review returns, and older rejects followed by a new
+    // pending submission do not count.
+    const [lastSubmit] = await this.db.query<[Array<{ at: unknown }>]>(
+      "SELECT at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;",
+      { task: id('task', targetId) });
+    const [rejectRows] = await this.db.query<[Array<{ id: RecordId; at: unknown }>]>(
+      "SELECT id, at FROM audit WHERE task = $task AND action = 'owner_reject' ORDER BY at DESC LIMIT 1;",
+      { task: id('task', targetId) });
+    const submitAt = lastSubmit?.[0]?.at;
+    const reject = rejectRows?.[0];
+    if (!submitAt) throw new CompanyError('conflict', 'revises target was never submitted');
+    if (!reject || !(new Date(String(reject.at)).getTime() > new Date(String(submitAt)).getTime())) {
+      throw new CompanyError('conflict', 'revises target lacks a real owner rejection on its latest submission');
+    }
+    const nextNo = (target.revision_no ?? 1) + 1;
+    const marker = new RegExp(`(?:^|[^0-9A-Za-z])(?:[vVrR]\\s*0*${nextNo}|第\\s*0*${nextNo}\\s*版)(?![0-9])`);
+    if (!marker.test(input.title)) {
+      throw new CompanyError('invalid', `revision title must carry the new version number v${nextNo}`);
+    }
+    const stamp = `\n\n—— 修订谱系（服务端记录）——\n上一版：task:${targetId}（v${nextNo - 1} → v${nextNo}）\n谱系：task:${lineageId}\n驳回审计：audit:${asId(reject.id)} @ ${String(reject.at)}`;
+
+    const vars = {
+      actor: id('employee', actor.employeeId), task: id('task', taskId),
+      revises: id('task', targetId), lineage: id('task', lineageId), revision_no: nextNo,
+      req_track: REQUIRED_TRACKS.screenwriter,
+      idem, digest,
+      audit: id('audit', randomUUID()), audit_sup: id('audit', randomUUID()),
+      outbox: id('outbox', randomUUID()), outbox_sup: id('outbox', randomUUID()),
+      title: input.title, context: input.context + stamp, executor: input.executorRole,
+      reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
+      kind: 'task', goal: input.goalId ? id('goal', input.goalId) : undefined,
+      project: input.project ? id('project', input.project) : undefined,
+      discipline: input.discipline, work_intent: input.workIntent,
+      sup_evidence: `被 task:${taskId} 取代（v${nextNo - 1} → v${nextNo}，谱系 task:${lineageId}）；驳回审计 audit:${asId(reject.id)}`,
+      create_evidence: `修订自 task:${targetId}（v${nextNo - 1} → v${nextNo}）；驳回审计 audit:${asId(reject.id)}`,
+    };
+    try {
+      const row = await this.txTask(`BEGIN;
+        LET $who = SELECT * FROM ONLY $actor;
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'actor revoked or forbidden' };
+        LET $d = SELECT * FROM ONLY $revises;
+        IF $d = NONE { THROW 'dependency not found' };
+        IF $d.executor_role != 'screenwriter' OR $d.discipline != $req_track OR $d.reviewer_role != 'owner' OR ($d.kind ?? 'task') != 'task' { THROW 'revises target is not a screenplay draft' };
+        IF $d.superseded_by != NONE { THROW 'revises target already superseded' };
+        IF $d.state NOT IN ['ready', 'doing', 'blocked'] { THROW 'revises target not supersedeable' };
+        IF ($d.goal ?? NONE) != ($goal ?? NONE) { THROW 'revises target in another goal' };
+        IF ($d.project ?? NONE) != ($project ?? NONE) { THROW 'revises target in another project' };
+        LET $last_submit = SELECT VALUE at FROM audit WHERE task = $revises AND action = 'submit' ORDER BY at DESC LIMIT 1;
+        LET $reject = SELECT * FROM audit WHERE task = $revises AND action = 'owner_reject' ORDER BY at DESC LIMIT 1;
+        IF array::len($last_submit) = 0 { THROW 'revises target has no submission' };
+        IF array::len($reject) = 0 OR $reject[0].at <= $last_submit[0] { THROW 'revises target lacks real owner rejection' };
+        LET $chain_ids = SELECT VALUE id FROM task WHERE lineage = $lineage OR id = $revises;
+        IF array::len(array::filter($dependencies, |$x| $x IN $chain_ids)) > 0 { THROW 'dependency inside revision lineage' };
+        FOR $dep IN $dependencies {
+          LET $dd = SELECT * FROM ONLY $dep;
+          IF $dd = NONE { THROW 'dependency not found' };
+        };
+        ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
+        LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
+        LET $created = CREATE ONLY $task CONTENT {
+          title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
+          discipline: $discipline, work_intent: $work_intent, project: $project,
+          dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
+          version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
+          delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
+          kind: $kind, goal: $goal, created_at: time::now(),
+          revises: $revises, lineage: $lineage, revision_no: $revision_no
+        };
+        LET $old = UPDATE ONLY $revises SET
+          state = 'void', superseded_by = $task, lineage = $lineage,
+          blocked_to = NONE, resume_role = NONE, resume_state = NONE, handover = NONE,
+          current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+          version = $d.version + 1
+          WHERE superseded_by = NONE AND state NOT IN ['done', 'void', 'review']
+          RETURN AFTER;
+        IF $old = NONE { THROW 'supersede race lost' };
+        UPDATE employee SET active_task = NONE WHERE active_task = $revises;
+        ${GOAL_ANCHOR_SQL}
+        CREATE ONLY $audit_sup CONTENT { task: $revises, actor: $actor, action: 'superseded', evidence: $sup_evidence, version: $old.version, at: time::now() };
+        LET $seq_sup = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox_sup CONTENT { task: $revises, kind: 'superseded', sequence: $seq_sup.value, payload: { state: 'void', superseded_by: $task, lineage: $lineage }, at: time::now() };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $create_evidence, at: time::now() };
+        LET $seq_new = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $seq_new.value, payload: { state: $created.state, revises: $revises, lineage: $lineage, revision_no: $revision_no }, at: time::now() };
         CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
@@ -921,7 +1120,8 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
-        LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND ${depUnsatisfiedFor('$t')};
+        ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
+        LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
         LET $next = UPDATE ONLY $task SET
           state = IF array::len($remaining) = 0 THEN (IF $t.resume_state = 'doing' THEN 'ready' ELSE $t.resume_state END) ELSE 'blocked' END,
           resume_role = NONE, resume_state = NONE, blocked_to = NONE, version = $t.version + 1 RETURN AFTER;
@@ -1039,7 +1239,8 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $d = NONE OR $d.goal != $t.goal { THROW 'defer denied: dependency missing or outside the task goal' };
       };
       LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
-      LET $remaining = SELECT VALUE id FROM task WHERE id IN $merged AND ${depUnsatisfiedFor('$t')};
+      ${RESOLVE_DEP_SQL('$merged', '$m_dep')}
+      LET $remaining = SELECT VALUE id FROM task WHERE id IN $m_dep_resolved AND ${depUnsatisfiedFor('$t')};
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
         state = IF array::len($remaining) = 0 THEN 'ready' ELSE 'blocked' END,
@@ -1092,10 +1293,15 @@ export class SurrealCompanyCore implements CompanyCore {
     if (before.state === 'void') return view(before); // already terminal, idempotent no-op
     if (before.reviewer_role === 'owner') {
       // Goal anchors are rollup bookkeeping; they never block retiring the gate itself.
-      const [liveDependents] = await this.db.query<[RecordId[]]>(
-        'SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN [$done, $void] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));',
+      // Dependents on ANY version of the task's screenplay lineage are live dependents of
+      // the tip too — retiring the tip would strand them blocked with no revision possible.
+      const rows = await this.db.query<[unknown, unknown, RecordId[]]>(`
+        LET $r = SELECT * FROM ONLY $task;
+        LET $chain = IF ($r.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $r.lineage) END;
+        SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $chain)) > 0
+          AND state NOT IN [$done, $void] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));`,
         { task: id('task', input.taskId), done: 'done', void: 'void' });
-      if (liveDependents.length > 0) {
+      if (rows[2].length > 0) {
         throw new CompanyError('conflict', 'Owner-gated task has live dependents; retire them first');
       }
     }
@@ -1113,7 +1319,8 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state IN ['done', 'void'] { THROW 'task already terminal' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
       IF $t.reviewer_role = 'owner' {
-        LET $live_dependents = SELECT VALUE id FROM task WHERE $task IN dependencies AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
+        LET $retire_chain = IF ($t.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $t.lineage) END;
+        LET $live_dependents = SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $retire_chain)) > 0 AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
         IF array::len($live_dependents) > 0 { THROW 'retire refused: live owner-gate dependents' };
       };
       LET $next = UPDATE ONLY $task SET

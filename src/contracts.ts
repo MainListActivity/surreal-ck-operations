@@ -62,6 +62,14 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
+  /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
+  revises?: TaskId;
+  /** Set on a superseded draft: points at the replacing version (chain tip has none). */
+  supersededBy?: TaskId;
+  /** Version-chain root shared by every draft of the same screenplay lineage. */
+  lineage?: TaskId;
+  /** 1-based version number inside the lineage (v1 has none until superseded). */
+  revisionNo?: number;
 }
 
 export interface HistoryEntry {
@@ -86,6 +94,15 @@ export interface CreateTask {
   dependencies?: TaskId[];
   idempotencyKey: string;
   workIntent?: WorkIntent;
+  /**
+   * Controlled screenplay-revision edge (gm/product only): both drafts must be owner-reviewed
+   * screenwriter tasks on the 编剧 track (kind=task) in the same goal and project; the target
+   * must be the unapproved, unsuperseded chain tip whose latest submission drew a real owner
+   * rejection. The service atomically voids the target (supersededBy pointer), inherits the
+   * lineage, and lets the new draft start once its own normal dependencies are satisfied —
+   * the edge never exempts other tasks or other dependencies.
+   */
+  revises?: TaskId;
 }
 
 export interface ClaimResult {

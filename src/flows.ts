@@ -84,7 +84,7 @@ function plan(goalId: string, head: string, afterScope: boolean): Spec {
 - 每个代码改动用 create_delivery（自动生成 实现 → 上线申请 → 合入部署与生产实测，上线由运营决定、qa 在生产实测）。
 - 非代码工作用 create_task，执行者与验收者不同岗位；小需求不要拉 ai-content、cs 参与。内容产线按段派工：原型/概念设计（P 段，老板 demo 验收）→ executorRole=concept-design、reviewerRole=owner；量产制作（M 段，GM/QA 验收）→ executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies（老板 approve 前量产任务不解锁）。项目内更细的产线分工（编剧/角色设计/分镜等岗位轨，见项目 AGENTS.md 与 project.disciplines 词表）不要当成全局岗位；create_task/create_delivery 传 discipline=<轨名>，只有挂该轨的编制会接活，不带轨的任务按普通岗位匹配。
 **编剧轨例外**：所有编剧轨任务（故事大纲、剧本初稿、二次创作修订、多轮打磨）一律用 executorRole=screenwriter 且必须 discipline=编剧——包括 P 段原型剧本（这是对『P 段=concept-design』的有意例外），P 段仍由 reviewerRole=owner 验收；M 段量产剧本 reviewerRole=gm。
-**剧本修订链**：验收驳回的剧本稿不走并行返工，默认在同一任务内多轮修订——把驳回意见逐条转成修订要点，修完重新提交评审；确需跨任务版本链时，下一轮 v(N+1) 任务（版本号写进任务标题）dependencies 挂被取代稿、待其正常 done 解锁。服务端暂无 retire_task/void 作废能力（目标语义已约定，待另立任务落地），不要把它当成可执行步骤引用。不要为了让下一轮解锁而验收不合格的稿子——验收通过 = 认可交付。存量任务不迁移。
+**剧本修订链**：P 段剧本被老板真实驳回后，gm/product 用 create_task 传 revises=<上一版任务id> 原子开下一版（executorRole=screenwriter、reviewerRole=owner、discipline=编剧，标题带新版本号 v(N+1)，context 写逐条修订要点）；服务端校验真实 owner 驳回后把旧稿置 void 并写 supersededBy 指向新稿，旧稿保留在任务图与审计中。普通下游依赖挂哪一版都一样解析到谱系最新版，最新版未经老板真实批准前全部保持 blocked，批准后统一解锁。M 段量产剧本（reviewerRole=gm）及任何非编剧轨、非 owner 验收任务不得用 revises，仍走同任务 return→返修流程。不要为了让下一轮解锁而验收不合格的稿子，验收通过 = 认可交付。存量任务不迁移。
 submit 证据：任务清单（id、标题、执行/验收岗位、依赖）。运营验收和 G3 会自动等待全部任务完成。
 ${AUTHORITY}`,
   };
