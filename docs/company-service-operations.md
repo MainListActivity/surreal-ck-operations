@@ -10,7 +10,7 @@
 
 用户级 launchd label 为 `org.surrealck.company-mcp`（任务服务）与 `org.surrealck.company-dispatcher`（v3 调度器，同一发布目录）。脚本 `scripts/company-service.sh` 默认只操作 `mcp`；v3 的调度器已迁入 Paseo 插件 `sck-company`（连同员工通道与运维代理），不要再装 launchd 调度器，否则会重复派工。`SCK_COMPONENTS=dispatcher`（或 `"mcp dispatcher"`）仅为旧部署保留；安装时同时把员工工具 `bin/sck` 复制到服务目录。旧版 launchd 调度器需要 `private/service.env` 中的 `SCK_AGENT_CWD`（员工工作目录，运营仓库 checkout），可选 `SCK_PASEO_BIN`、`SCK_NOTIFY=0`（关闭 macOS 通知）。Plist 位于 `~/Library/LaunchAgents/org.surrealck.company-<组件>.plist`，`KeepAlive` 在进程异常退出后重启。停止后不会删除数据库、凭证、日志或发布目录。卸载只去掉本服务 plist 与进程，不动数据。
 
-发布需先固定提交，并在版本目录运行 `rtk proxy pnpm install --frozen-lockfile`；将 `.env.example` 复制到上述 `private/service.env`，填入现有产品 env **路径**、确认空闲端口、GitHub 仓库和私有 GM 凭证**路径**，文件权限 0600。`rtk proxy sh scripts/company-service.sh install '/absolute/release/path'` 安装并立即启动。常用命令（在任意固定版本目录执行）：
+发布按下文双面流程先固定集成提交、生成快照并安装依赖。首次安装才由获授权的配置管理方将 `.env.example` 复制到上述 `private/service.env`，登记现有产品 env **路径**、空闲端口、GitHub 仓库和私有 GM 凭证**路径**，文件权限 0600；后续发布沿用现有私有配置，不复制覆盖或读取凭证。`rtk proxy sh scripts/company-service.sh install '/absolute/release/path'` 安装并立即启动。常用命令（在任意固定版本目录执行）：
 
 ```sh
 rtk proxy sh scripts/company-service.sh status
@@ -20,20 +20,88 @@ rtk proxy sh scripts/company-service.sh start
 rtk proxy sh scripts/company-service.sh uninstall
 ```
 
-`GET http://127.0.0.1:<port>/health` 是进程存活探针；`GET /ready` 检查实际目标库 ownership marker 可读，200 为 ready、503 为不可用。两者仅本机可访问，且同样应用 Host/Origin 检查；MCP `/mcp` 仍须每次 Bearer 鉴权。检查时用 `rtk proxy curl --fail http://127.0.0.1:<port>/ready`，`rtk proxy lsof -nP -iTCP:<port> -sTCP:LISTEN`，`rtk proxy sh scripts/company-service.sh status`。日志在 `logs/stdout.log` 和 `logs/stderr.log`（调度器为 `logs/stdout-dispatcher.log`、`logs/stderr-dispatcher.log`），只记录监听端口、投影数量和不含原始错误的重试消息；不要把完整日志上传到 Issue。启动失败先检查私有配置路径、文件权限、端口占用、现有 SurrealDB 可达性与本机 gh 登录。回滚到前一固定目录：在前一版本运行同一 `install <previous-release>`；卸载如上。
+`GET http://127.0.0.1:<port>/health` 是进程存活探针；`GET /ready` 检查实际目标库 ownership marker 可读，200 为 ready、503 为不可用。两者仅本机可访问，且同样应用 Host/Origin 检查；MCP `/mcp` 仍须每次 Bearer 鉴权。检查时用 `rtk proxy curl --fail http://127.0.0.1:<port>/ready`，`rtk proxy lsof -nP -iTCP:<port> -sTCP:LISTEN`，`rtk proxy sh scripts/company-service.sh status`。日志在 `logs/stdout.log` 和 `logs/stderr.log`（调度器为 `logs/stdout-dispatcher.log`、`logs/stderr-dispatcher.log`），只记录监听端口、投影数量和不含原始错误的重试消息；不要把完整日志上传到 Issue。启动失败先检查私有配置路径、文件权限、端口占用、现有 SurrealDB 可达性与本机 gh 登录。回滚须按下文「双面回滚」同时恢复 launchd 与插件来源；仅运行 `install <previous-release>` 不足以完成回滚。卸载如上。
 
-**插件面同步（每次 release install 必做）**：任务系统是双部署面——launchd `org.surrealck.company-mcp` 跑 `active` 指向的 release，而员工 comm 通道（sck → sidecar → vendored core）与调度器跑在 Paseo 插件 `sck-company` 进程内，插件加载自 `/Users/y/IdeaProjects/surreal-ck-operations-v3/plugin`（分支 `ops/v3-paseo-dispatch`），其 `plugin/server/vendor/` 是 `src/`+`schema/` 的**手工生成拷贝**，不随仓库提交自动更新。只切 active 不同步插件面会导致通道用旧 core 校验（曾出现新岗位 create_task 被旧 ROLES 拒 `invalid: Invalid role`）。每次发布执行：
+## 插件面同步（基线集成 + 固定 release 双面发布）
+
+任务系统有两个部署面：launchd `org.surrealck.company-mcp` 从 `active` 指向的 release 运行；员工 comm 通道（sck → sidecar → vendored core）、运维代理、调度器与交付预览运行在 Paseo 插件 `sck-company` 内。**两面必须使用同一个集成基线的固定 release**。只切 `active` 或只 reload 旧来源，会让两面 core/schema 不一致（曾出现新岗位被旧 ROLES 拒为 `invalid: Invalid role`）。
+
+现行路径自 `task/d7697420`、`task/b7fdaa55` 部署沿用：生产基线任务分支保留 `ops/v3-paseo-dispatch` 的在途提交，并集成已批准的 `origin/main`，再以 `git archive` 切 release。2026-10-10 核实的基线 `1b9d423e5bf34cc065ca96a657f3cde035b848e3` 同时是 `active` 目标与 `paseo plugin ls` 的 SOURCE/DIRECTORY 所在 release；这是历史核对点，后续发布用当次完整 SHA。
+
+`/Users/y/IdeaProjects/surreal-ck-operations-v3`（`ops/v3-paseo-dispatch`）保留为 **protected 历史工作树**，不再是生产插件来源；不得在其中 merge、reset、清理或覆盖生成物。插件在途功能通过基线合入保留，不能拿纯 main 快照覆盖生产。固定 release 内的 `plugin/server/vendor/` 仍是 `src/` + `schema/` 的生成拷贝，每次打包都须重生成。
+
+### 1. 固定并验证集成基线
+
+以下操作仅由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main 或 v3 历史树操作，不自行建树或切分支。先记录 `active` 的完整路径和插件 SOURCE/DIRECTORY，保留上一版双面回滚目录及依赖。用 `rtk git status --short --branch` 确认登记分支正确、树干净，`rtk git fetch origin` 获取已批准主线；记录当前生产基线、v3 分支和主线的完整 SHA。
+
+在登记的生产基线任务分支集成**上一生产基线 ∪ v3 在途提交 ∪ 已批准 origin/main**（已包含的祖先不重复合入）。用 `rtk git merge --no-edit <完整SHA>` 合入各缺失来源；冲突逐项审查，尤其调度器/sidecar，不能以覆盖文件丢掉任一侧功能。提交、推送基线后，用 `rtk git merge-base --is-ancestor <来源SHA> <基线SHA>` 分别确认三者均被保留；每次命令退出码须为 0。若需舍弃在途功能或无法确认兼容性，向经理报阻塞，不自行发布。
+
+部署记录应包含来源 SHA、最终基线 SHA、冲突处理与批准范围。基线须通过根与插件 typecheck、该变更要求的回归；本地数据库测试只用公司 fork。根/schema 与插件/vendor 来自此同一基线。
+
+### 2. 从提交生成固定 release
+
+下例变量须在同一个 shell 会话设置；`SCK_DEPLOY_REPO` 是当前登记部署工作目录，`SCK_BASELINE_SHA` 填已提交的完整集成 SHA，`SCK_PLUGIN_DEPS` 填上一步记录的上一固定 release 的 `plugin/node_modules`（首次切换时才用已核实的 v3 依赖目录）。不读取凭证或私有 env；不覆盖已存在的 release。所有占位符须替换后执行。
 
 ```sh
-cd /Users/y/IdeaProjects/surreal-ck-operations-v3
-git fetch origin && git status          # 确认工作树干净、识别未推送/在途提交（不得丢）
-git merge origin/main                    # 把 release 基线并入插件分支并推送
-sh plugin/scripts/vendor.sh              # 重新生成 server/vendor/src 与 server/vendor/schema
-paseo plugin reload sck-company          # 重载插件（短暂中断派工循环，避开密集时段）
-paseo plugin ls                          # 确认 sck-company running、无 error
+SCK_DEPLOY_REPO='/absolute/registered/deploy/worktree'
+SCK_BASELINE_SHA='<full-integrated-commit-sha>'
+SCK_RELEASE_ROOT="$HOME/Library/Application Support/SurrealCKCompany"
+SCK_RELEASE_DIR="$SCK_RELEASE_ROOT/releases/$SCK_BASELINE_SHA"
+SCK_PREVIOUS_RELEASE='/absolute/previous/release'
+SCK_PLUGIN_DEPS="$SCK_PREVIOUS_RELEASE/plugin/node_modules"
+PASEO_CLI='/Applications/Paseo.app/Contents/Resources/bin/paseo'
+rtk proxy test ! -e "$SCK_RELEASE_DIR"
+rtk proxy mkdir -p "$SCK_RELEASE_DIR"
+rtk git -C "$SCK_DEPLOY_REPO" archive --format=tar --output="$SCK_RELEASE_DIR/source.tar" "$SCK_BASELINE_SHA"
+rtk proxy tar -xf "$SCK_RELEASE_DIR/source.tar" -C "$SCK_RELEASE_DIR"
+rtk proxy rm "$SCK_RELEASE_DIR/source.tar"
+rtk proxy cp -RL "$SCK_PLUGIN_DEPS" "$SCK_RELEASE_DIR/plugin/node_modules"
+rtk proxy sh "$SCK_RELEASE_DIR/plugin/scripts/vendor.sh"
+rtk proxy pnpm --dir "$SCK_RELEASE_DIR" install --frozen-lockfile
+rtk proxy pnpm --dir "$SCK_RELEASE_DIR/plugin" install --frozen-lockfile --ignore-scripts
+rtk proxy pnpm --dir "$SCK_RELEASE_DIR" typecheck
+rtk proxy pnpm --dir "$SCK_RELEASE_DIR/plugin" typecheck
 ```
 
-reload 后用 `sck call get_context` 与实际派工各验证一次恢复。其它生成物：`plugin/node_modules` 由 `cd plugin && npm install` 管理，仅当 `plugin/package.json` 依赖变化时才需重装，无其它需同步的生成物。
+逐条检查退出码，任何一步失败都停止，保留当前生产版本。依赖拷贝要解引用，避免 release 指向会被回收的开发树；随后以该基线锁文件安装校准，不能以旧 `node_modules` 代替 frozen-lockfile 校验。预安装与 vendor 生成完才允许切换；上线后 release 不再原地修改。同 SHA 已有目录只可在核对完整快照、依赖和 vendor 后复用，不盲目覆盖。
+
+### 3. 安装 launchd 与重注册现有插件
+
+先安排短暂维护窗口，记录在办任务/编制状态并暂停新增派工；由经理使用现有管理通道处理受影响编制，不新建员工或 dispatcher。不要重启整个 Paseo 守护进程。现有私有配置由运行脚本加载，安装命令只传固定 release 路径。
+
+```sh
+rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_RELEASE_DIR"
+# MCP ready / bootstrap 成功后再切插件（端口用已登记配置）
+rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
+rtk proxy "$PASEO_CLI" plugin install "$SCK_RELEASE_DIR/plugin" --id sck-company
+rtk proxy "$PASEO_CLI" plugin reload sck-company
+rtk proxy "$PASEO_CLI" plugin ls sck-company
+```
+
+`plugin install <release>/plugin` 将**现有 ID** 的来源重新登记到固定目录；`reload` 仅重载已登记来源，不能替代 install。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
+
+### 4. 双面验证与恢复派工
+
+- `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
+- `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
+- 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
+- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。预览健康与监听进程按下节检查。
+
+证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
+
+### 5. 双面回滚
+
+**先停用受影响编制再回滚**：由经理通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
+
+```sh
+rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_PREVIOUS_RELEASE/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
+rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
+rtk proxy "$PASEO_CLI" plugin install "$SCK_PREVIOUS_RELEASE/plugin" --id sck-company
+rtk proxy "$PASEO_CLI" plugin reload sck-company
+rtk proxy "$PASEO_CLI" plugin ls sck-company
+```
+
+回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 
 ## 交付预览服务（插件内嵌正式版 · LAN/公网双面）
 
@@ -64,7 +132,7 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 **员工交付发布工具 `deliverable_publish`**（sidecar 基础工具，`sck call deliverable_publish '{"files":[绝对路径…],"taskId"?}'`）：把文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/` 并返回 `/d/` 路由的 LAN 可点 URL；taskId 缺省取在手租约。同名覆盖、隐藏名跳过、symlink 解引用；任一输入路径无效即整体报错不落半截包。员工证据里的预览链接一律用它返回的 URL。收件箱 `attachments.url` 当前按老板 LAN 口径直接返回 `/e/` 无签名 URL；公网签名通道（preview-sign + 签名面 :18778 + 隧道/Caddy）保留待用，配置 `SCK_PREVIEW_SECRET` 后插件 reload 即激活签名面。
 
-**部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走「插件面同步」流程（v3 merge + vendor.sh + `paseo plugin reload`）——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
+**部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走上文「插件面同步」的基线集成、固定 release 打包、launchd install 与 `paseo plugin install <release>/plugin` 重注册流程——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
 
 **状态观测**：`ops_info` 响应含 `preview` 段 `{lan:{running,port,lanUrl,uptime,lastError}, signed:{configured,running,port,uptime,lastError}, roots, lastError}`——loopback 探测 healthz 为准，失败回读插件写的 `$SCK_SERVICE_HOME/preview-status.json`。插件日志前缀 `[preview]`。
 
@@ -95,8 +163,8 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 
 本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)：
 
-1. 记录 MCP active release 提交、插件分支提交、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011/012（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
-2. 按上文双面流程切 fixed release、同步 `/Users/y/IdeaProjects/surreal-ck-operations-v3/plugin` 的受控源码与 vendor/schema，reload **现有** `sck-company`；保留插件在途提交，不另起 dispatcher。
+1. 记录 MCP active release 提交、插件 SOURCE/DIRECTORY 对应的固定 release 基线、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011/012（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
+2. 按上文双面流程把生产基线、v3 在途提交与已批准主线集成为固定 release，重生成 vendor/schema，安装 launchd，再用 `paseo plugin install <release>/plugin` 重注册并 reload **现有** `sck-company`；v3 checkout 保留为 protected 历史树，不另起 dispatcher。
 3. 验证 MCP `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复；记录两面实际提交/时间。经理安排真实串行 QA/工程及并行代码写手演练，QA 用普通通道读登记，不取得凭证、不自行建员工。证据含任务 ID、实际路径/branch、audit ID/时间、登记/有效引用 before/after，区分本地与生产。
 4. 分配策略需要回退时，两面同时设置 `SCK_WORKTREE_STRATEGY=legacy`（只对后续新代码分配恢复独占，已有 assignment 优先）；回收需要关闭时两面设置 `SCK_WORKTREE_RECLAIM=0`。restart MCP + reload 现有插件。保留 schema 011/012、登记、审计与在办现场。两面代码回滚也须保留 WT01/WT02 登记兼容版本。
 
