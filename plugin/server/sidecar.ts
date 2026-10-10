@@ -157,8 +157,8 @@ export class SidecarPool {
     return rotated;
   }
 
-  async readWorkspace(inst: EmployeeInst, taskId?: string): Promise<WorktreeAssignment | undefined> {
-    const workspace = await this.deps.core.readWorkspace?.(await this.credentialFor(inst.id), taskId);
+  async readWorkspace(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined> {
+    const workspace = await this.deps.core.readWorkspace?.(await this.credentialFor(inst.id), taskId, project);
     if (workspace) writeFileAtomic(join(commDir(this.deps.runDir, inst.id), 'workspace.json'), JSON.stringify(workspace));
     return workspace;
   }

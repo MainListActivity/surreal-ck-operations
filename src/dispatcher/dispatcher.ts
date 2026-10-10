@@ -267,7 +267,7 @@ export interface SidecarBridge {
   /** Claims the task as the instance and stages claim.json; undefined = lost the race. */
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
   /** Records the freshly spawned Paseo agentId for this instance. */
-  readWorkspace?(inst: EmployeeInst, taskId?: string): Promise<WorktreeAssignment | undefined>;
+  readWorkspace?(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
   bindAgent(instId: string, agentId: string): void;
   /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
@@ -280,6 +280,15 @@ export interface SidecarBridge {
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
 interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolean }
+
+/**
+ * Workspace anchor for task-less management dispatches (gm-attention, triage, eval).
+ * `task` anchors by task identity: its repoPath picks the candidate home and its id
+ * drives readWorkspace project resolution. `home`+`project` anchor a goal directly
+ * when no task exists yet (triage): `home` is the resolved repo the candidate pool,
+ * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
+ */
+interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
 
 export interface TickReport {
   commands: number;
@@ -513,8 +522,8 @@ export class Dispatcher {
       await owner.resolveNotice('model-unresolved');
     }
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
-      recusal?: ReviewRecusal) => {
-      const home = task?.repoPath ?? this.deps.env.opsRepo;
+      recusal?: ReviewRecusal, anchorHome?: string) => {
+      const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
       const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal);
       const demote = (id: string) => recusal?.hands.has(id) ? PRIOR_HAND_WEIGHT_FACTOR : 1;
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def)) * demote(inst.id);
@@ -682,7 +691,7 @@ export class Dispatcher {
     for (const group of gmGroups.values()) {
       if (running >= cfg.maxRunning) break;
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, group[0]);
+        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
       if (!result) continue;
       for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
       running++;
@@ -698,14 +707,26 @@ export class Dispatcher {
         const last = await wf.lastDispatch(`goal:${goal.id}`, 0, 'triage');
         if (!last || now - last.at >= cfg.redispatchMinutes * 60) due.push(goal);
       }
-      if (due.length) {
+      // Same per-repo anchoring as gm-attention: a due goal's project decides which
+      // shared worktree the gm triage session lands in. The goal has no task yet, so
+      // the anchor carries the resolved repo home plus the project id readWorkspace
+      // resolves; project-less goals stay on the ops repo tree.
+      const triageGroups = new Map<string, typeof due>();
+      for (const goal of due) {
+        const home = goal.repoPath ?? this.deps.env.opsRepo;
+        const group = triageGroups.get(home);
+        if (group) group.push(goal); else triageGroups.set(home, [goal]);
+      }
+      for (const [home, group] of triageGroups) {
+        if (running >= cfg.maxRunning) break;
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap);
-        if (result) {
-          for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
-          running++;
-          report.woke.push(...due.map(g => ({ task: `goal:${g.id}`, employee: result.id, spawned: result.spawned })));
-        }
+          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
+        if (!result) continue;
+        for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
+        running++;
+        busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
+        assigned.add(result.id);
+        report.woke.push(...group.map(g => ({ task: `goal:${g.id}`, employee: result.id, spawned: result.spawned })));
       }
     }
 
@@ -739,7 +760,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, task);
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -901,15 +922,15 @@ export class Dispatcher {
 
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
-    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal) => EmployeeInst | undefined,
+    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal, anchorHome?: string) => EmployeeInst | undefined,
     spawnable: (role: string, home: string, task?: SupervisedTask) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, readTask?: SupervisedTask,
+    prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? readTask, avoid, forReview, recusal);
+    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
@@ -918,7 +939,7 @@ export class Dispatcher {
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
       try {
-        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(existing, readTask?.id);
+        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(existing, anchor?.task?.id, anchor?.project);
         if (sidecar && task) {
           claim = await sidecar.claim(existing, task);
           if (!claim) {
@@ -954,7 +975,7 @@ export class Dispatcher {
         return undefined;
       }
     }
-    const defsOrdered = spawnable(role, task?.repoPath ?? readTask?.repoPath ?? env.opsRepo, task);
+    const defsOrdered = spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task);
     if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());
@@ -965,7 +986,7 @@ export class Dispatcher {
       let workspace: WorktreeAssignment | undefined;
       try {
         claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
-        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, readTask?.id);
+        if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
         await wf.retire(inst.id, 'allocation unavailable');
@@ -982,13 +1003,13 @@ export class Dispatcher {
       try {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? readTask?.repoPath ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
+          mode: UNATTENDED_MODE[def.provider], cwd: (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: spawnEnv,
           prompt: prompt(inst, true, claim, workspace),
         });
-        const cwd = (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? readTask?.repoPath ?? env.opsRepo;
-        const repoHome = task?.repoPath ?? readTask?.repoPath ?? env.opsRepo;
+        const cwd = (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
+        const repoHome = task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model };

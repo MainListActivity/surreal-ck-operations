@@ -397,13 +397,13 @@ export class SurrealCompanyCore implements CompanyCore {
     });
   }
 
-  async readWorkspace(credential: Credential, taskId?: TaskId): Promise<WorktreeAssignment | undefined> {
+  async readWorkspace(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined> {
     const actor = await this.authorized(credential);
     if (!['gm', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires gm/eval');
     if (!this.worktrees) return undefined;
     if (taskId) await this.getTask(credential, taskId);
-    const project = taskId ? await this.taskProject(taskId) : undefined;
-    return this.worktrees.readWorkspace(project?.repoPath ?? this.worktrees.options.opsRepo, actor, project);
+    const resolved = taskId ? await this.taskProject(taskId) : project ? await this.projects.get(project) : undefined;
+    return this.worktrees.readWorkspace(resolved?.repoPath ?? this.worktrees.options.opsRepo, actor, resolved);
   }
   async releaseWorkspace(credential: Credential): Promise<void> {
     const actor = await this.authorized(credential);

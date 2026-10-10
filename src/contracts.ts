@@ -189,8 +189,8 @@ export interface CompanyCore {
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;
   createTask(credential: Credential, input: CreateTask): Promise<TaskView>;
   claim(credential: Credential, taskId: TaskId): Promise<ClaimResult>;
-  /** Optional for old adapters; production cores expose authenticated inventory. */
-  readWorkspace?(credential: Credential, taskId?: TaskId): Promise<WorktreeAssignment | undefined>;
+  /** Optional for old adapters; production cores expose authenticated inventory. `project` anchors a project-scoped workspace for task-less dispatches (goal triage); taskId wins when both are given. */
+  readWorkspace?(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(credential: Credential): Promise<void>;
   listWorktrees?(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]>;
   /** GM: ownership reclaim or dry-run across registered repos (WT02). */
@@ -323,6 +323,8 @@ export interface GoalView {
   state: 'triage' | 'active' | 'done' | 'cancelled';
   tier?: GoalTier;
   project?: string;
+  /** Repo of the linked project, joined by triagePending; anchors the gm triage session's workspace. */
+  repoPath?: string;
   /** manual is the 运营验收 anchor; acceptance closes the goal (G3 for standard/program, 运营验收 for quick). */
   tasks: { intake?: TaskId; plan?: TaskId; manual?: TaskId; acceptance?: TaskId };
 }

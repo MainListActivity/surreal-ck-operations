@@ -35,12 +35,15 @@ interface GoalRow {
   state: GoalView['state'];
   tier?: GoalTier;
   project?: RecordId;
+  /** Joined `project.repo_path` (triagePending only); not a stored column. */
+  repo_path?: string;
   tasks: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
 }
 
 const goalView = (row: GoalRow): GoalView => ({
   id: asId(row.id), title: row.title, brief: row.brief, state: row.state, tier: row.tier,
   project: row.project ? asId(row.project) : undefined,
+  repoPath: row.repo_path ?? undefined,
   tasks: Object.fromEntries(Object.entries(row.tasks ?? {}).filter(([, v]) => v).map(([k, v]) => [k, asId(v)])),
 });
 
@@ -113,7 +116,7 @@ export class OwnerDesk {
   }
 
   async triagePending(): Promise<GoalView[]> {
-    const [rows] = await this.db.query<[GoalRow[]]>("SELECT * FROM goal WHERE state = 'triage' ORDER BY created_at;");
+    const [rows] = await this.db.query<[GoalRow[]]>("SELECT *, project.repo_path AS repo_path FROM goal WHERE state = 'triage' ORDER BY created_at;");
     return rows.map(goalView);
   }
 
