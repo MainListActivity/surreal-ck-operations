@@ -346,11 +346,12 @@ export class SurrealCompanyCore implements CompanyCore {
     return this.worktrees.locked(project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
       // Re-read under the cross-process repo lock: the first allocation may have completed while waiting.
       const fresh = await this.getTask(credential, taskId);
-      if (fresh.currentEmployee && fresh.currentEmployee !== actor.employeeId) throw new CompanyError('already_claimed', 'Task scene still held; dispatcher must revoke first');
+      const [now] = await this.db.query<[number]>('RETURN time::unix(time::now());');
+      if (fresh.currentEmployee && fresh.currentEmployee !== actor.employeeId && fresh.leaseExpiresAt && Date.parse(fresh.leaseExpiresAt) > now * 1000) throw new CompanyError('already_claimed', 'Task scene still leased');
       const holder = await this.db.select<EmployeeRow>(id('employee', actor.employeeId));
       if (holder?.active_task && asId(holder.active_task) !== taskId) {
         const active = await this.db.select<TaskRow>(holder.active_task);
-        if (active?.current_employee === actor.employeeId) throw new CompanyError('already_claimed', 'Employee still holds another task');
+        if (active?.current_employee === actor.employeeId && (active.lease_expires_at ?? 0) > now) throw new CompanyError('already_claimed', 'Employee still holds another task');
       }
       const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, project);
       return this.claimLease(actor, taskId, worktree);

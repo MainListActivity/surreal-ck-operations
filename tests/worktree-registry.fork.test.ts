@@ -238,3 +238,24 @@ run('new task branches start from available origin default branch rather than a 
   expect(readFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('approved remote baseline');
   expect(git(path, 'show', 'main:source.txt')).toBe('baseline'); await submit(core, eng, a);
 });
+
+run('explicit read engineering task and its independent review keep shared read workspace without creating task branch', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa');
+  const t = await task(core, 'engineering', { kind: 'read' }), reader = await core.claim(eng, t.id);
+  expect(reader.worktree!.intent.kind).toBe('read'); expect(reader.worktree!.mode).toBe('shared');
+  await submit(core, eng, reader);
+  const review = await core.claim(qa, t.id); expect(review.worktree!.worktreePath).toBe(reader.worktree!.worktreePath);
+  expect(review.worktree!.branch).toBe(reader.worktree!.branch);
+  await expect(core.accept(eng, proof(review), { text: 'self review denied', idempotencyKey: 'read-self-review-denied' })).rejects.toBeDefined();
+  await core.accept(qa, proof(review), { text: 'Independent fixture read review', idempotencyKey: `read-accept-${++count}` });
+});
+run('managed allocator keeps expired-lease takeover semantics and preserves scene while fencing stale proof', async () => {
+  const path = repo(), core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path } });
+  const eng = await employee('engineering'), next = await employee('engineering');
+  const t = await task(core, 'engineering'), a = await core.claim(eng, t.id);
+  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await Bun.sleep(1100);
+  const recovery = coreFor(path), b = await recovery.claim(next, t.id); expect(b.fence).toBeGreaterThan(a.fence); expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
+  expect(readFileSync(join(b.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('expired dirty scene');
+  await expect(core.checkpoint(eng, proof(a), { text: 'stale after takeover', idempotencyKey: 'managed-expired-stale' })).rejects.toBeDefined();
+  await submit(recovery, next, b);
+});

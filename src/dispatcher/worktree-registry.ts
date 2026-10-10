@@ -130,7 +130,7 @@ export class WorktreeRegistry {
     const defaultBranch = project?.defaultBranch ?? list[0]!.branch ?? 'HEAD';
     let base = defaultBranch;
     try { await git(repo, ['show-ref', '--verify', `refs/remotes/origin/${defaultBranch}`]); base = `origin/${defaultBranch}`; } catch {}
-    const desired = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task') ? `task/${task.id.slice(0, 8)}` : undefined;
+    const desired = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code')) ? `task/${task.id.slice(0, 8)}` : undefined;
     const own = previous && rows.find(r => String(r.id.id) === previous.id);
     const legacy = list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
     let chosen = own && list.find(t => t.path === own.path && (!desired || t.branch === desired)) ? own : undefined;
