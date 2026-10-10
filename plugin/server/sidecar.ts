@@ -18,7 +18,7 @@ import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workf
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
-  "get_context", "get_task_history", "list_worktrees", "checkpoint", "submit", "review", "report_blocker",
+  "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
   "record_score", "heartbeat", "deliverable_publish",
@@ -422,7 +422,22 @@ export class SidecarPool {
       return ops.call(cred, live().taskId, tool, rest);
     }
     switch (tool) {
-      case "list_worktrees": return core.listWorktrees ? core.listWorktrees(cred, args.taskId === undefined ? live().taskId : String(args.taskId)) : [];
+      case "list_worktrees": {
+        if (!core.listWorktrees) return [];
+        if (args.taskId !== undefined) return core.listWorktrees(cred, String(args.taskId));
+        // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。
+        const actor = await core.authenticate(cred);
+        return core.listWorktrees(cred, actor.role === "gm" ? undefined : live().taskId);
+      }
+      case "reclaim_worktrees": return core.reclaimWorktrees
+        ? core.reclaimWorktrees(cred, {
+            dryRun: args.dryRun === true,
+            repos: Array.isArray(args.repos) ? args.repos.map(String) : undefined,
+          })
+        : { scanId: "", removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+      case "list_worktree_audits": return core.listWorktreeAudits
+        ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
+        : [];
       case "get_context":
         return {
           principal: await core.authenticate(cred),
