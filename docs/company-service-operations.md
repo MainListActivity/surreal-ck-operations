@@ -78,7 +78,7 @@ rtk proxy "$PASEO_CLI" plugin reload sck-company
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
 
-`install` 校验 main 祖先关系、切 `active`，并在插件来源位于本服务目录时自动把 `~/.paseo/config.json` 的 `sck-company.path` 回指到本次 release 的 `plugin/` 后尝试 reload——插件面不再需要手工 `plugin install`；只有当插件被登记到服务目录之外的路径（如开发树）时才需要手工 `plugin install <release>/plugin --id sck-company`。`reload` 仅重载已登记来源，不能替代 install。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
+`install` 校验 main 祖先关系、切 `active`，并在插件已登记于本服务目录时自动执行 `plugin remove` + `plugin install <release>/plugin --id sck-company` 完成重指——daemon 只在登记时解析来源路径，`reload` 不重读 config、`install` 不允许覆盖既有 ID，所以重指只能走 remove+install（插件进程重启，sidecar `adopt()` 会恢复在编通道与活租约）。已指向本次 release 时 install 只做 reload。插件登记在服务目录之外的路径（如开发树）时 install 不干预，只提示。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
 
 ### 4. 双面验证与恢复派工
 
