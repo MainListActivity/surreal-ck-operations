@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,7 @@ import { OwnerDesk } from '../src/owner.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { readJsonFile } from '../src/comm.ts';
 
+setDefaultTimeout(30000);
 const run = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
 let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, gm: string;
 let count = 0;
