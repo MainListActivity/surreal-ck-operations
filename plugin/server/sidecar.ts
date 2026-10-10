@@ -181,6 +181,24 @@ export class SidecarPool {
     }
   }
 
+  /**
+   * Server-side truth for a held claim: the lease is alive only while the task
+   * still names this instance its employee under the same delivery, unexpired.
+   * Anything else (revoked, expired, re-claimed by another worker) is a stale
+   * local remnant — drop it instead of letting it block every future pick.
+   */
+  private async staleClaim(held: LiveClaim): Promise<boolean> {
+    try {
+      const cred = await this.credentialFor(held.instId);
+      const task = await this.deps.core.getTask(cred, held.taskId);
+      return task.currentEmployee !== held.instId
+          || task.deliveryId !== held.proof.deliveryId
+          || (task.leaseExpiresAt !== undefined && Date.parse(task.leaseExpiresAt) <= Date.now());
+    } catch {
+      return true; // unreachable/removed task — never worth blocking dispatch on
+    }
+  }
+
   /** Claims the task as the instance and stages claim.json in its comm dir. */
   async claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined> {
     // Legacy instances still carry a credential file their agent reads directly;
@@ -190,7 +208,16 @@ export class SidecarPool {
         (inst.paseoAgentId && !this.canReuse(inst))) {
       throw Object.assign(new Error("unhealthy session channel cannot claim"), { code: "stale_channel" });
     }
-    if (this.claims.has(inst.id)) throw Object.assign(new Error("session already holds a lease"), { code: "already_claimed" });
+    const held = this.claims.get(inst.id);
+    if (held) {
+      // A local claim outliving its server lease (settle stopped heartbeats, a
+      // supervisor revoked the lease) used to wedge here forever — verify and heal.
+      if (!(await this.staleClaim(held))) {
+        throw Object.assign(new Error("session already holds a lease"), { code: "already_claimed" });
+      }
+      this.log(`claim ${inst.id}: dropped stale lease on ${held.taskId}`);
+      this.endLease(inst.id);
+    }
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
     try {
@@ -241,11 +268,12 @@ export class SidecarPool {
     }
   }
 
-  /** Turn ended: ingest the agent's artifacts, then let the lease live or die. */
+  /** Turn ended: ingest the agent's artifacts, then let the lease live or die.
+   * The keepalive is NOT stopped here — the claim may outlive this turn (multi-turn
+   * work), and a claim whose beat died becomes an orphan no heartbeat can expire. */
   async settle(agentId: string): Promise<void> {
     const instId = this.instByAgent.get(agentId);
     if (!instId) return;
-    this.stopBeat(instId);
     const dir = commDir(this.deps.runDir, instId);
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
@@ -292,6 +320,17 @@ export class SidecarPool {
     }
   }
 
+  /**
+   * The lease was ended elsewhere (dispatcher revoked it server-side, or the task
+   * moved on): drop the matching local claim so the instance can claim again.
+   * taskId guards against dropping a newer claim than the one being revoked.
+   */
+  dropLease(instId: string, taskId?: string): void {
+    const live = this.claims.get(instId);
+    if (!live || (taskId !== undefined && live.taskId !== taskId)) return;
+    this.endLease(instId);
+  }
+
   /** The instance no longer holds a lease: stop keepalive and drop every ops session opened under it. */
   private endLease(instId: string): void {
     this.stopBeat(instId);
@@ -328,24 +367,81 @@ export class SidecarPool {
     this.active.delete(instId);
   }
 
-  /** Restart cannot authenticate the environment of an already-created Paseo session.
-   * Keep a deny-only binding until dispatcher retirement; never rotate credentials,
-   * rebuild a lease or ingest artifacts from an unverifiable session. */
+  /**
+   * Restart loses the in-memory channel state, but the workforce record still
+   * names the bound agent and rotate() re-issues a credential — enough to prove
+   * ownership and re-key the channel instead of quarantining every instance.
+   * The pointer file carries the fresh key to the agent's next sck call, so a
+   * running session keeps working across reloads.
+   */
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
       if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
-      this.endLease(inst.id);
-      this.launched.delete(inst.id);
-      this.keys.delete(inst.id);
-      this.creds.delete(inst.id);
-      this.quarantined.add(inst.id);
-      this.instByAgent.set(inst.paseoAgentId, inst.id);
-      this.active.add(inst.id);
-      this.dropBinding(inst.paseoAgentId);
-      ensureCommDirs(commDir(this.deps.runDir, inst.id));
-      this.log(`sidecar quarantined ${inst.id}: channel binding unavailable after restart`);
+      try {
+        const cred = await this.deps.workforce.rotate(inst.id); // retired/revoked insts throw
+        this.creds.set(inst.id, cred);
+        this.keys.set(inst.id, randomBytes(16).toString("hex"));
+        this.launched.add(inst.id);
+        this.active.add(inst.id);
+        this.quarantined.delete(inst.id);
+        this.instByAgent.set(inst.paseoAgentId, inst.id);
+        ensureCommDirs(commDir(this.deps.runDir, inst.id));
+        this.writeBinding(inst.paseoAgentId, inst.id);
+        this.log(`sidecar adopted ${inst.id}: channel re-keyed`);
+      } catch (error) {
+        // The workforce row is dead — keep the deny-only binding until retirement.
+        this.launched.delete(inst.id);
+        this.keys.delete(inst.id);
+        this.creds.delete(inst.id);
+        this.quarantined.add(inst.id);
+        this.instByAgent.set(inst.paseoAgentId, inst.id);
+        this.active.add(inst.id);
+        this.dropBinding(inst.paseoAgentId);
+        ensureCommDirs(commDir(this.deps.runDir, inst.id));
+        this.log(`sidecar quarantined ${inst.id}: ${(error as Error).message}`);
+      }
+    }
+    // Claims are process state: rebuild any lease still alive server-side so the
+    // instance keeps its seat (and any artifacts it wrote) across the restart.
+    for (const inst of insts) {
+      if (!this.launched.has(inst.id) || this.claims.has(inst.id)) continue;
+      try { await this.rebuildClaim(inst); }
+      catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
     this.ensureSweeper();
+  }
+
+  /**
+   * Re-establish the local claim for a lease that survived the restart, then run
+   * the turn-end ingest for artifacts the agent may have written while we were
+   * down. Only ingest when claim.json still names this delivery — older files
+   * belong to a dead lease and are archived as stale.
+   */
+  private async rebuildClaim(inst: EmployeeInst): Promise<void> {
+    const cred = await this.credentialFor(inst.id);
+    const doing = await this.deps.core.listTasks(cred, "doing");
+    const live = doing.find(t => t.currentEmployee === inst.id && !!t.deliveryId &&
+      (!t.leaseExpiresAt || Date.parse(t.leaseExpiresAt) > Date.now()));
+    if (!live) return;
+    const dir = commDir(this.deps.runDir, inst.id);
+    this.claims.set(inst.id, {
+      instId: inst.id, taskId: live.id,
+      proof: { taskId: live.id, deliveryId: live.deliveryId!, fence: live.fence, expectedVersion: live.version },
+    });
+    this.startBeat(inst.id);
+    this.log(`sidecar adopted lease ${live.id} for ${inst.id}`);
+    const claimMeta = readJsonFile<{ deliveryId?: string }>(join(dir, "claim.json"));
+    if (claimMeta?.deliveryId !== live.deliveryId) {
+      this.archive(reportPath(dir), "stale");
+      this.archive(blockerPath(dir), "stale");
+      return;
+    }
+    const blocker = readTextFile(blockerPath(dir));
+    const report = readTextFile(reportPath(dir));
+    const claim = this.claims.get(inst.id);
+    if (!claim) return;
+    if (blocker !== undefined) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
+    else if (report !== undefined) await this.finish(inst.id, claim, undefined, report, reportPath(dir));
   }
 
   private startBeat(instId: string): void {

@@ -69,12 +69,12 @@ test('插件认证重试保留原请求租约，不能在 B 下重放 A 的 ops 
   }
 });
 
-test('健康 launch 写绑定，重启 adopt 隔离并移除绑定，不补造 key 或轮换凭证', async () => {
+test('健康 launch 写绑定，重启 adopt 重铸通道：轮换凭证、重写绑定 key、实例可复用', async () => {
   const root = mkdtempSync(join(tmpdir(), 'plugin-binding-'));
   let rotations = 0;
   const deps: SidecarDeps = {
     runDir: join(root, 'comm'), sweepMs: 1_000_000,
-    core: {} as SidecarDeps['core'],
+    core: { listTasks: async () => [] } as unknown as SidecarDeps['core'],
     workforce: { rotate: async () => { rotations++; return 'synthetic-only'; } } as unknown as SidecarDeps['workforce'],
   };
   const original = new SidecarPool(deps);
@@ -86,14 +86,19 @@ test('健康 launch 写绑定，重启 adopt 隔离并移除绑定，不补造 k
     original.bindAgent(inst.id, 'synthetic-agent');
     inst.paseoAgentId = 'synthetic-agent';
     expect(existsSync(binding)).toBe(true);
+    const oldKey = readFileSync(binding, 'utf8').split('\n')[1];
+    // Same-process adoption is idempotent — the binding is already healthy.
     await original.adopt([inst]);
-    expect(existsSync(binding)).toBe(true);
     expect(original.canReuse(inst)).toBe(true);
+    expect(readFileSync(binding, 'utf8').split('\n')[1]).toBe(oldKey);
+    // A replacement process (restart) cannot reuse the in-memory key, so it
+    // rotates the credential and re-keys the pointer instead of quarantining.
     await replacement.adopt([inst]);
-    expect(replacement.canReuse(inst)).toBe(false);
-    expect(existsSync(binding)).toBe(false);
-    expect(rotations).toBe(0);
-    expect(() => replacement.env(inst)).toThrow('cannot be restored');
+    expect(rotations).toBe(1);
+    expect(replacement.canReuse(inst)).toBe(true);
+    const newKey = readFileSync(binding, 'utf8').split('\n')[1];
+    expect(newKey).not.toBe(oldKey);
+    expect(replacement.env(inst).SCK_COMM_KEY).toBe(newKey);
   } finally {
     original.detachAgent('synthetic-agent');
     replacement.detachAgent('synthetic-agent');

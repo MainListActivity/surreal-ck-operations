@@ -26,17 +26,17 @@ rtk proxy sh scripts/company-service.sh uninstall
 
 任务系统有两个部署面：launchd `org.surrealck.company-mcp` 从 `active` 指向的 release 运行；员工 comm 通道（sck → sidecar → vendored core）、运维代理、调度器与交付预览运行在 Paseo 插件 `sck-company` 内。**两面必须使用同一个集成基线的固定 release**。只切 `active` 或只 reload 旧来源，会让两面 core/schema 不一致（曾出现新岗位被旧 ROLES 拒为 `invalid: Invalid role`）。
 
-现行路径自 `task/d7697420`、`task/b7fdaa55` 部署沿用：生产基线任务分支保留 `ops/v3-paseo-dispatch` 的在途提交，并集成已批准的 `origin/main`，再以 `git archive` 切 release。2026-10-10 核实的基线 `1b9d423e5bf34cc065ca96a657f3cde035b848e3` 同时是 `active` 目标与 `paseo plugin ls` 的 SOURCE/DIRECTORY 所在 release；这是历史核对点，后续发布用当次完整 SHA。
+**部署只用 main 分支**：自 2026-10-10 起取消"生产基线任务分支"模式——所有变更必须先经 PR 合入 `origin/main`，release 一律从 `main` 的合并提交切出，`company-service.sh install` 会强制校验 release SHA 可达自 `origin/main`，不在 main 上的提交一律拒绝安装。历史上 `task/d7697420`、`task/b7fdaa55` 等生产基线分支曾让部署面与 main 漂移（双面跑过不同版本），该模式已废止；`/Users/y/IdeaProjects/surreal-ck-operations-v3`（`ops/v3-paseo-dispatch`）保留为 **protected 历史工作树**，不再是生产插件来源。
 
-`/Users/y/IdeaProjects/surreal-ck-operations-v3`（`ops/v3-paseo-dispatch`）保留为 **protected 历史工作树**，不再是生产插件来源；不得在其中 merge、reset、清理或覆盖生成物。插件在途功能通过基线合入保留，不能拿纯 main 快照覆盖生产。固定 release 内的 `plugin/server/vendor/` 仍是 `src/` + `schema/` 的生成拷贝，每次打包都须重生成。
+固定 release 内的 `plugin/server/vendor/` 仍是 `src/` + `schema/` 的生成拷贝，每次打包都须重生成。
 
-### 1. 固定并验证集成基线
+### 1. 合入 main 并固定提交
 
-以下操作仅由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main 或 v3 历史树操作，不自行建树或切分支。先记录 `active` 的完整路径和插件 SOURCE/DIRECTORY，保留上一版双面回滚目录及依赖。用 `rtk git status --short --branch` 确认登记分支正确、树干净，`rtk git fetch origin` 获取已批准主线；记录当前生产基线、v3 分支和主线的完整 SHA。
+以下操作仅由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main checkout 直接写代码，不自行建树或切分支。先记录 `active` 的完整路径和插件 SOURCE/DIRECTORY，保留上一版双面回滚目录及依赖。
 
-在登记的生产基线任务分支集成**上一生产基线 ∪ v3 在途提交 ∪ 已批准 origin/main**（已包含的祖先不重复合入）。用 `rtk git merge --no-edit <完整SHA>` 合入各缺失来源；冲突逐项审查，尤其调度器/sidecar，不能以覆盖文件丢掉任一侧功能。提交、推送基线后，用 `rtk git merge-base --is-ancestor <来源SHA> <基线SHA>` 分别确认三者均被保留；每次命令退出码须为 0。若需舍弃在途功能或无法确认兼容性，向经理报阻塞，不自行发布。
+变更在登记任务分支完成、通过评审后，按正常流程 PR 合入 `origin/main`（不允许把未合并的基线/任务分支直接切 release）。合入后 `rtk git fetch origin`，取 `origin/main` 的完整 SHA 作为本次 `SCK_BASELINE_SHA`——release 快照即该提交的内容。
 
-部署记录应包含来源 SHA、最终基线 SHA、冲突处理与批准范围。基线须通过根与插件 typecheck、该变更要求的回归；本地数据库测试只用公司 fork。根/schema 与插件/vendor 来自此同一基线。
+部署记录应包含来源 PR/SHA、最终 main SHA 与批准范围。该 SHA 须通过根与插件 typecheck、该变更要求的回归；本地数据库测试只用公司 fork。根/schema 与插件/vendor 来自这同一个 main 提交。
 
 ### 2. 从提交生成固定 release
 
@@ -78,7 +78,7 @@ rtk proxy "$PASEO_CLI" plugin reload sck-company
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
 
-`plugin install <release>/plugin` 将**现有 ID** 的来源重新登记到固定目录；`reload` 仅重载已登记来源，不能替代 install。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
+`install` 校验 main 祖先关系、切 `active`，并在插件来源位于本服务目录时自动把 `~/.paseo/config.json` 的 `sck-company.path` 回指到本次 release 的 `plugin/` 后尝试 reload——插件面不再需要手工 `plugin install`；只有当插件被登记到服务目录之外的路径（如开发树）时才需要手工 `plugin install <release>/plugin --id sck-company`。`reload` 仅重载已登记来源，不能替代 install。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
 
 ### 4. 双面验证与恢复派工
 

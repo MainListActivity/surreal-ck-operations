@@ -274,6 +274,8 @@ export interface SidecarBridge {
   commDirFor(instId: string): string;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
+  /** Server-side lease was revoked: drop the local claim remnant so the instance can pick again. */
+  dropLease?(instId: string, taskId?: string): void;
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
@@ -1020,8 +1022,12 @@ export class Dispatcher {
       '先核对任务分支/工作目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。',
       log ? `\n---\n${log.slice(-cfg.handoverChars)}` : '（无可用会话日志）',
     ].join('\n');
+    const holder = task.currentEmployee ?? inst?.id;
     if (await this.deps.workforce.revokeLease(task.id, task.currentEmployee!, reason, handover)) {
       report.revoked.push(task.id);
+      // The sidecar may still hold a local claim whose heartbeat died first;
+      // drop it or the instance stays un-claimable until the next restart.
+      if (holder) this.deps.sidecar?.dropLease?.(holder, task.id);
       this.log(`revoked ${task.id} from ${task.currentEmployee}: ${reason}`);
     }
   }

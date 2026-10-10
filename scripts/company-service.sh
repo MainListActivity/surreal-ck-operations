@@ -50,6 +50,16 @@ case "$action" in
     case "$release" in /*) ;; *) echo 'Release path must be absolute' >&2; exit 1;; esac
     [ -f "$release/src/mcp/run.ts" ] && [ -f "$release/src/dispatcher/run.ts" ] || { echo 'Release is incomplete' >&2; exit 1; }
     [ -f "$service_home/private/service.env" ] || { echo 'Private config is missing' >&2; exit 1; }
+    # Deploy gate: releases are cut from merged main only — the directory name is the
+    # commit it snapshots and must be reachable from origin/main of the ops repo.
+    sha=${release##*/}
+    case "$sha" in *[!0-9a-f]*) bad=1;; *) bad=; [ ${#sha} -eq 40 ] || bad=1;; esac
+    [ -z "$bad" ] || { echo "refused: release dir '$sha' is not a commit sha — release dirs are named releases/<main commit>" >&2; exit 1; }
+    ops_repo=${SCK_OPS_REPO:-$(/usr/bin/sed -n 's/^SCK_AGENT_CWD=//p' "$service_home/private/service.env" | /usr/bin/tr -d "\"'")}
+    [ -n "$ops_repo" ] && [ -d "$ops_repo/.git" ] || { echo "refused: cannot verify release — set SCK_OPS_REPO to the ops checkout" >&2; exit 1; }
+    git -C "$ops_repo" fetch origin main --quiet 2>/dev/null || echo "warning: git fetch failed; checking against last-known origin/main" >&2
+    git -C "$ops_repo" merge-base --is-ancestor "$sha" origin/main 2>/dev/null || {
+      echo "refused: $sha is not on origin/main — merge the change into main first, then cut the release from main HEAD" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
@@ -57,6 +67,27 @@ case "$action" in
     chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck"
     ln -s "$release" "$service_home/active.next"
     mv -h -f "$service_home/active.next" "$service_home/active"
+    # Dual-surface sync: the MCP face follows `active`, the employee channel face
+    # follows ~/.paseo/config.json plugins.sck-company.path. Left manual they
+    # drifted apart (service and plugin ran different releases); repoint the
+    # plugin at the same release whenever it lives under this service home.
+    paseo_cfg="$HOME/.paseo/config.json"
+    if [ -f "$paseo_cfg" ] && [ -d "$release/plugin" ]; then
+      SERVICE_HOME="$service_home" RELEASE="$release" CFG="$paseo_cfg" /usr/bin/python3 - <<'PY'
+import json, os
+cfg_path = os.environ['CFG']
+cfg = json.load(open(cfg_path))
+entry = (cfg.get('plugins') or {}).get('sck-company') or {}
+want = os.path.join(os.environ['RELEASE'], 'plugin')
+if entry.get('source') == 'directory' and os.environ['SERVICE_HOME'] in str(entry.get('path', '')) and entry.get('path') != want:
+    entry['path'] = want
+    cfg['plugins']['sck-company'] = entry
+    json.dump(cfg, open(cfg_path, 'w'), ensure_ascii=False, indent=2)
+    print(f"plugin path -> {want}")
+PY
+      command -v paseo >/dev/null 2>&1 && paseo plugin reload sck-company 2>/dev/null || \
+        echo "note: run 'paseo plugin reload sck-company' to load the new plugin" >&2
+    fi
     for c in $components; do
       write_plist "$c"
       unload "$c"

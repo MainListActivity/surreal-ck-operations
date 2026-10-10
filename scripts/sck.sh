@@ -9,8 +9,10 @@ if [ "${1:-}" = "sync-gate" ]; then
   exec "$BUN" src/mcp/sync-gate.ts
 fi
 # Spawn env is one-shot: Paseo strips SCK_COMM_* on session resume/refresh, but
-# always re-injects PASEO_AGENT_ID. Re-enter comm mode via the sidecar's pointer.
-if [ -z "${SCK_COMM_DIR:-}" ] && [ -n "${PASEO_AGENT_ID:-}" ] && [ -f "$service_home/comm-agents/$PASEO_AGENT_ID" ]; then
+# always re-injects PASEO_AGENT_ID. The sidecar's pointer file also carries the
+# freshest channel key across plugin restarts (adopt() re-keys channels), so it
+# takes precedence over whatever env the process was spawned with.
+if [ -n "${PASEO_AGENT_ID:-}" ] && [ -f "$service_home/comm-agents/$PASEO_AGENT_ID" ]; then
   SCK_COMM_DIR=$(/usr/bin/sed -n '1p' "$service_home/comm-agents/$PASEO_AGENT_ID")
   SCK_COMM_KEY=$(/usr/bin/sed -n '2p' "$service_home/comm-agents/$PASEO_AGENT_ID")
   export SCK_COMM_DIR SCK_COMM_KEY
