@@ -1094,3 +1094,38 @@ test('discipline tracks: project vocabulary, dispatch filter, cross-track claim 
   const aiToken = await enrollment.enroll('t-ai-anytrack', 'ai-content', ['execute', 'review']);
   await core.claim(aiToken, designTask.id);
 });
+
+test('专职编剧：单条固定模型种子、编剧轨领取、跨轨拒绝与无轨兼容', async () => {
+  const seeds = SEED_DEFS.filter(d => d.role === 'screenwriter');
+  expect(seeds).toEqual([{ id: 'screenwriter-agy', role: 'screenwriter', provider: 'antigravity',
+    model: 'gemini-3.7-flash-medium', tracks: ['编剧'], maxInstances: 1, priority: 10, weight: 60 }]);
+  await workforce.upsertDef(seeds[0]!.id, seeds[0]!);
+  const def = (await workforce.defs()).find(d => d.id === 'screenwriter-agy')!;
+  expect(def.tracks).toEqual(['编剧']);
+  expect(def.thinking).toBeUndefined();
+  // 重启 bootstrap 重放 008→010 后仍能保留并使用新增岗位编制。
+  await database.bootstrap();
+  expect((await workforce.defs()).find(d => d.id === def.id)).toEqual(def);
+  const inst = await workforce.spawnInst(def);
+  const credential = inst.credential!;
+  const mk = (title: string, discipline?: string) => core.createTask(tokens.gm, {
+    title, context: '合成编剧任务', executorRole: 'screenwriter', reviewerRole: 'gm', discipline, idempotencyKey: key(),
+  });
+  const writer = await mk('剧本初稿 v1', '编剧');
+  const artist = await mk('角色设计 v1', '角色设计');
+  const untracked = await mk('无轨剧本文稿 v1');
+  expect(writer.executorRole).toBe('screenwriter');
+  const claim = await core.claim(credential, writer.id);
+  expect(claim.task.state).toBe('doing');
+  expect(claim.task.discipline).toBe('编剧');
+  await expect(core.claim(credential, artist.id)).rejects.toMatchObject({
+    code: 'forbidden', message: 'Employee definition does not cover the task discipline',
+  });
+  await core.submit(credential, proofOf(claim), { text: '合成剧本交付证据：已完成初稿并核对编剧轨任务要求。', idempotencyKey: key() });
+  const freeClaim = await core.claim(credential, untracked.id);
+  expect(freeClaim.task.state).toBe('doing');
+  expect(freeClaim.task.discipline).toBeUndefined();
+  await core.submit(credential, proofOf(freeClaim), { text: '合成无轨文稿交付证据：已完成文稿并验证按岗位正常匹配。', idempotencyKey: key() });
+  const [markers] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
+  expect(markers[0]!.schema_version).toBe(10);
+});

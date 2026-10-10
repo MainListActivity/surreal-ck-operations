@@ -82,7 +82,7 @@ function plan(goalId: string, head: string, afterScope: boolean): Spec {
     context: `${head}
 你是经理。${afterScope ? '先读依赖任务里运营的《范围提案》。' : ''}把目标拆成可独立交付的任务，全部带 goalId="${goalId}"：
 - 每个代码改动用 create_delivery（自动生成 实现 → 上线申请 → 合入部署与生产实测，上线由运营决定、qa 在生产实测）。
-- 非代码工作用 create_task，执行者与验收者不同岗位；小需求不要拉 ai-content、cs 参与。内容产线按段派工：原型/概念设计（P 段，老板 demo 验收）→ executorRole=concept-design、reviewerRole=owner；量产制作（M 段，GM/QA 验收）→ executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies（老板 approve 前量产任务不解锁）。项目内更细的产线分工（编剧/角色设计/分镜等岗位轨，见项目 AGENTS.md 与 project.disciplines 词表）不要当成全局岗位；create_task/create_delivery 传 discipline=<轨名>，只有挂该轨的编制会接活，不带轨的任务按普通岗位匹配。
+- 非代码工作用 create_task，执行者与验收者不同岗位；小需求不要拉 ai-content、cs 参与。内容产线按段派工：原型/概念设计（P 段，老板 demo 验收）→ executorRole=concept-design、reviewerRole=owner；量产制作（M 段，GM/QA 验收）→ executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies（老板 approve 前量产任务不解锁）。编剧轨任务（含 P 段原型剧本）一律 executorRole=screenwriter，是 P 段默认派 concept-design 的有意例外；验收仍按段（P 段 owner，M 段 gm/qa），旧任务存量不迁。同一剧本的多轮打磨用串依赖任务链表达（初稿→驳回→修订稿 v2…），版本号写进任务标题，驳回意见整理为修订要点写进下一轮 context。项目内更细的产线分工（编剧/角色设计/分镜等岗位轨，见项目 AGENTS.md 与 project.disciplines 词表）用 discipline 表达；create_task/create_delivery 传 discipline=<轨名>，只有挂该轨的编制会接活，不带轨的任务按普通岗位匹配。
 submit 证据：任务清单（id、标题、执行/验收岗位、依赖）。运营验收和 G3 会自动等待全部任务完成。
 ${AUTHORITY}`,
   };

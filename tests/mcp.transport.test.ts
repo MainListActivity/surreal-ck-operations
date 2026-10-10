@@ -35,7 +35,11 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
   const connection = await connectCompanyClient({ url, credential: 'sck_valid', clientName: 'adapter-test' });
   try {
     expect(connection.client.getServerVersion()?.name).toBe('surreal-ck-company');
-    const tools = (await connection.client.listTools()).tools.map(tool => tool.name);
+    const listed = (await connection.client.listTools()).tools;
+    const executorSchema = listed.find(tool => tool.name === 'create_task')!.inputSchema.properties!.executorRole as { enum: string[] };
+    expect(executorSchema.enum).toContain('screenwriter');
+    expect(executorSchema.enum).not.toContain('eval');
+    const tools = listed.map(tool => tool.name);
     expect(tools).toContain('get_context');
     expect(tools).toContain('claim_next');
     expect(tools).toContain('review');
@@ -47,6 +51,11 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
       title: 'denied', context: 'synthetic', executorRole: 'qa', reviewerRole: 'gm', idempotencyKey: 'one',
     } });
     expect(denied.structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
+    const writerDenied = await connection.client.callTool({ name: 'create_task', arguments: {
+      title: '剧本 v1', context: 'synthetic', executorRole: 'screenwriter', reviewerRole: 'gm', idempotencyKey: 'writer',
+    } });
+    // 已通过 MCP 枚举校验并到达 core 的权限判断。
+    expect(writerDenied.structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
     active = false;
     await expect(connection.client.callTool({ name: 'get_context', arguments: {} })).rejects.toThrow();
     active = true;

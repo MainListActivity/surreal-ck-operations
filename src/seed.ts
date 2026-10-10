@@ -1,7 +1,7 @@
 import type { Role } from './contracts.ts';
 
 /**
- * Initial employee definitions: every role backed by three subscriptions. Edit rows in employee_def afterwards.
+ * Initial employee definitions: existing roles backed by three subscriptions; screenwriter has one antigravity seat. Edit rows in employee_def afterwards.
  * weight = dispatch probability share among eligible candidates of the same role (score-adjusted at runtime).
  */
 // model is a slot, not a pin: `auto:<family>` tracks the newest model of that
@@ -19,4 +19,7 @@ export const SEED_DEFS: Array<{ id: string; role: Role; provider: string; model:
   { id: 'eval-grok', role: 'eval' as Role, provider: 'grok', model: 'auto:grok', thinking: 'medium', maxInstances: 1, priority: 10, weight: 60 },
   { id: 'eval-codex', role: 'eval' as Role, provider: 'codex', model: 'auto:sol', thinking: 'low', maxInstances: 1, priority: 20, weight: 30 },
   { id: 'eval-devin', role: 'eval' as Role, provider: 'devin', model: 'auto:swe', thinking: 'medium', maxInstances: 1, priority: 30, weight: 10 },
+  // 专职编剧：老板只编制 antigravity 主笔；无模型族槽位与 thinkingOptions。
+  { id: 'screenwriter-agy', role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium',
+    tracks: ['编剧'], maxInstances: 1, priority: 10, weight: 60 },
 ];
