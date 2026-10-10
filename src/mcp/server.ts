@@ -180,7 +180,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project).',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
@@ -189,6 +189,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+      revises: z.string().min(1).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
 
