@@ -92,6 +92,21 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }));
   });
 
+  server.registerTool('reclaim_worktrees', {
+    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees.',
+    inputSchema: z.object({
+      dryRun: z.boolean().optional(),
+      repos: z.array(z.string()).optional(),
+    }),
+  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => core.reclaimWorktrees
+    ? core.reclaimWorktrees(token(ctx), { dryRun, repos })
+    : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 })));
+  server.registerTool('list_worktree_audits', {
+    description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
+    inputSchema: z.object({ limit: z.number().int().min(1).max(500).optional() }),
+  }, async ({ limit }, ctx) => run(token(ctx), () => core.listWorktreeAudits
+    ? core.listWorktreeAudits(token(ctx), limit)
+    : Promise.resolve([])));
   server.registerTool('list_worktrees', {
     description: 'Authenticated persistent worktree inventory and git reconciliation; task-scoped reads or gm global reads.',
     inputSchema: z.object({ taskId: z.string().min(1).optional() }),

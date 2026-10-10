@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -6,16 +6,36 @@ import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, TaskView, WorkIntent, WorktreeAssignment, WorktreeView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import {
+  decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
+} from './worktree-reclaim.ts';
 
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
 export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}`);
-export interface RegistryOptions { opsRepo: string; strategy?: 'shared' | 'legacy' }
+export interface RegistryOptions {
+  opsRepo: string;
+  strategy?: 'shared' | 'legacy';
+  /** When false, inventory still classifies but reclaim never deletes. Default: env/config enabled. */
+  reclaimEnabled?: boolean;
+  orphanGraceDays?: number;
+  /** Injectable clock for orphan grace tests. */
+  now?: () => Date;
+}
+export interface ReclaimResult {
+  scanId: string;
+  removed: string[];
+  kept: Array<{ path: string; reason: string }>;
+  branchesDeleted: string[];
+  branchesRetained: Array<{ branch: string; reason: string }>;
+  audited: number;
+}
 interface Tree { path: string; branch?: string; main: boolean }
 interface Row { id: RecordId; repo: string; project?: string; path: string; mode: WorktreeAssignment['mode'];
-  branch?: string; protection?: string; created_at: unknown; last_used_at: unknown }
+  branch?: string; protection?: string; created_at: unknown; last_used_at: unknown;
+  last_released_at?: unknown; cleanup_todo?: string }
 interface Ref { task?: RecordId; session_active?: boolean; employee: string; delivery: string; fence: number; intent: WorkIntent;
-  at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string;
+  at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string; tree_mode?: string;
   assigned_tree?: string; current_fence?: number; handover?: boolean; resume_state?: string }
 
 /** No shell, no credential files, and bounded git processes. */
@@ -79,7 +99,10 @@ const overlap = (a: string, b: string) => {
 const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
   if (r.session_active) return 'active';
   if (r.current === r.employee && r.current_delivery === r.delivery && r.current_fence === r.fence && r.assigned_tree === String(r.tree.id)) return 'active';
-  if (!r.current && r.intent.kind !== 'read' && (r.task_state === 'doing' || (r.task_state === 'ready' && r.handover) || (r.task_state === 'blocked' && r.resume_state === 'doing')) && r.assigned_tree === String(r.tree.id)) return 'recovery';
+  // Every non-terminal task state (ready, doing, review, blocked) keeps its scene: an unheld ref on
+  // the task's assigned non-shared tree stays recovery until 'done' releases it. Shared trees are
+  // already hard-protected, so their refs release normally and serial tasks keep reusing the tree.
+  if (!r.current && r.task_state && r.task_state !== 'done' && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
   return 'released';
 };
 
@@ -102,9 +125,10 @@ export class WorktreeRegistry {
   private async refs(repo?: string): Promise<Ref[]> {
     const [refs] = await this.db.query<[Ref[]]>(`SELECT *, task.current_employee AS current, task.delivery_id AS current_delivery,
       task.state AS task_state, task.fence AS current_fence, task.worktree.id AS assigned_tree, task.handover AS handover,
-      task.resume_state AS resume_state FROM worktree_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
+      task.resume_state AS resume_state, tree.mode AS tree_mode FROM worktree_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
     const [sessions] = await this.db.query<[Array<Ref & { retired?: boolean; enabled?: boolean }>]>(`SELECT *,
-      holder.retired AS retired, holder.workspace_read_active AS enabled FROM worktree_session_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
+      holder.retired AS retired, holder.workspace_read_active AS enabled, tree.mode AS tree_mode
+      FROM worktree_session_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
     return [...refs, ...sessions.map(r => ({ ...r, session_active: !!r.enabled && !r.retired }))];
   }
   /** Import every git tree as protected before using any of them. Never reset legacy/unknown trees. */
@@ -220,28 +244,292 @@ export class WorktreeRegistry {
   async releaseWorkspace(employeeId: string) {
     await this.db.query('UPDATE ONLY $holder SET workspace_read_active = false;', { holder: record('employee', employeeId) });
   }
+
+  private async policy(): Promise<{ enabled: boolean; orphanGraceMs: number; now: Date }> {
+    const [rows] = await this.db.query<[Array<{ worktree_reclaim_enabled?: boolean; worktree_orphan_grace_days?: number }>]>(
+      'SELECT worktree_reclaim_enabled, worktree_orphan_grace_days FROM company_meta:config;');
+    const cfg = rows[0] ?? {};
+    const enabled = this.options.reclaimEnabled ?? reclaimEnabledFrom(process.env, cfg);
+    const days = this.options.orphanGraceDays ?? parseGraceDays(
+      process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS ?? cfg.worktree_orphan_grace_days, 7);
+    return { enabled, orphanGraceMs: days * 86_400_000, now: this.options.now?.() ?? new Date() };
+  }
+
+  private asDate(value: unknown): Date | undefined {
+    if (value instanceof Date) return value;
+    if (typeof value === 'string' || typeof value === 'number') {
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? undefined : d;
+    }
+    if (value && typeof value === 'object') {
+      const raw = value as { toJSON?: () => unknown; toISOString?: () => string };
+      if (typeof raw.toISOString === 'function') {
+        const d = new Date(raw.toISOString());
+        return Number.isNaN(d.getTime()) ? undefined : d;
+      }
+      if (typeof raw.toJSON === 'function') return this.asDate(raw.toJSON());
+    }
+    return undefined;
+  }
+
+  private async audit(entry: {
+    scanId?: string; repo: string; path: string; tree?: RecordId; event: string; trigger: string;
+    ownership?: object; decision: string; result: 'success' | 'skipped' | 'failed'; reason: string; task?: RecordId;
+  }) {
+    await this.db.query(`CREATE worktree_audit CONTENT {
+      scan_id: $scan_id, repo: $repo, path: $path, tree: $tree, event: $event, trigger: $trigger,
+      ownership: $ownership, decision: $decision, result: $result, reason: $reason, task: $task, at: time::now()
+    };`, {
+      scan_id: entry.scanId, repo: entry.repo, path: entry.path, tree: entry.tree, event: entry.event,
+      trigger: entry.trigger, ownership: entry.ownership, decision: entry.decision, result: entry.result,
+      reason: entry.reason, task: entry.task,
+    });
+  }
+
+  /** Stamps the authority release clock; returns true only when it advanced (a new release epoch). */
+  private async markReleased(tree: RecordId, at?: Date): Promise<boolean> {
+    const when = at ?? new Date();
+    const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+      'UPDATE $tree SET last_released_at = $at WHERE last_released_at = NONE OR last_released_at < $at RETURN AFTER;',
+      { tree, at: when });
+    return (rows?.length ?? 0) > 0;
+  }
+
+  /** Safe remove without --force; keep dirty / unavailable scenes with an explicit reason. */
+  private async removeTree(repo: string, path: string): Promise<{ ok: boolean; reason?: string }> {
+    try {
+      await git(repo, ['worktree', 'remove', path]);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: error instanceof CompanyError ? error.message.slice(0, 200) : String(error).slice(0, 200) };
+    }
+  }
+
+  /** Delete only a fully merged local branch (`git branch -d`). Never force-delete. */
+  private async deleteMergedBranch(repo: string, branch: string): Promise<{ deleted: boolean; reason?: string }> {
+    try {
+      await git(repo, ['branch', '-d', branch]);
+      return { deleted: true };
+    } catch (error) {
+      return { deleted: false, reason: error instanceof CompanyError ? error.message.slice(0, 200) : String(error).slice(0, 200) };
+    }
+  }
+
+  private async branchStillNeeded(branch: string | undefined): Promise<boolean> {
+    if (!branch) return false;
+    const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+      `SELECT id FROM task WHERE state != 'done' AND worktree.branch = $branch LIMIT 1;`, { branch });
+    return (rows?.length ?? 0) > 0;
+  }
+
   async inventory(repo?: string): Promise<WorktreeView[]> {
     const known = await this.rows(repo);
-    for (const path of new Set(repo ? [repo] : known.map(r => r.repo))) {
+    const seeds = repo ? [repo] : [...new Set([this.options.opsRepo, ...known.map(r => r.repo)])];
+    for (const path of seeds) {
       await this.locked(path, (canonical, list) => this.reconcile(canonical, list)).catch(() => undefined);
     }
     const rows = await this.rows(repo), refs = await this.refs(repo);
+    const policy = await this.policy();
     const cache = new Map<string, Tree[]>();
     const result: WorktreeView[] = [];
     for (const row of rows) {
       if (!cache.has(row.repo)) cache.set(row.repo, await trees(row.repo).catch(() => []));
       const tree = cache.get(row.repo)!.find(t => t.path === row.path);
-      const references = refs.filter(r => String(r.tree.id) === String(row.id.id)).map(r => ({ taskId: r.task ? String(r.task.id) : `session:${r.employee}`, employee: r.employee,
-        deliveryId: r.delivery, fence: r.fence, intent: r.intent, state: refState(r), at: String(r.at) }));
-      const reasons = ['WT01: deletion disabled', ...(row.protection ? [row.protection] : [])];
-      if (references.some(r => r.state === 'active')) reasons.push('active-reference');
-      if (references.some(r => r.state === 'recovery')) reasons.push('unfinished-scene');
-      if (tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')) reasons.push('dirty-or-unavailable');
-      const status = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
-      if (status !== 'present') reasons.push(status);
-      result.push({ id: String(row.id.id), repo: row.repo, project: row.project, worktreePath: row.path, branch: row.branch, mode: row.mode,
-        createdAt: String(row.created_at), lastUsedAt: String(row.last_used_at), status, references, deletable: false, reasons });
+      const references = refs.filter(r => String(r.tree.id) === String(row.id.id)).map(r => ({
+        taskId: r.task ? String(r.task.id) : `session:${r.employee}`, employee: r.employee,
+        deliveryId: r.delivery, fence: r.fence, intent: r.intent, state: refState(r), at: String(r.at),
+      }));
+      const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+      const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
+      const decision = decideReclaim({
+        path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
+        status, dirty,
+        effectiveRefs: references.filter(r => r.state === 'active').length,
+        recoveryRefs: references.filter(r => r.state === 'recovery').length,
+        createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
+        lastReleasedAt: this.asDate(row.last_released_at),
+      }, policy);
+      const reasons = [...decision.reasons];
+      if (row.protection && !reasons.includes(row.protection)) reasons.push(row.protection);
+      if (row.cleanup_todo) reasons.push(`cleanup-todo:${row.cleanup_todo}`);
+      if (decision.graceRemainingMs !== undefined) {
+        reasons.push(`grace-remaining-ms:${decision.graceRemainingMs}`);
+      }
+      result.push({
+        id: String(row.id.id), repo: row.repo, project: row.project, worktreePath: row.path, branch: row.branch, mode: row.mode,
+        createdAt: String(row.created_at), lastUsedAt: String(row.last_used_at), status, references,
+        deletable: decision.deletable, reasons,
+      });
     }
     return result;
+  }
+
+  /**
+   * Ownership-based reclaim. Exclusive trees without effective refs are removed promptly when clean.
+   * Shared / protected / unknown / dirty / in-grace orphans are retained with durable audit reasons.
+   * Always re-checks references under the repo lock before deleting.
+   */
+  async reclaimAll(input: { trigger: ReclaimTrigger; dryRun?: boolean; repos?: string[]; treeId?: string } = { trigger: 'sweep' }): Promise<ReclaimResult> {
+    const scanId = randomUUID();
+    const result: ReclaimResult = { scanId, removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+    const policy = await this.policy();
+    const known = await this.rows();
+    const repos = [...new Set(input.repos ?? [this.options.opsRepo, ...known.map(r => r.repo)])];
+    await this.audit({
+      scanId, repo: '*', path: '*', event: 'orphan_scan', trigger: input.trigger,
+      decision: input.dryRun ? 'dry-run' : (policy.enabled ? 'scan' : 'disabled'),
+      result: 'success', reason: `repos=${repos.length};graceMs=${policy.orphanGraceMs}`,
+    });
+    result.audited++;
+
+    for (const repoPath of repos) {
+      try {
+        await this.locked(repoPath, async (repo, list) => {
+          await this.reconcile(repo, list);
+          const rows = await this.rows(repo);
+          const refs = await this.refs(repo);
+          for (const row of rows) {
+            if (input.treeId && String(row.id.id) !== input.treeId) continue;
+            const tree = list.find(t => t.path === row.path);
+            const live = refs.filter(r => String(r.tree.id) === String(row.id.id));
+            const active = live.filter(r => refState(r) === 'active');
+            const recovery = live.filter(r => refState(r) === 'recovery');
+            if (!active.length && !recovery.length && live.length) {
+              const latest = live.map(r => this.asDate(r.at)).filter((d): d is Date => !!d).sort((a, b) => b.getTime() - a.getTime())[0];
+              if (await this.markReleased(row.id, latest)) {
+                row.last_released_at = latest ?? new Date();
+                await this.audit({
+                  scanId, repo, path: row.path, tree: row.id, event: 'release', trigger: input.trigger,
+                  ownership: { mode: row.mode, refs: live.length }, decision: 'release', result: 'success',
+                  reason: 'all-references-released', task: live.find(r => r.task)?.task,
+                });
+                result.audited++;
+              }
+            }
+            const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+            const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
+            // Re-read refs inside the lock immediately before any delete decision.
+            const freshRefs = (await this.refs(repo)).filter(r => String(r.tree.id) === String(row.id.id));
+            const decision = decideReclaim({
+              path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
+              status, dirty,
+              effectiveRefs: freshRefs.filter(r => refState(r) === 'active').length,
+              recoveryRefs: freshRefs.filter(r => refState(r) === 'recovery').length,
+              createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
+              lastReleasedAt: this.asDate(row.last_released_at),
+            }, policy);
+
+            if (decision.action !== 'delete') {
+              const reason = decision.reasons.join(',');
+              result.kept.push({ path: row.path, reason });
+              if (!input.dryRun) {
+                // Abnormal retention (dirty/drift/missing/prior failures) becomes a durable follow-up;
+                // expected retention (refs, grace, protection) clears any stale todo.
+                const todo = /dirty|drift|missing|fail|unmerged/i.test(reason) ? reason.slice(0, 200) : undefined;
+                if ((row.cleanup_todo ?? undefined) !== todo) {
+                  await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo });
+                  row.cleanup_todo = todo;
+                }
+              }
+              await this.audit({
+                scanId, repo, path: row.path, tree: row.id, event: input.dryRun ? 'dry_run' : 'skip',
+                trigger: input.trigger, ownership: { mode: row.mode, refs: freshRefs.length },
+                decision: decision.action, result: 'skipped', reason,
+              });
+              result.audited++;
+              continue;
+            }
+
+            if (input.dryRun || !policy.enabled) {
+              result.kept.push({ path: row.path, reason: input.dryRun ? `dry-run:${decision.reasons.join(',')}` : 'reclaim-disabled' });
+              await this.audit({
+                scanId, repo, path: row.path, tree: row.id, event: 'dry_run', trigger: input.trigger,
+                ownership: { mode: row.mode }, decision: 'delete', result: 'skipped',
+                reason: decision.reasons.join(','),
+              });
+              result.audited++;
+              continue;
+            }
+
+            const removed = await this.removeTree(repo, row.path);
+            if (!removed.ok) {
+              const reason = removed.reason ?? 'git-remove-failed';
+              result.kept.push({ path: row.path, reason });
+              await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo: `git-remove-failed:${reason}`.slice(0, 200) });
+              row.cleanup_todo = `git-remove-failed:${reason}`.slice(0, 200);
+              await this.audit({
+                scanId, repo, path: row.path, tree: row.id, event: 'fail', trigger: input.trigger,
+                ownership: { mode: row.mode }, decision: 'delete', result: 'failed',
+                reason: removed.reason ?? 'git-remove-failed',
+              });
+              result.audited++;
+              continue;
+            }
+
+            result.removed.push(row.path);
+            const branch = row.branch;
+            const mode = row.mode;
+            await this.db.query(`BEGIN;
+              DELETE worktree_ref WHERE tree = $tree;
+              DELETE worktree_session_ref WHERE tree = $tree;
+              DELETE ONLY $tree;
+              COMMIT;`, { tree: row.id });
+            await this.audit({
+              scanId, repo, path: row.path, tree: row.id, event: 'delete', trigger: input.trigger,
+              ownership: { mode }, decision: 'delete', result: 'success',
+              reason: decision.reasons.join(','),
+            });
+            result.audited++;
+
+            if (branch && mode === 'exclusive') {
+              if (await this.branchStillNeeded(branch)) {
+                result.branchesRetained.push({ branch, reason: 'non-terminal-task-still-references-branch' });
+                await this.audit({
+                  scanId, repo, path: row.path, event: 'branch_retain', trigger: input.trigger,
+                  decision: 'retain_branch', result: 'skipped', reason: 'non-terminal-task-still-references-branch',
+                });
+                result.audited++;
+              } else {
+                const del = await this.deleteMergedBranch(repo, branch);
+                if (del.deleted) {
+                  result.branchesDeleted.push(branch);
+                } else {
+                  result.branchesRetained.push({ branch, reason: del.reason ?? 'unmerged-or-checked-out' });
+                  await this.audit({
+                    scanId, repo, path: row.path, event: 'branch_retain', trigger: input.trigger,
+                    decision: 'retain_branch', result: 'skipped', reason: del.reason ?? 'unmerged-or-checked-out',
+                  });
+                  result.audited++;
+                }
+              }
+            }
+          }
+          if (result.removed.some(p => dirname(p) === dirname(repo) || p.startsWith(dirname(repo)))) {
+            await git(repo, ['worktree', 'prune']).catch(() => undefined);
+          }
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200);
+        result.kept.push({ path: repoPath, reason: `repo-lock-or-scan-failed:${reason}` });
+        await this.audit({
+          scanId, repo: repoPath, path: repoPath, event: 'fail', trigger: input.trigger,
+          decision: 'scan', result: 'failed', reason,
+        });
+        result.audited++;
+      }
+    }
+    return result;
+  }
+
+  /** Event-triggered reclaim for a task that just reached a terminal done state. */
+  async reclaimAfterTerminal(task: TaskView, trigger: ReclaimTrigger = 'accept'): Promise<ReclaimResult | undefined> {
+    if (!task.worktree || task.state !== 'done') return undefined;
+    return this.reclaimAll({ trigger, treeId: task.worktree.id, repos: [task.worktree.repo] });
+  }
+
+  async listAudits(limit = 100): Promise<Array<Record<string, unknown>>> {
+    const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+      'SELECT * FROM worktree_audit ORDER BY at DESC LIMIT $limit;', { limit });
+    return rows ?? [];
   }
 }

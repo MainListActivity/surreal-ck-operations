@@ -5,6 +5,7 @@ import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota } from 
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
+import type { ReclaimResult } from './worktree-registry.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
@@ -26,8 +27,10 @@ export interface DispatcherDeps {
   rand?: () => number;
   /** Jev System One decision model; undefined disables the Jev evaluation path. */
   jev?: JevClient;
-  /** Removes worktrees of finished tasks; undefined disables the sweep. */
+  /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
+  /** WT02 ownership reclaim on the existing 10-minute sweep cadence. Undefined disables reclaim. */
+  reclaimWorktrees?: () => Promise<ReclaimResult>;
   /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
   quota?: () => Promise<ProviderQuota[]>;
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
@@ -574,13 +577,26 @@ export class Dispatcher {
     }
   }
 
-  /** Every 10 minutes, remove the git worktrees of tasks that are done. Dirty ones are kept and reported once. */
+  /** Every 10 minutes: ownership reclaim (WT02) or legacy done-branch sweep. Dirty / protected trees stay with reasons. */
   private async sweep(now: number) {
-    const { git, workforce: wf, env } = this.deps;
-    if (!git || now - this.lastSweep < 600) return;
+    const { git, workforce: wf, env, reclaimWorktrees } = this.deps;
+    if (now - this.lastSweep < 600) return;
+    if (!reclaimWorktrees && !git) return;
     this.lastSweep = now;
     try {
-      const result = await sweepWorktrees(git, [env.opsRepo, ...(await wf.projectRepos())], await wf.doneTaskIds());
+      if (reclaimWorktrees) {
+        const result = await reclaimWorktrees();
+        for (const path of result.removed) this.log(`reclaimed worktree ${path} scan=${result.scanId}`);
+        for (const kept of result.kept) {
+          if (this.keptLogged.has(kept.path + kept.reason)) continue;
+          this.keptLogged.add(kept.path + kept.reason);
+          this.log(`kept worktree ${kept.path}: ${kept.reason}`);
+        }
+        for (const branch of result.branchesDeleted) this.log(`deleted merged branch ${branch}`);
+        for (const retained of result.branchesRetained) this.log(`retained branch ${retained.branch}: ${retained.reason}`);
+        return;
+      }
+      const result = await sweepWorktrees(git!, [env.opsRepo, ...(await wf.projectRepos())], await wf.doneTaskIds());
       for (const path of result.removed) this.log(`removed worktree ${path}`);
       for (const kept of result.kept) {
         if (this.keptLogged.has(kept.path)) continue;
