@@ -18,8 +18,9 @@ export interface SpawnInput {
   prompt: string;
 }
 
-/** The dispatcher's only view of Paseo. Implemented by the paseo CLI; faked in tests. */
-export interface PaseoGateway {
+/** The dispatcher's only view of Paseo. Implemented by the paseo CLI; faked in tests.
+ * Workspace/project lifecycle members are optional so agent-level fakes stay valid. */
+export interface PaseoGateway extends Partial<PaseoWorkspaceGateway> {
   list(): Promise<Map<string, AgentInfo>>;
   status(agentId: string): Promise<{ status: string; pendingPermissions: number } | undefined>;
   lastError(agentId: string): Promise<string>;
@@ -36,7 +37,20 @@ export interface PaseoGateway {
 /** Paseo mode needed for unattended work; grok exposes no modes. */
 export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', devin: 'bypass', 'factory-droid': 'auto-high' };
 
-export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo'): PaseoGateway {
+/** Path-scoped workspace/project lifecycle operations. Worktree reclaim uses these to tear the
+ * Paseo side of a registered tree down: workspaces are matched by cwd and projects by path,
+ * never by title (titles repeat across trees). */
+export interface PaseoWorkspaceGateway {
+  /** Active workspaces; archived ones stop appearing, which makes re-running a no-op. */
+  listWorkspaces(): Promise<Array<{ workspaceId: string; cwd?: string }>>;
+  /** Soft-delete: the workspace's transcript stays in Paseo history. */
+  archiveWorkspace(workspaceId: string): Promise<void>;
+  listProjects(): Promise<Array<{ projectId: string; path?: string }>>;
+  /** Deleting a project archives its still-active workspaces and keeps the disk directory. */
+  deleteProject(projectId: string): Promise<void>;
+}
+
+export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo'): PaseoGateway & PaseoWorkspaceGateway {
   const run = async (args: string[], timeoutMs = 60_000): Promise<string> => {
     const child = Bun.spawn([bin, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
     const timer = setTimeout(() => child.kill(), timeoutMs);
@@ -95,6 +109,18 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
     },
     async archive(agentId) {
       await run(['archive', agentId]);
+    },
+    async listWorkspaces() {
+      return json<Array<{ workspaceId: string; cwd?: string }>>(['workspace', 'ls']);
+    },
+    async archiveWorkspace(workspaceId) {
+      await run(['workspace', 'archive', workspaceId]);
+    },
+    async listProjects() {
+      return json<Array<{ projectId: string; path?: string }>>(['project', 'ls']);
+    },
+    async deleteProject(projectId) {
+      await run(['project', 'delete', projectId]);
     },
     async spawn(input) {
       const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd);

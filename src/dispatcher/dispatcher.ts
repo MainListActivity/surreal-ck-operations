@@ -7,6 +7,7 @@ import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
+import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 
@@ -242,8 +243,9 @@ export interface DispatcherDeps {
   jev?: JevClient;
   /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
-  /** WT02 ownership reclaim on the existing 10-minute sweep cadence. Undefined disables reclaim. */
-  reclaimWorktrees?: () => Promise<ReclaimResult>;
+  /** WT02 ownership reclaim on the existing 10-minute sweep cadence, also reusable as the
+   * single-tree event hook (lease-end release). Undefined disables reclaim. */
+  reclaimWorktrees?: (input?: { trigger?: ReclaimTrigger; treeId?: string; repos?: string[] }) => Promise<ReclaimResult>;
   /** Remaining quota per provider (read from DB rows the Paseo plugin refreshes); feeds Jev staffing. */
   quota?: () => Promise<ProviderQuota[]>;
   /** Current "<provider>:<family>" → model id resolution for defs using `auto:<family>`; the Paseo plugin refreshes it. */
@@ -1028,6 +1030,13 @@ export class Dispatcher {
       // The sidecar may still hold a local claim whose heartbeat died first;
       // drop it or the instance stays un-claimable until the next restart.
       if (holder) this.deps.sidecar?.dropLease?.(holder, task.id);
+      // Lease-end release event: the holder's reference just left its tree. The registry re-reads
+      // refs under the repo lock and only tears a tree down when it decides delete — recovery
+      // scenes and shared/protected trees are always kept. Never blocks the revoke.
+      const tree = task.row.worktree;
+      if (tree && this.deps.reclaimWorktrees) {
+        await this.deps.reclaimWorktrees({ trigger: 'expire', treeId: tree.id, repos: [tree.repo] }).catch(() => undefined);
+      }
       this.log(`revoked ${task.id} from ${task.currentEmployee}: ${reason}`);
     }
   }

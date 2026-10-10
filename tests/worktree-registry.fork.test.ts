@@ -12,7 +12,7 @@ import type { ClaimResult, LeaseProof, Role, WorkIntent } from '../src/contracts
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { OwnerDesk } from '../src/owner.ts';
-import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
+import type { PaseoGateway, PaseoWorkspaceGateway } from '../src/dispatcher/paseo.ts';
 import { readJsonFile } from '../src/comm.ts';
 
 setDefaultTimeout(30000);
@@ -59,8 +59,8 @@ async function capture(core: SurrealCompanyCore, result: ClaimResult) {
   evidence.push({ taskId, employee: result.task.currentEmployee, assignment: result.worktree, fence: result.fence,
     auditId: String(audits[0]?.id), at: String(audits[0]?.at) });
 }
-const coreFor = (path: string) => {
-  const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path } });
+const coreFor = (path: string, paseo?: PaseoWorkspaceGateway) => {
+  const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, paseo } });
   const claim = core.claim.bind(core);
   core.claim = async (credential, taskId) => { const result = await claim(credential, taskId); await capture(core, result); return result; };
   return core;
@@ -76,6 +76,31 @@ async function acceptDone(core: SurrealCompanyCore, executor: string, claim: Cla
   const qa = await employee('qa');
   const review = await core.claim(qa, submitted.id);
   return core.accept(qa, proof(review), { text: 'Independent fixture accept for reclaim coverage', idempotencyKey: `fixture-accept-${++count}` });
+}
+/** In-memory Paseo workspace/project fixture for the three-layer teardown (WT03): archived and
+ * deleted entries stop being listed like the real CLI; `isolation: 'worktree'` simulates Paseo
+ * removing its own worktree directory during archive. */
+function paseoFixture() {
+  const workspaces: Array<{ id: string; cwd: string; isolation?: 'local' | 'worktree'; archived?: boolean }> = [];
+  const projects: Array<{ id: string; path: string; deleted?: boolean }> = [];
+  const calls: string[] = [];
+  let archiveFailure: string | undefined;
+  const gateway: PaseoWorkspaceGateway = {
+    listWorkspaces: async () => workspaces.filter(w => !w.archived).map(w => ({ workspaceId: w.id, cwd: w.cwd })),
+    archiveWorkspace: async id => {
+      calls.push(`archive:${id}`);
+      if (archiveFailure) throw new Error(archiveFailure);
+      const w = workspaces.find(x => x.id === id);
+      if (w) { w.archived = true; if (w.isolation === 'worktree') rmSync(w.cwd, { recursive: true, force: true }); }
+    },
+    listProjects: async () => projects.filter(p => !p.deleted).map(p => ({ projectId: p.id, path: p.path })),
+    deleteProject: async id => { calls.push(`deleteProject:${id}`); const p = projects.find(x => x.id === id); if (p) p.deleted = true; },
+  };
+  return {
+    gateway, calls, workspaces, projects,
+    failArchives: (message: string) => { archiveFailure = message; },
+    healArchives: () => { archiveFailure = undefined; },
+  };
 }
 
 run('serial QA and GM reuse one physical tree, with authenticated references and protected main', async () => {
@@ -288,7 +313,7 @@ run('project-bound non-lease eval uses project repo and carries persistent proje
 });
 
 run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with audit', async () => {
-  const path = repo(), core = coreFor(path), eng = await employee('engineering'), eng2 = await employee('engineering');
+  const path = repo(), paseo = paseoFixture(), core = coreFor(path, paseo.gateway), eng = await employee('engineering'), eng2 = await employee('engineering');
   const sharedClaim = await core.claim(eng, (await task(core, 'engineering')).id);
   writeFileSync(join(sharedClaim.worktree!.worktreePath, 'source.txt'), 'shared writer');
   git(sharedClaim.worktree!.worktreePath, 'add', '.');
@@ -302,9 +327,16 @@ run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with
   git(exclusiveClaim.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'exclusive change');
   const exclusivePath = exclusiveClaim.worktree!.worktreePath;
   const sharedPath = sharedClaim.worktree!.worktreePath;
+  // Paseo holds entries for every tree; only the reference-zero exclusive one may be torn down.
+  paseo.workspaces.push({ id: 'wks_shared', cwd: sharedPath }, { id: 'wks_exclusive', cwd: exclusivePath });
+  paseo.projects.push({ id: 'prj_shared', path: sharedPath }, { id: 'prj_exclusive', path: exclusivePath });
   await acceptDone(core, eng2, exclusiveClaim);
   expect(existsSync(exclusivePath)).toBe(false);
   expect(existsSync(sharedPath)).toBe(true);
+  expect(paseo.workspaces.find(w => w.id === 'wks_exclusive')!.archived).toBe(true);
+  expect(paseo.projects.find(p => p.id === 'prj_exclusive')!.deleted).toBe(true);
+  expect(paseo.workspaces.find(w => w.id === 'wks_shared')!.archived).toBeUndefined();
+  expect(paseo.projects.find(p => p.id === 'prj_shared')!.deleted).toBeUndefined();
   await acceptDone(core, eng, sharedClaim);
   expect(existsSync(sharedPath)).toBe(true);
   const inv = await core.listWorktrees(gm);
@@ -316,11 +348,17 @@ run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with
   const dirty = await core.claim(dirtyPeer, (await task(core, 'engineering')).id);
   expect(dirty.worktree!.mode).toBe('exclusive');
   writeFileSync(join(dirty.worktree!.worktreePath, 'wip.txt'), 'unsaved');
+  const dirtyPath = dirty.worktree!.worktreePath;
+  paseo.workspaces.push({ id: 'wks_dirty', cwd: dirtyPath });
+  paseo.projects.push({ id: 'prj_dirty', path: dirtyPath });
   await submit(core, dirtyPeer, dirty);
   const qa = await employee('qa');
   const review = await core.claim(qa, dirty.task.id);
   await core.accept(qa, proof(review), { text: 'Accept dirty exclusive fixture', idempotencyKey: `dirty-accept-${++count}` });
-  expect(existsSync(dirty.worktree!.worktreePath)).toBe(true);
+  expect(existsSync(dirtyPath)).toBe(true);
+  // Dirty trees keep all three layers: no Paseo archive, no project delete, no git remove.
+  expect(paseo.workspaces.find(w => w.id === 'wks_dirty')!.archived).toBeUndefined();
+  expect(paseo.projects.find(p => p.id === 'prj_dirty')!.deleted).toBeUndefined();
   const audits = await core.listWorktreeAudits(gm, 50);
   expect(audits.some(a => a.event === 'skip' && String(a.reason).includes('dirty'))).toBe(true);
   await submit(core, dirtyEng, holder);
@@ -377,13 +415,15 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
 }, 30000);
 
 run('WT02: review and returned-ready windows keep exclusive scene; release writes durable audit', async () => {
-  const path = repo(), core = coreFor(path);
+  const path = repo(), paseo = paseoFixture(), core = coreFor(path, paseo.gateway);
   const eng1 = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
   const holder = await core.claim(eng1, (await task(core, 'engineering')).id);
   expect(holder.worktree!.mode).toBe('shared');
   const c2 = await core.claim(eng2, (await task(core, 'engineering')).id);
   expect(c2.worktree!.mode).toBe('exclusive');
   const scene = c2.worktree!.worktreePath;
+  paseo.workspaces.push({ id: 'wks_scene', cwd: scene });
+  paseo.projects.push({ id: 'prj_scene', path: scene });
   writeFileSync(join(scene, 'source.txt'), 'review window work');
   git(scene, 'add', '.');
   git(scene, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'window work');
@@ -394,6 +434,9 @@ run('WT02: review and returned-ready windows keep exclusive scene; release write
   const firstSweep = await core.reclaimWorktrees(gm, { repos: [path] });
   expect(firstSweep.removed).not.toContain(scene);
   expect(existsSync(scene)).toBe(true);
+  // A live (recovery) reference keeps all three layers untouched.
+  expect(paseo.workspaces.find(w => w.id === 'wks_scene')!.archived).toBeUndefined();
+  expect(paseo.projects.find(p => p.id === 'prj_scene')!.deleted).toBeUndefined();
   let row = (await core.listWorktrees(gm)).find(w => w.id === c2.worktree!.id)!;
   expect(row.deletable).toBe(false);
   expect(row.reasons).toContain('unfinished-scene');
@@ -419,6 +462,8 @@ run('WT02: review and returned-ready windows keep exclusive scene; release write
   const reReview = await core.claim(qa2, resubmitted.id);
   await core.accept(qa2, proof(reReview), { text: 'Accept after returned window', idempotencyKey: `window-accept-${++count}` });
   expect(existsSync(scene)).toBe(false);
+  expect(paseo.workspaces.find(w => w.id === 'wks_scene')!.archived).toBe(true);
+  expect(paseo.projects.find(p => p.id === 'prj_scene')!.deleted).toBe(true);
   const audits = await core.listWorktreeAudits(gm, 100);
   const releases = audits.filter(a => a.event === 'release' && a.result === 'success');
   expect(releases.length).toBeGreaterThan(0);
@@ -459,3 +504,91 @@ run('WT02: inventory no longer hard-disables deletion and exposes grace reasons'
   expect(shared?.reasons.some(r => r === 'shared-retained' || r === 'active-reference')).toBe(true);
   await submit(core, eng, first);
 }, 20000);
+
+/** Stages an exclusive scene with Paseo holding a workspace (cwd) and a project (path) on it,
+ * plus the holder's shared-tree entries that must stay untouched. */
+async function exclusiveScene(paseo: ReturnType<typeof paseoFixture>, isolation: 'local' | 'worktree' = 'local') {
+  const path = repo(), core = coreFor(path, paseo.gateway), eng = await employee('engineering'), peer = await employee('engineering');
+  const holder = await core.claim(eng, (await task(core, 'engineering')).id);
+  const shared = holder.worktree!.worktreePath;
+  const exclusive = await core.claim(peer, (await task(core, 'engineering')).id);
+  expect(exclusive.worktree!.mode).toBe('exclusive');
+  const scene = exclusive.worktree!.worktreePath;
+  writeFileSync(join(scene, 'source.txt'), 'exclusive scene');
+  git(scene, 'add', '.');
+  git(scene, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'scene work');
+  paseo.workspaces.push({ id: 'wks_shared', cwd: shared }, { id: 'wks_scene', cwd: scene, isolation });
+  paseo.projects.push({ id: 'prj_shared', path: shared }, { id: 'prj_scene', path: scene });
+  return { path, core, eng, holder, peer, exclusive, scene };
+}
+
+run('WT03: reference-zero event tears down Paseo workspace, project and git tree in one decision', async () => {
+  const paseo = paseoFixture(), staged = await exclusiveScene(paseo);
+  const { core, eng, holder, peer, exclusive, scene } = staged;
+  await acceptDone(core, peer, exclusive);
+  // One decision, three ordered layers: workspace archive → project delete → git worktree removal.
+  expect(paseo.calls).toEqual(['archive:wks_scene', 'deleteProject:prj_scene']);
+  expect(existsSync(scene)).toBe(false);
+  // The registration is only cleared once every layer is through.
+  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === scene)).toBeUndefined();
+  const audits = await core.listWorktreeAudits(gm, 30);
+  const deleted = audits.find(a => a.event === 'delete' && a.result === 'success' && a.path === scene);
+  expect(String(deleted?.reason)).toContain('paseo-workspaces=1;paseo-projects=1');
+  // The holder's shared tree kept its Paseo entries untouched.
+  expect(paseo.workspaces.find(w => w.id === 'wks_shared')!.archived).toBeUndefined();
+  expect(paseo.projects.find(p => p.id === 'prj_shared')!.deleted).toBeUndefined();
+  await submit(core, eng, holder);
+}, 30000);
+
+run('WT03: a failed Paseo layer keeps the registration and the retry resumes from that layer', async () => {
+  const paseo = paseoFixture(), staged = await exclusiveScene(paseo);
+  const { path, core, eng, holder, peer, exclusive, scene } = staged;
+  paseo.failArchives('paseo daemon unreachable');
+  await acceptDone(core, peer, exclusive);
+  // Nothing may be recorded as cleaned: directory, workspace, project and registration all stay.
+  expect(existsSync(scene)).toBe(true);
+  expect(paseo.workspaces.find(w => w.id === 'wks_scene')!.archived).toBeUndefined();
+  expect(paseo.projects.find(p => p.id === 'prj_scene')!.deleted).toBeUndefined();
+  const kept = (await core.listWorktrees(gm)).find(w => w.worktreePath === scene);
+  expect(kept).toBeTruthy();
+  expect(kept!.reasons.some(r => r.startsWith('cleanup-todo:paseo-workspace-archive-failed:'))).toBe(true);
+  let audits = await core.listWorktreeAudits(gm, 30);
+  expect(audits.some(a => a.event === 'fail' && a.result === 'failed' && String(a.reason).startsWith('paseo-workspace-archive-failed:'))).toBe(true);
+
+  // The next sweep retries from the failed layer: archive succeeds (no workspace is recreated),
+  // the project is deleted and the git tree removed, clearing the registration.
+  paseo.healArchives();
+  const swept = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(swept.removed).toContain(scene);
+  expect(existsSync(scene)).toBe(false);
+  expect(paseo.workspaces.filter(w => w.id === 'wks_scene' && w.archived)).toHaveLength(1);
+  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === scene)).toBeUndefined();
+  audits = await core.listWorktreeAudits(gm, 30);
+  expect(audits.some(a => a.event === 'delete' && a.result === 'success' && a.path === scene && String(a.reason).includes('paseo-workspaces=1'))).toBe(true);
+  await submit(core, eng, holder);
+}, 30000);
+
+run('WT03: Paseo isolation=worktree archive removing its own directory still completes the teardown', async () => {
+  const paseo = paseoFixture(), staged = await exclusiveScene(paseo, 'worktree');
+  const { core, eng, holder, peer, exclusive, scene } = staged;
+  await acceptDone(core, peer, exclusive);
+  // The archive step removed the directory (isolation=worktree); git remove treats the
+  // already-gone worktree as success and the registration still clears in the same event.
+  expect(paseo.calls).toEqual(['archive:wks_scene', 'deleteProject:prj_scene']);
+  expect(existsSync(scene)).toBe(false);
+  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === scene)).toBeUndefined();
+  const audits = await core.listWorktreeAudits(gm, 30);
+  expect(audits.some(a => a.event === 'delete' && a.result === 'success' && a.path === scene && String(a.reason).includes('git-worktree=already-gone'))).toBe(true);
+  await submit(core, eng, holder);
+}, 30000);
+
+run('WT03: voided task releases its scene for the same three-layer teardown', async () => {
+  const paseo = paseoFixture(), staged = await exclusiveScene(paseo);
+  const { core, eng, holder, peer, exclusive, scene } = staged;
+  await core.retireTask(gm, { taskId: exclusive.task.id, text: 'Fixture retire: duplicate work, scene released', idempotencyKey: `retire-${++count}` });
+  // Terminal 'void' releases the refs like 'done'; the retire event runs the same teardown.
+  expect(paseo.calls).toEqual(['archive:wks_scene', 'deleteProject:prj_scene']);
+  expect(existsSync(scene)).toBe(false);
+  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === scene)).toBeUndefined();
+  await submit(core, eng, holder);
+}, 30000);

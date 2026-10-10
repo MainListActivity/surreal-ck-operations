@@ -1044,7 +1044,11 @@ export class SurrealCompanyCore implements CompanyCore {
       if (replayed) return replayed;
       throw error;
     }
-    return view(row);
+    const retired = view(row);
+    // Event-triggered reclaim: 'void' is terminal like 'done' — the scene's refs release and the
+    // same three-layer teardown applies under the repo lock. Never block the retire on reclaim.
+    if (this.worktrees) await this.worktrees.reclaimAfterTerminal(retired, 'retire').catch(() => undefined);
+    return retired;
   }
 
   /**

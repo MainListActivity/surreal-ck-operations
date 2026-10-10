@@ -49,6 +49,9 @@ export function company(): Promise<Company> {
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
+    // The Paseo gateway is shared: the dispatcher drives agents through it, and the worktree
+    // registry reuses its path-scoped workspace/project ops for the three-layer teardown.
+    const paseoGateway = createPaseoCli();
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
@@ -58,6 +61,7 @@ export function company(): Promise<Company> {
         ? false
         : process.env.SCK_WORKTREE_RECLAIM === '1' || process.env.SCK_WORKTREE_RECLAIM === 'true'
           ? true : undefined,
+      paseo: paseoGateway,
     };
     const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
@@ -75,7 +79,7 @@ export function company(): Promise<Company> {
     const dispatcher = new Dispatcher({
       workforce,
       owner,
-      paseo: createPaseoCli(),
+      paseo: paseoGateway,
       env: {
         opsRepo,
         sckBin: process.env.SCK_TOOL_BIN ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/bin/sck`,
@@ -84,8 +88,11 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
-      // WT02: ownership reclaim on the existing dispatcher sweep cadence (no new timers).
-      reclaimWorktrees: () => core.worktrees!.reclaimAll({ trigger: 'sweep' }),
+      // WT02: ownership reclaim on the existing dispatcher sweep cadence (no new timers);
+      // lease-end events reuse the same registry path for a single tree.
+      reclaimWorktrees: input => core.worktrees!.reclaimAll({
+        trigger: input?.trigger ?? 'sweep', treeId: input?.treeId, repos: input?.repos,
+      }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: () => readProviderQuotas({ db }),

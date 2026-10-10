@@ -6,6 +6,7 @@ import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, TaskView, WorkIntent, WorktreeAssignment, WorktreeView } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import type { PaseoWorkspaceGateway } from './paseo.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
 } from './worktree-reclaim.ts';
@@ -21,6 +22,10 @@ export interface RegistryOptions {
   orphanGraceDays?: number;
   /** Injectable clock for orphan grace tests. */
   now?: () => Date;
+  /** Path-scoped Paseo lifecycle ops. When wired, a delete decision also tears the Paseo
+   * workspace/project of the tree down (three-layer cleanup). Without it, reclaim keeps the
+   * previous git-only behavior and the delete audit says `paseo=unwired`. */
+  paseo?: PaseoWorkspaceGateway;
 }
 export interface ReclaimResult {
   scanId: string;
@@ -100,9 +105,11 @@ const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
   if (r.session_active) return 'active';
   if (r.current === r.employee && r.current_delivery === r.delivery && r.current_fence === r.fence && r.assigned_tree === String(r.tree.id)) return 'active';
   // Every non-terminal task state (ready, doing, review, blocked) keeps its scene: an unheld ref on
-  // the task's assigned non-shared tree stays recovery until 'done' releases it. Shared trees are
-  // already hard-protected, so their refs release normally and serial tasks keep reusing the tree.
-  if (!r.current && r.task_state && r.task_state !== 'done' && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
+  // the task's assigned non-shared tree stays recovery until a terminal state releases it. Terminal
+  // states ('done', 'void') never resume, so their refs release and the tree becomes reclaimable.
+  // Shared trees are already hard-protected, so their refs release normally and serial tasks keep
+  // reusing the tree.
+  if (!r.current && r.task_state && r.task_state !== 'done' && r.task_state !== 'void' && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
   return 'released';
 };
 
@@ -295,13 +302,44 @@ export class WorktreeRegistry {
     return (rows?.length ?? 0) > 0;
   }
 
-  /** Safe remove without --force; keep dirty / unavailable scenes with an explicit reason. */
-  private async removeTree(repo: string, path: string): Promise<{ ok: boolean; reason?: string }> {
+  /** Safe remove without --force; keep dirty / unavailable scenes with an explicit reason.
+   * A path that vanished between the delete decision and this call (a Paseo isolation=worktree
+   * archive removes its own worktree directory) counts as success, never as a failure. */
+  private async removeTree(repo: string, path: string): Promise<{ ok: boolean; reason?: string; alreadyGone?: boolean }> {
+    if (!existsSync(path)) {
+      // Drop stale git metadata for the missing directory, then re-check: still listed means git
+      // disagrees and the plain remove must surface the real error.
+      await git(repo, ['worktree', 'prune']).catch(() => undefined);
+      if (!(await trees(repo).catch(() => [])).some(t => t.path === path)) return { ok: true, alreadyGone: true };
+    }
     try {
       await git(repo, ['worktree', 'remove', path]);
       return { ok: true };
     } catch (error) {
       return { ok: false, reason: error instanceof CompanyError ? error.message.slice(0, 200) : String(error).slice(0, 200) };
+    }
+  }
+
+  /** Layers 1-2 of the teardown, ordered and idempotent: archive the Paseo workspaces whose cwd
+   * equals the registered path (never title-matched), then delete the Paseo project at that path
+   * (deleting a project also archives its live workspaces and keeps the disk directory). Already
+   * archived/deleted entries simply stop being listed, so a retry re-runs cleanly from here. */
+  private async paseoLayers(path: string): Promise<{ ok: boolean; unwired?: boolean; layer?: string; reason?: string; workspaces: number; projects: number }> {
+    const paseo = this.options.paseo;
+    if (!paseo) return { ok: true, unwired: true, workspaces: 0, projects: 0 };
+    const message = (error: unknown) => (error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160));
+    try {
+      const rows = (await paseo.listWorkspaces()).filter(w => w.cwd === path);
+      for (const w of rows) await paseo.archiveWorkspace(w.workspaceId);
+      try {
+        const projects = (await paseo.listProjects()).filter(p => p.path === path);
+        for (const p of projects) await paseo.deleteProject(p.projectId);
+        return { ok: true, workspaces: rows.length, projects: projects.length };
+      } catch (error) {
+        return { ok: false, layer: 'paseo-project-delete-failed', reason: message(error), workspaces: rows.length, projects: 0 };
+      }
+    } catch (error) {
+      return { ok: false, layer: 'paseo-workspace-archive-failed', reason: message(error), workspaces: 0, projects: 0 };
     }
   }
 
@@ -451,6 +489,23 @@ export class WorktreeRegistry {
               continue;
             }
 
+            // Three-layer teardown, same event, in order: 1) archive the Paseo workspaces at this
+            // path, 2) delete the Paseo project at this path, 3) remove the git worktree. A failed
+            // layer keeps the registration with its todo so the next event or sweep retries from
+            // it; nothing is recorded as cleaned before every layer is through.
+            const paseo = await this.paseoLayers(row.path);
+            if (!paseo.ok) {
+              const reason = `${paseo.layer}:${paseo.reason ?? 'unknown'}`.slice(0, 200);
+              result.kept.push({ path: row.path, reason });
+              await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo: reason });
+              row.cleanup_todo = reason;
+              await this.audit({
+                scanId, repo, path: row.path, tree: row.id, event: 'fail', trigger: input.trigger,
+                ownership: { mode: row.mode }, decision: 'delete', result: 'failed', reason,
+              });
+              result.audited++;
+              continue;
+            }
             const removed = await this.removeTree(repo, row.path);
             if (!removed.ok) {
               const reason = removed.reason ?? 'git-remove-failed';
@@ -477,7 +532,11 @@ export class WorktreeRegistry {
             await this.audit({
               scanId, repo, path: row.path, tree: row.id, event: 'delete', trigger: input.trigger,
               ownership: { mode }, decision: 'delete', result: 'success',
-              reason: decision.reasons.join(','),
+              reason: [
+                decision.reasons.join(','),
+                paseo.unwired ? 'paseo=unwired' : `paseo-workspaces=${paseo.workspaces};paseo-projects=${paseo.projects}`,
+                removed.alreadyGone ? 'git-worktree=already-gone' : undefined,
+              ].filter(Boolean).join(';'),
             });
             result.audited++;
 
@@ -521,9 +580,10 @@ export class WorktreeRegistry {
     return result;
   }
 
-  /** Event-triggered reclaim for a task that just reached a terminal done state. */
+  /** Event-triggered reclaim for a task that just reached a terminal state ('done' or 'void'):
+   * the tree's refs release either way, and the same three-layer teardown applies. */
   async reclaimAfterTerminal(task: TaskView, trigger: ReclaimTrigger = 'accept'): Promise<ReclaimResult | undefined> {
-    if (!task.worktree || task.state !== 'done') return undefined;
+    if (!task.worktree || (task.state !== 'done' && task.state !== 'void')) return undefined;
     return this.reclaimAll({ trigger, treeId: task.worktree.id, repos: [task.worktree.repo] });
   }
 
