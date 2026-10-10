@@ -47,6 +47,8 @@ export interface TaskView {
   discipline?: string;
   kind: TaskKind;
   goalId?: string;
+  /** Task-level project override (takes precedence over goal.project); undefined keeps the goal routing. */
+  projectOverlay?: string;
   dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
@@ -75,10 +77,12 @@ export interface CreateTask {
   context: string;
   executorRole: Role;
   reviewerRole: ReviewerRole;
-  /** Optional discipline track; when the goal's project defines a non-empty `disciplines` vocabulary the value must be in it. */
+  /** Optional discipline track; when the task's project (override, else the goal's) defines a non-empty `disciplines` vocabulary the value must be in it. */
   discipline?: string;
   kind?: Exclude<TaskKind, 'goal'>;
   goalId?: string;
+  /** Optional project override: registered project id only; takes precedence over goal.project for this task. */
+  project?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
   workIntent?: WorkIntent;
@@ -135,6 +139,8 @@ export interface CreateDelivery {
   spec: string;
   /** Optional discipline track; carried by the implementation leg only, release/deploy legs stay untracked. */
   discipline?: string;
+  /** Optional project override persisted on all three legs so the chain stays on one project. */
+  project?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
 }
@@ -219,6 +225,12 @@ export interface CompanyCore {
   triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
   /** gm/product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
   createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
+  /**
+   * gm only: rebind a blocked task to a registered project (task-level override over goal.project).
+   * Version-guarded, idempotent, fully audited; releases the stale worktree assignment through the
+   * normal lifecycle (the physical tree itself is never deleted here).
+   */
+  taskProjectUpdate?(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
   /** manage (gm/product): list every employee_def row for workforce review. */
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */
