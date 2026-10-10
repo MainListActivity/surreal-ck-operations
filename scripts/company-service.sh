@@ -67,26 +67,29 @@ case "$action" in
     chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck"
     ln -s "$release" "$service_home/active.next"
     mv -h -f "$service_home/active.next" "$service_home/active"
-    # Dual-surface sync: the MCP face follows `active`, the employee channel face
-    # follows ~/.paseo/config.json plugins.sck-company.path. Left manual they
-    # drifted apart (service and plugin ran different releases); repoint the
-    # plugin at the same release whenever it lives under this service home.
-    paseo_cfg="$HOME/.paseo/config.json"
-    if [ -f "$paseo_cfg" ] && [ -d "$release/plugin" ]; then
-      SERVICE_HOME="$service_home" RELEASE="$release" CFG="$paseo_cfg" /usr/bin/python3 - <<'PY'
-import json, os
-cfg_path = os.environ['CFG']
-cfg = json.load(open(cfg_path))
-entry = (cfg.get('plugins') or {}).get('sck-company') or {}
-want = os.path.join(os.environ['RELEASE'], 'plugin')
-if entry.get('source') == 'directory' and os.environ['SERVICE_HOME'] in str(entry.get('path', '')) and entry.get('path') != want:
-    entry['path'] = want
-    cfg['plugins']['sck-company'] = entry
-    json.dump(cfg, open(cfg_path, 'w'), ensure_ascii=False, indent=2)
-    print(f"plugin path -> {want}")
-PY
-      command -v paseo >/dev/null 2>&1 && paseo plugin reload sck-company 2>/dev/null || \
-        echo "note: run 'paseo plugin reload sck-company' to load the new plugin" >&2
+    # Dual-surface sync: the daemon resolves a plugin's registered source once —
+    # `plugin reload` does not re-read ~/.paseo/config.json and `plugin install`
+    # refuses an existing ID, so repointing is remove + install (a plugin-process
+    # restart; sidecar adopt() recovers live channels across it). Only repoint
+    # when the registered source lives under this service home.
+    PASEO="${PASEO:-/Applications/Paseo.app/Contents/Resources/bin/paseo}"
+    if [ -d "$release/plugin" ] && [ -x "$PASEO" ]; then
+      want="$release/plugin"
+      cur=$("$PASEO" plugin ls sck-company --json 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+rows = json.load(sys.stdin) or []
+print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")')
+      case "$cur" in
+        "$want") "$PASEO" plugin reload sck-company >/dev/null 2>&1 || true ;;
+        "$service_home"*|""|"")
+          [ -n "$cur" ] && "$PASEO" plugin remove sck-company >/dev/null 2>&1
+          if "$PASEO" plugin install "$want" --id sck-company >/dev/null 2>&1; then
+            echo "plugin source -> $want"
+          else
+            echo "warning: plugin repoint failed; run 'paseo plugin install \"$want\" --id sck-company' manually" >&2
+          fi ;;
+        *) echo "note: sck-company is registered outside the service home ($cur); leaving it as configured" >&2 ;;
+      esac
     fi
     for c in $components; do
       write_plist "$c"
