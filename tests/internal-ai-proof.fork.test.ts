@@ -169,6 +169,18 @@ check('real approval, byte hashes, normal alias mapping, encrypted proof and pub
   expect(JSON.stringify(rows)).not.toContain(delivered!);
   expect(JSON.stringify(a)).not.toContain('PRIVATE KEY');
 });
+check('status time claims carry the 30s clock margin; a verifier 5.5s behind the signing host still accepts',async()=>{
+  // 签约宿主时钟快 +5.5s（生产根因）：产品按真实时间校验，checkedAt/iat 必须不显未来。
+  const claims=await status(delivered!,'margin-status-nonce-0001');
+  const seconds=Math.floor(clock/1000);
+  expect(Number(claims.checkedAt)).toBeGreaterThanOrEqual(seconds-31);
+  expect(Number(claims.checkedAt)).toBeLessThanOrEqual(seconds-29);
+  expect(Number(claims.iat)).toBe(Number(claims.checkedAt));
+  expect(Number(claims.exp)-Number(claims.checkedAt)).toBe(60);
+  const productSeconds=(clock-5_500)/1000;
+  expect(Number(claims.checkedAt)).toBeLessThanOrEqual(productSeconds);
+  expect(Number(claims.iat)).toBeLessThanOrEqual(productSeconds);
+});
 check('prove resolves identities once per request; IdP failure after the first resolution cannot fail prove; digest comparison retained',async()=>{
   // a) 新签发路径：两 alias 各读一次身份 = 单请求恰一次完整解析（修复前 valid 里会再来两次读）。
   const before=identityReads;

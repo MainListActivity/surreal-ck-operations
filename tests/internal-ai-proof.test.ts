@@ -253,3 +253,61 @@ test('status requests append sanitized audit lines; deliver relays product error
     expect(raw).not.toContain(fixture.documentBytes);
   }finally{await rm(home,{recursive:true,force:true});}
 });
+test('status time claims carry a fixed clock margin; a verifier 5.5s behind the signing host still accepts',async()=>{
+  const home=await realpath(await mkdtemp(join(tmpdir(),'proof-margin-unit-')));
+  const taskId='synthetic-margin';
+  try {
+    const root=join(home,'evidence',taskId);await mkdir(root,{recursive:true});
+    const fixture=disabledSenseNovaFixture();
+    const manifestPath=join(root,'manifest.json'),documentPath=join(root,'evidence.json');
+    await writeFile(manifestPath,JSON.stringify(fixture.manifest));await writeFile(documentPath,fixture.documentBytes);
+    const scope:OpsScope={taskId,project:'surreal_ck',actor:{employeeId:'synthetic-employee',role:'engineering',capabilities:[]}};
+    const leaseStamp={taskId,employee:'synthetic-employee',delivery:'synthetic-delivery',fence:1,goal:'synthetic-goal',project:'surreal_ck',role:'engineering' as const};
+    const rows=new Map<string,ProofRow>();
+    const store={
+      lease:async()=>leaseStamp, leaseValid:async()=>true,
+      get:async(handleHash:string)=>rows.get(handleHash),
+      put:async(row:ProofRow)=>{rows.set(String(row.id.id),row);return row;},
+      status:async(hash:string)=>[...rows.values()].find(r=>r.status_hash===hash),
+    } as unknown as CompanyProofStore;
+    const signer=new ProofSigner(ProofSigner.generate()), key=Buffer.alloc(32,11);
+    const identities:ProofIdentity[]=[
+      {alias:'LCA04_REMOVABLE',subject:'user:synthetic-owner',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'admin',billingRole:'owner',billingAccountRef:'billing_account:synthetic'},
+      {alias:'LCA04_MEMBER',subject:'user:synthetic-member',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'participant',billingRole:'member',billingAccountRef:'billing_account:synthetic'},
+    ];
+    // 签约宿主时钟快 +5.5s：校验方（产品）真实时间比桥面 this.now() 慢 5.5 秒。
+    const hostSkewMs=5_500;
+    const clock=1_700_000_000_000;let deliveredJwt:string|undefined;
+    const bridge=new InternalAiProofBridge({
+      store,home,key:()=>key,now:()=>clock,signer:async()=>signer,
+      identities:async()=>identities,
+      rotate:async()=>{throw new Error('unused');},
+      deliver:async(jwt)=>{deliveredJwt=jwt;return{status:200,ok:true};},
+    });
+    const prove=await bridge.call(scope,'production','ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:fixture.manifest.activityId,nonce:'synthetic-nonce-3001',idempotencyKey:'margin-flow'}) as {proofHandle:string};
+    await bridge.call(scope,'production','ops_internal_ai_deliver',{proofHandle:prove.proofHandle,session:'synthetic-session'});
+    const claims=verifyCompanyProof(deliveredJwt!,signer.trust(),'proof',clock);
+    const bearer=(claims.status as {bearer:string}).bearer;
+    const response=await bridge.status(new Request('http://test.local/internal-ai/status',{headers:{authorization:'Bearer '+bearer,'x-sck-nonce':'synthetic-nonce-3002'}}));
+    expect(response.status).toBe(200);
+    const statusJwt=(await response.json() as {status:string}).status;
+    const payload=JSON.parse(Buffer.from(statusJwt.split('.')[1]!,'base64url').toString()) as {checkedAt:number,iat:number,exp:number,valid:boolean,nonce:string};
+    const seconds=Math.floor(clock/1000);
+    // 固定 30 秒安全边距：checkedAt≈iat≈now−30s±1s，iat 与 checkedAt 同一 shifted 基准。
+    expect(payload.checkedAt).toBeGreaterThanOrEqual(seconds-31);
+    expect(payload.checkedAt).toBeLessThanOrEqual(seconds-29);
+    expect(payload.iat).toBe(payload.checkedAt);
+    // 窗口形状不变：exp−checkedAt=60。
+    expect(payload.exp-payload.checkedAt).toBe(60);
+    expect(payload).toMatchObject({valid:true,nonce:'synthetic-nonce-3002'});
+    // 产品侧等价断言（checkedAt<=seconds 且 iat<=seconds）在校验方时钟慢 5.5s 时通过；
+    // 修复前 checkedAt=iat=now 相对校验方显未来 5.5s，必拒（422 根因）。
+    const productSeconds=(clock-hostSkewMs)/1000;
+    expect(payload.checkedAt).toBeLessThanOrEqual(productSeconds);
+    expect(payload.iat).toBeLessThanOrEqual(productSeconds);
+    expect(verifyCompanyProof(statusJwt,signer.trust(),'status',clock-hostSkewMs)).toMatchObject({valid:true,nonce:'synthetic-nonce-3002'});
+    // 边距不放大票据寿命：同形状（iat===checkedAt）但过旧 61 秒的状态仍被拒。
+    const stale=signer.sign('status',{jti:claims.jti,valid:true,version:1,approvalVersion:null,checkedAt:seconds-61,iat:seconds-61,exp:seconds-1,nonce:'synthetic-nonce-3003'});
+    expect(()=>verifyCompanyProof(stale,signer.trust(),'status',clock)).toThrow();
+  }finally{await rm(home,{recursive:true,force:true});}
+});
