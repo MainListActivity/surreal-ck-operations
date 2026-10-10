@@ -1137,7 +1137,15 @@ export class SurrealCompanyCore implements CompanyCore {
       if (replayed) return replayed;
       throw error;
     }
-    return view(row);
+    const task = view(row);
+    // Same event point as accept/return/release: a retire (void) is terminal, so its scene refs
+    // release and an exclusive tree with no other effective refs dies here together with its
+    // Paseo scene. Never block the retire itself on reclaim; durable audit and later event
+    // points or sweeps retry any failure.
+    if (task.worktree && this.worktrees) {
+      await this.worktrees.reclaimEvent(task.worktree.id, 'retire').catch(() => undefined);
+    }
+    return task;
   }
 
   /**

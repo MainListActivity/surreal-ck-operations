@@ -2,6 +2,7 @@ import { join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../config';
 import { SurrealCompanyCore } from '../core';
+import { createPaseoCli, createSceneCleaner } from '../dispatcher/paseo';
 import { CompanyDatabase } from '../database';
 import { Workforce } from '../workforce';
 import { readPrivateCredential } from './credential-file';
@@ -36,6 +37,11 @@ try {
   const core = new SurrealCompanyCore(db, { workforce, worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       strategy: process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared',
+      // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
+      // through this MCP process must tear the Paseo side down together with the git tree instead
+      // of leaving workspaces/projects behind. createSceneCleaner is idempotent, matching the
+      // plugin's semantics.
+      sceneCleaner: createSceneCleaner(createPaseoCli()),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
         ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
       reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'
