@@ -14,7 +14,7 @@
 
 1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
 2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
-   代码任务：在任务专属分支 `task/<任务ID前8位>` 的独立 worktree 里工作；checkpoint 前先把改动提交到该分支，并在 checkpoint 里写分支名和 worktree 路径。
+   工作目录以 `claim.json.worktree` 的持久登记为准（path/mode/branch/intent/discipline），员工不自行新建 worktree。物理 shared 树可供串行任务复用；工程每项仍用 `task/<任务ID前8位>` 分支与独立 PR，第二个并行代码写手由调度通道分配 exclusive，保留第一写手现场。活动引用期间员工不得 checkout/reset/pull；只有取得 `intent.kind=code` 写权的工程员工可在登记 task 分支 commit/push，checkpoint 前先提交，证据写分支与登记路径。读任务只读代码；内容写入须由派工显式授予 `assets` 相对目录，重叠目录排队、互不重叠可共用，不能自行扩大写权。附件始终写 `evidenceDir`。
 3. **交接**（本轮只做一项，做完即结束本轮）：
    - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
    - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
@@ -105,7 +105,7 @@ G3 交给老板时交付已经上线：写清入口链接和验收步骤，不�
 
 - 任务在你被叫醒前已由通道领取；租约证明（`deliveryId`、`fence`、`expectedVersion`）由通道代持并在每次写入时自动注入。
 - 你的会话在运行时，通道自动续租；会话归档、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
-- 任务 `done` 后，调度器每 10 分钟清理该任务的 git worktree（分支 `task/<id8>`）：有未提交或未跟踪改动时 git 会拒绝，就保留并记录。所以要保留的东西请先提交并推送分支；分支本身不删除（已合并的除外）。
+- WT01 持久登记与分配启用后，旧的按 `task/<id8>` 删除物理 worktree 定时清理停止注入；本链不启用新的删除策略。main、旧常驻插件、active/回滚 release 与未登记旧树受保护；活动引用、交接现场、dirty、缺失/branch 漂移均可通过 `list_worktrees {"taskId":"..."}` 查原因（GM 可全局查询）。提交/验收/阻塞/撤销后的引用有效性直接按任务服务租约与状态对账，旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支；清理策略另行批准。
 - 你被收回的租约立即失效：之后旧 `deliveryId` 的写入都会被拒绝。
 - 任务完成后进入绩效评审：默认由 **Jev**（TypeSafe System One 决策模型）在调度器进程内一次调用完成——按审计时间线给每位参与员工打五个维度的校准分并写入 `scorecard`，任务标记 `evaluated_at`。Jev 未配置、连续失败或置信度不足时，调度器改派 `eval` 岗位的 LLM 评审员接手。分数滚动更新员工定义的 `avg_score`，直接影响同类员工接到任务的概率。
 

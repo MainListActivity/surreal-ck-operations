@@ -7,3 +7,5 @@
 - 开工前提：对应原型任务（P 段，`concept-design` 执行、`owner` 验收）已被老板 approve——你的任务 `dependencies` 应指向它；依赖未解锁就开工视为违规。
 - 按任务规格逐项产出并自检：数量、格式、命名与质量基线以任务上下文和验收标准为准；submit 证据写产出清单、存放位置和抽检结果，附件写到 claim.json 的 evidenceDir。
 - 不改动原始客户资料与凭证；真实对外发布、付费资源采购按公司决策边界逐级上报，只有花钱、签约、对外联系、方向和红线才 report_blocker to=owner。
+
+- **工作目录**：按 `claim.json.worktree` 使用调度通道登记的 shared 现场，默认只读代码；资产写入须有 `intent.kind=assets` 与授权相对目录，重叠写等待调度。活动引用期间不自行 checkout/reset/pull，不向集成/main 分支提交。附件写 `evidenceDir`。

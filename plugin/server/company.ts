@@ -38,7 +38,6 @@ export function company(): Promise<Company> {
     const { SidecarPool } = await import("./sidecar.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli } = await import("./vendor/src/dispatcher/paseo.ts");
-    const { createGitCli } = await import("./vendor/src/dispatcher/worktrees.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
 
     const db = new CompanyDatabase(loadDatabaseConfig());
@@ -46,7 +45,10 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
-    const core = new SurrealCompanyCore(db);
+    const core = new SurrealCompanyCore(db, { worktrees: {
+      opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
+      strategy: process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared',
+    } });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
@@ -70,7 +72,8 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
-      git: createGitCli(),
+      // WT01 preserves all registered/legacy scenes. Cleanup resumes only with a separately approved policy.
+      // No git sweeper is injected while managed allocation is enabled.
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: async () => {

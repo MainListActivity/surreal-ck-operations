@@ -81,3 +81,21 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 ## QA 对接
 
 按 [#26 B01—B12](./qa/mcp-company-acceptance.md) 独立执行，尤其 B09 重启持久化、B11 非目标库与日志、B12 两位真实员工。#29 的 SDK/Bun 探针属于前期资料，#25 的合成三 token 联调也不等于 B12。QA 应记录本集成提交、`pnpm-lock.yaml` 哈希、URL、目标库、进程状态和脱敏日志路径。当前核心与 adapter 的准确 DTO、错误码、工具参数参见 `src/contracts.ts`、`src/mcp/server.ts` 和 [adapter 文档](./mcp-adapter.md)；本说明不修改已冻结的业务权限与租约语义。
+
+
+## WT01 登记、分配与上线验证
+
+物理工作目录以任务服务的 `worktree` 登记为准，任务分支与物理树分开：每仓一个 shared（QA/经理/产品/CS/内容默认只读），串行工程在无活动引用且干净时复用它、每项独立 `task/<id8>` 分支/PR；已有引用或 dirty 时新代码写手用 exclusive，原现场不切分支。内容写任务由管理方在 `create_task.workIntent` 显式授予 `{kind:"assets",paths:["assets/characters"]}`；重叠目录排队（大小写保守视为相同），互不重叠可共用，路径穿越/凭证目录/符号链接目录拒绝。GM/eval 无租约唤醒用 `workspace.json` 的 shared 只读登记与会话引用。附件保持 `evidenceDir`。
+
+仓库身份由 realpath + git common-dir 确定，未绑定 project 使用 `SCK_AGENT_CWD` 的规范仓库身份。MCP 与插件共同使用 Git common-dir 下的 `sck-worktree-allocation.lock`，由系统 `/usr/bin/python3` 的 kernel flock 持有（进程退出释放）；机器已有 Python，不安装全局工具。领取事务同时更新 task assignment、worktree_ref、employee active_task 和租约，失败不会落有效引用；网络丢响应重复 claim 保留 fence/路径。Git 树先登记，异常中断后未知树受保护，已存在的 task 分支现场就地接管，不 reset。引用有效性实时由任务 current_employee/delivery/fence/状态对账；撤销交接与被阻塞的写现场继续保护。main、常驻插件、active/回滚 release 均登记 protected。WT01 停止在生产注入旧按任务分支删除物理树的 sweeper，**不启用新的删除策略**，`deletable=false` 及 reasons 可查询。
+
+查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；GM 可不传 taskId 查询全局。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间及保护原因；不含凭证。branch 漂移或丢失只报告，不自动修复。
+
+本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 操作手册](./qa/worktree-allocation.md)：
+
+1. 记录 MCP active release 提交、插件分支提交、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
+2. 按上文双面流程切 fixed release、同步 `/Users/y/IdeaProjects/surreal-ck-operations-v3/plugin` 的受控源码与 vendor/schema，reload **现有** `sck-company`；保留插件在途提交，不另起 dispatcher。
+3. 验证 MCP `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复；记录两面实际提交/时间。经理安排真实串行 QA/工程及并行代码写手演练，QA 用普通通道读登记，不取得凭证、不自行建员工。证据含任务 ID、实际路径/branch、audit ID/时间、登记/有效引用 before/after，区分本地与生产。
+4. 分配策略需要回退时，两面同时设置 `SCK_WORKTREE_STRATEGY=legacy`（只对后续新分配恢复独占，已有 assignment 优先），restart MCP + reload 现有插件。保留 schema 011、登记与在办现场，不运行旧清理、不降级到不认识 worktree 的旧 core。两面代码回滚也须保留 WT01 登记兼容版本。
+
+新业务环境变量：无。可选策略开关仅用于受控回退；系统 Python 和现有 Git 是本机准备项。

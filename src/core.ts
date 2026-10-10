@@ -8,6 +8,8 @@ import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
+import type { WorkIntent, WorktreeAssignment, WorktreeView } from './contracts.ts';
 export { CompanyError };
 
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs', 'eval'];
@@ -101,6 +103,8 @@ interface TaskRow {
   jev_release_version?: number;
   jev_route_version?: number;
   owner_rerouted?: boolean;
+  work_intent?: WorkIntent;
+  worktree?: WorktreeAssignment;
   repo_path?: string;
   goal_tier?: string;
 }
@@ -122,6 +126,7 @@ export function view(row: TaskRow): TaskView {
     blockedTo: row.blocked_to,
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
+    workIntent: row.work_intent, worktree: row.worktree,
   };
 }
 
@@ -142,7 +147,7 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; worktrees?: RegistryOptions }) {
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
@@ -151,7 +156,9 @@ export class SurrealCompanyCore implements CompanyCore {
     this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
+    this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
   }
+  readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
   private readonly projects: ProjectStore;
   private get db() { return this.database.db; }
@@ -271,6 +278,8 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.executorRole === 'eval' || input.reviewerRole === 'eval') {
       throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
     }
+    validateIntent(input.workIntent);
+    if (input.workIntent?.kind === 'code' && input.executorRole !== 'engineering') throw new CompanyError('invalid', 'Code writes require engineering');
     const kind = input.kind ?? 'task';
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
@@ -287,7 +296,7 @@ export class SurrealCompanyCore implements CompanyCore {
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
-      discipline: input.discipline,
+      discipline: input.discipline, work_intent: input.workIntent,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -300,7 +309,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dependencies AND state != 'done';
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          discipline: $discipline,
+          discipline: $discipline, work_intent: $work_intent,
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
@@ -323,6 +332,58 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async claim(credential: Credential, taskId: TaskId): Promise<ClaimResult> {
     const actor = await this.authorized(credential);
+    if (!this.worktrees) return this.claimLease(actor, taskId);
+    const task = await this.getTask(credential, taskId);
+    const reviewing = task.state === 'review';
+    if (!['ready', 'doing', 'review'].includes(task.state) ||
+        !actor.capabilities.includes(reviewing ? 'review' : 'execute') ||
+        actor.role !== (reviewing ? task.reviewerRole : task.executorRole) ||
+        (reviewing && task.submittedBy === actor.employeeId) ||
+        (task.discipline && actor.tracks?.length && !actor.tracks.includes(task.discipline))) {
+      throw new CompanyError('forbidden', 'Task claim denied');
+    }
+    const project = await this.taskProject(taskId);
+    return this.worktrees.locked(project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
+      // Re-read under the cross-process repo lock: the first allocation may have completed while waiting.
+      const fresh = await this.getTask(credential, taskId);
+      if (fresh.currentEmployee && fresh.currentEmployee !== actor.employeeId) throw new CompanyError('already_claimed', 'Task scene still held; dispatcher must revoke first');
+      const holder = await this.db.select<EmployeeRow>(id('employee', actor.employeeId));
+      if (holder?.active_task && asId(holder.active_task) !== taskId) {
+        const active = await this.db.select<TaskRow>(holder.active_task);
+        if (active?.current_employee === actor.employeeId) throw new CompanyError('already_claimed', 'Employee still holds another task');
+      }
+      const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, project);
+      return this.claimLease(actor, taskId, worktree);
+    });
+  }
+
+  async readWorkspace(credential: Credential, taskId?: TaskId): Promise<WorktreeAssignment | undefined> {
+    const actor = await this.authorized(credential);
+    if (!['gm', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires gm/eval');
+    if (!this.worktrees) return undefined;
+    if (taskId) await this.getTask(credential, taskId);
+    const project = taskId ? await this.taskProject(taskId) : undefined;
+    return this.worktrees.readWorkspace(project?.repoPath ?? this.worktrees.options.opsRepo, actor);
+  }
+  async releaseWorkspace(credential: Credential): Promise<void> {
+    const actor = await this.authorized(credential);
+    await this.worktrees?.releaseWorkspace(actor.employeeId);
+  }
+
+  async listWorktrees(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]> {
+    const actor = await this.authorized(credential);
+    if (!this.worktrees) return [];
+    if (!taskId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+    if (taskId) {
+      await this.getTask(credential, taskId);
+      const project = await this.taskProject(taskId);
+      const { repo } = await this.worktrees.identity(project?.repoPath ?? this.worktrees.options.opsRepo);
+      return this.worktrees.inventory(repo);
+    }
+    return this.worktrees.inventory();
+  }
+
+  private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
     const row = await this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
@@ -350,11 +411,17 @@ export class SurrealCompanyCore implements CompanyCore {
         lease_expires_at = $now + $lease_seconds,
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
-        version = IF $same THEN $t.version ELSE $t.version + 1 END
+        version = IF $same THEN $t.version ELSE $t.version + 1 END,
+        worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END
         RETURN AFTER;
-      UPDATE ONLY $actor SET active_task = $task;
+      UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false;
+      IF $assignment != NONE {
+        UPDATE ONLY $tree SET last_used_at = time::now();
+        UPSERT ONLY $reference CONTENT { task: $task, tree: $tree, employee: $employee,
+          delivery: $next.delivery_id, fence: $next.fence, intent: $assignment.intent, at: time::now() };
+      };
       IF !$same {
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now() };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
@@ -362,6 +429,7 @@ export class SurrealCompanyCore implements CompanyCore {
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
+      assignment: worktree, tree: worktree ? id('worktree', worktree.id) : undefined, reference: id('worktree_ref', taskId),
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     });
     const taskView = view(row);
@@ -369,7 +437,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
       predecessors: await this.predecessors(taskId, actor.employeeId),
-      project };
+      project, worktree: taskView.worktree };
   }
 
   /**
