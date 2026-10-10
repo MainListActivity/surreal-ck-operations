@@ -16,7 +16,7 @@ interface Row { id: RecordId; repo: string; project?: string; path: string; mode
   branch?: string; protection?: string; created_at: unknown; last_used_at: unknown }
 interface Ref { task?: RecordId; session_active?: boolean; employee: string; delivery: string; fence: number; intent: WorkIntent;
   at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string;
-  assigned_tree?: string; handover?: boolean; resume_state?: string }
+  assigned_tree?: string; current_fence?: number; handover?: boolean; resume_state?: string }
 
 /** No shell, no credential files, and bounded git processes. */
 async function git(repo: string, args: string[]): Promise<string> {
@@ -78,7 +78,7 @@ const overlap = (a: string, b: string) => {
 };
 const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
   if (r.session_active) return 'active';
-  if (r.current === r.employee && r.current_delivery === r.delivery) return 'active';
+  if (r.current === r.employee && r.current_delivery === r.delivery && r.current_fence === r.fence && r.assigned_tree === String(r.tree.id)) return 'active';
   if (!r.current && r.intent.kind !== 'read' && (r.task_state === 'doing' || (r.task_state === 'ready' && r.handover) || (r.task_state === 'blocked' && r.resume_state === 'doing')) && r.assigned_tree === String(r.tree.id)) return 'recovery';
   return 'released';
 };
@@ -101,7 +101,7 @@ export class WorktreeRegistry {
   }
   private async refs(repo?: string): Promise<Ref[]> {
     const [refs] = await this.db.query<[Ref[]]>(`SELECT *, task.current_employee AS current, task.delivery_id AS current_delivery,
-      task.state AS task_state, task.worktree.id AS assigned_tree, task.handover AS handover,
+      task.state AS task_state, task.fence AS current_fence, task.worktree.id AS assigned_tree, task.handover AS handover,
       task.resume_state AS resume_state FROM worktree_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
     const [sessions] = await this.db.query<[Array<Ref & { retired?: boolean; enabled?: boolean }>]>(`SELECT *,
       holder.retired AS retired, holder.workspace_read_active AS enabled FROM worktree_session_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
@@ -127,7 +127,9 @@ export class WorktreeRegistry {
     const live = refs.filter(r => refState(r) !== 'released' && String(r.task?.id) !== task.id);
     const rows = await this.rows(repo);
     const previous = task.worktree;
-    const base = project?.defaultBranch ?? list[0]!.branch ?? 'HEAD';
+    const defaultBranch = project?.defaultBranch ?? list[0]!.branch ?? 'HEAD';
+    let base = defaultBranch;
+    try { await git(repo, ['show-ref', '--verify', `refs/remotes/origin/${defaultBranch}`]); base = `origin/${defaultBranch}`; } catch {}
     const desired = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task') ? `task/${task.id.slice(0, 8)}` : undefined;
     const own = previous && rows.find(r => String(r.id.id) === previous.id);
     const legacy = list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);

@@ -11,10 +11,10 @@ test('kernel repo lock serializes independent allocations and releases on failed
   let release!: () => void; const held = new Promise<void>(done => { release = done; });
   try {
     const a = withRepoLock(dir, async () => { order.push('a'); enter(); await held; throw new Error('synthetic allocation failure'); });
-    const failed = expect(a).rejects.toThrow('synthetic allocation failure');
+    const failed = a.catch((error: Error) => error);
     await entered;
     const b = withRepoLock(dir, async () => { order.push('b'); });
-    await Bun.sleep(50); expect(order).toEqual(['a']); release(); await failed; await b;
+    await Bun.sleep(50); expect(order).toEqual(['a']); release(); expect((await failed as Error).message).toBe('synthetic allocation failure'); await b;
     expect(order).toEqual(['a', 'b']);
     await withRepoLock(dir, async () => { order.push('retry'); }); expect(order).toEqual(['a', 'b', 'retry']);
   } finally { rmSync(dir, { recursive: true, force: true }); }

@@ -226,3 +226,13 @@ run('retry after git-created read tree lost initial registration reuses scene wi
   expect((await core.listWorktrees(gm)).find(w => w.id === b.worktree!.id)!.references.filter(r => r.state === 'active')).toHaveLength(1);
   await submit(core, qa, b);
 });
+
+run('new task branches start from available origin default branch rather than a stale shared checkout', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering');
+  git(path, 'checkout', '-b', 'approved-baseline'); writeFileSync(join(path, 'source.txt'), 'approved remote baseline');
+  git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'approved baseline');
+  git(path, 'update-ref', 'refs/remotes/origin/main', 'HEAD'); git(path, 'checkout', 'main');
+  const a = await core.claim(eng, (await task(core, 'engineering')).id);
+  expect(readFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('approved remote baseline');
+  expect(git(path, 'show', 'main:source.txt')).toBe('baseline'); await submit(core, eng, a);
+});
