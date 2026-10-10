@@ -1,0 +1,284 @@
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RecordId } from 'surrealdb';
+import { CompanyDatabase } from '../src/database.ts';
+import { asId, SurrealCompanyCore } from '../src/core.ts';
+import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { ProjectStore } from '../src/projects.ts';
+import { Workforce } from '../src/workforce.ts';
+import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
+
+setDefaultTimeout(60000);
+// Isolated local control-plane: spawns the company SurrealDB fork (~/.surrealdb/surreal) on a
+// private RocksDB store plus throwaway git repos. No production data, no credentials, no dispatcher.
+const run = process.env.RUN_SCK_TASK_PROJECT_TESTS === '1' ? test : test.skip;
+let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase;
+let gm: string, eng: string, eng2: string, eng3: string, product: string, count = 0;
+let repoOps: string, repoMlc: string, repoAnime: string;
+
+const config = () => ({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'task_project_fixture', database: 'control_plane' });
+
+beforeAll(async () => {
+  if (process.env.RUN_SCK_TASK_PROJECT_TESTS !== '1') return;
+  dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-task-project-')));
+  const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  port = listener.port!; listener.stop(true);
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root',
+    '--pass', 'fixture-only', '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
+  db = new CompanyDatabase(config());
+  await db.connect(); await db.bootstrap();
+
+  const git = (repo: string, ...args: string[]) => {
+    const r = Bun.spawnSync(['git', '-C', repo, ...args], { stdout: 'pipe', stderr: 'pipe' });
+    if (r.exitCode) throw new Error(r.stderr.toString());
+    return r.stdout.toString().trim();
+  };
+  const repo = (name: string) => {
+    const path = join(dir, name);
+    Bun.spawnSync(['git', 'init', '-q', '-b', 'main', path]);
+    writeFileSync(join(path, 'README.md'), 'fixture baseline');
+    git(path, 'add', '.');
+    git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline');
+    return path;
+  };
+  repoOps = repo('operations');
+  repoMlc = repo('maplayer-content');
+  repoAnime = repo('anime-repo');
+
+  const enrollment = new LocalEnrollmentAdmin(db);
+  gm = await enrollment.enroll('tp-gm', 'gm', ['execute', 'review', 'manage']);
+  eng = await enrollment.enroll('tp-eng', 'engineering', ['execute', 'review']);
+  eng2 = await enrollment.enroll('tp-eng2', 'engineering', ['execute', 'review']);
+  eng3 = await enrollment.enroll('tp-eng3', 'engineering', ['execute', 'review']);
+  product = await enrollment.enroll('tp-product', 'product', ['execute', 'review', 'manage']);
+
+  const projects = new ProjectStore(db.db);
+  await projects.upsert({ id: 'maplayer-content', name: 'MapLayer 内容仓', repoPath: repoMlc, release: '合入 main 后 CI 自动发布', rollback: '重发上一提交', redLines: [], envs: [] });
+  await projects.upsert({ id: 'anime', name: '动漫产线', repoPath: repoAnime, release: 'manual', envs: [] });
+}, 30000);
+
+afterAll(async () => {
+  if (!dir) return;
+  await db.close(); server.kill(); await server.exited;
+  rmSync(dir, { recursive: true, force: true });
+});
+
+const core = () => new SurrealCompanyCore(db, { worktrees: { opsRepo: repoOps } });
+const workforce = () => new Workforce(db, join(dir, 'unused-creds'));
+
+let c = 0;
+const key = () => `tp-${++c}-${crypto.randomUUID().slice(0, 8)}`;
+const proof = (claim: ClaimResult): LeaseProof =>
+  ({ taskId: claim.task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: claim.task.version });
+
+/** 无 project 目标：任务仅挂 goal，无单任务覆盖。 */
+async function taskOnNoProjectGoal(core: SurrealCompanyCore) {
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '跨仓库交付解堵', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  return core.createTask(gm, { title: `受控改绑 fixture ${++count}`, context: 'Isolated fixture task for project rebinding tests', executorRole: 'engineering', reviewerRole: 'engineering', goalId: asId(grows[0]!.id), idempotencyKey: key() });
+}
+/** goal 本身挂 anime 项目：用于「单任务覆盖不影响同目标其它任务」。 */
+async function animeGoal() {
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'anime 目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:anime, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  return asId(grows[0]!.id);
+}
+async function taskOnGoal(core: SurrealCompanyCore, goalId: string) {
+  return core.createTask(gm, { title: `anime 目标内任务 ${++count}`, context: 'Isolated fixture task under a project-carrying goal', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+}
+const blockByGm = async (core: SurrealCompanyCore, taskId: string, worker = eng) => {
+  const claim = await core.claim(worker, taskId);
+  const checkpointed = await core.checkpoint(worker, proof(claim), { text: 'fixture progress before blocking for rebind', idempotencyKey: key() });
+  const current = { taskId, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: checkpointed.version };
+  return core.block(worker, current, 'gm', { text: 'fixture: 工作区错配阻塞，等待经理改绑', idempotencyKey: key() });
+};
+/** 当前任务版本：负例断言 forbidden 的前提是先过版本门禁。 */
+const versionOf = async (core: SurrealCompanyCore, taskId: string) => (await core.getTask(gm, taskId)).version;
+const auditRows = async (taskId: string, action: string) => {
+  const [rows] = await db.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM audit WHERE task = $task AND action = $action;', { task: new RecordId('task', taskId), action });
+  return rows;
+};
+const taskRow = async (taskId: string) => {
+  const [rows] = await db.db.query<[Array<Record<string, unknown>>]>('SELECT * FROM $task;', { task: new RecordId('task', taskId) });
+  return rows[0]!;
+};
+const overlayOf = async (taskId: string) => {
+  const row = await taskRow(taskId);
+  const overlay = row['project'] as RecordId | undefined;
+  return overlay ? String(overlay.id) : undefined;
+};
+/** 直接构造 blocked+活租约的异常态（正常 block 流程会清租约；防御门禁需要该形态）。 */
+const forgeActiveLease = async (taskId: string, employee: string) => {
+  await db.db.query("UPDATE ONLY $task SET state = 'blocked', current_employee = $emp, delivery_id = 'forged', lease_expires_at = time::unix(time::now()) + 600;",
+    { task: new RecordId('task', taskId), emp: employee });
+};
+
+run('rebind routes claim workspace, claim.json project, inventory and supervisor repoPath to maplayer-content', async () => {
+  const C = core(), wf = workforce();
+  const t = await taskOnNoProjectGoal(C);
+  await blockByGm(C, t.id);
+  expect(await overlayOf(t.id)).toBeUndefined(); // 改绑前无覆盖
+
+  const rebound = await C.taskProjectUpdate(gm, { taskId: t.id, project: 'maplayer-content', expectedVersion: await versionOf(C, t.id), text: '经理裁定：该任务属于 maplayer-content 仓', idempotencyKey: key() });
+  expect(rebound.projectOverlay).toBe('maplayer-content');
+  expect(rebound.state).toBe('blocked');
+  expect(rebound.worktree).toBeUndefined(); // 旧 assignment 已清
+
+  // 改绑后经理 resume，任务按新项目路由重新进入派发。
+  await C.resume(gm, t.id, { text: 'fixture resume after rebind to the target project', idempotencyKey: key() });
+  const claim = await C.claim(eng, t.id);
+  expect(claim.project?.id).toBe('maplayer-content'); // claim.json.project 的来源（sidecar 原样序列化 ClaimResult）
+  expect(claim.worktree!.repo).toBe(repoMlc);
+  expect(existsSync(claim.worktree!.worktreePath)).toBe(true);
+  expect(claim.worktree!.branch).toBe(`task/${t.id.slice(0, 8)}`); // 后续合法 claim 重新分配目标仓任务分支
+  // listWorktrees（core 工作区清单）按新项目仓解析。
+  const inventory = await C.listWorktrees(gm, t.id);
+  expect(inventory.find(w => w.references.some(r => r.taskId === t.id && r.state === 'active'))!.repo).toBe(repoMlc);
+  // 监督器 repoPath（dispatcher home/名额/cwd 的单一来源）指向 maplayer-content。
+  const supervised = (await wf.tasks()).find(x => x.id === t.id)!;
+  expect(supervised.repoPath).toBe(repoMlc);
+  // 审计落行。
+  expect(await auditRows(t.id, 'task_project_update')).toHaveLength(1);
+  await C.submit(eng, proof(claim), { text: 'fixture delivery after rebind to maplayer-content', idempotencyKey: key() });
+});
+
+run('without an override a no-project goal task still routes to the operations repo', async () => {
+  const C = core(), wf = workforce();
+  const t = await taskOnNoProjectGoal(C);
+  const claim = await C.claim(eng, t.id);
+  expect(claim.project).toBeUndefined();
+  expect(claim.worktree!.repo).toBe(realpathSync(repoOps));
+  const supervised = (await wf.tasks()).find(x => x.id === t.id)!;
+  expect(supervised.repoPath).toBeUndefined(); // dispatcher 回退 opsRepo home
+  await C.submit(eng, proof(claim), { text: 'fixture delivery without any project override', idempotencyKey: key() });
+});
+
+run('a per-task override does not touch sibling tasks of the same goal', async () => {
+  const C = core(), wf = workforce();
+  const goalId = await animeGoal();
+  const first = await taskOnGoal(C, goalId);
+  const second = await taskOnGoal(C, goalId);
+  expect(first.goalId).toBe(goalId);
+  expect(second.goalId).toBe(goalId);
+  await blockByGm(C, second.id);
+  const rebound = await C.taskProjectUpdate(gm, { taskId: second.id, project: 'maplayer-content', expectedVersion: 4, text: '仅该任务改绑，同目标其它任务不受影响', idempotencyKey: key() });
+  expect(rebound.projectOverlay).toBe('maplayer-content');
+  const [sFirst, sSecond] = await Promise.all([
+    (await wf.tasks()).find(x => x.id === first.id)!,
+    (await wf.tasks()).find(x => x.id === second.id)!,
+  ]);
+  expect(sFirst.repoPath).toBe(repoAnime); // goal 级路由保持
+  expect(sSecond.repoPath).toBe(realpathSync(repoMlc));
+});
+
+run('create_delivery persists one project override across all three legs', async () => {
+  const C = core();
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '三腿同项目', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const withProject = await C.createDelivery(gm, { goalId: asId(grows[0]!.id), title: '改绑能力交付', spec: '实现受控改绑工具并在测试中验证三腿同项目与负例拒绝。', project: 'maplayer-content', idempotencyKey: key() });
+  expect(withProject).toHaveLength(3);
+  expect(withProject.map(t => t.projectOverlay)).toEqual(['maplayer-content', 'maplayer-content', 'maplayer-content']);
+  const without = await C.createDelivery(gm, { goalId: asId(grows[0]!.id), title: '默认路由交付', spec: '不带覆盖参数的交付链保持原有 goal.project 路由行为。', idempotencyKey: key() });
+  expect(without.map(t => t.projectOverlay)).toEqual([undefined, undefined, undefined]);
+});
+
+run('permission, state, lease, version-race, unknown-project and idempotency negatives all reject', async () => {
+  const C = core();
+  // 权限：engineering 与 product（有 manage 能力但非 gm）都拒绝。
+  const t = await taskOnNoProjectGoal(C);
+  await blockByGm(C, t.id);
+  const blockedVersion = await versionOf(C, t.id);
+  await expect(C.taskProjectUpdate(eng, { taskId: t.id, project: 'maplayer-content', expectedVersion: blockedVersion, text: '工程师尝试改绑必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(C.taskProjectUpdate(product, { taskId: t.id, project: 'maplayer-content', expectedVersion: blockedVersion, text: 'product 尝试改绑必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 项目不存在显式拒绝。
+  await expect(C.taskProjectUpdate(gm, { taskId: t.id, project: 'no-such-project', expectedVersion: blockedVersion, text: '未登记项目必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'not_found' });
+
+  // 幂等：同 key 同参重放返回同一结果，不重复审计；同 key 不同参冲突。
+  const idem = key();
+  const first = await C.taskProjectUpdate(gm, { taskId: t.id, project: 'maplayer-content', expectedVersion: blockedVersion, text: '幂等重放探测', idempotencyKey: idem });
+  const replayed = await C.taskProjectUpdate(gm, { taskId: t.id, project: 'maplayer-content', expectedVersion: blockedVersion, text: '幂等重放探测', idempotencyKey: idem });
+  expect(replayed.version).toBe(first.version);
+  expect(await auditRows(t.id, 'task_project_update')).toHaveLength(1);
+  await expect(C.taskProjectUpdate(gm, { taskId: t.id, project: 'anime', expectedVersion: blockedVersion, text: '幂等重放探测', idempotencyKey: idem })).rejects.toMatchObject({ code: 'conflict' });
+
+  // 版本竞态：改绑把版本推进一步后，用过期 expectedVersion 再改绑必须冲突。
+  await expect(C.taskProjectUpdate(gm, { taskId: t.id, project: 'anime', expectedVersion: first.version - 1, text: '版本竞态负例：版本已前进', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
+
+  // 状态负例：ready / doing / review / done。
+  const ready = await taskOnNoProjectGoal(C);
+  await expect(C.taskProjectUpdate(gm, { taskId: ready.id, project: 'maplayer-content', expectedVersion: await versionOf(C, ready.id), text: 'ready 任务必须先 block 才能改绑', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const doing = await taskOnNoProjectGoal(C);
+  await C.claim(eng3, doing.id); // 独立员工：doing 租约不再泄漏到后续负例的领取者
+  await expect(C.taskProjectUpdate(gm, { taskId: doing.id, project: 'maplayer-content', expectedVersion: await versionOf(C, doing.id), text: 'doing 任务持有租约必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const review = await taskOnNoProjectGoal(C);
+  const rc = await C.claim(eng2, review.id);
+  await C.submit(eng2, proof(rc), { text: 'fixture submission to reach review state', idempotencyKey: key() });
+  await expect(C.taskProjectUpdate(gm, { taskId: review.id, project: 'maplayer-content', expectedVersion: await versionOf(C, review.id), text: 'review 任务必须拒绝改绑', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const done = await taskOnNoProjectGoal(C);
+  await blockByGm(C, done.id, eng2);
+  await C.resume(gm, done.id, { text: 'fixture resume to walk the task to done', idempotencyKey: key() });
+  const dc = await C.claim(eng2, done.id);
+  await C.submit(eng2, proof(dc), { text: 'fixture submission for done path', idempotencyKey: key() });
+  const reviewerClaim = await C.claim(eng, done.id);
+  await C.accept(eng, proof(reviewerClaim), { text: 'fixture independent accept for done path', idempotencyKey: key() });
+  await expect(C.taskProjectUpdate(gm, { taskId: done.id, project: 'maplayer-content', expectedVersion: await versionOf(C, done.id), text: 'done 任务必须拒绝改绑', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // owner 阻塞拒绝（改绑不能绕过 owner 关口）。
+  const owned = await taskOnNoProjectGoal(C);
+  const oc = await C.claim(eng2, owned.id);
+  await C.block(eng2, proof(oc), 'owner', { text: 'fixture owner-blocked task must not be rebindable', idempotencyKey: key() });
+  await expect(C.taskProjectUpdate(gm, { taskId: owned.id, project: 'maplayer-content', expectedVersion: await versionOf(C, owned.id), text: 'owner 阻塞任务必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 活租约拒绝（异常态防御：blocked 但租约未过期）。
+  const leased = await taskOnNoProjectGoal(C);
+  await blockByGm(C, leased.id, eng2);
+  await forgeActiveLease(leased.id, 'tp-eng2');
+  await expect(C.taskProjectUpdate(gm, { taskId: leased.id, project: 'maplayer-content', expectedVersion: await versionOf(C, leased.id), text: '活租约任务必须拒绝改绑', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 已提交成果拒绝：review 中被打断成 blocked 的任务保留 submitted_by。
+  const submitted = await taskOnNoProjectGoal(C);
+  const sc = await C.claim(eng2, submitted.id);
+  await C.submit(eng2, proof(sc), { text: 'fixture submission before reviewer block', idempotencyKey: key() });
+  const rv = await C.claim(eng, submitted.id);
+  await C.block(eng, proof(rv), 'gm', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
+  await expect(C.taskProjectUpdate(gm, { taskId: submitted.id, project: 'maplayer-content', expectedVersion: await versionOf(C, submitted.id), text: '已有提交成果的任务必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+});
+
+run('rebind releases the stale registered reference but never deletes the physical tree', async () => {
+  const C = core();
+  const t = await taskOnNoProjectGoal(C);
+  const claim = await C.claim(eng, t.id);
+  const treePath = claim.worktree!.worktreePath;
+  const before = await C.listWorktrees(gm);
+  expect(before.find(w => w.worktreePath === treePath)!.references.some(r => r.taskId === t.id && r.state === 'active')).toBe(true);
+  await C.block(eng, proof(claim), 'gm', { text: 'fixture: 错配仓库阻塞，等待改绑', idempotencyKey: key() });
+
+  await C.taskProjectUpdate(gm, { taskId: t.id, project: 'maplayer-content', expectedVersion: await versionOf(C, t.id), text: '改绑后旧登记引用按生命周期释放', idempotencyKey: key() });
+  const after = await C.listWorktrees(gm); // 全局清单：旧树挂在旧仓，任务级清单已按新项目解析
+  const oldTree = after.find(w => w.worktreePath === treePath)!;
+  expect(oldTree).toBeDefined();
+  expect(oldTree.references.filter(r => r.taskId === t.id).every(r => r.state === 'released')).toBe(true);
+  expect(existsSync(treePath)).toBe(true); // 物理树未被删除，交给既有 reclaim 生命周期
+  // 改绑后经理 resume，再在新项目仓重新领取：分配 maplayer-content 的任务分支，而不是复用旧仓现场。
+  await C.resume(gm, t.id, { text: 'fixture resume after rebind away from the wrong repo', idempotencyKey: key() });
+  const next = await C.claim(eng2, t.id);
+  expect(next.worktree!.repo).toBe(repoMlc);
+  expect(next.worktree!.worktreePath).not.toBe(treePath);
+  await C.submit(eng2, proof(next), { text: 'fixture delivery proves rebinding rerouted the workspace', idempotencyKey: key() });
+});
+
+run('ops project resolution follows the override for broker scope and audit quota counting', async () => {
+  const C = core();
+  // create_task 带覆盖：claim 后 opsScope 解析到 maplayer-content（ops_info/broker 环境随之切换）。
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: 'ops 解析', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const t = await C.createTask(gm, { title: `ops 解析 fixture ${++count}`, context: 'Isolated fixture for ops project resolution', executorRole: 'engineering', reviewerRole: 'engineering', goalId: asId(grows[0]!.id), project: 'maplayer-content', idempotencyKey: key() });
+  expect(t.projectOverlay).toBe('maplayer-content');
+  const claim = await C.claim(eng, t.id);
+  const scope = await C.opsScope(eng, t.id);
+  expect(scope.project).toBe('maplayer-content');
+  // 配额计数按任务解析项目（覆盖优先）归属，而不是 goal 的项目。
+  await C.auditOps(scope, 'ops_call', 'fixture read-only ops call');
+  expect(await C.opsCount('maplayer-content', 'ops_call', 3600)).toBeGreaterThanOrEqual(1);
+  expect(claim.project?.id).toBe('maplayer-content');
+});

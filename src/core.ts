@@ -121,6 +121,8 @@ interface TaskRow {
   resume_state?: TaskState;
   kind?: TaskKind;
   goal?: RecordId;
+  /** Task-level project override (registered project id); NONE falls back to goal.project routing. */
+  project?: RecordId;
   handover?: boolean;
   previous_employee?: string;
   progress_at?: number;
@@ -145,6 +147,7 @@ export function view(row: TaskRow): TaskView {
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,
     kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
+    projectOverlay: row.project ? asId(row.project) : undefined,
     dependencies: (row.dependencies ?? []).map(asId), version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
@@ -302,9 +305,14 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
     requireReviewer(input.reviewerRole);
+    if (input.project !== undefined) requireText(input.project, 'project', 1, 60);
+    // Registered projects only: a typo must fail loudly, not silently fall back to goal routing.
+    if (input.project !== undefined && !(await this.projects.get(input.project))) {
+      throw new CompanyError('not_found', `project ${input.project} not found`);
+    }
     if (input.discipline !== undefined) {
       requireText(input.discipline, 'discipline', 1, 60);
-      const vocab = await this.disciplineVocab(input.goalId);
+      const vocab = await this.disciplineVocab(input.goalId, input.project);
       if (vocab && !vocab.has(input.discipline)) {
         throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
       }
@@ -335,6 +343,7 @@ export class SurrealCompanyCore implements CompanyCore {
       title: input.title, context: input.context, executor: input.executorRole,
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
+      project: input.project ? id('project', input.project) : undefined,
       discipline: input.discipline, work_intent: input.workIntent,
     };
     try {
@@ -348,7 +357,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dependencies AND ${DEP_UNSATISFIED};
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          discipline: $discipline, work_intent: $work_intent,
+          discipline: $discipline, work_intent: $work_intent, project: $project,
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
@@ -508,10 +517,18 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * Discipline vocabulary of the goal's project: a Set of track names when the project
-   * defines a non-empty `disciplines` list, else undefined (free-form values allowed).
+   * Discipline vocabulary for validating a new task's track: the explicitly given project's
+   * vocabulary when the task carries a project override, else the goal's project's vocabulary
+   * (a Set of track names when the project defines a non-empty `disciplines` list, else
+   * undefined = free-form values allowed).
    */
-  private async disciplineVocab(goalId?: string): Promise<Set<string> | undefined> {
+  private async disciplineVocab(goalId?: string, projectId?: string): Promise<Set<string> | undefined> {
+    if (projectId) {
+      const [rows] = await this.db.query<[Array<{ disciplines?: Array<{ name?: string }> }>]>(
+        'SELECT disciplines AS disciplines FROM $project;', { project: id('project', projectId) });
+      const names = (rows[0]?.disciplines ?? []).map(d => d?.name).filter((n): n is string => typeof n === 'string' && n.length > 0);
+      return names.length ? new Set(names) : undefined;
+    }
     if (!goalId) return undefined;
     const [rows] = await this.db.query<[Array<{ disciplines?: Array<{ name?: string }> }>]>(
       'SELECT project.disciplines AS disciplines FROM $goal;', { goal: id('goal', goalId) });
@@ -519,10 +536,15 @@ export class SurrealCompanyCore implements CompanyCore {
     return names.length ? new Set(names) : undefined;
   }
 
+  /**
+   * Resolved project of a task: the task-level override when set (rebound or created with one),
+   * otherwise the goal's project. This is the single project-resolution point for claim
+   * workspaces, claim.json.project, worktree inventory and ops scoping.
+   */
   private async taskProject(taskId: TaskId): Promise<ProjectView | undefined> {
-    const [rows] = await this.db.query<[Array<{ project?: RecordId }>]>(
-      'SELECT goal.project AS project FROM $task;', { task: id('task', taskId) });
-    const project = rows[0]?.project;
+    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
+      'SELECT project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
+    const project = rows[0]?.project ?? rows[0]?.goal_project;
     return project ? this.projects.get(String(project.id)) : undefined;
   }
 
@@ -578,9 +600,10 @@ export class SurrealCompanyCore implements CompanyCore {
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 3, 160);
     requireText(input.spec, 'spec', 20, 20000);
+    if (input.project !== undefined) requireText(input.project, 'project', 1, 60);
     if (input.discipline !== undefined) {
       requireText(input.discipline, 'discipline', 1, 60);
-      const vocab = await this.disciplineVocab(input.goalId);
+      const vocab = await this.disciplineVocab(input.goalId, input.project);
       if (vocab && !vocab.has(input.discipline)) {
         throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
       }
@@ -591,6 +614,8 @@ export class SurrealCompanyCore implements CompanyCore {
     for (const [index, spec] of specs.entries()) {
       const task = await this.createTask(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
+        // Every leg persists the same project override so the chain stays on one project.
+        project: input.project,
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
         discipline: index === 0 ? input.discipline : undefined,
       });
@@ -651,16 +676,18 @@ export class SurrealCompanyCore implements CompanyCore {
   async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {
     const actor = await this.authorized(credential);
     requireText(taskId, 'task', 1, 200);
-    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId }>]>(
-      'SELECT current_employee, state, lease_expires_at, goal.project AS project FROM $task;', { task: id('task', taskId) });
+    const [rows] = await this.db.query<[Array<{ current_employee?: string; state: TaskState; lease_expires_at?: number; project?: RecordId; goal_project?: RecordId }>]>(
+      'SELECT current_employee, state, lease_expires_at, project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
     const task = rows[0];
     if (!task) throw new CompanyError('not_found', 'Task not found');
     if (task.current_employee !== actor.employeeId || !['doing', 'review'].includes(task.state) ||
       (task.lease_expires_at ?? 0) <= Date.now() / 1000) {
       throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
     }
-    if (!task.project) throw new CompanyError('invalid', 'Task goal has no project environment');
-    return { actor, taskId, project: String(task.project.id) };
+    // Task-level override wins, same resolution as claim/readWorkspace.
+    const project = task.project ?? task.goal_project;
+    if (!project) throw new CompanyError('invalid', 'Task goal has no project environment');
+    return { actor, taskId, project: String(project.id) };
   }
 
   async auditOps(scope: OpsScope, action: string, evidence: string): Promise<void> {
@@ -671,7 +698,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async opsCount(project: string, action: string, windowSeconds: number): Promise<number> {
     const [rows] = await this.db.query<[Array<{ n: number }>]>(
-      'SELECT count() AS n FROM audit WHERE action = $action AND at > time::now() - <duration>$window AND task.goal.project = $project GROUP ALL;',
+      'SELECT count() AS n FROM audit WHERE action = $action AND at > time::now() - <duration>$window AND (task.project ?? task.goal.project) = $project GROUP ALL;',
       { action, project: id('project', project), window: `${Math.max(1, Math.floor(windowSeconds))}s` });
     return rows[0]?.n ?? 0;
   }
@@ -901,6 +928,7 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
+  /**
    * gm only: re-point an execute-phase gm block at the dependency graph. The task keeps
    * state 'blocked' — it never re-enters the dispatcher's gm-attention loop or the work
    * queues — but `blocked_to` clears, which is exactly what UNLOCK_SQL needs to flip it
@@ -1095,6 +1123,60 @@ export class SurrealCompanyCore implements CompanyCore {
       throw error;
     }
     return view(row);
+  }
+
+  /**
+   * gm only: rebind a blocked task to a registered project (task-level override over goal.project).
+   * The controlled unblock path for tasks stuck on the wrong repo: version-guarded, idempotent,
+   * fully audited. Only stopped, un-leased, never-submitted blocked tasks qualify; owner-blocked
+   * tasks are refused so a rebind can never bypass an owner gate. The stale worktree assignment
+   * is cleared (worktree_ref turns 'released' through its own ref state logic — the physical
+   * tree is left for the normal reclaim lifecycle, never deleted here), and the next legitimate
+   * claim allocates a fresh task branch in the target repo.
+   */
+  async taskProjectUpdate(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may rebind task projects');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.project, 'project', 1, 60);
+    requireText(input.text, 'evidence', 4, 4000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    // Registered projects only; a typo must fail loudly instead of silently unbinding.
+    if (!(await this.projects.get(input.project))) throw new CompanyError('not_found', `project ${input.project} not found`);
+    const idem = this.idemId(actor.employeeId, 'task_project_update', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, project: input.project, expectedVersion: input.expectedVersion, text: input.text }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return replay;
+    try {
+      const row = await this.txTask(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE { THROW 'task not found' };
+        IF $t.version != $expected { THROW 'task changed' };
+        IF $t.state != 'blocked' { THROW 'rebind denied: only blocked tasks can be rebound' };
+        IF $t.blocked_to = 'owner' { THROW 'rebind denied: owner blocked task' };
+        IF $t.submitted_by != NONE { THROW 'rebind denied: task has submitted results' };
+        IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'rebind denied: active lease' };
+        LET $next = UPDATE ONLY $task SET
+          project = $project, worktree = NONE, current_employee = NONE, delivery_id = NONE,
+          lease_expires_at = NONE, handover = NONE, version = $t.version + 1 RETURN AFTER;
+        UPDATE employee SET active_task = NONE WHERE active_task = $task;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'task_project_update', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'task_project_updated', sequence: $sequence.value, payload: { project: $project_id, version: $next.version }, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+        RETURN $next;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), task: id('task', input.taskId),
+        project: id('project', input.project), project_id: input.project,
+        expected: input.expectedVersion, evidence: input.text,
+        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      });
+      return view(row);
+    } catch (error) {
+      const replayed = await this.replay(idem, digest);
+      if (replayed) return replayed;
+      throw error;
+    }
   }
 
   /**
