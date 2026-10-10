@@ -34,7 +34,9 @@ beforeAll(async () => {
 afterAll(async () => { if (!dir) return;
   if (process.env.SCK_WORKTREE_EVIDENCE) {
     const [counts] = await db.db.query<[Array<{ trees: number; refs: number; sessions: number }>]>(`RETURN { trees: array::len((SELECT id FROM worktree)), refs: array::len((SELECT id FROM worktree_ref)), sessions: array::len((SELECT id FROM worktree_session_ref)) };`);
-    writeFileSync(process.env.SCK_WORKTREE_EVIDENCE, JSON.stringify({ environment: 'isolated-local-company-fork', database: 'worktree_fixture/control_plane', production: false, before: { trees: 0, refs: 0, sessions: 0 }, after: counts, allocations: evidence }, null, 2));
+    const registry = await new SurrealCompanyCore(db, { worktrees: { opsRepo: dir } }).listWorktrees(gm);
+    const effectiveReferences = registry.flatMap(w => w.references).filter(r => r.state !== 'released').length;
+    writeFileSync(process.env.SCK_WORKTREE_EVIDENCE, JSON.stringify({ environment: 'isolated-local-company-fork', database: 'worktree_fixture/control_plane', production: false, before: { trees: 0, refs: 0, sessions: 0, effectiveReferences: 0 }, after: { ...counts, effectiveReferences }, registry, allocations: evidence }, null, 2));
   }
   await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
 const git = (repo: string, ...args: string[]) => {
