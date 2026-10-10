@@ -137,14 +137,19 @@ export class InternalAiProofBridge {
       audit.rowFound = !!row;
       if (!row) return new Response('unauthorized', {status: 401});
       const signer = await this.deps.signer(row.lease.project, row.files.manifest.env);
-      const checkedAt = Math.floor(this.now() / 1000);
+      // 状态 JWT 的时间声明带固定安全边距：签约宿主时钟可能快于校验方（本公司宿主曾快 ~5.5s，
+      // 产品对 checkedAt/iat 零正向容差），显式签旧 30 秒保证任何宿主漂移 ≤+30s 时都不显未来；
+      // 状态票据是请求级 nonce 绑定短票据，产品侧 60 秒新鲜窗仅等效缩为 ~30 秒，无语义损失。
+      const STATUS_CLOCK_MARGIN_MS = 30_000;
+      const issuedAt = this.now() - STATUS_CLOCK_MARGIN_MS;
+      const checkedAt = Math.floor(issuedAt / 1000);
       let valid = true;
       try { await this.valid(row, signer, row.identities_digest); } catch (e) { valid = false; audit.failReason = statusFailReason(e); }
       audit.valid = valid;
       const at = Math.floor(this.now() / 1000);
       audit.httpStatus = 200;
       audit.payloadSummary = { valid, version: row.version, approvalVersion: row.approval?.version ?? null };
-      return Response.json({ status: signer.sign('status', { jti: this.content(row).jti, valid, version: row.version, approvalVersion: row.approval?.version ?? null, checkedAt, iat: at, exp: Math.min(at + 60, checkedAt + 60), nonce }) }, { headers: { 'cache-control': 'no-store' } });
+      return Response.json({ status: signer.sign('status', { jti: this.content(row).jti, valid, version: row.version, approvalVersion: row.approval?.version ?? null, checkedAt, iat: checkedAt, exp: Math.min(at + 60, checkedAt + 60), nonce }) }, { headers: { 'cache-control': 'no-store' } });
     } catch { audit.httpStatus = 503; return new Response('status unavailable', {status: 503}); }
     finally { await this.statusAudit(audit); }
   }
