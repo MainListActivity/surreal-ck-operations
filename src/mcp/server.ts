@@ -180,11 +180,12 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : core.returnTask(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('create_task', {
-    description: 'Create a managed company task; requires core manage capability.',
+    description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project).',
     inputSchema: z.object({
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
+      project: z.string().min(1).max(60).optional(),
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
@@ -233,10 +234,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa).',
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
+      project: z.string().min(1).max(60).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
@@ -257,6 +259,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'Resume a blocked task; requires core manage capability.',
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
+
+  server.registerTool('task_project_update', {
+    description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
+    inputSchema: z.object({
+      taskId: z.string().min(1), project: z.string().min(1).max(60),
+      expectedVersion: z.number().int().positive(), ...evidenceShape,
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskProjectUpdate
+    ? core.taskProjectUpdate(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',

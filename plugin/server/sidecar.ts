@@ -24,6 +24,8 @@ const BASE_TOOLS = [
   "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
+  // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
+  "task_project_update",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -357,6 +359,9 @@ export class SidecarPool {
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, String(args.taskId), evidence());
+      case "task_project_update": return core.taskProjectUpdate
+        ? core.taskProjectUpdate(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);
