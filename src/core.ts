@@ -696,9 +696,31 @@ export class SurrealCompanyCore implements CompanyCore {
   }
   checkpoint(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'checkpoint', evidence); }
   submit(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'submit', evidence); }
-  accept(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'accept', evidence); }
+  async accept(credential: Credential, proof: LeaseProof, evidence: Evidence) {
+    const task = await this.transition(credential, proof, 'accept', evidence);
+    // Event-triggered reclaim: exclusive scenes without effective refs are removed under the repo lock.
+    // Failures stay in durable audit and the periodic sweep retries; never block accept on reclaim.
+    if (task.state === 'done' && this.worktrees) {
+      await this.worktrees.reclaimAfterTerminal(task, 'accept').catch(() => undefined);
+    }
+    return task;
+  }
   returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence) { return this.transition(credential, proof, 'return', evidence); }
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence) { return this.transition(credential, proof, 'block', evidence, to); }
+
+  /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
+  async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree reclaim requires gm');
+    if (!this.worktrees) return { scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+    return this.worktrees.reclaimAll({ trigger: input?.dryRun ? 'dry_run' : 'manual', dryRun: input?.dryRun, repos: input?.repos });
+  }
+
+  async listWorktreeAudits(credential: Credential, limit = 100) {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree audit query requires gm');
+    return this.worktrees?.listAudits(limit) ?? [];
+  }
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');

@@ -105,7 +105,7 @@ G3 交给老板时交付已经上线：写清入口链接和验收步骤，不�
 
 - 任务在你被叫醒前已由通道领取；租约证明（`deliveryId`、`fence`、`expectedVersion`）由通道代持并在每次写入时自动注入。
 - 你的会话在运行时，通道自动续租；会话归档、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
-- WT01 持久登记与分配启用后，旧的按 `task/<id8>` 删除物理 worktree 定时清理停止注入；本链不启用新的删除策略。main、旧常驻插件、active/回滚 release 与未登记旧树受保护；活动引用、交接现场、dirty、缺失/branch 漂移均可通过 `list_worktrees {"taskId":"..."}` 查原因（GM 可全局查询）。提交/验收/阻塞/撤销后的引用有效性直接按任务服务租约与状态对账，旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支；清理策略另行批准。
+- WT01 持久登记与分配启用后，物理目录以登记为准。WT02 按归属回收：持久引用是唯一删除依据；租约过期/交接保留 recovery 现场；任务 done 后 exclusive 干净树可回收，shared / main / release / 外部与归属不明树保留；脏树与未合并分支不强制删除；孤儿宽限默认 7 天。沿用调度器既有 10 分钟 sweep，可用 `SCK_WORKTREE_RECLAIM=0` 关闭。活动引用、交接现场、dirty、缺失/branch 漂移与保留原因可通过 `list_worktrees` 查询（GM 可全局）；GM 另可 `reclaim_worktrees`（含 dryRun）与 `list_worktree_audits`。旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支。
 - 你被收回的租约立即失效：之后旧 `deliveryId` 的写入都会被拒绝。
 - 任务完成后进入绩效评审：默认由 **Jev**（TypeSafe System One 决策模型）在调度器进程内一次调用完成——按审计时间线给每位参与员工打五个维度的校准分并写入 `scorecard`，任务标记 `evaluated_at`。Jev 未配置、连续失败或置信度不足时，调度器改派 `eval` 岗位的 LLM 评审员接手。分数滚动更新员工定义的 `avg_score`，直接影响同类员工接到任务的概率。
 
