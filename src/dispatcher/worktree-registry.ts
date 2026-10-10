@@ -107,9 +107,12 @@ const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
   if (r.session_active) return 'active';
   if (r.current === r.employee && r.current_delivery === r.delivery && r.current_fence === r.fence && r.assigned_tree === String(r.tree.id)) return 'active';
   // Every non-terminal task state (ready, doing, review, blocked) keeps its scene: an unheld ref on
-  // the task's assigned non-shared tree stays recovery until 'done' releases it. Shared trees are
-  // already hard-protected, so their refs release normally and serial tasks keep reusing the tree.
-  if (!r.current && r.task_state && r.task_state !== 'done' && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
+  // the task's assigned non-shared tree stays recovery until a terminal state releases it. 'void'
+  // is terminal like 'done' — a retired task's scene refs release, so decideReclaim can delete the
+  // exclusive tree instead of pinning it forever. Shared trees are already hard-protected, so their
+  // refs release normally and serial tasks keep reusing the tree.
+  if (!r.current && r.task_state && r.task_state !== 'done' && r.task_state !== 'void'
+    && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
   return 'released';
 };
 
@@ -327,8 +330,10 @@ export class WorktreeRegistry {
 
   private async branchStillNeeded(branch: string | undefined): Promise<boolean> {
     if (!branch) return false;
+    // Terminal states (done, void) never need their branch again; an unmerged branch still
+    // survives `git branch -d`, so this only releases already-merged retired work.
     const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
-      `SELECT id FROM task WHERE state != 'done' AND worktree.branch = $branch LIMIT 1;`, { branch });
+      `SELECT id FROM task WHERE state NOT IN ['done', 'void'] AND worktree.branch = $branch LIMIT 1;`, { branch });
     return (rows?.length ?? 0) > 0;
   }
 

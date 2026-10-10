@@ -15,6 +15,7 @@ try {
   if (!ready) throw new Error('Company fork fixture did not become healthy');
   const targets = process.argv.includes('--all') ? [] : [
     'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
+    'tests/mcp-run-reclaim.fork.test.ts', 'tests/paseo-dead-paths.test.ts',
     'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',

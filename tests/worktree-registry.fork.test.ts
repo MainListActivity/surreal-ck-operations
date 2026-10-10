@@ -546,3 +546,51 @@ run('WT02: inventory no longer hard-disables deletion and exposes grace reasons'
   expect(shared?.reasons.some(r => r === 'shared-retained' || r === 'active-reference')).toBe(true);
   await submit(core, eng, first);
 }, 20000);
+
+run('WT04: retire/void is terminal — clean exclusive dies three layers at the retire event, dirty void keeps its tree without recovery refs', async () => {
+  const path = repo(), core = coreFor(path);
+  const calls: string[] = [];
+  const reclaiming = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, sceneCleaner: async p => {
+    calls.push(p);
+    return { workspacesArchived: 1, projectsDeleted: 1 };
+  } } });
+  const eng = await employee('engineering'), peer = await employee('engineering'), peer2 = await employee('engineering');
+  const holder = await reclaiming.claim(eng, (await task(reclaiming, 'engineering')).id); // shared writer forces exclusive peers
+  const claim = await reclaiming.claim(peer, (await task(reclaiming, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const scene = claim.worktree!.worktreePath;
+
+  // Retire the clean exclusive task: void releases its ref, so the retire event point kills the
+  // Paseo scene, the git tree and the row together — the same one point a done accept uses.
+  const retired = await reclaiming.retireTask(gm, {
+    taskId: claim.task.id, text: '作废重复链成员：独占树三层同消', idempotencyKey: `wt-retire-clean-${++count}`,
+  });
+  expect(retired.state).toBe('void');
+  expect(existsSync(scene)).toBe(false);
+  expect(calls).toEqual([scene]);
+  const audits = await core.listWorktreeAudits(gm, 100);
+  expect(audits.some(a => a.trigger === 'retire' && a.event === 'scene_release' && String(a.path) === scene)).toBe(true);
+  expect(audits.some(a => a.trigger === 'retire' && a.event === 'delete' && a.result === 'success' && String(a.path) === scene)).toBe(true);
+  // The retired task no longer pins its branch: the merged task branch is gone with the tree.
+  expect(git(path, 'branch', '--list', claim.worktree!.branch!)).toBe('');
+
+  // A dirty exclusive scene is kept (never force-deleted), but a void task leaves no recovery ref.
+  const dirtyClaim = await reclaiming.claim(peer2, (await task(reclaiming, 'engineering')).id);
+  expect(dirtyClaim.worktree!.mode).toBe('exclusive');
+  const dirtyScene = dirtyClaim.worktree!.worktreePath;
+  writeFileSync(join(dirtyScene, 'wip.txt'), 'unsaved void work');
+  const voided = await reclaiming.retireTask(gm, {
+    taskId: dirtyClaim.task.id, text: '作废脏树任务：引用释放、树按脏保留', idempotencyKey: `wt-retire-dirty-${++count}`,
+  });
+  expect(voided.state).toBe('void');
+  expect(existsSync(dirtyScene)).toBe(true);
+  const row = (await core.listWorktrees(gm)).find(w => w.worktreePath === dirtyScene)!;
+  expect(row.references.some(r => r.state === 'recovery')).toBe(false);
+  expect(row.references.every(r => r.state === 'released')).toBe(true);
+  expect(row.reasons).toContain('dirty-or-untracked');
+  expect(row.reasons.some(r => r.includes('unfinished-scene'))).toBe(false);
+  // The sweep never pins a dirty scene on a void task as unfinished either.
+  const swept = await reclaiming.reclaimWorktrees(gm, { repos: [path] });
+  expect(swept.kept.find(k => k.path === dirtyScene)!.reason).not.toContain('unfinished-scene');
+  await submit(core, eng, holder);
+}, 30000);
