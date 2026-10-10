@@ -15,6 +15,39 @@ export interface BrowserLoginInput {
   token: string;
   /** Epoch ms; the product stores epoch seconds. */
   expiresAt: number;
+  /**
+   * Operator console sessions are `oidc-client-ts` `UserManager` users: when set, the injector
+   * writes this serialized `User` record (see `oidcUserEntry`) under the sessionStorage key the
+   * SPA derives, instead of the customer app's two flat keys.
+   */
+  oidcUser?: { key: string; value: string };
+}
+
+/**
+ * The sessionStorage entry the ops console's `UserManager` reads back in `_loadUser`:
+ * `WebStorageStateStore` prefixes `oidc.` onto `user:<authority>:<client_id>`, and the value is
+ * `User.toStorageString()`'s JSON shape. `expires_at` is epoch seconds; `User.expired` drops the
+ * session once the token dies, so an injected session never outlives its access token.
+ */
+export function oidcUserEntry(input: {
+  authority: string;
+  clientId: string;
+  token: string;
+  /** Epoch ms. */
+  expiresAt: number;
+  scope: string;
+  profile: Record<string, unknown>;
+}): { key: string; value: string } {
+  return {
+    key: `oidc.user:${input.authority}:${input.clientId}`,
+    value: JSON.stringify({
+      access_token: input.token,
+      token_type: 'Bearer',
+      scope: input.scope,
+      profile: input.profile,
+      expires_at: Math.floor(input.expiresAt / 1000),
+    }),
+  };
 }
 
 export type BrowserInjector = (input: BrowserLoginInput) => Promise<{ url: string; title: string }>;
@@ -25,18 +58,26 @@ const RESULT_PREFIX = 'SCK_RESULT ';
 /**
  * Signs the agent's ego-browser page in as a test account without the agent ever holding the
  * token: the script, token included, goes to the CLI over stdin (never argv, which `ps` shows),
- * writes the keys the product's own auth client reads from sessionStorage, and lands on the app.
+ * writes what the target app reads from sessionStorage (the customer app's flat keys, or the ops
+ * console's serialized `User` record when `oidcUser` is set), and lands on the app.
  */
 export const egoBrowserInjector: BrowserInjector = input => {
   const bin = input.bin ?? process.env.SCK_EGO_BROWSER_BIN ?? join(homedir(), '.local/bin/ego-browser');
+  // The host picks which keys the page writes: the ops console's serialized `User` record, or
+  // the customer app's flat token keys — the page script itself never branches on the kind.
+  const entries = input.oidcUser
+    ? [{ key: input.oidcUser.key, value: input.oidcUser.value }]
+    : [
+        { key: 'oidc.access_token', value: input.token },
+        { key: 'oidc.exp', value: String(Math.floor(input.expiresAt / 1000)) },
+      ];
   const script = `
 const task = await taskSpace(${JSON.stringify(input.spaceId)});
 const page = task.page(${JSON.stringify(input.page)});
 await page.goto(${JSON.stringify(input.probeUrl)});
-await page.evaluate(({ token, exp }) => {
-  sessionStorage.setItem('oidc.access_token', token);
-  sessionStorage.setItem('oidc.exp', String(exp));
-}, ${JSON.stringify({ token: input.token, exp: Math.floor(input.expiresAt / 1000) })});
+await page.evaluate((entries) => {
+  for (const { key, value } of entries) sessionStorage.setItem(key, value);
+}, ${JSON.stringify(entries)});
 await page.goto(${JSON.stringify(input.landingUrl)});
 console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ url: await page.url(), title: await page.title() }));
 `;

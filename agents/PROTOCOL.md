@@ -16,6 +16,7 @@
 2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
    工作目录以 `claim.json.worktree` 的持久登记为准（path/mode/branch/intent/discipline），员工不自行新建 worktree。物理 shared 树可供串行任务复用；工程每项仍用 `task/<任务ID前8位>` 分支与独立 PR，第二个并行代码写手由调度通道分配 exclusive，保留第一写手现场。活动引用期间员工不得 checkout/reset/pull；只有取得 `intent.kind=code` 写权的工程员工可在登记 task 分支 commit/push，checkpoint 前先提交，证据写分支与登记路径。读任务只读代码；内容写入须由派工显式授予 `assets` 相对目录，重叠目录排队、互不重叠可共用，不能自行扩大写权。附件始终写 `evidenceDir`。
 3. **交接**（本轮只做一项，做完即结束本轮）：
+   - 证据附件（截图、导出报告、验收手册等文件）写到 `claim.json` 的 `evidenceDir` 目录——这是按任务共享的服务数据目录，不在任何 git 仓库里；禁止往运营仓库写交付物或证据文件。
    - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
    - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
    - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "gm", "text": "...", "idempotencyKey": "..."}`。
@@ -60,15 +61,19 @@
 | `ops_query` | `session`, `sql`, `vars?`, `slug?` | 以会话身份在所选 workspace 的数据库里执行 SurrealQL |
 | `ops_browser_login` | `session`, `spaceId`, `page?` | 把会话注入你的 ego-browser 任务空间（`page` 缺省 `p1`），浏览器里直接是已登录状态，不用输入密码 |
 | `ops_logout` | `session` | 关闭会话 |
+| `ops_idp_client_register` | `client_name`, `redirect_uris`, `access_token_audience` | 在 IdP 登记一个公开 SPA client（Authorization Code+PKCE、无 secret、`consent_policy=skip`）；redirect 与 audience 限产品域名下的 https 地址；同名幂等，只回公开 `clientId` |
+| `ops_invitation_issue` | `email`, `displayName`, `workspaceSlug`, `aiAllowance`, `reason`, `idempotencyKey`, `resend?` | 运营代办邀请开通（IdP 用户 + workspace bootstrap + 免费权益 + AI 额度），同幂等键重放安全；`resend:true` + 同一 `idempotencyKey` 为断链/过期重签发。一次性激活链接不回显——写老板本机 `handoff/invite-<key>.txt`（0600）由老板转交 |
 
 规则：
 - 会话分两种：`ops_login` 的客户会话走产品 API 与 workspace 数据；`ops_operator_login` 与 `ops_login`（`audience:"ops"`）的运营会话只用于 `ops_request` 调 `/api/ops/*`（运营台、内容、套餐与额度运营接口），产品侧每次请求都按平台运营身份实时校验，撤权立即生效。
 - `ops_operator_login` 的运营 client 是 IdP 动态登记的公开客户端（`consent_policy=require`）：代理在口令登录后携 `user_session` cookie 自动完成 IdP 的授权同意步再拿 code。自动同意只限公司自有运营 client；其它 client 或 customer 通道遇到 consent 要求一律 `login_failed(consent_required)`。
 - 会话句柄只属于你持有的这一个任务：交付、阻塞、被收回租约都会让它失效，不跨任务复用；需要时重新 `ops_login` / `ops_operator_login`。
+- 邀请签发与重发一律走 `ops_invitation_issue`；禁止用 `ops_request` 裸调 `/api/ops/invitations*`——裸调拿到的一次性激活链接不经 handoff 文件落盘，响应一丢链接即不可恢复。
 - 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
 - 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
 - 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
+- 浏览器空间用毕即关：你的 ego-browser 任务空间在提交或阻塞前必须 `finish`（无证据要移交就 `keep:[]`）。空间每留一个页签，本机浏览器就持有一个采集断言，屏幕无法熄屏；也别为同一任务开多个空间，复用你正持有任务的这一个。
 
 ## 管理工具（manage）
 

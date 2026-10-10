@@ -10,10 +10,16 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // minute or more. Cloudflare drops a silent origin at 120s and the employee's relay gives up at 120s, so this ends first.
 const CREATE_WORKSPACE_TIMEOUT_MS = 90_000;
 const CREATE_WORKSPACE_PATH = /^\/api\/workspaces\/?(\?|$)/;
+// Invitations run the same workspace saga plus IdP provisioning and grants; still ends before the 120s hard drop.
+const INVITATION_TIMEOUT_MS = 105_000;
+const INVITATION_PATH = /^\/api\/ops\/invitations\/?(\?|$)/;
 
-/** How long one product request may take; only workspace creation gets more than the default. */
+/** How long one product request may take; only workspace creation and invitation issuance get more than the default. */
 export function productTimeoutMs(method: string, path: string): number {
-  return method.toUpperCase() === 'POST' && CREATE_WORKSPACE_PATH.test(path) ? CREATE_WORKSPACE_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+  if (method.toUpperCase() !== 'POST') return REQUEST_TIMEOUT_MS;
+  if (CREATE_WORKSPACE_PATH.test(path)) return CREATE_WORKSPACE_TIMEOUT_MS;
+  if (INVITATION_PATH.test(path)) return INVITATION_TIMEOUT_MS;
+  return REQUEST_TIMEOUT_MS;
 }
 
 /** The product could not be reached or did not answer in time, so the request may or may not have taken effect. */

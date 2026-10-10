@@ -50,6 +50,8 @@ export interface RouteCandidate {
   quota?: string;
   health?: string;
   continued?: boolean;
+  /** Claimed this task before but never submitted — independent enough, but prefer clean candidates. */
+  prior?: boolean;
 }
 
 export interface RouteInput {
@@ -61,6 +63,7 @@ export interface RouteInput {
 
 const describe = (c: RouteCandidate): string => {
   const bits = [c.kind === 'reuse' ? (c.continued ? '继续之前持有人的会话' : '复用现有会话') : '新开一个会话',
+    c.prior ? '曾持有本任务但未提交（经手人）' : undefined,
     `${c.provider}/${c.model}`,
     c.scored ? `绩效均分 ${c.score?.toFixed(1)}/5（${c.scored} 次）` : '暂无绩效记录',
     c.quota ? `额度：${c.quota}` : '额度未知',

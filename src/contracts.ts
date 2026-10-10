@@ -1,7 +1,8 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'qa' | 'cs' | 'eval';
-export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done';
+/** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
+export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
 export type ReviewerRole = Role | 'owner';
 /** release：上线申请，由运营（或 Jev）决定是否上线；deploy：合入部署，由 qa 在生产实测验收。 */
@@ -138,6 +139,28 @@ export interface CreateDelivery {
   idempotencyKey: string;
 }
 
+/** gm only: re-point an execute-phase gm block at unmet dependencies instead of the manager. */
+export interface DeferTaskUntil {
+  taskId: TaskId;
+  /** Dependencies to merge into the task's existing set (union, same goal, acyclic). */
+  dependencies: TaskId[];
+  /** Business reason for the wait; audited together with the before/after dependency snapshot. */
+  text: string;
+  idempotencyKey: string;
+  /** Optimistic concurrency: refuse when the task version has moved. */
+  expectedVersion?: number;
+}
+
+/** gm/product: retire a task to the terminal 'void' state; dependents stop waiting on it. */
+export interface RetireTask {
+  taskId: TaskId;
+  /** Business reason for the retirement; audited together with the before-state snapshot. */
+  text: string;
+  idempotencyKey: string;
+  /** Optimistic concurrency: refuse when the task version has moved. */
+  expectedVersion?: number;
+}
+
 /** deliveryId + fence are mandatory for every write after claim. */
 export interface LeaseProof {
   taskId: TaskId;
@@ -183,6 +206,10 @@ export interface CompanyCore {
   returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
+  /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
+  deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
+  /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
+  retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;

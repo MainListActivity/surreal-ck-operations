@@ -114,6 +114,7 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     detachAgent: () => {},
     claim: async () => undefined,
     bindAgent: () => {},
+    commDirFor: () => '/tmp/comm',
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
     readWorkspace: async (inst, taskId) => {

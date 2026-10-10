@@ -15,7 +15,219 @@ export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usag
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 
-type InstState = 'busy' | 'idle' | 'down' | 'exhausted';
+export type InstState = 'busy' | 'idle' | 'down' | 'exhausted';
+
+/** 'ok' healthy / 'probe' single trial session allowed / 'down' cooling off. */
+const availabilityOf = (h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' =>
+  !h || h.state === 'healthy' ? 'ok' : now >= (h.until ?? 0) ? 'probe' : 'down';
+
+/** Quota circuit breaker, shared by the tick and the roster staffing preview. */
+export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyConfig, 'quotaFloorPct' | 'quotaWeeklyFloorPct'>, now: number): Map<string, string> {
+  const blocked = new Map<string, string>();
+  if (cfg.quotaFloorPct <= 0 && cfg.quotaWeeklyFloorPct <= 0) return blocked;
+  for (const q of rows) {
+    const age = q.fetchedAt ? now - Date.parse(q.fetchedAt) : 0;
+    if (age >= 15 * 60_000) continue;
+    const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
+    const session = hasSplit ? q.sessionPct : q.lowestPct;
+    const hits: string[] = [];
+    if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
+    if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
+    if (hits.length) blocked.set(q.provider, `额度不足（${hits.join('，')}）`);
+  }
+  return blocked;
+}
+
+/** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
+export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>): boolean {
+  if (quotaBlocked?.has(provider)) return false;
+  const availability = availabilityOf(health.get(provider), now);
+  if (availability === 'down') return false;
+  const busy = busyBy.get(provider) ?? 0;
+  return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
+}
+
+/** One row of the staffing preview: an instance that could be reused, or a def that could spawn. */
+export interface StaffingEntry {
+  kind: 'reuse' | 'spawn';
+  /** inst.id for reuse, `spawn:<defId>` for spawn. */
+  key: string;
+  ref: string;
+  role: string;
+  provider: string;
+  model?: string;
+  def?: EmployeeDef;
+  inst?: EmployeeInst;
+  /** effectiveWeight — exactly what weightedOrder picks by. */
+  weight: number;
+  /** Share of this candidate's weight among all eligible candidates in the same role+home pool. */
+  share: number;
+  eligible: boolean;
+  reason?: string;
+  /** Eligible but deprioritized (e.g. a claim-only prior holder reviewing a task it touched). */
+  note?: string;
+}
+
+/** Weight multiplier for claim-only prior holders on review dispatch. */
+export const PRIOR_HAND_WEIGHT_FACTOR = 0.15;
+
+export interface StaffingInput {
+  role: string;
+  home: string;
+  task?: SupervisedTask;
+  /** Review work never goes to the submitter. */
+  excludeSubmitter?: boolean;
+  /**
+   * Review recusal, only passed for review dispatch. `authors` (ever submitted
+   * this task) are a hard independence exclusion — nobody accepts their own
+   * delivery. `hands` (claimed but never submitted) are eligible at a demoted
+   * weight: their review is still independent and starvation-blocking a task
+   * behind them is worse than reusing session context they already hold.
+   */
+  recusal?: ReviewRecusal;
+  defs: EmployeeDef[];
+  insts: EmployeeInst[];
+  states: ReadonlyMap<string, InstState>;
+  holding: ReadonlySet<string>;
+  assigned?: ReadonlySet<string>;
+  health: ReadonlyMap<string, ProviderHealth>;
+  quotaBlocked: ReadonlyMap<string, string>;
+  busyBy: ReadonlyMap<string, number>;
+  providerMax: Record<string, number>;
+  slots: ReadonlyMap<string, string>;
+  opsRepo: string;
+  sidecar: boolean;
+  now: number;
+}
+
+/**
+ * The role+home candidate pool, evaluated with the exact predicates the tick uses.
+ * Eligible entries carry weight + normalized share; ineligible ones carry `reason`.
+ * The dispatcher consumes this for picks; the roster surfaces it verbatim, so the
+ * owner page always previews the same numbers dispatch would use.
+ */
+export function staffingPool(p: StaffingInput): StaffingEntry[] {
+  const resolveSlot = (def: EmployeeDef): string | undefined =>
+    (def.model ?? '').startsWith('auto:') ? p.slots.get(`${def.provider}:${(def.model ?? '').slice(5)}`) : (def.model || undefined);
+  const ready = (inst: EmployeeInst) =>
+    p.states.get(inst.id) === 'idle' ||
+    (p.states.get(inst.id) === 'exhausted' && availabilityOf(p.health.get(inst.provider ?? ''), p.now) === 'probe');
+  const currentModel = (inst: EmployeeInst): boolean => {
+    const def = p.defs.find(d => d.id === inst.def);
+    const target = def && resolveSlot(def);
+    return !target || !inst.model || inst.model === target;
+  };
+  const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  /** Distinguish quota circuit-break from full seats in the owner-facing reason. */
+  const capReason = (provider: string): string | undefined =>
+    p.quotaBlocked.get(provider) ?? (cap(provider) ? undefined : 'provider 无可用容量');
+  // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
+  // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
+  // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
+  // carry exactly the required track and the def must list it — empty tracks grants nothing.
+  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) => {
+    const required = REQUIRED_TRACKS[p.role as Role];
+    if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
+    return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+  };
+  const entries: StaffingEntry[] = [];
+  for (const inst of p.insts) {
+    if (inst.role !== p.role) continue;
+    if ((inst.repoHome ?? inst.cwd ?? p.opsRepo) !== p.home) continue;
+    const def = p.defs.find(d => d.id === inst.def);
+    const reason =
+      !ready(inst) ? '会话占用中/异常' :
+      p.assigned?.has(inst.id) ? '本轮已分配' :
+      p.holding.has(inst.id) ? '持有在办任务' :
+      p.recusal?.authors.has(inst.id) ? '提交过本任务，验收回避' :
+      (p.excludeSubmitter && inst.id === p.task?.submittedBy) ? '提交者回避' :
+      (p.sidecar && inst.credentialFile) ? '凭证文件实例不可接新任务' :
+      !trackOk(p.task, def?.tracks) ? '岗位轨不匹配' :
+      !currentModel(inst) ? '模型槽位已漂移' :
+      capReason(inst.provider ?? '');
+    const priorHand = !reason && (p.recusal?.hands.has(inst.id) ?? false);
+    entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
+      provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
+      weight: effectiveWeight(def) * (priorHand ? PRIOR_HAND_WEIGHT_FACTOR : 1),
+      share: 0, eligible: !reason, reason, note: priorHand ? '经手过本任务，降权兜底' : undefined });
+  }
+  for (const def of p.defs) {
+    if (def.role !== p.role) continue;
+    const resolved = resolveSlot(def);
+    const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
+    const reason =
+      !def.enabled ? '编制停用' :
+      !trackOk(p.task, def.tracks) ? '岗位轨不匹配' :
+      resolved === undefined ? '模型槽位未解析' :
+      seats >= def.maxInstances ? `实例数 ${seats}/${def.maxInstances} 已满` :
+      capReason(def.provider);
+    entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
+      provider: def.provider, model: resolved ?? def.model, def,
+      weight: effectiveWeight(def), share: 0, eligible: !reason, reason });
+  }
+  const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
+  for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
+  return entries;
+}
+
+/** Review recusal split: hard exclusion for authors, weight demotion for claim-only holders. */
+export interface ReviewRecusal {
+  /** submits>0 — wrote or accepted this task; reviewing own delivery is never allowed. */
+  authors: ReadonlySet<string>;
+  /** claims>0 without submits — held a lease, returned or revoked; eligible at demoted weight. */
+  hands: ReadonlySet<string>;
+}
+
+/** Shared audit-based recusal lookup. Unknown history must never become an empty set. */
+export async function readReviewRecusal(
+  workforce: Pick<Workforce, 'evalState'>, task: SupervisedTask,
+  log: (message: string) => void = () => {},
+): Promise<ReviewRecusal | undefined> {
+  try {
+    const state = await workforce.evalState(task.id);
+    const authors = new Set<string>();
+    const hands = new Set<string>();
+    for (const e of state.participants) {
+      if ((state.metrics[e]?.submits ?? 0) > 0) authors.add(e);
+      else if ((state.metrics[e]?.claims ?? 0) > 0) hands.add(e);
+    }
+    return { authors, hands };
+  } catch (error) {
+    log(`contributors read failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
+export interface ReviewStaffingPreview {
+  taskId: string;
+  title: string;
+  purpose: 'review';
+  role: string;
+  home: string;
+  status: 'ready' | 'history_unavailable';
+  entries: StaffingEntry[];
+}
+
+/** Task-scoped estimate; the public role/home pool stays independent of review recusal. */
+export async function reviewStaffingPreviews(
+  tasks: readonly SupervisedTask[],
+  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'recusal'>,
+  workforce: Pick<Workforce, 'evalState'>,
+): Promise<ReviewStaffingPreview[]> {
+  const previews: ReviewStaffingPreview[] = [];
+  for (const task of tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)) {
+    const recusal = await readReviewRecusal(workforce, task);
+    const home = task.repoPath ?? base.opsRepo;
+    const entries = staffingPool({ ...base, role: task.reviewerRole, home, task,
+      excludeSubmitter: true, recusal });
+    previews.push({ taskId: task.id, title: task.title, purpose: 'review', role: task.reviewerRole, home,
+      status: recusal === undefined ? 'history_unavailable' : 'ready',
+      entries: recusal === undefined
+        ? entries.map(e => ({ ...e, eligible: false, share: 0, reason: '贡献者历史读取失败，等待安全候选' }))
+        : entries });
+  }
+  return previews;
+}
 
 export interface DispatcherDeps {
   workforce: Workforce;
@@ -58,6 +270,8 @@ export interface SidecarBridge {
   readWorkspace?(inst: EmployeeInst, taskId?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
   bindAgent(instId: string, agentId: string): void;
+  /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
+  commDirFor(instId: string): string;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
 }
@@ -115,23 +329,8 @@ export class Dispatcher {
     // Quota circuit breaker: separate floors for short windows (session/5h + balances)
     // and long windows (week/month). Stale snapshots (>15min) fail open rather than
     // keeping a provider blocked forever.
-    const quotaBlocked = new Map<string, string>();
-    if (cfg.quotaFloorPct > 0 || cfg.quotaWeeklyFloorPct > 0) {
-      for (const q of quotaRows) {
-        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
-        if (age >= 15 * 60_000) continue;
-        // Rows written before split fields existed carry only lowestPct: judge it under the
-        // short-window floor. Once session/weekly are written, a missing short-window value
-        // means the provider simply has none — don't reinterpret the long-window low as short.
-        const hasSplit = q.sessionPct !== undefined || q.weeklyPct !== undefined;
-        const session = hasSplit ? q.sessionPct : q.lowestPct;
-        const hits: string[] = [];
-        if (session !== undefined && session < cfg.quotaFloorPct) hits.push(`短窗口/余额 ${Math.round(session)}%<${cfg.quotaFloorPct}%`);
-        if (q.weeklyPct !== undefined && q.weeklyPct < cfg.quotaWeeklyFloorPct) hits.push(`周/月额度 ${Math.round(q.weeklyPct)}%<${cfg.quotaWeeklyFloorPct}%`);
-        if (hits.length) quotaBlocked.set(q.provider, `额度不足（${hits.join('，')}）`);
-      }
-      if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
-    }
+    const quotaBlocked = quotaBlockedProviders(quotaRows, cfg, Date.now());
+    if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
 
     // 1. Session health.
     const states = new Map<string, InstState>();
@@ -288,44 +487,20 @@ export class Dispatcher {
     }
     const assigned = new Set<string>();
     const rand = this.deps.rand ?? Math.random;
-    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
-      (states.get(inst.id) === 'exhausted' && this.available(health.get(inst.provider ?? ''), now) === 'probe');
-    // An instance may only serve tasks on the model its def currently resolves to;
-    // otherwise a stale exhausted→probe instance could be reused for new work.
-    const currentModel = (inst: EmployeeInst): boolean => {
-      const def = defs.find(d => d.id === inst.def);
-      const target = def && resolveModel(def);
-      return !target || !inst.model || inst.model === target;
-    };
-    // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
-    // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
-    // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
-    // carry exactly the required track and the def must list it — empty tracks grants nothing.
-    const trackOk = (role: string, task: SupervisedTask | undefined, tracks: string[] | undefined) => {
-      const required = REQUIRED_TRACKS[role as Role];
-      if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
-      return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
-    };
-    const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      inst.role === role && ready(inst) && !assigned.has(inst.id) &&
-      !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
-      // A credential-file instance can only finish what it already holds; the sidecar
-      // refuses new claims for it, so it must not appear as a reuse candidate.
-      !(this.deps.sidecar && inst.credentialFile) &&
-      trackOk(role, task, defs.find(d => d.id === inst.def)?.tracks) &&
-      currentModel(inst) &&
-      this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
-    // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
-    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false) =>
-      insts.filter(i => ok(i, role, task, excludeSubmitter) && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home);
-    // An instance lives in one Paseo workspace (one project), so maxInstances is per project:
-    // a def at capacity in the ops repo can still spawn for a task in another repo.
-    // Credential-file stragglers do not consume seats: they cannot serve new work.
+    // The candidate pool is evaluated by staffingPool — the same function the owner
+    // page previews — so dispatch gating and the roster can never drift apart.
+    const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
+      providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
+      sidecar: !!this.deps.sidecar, now };
+    const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
+      recusal?: ReviewRecusal) =>
+      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned })
+        .flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask) =>
-      defs.filter(d => d.enabled && d.role === role && trackOk(role, task, d.tracks) && resolveModel(d) !== undefined &&
-        insts.filter(i => i.def === d.id && (i.repoHome ?? i.cwd ?? this.deps.env.opsRepo) === home &&
-          !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
-        this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));
+      staffingPool({ ...poolBase, insts, role, home, task })
+        .flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
+      (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
     // starve their roles, so escalate once (clears automatically when resolution returns).
     const unresolved = defs.filter(d => d.enabled && (d.model ?? '').startsWith('auto:') && resolveModel(d) === undefined);
@@ -335,11 +510,15 @@ export class Dispatcher {
     } else {
       await owner.resolveNotice('model-unresolved');
     }
-    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false) => {
+    const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
+      recusal?: ReviewRecusal) => {
       const home = task?.repoPath ?? this.deps.env.opsRepo;
-      const candidates = eligibleInsts(role, home, task, excludeSubmitter);
-      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
+      const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal);
+      const demote = (id: string) => recusal?.hands.has(id) ? PRIOR_HAND_WEIGHT_FACTOR : 1;
+      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def)) * demote(inst.id);
       // Continuity beats weights: the previous holder keeps the task when it is still available.
+      // Review work never hits this: an author's former holder is already out; a claim-only
+      // hand surviving as previousEmployee is continuity, not a conflict.
       const previous = candidates.find(i => i.id === task?.previousEmployee && states.get(i.id) === 'idle');
       if (previous) return previous;
       // A dead (exhausted) session cannot prove a provider recovered; probe with a live one when possible.
@@ -350,13 +529,15 @@ export class Dispatcher {
     };
     const spawnable = (role: string, home: string, task?: SupervisedTask) => weightedOrder(eligibleDefs(role, home, task), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
-    const routeEmployee = async (item: (typeof work)[number]): Promise<AssignPreference | undefined> => {
+    // Review 派工的作者在进 Jev 前就已从 reuse 候选剔除，经手人保留但打 prior 标记；
+    // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
+    const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       const cacheKey = `${item.purpose}:${item.task.id}`;
       const avoided = this.staffAvoid.get(cacheKey);
       const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
-      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review').filter(i => !dodged(i.id));
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', recusal).filter(i => !dodged(i.id));
       const spawn = eligibleDefs(item.role, home, item.task).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
       // Same candidate set → same verdict; only call Jev when the fingerprint moved.
@@ -370,7 +551,8 @@ export class Dispatcher {
           const def = defs.find(d => d.id === i.def);
           return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: i.model ?? def?.model ?? '',
             score: def?.avgScore, scored: def?.scored, quota: quotaByProvider.get(i.provider ?? def?.provider ?? '')?.summary,
-            health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee };
+            health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee,
+            prior: recusal?.hands.has(i.id) || undefined };
         }),
         ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: resolveModel(d) ?? d.model ?? '',
           score: d.avgScore, scored: d.scored, quota: quotaByProvider.get(d.provider)?.summary,
@@ -435,9 +617,21 @@ export class Dispatcher {
       if (running >= cfg.maxRunning) break;
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
-      const prefer = await routeEmployee(item);
+      // 验收独立性：review 派工先取本任务回避名单——提交过本任务的作者硬回避
+      // （验收自己的交付等于没验收），仅 claim 过未提交的经手人降权兜底、不硬阻断。
+      // 历史读失败时名单未知，fail-closed：本轮跳过让任务留在队列；submittedBy
+      // 拦截只覆盖当前提交人，挡不住非提交人的作者；读取恢复后自动继续。
+      const recusal = item.purpose === 'review' ? await readReviewRecusal(wf, item.task, message => this.log(message)) : undefined;
+      if (item.purpose === 'review' && recusal === undefined) {
+        await this.notice(`contributors:${item.task.id}`,
+          `任务 ${item.task.id} 继续等待验收：贡献者历史读取失败，回避名单未知，本轮不派复核，防止历史贡献者被重复派入验收。`, report);
+        continue;
+      }
+      if (item.purpose === 'review') await owner.resolveNotice(`contributors:${item.task.id}`);
+      const prefer = await routeEmployee(item, recusal);
       const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
-        (inst, first, claim) => wake(inst, item.task, this.deps.env, first, { comm: !!this.deps.sidecar, claim }), report, insts, item.purpose === 'review', prefer, slotMap);
+        (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
       if (!result) {
         if (prefer) {
           // Jev's pick just failed in assign; stop re-picking the same candidate
@@ -450,7 +644,11 @@ export class Dispatcher {
           this.staffAvoid.set(cacheKey, map);
         }
         const home = item.task.repoPath ?? this.deps.env.opsRepo;
-        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}。任务 ${item.task.id} 等待中。`, report);
+        const recused = item.purpose === 'review' && (recusal?.authors.size || recusal?.hands.size)
+          ? `；验收回避：${[...recusal.authors].sort().join('、') || '无'} 提交过本任务（硬回避）` +
+            (recusal.hands.size ? `，${[...recusal.hands].sort().join('、')} 仅经手未提交（降权兜底，仍可作为最后候选）` : '')
+          : '';
+        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}${recused}。任务 ${item.task.id} 等待中。`, report);
         continue;
       }
       await owner.resolveNotice(`staff:${item.role}`);
@@ -482,7 +680,7 @@ export class Dispatcher {
     for (const group of gmGroups.values()) {
       if (running >= cfg.maxRunning) break;
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap, group[0]);
+        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, group[0]);
       if (!result) continue;
       for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
       running++;
@@ -500,7 +698,7 @@ export class Dispatcher {
       }
       if (due.length) {
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap);
+          (inst, first, claim, worktree) => gmTriage(inst, due, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap);
         if (result) {
           for (const goal of due) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
           running++;
@@ -539,7 +737,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree }), report, insts, false, undefined, slotMap, task);
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, task);
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -691,30 +889,25 @@ export class Dispatcher {
   }
 
   private available(h: ProviderHealth | undefined, now: number): 'ok' | 'probe' | 'down' {
-    if (!h || h.state === 'healthy') return 'ok';
-    return now >= (h.until ?? 0) ? 'probe' : 'down';
+    return availabilityOf(h, now);
   }
 
   /** A recovering provider gets a single probe session until a turn completes cleanly. */
   private capacity(provider: string, cfg: CompanyConfig, health: Map<string, ProviderHealth>, busyBy: Map<string, number>, now: number, quotaBlocked?: Map<string, string>): boolean {
-    if (quotaBlocked?.has(provider)) return false;
-    const availability = this.available(health.get(provider), now);
-    if (availability === 'down') return false;
-    const busy = busyBy.get(provider) ?? 0;
-    return availability === 'probe' ? busy === 0 : busy < (cfg.providerMax[provider] ?? 1);
+    return providerCapacity(provider, cfg.providerMax, health, busyBy, now, quotaBlocked);
   }
 
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
-    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean) => EmployeeInst | undefined,
+    pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal) => EmployeeInst | undefined,
     spawnable: (role: string, home: string, task?: SupervisedTask) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference, slots?: Map<string, string>, readTask?: SupervisedTask,
+    prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, readTask?: SupervisedTask,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? readTask, avoid, forReview);
+    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? readTask, avoid, forReview, recusal);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
@@ -836,6 +1029,9 @@ export class Dispatcher {
   private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true) {
     await this.deps.workforce.retire(inst.id, reason);
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
+    // The dead session is useless and its red "error" entry confuses the roster —
+    // archive it (soft-delete, timeline kept) like session rotation already does.
+    if (inst.paseoAgentId) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
     report.retired.push(inst.id);
     this.log(`retired ${inst.id}: ${reason}`);
     const def = defs.find(d => d.id === inst.def);

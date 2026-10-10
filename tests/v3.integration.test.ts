@@ -227,6 +227,22 @@ test('gm may relay owner conversation; other roles may not', async () => {
   expect(history.at(-1)).toMatchObject({ action: 'owner_approve', actor: 'gm-relay:t-gm' });
 });
 
+test('instruct owner_command lands as a ready gm task carrying the owner text, idempotent on replay', async () => {
+  await database.db.query("CREATE owner_command CONTENT { kind: 'instruct', text: '盘一下上周的交付质量，给我一份简报' };");
+  const applied = await owner.applyPending();
+  const instruct = applied.find(r => r.kind === 'instruct');
+  expect(instruct).toMatchObject({ status: 'applied' });
+  expect(instruct!.result).toMatch(/^task=/);
+  const taskId = instruct!.result!.slice(5);
+  const t = await core.getTask(tokens.gm, taskId);
+  expect(t).toMatchObject({ state: 'ready', executorRole: 'gm', reviewerRole: 'product' });
+  expect(t.context).toContain('盘一下上周的交付质量');
+  // Re-apply of the same command id must not duplicate the task.
+  await database.db.query("UPDATE owner_command SET status = 'pending' WHERE kind = 'instruct';");
+  const again = await owner.applyPending();
+  expect(again.find(r => r.kind === 'instruct')!.result).toBe(`task=${taskId}`);
+});
+
 test('revoked lease hands over to a same-role employee with history; old session is fenced out', async () => {
   const t = await core.createTask(tokens.gm, { title: 'Handover task', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
@@ -344,13 +360,16 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect((await dispatcher.tick()).notices).not.toContain('budget');
   expect(notices.filter(n => n.includes('所有订阅')).length).toBe(1);
 
-  // Codex cooldown passes: the exhausted codex instance is probed with the review, and a clean turn heals codex.
+  // Codex cooldown passes. The review of t can no longer probe the exhausted codex instance:
+  // it claimed this task earlier, so contributor recusal keeps former executors out of review
+  // candidates (both defs are full, so nothing can spawn either). The review waits in queue,
+  // and probe recovery happens through the queued execute work (bump) instead.
   await database.db.query("UPDATE provider_health:codex SET until = 0;");
   report = await dispatcher.tick();
   expect(report.skipped).toBeUndefined();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
   expect(report.woke.map(w => w.employee)).toEqual([codexInst.employee]);
-  expect(report.woke[0].task).toBe(t.id);
-  expect(paseo.sent.at(-1)!.prompt).toContain('独立验收');
+  expect(report.woke[0].task).toBe(bump.id);
   paseo.set(codexAgent, 'idle');
   await dispatcher.tick();
   expect((await workforce.providerHealth()).get('codex')?.state).toBe('healthy');
@@ -660,6 +679,122 @@ test('a task whose dependencies are already done is created ready', async () => 
   expect(child.state).toBe('ready');
 });
 
+test('gm defers a gm-blocked execute task onto dependencies: manager wake stops, the gate finishing resumes it for qa', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await database.db.query('UPDATE employee_def SET enabled = false;');
+  await new ProjectStore(database.db).upsert({ id: 'deferproj', name: 'DF', repoPath: '/repo/defer', release: 'CI', envs: [{ name: 'production' }] });
+  const goal = await owner.createGoal({ text: '经理依赖等待', source: 'owner:test', key: key(), tier: 'quick', project: 'deferproj' });
+  const gate = await core.createTask(tokens.gm, { title: '恢复门槛', context: '三项修复部署全部完成的前置任务', executorRole: 'engineering',
+    reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: key() });
+  const qaTask = await core.createTask(tokens.gm, { title: '原QA生产实测', context: '被gm阻塞的执行任务，等待恢复门槛', executorRole: 'qa',
+    reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key() });
+  const held = await core.claim(tokens.qa, qaTask.id);
+  await core.block(tokens.qa, proofOf(held), 'gm', { text: '上游三链仍在进行中，本任务暂不能重复测试，请经理安排依赖等待。', idempotencyKey: key() });
+  const beforeVersion = (await task(qaTask.id)).version;
+  expect(await task(qaTask.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+
+  // defer merges the dependency, clears the gm flag and keeps the task out of the work queues.
+  const input = { taskId: qaTask.id, dependencies: [gate.id],
+    text: '等待恢复门槛 46da040f 的三项修复部署完成后自动恢复，原QA不重复测试。', idempotencyKey: key() };
+  const deferred = await core.deferTaskUntil(tokens.gm, input);
+  expect(deferred.state).toBe('blocked');
+  expect(deferred.blockedTo).toBeUndefined();
+  expect(deferred.dependencies).toEqual([gate.id]);
+  expect(deferred.version).toBe(beforeVersion + 1);
+  const deferredHistory = await core.history(tokens.gm, qaTask.id);
+  expect(deferredHistory.at(-1)).toMatchObject({ action: 'deferred', actor: 't-gm' });
+  expect(deferredHistory.at(-1)?.evidence).toContain('恢复阶段=doing');
+  expect(deferredHistory.at(-1)?.evidence).toContain(`after=[${gate.id}]`);
+  // Same key + same payload replays without bumping the version; same key + different payload conflicts.
+  expect(await core.deferTaskUntil(tokens.gm, input)).toMatchObject({ version: deferred.version });
+  await expect(core.deferTaskUntil(tokens.gm, { ...input, text: '同样的幂等键但理由不同，必须拒绝而不是重放。' }))
+    .rejects.toMatchObject({ code: 'conflict' });
+
+  // The dispatcher neither wakes the manager for the task nor dispatches it as qa work.
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+  const report = await dispatcher.tick();
+  expect(report.woke.some(w => w.task === qaTask.id)).toBe(false);
+
+  // When the gate finishes, UNLOCK_SQL resumes the deferred task and the dispatcher dispatches it to qa.
+  await execute(tokens['eng-a'], gate.id, '门槛交付：三项修复部署完成，提供足够长度的交付证据文本。');
+  await review(tokens['eng-b'], gate.id);
+  const unlocked = await task(qaTask.id);
+  expect(unlocked).toMatchObject({ state: 'ready', blockedTo: undefined });
+  await workforce.upsertDef('qa-codex', { role: 'qa', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
+  const resumed = await dispatcher.tick();
+  expect(resumed.woke.find(w => w.task === qaTask.id)?.spawned).toBe(true);
+  // Cleanup so later tests do not inherit a live qa def or a stray idle instance.
+  await database.db.query("UPDATE employee_def SET enabled = false WHERE id = 'qa-codex';");
+  await workforce.retire((await workforce.insts()).find(i => i.def === 'qa-codex')!.id, 'defer 测试清理');
+});
+
+test('defer_task_until refuses non-gm, owner blocks, review blocks, live leases, cycles, cross-goal and stale versions', async () => {
+  const mk = async (title: string, goalId?: string) => core.createTask(tokens.gm, { title, context: 'defer 拒绝矩阵用例',
+    executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+  const reason = '业务理由：依赖尚未完成，需要转为依赖等待而不是重复叫醒经理。';
+  const depReady = await mk('就绪依赖');
+
+  // A live lease (state doing) is not a gm block.
+  const leased = await mk('租约未释放');
+  await core.claim(tokens['eng-a'], leased.id);
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: leased.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+
+  // Owner-gate blocks and review-phase blocks stay out of scope.
+  const ownerBlocked = await mk('owner关口阻塞');
+  const ownerHold = await core.claim(tokens['eng-b'], ownerBlocked.id);
+  await core.block(tokens['eng-b'], proofOf(ownerHold), 'owner', { text: '需要老板决定付费事项才能继续执行本任务。', idempotencyKey: key() });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: ownerBlocked.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+
+  // Review-phase blocks: release eng-a's lease first so it can take the task to review.
+  expect(await workforce.revokeLease(leased.id, 't-eng-a', 'defer 测试：释放 eng-a', '【交接包】测试交接。')).toBe(true);
+  const reviewTask = await mk('review期阻塞');
+  const reviewDoing = await core.claim(tokens['eng-a'], reviewTask.id);
+  await core.submit(tokens['eng-a'], proofOf(reviewDoing), { text: '实现完成，提交评审：交付证据、测试结果与遗留事项都已写明。', idempotencyKey: key() });
+  const reviewer = await core.claim(tokens['eng-b'], reviewTask.id);
+  await core.block(tokens['eng-b'], proofOf(reviewer), 'gm', { text: '评审发现方向问题，需要经理先做产品决定。', idempotencyKey: key() });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: reviewTask.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+
+  // A gm-blocked task: self, missing, cycle, cross-goal and stale versions are all refused.
+  const blocked = await mk('gm阻塞任务');
+  const blockedHold = await core.claim(tokens['eng-b'], blocked.id);
+  await core.block(tokens['eng-b'], proofOf(blockedHold), 'gm', { text: '等待外部条件，请经理把本任务转为依赖等待。', idempotencyKey: key() });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: [blocked.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: ['00000000-0000-4000-8000-000000000000'], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'not_found' });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: [depReady.id], text: reason, idempotencyKey: key(), expectedVersion: 999 }))
+    .rejects.toMatchObject({ code: 'conflict' });
+  await expect(core.deferTaskUntil(tokens.product, { taskId: blocked.id, dependencies: [depReady.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+
+  // Direct cycle: a waits on b, then b must not wait back on a.
+  const a = await mk('环检测A');
+  const b = await mk('环检测B');
+  const aHold = await core.claim(tokens['eng-b'], a.id);
+  await core.block(tokens['eng-b'], proofOf(aHold), 'gm', { text: '环检测用例：a 先转为依赖等待，稍后尝试 b 反向等待制造环。', idempotencyKey: key() });
+  await core.deferTaskUntil(tokens.gm, { taskId: a.id, dependencies: [b.id], text: reason, idempotencyKey: key() });
+  const bHold = await core.claim(tokens['eng-b'], b.id);
+  await core.block(tokens['eng-b'], proofOf(bHold), 'gm', { text: '环检测用例：b 再转为依赖等待，应当被环检测直接拒绝。', idempotencyKey: key() });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: b.id, dependencies: [a.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+
+  // Dependencies must live inside the task's own goal.
+  const goalA = await owner.createGoal({ text: '目标甲', source: 'owner:test', key: key(), tier: 'quick' });
+  const goalB = await owner.createGoal({ text: '目标乙', source: 'owner:test', key: key(), tier: 'quick' });
+  const inA = (await core.listTasks(tokens.gm)).find(t => t.goalId === goalA.id)!;
+  const inB = (await core.listTasks(tokens.gm)).find(t => t.goalId === goalB.id)!;
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: blocked.id, dependencies: [inA.id], text: reason, idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  // The refused call touched nothing: goalB's tasks never gained the blocked task as a dependency.
+  expect((await core.listTasks(tokens.gm)).filter(t => t.goalId === goalB.id).every(t => !t.dependencies.includes(blocked.id))).toBeTrue();
+});
+
 test('dispatcher spawns instances in the workspace of the goal project and only reuses them for that project', async () => {
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');
@@ -736,6 +871,129 @@ test('dispatcher: a returned task goes back to its submitter for rework, review 
   report = await dispatcher.tick();
   const rework = report.woke.find(w => w.task === t.id);
   expect(rework?.employee).toBe(execInst.employee);
+});
+
+test('dispatcher: review hard-excludes authors but falls back to claim-only prior holders', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('DELETE owner_notice;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  // 先停用全部编制：早前测试留下的 enabled def（空位）会让「全员贡献者」场景新开出非贡献者实例。
+  await database.db.query('UPDATE employee_def SET enabled = false, error_streak = 0;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  const notified: string[] = [];
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, notify: async (_t, text) => { notified.push(text); } });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: '贡献者回避验收', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  // E1 实现并提交：audit 记下 claim + submit，E1 成为贡献者与提交者。
+  let report = await dispatcher.tick();
+  const exec = report.woke.find(w => w.task === t.id)!;
+  expect(exec.spawned).toBe(true);
+  const execAgent = [...paseo.agents.keys()][0];
+  const claim = await core.claim(tokenOf(exec.employee), t.id);
+  await core.submit(tokenOf(exec.employee), proofOf(claim), { text: '实现完成：代码在任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
+  paseo.set(execAgent, 'idle');
+
+  // Review 派给非贡献者 E2（另一编制新开）；E1（提交者+作者）被排除。
+  report = await dispatcher.tick();
+  const reviewer = report.woke.find(w => w.task === t.id)!;
+  expect(reviewer.employee).not.toBe(exec.employee);
+  expect(reviewer.spawned).toBe(true);
+  const reviewerAgent = [...paseo.agents.keys()][1];
+
+  // E2 领取复核（audit 记下 claim，E2 也成为贡献者）；租约被收回后 review 仍在队列。
+  const reviewClaim = await core.claim(tokenOf(reviewer.employee), t.id);
+  await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
+  paseo.set(reviewerAgent, 'idle');
+
+  // Review 再派工：E1（提交者+作者）硬回避，E2（复核过的前持有人、仅 claim 未提交）
+  // 降为兜底候选——两个编制满员无法新开时，E2 以降权身份接住复核而非死等。
+  report = await dispatcher.tick();
+  const rewoke = report.woke.find(w => w.task === t.id)!;
+  expect(rewoke.employee).toBe(reviewer.employee);
+  expect(rewoke.spawned).toBe(false);
+  expect((await task(t.id)).state).toBe('review');
+});
+
+test('dispatcher: review stays queued while contributor history read fails and resumes when it recovers', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('DELETE owner_notice;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query('UPDATE employee_def SET enabled = false, error_streak = 0;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
+  const paseo = new FakePaseo();
+  // Jev 派工咨询记录：异常读取期间 review 不得进入 Jev 选人（fail-closed）；恢复后候选也不得含贡献者。
+  const jevDispatches: Array<{ purpose?: string; taskId?: string; candidates?: Record<string, string> }> = [];
+  const jev: JevClient = {
+    model: 'jev-test',
+    async ask(state: unknown) {
+      const d = (state as { dispatch?: { purpose?: string; task?: { id?: string }; candidates?: Record<string, string> } }).dispatch;
+      if (d) jevDispatches.push({ purpose: d.purpose, taskId: d.task?.id, candidates: d.candidates });
+      return { model: 'jev-test', answers: {} } as never; // 无有效 pick → 加权兜底
+    },
+  };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, jev, notify: async () => {} });
+  const tokenOf = (employee: string) => readFileSync(join(credDir, `${employee}.token`), 'utf8');
+
+  const t = await core.createTask(tokens.gm, { title: '历史读取失败验收', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'engineering', idempotencyKey: key() });
+  // E1 实现并提交：作者+提交者。
+  let report = await dispatcher.tick();
+  const exec = report.woke.find(w => w.task === t.id)!;
+  expect(exec.spawned).toBe(true);
+  const execAgent = [...paseo.agents.keys()][0];
+  const claim = await core.claim(tokenOf(exec.employee), t.id);
+  await core.submit(tokenOf(exec.employee), proofOf(claim), { text: '实现完成：代码在任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
+  paseo.set(execAgent, 'idle');
+
+  // Review 派给非贡献者 E2；E2 领取（audit 记下 claim，成为非提交人贡献者）后租约被收回。
+  report = await dispatcher.tick();
+  const reviewer = report.woke.find(w => w.task === t.id)!;
+  expect(reviewer.spawned).toBe(true);
+  const reviewerAgent = [...paseo.agents.keys()][1];
+  const reviewClaim = await core.claim(tokenOf(reviewer.employee), t.id);
+  await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
+  paseo.set(reviewerAgent, 'idle');
+
+  // 贡献者历史读取失败：回避名单未知 → fail-closed。E2（非提交人前持有人）不得被重新唤醒，
+  // review 留在队列，owner 收件箱通知说明读取失败；Jev 不参与该 review 的选人；execute 派工不受影响。
+  const savedEvalState = workforce.evalState.bind(workforce);
+  workforce.evalState = async () => { throw new Error('synthetic contributor history read failure'); };
+  try {
+    const t2 = await core.createTask(tokens.gm, { title: '执行连续性', context: 'synthetic', executorRole: 'engineering',
+      reviewerRole: 'qa', idempotencyKey: key() });
+    report = await dispatcher.tick();
+    expect(report.woke.map(w => w.task)).not.toContain(t.id);
+    expect(report.woke.map(w => w.task)).toContain(t2.id);
+    expect(report.notices).toContain(`contributors:${t.id}`);
+    expect(jevDispatches.filter(d => d.purpose === 'review' && d.taskId === t.id)).toHaveLength(0);
+  } finally {
+    workforce.evalState = savedEvalState;
+  }
+  expect((await task(t.id)).state).toBe('review');
+
+  // 读取恢复：失败通知自动清除，回避名单生效——E1（作者）硬回避；
+  // E2（复核过的前持有人、仅 claim 未提交）降权兜底，复核派回 E2 继续而非死等。
+  report = await dispatcher.tick();
+  expect((await owner.openNotices()).some(n => n.key === `contributors:${t.id}`)).toBe(false);
+  const rewoke = report.woke.find(w => w.task === t.id)!;
+  expect(rewoke.employee).toBe(reviewer.employee);
+  expect(rewoke.spawned).toBe(false);
+  // Jev 若参与选人，候选里不出现作者；经手人可保留（带 prior 标记）。
+  for (const d of jevDispatches.filter(d => d.taskId === t.id)) {
+    expect(Object.keys(d.candidates ?? [])).not.toContain(exec.employee);
+  }
+  expect((await task(t.id)).state).toBe('review');
 });
 
 test('dispatcher: jev picks among eligible employees using quota and score context', async () => {

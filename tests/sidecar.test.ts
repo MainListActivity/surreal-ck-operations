@@ -20,6 +20,10 @@ interface Call { tool: string; proof?: LeaseProof; text?: string; to?: string }
 const calls: Call[] = [];
 
 let employeeForGetTask = 'eng-x';
+let authRole = 'engineering';
+const wtCalls: Array<{ cred: string; taskId?: string }> = [];
+const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
+const auditCalls: Array<{ cred: string; limit?: number }> = [];
 const snap = (proof: LeaseProof): LeaseProof => ({ ...proof }); // record a copy; the pool mutates its proof between calls
 
 const core = {
@@ -30,11 +34,17 @@ const core = {
   block: async (_c: string, proof: LeaseProof, to: string, ev: { text: string }) => { calls.push({ tool: 'block', proof: snap(proof), to, text: ev.text }); return taskView(proof.taskId); },
   accept: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'accept', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
   returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
-  authenticate: async () => ({ employeeId: 'eng-x', role: 'engineering', capabilities: ['execute'] as const }),
+  authenticate: async () => ({ employeeId: 'eng-x', role: authRole, capabilities: ['execute'] as const }),
   companyBrief: async () => ({ ok: true }),
   listTasks: async () => [],
   getTask: async (_c: string, taskId: string) => ({ ...taskView(taskId), currentEmployee: employeeForGetTask }),
   history: async () => [],
+  listWorktrees: async (c: string, taskId?: string) => { wtCalls.push({ cred: c, taskId }); return [] as never; },
+  reclaimWorktrees: async (c: string, input?: { dryRun?: boolean; repos?: string[] }) => {
+    reclaimCalls.push({ cred: c, input });
+    return { scanId: 's', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+  },
+  listWorktreeAudits: async (c: string, limit?: number) => { auditCalls.push({ cred: c, limit }); return [] as never; },
   createTask: async () => taskView('new'),
   relayGoal: async () => ({}), triageGoal: async () => ({}), createDelivery: async () => [],
   relayOwnerDecision: async () => taskView('x'), relayDirection: async () => {},
@@ -77,7 +87,11 @@ beforeEach(() => {
   calls.length = 0;
   opsCalls.length = 0;
   released.length = 0;
+  wtCalls.length = 0;
+  reclaimCalls.length = 0;
+  auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
+  authRole = 'engineering';
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
   pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20 });
 });
@@ -224,6 +238,37 @@ describe('sidecar', () => {
       expect(res.ok).toBe(false);
       expect(res.error).toContain('unknown_tool');
     }
+  });
+
+  test('worktree 工具经 sidecar 路由：员工缺省绑当前任务，gm 缺省取全局，回收/审计透传 core', async () => {
+    const i = inst('e13');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-13'));
+
+    // 员工缺省：当前租约任务；显式 taskId 原样透传
+    const scoped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w1', 'list_worktrees', {});
+    expect(scoped.ok).toBe(true);
+    expect(wtCalls[0]).toEqual({ cred: 'tok-e13', taskId: 'task-13' });
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w2', 'list_worktrees', { taskId: 'task-other' });
+    expect(wtCalls[1]).toEqual({ cred: 'tok-e13', taskId: 'task-other' });
+
+    // gm 缺省：全局库存（taskId undefined，角色门控在 core）
+    authRole = 'gm';
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w3', 'list_worktrees', {});
+    expect(wtCalls[2]).toEqual({ cred: 'tok-e13', taskId: undefined });
+
+    // 回收（dry-run 透传）与审计查询；写全量回收同样透传，由 core 做 gm 门控
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w4', 'reclaim_worktrees', { dryRun: true, repos: ['/repo/a'] });
+    expect(reclaimCalls[0]).toEqual({ cred: 'tok-e13', input: { dryRun: true, repos: ['/repo/a'] } });
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w5', 'reclaim_worktrees', {});
+    expect(reclaimCalls[1]).toEqual({ cred: 'tok-e13', input: { dryRun: false, repos: undefined } });
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w6', 'list_worktree_audits', { limit: 5 });
+    expect(auditCalls[0]).toEqual({ cred: 'tok-e13', limit: 5 });
+
+    // 工具清单暴露新工具
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w7', '__list__', {});
+    expect((listed.data as { tools: string[] }).tools)
+      .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
   });
 
   test('ops sessions are dropped when the lease ends and when the agent is archived', async () => {

@@ -6,7 +6,7 @@ import { GOAL_TIERS, goalTemplate } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import { asId, CompanyError, HASH, id, requireText, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 
-export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'pause' | 'resume';
+export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
   id: RecordId;
   kind: OwnerCommandKind;
@@ -134,7 +134,7 @@ export class OwnerDesk {
       IF $t = NONE { THROW 'task not found' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
       IF $decision = 'reply' AND ($t.state != 'blocked' OR $t.blocked_to != 'owner') { THROW 'task is not waiting for an owner answer' };
-      LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND state != 'done';
+      LET $remaining = SELECT * FROM task WHERE id IN $t.dependencies AND (state != 'done' AND (state != 'void' OR (reviewer_role = 'owner' AND ($t.goal = NONE OR $t.id NOT IN ($t.goal.anchors ?? [])))));
       LET $next = UPDATE ONLY $task SET
         state = IF $decision = 'approve' THEN 'done'
           ELSE IF $decision = 'reject' THEN 'ready'
@@ -216,6 +216,20 @@ export class OwnerDesk {
     };
   }
 
+  /** Free-form owner instruction routed to the manager as a gm task; gm decides how to act on it. */
+  async instruct(input: { text: string; source: string; key: string }): Promise<{ taskId: string }> {
+    requireText(input.text, 'instruction text', 2, 10000);
+    const taskId = HASH(`instruct\0${input.key}`).slice(0, 16);
+    const task = id('task', taskId);
+    if (await this.db.select(task)) return { taskId };
+    const title = `老板指示：${input.text.trim().split(/\r?\n/)[0].slice(0, 60)}`;
+    await this.db.query(`CREATE ONLY $task CONTENT { title: $title, context: $context, kind: 'task',
+      executor_role: 'gm', reviewer_role: 'product', dependencies: [], state: 'ready',
+      version: 1, fence: 0, resume_state: 'ready', created_at: time::now() };
+      ${EMIT_CREATED('$task')}`, { task, title, context: `老板原话：\n${input.text.trim()}\n\n来源：${input.source}` });
+    return { taskId };
+  }
+
   /** Applies owner_command rows written by the CLI or directly into SurrealDB. Safe to run concurrently. */
   async applyPending(limit = 20): Promise<Array<{ id: string; kind: string; status: string; result?: string }>> {
     await this.db.query(`UPDATE owner_command SET status = 'pending'
@@ -238,6 +252,7 @@ export class OwnerDesk {
             result = `state=${(await this.decide({ taskId: row.task, decision: row.kind, note: row.text ?? '', source, key })).state}`;
             break;
           case 'direction': await this.addDirection({ text: row.text ?? '', source, key }); break;
+          case 'instruct': result = `task=${(await this.instruct({ text: row.text ?? '', source, key })).taskId}`; break;
           case 'pause': case 'resume': await this.setPaused(row.kind === 'pause'); break;
           default: throw new CompanyError('invalid', 'unknown command kind');
         }

@@ -56,9 +56,30 @@ export class FakeWorld {
   readonly workspaces = new Map<string, Workspace>();
   /** Every access token the world ever minted, for leak assertions. */
   readonly minted: string[] = [];
-  readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string }> = [];
+  readonly browserLogins: Array<{ spaceId: number; page: string; token: string; probeUrl: string; landingUrl: string; oidcUser?: { key: string; value: string } }> = [];
   /** IdP subject → active platform-operator capabilities, like the product's capability table. */
   readonly operatorCaps = new Map<string, string[]>();
+  /** The provision token hash the fake product sealed at the last rotate call (null = env fallback). */
+  liveProvisionToken: { hash: string; principalId: string } | null = null;
+readonly issuedInvites = new Map<string, Record<string, unknown>>();
+  /** 行级暂存的一次性激活链接——GET/POST 读路径永不回显，仅 collect-delivery 一次性下发。 */
+  readonly inviteUrls = new Map<string, string>();
+  readonly inviteDeliveredAt = new Map<string, string>();
+  /** 异步模式：POST 返回 202 processing，GET 轮询该次数后翻 completed。 */
+  inviteAsyncPolls: number | null = null;
+  /** 僵死模拟：GET 永不推进，直到同键重发 POST 续跑（inviteResumeCalls++）。 */
+  inviteNeedsResume = false;
+  inviteResumeCalls = 0;
+  /** 异步完成时翻为 failed（带 errorCode/errorMessage）而非 completed。 */
+  inviteFailOnComplete = false;
+  /** resend 铸链计数（断言「重放不重复发」用）。 */
+  inviteResendCalls = 0;
+  /** key → 最近一次重签发时刻（24h 内重放去重）。 */
+  readonly inviteResentAt = new Map<string, number>();
+  /** resend 时 IdP 侧用户已激活 → 409。 */
+  readonly inviteActivatedUsers = new Set<string>();
+  private readonly invitePendingPolls = new Map<string, number>();
+  private inviteResumed = new Set<string>();
   private readonly grants = new Map<string, Grant>();
   private readonly challenges = new Map<string, { state: string; codeChallenge: string; redirectUri: string; client: string }>();
   private readonly codes = new Map<string, { userId: string; codeChallenge: string; redirectUri: string; client: string }>();
@@ -82,6 +103,42 @@ export class FakeWorld {
     this.sqlite.run(`CREATE TABLE user_password_credentials (
       id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id),
       password_hash TEXT NOT NULL, created_at TEXT, updated_at TEXT)`);
+    this.sqlite.run(`CREATE TABLE oidc_clients (
+      id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, client_id TEXT NOT NULL,
+      client_secret_hash TEXT, client_name TEXT NOT NULL, application_type TEXT NOT NULL,
+      trust_level TEXT NOT NULL, consent_policy TEXT NOT NULL, client_profile TEXT NOT NULL,
+      access_token_audience TEXT, allowed_scopes TEXT, initiate_login_uri TEXT,
+      claim_hook_url TEXT, claim_hook_auth_header_name TEXT, claim_hook_auth_header_value TEXT,
+      token_endpoint_auth_method TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+      grant_types TEXT NOT NULL, response_types TEXT NOT NULL, created_by TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE (tenant_id, client_id))`);
+    this.sqlite.run(`CREATE TABLE admin_service_principals (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL, scopes TEXT NOT NULL,
+      status TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, created_by TEXT NOT NULL)`);
+    this.sqlite.run(`CREATE TABLE audit_events (
+      id TEXT PRIMARY KEY, actor_type TEXT NOT NULL, actor_id TEXT, tenant_id TEXT,
+      event_type TEXT NOT NULL, target_type TEXT, target_id TEXT, payload TEXT, occurred_at TEXT NOT NULL)`);
+    this.sqlite.run(`CREATE TABLE tenants (
+      id TEXT PRIMARY KEY, slug TEXT NOT NULL, display_name TEXT NOT NULL, issuer TEXT NOT NULL)`);
+    this.insertTenant({ id: TENANT, slug: 'ck' });
+  }
+
+  /** Seeds a tenants row like the production `ck` tenant the IdP admin routes resolve by slug. */
+  insertTenant(row: { id: string; slug: string; displayName?: string }) {
+    this.sqlite.run('INSERT INTO tenants (id, slug, display_name, issuer) VALUES (?, ?, ?, ?)',
+      [row.id, row.slug, row.displayName ?? row.slug, `https://idp.test/t/${row.slug}`]);
+  }
+
+  /** Direct row access for assertions about what the broker stored on a principal. */
+  principal(id: string): Record<string, unknown> | undefined {
+    return (this.sqlite.query('SELECT * FROM admin_service_principals WHERE id = ?').get(id) ?? undefined) as never;
+  }
+  auditRows(eventType?: string): Array<Record<string, unknown>> {
+    const rows = eventType
+      ? this.sqlite.query('SELECT * FROM audit_events WHERE event_type = ?').all(eventType)
+      : this.sqlite.query('SELECT * FROM audit_events').all();
+    return rows as Array<Record<string, unknown>>;
   }
 
   advance(ms: number) { this.clock += ms; }
@@ -104,7 +161,7 @@ export class FakeWorld {
   };
 
   readonly browser: BrowserInjector = async input => {
-    this.browserLogins.push({ spaceId: input.spaceId, page: input.page, token: input.token, probeUrl: input.probeUrl, landingUrl: input.landingUrl });
+    this.browserLogins.push({ spaceId: input.spaceId, page: input.page, token: input.token, probeUrl: input.probeUrl, landingUrl: input.landingUrl, oidcUser: input.oidcUser });
     return { url: input.landingUrl, title: 'Fixture App' };
   };
 
@@ -146,10 +203,71 @@ export class FakeWorld {
 
   private route(url: URL, method: string, init?: RequestInit): Promise<Response> | Response {
     if (url.origin === 'https://idp.test' && url.pathname === '/t/ck/token') return this.idpToken(method, init);
+    if (url.origin === 'https://idp.test' && url.pathname.startsWith('/admin/')) return this.idpAdmin(url, method, init);
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
     return new Response('unreachable host', { status: 502 });
+  }
+
+  /**
+   * The IdP's three service-principal-scoped admin routes, mirroring ma_hono app.ts: a bearer is
+   * looked up by token hash, 401 when unknown, 403 when revoked or the route is outside its scopes
+   * (every other /admin/* route, including GET /admin/tenants/<id>, is human-admin-only for a
+   * principal). Provision writes `user.provisioned`/`user.provision.failed` audit rows with
+   * actorType `service_principal` and the principal id, like the real route.
+   */
+  private idpAdmin(url: URL, method: string, init?: RequestInit): Response {
+    const header = new Headers(init?.headers).get('authorization') ?? '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    const hash = token ? createHash('sha256').update(token).digest('base64url') : '';
+    const principal = this.sqlite.query('SELECT * FROM admin_service_principals WHERE token_hash = ?').get(hash) as Record<string, unknown> | null;
+    if (!principal) return json(401, { error: 'unauthorized' });
+    if (principal.status === 'revoked') return json(403, { error: 'forbidden' });
+    const scopes = JSON.parse(String(principal.scopes)) as string[];
+    const usersPath = /^\/admin\/tenants\/([^/]+)\/users$/.exec(url.pathname);
+    const need = method === 'GET' && url.pathname === '/admin/tenants' ? 'tenant.read'
+      : method === 'GET' && usersPath ? 'user.read'
+        : method === 'POST' && usersPath ? 'user.provision' : null;
+    if (!need || !scopes.includes(need)) return json(403, { error: 'forbidden' });
+
+    const audit = (eventType: string, payload: Record<string, unknown>, targetId: string | null = null, tenantId: string | null = null) => {
+      this.sqlite.run(`INSERT INTO audit_events (id, actor_type, actor_id, tenant_id, event_type, target_type, target_id, payload, occurred_at)
+        VALUES (?, 'service_principal', ?, ?, ?, 'user', ?, ?, ?)`,
+        [randomUUID(), String(principal.id), tenantId, eventType, targetId, JSON.stringify(payload), new Date(this.clock).toISOString()]);
+    };
+
+    if (need === 'tenant.read') {
+      const tenants = this.sqlite.query('SELECT id, slug, display_name, issuer FROM tenants').all() as Array<Record<string, unknown>>;
+      return json(200, { tenants: tenants.map(t => ({ id: t.id, slug: t.slug, display_name: t.display_name, issuer: t.issuer })) });
+    }
+    const tenantId = usersPath![1]!;
+    const tenant = this.sqlite.query('SELECT id FROM tenants WHERE id = ?').get(tenantId) as { id: string } | null;
+    if (!tenant) return json(404, { error: 'tenant_not_found' });
+    if (need === 'user.read') {
+      const users = this.sqlite.query('SELECT id, email, display_name, status FROM users WHERE tenant_id = ?').all(tenantId) as Array<Record<string, unknown>>;
+      return json(200, { users });
+    }
+    const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+    const email = String(body.email ?? '').trim();
+    const displayName = String(body.display_name ?? '').trim();
+    if (!email || !displayName) return json(400, { error: 'invalid_request' });
+    const existing = this.sqlite.query('SELECT id FROM users WHERE tenant_id = ? AND email = ?').get(tenantId, email);
+    if (existing) {
+      audit('user.provision.failed', { error: 'conflict', email }, null, tenantId);
+      return json(409, { error: 'conflict' });
+    }
+    const userId = randomUUID();
+    this.sqlite.run(`INSERT INTO users (id, tenant_id, email, email_verified, username, display_name, status, created_at, updated_at)
+      VALUES (?, ?, ?, 0, NULL, ?, 'active', ?, ?)`,
+      [userId, tenantId, email, displayName, new Date(this.clock).toISOString(), new Date(this.clock).toISOString()]);
+    const invitationToken = `inv-${randomBytes(16).toString('hex')}`;
+    audit('user.provisioned', { email }, userId, tenantId);
+    return json(201, {
+      user: { id: userId, tenant_id: tenantId, email, username: null, display_name: displayName, status: 'active', email_verified: false },
+      invitation_token: invitationToken,
+      activation_url: `https://idp.test/activate-account?token=${invitationToken}`,
+    });
   }
 
   /** An active IdP account whose password is known to the test. */
@@ -173,6 +291,38 @@ export class FakeWorld {
   }
   insertUser(username: string, email: string) {
     this.sqlite.run('INSERT INTO users (id, tenant_id, email, username, display_name, status) VALUES (?, ?, ?, ?, ?, ?)', [randomUUID(), TENANT, email, username, username, 'active']);
+  }
+
+  /**
+   * Seeds an oidc_clients row like the production DCR'd `sck-ops-console` public client
+   * (`consent_policy require`, no secret hash), for client-alignment assertions.
+   */
+  seedOidcClient(row: {
+    clientId: string; clientName?: string; redirectUris?: string[]; audience?: string;
+    consentPolicy?: string; authMethod?: string; secretHash?: string;
+  }) {
+    const stamp = new Date(this.clock).toISOString();
+    this.sqlite.run(`INSERT INTO oidc_clients (
+      id, tenant_id, client_id, client_secret_hash, client_name, application_type,
+      trust_level, consent_policy, client_profile, access_token_audience, allowed_scopes,
+      initiate_login_uri, claim_hook_url, claim_hook_auth_header_name, claim_hook_auth_header_value,
+      token_endpoint_auth_method, redirect_uris, grant_types, response_types, created_by,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'web', 'first_party_trusted', ?, 'spa', ?, NULL,
+      NULL, NULL, NULL, NULL, ?, ?, '["authorization_code"]', '["code"]', 'ops_broker', ?, ?)`,
+      [
+        randomUUID(), TENANT, row.clientId, row.secretHash ?? null, row.clientName ?? 'sck-ops-console',
+        row.consentPolicy ?? 'require', row.audience ?? OPS_RESOURCE,
+        row.authMethod ?? 'none', JSON.stringify(row.redirectUris ?? [OPS_REDIRECT]), stamp, stamp,
+      ]);
+  }
+
+  /** Direct row access for assertions about a registered OIDC client. */
+  oidcClient(clientName: string): Record<string, unknown> | undefined {
+    return (this.sqlite.query('SELECT * FROM oidc_clients WHERE client_name = ?').get(clientName) ?? undefined) as never;
+  }
+  oidcClientCount(): number {
+    return (this.sqlite.query('SELECT COUNT(*) AS n FROM oidc_clients').get() as { n: number }).n;
   }
 
   // ---------- IdP ----------
@@ -362,6 +512,141 @@ export class FakeWorld {
       if (method === 'GET' && entitlement) {
         if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
         return json(200, { slug: decodeURIComponent(url.pathname.split('/').pop()!), entitlement: { revision: 3 } });
+      }
+      // Mirrors POST /api/ops/idp-provision-token/rotate: subscription.manage capability, the
+      // candidate token is probed against the IdP (here: the D1 principal rows themselves), then
+      // sealed into the product's store — modelled as the live hash for later status reads.
+      if (method === 'POST' && url.pathname === '/api/ops/idp-provision-token/rotate') {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const token = String(body.token ?? '');
+        if (!token) return apiError(400, 'idp-provision-token-invalid-request');
+        const hash = createHash('sha256').update(token).digest('base64url');
+        const principal = this.sqlite.query(`SELECT * FROM admin_service_principals WHERE token_hash = ?`).get(hash) as Record<string, unknown> | null;
+        if (!principal || principal.status !== 'active') return apiError(400, 'idp-provision-token-invalid');
+        this.liveProvisionToken = { hash, principalId: String(principal.id) };
+        return json(200, { rotated: true, source: 'store', updatedAt: new Date(this.clock).toISOString(), updatedBy: grant.userId });
+      }
+      if (method === 'GET' && url.pathname === '/api/ops/idp-provision-token/status') {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        const live = this.liveProvisionToken;
+        return json(200, {
+          configured: true,
+          source: live ? 'store' : 'env',
+          env: { configured: true },
+          store: {
+            sealKeyConfigured: true,
+            entry: live ? { updatedAt: new Date(this.clock).toISOString(), updatedBy: 'ops:test', purpose: 'provision token' } : null,
+            unsealError: null,
+          },
+          idp: { reachable: true, status: null, error: null },
+        });
+      }
+      // Mirrors POST /api/ops/invitations: subscription.manage capability; async contract —
+      // fast path 201+URL（同步窗内完成即记为已收取），inviteAsyncPolls 模式回 202 processing
+      // 供 GET 轮询；僵死（inviteNeedsResume）行须同键重发续跑。
+      if (method === 'POST' && url.pathname === '/api/ops/invitations') {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = String(body.idempotencyKey ?? '');
+        const existing = this.issuedInvites.get(key);
+        if (existing) {
+          if (existing.status === 'processing') {
+            this.inviteResumeCalls += 1;
+            if (this.inviteNeedsResume && !this.inviteResumed.has(key)) {
+              this.inviteResumed.add(key); // 续跑成功：恢复推进
+            }
+          }
+          const delivery = { ...(existing.delivery as Record<string, unknown>), activationUrl: null };
+          return json(existing.status === 'processing' ? 200 : 200, { ...existing, replayed: true, delivery });
+        }
+        const url = `https://idp.test/activate-account?token=onetime-${randomUUID()}`;
+        this.inviteUrls.set(key, url);
+        const base = {
+          idempotencyKey: key, replayed: false,
+          user: { id: `uid-${key.slice(0, 8)}`, email: String(body.email ?? ''), status: 'provisioned', outcome: 'created' },
+          workspace: { slug: String(body.workspaceSlug ?? ''), dbName: 'ws_fake', outcome: 'created' },
+          entitlement: { planKey: String(body.planKey ?? 'pro'), productPlanRevisionId: 'product_plan_revision:x', billingAccountKey: 'personal:x' },
+          aiAllowance: { kind: 'compensation', amount: (body.aiAllowance as Record<string, unknown> | undefined)?.amount ?? 0, periodKey: `invite:${key}`, expiresAt: '2026-12-31T23:59:59.000Z', bucket: 'ai_allowance_bucket:fake' },
+        };
+        const asyncPolls = this.inviteAsyncPolls ?? 0;
+        if (asyncPolls > 0) {
+          const processing = { ...base, status: 'processing',
+            delivery: { channel: 'none', activationUrl: null, pendingCollect: false, note: '开通仍在进行' } };
+          this.issuedInvites.set(key, processing);
+          this.invitePendingPolls.set(key, asyncPolls);
+          return json(202, processing);
+        }
+        const completed = { ...base, status: 'completed',
+          delivery: { channel: 'activation_url', activationUrl: url, pendingCollect: false, note: 'invite note' } };
+        this.issuedInvites.set(key, completed);
+        this.inviteDeliveredAt.set(key, new Date(this.clock).toISOString()); // 同步窗内下发即收取
+        return json(201, completed);
+      }
+      // GET /api/ops/invitations/:key — quota.read，读路径永不含 URL 本体。
+      const inviteGet = /^\/api\/ops\/invitations\/([^/]+)$/.exec(url.pathname);
+      if (method === 'GET' && inviteGet) {
+        if (!caps.includes('quota.read')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(inviteGet[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        if (row.status === 'processing' && (!this.inviteNeedsResume || this.inviteResumed.has(key))) {
+          const left = this.invitePendingPolls.get(key) ?? 0;
+          if (left <= 1) {
+            this.invitePendingPolls.delete(key);
+            if (this.inviteFailOnComplete) {
+              row.status = 'failed';
+              row.errorCode = 'invite-slug-taken';
+              row.errorMessage = 'workspace slug 已被占用';
+            } else {
+              row.status = 'completed';
+              row.delivery = { channel: 'activation_url', activationUrl: null, pendingCollect: this.inviteUrls.has(key), note: '完成后经 collect-delivery 收取' };
+            }
+          } else {
+            this.invitePendingPolls.set(key, left - 1);
+          }
+        }
+        return json(200, { ...row, replayed: true });
+      }
+      // POST /api/ops/invitations/:key/resend — subscription.manage，镜像产品语义：
+      // completed 行铸新链暂存回行（pendingCollect）；processing/failed 409；
+      // 未收取或上次重签发仍在 24h 有效期内的重放不重复铸链。
+      const resend = /^\/api\/ops\/invitations\/([^/]+)\/resend$/.exec(url.pathname);
+      if (method === 'POST' && resend) {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(resend[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        if (row.status === 'processing') return apiError(409, 'invite-resend-while-processing');
+        if (row.status !== 'completed') return apiError(409, 'invite-resend-invalid-state');
+        const pendingCollect = this.inviteUrls.has(key) && !this.inviteDeliveredAt.has(key);
+        const resentAt = this.inviteResentAt.get(key);
+        const withinTtl = resentAt !== undefined && this.clock - resentAt < 24 * 60 * 60 * 1000;
+        if (!pendingCollect && !withinTtl) {
+          const u = row.user as Record<string, unknown> | null;
+          if (u && this.inviteActivatedUsers.has(String(u.id))) return apiError(409, 'invite-already-activated');
+          this.inviteResendCalls += 1;
+          this.inviteUrls.set(key, `https://idp.test/activate-account?token=resent-${randomUUID()}`);
+          this.inviteDeliveredAt.delete(key);
+          this.inviteResentAt.set(key, this.clock);
+        }
+        const nowPending = this.inviteUrls.has(key) && !this.inviteDeliveredAt.has(key);
+        row.delivery = { channel: 'activation_url', activationUrl: null, pendingCollect: nowPending, note: 'collect-delivery 一次性收取' };
+        return json(200, { ...row, replayed: true, delivery: row.delivery });
+      }
+      // POST /api/ops/invitations/:key/collect-delivery — subscription.manage，一次性收取。
+      const collect = /^\/api\/ops\/invitations\/([^/]+)\/collect-delivery$/.exec(url.pathname);
+      if (method === 'POST' && collect) {
+        if (!caps.includes('subscription.manage')) return apiError(403, 'platform-operator-capability-missing');
+        const key = decodeURIComponent(collect[1]!);
+        const row = this.issuedInvites.get(key);
+        if (!row) return apiError(404, 'invite-not-found');
+        const deliveredAt = this.inviteDeliveredAt.get(key) ?? null;
+        if (row.status !== 'completed' || deliveredAt || !this.inviteUrls.has(key)) {
+          return json(200, { idempotencyKey: key, status: row.status, activationUrl: null, deliveredAt });
+        }
+        const now = new Date(this.clock).toISOString();
+        this.inviteDeliveredAt.set(key, now);
+        row.delivery = { ...(row.delivery as Record<string, unknown>), pendingCollect: false };
+        return json(200, { idempotencyKey: key, status: 'completed', activationUrl: this.inviteUrls.get(key), deliveredAt: now });
       }
       return apiError(404, 'not-found');
     }

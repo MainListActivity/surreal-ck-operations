@@ -1,7 +1,11 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
-import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
+import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
@@ -13,6 +17,7 @@ function rig(patch: Record<string, unknown> = {}, hasEnv = true): Rig {
     core: company.core, projects: company.projects as never, secretKey: () => Buffer.alloc(32),
     controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
     fetch: world.fetch, now: world.now, d1: () => world.d1, queryAsUser: world.queryAsUser, browser: world.browser,
+    sleep: async (ms) => { world.clock += ms; },
   });
   return { world, company, broker, qa: company.lease('qa-1', 'qa', 'task-1'), outputs: [] };
 }
@@ -41,9 +46,12 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('ops tools are enumerated (proof tools exercised by independent fork suite)', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_info',
-      'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
-      'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove', 'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_info',
+      'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
+      'ops_idp_provision_rotate',
+      'ops_info', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
+      'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
+      'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
     ]);
   });
 
@@ -99,7 +107,9 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true, idpProvisionRotate: false });
+    // Public client metadata is listed for alignment checks; never secret material.
+    expect(info.clients).toEqual({ customer: { clientId: 'client-ck-1234', redirectUri: 'https://app.test/auth/callback' } });
     expectNoLeaks(r);
   });
 
@@ -397,6 +407,8 @@ describe('ops request, query and browser', () => {
     expect(result).toEqual({ signedInAs: 'sck-qa-one', url: 'https://app.test/', title: 'Fixture App' });
     expect(r.world.browserLogins).toHaveLength(1);
     expect(r.world.browserLogins[0]).toMatchObject({ spaceId: 3, page: 'p1', probeUrl: 'https://app.test/health' });
+    // Customer injection is unchanged: the flat oidc.access_token/oidc.exp keys, no User record.
+    expect(r.world.browserLogins[0]!.oidcUser).toBeUndefined();
     expect(r.world.tokens).toContain(r.world.browserLogins[0]!.token);
     expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_browser_login' });
     expectNoLeaks(r);
@@ -609,6 +621,32 @@ describe('operator sessions', () => {
     expect((await call(rig(opsPatch), 'ops_info')).can).toMatchObject({ operatorLogin: true });
   });
 
+  test('a broker client id that is not the registered console client fails at authorize', async () => {
+    // The production failure shape: the authorize URL carried a client the IdP never registered
+    // (or the proxy hard-binding would override). No retry, no consent hop, no token minted.
+    const r = rig({ ops: { clientId: 'ops-client-WRONG', redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } });
+    await opsUser(r, 'qa-ops');
+    const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('HTTP 400');
+    expect(r.world.requests.filter(x => x.url.includes('/api/auth/ops/token'))).toHaveLength(0);
+    expect(r.world.requests.filter(x => x.url.includes('/api/consent/'))).toHaveLength(0);
+    expectNoLeaks(r);
+  });
+
+  test('the operator client id travels on authorize and token exchange exactly as configured', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const authorize = () => r.world.requests.map(x => new URL(x.url)).find(u => u.pathname === '/t/ck/authorize')!;
+    await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    expect(authorize().searchParams.get('client_id')).toBe(OPS_CLIENT);
+    const exchange = r.world.requests.find(x => x.url.endsWith('/api/auth/ops/token'))!;
+    expect(exchange.method).toBe('POST');
+    // PKCE S256 was offered on authorize and proven at exchange (the fake rejects otherwise).
+    expect(authorize().searchParams.get('code_challenge_method')).toBe('S256');
+    expect(authorize().searchParams.get('code_challenge')).toBeTruthy();
+  });
+
   test('an account that is not a platform operator fails the login probe and keeps no session', async () => {
     const r = rig(opsPatch);
     await call(r, 'ops_account_ensure', { alias: 'qa-ops' }); // never registered as an operator
@@ -630,13 +668,13 @@ describe('operator sessions', () => {
     await opsUser(r, 'qa-ops');
     const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
     expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('invalid');
+    // ops_browser_login is intentionally absent: an operator session may inject into /ops/.
     for (const [tool, extra] of [
       ['ops_workspace_ensure', { slug: 'sck-x' }],
       ['ops_member_list', { slug: 'sck-x' }],
       ['ops_member_add', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_member_remove', { slug: 'sck-x', alias: 'qa-one' }],
       ['ops_query', { sql: 'SELECT 1' }],
-      ['ops_browser_login', { spaceId: 1 }],
     ] as const) {
       const err = await failure(call(r, tool, { session: op.session, ...extra }));
       expect(err.code, tool).toBe('invalid');
@@ -714,6 +752,72 @@ describe('operator sessions', () => {
     r.world.operatorCaps.set(subject, ['content.read']);
     const denied = await call(r, 'ops_request', { session: op.session, method: 'GET', path: entitlementPath });
     expect(denied).toMatchObject({ status: 403, body: { error: { code: 'platform-operator-capability-missing' } } });
+  });
+
+  test('an operator session injects into /ops/ as the console\'s oidc-client-ts User record', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    const result = await call(r, 'ops_browser_login', { session: op.session, spaceId: 7, page: 'p3' });
+    expect(result).toEqual({ signedInAs: 'sck-qa-ops', url: 'https://app.test/ops/', title: 'Fixture App' });
+
+    const login = r.world.browserLogins[0]!;
+    expect(login).toMatchObject({ spaceId: 7, page: 'p3', probeUrl: 'https://app.test/health', landingUrl: 'https://app.test/ops/' });
+    // The UserManager userStore key is `oidc.user:<authority>:<client_id>` with the issuer's
+    // trailing slash stripped — never the customer app's flat oidc.access_token/oidc.exp keys.
+    expect(login.oidcUser?.key).toBe(`oidc.user:https://idp.test/t/ck:${OPS_CLIENT}`);
+    const record = JSON.parse(login.oidcUser!.value) as Record<string, unknown>;
+    expect(record).toMatchObject({
+      access_token: login.token, token_type: 'Bearer', scope: 'openid',
+      profile: { sub: subject, email: 'sck-qa-ops@example.test' },
+    });
+    expect(record.expires_at).toBe(Math.floor((r.world.clock + 900_000) / 1000));
+    // The operator gate was re-probed before the token was handed to the browser.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/quota/context'))).toHaveLength(2);
+    expect(r.company.audits.at(-1)!.evidence).toContain('/ops/');
+    expectNoLeaks(r);
+  });
+
+  test('an operator browser login re-probes the gate: revocation refuses and drops the session', async () => {
+    const r = rig(opsPatch);
+    const subject = await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.operatorCaps.set(subject, []);
+    const error = await failure(call(r, 'ops_browser_login', { session: op.session, spaceId: 1 }));
+    expect(error.code).toBe('forbidden');
+    expect(error.message).toContain('platform-operator-inactive');
+    expect(r.world.browserLogins).toHaveLength(0);
+    // The dead session is dropped, so a stray retry cannot smuggle a revoked token anywhere.
+    expect((await failure(call(r, 'ops_request', { session: op.session, method: 'GET', path: '/api/ops/quota/context' }))).code).toBe('not_found');
+    expectNoLeaks(r);
+  });
+
+  test('an operator browser login whose token died re-auths on the ops channel first', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    r.world.expireTokens(); // the stored token dies: reauth mints a fresh ops-audience one
+    const result = await call(r, 'ops_browser_login', { session: op.session, spaceId: 1 });
+    expect(result.signedInAs).toBe('sck-qa-ops');
+    // Reauth stayed on the operator channel — a second /api/auth/ops/token, no customer exchange.
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/ops/token'))).toHaveLength(2);
+    expect(r.world.requests.filter(x => x.url.endsWith('/api/auth/token'))).toHaveLength(0);
+    // And the injected record carries the fresh ops-audience token, not the stale one.
+    const record = JSON.parse(r.world.browserLogins[0]!.oidcUser!.value) as Record<string, unknown>;
+    expect(record.access_token).toBe(r.world.tokens.at(-1));
+    expectNoLeaks(r);
+  });
+
+  test('a browser login with bad page args never reaches the injector for an operator either', async () => {
+    const r = rig(opsPatch);
+    await opsUser(r, 'qa-ops');
+    const op = await call(r, 'ops_operator_login', { alias: 'qa-ops' });
+    for (const args of [{ spaceId: -1 }, { spaceId: 1, page: 'x;rm' }]) {
+      expect((await failure(call(r, 'ops_browser_login', { session: op.session, ...args }))).code).toBe('invalid');
+    }
+    expect(r.world.browserLogins).toHaveLength(0);
+    // No re-probe ran for invalid args: validation precedes the operator gate check.
+    expect(r.world.requests.filter(x => x.url.includes('/api/ops/quota/context'))).toHaveLength(1);
   });
 });
 
@@ -842,5 +946,727 @@ describe('ops audience sessions (ops_login audience:"ops")', () => {
     const res = await call(r, 'ops_request', { session, method: 'GET', path: '/api/ops/quota/context' });
     expect(res).toMatchObject({ status: 403, ok: false, body: { error: { code: 'platform-operator-inactive' } } });
     expectNoLeaks(r);
+  });
+});
+
+describe('ops_idp_client_register', () => {
+  const REDIRECTS = ['https://app.test/ops/auth/callback.html'];
+
+  test('registers a public SPA client row in the IdP database', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    });
+    expect(res.result).toBe('created');
+    expect(res.clientId).toMatch(/^[0-9a-f-]{36}$/);
+    const row = r.world.oidcClient('sck-ops-console')!;
+    expect(row).toMatchObject({
+      tenant_id: TENANT, client_id: res.clientId, client_name: 'sck-ops-console',
+      application_type: 'web', client_profile: 'spa', token_endpoint_auth_method: 'none',
+      client_secret_hash: null, trust_level: 'first_party_trusted', consent_policy: 'skip',
+      access_token_audience: 'https://app.test/api/ops/mcp',
+      grant_types: '["authorization_code"]', response_types: '["code"]',
+    });
+    expect(JSON.parse(String(row.redirect_uris))).toEqual(REDIRECTS);
+    expectNoLeaks(r);
+  });
+
+  test('a replayed registration returns the existing client_id instead of a second row', async () => {
+    const r = rig();
+    const args = {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://app.test/api/ops/mcp',
+    };
+    const first = await call(r, 'ops_idp_client_register', args);
+    const again = await call(r, 'ops_idp_client_register', args);
+    expect(again).toMatchObject({ clientId: first.clientId, result: 'exists' });
+    expect(r.world.oidcClientCount()).toBe(1);
+  });
+
+  test('redirect_uris off the product host or off https are refused before any write', async () => {
+    const r = rig();
+    for (const redirect_uris of [
+      ['https://evil.example/callback'],
+      ['http://app.test/ops/auth/callback.html'],
+      ['app.test/ops/callback.html'],
+      ['https://sub.app.test.evil.example/callback'],
+    ]) {
+      const error = await failure(call(r, 'ops_idp_client_register', {
+        client_name: 'sck-ops-console', redirect_uris,
+        access_token_audience: 'https://app.test/api/ops/mcp',
+      }));
+      expect(error.code).toBe('invalid');
+    }
+    expect(r.world.oidcClientCount()).toBe(0);
+  });
+
+  test('an audience off the product host is refused before any write', async () => {
+    const r = rig();
+    const error = await failure(call(r, 'ops_idp_client_register', {
+      client_name: 'sck-ops-console', redirect_uris: REDIRECTS,
+      access_token_audience: 'https://attacker.example/api/ops/mcp',
+    }));
+    expect(error.code).toBe('invalid');
+    expect(r.world.oidcClientCount()).toBe(0);
+  });
+});
+
+describe('ops_idp_client_info', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+
+  test('reports the registered client and its alignment with the broker config', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info).toMatchObject({
+      clientName: 'sck-ops-console', clientId: OPS_CLIENT, redirectUris: [OPS_REDIRECT],
+      accessTokenAudience: OPS_RESOURCE, consentPolicy: 'require', clientProfile: 'spa',
+      tokenEndpointAuthMethod: 'none', grantTypes: ['authorization_code'], responseTypes: ['code'],
+      hasSecret: false,
+      alignment: {
+        customerClient: false, operatorClient: true, opsAudienceClient: false,
+        operatorRedirectRegistered: true, operatorAudienceMatch: true,
+      },
+    });
+    expectNoLeaks(r);
+  });
+
+  test('looks up by client_id and flags a drifted redirect or audience', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT, redirectUris: ['https://app.test/old/cb'], audience: 'https://app.test/api/ops/old' });
+    const info = await call(r, 'ops_idp_client_info', { client_id: OPS_CLIENT });
+    expect(info.clientName).toBe('sck-ops-console');
+    expect(info.alignment).toMatchObject({ operatorClient: true, operatorRedirectRegistered: false, operatorAudienceMatch: false });
+  });
+
+  test('a client other than the configured operator client is flagged as mismatched', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: 'ops-client-9999' });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info.alignment).toMatchObject({ operatorClient: false, customerClient: false });
+  });
+
+  test('the secret hash is reported as a boolean and never leaves the broker', async () => {
+    const r = rig(opsPatch);
+    r.world.seedOidcClient({ clientId: OPS_CLIENT, secretHash: 'deadbeef-secret-hash' });
+    const info = await call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' });
+    expect(info.hasSecret).toBe(true);
+    expect(JSON.stringify(info)).not.toContain('deadbeef-secret-hash');
+    expectNoLeaks(r, ['deadbeef-secret-hash']);
+  });
+
+  test('unknown clients are not_found; bad args are invalid; nothing reaches the database', async () => {
+    const r = rig(opsPatch);
+    expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'ghost-client' }))).code).toBe('not_found');
+    const sqlCalls = r.world.sql.length;
+    for (const args of [{}, { client_name: 'a', client_id: 'b' }, { client_name: 'Bad Name!' }, { client_id: 'x;drop' }]) {
+      expect((await failure(call(r, 'ops_idp_client_info', args))).code).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(sqlCalls);
+  });
+
+  test('without an IdP database configured the tool reports not_configured', async () => {
+    const r = rig({ ...opsPatch, d1: undefined });
+    expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' }))).code).toBe('not_configured');
+  });
+});
+
+describe('ops_idp_principal_mint', () => {
+  test('mints a revocable principal row, seals the token, and audits the mint in the IdP', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify' });
+    expect(res).toMatchObject({ label: 'qa-verify', scopes: ['tenant.read', 'user.read', 'user.provision'], status: 'active' });
+    const token = res.token as string;
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    // The D1 row mirrors the IdP's own mint: hash only, fixed scopes, ops caller attributed.
+    const row = r.world.principal(res.id)!;
+    expect(row).toMatchObject({ label: 'qa-verify', status: 'active', revoked_at: null, created_by: 'ops:qa-1' });
+    expect(row.token_hash).toBe(createHash('sha256').update(token).digest('base64url'));
+    expect(JSON.parse(String(row.scopes))).toEqual(['tenant.read', 'user.read', 'user.provision']);
+
+    // The IdP-side compensating audit attributes the mint to the calling employee's machine channel.
+    const minted = r.world.auditRows('admin.service_principal.minted');
+    expect(minted).toHaveLength(1);
+    expect(minted[0]).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1', target_type: 'service_principal', target_id: res.id });
+    expect(JSON.parse(String(minted[0]!.payload))).toMatchObject({ label: 'qa-verify', via: 'ops_broker' });
+
+    // The token is sealed under the principal id so ops_idp_admin_request can resolve it later.
+    const sealName = `IDP_SP_${res.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(r.company.sealed.get(`demo/production/${sealName}`)).toBe(token);
+    expect(JSON.stringify(r.company.sealed.keys())).not.toContain('_PASSWORD');
+
+    // The broker audit names the principal id, never the token; SQL carried the hash only.
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_principal_mint' });
+    expect(JSON.stringify(r.company.audits)).not.toContain(token);
+    for (const { sql } of r.world.sql) expect(sql).not.toContain(token);
+  });
+
+  test('sealAs returns the alias seal name and never the token value', async () => {
+    const r = rig();
+    const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' });
+    expect(res).toMatchObject({ label: 'qa-verify', sealed: 'IDP_SP_QA_VERIFY', status: 'active' });
+    expect(res.token).toBeUndefined();
+    const token = r.company.sealed.get('demo/production/IDP_SP_QA_VERIFY')!;
+    expect(token).toBeTruthy();
+    const sealName = `IDP_SP_${res.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(r.company.sealed.get(`demo/production/${sealName}`)).toBe(token);
+    expect(r.world.principal(res.id)!.token_hash).toBe(createHash('sha256').update(token).digest('base64url'));
+    expectNoLeaks(r);
+  });
+
+  test('bad arguments are refused before any write', async () => {
+    const r = rig();
+    for (const args of [{}, { label: '' }, { label: 'x'.repeat(90) }, { label: 'ok', sealAs: 'bad seal!' }]) {
+      expect((await failure(call(r, 'ops_idp_principal_mint', args))).code).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(0);
+    expect(r.company.sealed.size).toBe(0);
+  });
+
+  test('without an IdP database configured the tool reports not_configured', async () => {
+    const r = rig({ d1: undefined });
+    expect((await failure(call(r, 'ops_idp_principal_mint', { label: 'x' }))).code).toBe('not_configured');
+  });
+});
+
+describe('ops_idp_principal_revoke', () => {
+  test('revokes once, writes the IdP-side audit row, and stays idempotent', async () => {
+    const r = rig();
+    const mint = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' });
+    const res = await call(r, 'ops_idp_principal_revoke', { principalId: mint.id });
+    expect(res).toMatchObject({ id: mint.id, status: 'revoked', alreadyRevoked: false });
+    expect(res.revokedAt).toBeTruthy();
+    expect(r.world.principal(mint.id)).toMatchObject({ status: 'revoked', revoked_at: res.revokedAt });
+    const revoked = r.world.auditRows('admin.service_principal.revoked');
+    expect(revoked).toHaveLength(1);
+    expect(revoked[0]).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1', target_id: mint.id });
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_principal_revoke' });
+
+    const again = await call(r, 'ops_idp_principal_revoke', { principalId: mint.id });
+    expect(again).toMatchObject({ alreadyRevoked: true, revokedAt: res.revokedAt });
+    expect(r.world.auditRows('admin.service_principal.revoked')).toHaveLength(1);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_call' });
+    expectNoLeaks(r);
+  });
+
+  test('unknown and malformed ids fail before any write', async () => {
+    const r = rig();
+    expect((await failure(call(r, 'ops_idp_principal_revoke', { principalId: randomUUID() }))).code).toBe('not_found');
+    for (const args of [{}, { principalId: 'x;drop' }]) {
+      expect((await failure(call(r, 'ops_idp_principal_revoke', args))).code).toBe('invalid');
+    }
+  });
+});
+
+describe('ops_idp_admin_request', () => {
+  const mintSealed = async (r: Rig) =>
+    (await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' })) as { id: string };
+  const usersPath = `/admin/tenants/${TENANT}/users`;
+
+  test('relays the sealed token to the scoped routes and resolves the tenant', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const tenants = await call(r, 'ops_idp_admin_request', { principalId: id, method: 'GET', path: '/admin/tenants' });
+    expect(tenants).toMatchObject({ status: 200, ok: true });
+    expect(tenants.body.tenants[0]).toMatchObject({ id: TENANT, slug: 'ck' });
+    const sent = r.world.requests.find(q => q.url === 'https://idp.test/admin/tenants')!;
+    expect(sent.method).toBe('GET');
+    expectNoLeaks(r);
+  });
+
+  test('provisions a user, masks the one-time credentials, and attributes the audit to the principal', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const created = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(created).toMatchObject({ status: 201, ok: true });
+    expect(created.body.user).toMatchObject({ email: 'invite-1@example.test', display_name: 'Invite One', status: 'active' });
+    // invitation_token and activation_url are usable credentials: masked in the relayed body.
+    const text = JSON.stringify(created.body);
+    expect(text).toContain('[redacted]');
+    expect(text).not.toContain('inv-');
+    const provisioned = r.world.auditRows('user.provisioned');
+    expect(provisioned.at(-1)).toMatchObject({ actor_type: 'service_principal', actor_id: id, tenant_id: TENANT });
+
+    const again = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(again.status).toBe(409);
+    expect(r.world.auditRows('user.provision.failed').at(-1)).toMatchObject({ actor_type: 'service_principal', actor_id: id });
+    expectNoLeaks(r);
+  });
+
+  test('a revoked principal reaches the IdP and is answered 403 without creating users', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const before = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-1@example.test', display_name: 'Invite One' },
+    });
+    expect(before.status).toBe(201);
+    await call(r, 'ops_idp_principal_revoke', { principalId: id });
+    const after = await call(r, 'ops_idp_admin_request', {
+      principalId: id, method: 'POST', path: usersPath,
+      body: { email: 'invite-2@example.test', display_name: 'Invite Two' },
+    });
+    expect(after).toMatchObject({ status: 403, ok: false });
+    expect(r.world.sqlite.query('SELECT COUNT(*) AS n FROM users WHERE email = ?').get('invite-2@example.test')).toMatchObject({ n: 0 });
+    expect(r.world.auditRows('user.provisioned')).toHaveLength(1);
+    expectNoLeaks(r);
+  });
+
+  test('only the three scoped routes pass the proxy gate; nothing else reaches the IdP', async () => {
+    const r = rig();
+    const { id } = await mintSealed(r);
+    const before = r.world.requests.length;
+    for (const [method, path] of [
+      ['GET', `/admin/tenants/${TENANT}`],
+      ['GET', '/admin/service-principals'],
+      ['POST', '/admin/service-principals'],
+      ['GET', '/admin/login'],
+      ['POST', '/admin/tenants'],
+      ['DELETE', usersPath],
+      ['GET', `${usersPath}?email=x`],
+      ['GET', '/admin/tenants/../users'],
+      ['GET', '/api/tenants'],
+      ['GET', '/admin/tenants//users'],
+    ] as const) {
+      expect((await failure(call(r, 'ops_idp_admin_request', { principalId: id, method, path }))).code, `${method} ${path}`).toBe('invalid');
+    }
+    expect(r.world.requests).toHaveLength(before);
+  });
+
+  test('a principal without a broker-sealed token is not_found', async () => {
+    const r = rig();
+    r.world.sqlite.run(
+      `INSERT INTO admin_service_principals (id, label, token_hash, scopes, status, created_at, revoked_at, created_by)
+       VALUES (?, 'foreign', 'hash-of-unknown-token', '["tenant.read"]', 'active', ?, NULL, 'admin_user:owner')`,
+      ['11111111-2222-3333-4444-555555555555', new Date().toISOString()]);
+    const error = await failure(call(r, 'ops_idp_admin_request', {
+      principalId: '11111111-2222-3333-4444-555555555555', method: 'GET', path: '/admin/tenants',
+    }));
+    expect(error.code).toBe('not_found');
+    expect(r.world.requests.filter(q => q.url.includes('/admin/'))).toHaveLength(0);
+  });
+
+  test('the IdP verdict for an unsealed-hash principal is surfaced, not hidden', async () => {
+    const r = rig();
+    // Row exists (so minting side worked) but a different token is sealed — the IdP answers 401.
+    const id = randomUUID();
+    r.world.sqlite.run(
+      `INSERT INTO admin_service_principals (id, label, token_hash, scopes, status, created_at, revoked_at, created_by)
+       VALUES (?, 'drifted', 'different-hash', '["tenant.read"]', 'active', ?, NULL, 'ops:other')`,
+      [id, new Date().toISOString()]);
+    const sealName = `IDP_SP_${id.toUpperCase().replaceAll('-', '_')}`;
+    r.company.sealed.set(`demo/production/${sealName}`, 'sealed-but-stale-token');
+    const res = await call(r, 'ops_idp_admin_request', { principalId: id, method: 'GET', path: '/admin/tenants' });
+    expect(res).toMatchObject({ status: 401, ok: false });
+    expectNoLeaks(r, ['sealed-but-stale-token']);
+  });
+});
+
+describe('ops_idp_principal_list', () => {
+  test('列出 principal 元数据（id/label/status），可按 status 过滤，不含 token', async () => {
+    const r = rig();
+    const a = await call(r, 'ops_idp_principal_mint', { label: 'qa-a', sealAs: 'qa-a' });
+    const b = await call(r, 'ops_idp_principal_mint', { label: 'qa-b', sealAs: 'qa-b' });
+    await call(r, 'ops_idp_principal_revoke', { principalId: a.id });
+
+    const all = await call(r, 'ops_idp_principal_list', {});
+    expect(all.principals).toHaveLength(2);
+    expect(all.principals.map((p: { id: string }) => p.id).sort()).toEqual([a.id, b.id].sort());
+    const active = await call(r, 'ops_idp_principal_list', { status: 'active' });
+    expect(active.principals).toHaveLength(1);
+    expect(active.principals[0]).toMatchObject({ id: b.id, label: 'qa-b', status: 'active', createdBy: 'ops:qa-1' });
+    expect(JSON.stringify(active)).not.toContain('token_hash');
+    expect((await failure(call(r, 'ops_idp_principal_list', { status: 'weird' }))).code).toBe('invalid');
+    expectNoLeaks(r);
+  });
+});
+
+describe('ops_idp_provision_rotate（一键轮换）', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+  const opsUser = async (r: Rig, alias: string, caps: string[]) => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+  const opsSession = async (r: Rig, caps = ['quota.read', 'subscription.manage']) => {
+    await opsUser(r, 'qa-ops', caps);
+    return String((await call(r, 'ops_operator_login', { alias: 'qa-ops' })).session);
+  };
+
+  test('一条命令跑完「吊销旧 → 签新 → 注入密封仓 → 双探针验证」，明文不出 broker', async () => {
+    const r = rig(opsPatch);
+    const old = await call(r, 'ops_idp_principal_mint', { label: 'qa-old', sealAs: 'qa-old' }) as { id: string };
+    const session = await opsSession(r);
+
+    const res = await call(r, 'ops_idp_provision_rotate', { session, label: 'sck-provisioner' }) as {
+      rotated: boolean; newPrincipal: { id: string; label: string; scopes: string[] };
+      revoked: { id: string; alreadyRevoked: boolean };
+      product: { rotate: number; statusOk: boolean; source: string; storeEntry: boolean };
+      probes: { newToken: { status: number; ok: boolean }; oldToken: { status: number; ok: boolean } };
+    };
+
+    // 结果：旧吊销、新签、密封仓生效、双探针符合预期
+    expect(res.rotated).toBe(true);
+    expect(res.revoked).toMatchObject({ id: old.id, alreadyRevoked: false });
+    expect(res.newPrincipal).toMatchObject({ label: 'sck-provisioner', scopes: ['tenant.read', 'user.read', 'user.provision'] });
+    expect(res.newPrincipal.id).not.toBe(old.id);
+    expect(res.product).toMatchObject({ rotate: 200, statusOk: true, source: 'store', storeEntry: true });
+    expect(res.probes.newToken).toMatchObject({ status: 200, ok: true });
+    expect(res.probes.oldToken).toMatchObject({ status: 403, ok: false });
+
+    // IdP 侧行状态：旧 revoked + revoked_at；新 active、hash-only
+    expect(r.world.principal(old.id)).toMatchObject({ status: 'revoked' });
+    expect(String(r.world.principal(old.id)!.revoked_at)).toBeTruthy();
+    const newRow = r.world.principal(res.newPrincipal.id)!;
+    expect(newRow).toMatchObject({ label: 'sck-provisioner', status: 'active', created_by: 'ops:qa-1' });
+    const sealedNew = `demo/production/IDP_SP_${res.newPrincipal.id.toUpperCase().replaceAll('-', '_')}`;
+    expect(newRow.token_hash).toBe(createHash('sha256').update(String(r.company.sealed.get(sealedNew))).digest('base64url'));
+
+    // 产品确实收到了 rotate 调用（携带新 token 进密封仓模型）
+    const rotateCall = r.world.requests.find(q => q.method === 'POST' && q.url.endsWith('/api/ops/idp-provision-token/rotate'));
+    expect(rotateCall).toBeTruthy();
+    expect(r.world.liveProvisionToken?.principalId).toBe(res.newPrincipal.id);
+
+    // IdP 审计归因：revoked + minted 均记 management_token/ops:qa-1 且带轮换标记
+    const revokedAudit = r.world.auditRows('admin.service_principal.revoked').find(x => x.target_id === old.id);
+    expect(revokedAudit).toMatchObject({ actor_type: 'management_token', actor_id: 'ops:qa-1' });
+    const mintedAudit = r.world.auditRows('admin.service_principal.minted').find(x => x.target_id === res.newPrincipal.id);
+    expect(JSON.parse(String(mintedAudit!.payload))).toMatchObject({ via: 'ops_broker', rotation: true });
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_provision_rotate' });
+
+    // 明文泄漏检查：新/旧 token 不出现在返回值、审计、SQL 之外（SQL 只含 hash）
+    const newToken = r.company.sealed.get(`demo/production/IDP_SP_${res.newPrincipal.id.toUpperCase().replaceAll('-', '_')}`)!;
+    expect(JSON.stringify(r.outputs)).not.toContain(newToken);
+    expect(JSON.stringify(r.company.audits)).not.toContain(newToken);
+    for (const { sql } of r.world.sql) expect(sql).not.toContain(newToken);
+    expectNoLeaks(r);
+  });
+
+  test('省略 revokePrincipalId 时恰好一个 active 自动认领；多个则 invalid 并要求显式指定', async () => {
+    const r = rig(opsPatch);
+    const only = await call(r, 'ops_idp_principal_mint', { label: 'qa-only', sealAs: 'qa-only' }) as { id: string };
+    const session = await opsSession(r);
+    const res = await call(r, 'ops_idp_provision_rotate', { session }) as { revoked: { id: string } };
+    expect(res.revoked.id).toBe(only.id);
+
+    const r2 = rig(opsPatch);
+    await call(r2, 'ops_idp_principal_mint', { label: 'a', sealAs: 'a' });
+    const second = await call(r2, 'ops_idp_principal_mint', { label: 'b', sealAs: 'b' }) as { id: string };
+    const session2 = await opsSession(r2);
+    const error = await failure(call(r2, 'ops_idp_provision_rotate', { session: session2 }));
+    expect(error.code).toBe('invalid');
+    expect(error.message).toContain(second.id);
+    // 歧义失败发生在任何写之前
+    expect(r2.world.principal(second.id)).toMatchObject({ status: 'active' });
+    expect(r2.world.liveProvisionToken).toBeNull();
+  });
+
+  test('无 active principal 时等同首次激活（revoked=null）；显式指定已吊销 id 报 alreadyRevoked', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+    const res = await call(r, 'ops_idp_provision_rotate', { session }) as { revoked: null; product: { source: string } };
+    expect(res.revoked).toBeNull();
+    expect(res.product.source).toBe('store');
+
+    const r2 = rig(opsPatch);
+    const dead = await call(r2, 'ops_idp_principal_mint', { label: 'dead', sealAs: 'dead' }) as { id: string };
+    await call(r2, 'ops_idp_principal_revoke', { principalId: dead.id });
+    const session2 = await opsSession(r2);
+    const res2 = await call(r2, 'ops_idp_provision_rotate', { session: session2, revokePrincipalId: dead.id }) as { revoked: { alreadyRevoked: boolean } };
+    expect(res2.revoked.alreadyRevoked).toBe(true);
+    expect(r2.world.liveProvisionToken?.principalId).not.toBe(dead.id);
+  });
+
+  test('revokePrincipalId 指向不存在的 principal → not_found，不产生任何写', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session, revokePrincipalId: 'ghost-id' }));
+    expect(error.code).toBe('not_found');
+    expect(r.world.liveProvisionToken).toBeNull();
+  });
+
+  test('客户会话不可用（需运营会话）；rotate 端点失败则补偿吊销新 principal', async () => {
+    const r = rig(opsPatch);
+    await call(r, 'ops_account_ensure', { alias: 'qa-user' });
+    const customer = String((await call(r, 'ops_login', { alias: 'qa-user' })).session);
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session: customer }));
+    expect(error.code).toBe('invalid');
+    expect(error.message).toContain('ops_operator_login');
+
+    // rotate 返回 400（IdP 探测拒绝）时：新 principal 被补偿吊销，密封仓保持 env 兜底
+    const r2 = rig(opsPatch);
+    const old2 = await call(r2, 'ops_idp_principal_mint', { label: 'qa-old2', sealAs: 'qa-old2' }) as { id: string };
+    const session2 = await opsSession(r2);
+    r2.world.fault(
+      (method, url) => method === 'POST' && url.pathname === '/api/ops/idp-provision-token/rotate',
+      400,
+    );
+    const error2 = await failure(call(r2, 'ops_idp_provision_rotate', { session: session2 }));
+    expect(error2.code).toBe('invalid');
+    // 旧已吊销（spec 顺序），新也被补偿吊销——不留任何 active principal
+    expect(r2.world.principal(old2.id)).toMatchObject({ status: 'revoked' });
+    const actives = r2.world.sqlite.query(`SELECT id FROM admin_service_principals WHERE status = 'active'`).all();
+    expect(actives).toHaveLength(0);
+    expect(r2.world.liveProvisionToken).toBeNull();
+    expectNoLeaks(r2);
+  });
+
+  test('产品侧缺 subscription.manage 时 rotate 403 → invalid/forbidden 且补偿吊销', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r, ['quota.read']); // 没有 subscription.manage
+    const error = await failure(call(r, 'ops_idp_provision_rotate', { session }));
+    expect(error.code).toBe('forbidden');
+    const actives = r.world.sqlite.query(`SELECT id FROM admin_service_principals WHERE status = 'active'`).all();
+    expect(actives).toHaveLength(0);
+  });
+});
+
+describe('ops_invitation_issue（G2 邀请签发 + 老板交接文件）', () => {
+  const opsPatch = { ops: { clientId: OPS_CLIENT, redirectUri: OPS_REDIRECT, resource: OPS_RESOURCE } };
+  const opsUser = async (r: Rig, alias: string, caps: string[]) => {
+    await call(r, 'ops_account_ensure', { alias });
+    const user = r.world.user(`sck-${alias.toLowerCase().replaceAll('_', '-')}`)!;
+    r.world.operatorCaps.set(user.id, caps);
+    return user.id;
+  };
+  const opsSession = async (r: Rig, caps = ['quota.read', 'subscription.manage']) => {
+    await opsUser(r, 'qa-ops', caps);
+    return String((await call(r, 'ops_operator_login', { alias: 'qa-ops' })).session);
+  };
+  const inviteArgs = {
+    email: 'lawyer@firm.test', displayName: '张律师', workspaceSlug: 'firm-alpha',
+    aiAllowance: { amount: 200, expiresAt: '2026-12-31T23:59:59.000Z' },
+    reason: 'G2 试点开通', idempotencyKey: 'invite-key-001',
+  };
+
+  test('签发邀请：activation_url 落 handoff 文件（0600）不回显，员工只见指针', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+
+      expect(res).toMatchObject({ status: 201, ok: true });
+      const body = res.body as Record<string, any>;
+      expect(body.delivery.activationUrl).toBeNull();
+      expect(body.user).toMatchObject({ email: 'lawyer@firm.test', outcome: 'created' });
+      const handoff = res.handoff as { file: string };
+      expect(handoff.file).toContain('/handoff/invite-invite-key-001.txt');
+
+      // 交接文件在本机含完整链接与收件上下文，0600。
+      const file = readFileSync(handoff.file, 'utf8');
+      const issued = r.world.issuedInvites.get('invite-key-001')!;
+      const url = (issued.delivery as Record<string, unknown>).activationUrl as string;
+      expect(file).toContain(url);
+      expect(file).toContain('lawyer@firm.test');
+      expect(file).toContain('firm-alpha');
+      expect(statSync(handoff.file).mode & 0o777).toBe(0o600);
+
+      // 员工侧输出与审计不含 URL 明文。
+      expectNoLeaks(r, [url]);
+      expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_invitation_issue' });
+      expect(r.company.audits.at(-1)!.evidence).not.toContain(url);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('同幂等键重放：无新链接、不写新文件', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      const replay = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      expect(replay).toMatchObject({ status: 200, ok: true });
+      expect((replay.body as Record<string, any>).replayed).toBe(true);
+      expect(replay.handoff).toBeUndefined();
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('缺 subscription.manage 的运营身份被产品侧 403', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r, ['quota.read']);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('forbidden');
+  });
+
+  test('异步路径：POST 202 → 轮询 GET 完成 → collect-delivery 一次性收取 → handoff 落盘', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      r.world.inviteAsyncPolls = 3; // POST 回 202，三次 GET 后 completed
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+
+      // GET 轮询 + collect-delivery 确实走过
+      const inviteCalls = r.world.requests.filter((q) => q.url.includes('/api/ops/invitations'));
+      expect(inviteCalls.filter((q) => q.method === 'GET').length).toBeGreaterThanOrEqual(3);
+      expect(inviteCalls.some((q) => q.method === 'POST' && q.url.endsWith('/collect-delivery'))).toBe(true);
+
+      const handoff = res.handoff as { file: string };
+      const url = r.world.inviteUrls.get('invite-key-001')!;
+      const file = readFileSync(handoff.file, 'utf8');
+      expect(file).toContain(url);
+      // 员工侧响应/审计不回显 URL
+      expect(JSON.stringify(res)).not.toContain(url);
+      expectNoLeaks(r, [url]);
+      // 收取后产品侧不再二次下发
+      const row = r.world.issuedInvites.get('invite-key-001')!;
+      expect((row.delivery as Record<string, unknown>).pendingCollect).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('僵死续跑：轮询超阈值后同键重发 POST 触发产品侧续跑', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      r.world.inviteAsyncPolls = 1;
+      r.world.inviteNeedsResume = true; // GET 永不推进，须同键重发
+      const session = await opsSession(r);
+      const res = await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      expect(r.world.inviteResumeCalls).toBe(1);
+      expect(res.handoff).toBeDefined();
+      const url = r.world.inviteUrls.get('invite-key-001')!;
+      expect(readFileSync((res.handoff as { file: string }).file, 'utf8')).toContain(url);
+      expectNoLeaks(r, [url]);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('产品侧翻 failed：如实报出错误码与原因', async () => {
+    const r = rig(opsPatch);
+    r.world.inviteAsyncPolls = 1;
+    r.world.inviteFailOnComplete = true;
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('invite-slug-taken');
+    expect(error.message).toContain('invite-key-001');
+  });
+
+  test('久不完成：抛带恢复指引的 upstream_error（同键重发继续等）', async () => {
+    const r = rig(opsPatch);
+    r.world.inviteAsyncPolls = 999; // 单次调用预算内跑不完
+    const session = await opsSession(r);
+    const error = await failure(call(r, 'ops_invitation_issue', { session, ...inviteArgs }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('still processing');
+    expect(error.message).toContain('invite-key-001');
+    // 行仍在 processing——任务未丢
+    expect(r.world.issuedInvites.get('invite-key-001')!.status).toBe('processing');
+  });
+
+  test('resend:true：断链重签发 → collect 新链接 → 覆写同一 handoff 文件，员工不回显', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      const oldUrl = r.world.inviteUrls.get('invite-key-001')!;
+
+      const res = await call(r, 'ops_invitation_issue', {
+        session, idempotencyKey: 'invite-key-001', resend: true,
+      });
+      expect(res).toMatchObject({ status: 200, ok: true });
+      const body = res.body as Record<string, any>;
+      expect(body.delivery.activationUrl).toBeNull();
+      const handoff = res.handoff as { file: string };
+      expect(handoff.file).toContain('/handoff/invite-invite-key-001.txt');
+      const file = readFileSync(handoff.file, 'utf8');
+      const newUrl = r.world.inviteUrls.get('invite-key-001')!;
+      expect(newUrl).not.toBe(oldUrl);
+      expect(file).toContain(newUrl);
+      expect(file).not.toContain(oldUrl);
+      expect(file).toContain('lawyer@firm.test');
+      expect(statSync(handoff.file).mode & 0o777).toBe(0o600);
+      expect(r.world.inviteResendCalls).toBe(1);
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+      expectNoLeaks(r, [oldUrl, newUrl]);
+      expect(r.company.audits.at(-1)!.evidence).toContain('resend');
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resend 重放：24h 有效期内不重复铸链、不产第二文件', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-handoff-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = dir;
+    try {
+      const r = rig(opsPatch);
+      const session = await opsSession(r);
+      await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+      await call(r, 'ops_invitation_issue', { session, idempotencyKey: 'invite-key-001', resend: true });
+      const first = readFileSync(join(dir, 'handoff', 'invite-invite-key-001.txt'), 'utf8');
+
+      const replay = await call(r, 'ops_invitation_issue', {
+        session, idempotencyKey: 'invite-key-001', resend: true,
+      });
+      expect(replay).toMatchObject({ status: 200, ok: true });
+      expect(replay.handoff).toBeUndefined();
+      expect(r.world.inviteResendCalls).toBe(1); // 未再铸链
+      expect(readdirSync(join(dir, 'handoff'))).toHaveLength(1);
+      expect(readFileSync(join(dir, 'handoff', 'invite-invite-key-001.txt'), 'utf8')).toBe(first);
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('resend 错误面：不存在 → not_found；行在 processing → conflict；IdP 已激活 → conflict', async () => {
+    const r = rig(opsPatch);
+    const session = await opsSession(r);
+
+    const missing = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'no-such-key', resend: true,
+    }));
+    expect(missing.code).toBe('not_found');
+
+    await call(r, 'ops_invitation_issue', { session, ...inviteArgs });
+    r.world.issuedInvites.get('invite-key-001')!.status = 'processing';
+    const processing = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'invite-key-001', resend: true,
+    }));
+    expect(processing.code).toBe('conflict');
+    expect(processing.message).toContain('invite-resend-while-processing');
+
+    r.world.issuedInvites.get('invite-key-001')!.status = 'completed';
+    r.world.inviteActivatedUsers.add('uid-invite-k'); // uid = `uid-${key.slice(0,8)}`
+    const activated = await failure(call(r, 'ops_invitation_issue', {
+      session, idempotencyKey: 'invite-key-001', resend: true,
+    }));
+    expect(activated.code).toBe('conflict');
+    expect(activated.message).toContain('invite-already-activated');
   });
 });
