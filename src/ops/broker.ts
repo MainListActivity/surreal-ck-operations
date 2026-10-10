@@ -127,6 +127,14 @@ function errorCode(body: unknown): string {
   return 'error';
 }
 
+/** Proof delivery relays the product's `{error:{code}}` machine code on non-2xx only, strictly shaped; the field stays absent otherwise. */
+export function proofDeliverErrorCode(result: ProductResult): string | undefined {
+  if (result.ok || !result.body || typeof result.body !== 'object') return undefined;
+  const error = (result.body as { error?: unknown }).error;
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && /^[a-z][a-z0-9-]{2,60}$/.test(code) ? code : undefined;
+}
+
 function productFailure(what: string, res: ProductResult, specific: Partial<Record<number, CompanyError['code']>> = {}): CompanyError {
   const code = specific[res.status] ?? (res.status === 401 ? 'login_failed' : res.status >= 500 ? 'upstream_error' : 'invalid');
   return new CompanyError(code, `${what} failed: HTTP ${res.status} ${errorCode(res.body)}`, res.status >= 500);
@@ -172,7 +180,8 @@ export class OpsBroker {
         const ctx = await this.context(scope, env); const session = this.session(ctx, { session: handle });
         if (session.kind === 'customer') throw new CompanyError('forbidden', 'proof delivery requires ops audience');
         const result = await this.product(ctx, session, 'POST', '/api/ops/internal-ai/company-proof', { proof: jwt });
-        return { status: result.status, ok: result.ok };
+        const errorCode = proofDeliverErrorCode(result);
+        return { status: result.status, ok: result.ok, ...(errorCode ? { errorCode } : {}) };
       },
     });
     this.handlers = {

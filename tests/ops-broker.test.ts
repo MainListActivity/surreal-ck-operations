@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
-import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
+import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode } from '../src/ops/broker.ts';
 import { verifyPassword } from '../src/ops/password.ts';
 import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
@@ -1668,5 +1668,20 @@ describe('ops_invitation_issue（G2 邀请签发 + 老板交接文件）', () =>
     }));
     expect(activated.code).toBe('conflict');
     expect(activated.message).toContain('invite-already-activated');
+  });
+});
+
+describe('ops_internal_ai_deliver 产品错误码透传', () => {
+  test('仅非 2xx 且严格 {error:{code}} 形态才随结果返回 code', () => {
+    const code = (body: unknown, ok = false, status = 422) => proofDeliverErrorCode({ status, ok, body });
+    expect(code({ error: { code: 'company-status-unavailable' } })).toBe('company-status-unavailable');
+    expect(code({ error: { code: 'company-proof-expired' } })).toBe('company-proof-expired');
+    for (const body of [
+      { error: { code: 'ab' } }, { error: { code: 'UPPER-CASE' } }, { error: { code: 'has space' } },
+      { error: { code: 'a'.repeat(62) } }, { error: { code: 422 } }, { error: { message: 'm' } },
+      { error: 'company-status-unavailable' }, { code: 'company-status-unavailable' },
+      'unauthorized', null, undefined, 42,
+    ]) expect(code(body)).toBeUndefined();
+    expect(code({ error: { code: 'company-status-unavailable' } }, true, 200)).toBeUndefined();
   });
 });
