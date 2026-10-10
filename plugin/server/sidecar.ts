@@ -22,6 +22,8 @@ const BASE_TOOLS = [
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "record_score", "heartbeat",
   "deliverable_publish",
+  // Manage capability (gm/product) only, enforced in core; writes land in audit.
+  "def_list", "def_ensure", "project_disciplines_update",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -345,6 +347,9 @@ export class SidecarPool {
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
       case "resume_task": return core.resume(cred, String(args.taskId), evidence());
       case "record_score": return core.recordScore(cred, args as never);
+      case "def_list": return core.listDefs(cred);
+      case "def_ensure": return core.ensureDef(cred, args as never);
+      case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。
         const taskId = args.taskId !== undefined ? String(args.taskId) : live().taskId;

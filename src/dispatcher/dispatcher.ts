@@ -1,7 +1,8 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ClaimResult, ModelSlots, ProviderQuota } from '../contracts.ts';
+import type { ClaimResult, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
+import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
@@ -293,15 +294,20 @@ export class Dispatcher {
     };
     // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
     // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
-    const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
-      !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+    // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
+    // carry exactly the required track and the def must list it — empty tracks grants nothing.
+    const trackOk = (role: string, task: SupervisedTask | undefined, tracks: string[] | undefined) => {
+      const required = REQUIRED_TRACKS[role as Role];
+      if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
+      return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+    };
     const ok = (inst: EmployeeInst, role: string, task?: SupervisedTask, excludeSubmitter = false) =>
       inst.role === role && ready(inst) && !assigned.has(inst.id) &&
       !holding.has(inst.id) && (!excludeSubmitter || inst.id !== task?.submittedBy) &&
       // A credential-file instance can only finish what it already holds; the sidecar
       // refuses new claims for it, so it must not appear as a reuse candidate.
       !(this.deps.sidecar && inst.credentialFile) &&
-      trackOk(task, defs.find(d => d.id === inst.def)?.tracks) &&
+      trackOk(role, task, defs.find(d => d.id === inst.def)?.tracks) &&
       currentModel(inst) &&
       this.capacity(inst.provider ?? '', cfg, health, busyBy, now, quotaBlocked);
     // An instance lives in one Paseo workspace (one project); only reuse it for work of that project.
@@ -311,7 +317,7 @@ export class Dispatcher {
     // a def at capacity in the ops repo can still spawn for a task in another repo.
     // Credential-file stragglers do not consume seats: they cannot serve new work.
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask) =>
-      defs.filter(d => d.enabled && d.role === role && trackOk(task, d.tracks) && resolveModel(d) !== undefined &&
+      defs.filter(d => d.enabled && d.role === role && trackOk(role, task, d.tracks) && resolveModel(d) !== undefined &&
         insts.filter(i => i.def === d.id && (i.cwd ?? this.deps.env.opsRepo) === home &&
           !(this.deps.sidecar && i.credentialFile)).length < d.maxInstances &&
         this.capacity(d.provider, cfg, health, busyBy, now, quotaBlocked));

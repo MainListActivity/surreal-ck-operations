@@ -21,11 +21,11 @@ import { brokerConfig, FakeWorld } from './support/ops-world.ts';
 const NS = 'sck_agent_company_test_v3';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
 setDefaultTimeout(180_000);
-const core = new SurrealCompanyCore(database);
-const enrollment = new LocalEnrollmentAdmin(database);
-const owner = new OwnerDesk(database);
 const credDir = mkdtempSync(join(tmpdir(), 'sck-v3-test-'));
 const workforce = new Workforce(database, credDir);
+const core = new SurrealCompanyCore(database, { workforce });
+const enrollment = new LocalEnrollmentAdmin(database);
+const owner = new OwnerDesk(database);
 const tokens: Record<string, string> = {};
 
 beforeAll(async () => {
@@ -1093,4 +1093,89 @@ test('discipline tracks: project vocabulary, dispatch filter, cross-track claim 
   await core.claim(tokenOf(byTask.get(untrackedTask.id)!), storyboardTask.id);
   const aiToken = await enrollment.enroll('t-ai-anytrack', 'ai-content', ['execute', 'review']);
   await core.claim(aiToken, designTask.id);
+});
+
+test('screenwriter: required-track create_task, claim gating with and without a covering def', async () => {
+  // create_task 端：必配轨岗位（REQUIRED_TRACKS）缺轨/错轨显式 invalid，编剧轨任务正常接受。
+  await expect(core.createTask(tokens.gm, { title: '剧本 v1（缺轨）', context: 'synthetic',
+    executorRole: 'screenwriter', reviewerRole: 'gm', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid', message: 'executorRole screenwriter requires discipline=编剧' });
+  await expect(core.createTask(tokens.gm, { title: '剧本 v1（错轨）', context: 'synthetic',
+    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '分镜', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  const scripted = await core.createTask(tokens.gm, { title: '剧本 v1', context: 'synthetic',
+    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '编剧', idempotencyKey: key() });
+  expect(scripted.discipline).toBe('编剧');
+
+  await workforce.upsertDef('screenwriter-agy', { role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium', tracks: ['编剧'] });
+  const def = (await workforce.defs()).find(d => d.id === 'screenwriter-agy')!;
+  const inst = await workforce.spawnInst(def);
+  const token = inst.credential!; // credential-less sessions: minted in memory, never written to a file
+
+  // claim 端：存量错轨任务（模拟旁路写入）对编剧编制显式 forbidden。
+  await database.db.query('UPDATE $id SET discipline = "分镜";', { id: new RecordId('task', scripted.id) });
+  await expect(core.claim(token, scripted.id))
+    .rejects.toMatchObject({ code: 'forbidden', message: 'Employee definition does not cover the task discipline' });
+  await database.db.query('UPDATE $id SET discipline = "编剧";', { id: new RecordId('task', scripted.id) });
+  const claim = await core.claim(token, scripted.id);
+  expect(claim.task.discipline).toBe('编剧');
+  await core.submit(token, proofOf(claim, claim.task.version), { text: '剧本 v1 初稿完成：故事大纲、分场与角色小传已写入任务目录，等待验收。', idempotencyKey: key() });
+
+  // 空 tracks 对必配轨岗位不再视为全接：无轨编制的 screenwriter 领编剧任务 forbidden。
+  await workforce.upsertDef('screenwriter-notrack', { role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium' });
+  const bareDef = (await workforce.defs()).find(d => d.id === 'screenwriter-notrack')!;
+  const bare = await workforce.spawnInst(bareDef);
+  const next = await core.createTask(tokens.gm, { title: '剧本 v2', context: 'synthetic',
+    executorRole: 'screenwriter', reviewerRole: 'gm', discipline: '编剧', idempotencyKey: key() });
+  await expect(core.claim(bare.credential!, next.id)).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 固定身份（无 def）的 screenwriter 同样 forbidden：必配轨要求编制显式覆盖。
+  const fixed = await enrollment.enroll('t-sw-fixed', 'screenwriter', ['execute', 'review']);
+  await expect(core.claim(fixed, next.id)).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 无轨任务对其它岗位保持原语义：普通岗位照常领取（fresh 身份，不受前序测试租约影响）。
+  const plain = await core.createTask(tokens.gm, { title: '普通工程任务', context: 'synthetic',
+    executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() });
+  await core.claim(await enrollment.enroll('t-eng-fresh', 'engineering', ['execute', 'review']), plain.id);
+});
+
+test('manage tools: def_list/def_ensure/project_disciplines_update are manage-only, audited and surgical', async () => {
+  // 无 manage 能力的岗位一律 forbidden（def_list 只读也一样）。
+  await expect(core.listDefs(tokens['eng-a'])).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.ensureDef(tokens['eng-a'], { id: 'screenwriter-x', role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium' }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.updateProjectDisciplines(tokens['eng-a'], { project: 'disc-proj', disciplines: [] }))
+    .rejects.toMatchObject({ code: 'forbidden' });
+
+  // def_ensure：创建带轨编制 → 不传 tracks 保留 → [] 清轨 → enabled=false 停用；非法 role invalid。
+  await core.ensureDef(tokens.gm, { id: 'screenwriter-second', role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium', tracks: ['编剧'], weight: 50 });
+  expect((await workforce.defs()).find(d => d.id === 'screenwriter-second')).toMatchObject({ role: 'screenwriter', provider: 'antigravity', tracks: ['编剧'], enabled: true, weight: 50 });
+  await core.ensureDef(tokens.gm, { id: 'screenwriter-second', role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium' });
+  expect((await workforce.defs()).find(d => d.id === 'screenwriter-second')!.tracks).toEqual(['编剧']);
+  await core.ensureDef(tokens.gm, { id: 'screenwriter-second', role: 'screenwriter', provider: 'antigravity', model: 'gemini-3.7-flash-medium', tracks: [], enabled: false });
+  const cleared = (await workforce.defs()).find(d => d.id === 'screenwriter-second')!;
+  expect(cleared.tracks).toEqual([]);
+  expect(cleared.enabled).toBe(false);
+  await expect(core.ensureDef(tokens.gm, { id: 'bogus-def', role: 'no-such-role' as never, provider: 'antigravity', model: 'x' }))
+    .rejects.toMatchObject({ code: 'invalid' });
+
+  // project_disciplines_update：只改 disciplines，其余字段不动；名字唯一非空；项目必须存在。
+  const projects = new ProjectStore(database.db);
+  await projects.upsert({ id: 'disc-proj', name: '词表项目', repoPath: '/repo/disc-proj', release: 'manual', envs: [] });
+  const updated = await core.updateProjectDisciplines(tokens.gm, { project: 'disc-proj', disciplines: [{ name: '编剧', description: '剧本与分场' }, { name: '角色设计' }] });
+  expect(updated.repoPath).toBe('/repo/disc-proj');
+  expect(updated.disciplines!.map(d => d.name)).toEqual(['编剧', '角色设计']);
+  await expect(core.updateProjectDisciplines(tokens.gm, { project: 'disc-proj', disciplines: [{ name: '编剧' }, { name: '编剧' }] }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  await expect(core.updateProjectDisciplines(tokens.gm, { project: 'no-such-proj', disciplines: [] }))
+    .rejects.toMatchObject({ code: 'not_found' });
+
+  // 两类写入均落审计（3 次 def_ensure + 1 次 project_disciplines_update 成功；被拒调用不落）。
+  const [[auditRow]] = await database.db.query<[[{ n: number }]]>(
+    "SELECT count() AS n FROM audit WHERE action IN ['def_ensure', 'project_disciplines_update'] GROUP ALL;");
+  expect(auditRow.n).toBeGreaterThanOrEqual(4);
+
+  // def_list 返回管理视图（编制对 gm 可见，含种子编剧轨）。
+  const listed = (await core.listDefs(tokens.gm)).find(d => d.id === 'screenwriter-agy');
+  expect(listed).toMatchObject({ role: 'screenwriter', provider: 'antigravity', tracks: ['编剧'], enabled: true });
 });
