@@ -108,6 +108,7 @@ function fixture(goals: Array<{ id: string; project?: string }>) {
     send: async id => { agents.get(id)!.status = 'running'; },
     stop: async () => {},
     archive: async () => {},
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
 
   const sidecar: SidecarBridge = {
