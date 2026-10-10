@@ -204,6 +204,13 @@ export interface CompanyCore {
   submit(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   accept(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   returnTask(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
+  /**
+   * Channel-side claim rollback (spawn/wake failure, workspace handoff): drops the holder's
+   * lease without a reviewer verdict — a review task stays in review, a doing task returns to
+   * ready, and the audit row is 'released', never 'return'. Optional: cores without it simply
+   * let the lease expire, which already leaves review tasks claimable.
+   */
+  release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
