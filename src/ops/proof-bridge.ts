@@ -86,7 +86,7 @@ export class InternalAiProofBridge {
     const row = await this.deps.store.get(sha256(args.proofHandle));
     if (!row || row.lease.employee !== lease.employee || row.lease.taskId !== lease.taskId || row.lease.delivery !== lease.delivery || row.lease.fence !== lease.fence || row.files.manifest.env !== env) throw new CompanyError('not_found', 'unknown task-bound proof handle');
     if (tool === 'ops_internal_ai_revoke') { await this.deps.store.revoke(row); return { revoked: true, version: row.revoked ? row.version : row.version + 1 }; }
-    await this.valid(row, signer);
+    await this.valid(row, signer, await this.liveIdentitiesDigest(row));
     const content = this.content(row);
     const response = await this.deps.deliver(content.jwt, scope, env, proofToolSchemas.ops_internal_ai_deliver.parse(raw).session);
     return { status: response.status, ok: response.ok, configurationDigest: row.files.manifest.configurationDigest, paidCallsAllowed: content.mode === 'enable' ? 1 : 0 };
@@ -98,19 +98,25 @@ export class InternalAiProofBridge {
   private content(row: ProofRow): { jwt: string; jti: string; mode: 'enable' | 'register-disabled' } {
     return JSON.parse(openSecret(this.deps.key(), row.sealed, String(row.id.id))) as { jwt: string; jti: string; mode: 'enable' | 'register-disabled' };
   }
-  private async valid(row: ProofRow, signer: ProofSigner, precomputedIdentitiesDigest?: string): Promise<void> {
+  /** Live per-alias IdP resolution for deliver; a full pass can outlast the freshness window, so it
+   * runs before it starts. The digest it yields is still compared inside valid(). */
+  private async liveIdentitiesDigest(row: ProofRow): Promise<string> {
+    const files = await loadProofFiles(this.deps.home, row.approval?.taskId ?? row.lease.taskId, row.files.manifestPath, row.files.documentPath);
+    const scope: OpsScope = { taskId: row.lease.taskId, project: row.lease.project, actor: { employeeId: row.lease.employee, role: row.lease.role, capabilities: [] } };
+    return sha256(canonical(await this.deps.identities(scope, files.manifest.env, files)));
+  }
+  private async valid(row: ProofRow, signer: ProofSigner, identitiesDigest: string): Promise<void> {
     const validationStarted = this.now();
     if (row.revoked || row.expires_at <= this.now() || row.kid !== signer.kid || !await this.deps.store.leaseValid(row.lease)) throw new CompanyError('forbidden', 'proof expired or revoked');
     const files = await loadProofFiles(this.deps.home, row.approval?.taskId ?? row.lease.taskId, row.files.manifestPath, row.files.documentPath);
     if (files.manifestHash !== row.files.manifestHash || files.documentHash !== row.files.documentHash) throw new CompanyError('forbidden', 'proof evidence changed');
     this.assertFiles(files, this.content(row).mode);
     if (row.approval && canonical(await this.deps.store.approval(row.approval.taskId, files.manifest.env, files)) !== canonical(row.approval)) throw new CompanyError('forbidden', 'proof approval changed');
-    // Same-request prove callers pass the digest already resolved in that request (at most one full IdP
-    // resolution per prove); deliver/status resolve live for their own freshness. The comparison itself
-    // is never skipped in either path.
-    const identitiesDigest = precomputedIdentitiesDigest ?? sha256(canonical(await this.deps.identities({ taskId: row.lease.taskId, project: row.lease.project, actor: { employeeId: row.lease.employee, role: row.lease.role, capabilities: [] } }, files.manifest.env, files)));
+    // The digest is always supplied by the caller and always compared: prove and deliver pass this
+    // request's live resolution (their identity-drift check, kept outside the freshness window);
+    // status passes the digest stored on the row so the 5-second status path never resolves at all.
     if (identitiesDigest !== row.identities_digest) throw new CompanyError('forbidden', 'proof identity changed');
-    // Recheck after potentially slow IdP/network/file reads; no stale lease window.
+    // Recheck after potentially slow file/DB reads; no stale lease window.
     if (!await this.deps.store.leaseValid(row.lease) || row.expires_at <= this.now()) throw new CompanyError('forbidden', 'proof expired or revoked');
     const fresh = await this.deps.store.get(String(row.id.id));
     if (!fresh || fresh.revoked || fresh.version !== row.version) throw new CompanyError('forbidden', 'proof revoked during validation');
@@ -128,7 +134,7 @@ export class InternalAiProofBridge {
       const signer = await this.deps.signer(row.lease.project, row.files.manifest.env);
       const checkedAt = Math.floor(this.now() / 1000);
       let valid = true;
-      try { await this.valid(row, signer); } catch { valid = false; }
+      try { await this.valid(row, signer, row.identities_digest); } catch { valid = false; }
       const at = Math.floor(this.now() / 1000);
       return Response.json({ status: signer.sign('status', { jti: this.content(row).jti, valid, version: row.version, approvalVersion: row.approval?.version ?? null, checkedAt, iat: at, exp: Math.min(at + 60, checkedAt + 60), nonce }) }, { headers: { 'cache-control': 'no-store' } });
     } catch { return new Response('status unavailable', {status: 503}); }

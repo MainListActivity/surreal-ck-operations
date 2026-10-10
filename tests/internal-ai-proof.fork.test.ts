@@ -28,7 +28,7 @@ let delivered: string | undefined;
 let identityAvailable = true;
 // Trusted-identity read counters at the product boundary: one full identities resolution reads
 // /api/internal-ai/identity once per manifest alias (two aliases → two reads).
-let identityReads = 0, identityFailAfter = 0;
+let identityReads = 0, identityFailAfter = 0, identityDelayMs = 0;
 async function connect() {
   database = new CompanyDatabase({url: url + '/rpc', rootUser:'root', rootPassword:'root', namespace:'proof_test', database:'control_plane'});
   await database.connect(); await database.bootstrap(); core = new SurrealCompanyCore(database); projects = new ProjectStore(database.db);
@@ -46,6 +46,7 @@ function broker() {
       const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
       if (u.pathname === '/api/internal-ai/identity') {
         identityReads++;
+        if (identityDelayMs) clock += identityDelayMs; // 注入 IdP 慢读：假时钟前进，验证解析不在 60 秒窗内
         if (identityFailAfter > 0 && identityReads > identityFailAfter) return Response.json({}, {status:503});
         if (!identityAvailable) return Response.json({}, {status:404});
         const token = new Headers(init?.headers).get('authorization')!.slice(7);
@@ -197,6 +198,21 @@ check('prove resolves identities once per request; IdP failure after the first r
   identityAvailable=true;
   expect(await request('ops_internal_ai_prove',proofArgs('flake'))).toEqual(p);
 });
+check('deliver resolves identities outside the freshness window; a >60s IdP pass still reaches the product',async()=>{
+  identityDelayMs=35_000; // 两个别名各读一次身份 → 每次完整解析推假时钟约 +70s，旧实现会在 valid 内超窗
+  const clock0=clock, delivered0=delivered; // files() 的字节与后续用例的 delivered JWT 都以 clock0 为基准：一并恢复
+  try {
+    const before=identityReads;
+    const v=await request('ops_internal_ai_prove',proofArgs('slow'));
+    const login=await request('ops_login',{alias:'LCA04_OPS',audience:'ops'});
+    const priorDelivered=delivered;
+    const res=await request('ops_internal_ai_deliver',{proofHandle:v.proofHandle,session:login.session});
+    expect(res).toMatchObject({status:200,ok:true,paidCallsAllowed:1});
+    expect(delivered).toBeString();expect(delivered).not.toBe(priorDelivered);
+    expect(identityReads-before).toBe(4); // prove、deliver 各恰一次完整解析；valid 内不再解析
+    verifyCompanyProof(delivered!,trusted,'proof',clock);
+  } finally { identityDelayMs=0; clock=clock0; delivered=delivered0; }
+});
 check('reviewed-token-plan quota evidence signs approved-service; quota, schema and USD-balance violations reject',async()=>{
   const task=await core.createTask(gm,{title:'Synthetic token-plan approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
   const claim=await core.claim(author,task.id);
@@ -270,7 +286,17 @@ check('protected status, nonce, signed reply expiry, wrong audience/type and mem
   expect(()=>verifyCompanyProof(delivered!,{...trusted,audience:'other'},'proof',clock)).toThrow();
   expect(()=>verifyCompanyProof(delivered!,trusted,'status',clock)).toThrow();
   expect(()=>verifyCompanyProof(delivered!,trusted,'proof',clock+300_000)).toThrow();
-  world.workspaces.get('sck-ui01')!.members[1]!.disabled=true;expect((await status(delivered!)).valid).toBe(false);world.workspaces.get('sck-ui01')!.members[1]!.disabled=false;
+  // 状态路径零身份解析：不碰 IdP 登录也不读产品身份接口（5 秒预算内必须返回）。
+  const readsBefore=identityReads,requestsBefore=world.requests.length;
+  expect((await status(delivered!,'status-no-resolve')).valid).toBe(true);
+  expect(identityReads).toBe(readsBefore);expect(world.requests.length).toBe(requestsBefore);
+  // 成员禁用是身份漂移：状态面按行内已存 digest 仍判 valid，漂移由 prove/deliver 的现场比对负责——deliver 拒绝。
+  const drift=await request('ops_internal_ai_prove',proofArgs('drift'));
+  world.workspaces.get('sck-ui01')!.members[1]!.disabled=true;
+  expect((await status(delivered!)).valid).toBe(true);
+  const driftLogin=await request('ops_login',{alias:'LCA04_OPS',audience:'ops'});
+  await expect(request('ops_internal_ai_deliver',{proofHandle:drift.proofHandle,session:driftLogin.session})).rejects.toBeDefined();
+  world.workspaces.get('sck-ui01')!.members[1]!.disabled=false;
 });
 check('symlink/escape/hidden/oversize rejected; changed evidence invalidates old status',async()=>{
   const f=await files(consumerTask,'development-disabled');

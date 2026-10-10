@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { readProofFile, loadProofFiles } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
-import { proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest } from '../src/ops/proof-contract.ts';
+import { proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, type ProofIdentity } from '../src/ops/proof-contract.ts';
+import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
+import type { CompanyProofStore, ProofRow } from '../src/ops/proof-store.ts';
+import type { OpsScope } from '../src/contracts.ts';
 import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const now=Date.now(),sec=Math.floor(now/1000);
 const evidenceModels = () => evidenceSchema.options.map(o => o.shape.model);
@@ -132,5 +135,59 @@ test('same fd bounded file bytes; hidden/env/escape/symlink/oversize denied',asy
     const secret=join(root,'credentials.json');await writeFile(secret,'{}');
     const large=join(root,'large.json');await writeFile(large,'x'.repeat(256*1024+1));
     for(const path of [outside,secret,alias,large,join(root,'.env'),root]) await expect(readProofFile(home,'task-fixture',path)).rejects.toBeDefined();
+  }finally{await rm(home,{recursive:true,force:true});}
+});
+test('deliver resolves identities before the freshness window; status never resolves',async()=>{
+  const home=await realpath(await mkdtemp(join(tmpdir(),'proof-bridge-unit-')));
+  const taskId='synthetic-consumer';
+  try {
+    const root=join(home,'evidence',taskId);await mkdir(root,{recursive:true});
+    const fixture=disabledSenseNovaFixture();
+    const manifestPath=join(root,'manifest.json'),documentPath=join(root,'evidence.json');
+    await writeFile(manifestPath,JSON.stringify(fixture.manifest));await writeFile(documentPath,fixture.documentBytes);
+    const scope:OpsScope={taskId,project:'surreal_ck',actor:{employeeId:'synthetic-employee',role:'engineering',capabilities:[]}};
+    const leaseStamp={taskId,employee:'synthetic-employee',delivery:'synthetic-delivery',fence:1,goal:'synthetic-goal',project:'surreal_ck',role:'engineering' as const};
+    const rows=new Map<string,ProofRow>();
+    const store={
+      lease:async()=>leaseStamp, leaseValid:async()=>true,
+      get:async(handleHash:string)=>rows.get(handleHash),
+      put:async(row:ProofRow)=>{rows.set(String(row.id.id),row);return row;},
+      status:async(hash:string)=>[...rows.values()].find(r=>r.status_hash===hash),
+    } as unknown as CompanyProofStore;
+    const signer=new ProofSigner(ProofSigner.generate()), key=Buffer.alloc(32,7);
+    const identities:ProofIdentity[]=[
+      {alias:'LCA04_REMOVABLE',subject:'user:synthetic-owner',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'admin',billingRole:'owner',billingAccountRef:'billing_account:synthetic'},
+      {alias:'LCA04_MEMBER',subject:'user:synthetic-member',spaceId:'workspace:synthetic',database:'ws_synthetic',workspaceRole:'participant',billingRole:'member',billingAccountRef:'billing_account:synthetic'},
+    ];
+    // 一次完整解析把假时钟推过 60 秒窗：deliver 若在窗内解析会抛 temporarily_unavailable。
+    let clock=1_700_000_000_000, identityCalls=0, resolved=identities, deliveredJwt:string|undefined;
+    const bridge=new InternalAiProofBridge({
+      store, home, key:()=>key, now:()=>clock, signer:async()=>signer,
+      identities:async()=>{identityCalls++;clock+=61_000;return resolved;},
+      rotate:async()=>{throw new Error('unused');},
+      deliver:async(jwt)=>{deliveredJwt=jwt;return{status:200,ok:true};},
+    });
+    const prove=await bridge.call(scope,'production','ops_internal_ai_prove',{mode:'register-disabled',manifestPath,documentPath,activityId:fixture.manifest.activityId,nonce:'synthetic-nonce-0001',idempotencyKey:'unit-flow'}) as {proofHandle:string};
+    expect(identityCalls).toBe(1);
+    // 身份漂移仍 forbidden：digest 比对没有因为移出窗口而跳过，deps.deliver 不触发。
+    resolved=identities.map((i,n)=>n===0?{...i,subject:'user:drifted'}:i);
+    await expect(bridge.call(scope,'production','ops_internal_ai_deliver',{proofHandle:prove.proofHandle,session:'synthetic-session'})).rejects.toMatchObject({code:'forbidden'});
+    expect(deliveredJwt).toBeUndefined();
+    // identities 超过 60 秒仍完成下发：解析在窗外，60 秒只覆盖 valid 内的本地复查。
+    resolved=identities;
+    const callsBefore=identityCalls;
+    const result=await bridge.call(scope,'production','ops_internal_ai_deliver',{proofHandle:prove.proofHandle,session:'synthetic-session'}) as {status:number,ok:boolean,paidCallsAllowed:number};
+    expect(result).toMatchObject({status:200,ok:true,paidCallsAllowed:0});
+    expect(identityCalls).toBe(callsBefore+1);
+    expect(deliveredJwt).toBeString();
+    // 状态路径零解析：不碰 identities/passwordLogin，valid 用行内已存 digest。
+    const claims=verifyCompanyProof(deliveredJwt!,signer.trust(),'proof',clock);
+    const bearer=(claims.status as {bearer:string}).bearer;
+    const statusBefore=identityCalls;
+    const response=await bridge.status(new Request('http://test.local/internal-ai/status',{headers:{authorization:'Bearer '+bearer,'x-sck-nonce':'synthetic-nonce-0002'}}));
+    expect(response.status).toBe(200);
+    const statusClaims=verifyCompanyProof((await response.json() as {status:string}).status,signer.trust(),'status',clock);
+    expect(statusClaims).toMatchObject({valid:true,nonce:'synthetic-nonce-0002'});
+    expect(identityCalls).toBe(statusBefore);
   }finally{await rm(home,{recursive:true,force:true});}
 });
