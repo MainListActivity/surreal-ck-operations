@@ -255,14 +255,16 @@ export class SidecarPool {
     return result;
   }
 
-  /** Spawn failed after a pre-claim: hand the lease back so the task returns to ready. */
+  /** Spawn/wake/workspace-handoff rollback after a pre-claim: hand the lease back without a
+   * reviewer verdict — never routed through returnTask, which would fake a return and bounce
+   * a review task back to doing. Cores without the release op let the lease expire on its own. */
   async releaseClaim(instId: string, _taskId: string, reason: string): Promise<void> {
     const live = this.claims.get(instId);
     this.endLease(instId);
     if (!live) return;
     try {
       const cred = await this.credentialFor(instId);
-      await this.deps.core.returnTask(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
+      await this.deps.core.release?.(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
     } catch (error) {
       this.log(`releaseClaim ${instId} failed (lease will expire): ${(error as Error).message}`);
     }

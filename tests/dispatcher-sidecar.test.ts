@@ -17,10 +17,17 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
+  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>();
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0;
-  const addTask = (id: string) => { const v: TaskView = { id, title: id, context: '', state: 'ready', executorRole: 'engineering', reviewerRole: 'engineering', kind: 'task', dependencies: [], version: 1, fence: 0 };
-    views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0 } as unknown as SupervisedTask); };
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string } = {}) => {
+    const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
+      kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy };
+    if (opts.worktreePath) {
+      wtPaths.set(id, opts.worktreePath);
+      v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
+    }
+    views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
   const wf = {
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
     defs: async () => [def], serverNow: async () => 1000, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
@@ -32,19 +39,30 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     rotate: async (id: string) => { events.push(`rotate:${id}`); return `rotated-${id}`; },
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
+    evalState: async () => ({ participants: [], metrics: {} }),
   };
   const owner = { applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => false };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
-      events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
+      events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
-      return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [] }; },
+      return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
     getTask: async (_c: string, id: string) => ({ ...views.get(id)! }), history: async () => [], authenticate: async () => ({ employeeId: 'fixture', role: 'gm' }),
     companyBrief: async () => ({}), listTasks: async () => [], relayDirection: async () => { events.push('management'); }, heartbeat: async (_c: string, p: LeaseProof) => ({ task: check(p) }),
     submit: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`submit:${p.taskId}`); v.state = 'done'; v.currentEmployee = undefined; Object.assign(rows.find(t => t.id === v.id)!, v); return v; },
     block: async (_c: string, p: LeaseProof) => { check(p); events.push(`block:${p.taskId}`); return views.get(p.taskId)!; },
     accept: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`review:${p.taskId}`); return v; },
+    // Channel rollback: lease dropped with no reviewer verdict — review stays review, doing goes ready.
+    release: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`release:${p.taskId}`);
+      const holder = v.currentEmployee; Object.assign(v, { currentEmployee: undefined, deliveryId: undefined, version: v.version + 1 });
+      if (v.state === 'doing') v.state = 'ready';
+      Object.assign(rows.find(t => t.id === v.id)!, v);
+      const i = instances.find(i => i.id === holder); if (i) i.activeTask = undefined;
+      return v; },
+    returnTask: async (_c: string, p: LeaseProof) => { const v = check(p); events.push(`return:${p.taskId}`);
+      Object.assign(v, { state: 'ready', currentEmployee: undefined, deliveryId: undefined, version: v.version + 1 });
+      Object.assign(rows.find(t => t.id === v.id)!, v); return v; },
   };
   const ops = { tools: ['ops_info'], call: async () => { events.push('ops'); return {}; }, release: (id: string) => { events.push(`ops-release:${id}`); } };
   const makePool = () => new SidecarPool({ core: core as unknown as CompanyCore, workforce: wf as unknown as SidecarDeps['workforce'], ops, runDir: root, sweepMs: 5, heartbeatMs: 1000000 });
@@ -52,7 +70,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const paseo: PaseoGateway = {
     list: async () => agents, status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
     lastError: async () => '', logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
-    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); events.push(`spawn:${id}`); return id; },
+    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); events.push(`spawn:${id}`); return id; },
     send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
@@ -66,7 +84,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, instances, agents, envs, events, views, relay, get pool() { return pool; },
+  return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, get pool() { return pool; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -120,5 +138,55 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     const r = await w.dispatcher().tick();
     expect(r.retired).not.toContain(old.id); expect(w.instances).toHaveLength(1);
     expect(w.events).not.toContain('performance-failure');
+  });
+  test('review claim on a stale-cwd session releases silently and respawns into the worktree', async () => {
+    const w = world();
+    // A free, reusable engineering session anchored to the repo's shared tree.
+    const stale = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+    w.instances.push(stale);
+    w.pool.env(stale); w.pool.bindAgent(stale.id, 'agent-9'); stale.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    // A review task whose registered scene is the task's exclusive worktree.
+    w.addTask('t1', { state: 'review', submittedBy: 'employee-77', worktreePath: '/repo-task-t1' });
+    const r = await w.dispatcher().tick();
+    // Channel rollback is not a reviewer verdict: a release, never a return.
+    expect(w.events).toContain('claim:employee-9:t1');
+    expect(w.events).toContain('release:t1');
+    expect(w.events.some(e => e.startsWith('return:'))).toBe(false);
+    // The mismatched session retired and the same tick spawned a reviewer into the worktree.
+    expect(r.retired).toContain('employee-9');
+    const inst = w.instances.find(i => i.id !== 'employee-9')!;
+    expect(w.events).toContain(`claim:${inst.id}:t1`);
+    expect(w.cwds.get(inst.paseoAgentId!)).toBe('/repo-task-t1');
+    // The task stayed in review and is now held by the spawned reviewer.
+    expect(w.views.get('t1')!.state).toBe('review');
+    expect(w.views.get('t1')!.currentEmployee).toBe(inst.id);
+  });
+  test('releaseClaim on a review-state claim drops the lease without a reviewer return', async () => {
+    const w = world();
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst);
+    w.pool.env(inst);
+    w.addTask('t2', { state: 'review', submittedBy: 'employee-77' });
+    const claim = await w.pool.claim(inst, w.rows[0]!);
+    expect(claim?.task.state).toBe('review');
+    await w.pool.releaseClaim(inst.id, 't2', '工作区路径变化，换新会话接管登记现场');
+    expect(w.events).toContain('release:t2');
+    expect(w.events.some(e => e.startsWith('return:'))).toBe(false);
+    expect(w.views.get('t2')!.state).toBe('review');
+    expect(w.views.get('t2')!.currentEmployee).toBeUndefined();
+  });
+  test('a real reviewer return still records a return and requeues the task', async () => {
+    const w = world();
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst);
+    const env = w.pool.env(inst);
+    w.addTask('t3', { state: 'review', submittedBy: 'employee-77' });
+    await w.pool.claim(inst, w.rows[0]!);
+    const r = await w.relay(env, 'review', { decision: 'return', text: '验收退回：fixture 复核不通过的原因说明' });
+    expect(r.ok).toBe(true);
+    expect(w.events).toContain('return:t3');
+    expect(w.views.get('t3')!.state).toBe('ready');
   });
 });

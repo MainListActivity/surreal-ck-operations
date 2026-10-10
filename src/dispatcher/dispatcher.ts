@@ -939,14 +939,19 @@ export class Dispatcher {
           await paseo.archive(existing.paseoAgentId!);
           sidecar!.detachAgent(existing.paseoAgentId!);
           report.retired.push(existing.id);
-          return undefined;
+          const retiredAt = insts.indexOf(existing);
+          if (retiredAt >= 0) insts.splice(retiredAt, 1);
+          // Do not end the round here: fall through to the spawn path. A fresh
+          // instance's claim re-resolves the same registered worktree, so its
+          // spawn cwd matches by construction.
+        } else {
+          await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
+          this.onboarded.add(existing.id);
+          this.lastStatus.set(existing.paseoAgentId!, 'running');
+          await wf.touchWake(existing.id);
+          this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
+          return { ...existing, spawned: false };
         }
-        await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
-        this.onboarded.add(existing.id);
-        this.lastStatus.set(existing.paseoAgentId!, 'running');
-        await wf.touchWake(existing.id);
-        this.log(`woke ${existing.id} for ${task?.id ?? `dispatch:${role}`}`);
-        return { ...existing, spawned: false };
       } catch (error) {
         this.log(`wake ${existing.id} failed: ${(error as Error).message}`);
         if (workspace) await sidecar?.releaseWorkspace?.(existing);

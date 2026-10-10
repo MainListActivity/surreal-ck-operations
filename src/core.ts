@@ -808,6 +808,56 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     return task;
   }
+  /**
+   * Channel-side claim rollback (spawn/wake failure, workspace handoff): the holder's lease is
+   * dropped without a reviewer verdict — a review task stays in review awaiting a fresh claim,
+   * a doing task returns to ready. The audit row is 'released' so a rollback never reads as a
+   * reviewer return; handover markers from earlier holders are left untouched.
+   */
+  async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
+    const actor = await this.authorized(credential);
+    if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
+      throw new CompanyError('invalid', 'Invalid lease proof');
+    }
+    requireText(evidence.text, 'evidence', 20, 30000);
+    const idem = this.idemId(actor.employeeId, 'released', evidence.idempotencyKey);
+    const digest = HASH(JSON.stringify({ proof, evidence }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
+      IF $t.state = 'void' { THROW 'task retired' };
+      IF $t.lease_expires_at <= $now { THROW 'lease expired' };
+      IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
+      IF $t.state NOT IN ['doing', 'review'] { THROW 'task not held' };
+      LET $next = UPDATE ONLY $task SET
+        state = IF $t.state = 'doing' THEN 'ready' ELSE $t.state END,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        version = $t.version + 1 RETURN AFTER;
+      UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'released', sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    try {
+      const row = await this.txTask(query, {
+        actor: id('employee', actor.employeeId), employee: actor.employeeId,
+        task: id('task', proof.taskId), delivery: proof.deliveryId,
+        fence: proof.fence, expected: proof.expectedVersion, evidence: evidence.text,
+        audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
+      });
+      return view(row);
+    } catch (error) {
+      const prior = await this.replay(idem, digest);
+      if (prior) return prior;
+      throw error;
+    }
+  }
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence) { return this.transition(credential, proof, 'block', evidence, to); }
 
   /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
