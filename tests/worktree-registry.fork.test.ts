@@ -504,6 +504,32 @@ run('WT03: return and releaseWorkspace evaluate their tree in place without harm
   await submit(core, eng1, holder);
 }, 30000);
 
+run('WT03: channel rollback via core.release() keeps the scene for the next holder; terminal done still releases all three layers', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng, (await task(core, 'engineering')).id); // keeps shared writer active
+  const claim = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const scene = claim.worktree!.worktreePath;
+
+  // Channel-side claim rollback (sidecar.releaseClaim → core.release()): the rolled-back task
+  // keeps its worktree reference, so the release event evaluates the scene in place and keeps it.
+  const released = await core.release(eng2, proof(claim), { text: 'Fixture channel rollback without reviewer verdict', idempotencyKey: `event-release-${++count}` });
+  expect(released.state).toBe('ready');
+  expect(existsSync(scene)).toBe(true);
+  expect((await core.listWorktreeAudits(gm, 50)).some(a => a.trigger === 'release' && a.event === 'skip' && String(a.path) === scene)).toBe(true);
+
+  // The rolled-back task is claimable again on the same scene; the terminal done event is where
+  // all three layers die together.
+  const resumed = await core.claim(eng2, claim.task.id);
+  expect(resumed.worktree!.worktreePath).toBe(scene);
+  await submit(core, eng2, resumed);
+  const review = await core.claim(qa, resumed.task.id);
+  await core.accept(qa, proof(review), { text: 'Accept after channel rollback fixture', idempotencyKey: `event-release-accept-${++count}` });
+  expect(existsSync(scene)).toBe(false);
+  await submit(core, eng, holder);
+}, 30000);
+
 run('WT02: inventory no longer hard-disables deletion and exposes grace reasons', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), peer = await employee('engineering');
   const first = await core.claim(eng, (await task(core, 'engineering')).id);

@@ -150,9 +150,14 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
 
 const canonicalPath = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
 const withinTree = (candidate: string, root: string) => candidate === root || candidate.startsWith(root + sep);
-/** "already gone" is success for an idempotent teardown; anything else must surface for retry. */
+/**
+ * "Already gone" is success for an idempotent teardown; anything else must surface for retry.
+ * Only phrases that reliably mean the object no longer exists classify as gone — usage errors
+ * ("unknown flag", "missing required argument") must stay real failures, or a CLI misuse would
+ * pass for success, leave the scene behind, and destroy the retry anchor with the tree.
+ */
 const goneSceneError = (error: unknown) =>
-  /not.?found|no such|unknown|already|archived|missing/i.test(error instanceof Error ? error.message : String(error));
+  /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
 
 /**
  * Release the Paseo side of a task scene: archive every workspace whose cwd points at the

@@ -851,7 +851,14 @@ export class SurrealCompanyCore implements CompanyCore {
         fence: proof.fence, expected: proof.expectedVersion, evidence: evidence.text,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
       });
-      return view(row);
+      const task = view(row);
+      // Same event point as return: a released claim may have been the scene's last reference.
+      // decideReclaim keeps anything still referenced (e.g. a review task awaiting a fresh
+      // claim) or unsafe to delete; never block the rollback itself.
+      if (task.worktree && this.worktrees) {
+        await this.worktrees.reclaimEvent(task.worktree.id, 'release').catch(() => undefined);
+      }
+      return task;
     } catch (error) {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;

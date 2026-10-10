@@ -114,4 +114,19 @@ test('missing tree path and no matching paseo objects is a clean no-op', async (
   expect(paseo.deleted).toEqual([]);
 });
 
+test('CLI usage errors are real failures, not already-gone', async () => {
+  // "unknown flag" / "missing required argument" mean the call never ran: classifying them as
+  // gone would leave the scene behind and destroy the retry anchor with the tree.
+  const flag = fakePaseo([ws('w-flag', tree)], [], {
+    'ws:w-flag': "paseo workspace archive failed (exit 2): error: unknown flag '--forece'",
+  });
+  await expect(createSceneCleaner(flag)(tree)).rejects.toThrow('unknown flag');
+  expect(flag.archived).toEqual([]);
+  const arg = fakePaseo([ws('w-arg', tree)], [], {
+    'ws:w-arg': "paseo workspace archive failed (exit 2): error: missing required argument 'id'",
+  });
+  await expect(createSceneCleaner(arg)(tree)).rejects.toThrow('missing required argument');
+  expect(arg.archived).toEqual([]);
+});
+
 rmSync(dir, { recursive: true, force: true });
