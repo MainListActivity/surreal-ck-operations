@@ -193,6 +193,12 @@ export interface CompanyCore {
   readWorkspace?(credential: Credential, taskId?: TaskId): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(credential: Credential): Promise<void>;
   listWorktrees?(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]>;
+  /** GM: ownership reclaim or dry-run across registered repos (WT02). */
+  reclaimWorktrees?(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }): Promise<{
+    scanId: string; removed: string[]; kept: Array<{ path: string; reason: string }>;
+    branchesDeleted: string[]; branchesRetained: Array<{ branch: string; reason: string }>; audited: number;
+  }>;
+  listWorktreeAudits?(credential: Credential, limit?: number): Promise<Array<Record<string, unknown>>>;
   heartbeat(credential: Credential, proof: LeaseProof): Promise<ClaimResult>;
   checkpoint(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   submit(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;

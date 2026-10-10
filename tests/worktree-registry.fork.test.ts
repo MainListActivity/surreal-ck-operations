@@ -71,6 +71,12 @@ async function task(core: SurrealCompanyCore, role: Role, intent?: WorkIntent) {
 }
 const proof = (claim: ClaimResult): LeaseProof => ({ taskId: claim.task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: claim.task.version });
 async function submit(core: SurrealCompanyCore, credential: string, claim: ClaimResult) { return core.submit(credential, proof(claim), { text: 'Synthetic fixture completed with unchanged scene', idempotencyKey: `fixture-submit-${++count}` }); }
+async function acceptDone(core: SurrealCompanyCore, executor: string, claim: ClaimResult) {
+  const submitted = await submit(core, executor, claim);
+  const qa = await employee('qa');
+  const review = await core.claim(qa, submitted.id);
+  return core.accept(qa, proof(review), { text: 'Independent fixture accept for reclaim coverage', idempotencyKey: `fixture-accept-${++count}` });
+}
 
 run('serial QA and GM reuse one physical tree, with authenticated references and protected main', async () => {
   const path = repo(), core = coreFor(path), qa = await employee('qa');
@@ -160,7 +166,10 @@ run('restart persistence, revoked handover preserves dirty scene and fencing; le
 run('failed authorization/claim and symlink scopes never leave effective references; manual drift remains protected', async () => {
   const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa'), assets = await employee('asset-production');
   const t = await task(core, 'engineering'); await expect(core.claim(qa, t.id)).rejects.toMatchObject({ code: 'forbidden' });
-  expect((await core.listWorktrees(gm)).filter(w => w.repo === path)).toHaveLength(0);
+  // Global inventory may reconcile the repo main as protected; failed claims must leave no effective refs or managed writers.
+  const before = (await core.listWorktrees(gm)).filter(w => w.repo === path);
+  expect(before.every(w => w.references.filter(r => r.state !== 'released').length === 0)).toBe(true);
+  expect(before.every(w => w.mode === 'protected' && (w.worktreePath === path || w.reasons.includes('repository-main')))).toBe(true);
   const first = await core.claim(eng, t.id); await expect(core.claim(eng, (await task(core, 'engineering')).id)).rejects.toMatchObject({ code: 'already_claimed' });
   expect((await core.listWorktrees(gm)).flatMap(w => w.references).filter(r => r.state === 'active' && r.employee === first.task.currentEmployee)).toHaveLength(1);
   await submit(core, eng, first);
@@ -277,3 +286,176 @@ run('project-bound non-lease eval uses project repo and carries persistent proje
   expect((await core.listWorktrees(gm)).find(w => w.id === workspace!.id)!.project).toBe(project.id);
   await core.releaseWorkspace(judge);
 });
+
+run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with audit', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), eng2 = await employee('engineering');
+  const sharedClaim = await core.claim(eng, (await task(core, 'engineering')).id);
+  writeFileSync(join(sharedClaim.worktree!.worktreePath, 'source.txt'), 'shared writer');
+  git(sharedClaim.worktree!.worktreePath, 'add', '.');
+  git(sharedClaim.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'shared change');
+  // Keep first writer active so the second engineer gets exclusive.
+  const exclusiveClaim = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(exclusiveClaim.worktree!.mode).toBe('exclusive');
+  expect(exclusiveClaim.worktree!.worktreePath).not.toBe(sharedClaim.worktree!.worktreePath);
+  writeFileSync(join(exclusiveClaim.worktree!.worktreePath, 'source.txt'), 'exclusive clean');
+  git(exclusiveClaim.worktree!.worktreePath, 'add', '.');
+  git(exclusiveClaim.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'exclusive change');
+  const exclusivePath = exclusiveClaim.worktree!.worktreePath;
+  const sharedPath = sharedClaim.worktree!.worktreePath;
+  await acceptDone(core, eng2, exclusiveClaim);
+  expect(existsSync(exclusivePath)).toBe(false);
+  expect(existsSync(sharedPath)).toBe(true);
+  await acceptDone(core, eng, sharedClaim);
+  expect(existsSync(sharedPath)).toBe(true);
+  const inv = await core.listWorktrees(gm);
+  expect(inv.find(w => w.worktreePath === sharedPath)).toBeTruthy();
+  expect(inv.find(w => w.worktreePath === exclusivePath)).toBeUndefined();
+
+  const dirtyEng = await employee('engineering'), dirtyPeer = await employee('engineering');
+  const holder = await core.claim(dirtyEng, (await task(core, 'engineering')).id);
+  const dirty = await core.claim(dirtyPeer, (await task(core, 'engineering')).id);
+  expect(dirty.worktree!.mode).toBe('exclusive');
+  writeFileSync(join(dirty.worktree!.worktreePath, 'wip.txt'), 'unsaved');
+  await submit(core, dirtyPeer, dirty);
+  const qa = await employee('qa');
+  const review = await core.claim(qa, dirty.task.id);
+  await core.accept(qa, proof(review), { text: 'Accept dirty exclusive fixture', idempotencyKey: `dirty-accept-${++count}` });
+  expect(existsSync(dirty.worktree!.worktreePath)).toBe(true);
+  const audits = await core.listWorktreeAudits(gm, 50);
+  expect(audits.some(a => a.event === 'skip' && String(a.reason).includes('dirty'))).toBe(true);
+  await submit(core, dirtyEng, holder);
+}, 30000);
+
+run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed legacy tree', async () => {
+  const path = repo();
+  const clock = { now: new Date('2026-10-10T12:00:00.000Z') };
+  const core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path, now: () => clock.now } });
+  const eng = await employee('engineering'), next = await employee('engineering');
+  const t = await task(core, 'engineering');
+  const a = await core.claim(eng, t.id);
+  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'recovery scene');
+  await Bun.sleep(1100);
+  const invAfterExpire = await core.listWorktrees(gm);
+  expect(invAfterExpire.find(w => w.id === a.worktree!.id)!.references.some(r => r.state === 'recovery' || r.state === 'active')).toBe(true);
+  expect(existsSync(a.worktree!.worktreePath)).toBe(true);
+  const b = await core.claim(next, t.id);
+  expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
+  await acceptDone(core, next, b);
+
+  // Adopt a legacy company-managed tree with no task refs and advance the authority clock past grace.
+  const orphanPath = join(dir, `repo-orphan-task-${++count}`);
+  const id8 = 'abcdef12';
+  const legacyPath = join(dir, `legacy-task-${id8}`);
+  Bun.spawnSync(['git', 'init', '-q', '-b', 'main', orphanPath]);
+  writeFileSync(join(orphanPath, 'source.txt'), 'orphan-base');
+  git(orphanPath, 'add', '.');
+  git(orphanPath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'orphan base');
+  git(orphanPath, 'worktree', 'add', '-b', `task/${id8}`, legacyPath);
+  const orphanCore = new SurrealCompanyCore(db, {
+    worktrees: { opsRepo: orphanPath, orphanGraceDays: 7, now: () => clock.now },
+  });
+  await orphanCore.listWorktrees(gm); // reconcile as protected
+  const legacyReal = realpathSync(legacyPath);
+  const row = (await orphanCore.listWorktrees(gm)).find(w => w.worktreePath === legacyReal)!;
+  expect(row.mode).toBe('protected');
+  expect(row.deletable).toBe(false);
+  const aged = new Date(clock.now.getTime() - 8 * 86_400_000).toISOString();
+  await db.db.query('UPDATE ONLY $tree SET last_released_at = type::datetime($at), last_used_at = type::datetime($at);', {
+    tree: new RecordId('worktree', row.id), at: aged,
+  });
+  const afterAge = (await orphanCore.listWorktrees(gm)).find(w => w.id === row.id)!;
+  expect(afterAge.deletable).toBe(true);
+  expect(afterAge.reasons).toContain('orphan-past-grace');
+  const dry = await orphanCore.reclaimWorktrees(gm, { dryRun: true, repos: [orphanPath] });
+  expect(dry.kept.some(k => k.path === legacyReal && k.reason.includes('dry-run'))).toBe(true);
+  const reclaimed = await orphanCore.reclaimWorktrees(gm, { dryRun: false, repos: [orphanPath] });
+  expect(reclaimed.removed).toContain(legacyReal);
+  expect(existsSync(legacyPath)).toBe(false);
+  const audits = await orphanCore.listWorktreeAudits(gm, 40);
+  expect(audits.some(a => a.event === 'delete' && a.result === 'success')).toBe(true);
+  expect(audits.some(a => a.event === 'dry_run')).toBe(true);
+}, 30000);
+
+run('WT02: review and returned-ready windows keep exclusive scene; release writes durable audit', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng1 = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng1, (await task(core, 'engineering')).id);
+  expect(holder.worktree!.mode).toBe('shared');
+  const c2 = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(c2.worktree!.mode).toBe('exclusive');
+  const scene = c2.worktree!.worktreePath;
+  writeFileSync(join(scene, 'source.txt'), 'review window work');
+  git(scene, 'add', '.');
+  git(scene, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'window work');
+
+  // submit -> reviewer-claim window: a non-terminal 'review' task retains its exclusive scene.
+  const submitted = await submit(core, eng2, c2);
+  expect(submitted.state).toBe('review');
+  const firstSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(firstSweep.removed).not.toContain(scene);
+  expect(existsSync(scene)).toBe(true);
+  let row = (await core.listWorktrees(gm)).find(w => w.id === c2.worktree!.id)!;
+  expect(row.deletable).toBe(false);
+  expect(row.reasons).toContain('unfinished-scene');
+  expect(row.references.some(r => r.state === 'recovery')).toBe(true);
+
+  // reviewer claim then return: the 'ready' + handover NONE window also retains the scene.
+  const review = await core.claim(qa, submitted.id);
+  expect(review.worktree!.worktreePath).toBe(scene);
+  const returned = await core.returnTask(qa, proof(review), { text: 'Return keeps the non-terminal exclusive scene', idempotencyKey: `window-return-${++count}` });
+  expect(returned.state).toBe('ready');
+  expect(returned.handover).toBeUndefined();
+  const secondSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(secondSweep.removed).not.toContain(scene);
+  expect(existsSync(scene)).toBe(true);
+  row = (await core.listWorktrees(gm)).find(w => w.id === c2.worktree!.id)!;
+  expect(row.references.some(r => r.state === 'recovery')).toBe(true);
+
+  // terminal 'done' releases the task ref: durable release audit precedes the clean removal.
+  const resumed = await core.claim(eng2, returned.id);
+  expect(resumed.worktree!.worktreePath).toBe(scene);
+  const resubmitted = await submit(core, eng2, resumed);
+  const qa2 = await employee('qa');
+  const reReview = await core.claim(qa2, resubmitted.id);
+  await core.accept(qa2, proof(reReview), { text: 'Accept after returned window', idempotencyKey: `window-accept-${++count}` });
+  expect(existsSync(scene)).toBe(false);
+  const audits = await core.listWorktreeAudits(gm, 100);
+  const releases = audits.filter(a => a.event === 'release' && a.result === 'success');
+  expect(releases.length).toBeGreaterThan(0);
+  expect(releases.some(a => String(a.task).includes(submitted.id))).toBe(true);
+  await submit(core, eng1, holder);
+}, 30000);
+
+run('WT02: reclaim disabled switch and concurrent claim under lock keep scene', async () => {
+  const path = repo();
+  const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, reclaimEnabled: false } });
+  const eng = await employee('engineering'), peer = await employee('engineering');
+  const first = await core.claim(eng, (await task(core, 'engineering')).id);
+  const second = await core.claim(peer, (await task(core, 'engineering')).id);
+  expect(second.worktree!.mode).toBe('exclusive');
+  writeFileSync(join(second.worktree!.worktreePath, 'source.txt'), 'kept while disabled');
+  git(second.worktree!.worktreePath, 'add', '.');
+  git(second.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'exclusive');
+  await acceptDone(core, peer, second);
+  expect(existsSync(second.worktree!.worktreePath)).toBe(true);
+  const inv = await core.listWorktrees(gm);
+  expect(inv.find(w => w.id === second.worktree!.id)!.reasons).toContain('reclaim-disabled');
+  await submit(core, eng, first);
+}, 20000);
+
+run('WT02: inventory no longer hard-disables deletion and exposes grace reasons', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), peer = await employee('engineering');
+  const first = await core.claim(eng, (await task(core, 'engineering')).id);
+  const exclusive = await core.claim(peer, (await task(core, 'engineering')).id);
+  expect(exclusive.worktree!.mode).toBe('exclusive');
+  await submit(core, peer, exclusive);
+  const qa = await employee('qa');
+  const review = await core.claim(qa, exclusive.task.id);
+  await core.accept(qa, proof(review), { text: 'Accept to release exclusive refs', idempotencyKey: `inv-accept-${++count}` });
+  const inv = await core.listWorktrees(gm);
+  expect(inv.every(w => !w.reasons.includes('WT01: deletion disabled'))).toBe(true);
+  const shared = inv.find(w => w.mode === 'shared');
+  expect(shared?.deletable).toBe(false);
+  expect(shared?.reasons.some(r => r === 'shared-retained' || r === 'active-reference')).toBe(true);
+  await submit(core, eng, first);
+}, 20000);

@@ -48,10 +48,17 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
-    const core = new SurrealCompanyCore(db, { worktrees: {
+    const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
-      strategy: process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared',
-    } });
+      strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
+      orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
+        ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
+      reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'
+        ? false
+        : process.env.SCK_WORKTREE_RECLAIM === '1' || process.env.SCK_WORKTREE_RECLAIM === 'true'
+          ? true : undefined,
+    };
+    const core = new SurrealCompanyCore(db, { worktrees: worktreeOpts });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
@@ -76,8 +83,8 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
-      // WT01 preserves all registered/legacy scenes. Cleanup resumes only with a separately approved policy.
-      // No git sweeper is injected while managed allocation is enabled.
+      // WT02: ownership reclaim on the existing dispatcher sweep cadence (no new timers).
+      reclaimWorktrees: () => core.worktrees!.reclaimAll({ trigger: 'sweep' }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
       quota: () => readProviderQuotas({ db }),
