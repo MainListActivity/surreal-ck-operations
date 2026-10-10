@@ -369,7 +369,7 @@ export class Workforce {
   // ---- lease supervision ----
   async tasks(): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT *, goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+      "SELECT *, project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
     return rows.map(supervised);
   }
 
@@ -414,14 +414,23 @@ export class Workforce {
   async judgeInput(taskId: TaskId): Promise<JudgeInput> {
     const task = id('task', taskId);
     const [rows, submits, blocks] = await this.db.query<[
-      Array<{ title: string; context: string; resume_role?: string; project?: { id: RecordId; name: string; release?: string; red_lines?: string[] } }>,
+      Array<{ title: string; context: string; resume_role?: string; project_overlay?: RecordId; goal_project?: { id: RecordId; name: string; release?: string; red_lines?: string[] } }>,
       Array<{ evidence?: string }>, Array<{ evidence?: string }>,
-    ]>(`SELECT title, context, resume_role, goal.project.* AS project FROM $task;
+    ]>(`SELECT title, context, resume_role, project.id AS project_overlay, goal.project.* AS goal_project FROM $task;
       SELECT evidence, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
       SELECT evidence, at FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;`, { task });
     const row = rows[0];
     if (!row) throw new CompanyError('not_found', 'task not found');
-    const project = row.project?.id ? { id: asId(row.project.id), name: row.project.name, release: row.project.release, redLines: row.project.red_lines ?? [] } : undefined;
+    // Task-level override wins: Jev judges the release against the project the task now routes to.
+    const overlayId = row.project_overlay ? asId(row.project_overlay) : undefined;
+    let project: JudgeInput['project'];
+    if (overlayId) {
+      const [prows] = await this.db.query<[Array<{ name: string; release?: string; red_lines?: string[] }>]>(
+        'SELECT name, release, red_lines FROM $project;', { project: id('project', overlayId) });
+      project = { id: overlayId, name: prows[0]?.name ?? overlayId, release: prows[0]?.release, redLines: prows[0]?.red_lines ?? [] };
+    } else if (row.goal_project?.id) {
+      project = { id: asId(row.goal_project.id), name: row.goal_project.name, release: row.goal_project.release, redLines: row.goal_project.red_lines ?? [] };
+    }
     return { title: row.title, context: row.context.slice(0, 8000), submission: submits[0]?.evidence?.slice(0, 12000),
       question: blocks[0]?.evidence?.slice(0, 8000), blockedBy: row.resume_role, project };
   }
