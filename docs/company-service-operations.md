@@ -35,6 +35,8 @@ paseo plugin ls                          # 确认 sck-company running、无 erro
 
 reload 后用 `sck call get_context` 与实际派工各验证一次恢复。其它生成物：`plugin/node_modules` 由 `cd plugin && npm install` 管理，仅当 `plugin/package.json` 依赖变化时才需重装，无其它需同步的生成物。
 
+内部AI证明契约（`src/ops/proof-*.ts`，含 `reviewed-token-plan` 配额型证据类型，字段契约见 [internal-ai-proof-contract.md](./internal-ai-proof-contract.md)）同样只经 vendor 拷贝进入员工通道面与调度器：契约变更随固定 release 安装上线，但 `vendor.sh` 重新生成 + `paseo plugin reload sck-company` 完成前，员工侧仍按旧契约校验证据文档与 enable 配额语义，不能跳过插件面同步。
+
 ## 交付预览服务（插件内嵌正式版 · LAN/公网双面）
 
 交付预览 HTTP 服务正式版内嵌在 sck-company 插件 server 进程（`plugin/server/preview.ts` 生命周期层 + vendor 的 `src/preview-core.ts` 路由/安全），随插件启动、随 reload/卸载停止，不另起 daemon。**两个监听面分工明确**：
