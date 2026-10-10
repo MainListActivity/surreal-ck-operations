@@ -2,8 +2,11 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
+import { REQUIRED_TRACKS } from '../core';
+import type { Role } from '../contracts';
 
-const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs'] as const;
+const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs'] as const;
+const defRoles = [...roles, 'eval'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done'] as const;
 const proofShape = {
@@ -125,8 +128,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
       const abandoned = (task: TaskView) => task.state === 'doing' && task.executorRole === principal.role &&
         task.currentEmployee !== principal.employeeId && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) <= now);
       // Track filter mirrors the claim check: defs with a tracks list only see covered disciplines.
-      const trackOk = (task: TaskView) =>
-        !task.discipline || !principal.tracks?.length || principal.tracks.includes(task.discipline);
+      // Required-track roles (e.g. screenwriter) additionally need an exact required-track match.
+      const requiredTrack = REQUIRED_TRACKS[principal.role as Role];
+      const trackOk = (task: TaskView) => requiredTrack !== undefined
+        ? task.discipline === requiredTrack && (principal.tracks ?? []).includes(requiredTrack)
+        : !task.discipline || !principal.tracks?.length || principal.tracks.includes(task.discipline);
       const candidates = tasks.filter((task: TaskView) => trackOk(task) &&
         (task.state === 'review' && task.reviewerRole === principal.role && task.submittedBy !== principal.employeeId) ||
         (task.state === 'ready' && task.executorRole === principal.role) || abandoned(task),
@@ -184,6 +190,30 @@ function registerTools(server: McpServer, core: CompanyCore) {
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
+
+  // Workforce administration tools: manage capability only (gm/product), every write audited.
+  server.registerTool('def_list', {
+    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight).',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.listDefs(token(ctx))));
+
+  server.registerTool('def_ensure', {
+    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables. Basic fields are required on every call.',
+    inputSchema: z.object({
+      id: z.string().min(1).max(60), role: z.enum(defRoles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
+      thinking: z.string().min(1).max(40).optional(), tracks: z.array(z.string().min(1).max(60)).max(50).optional(),
+      maxInstances: z.number().int().min(0).max(8).optional(), priority: z.number().int().optional(),
+      weight: z.number().int().min(0).max(1000).optional(), enabled: z.boolean().optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.ensureDef(token(ctx), input)));
+
+  server.registerTool('project_disciplines_update', {
+    description: 'manage only (gm/product): replace a project disciplines vocabulary (unique non-empty names, audited); no other project field is touched.',
+    inputSchema: z.object({
+      project: z.string().min(1).max(60),
+      disciplines: z.array(z.object({ name: z.string().min(1).max(60), description: z.string().max(500).optional() })).max(50),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.updateProjectDisciplines(token(ctx), input)));
 
   server.registerTool('get_task_history', {
     description: 'Read the audited history of a task: claims, checkpoints, submissions, returns, owner decisions and handover packets.',

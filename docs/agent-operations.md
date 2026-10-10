@@ -116,7 +116,7 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 
   `model` 是槽位而非钉子：`auto:<族>`（`auto:sol` / `auto:grok` / `auto:swe`）表示跟随该 provider 该模型族的最新版——Paseo 插件每 5 分钟经 `providers.listModels` 刷新 `company_meta:model_slots`，调度器在派工前把槽位解析成具体模型 id（如 `auto:sol → gpt-6.1-sol`）再 spawn。厂家发布 `gpt-6.2-sol` 后：槽位更新 → 当 tick 先退役空闲旧模型实例（忙碌中的跑完当前会话）→ 下一个任务用新模型起新会话，全过程零人工。字面量（如 `gpt-6.1-sol`）则 pin 死。跨族/改名（`gpt-7`、新命名线）不会被 auto 匹配，等人工决策；槽位解析失败时该 def 不可新开并给老板发通知，存量实例继续跑上次的模型。首次采用新版本时插件发一条告知通知（不需要批准）。
 
-  或 `pnpm run admin def set|list|weight|tracks|enable|disable`、`pnpm run admin seed-defs`（写入默认 27 个定义：九岗位 × 三订阅）。`def tracks <id> <轨,轨|->` 限定编制的岗位轨；`def set` 不带轨参数，不会清掉已设的 tracks。也可在 Paseo 编制页用「注册员工」表单：岗位/provider/模型/thinking 全部下拉自 Paseo 实时数据（`providers.snapshot` + `listModels`），服务端注册前再校验一遍，杜绝手填错字。def id 自动取 `<role>-<provider>`。
+  或 `pnpm run admin def set|list|weight|tracks|enable|disable`、`pnpm run admin seed-defs`（写入默认 28 个定义：九岗位含 eval × codex/grok/devin 三订阅，另加 screenwriter-agy 单座）。`def tracks <id> <轨,轨|->` 限定编制的岗位轨；`def set` 不带轨参数，不会清掉已设的 tracks。也可在 Paseo 编制页用「注册员工」表单：岗位/provider/模型/thinking 全部下拉自 Paseo 实时数据（`providers.snapshot` + `listModels`），服务端注册前再校验一遍，杜绝手填错字。def id 自动取 `<role>-<provider>`。
 
 - **派工权重**：同岗位多个合格候选（空闲实例或可新开的定义）按 `weight × 绩效系数` 加权随机选取；`weight=0` 不会被主动选中（同岗位所有候选都是 0 时才均匀分配）。绩效系数 = `clamp(avg_score/3, 0.3, 2)`，尚无评分时为 1。调权：`pnpm run admin def weight <id> <n>`，或直接改 `employee_def.weight`——下一轮 tick 生效，无需重启。
 
@@ -129,6 +129,16 @@ printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME
 - **员工实例**：`employee` 表中带 `def` 的记录，由调度器按需生成；`paseo_agent_id` 登记实际会话，是实例身份的权威绑定。新实例的凭证不落盘——由插件 sidecar 在内存中代持，`spawn` 环境只注入 `SCK_COMM_DIR`/`SCK_COMM_KEY`；`claim`/续租/提交由 sidecar 以该凭证程序化执行，agent 进程拿不到也不认识它。`retired=true` 或凭证撤销后所有调用即 401，实例随会话关闭退役。同一定义连续 3 次异常会自动停用并通知老板。`pnpm run admin inst list` 查看。
   旧的凭证文件会话（`credential_file` 非空的实例）继续按原方式收尾，但不再被通道代领新任务，自然淘汰。
 - 旧员工（gm-01 等）以 `admin bind <员工编号> <agentId> <def>` 挂到定义上，继续保留身份和历史。
+
+## 管理工具（manage）
+
+gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外，还可通过 MCP 工具面或 `sck call` 调用三个仅限 manage 能力的编制管理工具——全部写审计，不带凭证值：
+
+- `def_list`：只读列出全部 `employee_def`（`id`/`role`/`provider`/`model`/`thinking`/`tracks`/`enabled`/`max_instances`/`priority`/`weight`）。任何岗位可读（只要能力里有 manage 即可调用，不写库）；无 manage 能力的岗位调用返回 `forbidden`。
+- `def_ensure`：创建或更新 `employee_def`，复用 `workforce.upsertDef` 的校验与写入逻辑；`tracks` 传 `[]` 清轨、不传则不动；`enabled=false` 停用（覆盖退役/收轨诉求）。`role` 必须是合法 `Role`（screenwriter 上线后含它）。调用者必须有 manage 能力，写入同时落审计（`actor`、`action=def_ensure`、参数摘要）。
+- `project_disciplines_update`：只改写 `project.disciplines` 词表（名字唯一非空校验沿用 `ProjectStore`），不碰项目其它字段。调用者必须有 manage 能力，写入同时落审计（`actor`、`action=project_disciplines_update`、参数摘要）。
+
+三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
 
 ## 运行参数
 

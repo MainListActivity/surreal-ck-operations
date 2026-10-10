@@ -433,7 +433,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
-const ROLE_LABEL: Record<string, string> = { gm: "总经理", product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", qa: "测试", cs: "客户成功", eval: "评审" };
+const ROLE_LABEL: Record<string, string> = { gm: "总经理", product: "运营/产品", engineering: "工程", "ai-content": "AI 内容", "concept-design": "原型/概念设计", "asset-production": "量产制作", screenwriter: "专职编剧", qa: "测试", cs: "客户成功", eval: "评审" };
 const MODEL_PREVIEW = 10;
 
 function RegisterDefCard({ ctx, editing, onDone, onCancel }: {

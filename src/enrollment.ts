@@ -2,9 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
-import { CompanyError } from './core.ts';
-
-const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'qa', 'cs', 'eval'];
+import { CompanyError, ROLES } from './core.ts';
 
 /** Local root-only enrollment API. Never pass this object to the MCP adapter. */
 export class LocalEnrollmentAdmin implements EnrollmentAdmin {
