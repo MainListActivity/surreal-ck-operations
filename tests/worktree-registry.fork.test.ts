@@ -376,6 +376,56 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
   expect(audits.some(a => a.event === 'dry_run')).toBe(true);
 }, 30000);
 
+run('WT02: review and returned-ready windows keep exclusive scene; release writes durable audit', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng1 = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng1, (await task(core, 'engineering')).id);
+  expect(holder.worktree!.mode).toBe('shared');
+  const c2 = await core.claim(eng2, (await task(core, 'engineering')).id);
+  expect(c2.worktree!.mode).toBe('exclusive');
+  const scene = c2.worktree!.worktreePath;
+  writeFileSync(join(scene, 'source.txt'), 'review window work');
+  git(scene, 'add', '.');
+  git(scene, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'window work');
+
+  // submit -> reviewer-claim window: a non-terminal 'review' task retains its exclusive scene.
+  const submitted = await submit(core, eng2, c2);
+  expect(submitted.state).toBe('review');
+  const firstSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(firstSweep.removed).not.toContain(scene);
+  expect(existsSync(scene)).toBe(true);
+  let row = (await core.listWorktrees(gm)).find(w => w.id === c2.worktree!.id)!;
+  expect(row.deletable).toBe(false);
+  expect(row.reasons).toContain('unfinished-scene');
+  expect(row.references.some(r => r.state === 'recovery')).toBe(true);
+
+  // reviewer claim then return: the 'ready' + handover NONE window also retains the scene.
+  const review = await core.claim(qa, submitted.id);
+  expect(review.worktree!.worktreePath).toBe(scene);
+  const returned = await core.returnTask(qa, proof(review), { text: 'Return keeps the non-terminal exclusive scene', idempotencyKey: `window-return-${++count}` });
+  expect(returned.state).toBe('ready');
+  expect(returned.handover).toBeUndefined();
+  const secondSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(secondSweep.removed).not.toContain(scene);
+  expect(existsSync(scene)).toBe(true);
+  row = (await core.listWorktrees(gm)).find(w => w.id === c2.worktree!.id)!;
+  expect(row.references.some(r => r.state === 'recovery')).toBe(true);
+
+  // terminal 'done' releases the task ref: durable release audit precedes the clean removal.
+  const resumed = await core.claim(eng2, returned.id);
+  expect(resumed.worktree!.worktreePath).toBe(scene);
+  const resubmitted = await submit(core, eng2, resumed);
+  const qa2 = await employee('qa');
+  const reReview = await core.claim(qa2, resubmitted.id);
+  await core.accept(qa2, proof(reReview), { text: 'Accept after returned window', idempotencyKey: `window-accept-${++count}` });
+  expect(existsSync(scene)).toBe(false);
+  const audits = await core.listWorktreeAudits(gm, 100);
+  const releases = audits.filter(a => a.event === 'release' && a.result === 'success');
+  expect(releases.length).toBeGreaterThan(0);
+  expect(releases.some(a => String(a.task).includes(submitted.id))).toBe(true);
+  await submit(core, eng1, holder);
+}, 30000);
+
 run('WT02: reclaim disabled switch and concurrent claim under lock keep scene', async () => {
   const path = repo();
   const core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, reclaimEnabled: false } });

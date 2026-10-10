@@ -4,9 +4,10 @@
 
 | 事件 | 引用 | 物理树 |
 |---|---|---|
-| 租约过期 / 撤回交接 | 释放旧员工/fence；非终态任务保留 recovery 引用 | 不删，接手续用 |
-| 任务 done（验收通过） | 任务保留引用结束 | exclusive 干净且无有效引用则立即回收；shared 保留 |
-| 脏树 / 未跟踪改动 | 不变 | 保留，审计 reason=`dirty-or-untracked` |
+| 提交待验收（review）/ 退回待续（ready）/ blocked / 租约过期 / 撤回交接 | 释放旧员工/fence；非终态任务在其 assigned_tree（非 shared）上的引用一律计 recovery | 不删现场，接手续用 |
+| shared 树上的任务引用 | 非终态也计 released（shared 硬保护，不依赖引用保留） | 不删；不挡串行工程复用 |
+| 任务 done（验收通过） | 任务保留引用结束，sweep/accept 观测到全量释放时写持久 `release` 审计 | exclusive 干净且无有效引用则立即回收；shared 保留 |
+| 脏树 / 未跟踪改动 | 不变 | 保留，审计 reason=`dirty-or-untracked` 并写 `cleanup_todo` 待办 |
 | 未合并任务分支 | 树可删 | 本地分支仅 `git branch -d`；失败则 `branch_retain` 审计 |
 | 孤儿宽限 N（默认 7 天） | 无 active/recovery 引用 | 仅公司管理任务树；时钟=last_released_at → last_used_at → created_at |
 
@@ -67,7 +68,7 @@ sck call list_worktree_audits '{"limit":100}'
 
 1. 经理取 `list_worktrees {}` 与四仓 git list 作 before；记录 MCP/插件提交与 schema 012 哈希
 2. 串行/并行工程任务：done 后 exclusive 不在 `git worktree list`，shared 仍在；两写手未提交改动互不覆盖
-3. fixture：dirty exclusive 保留；租约过期交接 recovery 保留；把 fixture `last_released_at` 拨到 N 前，经真实 sweep 删除；N 内与保护树仍在；`list_worktree_audits` 可见 success/skip/fail
+3. fixture：dirty exclusive 保留；租约过期交接、submit→review、return→ready 窗口 recovery 保留；把 fixture `last_released_at` 拨到 N 前，经真实 sweep 删除；N 内与保护树仍在；`list_worktree_audits` 可见 release/delete/skip/fail
 4. 至少 10 个同仓串行任务后 shared 数不增加；并行峰值与写手数相关；结束后收敛到共享/受保护基线加明确保留例外
 5. `SCK_WORKTREE_RECLAIM=0` 验证可关闭；回滚后登记/审计仍在
 

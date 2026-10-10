@@ -35,7 +35,7 @@ interface Row { id: RecordId; repo: string; project?: string; path: string; mode
   branch?: string; protection?: string; created_at: unknown; last_used_at: unknown;
   last_released_at?: unknown; cleanup_todo?: string }
 interface Ref { task?: RecordId; session_active?: boolean; employee: string; delivery: string; fence: number; intent: WorkIntent;
-  at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string;
+  at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string; tree_mode?: string;
   assigned_tree?: string; current_fence?: number; handover?: boolean; resume_state?: string }
 
 /** No shell, no credential files, and bounded git processes. */
@@ -99,7 +99,10 @@ const overlap = (a: string, b: string) => {
 const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
   if (r.session_active) return 'active';
   if (r.current === r.employee && r.current_delivery === r.delivery && r.current_fence === r.fence && r.assigned_tree === String(r.tree.id)) return 'active';
-  if (!r.current && r.intent.kind !== 'read' && (r.task_state === 'doing' || (r.task_state === 'ready' && r.handover) || (r.task_state === 'blocked' && r.resume_state === 'doing')) && r.assigned_tree === String(r.tree.id)) return 'recovery';
+  // Every non-terminal task state (ready, doing, review, blocked) keeps its scene: an unheld ref on
+  // the task's assigned non-shared tree stays recovery until 'done' releases it. Shared trees are
+  // already hard-protected, so their refs release normally and serial tasks keep reusing the tree.
+  if (!r.current && r.task_state && r.task_state !== 'done' && r.assigned_tree === String(r.tree.id) && r.tree_mode !== 'shared') return 'recovery';
   return 'released';
 };
 
@@ -122,9 +125,10 @@ export class WorktreeRegistry {
   private async refs(repo?: string): Promise<Ref[]> {
     const [refs] = await this.db.query<[Ref[]]>(`SELECT *, task.current_employee AS current, task.delivery_id AS current_delivery,
       task.state AS task_state, task.fence AS current_fence, task.worktree.id AS assigned_tree, task.handover AS handover,
-      task.resume_state AS resume_state FROM worktree_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
+      task.resume_state AS resume_state, tree.mode AS tree_mode FROM worktree_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
     const [sessions] = await this.db.query<[Array<Ref & { retired?: boolean; enabled?: boolean }>]>(`SELECT *,
-      holder.retired AS retired, holder.workspace_read_active AS enabled FROM worktree_session_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
+      holder.retired AS retired, holder.workspace_read_active AS enabled, tree.mode AS tree_mode
+      FROM worktree_session_ref WHERE $repo = NONE OR tree.repo = $repo;`, { repo });
     return [...refs, ...sessions.map(r => ({ ...r, session_active: !!r.enabled && !r.retired }))];
   }
   /** Import every git tree as protected before using any of them. Never reset legacy/unknown trees. */
@@ -282,14 +286,13 @@ export class WorktreeRegistry {
     });
   }
 
-  private async markReleased(tree: RecordId, at?: Date) {
+  /** Stamps the authority release clock; returns true only when it advanced (a new release epoch). */
+  private async markReleased(tree: RecordId, at?: Date): Promise<boolean> {
     const when = at ?? new Date();
-    await this.db.query(`BEGIN;
-      LET $cur = SELECT * FROM ONLY $tree;
-      IF $cur != NONE AND ($cur.last_released_at = NONE OR $cur.last_released_at < $at) {
-        UPDATE ONLY $tree SET last_released_at = $at;
-      };
-      COMMIT;`, { tree, at: when });
+    const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+      'UPDATE $tree SET last_released_at = $at WHERE last_released_at = NONE OR last_released_at < $at RETURN AFTER;',
+      { tree, at: when });
+    return (rows?.length ?? 0) > 0;
   }
 
   /** Safe remove without --force; keep dirty / unavailable scenes with an explicit reason. */
@@ -393,8 +396,15 @@ export class WorktreeRegistry {
             const recovery = live.filter(r => refState(r) === 'recovery');
             if (!active.length && !recovery.length && live.length) {
               const latest = live.map(r => this.asDate(r.at)).filter((d): d is Date => !!d).sort((a, b) => b.getTime() - a.getTime())[0];
-              await this.markReleased(row.id, latest);
-              row.last_released_at = latest ?? new Date();
+              if (await this.markReleased(row.id, latest)) {
+                row.last_released_at = latest ?? new Date();
+                await this.audit({
+                  scanId, repo, path: row.path, tree: row.id, event: 'release', trigger: input.trigger,
+                  ownership: { mode: row.mode, refs: live.length }, decision: 'release', result: 'success',
+                  reason: 'all-references-released', task: live.find(r => r.task)?.task,
+                });
+                result.audited++;
+              }
             }
             const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
             const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
@@ -412,6 +422,15 @@ export class WorktreeRegistry {
             if (decision.action !== 'delete') {
               const reason = decision.reasons.join(',');
               result.kept.push({ path: row.path, reason });
+              if (!input.dryRun) {
+                // Abnormal retention (dirty/drift/missing/prior failures) becomes a durable follow-up;
+                // expected retention (refs, grace, protection) clears any stale todo.
+                const todo = /dirty|drift|missing|fail|unmerged/i.test(reason) ? reason.slice(0, 200) : undefined;
+                if ((row.cleanup_todo ?? undefined) !== todo) {
+                  await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo });
+                  row.cleanup_todo = todo;
+                }
+              }
               await this.audit({
                 scanId, repo, path: row.path, tree: row.id, event: input.dryRun ? 'dry_run' : 'skip',
                 trigger: input.trigger, ownership: { mode: row.mode, refs: freshRefs.length },
@@ -434,7 +453,10 @@ export class WorktreeRegistry {
 
             const removed = await this.removeTree(repo, row.path);
             if (!removed.ok) {
-              result.kept.push({ path: row.path, reason: removed.reason ?? 'git-remove-failed' });
+              const reason = removed.reason ?? 'git-remove-failed';
+              result.kept.push({ path: row.path, reason });
+              await this.db.query('UPDATE ONLY $tree SET cleanup_todo = $todo;', { tree: row.id, todo: `git-remove-failed:${reason}`.slice(0, 200) });
+              row.cleanup_todo = `git-remove-failed:${reason}`.slice(0, 200);
               await this.audit({
                 scanId, repo, path: row.path, tree: row.id, event: 'fail', trigger: input.trigger,
                 ownership: { mode: row.mode }, decision: 'delete', result: 'failed',
