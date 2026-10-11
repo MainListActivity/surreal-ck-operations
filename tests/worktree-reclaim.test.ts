@@ -104,3 +104,11 @@ test('env and config switches', () => {
   expect(parseGraceDays('14')).toBe(14);
   expect(parseGraceDays('nope')).toBe(7);
 });
+
+test('a lane tree outlives every single task and dies with the last open one', () => {
+  const tree = { path: '/tmp/repo-sck-aaa-bbbbbbbb', branch: 'lane/bbbbbbbb-billing', mode: 'exclusive' as const, status: 'present' as const, dirty: false, effectiveRefs: 0, recoveryRefs: 0, lastUsedAt: now };
+  expect(isCompanyManagedPath(tree.path, tree.branch)).toBe(true);
+  expect(decideReclaim({ ...tree, laneOpen: 2 }, policy)).toMatchObject({ action: 'skip', deletable: false, reasons: ['lane-open'] });
+  expect(decideReclaim({ ...tree, laneOpen: 0 }, policy)).toMatchObject({ action: 'delete', deletable: true });
+  expect(decideReclaim({ ...tree, laneOpen: 0, dirty: true }, policy).reasons).toEqual(['dirty-or-untracked']);
+});

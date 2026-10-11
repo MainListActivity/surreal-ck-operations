@@ -168,6 +168,6 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 1. 记录 MCP active release 提交、插件 SOURCE/DIRECTORY 对应的固定 release 基线、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011/012（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
 2. 按上文双面流程把生产基线、v3 在途提交与已批准主线集成为固定 release，重生成 vendor/schema，安装 launchd，再用 `paseo plugin install <release>/plugin` 重注册并 reload **现有** `sck-company`；v3 checkout 保留为 protected 历史树，不另起 dispatcher。
 3. 验证 MCP `/ready`、插件 running、真实员工 `get_context` 与真实派发恢复；记录两面实际提交/时间。经理安排真实串行 QA/工程及并行代码写手演练，QA 用普通通道读登记，不取得凭证、不自行建员工。证据含任务 ID、实际路径/branch、audit ID/时间、登记/有效引用 before/after，区分本地与生产。
-4. 分配策略需要回退时，两面同时设置 `SCK_WORKTREE_STRATEGY=legacy`（只对后续新代码分配恢复独占，已有 assignment 优先）；回收需要关闭时两面设置 `SCK_WORKTREE_RECLAIM=0`。restart MCP + reload 现有插件。保留 schema 011/012、登记、审计与在办现场。两面代码回滚也须保留 WT01/WT02 登记兼容版本。
+4. 回收需要关闭时两面设置 `SCK_WORKTREE_RECLAIM=0`（`SCK_WORKTREE_STRATEGY` 已移除：代码任务始终独占任务树或所属线的树）。restart MCP + reload 现有插件。保留 schema 011/012、登记、审计与在办现场。两面代码回滚也须保留 WT01/WT02 登记兼容版本。
 
 新业务环境变量：可选 `SCK_WORKTREE_RECLAIM`、`SCK_WORKTREE_ORPHAN_GRACE_DAYS`；系统 Python 和现有 Git 是本机准备项。

@@ -95,18 +95,22 @@ run('serial QA and GM reuse one physical tree, with authenticated references and
   const history = await core.history(qa, first.task.id); expect(history.find(h => h.action === 'claim')!.evidence).toContain(first.worktree!.worktreePath);
   await submit(core, gm, manager2);
 });
-run('serial engineers keep independent task branches and PR histories while reusing clean tree', async () => {
-  const path = repo(), core = coreFor(path), eng = await employee('engineering');
+run('untagged engineering tasks each get their own task tree and branch; the shared tree never leaves its branch', async () => {
+  const path = repo(), core = coreFor(path), eng = await employee('engineering'), qa = await employee('qa');
+  const reader = await core.claim(qa, (await task(core, 'qa')).id);
   const first = await core.claim(eng, (await task(core, 'engineering')).id);
+  expect(first.worktree!.mode).toBe('exclusive'); expect(first.worktree!.worktreePath).not.toBe(reader.worktree!.worktreePath);
   writeFileSync(join(first.worktree!.worktreePath, 'source.txt'), 'first task');
   git(first.worktree!.worktreePath, 'add', '.'); git(first.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'first change');
   await submit(core, eng, first);
   const second = await core.claim(eng, (await task(core, 'engineering')).id);
-  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath); expect(second.worktree!.branch).not.toBe(first.worktree!.branch);
+  expect(second.worktree!.mode).toBe('exclusive'); expect(second.worktree!.branch).not.toBe(first.worktree!.branch);
   expect(readFileSync(join(second.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('baseline');
   expect(git(path, 'show', `${first.worktree!.branch}:source.txt`)).toBe('first task');
   expect(git(path, 'show', 'main:source.txt')).toBe('baseline');
-  await submit(core, eng, second);
+  expect(git(reader.worktree!.worktreePath, 'branch', '--show-current')).toBe(reader.worktree!.branch!);
+  expect(reader.worktree!.branch).toMatch(/^sck\/shared-/);
+  await submit(core, eng, second); await submit(core, qa, reader);
 });
 run('two first claims across independent processes get distinct writers; dirty first scene stays untouched', async () => {
   const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering');
@@ -124,7 +128,7 @@ run('two first claims across independent processes get distinct writers; dirty f
   const [first, second] = await Promise.all([claimInChild(a, ta.id), claimInChild(b, tb.id)]);
   await capture(core, first); await capture(core, second);
   expect(first.worktree!.worktreePath).not.toBe(second.worktree!.worktreePath);
-  expect([first.worktree!.mode, second.worktree!.mode].sort()).toEqual(['exclusive', 'shared']);
+  expect([first.worktree!.mode, second.worktree!.mode]).toEqual(['exclusive', 'exclusive']);
   writeFileSync(join(first.worktree!.worktreePath, 'source.txt'), 'uncommitted first');
   writeFileSync(join(second.worktree!.worktreePath, 'source.txt'), 'uncommitted second');
   expect(readFileSync(join(first.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('uncommitted first');
@@ -173,7 +177,8 @@ run('failed authorization/claim and symlink scopes never leave effective referen
   const first = await core.claim(eng, t.id); await expect(core.claim(eng, (await task(core, 'engineering')).id)).rejects.toMatchObject({ code: 'already_claimed' });
   expect((await core.listWorktrees(gm)).flatMap(w => w.references).filter(r => r.state === 'active' && r.employee === first.task.currentEmployee)).toHaveLength(1);
   await submit(core, eng, first);
-  symlinkSync(dir, join(first.worktree!.worktreePath, 'outside'));
+  const reader = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, reader);
+  symlinkSync(dir, join(reader.worktree!.worktreePath, 'outside'));
   await expect(core.claim(assets, (await task(core, 'asset-production', { kind: 'assets', paths: ['outside/assets'] })).id)).rejects.toMatchObject({ code: 'invalid' });
   git(first.worktree!.worktreePath, 'checkout', '-b', 'manual-drift');
   const external = join(dir, `external-${++count}`); git(path, 'worktree', 'add', '-b', `external-${count}`, external);
@@ -220,8 +225,8 @@ run('non-lease GM/eval shared sessions protect checkout and release without cred
   await submit(core, eng, writer);
 });
 
-run('strategy rollback preserves existing assignments and registry; new code stays isolated while read/asset trees share', async () => {
-  const path = repo(), core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path, strategy: 'legacy' } });
+run('new code stays isolated while read/asset trees share', async () => {
+  const path = repo(), core = new SurrealCompanyCore(db, { worktrees: { opsRepo: path } });
   const eng = await employee('engineering'), qa = await employee('qa'), assets = await employee('asset-production');
   const a = await core.claim(eng, (await task(core, 'engineering')).id); await submit(core, eng, a);
   const b = await core.claim(eng, (await task(core, 'engineering')).id); expect(b.worktree!.mode).toBe('exclusive'); expect(b.worktree!.worktreePath).not.toBe(a.worktree!.worktreePath);
@@ -289,12 +294,9 @@ run('project-bound non-lease eval uses project repo and carries persistent proje
 });
 
 run('WT02: done exclusive is removed, shared retained; dirty exclusive kept with audit', async () => {
-  const path = repo(), core = coreFor(path), eng = await employee('engineering'), eng2 = await employee('engineering');
-  const sharedClaim = await core.claim(eng, (await task(core, 'engineering')).id);
-  writeFileSync(join(sharedClaim.worktree!.worktreePath, 'source.txt'), 'shared writer');
-  git(sharedClaim.worktree!.worktreePath, 'add', '.');
-  git(sharedClaim.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'shared change');
-  // Keep first writer active so the second engineer gets exclusive.
+  const path = repo(), core = coreFor(path), eng = await employee('qa'), eng2 = await employee('engineering');
+  const sharedClaim = await core.claim(eng, (await task(core, 'qa')).id);
+  expect(sharedClaim.worktree!.mode).toBe('shared');
   const exclusiveClaim = await core.claim(eng2, (await task(core, 'engineering')).id);
   expect(exclusiveClaim.worktree!.mode).toBe('exclusive');
   expect(exclusiveClaim.worktree!.worktreePath).not.toBe(sharedClaim.worktree!.worktreePath);
@@ -379,8 +381,8 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
 
 run('WT02: review and returned-ready windows keep exclusive scene; release writes durable audit', async () => {
   const path = repo(), core = coreFor(path);
-  const eng1 = await employee('engineering'), eng2 = await employee('engineering'), qa = await employee('qa');
-  const holder = await core.claim(eng1, (await task(core, 'engineering')).id);
+  const eng1 = await employee('qa'), eng2 = await employee('engineering'), qa = await employee('qa');
+  const holder = await core.claim(eng1, (await task(core, 'qa')).id);
   expect(holder.worktree!.mode).toBe('shared');
   const c2 = await core.claim(eng2, (await task(core, 'engineering')).id);
   expect(c2.worktree!.mode).toBe('exclusive');
@@ -593,4 +595,80 @@ run('WT04: retire/void is terminal — clean exclusive dies three layers at the 
   const swept = await reclaiming.reclaimWorktrees(gm, { repos: [path] });
   expect(swept.kept.find(k => k.path === dirtyScene)!.reason).not.toContain('unfinished-scene');
   await submit(core, eng, holder);
+}, 30000);
+
+async function laneGoal(core: SurrealCompanyCore, name: string) {
+  const [rows] = await core.database.db.query<[Array<{ id: RecordId }>]>(`CREATE goal CONTENT { title: $title, brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;`, { title: `Lane fixture ${name}` });
+  return String(rows[0]!.id.id);
+}
+const laneTask = (core: SurrealCompanyCore, goalId: string, role: Role, lane: string, kind: WorkIntent['kind'], dependencies: string[] = []) =>
+  core.createTask(gm, { title: `Lane ${lane} ${++count}`, context: 'Isolated lane fixture', executorRole: role, reviewerRole: 'qa', goalId, dependencies, workIntent: { kind, lane }, idempotencyKey: `lane-task-${count}` });
+run('LANE: one lane keeps one tree and one branch for every task and employee; another lane runs in parallel in its own tree', async () => {
+  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering'), qa = await employee('qa');
+  const goal = await laneGoal(core, 'one');
+  const t1 = await laneTask(core, goal, 'engineering', 'billing', 'code');
+  const t2 = await laneTask(core, goal, 'engineering', 'billing', 'code', [t1.id]);
+  const review = await laneTask(core, goal, 'qa', 'billing', 'read', [t2.id]);
+  const other = await laneTask(core, goal, 'engineering', 'search', 'code');
+  const first = await core.claim(a, t1.id);
+  expect(first.worktree!.mode).toBe('exclusive'); expect(first.worktree!.lane).toBe(`${goal}:billing`); expect(first.worktree!.branch).toMatch(/^lane\/[0-9a-f]{8}-billing$/);
+  const parallel = await core.claim(c, other.id);
+  expect(parallel.worktree!.worktreePath).not.toBe(first.worktree!.worktreePath); expect(parallel.worktree!.branch).not.toBe(first.worktree!.branch);
+  writeFileSync(join(first.worktree!.worktreePath, 'source.txt'), 'step one');
+  git(first.worktree!.worktreePath, 'add', '.'); git(first.worktree!.worktreePath, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'step one');
+  await acceptDone(core, a, first);
+  expect(existsSync(first.worktree!.worktreePath)).toBe(true);
+  const second = await core.claim(b, t2.id);
+  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath); expect(second.worktree!.branch).toBe(first.worktree!.branch);
+  expect(readFileSync(join(second.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('step one');
+  await acceptDone(core, b, second);
+  expect(existsSync(first.worktree!.worktreePath)).toBe(true);
+  expect((await core.listWorktrees(gm)).find(w => w.worktreePath === first.worktree!.worktreePath)!.reasons).toContain('lane-open');
+  const reader = await core.claim(qa, review.id);
+  expect(reader.worktree!.worktreePath).toBe(first.worktree!.worktreePath); expect(reader.worktree!.intent.kind).toBe('read');
+  await submit(core, qa, reader);
+  const gate = await employee('qa'); const closing = await core.claim(gate, reader.task.id);
+  await core.accept(gate, proof(closing), { text: 'Lane review accepted', idempotencyKey: `lane-accept-${++count}` });
+  expect(existsSync(first.worktree!.worktreePath)).toBe(false);
+  expect(existsSync(parallel.worktree!.worktreePath)).toBe(true);
+  await submit(core, c, parallel);
+}, 60000);
+run('LANE: a task waits instead of sharing the lane tree with another active writer; readers never create a lane', async () => {
+  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), qa = await employee('qa');
+  const goal = await laneGoal(core, 'two');
+  const t1 = await laneTask(core, goal, 'engineering', 'api', 'code'), t2 = await laneTask(core, goal, 'engineering', 'api', 'code');
+  const first = await core.claim(a, t1.id);
+  await expect(core.claim(b, t2.id)).rejects.toMatchObject({ code: 'worktree_busy' });
+  const lonely = await core.claim(qa, (await laneTask(core, goal, 'qa', 'docs', 'read')).id);
+  expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
+  await submit(core, a, first); await submit(core, qa, lonely);
+}, 30000);
+run('LANE: a shared tree stranded on a task branch is moved back, and a stale unworked task branch restarts from the current base', async () => {
+  const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
+  const read = await core.claim(qa, (await task(core, 'qa')).id);
+  const shared = read.worktree!.worktreePath, baseline = git(path, 'rev-parse', 'main');
+  const stuck = await task(core, 'engineering'); const branch = `task/${stuck.id.slice(0, 8)}`;
+  git(shared, 'checkout', '-q', '-b', branch);
+  await db.db.query('UPDATE ONLY $tree SET branch = $branch;', { tree: new RecordId('worktree', read.worktree!.id), branch });
+  writeFileSync(join(path, 'source.txt'), 'moved on'); git(path, 'add', '.'); git(path, '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'main moved');
+  const claimed = await core.claim(eng, stuck.id);
+  expect(git(shared, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
+  expect(claimed.worktree!.branch).toBe(branch); expect(claimed.worktree!.worktreePath).not.toBe(shared);
+  expect(git(claimed.worktree!.worktreePath, 'rev-parse', 'HEAD')).toBe(git(path, 'rev-parse', 'main')); expect(baseline).not.toBe(git(path, 'rev-parse', 'main'));
+  await submit(core, eng, claimed); await submit(core, qa, read);
+}, 30000);
+run('LANE: a shared tree is not moved off its branch while a legacy code writer is still active on it', async () => {
+  const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
+  const read = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, read);
+  const writer = await core.claim(eng, (await task(core, 'engineering')).id);
+  const shared = read.worktree!, sharedKey = new RecordId('worktree', shared.id);
+  git(shared.worktreePath, 'checkout', '-q', '-b', 'legacy-writer');
+  await db.db.query('UPDATE ONLY $tree SET branch = $branch; UPDATE ONLY $ref SET tree = $tree; UPDATE ONLY $task SET worktree.id = $id;',
+    { tree: sharedKey, branch: 'legacy-writer', ref: new RecordId('worktree_ref', writer.task.id), task: new RecordId('task', writer.task.id), id: shared.id });
+  const during = await core.claim(qa, (await task(core, 'qa')).id);
+  expect(git(shared.worktreePath, 'branch', '--show-current')).toBe('legacy-writer'); expect(during.worktree!.worktreePath).toBe(shared.worktreePath);
+  await submit(core, eng, writer); await submit(core, qa, during);
+  const after = await core.claim(qa, (await task(core, 'qa')).id);
+  expect(git(shared.worktreePath, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
+  await submit(core, qa, after);
 }, 30000);

@@ -19,6 +19,8 @@ export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]
 export interface WorktreeAssignment {
   id: string; repo: string; project?: string; worktreePath: string;
   mode: 'shared' | 'exclusive' | 'protected'; branch?: string;
+  /** "<goal id>:<lane name>" when the tree belongs to a lane shared by every task of that lane. */
+  lane?: string;
   intent: WorkIntent; discipline: string;
 }
 export interface WorktreeView extends Omit<WorktreeAssignment, 'intent' | 'discipline'> {
@@ -158,6 +160,8 @@ export interface CreateDelivery {
   discipline?: string;
   /** Optional project override persisted on all three legs so the chain stays on one project. */
   project?: string;
+  /** Worktree lane shared by the three legs; defaults to one fresh lane per delivery so parallel changes never share a tree. */
+  lane?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
 }

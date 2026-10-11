@@ -3,7 +3,7 @@ import type { WorktreeAssignment } from '../contracts.ts';
 
 /** Path / branch patterns that identify company-managed task scenes (not releases or external tools). */
 const PATH_MANAGED = /-(?:task|wt|review|sck-[0-9a-f]+)-[0-9a-f]{8}$/i;
-const BRANCH_MANAGED = /^task\/[0-9a-f]{8}(?:-[\w./-]+)?$/i;
+const BRANCH_MANAGED = /^(?:task|lane)\/[0-9a-f]{8}(?:-[\w./-]+)?$/i;
 const SHARED_PATH = /-sck-[0-9a-f]+-shared$/i;
 const SHARED_BRANCH = /^sck\/shared-[0-9a-f]+$/i;
 const RELEASE_MARKER = /\/SurrealCKCompany\/releases\//i;
@@ -36,6 +36,8 @@ export interface TreeVerdictInput {
   dirty: boolean;
   effectiveRefs: number;
   recoveryRefs: number;
+  /** Non-terminal tasks of the tree's lane: a lane tree outlives every single task and dies with the last one. */
+  laneOpen?: number;
   createdAt?: Date;
   lastUsedAt?: Date;
   lastReleasedAt?: Date;
@@ -87,6 +89,9 @@ export function decideReclaim(input: TreeVerdictInput, policy: ReclaimPolicy): R
   }
   if (input.recoveryRefs > 0) {
     return { action: 'skip', deletable: false, reasons: ['unfinished-scene'], companyManaged };
+  }
+  if (input.laneOpen) {
+    return { action: 'skip', deletable: false, reasons: ['lane-open'], companyManaged };
   }
   if (input.status === 'missing') {
     return { action: 'skip', deletable: false, reasons: ['missing'], companyManaged };

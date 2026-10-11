@@ -16,7 +16,6 @@ export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}
 export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number }
 export interface RegistryOptions {
   opsRepo: string;
-  strategy?: 'shared' | 'legacy';
   /** When false, inventory still classifies but reclaim never deletes. Default: env/config enabled. */
   reclaimEnabled?: boolean;
   orphanGraceDays?: number;
@@ -39,7 +38,7 @@ export interface ReclaimResult {
 }
 interface Tree { path: string; branch?: string; main: boolean }
 interface Row { id: RecordId; repo: string; project?: string; path: string; mode: WorktreeAssignment['mode'];
-  branch?: string; protection?: string; created_at: unknown; last_used_at: unknown;
+  branch?: string; lane?: string; protection?: string; created_at: unknown; last_used_at: unknown;
   last_released_at?: unknown; cleanup_todo?: string }
 interface Ref { task?: RecordId; session_active?: boolean; employee: string; delivery: string; fence: number; intent: WorkIntent;
   at: unknown; tree: RecordId; current?: string; current_delivery?: string; task_state?: string; tree_mode?: string;
@@ -157,6 +156,32 @@ export class WorktreeRegistry {
         { tree: record('worktree', worktreeId(repo, t.path)), repo, project, path: t.path, branch: t.branch, protection, mode: managedRead ? 'shared' : 'protected' });
     }
   }
+  /** The shared tree is a read baseline. A branch that drifted onto it is moved off, never adopted. */
+  private async restoreShared(repo: string, list: Tree[], shared: Row, base: string, writing: boolean) {
+    const expected = `sck/shared-${hash(repo).slice(0, 12)}`;
+    const tree = list.find(t => t.path === shared.path);
+    if (!tree || basename(shared.path) !== `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-shared`) return;
+    if (tree.branch !== expected) {
+      if (writing || await git(shared.path, ['status', '--porcelain'])) return;
+      let exists = false;
+      try { await git(repo, ['show-ref', '--verify', `refs/heads/${expected}`]); exists = true; } catch {}
+      await git(shared.path, ['checkout', ...(exists ? [expected] : ['-b', expected, base])]);
+      tree.branch = expected;
+    }
+    if (shared.branch !== expected) {
+      await this.db.query('UPDATE ONLY $tree SET branch = $branch;', { tree: shared.id, branch: expected });
+      shared.branch = expected;
+    }
+  }
+  /** Non-terminal tasks that still belong to the lane; the lane tree lives until this reaches zero. */
+  private async laneOpen(lane: string | undefined): Promise<number> {
+    if (!lane) return 0;
+    const [goal, name] = lane.split(':');
+    const [rows] = await this.db.query<[Array<{ count: number }>]>(
+      `SELECT count() AS count FROM task WHERE goal = $goal AND work_intent.lane = $name AND state NOT IN ['done', 'void'] GROUP ALL;`,
+      { goal: record('goal', goal!), name });
+    return rows?.[0]?.count ?? 0;
+  }
   async allocate(repo: string, list: Tree[], task: TaskView, actor: Principal, project?: ProjectView): Promise<WorktreeAssignment> {
     await this.reconcile(repo, list, project?.id);
     const intent: WorkIntent = task.state === 'review' ? { kind: 'read' } : task.workIntent ?? { kind: actor.role === 'engineering' && task.kind !== 'release' ? 'code' : 'read' };
@@ -168,56 +193,50 @@ export class WorktreeRegistry {
     const defaultBranch = project?.defaultBranch ?? list[0]!.branch ?? 'HEAD';
     let base = defaultBranch;
     try { await git(repo, ['show-ref', '--verify', `refs/remotes/origin/${defaultBranch}`]); base = `origin/${defaultBranch}`; } catch {}
-    const desired = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code')) ? `task/${task.id.slice(0, 8)}` : undefined;
+    // A lane is one serial relay chain of a goal: every task tagged with it shares one tree and one branch.
+    const laneName = intent.kind === 'assets' ? undefined : task.workIntent?.lane;
+    const lane = laneName && task.goalId ? `${task.goalId}:${laneName}` : undefined;
+    const lane8 = lane ? hash(lane).slice(0, 8) : undefined;
+    const writes = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code'));
+    const desired = writes ? (lane ? `lane/${lane8}-${laneName}` : `task/${task.id.slice(0, 8)}`) : undefined;
+    const shared = rows.find(r => r.mode === 'shared');
+    // Never move a branch away from a code writer that is still working in the shared tree (legacy assignments).
+    if (shared) await this.restoreShared(repo, list, shared, base, refs.some(r => String(r.tree.id) === String(shared.id.id) && r.intent.kind === 'code' && refState(r) === 'active'));
     const own = previous && rows.find(r => String(r.id.id) === previous.id);
-    const legacy = list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
+    const legacy = lane ? undefined : list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
     let chosen = own && list.find(t => t.path === own.path && (!desired || t.branch === desired)) ? own : undefined;
     // Existing task trees are adopted in place, keeping protected mode and all uncommitted work.
     if (!chosen && legacy && (intent.kind === 'code' || desired)) chosen = rows.find(r => r.path === legacy.path);
-    const shared = rows.find(r => r.mode === 'shared');
+    // Whoever picks up the next task of a lane lands in the lane's tree; readers only join a lane that already exists.
+    if (!chosen && lane && (desired || intent.kind === 'read')) chosen = rows.find(r => r.lane === lane && list.some(t => t.path === r.path));
     const activeOn = (r: Row) => live.filter(f => String(f.tree.id) === String(r.id.id));
     if (chosen && desired && chosen.branch !== desired) chosen = undefined;
-    if (!chosen) {
-      if (shared && list.some(t => t.path === shared.path) && (this.options.strategy !== 'legacy' || (!desired && intent.kind !== 'code'))) {
-        const users = activeOn(shared);
-        const writers = users.filter(r => r.intent.kind !== 'read');
-        if (intent.kind === 'code' || desired) {
-          if (!users.length && !(await git(shared.path, ['status', '--porcelain']))) chosen = shared;
-        } else if (!writers.some(r => r.intent.kind === 'code')) chosen = shared;
-      }
-      // A shared tree with a code writer is still the default read workspace; no checkout takes place.
-      if (!chosen && intent.kind === 'read' && !desired && shared && list.some(t => t.path === shared.path)) chosen = shared;
-    }
+    // Code never runs in the shared tree: it is the read/asset baseline and its branch is never switched.
+    if (!chosen && !desired && shared && list.some(t => t.path === shared.path)) chosen = shared;
     if (intent.kind === 'assets') {
       if (live.some(r => r.intent.kind === 'assets' && r.intent.paths!.some(a => intent.paths!.some(b => overlap(a, b))))) throw new CompanyError('worktree_busy', 'Authorized asset directories overlap; wait for current writer');
-      if (!chosen && shared && activeOn(shared).some(r => r.intent.kind === 'code')) throw new CompanyError('worktree_busy', 'Shared repository has an active code writer; asset writes wait');
+      if (chosen && activeOn(chosen).some(r => r.intent.kind === 'code')) throw new CompanyError('worktree_busy', 'Shared repository has an active code writer; asset writes wait');
     }
     if (chosen && intent.kind === 'code' && task.currentEmployee !== actor.employeeId && activeOn(chosen).length) throw new CompanyError('worktree_busy', 'Task scene is referenced by another active delivery');
     if (!chosen) {
-      const mode = (this.options.strategy === 'legacy' && (intent.kind === 'code' || desired)) || (shared && (intent.kind === 'code' || desired)) ? 'exclusive' : 'shared';
-      const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : task.id.slice(0, 8)}`);
+      const mode = desired ? 'exclusive' : 'shared';
+      const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : lane8 ?? task.id.slice(0, 8)}`);
       // Do not treat an existing unregistered path as an empty target.
       if (existsSync(path)) throw new CompanyError('conflict', 'Unregistered allocation path exists; preserve it for reconciliation');
       const branch = desired ?? `sck/shared-${hash(repo).slice(0, 12)}`;
       let branchExists = false;
       try { await git(repo, ['show-ref', '--verify', `refs/heads/${branch}`]); branchExists = true; } catch {}
+      // A branch with no commits of its own is only a stale pointer: bring it to the current base before reuse.
+      if (branchExists && desired && base !== branch) {
+        try { await git(repo, ['merge-base', '--is-ancestor', branch, base]); await git(repo, ['branch', '-f', branch, base]); } catch {}
+      }
       await git(repo, ['worktree', 'add', ...(branchExists ? [] : ['-b', branch]), path, branchExists ? branch : base]);
       const canonical = realpathSync(path);
-      chosen = { id: record('worktree', worktreeId(repo, canonical)), repo, project: project?.id, path: canonical, branch, mode, created_at: new Date(), last_used_at: new Date() };
+      chosen = { id: record('worktree', worktreeId(repo, canonical)), repo, project: project?.id, path: canonical, branch, mode, lane: mode === 'exclusive' ? lane : undefined, created_at: new Date(), last_used_at: new Date() };
       // Persist the physical tree before the task claim. On failure it has no effective reference.
       await this.db.query(`UPSERT ONLY $tree CONTENT { repo: $repo, project: $project, path: $path,
-        branch: $branch, mode: $mode, created_at: time::now(), last_used_at: time::now() };`,
-        { tree: chosen.id, repo, project: project?.id, path: canonical, branch, mode });
-    } else if (desired && chosen.branch !== desired) {
-      const before = await git(chosen.path, ['symbolic-ref', '--short', 'HEAD']).catch(() => undefined);
-      if (before !== chosen.branch) throw new CompanyError('conflict', 'Registered branch drift; preserve scene');
-      const status = await git(repo, ['-C', chosen.path, 'status', '--porcelain']);
-      if (status) throw new CompanyError('worktree_busy', 'Shared scene contains uncommitted/untracked work; preserve before reuse');
-      let exists = false;
-      try { await git(repo, ['show-ref', '--verify', `refs/heads/${desired}`]); exists = true; } catch {}
-      await git(chosen.path, ['checkout', ...(exists ? [desired] : ['-b', desired, base])]);
-      chosen.branch = desired;
-      await this.db.query('UPDATE ONLY $tree SET branch = $branch;', { tree: chosen.id, branch: desired });
+        branch: $branch, mode: $mode, lane: $lane, created_at: time::now(), last_used_at: time::now() };`,
+        { tree: chosen.id, repo, project: project?.id, path: canonical, branch, mode, lane: chosen.lane });
     }
     // Refuse branch drift (manual checkout) instead of silently restoring/resetting the tree.
     const actualBranch = await git(chosen.path, ['symbolic-ref', '--short', 'HEAD']).catch(() => undefined);
@@ -229,8 +248,8 @@ export class WorktreeRegistry {
       if (resolved !== candidate || (resolved !== chosen.path && !resolved.startsWith(chosen.path + sep))) throw new CompanyError('invalid', 'Asset directory escapes worktree through symlink');
     }
     return { id: String(chosen.id.id), repo, project: project?.id, worktreePath: chosen.path, branch: chosen.branch,
-      mode: chosen.mode, intent,
-      discipline: intent.kind === 'code' ? '仅在本任务分支 commit/push；禁止 checkout/reset/pull；禁止凭证读取；附件写 evidenceDir。'
+      mode: chosen.mode, lane: chosen.lane, intent,
+      discipline: intent.kind === 'code' ? `仅在${chosen.lane ? '本线（lane）' : '本任务'}分支 commit/push；禁止 checkout/reset/pull；禁止凭证读取；附件写 evidenceDir。`
         : intent.kind === 'assets' ? '仅写授权目录；不得 checkout/reset/pull 或 commit/push；附件写 evidenceDir。'
           : '只读代码；不得 checkout/reset/pull、commit/push 或写资产；附件写 evidenceDir。' };
   }
@@ -361,6 +380,7 @@ export class WorktreeRegistry {
         status, dirty,
         effectiveRefs: references.filter(r => r.state === 'active').length,
         recoveryRefs: references.filter(r => r.state === 'recovery').length,
+        laneOpen: await this.laneOpen(row.lane),
         createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
         lastReleasedAt: this.asDate(row.last_released_at),
       }, policy);
@@ -371,7 +391,7 @@ export class WorktreeRegistry {
         reasons.push(`grace-remaining-ms:${decision.graceRemainingMs}`);
       }
       result.push({
-        id: String(row.id.id), repo: row.repo, project: row.project, worktreePath: row.path, branch: row.branch, mode: row.mode,
+        id: String(row.id.id), repo: row.repo, project: row.project, worktreePath: row.path, branch: row.branch, mode: row.mode, lane: row.lane,
         createdAt: String(row.created_at), lastUsedAt: String(row.last_used_at), status, references,
         deletable: decision.deletable, reasons,
       });
@@ -430,6 +450,7 @@ export class WorktreeRegistry {
               status, dirty,
               effectiveRefs: freshRefs.filter(r => refState(r) === 'active').length,
               recoveryRefs: freshRefs.filter(r => refState(r) === 'recovery').length,
+              laneOpen: await this.laneOpen(row.lane),
               createdAt: this.asDate(row.created_at), lastUsedAt: this.asDate(row.last_used_at),
               lastReleasedAt: this.asDate(row.last_released_at),
             }, policy);

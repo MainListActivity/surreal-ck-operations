@@ -52,7 +52,6 @@ export function company(): Promise<Company> {
     const paseo = createPaseoCli();
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
-      strategy: (process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared') as 'shared' | 'legacy',
       // Three-layer same-death: a task worktree's Paseo workspaces/project die with the tree.
       sceneCleaner: createSceneCleaner(paseo),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS

@@ -14,7 +14,7 @@
 
 1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
 2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
-   工作目录以 `claim.json.worktree` 的持久登记为准（path/mode/branch/intent/discipline），员工不自行新建 worktree。物理 shared 树可供串行任务复用；工程每项仍用 `task/<任务ID前8位>` 分支与独立 PR，第二个并行代码写手由调度通道分配 exclusive，保留第一写手现场。活动引用期间员工不得 checkout/reset/pull；只有取得 `intent.kind=code` 写权的工程员工可在登记 task 分支 commit/push，checkpoint 前先提交，证据写分支与登记路径。读任务只读代码；内容写入须由派工显式授予 `assets` 相对目录，重叠目录排队、互不重叠可共用，不能自行扩大写权。附件始终写 `evidenceDir`。
+   工作目录以 `claim.json.worktree` 的持久登记为准（path/mode/branch/intent/discipline），员工不自行新建 worktree。shared 树只作只读/资产基线，代码任务从不进入、其分支也不会被切换；代码任务由调度分配 exclusive 树：未分线的用 `task/<任务ID前8位>` 分支，属于同一条线（`worktree.lane`，工作意图 `workIntent.lane`）的任务无论岗位与接手人都共用同一棵树与同一个 `lane/…` 分支，线内串行，另一条线并行各用各的树。活动引用期间员工不得 checkout/reset/pull；只有取得 `intent.kind=code` 写权的工程员工可在登记分支（task 或 lane 分支）commit/push，checkpoint 前先提交，证据写分支与登记路径。读任务只读代码；内容写入须由派工显式授予 `assets` 相对目录，重叠目录排队、互不重叠可共用，不能自行扩大写权。附件始终写 `evidenceDir`。
 3. **交接**（本轮只做一项，做完即结束本轮）：
    - 证据附件（截图、导出报告、验收手册等文件）写到 `claim.json` 的 `evidenceDir` 目录——这是按任务共享的服务数据目录，不在任何 git 仓库里；禁止往运营仓库写交付物或证据文件。
    - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
@@ -121,7 +121,7 @@ G3 交给老板时交付已经上线：写清入口链接和验收步骤，不�
 
 - 任务在你被叫醒前已由通道领取；租约证明（`deliveryId`、`fence`、`expectedVersion`）由通道代持并在每次写入时自动注入。
 - 你的会话在运行时，通道自动续租；会话归档、订阅耗尽，或超过 90 分钟没有 checkpoint 时，调度器收回租约并附上你会话最后的日志作为交接包，改派给同岗位其他员工。
-- WT01 持久登记与分配启用后，物理目录以登记为准。WT02 按归属回收：持久引用是唯一删除依据；租约过期/交接保留 recovery 现场；任务 done 后 exclusive 干净树可回收，shared / main / release / 外部与归属不明树保留；脏树与未合并分支不强制删除；孤儿宽限默认 7 天。沿用调度器既有 10 分钟 sweep，可用 `SCK_WORKTREE_RECLAIM=0` 关闭。活动引用、交接现场、dirty、缺失/branch 漂移与保留原因可通过 `list_worktrees` 查询（GM 可全局）；GM 另可 `reclaim_worktrees`（含 dryRun）与 `list_worktree_audits`。旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支。
+- WT01 持久登记与分配启用后，物理目录以登记为准。WT02 按归属回收：持久引用是唯一删除依据；租约过期/交接保留 recovery 现场；任务 done 后 exclusive 干净树可回收（线的树要等该线最后一个未终态任务结束，`list_worktrees` 原因为 `lane-open`），shared / main / release / 外部与归属不明树保留；脏树与未合并分支不强制删除；孤儿宽限默认 7 天。沿用调度器既有 10 分钟 sweep，可用 `SCK_WORKTREE_RECLAIM=0` 关闭。活动引用、交接现场、dirty、缺失/branch 漂移与保留原因可通过 `list_worktrees` 查询（GM 可全局）；GM 另可 `reclaim_worktrees`（含 dryRun）与 `list_worktree_audits`。旧现场接手保留路径与分支，不自动 reset。需要保留的代码提交并推送任务分支。
 - 你被收回的租约立即失效：之后旧 `deliveryId` 的写入都会被拒绝。
 - 任务完成后进入绩效评审：默认由 **Jev**（TypeSafe System One 决策模型）在调度器进程内一次调用完成——按审计时间线给每位参与员工打五个维度的校准分并写入 `scorecard`，任务标记 `evaluated_at`。Jev 未配置、连续失败或置信度不足时，调度器改派 `eval` 岗位的 LLM 评审员接手。分数滚动更新员工定义的 `avg_score`，直接影响同类员工接到任务的概率。
 
