@@ -23,6 +23,7 @@ export const createGoal = defineRpc({
     text: z.string().min(2),
     tier: z.enum(["quick", "standard", "program"]).optional(),
     project: z.string().optional(),
+    pipeline: z.enum(["software", "video", "story"]).optional(),
     key,
   }),
   output: z.object({ id: z.string(), state: z.string() }),

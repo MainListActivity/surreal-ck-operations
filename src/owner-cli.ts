@@ -5,7 +5,7 @@ import { OwnerDesk, type OwnerCommandKind } from './owner.ts';
 import { Workforce } from './workforce.ts';
 
 const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，或在 Paseo 里对经理说）
-  pnpm run company goal [--tier quick|standard|program] [--project <项目>] "<目标>"
+  pnpm run company goal [--tier quick|standard|program] [--project <项目>] [--pipeline software|video|story] "<目标>"
                                              提出新目标；不指定 tier 时由 Jev/经理分级
   pnpm run company direction "<公司方向>"    记录公司运作方向，所有员工可见
   pnpm run company inbox                     查看待你决定的关口、员工提问和系统提醒
@@ -26,11 +26,12 @@ try {
     const at = argv.indexOf(`--${name}`);
     return at < 0 ? undefined : argv.splice(at, 2)[1];
   };
-  const commands: Record<string, (argv: string[]) => { kind: OwnerCommandKind; task?: string; text?: string; tier?: string; project?: string }> = {
+  const commands: Record<string, (argv: string[]) => { kind: OwnerCommandKind; task?: string; text?: string; tier?: string; project?: string; pipeline?: string }> = {
     goal: argv => {
       const tier = flag(argv, 'tier');
       const project = flag(argv, 'project');
-      return { kind: 'goal', text: argv.join(' '), tier, project };
+      const pipeline = flag(argv, 'pipeline');
+      return { kind: 'goal', text: argv.join(' '), tier, project, pipeline };
     },
     direction: argv => ({ kind: 'direction', text: argv.join(' ') }),
     approve: ([task, ...note]) => ({ kind: 'approve', task, text: note.join(' ') }),
@@ -42,7 +43,7 @@ try {
   if (commands[action]) {
     const command = commands[action]([first ?? '', ...rest].filter(Boolean));
     const [[created]] = await db.db.query<[[{ id: RecordId }]]>(
-      "CREATE owner_command CONTENT { kind: $kind, task: $task, text: $text, tier: $tier, project: $project, source: 'cli' };", command);
+      "CREATE owner_command CONTENT { kind: $kind, task: $task, text: $text, tier: $tier, project: $project, pipeline: $pipeline, source: 'cli' };", command);
     await desk.applyPending();
     const row = await db.db.select<{ status: string; result?: string }>(created.id);
     console.log(`${row?.status === 'applied' ? '已执行' : row?.status === 'failed' ? '失败' : '已排队'}：${action} ${row?.result ?? ''}`);

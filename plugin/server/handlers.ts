@@ -34,7 +34,7 @@ export function registerHandlers(server: PluginServerContext): void {
 
   server.handle(rpc.createGoal, async (input: RpcInput<typeof rpc.createGoal>) => {
     const goal = await (await company()).owner.createGoal({
-      text: input.text, source: SOURCE, key: input.key, tier: input.tier, project: input.project,
+      text: input.text, source: SOURCE, key: input.key, tier: input.tier, project: input.project, pipeline: input.pipeline,
     });
     return { id: goal.id, state: goal.state };
   });

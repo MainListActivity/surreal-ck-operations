@@ -2,6 +2,11 @@ import type { CreateTask, GoalTier, TaskKind } from './contracts.ts';
 
 export const GOAL_TIERS: readonly GoalTier[] = ['quick', 'standard', 'program'];
 
+/** Production lines: each has its own goal template. `software` is the original delivery flow. */
+export const PIPELINES = ['software', 'video', 'story'] as const;
+export type PipelineId = typeof PIPELINES[number];
+export const isPipeline = (value: unknown): value is PipelineId => PIPELINES.includes(value as PipelineId);
+
 type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRole'> & { kind: Exclude<TaskKind, 'goal'> };
 
 const AUTHORITY = '决策边界：能在公司内决定的事不找老板。技术方案与拆分由经理定，是否上线由运营定，运营定不了交经理；只有花钱/充值、签约、对外联系、公司方向和项目红线才 report_blocker to=owner，并写明已查过哪些来源。';
@@ -104,16 +109,65 @@ function finalGate(head: string): Spec {
   };
 }
 
+const VIDEO_PLAN = `把目标拆成可独立交付的任务，全部带 goalId，并按本项目的岗位轨工作（项目 AGENTS.md 与 project.disciplines 词表）。本目标走视频产线，不涉及软件上线，不要建 create_delivery，也不要把任务派给 product。
+- 原型/概念设计（P 段，老板 demo 验收）：executorRole=concept-design、reviewerRole=owner。新角色、视觉风格、场景基调先交 demo，老板批准后才解锁依赖它的量产任务。
+- 量产制作（M 段，GM/QA 验收）：executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies。
+- 每个任务必须传 discipline=<轨名>（词表内的轨名，不是 slug），单任务只挂一轨；产线岗不挂轨的任务会被拒绝。
+**编剧轨例外**：所有编剧轨任务（剧本初稿、二次创作修订、多轮打磨）用 executorRole=screenwriter 且 discipline=编剧；P 段由 owner 验收，M 段 reviewerRole=gm。剧本被老板真实驳回后，用 create_task 传 revises=<上一版任务id> 开下一版（标题带 v(N+1)，context 写逐条修订要点）。
+成片验收用抽帧与音画检查（见项目 AGENTS.md「QA 终验标准」）。`;
+
+const STORY_PLAN = `本目标走**长篇故事产线**：只负责把原著写完，由粗到细递归推进。故事作者不关心分集、时长、剧本格式、分镜、配音和渲染——这些是后面改编线的事，任务 context 里不要出现这些词，也不要把任务派给 product、ai-content、cs。
+底本：仓库里已有的故事筹备稿（目标描述里的 Markdown）。全部产出放项目的故事目录，不进视频的集数目录。所有故事任务传 discipline=原著；作者岗位 executorRole=story-author（该岗位上线前用项目 AGENTS.md「原著线」写的过渡岗位）。
+递归流程（每一层都是：先写概要 → 老板只看概要 → 通过后才展开下一层 → 最后补齐正文）：
+1. 第一层：《故事圣经与全书总纲》，executorRole=作者、reviewerRole=owner。
+2. 每一层概要任务通过后才展开下一层：卷概要 → 章概要 → 小章节概要，都是 reviewerRole=owner。
+3. 小章节概要通过后建 [正文] 任务（作者 → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。
+4. 概要被老板驳回：在原任务上按意见返修再交，不跳过去写正文。正文被退回：只改正文，不动已批概要。
+**不要一次建完所有层级**。每批只建当前层及其审批，并同时建一个 [展开下一层] 任务（executorRole=gm、reviewerRole=qa），让它依赖本层的老板审批任务；它在老板通过后执行，再建下一层任务和下一个 [展开下一层]——靠它把递归接力下去。全书写完时，由最后一个 [展开下一层] 建一个 kind=gate 的《全书完成确认》交老板。
+每个任务写清：对应层级、上游概要所在文件、输出文件路径、字数/篇幅预期（只按故事本身，不按集数）。`;
+
+function linePlan(goalId: string, head: string, pipeline: Exclude<PipelineId, 'software'>): Spec {
+  return {
+    title: '任务拆解与分派', kind: 'task', executorRole: 'gm', reviewerRole: 'qa',
+    context: `${head}
+你是经理。${pipeline === 'story' ? STORY_PLAN : VIDEO_PLAN}
+全部任务带 goalId="${goalId}"。submit 证据：任务清单（id、标题、执行/验收岗位、轨、依赖）。
+${AUTHORITY}`,
+  };
+}
+
+function videoGate(head: string): Spec {
+  return {
+    title: 'G3 老板最终验收', kind: 'gate', executorRole: 'gm', reviewerRole: 'owner',
+    context: `${head}
+你是经理。本目标的成片已通过 QA 终验。写《最终验收》，全文作为 submit 证据：
+1. 一句话结论：做完了什么。
+2. 成片/样片的可点链接（用 deliverable_publish 发布到局域网地址，老板可能不在电脑旁）和抽帧联络表。
+3. QA 终验结论（证据所在任务）。
+4. 已知限制。
+老板驳回时，按意见用 create_task（带 goalId）返工，然后结束本轮；最终验收会自动等待返工完成。`,
+  };
+}
+
 export interface TemplateTask extends Spec { ref: string; deps: string[] }
 export interface GoalTemplate {
   tasks: TemplateTask[];
   anchors: string[];
-  refs: { intake?: string; plan?: string; manual: string; acceptance: string };
+  refs: { intake?: string; plan?: string; manual?: string; acceptance?: string };
 }
 
 /** Task graph for a triaged goal. Refs are local names; the caller maps them to record ids. */
-export function goalTemplate(tier: GoalTier, title: string, brief: string, goalId: string): GoalTemplate {
-  const head = `所属目标：${title}（goal=${goalId}，级别 ${tier}）\n老板原始输入：\n${brief}\n`;
+export function goalTemplate(tier: GoalTier, title: string, brief: string, goalId: string, pipeline: PipelineId = 'software'): GoalTemplate {
+  const head = `所属目标：${title}（goal=${goalId}，级别 ${tier}${pipeline === 'software' ? '' : `，产线 ${pipeline}`}）\n老板原始输入：\n${brief}\n`;
+  if (pipeline === 'story') {
+    return { tasks: [{ ...linePlan(goalId, head, 'story'), ref: 'plan', deps: [] }], anchors: [], refs: { plan: 'plan' } };
+  }
+  if (pipeline === 'video') {
+    return {
+      tasks: [{ ...linePlan(goalId, head, 'video'), ref: 'plan', deps: [] }, { ...videoGate(head), ref: 'acceptance', deps: ['plan'] }],
+      anchors: ['acceptance'], refs: { plan: 'plan', acceptance: 'acceptance' },
+    };
+  }
   if (tier === 'quick') {
     const chain = quickChain(title, brief).map((spec, i) => ({ ...spec, ref: `d${i}`, deps: i ? [`d${i - 1}`] : [] }));
     return {

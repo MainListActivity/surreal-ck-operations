@@ -6,6 +6,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
+import { assertRoleContract, type DisciplineContract } from './role-contract.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
@@ -13,9 +14,10 @@ import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CompanyError } from './core-errors.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView } from './contracts.ts';
+import { ROLES } from './contracts.ts';
 export { CompanyError };
 
-export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs', 'eval'];
+export { ROLES };
 /**
  * 岗位→必配轨常量表：executorRole 在表内的任务必须带指定 discipline——createTask
  * 缺轨/错轨显式拒绝；claim/dispatch 双端要求任务轨等于必配轨且编制 tracks 显式含该轨
@@ -367,13 +369,14 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.project !== undefined && !(await this.projects.get(input.project))) {
       throw new CompanyError('not_found', `project ${input.project} not found`);
     }
+    const contract = await this.disciplineContract(input.goalId, input.project);
     if (input.discipline !== undefined) {
       requireText(input.discipline, 'discipline', 1, 60);
-      const vocab = await this.disciplineVocab(input.goalId, input.project);
-      if (vocab && !vocab.has(input.discipline)) {
-        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
+      if (contract && !contract.has(input.discipline)) {
+        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...contract.keys()].join('、')}`);
       }
     }
+    assertRoleContract(contract, input.executorRole, input.discipline);
     if (input.executorRole === 'eval' || input.reviewerRole === 'eval') {
       throw new CompanyError('invalid', 'eval is a workforce-only role and cannot take tasks');
     }
@@ -748,18 +751,18 @@ export class SurrealCompanyCore implements CompanyCore {
    * (a Set of track names when the project defines a non-empty `disciplines` list, else
    * undefined = free-form values allowed).
    */
-  private async disciplineVocab(goalId?: string, projectId?: string): Promise<Set<string> | undefined> {
+  private async disciplineContract(goalId?: string, projectId?: string): Promise<DisciplineContract | undefined> {
+    type Raw = { disciplines?: Array<{ name?: string; roles?: string[] }> };
+    let raw: Raw | undefined;
     if (projectId) {
-      const [rows] = await this.db.query<[Array<{ disciplines?: Array<{ name?: string }> }>]>(
-        'SELECT disciplines AS disciplines FROM $project;', { project: id('project', projectId) });
-      const names = (rows[0]?.disciplines ?? []).map(d => d?.name).filter((n): n is string => typeof n === 'string' && n.length > 0);
-      return names.length ? new Set(names) : undefined;
+      const [rows] = await this.db.query<[Raw[]]>('SELECT disciplines AS disciplines FROM $project;', { project: id('project', projectId) });
+      raw = rows[0];
+    } else if (goalId) {
+      const [rows] = await this.db.query<[Raw[]]>('SELECT project.disciplines AS disciplines FROM $goal;', { goal: id('goal', goalId) });
+      raw = rows[0];
     }
-    if (!goalId) return undefined;
-    const [rows] = await this.db.query<[Array<{ disciplines?: Array<{ name?: string }> }>]>(
-      'SELECT project.disciplines AS disciplines FROM $goal;', { goal: id('goal', goalId) });
-    const names = (rows[0]?.disciplines ?? []).map(d => d?.name).filter((n): n is string => typeof n === 'string' && n.length > 0);
-    return names.length ? new Set(names) : undefined;
+    const entries = (raw?.disciplines ?? []).filter((d): d is { name: string; roles?: string[] } => typeof d?.name === 'string' && d.name.length > 0);
+    return entries.length ? new Map(entries.map(d => [d.name, d.roles])) : undefined;
   }
 
   /**
@@ -837,10 +840,10 @@ export class SurrealCompanyCore implements CompanyCore {
     return `gm-relay:${actor.employeeId}`;
   }
 
-  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string }): Promise<GoalView> {
+  async relayGoal(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string; tier?: GoalTier; project?: string; pipeline?: string }): Promise<GoalView> {
     const source = await this.relayActor(credential, input.ownerQuote);
     return this.owner.createGoal({ text: input.text, source, key: `${source}:${input.idempotencyKey}`,
-      note: `老板原话：${input.ownerQuote}`, tier: input.tier, project: input.project });
+      note: `老板原话：${input.ownerQuote}`, tier: input.tier, project: input.project, pipeline: input.pipeline });
   }
 
   async triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView> {
@@ -857,9 +860,9 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.project !== undefined) requireText(input.project, 'project', 1, 60);
     if (input.discipline !== undefined) {
       requireText(input.discipline, 'discipline', 1, 60);
-      const vocab = await this.disciplineVocab(input.goalId, input.project);
-      if (vocab && !vocab.has(input.discipline)) {
-        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...vocab].join('、')}`);
+      const contract = await this.disciplineContract(input.goalId, input.project);
+      if (contract && !contract.has(input.discipline)) {
+        throw new CompanyError('invalid', `discipline must be in the project's tracks vocabulary: ${[...contract.keys()].join('、')}`);
       }
     }
     const specs = deliveryChain(input.title, input.spec);

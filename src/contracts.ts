@@ -1,6 +1,7 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'qa' | 'cs' | 'eval';
+export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs', 'eval'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
@@ -151,7 +152,9 @@ export interface ProjectView {
   rollback?: string;
   redLines: string[];
   /** Discipline tracks this project uses (e.g. 编剧/角色设计); non-empty means task.discipline is validated against it. */
-  disciplines?: Array<{ name: string; description?: string }>;
+  disciplines?: Array<{ name: string; description?: string; roles?: Role[] }>;
+  /** Default production line for goals of this project (software when unset). */
+  pipeline?: string;
   runbooks: string[];
   notes?: string;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
@@ -279,7 +282,7 @@ export interface CompanyCore {
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */
   ensureDef(credential: Credential, input: EnsureDef): Promise<DefView>;
   /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
-  updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string }> }): Promise<ProjectView>;
+  updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string; roles?: Role[] }> }): Promise<ProjectView>;
   /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
   opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope>;
   /** Appends a secret-free `ops_*` record to the task's audit trail. Only `ops_call` rows stay out of handover history. */
@@ -371,6 +374,8 @@ export interface GoalView {
   state: 'triage' | 'active' | 'done' | 'cancelled';
   tier?: GoalTier;
   project?: string;
+  /** Production line template this goal runs (software / video / story). */
+  pipeline?: string;
   /** Repo of the linked project, joined by triagePending; anchors the gm triage session's workspace. */
   repoPath?: string;
   /** manual is the 运营验收 anchor; acceptance closes the goal (G3 for standard/program, 运营验收 for quick). */
