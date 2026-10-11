@@ -1,7 +1,7 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
-export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'qa' | 'cs' | 'eval';
-export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs', 'eval'];
+export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'qa' | 'cs' | 'eval';
+export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'qa', 'cs', 'eval'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
