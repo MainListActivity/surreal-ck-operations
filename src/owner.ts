@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { CompanyBrief, GoalTier, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
+import { ROLES, type CompanyBrief, type GoalTier, type GoalView, type OwnerDecision, type Role, type TaskId, type TaskView } from './contracts.ts';
 import { GOAL_TIERS, goalTemplate, isPipeline } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import type { BriefData, WaitingItem } from './owner-brief.ts';
-import { asId, CompanyError, depUnsatisfiedFor, HASH, id, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
+import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
+import { assertRoleContract, loadContract } from './role-contract.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -163,6 +164,48 @@ export class OwnerDesk {
       COMMIT;`, {
       task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest,
     });
+    return view(rows.at(-2) as TaskRow);
+  }
+
+  /**
+   * Owner-level repair for mis-routed work: moves a task that has not started (blocked or ready, no live
+   * lease, never submitted) to another executor and/or reviewer role. The project's role contract and the
+   * required-track roles are checked exactly as at creation, and the move is audited.
+   */
+  async reassign(input: { taskId: TaskId; executorRole?: Role; reviewerRole?: Role | 'owner'; note: string; source: string; key: string }): Promise<TaskView> {
+    requireText(input.note, 'note', 4, 4000);
+    if (!input.executorRole && !input.reviewerRole) throw new CompanyError('invalid', 'executorRole or reviewerRole is required');
+    for (const role of [input.executorRole, input.reviewerRole]) {
+      if (role && role !== 'owner' && (!ROLES.includes(role) || role === 'eval')) throw new CompanyError('invalid', `Invalid role ${role}`);
+    }
+    if (input.executorRole === ('owner' as string)) throw new CompanyError('invalid', 'owner cannot execute tasks');
+    const idem = id('idempotency', HASH(`owner\0reassign\0${input.key}`));
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, executorRole: input.executorRole, reviewerRole: input.reviewerRole, note: input.note }));
+    const prior = await this.db.select<IdempotencyRow>(idem);
+    if (prior) {
+      if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+      return view(prior.result);
+    }
+    const before = await this.db.select<TaskRow & { goal?: RecordId; project?: RecordId }>(id('task', input.taskId));
+    if (!before) throw new CompanyError('not_found', 'task not found');
+    const executor = input.executorRole ?? before.executor_role, reviewer = input.reviewerRole ?? before.reviewer_role;
+    assertRoleContract(await loadContract(this.db, before.goal ? asId(before.goal) : undefined, before.project ? asId(before.project) : undefined), executor, before.discipline ?? undefined);
+    const required = REQUIRED_TRACKS[executor];
+    if (required !== undefined && before.discipline !== required) throw new CompanyError('invalid', `executorRole ${executor} requires discipline=${required}`);
+    const evidence = `来源：${input.source}\n改派：执行 ${before.executor_role}→${executor}；验收 ${before.reviewer_role}→${reviewer}\n${input.note}`;
+    const rows = await this.run(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'task not found' };
+      IF $t.version != $expected { THROW 'task version moved' };
+      IF $t.state NOT IN ['blocked', 'ready'] OR $t.submitted_by != NONE { THROW 'task is not awaiting start' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task is not awaiting start: active lease' };
+      LET $next = UPDATE ONLY $task SET executor_role = $executor, reviewer_role = $reviewer, version = $t.version + 1 RETURN AFTER;
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'reassign', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'reassigned', sequence: $sequence.value, payload: { executor: $executor, reviewer: $reviewer }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`, { task: id('task', input.taskId), expected: before.version, executor, reviewer, evidence, actor: input.source, idem, digest });
     return view(rows.at(-2) as TaskRow);
   }
 

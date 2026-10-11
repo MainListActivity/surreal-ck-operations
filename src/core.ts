@@ -6,7 +6,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
-import { assertRoleContract, type DisciplineContract } from './role-contract.ts';
+import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
@@ -751,18 +751,8 @@ export class SurrealCompanyCore implements CompanyCore {
    * (a Set of track names when the project defines a non-empty `disciplines` list, else
    * undefined = free-form values allowed).
    */
-  private async disciplineContract(goalId?: string, projectId?: string): Promise<DisciplineContract | undefined> {
-    type Raw = { disciplines?: Array<{ name?: string; roles?: string[] }> };
-    let raw: Raw | undefined;
-    if (projectId) {
-      const [rows] = await this.db.query<[Raw[]]>('SELECT disciplines AS disciplines FROM $project;', { project: id('project', projectId) });
-      raw = rows[0];
-    } else if (goalId) {
-      const [rows] = await this.db.query<[Raw[]]>('SELECT project.disciplines AS disciplines FROM $goal;', { goal: id('goal', goalId) });
-      raw = rows[0];
-    }
-    const entries = (raw?.disciplines ?? []).filter((d): d is { name: string; roles?: string[] } => typeof d?.name === 'string' && d.name.length > 0);
-    return entries.length ? new Map(entries.map(d => [d.name, d.roles])) : undefined;
+  private disciplineContract(goalId?: string, projectId?: string): Promise<DisciplineContract | undefined> {
+    return loadContract(this.db, goalId, projectId);
   }
 
   /**
