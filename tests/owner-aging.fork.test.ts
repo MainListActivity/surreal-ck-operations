@@ -45,7 +45,7 @@ const evidence = () => ({ text: 'fixture evidence long enough to be accepted by 
 async function gateTask(title: string) { const t = await make(title, { reviewerRole: 'owner' }); const c = await core.claim(eng, t.id); await core.submit(eng, proofOf(c), evidence()); return t; }
 async function questionTask(title: string) { const t = await make(title); const c = await core.claim(eng, t.id); await core.block(eng, proofOf(c), 'owner', evidence()); return t; }
 const dispatcher = (notified: string[]) => {
-  const d = new Dispatcher({ workforce: { config: async () => DEFAULT_CONFIG } as never, owner, paseo: {} as never, env: {} as never, notify: async (_title, text) => { notified.push(text); } });
+  const d = new Dispatcher({ workforce: { config: async () => DEFAULT_CONFIG, defs: async () => [{ role: 'engineering', provider: 'codex', enabled: true }], providerHealth: async () => new Map() } as never, quota: async () => [{ provider: 'codex', lowestPct: 0, fetchedAt: new Date().toISOString() }] as never, owner, paseo: {} as never, env: {} as never, notify: async (_title, text) => { notified.push(text); } });
   return d as unknown as { ownerAging(now: number, report: { notices: string[] }): Promise<void>; dailyBrief(now: number, cfg: typeof DEFAULT_CONFIG, report: { notices: string[] }): Promise<void> };
 };
 
@@ -87,7 +87,7 @@ run('the daily brief flags stuck work, is sent once per day and survives a resta
   const now = Math.floor(Date.now() / 1000), cfg = { ...DEFAULT_CONFIG, ownerBriefHour: 0 };
   await dispatcher(notified).dailyBrief(now, cfg, report);
   const brief = (await owner.openNotices()).find(n => n.key === `brief:${localDate(new Date(now * 1000))}`)!;
-  for (const part of ['每日简报', '【异常卡滞】', '依赖已完成却仍 blocked', '依赖都已完成', '没人领的活', '就绪 1']) expect(brief.text).toContain(part);
+  for (const part of ['每日简报', '【异常卡滞】', '依赖已完成却仍 blocked', '依赖都已完成', '没人领的活', '就绪 1', 'engineering：当前没有任何可用编制（codex 额度不足', '【员工流动】近24小时新建实例']) expect(brief.text).toContain(part);
   expect(notified).toHaveLength(1); expect(notified[0]).toStartWith('每日简报'); expect(notified[0]).not.toContain('\n');
   await dispatcher(notified).dailyBrief(now + 60, cfg, report);
   expect(notified).toHaveLength(1);

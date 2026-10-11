@@ -6,7 +6,7 @@ import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
-import { agingLevel, agingText, localDate, renderBrief } from '../owner-brief.ts';
+import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
@@ -38,6 +38,20 @@ export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyCo
     if (hits.length) blocked.set(q.provider, `额度不足（${hits.join('，')}）`);
   }
   return blocked;
+}
+
+/** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
+export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
+  const roles = new Map<string, RoleCapacity>();
+  for (const def of defs.filter(d => d.enabled)) {
+    const entry = roles.get(def.role) ?? { role: def.role, total: 0, usable: 0, down: [] };
+    roles.set(def.role, entry); entry.total++;
+    const h = health.get(def.provider);
+    const why = quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
+    if (!why) entry.usable++;
+    else if (!entry.down.some(d => d.startsWith(def.provider))) entry.down.push(`${def.provider} ${why}`);
+  }
+  return [...roles.values()].sort((a, b) => a.usable - b.usable || a.role.localeCompare(b.role));
 }
 
 /** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
@@ -1140,7 +1154,10 @@ export class Dispatcher {
     const { owner } = this.deps;
     const key = `brief:${date}`;
     if (await owner.hasNotice(key)) { this.briefedOn = date; return; }
-    const { summary, text } = renderBrief(await owner.briefData(now * 1000, date));
+    const { workforce: wf } = this.deps;
+    const quotaRows = await this.deps.quota?.().catch(() => [] as ProviderQuota[]) ?? [];
+    const capacity = roleCapacity(await wf.defs(), quotaBlockedProviders(quotaRows, cfg, Date.now()), await wf.providerHealth(), now);
+    const { summary, text } = renderBrief(await owner.briefData(now * 1000, date, capacity));
     await this.notice(key, text, report, { force: true, popup: summary });
     this.briefedOn = date;
     for (const notice of await owner.openNotices()) {
