@@ -157,12 +157,12 @@ export class WorktreeRegistry {
     }
   }
   /** The shared tree is a read baseline. A branch that drifted onto it is moved off, never adopted. */
-  private async restoreShared(repo: string, list: Tree[], shared: Row, base: string) {
+  private async restoreShared(repo: string, list: Tree[], shared: Row, base: string, writing: boolean) {
     const expected = `sck/shared-${hash(repo).slice(0, 12)}`;
     const tree = list.find(t => t.path === shared.path);
     if (!tree || basename(shared.path) !== `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-shared`) return;
     if (tree.branch !== expected) {
-      if (await git(shared.path, ['status', '--porcelain'])) return;
+      if (writing || await git(shared.path, ['status', '--porcelain'])) return;
       let exists = false;
       try { await git(repo, ['show-ref', '--verify', `refs/heads/${expected}`]); exists = true; } catch {}
       await git(shared.path, ['checkout', ...(exists ? [expected] : ['-b', expected, base])]);
@@ -200,7 +200,8 @@ export class WorktreeRegistry {
     const writes = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code'));
     const desired = writes ? (lane ? `lane/${lane8}-${laneName}` : `task/${task.id.slice(0, 8)}`) : undefined;
     const shared = rows.find(r => r.mode === 'shared');
-    if (shared) await this.restoreShared(repo, list, shared, base);
+    // Never move a branch away from a code writer that is still working in the shared tree (legacy assignments).
+    if (shared) await this.restoreShared(repo, list, shared, base, refs.some(r => String(r.tree.id) === String(shared.id.id) && r.intent.kind === 'code' && refState(r) === 'active'));
     const own = previous && rows.find(r => String(r.id.id) === previous.id);
     const legacy = lane ? undefined : list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
     let chosen = own && list.find(t => t.path === own.path && (!desired || t.branch === desired)) ? own : undefined;

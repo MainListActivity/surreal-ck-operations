@@ -657,3 +657,18 @@ run('LANE: a shared tree stranded on a task branch is moved back, and a stale un
   expect(git(claimed.worktree!.worktreePath, 'rev-parse', 'HEAD')).toBe(git(path, 'rev-parse', 'main')); expect(baseline).not.toBe(git(path, 'rev-parse', 'main'));
   await submit(core, eng, claimed); await submit(core, qa, read);
 }, 30000);
+run('LANE: a shared tree is not moved off its branch while a legacy code writer is still active on it', async () => {
+  const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
+  const read = await core.claim(qa, (await task(core, 'qa')).id); await submit(core, qa, read);
+  const writer = await core.claim(eng, (await task(core, 'engineering')).id);
+  const shared = read.worktree!, sharedKey = new RecordId('worktree', shared.id);
+  git(shared.worktreePath, 'checkout', '-q', '-b', 'legacy-writer');
+  await db.db.query('UPDATE ONLY $tree SET branch = $branch; UPDATE ONLY $ref SET tree = $tree; UPDATE ONLY $task SET worktree.id = $id;',
+    { tree: sharedKey, branch: 'legacy-writer', ref: new RecordId('worktree_ref', writer.task.id), task: new RecordId('task', writer.task.id), id: shared.id });
+  const during = await core.claim(qa, (await task(core, 'qa')).id);
+  expect(git(shared.worktreePath, 'branch', '--show-current')).toBe('legacy-writer'); expect(during.worktree!.worktreePath).toBe(shared.worktreePath);
+  await submit(core, eng, writer); await submit(core, qa, during);
+  const after = await core.claim(qa, (await task(core, 'qa')).id);
+  expect(git(shared.worktreePath, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
+  await submit(core, qa, after);
+}, 30000);
