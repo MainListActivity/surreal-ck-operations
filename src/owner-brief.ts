@@ -10,6 +10,9 @@ export interface WaitingItem {
   downstream: number;
 }
 
+/** How many of a role's enabled seats can take work right now, and why the others cannot. */
+export interface RoleCapacity { role: string; total: number; usable: number; down: string[] }
+
 export interface BriefData {
   date: string;
   waiting: Array<WaitingItem & { hours: number }>;
@@ -17,6 +20,9 @@ export interface BriefData {
   last24h: { done: number; returned: number; rejected: number; retired: number };
   goals: Array<{ title: string; days: number }>;
   resources: string[];
+  capacity: RoleCapacity[];
+  /** Employee instances opened/closed in the last 24h; a high lost-claim count means the scheduler is thrashing. */
+  churn: { created: number; retired: number; claimLost: number };
   staffingAlerts: number;
 }
 
@@ -57,11 +63,14 @@ export function renderBrief(data: BriefData): { summary: string; text: string } 
     lines.push('', '【在办目标】');
     for (const goal of data.goals.slice(0, 8)) lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天）`);
   }
-  if (data.resources.length || data.staffingAlerts) {
-    lines.push('', '【资源】');
+  const short_ = data.capacity.filter(c => c.usable < c.total);
+  if (short_.length || data.resources.length || data.staffingAlerts) {
+    lines.push('', '【产能】');
+    for (const c of short_) lines.push(`- ${c.role}：${c.usable === 0 ? '当前没有任何可用编制' : `可用编制 ${c.usable}/${c.total}`}（${c.down.join('；')}）`);
     for (const item of data.resources) lines.push(`- ${item}`);
     if (data.staffingAlerts) lines.push(`- 有 ${data.staffingAlerts} 个岗位暂无可用员工（见提醒）`);
   }
+  lines.push('', `【员工流动】近24小时新建实例 ${data.churn.created}，退役 ${data.churn.retired}${data.churn.claimLost ? `（认领失败 ${data.churn.claimLost}）` : ''}`);
   return { summary, text: lines.join('\n') };
 }
 

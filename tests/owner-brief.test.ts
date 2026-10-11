@@ -21,6 +21,8 @@ const data: BriefData = {
   last24h: { done: 38, returned: 4, rejected: 1, retired: 6 },
   goals: [{ title: '短剧重设计', days: 4 }],
   resources: ['grok exhausted：402 Payment Required', 'codex 额度剩余 0%'], staffingAlerts: 2,
+  capacity: [{ role: 'engineering', total: 6, usable: 3, down: ['codex 额度不足（周/月额度 0%<2%）', 'grok 额度耗尽或异常：402'] }, { role: 'qa', total: 5, usable: 5, down: [] }],
+  churn: { created: 12, retired: 14, claimLost: 5 },
 };
 
 test('brief leads with a one-line summary and lists the longest wait first', () => {
@@ -28,13 +30,19 @@ test('brief leads with a one-line summary and lists the longest wait first', () 
   expect(summary).toBe('每日简报 2026-10-11：待你处理 2 项（最久 7.7 天）｜异常卡滞 1｜近24小时完成 38');
   expect(text.split('\n')[0]).toBe(summary);
   expect(text.indexOf('已等 7.7 天')).toBeLessThan(text.indexOf('已等 6 小时'));
-  for (const part of ['【异常卡滞】', '小说拆解', '完成 38｜退回 4｜老板驳回 1｜作废 6', '短剧重设计（已 4 天）', 'codex 额度剩余 0%', '有 2 个岗位暂无可用员工']) expect(text).toContain(part);
+  for (const part of ['【异常卡滞】', '小说拆解', '完成 38｜退回 4｜老板驳回 1｜作废 6', '短剧重设计（已 4 天）', 'codex 额度剩余 0%', '有 2 个岗位暂无可用员工', '【产能】', 'engineering：可用编制 3/6（codex 额度不足', '新建实例 12，退役 14（认领失败 5）']) expect(text).toContain(part);
+  expect(text).not.toContain('qa：可用编制');
 });
 
 test('an empty brief says so and omits the empty sections', () => {
-  const { summary, text } = renderBrief({ ...data, waiting: [], stuck: [], goals: [], resources: [], staffingAlerts: 0 });
+  const { summary, text } = renderBrief({ ...data, waiting: [], stuck: [], goals: [], resources: [], capacity: [], staffingAlerts: 0 });
   expect(summary).toContain('待你处理 0 项｜异常卡滞 0');
-  expect(text).toContain('【等你处理】无'); expect(text).not.toContain('【异常卡滞】'); expect(text).not.toContain('【资源】');
+  expect(text).toContain('【等你处理】无'); expect(text).not.toContain('【异常卡滞】'); expect(text).not.toContain('【产能】'); expect(text).toContain('新建实例 12，退役 14（认领失败 5）');
 });
 
 test('local date is zero padded', () => { expect(localDate(new Date(2026, 0, 5, 9))).toBe('2026-01-05'); });
+
+test('a role with every seat down says so plainly', () => {
+  const { text } = renderBrief({ ...data, capacity: [{ role: 'gm', total: 3, usable: 0, down: ['codex 额度不足', 'grok 额度耗尽或异常'] }], resources: [], staffingAlerts: 0 });
+  expect(text).toContain('gm：当前没有任何可用编制（codex 额度不足；grok 额度耗尽或异常）');
+});
