@@ -14,6 +14,14 @@ export interface LoginTokens {
   accessToken: string;
   /** Epoch milliseconds. */
   expiresAt: number;
+  /** How many full authorize→exchange flows ran (transient failures burn one each). */
+  attempts: number;
+  /**
+   * Sanitized per-hop trace (`a<attempt>:<phase>@<host>:<HTTP status|errno> <ms>`), bounded
+   * to the tail of the flow. Hosts and outcomes only — never paths, challenges or tokens —
+   * so a transport failure can be located without weakening the audit surface.
+   */
+  trace: string;
 }
 
 /**
@@ -56,19 +64,41 @@ interface Io {
   fetcher: Fetcher;
   /** A fresh limit for the next request: the per-step limit, cut down to what is left of the budget. */
   step: () => { signal: AbortSignal; ms: number };
+  /** 1-based attempt currently in flight, stamped onto each trace row. */
+  attempt: number;
+  /** Sanitized hop records: phase, origin host, HTTP status or safe errno, wall time. */
+  trace: Array<{ attempt: number; phase: string; host: string; ms: number; result: string }>;
+}
+
+/** `bun@1.2.x` or `node@22.x`, recorded once in diagnostics for runtime comparisons. */
+const runtimeVersion = (): string => {
+  const bun = (globalThis as { Bun?: { version?: string } }).Bun;
+  return bun?.version ? `bun@${bun.version}` : `node@${process.version}`;
+};
+
+const TRACE_TAIL = 10;
+
+function formatTrace(io: Io): string {
+  return io.trace.slice(-TRACE_TAIL).map(t => `a${t.attempt}:${t.phase}@${t.host}:${t.result} ${t.ms}ms`).join(' | ');
 }
 
 /** One request, optionally with its JSON body; a timeout while the body is read counts as a timeout of the request. */
-async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false): Promise<{ response: Response; body?: unknown }> {
+async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false, phase?: string): Promise<{ response: Response; body?: unknown }> {
   const { signal, ms } = io.step();
+  const started = Date.now();
+  let host = 'unknown';
+  try { host = new URL(url).host; } catch { /* unreachable host is still recorded */ }
   try {
     const response = await io.fetcher(url, { ...init, signal });
     const body = parseBody
       ? await response.json().catch((error: Error) => { if (error.name === 'TimeoutError') throw error; return undefined; })
       : undefined;
+    io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: `HTTP ${response.status}` });
     return { response, body };
   } catch (error) {
-    throw new Unavailable(what, describeTransportFailure(error, ms).detail);
+    const { detail } = describeTransportFailure(error, ms);
+    io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
+    throw new Unavailable(what, detail);
   }
 }
 
@@ -94,7 +124,7 @@ async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Pr
     redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
     body: new URLSearchParams({ consent_challenge: challenge, decision: 'approve' }).toString(),
-  }, true);
+  }, true, 'consent');
   if (response.status >= 500) throw new Unavailable('IdP consent', `HTTP ${response.status}`);
   const location = response.headers.get('location');
   if (location) return new URL(location, consentUrl.toString());
@@ -108,7 +138,7 @@ async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Pr
 async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ challenge: string; loginApi: string }> {
   let current = authorizeUrl;
   for (let hop = 0; hop < MAX_HOPS; hop++) {
-    const { response } = await request('IdP authorize', io, current, { redirect: 'manual' });
+    const { response } = await request('IdP authorize', io, current, { redirect: 'manual' }, false, `authorize#${hop}`);
     if (response.status >= 500) throw new Unavailable('IdP authorize', `HTTP ${response.status}`);
     const location = response.headers.get('location');
     if (response.status < 300 || response.status > 399 || !location) {
@@ -214,14 +244,20 @@ export async function passwordLogin(
       const ms = Math.min(stepMs, Math.max(left(), MIN_STEP_MS));
       return { signal: AbortSignal.timeout(ms), ms };
     },
+    attempt: 0,
+    trace: [],
   };
   for (let attempt = 1; ; attempt++) {
+    io.attempt = attempt;
     try {
       return await signIn(config, username, password, channel, io, options.now ?? Date.now);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
       if (attempt >= MAX_ATTEMPTS || left() < RETRY_MIN_LEFT_MS) {
-        throw attempt === 1 ? error : new CompanyError('upstream_error', `${error.message}; gave up after ${attempt} attempts`, true);
+        const trace = formatTrace(io);
+        const attempts = attempt > 1 ? `; gave up after ${attempt} attempts` : '';
+        throw new CompanyError('upstream_error',
+          `${error.message}${attempts}${trace ? `; trace: ${trace}` : ''}; runtime ${runtimeVersion()}`, true);
       }
     }
   }
@@ -244,7 +280,7 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ login_challenge: challenge, username, password }).toString(),
-  }, true);
+  }, true, 'login');
   if (login.status >= 500) throw new Unavailable('IdP login', `HTTP ${login.status}`);
   const loginBody = loginRaw as { redirect_uri?: string; error?: string; mfa_state?: string } | undefined;
   if (loginBody?.mfa_state) throw new LoginError('mfa_required', 'IdP asked for a second factor; the broker only supports password-only test accounts');
@@ -274,10 +310,10 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
       grant_type: 'authorization_code', code, redirect_uri: channel.redirectUri, code_verifier: verifier,
       ...(channel.sendsClientId ? { client_id: channel.clientId } : {}),
     }).toString(),
-  }, true);
+  }, true, 'exchange');
   if (exchange.status >= 500) throw new Unavailable('token exchange', `HTTP ${exchange.status}`);
   const tokens = tokenRaw as { access_token?: string; expires_in?: number } | undefined;
   if (!exchange.ok || !tokens?.access_token) throw fail('token exchange', `HTTP ${exchange.status}`);
   const expiresAt = typeof tokens.expires_in === 'number' ? now() + tokens.expires_in * 1000 : jwtExpiry(tokens.access_token) ?? now() + 15 * 60_000;
-  return { accessToken: tokens.access_token, expiresAt };
+  return { accessToken: tokens.access_token, expiresAt, attempts: io.attempt, trace: formatTrace(io) };
 }

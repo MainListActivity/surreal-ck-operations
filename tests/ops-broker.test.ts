@@ -51,7 +51,7 @@ describe('ops gate', () => {
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
       'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
-      'ops_operator_login', 'ops_query', 'ops_request', 'ops_workspace_ensure',
+      'ops_operator_login', 'ops_query', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
     ]);
   });
 
