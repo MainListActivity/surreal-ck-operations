@@ -15,6 +15,9 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
   pnpm run company reply <任务ID> <回答>     回答员工提问并恢复任务
   pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>
                                              改派还没开工（blocked/ready、无租约、未提交）的任务；校验岗位契约，留审计
+  pnpm run company void <任务ID> <原因>      作废任务（依赖它的任务会解锁；终验关口作废不会关闭目标）
+  pnpm run company unlock <任务ID>           补跑已完成/作废任务的依赖解锁（任务依赖都完成了却还是 blocked 时用）
+  pnpm run company cancel-goal <目标ID> <原因>  取消目标：作废其全部未完成任务并关闭目标
   pnpm run company pause | resume            暂停/恢复派工
   pnpm run company status                    公司运行概况`;
 
@@ -71,6 +74,20 @@ try {
     if (!taskId) throw new Error('用法：pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>');
     const task = await desk.reassign({ taskId, executorRole, reviewerRole, note: note.join(' '), source: 'owner:cli', key: `cli:${taskId}:${executorRole ?? ''}:${reviewerRole ?? ''}` });
     console.log(`已改派：${task.title}\n执行 ${task.executorRole}｜验收 ${task.reviewerRole}｜状态 ${task.state}`);
+  } else if (action === 'void') {
+    const [taskId, ...note] = [first ?? '', ...rest].filter(Boolean);
+    if (!taskId) throw new Error('用法：pnpm run company void <任务ID> <原因>');
+    const task = await desk.retire({ taskId, note: note.join(' '), source: 'owner:cli', key: `cli-void:${taskId}` });
+    console.log(`已作废：${task.title}（${task.state}）`);
+  } else if (action === 'unlock') {
+    if (!first) throw new Error('用法：pnpm run company unlock <任务ID>');
+    const unlocked = await desk.unlockDependents({ taskId: first, source: 'owner:cli' });
+    console.log(unlocked.length ? `已解锁：${unlocked.join('、')}` : '没有需要解锁的任务。');
+  } else if (action === 'cancel-goal') {
+    const [goalId, ...note] = [first ?? '', ...rest].filter(Boolean);
+    if (!goalId) throw new Error('用法：pnpm run company cancel-goal <目标ID> <原因>');
+    const result = await desk.cancelGoal({ goalId, note: note.join(' '), source: 'owner:cli', key: `cli-cancel:${goalId}` });
+    console.log(`已作废 ${result.retired} 个任务；${result.remaining ? `仍有 ${result.remaining} 个未能作废，目标保持原状` : '目标已关闭（cancelled）'}`);
   } else if (action === 'status') {
     const workforce = new Workforce(db, '/nonexistent');
     const [brief, tasks, insts, health, config, defs] = await Promise.all([

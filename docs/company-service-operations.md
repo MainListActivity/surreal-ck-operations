@@ -214,3 +214,13 @@ pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|o
 ## 往返熔断
 
 同一个任务在员工与经理之间反复"阻塞 → 经理处理 → 再阻塞"（`block` 审计），达到 `block_loop_limit`（默认 5）次，调度器不再叫醒经理，而是把任务转成老板的问题：写明往返次数和最近三次阻塞原因，老板回复后任务按回复继续，并重新计数。`pnpm run admin config block_loop_limit <n>` 调整，`0` 关闭。起因：一个生产实测任务曾在 18 小时内往返 19 次、换了 18 个员工，每轮都在重复同样的失败。
+
+## 老板作废、解锁与取消目标
+
+```sh
+pnpm run company void <任务ID> "<原因>"          # 作废：只等它的下游自动解锁；终验关口作废不会关闭目标
+pnpm run company unlock <任务ID>                 # 补跑依赖解锁：依赖都完成了任务却还是 blocked 时用
+pnpm run company cancel-goal <目标ID> "<原因>"   # 作废目标下全部未完成任务并关闭目标（cancelled）
+```
+
+都带审计和幂等键，规则与经理的 `retire_task` 一致：已完成的任务不能作废，还有活下游的老板关口不能作废。**不要再直接改库改任务状态**——绕过解锁逻辑会让下游一直卡在 blocked（2026-10-11 的小说目标就这样卡过一次）。

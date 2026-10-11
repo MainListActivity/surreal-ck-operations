@@ -1,0 +1,83 @@
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RecordId } from 'surrealdb';
+import { CompanyDatabase } from '../src/database.ts';
+import { SurrealCompanyCore } from '../src/core.ts';
+import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { OwnerDesk } from '../src/owner.ts';
+
+setDefaultTimeout(60000);
+// Isolated company fork on a private RocksDB store: no production data, credentials or dispatcher.
+const run = process.env.RUN_SCK_OWNER_COMMANDS_TESTS === '1' ? test : test.skip;
+let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, owner: OwnerDesk, gm: string, count = 0;
+
+beforeAll(async () => {
+  if (process.env.RUN_SCK_OWNER_COMMANDS_TESTS !== '1') return;
+  dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-owner-commands-')));
+  const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  const port = listener.port!; listener.stop(true);
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', 'fixture-only', '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
+  db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'owner_commands_fixture', database: 'control_plane' });
+  await db.connect(); await db.bootstrap();
+  core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
+  gm = await new LocalEnrollmentAdmin(db).enroll('commands-gm', 'gm', ['execute', 'review', 'manage']);
+});
+afterAll(async () => { if (!dir) return; await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); });
+
+const key = () => `owner-cmd-${++count}-${crypto.randomUUID()}`;
+const task = (extra: Record<string, unknown> = {}) => core.createTask(gm, { title: `Command task ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(), ...extra } as never);
+const state = async (id: string) => (await core.getTask(gm, id)).state;
+const goalWith = async (tasks: Array<{ ref: string; deps?: string[]; reviewer?: string }>, anchors: string[]) => {
+  const [rows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '目标', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goalId = String(rows[0]!.id.id), ids: Record<string, string> = {};
+  for (const t of tasks) ids[t.ref] = (await task({ goalId, dependencies: (t.deps ?? []).map(d => ids[d]!), reviewerRole: t.reviewer ?? 'qa' })).id;
+  await db.db.query('UPDATE $goal SET anchors = $anchors;', { goal: rows[0]!.id, anchors: anchors.map(a => new RecordId('task', ids[a]!)) });
+  return { goalId, ids };
+};
+
+run('void retires a task, unlocks what only waited on it, is idempotent, and refuses finished work', async () => {
+  const a = await task(), b = await task({ dependencies: [a.id] });
+  expect(await state(b.id)).toBe('blocked');
+  const k = key();
+  const voided = await owner.retire({ taskId: a.id, note: '方向变了，不需要了', source: 'owner:test', key: k });
+  expect(voided.state).toBe('void'); expect(await state(b.id)).toBe('ready');
+  expect((await owner.retire({ taskId: a.id, note: '方向变了，不需要了', source: 'owner:test', key: k })).version).toBe(voided.version);
+  const [audit] = await db.db.query<[Array<{ action: string }>]>("SELECT action FROM audit WHERE task = $t AND action IN ['retire','dependency_unlocked'];", { t: new RecordId('task', b.id) });
+  expect(audit.map(x => x.action)).toEqual(['dependency_unlocked']);
+  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', b.id) });
+  await expect(owner.retire({ taskId: b.id, note: '已经完成的不能作废', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'conflict' });
+});
+
+run('retiring a goal\'s final gate never closes the goal, and a gate with live dependents is refused', async () => {
+  const { goalId, ids } = await goalWith([{ ref: 'work' }, { ref: 'gate', deps: ['work'], reviewer: 'owner' }], ['gate']);
+  await owner.retire({ taskId: ids.gate!, note: '不再需要最终关口', source: 'owner:test', key: key() });
+  expect(await state(ids.gate!)).toBe('void');
+  const [g] = await db.db.query<[Array<{ state: string }>]>('SELECT state FROM goal WHERE id = $g;', { g: new RecordId('goal', goalId) });
+  expect(g[0]!.state).toBe('active');
+  const gate = await task({ reviewerRole: 'owner' }); await task({ dependencies: [gate.id] });
+  await expect(owner.retire({ taskId: gate.id, note: '有依赖者不能作废', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'conflict' });
+});
+
+run('unlock re-evaluates dependents that stayed blocked after their dependency finished', async () => {
+  const a = await task(), b = await task({ dependencies: [a.id] });
+  await expect(owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).rejects.toMatchObject({ code: 'conflict' });
+  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', a.id) });
+  expect(await state(b.id)).toBe('blocked');
+  expect(await owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).toEqual([b.id]);
+  expect(await state(b.id)).toBe('ready');
+  expect(await owner.unlockDependents({ taskId: a.id, source: 'owner:test' })).toEqual([]);
+});
+
+run('cancel-goal retires every unfinished task, including owner gates, and closes the goal; finished work stays done', async () => {
+  const { goalId, ids } = await goalWith([{ ref: 'a' }, { ref: 'b', deps: ['a'] }, { ref: 'gate', deps: ['b'], reviewer: 'owner' }], ['gate']);
+  await db.db.query("UPDATE $t SET state = 'done';", { t: new RecordId('task', ids.a!) });
+  const result = await owner.cancelGoal({ goalId, note: '被新目标取代', source: 'owner:test', key: key() });
+  expect(result).toEqual({ retired: 2, remaining: 0 });
+  expect(await state(ids.a!)).toBe('done'); expect(await state(ids.b!)).toBe('void'); expect(await state(ids.gate!)).toBe('void');
+  const [g] = await db.db.query<[Array<{ state: string; note: string }>]>('SELECT state, note FROM goal WHERE id = $g;', { g: new RecordId('goal', goalId) });
+  expect(g[0]).toMatchObject({ state: 'cancelled' }); expect(g[0]!.note).toContain('被新目标取代');
+  await expect(owner.cancelGoal({ goalId: 'nope-nope', note: '不存在的目标', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'not_found' });
+});

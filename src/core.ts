@@ -75,7 +75,7 @@ export const RESOLVE_DEP_SQL = (deps: string, p: string) => `
  * the same lineage are re-evaluated too — their dependency resolves through superseded_by
  * to the finished tip.
  */
-const UNLOCK_CHILDREN_SQL = `
+export const UNLOCK_CHILDREN_SQL = `
   LET $done_row = SELECT * FROM ONLY $task;
   LET $task_chain = IF ($done_row.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $done_row.lineage) END;
   LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
