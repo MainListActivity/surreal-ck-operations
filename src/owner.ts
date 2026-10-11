@@ -259,7 +259,7 @@ export class OwnerDesk {
       SELECT count() FROM owner_command WHERE status IN ['pending', 'applying'] GROUP ALL;`);
     const latest = async (task: RecordId, action: string) => {
       const [rows] = await this.db.query<[Array<{ evidence?: string }>]>(
-        'SELECT evidence, at FROM audit WHERE task = $task AND action = $action ORDER BY at DESC LIMIT 1;', { task, action });
+        'SELECT evidence, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at DESC LIMIT 1;', { task, actions: action === 'block' ? ['block', 'escalate'] : [action] });
       return rows[0]?.evidence;
     };
     return {
@@ -289,6 +289,33 @@ export class OwnerDesk {
     return seen.size;
   }
 
+  /** Employee-to-manager round trips of a task since the owner last touched it, with the latest reasons (newest first). */
+  async blockLoops(taskId: TaskId): Promise<{ loops: number; reasons: string[] }> {
+    const task = id('task', taskId);
+    const [touched] = await this.db.query<[Array<{ at: unknown }>]>(
+      "SELECT at FROM audit WHERE task = $task AND action IN ['owner_reply', 'escalate'] ORDER BY at DESC LIMIT 1;", { task });
+    const [blocks] = await this.db.query<[Array<{ evidence?: string }>]>(
+      "SELECT evidence, at FROM audit WHERE task = $task AND action = 'block' AND at > <datetime>$since ORDER BY at DESC;",
+      { task, since: touched[0] ? String(touched[0].at) : '1970-01-01T00:00:00Z' });
+    return { loops: blocks.length, reasons: blocks.slice(0, 3).map(b => (b.evidence ?? '').replace(/\s+/g, ' ').slice(0, 300)) };
+  }
+
+  /** Stops a task that keeps bouncing between employee and manager: it becomes an owner question with the recent reasons. */
+  async escalateLooping(task: { id: TaskId; version: number }, loops: number, reasons: string[]): Promise<boolean> {
+    const evidence = `这个任务已在员工与经理之间往返 ${loops} 次（阻塞→经理处理→再阻塞）仍没有完成，系统不再自动循环。最近的阻塞原因：\n${reasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n请给方向后回复（任务按你的回复继续），或让经理把它拆小/作废。`;
+    try {
+      await this.run(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.version != $expected { THROW 'task is not blocked on gm' };
+        LET $next = UPDATE ONLY $task SET blocked_to = 'owner', version = $t.version + 1 RETURN AFTER;
+        CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'escalate', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE outbox CONTENT { task: $task, kind: 'escalated', sequence: $sequence.value, payload: { loops: $loops }, at: time::now() };
+        COMMIT;`, { task: id('task', task.id), expected: task.version, evidence, loops });
+      return true;
+    } catch { return false; }
+  }
+
   /** Gates and questions waiting on the owner, with how long they have waited and what they hold up. */
   async waitingOnOwner(): Promise<WaitingItem[]> {
     const [rows] = await this.db.query<[Array<TaskRow & { goal_title?: string }>]>(
@@ -296,7 +323,7 @@ export class OwnerDesk {
     return Promise.all(rows.map(async row => {
       const gate = row.state === 'review';
       const [audit] = await this.db.query<[Array<{ at: unknown }>]>(
-        'SELECT at FROM audit WHERE task = $task AND action = $action ORDER BY at DESC LIMIT 1;', { task: row.id, action: gate ? 'submit' : 'block' });
+        'SELECT at FROM audit WHERE task = $task AND action IN $actions ORDER BY at DESC LIMIT 1;', { task: row.id, actions: gate ? ['submit'] : ['block', 'escalate'] });
       const since = Date.parse(String(audit[0]?.at ?? (row as { created_at?: unknown }).created_at ?? new Date()));
       return { taskId: asId(row.id), version: row.version, kind: gate ? 'gate' as const : 'question' as const, title: row.title,
         goal: row.goal_title ?? undefined, sinceMs: since, downstream: await this.downstreamCount(row.id) };
