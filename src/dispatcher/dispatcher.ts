@@ -697,7 +697,9 @@ export class Dispatcher {
     const pendingGm: SupervisedTask[] = [];
     for (const task of gmBlocked) {
       const last = await wf.lastDispatch(task.id, task.version, 'gm-attention');
-      if (!last || now - last.at >= cfg.redispatchMinutes * 60) pendingGm.push(task);
+      if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      if (await this.breakLoop(task, cfg, report).catch(() => false)) continue;
+      pendingGm.push(task);
     }
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
     // per repo: the group's readTask anchors pick home, per-project spawn quota,
@@ -1121,6 +1123,17 @@ export class Dispatcher {
     for (const notice of await owner.openNotices()) {
       if (/^(gate|question):/.test(notice.key) && !live.has(notice.key)) await owner.resolveNotice(notice.key);
     }
+  }
+
+  /** True when the task kept bouncing between employee and manager and was handed to the owner instead of waking the manager again. */
+  private async breakLoop(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<boolean> {
+    if (cfg.blockLoopLimit <= 0) return false;
+    const { owner } = this.deps;
+    const { loops, reasons } = await owner.blockLoops(task.id);
+    if (loops < cfg.blockLoopLimit || !(await owner.escalateLooping(task, loops, reasons))) return false;
+    report.decisions.push(`escalate-loop:${task.id}`);
+    this.log(`task ${task.id} blocked on manager ${loops} times; escalated to owner`);
+    return true;
   }
 
   private lastAging = 0;
