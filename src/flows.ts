@@ -19,7 +19,7 @@ export function deliveryChain(title: string, spec: string): Spec[] {
     {
       title: `${title} · 实现`, kind: 'task', executorRole: 'engineering', reviewerRole: 'engineering',
       context: `${head}
-你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：串行可共享物理树，每项仍用 task/<本任务 id 前 8 位> 独立分支与 PR；并行写手由调度通道隔离。仅在 intent=code 的任务分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
+你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：树和分支由调度按任务或所属线（worktree.lane）分配，同一线的任务共用一棵树和一个分支，接手时在现有提交上继续，不另开分支；已有未合入 PR 就追加提交。仅在 intent=code 的登记分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
 完成标准：测试通过，推送分支并创建 PR（不要合入）。
 submit 证据：PR 链接、分支、提交 SHA、测试命令与结果、数据库迁移类型（无 / 只新增结构 / 改写或删除已有数据）、需要的新环境变量或主机准备。
 验收者是另一位工程师：读 diff、跑测试、确认 PR 的 CI 通过；不通过就 return 并写明问题。`,
@@ -54,7 +54,7 @@ export function quickChain(title: string, spec: string): Spec[] {
     {
       title: `${title} · 实现与上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
       context: `${head}
-你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：串行可共享物理树，每项仍用 task/<本任务 id 前 8 位> 独立分支与 PR；并行写手由调度通道隔离。仅在 intent=code 的任务分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
+你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：树和分支由调度按任务或所属线（worktree.lane）分配，同一线的任务共用一棵树和一个分支，接手时在现有提交上继续，不另开分支；已有未合入 PR 就追加提交。仅在 intent=code 的登记分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
 完成标准：测试通过，推送分支并创建 PR（不要合入）。
 本任务是实现与上线申请合一，submit 证据要同时包含：PR 链接、分支、提交 SHA、测试命令与结果、改动摘要、影响面、数据库迁移类型（无 / 只新增结构 / 改写或删除已有数据）、需要的新环境变量或主机准备、回滚方式、生产验证要点。
 验收者是运营，由运营决定是否上线（调度器可能先用 Jev 判断，高置信安全时自动批准）。accept = 同意上线；return = 需要补什么写明。

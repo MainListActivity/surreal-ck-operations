@@ -808,6 +808,7 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     const specs = deliveryChain(input.title, input.spec);
+    const lane = input.lane ?? `delivery-${HASH(input.idempotencyKey).slice(0, 8)}`;
     const created: TaskView[] = [];
     let dependencies = [...new Set(input.dependencies ?? [])];
     for (const [index, spec] of specs.entries()) {
@@ -815,6 +816,8 @@ export class SurrealCompanyCore implements CompanyCore {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
         project: input.project,
+        // One delivery is one lane: every leg works in the same tree and branch, whoever claims it.
+        workIntent: { kind: spec.kind === 'release' ? 'read' : 'code', lane },
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
         discipline: index === 0 ? input.discipline : undefined,
       });

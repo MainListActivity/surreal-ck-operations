@@ -36,7 +36,6 @@ try {
   const workforce = new Workforce(db, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '..', '.runtime', 'credentials')));
   const core = new SurrealCompanyCore(db, { workforce, worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
-      strategy: process.env.SCK_WORKTREE_STRATEGY === 'legacy' ? 'legacy' : 'shared',
       // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
       // through this MCP process must tear the Paseo side down together with the git tree instead
       // of leaving workspaces/projects behind. createSceneCleaner is idempotent, matching the
