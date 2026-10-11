@@ -92,7 +92,8 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('014-worktree-scene.surql'));
     await this.db.query(loadSchema('015-screenplay-revisions.surql'));
     await this.db.query(loadSchema('016-worktree-lane.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 16 WHERE schema_version < 16;');
+    await this.db.query(loadSchema('017-code-repo-binding.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 17 WHERE schema_version < 17;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

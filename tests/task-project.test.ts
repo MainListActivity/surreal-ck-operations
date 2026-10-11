@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -15,7 +15,7 @@ setDefaultTimeout(60000);
 // private RocksDB store plus throwaway git repos. No production data, no credentials, no dispatcher.
 const run = process.env.RUN_SCK_TASK_PROJECT_TESTS === '1' ? test : test.skip;
 let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase;
-let gm: string, eng: string, eng2: string, eng3: string, product: string, count = 0;
+let gm: string, eng: string, eng2: string, eng3: string, eng4: string, eng5: string, product: string, count = 0;
 let repoOps: string, repoMlc: string, repoAnime: string;
 
 const config = () => ({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'task_project_fixture', database: 'control_plane' });
@@ -53,6 +53,8 @@ beforeAll(async () => {
   eng = await enrollment.enroll('tp-eng', 'engineering', ['execute', 'review']);
   eng2 = await enrollment.enroll('tp-eng2', 'engineering', ['execute', 'review']);
   eng3 = await enrollment.enroll('tp-eng3', 'engineering', ['execute', 'review']);
+  eng4 = await enrollment.enroll('tp-eng4', 'engineering', ['execute', 'review']);
+  eng5 = await enrollment.enroll('tp-eng5', 'engineering', ['execute', 'review']);
   product = await enrollment.enroll('tp-product', 'product', ['execute', 'review', 'manage']);
 
   const projects = new ProjectStore(db.db);
@@ -281,4 +283,142 @@ run('ops project resolution follows the override for broker scope and audit quot
   await C.auditOps(scope, 'ops_call', 'fixture read-only ops call');
   expect(await C.opsCount('maplayer-content', 'ops_call', 3600)).toBeGreaterThanOrEqual(1);
   expect(claim.project?.id).toBe('maplayer-content');
+});
+
+// ---- bind_task_code_repo：显式代码仓库绑定，业务项目/ops 范围不动 ----
+
+run('bind routes the workspace to the ops repo while the business project stays untouched', async () => {
+  const C = core(), wf = workforce();
+  // 业务项目在 maplayer-content（goal.project），代码绑定到公司运营仓：产品目标 + 公司代码。
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '产品目标公司代码', brief: 'fixture', state: 'active', source: 'fixture', note: '', project: project:`maplayer-content`, tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const t = await C.createTask(gm, { title: `代码绑定 fixture ${++count}`, context: 'Isolated fixture for explicit code-repo binding', executorRole: 'engineering', reviewerRole: 'engineering', goalId: asId(grows[0]!.id), idempotencyKey: key() });
+  const claim = await C.claim(eng4, t.id);
+  const treePath = claim.worktree!.worktreePath;
+  expect(claim.worktree!.repo).toBe(repoMlc); // 绑定前走业务项目仓
+  await C.block(eng4, proof(claim), 'gm', { text: 'fixture: 代码仓错配阻塞，等待经理绑定', idempotencyKey: key() });
+
+  const version = await versionOf(C, t.id);
+  const bound = await C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: version, text: '经理裁定：代码在公司运营仓，业务项目保持 maplayer-content', idempotencyKey: key() });
+  expect(bound.codeRepoPath).toBe(realpathSync(repoOps));
+  expect(bound.version).toBe(version + 1);
+  expect(bound.state).toBe('blocked');
+  expect(bound.worktree).toBeUndefined(); // 旧 assignment 已清
+  expect(bound.projectOverlay).toBeUndefined(); // 业务项目解析未变
+
+  // 旧 worktree 引用按生命周期释放，物理树保留（不自行删树）。
+  const inventory = await C.listWorktrees(gm);
+  const oldTree = inventory.find(w => w.worktreePath === treePath)!;
+  expect(oldTree.references.filter(r => r.taskId === t.id).every(r => r.state === 'released')).toBe(true);
+  expect(existsSync(treePath)).toBe(true);
+
+  await C.resume(gm, t.id, { text: 'fixture resume after code-repo bind', idempotencyKey: key() });
+  const next = await C.claim(eng2, t.id);
+  expect(next.worktree!.repo).toBe(realpathSync(repoOps)); // 新 claim 在绑定仓分配任务分支
+  expect(next.worktree!.branch).toBe(`task/${t.id.slice(0, 8)}`);
+  expect(next.worktree!.worktreePath).not.toBe(treePath);
+  expect(next.project?.id).toBe('maplayer-content'); // claim.json.project 仍是业务项目
+  const scope = await C.opsScope(eng2, t.id);
+  expect(scope.project).toBe('maplayer-content'); // ops 环境/凭证范围不受代码绑定影响
+
+  const supervised = (await wf.tasks()).find(x => x.id === t.id)!;
+  expect(supervised.repoPath).toBe(realpathSync(repoOps)); // dispatcher home/cwd/repoHome 单点解析
+  expect(supervised.codeRepoPath).toBe(realpathSync(repoOps));
+
+  // 任务级清单按绑定仓解析；审计与 outbox 落行。
+  const scoped = await C.listWorktrees(gm, t.id);
+  expect(scoped.find(w => w.references.some(r => r.taskId === t.id && r.state === 'active'))!.repo).toBe(realpathSync(repoOps));
+  expect(await auditRows(t.id, 'bind_task_code_repo')).toHaveLength(1);
+  const [events] = await db.db.query<[Array<{ kind: string; payload: { new_repo?: string } }>]>("SELECT kind, payload FROM outbox WHERE task = $task AND kind = 'code_repo_bound';", { task: new RecordId('task', t.id) });
+  expect(events).toHaveLength(1);
+  expect(events[0]!.payload.new_repo).toBe(realpathSync(repoOps));
+  const hist = await C.history(gm, t.id);
+  expect(hist.some(h => h.action === 'bind_task_code_repo' && h.actor === 'tp-gm')).toBe(true);
+  await C.submit(eng2, proof(next), { text: 'fixture delivery after binding code repo to operations', idempotencyKey: key() });
+});
+
+run('dependency waits and defer_task_until waits stay bindable, then claim in the bound repo', async () => {
+  const C = core();
+  const [grows] = await db.db.query<[Array<{ id: RecordId }>]>("CREATE goal CONTENT { title: '依赖等待绑定', brief: 'fixture', state: 'active', source: 'fixture', note: '', tasks: {}, anchors: [], created_at: time::now() } RETURN AFTER;");
+  const goalId = asId(grows[0]!.id);
+  const gate = await C.createTask(gm, { title: `绑定门槛 ${++count}`, context: 'gate for dependency-wait bind fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+  const child = await C.createTask(gm, { title: `依赖等待任务 ${++count}`, context: 'blocked dependency-wait fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, dependencies: [gate.id], idempotencyKey: key() });
+  expect(child.state).toBe('blocked');
+  expect(child.blockedTo).toBeUndefined(); // 正式依赖等待：blocked_to 为空也可绑定
+
+  const bound = await C.bindTaskCodeRepo(gm, { taskId: child.id, codeRepoPath: repoAnime, expectedVersion: await versionOf(C, child.id), text: '依赖等待期提前绑定代码仓', idempotencyKey: key() });
+  expect(bound.codeRepoPath).toBe(realpathSync(repoAnime));
+
+  // 门槛完成后解锁的任务按绑定仓分配。
+  const gc = await C.claim(eng4, gate.id);
+  await C.submit(eng4, proof(gc), { text: 'fixture gate delivery', idempotencyKey: key() });
+  const gr = await C.claim(eng2, gate.id);
+  await C.accept(eng2, proof(gr), { text: 'fixture gate accept unlocks the child', idempotencyKey: key() });
+  const next = await C.claim(eng5, child.id);
+  expect(next.worktree!.repo).toBe(repoAnime);
+  await C.submit(eng5, proof(next), { text: 'fixture delivery after dependency-unlock bind', idempotencyKey: key() });
+
+  // defer_task_until 清掉 gm 标志后的依赖等待同样可绑定。
+  const gate2 = await C.createTask(gm, { title: `推迟门槛 ${++count}`, context: 'gate for defer-wait bind fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+  const held = await C.createTask(gm, { title: `推迟等待任务 ${++count}`, context: 'gm-blocked then deferred fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId, idempotencyKey: key() });
+  const hc = await C.claim(eng4, held.id);
+  await C.block(eng4, proof(hc), 'gm', { text: 'fixture gm block before defer', idempotencyKey: key() });
+  const deferred = await C.deferTaskUntil(gm, { taskId: held.id, dependencies: [gate2.id], text: '转为依赖等待：blocked_to 清空', idempotencyKey: key() });
+  expect(deferred.state).toBe('blocked');
+  expect(deferred.blockedTo).toBeUndefined();
+  const bound2 = await C.bindTaskCodeRepo(gm, { taskId: held.id, codeRepoPath: repoAnime, expectedVersion: deferred.version, text: 'defer 等待中绑定代码仓', idempotencyKey: key() });
+  expect(bound2.codeRepoPath).toBe(realpathSync(repoAnime));
+});
+
+run('bind rejects non-gm, unregistered and escaped paths, owner/review blocks, leases and stale versions', async () => {
+  const C = core();
+  const t = await taskOnNoProjectGoal(C);
+  await blockByGm(C, t.id, eng4);
+  const v = await versionOf(C, t.id);
+
+  // 权限：engineering 无 manage；product 有 manage 但非 gm —— 两者都拒绝。
+  await expect(C.bindTaskCodeRepo(eng4, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: v, text: '工程师绑定必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(C.bindTaskCodeRepo(product, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: v, text: 'product 绑定必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 路径校验：相对路径与 `..` 段是 invalid；未登记路径与 symlink 逃逸是 forbidden。
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: 'relative/path', expectedVersion: v, text: '相对路径必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: `${repoAnime}/../operations`, expectedVersion: v, text: '遍历段必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: join(dir, 'not-registered'), expectedVersion: v, text: '未登记仓库必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const escape = join(repoAnime, 'escape-link');
+  symlinkSync(dir, escape); // 指向仓外目录：canonical 后不在白名单
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: escape, expectedVersion: v, text: 'symlink 逃逸必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  rmSync(escape);
+
+  // 版本竞态：过期 expectedVersion 冲突。
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: v + 5, text: '版本竞态必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
+
+  // owner 阻塞与 review 阶段块：不能借绑定绕过关口或打断验收。
+  const owned = await taskOnNoProjectGoal(C);
+  const oc = await C.claim(eng2, owned.id);
+  await C.block(eng2, proof(oc), 'owner', { text: 'fixture owner-blocked task must not be rebindable', idempotencyKey: key() });
+  await expect(C.bindTaskCodeRepo(gm, { taskId: owned.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, owned.id), text: 'owner 阻塞必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const rev = await taskOnNoProjectGoal(C);
+  const rc = await C.claim(eng2, rev.id);
+  await C.submit(eng2, proof(rc), { text: 'fixture submission to reach review', idempotencyKey: key() });
+  const rv = await C.claim(eng4, rev.id);
+  await C.block(eng4, proof(rv), 'gm', { text: 'fixture reviewer block keeps submitted results', idempotencyKey: key() });
+  await expect(C.bindTaskCodeRepo(gm, { taskId: rev.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, rev.id), text: 'review 阶段块必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 活租约与可执行态：blocked+活租约、ready、doing 都拒绝。
+  const leased = await taskOnNoProjectGoal(C);
+  await blockByGm(C, leased.id, eng2);
+  await forgeActiveLease(leased.id, 'tp-eng2');
+  await expect(C.bindTaskCodeRepo(gm, { taskId: leased.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, leased.id), text: '活租约必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const ready = await taskOnNoProjectGoal(C);
+  await expect(C.bindTaskCodeRepo(gm, { taskId: ready.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, ready.id), text: 'ready 必须先 block', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+  const doing = await taskOnNoProjectGoal(C);
+  await C.claim(eng5, doing.id); // 独立员工：doing 租约不再泄漏到后续负例的领取者
+  await expect(C.bindTaskCodeRepo(gm, { taskId: doing.id, codeRepoPath: repoOps, expectedVersion: await versionOf(C, doing.id), text: 'doing 持有租约必须拒绝', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+
+  // 幂等：同 key 同参重放返回同一结果不重复审计；同 key 不同参冲突。
+  const idem = key();
+  const first = await C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: v, text: '幂等重放探测', idempotencyKey: idem });
+  const replayed = await C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoOps, expectedVersion: v, text: '幂等重放探测', idempotencyKey: idem });
+  expect(replayed.version).toBe(first.version);
+  expect(await auditRows(t.id, 'bind_task_code_repo')).toHaveLength(1);
+  await expect(C.bindTaskCodeRepo(gm, { taskId: t.id, codeRepoPath: repoAnime, expectedVersion: v, text: '幂等重放探测', idempotencyKey: idem })).rejects.toMatchObject({ code: 'conflict' });
 });
