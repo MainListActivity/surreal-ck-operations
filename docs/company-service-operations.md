@@ -180,7 +180,7 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 - **每日简报**：每天本地时间 9 点后的第一个周期发一条：等你处理的事（最久的排前面）、异常卡滞（依赖已完成却仍 blocked、就绪超过 1 小时没人领）、近 24 小时完成/退回/驳回/作废数、在办目标、供应商额度。调整时刻 `pnpm run admin config owner_brief_hour <0-23>`，关闭用 `-1`。重启不会重发。
 - **手机推送**：桌面通知在电脑前才看得到。要推到手机，在 `private/service.env` 里加 `SCK_NOTIFY_WEBHOOK=<地址>`（任何接受 JSON POST 的中继，Bark/Gotify 等；地址含密钥，只放私有配置），重载插件后所有通知同时 POST 到该地址（字段 `title`/`body`/`message`/`text`）。不配置则只有桌面通知和收件箱。
 
-集成测试用受控本地 fork 运行：`bun scripts/test-worktrees.ts`。直接 `bun test` 会读 `surreal_ck/.env`，连到生产 SurrealDB 服务器（只写 `sck_agent_company_test*` 命名空间，不碰公司库，但不应作为常规做法）。
+集成测试用受控本地 fork 运行：`pnpm test`（全部）或 `bun scripts/test-worktrees.ts [tests/xxx.test.ts …]`（指定文件）。直接 `bun test` 读 `surreal_ck/.env` 会连到生产 SurrealDB 服务器，所以 `loadDatabaseConfig()` 在测试环境（`NODE_ENV=test`）下遇到非本机地址会直接报错拒绝。
 
 ## 产线与岗位契约
 
