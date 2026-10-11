@@ -28,6 +28,7 @@ import {
   revokeServicePrincipal, sha256Base64Url, type ServicePrincipal,
 } from './idp-principals.ts';
 import { productRequest, ProductUnreachable, type ProductResult } from './product.ts';
+import { SUPPLIER_ADAPTER, SUPPLIER_PROVIDER, SUPPLIER_SERVICE, sampleSupplierPlan, supplierAliasFromSecretName } from './supplier.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 import { SessionStore, type OpsSession } from './sessions.ts';
 import { InternalAiProofBridge } from './proof-bridge.ts';
@@ -43,6 +44,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
+  'ops_supplier_plan_sample',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -95,6 +97,9 @@ const INVITE_RESUME_AFTER_MS = 290_000; // product stale threshold is 240s; wait
 const INVITE_WAIT_MS = 480_000;         // total budget per tool call; a same-key retry continues
 
 const invalid = (message: string) => new CompanyError('invalid', message);
+
+/** Last few sanitized login hops for audit lines: enough to locate a flow, small enough to stay readable. */
+const tailHops = (trace: string, n = 4): string => trace.split(' | ').slice(-n).join(' | ');
 
 function text(args: Args, key: string, max = 200): string {
   const value = args[key];
@@ -206,6 +211,7 @@ export class OpsBroker {
       ops_idp_admin_request: (ctx, args) => this.idpAdminRequest(ctx, args),
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
+      ops_supplier_plan_sample: (ctx, args) => this.supplierPlanSample(ctx, args),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -309,10 +315,19 @@ export class OpsBroker {
     const names = await this.deps.projects.sealedNames(ctx.scope.project, ctx.env);
     const accounts = names.map(aliasFromSecretName).filter((alias): alias is string => !!alias)
       .map(alias => ({ alias, username: accountUsername(alias, ctx.cfg.accounts.prefix) }));
+    const supplierKinds = new Map<string, Set<string>>();
+    for (const name of names) {
+      const hit = supplierAliasFromSecretName(name);
+      if (hit) (supplierKinds.get(hit.alias) ?? supplierKinds.set(hit.alias, new Set()).get(hit.alias)!).add(hit.kind);
+    }
     return {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
         tools: OPS_TOOLS, internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
+        supplierPlanSampling: {
+          provider: SUPPLIER_PROVIDER, adapter: SUPPLIER_ADAPTER, service: SUPPLIER_SERVICE,
+          aliases: [...supplierKinds.entries()].map(([alias, kinds]) => ({ alias, credentials: [...kinds].sort() })),
+        },
         // Public client identifiers only (never secrets), so employees can align the channels
         // with what the IdP has registered (ops_idp_client_info) and the product hard-binds.
         clients: {
@@ -324,6 +339,10 @@ export class OpsBroker {
         preview: await this.previewStatus(),
       },
     };
+  }
+
+  private serviceHome(): string {
+    return this.deps.serviceHome ?? process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
   }
 
   /**
@@ -925,7 +944,7 @@ export class OpsBroker {
         accountResult: ensured, workspace: session.workspace, canCreate: listing.canCreate,
         workspaces: listing.workspaces.map(({ slug, name, role }) => ({ slug, name, role })),
       },
-      audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}` },
+      audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}（attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
@@ -955,7 +974,7 @@ export class OpsBroker {
         session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
         audience: 'ops',
       },
-      audit: { action: 'ops_login', evidence: `login as ${username}（audience=ops）` },
+      audit: { action: 'ops_login', evidence: `login as ${username}（audience=ops，attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
@@ -999,7 +1018,7 @@ export class OpsBroker {
         session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
         accountResult: ensured, operator: clipJson(redactJson(probe.body, known)),
       },
-      audit: { action: 'ops_operator_login', evidence: `operator login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}` },
+      audit: { action: 'ops_operator_login', evidence: `operator login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}（attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
@@ -1176,6 +1195,40 @@ export class OpsBroker {
     return {
       value: { slug, alias, username, removed: true },
       audit: { action: 'ops_member_remove', evidence: `${session.username} 把 ${username} 移出 ${slug}` },
+    };
+  }
+
+  // ---------- supplier plan/quota evidence sampling ----------
+
+  /**
+   * `ops_supplier_plan_sample {env?, alias, purpose}`: samples the sealed supplier account's
+   * plan/quota facts through the fixed SenseNova adapter and writes a reviewed-token-plan
+   * evidence document plus a sanitized receipt under the task evidence root. The argument
+   * surface is deliberately closed — only an alias and a bounded purpose text; no URLs,
+   * paths, credentials, tokens, cookies or caller-supplied financial/account facts ever
+   * reach the provider. Every missing or unverifiable fact answers `blocked` with gaps.
+   */
+  private async supplierPlanSample(ctx: Ctx, args: Args): Promise<Outcome> {
+    const allowed = new Set(['env', 'alias', 'purpose']);
+    const extra = Object.keys(args).filter(key => !allowed.has(key));
+    if (extra.length) throw invalid(`ops_supplier_plan_sample accepts only alias and purpose (rejected: ${extra.join(', ')})`);
+    const alias = canonicalAlias(args.alias);
+    const purpose = text(args, 'purpose', 200);
+    if (/[:\\/@]|\b(?:bearer|token|cookie|secret|password|api[-_ ]?key)\b|[A-Za-z0-9_-]{32,}/i.test(purpose)) {
+      throw invalid('purpose must be a short plain-text evidence purpose, not a URL, path or credential');
+    }
+    const result = await sampleSupplierPlan({
+      project: ctx.scope.project, env: ctx.env, taskId: ctx.scope.taskId, alias, purpose,
+      readSealed: name => this.deps.projects.readSealed(ctx.scope.project, ctx.env, name, this.deps.secretKey()),
+      fetch: this.deps.fetch, now: this.now,
+      evidenceDir: join(this.serviceHome(), 'evidence', ctx.scope.taskId),
+    });
+    return {
+      value: result,
+      audit: {
+        action: 'ops_supplier_sample',
+        evidence: `ops_supplier_plan_sample ${alias}（${purpose}）→ ${result.status} accountRef=${result.accountRef ?? 'none'} doc=${result.documentSha256 ? result.documentSha256.slice(0, 16) : 'none'} gaps=${result.gaps.length}`,
+      },
     };
   }
 

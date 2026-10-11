@@ -94,6 +94,37 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
   denyConsents = false;
   /** Missing-cookie mode: the password route omits the `user_session` cookie the consent POST needs. */
   omitSessionCookie = false;
+  /**
+   * SenseNova supplier fixture for ops_supplier_plan_sample: the chat API key (Bearer on
+   * token.sensenova.cn) and the console session token (Bearer on platform.sensenova.cn).
+   * `apiKeyListed=false` drops the sealed key from the console key list → binding fails.
+   * Each `*Status` swaps the endpoint's healthy 200 for a failure code.
+   */
+  supplier = {
+    apiKey: 'sk-test-7f3a9c1e5b8d4f2a6e0c9b1d3f5a7e9c',
+    consoleToken: 'console-session-4d8f2b6a1c3e5f7a9b0d2e4f',
+    apiKeyListed: true,
+    extraApiKeys: [] as string[],
+    modelsStatus: 200,
+    keysStatus: 200,
+    poolStatus: 200,
+    planStatus: 200,
+    pools: [
+      {
+        id: 'pool-dedicated', pool: 'flash-lite', name: 'Flash-Lite', pool_type: 'dedicated',
+        window_5h: { limit: 60_000, remaining: 59_400, reset_at: Math.floor(this.clock / 1000) + 5 * 3600 },
+        window_7d: { limit: 600_000, remaining: 598_000, reset_at: Math.floor(this.clock / 1000) + 6 * 86_400 },
+        nearest_grant_expiry: Math.floor(this.clock / 1000) + 30 * 86_400,
+      },
+      {
+        id: 'pool-general', pool: 'general', name: '通用', pool_type: 'default',
+        window_5h: { limit: 60_000, remaining: 58_000, reset_at: Math.floor(this.clock / 1000) + 4 * 3600 },
+        window_7d: { limit: 600_000, remaining: 590_000, reset_at: Math.floor(this.clock / 1000) + 5 * 86_400 },
+        nearest_grant_expiry: Math.floor(this.clock / 1000) + 30 * 86_400,
+      },
+    ],
+    planHtml: '<html><body>SenseNova Token Plan 订阅方案 公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 ¥ 0 /月 60,000 积分 / 5 小时</body></html>',
+  };
 
   constructor() {
     this.sqlite.run(`CREATE TABLE users (
@@ -207,6 +238,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
+    if (url.host === 'token.sensenova.cn' || url.host === 'platform.sensenova.cn' || url.host === 'www.sensenova.cn') return this.supplierHost(url, method, init);
     return new Response('unreachable host', { status: 502 });
   }
 
@@ -416,6 +448,46 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
       return json(400, { error: 'invalid_grant' });
     }
     return json(200, { access_token: this.mint(code.userId, undefined, true), token_type: 'Bearer', expires_in: 900 });
+  }
+
+  /**
+   * SenseNova surfaces the supplier sampler reads: the chat `/v1/models` list takes the API
+   * key as Bearer; `/lite/console/v1/*` takes the console session token; the public plan
+   * page needs no auth. Wrong credentials answer 401 like the real endpoints.
+   */
+  private supplierHost(url: URL, method: string, init?: RequestInit): Response {
+    const s = this.supplier;
+    const token = (new Headers(init?.headers).get('authorization') ?? '').replace(/^Bearer /, '');
+    if (method !== 'GET') return json(405, { code: 12, message: 'Method Not Allowed' });
+    if (url.host === 'token.sensenova.cn') {
+      if (url.pathname !== '/v1/models') return json(404, { error: { code: 5, message: 'NOT_FOUND' } });
+      if (token !== s.apiKey) return json(401, { error: { code: 16, message: 'Forbidden' } });
+      if (s.modelsStatus !== 200) return new Response('', { status: s.modelsStatus });
+      return json(200, { object: 'list', data: [{ id: 'sensenova-6.8-flash-lite', object: 'model' }, { id: 'deepseek-v4-flash', object: 'model' }] });
+    }
+    if (url.host === 'platform.sensenova.cn') {
+      const unauth = (reason: string) => json(401, { code: 16, details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', domain: 'global', reason }], message: 'Unauthenticated' });
+      if (url.pathname === '/lite/console/v1/tokenplan/pool-usage') {
+        if (!token) return unauth('Authorization header is required');
+        if (token !== s.consoleToken) return unauth("Authentication type 'apikey' is not enabled");
+        if (s.poolStatus !== 200) return new Response('', { status: s.poolStatus });
+        return json(200, { pools: s.pools });
+      }
+      if (url.pathname === '/lite/console/v1/metered/api-keys') {
+        if (!token) return unauth('Authorization header is required');
+        if (token !== s.consoleToken) return unauth("Authentication type 'apikey' is not enabled");
+        if (s.keysStatus !== 200) return new Response('', { status: s.keysStatus });
+        const keys = [s.apiKey, ...s.extraApiKeys].map((key, i) => ({ id: `key-${i}`, api_key: key, displayname: `key ${i}`, status: 'Active' }));
+        return json(200, { api_keys: s.apiKeyListed ? keys : keys.filter(k => k.api_key !== s.apiKey), total_count: keys.length, next_page_token: '' });
+      }
+      return new Response('404 Not Found', { status: 404 });
+    }
+    if (url.host === 'www.sensenova.cn') {
+      if (url.pathname !== '/token-plan') return new Response('404', { status: 404 });
+      if (s.planStatus !== 200) return new Response('', { status: s.planStatus });
+      return new Response(s.planHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+    return new Response('unreachable host', { status: 502 });
   }
 
   // ---------- product ----------
