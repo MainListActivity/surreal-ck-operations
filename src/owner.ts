@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { CompanyBrief, GoalTier, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
-import { GOAL_TIERS, goalTemplate } from './flows.ts';
+import { GOAL_TIERS, goalTemplate, isPipeline } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import type { BriefData, WaitingItem } from './owner-brief.ts';
 import { asId, CompanyError, depUnsatisfiedFor, HASH, id, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
@@ -14,6 +14,7 @@ export interface OwnerCommandRow {
   text?: string;
   tier?: GoalTier;
   project?: string;
+  pipeline?: string;
   task?: string;
   source: string;
   status: 'pending' | 'applying' | 'applied' | 'failed';
@@ -36,6 +37,7 @@ interface GoalRow {
   state: GoalView['state'];
   tier?: GoalTier;
   project?: RecordId;
+  pipeline?: string;
   /** Joined `project.repo_path` (triagePending only); not a stored column. */
   repo_path?: string;
   tasks: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
@@ -44,6 +46,7 @@ interface GoalRow {
 const goalView = (row: GoalRow): GoalView => ({
   id: asId(row.id), title: row.title, brief: row.brief, state: row.state, tier: row.tier,
   project: row.project ? asId(row.project) : undefined,
+  pipeline: row.pipeline ?? undefined,
   repoPath: row.repo_path ?? undefined,
   tasks: Object.fromEntries(Object.entries(row.tasks ?? {}).filter(([, v]) => v).map(([k, v]) => [k, asId(v)])),
 });
@@ -58,9 +61,10 @@ export class OwnerDesk {
   constructor(private readonly database: CompanyDatabase) {}
   private get db() { return this.database.db; }
 
-  async createGoal(input: { text: string; source: string; key: string; note?: string; tier?: GoalTier; project?: string }): Promise<GoalView> {
+  async createGoal(input: { text: string; source: string; key: string; note?: string; tier?: GoalTier; project?: string; pipeline?: string }): Promise<GoalView> {
     requireText(input.text, 'goal text', 2, 20000);
     if (input.tier !== undefined && !GOAL_TIERS.includes(input.tier)) throw new CompanyError('invalid', 'Invalid goal tier');
+    if (input.pipeline !== undefined && !isPipeline(input.pipeline)) throw new CompanyError('invalid', 'pipeline must be software, video or story');
     const goalId = HASH(`goal\0${input.key}`).slice(0, 16);
     const goal = id('goal', goalId);
     let row = await this.db.select<GoalRow>(goal);
@@ -68,10 +72,12 @@ export class OwnerDesk {
       const project = input.project ? id('project', input.project) : undefined;
       if (project && !(await this.db.select(project))) throw new CompanyError('not_found', `project ${input.project} not found`);
       const title = input.text.trim().split(/\r?\n/)[0].slice(0, 60);
+      // An explicit line wins; otherwise the project's default line; a goal with neither runs the software flow.
+      const pipeline = input.pipeline ?? (project ? (await this.db.select<{ pipeline?: string }>(project))?.pipeline : undefined);
       try {
         await this.db.query(`CREATE ONLY $goal CONTENT { title: $title, brief: $brief, state: 'triage', source: $source, note: $note,
-          project: $project, tasks: {}, anchors: [], created_at: time::now() };`,
-        { goal, title, brief: input.text.trim(), source: input.source, note: input.note ?? '', project });
+          project: $project, pipeline: $pipeline, tasks: {}, anchors: [], created_at: time::now() };`,
+        { goal, title, brief: input.text.trim(), source: input.source, note: input.note ?? '', project, pipeline });
       } catch (error) {
         if (!(await this.db.select<GoalRow>(goal))) throw error;
       }
@@ -87,7 +93,7 @@ export class OwnerDesk {
     const row = await this.db.select<GoalRow>(goal);
     if (!row) throw new CompanyError('not_found', 'goal not found');
     if (row.state !== 'triage') return goalView(row);
-    const template = goalTemplate(tier, row.title, row.brief, goalId);
+    const template = goalTemplate(tier, row.title, row.brief, goalId, isPipeline(row.pipeline) ? row.pipeline : 'software');
     const ids = Object.fromEntries(template.tasks.map(t => [t.ref, id('task', randomUUID())]));
     const vars: Record<string, unknown> = { goal, tier, via, source: `triage:${via}`.slice(0, 200) };
     const creates = template.tasks.map((t, i) => {
@@ -321,7 +327,7 @@ export class OwnerDesk {
       let status = 'applied', result = '';
       try {
         switch (row.kind) {
-          case 'goal': result = `goal=${(await this.createGoal({ text: row.text ?? '', source, key, tier: row.tier, project: row.project })).id}`; break;
+          case 'goal': result = `goal=${(await this.createGoal({ text: row.text ?? '', source, key, tier: row.tier, project: row.project, pipeline: row.pipeline })).id}`; break;
           case 'approve': case 'reject': case 'reply':
             if (!row.task) throw new CompanyError('invalid', 'task is required');
             result = `state=${(await this.decide({ taskId: row.task, decision: row.kind, note: row.text ?? '', source, key })).state}`;

@@ -225,8 +225,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;
   server.registerTool('create_goal', {
-    description: 'gm only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev or gm picks quick/standard/program); project links a project environment.',
-    inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), ...relayShape }),
+    description: 'gm only: record a goal the owner gave in direct conversation. Without tier the goal waits in triage (Jev or gm picks quick/standard/program); project links a project environment; pipeline picks the production line template (software, video or story; defaults to the project\'s line).',
+    inputSchema: z.object({ text: z.string().min(2), tier: z.enum(tiers).optional(), project: z.string().min(1).optional(), pipeline: z.enum(['software', 'video', 'story']).optional(), ...relayShape }),
   }, async (input, ctx) => run(token(ctx), () => core.relayGoal(token(ctx), input)));
 
   server.registerTool('triage_goal', {

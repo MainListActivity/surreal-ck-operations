@@ -16,6 +16,7 @@ const STATE_COLOR: Record<string, string> = {
   blocked: "#d97706", ready: "#2563eb", doing: "#7c3aed", review: "#0891b2", done: "#16a34a",
 };
 const TIER_LABEL: Record<string, string> = { quick: "quick 小需求", standard: "standard 常规", program: "program 大项目" };
+const PIPELINE_LABEL: Record<string, string> = { software: "软件产线", video: "视频产线", story: "故事产线" };
 const KIND_LABEL: Record<string, string> = { goal: "范围", task: "任务", gate: "关口", release: "上线申请", deploy: "部署实测" };
 
 type Ctx = { theme: PluginSurfaceProps["theme"]; compact: boolean; navigation?: NavApi };
@@ -328,10 +329,11 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const [text, setText] = useState("");
   const [tier, setTier] = useState<GoalTier | undefined>();
   const [project, setProject] = useState<string | undefined>();
+  const [pipeline, setPipeline] = useState<"software" | "video" | "story" | undefined>();
   const [direction, setDirection] = useState("");
   const [feedback, setFeedback] = useState("");
   const submit = useMutation({
-    mutationFn: () => create({ text, tier, project, key: newKey() }),
+    mutationFn: () => create({ text, tier, project, pipeline, key: newKey() }),
     onSuccess: goal => {
       setText(""); setFeedback(`已创建目标 ${goal.id.slice(0, 16)}（${goal.state === "triage" ? "等待分级" : goal.state}）`);
       void queryClient.invalidateQueries();
@@ -369,6 +371,14 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
             {brief?.projects.map(p => (
               <Pressable key={p.id} style={[s.chip, project === p.id && s.chipActive]} onPress={() => setProject(p.id)}>
                 <Text style={[s.chipText, project === p.id && s.chipTextActive]}>{p.name}</Text>
+              </Pressable>
+            ))}
+          </View>
+          <Text style={s.muted}>产线（不选则用项目默认产线，没有则按软件产线）</Text>
+          <View style={s.row}>
+            {([undefined, "software", "video", "story"] as ("software" | "video" | "story" | undefined)[]).map(l => (
+              <Pressable key={l ?? "default"} style={[s.chip, pipeline === l && s.chipActive]} onPress={() => setPipeline(l)}>
+                <Text style={[s.chipText, pipeline === l && s.chipTextActive]}>{l ? PIPELINE_LABEL[l] : "项目默认"}</Text>
               </Pressable>
             ))}
           </View>

@@ -181,3 +181,11 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 - **手机推送**：桌面通知在电脑前才看得到。要推到手机，在 `private/service.env` 里加 `SCK_NOTIFY_WEBHOOK=<地址>`（任何接受 JSON POST 的中继，Bark/Gotify 等；地址含密钥，只放私有配置），重载插件后所有通知同时 POST 到该地址（字段 `title`/`body`/`message`/`text`）。不配置则只有桌面通知和收件箱。
 
 集成测试用受控本地 fork 运行：`bun scripts/test-worktrees.ts`。直接 `bun test` 会读 `surreal_ck/.env`，连到生产 SurrealDB 服务器（只写 `sck_agent_company_test*` 命名空间，不碰公司库，但不应作为常规做法）。
+
+## 产线与岗位契约
+
+不同产线流程不同（软件交付、视频、长篇故事），所以目标模板按产线选，不再全公司一套。
+
+- **产线**：`software`（默认，原流程）、`video`（拆解 → 老板最终验收，不含运营验收）、`story`（只有一个拆解任务，不自动收尾——靠 [展开下一层] 任务接力递归）。目标创建时指定：`pnpm run company goal --pipeline story --project <项目> "<目标>"`，或在插件「新目标」里选产线；不指定则取项目默认产线（`project set` 的 `pipeline` 字段），都没有则走软件线。
+- **岗位契约**：项目岗位轨词表里每条轨可写 `roles: [...]`，限定能承接它的岗位。建单（`create_task` / `create_delivery`）时校验：派给轨不允许的岗位会被拒绝；任何出现在某条轨 `roles` 里的岗位都是产线岗，建单必须挂轨。没有出现在任何 `roles` 里的岗位（gm、product、qa 等）仍可建不挂轨的协调任务。契约写在项目记录里，改项目配置即生效，不需要改代码。
+- `screenwriter` 仍保留原有的"必须挂 编剧 轨"硬规则。
