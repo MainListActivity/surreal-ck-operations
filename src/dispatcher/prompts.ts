@@ -14,6 +14,7 @@ const ROLE_NAMES: Record<string, string> = {
   'concept-design': '原型/概念设计（内容产线 P 段）',
   'asset-production': '量产制作（内容产线 M 段）',
   screenwriter: '专职编剧：故事与剧本多轮打磨，只接编剧轨',
+  'story-author': '长篇故事作者：从总纲到概要再到正文，只接原著轨，不接任何改编和制作',
   qa: '测试：上线后在生产环境逐条实测',
   cs: '客户成功',
   eval: '评审：任务完成后为参与员工打绩效分',

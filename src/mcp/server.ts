@@ -5,7 +5,7 @@ import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '..
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
 
-const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'qa', 'cs'] as const;
+const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
 const reviewerRoles = [...roles, 'owner'] as const;
 const states = ['blocked', 'ready', 'doing', 'review', 'done', 'void'] as const;

@@ -18,7 +18,7 @@ const usage = `Usage: pnpm run admin <command>
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def tracks <id> <轨,轨|->               限定编制的岗位轨（- 或空 = 全接；非空则只接 discipline 在列的任务）
   def enable|disable <id>
-  seed-defs                               写入默认员工定义（28 个：九岗位含 eval × codex/grok/devin 订阅，另加 screenwriter-agy（antigravity 单座），已存在则不覆盖）
+  seed-defs                               写入默认员工定义（29 个：九岗位含 eval × codex/grok/devin 订阅，另加 screenwriter-agy 与 story-author-agy（antigravity 单座），已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
   retire <employee-id> <reason>           退役实例并撤销凭证

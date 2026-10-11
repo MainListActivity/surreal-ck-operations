@@ -23,7 +23,7 @@ export { ROLES };
  * 缺轨/错轨显式拒绝；claim/dispatch 双端要求任务轨等于必配轨且编制 tracks 显式含该轨
  * （这些岗位的空 tracks 不再视为全接）。当前仅编剧岗，未来同类岗位在此扩展。
  */
-export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: '编剧' };
+export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: '编剧', 'story-author': '原著' };
 const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;

@@ -34,13 +34,14 @@
 
 ## 岗位
 
-任务岗位：gm（总经理）、product（运营/产品）、engineering（工程）、ai-content（AI 与内容，存量/通用岗）、concept-design（原型/概念设计，内容产线 P 段）、asset-production（量产制作，内容产线 M 段）、screenwriter（专职编剧，编剧轨专属）、qa（测试）、cs（客户成功）；另设 eval 评审岗位（不领任务、不验收，只写绩效分，见文末）。各岗位职责见 `agents/<role>.md`。
+任务岗位：gm（总经理）、product（运营/产品）、engineering（工程）、ai-content（AI 与内容，存量/通用岗）、concept-design（原型/概念设计，内容产线 P 段）、asset-production（量产制作，内容产线 M 段）、screenwriter（专职编剧，编剧轨专属）、story-author（长篇故事作者，原著轨专属）、qa（测试）、cs（客户成功）；另设 eval 评审岗位（不领任务、不验收，只写绩效分，见文末）。各岗位职责见 `agents/<role>.md`。
 
 **内容产线两段规则**（老板既定方向）：原型/概念设计与量产制作是内容产线的专属执行岗位，与 ai-content 互不错派。
 
 - P 段（原型/概念设计）：`executorRole=concept-design`、`reviewerRole=owner`——收口为老板 demo 验收，交付证据须附老板可直接打开的产物（静帧 PNG、可直接打开的页面或样片路径）。
 - M 段（量产制作）：`executorRole=asset-production`、`reviewerRole=gm` 或 `qa`——变体、铺量镜头、配音、渲染等批量产出走 GM/QA 验收，不过老板。
 - 编剧轨（专职编剧）：`executorRole=screenwriter` 且必须 `discipline=编剧`（建单时强制，缺轨/错轨直接 invalid）。编剧轨是「P 段=concept-design」的有意例外：P 段原型剧本也派 screenwriter、仍由 `reviewerRole=owner` 验收；M 段剧本任务由 `reviewerRole=gm` 验收。screenwriter 编制必须在 `tracks` 显式挂 `编剧`（空 tracks 不接活），任务与编制派工、claim 双端强制对口。
+- 原著轨（长篇故事作者）：`executorRole=story-author` 且必须 `discipline=原著`（建单与 claim 双端强制）。原著线是独立产线，只写故事：概要由老板验收（`reviewerRole=owner`），正文由 QA 验收；不涉及分集、时长、剧本格式和任何制作环节。流程见项目 AGENTS.md「原著线」与目标的拆解任务。
 - P→M 依赖：量产任务的 `dependencies` 须含对应原型任务，老板 approve 前量产任务不得解锁、不得开工；任何新增内容角色必须先过 demo 关再立项量产。依赖挂在剧本谱系任一旧版时，服务端解析到最新版执行同样的老板关口——最新版未批准前不解锁，最新版批准后统一解锁。
 - 项目级岗位轨（`discipline`/`tracks`）：项目内更细的产线分工（如动漫产线的 角色设计/分镜）不进全局岗位枚举；编剧轨已升格为全局岗位 screenwriter。项目词表与各轨说明见 `project.disciplines`（`project set` 或员工侧 `project_disciplines_update` 写入）；经理拆产线任务时按项目 AGENTS.md 的轨表给任务标 `discipline=<轨名>`——词表非空时取值必须在词表内，无项目或空词表可自由取值。编制 `tracks` 非空则只接对口轨任务（派工与 claim 双端强制，跨轨 claim 显式拒绝）；编制无轨或任务无轨则按岗位正常匹配。交付链里 discipline 只标在实现腿上，上线/部署腿不带轨。
 

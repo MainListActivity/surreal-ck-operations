@@ -117,13 +117,13 @@ const VIDEO_PLAN = `把目标拆成可独立交付的任务，全部带 goalId�
 成片验收用抽帧与音画检查（见项目 AGENTS.md「QA 终验标准」）。`;
 
 const STORY_PLAN = `本目标走**长篇故事产线**：只负责把原著写完，由粗到细递归推进。故事作者不关心分集、时长、剧本格式、分镜、配音和渲染——这些是后面改编线的事，任务 context 里不要出现这些词，也不要把任务派给 product、ai-content、cs。
-底本：仓库里已有的故事筹备稿（目标描述里的 Markdown）。全部产出放项目的故事目录，不进视频的集数目录。所有故事任务传 discipline=原著；作者岗位 executorRole=story-author（该岗位上线前用项目 AGENTS.md「原著线」写的过渡岗位）。
+底本：仓库里已有的故事筹备稿（目标描述里的 Markdown）。全部产出放项目的故事目录，不进视频的集数目录。所有故事任务传 discipline=原著，作者岗位 executorRole=story-author（只有这个岗位能承接原著轨，派给别的岗位会被拒绝）。
 递归流程（每一层都是：先写概要 → 老板只看概要 → 通过后才展开下一层 → 最后补齐正文）：
-1. 第一层：《故事圣经与全书总纲》，executorRole=作者、reviewerRole=owner。
+1. 第一层：《故事圣经与全书总纲》，executorRole=story-author、reviewerRole=owner。
 2. 每一层概要任务通过后才展开下一层：卷概要 → 章概要 → 小章节概要，都是 reviewerRole=owner。
-3. 小章节概要通过后建 [正文] 任务（作者 → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。
+3. 小章节概要通过后建 [正文] 任务（executorRole=story-author → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。
 4. 概要被老板驳回：在原任务上按意见返修再交，不跳过去写正文。正文被退回：只改正文，不动已批概要。
-**不要一次建完所有层级**。每批只建当前层及其审批，并同时建一个 [展开下一层] 任务（executorRole=gm、reviewerRole=qa），让它依赖本层的老板审批任务；它在老板通过后执行，再建下一层任务和下一个 [展开下一层]——靠它把递归接力下去。全书写完时，由最后一个 [展开下一层] 建一个 kind=gate 的《全书完成确认》交老板。
+**不要一次建完所有层级**。每批只建当前层及其审批，并同时建一个 [展开下一层] 任务（executorRole=gm、reviewerRole=qa），让它依赖本层的老板审批任务（概要被老板驳回时在原任务上返修，不另建）；它在老板通过后执行，再建下一层任务和下一个 [展开下一层]——靠它把递归接力下去。全书写完时，由最后一个 [展开下一层] 建一个 kind=gate 的《全书完成确认》交老板。
 每个任务写清：对应层级、上游概要所在文件、输出文件路径、字数/篇幅预期（只按故事本身，不按集数）。`;
 
 function linePlan(goalId: string, head: string, pipeline: Exclude<PipelineId, 'software'>): Spec {
