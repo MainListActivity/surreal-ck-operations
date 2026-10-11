@@ -44,6 +44,7 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('def_ensure');
     expect(tools).toContain('project_disciplines_update');
     expect(tools).toContain('defer_task_until');
+    expect(tools).toContain('bind_task_code_repo');
     const result = await connection.client.callTool({ name: 'get_context', arguments: { employeeId: 'gm-01', role: 'gm' } });
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });

@@ -155,8 +155,14 @@ export interface SupervisedTask {
   jevReleaseVersion?: number;
   jevRouteVersion?: number;
   ownerRerouted: boolean;
-  /** Repository of the goal's project; where the employee's Paseo workspace should live. */
+  /**
+   * Effective code repo for dispatch (home grouping, spawn cwd/repoHome): the task's explicit
+   * code_repo_path binding wins over the task project overlay, then the goal's project.
+   * Undefined falls back to the ops repo.
+   */
   repoPath?: string;
+  /** Explicit code-repo binding (code_repo_path); informational — repoPath already resolves it. */
+  codeRepoPath?: string;
   /** Tier of the goal this task belongs to (quick/standard/program); undefined for standalone tasks. */
   goalTier?: string;
 }
@@ -180,7 +186,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
-    goalTier: row.goal_tier ?? undefined };
+    codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };
 };
 
 const COOLDOWN_BASE = 30 * 60;
@@ -369,7 +375,7 @@ export class Workforce {
   // ---- lease supervision ----
   async tasks(): Promise<SupervisedTask[]> {
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT *, project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+      "SELECT *, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
     return rows.map(supervised);
   }
 

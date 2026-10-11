@@ -293,6 +293,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.taskProjectUpdate(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('bind_task_code_repo', {
+    description: 'gm only: bind an explicit code repository to a blocked execute-phase task (blocked_to=gm or a formal dependency wait; owner gates and review-phase blocks refuse). Only workspace allocation and dispatch repoHome/cwd follow the binding — the business project (opsScope/claim.json.project) is untouched. Targets are limited to the ops repo or a registered project repo_path, canonicalised (symlink/traversal escapes and unregistered paths refuse). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle.',
+    inputSchema: z.object({
+      taskId: z.string().min(1), codeRepoPath: z.string().min(1).max(1000),
+      expectedVersion: z.number().int().positive(), ...evidenceShape,
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.bindTaskCodeRepo
+    ? core.bindTaskCodeRepo(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
     inputSchema: z.object({

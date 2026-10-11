@@ -51,6 +51,12 @@ export interface TaskView {
   goalId?: string;
   /** Task-level project override (takes precedence over goal.project); undefined keeps the goal routing. */
   projectOverlay?: string;
+  /**
+   * Explicit code-repo binding (gm only): overrides the repo used for worktree allocation and
+   * dispatch repoHome/cwd. Never affects business project resolution (claim.json.project,
+   * opsScope, broker quotas) — that stays with projectOverlay/goal.project.
+   */
+  codeRepoPath?: string;
   dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
@@ -259,6 +265,15 @@ export interface CompanyCore {
    * normal lifecycle (the physical tree itself is never deleted here).
    */
   taskProjectUpdate?(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
+  /**
+   * gm only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
+   * Workspace allocation and dispatch repoHome/cwd follow the binding; the business project
+   * (taskProject → opsScope/claim.json.project) is untouched. Targets are limited to the ops
+   * repo or a registered project repo_path, canonicalised (symlink/traversal escapes refused).
+   * Version-guarded, idempotent, audited; releases the stale worktree assignment through the
+   * normal lifecycle (the physical tree itself is never deleted here).
+   */
+  bindTaskCodeRepo?(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView>;
   /** manage (gm/product): list every employee_def row for workforce review. */
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */

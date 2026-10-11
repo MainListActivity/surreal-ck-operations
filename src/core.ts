@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
@@ -148,6 +150,8 @@ interface TaskRow {
   goal?: RecordId;
   /** Task-level project override (registered project id); NONE falls back to goal.project routing. */
   project?: RecordId;
+  /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
+  code_repo_path?: string;
   handover?: boolean;
   previous_employee?: string;
   progress_at?: number;
@@ -178,6 +182,7 @@ export function view(row: TaskRow): TaskView {
     discipline: row.discipline ?? undefined,
     kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
     projectOverlay: row.project ? asId(row.project) : undefined,
+    codeRepoPath: row.code_repo_path ?? undefined,
     dependencies: (row.dependencies ?? []).map(asId), version: row.version,
     submittedBy: row.submitted_by, currentEmployee: row.current_employee,
     deliveryId: row.delivery_id,
@@ -192,6 +197,22 @@ export function view(row: TaskRow): TaskView {
     lineage: row.lineage ? asId(row.lineage) : undefined,
     revisionNo: row.revision_no ?? undefined,
   };
+}
+
+/** Ops repo (agent home); mirrors the plugin/MCP wiring fallback for SCK_AGENT_CWD. */
+const opsRepoPath = () => process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+
+/**
+ * Canonical form for repo allowlisting and routing comparisons: resolve() first, then
+ * realpath the nearest existing ancestor and re-append the remaining tail — a symlinked
+ * parent can never smuggle a path outside the registered set.
+ */
+export function canonicalRepoPath(input: string): string {
+  let probe = resolve(input);
+  const tail: string[] = [];
+  while (!existsSync(probe)) { tail.unshift(basename(probe)); probe = dirname(probe); }
+  const base = realpathSync(probe);
+  return tail.length ? join(base, ...tail) : base;
 }
 
 export function requireText(value: string, name: string, min = 1, max = 10000): void {
@@ -590,7 +611,9 @@ export class SurrealCompanyCore implements CompanyCore {
       throw new CompanyError('forbidden', 'Task claim denied');
     }
     const project = await this.taskProject(taskId);
-    return this.worktrees.locked(project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
+    // Code-repo routing: an explicit binding wins over the business project repo; the
+    // business `project` itself stays with taskProject for claim.json/opsScope.
+    return this.worktrees.locked(task.codeRepoPath ?? project?.repoPath ?? this.worktrees.options.opsRepo, async (repo, list) => {
       // Re-read under the cross-process repo lock: the first allocation may have completed while waiting.
       const fresh = await this.getTask(credential, taskId);
       const [now] = await this.db.query<[number]>('RETURN time::unix(time::now());');
@@ -600,7 +623,10 @@ export class SurrealCompanyCore implements CompanyCore {
         const active = await this.db.select<TaskRow>(holder.active_task);
         if (active?.current_employee === actor.employeeId && (active.lease_expires_at ?? 0) > now) throw new CompanyError('already_claimed', 'Employee still holds another task');
       }
-      const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, project);
+      // Bound to a different repo: the tree's default branch/tag comes from the project that
+      // actually owns that repo (or none for the ops repo), never from the business project.
+      const allocProject = fresh.codeRepoPath ? await this.projectForRepo(repo) : project;
+      const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, allocProject);
       return this.claimLease(actor, taskId, worktree);
     });
   }
@@ -609,9 +635,10 @@ export class SurrealCompanyCore implements CompanyCore {
     const actor = await this.authorized(credential);
     if (!['gm', 'eval'].includes(actor.role)) throw new CompanyError('forbidden', 'Non-lease workspace requires gm/eval');
     if (!this.worktrees) return undefined;
-    if (taskId) await this.getTask(credential, taskId);
-    const resolved = taskId ? await this.taskProject(taskId) : project ? await this.projects.get(project) : undefined;
-    return this.worktrees.readWorkspace(resolved?.repoPath ?? this.worktrees.options.opsRepo, actor, resolved);
+    const bound = taskId ? await this.getTask(credential, taskId) : undefined;
+    const resolved = taskId ? await this.taskProject(taskId!) : project ? await this.projects.get(project) : undefined;
+    const repo = bound?.codeRepoPath ?? resolved?.repoPath ?? this.worktrees.options.opsRepo;
+    return this.worktrees.readWorkspace(repo, actor, bound?.codeRepoPath ? await this.projectForRepo(repo) : resolved);
   }
   async releaseWorkspace(credential: Credential): Promise<void> {
     const actor = await this.authorized(credential);
@@ -623,9 +650,9 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!this.worktrees) return [];
     if (!taskId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
     if (taskId) {
-      await this.getTask(credential, taskId);
+      const task = await this.getTask(credential, taskId);
       const project = await this.taskProject(taskId);
-      const { repo } = await this.worktrees.identity(project?.repoPath ?? this.worktrees.options.opsRepo);
+      const { repo } = await this.worktrees.identity(task.codeRepoPath ?? project?.repoPath ?? this.worktrees.options.opsRepo);
       return this.worktrees.inventory(repo);
     }
     return this.worktrees.inventory();
@@ -745,6 +772,34 @@ export class SurrealCompanyCore implements CompanyCore {
       'SELECT project AS project, goal.project AS goal_project FROM $task;', { task: id('task', taskId) });
     const project = rows[0]?.project ?? rows[0]?.goal_project;
     return project ? this.projects.get(String(project.id)) : undefined;
+  }
+
+  /**
+   * The registered project whose repo_path canonicalises to `repoPath` (allocation metadata:
+   * default branch and tree tag), or undefined when the path is no project's repo (ops repo).
+   */
+  private async projectForRepo(repoPath: string): Promise<ProjectView | undefined> {
+    const target = canonicalRepoPath(repoPath);
+    for (const path of await this.projects.allRepoPaths()) {
+      try {
+        if (canonicalRepoPath(path) !== target) continue;
+      } catch { continue; }
+      const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+        'SELECT id FROM project WHERE repo_path = $path LIMIT 1;', { path });
+      return rows?.[0] ? this.projects.get(asId(rows[0].id)) : undefined;
+    }
+    return undefined;
+  }
+
+  /** bind_task_code_repo allowlist: opsRepo plus every registered project repo_path, canonicalised. */
+  private async allowedCodeRepos(): Promise<Set<string>> {
+    const paths = [this.worktrees?.options.opsRepo ?? opsRepoPath(), ...(await this.projects.allRepoPaths())];
+    const allowed = new Set<string>();
+    for (const p of paths) {
+      if (typeof p !== 'string' || !p.trim()) continue;
+      try { allowed.add(canonicalRepoPath(p)); } catch { /* an unreadable path can never be a bind target */ }
+    }
+    return allowed;
   }
 
   private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
@@ -1402,6 +1457,78 @@ export class SurrealCompanyCore implements CompanyCore {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
         project: id('project', input.project), project_id: input.project,
         expected: input.expectedVersion, evidence: input.text,
+        idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      });
+      return view(row);
+    } catch (error) {
+      const replayed = await this.replay(idem, digest);
+      if (replayed) return replayed;
+      throw error;
+    }
+  }
+
+  /**
+   * gm only: bind an explicit code repository (code_repo_path) to a blocked execute-phase task.
+   * Only workspace allocation, worktree registration and dispatch repoHome/cwd follow the
+   * binding — the business project (taskProject → claim.json.project, opsScope, broker
+   * quotas) is untouched, so a rebind can never smuggle another project's ops access.
+   *
+   * Allowed targets: the ops repo or a registered project repo_path, canonicalised —
+   * symlink escapes, traversal segments and unregistered paths are refused before any write.
+   * Only state=blocked tasks qualify: blocked_to='gm' and the formal dependency wait
+   * (blocked_to=NONE, including defer_task_until's cleared-gm wait) both bind; owner gates
+   * and review-phase blocks are refused, not guessed, as are live leases. The stale worktree
+   * assignment clears through the same lifecycle as task_project_update: the ref releases,
+   * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
+   */
+  async bindTaskCodeRepo(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may bind a task code repo');
+    requireText(input.taskId, 'task', 1, 200);
+    requireText(input.codeRepoPath, 'codeRepoPath', 1, 1000);
+    requireText(input.text, 'evidence', 4, 4000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      throw new CompanyError('invalid', 'Invalid expectedVersion');
+    }
+    if (!isAbsolute(input.codeRepoPath) || input.codeRepoPath.includes('\0') || input.codeRepoPath.split('/').includes('..')) {
+      throw new CompanyError('invalid', 'codeRepoPath must be an absolute path without traversal');
+    }
+    const bound = canonicalRepoPath(input.codeRepoPath);
+    const allowed = await this.allowedCodeRepos();
+    if (!allowed.has(bound)) {
+      throw new CompanyError('forbidden', 'codeRepoPath is not a registered project repo or the ops repo');
+    }
+    const before = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    const idem = this.idemId(actor.employeeId, 'bind_task_code_repo', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, codeRepoPath: bound, expectedVersion: input.expectedVersion, text: input.text }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return replay;
+    const evidence = `${input.text}\n[bind] code_repo_path: ${before.code_repo_path ?? '-'} -> ${bound}`;
+    try {
+      const row = await this.txTask(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t = NONE { THROW 'task not found' };
+        IF $t.version != $expected { THROW 'task version moved' };
+        IF $repo NOT IN $allowed { THROW 'bind denied: repo not registered' };
+        IF $t.state != 'blocked' { THROW 'bind denied: only blocked tasks can be rebound' };
+        IF $t.blocked_to = 'owner' { THROW 'bind denied: owner blocked task' };
+        IF $t.resume_state = 'review' { THROW 'bind denied: review-phase task' };
+        IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'bind denied: active lease' };
+        LET $next = UPDATE ONLY $task SET
+          code_repo_path = $repo, worktree = NONE, current_employee = NONE, delivery_id = NONE,
+          lease_expires_at = NONE, handover = NONE, version = $t.version + 1 RETURN AFTER;
+        UPDATE employee SET active_task = NONE WHERE active_task = $task;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'bind_task_code_repo', evidence: $evidence, version: $next.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'code_repo_bound', sequence: $sequence.value,
+          payload: { old_repo: $old_repo, new_repo: $repo, version: $next.version }, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+        RETURN $next;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), task: id('task', input.taskId),
+        repo: bound, allowed: [...allowed], old_repo: before.code_repo_path ?? null,
+        expected: input.expectedVersion, evidence,
         idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       });
       return view(row);

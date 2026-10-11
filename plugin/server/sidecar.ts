@@ -26,6 +26,8 @@ const BASE_TOOLS = [
   "def_list", "def_ensure", "project_disciplines_update",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
+  // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
+  "bind_task_code_repo",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -563,6 +565,9 @@ export class SidecarPool {
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));
+      case "bind_task_code_repo": return core.bindTaskCodeRepo
+        ? core.bindTaskCodeRepo(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

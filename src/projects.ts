@@ -121,6 +121,19 @@ export class ProjectStore {
     return Promise.all(rows.map(row => this.view(row)));
   }
 
+  /** Distinct non-empty registered project repo_path values (raw stored form). */
+  async allRepoPaths(): Promise<string[]> {
+    const [rows] = await this.db.query<[Array<{ repo_path?: string }>]>(
+      'SELECT repo_path FROM project WHERE repo_path != NONE ORDER BY repo_path;');
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const r of rows ?? []) {
+      const p = typeof r.repo_path === 'string' ? r.repo_path.trim() : '';
+      if (p && !seen.has(p)) { seen.add(p); out.push(p); }
+    }
+    return out;
+  }
+
   async get(projectId: string): Promise<ProjectView | undefined> {
     const row = await this.db.select<ProjectRow>(new RecordId('project', projectId));
     return row ? this.view(row) : undefined;
