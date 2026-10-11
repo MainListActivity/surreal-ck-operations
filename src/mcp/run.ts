@@ -3,6 +3,7 @@ import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../config';
 import { SurrealCompanyCore } from '../core';
 import { createPaseoCli, createSceneCleaner } from '../dispatcher/paseo';
+import { createSubmitCheck } from '../pr-gate';
 import { CompanyDatabase } from '../database';
 import { Workforce } from '../workforce';
 import { readPrivateCredential } from './credential-file';
@@ -34,7 +35,7 @@ try {
   }
   // Workforce powers the manage-only def_* tools; its credential dir is unused by def writes.
   const workforce = new Workforce(db, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '..', '.runtime', 'credentials')));
-  const core = new SurrealCompanyCore(db, { workforce, worktrees: {
+  const core = new SurrealCompanyCore(db, { workforce, submitCheck: process.env.SCK_PR_GATE === '0' ? undefined : createSubmitCheck(), worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
       // through this MCP process must tear the Paseo side down together with the git tree instead
