@@ -17,7 +17,7 @@ export interface BriefData {
   date: string;
   waiting: Array<WaitingItem & { hours: number }>;
   stuck: Array<{ taskId: string; title: string; reason: string }>;
-  last24h: { done: number; returned: number; rejected: number; retired: number };
+  last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
   goals: Array<{ title: string; days: number }>;
   resources: string[];
   capacity: RoleCapacity[];
@@ -58,7 +58,7 @@ export function renderBrief(data: BriefData): { summary: string; text: string } 
     lines.push('', '【异常卡滞】');
     for (const item of data.stuck.slice(0, 8)) lines.push(`- ${short(item.title, 50)}：${item.reason}（${item.taskId.slice(0, 8)}）`);
   }
-  lines.push('', `【近24小时】完成 ${data.last24h.done}｜退回 ${data.last24h.returned}｜老板驳回 ${data.last24h.rejected}｜作废 ${data.last24h.retired}`);
+  lines.push('', `【近24小时】完成 ${data.last24h.done}｜退回 ${data.last24h.returned}｜老板驳回 ${data.last24h.rejected}｜作废 ${data.last24h.retired}${data.last24h.rolledBack ? `｜通道回滚 ${data.last24h.rolledBack}（系统换会话，不算退回）` : ''}`);
   if (data.goals.length) {
     lines.push('', '【在办目标】');
     for (const goal of data.goals.slice(0, 8)) lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天）`);

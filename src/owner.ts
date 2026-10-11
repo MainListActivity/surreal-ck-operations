@@ -309,12 +309,12 @@ export class OwnerDesk {
     const waiting = (await this.waitingOnOwner()).map(item => ({ ...item, hours: (nowMs - item.sinceMs) / 3_600_000 }));
     const [blocked, ready, counts, goals, health, quotas, staffing, opened, closed] = await this.db.query<[
       Array<{ id: RecordId; title: string; dependencies?: RecordId[] }>, Array<{ id: RecordId; title: string }>,
-      Array<{ action: string; n: number }>, Array<{ title: string; created_at: unknown }>,
+      Array<{ action: string; mechanical?: boolean; n: number }>, Array<{ title: string; created_at: unknown }>,
       Array<{ id: RecordId; state: string; last_error?: string }>, Array<{ id: RecordId; lowest_pct?: number }>, Array<{ key: string }>,
       Array<{ n: number }>, Array<{ reason?: string; n: number }>,
     ]>(`SELECT id, title, dependencies FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(dependencies ?? []) > 0;
       SELECT id, title FROM task WHERE state = 'ready';
-      SELECT action, count() AS n FROM audit WHERE at > <datetime>$since AND action IN ['accept', 'owner_approve', 'return', 'owner_reject', 'retire'] GROUP BY action;
+      SELECT action, string::starts_with(evidence ?? '', '【通道回滚】') AS mechanical, count() AS n FROM audit WHERE at > <datetime>$since AND action IN ['accept', 'owner_approve', 'return', 'owner_reject', 'retire'] GROUP BY action, mechanical;
       SELECT title, created_at FROM goal WHERE state = 'active' ORDER BY created_at;
       SELECT id, state, last_error FROM provider_health;
       SELECT id, lowest_pct FROM company_meta WHERE lowest_pct != NONE;
@@ -333,12 +333,13 @@ export class OwnerDesk {
       const minutes = audit[0] ? (nowMs - Date.parse(String(audit[0].at))) / 60_000 : 0;
       if (minutes >= 60) stuck.push({ taskId: asId(task.id), title: task.title, reason: `就绪 ${Math.round(minutes)} 分钟仍未被领走` });
     }
-    const n = (...actions: string[]) => counts.filter(c => actions.includes(c.action)).reduce((sum, c) => sum + c.n, 0);
+    const n = (...actions: string[]) => counts.filter(c => actions.includes(c.action) && !c.mechanical).reduce((sum, c) => sum + c.n, 0);
+    const rolledBack = counts.filter(c => c.action === 'return' && c.mechanical).reduce((sum, c) => sum + c.n, 0);
     const resources = [
       ...health.filter(h => h.state !== 'healthy').map(h => `${asId(h.id)} ${h.state}${h.last_error ? `：${h.last_error.slice(0, 60)}` : ''}`),
       ...quotas.filter(q => (q.lowest_pct ?? 100) <= 2).map(q => `${asId(q.id).replace('quota_', '')} 额度剩余 ${q.lowest_pct}%`),
     ];
-    return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rejected: n('owner_reject'), retired: n('retire') },
+    return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rolledBack, rejected: n('owner_reject'), retired: n('retire') },
       goals: goals.map(g => ({ title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)) })),
       resources, capacity, staffingAlerts: staffing.length,
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };

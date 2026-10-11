@@ -18,7 +18,7 @@ const data: BriefData = {
   date: '2026-10-11',
   waiting: [{ ...item, hours: 185 }, { ...item, taskId: 'bbbbbbbb-2222', kind: 'gate', title: '最终验收', downstream: 0, hours: 6 }],
   stuck: [{ taskId: 'cccccccc-3333', title: '小说拆解', reason: '依赖都已完成，却仍是 blocked（需要解锁）' }],
-  last24h: { done: 38, returned: 4, rejected: 1, retired: 6 },
+  last24h: { done: 38, returned: 4, rolledBack: 7, rejected: 1, retired: 6 },
   goals: [{ title: '短剧重设计', days: 4 }],
   resources: ['grok exhausted：402 Payment Required', 'codex 额度剩余 0%'], staffingAlerts: 2,
   capacity: [{ role: 'engineering', total: 6, usable: 3, down: ['codex 额度不足（周/月额度 0%<2%）', 'grok 额度耗尽或异常：402'] }, { role: 'qa', total: 5, usable: 5, down: [] }],
@@ -30,7 +30,7 @@ test('brief leads with a one-line summary and lists the longest wait first', () 
   expect(summary).toBe('每日简报 2026-10-11：待你处理 2 项（最久 7.7 天）｜异常卡滞 1｜近24小时完成 38');
   expect(text.split('\n')[0]).toBe(summary);
   expect(text.indexOf('已等 7.7 天')).toBeLessThan(text.indexOf('已等 6 小时'));
-  for (const part of ['【异常卡滞】', '小说拆解', '完成 38｜退回 4｜老板驳回 1｜作废 6', '短剧重设计（已 4 天）', 'codex 额度剩余 0%', '有 2 个岗位暂无可用员工', '【产能】', 'engineering：可用编制 3/6（codex 额度不足', '新建实例 12，退役 14（认领失败 5）']) expect(text).toContain(part);
+  for (const part of ['【异常卡滞】', '小说拆解', '完成 38｜退回 4｜老板驳回 1｜作废 6｜通道回滚 7（系统换会话，不算退回）', '短剧重设计（已 4 天）', 'codex 额度剩余 0%', '有 2 个岗位暂无可用员工', '【产能】', 'engineering：可用编制 3/6（codex 额度不足', '新建实例 12，退役 14（认领失败 5）']) expect(text).toContain(part);
   expect(text).not.toContain('qa：可用编制');
 });
 

@@ -7,6 +7,7 @@ import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
+import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
@@ -234,7 +235,10 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions }) {
+  /** Optional pre-submit check of implementation deliveries; returns why the submission cannot go to review. */
+  private readonly submitCheck?: SubmitCheck;
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck }) {
+    this.submitCheck = options?.submitCheck;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
@@ -978,6 +982,13 @@ export class SurrealCompanyCore implements CompanyCore {
     if (idem && digest) {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
+    }
+    if (action === 'submit' && evidence && this.submitCheck) {
+      const row = await this.db.select<TaskRow>(id('task', proof.taskId));
+      if (row?.executor_role === 'engineering' && row.kind === 'task') {
+        const reason = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
+        if (reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${reason}`);
+      }
     }
     const flags = {
       heartbeat: action === 'heartbeat', checkpoint: action === 'checkpoint',

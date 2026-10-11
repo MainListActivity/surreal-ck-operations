@@ -70,7 +70,8 @@ export function company(): Promise<Company> {
         : process.env.SCK_WORKTREE_RECLAIM === '1' || process.env.SCK_WORKTREE_RECLAIM === 'true'
           ? true : undefined,
     };
-    const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts });
+    const { createSubmitCheck } = await import("./vendor/src/pr-gate.ts");
+    const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck() });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
