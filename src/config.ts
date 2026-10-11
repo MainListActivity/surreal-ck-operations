@@ -47,8 +47,14 @@ export function loadDatabaseConfig(): DatabaseConfig {
   if (!/^[a-z][a-z0-9_]{2,62}$/.test(namespace) || !/^[a-z][a-z0-9_]{2,62}$/.test(database)) {
     throw new Error('Invalid company namespace/database name');
   }
+  const url = get('SURREAL_URL');
+  // `bun test` loads the product .env by default, which points at the production SurrealDB server.
+  // Tests must run on a local fork instead (bun scripts/test-worktrees.ts [files]).
+  if (process.env.NODE_ENV === 'test' && !/^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(url)) {
+    throw new Error(`Refusing to run tests against a non-local database (${url.replace(/\/\/.*@/, '//')}); run them with: bun scripts/test-worktrees.ts <tests/file.test.ts>`);
+  }
   return {
-    url: get('SURREAL_URL'),
+    url,
     rootUser: get('SURREAL_ROOT_USER'),
     rootPassword: get('SURREAL_ROOT_PASS'),
     namespace,
