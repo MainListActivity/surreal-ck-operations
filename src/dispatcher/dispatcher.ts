@@ -6,6 +6,7 @@ import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
+import { agingLevel, agingText, localDate, renderBrief } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
@@ -470,6 +471,8 @@ export class Dispatcher {
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
+    await this.ownerAging(now, report).catch(error => this.log(`owner aging failed: ${(error as Error).message}`));
+    await this.dailyBrief(now, cfg, report).catch(error => this.log(`daily brief failed: ${(error as Error).message}`));
 
     // 4. Work that needs an employee.
     const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
@@ -1106,14 +1109,53 @@ export class Dispatcher {
     }
   }
 
-  private async notice(key: string, text: string, report: TickReport) {
+  private lastAging = 0;
+  private briefedOn = '';
+
+  /** Re-raises gates and questions that have waited on the owner too long, with what they are holding up. */
+  private async ownerAging(now: number, report: TickReport) {
+    if (now - this.lastAging < 300) return;
+    this.lastAging = now;
+    const { owner } = this.deps;
+    const live = new Set<string>();
+    for (const item of await owner.waitingOnOwner()) {
+      const hours = (now * 1000 - item.sinceMs) / 3_600_000;
+      const level = agingLevel(hours);
+      if (!level) continue;
+      const key = `aging:${item.taskId}:${item.version}:${level}`;
+      live.add(key);
+      await this.notice(key, agingText(item, hours), report, { force: level >= 2 });
+    }
+    for (const notice of await owner.openNotices()) {
+      if (notice.key.startsWith('aging:') && !live.has(notice.key)) await owner.resolveNotice(notice.key);
+    }
+  }
+
+  /** One brief per local day, from the configured hour on; survives restarts via the stored notice key. */
+  private async dailyBrief(now: number, cfg: CompanyConfig, report: TickReport) {
+    if (cfg.ownerBriefHour < 0) return;
+    const at = new Date(now * 1000);
+    const date = localDate(at);
+    if (at.getHours() < cfg.ownerBriefHour || this.briefedOn === date) return;
+    const { owner } = this.deps;
+    const key = `brief:${date}`;
+    if (await owner.hasNotice(key)) { this.briefedOn = date; return; }
+    const { summary, text } = renderBrief(await owner.briefData(now * 1000, date));
+    await this.notice(key, text, report, { force: true, popup: summary });
+    this.briefedOn = date;
+    for (const notice of await owner.openNotices()) {
+      if (notice.key.startsWith('brief:') && notice.key !== key) await owner.resolveNotice(notice.key);
+    }
+  }
+
+  private async notice(key: string, text: string, report: TickReport, opts: { force?: boolean; popup?: string } = {}) {
     if (!(await this.deps.owner.raiseNotice(key, text))) return;
     report.notices.push(key);
     if (!this.deps.notify) return;
     // Jev triage: a calibrated noul decides whether this notice deserves an immediate
     // desktop popup; the notice always lands in the owner inbox regardless. Fail-open.
     const jev = this.deps.jev;
-    if (jev) {
+    if (jev && !opts.force) {
       try {
         const cfg = await this.deps.workforce.config();
         if (cfg.jevNotifyTriage) {
@@ -1129,6 +1171,6 @@ export class Dispatcher {
         }
       } catch { /* fail-open: still popup */ }
     }
-    await this.deps.notify('Surreal CK 公司', text).catch(() => undefined);
+    await this.deps.notify('Surreal CK 公司', opts.popup ?? text).catch(() => undefined);
   }
 }

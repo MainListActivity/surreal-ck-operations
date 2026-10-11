@@ -171,3 +171,13 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 4. 回收需要关闭时两面设置 `SCK_WORKTREE_RECLAIM=0`（`SCK_WORKTREE_STRATEGY` 已移除：代码任务始终独占任务树或所属线的树）。restart MCP + reload 现有插件。保留 schema 011/012、登记、审计与在办现场。两面代码回滚也须保留 WT01/WT02 登记兼容版本。
 
 新业务环境变量：可选 `SCK_WORKTREE_RECLAIM`、`SCK_WORKTREE_ORPHAN_GRACE_DAYS`；系统 Python 和现有 Git 是本机准备项。
+
+## 老板提醒：老化升级与每日简报
+
+调度器每个周期都会检查等老板的东西（待批关口、待回答的问题），不再只在出现时提醒一次：
+
+- **老化升级**：等待满 4 小时、24 小时、72 小时各再提醒一次，之后每天一次；提醒写明已等多久、属于哪个目标、卡住多少下游任务。24 小时起的提醒强制弹通知（不再经 Jev 判断是否打扰）。老板处理后提醒自动消失。检查每 5 分钟一次。
+- **每日简报**：每天本地时间 9 点后的第一个周期发一条：等你处理的事（最久的排前面）、异常卡滞（依赖已完成却仍 blocked、就绪超过 1 小时没人领）、近 24 小时完成/退回/驳回/作废数、在办目标、供应商额度。调整时刻 `pnpm run admin config owner_brief_hour <0-23>`，关闭用 `-1`。重启不会重发。
+- **手机推送**：桌面通知在电脑前才看得到。要推到手机，在 `private/service.env` 里加 `SCK_NOTIFY_WEBHOOK=<地址>`（任何接受 JSON POST 的中继，Bark/Gotify 等；地址含密钥，只放私有配置），重载插件后所有通知同时 POST 到该地址（字段 `title`/`body`/`message`/`text`）。不配置则只有桌面通知和收件箱。
+
+集成测试用受控本地 fork 运行：`bun scripts/test-worktrees.ts`。直接 `bun test` 会读 `surreal_ck/.env`，连到生产 SurrealDB 服务器（只写 `sck_agent_company_test*` 命名空间，不碰公司库，但不应作为常规做法）。

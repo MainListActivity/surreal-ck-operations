@@ -4,6 +4,7 @@ import type { CompanyDatabase } from './database.ts';
 import type { CompanyBrief, GoalTier, GoalView, OwnerDecision, TaskId, TaskView } from './contracts.ts';
 import { GOAL_TIERS, goalTemplate } from './flows.ts';
 import { ProjectStore } from './projects.ts';
+import type { BriefData, WaitingItem } from './owner-brief.ts';
 import { asId, CompanyError, depUnsatisfiedFor, HASH, id, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
@@ -218,6 +219,76 @@ export class OwnerDesk {
       notices: await this.openNotices(),
       pendingCommands: pending[0]?.count ?? 0,
     };
+  }
+
+  async hasNotice(key: string): Promise<boolean> {
+    return Boolean(await this.db.select(id('owner_notice', HASH(key).slice(0, 24))));
+  }
+
+  /** Non-terminal tasks that transitively depend on `root`; bounded so a pathological graph cannot stall the tick. */
+  private async downstreamCount(root: RecordId): Promise<number> {
+    const seen = new Set<string>(); let frontier = [root];
+    for (let depth = 0; depth < 8 && frontier.length && seen.size < 200; depth++) {
+      const next: RecordId[] = [];
+      for (const node of frontier) {
+        const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
+          "SELECT id FROM task WHERE state NOT IN ['done', 'void'] AND $node IN dependencies;", { node });
+        for (const row of rows) if (!seen.has(String(row.id))) { seen.add(String(row.id)); next.push(row.id); }
+      }
+      frontier = next;
+    }
+    return seen.size;
+  }
+
+  /** Gates and questions waiting on the owner, with how long they have waited and what they hold up. */
+  async waitingOnOwner(): Promise<WaitingItem[]> {
+    const [rows] = await this.db.query<[Array<TaskRow & { goal_title?: string }>]>(
+      `SELECT *, goal.title AS goal_title FROM task WHERE (state = 'review' AND reviewer_role = 'owner') OR (state = 'blocked' AND blocked_to = 'owner');`);
+    return Promise.all(rows.map(async row => {
+      const gate = row.state === 'review';
+      const [audit] = await this.db.query<[Array<{ at: unknown }>]>(
+        'SELECT at FROM audit WHERE task = $task AND action = $action ORDER BY at DESC LIMIT 1;', { task: row.id, action: gate ? 'submit' : 'block' });
+      const since = Date.parse(String(audit[0]?.at ?? (row as { created_at?: unknown }).created_at ?? new Date()));
+      return { taskId: asId(row.id), version: row.version, kind: gate ? 'gate' as const : 'question' as const, title: row.title,
+        goal: row.goal_title ?? undefined, sinceMs: since, downstream: await this.downstreamCount(row.id) };
+    }));
+  }
+
+  /** Everything the daily brief reports, read straight from the task service (no model involved). */
+  async briefData(nowMs: number, date: string): Promise<BriefData> {
+    const sinceIso = new Date(nowMs - 86_400_000).toISOString();
+    const waiting = (await this.waitingOnOwner()).map(item => ({ ...item, hours: (nowMs - item.sinceMs) / 3_600_000 }));
+    const [blocked, ready, counts, goals, health, quotas, staffing] = await this.db.query<[
+      Array<{ id: RecordId; title: string; dependencies?: RecordId[] }>, Array<{ id: RecordId; title: string }>,
+      Array<{ action: string; n: number }>, Array<{ title: string; created_at: unknown }>,
+      Array<{ id: RecordId; state: string; last_error?: string }>, Array<{ id: RecordId; lowest_pct?: number }>, Array<{ key: string }>,
+    ]>(`SELECT id, title, dependencies FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(dependencies ?? []) > 0;
+      SELECT id, title FROM task WHERE state = 'ready';
+      SELECT action, count() AS n FROM audit WHERE at > <datetime>$since AND action IN ['accept', 'owner_approve', 'return', 'owner_reject', 'retire'] GROUP BY action;
+      SELECT title, created_at FROM goal WHERE state = 'active' ORDER BY created_at;
+      SELECT id, state, last_error FROM provider_health;
+      SELECT id, lowest_pct FROM company_meta WHERE lowest_pct != NONE;
+      SELECT key FROM owner_notice WHERE resolved_at = NONE AND string::starts_with(key, 'staff:');`, { since: sinceIso });
+    const stuck: BriefData['stuck'] = [];
+    for (const task of blocked) {
+      const [open] = await this.db.query<[Array<{ id: RecordId }>]>(
+        "SELECT id FROM task WHERE id IN $deps AND state != 'done' AND (state != 'void' OR reviewer_role = 'owner');", { deps: task.dependencies });
+      if (!open.length) stuck.push({ taskId: asId(task.id), title: task.title, reason: '依赖都已完成，却仍是 blocked（需要解锁）' });
+    }
+    for (const task of ready) {
+      const [audit] = await this.db.query<[Array<{ at: unknown }>]>(
+        "SELECT at FROM audit WHERE task = $task AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC LIMIT 1;", { task: task.id });
+      const minutes = audit[0] ? (nowMs - Date.parse(String(audit[0].at))) / 60_000 : 0;
+      if (minutes >= 60) stuck.push({ taskId: asId(task.id), title: task.title, reason: `就绪 ${Math.round(minutes)} 分钟仍未被领走` });
+    }
+    const n = (...actions: string[]) => counts.filter(c => actions.includes(c.action)).reduce((sum, c) => sum + c.n, 0);
+    const resources = [
+      ...health.filter(h => h.state !== 'healthy').map(h => `${asId(h.id)} ${h.state}${h.last_error ? `：${h.last_error.slice(0, 60)}` : ''}`),
+      ...quotas.filter(q => (q.lowest_pct ?? 100) <= 2).map(q => `${asId(q.id).replace('quota_', '')} 额度剩余 ${q.lowest_pct}%`),
+    ];
+    return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rejected: n('owner_reject'), retired: n('retire') },
+      goals: goals.map(g => ({ title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)) })),
+      resources, staffingAlerts: staffing.length };
   }
 
   /** Free-form owner instruction routed to the manager as a gm task; gm decides how to act on it. */

@@ -24,6 +24,10 @@ const notify = async (title: string, text: string) => {
   const child = spawn("/usr/bin/osascript", ["-e", `display notification "${esc(text)}" with title "${esc(title)}"`],
     { stdio: "ignore" });
   await new Promise<void>(resolve => child.once("close", () => resolve()));
+  // Optional phone push: any relay that accepts a JSON POST (Bark: title/body, Gotify: title/message). The URL carries the secret and lives in the private service env.
+  const hook = process.env.SCK_NOTIFY_WEBHOOK;
+  if (hook) await fetch(hook, { method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(8000),
+    body: JSON.stringify({ title, body: text.slice(0, 1500), message: text.slice(0, 1500), text: text.slice(0, 1500) }) }).catch(() => undefined);
 };
 
 export function company(): Promise<Company> {

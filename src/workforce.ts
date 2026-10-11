@@ -100,6 +100,8 @@ export interface CompanyConfig {
   sessionMaxInputK: number;
   /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
   evalQuickLlm: boolean;
+  /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
+  ownerBriefHour: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -107,7 +109,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -226,6 +228,7 @@ export class Workforce {
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
       evalQuickLlm: row?.eval_quick_llm === true,
+      ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
     };
   }
 
