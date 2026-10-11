@@ -5,7 +5,7 @@ import { ROLES, type CompanyBrief, type GoalTier, type GoalView, type OwnerDecis
 import { GOAL_TIERS, goalTemplate, isPipeline } from './flows.ts';
 import { ProjectStore } from './projects.ts';
 import type { BriefData, RoleCapacity, WaitingItem } from './owner-brief.ts';
-import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
+import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_CHILDREN_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 import { assertRoleContract, loadContract } from './role-contract.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
@@ -207,6 +207,85 @@ export class OwnerDesk {
       RETURN $next;
       COMMIT;`, { task: id('task', input.taskId), expected: before.version, executor, reviewer, evidence, actor: input.source, idem, digest });
     return view(rows.at(-2) as TaskRow);
+  }
+
+  /**
+   * Owner-level retire (作废): the task becomes void, its holder is released and dependents that were only
+   * waiting on it unlock. Closing a goal's final gate this way never closes the goal. Same guards as the
+   * manager's retire: finished tasks and owner gates with live dependents are refused.
+   */
+  async retire(input: { taskId: TaskId; note: string; source: string; key: string }): Promise<TaskView> {
+    requireText(input.note, 'note', 4, 4000);
+    const idem = id('idempotency', HASH(`owner\0retire\0${input.key}`));
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, note: input.note }));
+    const prior = await this.db.select<IdempotencyRow>(idem);
+    if (prior) {
+      if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+      return view(prior.result);
+    }
+    const before = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!before) throw new CompanyError('not_found', 'task not found');
+    if (before.state === 'void') return view(before);
+    const evidence = `来源：${input.source}\n${input.note}\n[retire] 作废前 state=${before.state} blocked_to=${before.blocked_to ?? '-'} holder=${before.current_employee ?? '-'} version=${before.version}`;
+    const rows = await this.run(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'task not found' };
+      IF $t.state IN ['done', 'void'] { THROW 'task is not awaiting: already terminal' };
+      IF $t.reviewer_role = 'owner' {
+        LET $chain = IF ($t.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $t.lineage) END;
+        LET $live = SELECT VALUE id FROM task WHERE array::len(array::filter(dependencies ?? [], |$d| $d IN $chain)) > 0 AND state NOT IN ['done', 'void'] AND (goal = NONE OR id NOT IN (goal.anchors ?? []));
+        IF array::len($live) > 0 { THROW 'task is not awaiting: owner gate has live dependents' };
+      };
+      LET $next = UPDATE ONLY $task SET state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1 RETURN AFTER;
+      UPDATE employee SET active_task = NONE WHERE active_task = $task;
+      ${UNLOCK_CHILDREN_SQL}
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`, { task: id('task', input.taskId), actor: input.source, evidence, holder: before.current_employee, idem, digest });
+    return view(rows.at(-2) as TaskRow);
+  }
+
+  /** Re-evaluates the dependents of a finished task; the repair for work that stayed blocked after its dependencies completed. */
+  async unlockDependents(input: { taskId: TaskId; source: string }): Promise<TaskId[]> {
+    const task = id('task', input.taskId);
+    const row = await this.db.select<TaskRow>(task);
+    if (!row) throw new CompanyError('not_found', 'task not found');
+    if (!['done', 'void'].includes(row.state)) throw new CompanyError('conflict', 'task is not awaiting: only finished tasks have dependents to unlock');
+    const waiting = async () => (await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE state = 'blocked' AND blocked_to = NONE AND $task IN dependencies;", { task }))[0].map(r => asId(r.id));
+    const before = await waiting();
+    await this.run(`BEGIN; ${UNLOCK_CHILDREN_SQL} CREATE audit CONTENT { task: $task, actor: $actor, action: 'unlock_repair', evidence: $evidence, at: time::now() }; COMMIT;`,
+      { task, actor: input.source, evidence: `来源：${input.source}\n补跑依赖解锁；原先等待的任务：${before.join(', ') || '无'}` });
+    const after = new Set(await waiting());
+    return before.filter(taskId => !after.has(taskId));
+  }
+
+  /** Cancels a goal: every unfinished task is retired (leaves first, so owner gates can go) and the goal is closed as cancelled. */
+  async cancelGoal(input: { goalId: string; note: string; source: string; key: string }): Promise<{ retired: number; remaining: number }> {
+    requireText(input.note, 'note', 4, 4000);
+    const goal = id('goal', input.goalId);
+    const row = await this.db.select<GoalRow>(goal);
+    if (!row) throw new CompanyError('not_found', 'goal not found');
+    let retired = 0, remaining = 0;
+    for (let round = 0; round < 12; round++) {
+      const [tasks] = await this.db.query<[Array<{ id: RecordId; dependencies?: RecordId[] }>]>("SELECT id, dependencies FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'];", { goal });
+      remaining = tasks.length;
+      if (!tasks.length) break;
+      const open = new Set(tasks.map(t => String(t.id)));
+      const needed = new Set(tasks.flatMap(t => (t.dependencies ?? []).map(String)).filter(d => open.has(d)));
+      const leaves = tasks.filter(t => !needed.has(String(t.id)));
+      let progressed = false;
+      for (const leaf of leaves.length ? leaves : tasks) {
+        try { await this.retire({ taskId: asId(leaf.id), note: `取消目标：${input.note}`, source: input.source, key: `${input.key}:${asId(leaf.id)}` }); retired++; progressed = true; } catch { /* retried next round */ }
+      }
+      if (!progressed) break;
+    }
+    const [left] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'];", { goal });
+    if (!left.length && row.state !== 'cancelled') await this.db.query("UPDATE $goal SET state = 'cancelled', cancelled_at = time::now(), note = $note;", { goal, note: `${input.source} 取消：${input.note}` });
+    return { retired, remaining: left.length };
   }
 
   async addDirection(input: { text: string; source: string; key: string }): Promise<void> {
