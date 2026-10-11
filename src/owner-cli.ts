@@ -1,6 +1,7 @@
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from './config.ts';
 import { CompanyDatabase } from './database.ts';
+import type { Role } from './contracts.ts';
 import { OwnerDesk, type OwnerCommandKind } from './owner.ts';
 import { Workforce } from './workforce.ts';
 
@@ -12,6 +13,8 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
   pnpm run company approve <任务ID> [意见]   批准关口
   pnpm run company reject <任务ID> <意见>    驳回关口（退回执行者按意见修改）
   pnpm run company reply <任务ID> <回答>     回答员工提问并恢复任务
+  pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>
+                                             改派还没开工（blocked/ready、无租约、未提交）的任务；校验岗位契约，留审计
   pnpm run company pause | resume            暂停/恢复派工
   pnpm run company status                    公司运行概况`;
 
@@ -60,6 +63,14 @@ try {
     }
     const other = inbox.notices.filter(n => !/^(gate|question):/.test(n.key));
     if (other.length) console.log(`\n=== 系统提醒 ===\n${other.map(n => `- ${n.text}`).join('\n')}`);
+  } else if (action === 'reassign') {
+    const args = [first ?? '', ...rest].filter(Boolean);
+    const executorRole = flag(args, 'executor') as Role | undefined;
+    const reviewerRole = flag(args, 'reviewer') as Role | 'owner' | undefined;
+    const [taskId, ...note] = args;
+    if (!taskId) throw new Error('用法：pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>');
+    const task = await desk.reassign({ taskId, executorRole, reviewerRole, note: note.join(' '), source: 'owner:cli', key: `cli:${taskId}:${executorRole ?? ''}:${reviewerRole ?? ''}` });
+    console.log(`已改派：${task.title}\n执行 ${task.executorRole}｜验收 ${task.reviewerRole}｜状态 ${task.state}`);
   } else if (action === 'status') {
     const workforce = new Workforce(db, '/nonexistent');
     const [brief, tasks, insts, health, config, defs] = await Promise.all([
