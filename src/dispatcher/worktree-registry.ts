@@ -200,8 +200,8 @@ export class WorktreeRegistry {
     const writes = intent.kind === 'code' || (task.state === 'review' && task.executorRole === 'engineering' && task.kind === 'task' && !['read', 'assets'].includes(task.workIntent?.kind ?? 'code'));
     const desired = writes ? (lane ? `lane/${lane8}-${laneName}` : `task/${task.id.slice(0, 8)}`) : undefined;
     const shared = rows.find(r => r.mode === 'shared');
-    // Never move a branch away from a code writer that is still working in the shared tree (legacy assignments).
-    if (shared) await this.restoreShared(repo, list, shared, base, refs.some(r => String(r.tree.id) === String(shared.id.id) && r.intent.kind === 'code' && refState(r) === 'active'));
+    // Never move a branch away from anyone still holding a task lease on the shared tree (legacy writers and reviewers).
+    if (shared) await this.restoreShared(repo, list, shared, base, refs.some(r => String(r.tree.id) === String(shared.id.id) && r.task && refState(r) === 'active'));
     const own = previous && rows.find(r => String(r.id.id) === previous.id);
     const legacy = lane ? undefined : list.find(t => t.branch === `task/${task.id.slice(0, 8)}` && !t.main);
     let chosen = own && list.find(t => t.path === own.path && (!desired || t.branch === desired)) ? own : undefined;
