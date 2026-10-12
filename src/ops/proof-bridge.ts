@@ -228,7 +228,21 @@ const statusFailReason = (e: unknown): string => {
 };
 
 /** Content-address the actual running implementation, including vendored plugin copies. */
+// Paseo bundles the plugin server to CJS via esbuild, where import.meta.url is
+// unavailable; plugin/scripts/vendor.sh therefore injects the canonical source
+// digest (same file list and order) into this marker at build time.
+const BUNDLED_DIAGNOSTIC_VERSION = '__SCK_BUNDLED_DIAGNOSTIC_VERSION__';
+const diagnosticSourceFiles = ['proof-bridge.ts', 'proof-store.ts', 'proof-files.ts', 'proof-contract.ts', 'approval-diagnosis.ts'] as const;
 let diagnosticVersion: Promise<string> | undefined;
 function diagnosticCodeVersion(): Promise<string> {
-  return diagnosticVersion ??= Promise.all(['proof-bridge.ts', 'proof-store.ts', 'proof-files.ts', 'proof-contract.ts', 'approval-diagnosis.ts'].map(file => readFile(new URL(file, import.meta.url)))).then(bytes => sha256(Buffer.concat(bytes)));
+  return diagnosticVersion ??= (async () => {
+    try {
+      const bytes = await Promise.all(diagnosticSourceFiles.map(file => readFile(new URL(file, import.meta.url))));
+      return sha256(Buffer.concat(bytes));
+    } catch (error) {
+      diagnosticVersion = undefined;
+      if (!/^[0-9a-f]{64}$/.test(BUNDLED_DIAGNOSTIC_VERSION)) throw error;
+      return BUNDLED_DIAGNOSTIC_VERSION;
+    }
+  })();
 }
