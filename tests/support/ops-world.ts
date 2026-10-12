@@ -121,6 +121,10 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     authConsentStall: false,
     issuedTokenTtlSec: 10_800,
     issuedToken: '',
+    // account-bound plan record returned inside pool-usage (FREE by default)
+    planType: 'TOKEN_PLAN_PLAN_TYPE_FREE',
+    // when true, one fixed billing path answers 200 instead of the absent-surface 404
+    billingPathLive: false,
     pools: [
       {
         id: 'pool-dedicated', pool: 'flash-lite', name: 'Flash-Lite', pool_type: 'dedicated',
@@ -515,7 +519,11 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
         if (!token) return unauth('Authorization header is required');
         if (token !== s.consoleToken && token !== s.issuedToken) return unauth("Authentication type 'apikey' is not enabled");
         if (s.poolStatus !== 200) return new Response('', { status: s.poolStatus });
-        return json(200, { pools: s.pools });
+        return json(200, { plan: { id: 'free', name: 'Free Plan', type: s.planType }, pools: s.pools });
+      }
+      if (url.pathname === '/lite/console/v1/billing' && s.billingPathLive) {
+        if (!token || (token !== s.consoleToken && token !== s.issuedToken)) return unauth('Authorization header is required');
+        return json(200, { accounts: [] });
       }
       if (url.pathname === '/lite/console/v1/metered/api-keys') {
         if (!token) return unauth('Authorization header is required');

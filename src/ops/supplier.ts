@@ -40,6 +40,20 @@ const API_KEY_PAGE_SIZE = 50;
 const API_KEY_MAX_PAGES = 10;
 
 /**
+ * Payment-surface enumeration under the console API (probed 2026-10-12): the Token Plan
+ * console exposes no billing, wallet, recharge, order or payment-method endpoints at all —
+ * every one of these fixed paths answers 404 for an authenticated session. Each is probed
+ * every sample; the moment any of them answers 2xx the account's payment facts can no
+ * longer be certified absent and the sampler fails closed for human re-review.
+ */
+const PAYMENT_SURFACE_PATHS = [
+  '/billing', '/billingAccounts', '/billing/balance', '/recharge', '/recharge/settings',
+  '/wallet', '/orders', '/payment-methods', '/auto-recharge', '/bills', '/finance/invoices',
+] as const;
+/** The account's own plan classification, read off the console pool-usage payload. */
+const FREE_PLAN_TYPE = 'TOKEN_PLAN_PLAN_TYPE_FREE';
+
+/**
  * Console-session auto-issuance chain (probed 2026-10-12, Ory Hydra layout):
  *   GET {AUTH_HOST}/oauth2/auth (client nova, PKCE S256)
  *     ->302-> {IAM_API}/auth/login?login_challenge=<c>
@@ -203,6 +217,15 @@ function parsePools(body: unknown): PoolFacts[] | null {
   });
 }
 
+/** The account-bound plan record inside the pool-usage payload; null when absent or drifted. */
+function parseAccountPlan(body: unknown): { id: string; name: string; type: string } | null {
+  const plan = (body as { plan?: unknown } | null)?.plan;
+  if (!plan || typeof plan !== 'object') return null;
+  const p = plan as Record<string, unknown>;
+  if (typeof p.id !== 'string' || typeof p.name !== 'string' || typeof p.type !== 'string') return null;
+  return { id: p.id.slice(0, 80), name: p.name.slice(0, 80), type: p.type.slice(0, 80) };
+}
+
 /** The pool that governs the bound model: Flash-Lite dedicated first, the general pool otherwise. */
 function governingPool(pools: PoolFacts[]): PoolFacts | undefined {
   return pools.find(p => p.poolType === 'dedicated') ?? pools.find(p => p.poolType === 'default') ?? pools[0];
@@ -298,6 +321,8 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let poolsOk = false;
   let crossBound = false;
   let apiKeysComplete = false;
+  let accountPlan: { id: string; name: string; type: string } | null = null;
+  let paymentSurfaceAbsent = false;
   if (!consoleToken) {
     gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)} and no sealed ${supplierUsernameSecretName(input.alias)}/${supplierPasswordSecretName(input.alias)}; account-bound quota and payment facts are unverifiable` });
   } else {
@@ -309,6 +334,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     ]);
 
     if (poolRes && poolRes.status === 200) {
+      accountPlan = parseAccountPlan(poolRes.body);
       const parsed = parsePools(poolRes.body);
       if (parsed) {
         pools.push(...parsed);
@@ -369,6 +395,29 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     } else {
       gaps.push({ field: 'binding', source: 'apiKeys', detail: keysRecord.detail ?? `api-keys list unavailable (HTTP ${keysFirst?.status ?? 'n/a'})` });
     }
+
+    // Payment-surface enumeration: every fixed billing-ish console path must answer 404 for
+    // this authenticated session. A 2xx means the provider now exposes a payment surface the
+    // public-copy derivation cannot cover, so the account's payment facts stop being
+    // certifiable and the sample fails closed.
+    const surfaceChecks: Array<{ path: string; status: number | null }> = [];
+    const surfaceRecords = PAYMENT_SURFACE_PATHS.map(path => source('paymentSurface', `${CONSOLE_API}${path}`));
+    const surfaceResults = await Promise.all(
+      PAYMENT_SURFACE_PATHS.map((path, i) => probe('paymentSurface', `${CONSOLE_API}${path}`, bearer(consoleToken), { fetcher, left }, surfaceRecords[i]!)),
+    );
+    let surfaceDrift = false;
+    for (let i = 0; i < PAYMENT_SURFACE_PATHS.length; i += 1) {
+      const res = surfaceResults[i];
+      surfaceChecks.push({ path: PAYMENT_SURFACE_PATHS[i]!, status: res?.status ?? null });
+      if (!res || res.status !== 404) surfaceDrift = true;
+      if (res && res.status === 404) surfaceRecords[i]!.ok = true;
+    }
+    paymentSurfaceAbsent = !surfaceDrift;
+    derivations.paymentSurface = surfaceChecks;
+    if (surfaceDrift) {
+      const found = surfaceChecks.filter(c => c.status !== 404).map(c => `${c.path}=${c.status ?? 'transport'}`).join(', ');
+      gaps.push({ field: 'noPaymentInstrument', source: 'paymentSurface', detail: `console payment surface not uniformly absent (${found}); payment facts need human review` });
+    }
   }
 
   // ---- derivations ----
@@ -376,10 +425,23 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   const accountBound = poolsOk && crossBound;
   derivations.accountBound = accountBound;
   derivations.applicabilityOk = applicabilityOk;
-  // The Token Plan free beta has no payment-instrument or top-up surface at all (official
-  // applicability markers) and this account is bound to that plan (console read): the two
-  // payment facts are jointly established, never caller-supplied.
-  const paymentFactsOk = accountBound && applicabilityOk;
+  // Payment facts need three independently re-checkable legs, per the contract's
+  // "independently verifiable" requirement:
+  //   1. official basis — the plan page states the free beta is fully open and paid tiers
+  //      have not launched (applicabilityOk), so no payment surface exists for the plan;
+  //   2. account applicability — the console's own pool-usage payload classifies this
+  //      account's plan as TOKEN_PLAN_PLAN_TYPE_FREE;
+  //   3. console absence — every fixed billing/recharge/order path answers 404 under this
+  //      session, so no payment instrument or auto-topup surface exists to configure.
+  // Any missing leg blocks the document with an explicit gap; none of it is caller-supplied.
+  const accountPlanFree = accountPlan?.type === FREE_PLAN_TYPE;
+  derivations.accountPlan = accountPlan;
+  derivations.accountPlanFree = accountPlanFree;
+  derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
+  const paymentFactsOk = accountBound && applicabilityOk && accountPlanFree && paymentSurfaceAbsent;
+  if (accountBound && applicabilityOk && !paymentFactsOk && !gaps.some(g => g.field === 'noPaymentInstrument')) {
+    gaps.push({ field: 'noPaymentInstrument', source: 'poolUsage', detail: `account plan type is not the certified free token-plan type (got ${accountPlan?.type ?? 'absent'}); payment facts unverifiable` });
+  }
   derivations.paymentFactsVerifiable = paymentFactsOk;
   if (consoleTokenSource || authHops)
     derivations.consoleSession = { tokenSource: consoleTokenSource ?? 'unavailable', sessionExpiresAt: consoleSessionExpiresAt, hops: authHops ?? [] };
@@ -573,7 +635,7 @@ const jwtExpMs = (token: string): number | undefined => {
  * fabricating a session. The issued token is pushed into `secrets` so every emitted
  * surface (receipt, result, audit echo) masks it; only issuance metadata lands on paper.
  */
-async function issueConsoleSession(
+export async function issueConsoleSession(
   io: { fetcher: Fetcher; left: () => number },
   username: string,
   password: string,
