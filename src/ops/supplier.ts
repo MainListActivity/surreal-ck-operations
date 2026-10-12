@@ -40,16 +40,31 @@ const API_KEY_PAGE_SIZE = 50;
 const API_KEY_MAX_PAGES = 10;
 
 /**
- * Payment-surface enumeration under the console API (probed 2026-10-12): the Token Plan
- * console exposes no billing, wallet, recharge, order or payment-method endpoints at all —
- * every one of these fixed paths answers 404 for an authenticated session. Each is probed
- * every sample; the moment any of them answers 2xx the account's payment facts can no
- * longer be certified absent and the sampler fails closed for human re-review.
+ * Guessed payment-surface URIs under the console API, probed every sample purely as
+ * observation. A 404 here proves nothing about account payment settings (RFC9110
+ * §15.5.5: 404 only says the resource was not found or is not disclosed); a live
+ * surface is still worth flagging for human review. These records are receipt
+ * evidence and must never feed the payment-fact verdict.
  */
 const PAYMENT_SURFACE_PATHS = [
   '/billing', '/billingAccounts', '/billing/balance', '/recharge', '/recharge/settings',
   '/wallet', '/orders', '/payment-methods', '/auto-recharge', '/bills', '/finance/invoices',
 ] as const;
+/**
+ * Authoritative account-level payment-state sources. The contract fields
+ * `noPaymentInstrument` (账户无任何支付方式绑定) and `autoTopupDisabled` are
+ * account-scope literals: only an official API that returns this account's payment
+ * bindings (e.g. a billingAccounts resource answering 200 with a certified-empty
+ * list) or an explicit official statement covering every applicable account can
+ * certify them. Probed 2026-10-12 across the Lite console API and SenseCore IAM:
+ * the user record carries no payment fields, no billing-account/payment resource
+ * exists, role bindings are not readable, and the provider's own client bundle
+ * contains zero billing endpoints — no official source exists, so the list stays
+ * empty and every sample blocks on paymentFacts. A new source lands here only via
+ * a code change carrying its own verification contract; guessed 404 URIs never
+ * qualify.
+ */
+const ACCOUNT_PAYMENT_SOURCES: readonly string[] = [];
 /** The account's own plan classification, read off the console pool-usage payload. */
 const FREE_PLAN_TYPE = 'TOKEN_PLAN_PLAN_TYPE_FREE';
 
@@ -396,10 +411,10 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       gaps.push({ field: 'binding', source: 'apiKeys', detail: keysRecord.detail ?? `api-keys list unavailable (HTTP ${keysFirst?.status ?? 'n/a'})` });
     }
 
-    // Payment-surface enumeration: every fixed billing-ish console path must answer 404 for
-    // this authenticated session. A 2xx means the provider now exposes a payment surface the
-    // public-copy derivation cannot cover, so the account's payment facts stop being
-    // certifiable and the sample fails closed.
+    // Payment-surface enumeration, observation only: record what each guessed
+    // billing-ish console path answers under this session. A live surface means the
+    // provider now ships payment features humans must review; uniform 404s are
+    // recorded as they happened but certify nothing (see ACCOUNT_PAYMENT_SOURCES).
     const surfaceChecks: Array<{ path: string; status: number | null }> = [];
     const surfaceRecords = PAYMENT_SURFACE_PATHS.map(path => source('paymentSurface', `${CONSOLE_API}${path}`));
     const surfaceResults = await Promise.all(
@@ -425,22 +440,30 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   const accountBound = poolsOk && crossBound;
   derivations.accountBound = accountBound;
   derivations.applicabilityOk = applicabilityOk;
-  // Payment facts need three independently re-checkable legs, per the contract's
-  // "independently verifiable" requirement:
-  //   1. official basis — the plan page states the free beta is fully open and paid tiers
-  //      have not launched (applicabilityOk), so no payment surface exists for the plan;
-  //   2. account applicability — the console's own pool-usage payload classifies this
-  //      account's plan as TOKEN_PLAN_PLAN_TYPE_FREE;
-  //   3. console absence — every fixed billing/recharge/order path answers 404 under this
-  //      session, so no payment instrument or auto-topup surface exists to configure.
-  // Any missing leg blocks the document with an explicit gap; none of it is caller-supplied.
+  // Payment facts (`noPaymentInstrument`, `autoTopupDisabled`) are account-scope
+  // literals in the evidence contract: they certify only through an authoritative
+  // account-level payment-state source — an official API returning this account's
+  // payment bindings, or an explicit official statement covering every applicable
+  // account. The provider ships neither today (ACCOUNT_PAYMENT_SOURCES is empty),
+  // so the facts stay unverifiable and the sample fails closed no matter how
+  // benign everything else looks. What we still record, as receipt observations
+  // rather than proof: the account's own plan classification from pool-usage
+  // (a non-free plan would additionally be disqualifying on its own) and the
+  // per-URI status of the guessed payment surface enumeration.
   const accountPlanFree = accountPlan?.type === FREE_PLAN_TYPE;
   derivations.accountPlan = accountPlan;
   derivations.accountPlanFree = accountPlanFree;
   derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
-  const paymentFactsOk = accountBound && applicabilityOk && accountPlanFree && paymentSurfaceAbsent;
+  derivations.paymentStateSources = ACCOUNT_PAYMENT_SOURCES.length;
+  const paymentFactsOk = ACCOUNT_PAYMENT_SOURCES.length > 0 && accountBound && accountPlanFree;
+  if (accountBound && accountPlan && !accountPlanFree && !gaps.some(g => g.field === 'noPaymentInstrument')) {
+    gaps.push({ field: 'noPaymentInstrument', source: 'poolUsage', detail: `account plan type is not the certified free token-plan type (got ${accountPlan.type}); payment facts unverifiable` });
+  }
   if (accountBound && applicabilityOk && !paymentFactsOk && !gaps.some(g => g.field === 'noPaymentInstrument')) {
-    gaps.push({ field: 'noPaymentInstrument', source: 'poolUsage', detail: `account plan type is not the certified free token-plan type (got ${accountPlan?.type ?? 'absent'}); payment facts unverifiable` });
+    gaps.push({ field: 'noPaymentInstrument', source: 'paymentFacts', detail: ACCOUNT_PAYMENT_SOURCES.length === 0
+      ? 'provider offers no official account-level payment-state source (Lite console API + SenseCore IAM probed); HTTP 404 enumeration is observation, not proof'
+      : 'registered payment-state sources did not certify the account' });
+    gaps.push({ field: 'autoTopupDisabled', source: 'paymentFacts', detail: 'same missing source: auto-topup state is equally uncertifiable' });
   }
   derivations.paymentFactsVerifiable = paymentFactsOk;
   if (consoleTokenSource || authHops)
@@ -467,48 +490,47 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let documentFile: string | undefined;
   let expiresAt: string | undefined;
 
+  const resets = [governing?.reset5h, governing?.reset7d].filter((v): v is number => typeof v === 'number');
+  const expiryMs = Math.min(sampledMs + MAX_DOC_AGE_MS, ...(resets.length ? resets.map(s => s * 1000) : [sampledMs + MAX_DOC_AGE_MS]));
+  if (expiryMs <= sampledMs) {
+    // A window boundary the provider already passed would make any document born-expired;
+    // report the stale facts even when the call is already blocked for other reasons.
+    gaps.push({ field: 'expiresAt', source: 'poolUsage', detail: 'pool window reset already elapsed; sampled facts are stale on arrival' });
+    canDocument = false;
+  }
   if (canDocument) {
-    const resets = [governing?.reset5h, governing?.reset7d].filter((v): v is number => typeof v === 'number');
-    const expiryMs = Math.min(sampledMs + MAX_DOC_AGE_MS, ...(resets.length ? resets.map(s => s * 1000) : [sampledMs + MAX_DOC_AGE_MS]));
-    if (expiryMs <= sampledMs) {
-      // A window boundary the provider already passed would make the document born-expired;
-      // that is source ambiguity, so the call fails closed instead of writing dead evidence.
-      gaps.push({ field: 'expiresAt', source: 'poolUsage', detail: 'pool window reset already elapsed; sampled facts are stale on arrival' });
-      canDocument = false;
+    expiresAt = new Date(expiryMs).toISOString();
+    document = {
+      schemaVersion: 1,
+      type: 'reviewed-token-plan',
+      accountRef: accountRef!,
+      endpoint: API_BASE,
+      model: BOUND_MODEL,
+      priceRevision: BOUND_PRICE_REVISION,
+      sampledAt,
+      expiresAt,
+      planName: PLAN_NAME,
+      planSourceUrl: PLAN_PAGE,
+      quotaUnit: QUOTA.unit,
+      quotaAmount: QUOTA.amount,
+      quotaWindowSeconds: QUOTA.windowSeconds,
+      quotaRemaining,
+      noPaymentInstrument: true,
+      autoTopupDisabled: true,
+      // The document's approval claim: it takes effect only through ops_internal_ai_prove's
+      // independent task-service approval receipt, never on this field alone.
+      serviceApproved: true,
+    };
+    const parsed = evidenceSchema.safeParse(document);
+    if (!parsed.success) {
+      gaps.push({ field: 'document', source: 'sampler', detail: 'generated document failed the reviewed-token-plan schema' });
+      document = undefined;
     } else {
-      expiresAt = new Date(expiryMs).toISOString();
-      document = {
-        schemaVersion: 1,
-        type: 'reviewed-token-plan',
-        accountRef: accountRef!,
-        endpoint: API_BASE,
-        model: BOUND_MODEL,
-        priceRevision: BOUND_PRICE_REVISION,
-        sampledAt,
-        expiresAt,
-        planName: PLAN_NAME,
-        planSourceUrl: PLAN_PAGE,
-        quotaUnit: QUOTA.unit,
-        quotaAmount: QUOTA.amount,
-        quotaWindowSeconds: QUOTA.windowSeconds,
-        quotaRemaining,
-        noPaymentInstrument: true,
-        autoTopupDisabled: true,
-        // The document's approval claim: it takes effect only through ops_internal_ai_prove's
-        // independent task-service approval receipt, never on this field alone.
-        serviceApproved: true,
-      };
-      const parsed = evidenceSchema.safeParse(document);
-      if (!parsed.success) {
-        gaps.push({ field: 'document', source: 'sampler', detail: 'generated document failed the reviewed-token-plan schema' });
-        document = undefined;
-      } else {
-        const bytes = Buffer.from(JSON.stringify(document, null, 2) + '\n', 'utf8');
-        documentSha256 = sha256(bytes);
-        mkdirSync(input.evidenceDir, { recursive: true, mode: 0o700 });
-        documentFile = join(input.evidenceDir, `supplier-plan-${SUPPLIER_PROVIDER}-${sampledMs}.json`);
-        writeFileSync(documentFile, bytes, { mode: 0o600 });
-      }
+      const bytes = Buffer.from(JSON.stringify(document, null, 2) + '\n', 'utf8');
+      documentSha256 = sha256(bytes);
+      mkdirSync(input.evidenceDir, { recursive: true, mode: 0o700 });
+      documentFile = join(input.evidenceDir, `supplier-plan-${SUPPLIER_PROVIDER}-${sampledMs}.json`);
+      writeFileSync(documentFile, bytes, { mode: 0o600 });
     }
   } else {
     notes.push('document not generated: one or more required facts could not be established; see gaps');
