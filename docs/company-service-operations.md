@@ -268,3 +268,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 - 每个项目每日的上限（tts 1500、dialogue 600、sfx 300、music 60、voice_design 30）仍由公司侧计数，可用 `SCK_MEDIA_DAILY_*` 调整。`media_info`、`media_voices` 不计次数。
 - 成功生成写 `ops_media_*` 审计。
 - vault 另有哈希链审计 `<服务目录>/vault/audit.log`，只记录事件、操作种类、次数和字节数，不含 key。
+
+## 远程部署（VPS MCP 服务）
+
+`sh scripts/deploy-mcp-remote.sh <main 提交 SHA>` 把指定提交部署到 VPS 的 `sckcompany` 服务，并校验 `/ready`。部署认证只用专用密钥 `~/.ssh/sck-deploy-ed25519`：密码短语保护、不进 ssh-agent、不存钥匙串，`SCK_DEPLOY_KEY` 可换路径。`IdentitiesOnly` 固定身份，全部连接复用一条控制通道，每次部署只需输一次密码短语。VPS 的 `authorized_keys` 只保留这把部署密钥；日常使用或已加载到 agent 的钥匙一律不得授权，否则任何同用户进程都能登录 VPS。
