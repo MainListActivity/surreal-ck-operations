@@ -227,25 +227,44 @@ pnpm run company cancel-goal <目标ID> "<原因>"   # 作废目标下全部未�
 
 ## 媒体生成（ElevenLabs）
 
-配音、音效、配乐和主题曲走 ElevenLabs。员工进程里没有 key：插件进程读取 `private/service.env` 里的 `ELEVENLABS_API_KEY`（或 `XI_API_KEY`），员工只调 `media_*` 工具，拿回的是文件路径和大小。
+ElevenLabs 的 key 只存在于 `sck-vault` 里。它是一个独立的小程序，key 保存在登录钥匙串中，钥匙串只信任这一份二进制。插件和员工进程都拿不到 key，员工只调用 `media_*` 工具，拿回的是文件路径和大小。`private/service.env` 里不再配置 `ELEVENLABS_API_KEY`。
 
-启用（老板做一次）：在 `private/service.env` 加一行 `ELEVENLABS_API_KEY=...`，然后执行 `paseo plugin reload sck-company`。`sck call media_info '{}'` 返回 `configured: true` 表示插件已读到 key；`subscription` 能返回额度则说明 key 有效。
+**安装（老板在终端做，一次性）**
 
-| 工具 | 参数 | 作用 |
-|---|---|---|
-| `media_info` | — | 配置状态、订阅额度（tier、字符用量与上限、重置时间）、本任务输出目录、今日用量与上限、用法提示 |
-| `media_voices` | `search?` | 查现成声线，返回 voice_id、名称、标签 |
-| `media_voice_design` | `name`、`description`（20-1000 字）、`text?`（100-1000 字）、`previewIndex?` | 零人工设计角色声线：保存各试听 mp3，并用所选试听建立声线，返回 voice_id |
-| `media_tts` | `voiceId`、`text`、`file`、`modelId?`（默认 `eleven_v3`）、`languageCode?` | 单句配音；台词可含 `[whispers]`、`[laughs]` 等音频标签 |
-| `media_dialogue` | `inputs:[{voiceId,text}]`、`file`、`modelId?`、`languageCode?` | 多人对白：最多 10 个声线，总字数不超过 2000，超出请拆段 |
-| `media_sfx` | `text`、`file`、`durationSeconds?`（0.5-30）、`loop?`、`promptInfluence?` | 音效 |
-| `media_music` | `file`，`prompt` 或 `compositionPlan`，`lengthMs?`（3000-600000）、`instrumental?`、`modelId?`（默认 `music_v1`） | 配乐（prompt 加 `instrumental:true`）或主题曲（compositionPlan，歌词写在 `sections[].lines`）；二者只能给一个，`lengthMs` 与 `instrumental` 只配 prompt |
+```sh
+sh <release>/vault/build.sh                        # 在固定 release 目录里构建（与插件同一提交），装到 <服务目录>/bin/sck-vault，并生成 plist
+<服务目录>/bin/sck-vault setup                     # 先用 Touch ID 确认，再隐藏输入 ElevenLabs key，只写入钥匙串
+cp <服务目录>/vault/org.surrealck.vault.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plist
+```
 
-输出与门禁：
+首次录入后正常不会弹窗。每次重新执行 `build.sh` 后，钥匙串会弹窗一次，因为信任绑定的是这份二进制的哈希。确认弹窗来自 sck-vault 后选择「始终允许」，然后执行 `launchctl kickstart -k gui/$(id -u)/org.surrealck.vault` 重启。
 
-- 文件只写到 `<服务目录>/evidence/<任务ID>/media/<file>`。`file` 只能是纯文件名 `名字.mp3`（字母、数字、`.`、`_`、`-`，不含路径），同名覆盖。员工自行拷贝进产品仓库。
-- 只有任务的租约持有人能调用。默认允许 ai-content、concept-design、asset-production、screenwriter、qa、engineering；`SCK_MEDIA_ROLES`（逗号分隔）可覆盖。
-- 每个项目每日的生成次数上限：tts 1500、dialogue 600、sfx 300、music 60、voice_design 30。用 `SCK_MEDIA_DAILY_TTS`、`SCK_MEDIA_DAILY_DIALOGUE`、`SCK_MEDIA_DAILY_SFX`、`SCK_MEDIA_DAILY_MUSIC`、`SCK_MEDIA_DAILY_VOICE_DESIGN` 覆盖，同样写在 `private/service.env`。`media_info`、`media_voices` 不计次数。
-- 成功生成写审计：`ops_media_tts`、`ops_media_dialogue`、`ops_media_sfx`、`ops_media_music`、`ops_media_voice_design`，证据含文件名、字节数、字数或时长（台词截断 60 字）；查询类写 `ops_call`。失败不计次数。
-- 员工进程环境里的 `ELEVENLABS_*` 与 `XI_API_KEY` 与其他外部凭证一样被清空（`plugin/server/scrub.ts`）。
-- 错误映射：未配置或 401 为 `not_configured`；429 或额度用尽为 `limit_reached`（可重试）；400/422 为 `invalid`（附上游原因，截断 300 字）；其它为 `upstream_error`。错误与审计里不会出现 key。
+`build.sh` 与插件必须使用同一个服务目录：构建时用 `SCK_SERVICE_HOME` 指定，插件启动时使用同样的环境变量。
+
+`private/service.env` 中的 `ELEVENLABS_API_KEY=` 一行，在新插件生效并验证之后删除，然后轮换该 key（旧 key 以明文存在过，员工可能读到过）。
+
+**授权（付费操作默认关闭）**
+
+```sh
+<服务目录>/bin/sck-vault grant --kinds tts,sfx --calls 50 --minutes 120   # 弹出 Touch ID，批准后生效
+<服务目录>/bin/sck-vault status                                          # 当前授权与剩余次数
+<服务目录>/bin/sck-vault revoke <授权ID>                                  # 立即撤销
+```
+
+操作种类：`tts`、`dialogue`、`sfx`、`music`、`voice_design`、`voice_create`、`voices`、`subscription`。授权只记录操作种类、每种次数和有效期，只存在 sck-vault 内存里，重启即失效。没有授权覆盖的操作，员工调用会得到 `forbidden`。
+
+**安全边界**
+
+- 员工进程、插件和 TypeScript 代码都没有 key。vault 的回复里也不含 key：上游回显的 key 会被替换成 `[已遮盖]`。
+- vault 只访问 `api.elevenlabs.io` 的固定端点，不跟随重定向，调用方不能指定 URL 或请求头。
+- 钥匙串只信任这一份二进制。副本放在别的路径运行时，会拒绝读取密钥。
+- 加固运行时，且没有调试权限，同用户的其它进程拿不到 vault 的内存。
+- 已授权的操作，同一台 Mac 上的任何本地进程都能在授权范围内调用。vault 分辨不出调用的是哪个员工，员工级的租约和角色检查仍在插件里。授权越小、越短，风险越小。
+- 同一时间只能有一个 sck-vault 监听 socket。老板拒绝一次授权后，60 秒内不再弹窗。
+
+**配额与审计**
+
+- 每个项目每日的上限（tts 1500、dialogue 600、sfx 300、music 60、voice_design 30）仍由公司侧计数，可用 `SCK_MEDIA_DAILY_*` 调整。`media_info`、`media_voices` 不计次数。
+- 成功生成写 `ops_media_*` 审计。
+- vault 另有哈希链审计 `<服务目录>/vault/audit.log`，只记录事件、操作种类、次数和字节数，不含 key。
