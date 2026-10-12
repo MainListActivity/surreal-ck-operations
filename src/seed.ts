@@ -25,7 +25,7 @@ export const SEED_DEFS: Array<{ id: string; role: Role; provider: string; model:
   // 长篇故事作者：同样只编制 antigravity 主笔，原著轨专属。
   { id: 'story-author-agy', role: 'story-author', provider: 'antigravity', model: 'gemini-3.7-flash-medium',
     tracks: ['原著'], maxInstances: 1, priority: 10, weight: 60 },
-  // 摄影摄像：运镜/镜头调度专属，antigravity 单座。
-  { id: 'cinematography-agy', role: 'cinematography', provider: 'antigravity', model: 'gemini-3.8-flash-medium',
+  // 摄影摄像：运镜/镜头调度专属，codex 单座（auto:sol 槽位跟随 sol 族最新）。
+  { id: 'cinematography-codex', role: 'cinematography', provider: 'codex', model: 'auto:sol', thinking: 'high',
     tracks: ['摄影'], maxInstances: 1, priority: 10, weight: 60 },
 ];
