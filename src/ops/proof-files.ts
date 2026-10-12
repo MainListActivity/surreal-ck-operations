@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { resolve, relative, sep, join } from 'node:path';
 import { CompanyError } from '../core-errors.ts';
-import { manifestSchema, evidenceSchema, configurationDigest, sha256 } from './proof-contract.ts';
+import { manifestSchema, evidenceSchema, configurationDigest, sha256, TOKEN_PLAN_PLAN_TYPE_FREE, type ServiceEvidence, type ProofManifest } from './proof-contract.ts';
 const denied = () => new CompanyError('forbidden', 'approval file unavailable or unsafe');
 /** No symlink components; hash the same bounded fd that was opened and recheck metadata after reading. */
 export async function readProofFile(home: string, task: string, path: string): Promise<Buffer> {
@@ -33,14 +33,28 @@ export async function readProofFile(home: string, task: string, path: string): P
     } finally { await fd.close(); }
   } catch { throw denied(); }
 }
+export function parseProofFiles(rawManifest: Buffer, rawDocument: Buffer) {
+  const manifest = manifestSchema.safeParse(parseJson(rawManifest));
+  const evidence = evidenceSchema.safeParse(parseJson(rawDocument));
+  if (!manifest.success || !evidence.success) return { manifest, evidence };
+  const { configurationDigest: digest, ...rest } = manifest.data;
+  return { manifest, evidence, digestValid: digest === configurationDigest(rest),
+    documentHashValid: manifest.data.documentHash === sha256(rawDocument),
+    serviceFieldsMatch: evidence.data.accountRef === manifest.data.service.accountRef && evidence.data.endpoint === manifest.data.service.endpoint && evidence.data.model === manifest.data.service.model && evidence.data.priceRevision === manifest.data.service.priceRevision };
+}
+function parseJson(bytes: Buffer): unknown { try { return JSON.parse(bytes.toString('utf8')); } catch { return null; } }
+export function evidenceChecks(e: ServiceEvidence, manifest: ProofManifest, now: number) {
+  return { sampleNotFuture: Date.parse(e.sampledAt) <= now, evidenceUnexpired: Date.parse(e.expiresAt) > now,
+    serviceEvidenceEligible: e.type === 'reviewed-service'
+      ? e.serviceApproved && e.balanceNanoUsd >= manifest.budget.totalNanoUsd
+      : e.type === 'reviewed-token-plan'
+        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && now - Date.parse(e.sampledAt) <= 86_400_000
+        : false };
+}
 export async function loadProofFiles(home: string, task: string, manifestPath: string, documentPath: string) {
   const [rawManifest, rawDocument] = await Promise.all([readProofFile(home, task, manifestPath), readProofFile(home, task, documentPath)]);
-  try {
-    const manifest = manifestSchema.parse(JSON.parse(rawManifest.toString('utf8')));
-    const evidence = evidenceSchema.parse(JSON.parse(rawDocument.toString('utf8')));
-    const { configurationDigest: digest, ...rest } = manifest;
-    if (digest !== configurationDigest(rest) || manifest.documentHash !== sha256(rawDocument) || evidence.accountRef !== manifest.service.accountRef || evidence.endpoint !== manifest.service.endpoint || evidence.model !== manifest.service.model || evidence.priceRevision !== manifest.service.priceRevision) throw denied();
-    return { manifest, evidence, manifestHash: sha256(rawManifest), documentHash: sha256(rawDocument), manifestPath: resolve(manifestPath), documentPath: resolve(documentPath) };
-  } catch { throw new CompanyError('invalid', 'approval manifest/evidence mismatch or unsupported format'); }
+  const parsed = parseProofFiles(rawManifest, rawDocument);
+  if (!parsed.manifest.success || !parsed.evidence.success || !parsed.digestValid || !parsed.documentHashValid || !parsed.serviceFieldsMatch) throw new CompanyError('invalid', 'approval manifest/evidence mismatch or unsupported format');
+  return { manifest: parsed.manifest.data, evidence: parsed.evidence.data, manifestHash: sha256(rawManifest), documentHash: sha256(rawDocument), manifestPath: resolve(manifestPath), documentPath: resolve(documentPath) };
 }
 export type ProofFiles = Awaited<ReturnType<typeof loadProofFiles>>;

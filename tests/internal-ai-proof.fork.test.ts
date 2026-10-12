@@ -123,7 +123,7 @@ beforeAll(async () => {
   await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed files',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,approval.id);
   await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
-  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,dependencies:[approvalTask],idempotencyKey:randomUUID()});
   consumerTask=task.id; await core.claim(consumer,task.id);
   trusted=await request('ops_internal_ai_trust') as ReturnType<ProofSigner['trust']>;
 },20_000);
@@ -152,6 +152,15 @@ check('actual versioned SenseNova disabled files prepare an immutable candidate 
   await writeFile(mp, JSON.stringify({ ...fixture.manifest, configurationDigest: '0'.repeat(64) }));
   await expect(prepare()).rejects.toBeDefined();
   expect(world.requests.length).toBe(requestsBefore);
+});
+check('diagnosis matches real approval marker and actor predicates without changing approval', async () => {
+  const store = new CompanyProofStore(database.db, now);
+  const loaded = await loadProofFiles(dir, approvalTask, manifestPath, documentPath);
+  const lease = await store.lease({taskId: consumerTask, project: 'surreal_ck', actor: {employeeId: String((await core.opsScope(consumer, consumerTask)).actor.employeeId), role: 'engineering', capabilities: []}});
+  const before = await store.approval(approvalTask, 'production', loaded);
+  const result = await store.diagnoseApproval(approvalTask, 'production', loaded, lease);
+  expect(result).toMatchObject({checks: {auditMarkerExactLine: {evaluated:true,matched:true}, auditActorMatchesAcceptedBy: {evaluated:true,matched:true}}, snapshotStable: true});
+  expect(await store.approval(approvalTask, 'production', loaded)).toEqual(before);
 });
 check('real approval, byte hashes, normal alias mapping, encrypted proof and public signature',async()=>{
   await new CompanyProofStore(database.db,now).approval(approvalTask,'production',await loadProofFiles(dir,approvalTask,manifestPath,documentPath));

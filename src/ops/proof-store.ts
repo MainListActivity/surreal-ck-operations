@@ -2,11 +2,16 @@ import { RecordId, type Surreal } from 'surrealdb';
 import type { OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { PROOF_GOAL, APPROVAL_MARKER } from './proof-contract.ts';
+import { canonical } from './proof-contract.ts';
+import { emptyChecks, mark, type DiagnosticCheck, type CheckResult } from './approval-diagnosis.ts';
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
 export type ApprovalReceipt = { taskId: string; version: number; action: 'accept' | 'owner_approve'; auditId: string; reviewer: string; digest: string };
 export type Candidate = { task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string };
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
+type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId };
+type ApprovalAuditRow = { id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number; at: unknown };
+type ApprovalSnapshot = { candidate?: Candidate; task?: ApprovalTaskRow; audit?: ApprovalAuditRow; reviewer?: { revoked: boolean; retired?: boolean }; ambiguous: boolean };
 const denied = () => new CompanyError('forbidden', 'company approval or live lease unavailable');
 export class CompanyProofStore {
   constructor(private readonly db: Surreal, private readonly now: () => number = Date.now) {}
@@ -32,43 +37,79 @@ export class CompanyProofStore {
   async candidate(taskId: string): Promise<Candidate | undefined> {
     const [rows] = await this.db.query<[Candidate[]]>('SELECT * FROM internal_ai_candidate WHERE task = $task LIMIT 1;', { task: new RecordId('task', taskId) }); return rows[0];
   }
-  async diagnoseApproval(taskId: string, env: string, files: ProofFiles, scope: { goal: string; project: string }): Promise<Record<string, unknown>> {
-    if (scope.goal !== PROOF_GOAL || scope.project !== 'surreal_ck') throw denied();
-    const candidate = await this.candidate(taskId);
-    const [tasks, audits] = await this.db.query<[Array<{ state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId }>, Array<{ id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number }>]>(
-      `SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
-       SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 1;`, { task: new RecordId('task', taskId) });
-    const task = tasks[0], audit = audits[0];
-    const result = {
-      lease: true, fileRead: true, schema: true,
-      candidate: { found: !!candidate, env: candidate?.env === env, digest: candidate?.digest === files.manifest.configurationDigest, manifestHash: candidate?.manifest_hash === files.manifestHash, documentHash: candidate?.document_hash === files.documentHash, manifestPath: candidate?.manifest_path === files.manifestPath, documentPath: candidate?.document_path === files.documentPath, author: candidate?.author === task?.submitted_by },
-      task: { found: !!task, state: task?.state === 'done', kind: !!task && ['task', 'gate'].includes(task.kind), goal: String(task?.goal?.id) === PROOF_GOAL, project: String(task?.project?.id) === 'surreal_ck', version: task?.version ?? null, submittedBy: !!task && candidate?.author === task.submitted_by },
-      audit: { found: !!audit, action: audit?.action ?? null, version: audit?.version ?? null, versionMatches: !!audit && !!task && audit.version === task.version, marker: !!audit && audit.evidence.split(/\\r?\\n/).some(line => line.trim() === APPROVAL_MARKER + files.manifest.configurationDigest) },
-      reviewer: { distinctSubmitter: !!task && task.accepted_by !== task.submitted_by, recordId: audit?.actor instanceof RecordId, active: null as boolean | null },
-      expired: Date.parse(files.evidence.expiresAt) <= this.now(),
-    };
-    if (audit?.action === 'accept' && audit.actor instanceof RecordId) {
-      const reviewer = await this.db.select<{ revoked: boolean; retired?: boolean }>(audit.actor);
-      result.reviewer.active = !!reviewer && !reviewer.revoked && !reviewer.retired;
-    } else if (audit?.action === 'owner_approve') {
-      result.reviewer.active = task?.accepted_by === 'owner' && task.reviewer_role === 'owner';
-    }
-    return result;
+  /** Authorization runs before file/candidate/audit reads. Only self or a direct server-stored dependency. */
+  async authorizeDiagnosis(lease: LeaseStamp, taskId: string): Promise<boolean> {
+    if (!['engineering', 'qa'].includes(lease.role) || !await this.leaseValid(lease)) return false;
+    const [callers, targets] = await this.db.query<[Array<{ dependencies: RecordId[] }>, Array<{ goal: RecordId; project: RecordId }>]>(
+      'SELECT dependencies FROM $caller; SELECT goal, goal.project AS project FROM $target;',
+      { caller: new RecordId('task', lease.taskId), target: new RecordId('task', taskId) });
+    return !!targets[0] && String(targets[0].goal?.id) === lease.goal && String(targets[0].project?.id) === lease.project &&
+      (lease.taskId === taskId || !!callers[0]?.dependencies?.some(dep => dep instanceof RecordId && String(dep.table) === 'task' && String(dep.id) === taskId));
   }
-
+  private async approvalSnapshot(taskId: string, diagnostic = false): Promise<ApprovalSnapshot> {
+    const [candidates, tasks, audits] = await this.db.query<[Candidate[], ApprovalTaskRow[], ApprovalAuditRow[]]>(
+      `SELECT task, digest, manifest_hash, document_hash, manifest_path, document_path, author, env FROM internal_ai_candidate WHERE task = $task LIMIT 1;
+       SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
+       SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 2;`,
+      { task: new RecordId('task', taskId) });
+    const audit = audits[0];
+    // A diagnostic never dereferences caller-controlled records or non-employee tables.
+    if (diagnostic && audit?.action === 'accept' && audit.actor instanceof RecordId && String(audit.actor.table) !== 'employee') throw denied();
+    let reviewer: ApprovalSnapshot['reviewer'];
+    if (audit?.action === 'accept' && audit.actor instanceof RecordId) {
+      const [rows] = await this.db.query<[Array<NonNullable<ApprovalSnapshot['reviewer']>>]>('SELECT revoked, retired FROM $reviewer;', { reviewer: audit.actor });
+      reviewer = rows[0];
+    }
+    return { candidate: candidates[0], task: tasks[0], audit, reviewer,
+      ambiguous: !!audits[1] && canonical(audits[1].at) === canonical(audit?.at) };
+  }
+  private approvalChecks(snapshot: ApprovalSnapshot, env: string, files?: ProofFiles) {
+    const checks = emptyChecks();
+    const set = (key: DiagnosticCheck, value: boolean) => mark(checks, key, value);
+    const { candidate: c, task: t, audit: a, reviewer: r } = snapshot;
+    set('candidateExists', !!c);
+    if (files) {
+      set('candidateEnvMatches', !!c && c.env === env);
+      set('candidateDigestMatches', !!c && c.digest === files.manifest.configurationDigest);
+      set('candidateManifestHashMatches', !!c && c.manifest_hash === files.manifestHash);
+      set('candidateDocumentHashMatches', !!c && c.document_hash === files.documentHash);
+      set('candidateManifestResolvedPathMatches', !!c && c.manifest_path === files.manifestPath);
+      set('candidateDocumentResolvedPathMatches', !!c && c.document_path === files.documentPath);
+    }
+    set('approvalTaskExists', !!t);
+    set('approvalTaskDone', !!t && t.state === 'done');
+    set('approvalTaskKindEligible', !!t && ['task', 'gate'].includes(t.kind));
+    set('approvalTaskGoalMatches', String(t?.goal?.id) === PROOF_GOAL);
+    set('approvalTaskProjectMatches', String(t?.project?.id) === 'surreal_ck');
+    set('candidateAuthorMatchesSubmitter', !!c && !!t && c.author === t.submitted_by);
+    set('approvalAuditExists', !!a);
+    set('auditVersionMatchesTask', !!a && !!t && a.version === t.version);
+    if (files) set('auditMarkerExactLine', !!a && !!c && a.evidence.split(/\r?\n/).some(line => line.trim() === APPROVAL_MARKER + c.digest));
+    if (a?.action === 'accept') {
+      set('auditActorIsRecordId', a.actor instanceof RecordId);
+      set('auditActorMatchesAcceptedBy', a.actor instanceof RecordId && !!t && String(a.actor.id) === t.accepted_by);
+      set('reviewerIndependent', !!t && t.accepted_by !== t.submitted_by);
+      set('reviewerExists', !!r);
+      set('reviewerNotRevoked', !!r && !r.revoked);
+      set('reviewerNotRetired', !!r && !r.retired);
+    } else if (a?.action === 'owner_approve') {
+      set('ownerAcceptedByMatches', !!t && t.accepted_by === 'owner');
+      set('ownerReviewerRoleMatches', !!t && t.reviewer_role === 'owner');
+    }
+    return checks;
+  }
+  async diagnoseApproval(taskId: string, env: string, files: ProofFiles | undefined, lease: LeaseStamp): Promise<{ checks: Record<DiagnosticCheck, CheckResult>; snapshotStable: boolean }> {
+    if (!await this.authorizeDiagnosis(lease, taskId)) throw denied();
+    const snapshot = await this.approvalSnapshot(taskId, true);
+    const checks = this.approvalChecks(snapshot, env, files);
+    const next = await this.approvalSnapshot(taskId, true);
+    return { checks, snapshotStable: !snapshot.ambiguous && !next.ambiguous && canonical(snapshot) === canonical(next) };
+  }
   async approval(taskId: string, env: string, files: ProofFiles): Promise<ApprovalReceipt> {
-    const candidate = await this.candidate(taskId);
-    if (!candidate || candidate.env !== env || candidate.digest !== files.manifest.configurationDigest || candidate.manifest_hash !== files.manifestHash || candidate.document_hash !== files.documentHash || candidate.manifest_path !== files.manifestPath || candidate.document_path !== files.documentPath) throw denied();
-    const [tasks, audits] = await this.db.query<[Array<{ state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId }>, Array<{ id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number }>]>(
-      `SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
-       SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 1;`, { task: new RecordId('task', taskId) });
-    const task = tasks[0], audit = audits[0];
-    if (!task || !audit || task.state !== 'done' || !['task', 'gate'].includes(task.kind) || String(task.goal?.id) !== PROOF_GOAL || String(task.project?.id) !== 'surreal_ck' || audit.version !== task.version || candidate.author !== task.submitted_by || !audit.evidence.split(/\r?\n/).some(line => line.trim() === APPROVAL_MARKER + candidate.digest)) throw denied();
-    if (audit.action === 'accept') {
-      if (!(audit.actor instanceof RecordId) || String(audit.actor.id) !== task.accepted_by || task.accepted_by === task.submitted_by) throw denied();
-      const reviewer = await this.db.select<{ revoked: boolean; retired?: boolean }>(audit.actor);
-      if (!reviewer || reviewer.revoked || reviewer.retired) throw denied();
-    } else if (task.accepted_by !== 'owner' || task.reviewer_role !== 'owner') throw denied();
+    const snapshot = await this.approvalSnapshot(taskId);
+    const checks = this.approvalChecks(snapshot, env, files);
+    if (Object.values(checks).some(check => check.evaluated && !check.matched)) throw denied();
+    const task = snapshot.task!, audit = snapshot.audit!, candidate = snapshot.candidate!;
     return { taskId, version: task.version, action: audit.action, auditId: String(audit.id), reviewer: task.accepted_by, digest: candidate.digest };
   }
   async rotationApproval(taskId: string, kid: string): Promise<void> {
