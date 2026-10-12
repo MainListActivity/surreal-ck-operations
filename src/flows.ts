@@ -112,7 +112,7 @@ function finalGate(head: string): Spec {
 const VIDEO_PLAN = `把目标拆成可独立交付的任务，全部带 goalId，并按本项目的岗位轨工作（项目 AGENTS.md 与 project.disciplines 词表）。本目标走视频产线，不涉及软件上线，不要建 create_delivery，也不要把任务派给 product。
 - 原型/概念设计（P 段，老板 demo 验收）：executorRole=concept-design、reviewerRole=owner。新角色、视觉风格、场景基调先交 demo，老板批准后才解锁依赖它的量产任务。
 - 量产制作（M 段，GM/QA 验收）：executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies。
-- 音频腿（配音/对白/音效/配乐/主题曲）：一律用 sck call media_* 生成（先 media_info 看授权、当日额度与输出目录），产物在证据目录 media/ 下，自行拷进交付位；台词/对白/声线挂 配音 轨，背景音乐/音效/主题曲挂 配乐 轨（词表无该轨时挂 配音）；声线设计可作为 P 段 demo 由 concept-design 承接（owner 验收）。media_* 返回 forbidden 表示老板未授权该操作：在证据里写清需要授权的操作种类与次数，report_blocker 给老板，不要绕过。
+- 音频腿（配音/对白/音效/配乐/主题曲）：一律用 sck call media_* 生成（先 media_info 看配置、当日额度与输出目录），产物在证据目录 media/ 下，自行拷进交付位；台词/对白/声线挂 配音 轨，背景音乐/音效/主题曲挂 配乐 轨（词表无该轨时挂 配音）；声线设计可作为 P 段 demo 由 concept-design 承接（owner 验收）。media_* 报错（额度用尽、key 未配置、上游故障）就如实写进证据并 report_blocker，不要绕过。
 - 每个任务必须传 discipline=<轨名>（词表内的轨名，不是 slug），单任务只挂一轨；产线岗不挂轨的任务会被拒绝。
 **编剧轨例外**：所有编剧轨任务（剧本初稿、二次创作修订、多轮打磨）用 executorRole=screenwriter 且 discipline=编剧；P 段由 owner 验收，M 段 reviewerRole=gm。剧本被老板真实驳回后，用 create_task 传 revises=<上一版任务id> 开下一版（标题带 v(N+1)，context 写逐条修订要点）。
 成片验收用抽帧与音画检查（见项目 AGENTS.md「QA 终验标准」）。`;

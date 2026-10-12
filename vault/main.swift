@@ -1,6 +1,6 @@
 // sck-vault is the only process that can use the ElevenLabs key. The key sits in the login Keychain under an ACL
 // bound to this exact binary, is read once at start (only from the install path), and is used only for fixed
-// ElevenLabs operations that a grant approved by the boss with Touch ID allows. No command or reply returns the key.
+// ElevenLabs operations. The only guarantee this process makes is that the key never leaves it.
 // vault/build.sh builds it ad-hoc signed with the hardened runtime and no entitlements.
 import CryptoKit
 import Darwin
@@ -92,8 +92,7 @@ func runningFromInstallPath() -> Bool {
     #endif
 }
 
-// MARK: Boss confirmation
-
+/// One-time boss confirmation for writing the key itself. Call-time operations need no human.
 enum Auth {
     static func confirm(_ reason: String) -> Bool {
         #if SCK_VAULT_TEST
@@ -212,16 +211,6 @@ func writeJSON(_ fd: Int32, _ object: [String: Any]) {
     writeAll(fd, data + Data([0x0a]))
 }
 
-/// Executable path of the process on the other end of the socket, so the boss sees who is asking.
-func peerPath(_ fd: Int32) -> String {
-    var pid: pid_t = 0
-    var length = socklen_t(MemoryLayout<pid_t>.size)
-    guard getsockopt(fd, 0 /* SOL_LOCAL */, 2 /* LOCAL_PEERPID */, &pid, &length) == 0 else { return "unknown" }
-    var buffer = [CChar](repeating: 0, count: 4096)
-    guard proc_pidpath(pid, &buffer, 4096) > 0 else { return "pid \(pid)" }
-    return String(cString: buffer)
-}
-
 // MARK: Fixed ElevenLabs endpoints
 
 struct Endpoint {
@@ -322,111 +311,7 @@ func scrubbed(_ data: Data) -> Data {
     return out
 }
 
-// MARK: Grants (boss-approved, memory only, lost on restart)
-
-struct Grant {
-    let id: String
-    let expires: Date
-    var callsLeft: [String: Int]
-}
-
-enum Grants {
-    private static let lock = NSLock()
-    private static var items: [String: Grant] = [:]
-    private static var approvalInFlight = false
-
-    static func beginApproval() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if approvalInFlight { return false }
-        approvalInFlight = true
-        return true
-    }
-
-    static func endApproval() {
-        lock.lock(); defer { lock.unlock() }
-        approvalInFlight = false
-    }
-
-    private static var deniedUntil = Date.distantPast
-
-    /// A refused request starts a cooldown, so a noisy caller cannot keep the boss's Touch ID prompt on screen.
-    static func coolingDown() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return Date() < deniedUntil
-    }
-
-    static func startCooldown() {
-        lock.lock(); defer { lock.unlock() }
-        deniedUntil = Date().addingTimeInterval(60)
-    }
-
-    static func add(kinds: [String], calls: Int, minutes: Int) -> Grant {
-        lock.lock(); defer { lock.unlock() }
-        let id = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
-        let grant = Grant(id: id, expires: Date().addingTimeInterval(TimeInterval(minutes * 60)),
-                          callsLeft: Dictionary(uniqueKeysWithValues: kinds.map { ($0, calls) }))
-        items[id] = grant
-        return grant
-    }
-
-    /// Any active grant that still covers the kind pays for the call. Callers never learn grant ids.
-    static func reserve(_ kind: String) -> String? {
-        lock.lock(); defer { lock.unlock() }
-        prune()
-        guard let grant = items.values.first(where: { ($0.callsLeft[kind] ?? 0) > 0 }),
-              var current = items[grant.id] else { return nil }
-        current.callsLeft[kind, default: 0] -= 1
-        items[grant.id] = current
-        return grant.id
-    }
-
-    static func refund(_ id: String, _ kind: String) {
-        lock.lock(); defer { lock.unlock() }
-        guard var grant = items[id] else { return }
-        grant.callsLeft[kind, default: 0] += 1
-        items[id] = grant
-    }
-
-    static func revoke(_ id: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return items.removeValue(forKey: id) != nil
-    }
-
-    static func snapshot() -> [[String: Any]] {
-        lock.lock(); defer { lock.unlock() }
-        prune()
-        let formatter = ISO8601DateFormatter()
-        return items.values.sorted { $0.expires < $1.expires }.map { grant -> [String: Any] in
-            ["id": grant.id, "expiresAt": formatter.string(from: grant.expires), "callsLeft": grant.callsLeft]
-        }
-    }
-
-    private static func prune() {
-        items = items.filter { $0.value.expires > Date() }
-    }
-}
-
 // MARK: Requests
-
-func requestGrant(_ object: [String: Any], requester: String) -> [String: Any] {
-    let kinds = (object["kinds"] as? [String]) ?? []
-    let calls = (object["calls"] as? Int) ?? 0
-    let minutes = (object["minutes"] as? Int) ?? 0
-    guard !kinds.isEmpty, kinds.allSatisfy({ kindNames.contains($0) }), (1...500).contains(calls), (1...720).contains(minutes) else {
-        return failure("invalid", "需要 kinds（已知操作）、calls 1-500、minutes 1-720")
-    }
-    guard !Grants.coolingDown() else { return failure("busy", "上一次请求被拒绝，一分钟后再试") }
-    guard Grants.beginApproval() else { return failure("busy", "已有授权请求等待老板确认") }
-    defer { Grants.endApproval() }
-    let reason = "sck-vault 授权：\(kinds.joined(separator: ", "))，每项最多 \(calls) 次，\(minutes) 分钟内有效。请求方：\(requester)"
-    guard Auth.confirm(reason) else {
-        Grants.startCooldown()
-        return failure("forbidden", "老板未批准")
-    }
-    let grant = Grants.add(kinds: kinds, calls: calls, minutes: minutes)
-    Audit.append(["event": "grant", "grant": grant.id, "kinds": kinds, "calls": calls, "minutes": minutes, "requester": requester])
-    return ["ok": true, "grantId": grant.id, "expiresAt": ISO8601DateFormatter().string(from: grant.expires)]
-}
 
 func performCall(_ object: [String: Any]) -> [String: Any] {
     guard let kind = object["kind"] as? String else { return failure("invalid", "需要 kind") }
@@ -439,16 +324,9 @@ func performCall(_ object: [String: Any]) -> [String: Any] {
     } catch {
         return failure("invalid", "参数不合法")
     }
-    guard let grantId = Grants.reserve(kind) else {
-        return failure("forbidden", "未获授权：老板未批准该操作，或授权次数已用完、已过期")
-    }
     let reply = upstream(spec)
-    Audit.append(["event": "call", "kind": kind, "grant": grantId, "status": reply?.status ?? 0, "bytes": reply?.body.count ?? 0])
-    guard let reply else {
-        Grants.refund(grantId, kind)
-        return failure("upstream_error", "ElevenLabs 无响应")
-    }
-    if !(200..<300).contains(reply.status) { Grants.refund(grantId, kind) }
+    Audit.append(["event": "call", "kind": kind, "status": reply?.status ?? 0, "bytes": reply?.body.count ?? 0])
+    guard let reply else { return failure("upstream_error", "ElevenLabs 无响应") }
     return ["ok": true, "status": reply.status, "contentType": reply.contentType, "bodyBase64": scrubbed(reply.body).base64EncodedString()]
 }
 
@@ -461,12 +339,7 @@ func handle(_ fd: Int32) {
     }
     switch op {
     case "status":
-        writeJSON(fd, ["ok": true, "configured": !Secrets.apiKey.isEmpty, "grants": Grants.snapshot()])
-    case "grant":
-        writeJSON(fd, requestGrant(object, requester: peerPath(fd)))
-    case "revoke":
-        let removed = Grants.revoke((object["grantId"] as? String) ?? "")
-        writeJSON(fd, removed ? ["ok": true] : failure("invalid", "没有这个授权"))
+        writeJSON(fd, ["ok": true, "configured": !Secrets.apiKey.isEmpty])
     case "call":
         writeJSON(fd, performCall(object))
     default:
@@ -535,28 +408,12 @@ func clientRequest(_ request: [String: Any]) -> Never {
     exit(0)
 }
 
-func grantRequest(_ args: [String]) -> [String: Any] {
-    func value(_ flag: String) -> String? {
-        guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else { return nil }
-        return args[index + 1]
-    }
-    return ["op": "grant",
-            "kinds": (value("--kinds") ?? "").split(separator: ",").map(String.init),
-            "calls": Int(value("--calls") ?? "") ?? 0,
-            "minutes": Int(value("--minutes") ?? "") ?? 0]
-}
-
 signal(SIGPIPE, SIG_IGN)
-let arguments = CommandLine.arguments
-switch arguments.count > 1 ? arguments[1] : "" {
+switch CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "" {
 case "serve": serve()
 case "setup": setup()
 case "status": clientRequest(["op": "status"])
-case "grant":
-    FileHandle.standardError.write(Data("已发送授权请求，请在弹出的 Touch ID 窗口中确认……\n".utf8))
-    clientRequest(grantRequest(Array(arguments.dropFirst(2))))
-case "revoke" where arguments.count > 2: clientRequest(["op": "revoke", "grantId": arguments[2]])
 default:
-    print("用法: sck-vault setup | serve | status | grant --kinds K1,K2 --calls N --minutes M | revoke <grantId>")
+    print("用法: sck-vault setup | serve | status")
     exit(2)
 }

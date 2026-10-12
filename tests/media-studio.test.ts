@@ -23,7 +23,7 @@ const audio = (text: string): VaultReply => ({ status: 200, contentType: 'audio/
 const outDir = () => join(root, 'task-1', 'media');
 
 const vault: MediaVault = {
-  status: async () => ({ configured, grants: [] }),
+  status: async () => ({ configured }),
   call: async (kind, params) => {
     const call = { kind, params };
     vaultCalls.push(call);
@@ -77,27 +77,25 @@ describe('media_info', () => {
     expect(info.configured).toBe(false);
   });
 
-  test('with a configured vault it shows the subscription, the grants that cover the boss budget, and today\'s usage', async () => {
+  test('with a configured vault it shows the subscription and today\'s usage', async () => {
     reply = () => json({ tier: 'creator', character_count: 1200, character_limit: 100000, next_character_count_reset_unix: 1760000000 });
     counts = { ops_media_tts: 3 };
-    const withGrant: MediaVault = { status: async () => ({ configured: true, grants: [{ id: 'g1', expiresAt: 'later', callsLeft: { tts: 5 } }] }), call: vault.call };
+    const withGrant: MediaVault = { status: async () => ({ configured: true }), call: vault.call };
     const info = await call(studio({ vault: withGrant }), 'media_info') as Record<string, any>;
     expect(kinds()).toEqual(['subscription']);
     expect(info.subscription).toEqual({ tier: 'creator', character_count: 1200, character_limit: 100000, next_character_count_reset_unix: 1760000000 });
-    expect(info.grants).toEqual([{ expiresAt: 'later', callsLeft: { tts: 5 } }]);
     expect(info.quotas.tts).toEqual({ used: 3, limit: 1500 });
   });
 
-  test('when the subscription call is refused the info still reports configured, grants and the reason', async () => {
+  test('when the subscription call is refused the info still reports configured and the reason', async () => {
     const refusing: MediaVault = {
-      status: async () => ({ configured: true, grants: [] }),
-      call: async () => { throw new CompanyError('forbidden', '未获授权：老板未批准该操作'); },
+      status: async () => ({ configured: true }),
+      call: async () => { throw new CompanyError('upstream_error', 'ElevenLabs 无响应'); },
     };
     const info = await call(studio({ vault: refusing }), 'media_info') as Record<string, any>;
     expect(info.configured).toBe(true);
-    expect(info.grants).toEqual([]);
     expect(info.subscription).toBeUndefined();
-    expect(info.subscriptionError).toContain('未获授权');
+    expect(info.subscriptionError).toContain('无响应');
     expect(info.quotas.tts).toEqual({ used: 0, limit: 1500 });
   });
 });
