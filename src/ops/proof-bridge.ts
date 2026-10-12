@@ -47,6 +47,12 @@ export class InternalAiProofBridge {
       if (!await this.deps.store.leaseValid(lease)) throw new CompanyError('forbidden', 'live lease unavailable');
       return (await this.deps.rotate(scope.project, env, signer.kid)).trust();
     }
+    if (tool === 'ops_internal_ai_approval_diagnose') {
+      const args = proofToolSchemas.ops_internal_ai_approval_diagnose.parse(raw);
+      const files = await loadProofFiles(this.deps.home, args.approvalTask, args.manifestPath, args.documentPath);
+      if (args.activityId !== files.manifest.activityId) throw new CompanyError('forbidden', 'activity scope mismatch');
+      return { codeVersion: 'internal-ai-proof-v1', taskId: args.approvalTask, ...await this.deps.store.diagnoseApproval(args.approvalTask, env, files, lease) };
+    }
     if (tool === 'ops_internal_ai_prepare') {
       const args = proofToolSchemas.ops_internal_ai_prepare.parse(raw);
       const files = await loadProofFiles(this.deps.home, scope.taskId, args.manifestPath, args.documentPath);

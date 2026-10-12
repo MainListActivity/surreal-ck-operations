@@ -32,6 +32,30 @@ export class CompanyProofStore {
   async candidate(taskId: string): Promise<Candidate | undefined> {
     const [rows] = await this.db.query<[Candidate[]]>('SELECT * FROM internal_ai_candidate WHERE task = $task LIMIT 1;', { task: new RecordId('task', taskId) }); return rows[0];
   }
+  async diagnoseApproval(taskId: string, env: string, files: ProofFiles, scope: { goal: string; project: string }): Promise<Record<string, unknown>> {
+    if (scope.goal !== PROOF_GOAL || scope.project !== 'surreal_ck') throw denied();
+    const candidate = await this.candidate(taskId);
+    const [tasks, audits] = await this.db.query<[Array<{ state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId }>, Array<{ id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number }>]>(
+      `SELECT state, kind, version, submitted_by, accepted_by, reviewer_role, goal, goal.project AS project FROM $task;
+       SELECT id, actor, action, evidence, version, at FROM audit WHERE task = $task AND action IN ['accept', 'owner_approve'] ORDER BY at DESC LIMIT 1;`, { task: new RecordId('task', taskId) });
+    const task = tasks[0], audit = audits[0];
+    const result = {
+      lease: true, fileRead: true, schema: true,
+      candidate: { found: !!candidate, env: candidate?.env === env, digest: candidate?.digest === files.manifest.configurationDigest, manifestHash: candidate?.manifest_hash === files.manifestHash, documentHash: candidate?.document_hash === files.documentHash, manifestPath: candidate?.manifest_path === files.manifestPath, documentPath: candidate?.document_path === files.documentPath, author: candidate?.author === task?.submitted_by },
+      task: { found: !!task, state: task?.state === 'done', kind: !!task && ['task', 'gate'].includes(task.kind), goal: String(task?.goal?.id) === PROOF_GOAL, project: String(task?.project?.id) === 'surreal_ck', version: task?.version ?? null, submittedBy: !!task && candidate?.author === task.submitted_by },
+      audit: { found: !!audit, action: audit?.action ?? null, version: audit?.version ?? null, versionMatches: !!audit && !!task && audit.version === task.version, marker: !!audit && audit.evidence.split(/\\r?\\n/).some(line => line.trim() === APPROVAL_MARKER + files.manifest.configurationDigest) },
+      reviewer: { distinctSubmitter: !!task && task.accepted_by !== task.submitted_by, recordId: audit?.actor instanceof RecordId, active: null as boolean | null },
+      expired: Date.parse(files.evidence.expiresAt) <= this.now(),
+    };
+    if (audit?.action === 'accept' && audit.actor instanceof RecordId) {
+      const reviewer = await this.db.select<{ revoked: boolean; retired?: boolean }>(audit.actor);
+      result.reviewer.active = !!reviewer && !reviewer.revoked && !reviewer.retired;
+    } else if (audit?.action === 'owner_approve') {
+      result.reviewer.active = task?.accepted_by === 'owner' && task.reviewer_role === 'owner';
+    }
+    return result;
+  }
+
   async approval(taskId: string, env: string, files: ProofFiles): Promise<ApprovalReceipt> {
     const candidate = await this.candidate(taskId);
     if (!candidate || candidate.env !== env || candidate.digest !== files.manifest.configurationDigest || candidate.manifest_hash !== files.manifestHash || candidate.document_hash !== files.documentHash || candidate.manifest_path !== files.manifestPath || candidate.document_path !== files.documentPath) throw denied();

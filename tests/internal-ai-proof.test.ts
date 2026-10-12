@@ -133,6 +133,7 @@ test('pinned Ed25519 signature rejects alteration, other key/kid/audience/type, 
 });
 test('strict request schemas reject caller identity/role/hash/URL injection',()=>{
   const input={mode:'register-disabled',manifestPath:'/fixture.json',documentPath:'/evidence.json',activityId:'fixture',nonce:'synthetic-nonce-1234',idempotencyKey:'request'};
+  expect(proofToolSchemas.ops_internal_ai_approval_diagnose.safeParse({approvalTask:'approved-task',manifestPath:'/fixture.json',documentPath:'/evidence.json',activityId:'fixture'}).success).toBe(true);
   expect(proofToolSchemas.ops_internal_ai_prove.safeParse(input).success).toBe(true);
   for(const extra of [{subject:'self-report'},{role:'owner'},{documentHash:'a'.repeat(64)},{jwksUrl:'https://untrusted.test'},{env:'staging'},{mode:'approve'}]) expect(proofToolSchemas.ops_internal_ai_prove.safeParse({...input,...extra}).success).toBe(false);
 });
