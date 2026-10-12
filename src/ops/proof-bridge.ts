@@ -1,13 +1,14 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { appendFile, chmod, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { appendFile, chmod, mkdir, readFile } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { openSecret, sealSecret } from '../projects.ts';
 import { canonical, sha256, APPROVAL_MARKER, TOKEN_PLAN_PLAN_TYPE_FREE, type ProofIdentity, type ProofTool, proofToolSchemas } from './proof-contract.ts';
-import { loadProofFiles, type ProofFiles } from './proof-files.ts';
+import { loadProofFiles, readProofFile, parseProofFiles, evidenceChecks, type ProofFiles } from './proof-files.ts';
 import { CompanyProofStore, type ProofRow } from './proof-store.ts';
+import { emptyChecks, mark, diagnosis, type DiagnosticCheck } from './approval-diagnosis.ts';
 import { ProofSigner } from './proof-signer.ts';
 export type IdentityResolver = (scope: OpsScope, env: string, files: ProofFiles) => Promise<ProofIdentity[]>;
 export interface BridgeDeps {
@@ -22,21 +23,75 @@ export class InternalAiProofBridge {
   private readonly now: () => number;
   constructor(private readonly deps: BridgeDeps) { this.now = deps.now ?? Date.now; }
   private assertFiles(files: ProofFiles, mode: 'register-disabled' | 'enable'): void {
-    const e = files.evidence;
     if (mode !== 'enable') return;
-    // 时间窗对全部受审类型一致：采样不晚于 now，expiresAt 未过。
-    const fresh = Date.parse(e.sampledAt) <= this.now() && Date.parse(e.expiresAt) > this.now();
-    // reviewed-service 分支行为不变（USD 余额须覆盖预算）；配额型改查配额语义，不要求 USD 余额。
-    const ok = e.type === 'reviewed-service'
-      ? e.serviceApproved && e.balanceNanoUsd >= files.manifest.budget.totalNanoUsd
-      : e.type === 'reviewed-token-plan'
-        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && this.now() - Date.parse(e.sampledAt) <= 86_400_000
-        : false;
-    if (!ok || !fresh) throw new CompanyError('forbidden', 'reviewed service evidence unavailable');
+    if (Object.values(evidenceChecks(files.evidence, files.manifest, this.now())).some(matched => !matched)) throw new CompanyError('forbidden', 'reviewed service evidence unavailable');
   }
+  private async diagnose(scope: OpsScope, env: string, raw: Record<string, unknown>) {
+    const args = proofToolSchemas.ops_internal_ai_approval_diagnose.parse(raw);
+    let lease;
+    try {
+      lease = await this.deps.store.lease(scope);
+      if (!await this.deps.store.authorizeDiagnosis(lease, args.approvalTask)) return { outcome: 'denied', failure: 'scope-denied' } as const;
+    } catch (error) {
+      if (error instanceof CompanyError && error.code === 'forbidden') return { outcome: 'denied', failure: 'scope-denied' } as const;
+      return { outcome: 'unavailable', failure: 'dependency-unavailable' } as const;
+    }
+    const checks = emptyChecks();
+    const set = (key: DiagnosticCheck, value: boolean) => mark(checks, key, value);
+    for (const key of ['leaseCallerMatches', 'leaseStateEligible', 'leaseUnexpired', 'leaseEmployeeActive', 'leaseRoleEligible', 'leaseGoalProjectMatch', 'leaseFenceDeliveryCurrent'] as const) set(key, true);
+    const roots = ['evidence', 'deliverables'].map(kind => resolve(this.deps.home, kind, args.approvalTask) + sep);
+    set('manifestRootMatches', roots.some(root => resolve(args.manifestPath).startsWith(root)));
+    set('documentRootMatches', roots.some(root => resolve(args.documentPath).startsWith(root)));
+    let files: ProofFiles | undefined;
+    if (checks.manifestRootMatches.matched && checks.documentRootMatches.matched) {
+      try {
+        const [rm, rd] = await Promise.all([readProofFile(this.deps.home, args.approvalTask, args.manifestPath), readProofFile(this.deps.home, args.approvalTask, args.documentPath)]);
+        set('fileSafetyValid', true);
+        const parsed = parseProofFiles(rm, rd);
+        set('manifestSchemaValid', parsed.manifest.success);
+        set('documentSchemaValid', parsed.evidence.success);
+        if (parsed.manifest.success && parsed.evidence.success) {
+          set('configurationDigestValid', !!parsed.digestValid);
+          set('documentHashValid', !!parsed.documentHashValid);
+          set('serviceFieldsMatch', !!parsed.serviceFieldsMatch);
+          files = { manifest: parsed.manifest.data, evidence: parsed.evidence.data, manifestHash: sha256(rm), documentHash: sha256(rd), manifestPath: resolve(args.manifestPath), documentPath: resolve(args.documentPath) };
+          set('activityIdMatches', args.activityId === files.manifest.activityId);
+          const time = evidenceChecks(files.evidence, files.manifest, this.now());
+          for (const key of Object.keys(time) as (keyof typeof time)[]) set(key, time[key]);
+        }
+      } catch { set('fileSafetyValid', false); }
+    }
+    try {
+      const stored = await this.deps.store.diagnoseApproval(args.approvalTask, env, files, lease);
+      for (const key of Object.keys(stored.checks) as DiagnosticCheck[]) if (stored.checks[key].evaluated) checks[key] = stored.checks[key];
+      set('approvalSnapshotStable', stored.snapshotStable);
+      set('leaseStillCurrent', await this.deps.store.leaseValid(lease));
+      // Re-read exactly the bounded files; never combine a changed file with an earlier approval snapshot.
+      let fileStable = true;
+      if (files) {
+        try {
+          const [rm, rd] = await Promise.all([readProofFile(this.deps.home, args.approvalTask, args.manifestPath), readProofFile(this.deps.home, args.approvalTask, args.documentPath)]);
+          fileStable = sha256(rm) === files.manifestHash && sha256(rd) === files.documentHash;
+        } catch { fileStable = false; }
+      }
+      if (!await this.deps.store.authorizeDiagnosis(lease, args.approvalTask)) return { outcome: 'denied', failure: 'scope-denied' } as const;
+      set('leaseStillCurrent', await this.deps.store.leaseValid(lease));
+      if (files) {
+        const time = evidenceChecks(files.evidence, files.manifest, this.now());
+        for (const key of Object.keys(time) as (keyof typeof time)[]) set(key, time[key]);
+      }
+      const stable = stored.snapshotStable && checks.leaseStillCurrent.matched && fileStable;
+      return { ...diagnosis(checks, stable), expired: checks.evidenceUnexpired.evaluated && !checks.evidenceUnexpired.matched, codeVersion: await diagnosticCodeVersion() };
+    } catch (error) {
+      if (error instanceof CompanyError && error.code === 'forbidden') return { outcome: 'denied', failure: 'scope-denied' } as const;
+      return diagnosis(checks, false, true);
+    }
+  }
+
   async call(scope: OpsScope, env: string, tool: ProofTool, raw: Record<string, unknown>): Promise<unknown> {
     const schema = proofToolSchemas[tool]; const parsed = schema.safeParse(raw);
     if (!parsed.success || env !== 'production') throw new CompanyError('invalid', 'invalid internal AI proof request');
+    if (tool === 'ops_internal_ai_approval_diagnose') return this.diagnose(scope, env, raw);
     const lease = await this.deps.store.lease(scope);
     const signer = await this.deps.signer(scope.project, env);
     if (tool === 'ops_internal_ai_trust') return signer.trust();
@@ -171,3 +226,9 @@ const statusFailReason = (e: unknown): string => {
   const reason = e instanceof CompanyError ? e.message : e instanceof Error ? e.name : 'unknown';
   return STATUS_REASON.test(reason) ? reason : 'redacted';
 };
+
+/** Content-address the actual running implementation, including vendored plugin copies. */
+let diagnosticVersion: Promise<string> | undefined;
+function diagnosticCodeVersion(): Promise<string> {
+  return diagnosticVersion ??= Promise.all(['proof-bridge.ts', 'proof-store.ts', 'proof-files.ts', 'proof-contract.ts', 'approval-diagnosis.ts'].map(file => readFile(new URL(file, import.meta.url)))).then(bytes => sha256(Buffer.concat(bytes)));
+}

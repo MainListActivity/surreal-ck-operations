@@ -43,7 +43,7 @@ export const OPS_TOOLS = [
   'ops_idp_client_info', 'ops_idp_client_register',
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
-  'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
+  'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
   'ops_supplier_plan_sample',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
@@ -236,6 +236,10 @@ export class OpsBroker {
     // Bridge upstream errors must never echo subjects, file bodies, signed capabilities or passwords.
     try {
       const value = await this.proofBridge.call(ctx.scope, ctx.env, tool, args);
+      if (tool === 'ops_internal_ai_approval_diagnose') {
+        const result = value as { outcome: string; failure: string };
+        return { value, audit: { action: 'ops_proof', evidence: `${tool} outcome=${result.outcome} failure=${result.failure}` } };
+      }
       const keyId = value && typeof value === 'object' && 'kid' in value ? String(value.kid) : value && typeof value === 'object' && 'keyId' in value ? String(value.keyId) : 'unchanged';
       const digest = value && typeof value === 'object' && 'configurationDigest' in value ? String(value.configurationDigest) : value && typeof value === 'object' && 'digest' in value ? String(value.digest) : 'none';
       const handleRef = typeof args.proofHandle === 'string' ? sha256(args.proofHandle) : value && typeof value === 'object' && 'proofHandle' in value ? sha256(String(value.proofHandle)) : 'none';

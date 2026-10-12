@@ -10,6 +10,8 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
+import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
+import { diagnosticFailureByCheck, type ApprovalDiagnosis } from '../src/ops/approval-diagnosis.ts';
 import { CompanyProofStore } from '../src/ops/proof-store.ts';
 import { TOKEN_PLAN_PLAN_TYPE_FREE, PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofManifest } from '../src/ops/proof-contract.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
@@ -123,7 +125,7 @@ beforeAll(async () => {
   await core.submit(author,{taskId:approval.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed files',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,approval.id);
   await core.accept(reviewer,{taskId:approval.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
-  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const task=await core.createTask(gm,{title:'Synthetic consuming task',context:'Only test fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,dependencies:[approvalTask],idempotencyKey:randomUUID()});
   consumerTask=task.id; await core.claim(consumer,task.id);
   trusted=await request('ops_internal_ai_trust') as ReturnType<ProofSigner['trust']>;
 },20_000);
@@ -152,6 +154,179 @@ check('actual versioned SenseNova disabled files prepare an immutable candidate 
   await writeFile(mp, JSON.stringify({ ...fixture.manifest, configurationDigest: '0'.repeat(64) }));
   await expect(prepare()).rejects.toBeDefined();
   expect(world.requests.length).toBe(requestsBefore);
+});
+check('diagnosis matches real approval marker and actor predicates without changing approval', async () => {
+  const store = new CompanyProofStore(database.db, now);
+  const loaded = await loadProofFiles(dir, approvalTask, manifestPath, documentPath);
+  const lease = await store.lease({taskId: consumerTask, project: 'surreal_ck', actor: {employeeId: String((await core.opsScope(consumer, consumerTask)).actor.employeeId), role: 'engineering', capabilities: []}});
+  const before = await store.approval(approvalTask, 'production', loaded);
+  const result = await store.diagnoseApproval(approvalTask, 'production', loaded, lease);
+  expect(result).toMatchObject({checks: {auditMarkerExactLine: {evaluated:true,matched:true}, auditActorMatchesAcceptedBy: {evaluated:true,matched:true}}, snapshotStable: true});
+  expect(await store.approval(approvalTask, 'production', loaded)).toEqual(before);
+});
+type DiagnosticResult = Extract<ApprovalDiagnosis, {outcome:'evaluated'}> & {codeVersion:string; expired:boolean};
+const diagnoseArgs = () => ({approvalTask, manifestPath, documentPath, activityId: manifest.activityId});
+check('diagnosis is referenced, scoped, read-only, content-versioned and never signs or resolves identities', async () => {
+  const store = new CompanyProofStore(database.db, now);
+  const scope = await core.opsScope(consumer, consumerTask);
+  const unused = async (): Promise<never> => { throw new Error('diagnosis must not call signing, identities or delivery'); };
+  const bridge = new InternalAiProofBridge({store,home:dir,now,key:()=>{throw new Error('no sealing key');},signer:unused,identities:unused,rotate:unused,deliver:unused});
+  const [before] = await database.db.query<[unknown[]]>('SELECT * FROM internal_ai_candidate;');
+  const output = await bridge.call(scope,'production','ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult;
+  expect(output).toMatchObject({outcome:'evaluated',failure:'none',snapshotStable:true,allApplicableChecksMatch:true,expired:false});
+  expect(output.codeVersion).toMatch(/^[a-f0-9]{64}$/);
+  expect(Object.keys(output.checks).sort()).toEqual(Object.keys(diagnosticFailureByCheck).sort());
+  for (const check of Object.values(output.checks)) { expect(typeof check.evaluated).toBe('boolean'); expect(typeof check.matched).toBe('boolean'); if (!check.evaluated) expect(check.matched).toBe(false); }
+  const serialized = JSON.stringify(output);
+  for (const value of [manifestPath,documentPath,manifest.configurationDigest,manifest.documentHash,scope.actor.employeeId,approvalTask]) expect(serialized).not.toContain(value);
+  const [after] = await database.db.query<[unknown[]]>('SELECT * FROM internal_ai_candidate;');expect(after).toEqual(before);
+  const reads=identityReads; const output2=await request('ops_internal_ai_approval_diagnose',diagnoseArgs());expect(output2).toEqual(output);expect(identityReads).toBe(reads);
+  const [proofs,audits] = await database.db.query<[unknown[],Array<{evidence:string}>]>('SELECT * FROM internal_ai_proof; SELECT evidence, at FROM audit WHERE task=$task AND action="ops_proof" ORDER BY at DESC LIMIT 1;', {task:new RecordId('task',consumerTask)});
+  expect(proofs).toHaveLength(0);expect(audits[0]?.evidence).toBe('ops_internal_ai_approval_diagnose outcome=evaluated failure=none');
+  // Caller identity/role cannot be supplied by the request.
+  await expect(request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),role:'engineering',sql:'SELECT * FROM employee'})).rejects.toBeDefined();
+  const product = await new LocalEnrollmentAdmin(database).enroll('test-diagnosis-product','product',['execute','review']);
+  const task = await core.createTask(gm,{title:'Synthetic product caller',context:'Only test fixtures',executorRole:'product',reviewerRole:'qa',goalId:PROOF_GOAL,dependencies:[approvalTask],idempotencyKey:randomUUID()});
+  await core.claim(product,task.id);
+  expect(await bridge.call(await core.opsScope(product,task.id),'production','ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
+  expect(await request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),approvalTask:'missing-task'})).toEqual({outcome:'denied',failure:'scope-denied'});
+  const unreferenced = await core.createTask(gm,{title:'Synthetic unreferenced approval',context:approvalTask,executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  expect(await request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),approvalTask:unreferenced.id})).toEqual({outcome:'denied',failure:'scope-denied'});
+});
+check('cross-goal, cross-project, no lease and unreferenced callers fail closed before diagnosis', async () => {
+  const target = new RecordId('task',approvalTask), caller = new RecordId('task',consumerTask);
+  const [rows] = await database.db.query<[Array<{lease_expires_at:number;dependencies:RecordId[]}>]>('SELECT lease_expires_at, dependencies FROM $caller;',{caller});
+  const otherGoal = new RecordId('goal','synthetic-other-goal');
+  await database.db.query('CREATE $goal CONTENT {project:$project};',{goal:otherGoal,project:new RecordId('project','surreal_ck')});
+  try {
+    await database.db.query('UPDATE $target SET goal=$other;',{target,other:otherGoal});
+    expect(await request('ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
+    await database.db.query('UPDATE $target SET goal=$goal; UPDATE $goal SET project=$other;',{target,goal:new RecordId('goal',PROOF_GOAL),other:new RecordId('project','other-project')});
+    await expect(request('ops_internal_ai_approval_diagnose',diagnoseArgs())).rejects.toBeDefined();
+    await database.db.query('UPDATE $goal SET project=$project; UPDATE $caller SET dependencies=[];',{goal:new RecordId('goal',PROOF_GOAL),project:new RecordId('project','surreal_ck'),caller});
+    expect(await request('ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
+    await database.db.query('UPDATE $caller SET dependencies=$deps, lease_expires_at=0;',{caller,deps:rows[0]!.dependencies});
+    await expect(request('ops_internal_ai_approval_diagnose',diagnoseArgs())).rejects.toBeDefined();
+  } finally {
+    await database.db.query('UPDATE $target SET goal=$goal; UPDATE $goal SET project=$project; UPDATE $caller SET dependencies=$deps,lease_expires_at=$expiry;', {target,goal:new RecordId('goal',PROOF_GOAL),project:new RecordId('project','surreal_ck'),caller,deps:rows[0]!.dependencies,expiry:rows[0]!.lease_expires_at});
+  }
+});
+check('diagnostic rereads detect real fork snapshot changes and redact database failures', async () => {
+  const realDb = database.db;
+  let snapshots = 0;
+  const proxy = new Proxy(realDb, {get(target,property) {
+    if (property === 'query') return async (sql:string,vars:Record<string,unknown>) => {
+      if (sql.startsWith('SELECT task, digest')) {
+        snapshots++;
+        if (snapshots === 2) await realDb.query('UPDATE $task SET version+=1;',{task:new RecordId('task',approvalTask)});
+      }
+      return target.query(sql,vars);
+    };
+    const value = Reflect.get(target,property);return typeof value === 'function' ? value.bind(target) : value;
+  }});
+  const [rows] = await realDb.query<[Array<{version:number}>]>('SELECT version FROM $task;',{task:new RecordId('task',approvalTask)});
+  const store = new CompanyProofStore(proxy,now);
+  const scope = await core.opsScope(consumer,consumerTask);
+  const unused = async (): Promise<never> => {throw new Error('must not sign');};
+  const bridge = new InternalAiProofBridge({store,home:dir,now,key:()=>Buffer.alloc(32),signer:unused,identities:unused,rotate:unused,deliver:unused});
+  try {
+    const result = await bridge.call(scope,'production','ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult;
+    expect(result).toMatchObject({failure:'snapshot-unstable',snapshotStable:false,allApplicableChecksMatch:false});
+  } finally { await realDb.query('UPDATE $task SET version=$version;',{task:new RecordId('task',approvalTask),version:rows[0]!.version}); }
+  const lease = await new CompanyProofStore(realDb,now).lease(scope);
+  const unavailable = {lease:async()=>lease,authorizeDiagnosis:async()=>true,diagnoseApproval:async()=>{throw new Error('JWT synthetic-secret-body token sealed ciphertext /private/sensitive.json');}} as unknown as CompanyProofStore;
+  const failureBridge = new InternalAiProofBridge({store:unavailable,home:dir,now,key:()=>Buffer.alloc(32),signer:unused,identities:unused,rotate:unused,deliver:unused});
+  const result = await failureBridge.call(scope,'production','ops_internal_ai_approval_diagnose',diagnoseArgs());
+  expect(result).toMatchObject({failure:'dependency-unavailable',allApplicableChecksMatch:false});
+  for(const value of ['synthetic-secret-body','JWT','sealed','ciphertext','/private/']) expect(JSON.stringify(result)).not.toContain(value);
+});
+check('real fork rejects each candidate, author, audit, actor and reviewer mismatch with a precise diagnosis', async () => {
+  const store = new CompanyProofStore(database.db, now);
+  const loaded = await loadProofFiles(dir,approvalTask,manifestPath,documentPath);
+  const [candidates,tasks,audits] = await database.db.query<[Array<Record<string,unknown>>,Array<Record<string,unknown>>,Array<Record<string,unknown>>]>(
+    "SELECT * FROM internal_ai_candidate WHERE task=$task; SELECT * FROM $task; SELECT * FROM audit WHERE task=$task AND action='accept' ORDER BY at DESC LIMIT 1;",
+    {task:new RecordId('task',approvalTask)});
+  const candidate = candidates[0]!, task = tasks[0]!, audit = audits[0]!;
+  const actor = audit.actor as RecordId;
+  const [who] = await database.db.query<[Array<Record<string,unknown>>]>('SELECT * FROM $actor;',{actor});
+  const restore = async () => { await database.db.query('DELETE $c; CREATE $c CONTENT $candidate; UPSERT $t CONTENT $task; UPSERT $a CONTENT $audit; UPSERT $r CONTENT $reviewer;', {c:candidate.id,t:task.id,a:audit.id,r:actor,candidate,task,audit,reviewer:who[0]}); };
+  const scenarios = [
+    ['UPDATE $c SET env="wrong";','candidate-env-mismatch'],
+    ['UPDATE $c SET digest="'+'0'.repeat(64)+'";','candidate-digest-mismatch'],
+    ['UPDATE $c SET manifest_hash="wrong";','candidate-manifest-hash-mismatch'],
+    ['UPDATE $c SET document_hash="wrong";','candidate-document-hash-mismatch'],
+    ['UPDATE $c SET manifest_path="wrong";','candidate-manifest-path-mismatch'],
+    ['UPDATE $c SET document_path="wrong";','candidate-document-path-mismatch'],
+    ['UPDATE $c SET author="synthetic-other-author";','candidate-author-mismatch'],
+    ['UPDATE $t SET version += 1;','audit-version-mismatch'],
+    ['UPDATE $t SET state="void";','approval-task-not-done'],
+    ['UPDATE $t SET kind="other";','approval-task-kind-ineligible'],
+    ['UPDATE $a SET evidence="prefix '+APPROVAL_MARKER+'";','audit-marker-missing'],
+    ['UPDATE $a SET actor="employee:synthetic-string";','audit-actor-not-record-id'],
+    ['UPDATE $t SET accepted_by="synthetic-mismatch";','audit-actor-mismatch'],
+    ['UPDATE $c SET author=$actorId; UPDATE $t SET submitted_by=$actorId;','self-review'],
+    ['UPDATE $r SET revoked=true;','reviewer-revoked'],
+    ['UPDATE $r SET retired=true;','reviewer-retired'],
+    ['DELETE $r;','reviewer-missing'],
+    ['DELETE $c;','candidate-missing'],
+    ['DELETE $a;','approval-audit-missing'],
+  ] as const;
+  try {
+    for (const [sql,failure] of scenarios) {
+      await restore();
+      let command = sql!, changed = candidate;
+      const match = /^UPDATE \$c SET ([a-z_]+)="([^"]*)";/.exec(command);
+      if (match) { changed = {...candidate,[match[1]!]:match[2]}; command = command.replace(match[0], 'DELETE $c; CREATE $c CONTENT $changed;'); }
+      else if (command.startsWith('UPDATE $c SET author=$actorId;')) { changed={...candidate,author:String(actor.id)}; command=command.replace('UPDATE $c SET author=$actorId;', 'DELETE $c; CREATE $c CONTENT $changed;'); }
+      await database.db.query(command,{c:candidate.id,t:task.id,a:audit.id,r:actor,actorId:String(actor.id),changed});
+      const result = await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult;
+      expect(result.failure).toBe(failure!);expect(result.allApplicableChecksMatch).toBe(false);
+      await expect(store.approval(approvalTask,'production',loaded)).rejects.toBeDefined();
+    }
+    await restore();
+    // Exact line semantics: CRLF with surrounding whitespace is legal; embedded/backtick markers are not.
+    await database.db.query('UPDATE $a SET evidence=$e;',{a:audit.id,e:'review notes\r\n  '+APPROVAL_MARKER+manifest.configurationDigest+'  \r\nend'});
+    expect((await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult).failure).toBe('none');
+    await store.approval(approvalTask,'production',loaded);
+    await database.db.query('UPDATE $a SET evidence=$e;',{a:audit.id,e:'`'+APPROVAL_MARKER+manifest.configurationDigest+'`'});
+    expect((await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult).failure).toBe('audit-marker-missing');
+    await restore();
+    await database.db.query('UPDATE $r SET archived=true;',{r:actor});
+    expect((await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult).failure).toBe('none');
+    await store.approval(approvalTask,'production',loaded);
+    // Diagnostic must never follow an arbitrary non-employee RecordId into another table.
+    await database.db.query('UPDATE $a SET actor=$foreign;',{a:audit.id,foreign:new RecordId('project',String(actor.id))});
+    expect(await request('ops_internal_ai_approval_diagnose',diagnoseArgs())).toEqual({outcome:'denied',failure:'scope-denied'});
+    await restore();
+    await database.db.query('UPDATE $a SET action="owner_approve"; UPDATE $t SET accepted_by="owner", reviewer_role="owner";',{a:audit.id,t:task.id});
+    const owner = await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult;
+    expect(owner.failure).toBe('none');expect(owner.checks.reviewerExists.evaluated).toBe(false);expect(owner.checks.ownerAcceptedByMatches.matched).toBe(true);
+    await store.approval(approvalTask,'production',loaded);
+    // The same timestamp has no unique latest review: diagnostic refuses to combine an ambiguous snapshot.
+    const duplicate = new RecordId('audit','synthetic-ambiguous');
+    await database.db.query('CREATE $id CONTENT $row;',{id:duplicate,row:{...audit,id:duplicate}});
+    expect((await request('ops_internal_ai_approval_diagnose',diagnoseArgs()) as DiagnosticResult).failure).toBe('snapshot-unstable');
+    await database.db.query('DELETE $id;',{id:duplicate});
+  } finally { await restore(); }
+});
+check('expired evidence remains diagnostic-only; wrong roots, schema, digest, hash and activity identify exact failures', async () => {
+  const originalManifest = await Bun.file(manifestPath).text(), originalDocument = await Bun.file(documentPath).text();
+  const diagnose = async (args:Record<string,unknown>={}) => request('ops_internal_ai_approval_diagnose',{...diagnoseArgs(),...args}) as Promise<DiagnosticResult>;
+  const initial = clock;
+  const [leases] = await database.db.query<[Array<{lease_expires_at:number}>]>('SELECT lease_expires_at FROM $task;', {task:new RecordId('task',consumerTask)});
+  try {
+    expect((await diagnose({manifestPath:'/outside/manifest.json'})).failure).toBe('manifest-root-mismatch');
+    expect((await diagnose({activityId:'wrong'})).failure).toBe('activity-mismatch');
+    await writeFile(manifestPath,'{}');expect((await diagnose()).failure).toBe('manifest-schema-invalid');
+    await writeFile(manifestPath,JSON.stringify({...manifest,configurationDigest:'0'.repeat(64)}));expect((await diagnose()).failure).toBe('configuration-digest-invalid');
+    await writeFile(manifestPath,originalManifest);await writeFile(documentPath,originalDocument+'\n');expect((await diagnose()).failure).toBe('document-hash-invalid');
+    await writeFile(documentPath,originalDocument);
+    clock = Date.parse((JSON.parse(originalDocument) as {expiresAt:string}).expiresAt);
+    await database.db.query('UPDATE $task SET lease_expires_at=$expiry;', {task:new RecordId('task',consumerTask),expiry:clock/1000+600});
+    const expired = await diagnose();expect(expired).toMatchObject({failure:'evidence-expired',expired:true,allApplicableChecksMatch:false});
+    expect(expired.checks.auditMarkerExactLine.matched).toBe(true);
+    await expect(request('ops_internal_ai_prove',proofArgs('expired-only'))).rejects.toBeDefined();
+  } finally { clock=initial; await database.db.query('UPDATE $task SET lease_expires_at=$expiry;', {task:new RecordId('task',consumerTask),expiry:leases[0]!.lease_expires_at}); await writeFile(manifestPath,originalManifest);await writeFile(documentPath,originalDocument); }
 });
 check('real approval, byte hashes, normal alias mapping, encrypted proof and public signature',async()=>{
   await new CompanyProofStore(database.db,now).approval(approvalTask,'production',await loadProofFiles(dir,approvalTask,manifestPath,documentPath));

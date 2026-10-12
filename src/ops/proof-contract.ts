@@ -87,6 +87,7 @@ const files = { manifestPath: z.string().max(1024), documentPath: z.string().max
 export const proofToolSchemas = {
   ops_internal_ai_prepare: z.object({ ...base, ...files }).strict(),
   ops_internal_ai_prove: z.object({ ...base, ...files, mode: z.enum(['register-disabled', 'enable']), approvalTask: ref.optional(), activityId: ref, nonce: z.string().regex(/^[A-Za-z0-9_-]{16,64}$/), idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/) }).strict(),
+  ops_internal_ai_approval_diagnose: z.object({ ...base, ...files, approvalTask: ref, activityId: ref }).strict(),
   ops_internal_ai_deliver: z.object({ ...base, proofHandle: z.string().regex(/^p_[a-f0-9]{64}$/), session: z.string().max(128) }).strict(),
   ops_internal_ai_revoke: z.object({ ...base, proofHandle: z.string().regex(/^p_[a-f0-9]{64}$/) }).strict(),
   ops_internal_ai_trust: z.object(base).strict(),
