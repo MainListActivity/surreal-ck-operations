@@ -38,8 +38,8 @@ run('cinematography tasks must carry the 摄影 track and only a def that covers
   expect(shot).toMatchObject({ executorRole: 'cinematography', discipline: '摄影' });
   await workforce.upsertDef('cinema-no-track', { role: 'cinematography', provider: 'antigravity', model: 'gemini-3.8-flash-medium' });
   await expect(claimAs('cinema-no-track', shot.id)).rejects.toMatchObject({ code: 'forbidden' });
-  const seed = SEED_DEFS.find(d => d.id === 'cinematography-agy')!;
-  expect(seed).toMatchObject({ role: 'cinematography', provider: 'antigravity', tracks: ['摄影'] });
+  const seed = SEED_DEFS.find(d => d.id === 'cinematography-codex')!;
+  expect(seed).toMatchObject({ role: 'cinematography', provider: 'codex', thinking: 'high', tracks: ['摄影'] });
   await workforce.upsertDef(seed.id, seed);
   expect((await claimAs(seed.id, shot.id)).task).toMatchObject({ id: shot.id, state: 'doing' });
 });
