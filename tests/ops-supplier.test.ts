@@ -130,7 +130,11 @@ describe('ops_supplier_plan_sample', () => {
     const receipt = JSON.parse(readFileSync(receiptFile, 'utf8'));
     expect(receipt).toMatchObject({ generated: true, alias: ALIAS, purpose: PURPOSE, taskId: 'task-1', documentSha256: result.documentSha256 });
     expect(receipt.pools).toHaveLength(2); // dual pools preserved as side evidence
-    expect(receipt.sources.map((s: { name: string }) => s.name).sort()).toEqual(['apiKeys', 'models', 'planPage', 'poolUsage']);
+    const names = receipt.sources.map((s: { name: string }) => s.name).sort();
+    expect(names).toEqual(['apiKeys', 'models', 'planPage', ...Array(11).fill('paymentSurface'), 'poolUsage'].sort());
+    expect(receipt.derivations.accountPlan).toEqual({ id: 'free', name: 'Free Plan', type: 'TOKEN_PLAN_PLAN_TYPE_FREE' });
+    expect(receipt.derivations.consolePaymentSurfaceAbsent).toBe(true);
+    expect(receipt.derivations.paymentFactsVerifiable).toBe(true);
     expect(r.company.audits.map(a => a.action)).toEqual(['ops_supplier_sample']);
     // Read-only: only allowlisted GETs, no chat/model invocation anywhere.
     expect(onlyAllowedRequests(r)).toEqual([]);
@@ -289,6 +293,30 @@ describe('ops_supplier_plan_sample', () => {
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'planApplicability' })]));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('bound account + free copy, but a live console billing surface → payment facts blocked', async () => {
+    const r = rig();
+    seal(r);
+    r.world.supplier.billingPathLive = true;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'noPaymentInstrument', source: 'paymentSurface' })]));
+    expect(result.receipt.derivations.consolePaymentSurfaceAbsent).toBe(false);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('an account plan type other than the certified free type fails payment facts', async () => {
+    const r = rig();
+    seal(r);
+    r.world.supplier.planType = 'TOKEN_PLAN_PLAN_TYPE_PRO';
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'noPaymentInstrument', source: 'poolUsage' })]));
+    expect(result.receipt.derivations.accountPlanFree).toBe(false);
     expectNoSupplierLeaks(r);
   });
 
