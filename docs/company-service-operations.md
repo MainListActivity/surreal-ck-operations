@@ -198,7 +198,7 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] "<原因>"
 ```
 
-只改还没开工的任务：状态必须是 blocked 或 ready，没有有效租约，也从未提交过。改派前会按创建时同样的规则校验——项目岗位契约（轨限定的承接岗位）和必配轨岗位（screenwriter、story-author）——并写一条 `reassign` 审计，任务版本加一。同一请求重放是幂等的。已开工、已提交或已完成的任务会被拒绝。
+只改还没开工的任务：状态必须是 blocked 或 ready，没有有效租约，也从未提交过。改派前会按创建时同样的规则校验——项目岗位契约（轨限定的承接岗位）和必配轨岗位（screenwriter、story-author、cinematography）——并写一条 `reassign` 审计，任务版本加一。同一请求重放是幂等的。已开工、已提交或已完成的任务会被拒绝。
 
 ## 每日简报里的产能与员工流动
 

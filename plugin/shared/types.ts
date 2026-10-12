@@ -2,7 +2,7 @@
 
 export type GoalTier = "quick" | "standard" | "program";
 export type TaskState = "blocked" | "ready" | "doing" | "review" | "done" | "void";
-export type Role = "gm" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "qa" | "cs" | "eval";
+export type Role = "gm" | "product" | "engineering" | "ai-content" | "concept-design" | "asset-production" | "screenwriter" | "story-author" | "cinematography" | "qa" | "cs" | "eval";
 export type TaskKind = "goal" | "task" | "gate" | "release" | "deploy";
 
 export interface TaskView {
