@@ -4,11 +4,19 @@ export const PROOF_ISSUER = 'urn:surreal-ck:company:internal-ai:v1';
 export const PROOF_AUDIENCE = 'urn:surreal-ck:surreal_ck:production:internal-ai:v1';
 export const PROOF_GOAL = '2e2a6e41c1193595';
 export const APPROVAL_MARKER = 'company-internal-ai-approve:v1:';
-const ref = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
-// 仅 model 允许非空版本片段；绝对末尾断言同时拒绝尾部换行。
+/** 供应商账户计划类型读回常量：reviewed-token-plan 文档只接受 FREE，非 FREE 值不过校验。 */
+export const TOKEN_PLAN_PLAN_TYPE_FREE = "TOKEN_PLAN_PLAN_TYPE_FREE";
+const boundedRef = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+/** 供应商/计划出处只接受无凭据、无查询的 https URL：与 endpoint 同一规则，拒绝 userinfo/port/query/hash。 */
+const httpsSource = z.string().url().refine(v => {
+  const u = new URL(v);
+  return u.protocol === "https:" && !u.username && !u.password && !u.search && !u.hash && !u.port;
+});
+/** 公司侧 model 是有界安全标识：非空安全片段以单点号分隔，长度 1..128，拒绝空白/斜杠/URL/Unicode。 */
 const model = z.string().max(128).regex(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*(?![\s\S])/);
+const ref = boundedRef;
+const endpoint = httpsSource;
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
-const endpoint = z.string().url().refine(v => { const u = new URL(v); return u.protocol === 'https:' && !u.username && !u.password && !u.search && !u.hash && !u.port; });
 export const manifestSchema = z.object({
   schemaVersion: z.literal(1), goalId: z.literal(PROOF_GOAL), project: z.literal('surreal_ck'), env: z.literal('production'),
   activityId: ref, workspaceSlug: z.string().regex(/^[a-z0-9-]{1,40}$/), documentHash: hash,
@@ -20,39 +28,53 @@ export const manifestSchema = z.object({
   ]), configurationDigest: hash,
 }).strict();
 export type ProofManifest = z.infer<typeof manifestSchema>;
-/** 非空短文本且不含控制字符：证据文档自由文本字段统一边界。 */
-const controlFreeText = (max: number) => z.string().min(1).max(max).refine(v => ![...v].some(ch => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) == 127));
 /** 三种证据文档共用的服务标识与采样窗口字段；余额与配额字段按 type 判别，互不混入。 */
-const evidenceBase = { schemaVersion: z.literal(1), accountRef: ref, endpoint, model, priceRevision: ref, sampledAt: z.string().datetime(), expiresAt: z.string().datetime(), autoTopupDisabled: z.literal(true), serviceApproved: z.boolean() };
-const balanceEvidence = { currency: z.literal('USD'), balanceNanoUsd: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) };
+const evidenceBase = {
+  schemaVersion: z.literal(1),
+  accountRef: boundedRef,
+  endpoint: httpsSource,
+  model,
+  priceRevision: boundedRef,
+  sampledAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+  serviceApproved: z.boolean(),
+};
+const controlFreeText = (max: number) => z.string().min(1).max(max).refine(v => ![...v].some(ch => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) == 127));
 /**
- * 受审证据文档，按 type 判别的冻结联合，字段与产品侧 reviewedEvidenceSchema 逐字一致：
- * - development-disabled / reviewed-service：USD-only 余额契约；
- * - reviewed-token-plan：配额型供应商（无 USD 现金价目/余额），用官方计划出处与积分/次数配额表达可用性；
- *   绝不允许把配额换算成美元写余额字段，也不接受 FX/CNY/未知币种。
+ * 受审证据文档（公司侧 evidenceSchema 的等价物），按 type 判别的冻结联合：
+ * - development-disabled / reviewed-service：USD-only 余额契约，字段与历史逐字一致；
+ * - reviewed-token-plan（schemaVersion 2）：配额型供应商（无 USD 现金价目/余额），用官方 Token Plan
+ *   出处、积分/次数配额与账户计划类型读回表达可用性；绝不允许把配额换算成美元写余额字段，
+ *   也不接受 FX/CNY/未知币种。v1 的账户级断言（noPaymentInstrument/autoTopupDisabled）在供应商侧
+ *   无可核定来源已移除；账户是否零扣费改由 accountPlanType=FREE 读回 + 官方付费功能未上线
+ *   + 配额硬顶 + 零费率证书（worstCost=0）表达；auto_topup_disabled 由我方计量配置断言。
  */
-export const evidenceSchema = z.discriminatedUnion('type', [
-  z.object({ ...evidenceBase, type: z.literal('development-disabled'), ...balanceEvidence }).strict(),
-  z.object({ ...evidenceBase, type: z.literal('reviewed-service'), ...balanceEvidence }).strict(),
+export const reviewedEvidenceSchema = z.discriminatedUnion("type", [
+  z.object({ ...evidenceBase, type: z.literal("development-disabled"), autoTopupDisabled: z.literal(true), currency: z.literal("USD"), balanceNanoUsd: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
+  z.object({ ...evidenceBase, type: z.literal("reviewed-service"), autoTopupDisabled: z.literal(true), currency: z.literal("USD"), balanceNanoUsd: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
   z.object({
-    ...evidenceBase, type: z.literal('reviewed-token-plan'),
+    ...evidenceBase,
+    schemaVersion: z.literal(2),
+    type: z.literal("reviewed-token-plan"),
     /** 官方计划名（如 SenseNova Token Plan 公测档）：非空短文本，禁控制字符。 */
     planName: controlFreeText(200),
-    /** 计划官方出处 URL：与 endpoint 同一规则，拒绝 userinfo/port/query/hash。 */
-    planSourceUrl: endpoint,
+    /** 计划官方出处 URL（https、无 userinfo/port/query/hash）。 */
+    planSourceUrl: httpsSource,
+    /** 供应商账户计划类型读回值：仅接受 FREE 常量，非 FREE 即拒绝，不放宽为任意字符串。 */
+    accountPlanType: z.literal(TOKEN_PLAN_PLAN_TYPE_FREE),
     /** 配额单位：积分点或请求次数；无 USD 语义。 */
-    quotaUnit: z.enum(['points', 'requests']),
+    quotaUnit: z.enum(["points", "requests"]),
     /** 滚动窗口内的配额总量，必须为正整数。 */
     quotaAmount: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     /** 配额滚动窗口秒数（如 5 小时 = 18000）。 */
     quotaWindowSeconds: z.number().int().positive(),
     /** 采样时剩余配额；可空（官方只读接口未核定时不得臆造），存在时必须非负。 */
     quotaRemaining: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
-    /** 账户无任何支付方式绑定：字面 true，缺省/臆造即拒。 */
-    noPaymentInstrument: z.literal(true),
   }).strict(),
 ]);
-export type ServiceEvidence = z.infer<typeof evidenceSchema>;
+export type ReviewedEvidence = z.infer<typeof reviewedEvidenceSchema>;
+export const evidenceSchema = reviewedEvidenceSchema;
+export type ServiceEvidence = ReviewedEvidence;
 export const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';

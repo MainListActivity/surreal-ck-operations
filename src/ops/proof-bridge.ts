@@ -5,7 +5,7 @@ import { RecordId } from 'surrealdb';
 import type { OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { openSecret, sealSecret } from '../projects.ts';
-import { canonical, sha256, APPROVAL_MARKER, type ProofIdentity, type ProofTool, proofToolSchemas } from './proof-contract.ts';
+import { canonical, sha256, APPROVAL_MARKER, TOKEN_PLAN_PLAN_TYPE_FREE, type ProofIdentity, type ProofTool, proofToolSchemas } from './proof-contract.ts';
 import { loadProofFiles, type ProofFiles } from './proof-files.ts';
 import { CompanyProofStore, type ProofRow } from './proof-store.ts';
 import { ProofSigner } from './proof-signer.ts';
@@ -30,7 +30,7 @@ export class InternalAiProofBridge {
     const ok = e.type === 'reviewed-service'
       ? e.serviceApproved && e.balanceNanoUsd >= files.manifest.budget.totalNanoUsd
       : e.type === 'reviewed-token-plan'
-        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.noPaymentInstrument === true && e.autoTopupDisabled === true
+        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && this.now() - Date.parse(e.sampledAt) <= 86_400_000
         : false;
     if (!ok || !fresh) throw new CompanyError('forbidden', 'reviewed service evidence unavailable');
   }

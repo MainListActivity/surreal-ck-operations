@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { readProofFile, loadProofFiles } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
-import { proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, type ProofIdentity } from '../src/ops/proof-contract.ts';
+import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, type ProofIdentity } from '../src/ops/proof-contract.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
 import type { CompanyProofStore, ProofRow } from '../src/ops/proof-store.ts';
 import type { OpsScope } from '../src/contracts.ts';
+import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const now=Date.now(),sec=Math.floor(now/1000);
 const evidenceModels = () => evidenceSchema.options.map(o => o.shape.model);
@@ -46,26 +47,37 @@ test('model dots do not widen any other ref or allow unknown document fields', (
 });
 test('reviewed-token-plan evidence follows the frozen quota contract; USD/missing/forged fields reject', () => {
   const tokenPlan = {
-    schemaVersion: 1, type: 'reviewed-token-plan', accountRef: 'synthetic-sensenova-account',
+    schemaVersion: 2, type: 'reviewed-token-plan', accountRef: 'synthetic-sensenova-account',
     endpoint: 'https://token.sensenova.cn/v1', model: 'sensenova-6.8-flash-lite', priceRevision: 'sensenova-plan-2026-10-10',
-    sampledAt: '2026-10-10T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z', autoTopupDisabled: true, serviceApproved: true,
+    sampledAt: '2026-10-10T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z', serviceApproved: true,
     planName: 'SenseNova Token Plan 公测档', planSourceUrl: 'https://www.sensenova.cn/token-plan', quotaUnit: 'points',
-    quotaAmount: 100_000, quotaWindowSeconds: 18_000, quotaRemaining: 90_000, noPaymentInstrument: true,
+    quotaAmount: 100_000, quotaWindowSeconds: 18_000, quotaRemaining: 90_000, accountPlanType: TOKEN_PLAN_PLAN_TYPE_FREE,
   };
-  expect(evidenceSchema.safeParse(tokenPlan).success).toBe(true);
+  for (const good of [tokenPlan, { ...tokenPlan, quotaRemaining: null }, { ...tokenPlan, quotaRemaining: 0 }]) {
+    expect(evidenceSchema.parse(good)).toEqual(productSchema.parse(good));
+  }
   expect(evidenceSchema.safeParse({ ...tokenPlan, quotaRemaining: null }).success).toBe(true);
   expect(evidenceSchema.safeParse({ ...tokenPlan, quotaRemaining: 0 }).success).toBe(true);
   const strip = (key: string) => { const clone: Record<string, unknown> = { ...tokenPlan }; delete clone[key]; return clone; };
   for (const bad of [
     { ...tokenPlan, quotaAmount: 0 }, { ...tokenPlan, quotaAmount: -1 }, { ...tokenPlan, quotaAmount: 1.5 },
     { ...tokenPlan, quotaWindowSeconds: 0 }, { ...tokenPlan, quotaRemaining: -1 },
-    { ...tokenPlan, noPaymentInstrument: false }, { ...tokenPlan, quotaUnit: 'credits' }, { ...tokenPlan, quotaUnit: 'usd' },
+    { ...tokenPlan, noPaymentInstrument: true }, { ...tokenPlan, autoTopupDisabled: true }, { ...tokenPlan, schemaVersion: 1 }, { ...tokenPlan, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_PRO' }, { ...tokenPlan, quotaUnit: 'credits' }, { ...tokenPlan, quotaUnit: 'usd' },
     { ...tokenPlan, planName: '' }, { ...tokenPlan, planName: 'a\nb' }, { ...tokenPlan, planName: 'x'.repeat(201) },
     { ...tokenPlan, planSourceUrl: 'http://www.sensenova.cn/token-plan' }, { ...tokenPlan, planSourceUrl: 'https://www.sensenova.cn/token-plan?a=1' },
     { ...tokenPlan, planSourceUrl: 'https://user@www.sensenova.cn/token-plan' }, { ...tokenPlan, planSourceUrl: 'https://www.sensenova.cn:8443/token-plan' },
     { ...tokenPlan, currency: 'USD' }, { ...tokenPlan, balanceNanoUsd: 0 }, { ...tokenPlan, type: 'reviewed-quota' }, { ...tokenPlan, unknownField: 1 },
-    strip('planName'), strip('planSourceUrl'), strip('quotaUnit'), strip('quotaAmount'), strip('quotaWindowSeconds'), strip('quotaRemaining'), strip('noPaymentInstrument'),
-  ]) expect(evidenceSchema.safeParse(bad).success).toBe(false);
+    strip('planName'), strip('planSourceUrl'), strip('quotaUnit'), strip('quotaAmount'), strip('quotaWindowSeconds'), strip('quotaRemaining'), strip('accountPlanType'),
+  ]) { expect(evidenceSchema.safeParse(bad).success).toBe(false); expect(productSchema.safeParse(bad).success).toBe(false); }
+  // USD 两路径用同一 fixture 跑双端真实 schema，成功和拒绝结果保持一致。
+  for (const type of ['development-disabled', 'reviewed-service']) {
+    const usd = { ...disabledSenseNovaFixture().evidence, type };
+    expect(evidenceSchema.parse(usd)).toEqual(productSchema.parse(usd));
+    for (const bad of [{ ...usd, schemaVersion: 2 }, { ...usd, currency: 'CNY' }, { ...usd, autoTopupDisabled: false }, { ...usd, accountPlanType: TOKEN_PLAN_PLAN_TYPE_FREE }]) {
+      expect(evidenceSchema.safeParse(bad).success).toBe(false);
+      expect(productSchema.safeParse(bad).success).toBe(false);
+    }
+  }
   // USD 余额分支不接受配额字段，两族字段互不混入；旧类型形状不变。
   const { evidence } = disabledSenseNovaFixture();
   expect(evidenceSchema.safeParse({ ...evidence, quotaAmount: 1 }).success).toBe(false);

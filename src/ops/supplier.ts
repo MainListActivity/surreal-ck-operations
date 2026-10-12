@@ -9,15 +9,15 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { describeTransportFailure, type Fetcher } from './fetcher.ts';
-import { evidenceSchema, sha256 } from './proof-contract.ts';
+import { evidenceSchema, sha256, TOKEN_PLAN_PLAN_TYPE_FREE } from './proof-contract.ts';
 import { clip, redactJson } from './redact.ts';
 
 /**
- * The fixed SenseNova adapter (v1). Every endpoint, method and field below was reviewed
+ * The fixed SenseNova adapter (v2). Every endpoint, method and field below was reviewed
  * against the provider's public pages and console surface; callers can never steer the
  * sampler to another host, path, method or body.
  */
-export const SUPPLIER_ADAPTER = 'sensenova-token-plan/1';
+export const SUPPLIER_ADAPTER = 'sensenova-token-plan/2';
 export const SUPPLIER_PROVIDER = 'sensenova';
 const API_BASE = 'https://token.sensenova.cn/v1';
 const CONSOLE_API = 'https://platform.sensenova.cn/lite/console/v1';
@@ -50,23 +50,7 @@ const PAYMENT_SURFACE_PATHS = [
   '/billing', '/billingAccounts', '/billing/balance', '/recharge', '/recharge/settings',
   '/wallet', '/orders', '/payment-methods', '/auto-recharge', '/bills', '/finance/invoices',
 ] as const;
-/**
- * Authoritative account-level payment-state sources. The contract fields
- * `noPaymentInstrument` (账户无任何支付方式绑定) and `autoTopupDisabled` are
- * account-scope literals: only an official API that returns this account's payment
- * bindings (e.g. a billingAccounts resource answering 200 with a certified-empty
- * list) or an explicit official statement covering every applicable account can
- * certify them. Probed 2026-10-12 across the Lite console API and SenseCore IAM:
- * the user record carries no payment fields, no billing-account/payment resource
- * exists, role bindings are not readable, and the provider's own client bundle
- * contains zero billing endpoints — no official source exists, so the list stays
- * empty and every sample blocks on paymentFacts. A new source lands here only via
- * a code change carrying its own verification contract; guessed 404 URIs never
- * qualify.
- */
-const ACCOUNT_PAYMENT_SOURCES: readonly string[] = [];
-/** The account's own plan classification, read off the console pool-usage payload. */
-const FREE_PLAN_TYPE = 'TOKEN_PLAN_PLAN_TYPE_FREE';
+
 
 /**
  * Console-session auto-issuance chain (probed 2026-10-12, Ory Hydra layout):
@@ -339,7 +323,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let accountPlan: { id: string; name: string; type: string } | null = null;
   let paymentSurfaceAbsent = false;
   if (!consoleToken) {
-    gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)} and no sealed ${supplierUsernameSecretName(input.alias)}/${supplierPasswordSecretName(input.alias)}; account-bound quota and payment facts are unverifiable` });
+    gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)} and no sealed ${supplierUsernameSecretName(input.alias)}/${supplierPasswordSecretName(input.alias)}; account-bound quota and plan type are unverifiable` });
   } else {
     const keysRecord = source('apiKeys', `${CONSOLE_API}/metered/api-keys`);
     const poolRecord = source('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`);
@@ -414,7 +398,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     // Payment-surface enumeration, observation only: record what each guessed
     // billing-ish console path answers under this session. A live surface means the
     // provider now ships payment features humans must review; uniform 404s are
-    // recorded as they happened but certify nothing (see ACCOUNT_PAYMENT_SOURCES).
+    // recorded as observations only; they never certify account payment state.
     const surfaceChecks: Array<{ path: string; status: number | null }> = [];
     const surfaceRecords = PAYMENT_SURFACE_PATHS.map(path => source('paymentSurface', `${CONSOLE_API}${path}`));
     const surfaceResults = await Promise.all(
@@ -431,7 +415,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     derivations.paymentSurface = surfaceChecks;
     if (surfaceDrift) {
       const found = surfaceChecks.filter(c => c.status !== 404).map(c => `${c.path}=${c.status ?? 'transport'}`).join(', ');
-      gaps.push({ field: 'noPaymentInstrument', source: 'paymentSurface', detail: `console payment surface not uniformly absent (${found}); payment facts need human review` });
+      gaps.push({ field: 'planApplicability', source: 'paymentSurface', detail: `console payment surface not uniformly absent (${found}); payment surface drift needs human review` });
     }
   }
 
@@ -440,32 +424,20 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   const accountBound = poolsOk && crossBound;
   derivations.accountBound = accountBound;
   derivations.applicabilityOk = applicabilityOk;
-  // Payment facts (`noPaymentInstrument`, `autoTopupDisabled`) are account-scope
-  // literals in the evidence contract: they certify only through an authoritative
-  // account-level payment-state source — an official API returning this account's
-  // payment bindings, or an explicit official statement covering every applicable
-  // account. The provider ships neither today (ACCOUNT_PAYMENT_SOURCES is empty),
-  // so the facts stay unverifiable and the sample fails closed no matter how
-  // benign everything else looks. What we still record, as receipt observations
-  // rather than proof: the account's own plan classification from pool-usage
-  // (a non-free plan would additionally be disqualifying on its own) and the
-  // per-URI status of the guessed payment surface enumeration.
-  const accountPlanFree = accountPlan?.type === FREE_PLAN_TYPE;
+  // Only the authenticated console plan record, cross-bound to the sealed API key,
+  // establishes FREE. Public copy, model liveness and HTTP 404s are not account facts.
+  const accountPlanFree = accountBound && accountPlan?.type === TOKEN_PLAN_PLAN_TYPE_FREE;
   derivations.accountPlan = accountPlan;
   derivations.accountPlanFree = accountPlanFree;
+  derivations.accountPlanSource = { source: 'poolUsage', accountBound, verified: accountPlanFree };
   derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
-  derivations.paymentStateSources = ACCOUNT_PAYMENT_SOURCES.length;
-  const paymentFactsOk = ACCOUNT_PAYMENT_SOURCES.length > 0 && accountBound && accountPlanFree;
-  if (accountBound && accountPlan && !accountPlanFree && !gaps.some(g => g.field === 'noPaymentInstrument')) {
-    gaps.push({ field: 'noPaymentInstrument', source: 'poolUsage', detail: `account plan type is not the certified free token-plan type (got ${accountPlan.type}); payment facts unverifiable` });
+  derivations.unverifiedAccountFacts = ['noPaymentInstrument', 'autoTopupDisabled'];
+  notes.push('account payment bindings and supplier auto-topup state remain unverified; v2 makes neither assertion');
+  if (!accountPlanFree) {
+    gaps.push({ field: 'account-plan-free', source: 'poolUsage', detail: accountPlan
+      ? 'authenticated account plan is not verified FREE for the bound API key'
+      : 'authenticated account plan source missing or unreadable; public copy and 404s cannot substitute' });
   }
-  if (accountBound && applicabilityOk && !paymentFactsOk && !gaps.some(g => g.field === 'noPaymentInstrument')) {
-    gaps.push({ field: 'noPaymentInstrument', source: 'paymentFacts', detail: ACCOUNT_PAYMENT_SOURCES.length === 0
-      ? 'provider offers no official account-level payment-state source (Lite console API + SenseCore IAM probed); HTTP 404 enumeration is observation, not proof'
-      : 'registered payment-state sources did not certify the account' });
-    gaps.push({ field: 'autoTopupDisabled', source: 'paymentFacts', detail: 'same missing source: auto-topup state is equally uncertifiable' });
-  }
-  derivations.paymentFactsVerifiable = paymentFactsOk;
   if (consoleTokenSource || authHops)
     derivations.consoleSession = { tokenSource: consoleTokenSource ?? 'unavailable', sessionExpiresAt: consoleSessionExpiresAt, hops: authHops ?? [] };
   if (apiKey && !keyLive && !gaps.some(g => g.source === 'models')) {
@@ -474,17 +446,20 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
 
   const governing = pools.length ? governingPool(pools) : undefined;
   let quotaRemaining: number | null = null;
+  const quotaVerified = !!governing && governing.limit5h === QUOTA.amount;
+  derivations.quotaHardCapVerified = quotaVerified;
+  if (!quotaVerified) gaps.push({ field: 'quota', source: 'poolUsage', detail: 'governing pool hard cap missing or differs from reviewed official quota' });
   if (governing) {
     quotaRemaining = governing.remaining5h;
     if (quotaRemaining === null) {
       gaps.push({ field: 'quotaRemaining', source: 'poolUsage', detail: `governing pool ${governing.poolType} exposes no 5h remaining figure` });
     }
     if (governing.limit5h !== null && governing.limit5h !== QUOTA.amount) {
-      notes.push(`governing pool 5h limit ${governing.limit5h} differs from certified ${QUOTA.amount}; document keeps the reviewed plan facts`);
+      notes.push(`governing pool 5h limit ${governing.limit5h} differs from certified ${QUOTA.amount}; document blocked for quota re-review`);
     }
   }
 
-  let canDocument = !!accountRef && keyLive && modelListed && accountBound && paymentFactsOk;
+  let canDocument = !!accountRef && keyLive && modelListed && accountBound && accountPlanFree && applicabilityOk && paymentSurfaceAbsent && quotaVerified;
   let document: Record<string, unknown> | undefined;
   let documentSha256: string | undefined;
   let documentFile: string | undefined;
@@ -501,7 +476,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   if (canDocument) {
     expiresAt = new Date(expiryMs).toISOString();
     document = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       type: 'reviewed-token-plan',
       accountRef: accountRef!,
       endpoint: API_BASE,
@@ -515,8 +490,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       quotaAmount: QUOTA.amount,
       quotaWindowSeconds: QUOTA.windowSeconds,
       quotaRemaining,
-      noPaymentInstrument: true,
-      autoTopupDisabled: true,
+      accountPlanType: accountPlan!.type,
       // The document's approval claim: it takes effect only through ops_internal_ai_prove's
       // independent task-service approval receipt, never on this field alone.
       serviceApproved: true,
