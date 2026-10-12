@@ -1,7 +1,7 @@
 // ElevenLabs media studio. An employee asks for a voice, a line, a sound or a score; this trusted code asks sck-vault
 // (the only holder of the key) for the upstream operation, writes the audio into the task's evidence folder and
 // returns paths and sizes only. Every call is gated on the live task lease, role-checked, capped per project per day
-// and audited. The boss's grants inside sck-vault cap what the vault will pay for.
+// and audited. The vault's only job is key custody: the key never leaves it.
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -33,7 +33,7 @@ const TIPS = [
   '台词与对白可加音频标签，如 [whispers] [laughs] [sighs]（eleven_v3 支持）',
   '声线先 media_voices 查现成的；没有合适的就 media_voice_design 设计，返回的 voice_id 直接用于 media_tts / media_dialogue',
   'file 只能是纯文件名 xxx.mp3（不含路径），产物写在 outputDir；需要进产品仓库的文件自行拷贝',
-  'grants 列出老板批准的付费操作及剩余次数；没有列出的操作当前不可用，如实报告，不要自行绕过',
+  '每次调用都受租约、角色与项目每日配额约束（代码判断）；报错如实上报，不要自行绕过',
 ];
 
 type Args = Record<string, unknown>;
@@ -223,7 +223,7 @@ export class MediaStudio {
     });
     const configured = status?.configured === true;
     // A refused or unreachable subscription call must not take the diagnostic output down with it:
-    // employees need configured/grants/quotas to say exactly what the boss has to approve.
+    // employees need configured/quotas to report exactly which quota is exhausted.
     let sub: Subscription | undefined;
     let subscriptionError: string | undefined;
     if (configured) {
@@ -243,7 +243,6 @@ export class MediaStudio {
         tier: sub.tier, character_count: sub.character_count, character_limit: sub.character_limit, next_character_count_reset_unix: sub.next_character_count_reset_unix,
       },
       subscriptionError,
-      grants: (status?.grants ?? []).map(({ expiresAt, callsLeft }) => ({ expiresAt, callsLeft })),
       outputDir: this.outputDir(scope),
       quotas,
       tips: TIPS,

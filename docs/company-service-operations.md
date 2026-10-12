@@ -244,15 +244,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 `private/service.env` 中的 `ELEVENLABS_API_KEY=` 一行，在新插件生效并验证之后删除，然后轮换该 key（旧 key 以明文存在过，员工可能读到过）。
 
-**授权（付费操作默认关闭）**
+**调用（无需授权）**
 
 ```sh
-<服务目录>/bin/sck-vault grant --kinds tts,sfx --calls 50 --minutes 120   # 弹出 Touch ID，批准后生效
-<服务目录>/bin/sck-vault status                                          # 当前授权与剩余次数
-<服务目录>/bin/sck-vault revoke <授权ID>                                  # 立即撤销
+<服务目录>/bin/sck-vault status   # {"configured": true} 表示密钥就绪
 ```
 
-操作种类：`tts`、`dialogue`、`sfx`、`music`、`voice_design`、`voice_create`、`voices`、`subscription`。授权只记录操作种类、每种次数和有效期，只存在 sck-vault 内存里，重启即失效。没有授权覆盖的操作，员工调用会得到 `forbidden`。
+操作种类：`tts`、`dialogue`、`sfx`、`music`、`voice_design`、`voice_create`、`voices`、`subscription`。密钥录入后员工即可调用，不需要老板批准——vault 的职责只有一条：密钥不出进程。员工侧的租约、角色与项目每日配额由插件代码判断。
 
 **安全边界**
 
@@ -260,8 +258,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 - vault 只访问 `api.elevenlabs.io` 的固定端点，不跟随重定向，调用方不能指定 URL 或请求头。
 - 钥匙串只信任这一份二进制。副本放在别的路径运行时，会拒绝读取密钥。
 - 加固运行时，且没有调试权限，同用户的其它进程拿不到 vault 的内存。
-- 已授权的操作，同一台 Mac 上的任何本地进程都能在授权范围内调用。vault 分辨不出调用的是哪个员工，员工级的租约和角色检查仍在插件里。授权越小、越短，风险越小。
-- 同一时间只能有一个 sck-vault 监听 socket。老板拒绝一次授权后，60 秒内不再弹窗。
+- 同一台 Mac 上的任何本地进程都能调用固定端点操作。vault 分辨不出调用者身份，员工级的租约和角色检查仍在插件里；绕过插件直调 socket 无法拿到 key，但能发起上游调用，这是已接受的残余面。
+- 同一时间只能有一个 sck-vault 监听 socket。
 
 **配额与审计**
 

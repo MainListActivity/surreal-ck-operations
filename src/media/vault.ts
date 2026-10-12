@@ -4,24 +4,23 @@ import { Socket } from 'node:net';
 import { CompanyError } from '../core-errors.ts';
 
 export interface VaultReply { status: number; contentType: string; body: Buffer }
-export interface VaultGrant { id: string; expiresAt: string; callsLeft: Record<string, number> }
 export interface MediaVault {
-  status(): Promise<{ configured: boolean; grants: VaultGrant[] }>;
+  status(): Promise<{ configured: boolean }>;
   call(kind: string, params: Record<string, unknown>): Promise<VaultReply>;
 }
 
 /** Music generation can take minutes upstream, so the reply window is longer than the vault's own timeouts. */
 const REPLY_MS = 330_000;
 const CODES: Partial<Record<string, CompanyError['code']>> = {
-  forbidden: 'forbidden', invalid: 'invalid', busy: 'temporarily_unavailable', upstream_error: 'upstream_error',
+  forbidden: 'forbidden', invalid: 'invalid', busy: 'temporarily_unavailable', upstream_error: 'upstream_error', limit_reached: 'limit_reached',
 };
 
 export class VaultClient implements MediaVault {
   constructor(private readonly socketPath: string) {}
 
-  async status(): Promise<{ configured: boolean; grants: VaultGrant[] }> {
+  async status(): Promise<{ configured: boolean }> {
     const reply = await this.request({ op: 'status' });
-    return { configured: reply.configured === true, grants: Array.isArray(reply.grants) ? reply.grants : [] };
+    return { configured: reply.configured === true };
   }
 
   async call(kind: string, params: Record<string, unknown>): Promise<VaultReply> {

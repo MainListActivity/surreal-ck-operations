@@ -21,14 +21,13 @@ function runVault(args: string[], socket = join(dir, 'vault.sock')) {
   return Bun.spawnSync([TEST_BIN, ...args], { env: { ...process.env, SCK_VAULT_TEST_SOCKET: socket }, stdout: 'pipe', stderr: 'pipe' });
 }
 
-async function startVault(socket: string, autoApprove: '1' | '0') {
+async function startVault(socket: string) {
   const proc = Bun.spawn([TEST_BIN, 'serve'], {
     env: {
       ...process.env,
       SCK_VAULT_TEST_SOCKET: socket,
       SCK_VAULT_TEST_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
       SCK_VAULT_TEST_SECRET: SECRET,
-      SCK_VAULT_TEST_AUTO_APPROVE: autoApprove,
     },
     stdout: 'ignore',
     stderr: 'pipe',
@@ -78,7 +77,7 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     servers = [up, other];
     const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh'), '--test'], { stdout: 'pipe', stderr: 'pipe' });
     expect(build.exitCode).toBe(0);
-    vault = await startVault(socket, '1');
+    vault = await startVault(socket);
     client = new VaultClient(socket);
   });
 
@@ -88,24 +87,11 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test('status reports a configured vault with no grants yet', async () => {
-    expect(await client.status()).toEqual({ configured: true, grants: [] });
+  test('status reports whether the vault holds a key', async () => {
+    expect(await client.status()).toEqual({ configured: true });
   });
 
-  test('a call without any grant is refused before the upstream is touched', async () => {
-    const before = upstream.seen.length;
-    const error = await client.call('tts', { voiceId: 'voice1', text: 'hi' }).catch((e: unknown) => e);
-    expect((error as CompanyError).code).toBe('forbidden');
-    expect(upstream.seen.length).toBe(before);
-  });
-
-  test('the boss grants a budget from the terminal; the grant shows up without any id a caller could reuse', () => {
-    const granted = runVault(['grant', '--kinds', 'tts,voices,voice_design', '--calls', '2', '--minutes', '5'], socket);
-    expect(granted.exitCode).toBe(0);
-    expect(JSON.parse(granted.stdout.toString()).ok).toBe(true);
-  });
-
-  test('a granted tts call reaches the upstream with the key, on the fixed endpoint, and returns the audio bytes', async () => {
+  test('a call reaches the upstream with the key, on the fixed endpoint', async () => {
     const reply = await client.call('tts', { voiceId: 'voice1', text: 'hello', model_id: 'eleven_v3' });
     expect(reply.status).toBe(200);
     expect(reply.contentType).toBe('audio/mpeg');
@@ -115,10 +101,6 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     expect(JSON.parse(seen?.body ?? '{}')).toEqual({ text: 'hello', model_id: 'eleven_v3' });
   });
 
-  test('a kind the boss did not grant is refused', async () => {
-    const error = await client.call('sfx', { text: 'door' }).catch((e: unknown) => e);
-    expect((error as CompanyError).code).toBe('forbidden');
-  });
 
   test('a voice id that could change the path is refused before any request', async () => {
     const before = upstream.seen.length;
@@ -131,15 +113,6 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     const reply = await client.call('voices', { search: 'narrator' });
     expect(reply.status).toBe(302);
     expect(upstream.other).toBe(0);
-    const status = await client.status();
-    expect(status.grants[0]?.callsLeft.voices).toBe(2);
-  });
-
-  test('the budget is enforced by the vault: two tts calls in total, then refused', async () => {
-    const second = await client.call('tts', { voiceId: 'voice1', text: 'again' });
-    expect(second.status).toBe(200);
-    const third = await client.call('tts', { voiceId: 'voice1', text: 'too many' }).catch((e: unknown) => e);
-    expect((third as CompanyError).code).toBe('forbidden');
   });
 
   test('upstream errors come back with their status and the key scrubbed out of the text', async () => {
@@ -153,34 +126,17 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
   test('the key is in neither the vault log, the audit trail, nor any reply', () => {
     const audit = join(dir, 'audit.log');
     const lines = readFileSync(audit, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(lines.length).toBeGreaterThan(3);
+    expect(lines.length).toBeGreaterThanOrEqual(3);
     expect(lines.every(line => typeof line.hash === 'string' && typeof line.prev === 'string')).toBe(true);
+    expect(lines.every(line => line.event === 'call')).toBe(true);
     expect(readFileSync(audit, 'utf8')).not.toContain(SECRET);
     expect(readdirSync(dir)).toContain('audit.log');
   });
 
-  test('revoking the grant from the terminal stops every call at once', async () => {
-    const status = await client.status();
-    const id = status.grants[0]?.id ?? '';
-    expect(id.length).toBeGreaterThan(0);
-    expect(JSON.parse(runVault(['revoke', id], socket).stdout.toString()).ok).toBe(true);
-    const error = await client.call('tts', { voiceId: 'voice1', text: 'after revoke' }).catch((e: unknown) => e);
-    expect((error as CompanyError).code).toBe('forbidden');
-  });
-
-  test('a boss who does not approve the request leaves the vault with no grant', async () => {
-    const denied = join(dir, 'denied.sock');
-    const second = await startVault(denied, '0');
-    try {
-      const result = runVault(['grant', '--kinds', 'tts', '--calls', '5', '--minutes', '5'], denied);
-      expect(JSON.parse(result.stdout.toString()).code).toBe('forbidden');
-      const status = await new VaultClient(denied).status();
-      expect(status.grants).toEqual([]);
-      const again = runVault(['grant', '--kinds', 'tts', '--calls', '5', '--minutes', '5'], denied);
-      expect(JSON.parse(again.stdout.toString()).code).toBe('busy');
-    } finally {
-      second.kill();
-    }
+  test('the grant command no longer exists: permission is code, not approval', () => {
+    const result = runVault(['grant', '--kinds', 'tts', '--calls', '5'], socket);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr.toString() + result.stdout.toString()).toContain('用法');
   });
 
   test('a second vault cannot take over the socket of a running one', async () => {

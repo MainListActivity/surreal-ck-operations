@@ -78,7 +78,7 @@
 
 ## 媒体工具（media_*）
 
-配音、音效、配乐、主题曲用 `sck call media_<名字> '<JSON>'`，先 `sck call media_info '{}'` 看用法、当日额度和输出目录，以及 `grants`（老板批准的付费操作与剩余次数）。产物写在证据目录的 `media/` 下，文件名只能是 `xxx.mp3`；需要进产品仓库时自己拷贝。ElevenLabs 的 key 由 sck-vault 持有，不要找老板要。没有授权（`forbidden`）、额度用尽（`limit_reached`）或 key 未配置（`not_configured`）时，如实写进报告，不要绕过。
+配音、音效、配乐、主题曲用 `sck call media_<名字> '<JSON>'`，先 `sck call media_info '{}'` 看用法、当日额度和输出目录。产物写在证据目录的 `media/` 下，文件名只能是 `xxx.mp3`；需要进产品仓库时自己拷贝。ElevenLabs 的 key 由 sck-vault 持有，不要找老板要。额度用尽（`limit_reached`）或 key 未配置（`not_configured`）时，如实写进报告，不要绕过。
 
 ## 管理工具（manage）
 
