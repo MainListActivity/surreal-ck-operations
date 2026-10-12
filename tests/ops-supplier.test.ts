@@ -6,6 +6,8 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, test } from 'bun:test';
+import { sha256, evidenceSchema } from '../src/ops/proof-contract.ts';
+import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
 import { FakeCompany, FakeWorld, brokerConfig } from './support/ops-world.ts';
 
@@ -81,7 +83,7 @@ describe('ops_supplier_plan_sample', () => {
     seal(r);
     const info = await call(r, 'ops_info');
     expect(info.supplierPlanSampling).toMatchObject({
-      provider: 'sensenova', adapter: 'sensenova-token-plan/1',
+      provider: 'sensenova', adapter: 'sensenova-token-plan/2',
       service: {
         endpoint: 'https://token.sensenova.cn/v1',
         model: 'sensenova-6.8-flash-lite',
@@ -93,16 +95,19 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('Free plan + bound account + every guessed payment URI 404, but no official payment-state source → blocked, no document', async () => {
+  test('FREE console plan + bound API key + official applicability → v2 document, payment state unverified', async () => {
     const r = rig();
     seal(r);
     const result = await sample(r);
-    // Every fact the sampler can establish stays reported — the bound account ref, the
-    // account's own FREE plan classification, the quota pools and the per-URI probe
-    // observations — but none of them can certify account-level payment facts.
-    expect(result.status).toBe('blocked');
-    expect(result.document).toBeUndefined();
-    expect(result.documentSha256).toBeUndefined();
+    expect(result.status).toBe('sampled');
+    expect(result.document).toMatchObject({ schemaVersion: 2, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE', quotaAmount: 60000 });
+    expect(result.document).not.toHaveProperty('noPaymentInstrument');
+    expect(result.document).not.toHaveProperty('autoTopupDisabled');
+    expect(result.documentSha256).toMatch(/^[a-f0-9]{64}$/);
+    const bytes = readFileSync(result.documentFile);
+    expect(sha256(bytes)).toBe(result.documentSha256);
+    expect(evidenceSchema.parse(JSON.parse(bytes.toString('utf8')))).toEqual(productSchema.parse(result.document));
+    expect(Date.parse(result.expiresAt) - Date.parse(result.sampledAt)).toBeLessThanOrEqual(86400000);
     expect(result.accountRef).toMatch(/^snv[a-f0-9]{24}$/);
     expect(result.receipt.derivations).toMatchObject({
       accountBound: true,
@@ -110,23 +115,19 @@ describe('ops_supplier_plan_sample', () => {
       accountPlan: { id: 'free', name: 'Free Plan', type: 'TOKEN_PLAN_PLAN_TYPE_FREE' },
       accountPlanFree: true,
       consolePaymentSurfaceAbsent: true,
-      paymentStateSources: 0,
-      paymentFactsVerifiable: false,
+      unverifiedAccountFacts: ['noPaymentInstrument', 'autoTopupDisabled'],
     });
-    expect(result.gaps).toEqual(expect.arrayContaining([
-      expect.objectContaining({ field: 'noPaymentInstrument', source: 'paymentFacts' }),
-      expect.objectContaining({ field: 'autoTopupDisabled', source: 'paymentFacts' }),
-    ]));
+    expect(result.gaps).toEqual([]);
     // The receipt is still written: sources, observations and gaps are the evidence.
     const receiptFile = result.receiptFile as string;
     const receipt = JSON.parse(readFileSync(receiptFile, 'utf8'));
-    expect(receipt).toMatchObject({ generated: false, alias: ALIAS, purpose: PURPOSE, taskId: 'task-1', documentSha256: null });
+    expect(receipt).toMatchObject({ generated: true, alias: ALIAS, purpose: PURPOSE, taskId: 'task-1', documentSha256: result.documentSha256 });
     expect(receipt.pools).toHaveLength(2); // dual pools preserved as side evidence
     const names = receipt.sources.map((s: { name: string }) => s.name).sort();
     expect(names).toEqual(['apiKeys', 'models', 'planPage', ...Array(11).fill('paymentSurface'), 'poolUsage'].sort());
     expect(statSync(receiptFile).mode & 0o777).toBe(0o600);
     const dir = join(r.home, 'evidence', 'task-1');
-    expect(readdirSync(dir).some(f => /supplier-plan-sensenova-\d+\.json$/.test(f))).toBe(false);
+    expect(readdirSync(dir).some(f => /supplier-plan-sensenova-\d+\.json$/.test(f))).toBe(true);
     expect(r.company.audits.map(a => a.action)).toEqual(['ops_supplier_sample']);
     // Read-only: only allowlisted GETs, no chat/model invocation anywhere.
     expect(onlyAllowedRequests(r)).toEqual([]);
@@ -146,12 +147,12 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('sealed console credentials auto-issue a session token → account facts established, paymentFacts still blocked', async () => {
+  test('sealed console credentials auto-issue a session token → account facts established, v2 sampled', async () => {
     const r = rig();
     seal(r, { consoleToken: false, consoleCreds: true });
     const result = await sample(r);
-    expect(result.status).toBe('blocked');
-    expect(result.document).toBeUndefined();
+    expect(result.status).toBe('sampled');
+    expect(result.document.schemaVersion).toBe(2);
     const receipt = JSON.parse(readFileSync(String(result.receiptFile), 'utf8'));
     expect(receipt.derivations.consoleSession.tokenSource).toBe('issued');
     expect(receipt.derivations.consoleSession.sessionExpiresAt).toMatch(/^\d{4}-/);
@@ -164,7 +165,7 @@ describe('ops_supplier_plan_sample', () => {
     const r = rig();
     seal(r, { consoleCreds: true });
     const result = await sample(r);
-    expect(result.status).toBe('blocked');
+    expect(result.status).toBe('sampled');
     expect(result.receipt.derivations.consoleSession.tokenSource).toBe('issued');
     expectNoSupplierLeaks(r);
   });
@@ -174,7 +175,7 @@ describe('ops_supplier_plan_sample', () => {
     seal(r, { consoleCreds: true });
     r.world.supplier.authLoginStatus = 401;
     const result = await sample(r);
-    expect(result.status).toBe('blocked');
+    expect(result.status).toBe('sampled');
     expect(result.receipt.derivations.consoleSession.tokenSource).toBe('sealed');
     expect(result.receipt.notes.some((n: string) => n.includes('fallback'))).toBe(true);
     expect(result.gaps.some((g: { source: string }) => g.source === 'auto-issuance')).toBe(true);
@@ -287,28 +288,50 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('bound account + free copy, but a live console billing surface → payment facts blocked', async () => {
+  test('bound account + free copy, but a live console billing surface → applicability drift blocks', async () => {
     const r = rig();
     seal(r);
     r.world.supplier.billingPathLive = true;
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.document).toBeUndefined();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'noPaymentInstrument', source: 'paymentSurface' })]));
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'planApplicability', source: 'paymentSurface' })]));
     expect(result.receipt.derivations.consolePaymentSurfaceAbsent).toBe(false);
     expectNoSupplierLeaks(r);
   });
 
-  test('an account plan type other than the certified free type fails payment facts', async () => {
+  test('an account plan type other than the certified free type fails account-plan-free', async () => {
     const r = rig();
     seal(r);
     r.world.supplier.planType = 'TOKEN_PLAN_PLAN_TYPE_PRO';
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.document).toBeUndefined();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'noPaymentInstrument', source: 'poolUsage' })]));
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'account-plan-free', source: 'poolUsage' })]));
     expect(result.receipt.derivations.accountPlanFree).toBe(false);
     expectNoSupplierLeaks(r);
+  });
+
+  test('missing console plan cannot borrow FREE from public page, models or payment 404s', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.planType = undefined as never;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'account-plan-free', source: 'poolUsage' })]));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('quota hard cap drift or absence fails closed', async () => {
+    for (const limit of [0, 60001, null]) {
+      const r = rig(); seal(r);
+      r.world.supplier.pools[0]!.window_5h.limit = limit as never;
+      const result = await sample(r);
+      expect(result.status).toBe('blocked');
+      expect(result.document).toBeUndefined();
+      expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'quota', source: 'poolUsage' })]));
+      expectNoSupplierLeaks(r);
+    }
   });
 
   test('a drifted pool-usage schema blocks rather than guessing quota', async () => {
@@ -326,8 +349,8 @@ describe('ops_supplier_plan_sample', () => {
     seal(r);
     (r.world.supplier.pools[0]!.window_5h as { remaining: number | null }).remaining = null as never;
     const result = await sample(r);
-    expect(result.status).toBe('blocked');
-    expect(result.document).toBeUndefined();
+    expect(result.status).toBe('sampled');
+    expect(result.document.quotaRemaining).toBeNull();
     expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'quotaRemaining' })]));
     expectNoSupplierLeaks(r);
   });

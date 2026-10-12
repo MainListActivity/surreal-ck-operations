@@ -11,7 +11,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { CompanyProofStore } from '../src/ops/proof-store.ts';
-import { PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofManifest } from '../src/ops/proof-contract.ts';
+import { TOKEN_PLAN_PLAN_TYPE_FREE, PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofManifest } from '../src/ops/proof-contract.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
 import { loadProofFiles } from '../src/ops/proof-files.ts';
 import { brokerConfig, FakeWorld, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
@@ -68,10 +68,10 @@ function broker() {
 type EvidenceDoc = Record<string, unknown>;
 async function files(task: string, type: 'reviewed-service'|'development-disabled'|'reviewed-token-plan' = 'reviewed-service') {
   const root = join(dir, 'evidence', task); await mkdir(root,{recursive:true});
-  const base = {schemaVersion:1,type,accountRef:'existing-service-opaque',endpoint:'https://api.openai.com/v1',model:'gpt-4o-mini-2024-07-18',priceRevision:'openai-mini-2026-10-09',sampledAt:new Date(clock-1000).toISOString(),expiresAt:new Date(clock+3_600_000).toISOString(),autoTopupDisabled:true};
+  const base = {schemaVersion:1,type,accountRef:'existing-service-opaque',endpoint:'https://api.openai.com/v1',model:'gpt-4o-mini-2024-07-18',priceRevision:'openai-mini-2026-10-09',sampledAt:new Date(clock-1000).toISOString(),expiresAt:new Date(clock+3_600_000).toISOString()};
   const evidence = type === 'reviewed-token-plan'
-    ? {...base,serviceApproved:true,planName:'SenseNova Token Plan 公测档',planSourceUrl:'https://www.sensenova.cn/token-plan',quotaUnit:'points',quotaAmount:100_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,noPaymentInstrument:true}
-    : {...base,serviceApproved:type==='reviewed-service',currency:'USD',balanceNanoUsd:1_000_000_000};
+    ? {...base,schemaVersion:2,serviceApproved:true,planName:'SenseNova Token Plan 公测档',planSourceUrl:'https://www.sensenova.cn/token-plan',quotaUnit:'points',quotaAmount:100_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,accountPlanType:TOKEN_PLAN_PLAN_TYPE_FREE}
+    : {...base,autoTopupDisabled:true,serviceApproved:type==='reviewed-service',currency:'USD',balanceNanoUsd:1_000_000_000};
   const bytes = JSON.stringify(evidence);
   const rest = {schemaVersion:1 as const,goalId:PROOF_GOAL as typeof PROOF_GOAL,project:'surreal_ck' as const,env:'production' as const,activityId:'ui01-internal',workspaceSlug:'sck-ui01',documentHash:sha256(bytes),service:{accountRef:evidence.accountRef,endpoint:evidence.endpoint,model:evidence.model,priceRevision:evidence.priceRevision},budget:{currency:'USD' as const,totalNanoUsd:1_000_000_000,perAttemptNanoUsd:100_000_000,maxAttempts:30,autoTopupDisabled:true as const},identities:[{alias:'LCA04_REMOVABLE' as const,workspaceRole:'admin' as const,billingRole:'owner' as const},{alias:'LCA04_MEMBER' as const,workspaceRole:'participant' as const,billingRole:'member' as const}] as ProofManifest['identities']};
   const m = {...rest,configurationDigest:configurationDigest(rest)};
@@ -230,6 +230,8 @@ check('reviewed-token-plan quota evidence signs approved-service; quota, schema 
   const claim=await core.claim(author,task.id);
   const f=await files(task.id,'reviewed-token-plan');
   const prepared=await ops.call(author,task.id,'ops_internal_ai_prepare',{manifestPath:f.manifestPath,documentPath:f.documentPath}) as {approvalMarker:string};
+  const disabled = await ops.call(author,task.id,'ops_internal_ai_prove',{mode:'register-disabled',manifestPath:f.manifestPath,documentPath:f.documentPath,activityId:f.manifest.activityId,nonce:'v2-disabled-nonce-0001',idempotencyKey:'v2-disabled'});
+  expect(disabled).toMatchObject({type:'development-disabled',scope:'register-disabled',paidCallsAllowed:0,documentHash:f.manifest.documentHash});
   await core.submit(author,{taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed token-plan files',idempotencyKey:randomUUID()});
   const review=await core.claim(reviewer,task.id);
   await core.accept(reviewer,{taskId:task.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
@@ -245,25 +247,36 @@ check('reviewed-token-plan quota evidence signs approved-service; quota, schema 
   // 断言层拒绝：文档契约合法但配额语义不满足 enable（剩余为 0、未批准、采样在未来、已过期）。
   const assertViolations:Array<[string,EvidenceDoc]>=[
     ['empty',{...f.evidence,quotaRemaining:0}],
+    ['stale',{...f.evidence,sampledAt:new Date(clock-86_400_001).toISOString()}],
     ['unapproved',{...f.evidence,serviceApproved:false}],
     ['future',{...f.evidence,sampledAt:new Date(clock+60_000).toISOString()}],
     ['expired',{...f.evidence,expiresAt:new Date(clock-60_000).toISOString()}],
   ];
   for(const [id,bad] of assertViolations){await rewrite(f,bad);await expect(request('ops_internal_ai_prove',args(id))).rejects.toMatchObject({code:'forbidden'});}
-  // 契约层拒绝：缺配额字段、noPaymentInstrument 缺失或为 false、quotaAmount 非正、USD 字段混入配额文档。
-  const {noPaymentInstrument:_np,...withoutPayment}=f.evidence as EvidenceDoc;
+  // 契约层拒绝：缺配额字段、accountPlanType 缺失/非 FREE 或混入旧字段、quotaAmount 非正、USD 字段混入配额文档。
+  const {accountPlanType:_np,...withoutPayment}=f.evidence as EvidenceDoc;
   const {planName:_pn,...withoutPlan}=f.evidence as EvidenceDoc;
   const schemaViolations:Array<[string,EvidenceDoc]>=[
     ['nopay',withoutPayment],
-    ['payfalse',{...f.evidence,noPaymentInstrument:false}],
+    ['nonfree',{...f.evidence,accountPlanType:'TOKEN_PLAN_PLAN_TYPE_PRO'}],
+    ['v1',{...f.evidence,schemaVersion:1}],
+    ['oldpayment',{...f.evidence,noPaymentInstrument:true}],
+    ['oldtopup',{...f.evidence,autoTopupDisabled:true}],
     ['noplan',withoutPlan],
     ['zeroamount',{...f.evidence,quotaAmount:0}],
     ['usdmix',{...f.evidence,currency:'USD',balanceNanoUsd:1}],
   ];
-  for(const [id,bad] of schemaViolations){await rewrite(f,bad);await expect(request('ops_internal_ai_prove',args(id))).rejects.toBeDefined();}
+  const own = await files(consumerTask,'reviewed-token-plan');
+  for(const [id,bad] of schemaViolations){
+    await rewrite(f,bad);
+    await rewrite(own,bad);
+    await expect(request('ops_internal_ai_prepare',{manifestPath:own.manifestPath,documentPath:own.documentPath})).rejects.toMatchObject({code:'invalid'});
+    await expect(request('ops_internal_ai_prove',{...args(id),mode:'register-disabled',manifestPath:own.manifestPath,documentPath:own.documentPath})).rejects.toMatchObject({code:'invalid'});
+    await expect(request('ops_internal_ai_prove',args(id))).rejects.toMatchObject({code:'invalid'});
+  }
   // USD 余额分支行为不变：余额低于预算仍拒签，不放宽余额检查。
-  const {planName:_1,planSourceUrl:_2,quotaUnit:_3,quotaAmount:_4,quotaWindowSeconds:_5,quotaRemaining:_6,noPaymentInstrument:_7,...shared}=f.evidence as EvidenceDoc;
-  await rewrite(f,{...shared,type:'reviewed-service',currency:'USD',balanceNanoUsd:0});
+  const {planName:_1,planSourceUrl:_2,quotaUnit:_3,quotaAmount:_4,quotaWindowSeconds:_5,quotaRemaining:_6,accountPlanType:_7,...shared}=f.evidence as EvidenceDoc;
+  await rewrite(f,{...shared,schemaVersion:1,autoTopupDisabled:true,type:'reviewed-service',currency:'USD',balanceNanoUsd:0});
   await expect(request('ops_internal_ai_prove',args('lowbalance'))).rejects.toMatchObject({code:'forbidden'});
   await files(task.id,'reviewed-token-plan');
 });

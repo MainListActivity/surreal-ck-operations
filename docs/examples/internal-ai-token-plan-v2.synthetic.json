@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 2,
+  "type": "reviewed-token-plan",
+  "accountRef": "synthetic-account",
+  "endpoint": "https://token.sensenova.cn/v1",
+  "model": "sensenova-6.8-flash-lite",
+  "priceRevision": "sensenova-token-plan-2026-10-10",
+  "sampledAt": "2026-10-12T10:00:00.000Z",
+  "expiresAt": "2026-10-12T15:00:00.000Z",
+  "serviceApproved": true,
+  "planName": "SenseNova Token Plan Free · 公测",
+  "planSourceUrl": "https://www.sensenova.cn/token-plan",
+  "accountPlanType": "TOKEN_PLAN_PLAN_TYPE_FREE",
+  "quotaUnit": "points",
+  "quotaAmount": 60000,
+  "quotaWindowSeconds": 18000,
+  "quotaRemaining": null
+}
