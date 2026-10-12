@@ -109,6 +109,18 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     keysStatus: 200,
     poolStatus: 200,
     planStatus: 200,
+    // console-session auto-issuance fixture (Ory Hydra chain on the two allowlisted hosts)
+    consoleUser: 'snv-console-operator',
+    consolePassword: 'console-pw-9e8f7a6b5c4d3e2f1a0b',
+    authChallenge: 'fake-login-challenge-0123456789abcdef',
+    lastAuthState: '',
+    authChallengeValid: true,
+    authLoginStatus: 200,
+    authTokenStatus: 200,
+    authRedirectHost: 'platform.sensenova.cn',
+    authConsentStall: false,
+    issuedTokenTtlSec: 10_800,
+    issuedToken: '',
     pools: [
       {
         id: 'pool-dedicated', pool: 'flash-lite', name: 'Flash-Lite', pool_type: 'dedicated',
@@ -238,7 +250,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (url.origin === 'https://idp.test') return this.idpAuthorize(url);
     if (url.origin === 'https://auth.test') return this.loginHost(url, method, init);
     if (url.origin === 'https://app.test') return this.product(url, method, init);
-    if (url.host === 'token.sensenova.cn' || url.host === 'platform.sensenova.cn' || url.host === 'www.sensenova.cn') return this.supplierHost(url, method, init);
+    if (['token.sensenova.cn', 'platform.sensenova.cn', 'www.sensenova.cn', 'iam.sensecoreapi.cn'].includes(url.host)) return this.supplierHost(url, method, init);
     return new Response('unreachable host', { status: 502 });
   }
 
@@ -458,6 +470,38 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
   private supplierHost(url: URL, method: string, init?: RequestInit): Response {
     const s = this.supplier;
     const token = (new Headers(init?.headers).get('authorization') ?? '').replace(/^Bearer /, '');
+    // OAuth issuance chain (POST-bearing endpoints precede the GET-only guard).
+    if (url.host === 'platform.sensenova.cn' && url.pathname === '/oauth2/auth') {
+      if (url.searchParams.get('login_verifier') === 'ver-1') {
+        if (s.authConsentStall) return new Response('<html>consent required</html>', { status: 200 });
+        return new Response('', { status: 302, headers: { location: `https://platform.sensenova.cn/?code=code-1&state=${s.lastAuthState}` } });
+      }
+      s.lastAuthState = url.searchParams.get('state') ?? '';
+      return new Response('', { status: 302, headers: { location: `https://iam.sensecoreapi.cn/iam/authn/v1/auth/login?login_challenge=${s.authChallenge}`, 'set-cookie': 'oauth2_authentication_csrf=csrf1; Path=/; HttpOnly' } });
+    }
+    if (url.host === 'platform.sensenova.cn' && url.pathname === '/oauth2/token' && method === 'POST') {
+      const form = new URLSearchParams(String(init?.body ?? ''));
+      if (s.authTokenStatus !== 200 || form.get('code') !== 'code-1')
+        return json(400, { error: 'invalid_grant', error_description: 'The provided authorization grant is invalid' });
+      const exp = Math.floor(this.clock / 1000) + s.issuedTokenTtlSec;
+      const payload = Buffer.from(JSON.stringify({ sub: s.consoleUser, exp })).toString('base64url');
+      s.issuedToken = `eyJhbGciOiJURVNUIn0.${payload}.${randomBytes(8).toString('base64url')}`;
+      return json(200, { access_token: s.issuedToken, token_type: 'bearer', expires_in: s.issuedTokenTtlSec, scope: 'openid offline offline_access', id_token: `eyJhbGciOiJURVNUIn0.${Buffer.from(JSON.stringify({ sub: s.consoleUser })).toString('base64url')}.sig` });
+    }
+    if (url.host === 'iam.sensecoreapi.cn') {
+      if (url.pathname === '/iam/authn/v1/auth/checkChallenge')
+        return json(200, { is_valid: s.authChallengeValid && url.searchParams.get('challenge') === s.authChallenge, redirect: '', platform: 'uconsole' });
+      if (url.pathname === '/iam/authn/v1/auth/login')
+        return new Response('', { status: 302, headers: { location: 'https://platform.sensenova.cn/login?login_challenge=' + s.authChallenge } });
+      if (url.pathname === '/iam/authn/v1/auth/nova/login' && method === 'POST') {
+        if (s.authLoginStatus !== 200) return new Response('', { status: s.authLoginStatus });
+        const body = JSON.parse(String(init?.body ?? '{}')) as { username?: string; password?: string; challenge?: string };
+        if (body.username !== s.consoleUser || body.password !== s.consolePassword || body.challenge !== s.authChallenge)
+          return json(401, { code: 16, message: 'Unauthenticated' });
+        return json(200, { redirect: `https://${s.authRedirectHost}/oauth2/auth?login_verifier=ver-1` });
+      }
+      return new Response('404 Not Found', { status: 404 });
+    }
     if (method !== 'GET') return json(405, { code: 12, message: 'Method Not Allowed' });
     if (url.host === 'token.sensenova.cn') {
       if (url.pathname !== '/v1/models') return json(404, { error: { code: 5, message: 'NOT_FOUND' } });
@@ -469,13 +513,13 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
       const unauth = (reason: string) => json(401, { code: 16, details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', domain: 'global', reason }], message: 'Unauthenticated' });
       if (url.pathname === '/lite/console/v1/tokenplan/pool-usage') {
         if (!token) return unauth('Authorization header is required');
-        if (token !== s.consoleToken) return unauth("Authentication type 'apikey' is not enabled");
+        if (token !== s.consoleToken && token !== s.issuedToken) return unauth("Authentication type 'apikey' is not enabled");
         if (s.poolStatus !== 200) return new Response('', { status: s.poolStatus });
         return json(200, { pools: s.pools });
       }
       if (url.pathname === '/lite/console/v1/metered/api-keys') {
         if (!token) return unauth('Authorization header is required');
-        if (token !== s.consoleToken) return unauth("Authentication type 'apikey' is not enabled");
+        if (token !== s.consoleToken && token !== s.issuedToken) return unauth("Authentication type 'apikey' is not enabled");
         if (s.keysStatus !== 200) return new Response('', { status: s.keysStatus });
         const keys = [s.apiKey, ...s.extraApiKeys].map((key, i) => ({ id: `key-${i}`, api_key: key, displayname: `key ${i}`, status: 'Active' }));
         return json(200, { api_keys: s.apiKeyListed ? keys : keys.filter(k => k.api_key !== s.apiKey), total_count: keys.length, next_page_token: '' });

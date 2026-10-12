@@ -6,8 +6,8 @@
 // real read becomes an explicit gap and the call answers `blocked` without a document:
 // the sampler never fabricates account, quota or payment facts.
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { CompanyError } from '../core-errors.ts';
 import { describeTransportFailure, type Fetcher } from './fetcher.ts';
 import { evidenceSchema, sha256 } from './proof-contract.ts';
 import { clip, redactJson } from './redact.ts';
@@ -39,13 +39,37 @@ const MAX_DOC_AGE_MS = 24 * 60 * 60 * 1000;
 const API_KEY_PAGE_SIZE = 50;
 const API_KEY_MAX_PAGES = 10;
 
+/**
+ * Console-session auto-issuance chain (probed 2026-10-12, Ory Hydra layout):
+ *   GET {AUTH_HOST}/oauth2/auth (client nova, PKCE S256)
+ *     ->302-> {IAM_API}/auth/login?login_challenge=<c>
+ *   GET {IAM_API}/auth/checkChallenge -> POST {IAM_API}/auth/nova/login
+ *     -> {redirect*} -> manual redirect hops (allowlisted hosts only) -> code on CALLBACK
+ *   POST {AUTH_HOST}/oauth2/token -> bearer for the console reads.
+ * Password is posted plaintext with is_encrypt=false, the SPA's own fallback when the
+ * JWKS host (signin.sensecore.cn) is unreachable; that host is deliberately NOT in the
+ * allowlist below so no JWE is attempted.
+ */
+const AUTH_HOST = 'https://platform.sensenova.cn';
+const AUTH_CALLBACK = 'https://platform.sensenova.cn';
+const IAM_API = 'https://iam.sensecoreapi.cn/iam/authn/v1';
+const OAUTH_CLIENT = 'nova';
+const OAUTH_SCOPE = 'openid offline offline_access';
+const AUTH_HOST_ALLOWLIST = new Set(['platform.sensenova.cn', 'iam.sensecoreapi.cn']);
+const AUTH_MAX_REDIRECT_HOPS = 8;
+
 /** Sealed secret naming: the only materialization paths the broker accepts for a supplier alias. */
 export const supplierApiKeySecretName = (alias: string) => `SUPPLIER_${alias}_API_KEY`;
 export const supplierConsoleSecretName = (alias: string) => `SUPPLIER_${alias}_CONSOLE_TOKEN`;
+export const supplierUsernameSecretName = (alias: string) => `SUPPLIER_${alias}_USERNAME`;
+export const supplierPasswordSecretName = (alias: string) => `SUPPLIER_${alias}_PASSWORD`;
 /** Which kinds of sealed material a supplier alias currently supports (for ops_info). */
-export const supplierAliasFromSecretName = (name: string): { alias: string; kind: 'apiKey' | 'consoleToken' } | undefined => {
-  const hit = /^SUPPLIER_([A-Z0-9][A-Z0-9_]*)_(API_KEY|CONSOLE_TOKEN)$/.exec(name);
-  return hit ? { alias: hit[1]!, kind: hit[2] === 'API_KEY' ? 'apiKey' : 'consoleToken' } : undefined;
+export const supplierAliasFromSecretName = (name: string): { alias: string; kind: 'apiKey' | 'consoleToken' | 'username' | 'password' } | undefined => {
+  const hit = /^SUPPLIER_([A-Z0-9][A-Z0-9_]*)_(API_KEY|CONSOLE_TOKEN|USERNAME|PASSWORD)$/.exec(name);
+  if (!hit) return undefined;
+  const suffix = hit[2]!;
+  const kind = suffix === 'API_KEY' ? 'apiKey' : suffix === 'CONSOLE_TOKEN' ? 'consoleToken' : suffix === 'USERNAME' ? 'username' : 'password';
+  return { alias: hit[1]!, kind };
 };
 
 /** One fact the sampler could not establish; why the call ended `blocked` or a field stayed null. */
@@ -204,8 +228,34 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   };
 
   const apiKey = await input.readSealed(supplierApiKeySecretName(input.alias));
-  const consoleToken = await input.readSealed(supplierConsoleSecretName(input.alias));
-  for (const value of [apiKey, consoleToken]) if (value && value.length >= 6) secrets.push(value);
+  const pastedToken = await input.readSealed(supplierConsoleSecretName(input.alias));
+  const username = await input.readSealed(supplierUsernameSecretName(input.alias));
+  const password = await input.readSealed(supplierPasswordSecretName(input.alias));
+  for (const value of [apiKey, pastedToken, username, password]) if (value && value.length >= 6) secrets.push(value);
+
+  // Console session: sealed username/password auto-issuance is the primary path
+  // (fresh token, real lifetime read off the JWT); a manually pasted
+  // SUPPLIER_<ALIAS>_CONSOLE_TOKEN stays as the documented fallback channel.
+  let consoleToken: string | undefined;
+  let consoleTokenSource: 'issued' | 'sealed' | undefined;
+  let consoleSessionExpiresAt: string | null = null;
+  let authHops: AuthHop[] | undefined;
+  if (username && password) {
+    const issued = await issueConsoleSession({ fetcher, left }, username, password, secrets);
+    authHops = issued.hops;
+    if (issued.session) {
+      consoleToken = issued.session.token;
+      consoleTokenSource = 'issued';
+      consoleSessionExpiresAt = issued.session.expiresAtMs ? new Date(issued.session.expiresAtMs).toISOString() : null;
+    } else if (issued.gap) {
+      gaps.push(issued.gap);
+    }
+  }
+  if (!consoleToken && pastedToken) {
+    consoleToken = pastedToken;
+    consoleTokenSource = 'sealed';
+    if (authHops) notes.push('console session auto-issuance failed; sealed console token used as fallback');
+  }
   const accountRef = apiKey ? `snv${sha256(`sensenova|${apiKey}`).slice(0, 24)}` : null;
   if (!apiKey) gaps.push({ field: 'accountRef', source: 'sealed-store', detail: `no sealed ${supplierApiKeySecretName(input.alias)} for alias ${input.alias}` });
 
@@ -249,7 +299,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let crossBound = false;
   let apiKeysComplete = false;
   if (!consoleToken) {
-    gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)}; account-bound quota and payment facts are unverifiable` });
+    gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)} and no sealed ${supplierUsernameSecretName(input.alias)}/${supplierPasswordSecretName(input.alias)}; account-bound quota and payment facts are unverifiable` });
   } else {
     const keysRecord = source('apiKeys', `${CONSOLE_API}/metered/api-keys`);
     const poolRecord = source('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`);
@@ -331,6 +381,8 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   // payment facts are jointly established, never caller-supplied.
   const paymentFactsOk = accountBound && applicabilityOk;
   derivations.paymentFactsVerifiable = paymentFactsOk;
+  if (consoleTokenSource || authHops)
+    derivations.consoleSession = { tokenSource: consoleTokenSource ?? 'unavailable', sessionExpiresAt: consoleSessionExpiresAt, hops: authHops ?? [] };
   if (apiKey && !keyLive && !gaps.some(g => g.source === 'models')) {
     gaps.push({ field: 'apiKey', source: 'models', detail: 'chat credential liveness unverified' });
   }
@@ -427,3 +479,211 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     gaps,
   }, secrets) as SupplierSampleResult;
 }
+interface AuthHop {
+  phase: string;
+  host: string;
+  status: number | null;
+  ms: number;
+  ok: boolean;
+}
+
+interface IssuedSession {
+  token: string;
+  expiresAtMs: number | null;
+  hops: AuthHop[];
+}
+
+const authGap = (detail: string, hops: AuthHop[]): { gap: Gap; hops: AuthHop[] } => ({
+  gap: { field: 'consoleToken', source: 'auto-issuance', detail },
+  hops,
+});
+
+const b64u = (buf: Buffer): string =>
+  buf.toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+const randToken = (chars: number): string => b64u(randomBytes(48)).slice(0, chars);
+const safeJson = (text: string | undefined): Record<string, unknown> | undefined => {
+  if (!text) return undefined;
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * One bounded request inside the fixed two-host auth allowlist. Redirects are never
+ * followed automatically — Location comes back for the caller to validate — and cookies
+ * are relayed only to the same allowlisted host that set them, mirroring the browser
+ * flow without ever widening the surface.
+ */
+async function authRequest(
+  io: { fetcher: Fetcher; left: () => number },
+  url: string,
+  init: { method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
+  hops: AuthHop[],
+  phase: string,
+  cookies: Map<string, Map<string, string>>,
+): Promise<{ status: number; headers: Headers; text?: string; error?: string }> {
+  const host = new URL(url).host;
+  if (!AUTH_HOST_ALLOWLIST.has(host))
+    return { status: 0, headers: new Headers(), error: `host not allowlisted: ${host}` };
+  const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
+  const jar = cookies.get(host);
+  const headers: Record<string, string> = { ...init.headers };
+  if (jar && jar.size) headers.cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+  const started = Date.now();
+  try {
+    const res = await io.fetcher(url, {
+      method: init.method ?? 'GET',
+      headers,
+      body: init.body,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(ms),
+    });
+    const elapsed = Date.now() - started;
+    hops.push({ phase, host, status: res.status, ms: elapsed, ok: res.status >= 200 && res.status < 400 });
+    let jar2 = cookies.get(host);
+    for (const raw of res.headers.getSetCookie?.() ?? []) {
+      const pair = /^([^=;]+)=([^;]*)/.exec(raw.trim());
+      if (!pair) continue;
+      if (!jar2) { jar2 = new Map(); cookies.set(host, jar2); }
+      jar2.set(pair[1]!, pair[2]!);
+    }
+    const text = clip(await res.text().catch(() => ''), MAX_BODY_BYTES);
+    return { status: res.status, headers: res.headers, text };
+  } catch (error) {
+    hops.push({ phase, host, status: null, ms: Date.now() - started, ok: false });
+    return { status: 0, headers: new Headers(), error: describeTransportFailure(error, Date.now() - started).detail };
+  }
+}
+
+/** Reads `exp` out of a JWT payload; undefined when the token is not a decodable JWT. */
+const jwtExpMs = (token: string): number | undefined => {
+  const parts = token.split('.');
+  if (parts.length < 2) return undefined;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as { exp?: unknown };
+    return typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp * 1000 : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * Mint a console access token from the sealed username/password through the provider's
+ * OAuth authorization chain. Never throws: every drift, rejection, captcha/risk-control
+ * surface or transport fault becomes a gap and the sampler answers `blocked` instead of
+ * fabricating a session. The issued token is pushed into `secrets` so every emitted
+ * surface (receipt, result, audit echo) masks it; only issuance metadata lands on paper.
+ */
+async function issueConsoleSession(
+  io: { fetcher: Fetcher; left: () => number },
+  username: string,
+  password: string,
+  secrets: string[],
+): Promise<{ session?: IssuedSession; gap?: Gap; hops: AuthHop[] }> {
+  const hops: AuthHop[] = [];
+  const cookies = new Map<string, Map<string, string>>();
+  const verifier = randToken(50);
+  const challenge = b64u(createHash('sha256').update(verifier).digest());
+  const state = randToken(24);
+
+  const authorizeUrl =
+    `${AUTH_HOST}/oauth2/auth?response_type=code&client_id=${OAUTH_CLIENT}` +
+    `&code_challenge_method=S256&code_challenge=${challenge}` +
+    `&redirect_uri=${encodeURIComponent(AUTH_CALLBACK)}` +
+    `&scope=${encodeURIComponent(OAUTH_SCOPE)}&state=${state}&lang=zh-CN`;
+  const authz = await authRequest(io, authorizeUrl, {}, hops, 'oauth2/auth', cookies);
+  if (authz.error) return { ...authGap(`authorize transport failed: ${authz.error}`, hops) };
+  const loginLoc = authz.headers.get('location') ?? '';
+  let loginChallenge = '';
+  try {
+    const u = new URL(loginLoc);
+    if (u.host === 'iam.sensecoreapi.cn' && u.pathname === '/iam/authn/v1/auth/login')
+      loginChallenge = u.searchParams.get('login_challenge') ?? '';
+  } catch { /* location unparseable */ }
+  if (authz.status !== 302 || !loginChallenge)
+    return { ...authGap(`authorize yielded no login challenge: HTTP ${authz.status}`, hops) };
+
+  const chk = await authRequest(
+    io, `${IAM_API}/auth/checkChallenge?challenge=${encodeURIComponent(loginChallenge)}`,
+    {}, hops, 'checkChallenge', cookies);
+  if (chk.error) return { ...authGap(`checkChallenge transport failed: ${chk.error}`, hops) };
+  if (chk.status !== 200 || safeJson(chk.text)?.is_valid !== true)
+    return { ...authGap(`login challenge rejected or expired: HTTP ${chk.status}`, hops) };
+
+  const login = await authRequest(
+    io, `${IAM_API}/auth/nova/login`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username, password, challenge: loginChallenge, is_encrypt: false }),
+    },
+    hops, 'nova/login', cookies);
+  if (login.error) return { ...authGap(`login transport failed: ${login.error}`, hops) };
+  if (login.status !== 200)
+    return { ...authGap(`login rejected: HTTP ${login.status} (bad credentials, captcha or risk-control)`, hops) };
+  const loginBody = safeJson(login.text);
+  if (Array.isArray(loginBody?.tenant_list) && loginBody.tenant_list.length)
+    return { ...authGap('login requires an interactive tenant selection (tenant_list present)', hops) };
+  const redirect =
+    (typeof loginBody?.redirect_uri === 'string' && loginBody.redirect_uri) ||
+    (typeof loginBody?.redirect_to === 'string' && loginBody.redirect_to) ||
+    (typeof loginBody?.redirect === 'string' && loginBody.redirect) || '';
+  if (!redirect.startsWith('https://'))
+    return { ...authGap('login returned no usable redirect (captcha/risk-control or drifted shape)', hops) };
+
+  let code = '';
+  let next: string | undefined = redirect;
+  for (let i = 0; i < AUTH_MAX_REDIRECT_HOPS && next; i += 1) {
+    let u: URL;
+    try { u = new URL(next); } catch {
+      return { ...authGap('redirect hop was not an absolute URL', hops) };
+    }
+    if (u.protocol !== 'https:' || !AUTH_HOST_ALLOWLIST.has(u.host))
+      return { ...authGap(`redirect hop escaped the allowlisted hosts: ${u.host}`, hops) };
+    if (u.searchParams.get('code')) {
+      if (u.origin !== AUTH_CALLBACK || (u.pathname !== '/' && u.pathname !== '') || u.searchParams.get('state') !== state)
+        return { ...authGap('authorization code landed off the registered callback or state mismatched', hops) };
+      code = u.searchParams.get('code')!;
+      break;
+    }
+    const hop = await authRequest(io, u.toString(), {}, hops, `redirect#${i + 1}`, cookies);
+    if (hop.error) return { ...authGap(`redirect hop transport failed: ${hop.error}`, hops) };
+    const loc = hop.headers.get('location');
+    if (loc) {
+      try { next = new URL(loc, u).toString(); } catch { return { ...authGap('redirect location unparseable', hops) }; }
+      continue;
+    }
+    return { ...authGap(`redirect chain stalled: HTTP ${hop.status} with no location`, hops) };
+  }
+  if (!code) return { ...authGap('redirect chain exhausted without an authorization code', hops) };
+
+  const token = await authRequest(
+    io, `${AUTH_HOST}/oauth2/token`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: OAUTH_CLIENT,
+        code,
+        redirect_uri: AUTH_CALLBACK,
+        code_verifier: verifier,
+        state,
+      }).toString(),
+    },
+    hops, 'oauth2/token', cookies);
+  if (token.error) return { ...authGap(`token exchange transport failed: ${token.error}`, hops) };
+  if (token.status !== 200) return { ...authGap(`token exchange rejected: HTTP ${token.status}`, hops) };
+  const tokenBody = safeJson(token.text);
+  const accessToken = typeof tokenBody?.access_token === 'string' ? tokenBody.access_token : '';
+  if (!accessToken) return { ...authGap('token exchange returned no access_token', hops) };
+
+  secrets.push(accessToken);
+  for (const jar of cookies.values()) for (const v of jar.values()) if (v.length >= 6) secrets.push(v);
+  const expiresAtMs =
+    jwtExpMs(accessToken) ??
+    (typeof tokenBody?.expires_in === 'number' && tokenBody.expires_in > 0
+      ? Date.now() + tokenBody.expires_in * 1000
+      : null);
+  return { session: { token: accessToken, expiresAtMs, hops }, hops };
+}
+

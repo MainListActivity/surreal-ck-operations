@@ -46,9 +46,13 @@ const PURPOSE = 'internal-ai plan evidence';
 const sample = (r: Rig, args: Record<string, unknown> = {}) =>
   call(r, 'ops_supplier_plan_sample', { alias: ALIAS, purpose: PURPOSE, ...args });
 
-function seal(r: Rig, { apiKey = true, consoleToken = true } = {}) {
+function seal(r: Rig, { apiKey = true, consoleToken = true, consoleCreds = false } = {}) {
   if (apiKey) r.company.sealed.set(`demo/production/SUPPLIER_${ALIAS}_API_KEY`, r.world.supplier.apiKey);
   if (consoleToken) r.company.sealed.set(`demo/production/SUPPLIER_${ALIAS}_CONSOLE_TOKEN`, r.world.supplier.consoleToken);
+  if (consoleCreds) {
+    r.company.sealed.set(`demo/production/SUPPLIER_${ALIAS}_USERNAME`, r.world.supplier.consoleUser);
+    r.company.sealed.set(`demo/production/SUPPLIER_${ALIAS}_PASSWORD`, r.world.supplier.consolePassword);
+  }
 }
 
 /** The sampler's output, audit rows and on-disk files must never contain sealed material. */
@@ -60,11 +64,16 @@ function expectNoSupplierLeaks(r: Rig) {
   ]);
   expect(haystack).not.toContain(r.world.supplier.apiKey);
   expect(haystack).not.toContain(r.world.supplier.consoleToken);
+  expect(haystack).not.toContain(r.world.supplier.consoleUser);
+  expect(haystack).not.toContain(r.world.supplier.consolePassword);
+  if (r.world.supplier.issuedToken) expect(haystack).not.toContain(r.world.supplier.issuedToken);
 }
 
 const onlyAllowedRequests = (r: Rig) => r.world.requests.filter(q =>
   !q.url.startsWith('https://token.sensenova.cn/v1/models')
   && !q.url.startsWith('https://platform.sensenova.cn/lite/console/v1/')
+  && !q.url.startsWith('https://platform.sensenova.cn/oauth2/')
+  && !q.url.startsWith('https://iam.sensecoreapi.cn/iam/authn/v1/')
   && !q.url.startsWith('https://www.sensenova.cn/token-plan'));
 
 describe('ops_supplier_plan_sample', () => {
@@ -138,6 +147,95 @@ describe('ops_supplier_plan_sample', () => {
     expect(result.gaps.map((g: { field: string }) => g.field)).toContain('consoleToken');
     expect(readdirSync(join(r.home, 'evidence', 'task-1')).some(f => f.endsWith('-receipt.json'))).toBe(true);
     expect(readdirSync(join(r.home, 'evidence', 'task-1')).some(f => /supplier-plan-sensenova-\d+\.json$/.test(f))).toBe(false);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('sealed console credentials auto-issue a session token → sampled with real facts', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    expect(result.document.type).toBe('reviewed-token-plan');
+    expect(result.document.serviceApproved).toBe(true);
+    const receipt = JSON.parse(readFileSync(String(result.receiptFile), 'utf8'));
+    expect(receipt.derivations.consoleSession.tokenSource).toBe('issued');
+    expect(receipt.derivations.consoleSession.sessionExpiresAt).toMatch(/^\d{4}-/);
+    expect(receipt.derivations.consoleSession.hops.map((h: { phase: string }) => h.phase))
+      .toEqual(expect.arrayContaining(['oauth2/auth', 'checkChallenge', 'nova/login', 'oauth2/token']));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('auto-issuance is preferred over a pasted console token when both exist', async () => {
+    const r = rig();
+    seal(r, { consoleCreds: true });
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    expect(result.receipt.derivations.consoleSession.tokenSource).toBe('issued');
+    expectNoSupplierLeaks(r);
+  });
+
+  test('failed issuance falls back to a sealed console token and says so', async () => {
+    const r = rig();
+    seal(r, { consoleCreds: true });
+    r.world.supplier.authLoginStatus = 401;
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    expect(result.receipt.derivations.consoleSession.tokenSource).toBe('sealed');
+    expect(result.receipt.notes.some((n: string) => n.includes('fallback'))).toBe(true);
+    expect(result.gaps.some((g: { source: string }) => g.source === 'auto-issuance')).toBe(true);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('failed issuance with no pasted token stays blocked', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    r.world.supplier.authLoginStatus = 401;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps.filter((g: { field: string }) => g.field === 'consoleToken').length).toBeGreaterThanOrEqual(1);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('a login redirect escaping the allowlisted hosts fails the chain closed', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    r.world.supplier.authRedirectHost = 'evil.example';
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.gaps.some((g: { detail?: string }) => g.detail?.includes('allowlisted hosts'))).toBe(true);
+    expect(r.world.requests.some(q => q.url.includes('evil.example'))).toBe(false);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('a wrong console password fails issuance closed, nothing is minted', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    r.company.sealed.set(`demo/production/SUPPLIER_${ALIAS}_PASSWORD`, 'wrong-password-00000000');
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(r.world.supplier.issuedToken).toBe('');
+    expectNoSupplierLeaks(r);
+  });
+
+  test('a consent/risk wall instead of a code stalls the chain closed', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    r.world.supplier.authConsentStall = true;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.gaps.some((g: { detail?: string }) => g.detail?.includes('redirect chain'))).toBe(true);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('an invalid login challenge fails issuance before credentials are posted', async () => {
+    const r = rig();
+    seal(r, { consoleToken: false, consoleCreds: true });
+    r.world.supplier.authChallengeValid = false;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.gaps.some((g: { detail?: string }) => g.detail?.includes('challenge'))).toBe(true);
+    expect(r.world.requests.some(q => q.url.includes('/nova/login'))).toBe(false);
     expectNoSupplierLeaks(r);
   });
 
