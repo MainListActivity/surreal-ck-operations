@@ -23,7 +23,9 @@ if (comm) {
     args: json ? JSON.parse(json) : {},
   }));
   const resFile = join(resDir(comm), `${key}.json`);
-  const deadline = Date.now() + 120_000;
+  // Media generation runs upstream for minutes (music up to 300s); wait past the studio's own timeout.
+  const waitMs = name === 'media_music' || name === 'media_voice_design' ? 330_000 : name?.startsWith('media_') ? 150_000 : 120_000;
+  const deadline = Date.now() + waitMs;
   for (;;) {
     const res = readJsonFile<CommResponse>(resFile);
     if (res) {

@@ -3,6 +3,7 @@
 import { installBunShim } from "./bun-shim";
 import { loadServiceEnv } from "./env";
 import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
 import { readProviderQuotas } from "./dispatch";
 
 export interface Company {
@@ -48,6 +49,7 @@ export function company(): Promise<Company> {
     const { CompanyProofStore } = await import("./vendor/src/ops/proof-store.ts");
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
+    const { MediaStudio } = await import("./vendor/src/media/elevenlabs.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli, createSceneCleaner } = await import("./vendor/src/dispatcher/paseo.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
@@ -78,9 +80,14 @@ export function company(): Promise<Company> {
       core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db),
       log: message => console.log(message),
     });
+    const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;
+    // The ElevenLabs key is read by this process only; employees reach it through the media_* tools.
+    const media = new MediaStudio({
+      core, apiKey: () => process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY, evidenceRoot: join(dirname(runDir), "evidence"), fetch,
+    });
     const sidecar = new SidecarPool({
-      core, workforce, ops,
-      runDir: process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`,
+      core, workforce, ops, media,
+      runDir,
       log: message => console.log(message),
     });
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";

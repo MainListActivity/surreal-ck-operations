@@ -76,6 +76,10 @@
 - 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
 - 浏览器空间用毕即关：你的 ego-browser 任务空间在提交或阻塞前必须 `finish`（无证据要移交就 `keep:[]`）。空间每留一个页签，本机浏览器就持有一个采集断言，屏幕无法熄屏；也别为同一任务开多个空间，复用你正持有任务的这一个。
 
+## 媒体工具（media_*）
+
+配音、音效、配乐、主题曲用 `sck call media_<名字> '<JSON>'`，先 `sck call media_info '{}'` 看用法、当日额度和输出目录。产物写在证据目录的 `media/` 下，文件名只能是 `xxx.mp3`；需要进产品仓库时自己拷贝。ElevenLabs 的 key 由代理持有，不要找老板要；额度用尽或 key 未配置时如实写进报告。
+
 ## 管理工具（manage）
 
 gm 与 product（`capabilities` 含 `manage`）另有一组仅限 manage 能力的编制管理工具，MCP 工具面与 `sck call` 同名可用；三次写入全部落审计，不携带凭证值：

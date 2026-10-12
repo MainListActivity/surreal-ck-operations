@@ -224,3 +224,28 @@ pnpm run company cancel-goal <目标ID> "<原因>"   # 作废目标下全部未�
 ```
 
 都带审计和幂等键，规则与经理的 `retire_task` 一致：已完成的任务不能作废，还有活下游的老板关口不能作废。**不要再直接改库改任务状态**——绕过解锁逻辑会让下游一直卡在 blocked（2026-10-11 的小说目标就这样卡过一次）。
+
+## 媒体生成（ElevenLabs）
+
+配音、音效、配乐和主题曲走 ElevenLabs。员工进程里没有 key：插件进程读取 `private/service.env` 里的 `ELEVENLABS_API_KEY`（或 `XI_API_KEY`），员工只调 `media_*` 工具，拿回的是文件路径和大小。
+
+启用（老板做一次）：在 `private/service.env` 加一行 `ELEVENLABS_API_KEY=...`，然后执行 `paseo plugin reload sck-company`。`sck call media_info '{}'` 返回 `configured: true` 表示插件已读到 key；`subscription` 能返回额度则说明 key 有效。
+
+| 工具 | 参数 | 作用 |
+|---|---|---|
+| `media_info` | — | 配置状态、订阅额度（tier、字符用量与上限、重置时间）、本任务输出目录、今日用量与上限、用法提示 |
+| `media_voices` | `search?` | 查现成声线，返回 voice_id、名称、标签 |
+| `media_voice_design` | `name`、`description`（20-1000 字）、`text?`（100-1000 字）、`previewIndex?` | 零人工设计角色声线：保存各试听 mp3，并用所选试听建立声线，返回 voice_id |
+| `media_tts` | `voiceId`、`text`、`file`、`modelId?`（默认 `eleven_v3`）、`languageCode?` | 单句配音；台词可含 `[whispers]`、`[laughs]` 等音频标签 |
+| `media_dialogue` | `inputs:[{voiceId,text}]`、`file`、`modelId?`、`languageCode?` | 多人对白：最多 10 个声线，总字数不超过 2000，超出请拆段 |
+| `media_sfx` | `text`、`file`、`durationSeconds?`（0.5-30）、`loop?`、`promptInfluence?` | 音效 |
+| `media_music` | `file`，`prompt` 或 `compositionPlan`，`lengthMs?`（3000-600000）、`instrumental?`、`modelId?`（默认 `music_v1`） | 配乐（prompt 加 `instrumental:true`）或主题曲（compositionPlan，歌词写在 `sections[].lines`）；二者只能给一个，`lengthMs` 与 `instrumental` 只配 prompt |
+
+输出与门禁：
+
+- 文件只写到 `<服务目录>/evidence/<任务ID>/media/<file>`。`file` 只能是纯文件名 `名字.mp3`（字母、数字、`.`、`_`、`-`，不含路径），同名覆盖。员工自行拷贝进产品仓库。
+- 只有任务的租约持有人能调用。默认允许 ai-content、concept-design、asset-production、screenwriter、qa、engineering；`SCK_MEDIA_ROLES`（逗号分隔）可覆盖。
+- 每个项目每日的生成次数上限：tts 1500、dialogue 600、sfx 300、music 60、voice_design 30。用 `SCK_MEDIA_DAILY_TTS`、`SCK_MEDIA_DAILY_DIALOGUE`、`SCK_MEDIA_DAILY_SFX`、`SCK_MEDIA_DAILY_MUSIC`、`SCK_MEDIA_DAILY_VOICE_DESIGN` 覆盖，同样写在 `private/service.env`。`media_info`、`media_voices` 不计次数。
+- 成功生成写审计：`ops_media_tts`、`ops_media_dialogue`、`ops_media_sfx`、`ops_media_music`、`ops_media_voice_design`，证据含文件名、字节数、字数或时长（台词截断 60 字）；查询类写 `ops_call`。失败不计次数。
+- 员工进程环境里的 `ELEVENLABS_*` 与 `XI_API_KEY` 与其他外部凭证一样被清空（`plugin/server/scrub.ts`）。
+- 错误映射：未配置或 401 为 `not_configured`；429 或额度用尽为 `limit_reached`（可重试）；400/422 为 `invalid`（附上游原因，截断 300 字）；其它为 `upstream_error`。错误与审计里不会出现 key。

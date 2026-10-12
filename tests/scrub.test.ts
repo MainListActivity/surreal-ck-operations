@@ -7,7 +7,7 @@ import { blockedPatterns, externalPatterns, installZdot, registerScrub, scrubEnv
 const daemonEnv = {
   PATH: '/usr/bin', HOME: '/Users/x', SSH_AUTH_SOCK: '/tmp/agent.sock', OPENAI_API_KEY: 'provider-login',
   CLOUDFLARE_API_TOKEN: 'cf-secret', CLOUDFLARE_ACCOUNT_ID: 'acct', JEV_API_KEY: 'jev-secret',
-  SURREAL_ROOT_PASS: 'root-pass', SCK_PRODUCT_ENV: '/p/.env',
+  SURREAL_ROOT_PASS: 'root-pass', SCK_PRODUCT_ENV: '/p/.env', ELEVENLABS_API_KEY: 'el-secret', XI_API_KEY: 'xi-secret',
 };
 
 const scratch = mkdtempSync(join(tmpdir(), 'sck-scrub-test-'));
@@ -23,12 +23,17 @@ describe('scrubEnv', () => {
   test('blanks inherited infrastructure credentials and leaves everything else alone', () => {
     const env = scrubEnv({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' }, daemonEnv);
     expect(env).toEqual({
-      CLOUDFLARE_API_TOKEN: '', CLOUDFLARE_ACCOUNT_ID: '', JEV_API_KEY: '', SURREAL_ROOT_PASS: '', SCK_PRODUCT_ENV: '',
+      CLOUDFLARE_API_TOKEN: '', CLOUDFLARE_ACCOUNT_ID: '', JEV_API_KEY: '', SURREAL_ROOT_PASS: '', SCK_PRODUCT_ENV: '', ELEVENLABS_API_KEY: '', XI_API_KEY: '',
       SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k',
     });
     expect(env.PATH).toBeUndefined();
     expect(env.OPENAI_API_KEY).toBeUndefined(); // the provider process shares this env; blanking it would break the agent
     expect(env.SSH_AUTH_SOCK).toBeUndefined();
+  });
+
+  test('the ElevenLabs key names are blanked as well', () => {
+    expect(blockedPatterns()).toEqual(expect.arrayContaining(['ELEVENLABS_', 'XI_API_KEY']));
+    expect(scrubEnv({}, { ELEVENLABS_API_KEY: 'el', XI_API_KEY: 'xi', PATH: '/bin' })).toEqual({ ELEVENLABS_API_KEY: '', XI_API_KEY: '' });
   });
 
   test('values the launch sets explicitly win over the blanking', () => {
@@ -95,7 +100,7 @@ describe('zsh startup shim files', () => {
 });
 
 const zsh = Bun.which('zsh');
-const FIELDS = ['CLOUDFLARE_API_TOKEN', 'CF_API_SHELLVAR', 'SURREAL_PASS', 'TYPESAFE_X', 'JEV_API_KEY'] as const;
+const FIELDS = ['CLOUDFLARE_API_TOKEN', 'CF_API_SHELLVAR', 'SURREAL_PASS', 'TYPESAFE_X', 'JEV_API_KEY', 'ELEVENLABS_API_KEY'] as const;
 const KEPT = ['KEEP_RC', 'KEEP_ENV', 'KEEP_PROFILE'] as const;
 
 describe.skipIf(!zsh)('zsh startup shim in a real zsh', () => {
@@ -103,7 +108,7 @@ describe.skipIf(!zsh)('zsh startup shim in a real zsh', () => {
     const home = fresh(name);
     writeFileSync(join(home, '.zshenv'), 'export TYPESAFE_X=leak-env KEEP_ENV=env\n');
     writeFileSync(join(home, '.zprofile'), 'export SURREAL_PASS=leak-profile KEEP_PROFILE=profile\n');
-    writeFileSync(join(home, '.zshrc'), 'export CLOUDFLARE_API_TOKEN=leak-rc JEV_API_KEY=leak-rc KEEP_RC=rc\nCF_API_SHELLVAR=leak-unexported\n');
+    writeFileSync(join(home, '.zshrc'), 'export CLOUDFLARE_API_TOKEN=leak-rc JEV_API_KEY=leak-rc ELEVENLABS_API_KEY=leak-rc KEEP_RC=rc\nCF_API_SHELLVAR=leak-unexported\n');
     return home;
   }
 
@@ -227,7 +232,7 @@ describe('agent.session_open hook with the zsh startup shim', () => {
     const out = await hook({}, { zdotdir }).open({ ...base, reason: 'create', env: launch });
     expect(out?.env.ZDOTDIR).toBe(zdotdir);
     expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain(`'/Users/x/.zshrc'`);
-    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_)*');
+    expect(readFileSync(join(zdotdir, '.zshrc'), 'utf8')).toContain('(CLOUDFLARE_|CF_API_|SURREAL|JEV_|TYPESAFE_|ELEVENLABS_|XI_API_KEY)*');
   });
 
   test('the shim sources the user\'s ZDOTDIR when they have one, and never itself', async () => {
