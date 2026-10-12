@@ -13,6 +13,12 @@
 set -eu
 
 host=${SCK_REMOTE_HOST:-ubuntu@129.146.179.37}
+# Deploys authenticate with a dedicated, passphrase-protected key that is never
+# loaded into ssh-agent, so a same-user process cannot silently reuse it. All
+# ssh/scp calls share one control channel: the boss types the passphrase once
+# per deploy, on the first connection.
+deploy_key=${SCK_DEPLOY_KEY:-$HOME/.ssh/sck-deploy-ed25519}
+ssh_opts="-o IdentitiesOnly=yes -o IdentityFile=$deploy_key -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-sck-deploy-%h -o ControlPersist=300"
 commit=${1:-$(git rev-parse HEAD)}
 remote_home=/opt/sck-company
 port=${SCK_MCP_PORT:-38473}
@@ -22,6 +28,7 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 product_env=${SCK_PRODUCT_ENV:-/Users/y/IdeaProjects/surreal_ck/.env}
 
 [ -f "$product_env" ] || { echo "product env missing: $product_env" >&2; exit 1; }
+[ -f "$deploy_key" ] || { echo "deploy key missing: $deploy_key (ssh-keygen -t ed25519 -f $deploy_key, then add its .pub to the host's authorized_keys)" >&2; exit 1; }
 
 # --- local staging: release archive + remote service.env ---------------------
 staging=$(mktemp -d)
@@ -49,7 +56,7 @@ grep -q '^SURREAL_ROOT_PASS=.\+' "$staging/creds.env" || { echo 'SURREAL_ROOT_PA
 chmod 600 "$staging/service.env"
 
 # --- remote: user, dirs, bun runtime ----------------------------------------
-ssh "$host" 'sudo bash -s' <<REMOTE_SETUP
+ssh $ssh_opts "$host" 'sudo bash -s' <<REMOTE_SETUP
 set -eu
 id sckcompany >/dev/null 2>&1 || useradd --system -d $remote_home -s /usr/sbin/nologin sckcompany
 mkdir -p $remote_home/{releases,private,state,bin}
@@ -61,10 +68,10 @@ fi
 REMOTE_SETUP
 
 # --- remote: release payload -------------------------------------------------
-ssh "$host" "sudo -u sckcompany mkdir -p $remote_home/releases/$commit"
-cat "$staging/release.tar" | ssh "$host" "sudo -u sckcompany tar -x -C $remote_home/releases/$commit"
-scp -q "$staging/service.env" "$host:/tmp/sck-service.env"
-ssh "$host" 'sudo bash -s' <<REMOTE_ENV
+ssh $ssh_opts "$host" "sudo -u sckcompany mkdir -p $remote_home/releases/$commit"
+cat "$staging/release.tar" | ssh $ssh_opts "$host" "sudo -u sckcompany tar -x -C $remote_home/releases/$commit"
+scp -q $ssh_opts "$staging/service.env" "$host:/tmp/sck-service.env"
+ssh $ssh_opts "$host" 'sudo bash -s' <<REMOTE_ENV
 set -eu
 mv /tmp/sck-service.env $remote_home/private/service.env
 chown sckcompany:sckcompany $remote_home/private/service.env
@@ -75,7 +82,7 @@ chown -h sckcompany:sckcompany $remote_home/current
 REMOTE_ENV
 
 # --- remote: systemd unit ----------------------------------------------------
-ssh "$host" 'sudo bash -s' <<REMOTE_UNIT
+ssh $ssh_opts "$host" 'sudo bash -s' <<REMOTE_UNIT
 set -eu
 cat > /etc/systemd/system/sck-company-mcp.service <<UNIT
 [Unit]
@@ -107,7 +114,7 @@ REMOTE_UNIT
 # --- remote: restart onto the new release ------------------------------------
 # The process reads its code once at start, so moving the `current` symlink is not enough
 # (`enable --now` leaves a running unit alone). Fail the deploy if the new release is not ready.
-ssh "$host" bash -s -- "$port" <<'REMOTE_RESTART'
+ssh $ssh_opts "$host" bash -s -- "$port" <<'REMOTE_RESTART'
 set -eu
 sudo systemctl restart sck-company-mcp.service
 for _ in $(seq 1 45); do
@@ -119,7 +126,7 @@ exit 1
 REMOTE_RESTART
 
 # --- remote: caddy route -----------------------------------------------------
-ssh "$host" 'sudo bash -s' <<REMOTE_CADDY
+ssh $ssh_opts "$host" 'sudo bash -s' <<REMOTE_CADDY
 set -eu
 caddyfile=/etc/caddy/Caddyfile
 if ! grep -q 'sck-mcp' "\$caddyfile"; then
