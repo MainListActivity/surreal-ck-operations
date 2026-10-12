@@ -74,6 +74,16 @@ const ops = {
   },
   release: (employeeId: string) => { released.push(employeeId); },
 };
+const mediaCalls: OpsCall[] = [];
+const mediaReleased: string[] = [];
+const media = {
+  tools: ['media_info', 'media_tts'] as const,
+  call: async (credential: string, taskId: string, tool: string, args: Record<string, unknown>) => {
+    mediaCalls.push({ credential, taskId, tool, args });
+    return { ok: true, tool };
+  },
+  release: (employeeId: string) => { mediaReleased.push(employeeId); },
+};
 
 const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown>) => {
   writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
@@ -87,13 +97,15 @@ beforeEach(() => {
   calls.length = 0;
   opsCalls.length = 0;
   released.length = 0;
+  mediaCalls.length = 0;
+  mediaReleased.length = 0;
   wtCalls.length = 0;
   reclaimCalls.length = 0;
   auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
   authRole = 'engineering';
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
-  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20 });
 });
 afterEach(() => { rmSync(runDir, { recursive: true, force: true }); });
 
@@ -282,6 +294,22 @@ describe('sidecar', () => {
     expect(released).toEqual(['e12']);
     pool.detachAgent('agent-12');
     expect(released).toEqual(['e12', 'e12']);
+  });
+
+  test('media tools are listed and relayed under the lease holder task id, like ops; the lease end drops their state too', async () => {
+    const i = inst('e14');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-14'));
+    mediaReleased.length = 0; // claim clears leftovers from a previous lease first
+    const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'm1', '__list__', {});
+    expect((listed.data as { tools: string[] }).tools).toEqual(expect.arrayContaining(['media_info', 'media_tts', 'ops_info']));
+    const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'm2', 'media_tts', { voiceId: 'v1', taskId: 'someone-elses-task' });
+    expect(res).toEqual({ ok: true, data: { ok: true, tool: 'media_tts' } });
+    expect(mediaCalls).toEqual([{ credential: 'tok-e14', taskId: 'task-14', tool: 'media_tts', args: { voiceId: 'v1' } }]);
+    expect(opsCalls).toHaveLength(0);
+    const submitted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'm3', 'submit', { text: 'done' });
+    expect(submitted.ok).toBe(true);
+    expect(mediaReleased).toEqual(['e14']);
   });
 
   test('adopt re-keys a live binding: channel stays usable, stale artifacts orphaned', async () => {
