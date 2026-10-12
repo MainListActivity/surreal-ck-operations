@@ -230,7 +230,10 @@ export class SidecarPool {
       result = await this.deps.core.claim(cred, task.id);
     } catch (error) {
       const code = (error as { code?: string }).code ?? "";
-      if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) return undefined;
+      if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) {
+        this.log(`claim ${task.id} denied for ${inst.id}: ${code} (${(error as Error).message?.slice(0, 160)})`);
+        return undefined;
+      }
       throw error;
     }
     this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under

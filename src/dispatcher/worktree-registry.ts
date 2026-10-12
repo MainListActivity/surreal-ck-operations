@@ -217,7 +217,10 @@ export class WorktreeRegistry {
       if (live.some(r => r.intent.kind === 'assets' && r.intent.paths!.some(a => intent.paths!.some(b => overlap(a, b))))) throw new CompanyError('worktree_busy', 'Authorized asset directories overlap; wait for current writer');
       if (chosen && activeOn(chosen).some(r => r.intent.kind === 'code')) throw new CompanyError('worktree_busy', 'Shared repository has an active code writer; asset writes wait');
     }
-    if (chosen && intent.kind === 'code' && task.currentEmployee !== actor.employeeId && activeOn(chosen).length) throw new CompanyError('worktree_busy', 'Task scene is referenced by another active delivery');
+    if (chosen && intent.kind === 'code' && task.currentEmployee !== actor.employeeId && activeOn(chosen).length) {
+      const held = activeOn(chosen).map(r => `${String(r.task?.id ?? '?').slice(-8)}:${r.intent.kind}:${refState(r)}`).join(',');
+      throw new CompanyError('worktree_busy', `Task scene ${chosen.path} (mode=${chosen.mode} branch=${chosen.branch}) referenced by ${held}`);
+    }
     if (!chosen) {
       const mode = desired ? 'exclusive' : 'shared';
       const path = join(dirname(repo), `${basename(repo)}-sck-${hash(repo).slice(0, 8)}-${mode === 'shared' ? 'shared' : lane8 ?? task.id.slice(0, 8)}`);
