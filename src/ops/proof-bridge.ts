@@ -74,8 +74,14 @@ export class InternalAiProofBridge {
           fileStable = sha256(rm) === files.manifestHash && sha256(rd) === files.documentHash;
         } catch { fileStable = false; }
       }
+      if (!await this.deps.store.authorizeDiagnosis(lease, args.approvalTask)) return { outcome: 'denied', failure: 'scope-denied' } as const;
+      set('leaseStillCurrent', await this.deps.store.leaseValid(lease));
+      if (files) {
+        const time = evidenceChecks(files.evidence, files.manifest, this.now());
+        for (const key of Object.keys(time) as (keyof typeof time)[]) set(key, time[key]);
+      }
       const stable = stored.snapshotStable && checks.leaseStillCurrent.matched && fileStable;
-      return { ...diagnosis(checks, stable), codeVersion: await diagnosticCodeVersion() };
+      return { ...diagnosis(checks, stable), expired: checks.evidenceUnexpired.evaluated && !checks.evidenceUnexpired.matched, codeVersion: await diagnosticCodeVersion() };
     } catch (error) {
       if (error instanceof CompanyError && error.code === 'forbidden') return { outcome: 'denied', failure: 'scope-denied' } as const;
       return diagnosis(checks, false, true);

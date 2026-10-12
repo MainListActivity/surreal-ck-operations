@@ -2,7 +2,6 @@ import { RecordId, type Surreal } from 'surrealdb';
 import type { OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { PROOF_GOAL, APPROVAL_MARKER } from './proof-contract.ts';
-import { canonical } from './proof-contract.ts';
 import { emptyChecks, mark, type DiagnosticCheck, type CheckResult } from './approval-diagnosis.ts';
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
@@ -61,7 +60,7 @@ export class CompanyProofStore {
       reviewer = rows[0];
     }
     return { candidate: candidates[0], task: tasks[0], audit, reviewer,
-      ambiguous: !!audits[1] && canonical(audits[1].at) === canonical(audit?.at) };
+      ambiguous: !!audits[1] && JSON.stringify(audits[1].at) === JSON.stringify(audit?.at) };
   }
   private approvalChecks(snapshot: ApprovalSnapshot, env: string, files?: ProofFiles) {
     const checks = emptyChecks();
@@ -103,7 +102,7 @@ export class CompanyProofStore {
     const snapshot = await this.approvalSnapshot(taskId, true);
     const checks = this.approvalChecks(snapshot, env, files);
     const next = await this.approvalSnapshot(taskId, true);
-    return { checks, snapshotStable: !snapshot.ambiguous && !next.ambiguous && canonical(snapshot) === canonical(next) };
+    return { checks, snapshotStable: !snapshot.ambiguous && !next.ambiguous && JSON.stringify(snapshot) === JSON.stringify(next) };
   }
   async approval(taskId: string, env: string, files: ProofFiles): Promise<ApprovalReceipt> {
     const snapshot = await this.approvalSnapshot(taskId);

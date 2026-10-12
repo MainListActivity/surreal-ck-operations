@@ -7,7 +7,9 @@ import { readProofFile, loadProofFiles } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
 import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, type ProofIdentity } from '../src/ops/proof-contract.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
-import type { CompanyProofStore, ProofRow } from '../src/ops/proof-store.ts';
+import { CompanyProofStore, type ProofRow } from '../src/ops/proof-store.ts';
+import { RecordId, type Surreal } from 'surrealdb';
+import { diagnosticFailureByCheck } from '../src/ops/approval-diagnosis.ts';
 import type { OpsScope } from '../src/contracts.ts';
 import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
@@ -323,4 +325,48 @@ test('status time claims carry a fixed clock margin; a verifier 5.5s behind the 
     const stale=signer.sign('status',{jti:claims.jti,valid:true,version:1,approvalVersion:null,checkedAt:seconds-61,iat:seconds-61,exp:seconds-1,nonce:'synthetic-nonce-3003'});
     expect(()=>verifyCompanyProof(stale,signer.trust(),'status',clock)).toThrow();
   }finally{await rm(home,{recursive:true,force:true});}
+});
+
+test('approval diagnostics use production predicates, strict authorization and no signing dependencies', async () => {
+  const home=await realpath(await mkdtemp(join(tmpdir(),'proof-diagnose-unit-')));
+  const taskId='synthetic-diagnostic';
+  const fixture=disabledSenseNovaFixture();
+  const root=join(home,'evidence',taskId);await mkdir(root,{recursive:true});
+  const manifestPath=join(root,'manifest.json'),documentPath=join(root,'evidence.json');
+  await writeFile(manifestPath,JSON.stringify(fixture.manifest));await writeFile(documentPath,fixture.documentBytes);
+  const loaded=await loadProofFiles(home,taskId,manifestPath,documentPath);
+  const scope:OpsScope={taskId,project:'surreal_ck',actor:{employeeId:'synthetic-caller',role:'engineering',capabilities:[]}};
+  let role='engineering', authorize=true, revoked=false, retired=false;
+  const task={state:'done',kind:'task',version:10,submitted_by:'synthetic-author',accepted_by:'synthetic-reviewer',reviewer_role:'qa',goal:new RecordId('goal',fixture.manifest.goalId),project:new RecordId('project','surreal_ck')};
+  const candidate={task:new RecordId('task',taskId),env:'production',digest:fixture.manifest.configurationDigest,manifest_hash:loaded.manifestHash,document_hash:loaded.documentHash,manifest_path:manifestPath,document_path:documentPath,author:task.submitted_by};
+  const audit={id:new RecordId('audit','synthetic'),actor:new RecordId('employee',task.accepted_by) as RecordId|string,action:'accept',version:10,evidence:'notes\r\n '+ 'company-internal-ai-approve:v1:'+candidate.digest+' \r\n',at:new Date()};
+  const db={query:async(sql:string)=>{
+    if(sql.startsWith('SELECT current_employee')) return [[{current_employee:scope.actor.employeeId,delivery_id:'synthetic-delivery',fence:1,lease_expires_at:Date.now()/1000+600,state:'doing',goal:task.goal,project:task.project,revoked:false,retired:false,role}]];
+    if(sql.startsWith('SELECT dependencies')) return [[{dependencies:[]}],authorize?[{goal:task.goal,project:task.project}]:[]];
+    if(sql.startsWith('SELECT task, digest')) return [[candidate],[task],[audit]];
+    if(sql.startsWith('SELECT revoked')) return [[{revoked,retired}]];
+    throw new Error('unexpected read');
+  }} as unknown as Surreal;
+  const store=new CompanyProofStore(db);
+  const unused=async():Promise<never>=>{throw new Error('must not sign/resolve/deliver');};
+  const bridge=new InternalAiProofBridge({store,home,key:()=>{throw new Error('must not read key');},signer:unused,identities:unused,rotate:unused,deliver:unused});
+  const args={approvalTask:taskId,manifestPath,documentPath,activityId:fixture.manifest.activityId};
+  const diagnose=()=>bridge.call(scope,'production','ops_internal_ai_approval_diagnose',args) as Promise<{failure:string;checks:Record<string,{evaluated:boolean;matched:boolean}>}>;
+  try {
+    const result=await diagnose();expect(result.failure).toBe('service-evidence-ineligible');
+    expect(result.checks.auditMarkerExactLine).toEqual({evaluated:true,matched:true});
+    expect(result.checks.auditActorMatchesAcceptedBy.matched).toBe(true);
+    expect(Object.keys(result.checks).sort()).toEqual(Object.keys(diagnosticFailureByCheck).sort());
+    const receipt=await store.approval(taskId,'production',loaded);expect(receipt.version).toBe(10);
+    audit.actor='employee:synthetic-reviewer';
+    const actor=await diagnose();expect(actor.checks.auditActorIsRecordId.matched).toBe(false);
+    await expect(store.approval(taskId,'production',loaded)).rejects.toMatchObject({code:'forbidden'});
+    audit.actor=new RecordId('employee',task.accepted_by);revoked=true;
+    expect((await diagnose()).checks.reviewerNotRevoked.matched).toBe(false);
+    await expect(store.approval(taskId,'production',loaded)).rejects.toMatchObject({code:'forbidden'});
+    revoked=false;retired=true;expect((await diagnose()).checks.reviewerNotRetired.matched).toBe(false);
+    retired=false;role='product';expect(await diagnose() as unknown).toEqual({outcome:'denied',failure:'scope-denied'});
+    role='engineering';authorize=false;expect(await diagnose() as unknown).toEqual({outcome:'denied',failure:'scope-denied'});
+    await expect(bridge.call(scope,'production','ops_internal_ai_approval_diagnose',{...args,sql:'SELECT * FROM employee'})).rejects.toMatchObject({code:'invalid'});
+  } finally {await rm(home,{recursive:true,force:true});}
 });
