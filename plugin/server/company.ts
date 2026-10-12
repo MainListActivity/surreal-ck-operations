@@ -1,7 +1,7 @@
 // Lazily boots the company stack inside the plugin's Node subprocess.
 // Repo modules live under server/vendor (copied by scripts/vendor.sh at install/update).
 import { installBunShim } from "./bun-shim";
-import { loadServiceEnv } from "./env";
+import { loadServiceEnv, serviceHome } from "./env";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { readProviderQuotas } from "./dispatch";
@@ -50,6 +50,7 @@ export function company(): Promise<Company> {
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { MediaStudio } = await import("./vendor/src/media/elevenlabs.ts");
+    const { VaultClient } = await import("./vendor/src/media/vault.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli, createSceneCleaner } = await import("./vendor/src/dispatcher/paseo.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
@@ -81,9 +82,9 @@ export function company(): Promise<Company> {
       log: message => console.log(message),
     });
     const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;
-    // The ElevenLabs key is read by this process only; employees reach it through the media_* tools.
+    // The ElevenLabs key lives only in sck-vault (its own process, Keychain-bound); this side never sees it.
     const media = new MediaStudio({
-      core, apiKey: () => process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY, evidenceRoot: join(dirname(runDir), "evidence"), fetch,
+      core, vault: new VaultClient(join(serviceHome(), "vault", "vault.sock")), evidenceRoot: join(dirname(runDir), "evidence"),
     });
     const sidecar = new SidecarPool({
       core, workforce, ops, media,
