@@ -222,7 +222,17 @@ export class MediaStudio {
       throw error;
     });
     const configured = status?.configured === true;
-    const sub = configured ? await this.json<Subscription>('subscription', {}) : undefined;
+    // A refused or unreachable subscription call must not take the diagnostic output down with it:
+    // employees need configured/grants/quotas to say exactly what the boss has to approve.
+    let sub: Subscription | undefined;
+    let subscriptionError: string | undefined;
+    if (configured) {
+      try {
+        sub = await this.json<Subscription>('subscription', {});
+      } catch (error) {
+        subscriptionError = error instanceof CompanyError ? error.message : 'subscription 查询失败';
+      }
+    }
     const quotas = Object.fromEntries(await Promise.all(KINDS.map(async kind => [kind, {
       used: await this.deps.core.opsCount(scope.project, `ops_media_${kind}`, DAY_SECONDS), limit: this.limits[kind],
     }])));
@@ -232,6 +242,7 @@ export class MediaStudio {
       subscription: sub && {
         tier: sub.tier, character_count: sub.character_count, character_limit: sub.character_limit, next_character_count_reset_unix: sub.next_character_count_reset_unix,
       },
+      subscriptionError,
       grants: (status?.grants ?? []).map(({ expiresAt, callsLeft }) => ({ expiresAt, callsLeft })),
       outputDir: this.outputDir(scope),
       quotas,

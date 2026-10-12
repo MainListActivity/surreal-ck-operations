@@ -87,6 +87,19 @@ describe('media_info', () => {
     expect(info.grants).toEqual([{ expiresAt: 'later', callsLeft: { tts: 5 } }]);
     expect(info.quotas.tts).toEqual({ used: 3, limit: 1500 });
   });
+
+  test('when the subscription call is refused the info still reports configured, grants and the reason', async () => {
+    const refusing: MediaVault = {
+      status: async () => ({ configured: true, grants: [] }),
+      call: async () => { throw new CompanyError('forbidden', '未获授权：老板未批准该操作'); },
+    };
+    const info = await call(studio({ vault: refusing }), 'media_info') as Record<string, any>;
+    expect(info.configured).toBe(true);
+    expect(info.grants).toEqual([]);
+    expect(info.subscription).toBeUndefined();
+    expect(info.subscriptionError).toContain('未获授权');
+    expect(info.quotas.tts).toEqual({ used: 0, limit: 1500 });
+  });
 });
 
 describe('media_voices', () => {
