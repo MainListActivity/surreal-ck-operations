@@ -218,6 +218,106 @@ export function registerHandlers(server: PluginServerContext): void {
     };
   });
 
+  server.handle(rpc.pulse, async (_input: unknown, { paseo }: { paseo: any }) => {
+    const { db, owner, workforce, opsRepo } = await company();
+    const { staffingPool, quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { localDate } = await import("./vendor/src/owner-brief.ts");
+    const { readProviderQuotas } = await import("./dispatch.ts");
+    const { RecordId } = await import("surrealdb");
+    const asId = (x: unknown) => { const s = String(x); return s.includes("⟨") ? s.split("⟨").pop()!.replace("⟩", "") : s; };
+    const now = Date.now();
+    const nowS = Math.floor(now / 1000);
+    const cfg = await workforce.config();
+
+    // Same inputs the dispatcher tick derives: the "why unclaimed" answer below is
+    // the identical staffingPool verdict, not a parallel reimplementation.
+    const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
+    const agents = paseo ? await paseo.agents.list() : { entries: [] };
+    const statusById = new Map<string, string>((agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
+    const modelSlots = paseo ? await refreshModels(paseo, await company()).catch(() => ({} as Record<string, string>)) : {};
+    const defs = await workforce.defs();
+    const insts = await workforce.insts();
+    const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
+    type InstState = import("./vendor/src/dispatcher/dispatcher").InstState;
+    const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
+    const states = new Map<string, InstState>();
+    for (const inst of insts) {
+      const st = inst.paseoAgentId ? statusById.get(inst.paseoAgentId) ?? "missing" : "missing";
+      states.set(inst.id,
+        st === "running" || st === "initializing" ? "busy" :
+        st === "idle" ? "idle" :
+        st === "error" && healthMap.get(inst.provider ?? "")?.state === "exhausted" ? "exhausted" : "down");
+    }
+    const tasks = await workforce.tasks();
+    const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+    const busyBy = new Map<string, number>();
+    for (const inst of insts) {
+      if (states.get(inst.id) !== "busy") continue;
+      busyBy.set(inst.provider ?? "", (busyBy.get(inst.provider ?? "") ?? 0) + 1);
+    }
+    const quotaBlocked = quotaBlockedProviders(await readProviderQuotas({ db }), cfg, now);
+    const poolBase = { defs, insts, states, holding, health: healthMap, quotaBlocked, busyBy,
+      providerMax: cfg.providerMax, slots: new Map(Object.entries(modelSlots)), opsRepo, sidecar: true, now: nowS };
+
+    const brief = await owner.briefData(now, localDate(new Date(now)),
+      roleCapacity(defs, quotaBlocked, healthMap, nowS));
+
+    const [doingRows] = await db.db.query<[any[]]>(
+      `SELECT id, title, executor_role, discipline, current_employee, goal.title AS goal_title FROM task WHERE state = 'doing';`);
+    const doingIds = (doingRows ?? []).map(r => r.id);
+    const [claims] = await db.db.query<[any[]]>(
+      `SELECT task, at, actor FROM audit WHERE action = 'claim' AND task INSIDE $ids ORDER BY at DESC;`,
+      { ids: doingIds.length ? doingIds : [new RecordId("task", "none")] });
+    const claimBy = new Map<string, any>();
+    for (const c of claims ?? []) { const k = String(c.task); if (!claimBy.has(k)) claimBy.set(k, c); }
+    const doing = (doingRows ?? []).map((r: any) => {
+      const claim = claimBy.get(String(r.id));
+      return {
+        taskId: asId(r.id), title: String(r.title ?? ""), employee: r.current_employee ? asId(r.current_employee) : undefined,
+        role: String(r.executor_role ?? ""), discipline: r.discipline ?? undefined, goal: r.goal_title ?? undefined,
+        sinceMin: claim ? Math.max(0, Math.round((now - Date.parse(String(claim.at))) / 60_000)) : undefined,
+      };
+    });
+
+    // Ready queue with the dominant "nobody can take this" reason when the whole
+    // pool is ineligible: this is what silent starvation looks like to the owner.
+    const ready = [] as Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
+    for (const t of tasks.filter(t => t.state === "ready")) {
+      const [audit] = await db.db.query<[any[]]>(
+        `SELECT at FROM audit WHERE task = $task AND action IN ['create','dependency_unlocked','return','release','revoke','resume'] ORDER BY at DESC LIMIT 1;`,
+        { task: new RecordId("task", t.id) });
+      const waitingMin = audit?.[0] ? Math.max(0, Math.round((now - Date.parse(String(audit[0].at))) / 60_000)) : 0;
+      const pool = staffingPool({ ...poolBase, role: t.executorRole, home: t.repoPath ?? opsRepo, task: t });
+      let unclaimableReason: string | undefined;
+      if (pool.length && !pool.some(e => e.eligible)) {
+        const counts = new Map<string, number>();
+        for (const e of pool) counts.set(e.reason ?? "未知", (counts.get(e.reason ?? "未知") ?? 0) + 1);
+        unclaimableReason = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
+      } else if (!pool.length) {
+        unclaimableReason = "该岗位没有任何编制";
+      }
+      ready.push({ taskId: t.id, title: t.title, role: t.executorRole, discipline: t.discipline, waitingMin, unclaimableReason });
+    }
+
+    const [recentDone] = await db.db.query<[any[]]>(
+      `SELECT task, task.title AS title, at, actor FROM audit WHERE action IN ['accept','owner_approve'] ORDER BY at DESC LIMIT 8;`);
+
+    const readyIds = new Set(ready.map(r => r.taskId));
+    return {
+      at: new Date(now).toISOString(),
+      paused: !!cfg.paused,
+      doing, ready,
+      stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
+      waiting: brief.waiting ?? [],
+      recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),
+      last24h: brief.last24h,
+      resources: brief.resources ?? [],
+      staffingAlerts: brief.staffingAlerts ?? 0,
+      churn: brief.churn,
+      goals: brief.goals ?? [],
+    };
+  });
+
   server.handle(rpc.providerOptions, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { ROLES } = await import("./vendor/src/core.ts");
     const { MODEL_FAMILY } = await import("./dispatch.ts");

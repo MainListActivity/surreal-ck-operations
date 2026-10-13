@@ -19,7 +19,7 @@ const mkHome = () => {
 describe('plugin preview 生命周期（node:http 内嵌双面）', () => {
   test('start→LAN healthz/文件可达→stop 幂等且端口释放', async () => {
     const home = mkHome();
-    const h = startPreview({ home, port: 0, coreFactory: (o) => createPreviewFetch(o), log: () => {} });
+    const h = startPreview({ home, port: 0, secret: '', coreFactory: (o) => createPreviewFetch(o), log: () => {} });
     try {
       const port = await h.ready;
       const r = await fetch(`http://127.0.0.1:${port}/healthz`);
