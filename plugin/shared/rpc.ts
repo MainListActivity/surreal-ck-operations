@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Roster, TaskAttachment, TaskView } from "./types";
+import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -15,6 +15,12 @@ export const brief = defineRpc({
   name: "company.brief",
   input: z.object({}),
   output: record<Brief>(),
+});
+
+export const pulse = defineRpc({
+  name: "company.pulse",
+  input: z.object({}),
+  output: record<Pulse>(),
 });
 
 export const createGoal = defineRpc({

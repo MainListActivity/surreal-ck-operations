@@ -67,14 +67,15 @@ test('roster RPC: unknown history blocks all candidates at zero share; recovery 
 });
 
 // Compile and render the actual roster JSX section with wire responses, without a host UI runtime.
+// The review-pool details live inside the collapsed 调度明细 section on the slimmed page.
 const page = await Bun.file(new URL('../plugin/client/company.tsx', import.meta.url)).text();
-const sectionStart = page.indexOf('<Section title="待验收任务候选预览"');
-const sectionEnd = page.indexOf('<Section title="员工编制"', sectionStart);
-if (sectionStart < 0 || sectionEnd < 0) throw new Error('Missing task-scoped roster UI section');
+const sectionStart = page.indexOf('<Collapsible title="调度明细');
+const sectionEnd = page.indexOf('</Collapsible>', sectionStart);
+if (sectionStart < 0 || sectionEnd < 0) throw new Error('Missing roster debug (调度明细) UI section');
 const compiled = new Bun.Transpiler({ loader: 'tsx', tsconfig: {
   compilerOptions: { jsx: 'react', jsxFactory: 'React.createElement' },
-} }).transformSync(`return (${page.slice(sectionStart, sectionEnd).trim()});`);
-const render = new Function('r', 's', 'ctx', 'React', 'Section', 'View', 'Text', compiled);
+} }).transformSync(`return (${page.slice(sectionStart, sectionEnd + '</Collapsible>'.length).trim()});`);
+const render = new Function('r', 's', 'ctx', 'React', 'Section', 'View', 'Text', 'Collapsible', 'ROLE_LABEL', compiled);
 const collectText = (node: unknown): string => {
   if (node == null || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -85,7 +86,7 @@ const collectText = (node: unknown): string => {
 const renderText = (response: Roster): string => collectText(render(response,
   { card: {}, text: {}, muted: {} }, {},
   { createElement: (_type: unknown, _props: unknown, ...children: unknown[]) => ({ children }) },
-  'Section', 'View', 'Text'));
+  'Section', 'View', 'Text', 'Collapsible', {}));
 
 test('roster page JSX displays task, review recusal and unknown history at zero share', async () => {
   historyFails = false;

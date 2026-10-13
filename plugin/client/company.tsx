@@ -268,6 +268,124 @@ function DecideCard({ taskId, kind, body, ctx, onDone }: {
   );
 }
 
+/** 时间间隔的人话格式：分钟→小时→天 */
+const fmtAge = (min?: number): string => {
+  if (min === undefined) return "";
+  if (min < 60) return `${min} 分钟`;
+  const h = min / 60;
+  if (h < 48) return `${h.toFixed(h < 10 ? 1 : 0)} 小时`;
+  return `${Math.floor(h / 24)} 天`;
+};
+
+/** 可折叠分区：默认收起，点标题展开 */
+function Collapsible({ title, count, ctx, children, defaultOpen }: {
+  title: string; count?: number; ctx: Ctx; children: React.ReactNode; defaultOpen?: boolean;
+}) {
+  const s = makeStyles(ctx);
+  const [open, setOpen] = useState(defaultOpen ?? false);
+  return (
+    <View style={{ gap: 8 }}>
+      <Pressable accessibilityRole="button" style={s.row} onPress={() => setOpen(!open)}>
+        <Text style={s.h2}>{open ? "▾ " : "▸ "}{title}</Text>
+        {count !== undefined && count > 0 && (
+          <View style={s.badge}><Text style={s.badgeText}>{count}</Text></View>
+        )}
+      </Pressable>
+      {open ? children : null}
+    </View>
+  );
+}
+
+/** 动态页：一页回答「公司现在在干什么、什么卡住了、为什么」。 */
+function PulseTab({ ctx }: { ctx: Ctx }) {
+  const s = makeStyles(ctx);
+  const pulseRpc = useRpc(rpc.pulse);
+  const data = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
+  const p = data.data;
+  const attention = (p?.waiting.length ?? 0) + (p?.stuck.length ?? 0) + (p?.ready.filter(r => r.unclaimableReason).length ?? 0) + (p?.resources.length ?? 0) + (p?.staffingAlerts ?? 0);
+  return (
+    <View style={{ gap: 12 }}>
+      <View style={s.card}>
+        <Text style={s.text}>
+          {p?.paused ? "派工已暂停" : "派工运行中"}
+          {p ? ` · 在办 ${p.doing.length} · 就绪 ${p.ready.length} · 卡住 ${p.stuck.length} · 待你处理 ${p.waiting.length}` : ""}
+        </Text>
+        {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
+      </View>
+      <Section title="正在办" count={p?.doing.length} ctx={ctx}>
+        {(p?.doing.length ?? 0) === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
+        {p?.doing.map(d => (
+          <View key={d.taskId} style={s.card}>
+            <Text style={s.text}>{d.title}</Text>
+            <Text style={s.muted}>
+              {d.employee ?? d.role}{d.discipline ? ` · ${d.discipline}` : ""}{d.goal ? ` · ${d.goal.slice(0, 40)}` : ""}
+              {d.sinceMin !== undefined ? ` · 已进行 ${fmtAge(d.sinceMin)}` : ""}
+            </Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="待你处理" count={p?.waiting.length} ctx={ctx}>
+        {p?.waiting.map(w => (
+          <View key={w.taskId} style={s.card}>
+            <Text style={s.text}>{w.kind === "gate" ? "批准" : "回答"} · {w.title}</Text>
+            <Text style={s.muted}>已等 {w.hours < 1 ? `${Math.round(w.hours * 60)} 分钟` : `${w.hours.toFixed(1)} 小时`}{w.downstream ? ` · 卡住下游 ${w.downstream} 个任务` : ""}{w.goal ? ` · ${w.goal.slice(0, 40)}` : ""} · 到「收件箱」处理</Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="卡住" count={p?.stuck.length} ctx={ctx}>
+        {p?.stuck.map(t => (
+          <View key={t.taskId} style={s.card}>
+            <Text style={s.text}>{t.title}</Text>
+            <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
+          </View>
+        ))}
+      </Section>
+      <Section title="就绪待领" count={p?.ready.length} ctx={ctx}>
+        {(p?.ready.length ?? 0) === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
+        {p?.ready.map(r => (
+          <View key={r.taskId} style={s.card}>
+            <Text style={s.text}>{r.title}</Text>
+            <Text style={s.muted}>
+              {ROLE_LABEL[r.role] ?? r.role}{r.discipline ? ` · ${r.discipline}` : ""} · 已等 {fmtAge(r.waitingMin)}
+            </Text>
+            {r.unclaimableReason && (
+              <Text style={{ color: "#d97706", fontSize: 13 }}>无人可派：{r.unclaimableReason}</Text>
+            )}
+          </View>
+        ))}
+      </Section>
+      <Section title="资源异常" count={(p?.resources.length ?? 0) + (p?.staffingAlerts ?? 0)} ctx={ctx}>
+        {(p?.resources.length ?? 0) === 0 && (p?.staffingAlerts ?? 0) === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
+        {p?.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
+        {(p?.staffingAlerts ?? 0) > 0 && <Text style={s.text}>有 {p!.staffingAlerts} 个岗位暂无可用员工（见收件箱提醒）</Text>}
+      </Section>
+      <Collapsible title="近 24 小时" ctx={ctx}>
+        <View style={s.card}>
+          <Text style={s.text}>
+            完成 {p?.last24h.done ?? 0} · 退回 {p?.last24h.returned ?? 0} · 驳回 {p?.last24h.rejected ?? 0} · 通道回滚 {p?.last24h.rolledBack ?? 0} · 退役 {p?.last24h.retired ?? 0}
+          </Text>
+          <Text style={s.muted}>员工流动：新建 {p?.churn.created ?? 0} · 退役 {p?.churn.retired ?? 0} · 认领失败 {p?.churn.claimLost ?? 0}</Text>
+        </View>
+      </Collapsible>
+      <Collapsible title="最近完成" count={p?.recentDone.length} ctx={ctx}>
+        <View style={s.card}>
+          {(p?.recentDone.length ?? 0) === 0 && <Text style={s.muted}>暂无。</Text>}
+          {p?.recentDone.map(d => (
+            <Text key={d.taskId + d.at} style={s.muted}>{d.at.slice(5, 16).replace("T", " ")} · {d.actor ? `${d.actor} · ` : ""}{d.title.slice(0, 60)}</Text>
+          ))}
+        </View>
+      </Collapsible>
+      <Collapsible title="在办目标" count={p?.goals.length} ctx={ctx}>
+        <View style={s.card}>
+          {p?.goals.map((g, i) => <Text key={i} style={s.text}>{g.title.slice(0, 70)}{g.days > 0 ? `（已 ${g.days} 天）` : ""}</Text>)}
+        </View>
+      </Collapsible>
+      {data.isLoading && <Text style={s.muted}>加载中…</Text>}
+      {data.isError && <Text style={s.muted}>加载失败：{String((data.error as Error).message).slice(0, 200)}</Text>}
+    </View>
+  );
+}
+
 function InboxTab({ ctx }: { ctx: Ctx }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -694,125 +812,140 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
           </View>
         ))}
       </Section>
-      <Section title="订阅额度" ctx={ctx}>
-        <View style={s.card}>
-          {(r?.usage ?? []).map(u => {
-            const bits = [
-              ...u.windows.filter(w => w.remainingPct != null).map(w =>
-                `${w.label} 剩余 ${Math.round(w.remainingPct!)}%${w.resetsAt ? `（${w.resetsAt.slice(5, 16).replace("T", " ")} 重置）` : ""}`),
-              ...u.balances.filter(b => b.remaining != null).map(b =>
-                `${b.label} 剩 ${b.remaining}${b.limit != null ? `/${b.limit}` : ""} ${b.unit ?? ""}`),
-            ];
-            return (
-              <Text key={u.providerId} style={s.text}>
-                {u.displayName ?? u.providerId}{u.planLabel ? `（${u.planLabel}）` : ""}：
-                {bits.length ? bits.join("；") : `状态 ${u.status}`}
-              </Text>
-            );
-          })}
-          {(r?.usage.length ?? 0) === 0 && <Text style={s.muted}>暂无额度数据。</Text>}
-        </View>
-      </Section>
-      <Section title="订阅健康度" ctx={ctx}>
-        <View style={s.card}>
-          {(r?.health.length ?? 0) === 0 && <Text style={s.muted}>各订阅正常。</Text>}
-          {r?.health.map(h => (
-            <Text key={h.provider} style={s.text}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
-          ))}
-        </View>
-      </Section>
-      <Section title={editDef ? `编辑 ${editDef.id}` : "注册员工"} ctx={ctx}>
-        <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
-          onDone={() => { setEditDef(undefined); refreshAll(); }} onCancel={() => setEditDef(undefined)} />
-      </Section>
-      <Section title="待验收任务候选预览" count={r?.reviewPools?.length} ctx={ctx}>
-        <View style={s.card}>
-          <Text style={s.muted}>当前候选估算；最终派工由调度器执行。回避仅用于对应任务的 review。</Text>
-          {(r?.reviewPools?.length ?? 0) === 0 && <Text style={s.muted}>暂无等待派工的验收任务。</Text>}
-          {r?.reviewPools?.map(p => (
-            <View key={p.taskId} style={{ gap: 4 }}>
-              <Text style={s.text}>{p.title} · {p.taskId} · review · {p.role}</Text>
-              <Text style={s.muted}>项目：{p.home}</Text>
-              {p.status === "history_unavailable" && (
-                <Text style={s.text}>贡献者历史读取失败：候选不可派，中选率 0%，等待安全候选。</Text>
-              )}
-              {p.entries.length === 0 && <Text style={s.muted}>暂无候选，任务继续等待。</Text>}
-              {p.entries.map(e => (
-                <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
-                  {e.kind === "spawn" ? "新开" : "复用"} · {e.ref} · {e.eligible
-                    ? `可派 · 权重 ${Math.round(e.weight * 10) / 10} · 中选率 ${Math.round(e.share * 100)}%`
-                    : `不可派（${e.reason ?? "未知"}） · 中选率 0%`}
-                </Text>
-              ))}
-            </View>
-          ))}
-        </View>
-      </Section>
-      <Section title="员工编制" count={r?.defs.length} ctx={ctx}>
-        <View style={s.card}>
-          {(() => {
-            const defs = r?.defs ?? [];
-            const insts = r?.instances ?? [];
-            const groups = Object.keys(ROLE_LABEL)
-              .map(role => ({ role, defs: defs.filter(d => d.role === role) }))
-              .concat(defs.some(d => !(d.role in ROLE_LABEL))
-                ? [{ role: "", defs: defs.filter(d => !(d.role in ROLE_LABEL)) }]
-                : [])
-              .filter(g => g.defs.length > 0);
-            const pools = r?.pools ?? [];
-            const homeLabel = (home: string) => home === r?.opsRepo ? "运营仓库" : home.split("/").pop() ?? home;
-            const fmtW = (w: number) => String(Math.round(w * 10) / 10);
-            const spawnCands = (defId: string) =>
-              pools.flatMap(p => p.entries.filter(e => e.kind === "spawn" && e.ref === defId)
-                .map(e => ({ home: p.home, ...e })));
-            const reuseCand = (instId: string, home: string) =>
-              pools.flatMap(p => p.home === home ? p.entries : [])
-                .find(e => e.kind === "reuse" && e.ref === instId);
-            const candText = (e: { weight: number; share: number; eligible: boolean; reason?: string }) =>
-              e.eligible ? `权重 ${fmtW(e.weight)} · 中选率 ${Math.round(e.share * 100)}%` : `不可派（${e.reason ?? "未知"}）`;
-            return groups.map(g => (
-              <View key={g.role || "other"} style={{ gap: 4 }}>
-                <Text style={s.muted}>
-                  {g.role ? `${ROLE_LABEL[g.role]}（${g.role}）` : "其他"} · {g.defs.length} 编制 · {g.defs.reduce((n, d) => n + insts.filter(i => i.def === d.id).length, 0)} 实例
-                </Text>
-                {[...g.defs].sort((a, b) => a.provider.localeCompare(b.provider) || (b.weight ?? 0) - (a.weight ?? 0)).map(d => {
-                  const defInsts = insts.filter(i => i.def === d.id);
-                  const cands = spawnCands(d.id);
+      {(() => {
+        const usage = r?.usage ?? [];
+        const health = r?.health ?? [];
+        const defs = r?.defs ?? [];
+        const insts = r?.instances ?? [];
+        // 「需要处理」只放异常：耗尽/不健康的订阅、低额度窗口、停用编制、会话异常实例。
+        const problems: string[] = [];
+        for (const h of health.filter(h => h.state !== "healthy"))
+          problems.push(`订阅 ${h.provider}：${h.state}${h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}`);
+        for (const u of usage) {
+          for (const w of u.windows.filter(w => (w.remainingPct ?? 100) <= 15))
+            problems.push(`订阅 ${u.displayName ?? u.providerId}：${w.label} 剩余 ${Math.round(w.remainingPct!)}%`);
+          for (const b of u.balances.filter(b => (b.remaining ?? 1) <= 0))
+            problems.push(`订阅 ${u.displayName ?? u.providerId}：${b.label} 余额 ${b.remaining} ${b.unit ?? ""}`);
+        }
+        for (const d of defs.filter(d => !d.enabled))
+          problems.push(`编制已停用：${d.id}`);
+        for (const i of insts.filter(i => i.agentStatus && !["running", "idle", "initializing"].includes(i.agentStatus)))
+          problems.push(`实例会话异常：${i.id.split("⟨").pop()?.replace("⟩", "")}（${i.agentStatus}）`);
+        return (
+          <>
+            <Section title="需要处理" count={problems.length} ctx={ctx}>
+              <View style={s.card}>
+                {problems.length === 0 && <Text style={s.muted}>一切正常。</Text>}
+                {problems.map((p, i) => <Text key={i} style={[s.text, { color: "#d97706" }]}>{p}</Text>)}
+              </View>
+            </Section>
+            <Collapsible title="订阅额度与健康" count={usage.length} ctx={ctx}>
+              <View style={s.card}>
+                {usage.map(u => {
+                  const bits = [
+                    ...u.windows.filter(w => w.remainingPct != null).map(w =>
+                      `${w.label} 剩余 ${Math.round(w.remainingPct!)}%${w.resetsAt ? `（${w.resetsAt.slice(5, 16).replace("T", " ")} 重置）` : ""}`),
+                    ...u.balances.filter(b => b.remaining != null).map(b =>
+                      `${b.label} 剩 ${b.remaining}${b.limit != null ? `/${b.limit}` : ""} ${b.unit ?? ""}`),
+                  ];
                   return (
-                    <View key={d.id} style={{ gap: 2 }}>
-                      <View style={s.row}>
-                        <Text style={[s.text, { flex: 1 }]}>
-                          {"  "}{d.provider}/{d.model}{d.resolved ? ` → ${d.resolved}` : ""}{d.thinking ? ` · ${d.thinking}` : ""} · 上限 {d.maxInstances} · 权 {d.weight}{d.avgScore ? ` × 绩效 ${d.avgScore.toFixed(1)}` : ""}{cands[0] ? ` → 有效 ${fmtW(cands[0].weight)}` : ""}{d.enabled ? "" : " · 已停用"}
-                        </Text>
-                        <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
-                          <Text style={s.chipText}>编辑</Text>
-                        </Pressable>
-                        <Pressable accessibilityRole="button" style={s.chip}
-                          onPress={async () => { await toggleDef({ defId: d.id, enabled: !d.enabled }); refreshAll(); }}>
-                          <Text style={s.chipText}>{d.enabled ? "停用" : "启用"}</Text>
-                        </Pressable>
-                      </View>
-                      {cands.map(c => (
-                        <Text key={c.home} style={s.muted}>
-                          {"    "}▸ 新开@{homeLabel(c.home)}：{candText(c)}
-                        </Text>
-                      ))}
-                      {defInsts.map(i => {
-                        const c = reuseCand(i.id, i.cwd ?? r?.opsRepo ?? "");
-                        return (
-                          <Text key={i.id} style={s.muted}>
-                            {"    "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.cwd?.split("/").pop() ?? "运营仓库"}{i.agentStatus ? ` · ${i.agentStatus}` : ""}{c ? ` · ${candText(c)}` : ""}
-                          </Text>
-                        );
-                      })}
-                    </View>
+                    <Text key={u.providerId} style={s.text}>
+                      {u.displayName ?? u.providerId}{u.planLabel ? `（${u.planLabel}）` : ""}：
+                      {bits.length ? bits.join("；") : `状态 ${u.status}`}
+                    </Text>
                   );
                 })}
+                {usage.length === 0 && <Text style={s.muted}>暂无额度数据。</Text>}
+                {health.map(h => (
+                  <Text key={h.provider} style={s.muted}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
+                ))}
               </View>
-            ));
-          })()}
-        </View>
-      </Section>
+            </Collapsible>
+            <Section title="员工编制" count={defs.length} ctx={ctx}>
+              {Object.keys(ROLE_LABEL)
+                .map(role => ({ role, defs: defs.filter(d => d.role === role) }))
+                .concat(defs.some(d => !(d.role in ROLE_LABEL)) ? [{ role: "", defs: defs.filter(d => !(d.role in ROLE_LABEL)) }] : [])
+                .filter(g => g.defs.length > 0)
+                .map(g => {
+                  const roleInsts = insts.filter(i => g.defs.some(d => d.id === i.def));
+                  const busy = roleInsts.filter(i => i.agentStatus === "running" || i.agentStatus === "initializing").length;
+                  const idle = roleInsts.filter(i => i.agentStatus === "idle").length;
+                  const enabled = g.defs.filter(d => d.enabled).length;
+                  return (
+                    <Collapsible key={g.role || "other"} ctx={ctx}
+                      title={`${g.role ? (ROLE_LABEL[g.role] ?? g.role) : "其他"} · 启用 ${enabled}/${g.defs.length} · 忙 ${busy} 闲 ${idle}`}>
+                      <View style={s.card}>
+                        {[...g.defs].sort((a, b) => a.provider.localeCompare(b.provider)).map(d => {
+                          const defInsts = insts.filter(i => i.def === d.id);
+                          return (
+                            <View key={d.id} style={{ gap: 2 }}>
+                              <View style={s.row}>
+                                <Text style={[s.text, { flex: 1 }]}>
+                                  {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.avgScore ? ` · 绩效 ${d.avgScore.toFixed(1)}` : ""}{d.enabled ? "" : " · 已停用"}
+                                </Text>
+                                <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
+                                  <Text style={s.chipText}>编辑</Text>
+                                </Pressable>
+                                <Pressable accessibilityRole="button" style={s.chip}
+                                  onPress={async () => { await toggleDef({ defId: d.id, enabled: !d.enabled }); refreshAll(); }}>
+                                  <Text style={s.chipText}>{d.enabled ? "停用" : "启用"}</Text>
+                                </Pressable>
+                              </View>
+                              {defInsts.map(i => (
+                                <Text key={i.id} style={s.muted}>
+                                  {"  "}· {i.id.split("⟨").pop()?.replace("⟩", "")} · {i.agentStatus ?? "未连接"}
+                                </Text>
+                              ))}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    </Collapsible>
+                  );
+                })}
+            </Section>
+            <Section title={editDef ? `编辑 ${editDef.id}` : "注册员工"} ctx={ctx}>
+              <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
+                onDone={() => { setEditDef(undefined); refreshAll(); }} onCancel={() => setEditDef(undefined)} />
+            </Section>
+            <Collapsible title="调度明细（调试排障用）" ctx={ctx}>
+              <View style={s.card}>
+                <Text style={s.muted}>当前候选估算；最终派工由调度器执行。回避仅用于对应任务的 review。</Text>
+                {(r?.reviewPools?.length ?? 0) === 0 && <Text style={s.muted}>暂无等待派工的验收任务。</Text>}
+                {r?.reviewPools?.map(p => (
+                  <View key={p.taskId} style={{ gap: 4 }}>
+                    <Text style={s.text}>{p.title} · {p.taskId} · review · {p.role}</Text>
+                    <Text style={s.muted}>项目：{p.home}</Text>
+                    {p.status === "history_unavailable" && (
+                      <Text style={s.text}>贡献者历史读取失败：候选不可派，中选率 0%，等待安全候选。</Text>
+                    )}
+                    {p.entries.length === 0 && <Text style={s.muted}>暂无候选，任务继续等待。</Text>}
+                    {p.entries.map(e => (
+                      <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
+                        {e.kind === "spawn" ? "新开" : "复用"} · {e.ref} · {e.eligible
+                          ? `可派 · 权重 ${Math.round(e.weight * 10) / 10} · 中选率 ${Math.round(e.share * 100)}%`
+                          : `不可派（${e.reason ?? "未知"}） · 中选率 0%`}
+                      </Text>
+                    ))}
+                  </View>
+                ))}
+                {(r?.pools ?? []).filter(p => p.entries.length).map(p => (
+                  <View key={`${p.role}@${p.home}`} style={{ gap: 2, marginTop: 8 }}>
+                    <Text style={s.muted}>池 {ROLE_LABEL[p.role] ?? p.role}@{p.home === r?.opsRepo ? "运营仓库" : p.home.split("/").pop()}</Text>
+                    {p.entries.map(e => (
+                      <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
+                        {"  "}{e.kind === "spawn" ? "新开" : "复用"} · {e.ref.split("⟨").pop()?.replace("⟩", "")} · {e.eligible
+                          ? `可派 · 权重 ${Math.round(e.weight * 10) / 10} · 中选率 ${Math.round(e.share * 100)}%`
+                          : `不可派（${e.reason ?? "未知"}）`}
+                      </Text>
+                    ))}
+                  </View>
+                ))}
+              </View>
+            </Collapsible>
+          </>
+        );
+      })()}
     </View>
   );
 }
@@ -822,8 +955,9 @@ export function CompanySurface(props: PluginSurfaceProps) {
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });
-  const [tab, setTab] = useState<"inbox" | "new" | "goals" | "roster">("inbox");
+  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster">("pulse");
   const tabs = [
+    { id: "pulse" as const, title: "动态" },
     { id: "inbox" as const, title: "收件箱" },
     { id: "new" as const, title: "发目标" },
     { id: "goals" as const, title: "目标进展" },
@@ -839,6 +973,7 @@ export function CompanySurface(props: PluginSurfaceProps) {
         ))}
       </View>
       <ScrollView contentContainerStyle={s.scroll}>
+        {tab === "pulse" && <PulseTab ctx={ctx} />}
         {tab === "inbox" && <InboxTab ctx={ctx} />}
         {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
         {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}

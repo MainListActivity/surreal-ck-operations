@@ -63,6 +63,31 @@ export interface Inbox {
   pendingCommands: number;
 }
 
+/**
+ * 公司动态一页答「发生了什么」：谁在干什么、什么卡住了、为什么没人领、
+ * 最近做完了什么、资源有没有异常。全部来自任务服务与调度器同一套判定。
+ */
+export interface Pulse {
+  at: string;
+  paused: boolean;
+  /** state=doing 的任务 */
+  doing: Array<{ taskId: string; title: string; employee?: string; role: string; discipline?: string; goal?: string; sinceMin?: number }>;
+  /** 就绪但还没被领走的任务；unclaimableReason 是全候选不可派时的主因 */
+  ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
+  /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
+  stuck: Array<{ taskId: string; title: string; reason: string }>;
+  /** 等老板拍板/回答（带已等时长与下游受阻数） */
+  waiting: Array<{ taskId: string; kind: "gate" | "question"; title: string; goal?: string; hours: number; downstream: number }>;
+  /** 最近完成（accept/owner_approve） */
+  recentDone: Array<{ taskId: string; title: string; at: string; actor?: string }>;
+  last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
+  /** 订阅健康/低额度异常行（正常时为空） */
+  resources: string[];
+  staffingAlerts: number;
+  churn: { created: number; retired: number; claimLost: number };
+  goals: Array<{ title: string; days: number }>;
+}
+
 /** One regular file inside a task's evidenceDir (<serviceHome>/evidence/<taskId>). */
 export interface TaskAttachment {
   name: string;
