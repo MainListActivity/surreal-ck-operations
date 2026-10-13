@@ -14,8 +14,14 @@ type CompanyApi = {
     inbox(): Promise<unknown>;
     brief(): Promise<unknown>;
     decide(input: { taskId: string; decision: "approve" | "reject" | "reply"; note: string; source: string; key: string }): Promise<unknown>;
+    retire(input: { taskId: string; note: string; source: string; key: string }): Promise<unknown>;
+    unlockDependents(input: { taskId: string; source: string }): Promise<string[]>;
+    cancelGoal(input: { goalId: string; note: string; source: string; key: string }): Promise<{ retired: number; remaining: number }>;
     resolveNotice(key: string): Promise<void>;
     instruct(input: { text: string; source: string; key: string }): Promise<{ taskId: string }>;
+  };
+  workforce: {
+    revokeTaskLease(taskId: string, reason: string, handover: string, actor: string): Promise<{ ok: boolean; employee?: string }>;
   };
   db: { db: {
     query<T>(q: string, vars?: Record<string, unknown>): Promise<T>;
@@ -145,6 +151,35 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         });
         return json({ ok: true, task });
       }
+      if (req.method === "POST" && sub === "/api/void") {
+        const b = await req.json() as { taskId?: string; note?: string; key?: string };
+        if (!b.taskId || (b.note ?? "").trim().length < 2) return json({ error: "作废需要写明原因" }, 400);
+        const key = typeof b.key === "string" && /^[A-Za-z0-9_-]{8,72}$/.test(b.key) ? b.key : `web-void:${b.taskId}:${Date.now()}`;
+        const task = await (await opts.company()).owner.retire({ taskId: b.taskId, note: b.note!, source: SOURCE, key });
+        return json({ ok: true, task });
+      }
+      if (req.method === "POST" && sub === "/api/revoke") {
+        const b = await req.json() as { taskId?: string; note?: string };
+        if (!b.taskId) return json({ error: "bad input" }, 400);
+        const reason = (b.note ?? "").trim() || "老板终止在途执行";
+        const r = await (await opts.company()).workforce.revokeTaskLease(b.taskId, reason,
+          "【交接包】老板终止了上一棒的在途执行。先核对任务分支/授权目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。",
+          SOURCE);
+        return json(r);
+      }
+      if (req.method === "POST" && sub === "/api/unlock") {
+        const b = await req.json() as { taskId?: string };
+        if (!b.taskId) return json({ error: "bad input" }, 400);
+        const unlocked = await (await opts.company()).owner.unlockDependents({ taskId: b.taskId, source: SOURCE });
+        return json({ ok: true, unlocked });
+      }
+      if (req.method === "POST" && sub === "/api/cancel-goal") {
+        const b = await req.json() as { goalId?: string; note?: string; key?: string };
+        if (!b.goalId || (b.note ?? "").trim().length < 2) return json({ error: "取消目标需要写明原因" }, 400);
+        const key = typeof b.key === "string" && /^[A-Za-z0-9_-]{8,72}$/.test(b.key) ? b.key : `web-cancel:${b.goalId}:${Date.now()}`;
+        const r = await (await opts.company()).owner.cancelGoal({ goalId: b.goalId, note: b.note!, source: SOURCE, key });
+        return json({ ok: true, ...r });
+      }
       if (req.method === "POST" && sub === "/api/notice") {
         const b = await req.json() as { key?: string };
         if (!b.key) return json({ error: "bad input" }, 400);
@@ -198,6 +233,10 @@ a{color:#6fa3ff;word-break:break-all}
 .notice{display:flex;justify-content:space-between;gap:10px;align-items:center}
 .notice button{background:#2a3140;color:#cfd5e3;border:none;border-radius:8px;padding:6px 12px;font-size:13px}
 .doc{cursor:pointer;padding:9px 10px;background:#10131a;border-radius:8px;margin-top:6px;font-size:14px}
+.trow{padding:10px 0;border-top:1px solid #262b38}
+.trow:first-child{border-top:none}
+.trow .row{margin-top:6px}
+.trow .act{padding:6px 12px;font-size:13px}
 .docbody{white-space:pre-wrap;font:13px/1.6 ui-monospace,Menlo,monospace;background:#10131a;border-radius:8px;padding:12px;margin-top:8px;max-height:60vh;overflow:auto}
 .tier{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid #2a3140;color:#9aa3b8}
 .st{font-size:11px;color:#8b93a7}
@@ -242,6 +281,39 @@ async function decide(tid,dec){
   }catch(e){alert(e.message)}
 }
 async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
+async function voidTask(tid,gid){
+  const note=prompt('作废原因（必填，会进任务审计）')||'';
+  if(note.trim().length<2)return;
+  try{await api('void',{taskId:tid,note,key:newKey()});if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+}
+async function revokeTask(tid,gid){
+  const note=prompt('终止原因（可留空），只撤当前在途执行，任务回 ready 等下一位员工','');
+  if(note===null)return;
+  try{const r=await api('revoke',{taskId:tid,note});alert(r.ok?('已撤销 '+(r.employee||'')+' 的租约'):'该任务没有在途租约');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+}
+async function unlockTask(tid,gid){
+  try{const r=await api('unlock',{taskId:tid});alert(r.unlocked&&r.unlocked.length?('已解锁：'+r.unlocked.join('、')):'没有需要解锁的任务');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+}
+async function cancelGoal(gid){
+  const note=prompt('取消目标原因（必填），会作废其全部未完成任务并关闭目标')||'';
+  if(note.trim().length<2)return;
+  if(!confirm('确认取消这个目标？未完成任务将全部作废。'))return;
+  try{const r=await api('cancel-goal',{goalId:gid,note,key:newKey()});alert('已作废 '+r.retired+' 个任务'+(r.remaining?('；仍有 '+r.remaining+' 个未能作废，目标保持原状'):'，目标已关闭'));await load()}catch(e){alert(e.message)}
+}
+const TERMINAL=['done','void'];
+function taskActions(t,gid){
+  let h='';
+  if(t.state==='doing'&&t.currentEmployee)h+='<button class="act mid" onclick="revokeTask(\\''+t.id+'\\',\\''+gid+'\\')">终止在途</button>';
+  if(t.state==='blocked')h+='<button class="act mid" onclick="unlockTask(\\''+t.id+'\\',\\''+gid+'\\')">解锁</button>';
+  if(!TERMINAL.includes(t.state))h+='<button class="act no" onclick="voidTask(\\''+t.id+'\\',\\''+gid+'\\')">作废</button>';
+  return h;
+}
+async function reloadGoalTasks(gid){
+  const d=document.getElementById('gt-'+gid)?.querySelector('.docbody');if(!d)return;
+  try{const r=await api('tasks?goalId='+encodeURIComponent(gid));
+    d.innerHTML=(r.tasks||[]).map(t=>'<div class="trow"><div class="meta">['+esc(t.state)+'] '+esc(t.executorRole)+'→'+esc(t.reviewerRole)+(t.currentEmployee?' · '+esc(t.currentEmployee):'')+'</div><div>'+esc(t.title)+'</div><div class="row">'+taskActions(t,gid)+'</div></div>').join('')||'（无任务）';
+  }catch(e){d.textContent=e.message}
+}
 async function instruct(){
   const t=document.getElementById('gm-text');if(!t.value.trim())return;
   try{await api('instruct',{text:t.value,key:newKey()});t.value='';document.getElementById('gm-ok').textContent='已下达，经理稍后处理';await load()}catch(e){alert(e.message)}
@@ -255,9 +327,7 @@ async function openGoal(gid){
   const el=document.getElementById('gt-'+gid);
   if(el.dataset.open){el.dataset.open='';el.querySelector('.docbody')?.remove();return}
   el.dataset.open='1';const d=document.createElement('div');d.className='docbody';d.textContent='加载中…';el.appendChild(d);
-  try{const r=await api('tasks?goalId='+encodeURIComponent(gid));
-    d.textContent=(r.tasks||[]).map(t=>'['+t.state+'] '+t.title+'  ('+t.executor_role+'→'+t.reviewer_role+')').join('\\n')||'（无任务）';
-  }catch(e){d.textContent=e.message}
+  await reloadGoalTasks(gid);
 }
 function render(){
   const m=document.getElementById('m');
@@ -268,7 +338,8 @@ function render(){
       <div class="atts" id="at-\${x.task.id}"></div>
       <textarea id="n-\${x.task.id}" placeholder="说明（批准可留空，退回必填）"></textarea>
       <div class="row"><button class="act ok" onclick="decide('\${x.task.id}','approve')">批准</button>
-      <button class="act no" onclick="decide('\${x.task.id}','reject')">退回</button></div></div>\`).join('');
+      <button class="act no" onclick="decide('\${x.task.id}','reject')">退回</button>
+      <button class="act no" onclick="voidTask('\${x.task.id}')">作废</button></div></div>\`).join('');
     const q=(INBOX?.questions||[]).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
       <div class="meta">来自 \${esc(x.task.executor_role)} 的问题</div>
       <div class="body">\${linkify(x.question||'（无问题文本）')}</div>
@@ -282,7 +353,8 @@ function render(){
     m.innerHTML=(BRIEF?.goals||[]).map(g=>\`<div class="card glist" id="gt-\${g.id}"><h3>\${esc(g.title)}</h3>
       <div class="meta"><span class="tier">\${esc(g.tier)}</span> <span class="st">\${esc(g.state)}</span> \${g.project?esc(g.project):''}</div>
       <div class="body" style="max-height:120px">\${esc(g.brief||'')}</div>
-      <div class="row"><button class="act mid" onclick="openGoal('\${g.id}')">查看任务</button></div></div>\`).join('')||'<div class="empty">无在办目标</div>';
+      <div class="row"><button class="act mid" onclick="openGoal('\${g.id}')">查看任务</button>
+      <button class="act no" onclick="cancelGoal('\${g.id}')">取消目标</button></div></div>\`).join('')||'<div class="empty">无在办目标</div>';
   }else if(T==='docs'){
     if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
     const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));

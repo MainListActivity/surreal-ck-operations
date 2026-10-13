@@ -58,6 +58,30 @@ export const decide = defineRpc({
   output: z.object({ state: z.string() }),
 });
 
+export const voidTask = defineRpc({
+  name: "company.task.void",
+  input: z.object({ taskId: z.string().min(1), note: z.string().min(2), key }),
+  output: z.object({ state: z.string() }),
+});
+
+export const revokeTask = defineRpc({
+  name: "company.task.revoke",
+  input: z.object({ taskId: z.string().min(1), note: z.string().default("") }),
+  output: z.object({ ok: z.boolean(), employee: z.string().optional() }),
+});
+
+export const unlockTask = defineRpc({
+  name: "company.task.unlock",
+  input: z.object({ taskId: z.string().min(1) }),
+  output: z.object({ unlocked: z.array(z.string()) }),
+});
+
+export const cancelGoalRpc = defineRpc({
+  name: "company.goal.cancel",
+  input: z.object({ goalId: z.string().min(1), note: z.string().min(2), key }),
+  output: z.object({ retired: z.number(), remaining: z.number() }),
+});
+
 export const resolveNotice = defineRpc({
   name: "company.notice.resolve",
   input: z.object({ key }),

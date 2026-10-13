@@ -555,6 +555,107 @@ function TaskRow({ task, ctx, depth, onOpen }: { task: TaskView; ctx: Ctx; depth
   );
 }
 
+/** 老板对单个任务的生命周期操作：终止在途（撤租约）、解锁依赖、作废任务。终态任务不出按钮。 */
+function TaskOwnerActions({ task, ctx, onDone }: { task: TaskView; ctx: Ctx; onDone: () => void }) {
+  const s = makeStyles(ctx);
+  const voidRpc = useRpc(rpc.voidTask);
+  const revokeRpc = useRpc(rpc.revokeTask);
+  const unlockRpc = useRpc(rpc.unlockTask);
+  const [note, setNote] = useState("");
+  const [result, setResult] = useState<string>();
+  const mutation = useMutation({
+    mutationFn: async (action: "revoke" | "void" | "unlock") => {
+      if (action === "revoke") {
+        const r = await revokeRpc({ taskId: task.id, note });
+        if (!r.ok) throw new Error("没有在途租约可撤");
+        return `已撤销 ${r.employee ?? ""} 的租约，任务回就绪等下一位员工`;
+      }
+      if (action === "void") {
+        const t = await voidRpc({ taskId: task.id, note, key: newKey() });
+        return `已作废（${t.state}）`;
+      }
+      const u = await unlockRpc({ taskId: task.id });
+      return u.unlocked.length ? `已解锁：${u.unlocked.join("、")}` : "没有需要解锁的任务";
+    },
+    onSuccess: r => { setNote(""); setResult(r); onDone(); },
+    onError: e => setResult(`失败：${String((e as Error).message).slice(0, 140)}`),
+  });
+  if (task.state === "done" || task.state === "void") return null;
+  return (
+    <View style={{ gap: 6, marginTop: 6 }}>
+      <TextInput
+        style={[s.input, { minHeight: 32 }]}
+        placeholder="说明（作废必填，终止/解锁可留空）"
+        placeholderTextColor={ctx.theme.colors.foregroundMuted}
+        value={note} onChangeText={setNote} multiline
+      />
+      <View style={s.row}>
+        {task.state === "doing" && task.currentEmployee ? (
+          <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={mutation.isPending}
+            onPress={() => mutation.mutate("revoke")}>
+            <Text style={s.buttonSecondaryText}>终止在途执行</Text>
+          </Pressable>
+        ) : null}
+        {task.state === "blocked" ? (
+          <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={mutation.isPending}
+            onPress={() => mutation.mutate("unlock")}>
+            <Text style={s.buttonSecondaryText}>解锁依赖</Text>
+          </Pressable>
+        ) : null}
+        <Pressable accessibilityRole="button" style={s.buttonDanger}
+          disabled={mutation.isPending || note.trim().length < 2}
+          onPress={() => mutation.mutate("void")}>
+          <Text style={s.buttonDangerText}>作废任务</Text>
+        </Pressable>
+      </View>
+      {result ? <Text style={s.muted}>{result}</Text> : null}
+    </View>
+  );
+}
+
+/** 目标级操作：取消目标（作废全部未完成任务并关闭目标）。点开两次确认。 */
+function CancelGoalButton({ goalId, ctx, onDone }: { goalId: string; ctx: Ctx; onDone: () => void }) {
+  const s = makeStyles(ctx);
+  const cancelRpc = useRpc(rpc.cancelGoalRpc);
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [result, setResult] = useState<string>();
+  const mutation = useMutation({
+    mutationFn: () => cancelRpc({ goalId, note, key: newKey() }),
+    onSuccess: r => {
+      setOpen(false); setNote("");
+      setResult(`已作废 ${r.retired} 个任务${r.remaining ? `；仍有 ${r.remaining} 个未能作废，目标保持原状` : "，目标已关闭"}`);
+      onDone();
+    },
+    onError: e => setResult(`失败：${String((e as Error).message).slice(0, 140)}`),
+  });
+  return (
+    <View style={{ gap: 6, marginTop: 4 }}>
+      <Pressable accessibilityRole="button" style={[s.buttonDanger, { alignSelf: "flex-start" }]}
+        onPress={() => setOpen(o => !o)}>
+        <Text style={s.buttonDangerText}>{open ? "收起" : "取消目标…"}</Text>
+      </Pressable>
+      {open ? (
+        <>
+          <Text style={s.muted}>将作废该目标全部未完成任务并关闭目标，操作进审计。</Text>
+          <TextInput
+            style={[s.input, { minHeight: 32 }]}
+            placeholder="取消原因（必填）"
+            placeholderTextColor={ctx.theme.colors.foregroundMuted}
+            value={note} onChangeText={setNote} multiline
+          />
+          <Pressable accessibilityRole="button" style={[s.button, { alignSelf: "flex-start" }]}
+            disabled={mutation.isPending || note.trim().length < 2}
+            onPress={() => mutation.mutate()}>
+            <Text style={s.buttonText}>确认取消目标</Text>
+          </Pressable>
+        </>
+      ) : null}
+      {result ? <Text style={s.muted}>{result}</Text> : null}
+    </View>
+  );
+}
+
 function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const tasksRpc = useRpc(rpc.goalTasks);
@@ -572,6 +673,8 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
     queryFn: () => detailRpc({ taskId: openTask! }),
     enabled: openTask !== undefined,
   });
+  const queryClient = useQueryClient();
+  const refreshAll = () => { void tasksQuery.refetch(); void detailQuery.refetch(); void queryClient.invalidateQueries(); };
   const goals = (brief?.goals ?? []).filter((g: GoalView) => g.state !== "cancelled");
   return (
     <View style={{ gap: 12 }}>
@@ -592,6 +695,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                   {openTask === t.id && detailQuery.data && (
                     <View style={[s.card, { marginLeft: 14, backgroundColor: ctx.theme.colors.surface2 }]}>
                       <ExpandableText text={detailQuery.data.task.context} lines={8} style={s.muted} ctx={ctx} />
+                      <TaskOwnerActions task={detailQuery.data.task} ctx={ctx} onDone={refreshAll} />
                       {detailQuery.data.audit.map((a, i) => (
                         <ExpandableText key={i} lines={4} style={s.mono} ctx={ctx}
                           text={`${a.at.slice(5, 16)} ${a.action} · ${a.actor}${a.evidence ? ` — ${a.evidence}` : ""}`} />
@@ -601,6 +705,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 </View>
               ))}
               {tasksQuery.isLoading && <Text style={s.muted}>加载任务…</Text>}
+              <CancelGoalButton goalId={g.id} ctx={ctx} onDone={refreshAll} />
             </View>
           )}
         </View>
