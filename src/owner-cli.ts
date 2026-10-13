@@ -15,6 +15,7 @@ const usage = `老板入口（也可直接在 SurrealDB 写 owner_command 表，
   pnpm run company reply <任务ID> <回答>     回答员工提问并恢复任务
   pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>
                                              改派还没开工（blocked/ready、无租约、未提交）的任务；校验岗位契约，留审计
+  pnpm run company revoke <任务ID> [原因]    终止在途执行：撤掉当前持有人的租约回到 ready，任务保留等下一位员工（要整个任务作废用 void）
   pnpm run company void <任务ID> <原因>      作废任务（依赖它的任务会解锁；终验关口作废不会关闭目标）
   pnpm run company unlock <任务ID>           补跑已完成/作废任务的依赖解锁（任务依赖都完成了却还是 blocked 时用）
   pnpm run company cancel-goal <目标ID> <原因>  取消目标：作废其全部未完成任务并关闭目标
@@ -74,6 +75,16 @@ try {
     if (!taskId) throw new Error('用法：pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|owner>] <原因>');
     const task = await desk.reassign({ taskId, executorRole, reviewerRole, note: note.join(' '), source: 'owner:cli', key: `cli:${taskId}:${executorRole ?? ''}:${reviewerRole ?? ''}` });
     console.log(`已改派：${task.title}\n执行 ${task.executorRole}｜验收 ${task.reviewerRole}｜状态 ${task.state}`);
+  } else if (action === 'revoke') {
+    const [taskId, ...note] = [first ?? '', ...rest].filter(Boolean);
+    if (!taskId) throw new Error('用法：pnpm run company revoke <任务ID> [原因]');
+    const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? '/nonexistent');
+    const reason = note.join(' ') || '老板终止在途执行';
+    const result = await workforce.revokeTaskLease(taskId, reason,
+      '【交接包】老板终止了上一棒的在途执行。先核对任务分支/授权目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。',
+      'owner:cli');
+    if (!result.ok) { console.log('该任务没有在途租约可撤。'); process.exitCode = 1; }
+    else console.log(`已撤销 ${result.employee} 的租约，任务回到 ready 等下一位员工。`);
   } else if (action === 'void') {
     const [taskId, ...note] = [first ?? '', ...rest].filter(Boolean);
     if (!taskId) throw new Error('用法：pnpm run company void <任务ID> <原因>');

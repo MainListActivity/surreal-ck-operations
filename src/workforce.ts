@@ -494,7 +494,7 @@ export class Workforce {
    * Revokes the holder's lease. Execution returns to ready (review stays review) with a handover flag.
    * The cleared delivery ID invalidates every later write from the old session; the next claim bumps the fence.
    */
-  async revokeLease(taskId: TaskId, employeeId: string, reason: string, handover: string): Promise<boolean> {
+  async revokeLease(taskId: TaskId, employeeId: string, reason: string, handover: string, actor = 'dispatcher'): Promise<boolean> {
     const evidence = `原因：${reason}\n\n${handover}`.slice(0, 30000);
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
@@ -504,11 +504,22 @@ export class Workforce {
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         handover = true, previous_employee = $employee, version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
-      CREATE audit CONTENT { task: $task, actor: 'dispatcher', action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $actor, action: 'revoked', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $task, kind: 'revoked', sequence: $sequence.value, payload: { employee: $employee, state: $next.state }, at: time::now() };
-      COMMIT;`, { task: id('task', taskId), employee: employeeId, evidence }).responses();
+      COMMIT;`, { task: id('task', taskId), employee: employeeId, evidence, actor }).responses();
     return responses.every(r => r.success);
+  }
+
+  /**
+   * 终止在途执行：撤掉当前持有人的租约（doing→ready），任务本身保留等下一位员工。
+   * 老板侧「临时终止某个任务」的语义就是撤租约而不是作废——作废用 OwnerDesk.retire。
+   */
+  async revokeTaskLease(taskId: TaskId, reason: string, handover: string, actor: string): Promise<{ ok: boolean; employee?: string }> {
+    const task = await this.db.select<{ current_employee?: string }>(id('task', taskId));
+    if (!task?.current_employee) return { ok: false };
+    const ok = await this.revokeLease(taskId, task.current_employee, reason, handover, actor);
+    return { ok, employee: ok ? task.current_employee : undefined };
   }
 
   // ---- dispatch bookkeeping ----

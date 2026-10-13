@@ -218,10 +218,13 @@ pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|o
 ## 老板作废、解锁与取消目标
 
 ```sh
+pnpm run company revoke <任务ID> ["<原因>"]      # 终止在途执行：撤当前持有人租约回 ready，任务保留等下一位
 pnpm run company void <任务ID> "<原因>"          # 作废：只等它的下游自动解锁；终验关口作废不会关闭目标
 pnpm run company unlock <任务ID>                 # 补跑依赖解锁：依赖都完成了任务却还是 blocked 时用
 pnpm run company cancel-goal <目标ID> "<原因>"   # 作废目标下全部未完成任务并关闭目标（cancelled）
 ```
+
+`revoke` 与 `void` 的区别：revoke 只撤在途租约（员工换人或路线变更时用，任务本身继续），void 是把任务整个作废。两者在插件「目标进展」页（任务详情与目标卡按钮）和网页审核台（/o/<token>/，目标页与待办关口按钮）也能直接操作，不用开终端。
 
 都带审计和幂等键，规则与经理的 `retire_task` 一致：已完成的任务不能作废，还有活下游的老板关口不能作废。**不要再直接改库改任务状态**——绕过解锁逻辑会让下游一直卡在 blocked（2026-10-11 的小说目标就这样卡过一次）。
 

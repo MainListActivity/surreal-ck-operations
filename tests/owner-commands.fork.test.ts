@@ -81,3 +81,20 @@ run('cancel-goal retires every unfinished task, including owner gates, and close
   expect(g[0]).toMatchObject({ state: 'cancelled' }); expect(g[0]!.note).toContain('被新目标取代');
   await expect(owner.cancelGoal({ goalId: 'nope-nope', note: '不存在的目标', source: 'owner:test', key: key() })).rejects.toMatchObject({ code: 'not_found' });
 });
+
+run('revoke releases the live lease back to ready with owner provenance; no-ops without a lease', async () => {
+  const { Workforce } = await import('../src/workforce.ts');
+  const wf = new Workforce(db, '/nonexistent');
+  const a = await task();
+  await db.db.query("CREATE employee:`fixture-worker` CONTENT { role: 'engineering', active_task: $t };", { t: new RecordId('task', a.id) });
+  await db.db.query("UPDATE $t SET state = 'doing', current_employee = 'fixture-worker', lease_expires_at = time::unix(time::now()) + 3600;", { t: new RecordId('task', a.id) });
+  const r = await wf.revokeTaskLease(a.id, '老板终止在途执行', '【交接包】', 'owner:test');
+  expect(r).toEqual({ ok: true, employee: 'fixture-worker' });
+  const [t] = await db.db.query<[Array<{ state: string; current_employee?: string; previous_employee?: string; handover?: boolean }>]>('SELECT state, current_employee, previous_employee, handover FROM task WHERE id = $t;', { t: new RecordId('task', a.id) });
+  expect(t[0]).toMatchObject({ state: 'ready', current_employee: undefined, previous_employee: 'fixture-worker', handover: true });
+  const [e] = await db.db.query<[Array<{ active_task?: unknown }>]>('SELECT active_task FROM employee WHERE id = employee:`fixture-worker`;');
+  expect(e[0]!.active_task).toBeUndefined();
+  const [audit] = await db.db.query<[Array<{ action: string; actor: unknown }>]>("SELECT action, actor FROM audit WHERE task = $t AND action = 'revoked';", { t: new RecordId('task', a.id) });
+  expect(audit[0]).toMatchObject({ action: 'revoked', actor: 'owner:test' });
+  expect(await wf.revokeTaskLease(a.id, '再撤一次', '', 'owner:test')).toEqual({ ok: false });
+});

@@ -56,6 +56,31 @@ export function registerHandlers(server: PluginServerContext): void {
     return { state: task.state };
   });
 
+  server.handle(rpc.voidTask, async (input: RpcInput<typeof rpc.voidTask>) => {
+    const task = await (await company()).owner.retire({
+      taskId: input.taskId, note: input.note, source: SOURCE, key: input.key,
+    });
+    return { state: task.state };
+  });
+
+  server.handle(rpc.revokeTask, async (input: RpcInput<typeof rpc.revokeTask>) => {
+    const reason = input.note.trim() || "老板终止在途执行";
+    return await (await company()).workforce.revokeTaskLease(input.taskId, reason,
+      "【交接包】老板终止了上一棒的在途执行。先核对任务分支/授权目录中的实际改动与已有 checkpoint，再继续；不要重复已完成且已验证的步骤。",
+      SOURCE);
+  });
+
+  server.handle(rpc.unlockTask, async (input: RpcInput<typeof rpc.unlockTask>) => {
+    const unlocked = await (await company()).owner.unlockDependents({ taskId: input.taskId, source: SOURCE });
+    return { unlocked };
+  });
+
+  server.handle(rpc.cancelGoalRpc, async (input: RpcInput<typeof rpc.cancelGoalRpc>) => {
+    return await (await company()).owner.cancelGoal({
+      goalId: input.goalId, note: input.note, source: SOURCE, key: input.key,
+    });
+  });
+
   server.handle(rpc.resolveNotice, async (input: RpcInput<typeof rpc.resolveNotice>) => {
     await (await company()).owner.resolveNotice(input.key);
     return { ok: true };
