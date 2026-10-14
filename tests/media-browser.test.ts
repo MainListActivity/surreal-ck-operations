@@ -192,6 +192,8 @@ describe('notebook lane', () => {
     await call(s, 'notebook_write', { notebook: '梦痕纪元', prompt: '继续写下一段正文，承接上一段', file: 'p2.md', chat: 'https://gemini.google.com/app/abc123' });
     expect(ran.at(-1)!.script).toContain('"chat":"https://gemini.google.com/app/abc123"');
     expect(ran.at(-1)!.script).toContain('gemini.google.com/app/');
+    // 产物文件尾自动落会话标记，供返修补丁回到同一会话
+    expect(ran.at(-1)!.script).toContain('gemini-session');
   });
 
   test('notebook_remove_source routes with title and gates quota', async () => {

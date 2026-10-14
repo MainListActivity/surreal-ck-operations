@@ -442,9 +442,12 @@ if (ARGS.notebookOp === 'write') {
   });
   if (text) text = text.replace(/^\\s*Gemini said\\s*/i, '').trim();
   if (!text || text.length < 10) { fail('failed', '回复提取失败'); }
-  fs.writeFileSync(outPath, text + '\\n');
   const chatId = await p.evaluate(() => (location.pathname.match(/app\\/([0-9a-f]+)/i) || [])[1] || '');
-  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.slice(0, 30000), url: chatId ? 'https://gemini.google.com/app/' + chatId : undefined });
+  const chatUrl = chatId ? 'https://gemini.google.com/app/' + chatId : '';
+  // Stamp the producing session into the artifact so later revision passes can
+  // resume the same Gemini conversation (chat param) instead of cold-starting.
+  fs.writeFileSync(outPath, text + '\\n\\n<!-- gemini-session: ' + (chatUrl || 'unknown') + ' -->\\n');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.slice(0, 30000), url: chatUrl || undefined });
   process.exit(0);
 }
 
