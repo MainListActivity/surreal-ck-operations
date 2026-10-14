@@ -262,7 +262,11 @@ let INBOX=null,BRIEF=null,DOCS=null,T='todo';
 function tab(t){T=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));render()}
 async function load(){
   document.getElementById('stat').textContent='加载中…';
-  try{[INBOX,BRIEF]=await Promise.all([api('inbox'),api('brief')]);
+  // brief is only rendered on the goals tab; polling it every 20s on todo used to
+  // run the heaviest aggregate query in a loop and starve the shared DB channel.
+  try{
+    INBOX=await api('inbox');
+    if(T!=='todo'||!BRIEF)BRIEF=await api('brief');
     const n=(INBOX.gates?.length||0)+(INBOX.questions?.length||0);
     document.getElementById('stat').textContent=n?('待办 '+n):'无待办';
     render();}catch(e){document.getElementById('stat').textContent='加载失败';}
