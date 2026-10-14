@@ -93,11 +93,10 @@ const RNImage = (() => {
     (typeof candidate === "object" && candidate !== null && "$$typeof" in candidate))
     ? candidate as React.ComponentType<{
         source: { uri: string }; style?: unknown; resizeMode?: string; accessibilityLabel?: string;
+        onError?: () => void;
       }>
     : undefined;
 })();
-
-const IMAGE_INLINE_MAX = 5 * 1024 * 1024;
 
 type NavApi = NonNullable<PluginSurfaceProps["navigation"]>;
 
@@ -151,26 +150,44 @@ function AttachmentRow({ taskId, a, label, ctx }: { taskId: string; a: TaskAttac
   );
 }
 
+/**
+ * 图片附件行：默认只列「预览 + 打开」。点预览才挂载 Image，且走 LAN 预览服务的
+ * http URL 流式加载——图片字节不过 RPC 桥。旧实现把每张图整文件 base64 进
+ * data URI 自动渲染，多图任务（evidence 里有上千张/数 GB）一展开就把插件进程
+ * 内存撑爆重启；改为按需单张出图后，打开任务本身不再触发任何图片字节传输。
+ */
 function InlineImage({ taskId, a, ctx }: { taskId: string; a: TaskAttachment; ctx: Ctx }) {
   const s = makeStyles(ctx);
-  const read = useRpc(rpc.readAttachment);
-  const previewable = !!RNImage && a.sizeBytes <= IMAGE_INLINE_MAX;
+  const getUrl = useRpc(rpc.attachmentUrl);
+  const [show, setShow] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const q = useQuery({
-    queryKey: ["attachmentImage", taskId, a.relPath],
-    queryFn: () => read({ taskId, name: a.relPath }),
-    enabled: previewable,
+    queryKey: ["attachmentUrl", taskId, a.relPath],
+    queryFn: () => getUrl({ taskId, name: a.relPath }),
+    enabled: show && !!RNImage,
     staleTime: 300_000,
     retry: false,
   });
-  const uri = q.data?.dataUri;
+  const uri = q.data?.url;
   return (
     <View style={{ gap: 4 }}>
-      {previewable && uri ? (
-        <RNImage source={{ uri }} accessibilityLabel={a.name} resizeMode="contain"
-          style={{ width: "100%", height: 200, borderRadius: 8, backgroundColor: ctx.theme.colors.surface2 }} />
-      ) : null}
-      <AttachmentRow taskId={taskId} a={a} label="打开" ctx={ctx} />
-      {previewable && q.isError && <Text style={s.muted}>预览不可用，可点打开查看。</Text>}
+      <View style={s.row}>
+        {!!RNImage && (
+          <Pressable accessibilityRole="button" onPress={() => setShow(v => !v)}>
+            <Text style={{ color: ctx.theme.colors.accent, fontSize: 13 }}>{show ? "收起" : "预览"}</Text>
+          </Pressable>
+        )}
+        <AttachmentRow taskId={taskId} a={a} label="打开" ctx={ctx} />
+      </View>
+      {show && !!RNImage && (
+        uri && !loadFailed ? (
+          <RNImage source={{ uri }} accessibilityLabel={a.name} resizeMode="contain"
+            onError={() => setLoadFailed(true)}
+            style={{ width: "100%", height: 200, borderRadius: 8, backgroundColor: ctx.theme.colors.surface2 }} />
+        ) : (
+          <Text style={s.muted}>{q.isLoading ? "加载预览…" : "预览不可用，可点打开查看。"}</Text>
+        )
+      )}
     </View>
   );
 }
