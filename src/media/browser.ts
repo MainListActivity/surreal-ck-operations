@@ -193,7 +193,7 @@ export class BrowserStudio {
       notes: [
         '网页会话生成：provider=auto 按 ' + ROUTES.image.join(' → ') + ' 顺序 failover',
         '图片产物为 PNG（透明底能力以会话实际支持为准）；视频产物 mp4 优先、提取失败回落 webm',
-        'notebook_* 为 NotebookLM 知识库通道：query 基于笔记本源 grounded 生成章节草稿（带源引用），add_source 把已批文本注入笔记本，约定每卷一本（如 作品名·卷N）',
+        'notebook_* 为 NotebookLM 写作引擎通道：一部作品一本（如《作品名》），圣经/概要/已批正文全部进同一本保证连续性；query 基于本内源 grounded 出稿（带源引用），add_source 把已批文本回注',
         'login_required 错误 = 对应平台网页会话过期，需要老板在 ego 浏览器里重新登录该站',
         'limit_reached 为账号级配额（Grok 按周），等重置或换 provider',
       ],
@@ -201,7 +201,7 @@ export class BrowserStudio {
         media_image: '{"prompt","file":"x.png","refs?"[:至多4张参考图绝对路径],"provider?"[:auto/chatgpt/gemini/grok]}',
         media_video: '{"prompt","file":"x.mp4","seconds?"(4-10),"provider?"[:auto/gemini/grok]}',
         notebook_list: '{}',
-        notebook_create: '{"title":"作品名·卷N"}',
+        notebook_create: '{"title":"作品名"}',
         notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"}',
         notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01c03-章名","text":"<正文markdown>"}',
       },
