@@ -11,7 +11,7 @@ let counts: Record<string, number> = {};
 let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let ran: Array<{ provider: string; script: string }> = [];
 // Scripted per-provider results, consumed in call order; last entry repeats.
-let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number }> = [];
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown }> = [];
 let ref = '';
 
 const core = {
@@ -130,6 +130,49 @@ describe('media_video', () => {
 
   test('chatgpt is not a video provider', async () => {
     expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.mp4', provider: 'chatgpt' }))).code).toBe('invalid');
+  });
+});
+
+describe('notebook lane', () => {
+  test('notebook_list is ungated and returns notebooks from the runner', async () => {
+    counts['ops_browser_notebook'] = 200; // at cap; reads still allowed
+    results = [{ ok: true, notebooks: [{ id: '7104ed40-x', title: '科幻主题故事', sources: '2' }] }];
+    const value = await call(studio(), 'notebook_list') as any;
+    expect(value.notebooks[0].title).toBe('科幻主题故事');
+    expect(audits[0].action).toBe('ops_browser_notebook');
+  });
+
+  test('notebook_query validates args, gates quota, writes md to evidence dir', async () => {
+    const s = studio();
+    expect((await fail(call(s, 'notebook_query', { notebook: '梦痕纪元·卷1', prompt: '根据圣经写第一章开场段落' }))).code).toBe('invalid'); // missing file
+    expect((await fail(call(s, 'notebook_query', { notebook: 'xx', prompt: '根据圣经写第一章开场段落', file: 'a.txt' }))).code).toBe('invalid'); // wrong ext
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'draft.md'), bytes: 1200 }];
+    const value = await call(s, 'notebook_query', { notebook: '梦痕纪元·卷1', prompt: '根据圣经写第一章开场，500字', file: 'draft.md' }) as any;
+    expect(value.file).toContain('draft.md');
+    expect(ran[0].provider).toBe('notebook');
+    expect(ran[0].script).toContain('"notebookOp":"query"');
+    expect(audits.at(-1)!.evidence).toContain('notebook_query');
+    counts['ops_browser_notebook'] = 200;
+    expect((await fail(call(s, 'notebook_query', { notebook: 'x', prompt: '写第二章', file: 'b.md' }))).code).toBe('limit_reached');
+  });
+
+  test('notebook_add_source and notebook_create route to the notebook provider', async () => {
+    const s = studio();
+    results = [{ ok: true, notebook: '7104ed40-20f5' }];
+    await call(s, 'notebook_add_source', { notebook: '科幻主题故事', title: 'v01c01-开场', text: '第一章正文内容，足够长的测试文本。' });
+    expect(ran[0].script).toContain('"notebookOp":"add_source"');
+    expect(ran[0].script).toContain('第一章正文内容');
+    results = [{ ok: true, notebook: 'new-id-123', url: 'https://notebook.google.com/notebook/new-id-123' }];
+    const created = await call(s, 'notebook_create', { title: '梦痕纪元·卷2' }) as any;
+    expect(created.url).toContain('new-id-123');
+    expect((await fail(call(s, 'notebook_add_source', { notebook: 'x', text: 'short' }))).code).toBe('invalid');
+  });
+
+  test('notebook errors map codes like the media lane', async () => {
+    results = [{ ok: false, code: 'login_required', message: 'session expired' }];
+    const e1 = await fail(call(studio(), 'notebook_query', { notebook: 'xx', prompt: '根据圣经写第一章开场段落', file: 'a.md' }));
+    expect(e1.code).toBe('not_configured');
+    expect(e1.message).toContain('session expired');
   });
 });
 
