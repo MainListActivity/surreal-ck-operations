@@ -50,6 +50,8 @@ export interface SidecarDeps {
   ops?: OpsGateway;
   /** ElevenLabs media studio (`media_*` tools): same gateway shape, the key stays in the plugin. */
   media?: OpsGateway;
+  /** sync.so video studio (`sync_*` tools): same gateway shape; spend is approval-gated inside. */
+  sync?: OpsGateway;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
   log?: (message: string) => void;
@@ -246,6 +248,7 @@ export class SidecarPool {
     }
     this.deps.ops?.release(inst.id); // sessions never outlive the lease they were opened under
     this.deps.media?.release(inst.id);
+    this.deps.sync?.release(inst.id);
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
     // Requests queued under the previous/no lease cannot consume this new one.
@@ -361,6 +364,7 @@ export class SidecarPool {
     this.claims.delete(instId);
     this.deps.ops?.release(instId);
     this.deps.media?.release(instId);
+    this.deps.sync?.release(instId);
     // claim.json describes a dead lease — remove it so a re-used/woken agent knows it holds nothing.
     try { unlinkSync(join(commDir(this.deps.runDir, instId), "claim.json")); } catch { /* already gone */ }
   }
@@ -518,7 +522,8 @@ export class SidecarPool {
     const core = this.deps.core;
     const ops = this.deps.ops;
     const media = this.deps.media;
-    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? [])] };
+    const sync = this.deps.sync;
+    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
     const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
@@ -540,7 +545,7 @@ export class SidecarPool {
       }
       return view;
     };
-    const gateway = [ops, media].find(item => item?.tools.includes(tool));
+    const gateway = [ops, media, sync].find(item => item?.tools.includes(tool));
     if (gateway) {
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;

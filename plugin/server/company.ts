@@ -50,6 +50,7 @@ export function company(): Promise<Company> {
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { MediaStudio } = await import("./vendor/src/media/elevenlabs.ts");
+    const { SyncStudio } = await import("./vendor/src/media/sync.ts");
     const { VaultClient } = await import("./vendor/src/media/vault.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { createPaseoCli, createSceneCleaner } = await import("./vendor/src/dispatcher/paseo.ts");
@@ -82,12 +83,17 @@ export function company(): Promise<Company> {
       log: message => console.log(message),
     });
     const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;
-    // The ElevenLabs key lives only in sck-vault (its own process, Keychain-bound); this side never sees it.
+    // Provider keys live only in sck-vault (its own process, Keychain-bound); this side never sees them.
+    const vault = new VaultClient(join(serviceHome(), "vault", "vault.sock"));
     const media = new MediaStudio({
-      core, vault: new VaultClient(join(serviceHome(), "vault", "vault.sock")), evidenceRoot: join(dirname(runDir), "evidence"),
+      core, vault, evidenceRoot: join(dirname(runDir), "evidence"),
+    });
+    // sync-3 video channel: same vault boundary, plus owner approval artifacts under private/sync/.
+    const sync = new SyncStudio({
+      core, vault, evidenceRoot: join(dirname(runDir), "evidence"), serviceHome: serviceHome(),
     });
     const sidecar = new SidecarPool({
-      core, workforce, ops, media,
+      core, workforce, ops, media, sync,
       runDir,
       log: message => console.log(message),
     });
