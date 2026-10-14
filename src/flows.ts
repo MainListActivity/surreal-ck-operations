@@ -127,7 +127,8 @@ const STORY_PLAN = `本目标走**长篇故事产线**：只负责把原著写�
 3. 小章节概要通过后建 [正文] 任务（executorRole=story-author → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。
 4. 概要被老板驳回：在原任务上按意见返修再交，不跳过去写正文。正文被退回：只改正文，不动已批概要。
 **不要一次建完所有层级**。每批只建当前层及其审批，并同时建一个 [展开下一层] 任务（executorRole=gm、reviewerRole=qa），让它依赖本层的老板审批任务（概要被老板驳回时在原任务上返修，不另建）；它在老板通过后执行，再建下一层任务和下一个 [展开下一层]——靠它把递归接力下去。全书写完时，由最后一个 [展开下一层] 建一个 kind=gate 的《全书完成确认》交老板。
-每个任务写清：对应层级、上游概要所在文件、输出文件路径、字数/篇幅预期（只按故事本身，不按集数）。`;
+每个任务写清：对应层级、上游概要所在文件、输出文件路径、字数/篇幅预期（只按故事本身，不按集数）。
+**NotebookLM 协同**：作家的起草与知识库维护可用 notebook_* 工具（基于老板 Google 账号的 NotebookLM，会话级）。约定每卷一本（标题形如《作品名·卷N》，先用 notebook_list 查已有）；notebook_query 基于笔记本内源 grounded 出稿（带源引用，防设定漂移），产物落证据目录 media/ 下照常走评审；批准后 notebook_add_source 把已批正文/概要注入对应笔记本让 canon 生长。正文权威副本仍写故事目录文件——笔记本是知识库与老板书架，不替代仓库。login_required/限流如实报 blocker。`;
 
 function linePlan(goalId: string, head: string, pipeline: Exclude<PipelineId, 'software'>): Spec {
   return {
