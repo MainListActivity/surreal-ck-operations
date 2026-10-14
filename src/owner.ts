@@ -31,6 +31,11 @@ export interface OwnerInbox {
   pendingCommands: number;
 }
 
+// WSS to the production DB sustains only ~50KB/s: keep every routine response small
+// or interactive RPCs queue behind multi-second transfers and hit the 30s daemon timeout.
+const LIST_CTX_CHARS = 1200;
+const GATE_EVIDENCE_CHARS = 8000;
+
 interface GoalRow {
   id: RecordId;
   title: string;
@@ -333,17 +338,25 @@ export class OwnerDesk {
 
   async inbox(): Promise<OwnerInbox> {
     const [gates, questions, pending] = await this.db.query<[TaskRow[], TaskRow[], Array<{ count: number }>]>(
-      `SELECT * FROM task WHERE state = 'review' AND reviewer_role = 'owner' ORDER BY id;
-      SELECT * FROM task WHERE state = 'blocked' AND blocked_to = 'owner' ORDER BY id;
-      SELECT count() FROM owner_command WHERE status IN ['pending', 'applying'] GROUP ALL;`);
-    const latest = async (task: RecordId, action: string) => {
-      const [rows] = await this.db.query<[Array<{ evidence?: string }>]>(
-        'SELECT evidence, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at DESC LIMIT 1;', { task, actions: action === 'block' ? ['block', 'escalate'] : [action] });
-      return rows[0]?.evidence;
-    };
+      `SELECT *, string::slice(context ?? '', 0, $ctx) AS context FROM task WHERE state = 'review' AND reviewer_role = 'owner' ORDER BY id;
+      SELECT *, string::slice(context ?? '', 0, $ctx) AS context FROM task WHERE state = 'blocked' AND blocked_to = 'owner' ORDER BY id;
+      SELECT count() FROM owner_command WHERE status IN ['pending', 'applying'] GROUP ALL;`,
+      { ctx: LIST_CTX_CHARS });
+    // One audit pass for every card instead of a round trip per task: the WSS channel
+    // is ~50KB/s so per-task lookups turn a handful of gates into seconds of backlog.
+    const ids = [...gates, ...questions].map(r => r.id);
+    const [auditRows] = ids.length ? await this.db.query<[Array<{ task: RecordId; action: string; evidence?: string; at: unknown }>]>(
+      `SELECT task, action, string::slice(evidence ?? '', 0, $ev) AS evidence, at FROM audit
+       WHERE task IN $ids AND action IN ['submit', 'block', 'escalate'] ORDER BY at DESC;`,
+      { ids, ev: GATE_EVIDENCE_CHARS }) : [[]];
+    const latestBy = new Map<string, string | undefined>();
+    for (const a of auditRows ?? []) {
+      const key = `${asId(a.task)}|${a.action === 'submit' ? 'submit' : 'question'}`;
+      if (!latestBy.has(key)) latestBy.set(key, a.evidence);
+    }
     return {
-      gates: await Promise.all(gates.map(async row => ({ task: view(row), submission: await latest(row.id, 'submit') }))),
-      questions: await Promise.all(questions.map(async row => ({ task: view(row), question: await latest(row.id, 'block') }))),
+      gates: gates.map(row => ({ task: view(row), submission: latestBy.get(`${asId(row.id)}|submit`) })),
+      questions: questions.map(row => ({ task: view(row), question: latestBy.get(`${asId(row.id)}|question`) })),
       notices: await this.openNotices(),
       pendingCommands: pending[0]?.count ?? 0,
     };
@@ -354,14 +367,29 @@ export class OwnerDesk {
   }
 
   /** Non-terminal tasks that transitively depend on `root`; bounded so a pathological graph cannot stall the tick. */
-  private async downstreamCount(root: RecordId): Promise<number> {
+  /** Non-terminal dependency edges, loaded once so BFS never pays a per-node round trip. */
+  private async openGraph(): Promise<Map<string, string[]>> {
+    const [rows] = await this.db.query<[Array<{ id: RecordId; dependencies?: RecordId[] }>]>(
+      "SELECT id, dependencies FROM task WHERE state NOT IN ['done', 'void'];");
+    const children = new Map<string, string[]>();
+    for (const row of rows ?? []) {
+      for (const dep of row.dependencies ?? []) {
+        const key = asId(dep);
+        const list = children.get(key);
+        if (list) list.push(asId(row.id)); else children.set(key, [asId(row.id)]);
+      }
+    }
+    return children;
+  }
+
+  private downstreamCount(root: string, children: Map<string, string[]>): number {
     const seen = new Set<string>(); let frontier = [root];
     for (let depth = 0; depth < 8 && frontier.length && seen.size < 200; depth++) {
-      const next: RecordId[] = [];
+      const next: string[] = [];
       for (const node of frontier) {
-        const [rows] = await this.db.query<[Array<{ id: RecordId }>]>(
-          "SELECT id FROM task WHERE state NOT IN ['done', 'void'] AND $node IN dependencies;", { node });
-        for (const row of rows) if (!seen.has(String(row.id))) { seen.add(String(row.id)); next.push(row.id); }
+        for (const child of children.get(node) ?? []) {
+          if (!seen.has(child)) { seen.add(child); next.push(child); }
+        }
       }
       frontier = next;
     }
@@ -377,6 +405,29 @@ export class OwnerDesk {
       "SELECT evidence, at FROM audit WHERE task = $task AND action = 'block' AND at > <datetime>$since ORDER BY at DESC;",
       { task, since: touched[0] ? String(touched[0].at) : '1970-01-01T00:00:00Z' });
     return { loops: blocks.length, reasons: blocks.slice(0, 3).map(b => (b.evidence ?? '').replace(/\s+/g, ' ').slice(0, 300)) };
+  }
+
+  /** Batch variant of blockLoops: two queries for the whole gm-blocked set instead of two per task. */
+  async blockLoopStats(taskIds: TaskId[]): Promise<Map<string, { loops: number; reasons: string[] }>> {
+    const ids = taskIds.map(t => id('task', t));
+    const stats = new Map<string, { loops: number; reasons: string[] }>();
+    if (!ids.length) return stats;
+    const [touched, blocks] = await this.db.query<[Array<{ task: RecordId; at: unknown }>, Array<{ task: RecordId; evidence?: string; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $ids AND action IN ['owner_reply', 'escalate'] ORDER BY at DESC;
+       SELECT task, evidence, at FROM audit WHERE task IN $ids AND action = 'block' ORDER BY at DESC;`,
+      { ids });
+    const touchedAt = new Map<string, string>();
+    for (const t of touched ?? []) { const k = asId(t.task); if (!touchedAt.has(k)) touchedAt.set(k, String(t.at)); }
+    for (const b of blocks ?? []) {
+      const k = asId(b.task);
+      const since = touchedAt.get(k);
+      if (since && String(b.at) <= since) continue;
+      const s = stats.get(k) ?? { loops: 0, reasons: [] as string[] };
+      s.loops += 1;
+      if (s.reasons.length < 3) s.reasons.push((b.evidence ?? '').replace(/\s+/g, ' ').slice(0, 300));
+      stats.set(k, s);
+    }
+    return stats;
   }
 
   /** Stops a task that keeps bouncing between employee and manager: it becomes an owner question with the recent reasons. */
@@ -398,15 +449,24 @@ export class OwnerDesk {
   /** Gates and questions waiting on the owner, with how long they have waited and what they hold up. */
   async waitingOnOwner(): Promise<WaitingItem[]> {
     const [rows] = await this.db.query<[Array<TaskRow & { goal_title?: string }>]>(
-      `SELECT *, goal.title AS goal_title FROM task WHERE (state = 'review' AND reviewer_role = 'owner') OR (state = 'blocked' AND blocked_to = 'owner');`);
-    return Promise.all(rows.map(async row => {
+      `SELECT *, NONE AS context, goal.title AS goal_title FROM task WHERE (state = 'review' AND reviewer_role = 'owner') OR (state = 'blocked' AND blocked_to = 'owner');`);
+    if (!rows.length) return [];
+    const [auditRows] = await this.db.query<[Array<{ task: RecordId; action: string; at: unknown }>]>(
+      `SELECT task, action, at FROM audit WHERE task IN $ids AND action IN ['submit', 'block', 'escalate'] ORDER BY at DESC;`,
+      { ids: rows.map(r => r.id) });
+    // First row per (task, kind) in the DESC stream is the latest touch.
+    const latestAt = new Map<string, unknown>();
+    for (const a of auditRows ?? []) {
+      const key = `${asId(a.task)}|${a.action === 'submit' ? 'gate' : 'question'}`;
+      if (!latestAt.has(key)) latestAt.set(key, a.at);
+    }
+    const children = await this.openGraph();
+    return rows.map(row => {
       const gate = row.state === 'review';
-      const [audit] = await this.db.query<[Array<{ at: unknown }>]>(
-        'SELECT at FROM audit WHERE task = $task AND action IN $actions ORDER BY at DESC LIMIT 1;', { task: row.id, actions: gate ? ['submit'] : ['block', 'escalate'] });
-      const since = Date.parse(String(audit[0]?.at ?? (row as { created_at?: unknown }).created_at ?? new Date()));
+      const since = Date.parse(String(latestAt.get(`${asId(row.id)}|${gate ? 'gate' : 'question'}`) ?? (row as { created_at?: unknown }).created_at ?? new Date()));
       return { taskId: asId(row.id), version: row.version, kind: gate ? 'gate' as const : 'question' as const, title: row.title,
-        goal: row.goal_title ?? undefined, sinceMs: since, downstream: await this.downstreamCount(row.id) };
-    }));
+        goal: row.goal_title ?? undefined, sinceMs: since, downstream: this.downstreamCount(asId(row.id), children) };
+    });
   }
 
   /** Everything the daily brief reports, read straight from the task service (no model involved). */
@@ -428,15 +488,26 @@ export class OwnerDesk {
       SELECT count() AS n FROM employee WHERE role != NONE AND created_at > <datetime>$since GROUP ALL;
       SELECT retired_reason AS reason, count() AS n FROM employee WHERE retired = true AND retired_at > <datetime>$since GROUP BY retired_reason;`, { since: sinceIso });
     const stuck: BriefData['stuck'] = [];
+    // One pass over all open dependency rows, then membership tests in memory —
+    // per-task SELECTs turn a brief into hundreds of round trips on the thin WSS pipe.
+    const allDeps = [...new Set(blocked.flatMap(t => t.dependencies ?? []))];
+    const [openDeps] = allDeps.length ? await this.db.query<[Array<{ id: RecordId }>]>(
+      "SELECT id FROM task WHERE id IN $deps AND state != 'done' AND (state != 'void' OR reviewer_role = 'owner');", { deps: allDeps }) : [[]];
+    const openDepIds = new Set((openDeps ?? []).map(r => asId(r.id)));
     for (const task of blocked) {
-      const [open] = await this.db.query<[Array<{ id: RecordId }>]>(
-        "SELECT id FROM task WHERE id IN $deps AND state != 'done' AND (state != 'void' OR reviewer_role = 'owner');", { deps: task.dependencies });
-      if (!open.length) stuck.push({ taskId: asId(task.id), title: task.title, reason: '依赖都已完成，却仍是 blocked（需要解锁）' });
+      if (!(task.dependencies ?? []).some(d => openDepIds.has(asId(d))))
+        stuck.push({ taskId: asId(task.id), title: task.title, reason: '依赖都已完成，却仍是 blocked（需要解锁）' });
     }
+    const readyIds = ready.map(r => r.id);
+    const [readyAudits] = readyIds.length ? await this.db.query<[Array<{ task: RecordId; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $ids
+       AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC;`,
+      { ids: readyIds }) : [[]];
+    const lastReadyAt = new Map<string, unknown>();
+    for (const a of readyAudits ?? []) { const k = asId(a.task); if (!lastReadyAt.has(k)) lastReadyAt.set(k, a.at); }
     for (const task of ready) {
-      const [audit] = await this.db.query<[Array<{ at: unknown }>]>(
-        "SELECT at FROM audit WHERE task = $task AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC LIMIT 1;", { task: task.id });
-      const minutes = audit[0] ? (nowMs - Date.parse(String(audit[0].at))) / 60_000 : 0;
+      const at = lastReadyAt.get(asId(task.id));
+      const minutes = at ? (nowMs - Date.parse(String(at))) / 60_000 : 0;
       if (minutes >= 60) stuck.push({ taskId: asId(task.id), title: task.title, reason: `就绪 ${Math.round(minutes)} 分钟仍未被领走` });
     }
     const n = (...actions: string[]) => counts.filter(c => actions.includes(c.action) && !c.mechanical).reduce((sum, c) => sum + c.n, 0);

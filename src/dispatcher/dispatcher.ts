@@ -695,10 +695,20 @@ export class Dispatcher {
     }
 
     const pendingGm: SupervisedTask[] = [];
+    // Batch audit reads up front: per-task blockLoops() would cost two round trips per
+    // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
+    // interactive RPCs queued past the daemon's 30s timeout.
+    const gmLoopStats = gmBlocked.length && typeof owner.blockLoopStats === 'function'
+      ? await owner.blockLoopStats(gmBlocked.map(t => t.id)).catch(() => new Map<string, { loops: number; reasons: string[] }>())
+      : undefined;
+    const gmLastDispatches = gmBlocked.length && typeof wf.lastDispatches === 'function'
+      ? await wf.lastDispatches(gmBlocked.map(t => t.id), 'gm-attention').catch(() => new Map<string, { employee: string; at: number }>())
+      : undefined;
     for (const task of gmBlocked) {
-      const last = await wf.lastDispatch(task.id, task.version, 'gm-attention');
+      const last = gmLastDispatches ? gmLastDispatches.get(`${task.id}:${task.version}`)
+        : await wf.lastDispatch(task.id, task.version, 'gm-attention');
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
-      if (await this.breakLoop(task, cfg, report).catch(() => false)) continue;
+      if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
       pendingGm.push(task);
     }
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
@@ -1126,10 +1136,11 @@ export class Dispatcher {
   }
 
   /** True when the task kept bouncing between employee and manager and was handed to the owner instead of waking the manager again. */
-  private async breakLoop(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<boolean> {
+  private async breakLoop(task: SupervisedTask, cfg: CompanyConfig, report: TickReport,
+      prefetched?: { loops: number; reasons: string[] }): Promise<boolean> {
     if (cfg.blockLoopLimit <= 0) return false;
     const { owner } = this.deps;
-    const { loops, reasons } = await owner.blockLoops(task.id);
+    const { loops, reasons } = prefetched ?? await owner.blockLoops(task.id);
     if (loops < cfg.blockLoopLimit || !(await owner.escalateLooping(task, loops, reasons))) return false;
     report.decisions.push(`escalate-loop:${task.id}`);
     this.log(`task ${task.id} blocked on manager ${loops} times; escalated to owner`);

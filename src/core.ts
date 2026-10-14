@@ -32,6 +32,8 @@ const HISTORY_LIMIT = 40;
 const OPS_HISTORY_LIMIT = 15;
 const HISTORY_EVIDENCE_CHARS = 6000;
 const OPS_EVIDENCE_CHARS = 600;
+const LIST_CONTEXT_CHARS = 1200;
+const LIST_TASKS_LIMIT = 500;
 export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
 export const id = (table: string, value: string) => new RecordId(table, value);
 export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
@@ -286,13 +288,18 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]> {
     const actor = await this.authorized(credential);
-    const [rows] = actor.role === 'gm'
-      ? await this.db.query<[TaskRow[]]>('SELECT * FROM task ORDER BY id;')
-      : await this.db.query<[TaskRow[]]>(
-          'SELECT * FROM task WHERE executor_role = $role OR reviewer_role = $role ORDER BY id;', { role: actor.role }
-        );
-    return rows.filter(row => (!state || row.state === state) &&
-      !(row.state === 'review' && row.submitted_by === actor.employeeId)).map(view);
+    // context holds ~77% of table bytes; list views get a preview (full text via getTask).
+    // The single WSS channel sustains only ~50KB/s, so unbounded SELECT * stalls every
+    // other query behind it for tens of seconds. get_context's contract is the
+    // claimable/working set — terminal rows stay reachable through an explicit state.
+    const scoped = actor.role !== 'gm';
+    const [rows] = await this.db.query<[TaskRow[]]>(
+      `SELECT *, string::slice(context ?? '', 0, $ctx) AS context FROM task
+       WHERE ${state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']"}
+         AND ($scoped = false OR executor_role = $role OR reviewer_role = $role)
+       ORDER BY created_at DESC, id LIMIT $limit;`,
+      { state, scoped, role: actor.role ?? '', ctx: LIST_CONTEXT_CHARS, limit: LIST_TASKS_LIMIT });
+    return rows.filter(row => !(row.state === 'review' && row.submitted_by === actor.employeeId)).map(view);
   }
 
   async getTask(credential: Credential, taskId: TaskId): Promise<TaskView> {
@@ -804,9 +811,9 @@ export class SurrealCompanyCore implements CompanyCore {
     // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the
     // handover history; routine `ops_call` reads are never shown.
     const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
-      `SELECT action, actor, evidence, version, at FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT $limit;
-       SELECT action, actor, evidence, version, at FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC LIMIT $ops_limit;`,
-      { task: id('task', taskId), limit: HISTORY_LIMIT, ops_limit: OPS_HISTORY_LIMIT }
+      `SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT $limit;
+       SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC LIMIT $ops_limit;`,
+      { task: id('task', taskId), limit: HISTORY_LIMIT, ops_limit: OPS_HISTORY_LIMIT, ev_chars: HISTORY_EVIDENCE_CHARS }
     );
     const rows = [...protocol, ...ops].sort((a, b) => (String(a.at) < String(b.at) ? 1 : String(a.at) > String(b.at) ? -1 : 0));
     return rows.reverse().map(row => ({

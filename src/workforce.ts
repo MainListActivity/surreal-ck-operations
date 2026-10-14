@@ -380,8 +380,11 @@ export class Workforce {
 
   // ---- lease supervision ----
   async tasks(): Promise<SupervisedTask[]> {
+    // context is ~77% of table bytes and dispatch never reads it; over a ~50KB/s WSS
+    // channel carrying it would stall every other query behind megabytes of backlog.
     const [rows] = await this.db.query<[TaskRow[]]>(
-      "SELECT *, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;");
+      `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier
+       FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;`);
     return rows.map(supervised);
   }
 
@@ -529,6 +532,16 @@ export class Workforce {
   async lastDispatch(taskId: string, version: number, purpose: string): Promise<{ employee: string; at: number } | undefined> {
     const row = await this.db.select<{ employee: string; at: number }>(this.dispatchId(taskId, version, purpose));
     return row ?? undefined;
+  }
+  /** Batch lookup of dispatch rows keyed "taskId:version" — one query instead of a select per blocked task. */
+  async lastDispatches(taskIds: string[], purpose: string): Promise<Map<string, { employee: string; at: number }>> {
+    const out = new Map<string, { employee: string; at: number }>();
+    if (!taskIds.length) return out;
+    const [rows] = await this.db.query<[Array<{ task: string; version: number; employee: string; at: number }>]>(
+      'SELECT task, version, employee, at FROM dispatch WHERE task IN $ids AND purpose = $purpose;',
+      { ids: taskIds, purpose });
+    for (const r of rows ?? []) out.set(`${r.task}:${r.version}`, { employee: r.employee, at: r.at });
+    return out;
   }
   async recordDispatch(taskId: string, version: number, purpose: string, employee: string): Promise<void> {
     await this.db.query('UPSERT $d CONTENT { task: $task, version: $version, purpose: $purpose, employee: $employee, at: time::unix(time::now()) };',

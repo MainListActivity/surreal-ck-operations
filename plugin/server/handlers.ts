@@ -96,7 +96,7 @@ export function registerHandlers(server: PluginServerContext): void {
     const { view } = await import("./vendor/src/core.ts");
     const { id } = await import("./vendor/src/core.ts");
     const [rows] = await db.db.query<[Parameters<typeof view>[0][]]>(
-      "SELECT * FROM task WHERE goal = $goal ORDER BY created_at, id;", { goal: id("goal", input.goalId) });
+      "SELECT *, string::slice(context ?? '', 0, 1200) AS context FROM task WHERE goal = $goal ORDER BY created_at, id LIMIT 500;", { goal: id("goal", input.goalId) });
     return { tasks: rows.map(view) };
   });
 
@@ -106,7 +106,9 @@ export function registerHandlers(server: PluginServerContext): void {
     const task = await db.db.select<any>(id("task", input.taskId));
     if (!task) throw new Error("task not found");
     const [audit] = await db.db.query<[any[]]>(
-      "SELECT action, actor, evidence, version, at FROM audit WHERE task = $task ORDER BY at;", { task: task.id });
+      `SELECT action, actor, string::slice(evidence ?? '', 0, 6000) AS evidence, version, at
+       FROM (SELECT * FROM audit WHERE task = $task ORDER BY at DESC LIMIT 300) ORDER BY at;`,
+      { task: task.id });
     return {
       task: view(task as Parameters<typeof view>[0]),
       audit: audit.map(a => ({ action: a.action, actor: asId(a.actor), evidence: a.evidence, version: a.version, at: String(a.at) })),
@@ -306,12 +308,19 @@ export function registerHandlers(server: PluginServerContext): void {
 
     // Ready queue with the dominant "nobody can take this" reason when the whole
     // pool is ineligible: this is what silent starvation looks like to the owner.
+    // Batch the per-task audit lookups: a ready queue of N tasks used to cost N
+    // sequential round trips, stalling the single ~50KB/s WSS channel for minutes.
+    const readyTasks = tasks.filter(t => t.state === "ready");
+    const [readyAudits] = readyTasks.length ? await db.db.query<[any[]]>(
+      `SELECT task, at FROM audit WHERE task IN $ids
+       AND action IN ['create','dependency_unlocked','return','release','revoke','resume'] ORDER BY at DESC;`,
+      { ids: readyTasks.map(t => new RecordId("task", t.id)) }) : [[]];
+    const readyAt = new Map<string, unknown>();
+    for (const a of readyAudits ?? []) { const k = asId(a.task); if (!readyAt.has(k)) readyAt.set(k, a.at); }
     const ready = [] as Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
-    for (const t of tasks.filter(t => t.state === "ready")) {
-      const [audit] = await db.db.query<[any[]]>(
-        `SELECT at FROM audit WHERE task = $task AND action IN ['create','dependency_unlocked','return','release','revoke','resume'] ORDER BY at DESC LIMIT 1;`,
-        { task: new RecordId("task", t.id) });
-      const waitingMin = audit?.[0] ? Math.max(0, Math.round((now - Date.parse(String(audit[0].at))) / 60_000)) : 0;
+    for (const t of readyTasks) {
+      const at = readyAt.get(t.id);
+      const waitingMin = at ? Math.max(0, Math.round((now - Date.parse(String(at))) / 60_000)) : 0;
       const pool = staffingPool({ ...poolBase, role: t.executorRole, home: t.repoPath ?? opsRepo, task: t });
       let unclaimableReason: string | undefined;
       if (pool.length && !pool.some(e => e.eligible)) {
