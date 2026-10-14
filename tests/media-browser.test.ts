@@ -1,0 +1,170 @@
+import { beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CompanyError } from '../src/core-errors.ts';
+import { BROWSER_TOOLS, BrowserStudio } from '../src/media/browser.ts';
+
+let root = '';
+let role = 'asset-production';
+let counts: Record<string, number> = {};
+let audits: Array<{ task: string; action: string; evidence: string }> = [];
+let ran: Array<{ provider: string; script: string }> = [];
+// Scripted per-provider results, consumed in call order; last entry repeats.
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number }> = [];
+let ref = '';
+
+const core = {
+  opsScope: async (credential: string, taskId: string) => {
+    if (credential !== 'holder') throw new CompanyError('forbidden', 'Ops tools are only available to the current lease holder of the task');
+    return { actor: { employeeId: 'emp-1', role, capabilities: ['execute'] }, taskId, project: 'proj-1' };
+  },
+  auditOps: async (scope: { taskId: string }, action: string, evidence: string) => { audits.push({ task: scope.taskId, action, evidence }); },
+  opsCount: async (_project: string, action: string) => counts[action] ?? 0,
+};
+
+const studio = () => new BrowserStudio({
+  core: core as never,
+  evidenceRoot: root,
+  runner: async (provider, script) => {
+    ran.push({ provider, script });
+    const result = results.length > 1 ? results.shift()! : results[0];
+    if (result?.ok && !result.file) {
+      const name = script.match(/"file":"([^"]+)"/)?.[1] ?? 'x.png';
+      const file = join(root, 'task-1', 'media', name);
+      writeFileSync(file, 'px');
+      result.file = file;
+      result.bytes = 2;
+    }
+    return result ?? { ok: false, code: 'failed', message: 'no scripted result' };
+  },
+});
+
+const call = (s: BrowserStudio, tool: string, args: Record<string, unknown> = {}, credential = 'holder') => s.call(credential, 'task-1', tool, args);
+async function fail(promise: Promise<unknown>): Promise<CompanyError> {
+  try { await promise; } catch (error) { return error as CompanyError; }
+  throw new Error('expected a rejection');
+}
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'sck-browser-'));
+  role = 'asset-production';
+  counts = {};
+  audits = [];
+  ran = [];
+  results = [{ ok: true }];
+  ref = join(root, 'ref.png');
+  writeFileSync(ref, 'ref');
+  for (const name of Object.keys(process.env)) if (name.startsWith('SCK_BROWSER_')) delete process.env[name];
+});
+
+describe('media_image', () => {
+  test('writes to the leased task evidence dir, audits provider and prompt', async () => {
+    const value = await call(studio(), 'media_image', { prompt: 'painterly portrait of the heroine, transparent background', file: 'hero.png' }) as any;
+    expect(value.provider).toBe('chatgpt'); // ROUTES.image[0]
+    expect(value.file).toContain(join('task-1', 'media'));
+    expect(audits).toHaveLength(1);
+    expect(audits[0].action).toBe('ops_browser_image');
+    expect(audits[0].evidence).toContain('media_image chatgpt hero.png');
+  });
+
+  test('provider=auto fails over on limit_reached and reports attempts', async () => {
+    results = [
+      { ok: false, code: 'limit_reached', message: 'weekly limit' },
+      { ok: true },
+    ];
+    const value = await call(studio(), 'media_image', { prompt: 'a hallway scene, 16:9, painterly', file: 'hall.png' }) as any;
+    expect(value.provider).toBe('gemini');
+    expect(value.attempts).toEqual(['chatgpt: limit_reached']);
+    expect(ran.map(r => r.provider)).toEqual(['chatgpt', 'gemini']);
+  });
+
+  test('last provider failure maps code: login_required → not_configured, limit_reached → limit_reached', async () => {
+    results = [
+      { ok: false, code: 'login_required', message: 'session expired' },
+      { ok: false, code: 'limit_reached', message: 'Resets Oct 16' },
+      { ok: false, code: 'login_required', message: 'session expired' },
+    ];
+    const error = await fail(call(studio(), 'media_image', { prompt: 'a portrait of the character', file: 'p.png' }));
+    expect(error.code).toBe('not_configured');
+    expect(error.message).toContain('chatgpt');
+    results = [{ ok: false, code: 'limit_reached', message: 'Resets Oct 16' }];
+    const limited = await fail(call(studio(), 'media_image', { prompt: 'a portrait of the character', file: 'p.png', provider: 'grok' }));
+    expect(limited.code).toBe('limit_reached');
+    expect(limited.message).toContain('Resets Oct 16');
+  });
+
+  test('single requested provider skips failover', async () => {
+    results = [{ ok: false, code: 'failed', message: 'timeout' }];
+    await fail(call(studio(), 'media_image', { prompt: 'a portrait of the character', file: 'p.png', provider: 'gemini' }));
+    expect(ran.map(r => r.provider)).toEqual(['gemini']);
+  });
+
+  test('rejects bad file name, oversized refs, unknown provider, non-lease-holder, wrong role', async () => {
+    const s = studio();
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: '../x.png' }))).code).toBe('invalid');
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png', refs: [ref, ref, ref, ref, ref] }))).code).toBe('invalid');
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png', refs: ['relative/ref.png'] }))).code).toBe('invalid');
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png', provider: 'midjourney' }))).code).toBe('invalid');
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png' }, 'intruder'))).code).toBe('forbidden');
+    role = 'product';
+    expect((await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png' }))).code).toBe('forbidden');
+  });
+
+  test('daily cap blocks before any browser run', async () => {
+    counts['ops_browser_image'] = 120;
+    const error = await fail(call(studio(), 'media_image', { prompt: 'a portrait of the character', file: 'x.png' }));
+    expect(error.code).toBe('limit_reached');
+    expect(ran).toHaveLength(0);
+  });
+});
+
+describe('media_video', () => {
+  test('routes to gemini by default, accepts mp4/webm names only', async () => {
+    const value = await call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene, rain on glass', file: 'clip.mp4', seconds: 6 }) as any;
+    expect(value.provider).toBe('gemini');
+    expect(ran[0].script).toContain('"kind":"video"');
+    expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.avi' }))).code).toBe('invalid');
+    expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.mp4', seconds: 30 }))).code).toBe('invalid');
+  });
+
+  test('chatgpt is not a video provider', async () => {
+    expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.mp4', provider: 'chatgpt' }))).code).toBe('invalid');
+  });
+});
+
+describe('media_browser_info and serialisation', () => {
+  test('info reports routes, quotas and last provider error', async () => {
+    counts['ops_browser_image'] = 3;
+    const s = studio();
+    results = [{ ok: false, code: 'login_required', message: 'expired' }];
+    await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png', provider: 'grok' }));
+    const info = await call(s, 'media_browser_info') as any;
+    expect(info.providers.image).toEqual(['chatgpt', 'gemini', 'grok']);
+    expect(info.quotas.image.used).toBe(3);
+    expect(info.providerStatus.grok).toContain('login_required');
+  });
+
+  test('jobs serialize on the shared browser profile', async () => {
+    let active = 0;
+    let maxActive = 0;
+    const s = new BrowserStudio({
+      core: core as never,
+      evidenceRoot: root,
+      runner: async (provider, script) => {
+        active++; maxActive = Math.max(maxActive, active);
+        await new Promise(res => setTimeout(res, 20));
+        active--;
+        const file = join(root, 'task-1', 'media', 'x.png');
+        writeFileSync(file, 'px');
+        return { ok: true, file, bytes: 2 };
+      },
+    });
+    await Promise.all([
+      call(s, 'media_image', { prompt: 'first portrait of the heroine', file: 'x.png', provider: 'grok' }),
+      call(s, 'media_image', { prompt: 'second portrait of the heroine', file: 'x.png', provider: 'grok' }),
+      call(s, 'media_image', { prompt: 'third portrait of the heroine', file: 'x.png', provider: 'grok' }),
+    ]);
+    expect(maxActive).toBe(1);
+  });
+});

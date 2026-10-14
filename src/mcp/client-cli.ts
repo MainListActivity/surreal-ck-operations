@@ -24,7 +24,10 @@ if (comm) {
   }));
   const resFile = join(resDir(comm), `${key}.json`);
   // Media generation runs upstream for minutes (music up to 300s); wait past the studio's own timeout.
-  const waitMs = name === 'media_music' || name === 'media_voice_design' || name?.startsWith('sync_') ? 330_000 : name?.startsWith('media_') ? 150_000 : 120_000;
+  // Browser-lane jobs go through a real web UI: image ~60s, video gen plus capture ~120s.
+  const waitMs = name === 'media_music' || name === 'media_voice_design' || name === 'media_video' || name?.startsWith('sync_') ? 330_000
+    : name === 'media_image' ? 300_000
+    : name?.startsWith('media_') ? 150_000 : 120_000;
   const deadline = Date.now() + waitMs;
   for (;;) {
     const res = readJsonFile<CommResponse>(resFile);

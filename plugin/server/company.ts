@@ -92,8 +92,12 @@ export function company(): Promise<Company> {
     const sync = new SyncStudio({
       core, vault, evidenceRoot: join(dirname(runDir), "evidence"), serviceHome: serviceHome(),
     });
+    // Browser-session generation (ChatGPT/Gemini/Grok web UIs): ego-browser drives the owner's
+    // logged-in accounts; sessions and any account secrets stay inside that browser profile.
+    const { BrowserStudio } = await import("./vendor/src/media/browser.ts");
+    const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence") });
     const sidecar = new SidecarPool({
-      core, workforce, ops, media, sync,
+      core, workforce, ops, media, browser, sync,
       runDir,
       log: message => console.log(message),
     });
