@@ -50,6 +50,8 @@ export interface SidecarDeps {
   ops?: OpsGateway;
   /** ElevenLabs media studio (`media_*` tools): same gateway shape, the key stays in the plugin. */
   media?: OpsGateway;
+  /** Browser-session media lane (`media_image`/`media_video`): drives the owner's logged-in web accounts. */
+  browser?: OpsGateway;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
   log?: (message: string) => void;
@@ -518,7 +520,8 @@ export class SidecarPool {
     const core = this.deps.core;
     const ops = this.deps.ops;
     const media = this.deps.media;
-    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? [])] };
+    const browser = this.deps.browser;
+    if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
     const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
@@ -540,7 +543,7 @@ export class SidecarPool {
       }
       return view;
     };
-    const gateway = [ops, media].find(item => item?.tools.includes(tool));
+    const gateway = [ops, media, browser].find(item => item?.tools.includes(tool));
     if (gateway) {
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;

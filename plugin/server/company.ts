@@ -86,8 +86,12 @@ export function company(): Promise<Company> {
     const media = new MediaStudio({
       core, vault: new VaultClient(join(serviceHome(), "vault", "vault.sock")), evidenceRoot: join(dirname(runDir), "evidence"),
     });
+    // Browser-session generation (ChatGPT/Gemini/Grok web UIs): ego-browser drives the owner's
+    // logged-in accounts; sessions and any account secrets stay inside that browser profile.
+    const { BrowserStudio } = await import("./vendor/src/media/browser.ts");
+    const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence") });
     const sidecar = new SidecarPool({
-      core, workforce, ops, media,
+      core, workforce, ops, media, browser,
       runDir,
       log: message => console.log(message),
     });
