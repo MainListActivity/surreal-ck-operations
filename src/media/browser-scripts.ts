@@ -410,7 +410,7 @@ if (!text || text.trim().length < 10) {
     const btn = copies[copies.length - 1];
     if (!btn) return null;
     const stop = /^(Thoughts|expand_more|expand_less|keep_pin|copy|thumb_up|thumb_down|save( to note)?|save message|note_add|share|edit|delete|rate response|good response|bad response)\s*$/i;
-    const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+)\s*$/i;
+    const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+|[。，、；：！？\\.,;:!?]+)\s*$/i;
     const clean = (el) => {
       const out = [];
       for (const line of el.innerText.split('\\n')) {
@@ -436,7 +436,9 @@ if (!text || text.trim().length < 10) {
 }
 if (!text || text.trim().length < 10) { fail('failed', '回复提取失败'); }
 fs.writeFileSync(outPath, text.trim() + '\\n');
-emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId });
+// Return the answer inline too so callers can use query as a lookup path
+// without reading the evidence file. Cap the payload; file keeps full text.
+emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.trim().slice(0, 30000) });
 `;
 }
 

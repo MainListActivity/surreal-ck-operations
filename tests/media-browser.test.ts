@@ -11,7 +11,7 @@ let counts: Record<string, number> = {};
 let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let ran: Array<{ provider: string; script: string }> = [];
 // Scripted per-provider results, consumed in call order; last entry repeats.
-let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown }> = [];
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string }> = [];
 let ref = '';
 
 const core = {
@@ -146,9 +146,10 @@ describe('notebook lane', () => {
     const s = studio();
     expect((await fail(call(s, 'notebook_query', { notebook: '梦痕纪元·卷1', prompt: '根据圣经写第一章开场段落' }))).code).toBe('invalid'); // missing file
     expect((await fail(call(s, 'notebook_query', { notebook: 'xx', prompt: '根据圣经写第一章开场段落', file: 'a.txt' }))).code).toBe('invalid'); // wrong ext
-    results = [{ ok: true, file: join(root, 'task-1', 'media', 'draft.md'), bytes: 1200 }];
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'draft.md'), bytes: 1200, text: '2089年，林深扣紧骨传导耳机。' }];
     const value = await call(s, 'notebook_query', { notebook: '梦痕纪元·卷1', prompt: '根据圣经写第一章开场，500字', file: 'draft.md' }) as any;
     expect(value.file).toContain('draft.md');
+    expect(value.text).toContain('林深'); // inline answer doubles as the lookup path
     expect(ran[0].provider).toBe('notebook');
     expect(ran[0].script).toContain('"notebookOp":"query"');
     expect(audits.at(-1)!.evidence).toContain('notebook_query');

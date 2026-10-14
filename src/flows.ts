@@ -124,11 +124,11 @@ const STORY_PLAN = `本目标走**长篇故事产线**：只负责把原著写�
 递归流程（每一层都是：先写概要 → 老板只看概要 → 通过后才展开下一层 → 最后补齐正文）：
 1. 第一层：《故事圣经与全书总纲》，executorRole=story-author、reviewerRole=owner。
 2. 每一层概要任务通过后才展开下一层：卷概要 → 章概要 → 小章节概要，都是 reviewerRole=owner。
-3. 小章节概要通过后建 [正文] 任务（executorRole=story-author → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。
+3. 小章节概要通过后建 [正文] 任务（executorRole=story-author → reviewerRole=qa，对照已批概要和故事圣经验收）；QA 通过后建 [小章节交付] 任务（executorRole=gm → reviewerRole=qa，登记章节路径、字数、与概要的对照）。一个小章节交付 = 一个完成单位。正文不由员工亲笔撰写：把原本写给作家的完整写作指令（章节概要、文风要求、字数）作为 prompt 发给 notebook_query，拿回的 grounded 稿经一致性核查后作为正文提交。
 4. 概要被老板驳回：在原任务上按意见返修再交，不跳过去写正文。正文被退回：只改正文，不动已批概要。
 **不要一次建完所有层级**。每批只建当前层及其审批，并同时建一个 [展开下一层] 任务（executorRole=gm、reviewerRole=qa），让它依赖本层的老板审批任务（概要被老板驳回时在原任务上返修，不另建）；它在老板通过后执行，再建下一层任务和下一个 [展开下一层]——靠它把递归接力下去。全书写完时，由最后一个 [展开下一层] 建一个 kind=gate 的《全书完成确认》交老板。
 每个任务写清：对应层级、上游概要所在文件、输出文件路径、字数/篇幅预期（只按故事本身，不按集数）。
-**NotebookLM 协同**：作家的起草与知识库维护可用 notebook_* 工具（基于老板 Google 账号的 NotebookLM，会话级）。约定每卷一本（标题形如《作品名·卷N》，先用 notebook_list 查已有）；notebook_query 基于笔记本内源 grounded 出稿（带源引用，防设定漂移），产物落证据目录 media/ 下照常走评审；批准后 notebook_add_source 把已批正文/概要注入对应笔记本让 canon 生长。正文权威副本仍写故事目录文件——笔记本是知识库与老板书架，不替代仓库。login_required/限流如实报 blocker。`;
+**NotebookLM 即作家**：正文写作完全交给 NotebookLM（基于老板 Google 账号，会话级），员工是它的操盘手而非写手。约定**一部作品一本**（标题形如《作品名》，先用 notebook_list 查已有、没有则 notebook_create）——故事圣经、全书总纲、各卷/章/小章节概要、每段已批正文全部注入同一个笔记本，让它始终感知已写的全部内容。各层概要任务和正文任务都把原本写给作家的指令作为 prompt 发 notebook_query（带源引用 grounded 出稿，防设定漂移），产物落证据目录 media/ 下照常走评审；批准后 notebook_add_source 把已批文本回注该笔记本，canon 随写作推进持续生长。**双写**：进笔记本的每份源都以仓库文件为底本（先落 story/ 再注入），本地永远保留完整数据，不依赖笔记本做存储。**查询路径**：notebook_query 也可用于临时查证（设定核对、回顾前文、一致性提问），答复正文随结果直接返回，需要留档的另写证据文件。正文权威副本仍写故事目录文件——笔记本是写作引擎与老板书架，不替代仓库。员工职责变为：维护笔记本源齐全、发写作指令、核查产出与已批概要/圣经一致后提交。login_required/限流如实报 blocker。`;
 
 function linePlan(goalId: string, head: string, pipeline: Exclude<PipelineId, 'software'>): Spec {
   return {
