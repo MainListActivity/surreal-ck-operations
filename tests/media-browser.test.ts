@@ -187,6 +187,11 @@ describe('notebook lane', () => {
     expect(ran[0].script).toContain('gemini.google.com/notebook/');
     expect(audits.at(-1)!.action).toBe('ops_browser_notebook');
     expect((await fail(call(s, 'notebook_write', { notebook: 'x', prompt: '写点东西出来看看效果如何', file: 'a.txt' }))).code).toBe('invalid');
+    // 一章一个会话：chat 参数回链到既有会话继续写
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'p2.md'), bytes: 500, text: '第二段……', url: 'https://gemini.google.com/app/abc123' }];
+    await call(s, 'notebook_write', { notebook: '梦痕纪元', prompt: '继续写下一段正文，承接上一段', file: 'p2.md', chat: 'https://gemini.google.com/app/abc123' });
+    expect(ran.at(-1)!.script).toContain('"chat":"https://gemini.google.com/app/abc123"');
+    expect(ran.at(-1)!.script).toContain('gemini.google.com/app/');
   });
 
   test('notebook_remove_source routes with title and gates quota', async () => {

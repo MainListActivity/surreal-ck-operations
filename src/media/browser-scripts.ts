@@ -21,6 +21,7 @@ interface ScriptArgs {
   notebook?: string;   // notebook id (from URL) or title substring
   title?: string;      // source title / new notebook name / remove_source target substring
   text?: string;       // source body for add_source
+  chat?: string;       // write op: existing Gemini chat id/url to continue the same conversation
 }
 
 // Shared helpers injected into every provider script.
@@ -388,8 +389,11 @@ if (ARGS.notebookOp === 'remove_source') {
 
 if (ARGS.notebookOp === 'write') {
   // Draft inside the Gemini shell: gemini.google.com/notebook/<id> spawns a
-  // persistent Gemini chat grounded on this notebook's sources.
-  try { await p.goto('https://gemini.google.com/notebook/' + nbId); } catch {}
+  // persistent Gemini chat grounded on this notebook's sources. ARGS.chat
+  // continues an existing conversation (one chapter = one session).
+  const chatIdIn = ((ARGS.chat || '').match(/app\\/([0-9a-f]+)/i) || [])[1]
+    || (/^[0-9a-f]{6,}$/i.test(ARGS.chat || '') ? ARGS.chat : '');
+  try { await p.goto(chatIdIn ? 'https://gemini.google.com/app/' + chatIdIn : 'https://gemini.google.com/notebook/' + nbId); } catch {}
   try { await p.waitForLoadState('load'); } catch {}
   await p.waitForTimeout(5000);
   const gBody = await bodyText(p);

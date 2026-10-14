@@ -205,7 +205,7 @@ export class BrowserStudio {
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
         notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — 返回含 text 正文（≤30k），可直接当查询通道用',
-        notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — Gemini 壳内写作，正文入 text + 文件，url 为会话链接',
+        notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md","chat"?:<既有会话id或url>} — Gemini 壳内写作；一章一个会话，续写/修订传 chat 回到同一会话',
         notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01-卷名","text":"<正文markdown>"}',
         notebook_remove_source: '{"notebook":"<笔记本id或标题>","title":"<源标题子串>"} — 源不可编辑，更新=删旧+重注',
       },
@@ -297,7 +297,8 @@ export class BrowserStudio {
         const prompt = str(args, 'prompt', 10, 12000);
         const file = String(args.file ?? '');
         if (!MD_FILE.test(file)) throw invalid('file 只能是纯文件名 xxx.md');
-        scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file };
+        const chat = typeof args.chat === 'string' && args.chat.trim() ? args.chat.trim().slice(0, 200) : undefined;
+        scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file, chat };
         break;
       }
     }
