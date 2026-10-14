@@ -410,7 +410,7 @@ if (!text || text.trim().length < 10) {
     const btn = copies[copies.length - 1];
     if (!btn) return null;
     const stop = /^(Thoughts|expand_more|expand_less|keep_pin|copy|thumb_up|thumb_down|save( to note)?|save message|note_add|share|edit|delete|rate response|good response|bad response)\s*$/i;
-    const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+)\s*$/i;
+    const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+|[。，、；：！？\\.,;:!?]+)\s*$/i;
     const clean = (el) => {
       const out = [];
       for (const line of el.innerText.split('\\n')) {
