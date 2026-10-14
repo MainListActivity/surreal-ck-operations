@@ -65,6 +65,14 @@ interface LiveClaim {
   /** Hash of artifact content already consumed, so a stale file never submits twice. */
   reportHash?: string;
   blockerHash?: string;
+  /** Turns that ended without any closeout artifact while this claim was live. */
+  nudges?: number;
+}
+
+/** What settle() found for a finished turn; `silent` carries the still-open round. */
+export interface SettleResult {
+  status: "ingested" | "no_claim" | "silent";
+  silent?: { instId: string; taskId: string; nudges: number };
 }
 
 export class SidecarPool {
@@ -283,9 +291,9 @@ export class SidecarPool {
   /** Turn ended: ingest the agent's artifacts, then let the lease live or die.
    * The keepalive is NOT stopped here — the claim may outlive this turn (multi-turn
    * work), and a claim whose beat died becomes an orphan no heartbeat can expire. */
-  async settle(agentId: string): Promise<void> {
+  async settle(agentId: string): Promise<SettleResult> {
     const instId = this.instByAgent.get(agentId);
-    if (!instId) return;
+    if (!instId) return { status: "no_claim" };
     const dir = commDir(this.deps.runDir, instId);
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
@@ -296,17 +304,21 @@ export class SidecarPool {
       for (const [text, path] of [[blocker, blockerPath(dir)], [report, reportPath(dir)]] as const) {
         if (text !== undefined) this.archive(path, "orphaned");
       }
-      return;
+      return { status: "no_claim" };
     }
     if (blocker !== undefined && hash(blocker) !== live.blockerHash) {
       await this.finish(instId, live, "gm", blocker, blockerPath(dir));
-      return;
+      return { status: "ingested" };
     }
     if (report !== undefined && hash(report) !== live.reportHash) {
       await this.finish(instId, live, undefined, report, reportPath(dir));
-      return;
+      return { status: "ingested" };
     }
-    this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId}`);
+    // Turn closed with the round still open: keep the lease while the caller decides
+    // between a wake nudge and a server-side release; the count feeds that decision.
+    live.nudges = (live.nudges ?? 0) + 1;
+    this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
+    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges } };
   }
 
   private async finish(
