@@ -11,7 +11,7 @@ let counts: Record<string, number> = {};
 let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let ran: Array<{ provider: string; script: string }> = [];
 // Scripted per-provider results, consumed in call order; last entry repeats.
-let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string }> = [];
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string; title?: string }> = [];
 let ref = '';
 
 const core = {
@@ -174,6 +174,31 @@ describe('notebook lane', () => {
     const e1 = await fail(call(studio(), 'notebook_query', { notebook: 'xx', prompt: '根据圣经写第一章开场段落', file: 'a.md' }));
     expect(e1.code).toBe('not_configured');
     expect(e1.message).toContain('session expired');
+  });
+
+  test('notebook_write routes to the Gemini notebook shell and returns text', async () => {
+    const s = studio();
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'draft.md'), bytes: 800, text: '地下二十八公里的死寂……', url: 'https://gemini.google.com/app/abc123' }];
+    const value = await call(s, 'notebook_write', { notebook: '梦痕纪元', prompt: '根据卷一概要写第三章开场，文风与已写两章一致，500字', file: 'draft.md' }) as any;
+    expect(value.text).toContain('地下二十八公里');
+    expect(value.url).toContain('gemini.google.com/app/');
+    expect(ran[0].provider).toBe('notebook');
+    expect(ran[0].script).toContain('"notebookOp":"write"');
+    expect(ran[0].script).toContain('gemini.google.com/notebook/');
+    expect(audits.at(-1)!.action).toBe('ops_browser_notebook');
+    expect((await fail(call(s, 'notebook_write', { notebook: 'x', prompt: '写点东西出来看看效果如何', file: 'a.txt' }))).code).toBe('invalid');
+  });
+
+  test('notebook_remove_source routes with title and gates quota', async () => {
+    const s = studio();
+    expect((await fail(call(s, 'notebook_remove_source', { notebook: 'x' }))).code).toBe('invalid'); // missing title
+    results = [{ ok: true, notebook: 'nb-1', title: '卷一 正文汇编' }];
+    const value = await call(s, 'notebook_remove_source', { notebook: '梦痕纪元', title: '卷一 正文汇编' }) as any;
+    expect(value.op).toBe('remove_source');
+    expect(ran[0].script).toContain('"notebookOp":"remove_source"');
+    expect(ran[0].script).toContain('卷一 正文汇编');
+    counts['ops_browser_notebook'] = 200;
+    expect((await fail(call(s, 'notebook_remove_source', { notebook: 'x', title: 'y' }))).code).toBe('limit_reached');
   });
 });
 

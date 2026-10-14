@@ -17,9 +17,9 @@ interface ScriptArgs {
   seconds?: number;
   timeoutMs: number;
   // notebook lane
-  notebookOp?: 'list' | 'create' | 'query' | 'add_source';
+  notebookOp?: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write';
   notebook?: string;   // notebook id (from URL) or title substring
-  title?: string;      // source title / new notebook name
+  title?: string;      // source title / new notebook name / remove_source target substring
   text?: string;       // source body for add_source
 }
 
@@ -348,6 +348,103 @@ if (ARGS.notebookOp === 'add_source') {
   process.exit(0);
 }
 
+if (ARGS.notebookOp === 'remove_source') {
+  // Sources cannot be edited in place; volume consolidation relies on remove+re-add.
+  const target = ARGS.title || '';
+  let removedAny = false;
+  for (let round = 0; round < 20; round++) {
+    const label = await p.evaluate(({ q }) => {
+      const cb = [...document.querySelectorAll('input[type="checkbox"]')].find(c => {
+        const l = c.getAttribute('aria-label') || '';
+        return /^Select /.test(l) && !/all sources|chat sources/i.test(l) && l.toLowerCase().includes(q.toLowerCase());
+      });
+      if (!cb) return null;
+      const l = cb.getAttribute('aria-label');
+      let row = cb;
+      for (let i = 0; i < 8 && row; i++) { if (row.querySelectorAll && row.querySelectorAll('button').length) break; row = row.parentElement; }
+      [...row.querySelectorAll('button')].find(b => /^More$/i.test(b.getAttribute('aria-label') || ''))?.click();
+      return l;
+    }, { q: target });
+    if (!label) break;
+    await p.waitForTimeout(1000);
+    const clicked = await p.evaluate(() => {
+      const mi = [...document.querySelectorAll('[role="menuitem"],button')].find(b => /Remove note|Remove source|delete/i.test(b.innerText || ''));
+      if (!mi) return false;
+      mi.click(); return true;
+    });
+    if (!clicked) { fail('failed', '源菜单里没有 Remove 项'); }
+    await p.waitForTimeout(1200);
+    await p.evaluate(() => {
+      const btn = [...document.querySelectorAll('button')].find(b => /^(Remove|Delete|删除|确认)$/i.test((b.innerText || '').trim()));
+      btn?.click();
+    });
+    await p.waitForTimeout(2000);
+    removedAny = true;
+  }
+  if (!removedAny) { fail('failed', '找不到要删除的源：' + target); }
+  emit({ ok: true, notebook: nbId, title: target });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'write') {
+  // Draft inside the Gemini shell: gemini.google.com/notebook/<id> spawns a
+  // persistent Gemini chat grounded on this notebook's sources.
+  try { await p.goto('https://gemini.google.com/notebook/' + nbId); } catch {}
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(5000);
+  const gBody = await bodyText(p);
+  if (loginWall(gBody)) { fail('login_required', 'gemini.google.com 需要重新登录'); }
+  let sent = false;
+  const sendDeadline = Date.now() + 30000;
+  while (!sent && Date.now() < sendDeadline) {
+    sent = await p.evaluate(({ prompt }) => {
+      const tb = [...document.querySelectorAll('[contenteditable="true"], textarea')]
+        .find(e => e.offsetParent !== null && /prompt|Gemini|question/i.test(e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || ''))
+        || [...document.querySelectorAll('[contenteditable="true"], textarea')].filter(e => e.offsetParent !== null).pop();
+      if (!tb) return false;
+      tb.focus();
+      if (tb.tagName === 'TEXTAREA') { tb.value = prompt; tb.dispatchEvent(new Event('input', { bubbles: true })); }
+      else { tb.innerText = prompt; tb.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+      return true;
+    }, { prompt: ARGS.prompt });
+    if (!sent) await p.waitForTimeout(2000);
+  }
+  if (!sent) { fail('failed', '找不到 Gemini 输入框'); }
+  await p.waitForTimeout(500);
+  const baseCopies = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy" i]').length);
+  const submitted = await p.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')].find(b => /^(Submit|Send)$/i.test((b.getAttribute('aria-label') || b.innerText || '').trim()));
+    if (btn) { btn.click(); return true; } return false;
+  });
+  if (!submitted) await p.keyboard.press('Enter');
+  // wait for the response's copy button, then stabilize
+  const w0 = Date.now();
+  let ready = false;
+  while (Date.now() - w0 < ARGS.timeoutMs - 30000) {
+    const n = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy" i]').length);
+    const busy = await p.evaluate(() => [...document.querySelectorAll('button')].some(b => /stop/i.test(b.getAttribute('aria-label') || '')));
+    if (n > baseCopies && !busy) { ready = true; break; }
+    await p.waitForTimeout(3000);
+  }
+  if (!ready) { fail('failed', '等待 Gemini 回复超时'); }
+  await p.waitForTimeout(4000);
+  let text = await p.evaluate(() => {
+    const copies = [...document.querySelectorAll('button[aria-label*="Copy" i]')];
+    const btn = copies[copies.length - 1];
+    if (!btn) return null;
+    let n = btn;
+    for (let i = 0; i < 10 && n; i++) { if ((n.innerText || '').length > 200) break; n = n.parentElement; }
+    return n ? n.innerText : null;
+  });
+  if (text) text = text.replace(/^\\s*Gemini said\\s*/i, '').trim();
+  if (!text || text.length < 10) { fail('failed', '回复提取失败'); }
+  fs.writeFileSync(outPath, text + '\\n');
+  const chatId = await p.evaluate(() => (location.pathname.match(/app\\/([0-9a-f]+)/i) || [])[1] || '');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.slice(0, 30000), url: chatId ? 'https://gemini.google.com/app/' + chatId : undefined });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'query') {
 // notebook_query — fill via evaluate (snapshot refs for the query textarea vary by layout)
 const baseline = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy model response" i]').length);
 let filled = false;
@@ -439,6 +536,7 @@ fs.writeFileSync(outPath, text.trim() + '\\n');
 // Return the answer inline too so callers can use query as a lookup path
 // without reading the evidence file. Cap the payload; file keeps full text.
 emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.trim().slice(0, 30000) });
+}
 `;
 }
 

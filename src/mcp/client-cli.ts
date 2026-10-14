@@ -27,7 +27,7 @@ if (comm) {
   // Browser-lane jobs go through a real web UI: image ~60s, video gen plus capture ~120s.
   // Notebook chapter drafts are long grounded generations: allow up to the studio's 480s cap.
   const waitMs = name === 'media_music' || name === 'media_voice_design' || name === 'media_video' ? 330_000
-    : name === 'notebook_query' ? 500_000
+    : name === 'notebook_query' || name === 'notebook_write' ? 500_000
     : name === 'media_image' ? 300_000
     : name?.startsWith('media_') || name?.startsWith('notebook_') ? 150_000 : 120_000;
   const deadline = Date.now() + waitMs;
