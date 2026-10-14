@@ -436,7 +436,9 @@ if (!text || text.trim().length < 10) {
 }
 if (!text || text.trim().length < 10) { fail('failed', '回复提取失败'); }
 fs.writeFileSync(outPath, text.trim() + '\\n');
-emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId });
+// Return the answer inline too so callers can use query as a lookup path
+// without reading the evidence file. Cap the payload; file keeps full text.
+emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.trim().slice(0, 30000) });
 `;
 }
 

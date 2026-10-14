@@ -37,7 +37,7 @@ const MAX_REF_BYTES = 20 * 1024 * 1024;
 
 type Args = Record<string, unknown>;
 interface Out { value: unknown; audit?: { action: string; evidence: string } }
-interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown }
+interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown; text?: string }
 type Runner = (provider: Provider, script: string, timeoutMs: number) => Promise<RunResult>;
 
 export interface BrowserDeps {
@@ -202,7 +202,7 @@ export class BrowserStudio {
         media_video: '{"prompt","file":"x.mp4","seconds?"(4-10),"provider?"[:auto/gemini/grok]}',
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
-        notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"}',
+        notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — 返回含 text 正文（≤30k），可直接当查询通道用',
         notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01c03-章名","text":"<正文markdown>"}',
       },
     } };
@@ -294,7 +294,7 @@ export class BrowserStudio {
       op,
       notebook: result.notebook ?? scriptArgs.notebook,
       notebooks: result.notebooks,
-      file: result.file, bytes: result.bytes, url: result.url,
+      file: result.file, bytes: result.bytes, url: result.url, text: result.text,
     }, audit: { action: 'ops_browser_notebook', evidence: `notebook_${op} ${evidenceBits}`.slice(0, 160) } };
   }
 
