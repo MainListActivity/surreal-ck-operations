@@ -65,6 +65,8 @@ case "$action" in
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
     cp "$(dirname "$0")/sck.sh" "$service_home/bin/sck"
     chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck"
+    prev_release=""
+    if [ -L "$service_home/active" ]; then prev_release=$(readlink "$service_home/active"); fi
     ln -s "$release" "$service_home/active.next"
     mv -h -f "$service_home/active.next" "$service_home/active"
     # Dual-surface sync: the daemon resolves a plugin's registered source once —
@@ -95,6 +97,28 @@ print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", ""
       write_plist "$c"
       unload "$c"
       launchctl bootstrap "$domain" "$(plist "$c")"
+    done
+    # Release retention: snapshots run ~300MB each and used to accumulate without
+    # bound (100 dirs ≈ 30GB filled the disk once already). Event-point cleanup —
+    # after a successful install keep exactly: this release, the release it
+    # replaced (rollback), the currently registered plugin source, and the newest
+    # other snapshot as a spare. SCK_RELEASE_KEEP overrides the spare count.
+    releases_dir="$service_home/releases"
+    keep=" ${release##*/} ${prev_release##*/} "
+    PASEO="${PASEO:-/Applications/Paseo.app/Contents/Resources/bin/paseo}"
+    cur_src=$("$PASEO" plugin ls sck-company --json 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+rows = json.load(sys.stdin) or []
+print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")' 2>/dev/null)
+    case "$cur_src" in "$releases_dir"/*/plugin) keep="$keep $(basename "$(dirname "$cur_src")") ";; esac
+    spare=${SCK_RELEASE_KEEP:-1}
+    for d in $(ls -td "$releases_dir"/*/ 2>/dev/null); do
+      b=${d%/}; b=${b##*/}
+      case "$b" in *[!0-9a-f]*) continue;; esac
+      [ ${#b} -eq 40 ] || continue
+      case "$keep" in *" $b "*) continue;; esac
+      if [ "$spare" -gt 0 ]; then spare=$((spare - 1)); keep="$keep $b "; continue; fi
+      rm -rf "$d" && echo "release pruned: $b"
     done
     ;;
   start)
