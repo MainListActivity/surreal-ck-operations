@@ -10,7 +10,7 @@ import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { buildScript } from './browser-scripts.ts';
 
-export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source'] as const;
+export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source', 'notebook_remove_source', 'notebook_write'] as const;
 export type BrowserTool = typeof BROWSER_TOOLS[number];
 export const BROWSER_PROVIDERS = ['chatgpt', 'gemini', 'grok', 'notebook'] as const;
 export type Provider = typeof BROWSER_PROVIDERS[number];
@@ -154,6 +154,8 @@ export class BrowserStudio {
       : tool === 'notebook_create' ? () => this.notebookOp(scope, 'create', args)
       : tool === 'notebook_query' ? () => this.notebookOp(scope, 'query', args)
       : tool === 'notebook_add_source' ? () => this.notebookOp(scope, 'add_source', args)
+      : tool === 'notebook_remove_source' ? () => this.notebookOp(scope, 'remove_source', args)
+      : tool === 'notebook_write' ? () => this.notebookOp(scope, 'write', args)
       : undefined;
     if (!handler) throw invalid(`unknown browser media tool: ${tool}`);
     try {
@@ -193,7 +195,7 @@ export class BrowserStudio {
       notes: [
         '网页会话生成：provider=auto 按 ' + ROUTES.image.join(' → ') + ' 顺序 failover',
         '图片产物为 PNG（透明底能力以会话实际支持为准）；视频产物 mp4 优先、提取失败回落 webm',
-        'notebook_* 为 NotebookLM 写作引擎通道：一部作品一本（如《作品名》），圣经/概要/已批正文全部进同一本保证连续性；query 基于本内源 grounded 出稿（带源引用），add_source 把已批文本回注',
+        'notebook_* 为笔记本通道：一部作品一本（如《作品名》），源按一卷一个（卷正文汇编）；write 在 Gemini 壳内基于笔记本源写作，query 查证/读取，add_source/remove_source 维护卷源',
         'login_required 错误 = 对应平台网页会话过期，需要老板在 ego 浏览器里重新登录该站',
         'limit_reached 为账号级配额（Grok 按周），等重置或换 provider',
       ],
@@ -203,7 +205,9 @@ export class BrowserStudio {
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
         notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — 返回含 text 正文（≤30k），可直接当查询通道用',
-        notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01c03-章名","text":"<正文markdown>"}',
+        notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — Gemini 壳内写作，正文入 text + 文件，url 为会话链接',
+        notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01-卷名","text":"<正文markdown>"}',
+        notebook_remove_source: '{"notebook":"<笔记本id或标题>","title":"<源标题子串>"} — 源不可编辑，更新=删旧+重注',
       },
     } };
   }
@@ -247,7 +251,7 @@ export class BrowserStudio {
 
   /** NotebookLM lane: query drafts text into the evidence dir; add_source pushes approved
       text back into the notebook so canon grows. list/create are ungated reads. */
-  private async notebookOp(scope: OpsScope, op: 'list' | 'create' | 'query' | 'add_source', args: Args): Promise<Out> {
+  private async notebookOp(scope: OpsScope, op: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write', args: Args): Promise<Out> {
     const outDir = this.outputDir(scope);
     mkdirSync(outDir, { recursive: true, mode: 0o700 });
     const timeoutMs = TIMEOUT.notebook;
@@ -280,6 +284,22 @@ export class BrowserStudio {
         scriptArgs = { ...base, notebookOp: 'add_source', notebook, text, title };
         break;
       }
+      case 'remove_source': {
+        await this.gate(scope, 'notebook');
+        const notebook = str(args, 'notebook', 2, 200);
+        const title = str(args, 'title', 1, 200);
+        scriptArgs = { ...base, notebookOp: 'remove_source', notebook, title };
+        break;
+      }
+      case 'write': {
+        await this.gate(scope, 'notebook');
+        const notebook = str(args, 'notebook', 2, 200);
+        const prompt = str(args, 'prompt', 10, 12000);
+        const file = String(args.file ?? '');
+        if (!MD_FILE.test(file)) throw invalid('file 只能是纯文件名 xxx.md');
+        scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file };
+        break;
+      }
     }
     const result = await this.enqueue(() => this.run('notebook', buildScript('notebook', scriptArgs), timeoutMs));
     if (!result.ok) {
@@ -288,7 +308,7 @@ export class BrowserStudio {
       const cls = code === 'login_required' ? 'not_configured' : code === 'limit_reached' ? 'limit_reached' : 'upstream_error';
       throw new CompanyError(cls, `notebook ${op} 失败：${result.message ?? '未知错误'}`);
     }
-    if (op === 'query' && !result.file) throw new CompanyError('upstream_error', 'notebook query 未产出文件');
+    if ((op === 'query' || op === 'write') && !result.file) throw new CompanyError('upstream_error', `notebook ${op} 未产出文件`);
     const evidenceBits = [op, scriptArgs.notebook ?? '', scriptArgs.title ?? '', scriptArgs.file ?? ''].join(' ').trim();
     return { value: {
       op,
