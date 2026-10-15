@@ -160,6 +160,12 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
       grant_types TEXT NOT NULL, response_types TEXT NOT NULL, created_by TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE (tenant_id, client_id))`);
+    this.sqlite.run(`CREATE TABLE client_access_token_claims (
+      id TEXT PRIMARY KEY, client_id TEXT NOT NULL REFERENCES oidc_clients(id),
+      tenant_id TEXT NOT NULL, claim_name TEXT NOT NULL, source_type TEXT NOT NULL,
+      fixed_value TEXT, user_field TEXT, hook_field TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE (client_id, claim_name))`);
     this.sqlite.run(`CREATE TABLE admin_service_principals (
       id TEXT PRIMARY KEY, label TEXT NOT NULL, token_hash TEXT NOT NULL, scopes TEXT NOT NULL,
       status TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, created_by TEXT NOT NULL)`);
@@ -371,6 +377,29 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
   }
   oidcClientCount(): number {
     return (this.sqlite.query('SELECT COUNT(*) AS n FROM oidc_clients').get() as { n: number }).n;
+  }
+
+  /**
+   * Seeds a client_access_token_claims row under an already-registered client; `clientId` is the
+   * public oidc_clients.client_id, the row stores the internal id like production does.
+   */
+  seedClientClaim(row: {
+    clientId: string; claimName: string; sourceType?: string;
+    fixedValue?: string | null; userField?: string | null; hookField?: string | null;
+  }) {
+    const client = this.sqlite.query('SELECT id FROM oidc_clients WHERE client_id = ?').get(row.clientId) as { id: string } | null;
+    if (!client) throw new Error(`seedClientClaim needs an oidc_clients row for ${row.clientId}`);
+    const stamp = new Date(this.clock).toISOString();
+    this.sqlite.run(`INSERT INTO client_access_token_claims
+      (id, client_id, tenant_id, claim_name, source_type, fixed_value, user_field, hook_field, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [randomUUID(), client.id, TENANT, row.claimName, row.sourceType ?? 'fixed',
+        row.fixedValue ?? null, row.userField ?? null, row.hookField ?? null, stamp, stamp]);
+  }
+
+  /** Direct row access for assertions about which claim rows survive a delete. */
+  clientClaims(): Array<Record<string, unknown>> {
+    return this.sqlite.query('SELECT * FROM client_access_token_claims').all() as Array<Record<string, unknown>>;
   }
 
   // ---------- IdP ----------

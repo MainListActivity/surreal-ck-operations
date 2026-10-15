@@ -22,6 +22,10 @@ import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
 import {
+  claimName, claimQualifiers, deleteClientClaims, describeQualifiers,
+  listClientClaims, resolveClient, scanClaimsByName,
+} from './idp-claims.ts';
+import {
   adminRequestTarget, findServicePrincipal, idpAdminRequest, insertServicePrincipal,
   listServicePrincipals, mintServicePrincipalToken,
   principalAliasSecretName, principalId, principalTokenSecretName, recordIdpAuditBestEffort,
@@ -40,7 +44,7 @@ import type { ProofFiles } from './proof-files.ts';
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
-  'ops_idp_client_info', 'ops_idp_client_register',
+  'ops_idp_client_claims', 'ops_idp_client_info', 'ops_idp_client_register',
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
@@ -203,6 +207,7 @@ export class OpsBroker {
       ops_request: (ctx, args) => this.request(ctx, args),
       ops_query: (ctx, args) => this.query(ctx, args),
       ops_browser_login: (ctx, args) => this.browserLogin(ctx, args),
+      ops_idp_client_claims: (ctx, args) => this.idpClientClaims(ctx, args),
       ops_idp_client_info: (ctx, args) => this.idpClientInfo(ctx, args),
       ops_idp_client_register: (ctx, args) => this.idpClientRegister(ctx, args),
       ops_idp_principal_mint: (ctx, args) => this.idpPrincipalMint(ctx, args),
@@ -503,6 +508,67 @@ export class OpsBroker {
       audit: {
         action: result === 'created' ? 'ops_idp_client_create' : 'ops_call',
         evidence: `ops_idp_client_register ${clientName} → ${result} ${clientId}`,
+      },
+    };
+  }
+
+  /**
+   * Reads and surgically deletes IdP client access-token claim rows — the compliant path for
+   * locating and removing malformed claims (e.g. an array-semantic claim stored as a bare string,
+   * which breaks token deserialization for the whole client). `list` resolves the internal
+   * oidc_clients.id the claims table keys on, or scans one claim_name tenant-wide; `delete` is
+   * scoped to one public client_id + claim_name plus optional equality qualifiers, answers the
+   * exact rows it removed, and refuses to report success on an empty match.
+   */
+  private async idpClientClaims(ctx: Ctx, args: Args): Promise<Outcome> {
+    const action = args.action;
+    if (action !== 'list' && action !== 'delete') throw invalid('action must be "list" or "delete"');
+    const d1 = this.d1(ctx);
+    const tenantId = ctx.cfg.d1!.tenantId;
+    const byName = args.client_name !== undefined;
+    const byId = args.client_id !== undefined;
+    if (byName && byId) throw invalid('pass at most one of client_name or client_id');
+    const name = args.claim_name === undefined ? undefined : claimName(args.claim_name);
+    const qualifiers = claimQualifiers(args);
+
+    if (action === 'list') {
+      if (!byName && !byId && name === undefined) {
+        throw invalid('list needs a client (client_id or client_name), a claim_name to scan for, or both');
+      }
+      if (!byName && !byId) {
+        const result = await scanClaimsByName(d1, tenantId, name!, qualifiers);
+        return {
+          value: result,
+          audit: { action: 'ops_call', evidence: `ops_idp_client_claims list claim_name=${name} → ${result.claims.length} 行` },
+        };
+      }
+      const key = byName ? { clientName: spaClientName(args.client_name) } : { clientId: clientId(args.client_id) };
+      const client = await resolveClient(d1, tenantId, key);
+      if (!client) {
+        throw new CompanyError('not_found', `no IdP client registered for ${'clientName' in key ? `client_name ${key.clientName}` : `client_id ${key.clientId}`}`);
+      }
+      const result = await listClientClaims(d1, tenantId, client, name, qualifiers);
+      return {
+        value: { clientId: client.clientId, clientName: client.clientName, ...result },
+        audit: { action: 'ops_call', evidence: `ops_idp_client_claims list ${client.clientName} → ${result.claims.length} 行` },
+      };
+    }
+
+    if (!byId) throw invalid('delete requires the public client_id (resolve it with a list call first)');
+    if (name === undefined) throw invalid('delete requires claim_name');
+    const publicId = clientId(args.client_id);
+    const client = await resolveClient(d1, tenantId, { clientId: publicId });
+    if (!client) throw new CompanyError('not_found', `no IdP client registered for client_id ${publicId}`);
+    const rows = await deleteClientClaims(d1, tenantId, client, name, qualifiers);
+    if (!rows.length) {
+      throw new CompanyError('not_found', `no claim rows matched client ${publicId} claim_name ${name}`);
+    }
+    const qualifierText = describeQualifiers(qualifiers);
+    return {
+      value: { deleted: rows.length, rows },
+      audit: {
+        action: 'ops_idp_claims_delete',
+        evidence: `ops_idp_client_claims delete ${client.clientName}(${client.clientId})/${name}${qualifierText ? ` where ${qualifierText}` : ''} → ${rows.length} 行`,
       },
     };
   }

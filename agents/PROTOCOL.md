@@ -64,6 +64,7 @@
 | `ops_browser_login` | `session`, `spaceId`, `page?` | 把会话注入你的 ego-browser 任务空间（`page` 缺省 `p1`），浏览器里直接是已登录状态，不用输入密码 |
 | `ops_logout` | `session` | 关闭会话 |
 | `ops_idp_client_register` | `client_name`, `redirect_uris`, `access_token_audience` | 在 IdP 登记一个公开 SPA client（Authorization Code+PKCE、无 secret、`consent_policy=skip`）；redirect 与 audience 限产品域名下的 https 地址；同名幂等，只回公开 `clientId` |
+| `ops_idp_client_claims` | `action`, `client_id`/`client_name`, `claim_name`, 可选 `source_type`/`fixed_value`/`user_field`/`hook_field` 等值限定词 | 读/删 IdP client 的 access_token claim 行（修畸形 claim 的合规通道）：`action:"list"` 传 client_id 或 client_name 列该 client 全部 claim（可再带 claim_name/限定词收窄），或只传 claim_name 做全 tenant 扫描定位畸形行；`action:"delete"` 必传 `client_id`+`claim_name`，限定词做精确删除，回 `{deleted, rows}`，命中 0 行报 `not_found` |
 | `ops_invitation_issue` | `email`, `displayName`, `workspaceSlug`, `aiAllowance`, `reason`, `idempotencyKey`, `resend?` | 运营代办邀请开通（IdP 用户 + workspace bootstrap + 免费权益 + AI 额度），同幂等键重放安全；`resend:true` + 同一 `idempotencyKey` 为断链/过期重签发。一次性激活链接不回显——写老板本机 `handoff/invite-<key>.txt`（0600）由老板转交 |
 
 规则：

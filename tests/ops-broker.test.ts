@@ -46,8 +46,8 @@ function expectNoLeaks(r: Rig, extra: string[] = []) {
 describe('ops gate', () => {
   test('ops tools are enumerated (proof tools exercised by independent fork suite)', () => {
     expect([...OPS_TOOLS].sort()).toEqual([
-      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_info',
-      'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
+      'ops_account_ensure', 'ops_browser_login', 'ops_health', 'ops_idp_admin_request', 'ops_idp_client_claims',
+      'ops_idp_client_info', 'ops_idp_client_register', 'ops_idp_principal_list', 'ops_idp_principal_mint', 'ops_idp_principal_revoke',
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
       'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
@@ -1069,6 +1069,121 @@ describe('ops_idp_client_info', () => {
   test('without an IdP database configured the tool reports not_configured', async () => {
     const r = rig({ ...opsPatch, d1: undefined });
     expect((await failure(call(r, 'ops_idp_client_info', { client_name: 'sck-ops-console' }))).code).toBe('not_configured');
+  });
+});
+
+describe('ops_idp_client_claims', () => {
+  /** One client carrying three claim rows, incl. an array-semantic claim stored as JSON text. */
+  const seedClaims = (r: Rig, clientId = OPS_CLIENT, clientName = 'sck-ops-console') => {
+    r.world.seedOidcClient({ clientId, clientName });
+    r.world.seedClientClaim({ clientId, claimName: 'dept', sourceType: 'user_field', userField: 'department' });
+    r.world.seedClientClaim({ clientId, claimName: 'roles', sourceType: 'fixed', fixedValue: '["owner"]' });
+    r.world.seedClientClaim({ clientId, claimName: 'tier', sourceType: 'fixed', fixedValue: 'pro' });
+  };
+  const claimRow = (clientId: string, clientName: string, over: Record<string, unknown>) => ({
+    clientId, clientName, sourceType: 'fixed', fixedValue: null, userField: null, hookField: null, ...over,
+  });
+
+  test('list resolves the internal client id and returns only claim columns', async () => {
+    const r = rig();
+    seedClaims(r);
+    const res = await call(r, 'ops_idp_client_claims', { action: 'list', client_id: OPS_CLIENT });
+    expect(res).toEqual({
+      clientId: OPS_CLIENT, clientName: 'sck-ops-console', truncated: false,
+      claims: [
+        claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'dept', sourceType: 'user_field', userField: 'department' }),
+        claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'roles', fixedValue: '["owner"]' }),
+        claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'tier', fixedValue: 'pro' }),
+      ],
+    });
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_call' });
+    expectNoLeaks(r);
+  });
+
+  test('list by client_name can narrow to a single claim_name and qualifiers', async () => {
+    const r = rig();
+    seedClaims(r);
+    const one = await call(r, 'ops_idp_client_claims', { action: 'list', client_name: 'sck-ops-console', claim_name: 'roles' });
+    expect(one.claims).toEqual([claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'roles', fixedValue: '["owner"]' })]);
+    // A qualifier must match the stored text exactly; IS-style semantics let null pin NULL columns.
+    const hit = await call(r, 'ops_idp_client_claims', { action: 'list', client_name: 'sck-ops-console', claim_name: 'roles', fixed_value: '["owner"]', user_field: null });
+    expect(hit.claims).toHaveLength(1);
+    const miss = await call(r, 'ops_idp_client_claims', { action: 'list', client_name: 'sck-ops-console', claim_name: 'roles', fixed_value: 'owner' });
+    expect(miss.claims).toHaveLength(0);
+  });
+
+  test('list by claim_name alone scans every client in the tenant', async () => {
+    const r = rig();
+    seedClaims(r);
+    r.world.seedOidcClient({ clientId: 'ck-customer-app', clientName: 'ck-customer-app' });
+    r.world.seedClientClaim({ clientId: 'ck-customer-app', claimName: 'roles', sourceType: 'fixed', fixedValue: 'owner' }); // malformed: bare string
+    r.world.seedClientClaim({ clientId: 'ck-customer-app', claimName: 'tier', sourceType: 'fixed', fixedValue: 'free' });
+    const all = await call(r, 'ops_idp_client_claims', { action: 'list', claim_name: 'roles' });
+    expect(all.claims).toEqual([
+      claimRow('ck-customer-app', 'ck-customer-app', { claimName: 'roles', fixedValue: 'owner' }),
+      claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'roles', fixedValue: '["owner"]' }),
+    ]);
+    // Qualifiers pin the scan to exactly the malformed rows.
+    const malformed = await call(r, 'ops_idp_client_claims', { action: 'list', claim_name: 'roles', fixed_value: 'owner' });
+    expect(malformed.claims).toEqual([claimRow('ck-customer-app', 'ck-customer-app', { claimName: 'roles', fixedValue: 'owner' })]);
+    expectNoLeaks(r);
+  });
+
+  test('delete removes exactly the qualified rows and reports them', async () => {
+    const r = rig();
+    seedClaims(r);
+    r.world.seedOidcClient({ clientId: 'other-client', clientName: 'other-client' });
+    r.world.seedClientClaim({ clientId: 'other-client', claimName: 'roles', sourceType: 'fixed', fixedValue: 'owner' });
+    const res = await call(r, 'ops_idp_client_claims', {
+      action: 'delete', client_id: OPS_CLIENT, claim_name: 'roles', source_type: 'fixed', fixed_value: '["owner"]',
+    });
+    expect(res).toEqual({
+      deleted: 1,
+      rows: [claimRow(OPS_CLIENT, 'sck-ops-console', { claimName: 'roles', fixedValue: '["owner"]' })],
+    });
+    // The other client's same-named claim and this client's other claims survive.
+    expect(r.world.clientClaims()).toHaveLength(3);
+    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_idp_claims_delete' });
+    expect(r.company.audits.at(-1)!.evidence).toContain('sck-ops-console');
+    expect(r.company.audits.at(-1)!.evidence).toContain('roles');
+    expectNoLeaks(r);
+  });
+
+  test('delete without qualifiers removes the claim row; an empty match is not_found, not silent', async () => {
+    const r = rig();
+    seedClaims(r);
+    const res = await call(r, 'ops_idp_client_claims', { action: 'delete', client_id: OPS_CLIENT, claim_name: 'tier' });
+    expect(res.deleted).toBe(1);
+    expect((await failure(call(r, 'ops_idp_client_claims', { action: 'delete', client_id: OPS_CLIENT, claim_name: 'tier' }))).code).toBe('not_found');
+    expect((await failure(call(r, 'ops_idp_client_claims', { action: 'delete', client_id: OPS_CLIENT, claim_name: 'roles', fixed_value: 'nope' }))).code).toBe('not_found');
+    expect((await failure(call(r, 'ops_idp_client_claims', { action: 'delete', client_id: 'ghost-client', claim_name: 'roles' }))).code).toBe('not_found');
+    expect(r.world.clientClaims()).toHaveLength(2);
+  });
+
+  test('bad arguments are refused before the database is touched', async () => {
+    const r = rig();
+    seedClaims(r);
+    const sqlCalls = r.world.sql.length;
+    for (const args of [
+      {},
+      { action: 'peek' },
+      { action: 'list' },
+      { action: 'list', client_id: 'a', client_name: 'b' },
+      { action: 'list', client_id: 'x;drop' },
+      { action: 'list', claim_name: 'bad name!' },
+      { action: 'list', claim_name: 'roles', source_type: 'weird' },
+      { action: 'delete', client_name: 'sck-ops-console', claim_name: 'roles' },
+      { action: 'delete', client_id: OPS_CLIENT },
+    ]) {
+      expect((await failure(call(r, 'ops_idp_client_claims', args))).code, JSON.stringify(args)).toBe('invalid');
+    }
+    expect(r.world.sql).toHaveLength(sqlCalls);
+    expect((await failure(call(r, 'ops_idp_client_claims', { action: 'list', client_name: 'ghost-client' }))).code).toBe('not_found');
+  });
+
+  test('without an IdP database configured the tool reports not_configured', async () => {
+    const r = rig({ d1: undefined });
+    expect((await failure(call(r, 'ops_idp_client_claims', { action: 'list', claim_name: 'roles' }))).code).toBe('not_configured');
   });
 });
 
