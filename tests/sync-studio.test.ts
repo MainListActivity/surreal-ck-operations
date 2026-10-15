@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CompanyError } from '../src/core-errors.ts';
@@ -920,5 +920,19 @@ describe('R3: evidence dirs anchor to the canonical root; symlinks never widen t
     const res = await call(s, 'sync_estimate', { durationSeconds: 8 }) as any;
     expect(res.estimatedGenerationCostUsd).toBe(0.5);
     expect(existsSync(join(root, 'task-2', 'sync', 'ledger.jsonl'))).toBe(false);
+  });
+
+  test('the evidence mirror never appends through a planted ledger.jsonl file symlink', async () => {
+    const s = studio();
+    await seedAssets(s); // task-1/sync is a real dir with a real ledger so far
+    const foreignLedger = join(root, 'task-2', 'sync', 'ledger.jsonl');
+    mkdirSync(join(root, 'task-2', 'sync'), { recursive: true });
+    writeFileSync(foreignLedger, 'FOREIGN-LINE\n');
+    rmSync(join(root, 'task-1', 'sync', 'ledger.jsonl'));
+    symlinkSync(foreignLedger, join(root, 'task-1', 'sync', 'ledger.jsonl'));
+    const res = await call(s, 'sync_estimate', { durationSeconds: 8 }) as any;
+    expect(res.estimatedGenerationCostUsd).toBe(0.5); // the call itself still succeeds
+    expect(readFileSync(foreignLedger, 'utf8')).toBe('FOREIGN-LINE\n'); // foreign ledger untouched
+    expect(lstatSync(join(root, 'task-1', 'sync', 'ledger.jsonl')).isSymbolicLink()).toBe(true); // planted link preserved
   });
 });

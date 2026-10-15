@@ -8,7 +8,7 @@
 // ledger under evidence is a review mirror and never participates in authorization.
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
@@ -336,7 +336,15 @@ export class SyncStudio {
   private mirror(scope: OpsScope, entry: Args): void {
     try {
       const dir = this.writeDir(scope, ['sync']);
-      appendFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify({ ts: iso(this.now()), ...entry })}\n`, { mode: 0o600 });
+      // The directory chain is clean, but the ledger FILE itself can be a planted symlink (or a
+      // fifo/socket) inside a legitimate sync/ dir — appendFileSync would follow it across task
+      // boundaries. lstat first and skip non-regular/symlink targets; O_NOFOLLOW on the append
+      // closes the check→open swap window atomically. Either way the mirror just stays silent.
+      const path = join(dir, 'ledger.jsonl');
+      const st = (() => { try { return lstatSync(path); } catch { return undefined; } })();
+      if (st !== undefined && (!st.isFile() || st.isSymbolicLink())) return;
+      const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+      try { writeSync(fd, `${JSON.stringify({ ts: iso(this.now()), ...entry })}\n`); } finally { closeSync(fd); }
     } catch { /* the ledger is a review mirror; it must never fail a call */ }
   }
 
