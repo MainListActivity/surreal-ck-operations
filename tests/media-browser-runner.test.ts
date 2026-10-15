@@ -65,8 +65,10 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     const r = await p;
     expect(r.ok).toBe(false);
     expect(r.code).toBe('failed');
-    expect(r.message).toContain('进程异常结束(exit=1)');
-    expect(r.message).toContain('emit-then-crash'); // marker kept as diagnostic in the message tail
+    expect(r.message).toContain('进程异常结束(exit=1');
+    expect(r.message).toContain('已产出结果被丢弃'); // presence flag only
+    expect(r.message).not.toContain('emit-then-crash'); // marker payload never echoed
+    expect(r.message).not.toContain('post-marker-crash'); // raw stderr never echoed
   });
 
   test('T5: our SIGKILL settles as timeout; an earlier marker does not count', async () => {
@@ -78,7 +80,7 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     child.emit('close', null, 'SIGKILL');
     const r = await p;
     expect(r.ok).toBe(false);
-    expect(r.message).toBe('脚本超时已终止');
+    expect(r.message).toContain('脚本超时已终止');
   });
 
   test('T6: no marker + exit 1 (probe P3 signature) is an abnormal exit with the stderr tail', async () => {
@@ -88,8 +90,8 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     child.emit('close', 1, null);
     const r = await p;
     expect(r.ok).toBe(false);
-    expect(r.message).toContain('进程异常结束(exit=1)');
-    expect(r.message).toContain('probe-crash');
+    expect(r.message).toContain('进程异常结束(exit=1');
+    expect(r.message).not.toContain('probe-crash'); // stderr content must not leak
   });
 
   test('T6b: no marker + clean exit 0 is 脚本无结果输出', async () => {
@@ -100,7 +102,7 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     const r = await p;
     expect(r.ok).toBe(false);
     expect(r.message).toContain('脚本无结果输出');
-    expect(r.message).toContain('some diagnostic noise');
+    expect(r.message).not.toContain('some diagnostic noise'); // stderr content must not leak
   });
 
   test('T7: spawn error settles once; a later close cannot override', async () => {
@@ -124,8 +126,16 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     expect(child.kills).toHaveLength(0);
   });
 
-  test('T9: bad JSON / non-object / missing ok all fail closed as 结果解析失败', async () => {
-    for (const line of ['__RESULT__not-json', '__RESULT__123', '__RESULT__[1,2]', '__RESULT__{"code":"x"}', '__RESULT__{"ok":"yes"}']) {
+  test('T9: bad JSON / non-object / missing ok / wrong-typed fields all fail closed as 结果解析失败', async () => {
+    for (const line of [
+      '__RESULT__not-json', '__RESULT__123', '__RESULT__[1,2]', '__RESULT__{"code":"x"}', '__RESULT__{"ok":"yes"}',
+      // QA return R1: supported fields with wrong types must not pass as success or error
+      '__RESULT__{"ok":true,"file":17,"bytes":"bad","message":{},"url":[],"code":42}',
+      '__RESULT__{"ok":false,"code":42}',
+      '__RESULT__{"ok":true,"notebooks":{"id":"x"}}',
+      '__RESULT__{"ok":true,"notebook":[1,2]}',
+      '__RESULT__{"ok":true,"extra":{"nested":"object"}}',
+    ]) {
       const child = new FakeChild();
       const p = run(child);
       child.stderr.emit('data', `${line}\n`);
@@ -147,6 +157,53 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     expect(r.message).toContain('需要重新登录');
   });
 
+  test('R1: all supported RunResult field shapes pass through unchanged', async () => {
+    for (const [line, check] of [
+      ['__RESULT__{"ok":true,"file":"/x.png","bytes":2,"via":"canvas"}', (r: { file?: string; via?: string }) => r.file === '/x.png' && r.via === 'canvas'],
+      ['__RESULT__{"ok":true,"notebook":{"id":"n1","title":"梦痕纪元"},"url":"https://notebook.google.com/notebook/n1"}', (r: { url?: string }) => r.url!.includes('n1')],
+      ['__RESULT__{"ok":true,"notebooks":[{"id":"a"}]}', (r: { notebooks?: unknown }) => Array.isArray(r.notebooks) && r.notebooks.length === 1],
+      ['__RESULT__{"ok":true,"text":"章节正文……","notebook":"nb-id"}', (r: { text?: string }) => r.text === '章节正文……'],
+    ] as const) {
+      const child = new FakeChild();
+      const p = run(child);
+      child.stderr.emit('data', `${line}\n`);
+      child.emit('close', 0, null);
+      const r = await p;
+      expect(r.ok).toBe(true);
+      expect(check(r)).toBe(true);
+    }
+  });
+
+  test('R2: private stderr/marker content never appears in failure messages', async () => {
+    const SECRET = 'PRIVATE-CHAPTER-老板正文-sentinel-7f3a';
+    // abnormal exit with page content + marker on stderr
+    let child = new FakeChild();
+    let p = run(child);
+    child.stderr.emit('data', `page dump ${SECRET}\n__RESULT__{"ok":true,"text":"${SECRET}"}\n`);
+    child.emit('close', 1, null);
+    let r = await p;
+    expect(r.ok).toBe(false);
+    expect(r.message).not.toContain(SECRET);
+    // clean exit with noisy stderr but no marker
+    child = new FakeChild();
+    p = run(child);
+    child.stderr.emit('data', `login wall text ${SECRET}\n`);
+    child.emit('close', 0, null);
+    r = await p;
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('脚本无结果输出');
+    expect(r.message).not.toContain(SECRET);
+    // killed after writing private content
+    child = new FakeChild();
+    p = run(child, 5, 20);
+    child.stderr.emit('data', `${SECRET}\n`);
+    await sleep(80);
+    child.emit('close', null, 'SIGKILL');
+    r = await p;
+    expect(r.ok).toBe(false);
+    expect(r.message).not.toContain(SECRET);
+  });
+
   test('fragmented marker chunks and mid-line lookalikes: only line-start markers count', async () => {
     const child = new FakeChild();
     const p = run(child);
@@ -165,7 +222,7 @@ describe('runWithSpawn: ego-browser stream protocol', () => {
     child.emit('close', null, 'SIGTERM');
     const r = await p;
     expect(r.ok).toBe(false);
-    expect(r.message).toContain('进程异常结束(signal=SIGTERM)');
+    expect(r.message).toContain('进程异常结束(signal=SIGTERM');
   });
 });
 
