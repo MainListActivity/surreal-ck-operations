@@ -1,13 +1,14 @@
 // Sync-3 video media studio (sync.so). Employees hand this trusted code a video+audio pair from
 // their task evidence inbox; it uploads through sck-vault (the only key holder), quotes without
-// generating, and submits lip-sync jobs only under an owner spend-approval artifact — never an
-// env flag. Every call is lease- and role-gated, capped per project per day, audited, and writes
+// generating, and submits lip-sync jobs only under an owner paid spend-approval artifact — never
+// an env flag, and never a free-trial artifact: unverified free quotas are not spendable, so this
+// build keeps free-trial generation closed. Every call is lease- and role-gated, capped per project per day, audited, and writes
 // only into the task's own sync/ evidence folder. Authoritative bindings, spend approvals and the
 // submit state machine live in <serviceHome>/private/sync/ (0600, employees cannot write); the
 // ledger under evidence is a review mirror and never participates in authorization.
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
@@ -55,13 +56,13 @@ const USAGE: Record<Exclude<SyncTool, 'sync_info'>, string> = {
   sync_errors: '{} 供应商机器可读错误目录（只读探测）',
   sync_upload: UPLOAD_USAGE,
   sync_estimate: '{"durationSeconds","fps"?} 试算 或 {"videoAssetId","audioAssetId"?} 按已注册资产实测报价；零生成',
-  sync_generate: '{"videoAssetId","audioAssetId","outputFileName?":"xxx.mp4"} 提交 sync-3 口型任务：需老板授权工件，model/sync_mode=silence/同长音画全部锁死，返回 actionId 与幂等键',
+  sync_generate: '{"videoAssetId","audioAssetId","outputFileName?":"xxx.mp4"} 提交 sync-3 口型任务：需老板 paid 授权工件（free-trial 本版不放行），model/sync_mode=silence/同长音画全部锁死；返回 actionId 与幂等键，同音画同参数重复调用归并同一动作',
   sync_status: '{"actionId"|"generationId","wait?","timeout?"(1-10),"includeProgress?"} 查询本任务已提交动作；wait 与 includeProgress 互斥',
   sync_download: '{"actionId"|"generationId","file":"xxx.mp4"} 下载已完成结果到本任务 sync/ 目录',
 };
 const TIPS = [
   '输入先放到 <任务证据目录>/sync/in/，只接受 .mp4/.wav；上传按 SHA256 去重，同账户同项目命中直接复用 assetId',
-  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的授权工件或等效可核定免费资格才放行；env 无法放行',
+  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的 paid 授权工件放行；free-trial 工件本版不放行（真实免费资格未核定），env/声明也无法放行',
   '上传、estimate、status、download 等零费用检查在无密钥时报 not_configured，如实上报不要绕过',
   'sync_status 的 wait 与 includeProgress 官方互斥，一次只能用一个',
   '所有查询/下载只认本任务台账绑定的 actionId/generationId，跨任务探测一律 forbidden',
@@ -299,26 +300,57 @@ export class SyncStudio {
   }
 
   private outDir(scope: OpsScope): string { return join(this.deps.evidenceRoot, scope.taskId, 'sync'); }
-  private ledger(scope: OpsScope): string { return join(this.outDir(scope), 'ledger.jsonl'); }
+
+  /** Trust anchor: the realpath of evidenceRoot — never a symlink-resolved task directory. */
+  private evidenceBase(): string {
+    try { return realpathSync(this.deps.evidenceRoot); } catch { throw invalid('证据根目录不可用'); }
+  }
+
+  private canonicalDir(scope: OpsScope, sub: readonly string[]): string {
+    if (!ID.test(scope.taskId)) throw invalid('taskId 异常'); // defense in depth: taskId comes from the lease
+    return join(this.evidenceBase(), scope.taskId, ...sub);
+  }
+
+  /**
+   * Resolve a task's sync subdir for writing. Every existing path component is lstat-checked
+   * BEFORE mkdir, so a symlinked ancestor (dangling or not) can never redirect the creation into
+   * a foreign directory; the post-mkdir realpath equality re-checks the check→create window.
+   */
+  private writeDir(scope: OpsScope, sub: readonly string[]): string {
+    const canonical = this.canonicalDir(scope, sub);
+    let cursor = this.evidenceBase();
+    for (const seg of [scope.taskId, ...sub]) {
+      cursor = join(cursor, seg);
+      const st = (() => { try { return lstatSync(cursor); } catch { return undefined; } })();
+      if (st === undefined) continue;
+      if (st.isSymbolicLink()) throw invalid('输出目录路径含符号链接：越界拒绝');
+      if (!st.isDirectory()) throw invalid('输出目录路径被非目录占用');
+    }
+    mkdirSync(canonical, { recursive: true, mode: 0o700 });
+    let real: string;
+    try { real = realpathSync(canonical); } catch { throw invalid('输出目录不可用'); }
+    if (real !== canonical) throw invalid('输出目录被替换为越界目标');
+    return canonical;
+  }
 
   private mirror(scope: OpsScope, entry: Args): void {
     try {
-      const dir = this.outDir(scope);
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      appendFileSync(this.ledger(scope), `${JSON.stringify({ ts: iso(this.now()), ...entry })}\n`, { mode: 0o600 });
+      const dir = this.writeDir(scope, ['sync']);
+      appendFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify({ ts: iso(this.now()), ...entry })}\n`, { mode: 0o600 });
     } catch { /* the ledger is a review mirror; it must never fail a call */ }
   }
 
-  /** Task evidence inbox: only files the current task itself placed under sync/in/ can be uploaded. */
+  /**
+   * Task evidence inbox: only files the current task itself placed under sync/in/ can be uploaded.
+   * The anchor is the canonical evidenceRoot/taskId/sync/in path — if any level (task, sync, in,
+   * or the file itself) is a symlink escaping that prefix, realpath deviates and we refuse.
+   */
   private inboxFile(scope: OpsScope, name: string): { path: string; bytes: Buffer; size: number } {
     if (!FILE.test(name) || !/\.(mp4|wav)$/i.test(name)) throw invalid('file 只能是 sync/in/ 下纯文件名 xxx.mp4 或 xxx.wav');
-    const dir = join(this.outDir(scope), 'in');
-    const path = join(dir, name);
+    const canonical = this.canonicalDir(scope, ['sync', 'in']);
     let resolved: string;
-    try { resolved = realpathSync(path); } catch { throw invalid(`输入文件不存在：sync/in/${name}`); }
-    let root: string;
-    try { root = realpathSync(dir); } catch { throw invalid('输入目录 sync/in/ 不存在'); }
-    if (!resolved.startsWith(root + sep) || !statSync(resolved).isFile()) throw invalid('输入文件越界或不是普通文件');
+    try { resolved = realpathSync(join(canonical, name)); } catch { throw invalid(`输入文件不存在：sync/in/${name}`); }
+    if (!resolved.startsWith(canonical + sep) || !statSync(resolved).isFile()) throw invalid('输入文件越界或不是普通文件');
     const size = statSync(resolved).size;
     if (size <= 0 || size > MAX_UPLOAD_BYTES) throw invalid(`输入文件大小 ${size} 超出上限`);
     return { path: resolved, bytes: readFileSync(resolved), size };
@@ -424,13 +456,23 @@ export class SyncStudio {
       .filter((a): a is Approval => !!a);
   }
 
-  /** Newest structurally-valid approval that binds this scope, this account and has not expired. */
-  private validApproval(scope: OpsScope, keyFp: string, approvals = this.loadApprovals()): Approval | undefined {
+  /** Structurally-valid artifacts that bind this scope, this account and have not expired, newest first. */
+  private boundApprovals(scope: OpsScope, keyFp: string, approvals = this.loadApprovals()): Approval[] {
     const now = this.now();
     return approvals
       .filter(a => a.issuer === 'owner' && a.project === scope.project && a.taskId === scope.taskId &&
         a.accountRef === keyFp && Date.parse(a.issuedAt) <= now && now < Date.parse(a.expiresAt) && a.models.includes(MODEL))
-      .sort((a, b) => Date.parse(b.issuedAt) - Date.parse(a.issuedAt))[0];
+      .sort((a, b) => Date.parse(b.issuedAt) - Date.parse(a.issuedAt));
+  }
+
+  /**
+   * Newest bound approval that can actually open the generate gate. Only `paid` artifacts qualify:
+   * free-trial generation is closed in this build — a free-trial artifact (even one carrying
+   * self-declared freeEvidence) can never satisfy the gate, so every such call deterministically
+   * fails payment_approval_required before any upstream sync_generate.
+   */
+  private validApproval(scope: OpsScope, keyFp: string, approvals = this.loadApprovals()): Approval | undefined {
+    return this.boundApprovals(scope, keyFp, approvals).find(a => a.kind === 'paid');
   }
 
   /**
@@ -525,7 +567,8 @@ export class SyncStudio {
       throw error;
     });
     const configured = status?.configured === true;
-    const approval = status?.keyFp ? this.validApproval(scope, status.keyFp) : undefined;
+    const bound = status?.keyFp ? this.boundApprovals(scope, status.keyFp) : [];
+    const approval = bound.find(a => a.kind === 'paid');
     const actions = this.listActions().filter(a => a.taskId === scope.taskId);
     const registry = this.readRegistry();
     let assets = 0;
@@ -555,7 +598,13 @@ export class SyncStudio {
           verdict: 'unproven',
           apiQuotaEndpoint: false,
           accountRef: status?.keyFp ?? null,
-          approval: { present: !!approval, approvalId: approval?.approvalId ?? null },
+          approval: pick({ present: !!approval, approvalId: approval?.approvalId ?? null, kind: approval?.kind }),
+          freeTrial: {
+            supported: false,
+            generation: 'closed',
+            boundArtifacts: bound.filter(a => a.kind === 'free-trial').length,
+            note: '免费资格无官方核定端点；本版 free-trial 工件（含自声明 freeEvidence）一律不放行生成',
+          },
           evidence: {
             source: 'vendor-marketing + authenticated probes + owner-attested approval artifacts',
             marketingFreeTier: { lipSyncPerMonth: 3, sync3PerMonth: 1, sync3MaxSeconds: 15, otherMaxSeconds: 20, noCard: true, watermark: true },
@@ -563,7 +612,7 @@ export class SyncStudio {
             missing: '账户级剩余次数/计划类型——无官方端点，绝不合成',
           },
           validity: '工件有效期见 approvals/<id>.json；marketing 口径随官方页面变动',
-          note: '无工件时 generate 恒拒（payment_approval_required），env 无法放行',
+          note: '无 paid 工件时 generate 恒拒（payment_approval_required）；free-trial 工件与 env/声明一律不放行',
         },
         quotas,
         bindings: { assets, actions: actions.length },
@@ -575,16 +624,24 @@ export class SyncStudio {
 
   private async models(scope: OpsScope): Promise<Out> {
     await this.keyFp();
+    await this.capCheck(scope, 'read');
     const res = await this.json<unknown>('sync_models', {});
     const list = Array.isArray(res) ? res : record(res).models;
-    return { value: { models: Array.isArray(list) ? list : res } };
+    return {
+      value: { models: Array.isArray(list) ? list : res },
+      audit: { action: 'ops_sync_read', evidence: 'models catalog probe' },
+    };
   }
 
   private async errors(scope: OpsScope): Promise<Out> {
     await this.keyFp();
+    await this.capCheck(scope, 'read');
     const res = await this.json<unknown>('sync_errors', {});
     const list = Array.isArray(res) ? res : record(res).errors;
-    return { value: { errors: Array.isArray(list) ? list : res } };
+    return {
+      value: { errors: Array.isArray(list) ? list : res },
+      audit: { action: 'ops_sync_read', evidence: 'errors catalog probe' },
+    };
   }
 
   private async capCheck(scope: OpsScope, kind: keyof typeof DEFAULT_LIMITS): Promise<void> {
@@ -733,19 +790,73 @@ export class SyncStudio {
     };
   }
 
+  /**
+   * Logical generation identity: same task/project authorization domain, same account fingerprint,
+   * same video+audio content SHA and the same normalized options → the same ledger action.
+   * outputFileName and re-uploaded assetIds are deliberately NOT part of it.
+   */
+  private findLogicalAction(scope: OpsScope, keyFp: string, requestDigest: string, optionsJson: string, video: AssetEntry, audio: AssetEntry): SyncAction | undefined {
+    return this.listActions().find(a => a.taskId === scope.taskId && a.project === scope.project &&
+      a.accountRef === keyFp && a.state !== 'void' &&
+      (a.requestDigest === requestDigest ||
+        (a.inputs?.videoSha256 === video.sha256 && a.inputs?.audioSha256 === audio.sha256 &&
+          JSON.stringify(record(a.requestBody).options ?? {}) === optionsJson)));
+  }
+
+  /**
+   * Fold a repeat call into the existing ledger action: no new action, no new key, no second
+   * reservation. `unknown` gets the bounded ORIGINAL-key/original-payload recheck, nothing else.
+   */
+  private async dedup(scope: OpsScope, found: SyncAction): Promise<Out> {
+    let merged = found;
+    if (merged.state === 'unknown' && !merged.generationId) {
+      await this.reconcileUnknown(merged);
+      merged = this.readJson<SyncAction>(join(this.dirs.actions, `${merged.actionId}.json`)) ?? merged;
+    }
+    this.mirror(scope, { op: 'generate-dedup', actionId: merged.actionId, generationId: merged.generationId, state: merged.state, idempotencyKey: merged.idempotencyKey });
+    return {
+      value: pick({
+        actionId: merged.actionId, generationId: merged.generationId, status: merged.state, deduped: true,
+        error: ['rejected', 'void', 'failed'].includes(merged.state) ? merged.history.at(-1)?.note : undefined,
+        idempotencyKey: merged.idempotencyKey,
+        estimate: {
+          estimatedFrameCount: merged.estimate?.frameCount, estimatedGenerationCostUsd: merged.estimate?.usd,
+          estimatedCredits: merged.estimate?.credits ?? null,
+          basis: { durationSeconds: merged.inputs?.billableSeconds, fps: merged.inputs?.fps, source: 'registry' },
+        },
+      }),
+      audit: { action: 'ops_sync_generate', evidence: `actionId=${merged.actionId} dedup=1 state=${merged.state} key=${merged.idempotencyKey.slice(0, 24)}` },
+    };
+  }
+
   private async generate(scope: OpsScope, args: Args): Promise<Out> {
     const videoAssetId = str(args, 'videoAssetId', 1, 128);
     const audioAssetId = str(args, 'audioAssetId', 1, 128);
+    // outputFileName expresses submit intent only; it never participates in the supplier-visible
+    // generation identity, so a rename can never spawn a second send. Download names come from
+    // sync_download's own `file` argument.
     const outputFileName = args.outputFileName === undefined ? 'result.mp4' : str(args, 'outputFileName', 1, 121);
     if (!FILE.test(outputFileName) || !outputFileName.endsWith('.mp4')) throw invalid('outputFileName 只能是纯文件名 xxx.mp4');
     const keyFp = await this.keyFp();
 
-    // Gate 2 — consume rights (authoritative registry only; the evidence ledger is never consulted).
-    const [video, audio] = await this.withLock(() => [
-      this.requireAsset(scope, keyFp, videoAssetId),
-      this.requireAsset(scope, keyFp, audioAssetId),
-    ] as const);
-    if (video.type !== 'VIDEO' || audio.type !== 'AUDIO') throw invalid('输入类型固定为一 video + 一 audio');
+    // Gate 2 — consume rights (authoritative registry only; the evidence ledger is never consulted),
+    // plus the first logical-identity lookup inside the same lock acquisition.
+    const prepared = await this.withLock(() => {
+      const video = this.requireAsset(scope, keyFp, videoAssetId);
+      const audio = this.requireAsset(scope, keyFp, audioAssetId);
+      if (video.type !== 'VIDEO' || audio.type !== 'AUDIO') throw invalid('输入类型固定为一 video + 一 audio');
+      const requestBody = {
+        model: MODEL,
+        input: [{ type: 'video', assetId: video.assetId }, { type: 'audio', assetId: audio.assetId }],
+        options: { sync_mode: 'silence' },
+      };
+      const requestDigest = sha256hex(JSON.stringify(requestBody));
+      const optionsJson = JSON.stringify(requestBody.options);
+      const existing = this.findLogicalAction(scope, keyFp, requestDigest, optionsJson, video, audio);
+      return { video, audio, requestBody, requestDigest, optionsJson, existing };
+    });
+    const { video, audio, requestBody, requestDigest, optionsJson } = prepared;
+    if (prepared.existing) return this.dedup(scope, prepared.existing);
 
     // Gate 3 — measured media consistency; billable duration covers silence extending the longer input.
     const tolerance = 1 / (video.media.fps ?? 30) + 1 / (audio.media.sampleRate ?? 48_000);
@@ -756,28 +867,31 @@ export class SyncStudio {
     const fps = video.media.fps ?? 30;
     if (billable > this.maxJobSeconds) throw invalid(`计费时长 ${billable.toFixed(2)}s 超过 SCK_SYNC_MAX_JOB_SECONDS=${this.maxJobSeconds}s`);
 
-    // Gate 4 — owner spend-approval artifact; nothing else can ever open this gate.
+    // Gate 4 — owner paid spend-approval artifact; nothing else can ever open this gate.
     const approval = this.validApproval(scope, keyFp);
-    if (!approval) throw approvalRequired();
+    if (!approval) {
+      const freeOnly = this.boundApprovals(scope, keyFp).length > 0;
+      throw approvalRequired(freeOnly
+        ? 'free-trial 授权工件本版不放行生成（免费资格未经官方核定端点证明）；需要老板 paid 工件'
+        : undefined);
+    }
     if (billable > approval.maxJobSeconds) throw approvalRequired(`计费时长 ${billable.toFixed(2)}s 超过授权单任务上限 ${approval.maxJobSeconds}s`);
 
     // Gate 5 — real upstream quote on measured inputs, never on employee-declared numbers.
     const quote = await this.quote(billable, fps);
-    if (approval.kind === 'paid' && quote.usd > approval.maxUsdPerJob) {
+    if (quote.usd > approval.maxUsdPerJob) {
       throw approvalRequired(`报价 $${quote.usd.toFixed(4)} 超过授权单任务上限 $${approval.maxUsdPerJob}`);
     }
 
-    const requestBody = {
-      model: MODEL,
-      input: [{ type: 'video', assetId: video.assetId }, { type: 'audio', assetId: audio.assetId }],
-      options: { sync_mode: 'silence' },
-    };
-    const idempotencyKey = `sck-${sha256hex(`v1|${MODEL}|${video.assetId}|${audio.assetId}|${JSON.stringify(requestBody.options)}|${outputFileName}`)}`;
-    const requestDigest = sha256hex(JSON.stringify(requestBody));
+    // v2 key = trusted account ref + task/project authorization domain + model + content SHAs +
+    // normalized options. The supplier sees one identity per logical request, so a renamed output
+    // or a re-registered assetId can never mint a second key.
+    const idempotencyKey = `sck-${sha256hex(`v2|${keyFp}|${scope.project}|${scope.taskId}|${MODEL}|${video.sha256}|${audio.sha256}|${optionsJson}`)}`;
     const actionId = `act-${randomUUID()}`;
 
-    // Gate 6 — single critical section (GM ruling): reconcile → re-validate approval → reserve
-    // budget → persist reserved → persist sending+sendIntent, all under one flock acquisition.
+    // Gate 6 — single critical section (GM ruling): reconcile → dedup re-check → re-validate
+    // approval → reserve budget → persist reserved → persist sending+sendIntent, all under one
+    // flock acquisition. Concurrent identical calls serialize here and converge on one action.
     const action: SyncAction = {
       actionId, taskId: scope.taskId, project: scope.project, accountRef: keyFp, approvalId: approval.approvalId,
       idempotencyKey, requestDigest, requestBody,
@@ -789,14 +903,16 @@ export class SyncStudio {
       state: 'reserved', reservedUsd: quote.usd, reservedCount: 1,
       history: [{ state: 'reserved', at: iso(this.now()), note: '预算预留（锁内）' }],
     };
+    let folded: SyncAction | undefined;
     await this.withLock(() => {
+      const existing = this.findLogicalAction(scope, keyFp, requestDigest, optionsJson, video, audio);
+      if (existing) { folded = existing; return; }
       const live = this.validApproval(scope, keyFp);
       if (!live || live.approvalId !== approval.approvalId) throw approvalRequired('授权工件在预留前失效');
       const budget = this.readBudget();
       const used = Object.values(budget.byAction).filter(b => b.approvalId === approval.approvalId)
         .reduce((sum, b) => ({ count: sum.count + b.count, usd: sum.usd + b.usd }), { count: 0, usd: 0 });
-      if (used.count + 1 > approval.maxGenerations ||
-          (approval.kind === 'paid' && used.usd + quote.usd > approval.maxUsdTotal)) {
+      if (used.count + 1 > approval.maxGenerations || used.usd + quote.usd > approval.maxUsdTotal) {
         throw approvalRequired('授权次数或金额已用尽');
       }
       budget.byAction[actionId] = { count: 1, usd: quote.usd, approvalId: approval.approvalId };
@@ -808,6 +924,7 @@ export class SyncStudio {
       action.history.push({ state: 'sending', at: iso(this.now()), note: '发送意图持久化（同锁），此后可能已发送' });
       this.writeJson(join(this.dirs.actions, `${actionId}.json`), action);
     });
+    if (folded) return this.dedup(scope, folded);
 
     // Gate 7 — the only upstream generate call in this code path, outside the lock.
     let reply: VaultReply | undefined;
@@ -973,10 +1090,11 @@ export class SyncStudio {
       action = this.readJson<SyncAction>(join(this.dirs.actions, `${action.actionId}.json`)) ?? action;
       if (action.state !== 'completed') throw new CompanyError('conflict', `动作状态 ${action.state}，结果不可下载（generation_not_ready）`);
     }
+    // Boundary check before asking upstream for anything: a symlinked sync/ dir must never pull a
+    // signed URL, let alone write the foreign target or mirror into it.
+    const dir = this.writeDir(scope, ['sync']);
     const url = (await this.run('sync_download_url', { id: generationId })).body.toString('utf8').trim();
     const bytes = await this.fetchUrl(url, { method: 'GET' });
-    const dir = this.outDir(scope);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const path = join(dir, file);
     const tmp = `${path}.${randomUUID()}.tmp`;
     writeFileSync(tmp, bytes, { mode: 0o600 });

@@ -20,6 +20,7 @@ let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let vaultCalls: VaultCall[] = [];
 let fetches: Array<{ url: string; method: string }> = [];
 let syncConfigured = true;
+let accountFp = KEY_FP;
 let clock = 1_700_000_000_000;
 let reply: (call: VaultCall) => VaultReply = () => json({});
 let seq = 0;
@@ -91,7 +92,7 @@ const wav = (seconds: number, rate = 48_000): Buffer => {
 // ---------- mocks ----------
 
 const vault: MediaVault = {
-  status: async () => ({ configured: true, providers: { sync: { configured: syncConfigured, keyFp: syncConfigured ? KEY_FP : undefined } } }),
+  status: async () => ({ configured: true, providers: { sync: { configured: syncConfigured, keyFp: syncConfigured ? accountFp : undefined } } }),
   call: async (kind, params) => {
     const call = { kind, params };
     vaultCalls.push(call);
@@ -165,6 +166,7 @@ beforeEach(() => {
   vaultCalls = [];
   fetches = [];
   syncConfigured = true;
+  accountFp = KEY_FP;
   seq = 0;
   reply = call => {
     switch (call.kind) {
@@ -417,7 +419,7 @@ describe('sync_generate submit path', () => {
     expect(audits.at(-1)?.action).toBe('ops_sync_generate');
   });
 
-  test('maxGenerations=1 lets exactly one of two concurrent submits through; both resolve deterministically', async () => {
+  test('maxGenerations=1 concurrent identical submits converge on one action and one upstream send', async () => {
     const s = studio();
     const assets = await seedAssets(s);
     approval();
@@ -426,13 +428,30 @@ describe('sync_generate submit path', () => {
       call(s, 'sync_generate', args).then(v => ({ ok: v })).catch(e => ({ err: e as CompanyError })),
       call(s, 'sync_generate', args).then(v => ({ ok: v })).catch(e => ({ err: e as CompanyError })),
     ]);
-    const accepted = [one, two].filter(r => 'ok' in r);
-    const refused = [one, two].filter(r => 'err' in r && (r.err as CompanyError).code === 'payment_approval_required');
-    expect(accepted.length).toBe(1);
-    expect(refused.length).toBe(1);
-    expect(vaultCalls.filter(c => c.kind === 'sync_generate').length).toBe(1);
-    // A sequential third attempt on the same inputs is also refused: the budget row is the truth.
-    expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
+    // Identical logical request: the second caller folds into the first's action instead of
+    // burning another reservation. One action, one budget row; a same-key recheck may post once
+    // more, but every upstream call must carry the ORIGINAL idempotency key and payload.
+    expect('ok' in one && 'ok' in two).toBe(true);
+    const firstActionId = (one as { ok: any }).ok.actionId;
+    const firstKey = (one as { ok: any }).ok.idempotencyKey;
+    expect((two as { ok: any }).ok.actionId).toBe(firstActionId);
+    const posts = vaultCalls.filter(c => c.kind === 'sync_generate');
+    expect(posts.length).toBeLessThanOrEqual(2);
+    for (const post of posts) expect(post.params.idempotencyKey).toBe(firstKey);
+    expect(Object.keys(readBudget().byAction)).toEqual([firstActionId]);
+    // A sequential retry on the same inputs folds into the same action too, no new reservation.
+    const again = await call(s, 'sync_generate', args) as any;
+    expect(again.actionId).toBe(firstActionId);
+    expect(again.deduped).toBe(true);
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate').length).toBe(posts.length);
+    // A genuinely different request still hits the cap.
+    const v2 = mp4(6);
+    inbox('task-1', 'v2.mp4', v2);
+    const other = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(v2) }) as any;
+    const audio = wav(6);
+    inbox('task-1', 'a2.wav', audio);
+    const a2 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(audio) }) as any;
+    expect((await fail(call(s, 'sync_generate', { videoAssetId: other.assetId, audioAssetId: a2.assetId }))).code).toBe('payment_approval_required');
   });
 
   test('a paid approval refuses when the measured quote exceeds maxUsdPerJob, before submission', async () => {
@@ -669,5 +688,237 @@ describe('supplier errors and redaction', () => {
     inbox('task-1', 'v.mp4', mp4(8));
     expect((await fail(call(studio(), 'sync_upload', { file: 'v.mp4', sha256: sha(mp4(8)) }))).code).toBe('limit_reached');
     expect(vaultCalls).toEqual([]);
+  });
+});
+
+// ---------- release-boundary rework (task aff27795): R1 free-trial closed, R2 SHA-identity dedup, R3 dir anchoring ----------
+
+describe('R1: free-trial generation stays closed', () => {
+  test('a free-trial artifact deterministically refuses before upstream, even with self-declared freeEvidence', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({
+      kind: 'free-trial', maxUsdPerJob: 0, maxUsdTotal: 0,
+      freeEvidence: { source: 'self-declared', observedAt: new Date(clock).toISOString(), freeRemaining: 99, noPaymentSource: true, autoRecharge: false },
+    });
+    const err = await fail(call(s, 'sync_generate', args));
+    expect(err.code).toBe('payment_approval_required');
+    expect(kinds()).not.toContain('sync_generate');
+    const info = await call(s, 'sync_info') as any;
+    expect(info.account.verdict).toBe('unproven');
+    expect(info.account.freeTrial.supported).toBe(false);
+    expect(info.account.freeTrial.boundArtifacts).toBe(1);
+    // A free-trial artifact is not a generation approval: the paid gate reports absent.
+    expect(info.account.approval.present).toBe(false);
+  });
+
+  test('paid approvals still gate generation exactly as before', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 1 });
+    const res = await call(s, 'sync_generate', args) as any;
+    expect(res.status).toBe('accepted');
+    expect(kinds().filter(k => k === 'sync_generate')).toHaveLength(1);
+  });
+});
+
+describe('R2: generation identity is content-anchored, dedup folds repeats into one action', () => {
+  test('same SHAs with a renamed output dedupe to the original action; unknown rechecks the SAME key', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 3 });
+    const original = reply;
+    let attempts = 0;
+    reply = c => {
+      if (c.kind === 'sync_generate' && ++attempts === 1) throw new Error('simulated timeout');
+      return original(c);
+    };
+    const first = await call(s, 'sync_generate', { ...args, outputFileName: 'first.mp4' }) as any;
+    expect(first.status).toBe('unknown');
+    // A fresh studio instance over the same dirs: a restart still finds the same ledger action.
+    const second = await call(studio(), 'sync_generate', { ...args, outputFileName: 'second.mp4' }) as any;
+    expect(second.actionId).toBe(first.actionId);
+    expect(second.idempotencyKey).toBe(first.idempotencyKey);
+    expect(second.deduped).toBe(true);
+    expect(second.status).toBe('accepted'); // the bounded same-key recheck merged the late 201
+    const posts = vaultCalls.filter(c => c.kind === 'sync_generate');
+    expect(posts).toHaveLength(2); // original send + same-key recheck, never a fresh key
+    expect(posts[1].params.idempotencyKey).toBe(first.idempotencyKey);
+    expect(posts[1].params.input).toEqual(posts[0].params.input);
+    expect(Object.keys(readBudget().byAction)).toEqual([first.actionId]);
+    expect(readdirSync(priv('actions')).filter(f => f.endsWith('.json'))).toHaveLength(1);
+  });
+
+  test('the same SHA pair re-registered under a fresh assetId still merges into the original action', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 3 });
+    const first = await call(s, 'sync_generate', args) as any;
+    expect(first.status).toBe('accepted');
+    // The registry re-bound the same video bytes to a new upstream assetId (re-upload semantics).
+    const registry = JSON.parse(readFileSync(priv('assets.json'), 'utf8'));
+    registry.entries[KEY_FP]['proj-1'][args.videoSha].assetId = 'ast-video-reup';
+    writeFileSync(priv('assets.json'), JSON.stringify(registry));
+    vaultCalls = [];
+    const second = await call(s, 'sync_generate', { videoAssetId: 'ast-video-reup', audioAssetId: args.audioAssetId }) as any;
+    expect(second.actionId).toBe(first.actionId);
+    expect(second.deduped).toBe(true);
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toHaveLength(0);
+    expect(Object.keys(readBudget().byAction)).toEqual([first.actionId]);
+  });
+
+  test('a v1-keyed unknown action dedupes by content identity and rechecks under its ORIGINAL key', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 3 });
+    const requestBody = {
+      model: 'sync-3',
+      input: [{ type: 'video', assetId: args.videoAssetId }, { type: 'audio', assetId: args.audioAssetId }],
+      options: { sync_mode: 'silence' },
+    };
+    mkdirSync(priv('actions'), { recursive: true });
+    writeFileSync(priv('actions/act-legacy.json'), JSON.stringify({
+      actionId: 'act-legacy', taskId: 'task-1', project: 'proj-1', accountRef: KEY_FP, approvalId: 'ap-1',
+      idempotencyKey: 'sck-v1legacy', requestDigest: sha(JSON.stringify(requestBody)), requestBody,
+      inputs: { videoAssetId: args.videoAssetId, audioAssetId: args.audioAssetId, videoSha256: args.videoSha, audioSha256: args.audioSha, billableSeconds: 8, fps: 30 },
+      estimate: { frameCount: 240, usd: 0.5, credits: null },
+      state: 'unknown', reservedUsd: 0.5, reservedCount: 1,
+      recovery: { attempts: 0, firstAt: clock, nextAt: clock },
+      history: [{ state: 'sending', at: new Date(clock).toISOString(), note: 'pre-upgrade send intent persisted' }],
+    }));
+    writeFileSync(priv('budget.json'), JSON.stringify({ schema: 'sync-budget/1', byAction: { 'act-legacy': { count: 1, usd: 0.5, approvalId: 'ap-1' } } }));
+    const res = await call(s, 'sync_generate', { ...args, outputFileName: 'renamed.mp4' }) as any;
+    expect(res.actionId).toBe('act-legacy');
+    expect(res.deduped).toBe(true);
+    const posts = vaultCalls.filter(c => c.kind === 'sync_generate');
+    expect(posts).toHaveLength(1);
+    expect(posts[0].params.idempotencyKey).toBe('sck-v1legacy'); // original key+payload resent, never a new v2 key
+    expect(posts[0].params.input).toEqual(requestBody.input);
+    expect(res.status).toBe('accepted');
+  });
+
+  test('only a void action (proven unsent) may retry the same logical key', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 3 });
+    const first = await call(s, 'sync_generate', args) as any;
+    const action = readAction(first.actionId);
+    action.state = 'void';
+    action.history.push({ state: 'void', at: new Date(clock).toISOString(), note: 'test: provably unsent' });
+    writeFileSync(priv(`actions/${first.actionId}.json`), JSON.stringify(action));
+    const budget = readBudget();
+    delete budget.byAction[first.actionId];
+    writeFileSync(priv('budget.json'), JSON.stringify(budget));
+    const second = await call(s, 'sync_generate', args) as any;
+    expect(second.actionId).not.toBe(first.actionId);
+    expect(second.idempotencyKey).toBe(first.idempotencyKey); // same logical identity, fresh action
+    expect(second.status).toBe('accepted');
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toHaveLength(2);
+  });
+
+  test('different task or account domains never fold into each other\'s actions', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval({ maxGenerations: 3 });
+    const one = await call(s, 'sync_generate', args) as any;
+    // task-2 uploads the same bytes: the registry reuses assetIds but the task domain differs.
+    inbox('task-2', 'v.mp4', mp4(8));
+    inbox('task-2', 'a.wav', wav(8));
+    const v2 = await call(s, 'sync_upload', { file: 'v.mp4', sha256: sha(mp4(8)) }, 'holder', 'task-2') as any;
+    const a2 = await call(s, 'sync_upload', { file: 'a.wav', sha256: sha(wav(8)) }, 'holder', 'task-2') as any;
+    approval({ approvalId: 'ap-2', taskId: 'task-2', maxGenerations: 3 }, 'ap-2.json');
+    const two = await call(s, 'sync_generate', { videoAssetId: v2.assetId, audioAssetId: a2.assetId }, 'holder', 'task-2') as any;
+    expect(two.actionId).not.toBe(one.actionId);
+    expect(two.idempotencyKey).not.toBe(one.idempotencyKey);
+    // A different account fingerprint is a different domain even inside the same task.
+    accountFp = 'FP-SYNC-02';
+    inbox('task-1', 'v2.mp4', mp4(8));
+    inbox('task-1', 'a2.wav', wav(8));
+    const v3 = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(mp4(8)) }) as any;
+    const a3 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(wav(8)) }) as any;
+    expect(v3.assetId).not.toBe(v2.assetId);
+    approval({ approvalId: 'ap-b', accountRef: 'FP-SYNC-02', maxGenerations: 3 }, 'ap-b.json');
+    const three = await call(s, 'sync_generate', { videoAssetId: v3.assetId, audioAssetId: a3.assetId }) as any;
+    expect(three.actionId).not.toBe(one.actionId);
+    expect(three.idempotencyKey).not.toBe(one.idempotencyKey);
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toHaveLength(3);
+  });
+});
+
+describe('R3: evidence dirs anchor to the canonical root; symlinks never widen the boundary', () => {
+  test('a symlinked sync/in pointing at another task\'s inbox is refused before any upload', async () => {
+    const s = studio();
+    const bytes = mp4(8);
+    inbox('task-2', 'foreign.mp4', bytes);
+    mkdirSync(join(root, 'task-1', 'sync'), { recursive: true });
+    symlinkSync(join(root, 'task-2', 'sync', 'in'), join(root, 'task-1', 'sync', 'in'));
+    const err = await fail(call(s, 'sync_upload', { file: 'foreign.mp4', sha256: sha(bytes) }));
+    expect(err.code).toBe('invalid');
+    expect(vaultCalls).toEqual([]);
+  });
+
+  test('symlinks at the task dir, sync dir, or an outside path are all refused', async () => {
+    const s = studio();
+    const bytes = mp4(8);
+    inbox('task-2', 'foreign.mp4', bytes);
+    mkdirSync(join(root, 'task-1'), { recursive: true });
+    symlinkSync(join(root, 'task-2', 'sync'), join(root, 'task-1', 'sync'));
+    expect((await fail(call(s, 'sync_upload', { file: 'foreign.mp4', sha256: sha(bytes) }))).code).toBe('invalid');
+    rmSync(join(root, 'task-1'), { recursive: true, force: true });
+    symlinkSync(join(root, 'task-2'), join(root, 'task-1'));
+    expect((await fail(call(s, 'sync_upload', { file: 'foreign.mp4', sha256: sha(bytes) }))).code).toBe('invalid');
+    const outside = mkdtempSync(join(tmpdir(), 'sck-foreign-'));
+    try {
+      mkdirSync(join(outside, 'in'), { recursive: true });
+      writeFileSync(join(outside, 'in', 'x.mp4'), bytes);
+      rmSync(join(root, 'task-1'), { recursive: true, force: true });
+      mkdirSync(join(root, 'task-1', 'sync'), { recursive: true });
+      symlinkSync(join(outside, 'in'), join(root, 'task-1', 'sync', 'in'));
+      expect((await fail(call(s, 'sync_upload', { file: 'x.mp4', sha256: sha(bytes) }))).code).toBe('invalid');
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+    expect(vaultCalls).toEqual([]);
+  });
+
+  test('a file symlink to foreign evidence is refused; an in-inbox alias still uploads', async () => {
+    const s = studio();
+    const bytes = mp4(8);
+    inbox('task-2', 'foreign.mp4', bytes);
+    const dir = join(root, 'task-1', 'sync', 'in');
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(root, 'task-2', 'sync', 'in', 'foreign.mp4'), join(dir, 'linked.mp4'));
+    expect((await fail(call(s, 'sync_upload', { file: 'linked.mp4', sha256: sha(bytes) }))).code).toBe('invalid');
+    inbox('task-1', 'real.mp4', bytes);
+    symlinkSync(join(dir, 'real.mp4'), join(dir, 'alias.mp4'));
+    const res = await call(s, 'sync_upload', { file: 'alias.mp4', sha256: sha(bytes) }) as any;
+    expect(res.assetId).toBe('ast-1');
+  });
+
+  test('download refuses a symlinked sync dir and never writes the foreign target', async () => {
+    const s = studio();
+    const args = await seedAssets(s);
+    approval();
+    const res = await call(s, 'sync_generate', args) as any;
+    rmSync(join(root, 'task-1', 'sync'), { recursive: true, force: true });
+    mkdirSync(join(root, 'task-2', 'sync'), { recursive: true });
+    symlinkSync(join(root, 'task-2', 'sync'), join(root, 'task-1', 'sync'));
+    vaultCalls = [];
+    const err = await fail(call(s, 'sync_download', { actionId: res.actionId, file: 'out.mp4' }));
+    expect(err.code).toBe('invalid');
+    expect(existsSync(join(root, 'task-2', 'sync', 'out.mp4'))).toBe(false);
+    expect(existsSync(join(root, 'task-2', 'sync', 'ledger.jsonl'))).toBe(false);
+    expect(kinds()).not.toContain('sync_download_url'); // refused before asking upstream for a URL
+  });
+
+  test('the evidence mirror never writes through a symlinked sync dir', async () => {
+    const s = studio();
+    await seedAssets(s);
+    rmSync(join(root, 'task-1', 'sync'), { recursive: true, force: true });
+    mkdirSync(join(root, 'task-2', 'sync'), { recursive: true });
+    symlinkSync(join(root, 'task-2', 'sync'), join(root, 'task-1', 'sync'));
+    const res = await call(s, 'sync_estimate', { durationSeconds: 8 }) as any;
+    expect(res.estimatedGenerationCostUsd).toBe(0.5);
+    expect(existsSync(join(root, 'task-2', 'sync', 'ledger.jsonl'))).toBe(false);
   });
 });
