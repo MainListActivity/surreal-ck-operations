@@ -16,6 +16,8 @@ import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } 
 export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
+// Task-level cooldown after a claim denial; a version bump re-arms the task.
+const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
 
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted';
 
@@ -334,6 +336,10 @@ export class Dispatcher {
   // assign attempt failed for a cooldown window.
   private readonly staffCache = new Map<string, { fp: string; prefer?: AssignPreference }>();
   private readonly staffAvoid = new Map<string, Map<string, number>>();
+  // Claim denials are task-state refusals (already claimed, busy worktree, gone
+  // task): every candidate would hit the same wall, so a fresh denial cools the
+  // task for a while instead of spawning a disposable instance every tick.
+  private readonly taskDeny = new Map<string, { at: number; version?: number }>();
   private lastSweep = 0;
   private readonly keptLogged = new Set<string>();
 
@@ -954,6 +960,13 @@ export class Dispatcher {
     return providerCapacity(provider, cfg.providerMax, health, busyBy, now, quotaBlocked);
   }
 
+  /** Record a task-side claim denial; keeps the map bounded to the cooldown horizon. */
+  private markDenied(task: SupervisedTask): void {
+    const now = Date.now();
+    for (const [id, deny] of this.taskDeny) if (now - deny.at >= CLAIM_DENY_COOLDOWN_MS) this.taskDeny.delete(id);
+    this.taskDeny.set(task.id, { at: now, version: task.version });
+  }
+
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal, anchorHome?: string) => EmployeeInst | undefined,
@@ -963,6 +976,10 @@ export class Dispatcher {
     prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
+    if (task && sidecar) {
+      const deny = this.taskDeny.get(task.id);
+      if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
+    }
     const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
     const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
     // A legacy credential-file session can't be sidecar-claimed for new work; let
@@ -977,6 +994,7 @@ export class Dispatcher {
         if (sidecar && task) {
           claim = await sidecar.claim(existing, task);
           if (!claim) {
+            this.markDenied(task);
             this.log(`claim ${task.id} as ${existing.id} lost; skipping`);
             return undefined;
           }
@@ -1030,7 +1048,8 @@ export class Dispatcher {
         return undefined;
       }
       if (sidecar && task && !claim) {
-        await wf.retire(inst.id, 'claim race lost');
+        this.markDenied(task);
+        await wf.retire(inst.id, 'claim denied');
         report.retired.push(inst.id);
         return undefined;
       }

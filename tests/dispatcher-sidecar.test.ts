@@ -17,7 +17,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
-  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>();
+  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0;
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string } = {}) => {
@@ -45,6 +45,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
+      if (denied.has(id)) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error('scene is busy'), { code: 'worktree_busy' }); }
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
@@ -84,7 +85,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, get pool() { return pool; },
+  return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -188,5 +189,29 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.ok).toBe(true);
     expect(w.events).toContain('return:t3');
     expect(w.views.get('t3')!.state).toBe('ready');
+  });
+  test('a task-side claim denial cools the task instead of churning disposable instances', async () => {
+    const w = world(); w.addTask('jammed'); w.denied.add('jammed');
+    const d = w.dispatcher();
+    const r1 = await d.tick();
+    // First attempt spawned one instance, was refused, retired it.
+    expect(w.events.filter(e => e.startsWith('claim-denied:'))).toHaveLength(1);
+    expect(w.instances).toHaveLength(1);
+    expect(r1.retired).toContain(w.instances[0]!.id);
+    // Same version while cooled: no new instance, no new claim attempt.
+    await d.tick(); await d.tick();
+    expect(w.events.filter(e => e.startsWith('claim-denied:'))).toHaveLength(1);
+    expect(w.instances).toHaveLength(1);
+    // A version bump re-arms the task: the next tick retries the claim.
+    w.views.get('jammed')!.version += 1; w.rows[0]!.version += 1;
+    await d.tick();
+    expect(w.events.filter(e => e.startsWith('claim-denied:'))).toHaveLength(2);
+    expect(w.instances).toHaveLength(2);
+    // Once the refusal clears the very next attempt claims and spawns normally.
+    w.denied.delete('jammed');
+    w.views.get('jammed')!.version += 1; w.rows[0]!.version += 1;
+    await d.tick();
+    expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
+    expect(w.agents.size).toBe(1);
   });
 });
