@@ -230,7 +230,7 @@ struct Endpoint {
 let kindNames = ["tts", "dialogue", "sfx", "music", "voice_design", "voice_create", "voices", "subscription",
                  "sync_models", "sync_errors", "sync_asset_presign", "sync_asset_register",
                  "sync_estimate", "sync_generate", "sync_get", "sync_download_url",
-                 "sync_projects", "sync_generations"]
+                 "sync_projects", "sync_generations", "sync_project_create"]
 
 func jsonBody(_ object: [String: Any]) throws -> Data {
     guard let data = try? JSONSerialization.data(withJSONObject: object), data.count <= 1 << 20 else {
@@ -359,6 +359,21 @@ func endpoint(_ kind: String, _ params: [String: Any]) throws -> Endpoint {
             throw VaultError(code: "invalid", message: "id 不合法")
         }
         return Endpoint(method: "GET", path: "/v2/generations/\(id)/download", query: [], body: nil, timeout: 60, provider: "sync")
+    case "sync_project_create":
+        // The only controlled write on this surface: one idempotent project creation per key, run
+        // by sync_project_prepare. The studio fixes the body to {"name": …} and owns a
+        // ledger-persisted client UUID as the Idempotency-Key, so a replayed call can never mint
+        // a second project; the caller still never picks a URL, host or any other header.
+        guard let name = params["name"] as? String,
+              name.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", options: .regularExpression) != nil else {
+            throw VaultError(code: "invalid", message: "name 不合法")
+        }
+        guard let key = params["idempotencyKey"] as? String,
+              key.range(of: "^[A-Za-z0-9._~-]{1,128}$", options: .regularExpression) != nil else {
+            throw VaultError(code: "invalid", message: "idempotencyKey 不合法")
+        }
+        return Endpoint(method: "POST", path: "/v2/projects", query: [], body: try jsonBody(["name": name]),
+                        timeout: 60, provider: "sync", extraHeaders: [("Idempotency-Key", key)])
     case "sync_projects", "sync_generations":
         // Read-only org-side listings: projects prove org membership, generations prove consumption.
         // limit 1-100 and an opaque cursor are the only caller-controlled parameters.

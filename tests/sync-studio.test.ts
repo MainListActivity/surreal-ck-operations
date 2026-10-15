@@ -220,10 +220,10 @@ describe('lease and role gates', () => {
     expect(info.configured.sync).toBe(true);
   });
 
-  test('the tool list carries all ten sync tools', () => {
+  test('the tool list carries all eleven sync tools', () => {
     expect([...studio().tools]).toEqual([...SYNC_TOOLS]);
     expect([...studio().tools].sort()).toEqual(
-      ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'].sort());
+      ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_project_prepare', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'].sort());
   });
 });
 
@@ -340,6 +340,142 @@ describe('sync_projects / sync_generations', () => {
     syncConfigured = false;
     expect((await fail(call(studio(), 'sync_projects'))).code).toBe('not_configured');
     expect((await fail(call(studio(), 'sync_generations'))).code).toBe('not_configured');
+    expect(vaultCalls).toEqual([]);
+  });
+});
+
+// ---------- controlled project prepare ----------
+
+describe('sync_project_prepare', () => {
+  test('empty org creates exactly once under a persisted client UUID; re-entry hits the record with zero calls', async () => {
+    let creates = 0;
+    reply = call => {
+      if (call.kind === 'sync_project_create') {
+        creates += 1;
+        return json({ id: 'p-new', name: 'sck-controlled', organizationId: 'org-1' }, 201);
+      }
+      return json({ items: creates === 0 ? [] : [{ id: 'p-new', name: 'sck-controlled', organizationId: 'org-1' }] });
+    };
+    const first = await call(studio(), 'sync_project_prepare') as any;
+    expect(first).toMatchObject({ ready: true, reused: false, organizationId: 'org-1', projectId: 'p-new', projectName: 'sck-controlled' });
+    expect(creates).toBe(1);
+    expect(vaultCalls.map(c => c.kind)).toEqual(['sync_projects', 'sync_project_create', 'sync_projects']);
+    // The POST carries the ledger- minted UUID out-of-band; re-entry must replay the same one.
+    expect(vaultCalls[1].params).toEqual({ name: 'sck-controlled', idempotencyKey: first.clientUuid });
+    expect(audits.at(-1)).toMatchObject({ action: 'ops_sync_prepare' });
+
+    counts = { ops_sync_read: 999 }; // read cap exhausted — a ready hit still replays, with zero upstream calls
+    const second = await call(studio(), 'sync_project_prepare') as any;
+    expect(second).toMatchObject({ ready: true, reused: false, organizationId: 'org-1', projectId: 'p-new', clientUuid: first.clientUuid });
+    expect(creates).toBe(1);
+    expect(vaultCalls).toHaveLength(3);
+    const record = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(record.state).toBe('ready');
+    expect(record.accountRef).toBe(accountFp);
+    expect(record.clientUuid).toBe(first.clientUuid);
+    // The evidence mirror records counts only — org ids never enter the task-side ledger.
+    const ledger = readFileSync(join(root, 'task-1', 'sync', 'ledger.jsonl'), 'utf8');
+    expect(ledger).toContain('"project-prepare"');
+    expect(ledger).not.toContain('org-1');
+  });
+
+  test('non-empty org reuses an existing project and never creates', async () => {
+    // The binding is deterministic in the project set, independent of createdAt: smallest id wins.
+    reply = () => json({ items: [
+      { id: 'p-b', name: 'older-created', organizationId: 'org-1', createdAt: '2026-01-01T00:00:00Z' },
+      { id: 'p-a', name: 'newer-created', organizationId: 'org-1', createdAt: '2026-02-01T00:00:00Z' },
+    ] });
+    const res = await call(studio(), 'sync_project_prepare') as any;
+    expect(res).toMatchObject({ ready: true, reused: true, projectId: 'p-a', projectName: 'newer-created', organizationId: 'org-1' });
+    expect(kinds()).toEqual(['sync_projects']); // GET only — no POST, no second project
+    expect(existsSync(priv('budget.json'))).toBe(false); // nothing reserved, nothing consumed
+  });
+
+  test('multi-org fails closed before any create and records the real state', async () => {
+    reply = () => json({ items: [{ id: 'p-1', organizationId: 'org-a' }, { id: 'p-2', organizationId: 'org-b' }] });
+    const err = await fail(call(studio(), 'sync_project_prepare'));
+    expect(err.code).toBe('conflict');
+    expect(err.message).toContain('2 个组织');
+    expect(kinds()).toEqual(['sync_projects']); // refused before any write
+    const record = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(record.state).toBe('failed');
+    expect(record.lastError).toBe('multi_org count=2');
+  });
+
+  test('create refusal records the real upstream status/code; re-entry replays the SAME client UUID', async () => {
+    let creates = 0;
+    reply = call => {
+      if (call.kind === 'sync_project_create') {
+        creates += 1;
+        return json({ code: 'validation_failed', message: 'rejected' }, 400);
+      }
+      return json({ items: [] });
+    };
+    expect((await fail(call(studio(), 'sync_project_prepare'))).code).toBe('invalid');
+    const first = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(first.state).toBe('failed');
+    expect(first.lastError).toBe('HTTP 400 validation_failed');
+    expect((await fail(call(studio(), 'sync_project_prepare'))).code).toBe('invalid');
+    const second = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(second.clientUuid).toBe(first.clientUuid);
+    const createCalls = vaultCalls.filter(c => c.kind === 'sync_project_create');
+    expect(createCalls).toHaveLength(2);
+    expect(createCalls.every(c => c.params.idempotencyKey === first.clientUuid)).toBe(true);
+  });
+
+  test('a create receipt whose project never shows up in the readback is a mismatch — fail closed', async () => {
+    let creates = 0;
+    reply = call => {
+      if (call.kind === 'sync_project_create') { creates += 1; return json({ id: 'p-created', organizationId: 'org-1' }, 201); }
+      // First readback (pre-create) is empty; the post-create readback shows a DIFFERENT project.
+      return json({ items: creates === 0 ? [] : [{ id: 'p-other', organizationId: 'org-1' }] });
+    };
+    const err = await fail(call(studio(), 'sync_project_prepare'));
+    expect(err.code).toBe('conflict');
+    expect(err.message).toContain('未出现在回读中');
+    const record = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(record.state).toBe('failed');
+    expect(record.lastError).toContain('readback_missing_created');
+  });
+
+  test('rows without organizationId refuse before anything is created', async () => {
+    reply = () => json({ items: [{ id: 'p-1' }] });
+    const err = await fail(call(studio(), 'sync_project_prepare'));
+    expect(err.code).toBe('conflict');
+    expect(kinds()).toEqual(['sync_projects']);
+  });
+
+  test('a corrupted prepare record refuses instead of re-minting a second identity', async () => {
+    mkdirSync(priv('prepare'), { recursive: true, mode: 0o700 });
+    writeFileSync(priv(`prepare/prepare-${accountFp}.json`), '{"schema":"wrong"');
+    reply = () => json({ items: [] });
+    const err = await fail(call(studio(), 'sync_project_prepare'));
+    expect(err.code).toBe('conflict');
+    expect(err.message).toContain('台账损坏');
+    expect(vaultCalls).toEqual([]); // no readback, no create — nothing before the refusal
+  });
+
+  test('readback follows cursor pages to a converged unique-org binding', async () => {
+    let page = 0;
+    reply = call => {
+      if (call.kind === 'sync_projects') {
+        page += 1;
+        return page < 3
+          ? json({ items: [{ id: `p-${page}`, organizationId: 'org-1' }], nextCursor: `c${page}` })
+          : json({ items: [{ id: `p-${page}`, organizationId: 'org-1' }] });
+      }
+      return json({ id: 'p-x' }, 201);
+    };
+    const res = await call(studio(), 'sync_project_prepare') as any;
+    expect(res.ready).toBe(true);
+    expect(res.projectId).toBe('p-1'); // lexicographic tie-break is deterministic
+    expect(vaultCalls.filter(c => c.kind === 'sync_projects')).toHaveLength(3);
+  });
+
+  test('arguments are refused, and an unconfigured key refuses before any upstream call', async () => {
+    expect((await fail(call(studio(), 'sync_project_prepare', { org: 'x' }))).code).toBe('invalid');
+    syncConfigured = false;
+    expect((await fail(call(studio(), 'sync_project_prepare'))).code).toBe('not_configured');
     expect(vaultCalls).toEqual([]);
   });
 });

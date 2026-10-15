@@ -16,7 +16,7 @@ import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import type { MediaVault, VaultReply } from './vault.ts';
 
-export const SYNC_TOOLS = ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'] as const;
+export const SYNC_TOOLS = ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_project_prepare', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'] as const;
 export type SyncTool = typeof SYNC_TOOLS[number];
 
 type Args = Record<string, unknown>;
@@ -60,6 +60,7 @@ const USAGE: Record<Exclude<SyncTool, 'sync_info'>, string> = {
   sync_models: '{} 列出供应商可见模型（只读探测）',
   sync_errors: '{} 供应商机器可读错误目录（只读探测）',
   sync_projects: '{"limit"?1-100,"cursor"?} 列密封 key 所属组织的项目（只读）：只证组织归属（控制台↔keyFp 绑定证据），不证计划/余量',
+  sync_project_prepare: '{} 唯一项目与组织绑定就绪（受控，零费用）：GET 回读先行，projects 已非空则复用现有项目不新建（取 id 最小者，确定可复现）；空则按台账持久化的固定 client UUID 幂等 POST /v2/projects 至多一次，再回读校验 ≥1 项目且全组织唯一 organizationId；多组织/回读不一致/创建被拒一律 fail-closed 记真实错误码。无参数、无 --org 降级',
   sync_generations: '{"since"?(ISO 默认当月初),"limit"?1-100,"cursor"?} 列本组织已消耗生成（只读）：只证消耗侧，不证剩余上限',
   sync_upload: UPLOAD_USAGE,
   sync_estimate: '{"durationSeconds","fps"?} 试算 或 {"videoAssetId","audioAssetId"?} 按已注册资产实测报价；零生成',
@@ -72,6 +73,7 @@ const TIPS = [
   'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的授权工件放行——paid 按 USD 预算闸；free-trial 走 sck-sync-attest 控制台目证落盘（每份证据须声明截图真实采集时点，JIT≤2h 自最早证据起算、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA allowlist 绑定），env/声明一律不放行',
   '上传、estimate、projects、generations、status、download 等零费用检查在无密钥时报 not_configured，如实上报不要绕过',
   'sync_projects/sync_generations 只证组织归属与已消耗：剩余次数上限无官方端点，绝不合成',
+  'free-trial 落件前置：先 sync_project_prepare 就绪（唯一 organizationId+projectId 入台账），sck-sync-attest 据此建立控制台↔keyFp 绑定——空项目组织 attest 必拒，这不是可绕过的检查',
   'sync_status 的 wait 与 includeProgress 官方互斥，一次只能用一个',
   '所有查询/下载只认本任务台账绑定的 actionId/generationId，跨任务探测一律 forbidden',
 ];
@@ -108,6 +110,19 @@ interface SyncAction {
   history: Array<{ state: ActionState; at: string; note: string }>;
 }
 interface Budget { schema: 'sync-budget/1'; byAction: Record<string, { count: number; usd: number; approvalId: string }> }
+/**
+ * Authoritative per-key prepare state under private/sync/prepare/. `ready` is the only state
+ * attest trusts: it means a full GET readback saw ≥1 project with exactly one organizationId,
+ * bound to this keyFp. `creating` persists the client UUID before the POST so a crash can only
+ * ever replay the SAME idempotency key; `failed` records the real upstream status/code.
+ */
+interface PrepareRecord {
+  schema: 'sync-prepare/1'; accountRef: string; clientUuid: string;
+  state: 'creating' | 'ready' | 'failed';
+  organizationId?: string; projectId?: string; projectName?: string; reused?: boolean;
+  at: string; readbackAt?: string; projectsSeen?: number; lastError?: string;
+  history: Array<{ at: string; action: string; note: string }>;
+}
 
 export interface SyncDeps {
   core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'>;
@@ -268,6 +283,7 @@ export class SyncStudio {
       sync_models: scope => this.models(scope),
       sync_errors: scope => this.errors(scope),
       sync_projects: (scope, args) => this.projects(scope, args),
+      sync_project_prepare: (scope, args) => this.prepareProject(scope, args),
       sync_generations: (scope, args) => this.generations(scope, args),
       sync_upload: (scope, args) => this.upload(scope, args),
       sync_estimate: (scope, args) => this.estimate(scope, args),
@@ -308,6 +324,7 @@ export class SyncStudio {
       assets: join(root, 'assets.json'),
       actions: join(root, 'actions'),
       approvals: join(root, 'approvals'),
+      prepare: join(root, 'prepare'),
       budget: join(root, 'budget.json'),
       lock: join(root, 'budget.lock'),
     };
@@ -432,7 +449,7 @@ export class SyncStudio {
   // ---------- authoritative state (private/sync/) ----------
 
   private ensureDirs(): void {
-    for (const dir of [this.dirs.root, this.dirs.actions, this.dirs.approvals]) {
+    for (const dir of [this.dirs.root, this.dirs.actions, this.dirs.approvals, this.dirs.prepare]) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       chmodSync(dir, 0o700);
     }
@@ -758,6 +775,176 @@ export class SyncStudio {
         proves: '组织归属（控制台截图↔keyFp 绑定证据）；不证计划类型与剩余余量',
       }),
       audit: { action: 'ops_sync_read', evidence: `projects count=${projects.length} orgs=${organizationIds.length}` },
+    };
+  }
+
+  // ---------- controlled project prepare (the only write on this surface; free & generation-free) ----------
+
+  private preparePath(keyFp: string): string {
+    // keyFp is a vault-side hex fingerprint; only a filename-safe charset may reach a path —
+    // anything else (a compromised or future vault reply) is refused rather than trusted.
+    if (!/^[A-Za-z0-9._-]{8,64}$/.test(keyFp)) throw invalid('密钥指纹异常，拒绝写 prepare 台账');
+    return join(this.dirs.prepare, `prepare-${keyFp}.json`);
+  }
+
+  /** Malformed or foreign records are refused loudly, never silently re-minted into a second create. */
+  private readPrepare(keyFp: string): PrepareRecord | undefined {
+    let raw: string | undefined;
+    try { raw = readFileSync(this.preparePath(keyFp), 'utf8'); } catch { return undefined; } // no file → no record
+    let parsed: Args | undefined;
+    try { parsed = JSON.parse(raw) as Args; } catch {
+      throw new CompanyError('conflict', 'prepare 台账损坏（非 JSON）：需人工确认后移除该文件重跑，禁止自动换键重创');
+    }
+    const value = parsed as unknown;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new CompanyError('conflict', 'prepare 台账损坏（非对象）：需人工确认后移除该文件重跑，禁止自动换键重创');
+    }
+    const raw2 = value as PrepareRecord;
+    if (raw2.schema !== 'sync-prepare/1' || raw2.accountRef !== keyFp ||
+        typeof raw2.clientUuid !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw2.clientUuid) ||
+        !['creating', 'ready', 'failed'].includes(raw2.state)) {
+      throw new CompanyError('conflict', 'prepare 台账损坏（无法解析或字段不符）：需人工确认后移除该文件重跑，禁止自动换键重创');
+    }
+    return raw2;
+  }
+
+  private writePrepare(record: PrepareRecord): void {
+    this.writeJson(this.preparePath(record.accountRef), record);
+  }
+
+  /**
+   * Full GET /v2/projects readback via the fixed read-only kind, bounded pagination. A page that
+   * fails or a row missing organizationId fails closed with the real status — a half-known
+   * project set can never pass as "unique org" evidence.
+   */
+  private async readbackProjects(pending: PrepareRecord): Promise<Array<{ id: string; name?: string; organizationId: string }>> {
+    try {
+      const rows: Array<{ id: string; name?: string; organizationId: string }> = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 10; page += 1) {
+        const res = record(await this.json<Args>('sync_projects', pick({ limit: 100, cursor })));
+        const items = Array.isArray(res.items) ? res.items : [];
+        for (const item of items) {
+          const p = record(item);
+          const id = typeof p.id === 'string' ? p.id : undefined;
+          const organizationId = typeof p.organizationId === 'string' ? p.organizationId : undefined;
+          if (id === undefined || organizationId === undefined || organizationId.length === 0) {
+            throw new CompanyError('conflict', '回读不一致：项目行缺少 id/organizationId（HTTP 200 但契约不符），fail-closed');
+          }
+          rows.push({ id, name: typeof p.name === 'string' ? p.name : undefined, organizationId });
+        }
+        cursor = typeof res.nextCursor === 'string' && res.nextCursor.length > 0 ? res.nextCursor : undefined;
+        if (!cursor) return rows;
+      }
+      throw new CompanyError('conflict', '回读未收敛：项目超过 10 页（>1000），拒绝在未证全量时判定组织唯一性');
+    } catch (error) {
+      const code = error instanceof CompanyError ? error.code : 'upstream_error';
+      this.writePrepare({ ...pending, state: 'failed', lastError: `readback ${code}`, history: [...pending.history, { at: iso(this.now()), action: 'readback', note: `回读失败：${code}（保留同键重入）` }] });
+      throw error;
+    }
+  }
+
+  /** The one upstream write: fixed body + ledger-persisted client UUID; non-2xx fails closed with the real code. */
+  private async createProject(pending: PrepareRecord, name: string): Promise<Args> {
+    let reply: VaultReply;
+    try {
+      reply = await this.deps.vault.call('sync_project_create', { name, idempotencyKey: pending.clientUuid });
+    } catch (error) {
+      // Vault-side rejection (never reached upstream): keep the same key for re-entry.
+      const failure = error instanceof CompanyError ? error : new CompanyError('upstream_error', 'sck-vault 调用失败', true);
+      this.writePrepare({ ...pending, state: 'failed', lastError: `vault ${failure.code}`, history: [...pending.history, { at: iso(this.now()), action: 'create', note: `vault 拒绝：${failure.code}` }] });
+      throw failure;
+    }
+    if (!(reply.status >= 200 && reply.status < 300)) {
+      const body = record(safeJson(reply.body));
+      const rawCode = String(body.code ?? body.errorCode ?? body.error_code ?? body.error ?? '').toLowerCase();
+      const lastError = `HTTP ${reply.status}${rawCode ? ` ${rawCode}` : ''}`;
+      this.writePrepare({ ...pending, state: 'failed', lastError, history: [...pending.history, { at: iso(this.now()), action: 'create', note: `创建被拒：${lastError}（fail-closed，保留同键重入）` }] });
+      throw upstreamFailure(reply);
+    }
+    this.writePrepare({ ...pending, state: 'creating', history: [...pending.history, { at: iso(this.now()), action: 'create', note: `POST /v2/projects 已接受（HTTP ${reply.status}），待回读确认` }] });
+    return record(safeJson(reply.body));
+  }
+
+  /**
+   * sync_project_prepare: make the sealed key's org attest-ready. Readback first — a non-empty
+   * project set is reused (nothing is created); an empty set triggers exactly one idempotent
+   * POST under the ledger-persisted client UUID, then a fresh readback must show ≥1 project,
+   * exactly one organizationId and, when the create returned an id, that project present.
+   * Every failure mode records the real status/code and refuses; the whole tool is
+   * generation-free, allowance-free and charge-free by construction.
+   */
+  private async prepareProject(scope: OpsScope, args: Args): Promise<Out> {
+    if (Object.keys(record(args)).length > 0) throw invalid('sync_project_prepare 不接受参数（无 --org 降级，绑定语义固定）');
+    const keyFp = await this.keyFp();
+    const prior = this.readPrepare(keyFp);
+    // Hit: a ready record replays the recorded binding with zero upstream calls and no cap use.
+    if (prior?.state === 'ready') {
+      this.mirror(scope, { op: 'project-prepare', hit: 1, reused: prior.reused ? 1 : 0, projects: prior.projectsSeen });
+      return {
+        value: pick({
+          ready: true, reused: prior.reused ?? false, accountRef: keyFp, clientUuid: prior.clientUuid,
+          organizationId: prior.organizationId, projectId: prior.projectId, projectName: prior.projectName,
+          readbackAt: prior.readbackAt, at: prior.at,
+        }),
+        audit: { action: 'ops_sync_prepare', evidence: `hit reuse=${prior.reused ? 1 : 0} project=${prior.projectId} projects=${prior.projectsSeen}` },
+      };
+    }
+
+    await this.capCheck(scope, 'read');
+    const projectName = 'sck-controlled';
+    // Authoritative state dirs (incl. prepare/) must exist before the first ledger write — this
+    // flow never enters kernelLock, which is where the other tools get theirs.
+    this.ensureDirs();
+    let pending = prior ?? { schema: 'sync-prepare/1' as const, accountRef: keyFp, clientUuid: randomUUID(), state: 'creating' as const, at: iso(this.now()), history: [] };
+    if (!prior) this.writePrepare(pending);
+
+    // Step 1 — readback before any write: non-empty ⇒ reuse, empty ⇒ one idempotent create.
+    let projects = await this.readbackProjects(pending);
+    let created: Args | undefined;
+    let reused = projects.length > 0;
+    if (!reused) {
+      created = await this.createProject(pending, projectName);
+      pending = this.readPrepare(keyFp) ?? pending;
+      projects = await this.readbackProjects(pending);
+    } else {
+      this.writePrepare({ ...pending, state: 'creating', history: [...pending.history, { at: iso(this.now()), action: 'readback', note: `回读已有 ${projects.length} 个项目：复用不新建` }] });
+      pending = this.readPrepare(keyFp) ?? pending;
+    }
+
+    // Step 2 — binding validation: ≥1 project, exactly one organizationId, created id visible.
+    const organizationIds = [...new Set(projects.map(p => p.organizationId))];
+    const failClosed = (lastError: string, note: string): never => {
+      this.writePrepare({ ...pending, state: 'failed', lastError, history: [...pending.history, { at: iso(this.now()), action: 'validate', note }] });
+      throw new CompanyError('conflict', note);
+    };
+    if (projects.length === 0) failClosed('readback_empty', '回读不一致：创建回执后项目集仍为空（HTTP 200），fail-closed');
+    if (organizationIds.length > 1) failClosed(`multi_org count=${organizationIds.length}`, `项目列表跨 ${organizationIds.length} 个组织，无法唯一绑定，fail-closed（不加 --org 降级）`);
+    const organizationId = organizationIds[0];
+    if (created) {
+      const createdId = typeof created.id === 'string' ? created.id : undefined;
+      if (createdId && !projects.some(p => p.id === createdId)) {
+        failClosed(`readback_missing_created ${createdId}`, `回读不一致：创建回执的项目 ${createdId} 未出现在回读中，fail-closed`);
+      }
+    }
+
+    // Step 3 — bind deterministically: the lexicographically-first id, so the same project set
+    // always reproduces the same binding.
+    const chosen = projects.reduce((best, p) => p.id < best.id ? p : best, projects[0]);
+    const now = iso(this.now());
+    const ready: PrepareRecord = {
+      ...pending, state: 'ready', organizationId, projectId: chosen.id, projectName: chosen.name ?? projectName,
+      reused, projectsSeen: projects.length, readbackAt: now,
+      history: [...pending.history, { at: now, action: 'ready', note: `绑定 organizationId=${organizationId} projectId=${chosen.id}（${reused ? '复用' : '新建'}）` }],
+    };
+    this.writePrepare(ready);
+    this.mirror(scope, { op: 'project-prepare', hit: 0, reused: reused ? 1 : 0, projects: projects.length });
+    return {
+      value: pick({
+        ready: true, reused, accountRef: keyFp, clientUuid: ready.clientUuid,
+        organizationId, projectId: chosen.id, projectName: ready.projectName, readbackAt: now, at: ready.at,
+      }),
+      audit: { action: 'ops_sync_prepare', evidence: `ready reuse=${reused ? 1 : 0} project=${chosen.id} projects=${projects.length}` },
     };
   }
 
