@@ -51,6 +51,18 @@ const PAYMENT_SURFACE_PATHS = [
   '/wallet', '/orders', '/payment-methods', '/auto-recharge', '/bills', '/finance/invoices',
 ] as const;
 
+/**
+ * Registry of authoritative account-level payment-state sources. The revised contract
+ * no longer asserts account payment bindings or supplier auto-topup state, so nothing
+ * reads this list today; it stays as the single registration point in case the
+ * provider ever ships an official account-level payment-state API. Probed 2026-10-12
+ * across the Lite console API and SenseCore IAM: the user record carries no payment
+ * fields, no billing-account/payment resource exists, role bindings are not readable,
+ * and the provider's own client bundle contains zero billing endpoints. An entry
+ * lands here only via a code change carrying its own verification contract; guessed
+ * 404 URIs never qualify.
+ */
+export const ACCOUNT_PAYMENT_SOURCES: readonly string[] = [];
 
 /**
  * Console-session auto-issuance chain (probed 2026-10-12, Ory Hydra layout):
@@ -398,7 +410,9 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     // Payment-surface enumeration, observation only: record what each guessed
     // billing-ish console path answers under this session. A live surface means the
     // provider now ships payment features humans must review; uniform 404s are
-    // recorded as observations only; they never certify account payment state.
+    // recorded as observations only. The enumeration never certifies account payment
+    // state and never gates the document — the official plan-page markers are the
+    // paid-tier tripwire.
     const surfaceChecks: Array<{ path: string; status: number | null }> = [];
     const surfaceRecords = PAYMENT_SURFACE_PATHS.map(path => source('paymentSurface', `${CONSOLE_API}${path}`));
     const surfaceResults = await Promise.all(
@@ -415,7 +429,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     derivations.paymentSurface = surfaceChecks;
     if (surfaceDrift) {
       const found = surfaceChecks.filter(c => c.status !== 404).map(c => `${c.path}=${c.status ?? 'transport'}`).join(', ');
-      gaps.push({ field: 'planApplicability', source: 'paymentSurface', detail: `console payment surface not uniformly absent (${found}); payment surface drift needs human review` });
+      notes.push(`console payment surface not uniformly absent (${found}); receipt observation for human review, not a proof input`);
     }
   }
 
@@ -431,8 +445,9 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   derivations.accountPlanFree = accountPlanFree;
   derivations.accountPlanSource = { source: 'poolUsage', accountBound, verified: accountPlanFree };
   derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
-  derivations.unverifiedAccountFacts = ['noPaymentInstrument', 'autoTopupDisabled'];
-  notes.push('account payment bindings and supplier auto-topup state remain unverified; v2 makes neither assertion');
+  derivations.paymentStateSources = ACCOUNT_PAYMENT_SOURCES.length;
+  derivations.removedAccountAssertions = ['noPaymentInstrument', 'autoTopupDisabled'];
+  notes.push('the revised contract dropped the account-level payment assertions noPaymentInstrument/autoTopupDisabled; their absence is contractual, not a gap more probing could close');
   if (!accountPlanFree) {
     gaps.push({ field: 'account-plan-free', source: 'poolUsage', detail: accountPlan
       ? 'authenticated account plan is not verified FREE for the bound API key'
@@ -459,7 +474,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     }
   }
 
-  let canDocument = !!accountRef && keyLive && modelListed && accountBound && accountPlanFree && applicabilityOk && paymentSurfaceAbsent && quotaVerified;
+  let canDocument = !!accountRef && keyLive && modelListed && accountBound && accountPlanFree && applicabilityOk && quotaVerified;
   let document: Record<string, unknown> | undefined;
   let documentSha256: string | undefined;
   let documentFile: string | undefined;

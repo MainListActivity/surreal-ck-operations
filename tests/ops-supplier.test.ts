@@ -9,6 +9,7 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { sha256, evidenceSchema } from '../src/ops/proof-contract.ts';
 import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
+import { ACCOUNT_PAYMENT_SOURCES } from '../src/ops/supplier.ts';
 import { FakeCompany, FakeWorld, brokerConfig } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; home: string; qa: string; outputs: unknown[] }
@@ -115,7 +116,8 @@ describe('ops_supplier_plan_sample', () => {
       accountPlan: { id: 'free', name: 'Free Plan', type: 'TOKEN_PLAN_PLAN_TYPE_FREE' },
       accountPlanFree: true,
       consolePaymentSurfaceAbsent: true,
-      unverifiedAccountFacts: ['noPaymentInstrument', 'autoTopupDisabled'],
+      paymentStateSources: 0,
+      removedAccountAssertions: ['noPaymentInstrument', 'autoTopupDisabled'],
     });
     expect(result.gaps).toEqual([]);
     // The receipt is still written: sources, observations and gaps are the evidence.
@@ -288,16 +290,24 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('bound account + free copy, but a live console billing surface → applicability drift blocks', async () => {
+  test('a live console billing surface is receipt observation only and never gates the document', async () => {
     const r = rig();
     seal(r);
     r.world.supplier.billingPathLive = true;
     const result = await sample(r);
-    expect(result.status).toBe('blocked');
-    expect(result.document).toBeUndefined();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'planApplicability', source: 'paymentSurface' })]));
+    expect(result.status).toBe('sampled');
+    expect(result.document).toMatchObject({ schemaVersion: 2, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE' });
     expect(result.receipt.derivations.consolePaymentSurfaceAbsent).toBe(false);
+    expect(result.receipt.derivations.paymentSurface).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: '/billing', status: 200 })]),
+    );
+    expect(result.receipt.notes.some((n: string) => n.includes('payment surface'))).toBe(true);
+    expect(result.gaps.some((g: { source?: string }) => g.source === 'paymentSurface')).toBe(false);
     expectNoSupplierLeaks(r);
+  });
+
+  test('ACCOUNT_PAYMENT_SOURCES stays an empty reserved registry under the revised contract', async () => {
+    expect(ACCOUNT_PAYMENT_SOURCES).toEqual([]);
   });
 
   test('an account plan type other than the certified free type fails account-plan-free', async () => {
