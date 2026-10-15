@@ -87,7 +87,12 @@ print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", ""
     prev_release=""
     if [ -L "$service_home/active" ]; then prev_release=$(readlink "$service_home/active"); fi
     ln -s "$release" "$service_home/active.next"
-    mv -h -f "$service_home/active.next" "$service_home/active"
+    # rename(2) swaps the symlink atomically without following it; `mv -h` is
+    # BSD-only and GNU `mv` would dereference the destination symlink instead.
+    RELEASE_LINK="$service_home/active" NEXT_LINK="$service_home/active.next" /usr/bin/python3 - <<'PY'
+import os
+os.rename(os.environ['NEXT_LINK'], os.environ['RELEASE_LINK'])
+PY
     # Dual-surface sync: the daemon resolves a plugin's registered source once —
     # `plugin reload` does not re-read ~/.paseo/config.json and `plugin install`
     # refuses an existing ID, so repointing is remove + install (a plugin-process
