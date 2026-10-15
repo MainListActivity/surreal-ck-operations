@@ -94,6 +94,8 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
         });
         if (url.pathname === '/v2/models') return Response.json({ models: [{ id: 'sync-3' }] });
         if (url.pathname === '/v2/errors') return Response.json([{ code: 'invalid_asset_id_format' }]);
+        if (url.pathname === '/v2/projects') return Response.json({ items: [{ id: 'p-1', organizationId: 'org-1' }] });
+        if (url.pathname === '/v2/generations') return Response.json([{ id: 'gen-1', model: 'sync-3', status: 'COMPLETED' }]);
         if (url.pathname === '/v2/generations/estimate') return Response.json({ estimatedGenerationCost: 0.5 });
         if (url.pathname === '/v2/generate' && req.method === 'POST') {
           return Response.json({ id: 'gen-1', status: 'PENDING' }, { status: 201, headers: { 'idempotency-replayed': 'false' } });
@@ -222,6 +224,26 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     expect((denied as CompanyError).code).toBe('invalid');
     const badModel = await client.call('sync_estimate', { model: 'sync-2', duration: 8 }).catch((e: unknown) => e);
     expect((badModel as CompanyError).code).toBe('invalid');
+  });
+
+  test('sync_projects and sync_generations are fixed GETs that only forward limit/cursor', async () => {
+    const projects = await client.call('sync_projects', { limit: 50, cursor: 'cur-1' });
+    expect(projects.status).toBe(200);
+    let seen = syncUpstream.seen.at(-1)!;
+    expect(seen).toMatchObject({ method: 'GET', key: SYNC_SECRET, xiKey: null });
+    expect(seen.path.startsWith('/v2/projects?')).toBe(true);
+    expect(seen.path).toContain('limit=50');
+    expect(seen.path).toContain('cursor=cur-1');
+    const generations = await client.call('sync_generations', {});
+    expect(generations.status).toBe(200);
+    seen = syncUpstream.seen.at(-1)!;
+    expect(seen).toMatchObject({ method: 'GET', path: '/v2/generations', key: SYNC_SECRET });
+    // Bad params are refused before any request.
+    const before = syncUpstream.seen.length;
+    expect((await client.call('sync_projects', { limit: 0 }).catch((e: unknown) => e) as CompanyError).code).toBe('invalid');
+    expect((await client.call('sync_projects', { limit: 101 }).catch((e: unknown) => e) as CompanyError).code).toBe('invalid');
+    expect((await client.call('sync_generations', { cursor: '../evil' }).catch((e: unknown) => e) as CompanyError).code).toBe('invalid');
+    expect(syncUpstream.seen.length).toBe(before);
   });
 
   test('sync_download_url hits the fixed download endpoint and returns the signed URL body verbatim', async () => {

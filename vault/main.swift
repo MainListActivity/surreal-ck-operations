@@ -229,7 +229,8 @@ struct Endpoint {
 
 let kindNames = ["tts", "dialogue", "sfx", "music", "voice_design", "voice_create", "voices", "subscription",
                  "sync_models", "sync_errors", "sync_asset_presign", "sync_asset_register",
-                 "sync_estimate", "sync_generate", "sync_get", "sync_download_url"]
+                 "sync_estimate", "sync_generate", "sync_get", "sync_download_url",
+                 "sync_projects", "sync_generations"]
 
 func jsonBody(_ object: [String: Any]) throws -> Data {
     guard let data = try? JSONSerialization.data(withJSONObject: object), data.count <= 1 << 20 else {
@@ -358,6 +359,25 @@ func endpoint(_ kind: String, _ params: [String: Any]) throws -> Endpoint {
             throw VaultError(code: "invalid", message: "id 不合法")
         }
         return Endpoint(method: "GET", path: "/v2/generations/\(id)/download", query: [], body: nil, timeout: 60, provider: "sync")
+    case "sync_projects", "sync_generations":
+        // Read-only org-side listings: projects prove org membership, generations prove consumption.
+        // limit 1-100 and an opaque cursor are the only caller-controlled parameters.
+        var query: [URLQueryItem] = []
+        if let raw = params["limit"], !(raw is NSNull) {
+            guard let limit = (raw as? NSNumber)?.intValue, limit >= 1, limit <= 100 else {
+                throw VaultError(code: "invalid", message: "limit 需在 1-100")
+            }
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let raw = params["cursor"], !(raw is NSNull) {
+            guard let cursor = raw as? String,
+                  cursor.range(of: "^[A-Za-z0-9][A-Za-z0-9._~+/=-]{0,511}$", options: .regularExpression) != nil else {
+                throw VaultError(code: "invalid", message: "cursor 不合法")
+            }
+            query.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        let path = kind == "sync_projects" ? "/v2/projects" : "/v2/generations"
+        return Endpoint(method: "GET", path: path, query: query, body: nil, timeout: 60, provider: "sync")
     default:
         throw VaultError(code: "invalid", message: "未知操作类型")
     }
