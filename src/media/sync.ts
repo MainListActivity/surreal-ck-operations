@@ -41,6 +41,7 @@ const REPLAY_DAYS = 7;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const FREE_TRIAL_JIT_MS = 2 * 3_600_000;      // attestation freshness window: capturedAt ≤ 2h at submit
 const FREE_TRIAL_MAX_JOB_SECONDS = 8;         // free-tier single-shot ceiling pinned to this D01
+const PREPARE_LOCK_WAIT_MS = 60_000;          // per-key prepare decision is atomic; waiters queue, not re-mint
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 const notConfigured = () => new CompanyError('not_configured', 'Sync 密钥未配置：请老板运行 sck-vault setup sync，并确认 sck-vault 正在运行');
@@ -60,7 +61,7 @@ const USAGE: Record<Exclude<SyncTool, 'sync_info'>, string> = {
   sync_models: '{} 列出供应商可见模型（只读探测）',
   sync_errors: '{} 供应商机器可读错误目录（只读探测）',
   sync_projects: '{"limit"?1-100,"cursor"?} 列密封 key 所属组织的项目（只读）：只证组织归属（控制台↔keyFp 绑定证据），不证计划/余量',
-  sync_project_prepare: '{} 唯一项目与组织绑定就绪（受控，零费用）：GET 回读先行，projects 已非空则复用现有项目不新建（取 id 最小者，确定可复现）；空则按台账持久化的固定 client UUID 幂等 POST /v2/projects 至多一次，再回读校验 ≥1 项目且全组织唯一 organizationId；多组织/回读不一致/创建被拒一律 fail-closed 记真实错误码。无参数、无 --org 降级',
+  sync_project_prepare: '{} 唯一项目与组织绑定就绪（受控，零费用）：GET 回读先行并严格校验契约（items 缺失/null/非数组即拒，不归一为空集），projects 已非空则复用现有项目不新建（取 id 最小者，确定可复现）；空则按台账持久化的固定 client UUID 幂等 POST /v2/projects 至多一次，再回读校验 ≥1 项目且全组织唯一 organizationId；多组织/回读不一致/创建被拒一律 fail-closed 记真实错误码。同 key 跨执行体互斥：并发首调锁内重读台账归并同键，绝不各生成一键。无参数、无 --org 降级',
   sync_generations: '{"since"?(ISO 默认当月初),"limit"?1-100,"cursor"?} 列本组织已消耗生成（只读）：只证消耗侧，不证剩余上限',
   sync_upload: UPLOAD_USAGE,
   sync_estimate: '{"durationSeconds","fps"?} 试算 或 {"videoAssetId","audioAssetId"?} 按已注册资产实测报价；零生成',
@@ -573,20 +574,20 @@ export class SyncStudio {
    * first (reserved-without-send-intent is provably never sent → void+release; budget rows without
    * an action are orphaned reservations → released; sending → unknown keeping its budget).
    */
-  private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
-    const run = this.queue.then(() => this.kernelLock(fn));
+  private async withLock<T>(fn: () => Promise<T> | T, waitMs = this.lockWaitMs): Promise<T> {
+    const run = this.queue.then(() => this.kernelLock(fn, waitMs));
     this.queue = run.then(() => undefined, () => undefined);
     return run;
   }
 
-  private async kernelLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  private async kernelLock<T>(fn: () => Promise<T> | T, waitMs = this.lockWaitMs): Promise<T> {
     this.ensureDirs();
-    const helper = spawn('/usr/bin/python3', ['-c', LOCK_HELPER, this.dirs.lock, String(this.lockWaitMs)], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const helper = spawn('/usr/bin/python3', ['-c', LOCK_HELPER, this.dirs.lock, String(waitMs)], { stdio: ['pipe', 'pipe', 'pipe'] });
     let exited = false;
     const closed = new Promise<void>(done => helper.once('close', () => { exited = true; done(); }));
     try {
       await new Promise<void>((done, reject) => {
-        const timer = setTimeout(() => { helper.kill(); reject(new CompanyError('temporarily_unavailable', 'Sync 预算锁获取超时')); }, this.lockWaitMs + 1_000);
+        const timer = setTimeout(() => { helper.kill(); reject(new CompanyError('temporarily_unavailable', 'Sync 预算锁获取超时')); }, waitMs + 1_000);
         helper.once('error', () => { clearTimeout(timer); reject(new CompanyError('temporarily_unavailable', 'Sync 预算锁不可用')); });
         helper.once('close', () => { clearTimeout(timer); reject(new CompanyError('temporarily_unavailable', 'Sync 预算锁被占用，稍后重试')); });
         helper.stdout.once('data', () => { clearTimeout(timer); done(); });
@@ -813,9 +814,11 @@ export class SyncStudio {
   }
 
   /**
-   * Full GET /v2/projects readback via the fixed read-only kind, bounded pagination. A page that
-   * fails or a row missing organizationId fails closed with the real status — a half-known
-   * project set can never pass as "unique org" evidence.
+   * Full GET /v2/projects readback via the fixed read-only kind, bounded pagination, STRICT
+   * contract: a 200 reply whose root is not an object with a well-formed `items` array is a
+   * broken readback, never an empty project set — normalizing it to [] would mint a key and
+   * create a project on a malformed org. Every contract violation fails closed before any
+   * sync_project_create can happen.
    */
   private async readbackProjects(pending: PrepareRecord): Promise<Array<{ id: string; name?: string; organizationId: string }>> {
     try {
@@ -823,8 +826,10 @@ export class SyncStudio {
       let cursor: string | undefined;
       for (let page = 0; page < 10; page += 1) {
         const res = record(await this.json<Args>('sync_projects', pick({ limit: 100, cursor })));
-        const items = Array.isArray(res.items) ? res.items : [];
-        for (const item of items) {
+        if (!Array.isArray(res.items)) {
+          throw new CompanyError('conflict', '回读契约不符：HTTP 200 但根结构非对象或 items 缺失/null/非数组，fail-closed');
+        }
+        for (const item of res.items) {
           const p = record(item);
           const id = typeof p.id === 'string' ? p.id : undefined;
           const organizationId = typeof p.organizationId === 'string' ? p.organizationId : undefined;
@@ -866,38 +871,38 @@ export class SyncStudio {
     return record(safeJson(reply.body));
   }
 
+  /** Ready-record replay: terminal state, identical fields, zero upstream calls. */
+  private prepareHit(scope: OpsScope, keyFp: string, prior: PrepareRecord): Out {
+    this.mirror(scope, { op: 'project-prepare', hit: 1, reused: prior.reused ? 1 : 0, projects: prior.projectsSeen });
+    return {
+      value: pick({
+        ready: true, reused: prior.reused ?? false, accountRef: keyFp, clientUuid: prior.clientUuid,
+        organizationId: prior.organizationId, projectId: prior.projectId, projectName: prior.projectName,
+        readbackAt: prior.readbackAt, at: prior.at,
+      }),
+      audit: { action: 'ops_sync_prepare', evidence: `hit reuse=${prior.reused ? 1 : 0} project=${prior.projectId} projects=${prior.projectsSeen}` },
+    };
+  }
+
   /**
-   * sync_project_prepare: make the sealed key's org attest-ready. Readback first — a non-empty
-   * project set is reused (nothing is created); an empty set triggers exactly one idempotent
-   * POST under the ledger-persisted client UUID, then a fresh readback must show ≥1 project,
-   * exactly one organizationId and, when the create returned an id, that project present.
-   * Every failure mode records the real status/code and refuses; the whole tool is
-   * generation-free, allowance-free and charge-free by construction.
+   * The whole fresh-prepare decision runs under one per-key mutual exclusion (kernel flock):
+   * re-read the ledger AFTER acquiring the lock, mint the client UUID exactly once and persist
+   * it BEFORE the POST, and only then decide on the create. A concurrent executor waits on the
+   * same lock and re-reads the ledger here — it either replays the converged ready binding or
+   * reuses the SAME persisted UUID (crash leftovers included), so a logical creation happens at
+   * most once per key no matter how many executors race. The lock hold includes the readbacks
+   * and the single POST: prepare is a rare, short, zero-charge operation, and keeping the
+   * decision atomic is worth the hold; everything else on this lock stays millisecond-scale.
    */
-  private async prepareProject(scope: OpsScope, args: Args): Promise<Out> {
-    if (Object.keys(record(args)).length > 0) throw invalid('sync_project_prepare 不接受参数（无 --org 降级，绑定语义固定）');
-    const keyFp = await this.keyFp();
-    const prior = this.readPrepare(keyFp);
-    // Hit: a ready record replays the recorded binding with zero upstream calls and no cap use.
-    if (prior?.state === 'ready') {
-      this.mirror(scope, { op: 'project-prepare', hit: 1, reused: prior.reused ? 1 : 0, projects: prior.projectsSeen });
-      return {
-        value: pick({
-          ready: true, reused: prior.reused ?? false, accountRef: keyFp, clientUuid: prior.clientUuid,
-          organizationId: prior.organizationId, projectId: prior.projectId, projectName: prior.projectName,
-          readbackAt: prior.readbackAt, at: prior.at,
-        }),
-        audit: { action: 'ops_sync_prepare', evidence: `hit reuse=${prior.reused ? 1 : 0} project=${prior.projectId} projects=${prior.projectsSeen}` },
-      };
-    }
+  private async prepareLocked(scope: OpsScope, keyFp: string): Promise<Out> {
+    this.ensureDirs();
+    let prior = this.readPrepare(keyFp);
+    if (prior?.state === 'ready') return this.prepareHit(scope, keyFp, prior);
 
     await this.capCheck(scope, 'read');
     const projectName = 'sck-controlled';
-    // Authoritative state dirs (incl. prepare/) must exist before the first ledger write — this
-    // flow never enters kernelLock, which is where the other tools get theirs.
-    this.ensureDirs();
     let pending = prior ?? { schema: 'sync-prepare/1' as const, accountRef: keyFp, clientUuid: randomUUID(), state: 'creating' as const, at: iso(this.now()), history: [] };
-    if (!prior) this.writePrepare(pending);
+    if (!prior) this.writePrepare(pending); // the only mint: inside the lock, before any upstream contact
 
     // Step 1 — readback before any write: non-empty ⇒ reuse, empty ⇒ one idempotent create.
     let projects = await this.readbackProjects(pending);
@@ -946,6 +951,24 @@ export class SyncStudio {
       }),
       audit: { action: 'ops_sync_prepare', evidence: `ready reuse=${reused ? 1 : 0} project=${chosen.id} projects=${projects.length}` },
     };
+  }
+
+  /**
+   * sync_project_prepare: make the sealed key's org attest-ready. Readback first — a non-empty
+   * project set is reused (nothing is created); an empty set triggers exactly one idempotent
+   * POST under the ledger-persisted client UUID, then a fresh readback must show ≥1 project,
+   * exactly one organizationId and, when the create returned an id, that project present.
+   * Every failure mode records the real status/code and refuses; the whole tool is
+   * generation-free, allowance-free and charge-free by construction, and the create decision is
+   * atomic per key across executors (see prepareLocked).
+   */
+  private async prepareProject(scope: OpsScope, args: Args): Promise<Out> {
+    if (Object.keys(record(args)).length > 0) throw invalid('sync_project_prepare 不接受参数（无 --org 降级，绑定语义固定）');
+    const keyFp = await this.keyFp();
+    // Read-only fast path: a ready record is terminal, so replaying it needs no lock and no cap.
+    const settled = this.readPrepare(keyFp);
+    if (settled?.state === 'ready') return this.prepareHit(scope, keyFp, settled);
+    return this.withLock(() => this.prepareLocked(scope, keyFp), PREPARE_LOCK_WAIT_MS);
   }
 
   /**

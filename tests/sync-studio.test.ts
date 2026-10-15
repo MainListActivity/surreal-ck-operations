@@ -478,6 +478,87 @@ describe('sync_project_prepare', () => {
     expect((await fail(call(studio(), 'sync_project_prepare'))).code).toBe('not_configured');
     expect(vaultCalls).toEqual([]);
   });
+
+  test('R1: a malformed 200 readback is a contract refusal, never an empty set — create count stays 0', async () => {
+    for (const root of [{ detail: 'upstream glitch' }, { items: null }, [], { items: 'nope' }]) {
+      vaultCalls = [];
+      reply = () => json(root);
+      const err = await fail(call(studio(), 'sync_project_prepare'));
+      expect(err.code).toBe('conflict');
+      expect(err.message).toContain('回读契约不符');
+      // The strict refusal happens BEFORE any sync_project_create: only the GET ever left.
+      expect(kinds()).toEqual(['sync_projects']);
+      const record = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+      expect(record.state).toBe('failed');
+      expect(record.lastError).toBe('readback conflict');
+    }
+    expect(vaultCalls.filter(c => c.kind === 'sync_project_create')).toHaveLength(0);
+  });
+
+  test('R1: concurrent first calls across executor instances share one flock and one client UUID', async () => {
+    const createKeys: string[] = [];
+    let reads = 0;
+    reply = call => {
+      if (call.kind === 'sync_project_create') {
+        createKeys.push(String(call.params.idempotencyKey));
+        return json({ id: 'p-created', name: 'sck-controlled', organizationId: 'org-1' }, 201);
+      }
+      reads += 1;
+      // The winner's first readback is empty (nothing upstream yet); every later readback
+      // (including the winner's own post-create one) shows the project.
+      return json({ items: reads === 1 ? [] : [{ id: 'p-created', name: 'sck-controlled', organizationId: 'org-1' }] });
+    };
+    // Two independent studio instances = two executor sessions with separate in-process queues;
+    // only the kernel flock serializes them, exactly like two concurrent holders of one key.
+    const [a, b] = await Promise.all([
+      call(studio(), 'sync_project_prepare') as Promise<any>,
+      call(studio(), 'sync_project_prepare') as Promise<any>,
+    ]);
+    expect(a.ready).toBe(true);
+    expect(b.ready).toBe(true);
+    // One decision, one mint: both executors report the SAME client UUID and binding, and the
+    // single POST that left carried that one key.
+    expect(b.clientUuid).toBe(a.clientUuid);
+    expect(b.projectId).toBe(a.projectId);
+    expect(b.organizationId).toBe(a.organizationId);
+    expect(createKeys).toEqual([a.clientUuid]);
+    const record = JSON.parse(readFileSync(priv(`prepare/prepare-${accountFp}.json`), 'utf8'));
+    expect(record.state).toBe('ready');
+    expect(record.clientUuid).toBe(a.clientUuid);
+  });
+
+  test('R1: a persisted creating intent survives a crash — re-entry re-POSTs under the SAME UUID', async () => {
+    const seededUuid = '0e1c2a6e-1111-4222-8333-444455556666';
+    mkdirSync(priv('prepare'), { recursive: true, mode: 0o700 });
+    // Crash window: intent (and UUID) persisted, but the POST never landed anywhere.
+    writeFileSync(priv(`prepare/prepare-${accountFp}.json`), JSON.stringify({
+      schema: 'sync-prepare/1', accountRef: accountFp, clientUuid: seededUuid, state: 'creating',
+      at: new Date(clock).toISOString(), history: [{ at: new Date(clock).toISOString(), action: 'create', note: '崩溃回收现场' }],
+    }), { mode: 0o600 });
+    let reads = 0;
+    reply = call => {
+      if (call.kind === 'sync_project_create') return json({ id: 'p-created', organizationId: 'org-1' }, 201);
+      reads += 1;
+      return json({ items: reads === 1 ? [] : [{ id: 'p-created', organizationId: 'org-1' }] });
+    };
+    const res = await call(studio(), 'sync_project_prepare') as any;
+    expect(res).toMatchObject({ ready: true, reused: false, projectId: 'p-created', clientUuid: seededUuid });
+    expect(vaultCalls[1].params).toEqual({ name: 'sck-controlled', idempotencyKey: seededUuid });
+  });
+
+  test('R1: an unknown POST outcome converges by readback — the project shows up, so no second create', async () => {
+    const seededUuid = '1f2d3c4e-1111-4222-8333-444455556666';
+    mkdirSync(priv('prepare'), { recursive: true, mode: 0o700 });
+    // Crash AFTER the send: intent persisted with the original UUID, upstream state unknown.
+    writeFileSync(priv(`prepare/prepare-${accountFp}.json`), JSON.stringify({
+      schema: 'sync-prepare/1', accountRef: accountFp, clientUuid: seededUuid, state: 'creating',
+      at: new Date(clock).toISOString(), history: [{ at: new Date(clock).toISOString(), action: 'create', note: 'POST /v2/projects 已接受（HTTP 201），待回读确认' }],
+    }), { mode: 0o600 });
+    reply = () => json({ items: [{ id: 'p-created', organizationId: 'org-1' }] });
+    const res = await call(studio(), 'sync_project_prepare') as any;
+    expect(res).toMatchObject({ ready: true, reused: true, projectId: 'p-created', clientUuid: seededUuid });
+    expect(kinds()).toEqual(['sync_projects']); // POST=0: the readback proves the create already happened
+  });
 });
 
 // ---------- upload ----------
