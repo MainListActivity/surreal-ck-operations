@@ -310,14 +310,14 @@ describe('ops_supplier_plan_sample', () => {
     expect(ACCOUNT_PAYMENT_SOURCES).toEqual([]);
   });
 
-  test('an account plan type other than the certified free type fails account-plan-free', async () => {
+  test('an account plan type other than the certified free type fails accountPlanType', async () => {
     const r = rig();
     seal(r);
     r.world.supplier.planType = 'TOKEN_PLAN_PLAN_TYPE_PRO';
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.document).toBeUndefined();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'account-plan-free', source: 'poolUsage' })]));
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'accountPlanType', source: 'poolUsage' })]));
     expect(result.receipt.derivations.accountPlanFree).toBe(false);
     expectNoSupplierLeaks(r);
   });
@@ -328,7 +328,7 @@ describe('ops_supplier_plan_sample', () => {
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.document).toBeUndefined();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'account-plan-free', source: 'poolUsage' })]));
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'accountPlanType', source: 'poolUsage' })]));
     expectNoSupplierLeaks(r);
   });
 
