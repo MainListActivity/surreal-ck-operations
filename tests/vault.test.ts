@@ -94,6 +94,9 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
         });
         if (url.pathname === '/v2/models') return Response.json({ models: [{ id: 'sync-3' }] });
         if (url.pathname === '/v2/errors') return Response.json([{ code: 'invalid_asset_id_format' }]);
+        if (url.pathname === '/v2/projects' && req.method === 'POST') {
+          return Response.json({ id: 'p-created', name: JSON.parse(body || '{}').name, organizationId: 'org-1' }, { status: 201, headers: { 'idempotency-replayed': 'false' } });
+        }
         if (url.pathname === '/v2/projects') return Response.json({ items: [{ id: 'p-1', organizationId: 'org-1' }] });
         if (url.pathname === '/v2/generations') return Response.json([{ id: 'gen-1', model: 'sync-3', status: 'COMPLETED' }]);
         if (url.pathname === '/v2/generations/estimate') return Response.json({ estimatedGenerationCost: 0.5 });
@@ -208,6 +211,20 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
       input: [{ type: 'video', assetId: 'ast-1' }, { type: 'audio', assetId: 'ast-2' }],
       options: { sync_mode: 'silence' },
     });
+  });
+
+  test('sync_project_create is the one controlled write: pinned body and out-of-band Idempotency-Key', async () => {
+    const reply = await client.call('sync_project_create', { name: 'sck-controlled', idempotencyKey: '0e1c2a6e-1111-4222-8333-444455556666' });
+    expect(reply.status).toBe(201);
+    expect(reply.headers?.['idempotency-replayed']).toBe('false');
+    const seen = syncUpstream.seen.at(-1)!;
+    expect(seen).toMatchObject({ method: 'POST', path: '/v2/projects', key: SYNC_SECRET, xiKey: null, idem: '0e1c2a6e-1111-4222-8333-444455556666' });
+    expect(JSON.parse(seen.body)).toEqual({ name: 'sck-controlled' });
+    // Bad name or a missing key is refused before any request leaves the vault.
+    const before = syncUpstream.seen.length;
+    expect((await client.call('sync_project_create', { name: '../evil', idempotencyKey: 'k' }).catch((e: unknown) => e) as CompanyError).code).toBe('invalid');
+    expect((await client.call('sync_project_create', { name: 'x' }).catch((e: unknown) => e) as CompanyError).code).toBe('invalid');
+    expect(syncUpstream.seen.length).toBe(before);
   });
 
   test('sync_get builds the mutually exclusive wait/progress queries and pins the model contract', async () => {

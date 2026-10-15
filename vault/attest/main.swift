@@ -2,13 +2,14 @@
 // artifact. The boss feeds it console screenshots (billing plan + payment method, projects
 // page with the org marker, both carrying a timestamp) AND declares each file's real capture
 // time — never inferred from mtime or landing time. The tool hashes the evidence, binds every
-// file's SHA256 to its declared capturedAt, reads the sealed key's own org id through sck-vault
-// (never the key), asks for device-owner confirmation plus typed attestations, then writes a
-// single-use free-trial artifact into <serviceHome>/private/sync/approvals/. The artifact's
-// capturedAt is the EARLIEST evidence capture time, issuedAt is the landing time — re-landing
-// old screenshots can never refresh the 2h qualification window. Screenshot bytes never leave
-// this process and are never shown to employees or the model. vault/build.sh builds it
-// alongside sck-vault.
+// file's SHA256 to its declared capturedAt, takes the org binding from the controlled
+// sync_project_prepare ledger (unique organizationId + project ID per key — an empty or
+// multi-org org cannot have a ready record), asks for device-owner confirmation plus typed
+// attestations, then writes a single-use free-trial artifact into
+// <serviceHome>/private/sync/approvals/. The artifact's capturedAt is the EARLIEST evidence
+// capture time, issuedAt is the landing time — re-landing old screenshots can never refresh
+// the 2h qualification window. Screenshot bytes never leave this process and are never shown
+// to employees or the model. vault/build.sh builds it alongside sck-vault.
 import CryptoKit
 import Foundation
 import LocalAuthentication
@@ -255,8 +256,7 @@ func run() -> Never {
     }
     guard evidencePairs.count >= 2 else { fail("--evidence 至少两份：billing 页（plan+payment method）与 projects 页（含组织标识），各声明截图上的真实采集时点") }
 
-    // The sealed key's own org id: projects listed through the key prove membership; the boss
-    // attests the console shows the same org. keyFp is a fingerprint, never the key.
+    // The sealed key's identity comes from sck-vault (keyFp is a fingerprint, never the key).
     guard let status = vaultRequest(["op": "status"]), status["ok"] as? Bool == true else {
         fail("sck-vault 未运行，无法取得密钥指纹")
     }
@@ -265,21 +265,28 @@ func run() -> Never {
     guard sync?["configured"] as? Bool == true, let keyFp = sync?["keyFp"] as? String else {
         fail("sck-vault 中没有 sync 密钥")
     }
-    guard let reply = vaultRequest(["op": "call", "kind": "sync_projects", "params": ["limit": 100]]),
-          reply["ok"] as? Bool == true, let body64 = reply["bodyBase64"] as? String,
-          let body = Data(base64Encoded: body64) else {
-        fail("经 sck-vault 查询 /v2/projects 失败")
+    // Org-uniqueness evidence comes from the controlled sync_project_prepare readback, not from
+    // a live probe here: a ready prepare-<keyFp>.json record means a full GET /v2/projects
+    // readback already saw ≥1 project with exactly one organizationId bound to THIS key. An
+    // empty org, a multi-org key or a refused create can never have a ready record, so those
+    // negatives still refuse — now with the prepare ledger as the single source of truth.
+    guard matches(keyFp, "^[A-Za-z0-9._-]{8,64}$") else { fail("密钥指纹异常") }
+    let preparePath = Paths.home + "/private/sync/prepare/prepare-\(keyFp).json"
+    guard FileManager.default.fileExists(atPath: preparePath),
+          let prepareData = FileManager.default.contents(atPath: preparePath),
+          let prepare = try? JSONSerialization.jsonObject(with: prepareData) as? [String: Any],
+          prepare["schema"] as? String == "sync-prepare/1" else {
+        fail("未找到本 key 的 prepare 就绪台账：先运行 sync_project_prepare（\(preparePath)）")
     }
-    let statusCode = (reply["status"] as? NSNumber)?.intValue ?? 0
-    guard (200..<300).contains(statusCode) else { fail("/v2/projects 上游返回 HTTP \(statusCode)") }
-    var orgIds = Set<String>()
-    if let parsed = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-       let items = parsed["items"] as? [[String: Any]] {
-        for item in items { if let org = item["organizationId"] as? String { orgIds.insert(org) } }
+    guard prepare["state"] as? String == "ready" else {
+        fail("sync_project_prepare 未就绪（state=\(prepare["state"] as? String ?? "?")）：空项目集/多组织/创建被拒均无法落 free-trial 工件")
     }
-    guard !orgIds.isEmpty else { fail("该 key 所属组织没有任何项目，无法建立控制台↔keyFp 绑定") }
-    guard orgIds.count == 1 else { fail("项目列表跨多个组织（\(orgIds.count) 个 organizationId），无法唯一绑定") }
-    let accountOrg = orgIds.first!
+    guard prepare["accountRef"] as? String == keyFp else { fail("prepare 台账与当前密钥指纹不符（绑定不符，fail-closed）") }
+    guard let accountOrg = prepare["organizationId"] as? String, !accountOrg.isEmpty,
+          let preparedProject = prepare["projectId"] as? String, !preparedProject.isEmpty else {
+        fail("prepare 台账缺少 organizationId/projectId（回读记录不完整，fail-closed）")
+    }
+    let readbackAt = prepare["readbackAt"] as? String ?? "?"
 
     // Evidence: hash only; the bytes themselves never leave this process. Each file's SHA256
     // is bound to the owner-declared capture time checked above.
@@ -310,7 +317,8 @@ func run() -> Never {
     将落盘 free-trial 单次授权工件：
       project: \(project)   taskId: \(taskId)
       accountRef(keyFp): \(keyFp)
-      accountOrg(key 侧 /v2/projects): \(accountOrg)
+      accountOrg(sync_project_prepare 回读): \(accountOrg)
+      preparedProject(回读绑定项目): \(preparedProject)   readbackAt: \(readbackAt)
       输入绑定: video=\(videoSha.prefix(16))… audio=\(audioSha.prefix(16))…
       证据（文件名 → 声明采集时点 | sha256 前16）:
     """)
@@ -326,7 +334,7 @@ func run() -> Never {
     guard ask("① 确认 sync.so 控制台 billing 页显示：当前计划为 free，且未绑定任何支付方式（payment method = none）") else {
         fail("已中止：billing 目证未确认")
     }
-    guard ask("② 确认控制台组织标识与上方 accountOrg 一致，且本月 sync-3 剩余次数 ≥ \(rest)") else {
+    guard ask("② 确认控制台组织标识与上方 accountOrg 一致（prepare 回读绑定项目 \(preparedProject)），且本月 sync-3 剩余次数 ≥ \(rest)") else {
         fail("已中止：组织归属或剩余次数未确认")
     }
     let sharedWhen = iso(earliestCapture)
@@ -362,6 +370,10 @@ func run() -> Never {
         "evidenceHashes": evidenceHashes,
         "evidenceCapturedAt": evidenceCapturedAt,
         "accountOrg": accountOrg,
+        // Provenance of the org binding: which prepared project and which readback instant the
+        // accountOrg came from (sync_project_prepare ledger). Informational, never a gate.
+        "preparedProject": preparedProject,
+        "preparedReadbackAt": readbackAt,
         "issuedAt": iso(now),
         "expiresAt": iso(endOfUtcMonth(now)),
     ]
@@ -384,7 +396,7 @@ func run() -> Never {
 
     let entry: [String: Any] = [
         "ts": iso(now), "event": "attest", "approvalId": approvalId, "project": project, "taskId": taskId,
-        "accountRef": keyFp, "accountOrg": accountOrg, "sync3Remaining": rest,
+        "accountRef": keyFp, "accountOrg": accountOrg, "preparedProject": preparedProject, "sync3Remaining": rest,
         "evidence": evidenceHashes.keys.sorted(), "capturedAt": iso(earliestCapture), "expiresAt": iso(endOfUtcMonth(now)),
         "by": "deviceOwnerAuthentication",
     ]

@@ -5,11 +5,13 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// sck-sync-attest end to end: a fake vault socket answers status + sync_projects; the test
-// binary then writes the single-use free-trial artifact it would land for the owner. Every
-// evidence file must carry its owner-declared real capture instant; the artifact's capturedAt
-// is the earliest of them while issuedAt stays the landing moment. Nothing here touches the
-// real vault, keychain or upstream — fixtures only.
+// sck-sync-attest end to end: a fake vault socket answers status only — the org binding now
+// comes from the sync_project_prepare ledger fixture (private/sync/prepare/prepare-<keyFp>.json),
+// and attest never probes /v2/projects by itself. The test binary then writes the single-use
+// free-trial artifact it would land for the owner. Every evidence file must carry its
+// owner-declared real capture instant; the artifact's capturedAt is the earliest of them while
+// issuedAt stays the landing moment. Nothing here touches the real vault, keychain or upstream —
+// fixtures only.
 
 const ROOT = join(import.meta.dir, '..');
 const BIN = join(ROOT, 'vault', 'build', 'sck-sync-attest-test');
@@ -28,13 +30,22 @@ const replyFor = (req: Record<string, unknown>): Record<string, unknown> => {
   if (req.op === 'status') {
     return { ok: true, configured: true, providers: { elevenlabs: { configured: true }, sync: { configured: true, keyFp: KEY_FP } } };
   }
-  if (req.op === 'call' && req.kind === 'sync_projects') {
-    return {
-      ok: true, status: 200, contentType: 'application/json',
-      bodyBase64: Buffer.from(JSON.stringify({ items: [{ id: 'p-1', organizationId: 'org-bound' }] })).toString('base64'),
-    };
-  }
+  // No call kinds are answered: since the prepare-ledger alignment, attest must not send any
+  // upstream probe through the vault. An unexpected call surfaces as an unknown-op failure.
   return { ok: false, code: 'invalid', message: 'unknown op' };
+};
+
+/** (Re)writes the prepare ledger the attest binary reads; defaults to a ready record. */
+const writePrepareLedger = (over: Record<string, unknown> = {}) => {
+  mkdirSync(join(home, 'private', 'sync', 'prepare'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, 'private', 'sync', 'prepare', `prepare-${KEY_FP}.json`), JSON.stringify({
+    schema: 'sync-prepare/1', accountRef: KEY_FP,
+    clientUuid: '0e1c2a6e-1111-4222-8333-444455556666', state: 'ready',
+    organizationId: 'org-bound', projectId: 'p-1', projectName: 'sck-controlled',
+    reused: false, at: iso(Date.now() - 3_600_000), readbackAt: iso(Date.now() - 3_600_000),
+    projectsSeen: 1, history: [],
+    ...over,
+  }), { mode: 0o600 });
 };
 
 // The mock vault lives in this process, so the attest binary must be spawned async:
@@ -78,6 +89,7 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     mkdirSync(home, { recursive: true });
     writeFileSync(join(dir, 'billing.png'), 'fake billing screenshot bytes');
     writeFileSync(join(dir, 'projects.png'), 'fake projects screenshot bytes');
+    writePrepareLedger();
     const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh'), '--test'], { stdout: 'pipe', stderr: 'pipe' });
     expect(build.exitCode).toBe(0);
     server = net.createServer(conn => {
@@ -110,6 +122,7 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
       taskId: '02186d39-94fa-4582-be50-7a66278b7fad', accountRef: KEY_FP,
       kind: 'free-trial', models: ['sync-3'], maxGenerations: 1, maxUsdPerJob: 0, maxUsdTotal: 0,
       maxJobSeconds: 8, plan: 'free', paymentMethod: 'none', sync3Remaining: 1, accountOrg: 'org-bound',
+      preparedProject: 'p-1',
       inputSha256Allowlist: [sha('d01-video'), sha('d01-audio')],
     });
     expect(artifact.approvalId).toMatch(/^ft-[0-9a-f]{8}$/);
@@ -125,10 +138,10 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     expect(Date.parse(artifact.issuedAt)).toBeGreaterThan(Date.parse(artifact.capturedAt));
     expect(Math.abs(Date.parse(artifact.issuedAt) - Date.now())).toBeLessThan(60_000);
     expect(Date.parse(artifact.expiresAt)).toBeGreaterThan(Date.now());
-    // The org binding came through the sealed key's own project list, not an argument.
-    expect(calls.some(c => c.op === 'call' && c.kind === 'sync_projects')).toBe(true);
+    // The org binding comes from the prepare ledger: attest never probes upstream itself.
+    expect(calls.every(c => c.op === 'status')).toBe(true);
     const log = JSON.parse(readFileSync(join(home, 'private', 'sync', 'attest-log.jsonl'), 'utf8').trim().split('\n').at(-1)!);
-    expect(log).toMatchObject({ event: 'attest', approvalId: artifact.approvalId, accountOrg: 'org-bound', capturedAt: artifact.capturedAt, by: 'deviceOwnerAuthentication' });
+    expect(log).toMatchObject({ event: 'attest', approvalId: artifact.approvalId, accountOrg: 'org-bound', preparedProject: 'p-1', capturedAt: artifact.capturedAt, by: 'deviceOwnerAuthentication' });
   });
 
   test('evidence order never changes the earliest-instant rule', async () => {
@@ -168,8 +181,7 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     // An instant exactly at the reference now is not future — it lands.
     expect((await run(baseArgs('2026-10-15T12:00:00.000Z', past), 'yes\nyes\nyes\n', fixedNow)).exitCode).toBe(0);
     expect(artifactFiles().length).toBe(before + 1); // only the exact-now run landed
-    expect(calls.filter(c => c.op === 'call' && c.kind === 'sync_projects')
-      .length).toBe(1); // refusals never reached the vault
+    expect(calls.some(c => c.op === 'call')).toBe(false); // refusals never probed; the landing run needs no probe either
   });
 
   test('stale, mixed, future, missing or malformed capture times all refuse without an artifact', async () => {
@@ -215,5 +227,30 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     const oneShot = baseArgs().slice(0, baseArgs().indexOf('--evidence') + 3);
     expect((await run(oneShot)).exitCode).toBe(1);
     expect(calls).toEqual([]);
+  });
+
+  test('attest refuses without a ready prepare ledger: missing, failed, foreign-key or incomplete', async () => {
+    const ledgerPath = join(home, 'private', 'sync', 'prepare', `prepare-${KEY_FP}.json`);
+    const before = artifactFiles().length;
+    // Missing ledger entirely: project preparation never ran for this key.
+    rmSync(ledgerPath);
+    expect((await run(baseArgs())).exitCode).toBe(1);
+    expect((await run(baseArgs())).stderr).toContain('sync_project_prepare');
+    // A failed prepare (empty org / multi-org / refused create) is never a ready record.
+    writePrepareLedger({ state: 'failed', lastError: 'multi_org count=2' });
+    expect((await run(baseArgs())).exitCode).toBe(1);
+    expect((await run(baseArgs())).stderr).toContain('未就绪');
+    // The ledger binds THIS key; a record minted under another fingerprint is a binding mismatch.
+    writePrepareLedger({ accountRef: 'fedcba0987654321' });
+    expect((await run(baseArgs())).exitCode).toBe(1);
+    expect((await run(baseArgs())).stderr).toContain('绑定不符');
+    // An incomplete record (no organizationId/projectId) cannot establish the binding either.
+    writePrepareLedger({ organizationId: '', projectId: '' });
+    expect((await run(baseArgs())).exitCode).toBe(1);
+    expect((await run(baseArgs())).stderr).toContain('回读记录不完整');
+    // Restored ready record: landing works again, all negatives above left no artifact.
+    writePrepareLedger();
+    expect((await run(baseArgs())).exitCode).toBe(0);
+    expect(artifactFiles().length).toBe(before + 1);
   });
 });
