@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildScript, TURN_HELPERS } from '../src/media/browser-scripts.ts';
 
 // Executable select/extract tests: the SAME in-page code the write/recover ops
@@ -28,6 +30,13 @@ class El {
   get innerText(): string {
     return [this.ownText, ...this.children.map(c => c.innerText)].filter(s => s.length > 0).join('\n');
   }
+  // Input simulation for full-script tests: the fill path assigns innerText and
+  // fires events; Send/click handlers mutate the fake DOM between probes.
+  set innerText(v: string) { this.ownText = v; }
+  onClick?: () => void;
+  click(): void { this.onClick?.(); }
+  focus(): void {}
+  dispatchEvent(): boolean { return true; }
   *walk(): Generator<El> {
     for (const c of this.children) { yield c; yield* c.walk(); }
   }
@@ -288,6 +297,171 @@ describe('recover lane (executable)', () => {
     expect(recoverBlock).not.toContain('ARGS.prompt');
     expect(recoverBlock).not.toContain('keyboard.press');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Full generated-script runs: the COMPLETE string produced by buildScript() is
+// executed against a stub page/process/console — same harness shape as the
+// deploy-QA negative fixture (task 42314024 qa/recover-negative.ts) that caught
+// recover returning ok on unfinished replies. Only the browser DOM, waits and
+// process.exit are faked; file writes are real, into a temp dir, so a wrong
+// success path would visibly clobber the sentinel artifact.
+// bun lacks InputEvent/location globals — polyfill for the in-page code.
+(globalThis as Record<string, unknown>).InputEvent ??= class extends Event {
+  constructor(t: string, i?: EventInit) { super(t, i); }
+};
+
+interface ScriptRun {
+  ok?: boolean; code?: string; message?: string; file?: string; sha256?: string;
+  source?: string; turns?: Array<{ i: number; role: string; len: number }>;
+  url?: string; text?: string; bytes?: number;
+  nav: string[]; pickReads: number;
+}
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as
+  new (...args: string[]) => (...a: unknown[]) => Promise<unknown>;
+
+async function runScript(script: string, body: El, opts: { onPick?: (reads: number) => void; pathname?: string } = {}): Promise<ScriptRun> {
+  const doc = { body, querySelectorAll: (s: string) => body.querySelectorAll(s) };
+  const nav: string[] = [];
+  const logs: string[] = [];
+  let pickReads = 0;
+  const page = {
+    goto: async (u: string) => { nav.push(u); },
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+    evaluate: async (fn: (...a: never[]) => unknown, arg?: unknown) => {
+      const src = fn.toString();
+      if (src.includes('return pickReply(turn)')) { pickReads += 1; opts.onPick?.(pickReads); }
+      return new Function('document', 'location', 'arg', 'return (' + src + ')(arg)')(
+        doc, { pathname: opts.pathname ?? '/app/deadbeef123456' }, arg);
+    },
+  };
+  const taskSpace = async () => ({ pages: async () => [page], newPage: async () => page });
+  const processStub = { exit: () => { throw new Error('FIXTURE_EXIT'); } };
+  try {
+    await new AsyncFunction('taskSpace', 'process', 'console', script)(
+      taskSpace, processStub, { log: (s: string) => logs.push(s) });
+  } catch (e) {
+    if ((e as Error).message !== 'FIXTURE_EXIT') throw e;
+  }
+  const line = logs.filter(s => s.startsWith('__RESULT__')).pop();
+  return { ...(line ? JSON.parse(line.slice('__RESULT__'.length)) : {}), nav, pickReads };
+}
+
+const recoverScript = (outDir: string, turn?: number) => buildScript('notebook', {
+  kind: 'notebook', prompt: '', outDir, file: 'candidate.md', refs: [], timeoutMs: 480000,
+  notebookOp: 'recover', chat: '298352bc8337e01f', turn,
+});
+
+describe('full generated scripts (page-stub executable)', () => {
+  const SENTINEL = 'PREVIOUS_VALID_ARTIFACT';
+  const seed = (outDir: string) => { writeFileSync(join(outDir, 'candidate.md'), SENTINEL); };
+  const preserved = (outDir: string) => readFileSync(join(outDir, 'candidate.md'), 'utf8') === SENTINEL;
+
+  test('recover map mode (no turn): emits turn map, writes nothing, never picks', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-recmap-'));
+    const body = new El('body').add(userTurn('初稿指令'), modelTurn('v1 正文'), userTurn('返修指令'), modelTurn('v2 正文'));
+    const r = await runScript(recoverScript(outDir), body);
+    expect(r.ok).toBe(true);
+    expect(r.turns!.map(t => t.role)).toEqual(['user', 'model', 'user', 'model']);
+    expect(r.pickReads).toBe(0);
+    expect(existsSync(join(outDir, 'candidate.md'))).toBe(false); // map mode must not write
+    expect(r.nav).toEqual(['https://gemini.google.com/app/298352bc8337e01f']);
+  });
+
+  test('recover QA-negative: no Copy action + thoughts-only text → fails, sentinel preserved', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-recneg1-'));
+    seed(outDir);
+    const model = new El('model-response', { text: 'Thoughts\n正在分析问题，暂时尚未产出最终模型回复。' });
+    const body = new El('body').add(userTurn('QA fixture prompt'), model);
+    const r = await runScript(recoverScript(outDir, 0), body);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('Copy'); // completion marker missing → fail closed
+    expect(r.pickReads).toBe(1);
+    expect(preserved(outDir)).toBe(true);
+  });
+
+  test('recover QA-negative: Stop appears on the stability re-read → fails, sentinel preserved', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-recneg2-'));
+    seed(outDir);
+    const body = new El('body').add(userTurn('QA fixture prompt'), modelTurn('这是用于测试的固定最终答复，长度足够。'));
+    const r = await runScript(recoverScript(outDir, 0), body, {
+      onPick: reads => { if (reads === 2) body.add(new El('button', { attrs: { 'aria-label': 'Stop generating' } })); },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.pickReads).toBe(2);
+    expect(preserved(outDir)).toBe(true);
+  });
+
+  test('recover positive: finished reply → atomic write, provenance + sha256', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-recpos-'));
+    seed(outDir);
+    const reply = '这是用于测试的固定最终答复，长度足够。';
+    const body = new El('body').add(userTurn('QA fixture prompt'), modelTurn(reply));
+    const r = await runScript(recoverScript(outDir, 0), body);
+    expect(r.ok).toBe(true);
+    expect(r.source).toBe('gemini:298352bc8337e01f#i1');
+    expect(r.sha256).toBeTruthy();
+    expect(preserved(outDir)).toBe(false); // a genuinely finished reply MAY replace the candidate
+    const written = readFileSync(join(outDir, 'candidate.md'), 'utf8');
+    expect(written).toContain(reply);
+    expect(written).toContain('recovered i1');
+  });
+
+  test('recover fails closed: model node picked / no reply after user turn', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-recbad-'));
+    seed(outDir);
+    const body = new El('body').add(userTurn('u0'), modelTurn('m0 答复内容足够长'), userTurn('发了还没回'));
+    const notUser = await runScript(recoverScript(outDir, 1), body);
+    expect(notUser.ok).toBe(false);
+    expect(notUser.message).toContain('不是用户轮次');
+    const noReply = await runScript(recoverScript(outDir, 2), body);
+    expect(noReply.ok).toBe(false);
+    expect(noReply.message).toContain('没有模型答复');
+    expect(preserved(outDir)).toBe(true);
+  });
+
+  const geminiShell = () => {
+    const input = new El('div', { attrs: { contenteditable: 'true', 'aria-label': 'Enter a prompt for Gemini' } });
+    const send = new El('button', { attrs: { 'aria-label': 'Send' } });
+    const body = new El('body').add(input, send);
+    return { body, send };
+  };
+  const NB_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+  test('write full script: new MODEL-RESPONSE after our USER-QUERY → ok + sha256 + session marker', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-wrpos-'));
+    const reply = '2089年，地下二十八公里只剩死寂。林深扣紧骨传导耳机，听见自己的心跳。';
+    const { body, send } = geminiShell();
+    send.onClick = () => body.add(userTurn('这是针对第一卷第07章的返修与精简指令'), modelTurn(reply));
+    const script = buildScript('notebook', {
+      kind: 'notebook', prompt: '这是针对第一卷第07章的返修与精简指令', outDir, file: 'candidate.md',
+      refs: [], timeoutMs: 480000, notebookOp: 'write', notebook: NB_ID,
+    });
+    const r = await runScript(script, body);
+    expect(r.ok).toBe(true);
+    expect(r.sha256).toBeTruthy();
+    expect(r.url).toBe('https://gemini.google.com/app/deadbeef123456');
+    const written = readFileSync(join(outDir, 'candidate.md'), 'utf8');
+    expect(written).toContain(reply);
+    expect(written).toContain('gemini-session: https://gemini.google.com/app/deadbeef123456');
+  });
+
+  test('write full script: only our USER-QUERY lands (Copy prompt, no reply) → timeout fail, artifact untouched', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'sck-wrneg-'));
+    seed(outDir);
+    const { body, send } = geminiShell();
+    send.onClick = () => body.add(userTurn('这是针对第一卷第07章的返修与精简指令')); // Copy prompt only — the original bug surface
+    const script = buildScript('notebook', {
+      kind: 'notebook', prompt: '这是针对第一卷第07章的返修与精简指令', outDir, file: 'candidate.md',
+      refs: [], timeoutMs: 31000, notebookOp: 'write', notebook: NB_ID, // 1s poll window → fast timeout
+    });
+    const r = await runScript(script, body);
+    expect(r.ok).toBe(false);
+    expect(r.message).toContain('不自动重发');
+    expect(preserved(outDir)).toBe(true);
+  }, 20000);
 });
 
 describe('generated scripts parse (template-escape regression)', () => {
