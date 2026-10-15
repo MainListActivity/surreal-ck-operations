@@ -23,5 +23,6 @@ jobs:
       - run: pnpm typecheck
         working-directory: plugin
       - run: pnpm test:bridge
+      - run: pnpm test:service
       # Fork integration is independently run on the company's installed fork.
       # No upstream database or private production credentials in hosted CI.
