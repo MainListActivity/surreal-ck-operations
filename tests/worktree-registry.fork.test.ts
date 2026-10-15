@@ -643,6 +643,25 @@ run('LANE: a task waits instead of sharing the lane tree with another active wri
   expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
   await submit(core, a, first); await submit(core, qa, lonely);
 }, 30000);
+run('LANE: a blocked task keeps its scene but does not lock the lane — a rework claim enters the parked tree, and an active writer still serializes', async () => {
+  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering');
+  const goal = await laneGoal(core, 'returned');
+  const t1 = await laneTask(core, goal, 'engineering', 'returned', 'code');
+  const t2 = await laneTask(core, goal, 'engineering', 'returned', 'code');
+  const t3 = await laneTask(core, goal, 'engineering', 'returned', 'code');
+  const first = await core.claim(a, t1.id);
+  const tree = first.worktree!;
+  // Returned/blocked work is non-terminal: the task keeps its scene as a recovery ref so a
+  // resumption lands back on the lane, but the parked bookmark must not occupy the tree.
+  await db.db.query('UPDATE ONLY $task SET state = $state, current_employee = NONE, delivery_id = NONE;', { task: new RecordId('task', t1.id), state: 'blocked' });
+  const rework = await core.claim(b, t2.id);
+  expect(rework.worktree!.worktreePath).toBe(tree.worktreePath);
+  expect(rework.worktree!.branch).toBe(tree.branch);
+  // The parked scene did not open the lane to concurrent writers: a third code claim on the
+  // same lane still waits behind the actively-working rework task.
+  await expect(core.claim(c, t3.id)).rejects.toMatchObject({ code: 'worktree_busy' });
+  await submit(core, b, rework);
+}, 30000);
 run('LANE: a shared tree stranded on a task branch is moved back, and a stale unworked task branch restarts from the current base', async () => {
   const path = repo(), core = coreFor(path), qa = await employee('qa'), eng = await employee('engineering');
   const read = await core.claim(qa, (await task(core, 'qa')).id);
