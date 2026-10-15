@@ -11,7 +11,7 @@ let counts: Record<string, number> = {};
 let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let ran: Array<{ provider: string; script: string }> = [];
 // Scripted per-provider results, consumed in call order; last entry repeats.
-let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string; title?: string }> = [];
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string; title?: string; turns?: unknown; sha256?: string; source?: string }> = [];
 let ref = '';
 
 const core = {
@@ -194,6 +194,32 @@ describe('notebook lane', () => {
     expect(ran.at(-1)!.script).toContain('gemini.google.com/app/');
     // 产物文件尾自动落会话标记，供返修补丁回到同一会话
     expect(ran.at(-1)!.script).toContain('gemini-session');
+  });
+
+  test('notebook_recover: authorized chat only, probe lists turns, turn+file extracts', async () => {
+    const s = studio();
+    // chat is mandatory — recover is bound to an authorized existing conversation
+    expect((await fail(call(s, 'notebook_recover', { turn: 2, file: 'a.md' }))).code).toBe('invalid');
+    // turn + file travel together: extraction needs a destination
+    expect((await fail(call(s, 'notebook_recover', { chat: 'https://gemini.google.com/app/abc123', turn: 2 }))).code).toBe('invalid');
+    expect((await fail(call(s, 'notebook_recover', { chat: 'abc123', turn: 2, file: 'a.txt' }))).code).toBe('invalid');
+    // probe mode (no turn): lists the turn map, no file needed
+    results = [{ ok: true, url: 'https://gemini.google.com/app/abc123', turns: [{ i: 0, role: 'user', len: 100 }, { i: 1, role: 'model', len: 8000 }] }];
+    const map = await call(s, 'notebook_recover', { chat: 'https://gemini.google.com/app/abc123' }) as any;
+    expect(map.turns[1].role).toBe('model');
+    expect(ran[0].provider).toBe('notebook');
+    expect(ran[0].script).toContain('"notebookOp":"recover"');
+    expect(ran[0].script).toContain('gemini.google.com/app/');
+    const recoverBlock = ran[0].script.slice(ran[0].script.indexOf("ARGS.notebookOp === 'recover'"), ran[0].script.indexOf('const nbId'));
+    expect(recoverBlock).not.toContain('notebook.google.com'); // never opens the notebook
+    // ungated read like list: still allowed at the daily cap (no model quota spent)
+    counts['ops_browser_notebook'] = 200;
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'r.md'), bytes: 10, sha256: 'deadbeef', source: 'gemini:abc123#i3' }];
+    const got = await call(s, 'notebook_recover', { chat: 'abc123', turn: 2, file: 'r.md' }) as any;
+    expect(got.source).toContain('abc123');
+    expect(got.sha256).toBe('deadbeef');
+    expect(ran.at(-1)!.script).toContain('"turn":2');
+    expect(audits.at(-1)!.evidence).toContain('notebook_recover');
   });
 
   test('notebook_remove_source routes with title and gates quota', async () => {
