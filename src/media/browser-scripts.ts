@@ -17,11 +17,12 @@ interface ScriptArgs {
   seconds?: number;
   timeoutMs: number;
   // notebook lane
-  notebookOp?: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write';
+  notebookOp?: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write' | 'recover';
   notebook?: string;   // notebook id (from URL) or title substring
   title?: string;      // source title / new notebook name / remove_source target substring
   text?: string;       // source body for add_source
   chat?: string;       // write op: existing Gemini chat id/url to continue the same conversation
+  turn?: number;       // recover op: turn-node index (USER-QUERY position in DOM order)
 }
 
 // Shared helpers injected into every provider script.
@@ -92,6 +93,82 @@ const saveVideo = async (page, dest, seconds) => {
 const bodyText = (page) => page.evaluate(() => document.body.innerText.slice(-1200));
 const hitLimit = (t) => /weekly limit|limit reached|rate limit|quota|try again later|Resets/i.test(t || '');
 const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|create account/i.test(t || '');
+`;
+
+// Turn attribution for the Gemini chat surface (write/recover ops). The chat is a
+// DOM-ordered list of USER-QUERY / MODEL-RESPONSE custom elements; the model's own
+// action bar carries exactly `Copy` while the user bubble carries `Copy prompt` —
+// page-wide `aria-label*="Copy"` counts match BOTH, which is how the old write lane
+// returned the user's own instruction as the model answer. Everything here keys on
+// turn nodes and their own action bars, never on whole-page counts or body tails.
+// Exported so tests execute this same code against sanitized DOM fixtures.
+export const TURN_HELPERS = /* js */ `
+const turnNodes = () => [...document.querySelectorAll('user-query, model-response')];
+const turnRole = (el) => el && el.tagName === 'MODEL-RESPONSE' ? 'model' : el && el.tagName === 'USER-QUERY' ? 'user' : 'unknown';
+const btnLabel = (b) => ((b.getAttribute('aria-label') || '') + '').trim();
+const elVisible = (el) => !!el && !el.hidden && (typeof el.offsetParent === 'undefined' || el.offsetParent !== null || (el.getClientRects ? el.getClientRects().length > 0 : true));
+const replyCopyBtn = (el) => [...el.querySelectorAll('button[aria-label]')].find(b => /^copy$/i.test(btnLabel(b)));
+const fnv1a = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(36); };
+const stopBtnVisible = () => [...document.querySelectorAll('button')].some(b => /stop/i.test(btnLabel(b)) && elVisible(b));
+// MODEL-RESPONSE text: .response-content innerText, minus the screen-reader
+// 'Gemini said' label and the action-bar/icon lines around it.
+const responseText = (el) => {
+  const stop = /^(Thoughts|expand_more|expand_less|keep_pin|copy|thumb_up|thumb_down|save( to note)?|note_add|share|edit|delete|rate response|good response|bad response|more_horiz|Gemini said)\\s*$/i;
+  const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+|[。，、；：！？\\.,;:!?]+)\\s*$/i;
+  const root = el.querySelector('.response-content') || el;
+  const out = [];
+  for (const line of (root.innerText || '').split('\\n')) {
+    const t = line.trim();
+    if (stop.test(t)) { if (out.length === 0) continue; break; }
+    if (!drop.test(t)) out.push(line);
+  }
+  return out.join('\\n').replace(/^\\s*Gemini said\\s*/i, '').trim();
+};
+// One structural read of the chat vs a pre-submit baseline: a reply counts only
+// when a NEW MODEL-RESPONSE sits after the NEW last USER-QUERY.
+const chatProbe = (base) => {
+  const nodes = turnNodes();
+  const users = nodes.filter(n => turnRole(n) === 'user');
+  const models = nodes.filter(n => turnRole(n) === 'model');
+  const lastUser = users[users.length - 1] || null;
+  const lastModel = models[models.length - 1] || null;
+  const lastUserIdx = lastUser ? nodes.indexOf(lastUser) : -1;
+  const lastModelIdx = lastModel ? nodes.indexOf(lastModel) : -1;
+  const newUser = users.length > base.users && lastUserIdx > base.lastUserIdx;
+  const newModel = !!lastModel && lastModelIdx > lastUserIdx && lastModelIdx > base.lastModelIdx;
+  const text = newModel ? responseText(lastModel) : '';
+  return {
+    users: users.length, models: models.length, lastUserIdx, lastModelIdx, newUser, newModel,
+    hasCopy: newModel && !!replyCopyBtn(lastModel),
+    stopVisible: stopBtnVisible(),
+    hash: text ? fnv1a(text) : '', len: text.length, text,
+    tail: (document.body.innerText || '').slice(-800),
+  };
+};
+// Read-only turn map for recover: caller picks a USER-QUERY index, then pickReply
+// takes the MODEL-RESPONSE immediately after it (strict alternating order).
+const turnMap = () => ({
+  turns: turnNodes().map((n, i) => ({ i, role: turnRole(n), len: (((n.querySelector('.response-content') || n).innerText || '') + '').trim().length })),
+  stopVisible: stopBtnVisible(),
+});
+const pickReply = (turn) => {
+  const nodes = turnNodes();
+  if (!Number.isInteger(turn) || turn < 0 || turn >= nodes.length) return { err: 'out_of_range', nodes: nodes.length };
+  if (turnRole(nodes[turn]) !== 'user') return { err: 'not_user_turn', role: turnRole(nodes[turn]) };
+  const m = nodes[turn + 1];
+  if (!m || turnRole(m) !== 'model') return { err: 'no_reply' };
+  const text = responseText(m);
+  return { err: '', text, idx: turn + 1, hasCopy: !!replyCopyBtn(m), stopVisible: stopBtnVisible() };
+};
+// Extracted text that is a user bubble ('You said …') or echoes the prompt back
+// verbatim is not a model answer — fail closed, never write it as the artifact.
+const replyLooksFake = (text, prompt) => {
+  const squash = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  if (/^you said/i.test(squash(text))) return true;
+  const bare = (s) => (s || '').replace(/\\s+/g, '');
+  const p = bare(prompt);
+  return !!p && bare(text) === p;
+};
 `;
 
 // The runtime script: ARGS is interpolated by browser.ts as a JSON literal.
@@ -288,6 +365,55 @@ if (ARGS.notebookOp === 'create') {
   process.exit(0);
 }
 
+if (ARGS.notebookOp === 'recover') {
+  // Read-only retrieval of an existing model reply: authorized chat + explicit
+  // user turn. Never types or sends a prompt. Emits provenance + sha256 so the
+  // recovered artifact stays auditable (same source rules as a live write).
+  const chatIdIn = ((ARGS.chat || '').match(/app\\/([0-9a-f]+)/i) || [])[1]
+    || (/^[0-9a-f]{6,}$/i.test(ARGS.chat || '') ? ARGS.chat : '');
+  if (!chatIdIn) { fail('failed', 'recover 需要既有 Gemini 会话的 chat id 或 url'); }
+  try { await p.goto('https://gemini.google.com/app/' + chatIdIn); } catch {}
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(5000);
+  const gBody = await bodyText(p);
+  if (loginWall(gBody)) { fail('login_required', 'gemini.google.com 需要重新登录'); }
+  const chatUrl0 = 'https://gemini.google.com/app/' + chatIdIn;
+  if (ARGS.turn === undefined || ARGS.turn === null) {
+    const map = await p.evaluate(() => {
+${TURN_HELPERS}
+      return turnMap();
+    });
+    emit({ ok: true, url: chatUrl0, turns: map.turns, stopVisible: map.stopVisible });
+    process.exit(0);
+  }
+  const pick = await p.evaluate(({ turn }) => {
+${TURN_HELPERS}
+    return pickReply(turn);
+  }, { turn: ARGS.turn });
+  if (pick.err === 'out_of_range') { fail('failed', '轮次序号越界（当前 ' + pick.nodes + ' 个节点；先不带 turn 调用查看轮次地图）'); }
+  if (pick.err === 'not_user_turn') { fail('failed', '节点 ' + ARGS.turn + ' 不是用户轮次（role=' + pick.role + '）'); }
+  if (pick.err === 'no_reply') { fail('failed', '该用户轮次之后没有模型答复'); }
+  if (pick.stopVisible) { fail('failed', '答复仍在生成中，稍后再取'); }
+  if (!pick.text || pick.text.length < 10) { fail('failed', '答复提取为空'); }
+  await p.waitForTimeout(3000);
+  const again = await p.evaluate(({ turn }) => {
+${TURN_HELPERS}
+    return pickReply(turn);
+  }, { turn: ARGS.turn });
+  if (again.err || again.text !== pick.text) { fail('failed', '答复文本未稳定，未取回'); }
+  const fake = await p.evaluate(({ text }) => {
+${TURN_HELPERS}
+    return replyLooksFake(text, '');
+  }, { text: pick.text });
+  if (fake) { fail('failed', '取回的是用户轮文本，不是模型答复'); }
+  const tmp = outPath + '.tmp';
+  fs.writeFileSync(tmp, pick.text + '\\n\\n<!-- gemini-session: ' + chatUrl0 + ' recovered i' + pick.idx + ' -->\\n');
+  fs.renameSync(tmp, outPath);
+  const crypto = await import('node:crypto');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, url: chatUrl0, text: pick.text.slice(0, 30000), source: 'gemini:' + chatIdIn + '#i' + pick.idx, sha256: crypto.createHash('sha256').update(pick.text).digest('hex') });
+  process.exit(0);
+}
+
 const nbId = await openNotebook();
 await p.waitForTimeout(2000);
 const body0 = await bodyText(p);
@@ -415,39 +541,58 @@ if (ARGS.notebookOp === 'write') {
   }
   if (!sent) { fail('failed', '找不到 Gemini 输入框'); }
   await p.waitForTimeout(500);
-  const baseCopies = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy" i]').length);
+  // Baseline BEFORE submitting: which turns already exist. The new answer must
+  // be a NEW MODEL-RESPONSE after the NEW last USER-QUERY — page copy counts,
+  // body-tail text, older replies and our own prompt bubble never count.
+  const baseProbe = await p.evaluate(() => {
+${TURN_HELPERS}
+    const nodes = turnNodes();
+    const users = nodes.filter(n => turnRole(n) === 'user');
+    const models = nodes.filter(n => turnRole(n) === 'model');
+    return { users: users.length, lastUserIdx: users.length ? nodes.indexOf(users[users.length - 1]) : -1, lastModelIdx: models.length ? nodes.indexOf(models[models.length - 1]) : -1 };
+  });
   const submitted = await p.evaluate(() => {
     const btn = [...document.querySelectorAll('button')].find(b => /^(Submit|Send)$/i.test((b.getAttribute('aria-label') || b.innerText || '').trim()));
     if (btn) { btn.click(); return true; } return false;
   });
   if (!submitted) await p.keyboard.press('Enter');
-  // wait for the response's copy button, then stabilize
+  // Ready = new attributed MODEL-RESPONSE with its own Copy action rendered, no
+  // visible Stop, and identical text hash on three consecutive reads (~6s).
   const w0 = Date.now();
   let ready = false;
+  let stableReads = 0;
+  let lastHash = '';
+  let lastText = '';
   while (Date.now() - w0 < ARGS.timeoutMs - 30000) {
-    const n = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy" i]').length);
-    const busy = await p.evaluate(() => [...document.querySelectorAll('button')].some(b => /stop/i.test(b.getAttribute('aria-label') || '')));
-    if (n > baseCopies && !busy) { ready = true; break; }
+    const probe = await p.evaluate(({ base }) => {
+${TURN_HELPERS}
+      return chatProbe(base);
+    }, { base: baseProbe });
+    if (hitLimit(probe.tail)) { fail('limit_reached', 'Gemini 配额/限流：' + probe.tail.slice(-200)); }
+    if (loginWall(probe.tail)) { fail('login_required', 'Gemini 会话失效'); }
+    if (probe.newUser && probe.newModel && probe.hasCopy && !probe.stopVisible && probe.len >= 10) {
+      if (probe.hash === lastHash) { stableReads += 1; } else { stableReads = 0; lastHash = probe.hash; }
+      lastText = probe.text;
+      if (stableReads >= 2) { ready = true; break; }
+    } else { stableReads = 0; lastHash = ''; }
     await p.waitForTimeout(3000);
   }
-  if (!ready) { fail('failed', '等待 Gemini 回复超时'); }
-  await p.waitForTimeout(4000);
-  let text = await p.evaluate(() => {
-    const copies = [...document.querySelectorAll('button[aria-label*="Copy" i]')];
-    const btn = copies[copies.length - 1];
-    if (!btn) return null;
-    let n = btn;
-    for (let i = 0; i < 10 && n; i++) { if ((n.innerText || '').length > 200) break; n = n.parentElement; }
-    return n ? n.innerText : null;
-  });
-  if (text) text = text.replace(/^\\s*Gemini said\\s*/i, '').trim();
-  if (!text || text.length < 10) { fail('failed', '回复提取失败'); }
+  // The prompt may already be on the page — never auto-resend; point at recover.
+  if (!ready) { fail('failed', '等待 Gemini 本轮答复超时：prompt 可能已发送（不自动重发；检查会话后可重试，或用 notebook_recover 只读取回既有答复）'); }
+  const fake = await p.evaluate(({ text, prompt }) => {
+${TURN_HELPERS}
+    return replyLooksFake(text, prompt);
+  }, { text: lastText, prompt: ARGS.prompt });
+  if (fake) { fail('failed', '取回内容不是模型答复（用户轮文本或与 prompt 相同）'); }
   const chatId = await p.evaluate(() => (location.pathname.match(/app\\/([0-9a-f]+)/i) || [])[1] || '');
   const chatUrl = chatId ? 'https://gemini.google.com/app/' + chatId : '';
-  // Stamp the producing session into the artifact so later revision passes can
-  // resume the same Gemini conversation (chat param) instead of cold-starting.
-  fs.writeFileSync(outPath, text + '\\n\\n<!-- gemini-session: ' + (chatUrl || 'unknown') + ' -->\\n');
-  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.slice(0, 30000), url: chatUrl || undefined });
+  // Confirmed reply only: candidate file then atomic rename — a failed run never
+  // clobbers the previous valid artifact. Session marker kept for continuation.
+  const tmp = outPath + '.tmp';
+  fs.writeFileSync(tmp, lastText + '\\n\\n<!-- gemini-session: ' + (chatUrl || 'unknown') + ' -->\\n');
+  fs.renameSync(tmp, outPath);
+  const crypto = await import('node:crypto');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: lastText.slice(0, 30000), url: chatUrl || undefined, sha256: crypto.createHash('sha256').update(lastText).digest('hex') });
   process.exit(0);
 }
 

@@ -10,7 +10,7 @@ import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { buildScript } from './browser-scripts.ts';
 
-export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source', 'notebook_remove_source', 'notebook_write'] as const;
+export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source', 'notebook_remove_source', 'notebook_write', 'notebook_recover'] as const;
 export type BrowserTool = typeof BROWSER_TOOLS[number];
 export const BROWSER_PROVIDERS = ['chatgpt', 'gemini', 'grok', 'notebook'] as const;
 export type Provider = typeof BROWSER_PROVIDERS[number];
@@ -37,7 +37,7 @@ const MAX_REF_BYTES = 20 * 1024 * 1024;
 
 type Args = Record<string, unknown>;
 interface Out { value: unknown; audit?: { action: string; evidence: string } }
-interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown; text?: string }
+interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown; text?: string; turns?: unknown; sha256?: string; source?: string }
 type Runner = (provider: Provider, script: string, timeoutMs: number) => Promise<RunResult>;
 
 export interface BrowserDeps {
@@ -117,6 +117,7 @@ const pickResult = (text: string): string | undefined => text.split('\n').filter
 const RESULT_FIELD_TYPES: Record<string, 'boolean' | 'number' | 'string' | 'array'> = {
   ok: 'boolean', code: 'string', message: 'string', file: 'string', bytes: 'number',
   via: 'string', url: 'string', text: 'string', notebooks: 'array',
+  turns: 'array', sha256: 'string', source: 'string',
 };
 
 /**
@@ -225,6 +226,7 @@ export class BrowserStudio {
       : tool === 'notebook_add_source' ? () => this.notebookOp(scope, 'add_source', args)
       : tool === 'notebook_remove_source' ? () => this.notebookOp(scope, 'remove_source', args)
       : tool === 'notebook_write' ? () => this.notebookOp(scope, 'write', args)
+      : tool === 'notebook_recover' ? () => this.notebookOp(scope, 'recover', args)
       : undefined;
     if (!handler) throw invalid(`unknown browser media tool: ${tool}`);
     try {
@@ -275,6 +277,7 @@ export class BrowserStudio {
         notebook_create: '{"title":"作品名"}',
         notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — 返回含 text 正文（≤30k），可直接当查询通道用',
         notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md","chat"?:<既有会话id或url>} — Gemini 壳内写作；一章一个会话，续写/修订传 chat 回到同一会话',
+        notebook_recover: '{"chat":"<gemini会话id或url>","turn"?:<节点序号>,"file"?:x.md} — 只读取回既有模型答复，绝不发送 prompt；不带 turn 只列轮次地图（USER-QUERY/MODEL-RESPONSE 的 i），带 turn+file 取该用户轮次之后紧跟的答复',
         notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01-卷名","text":"<正文markdown>"}',
         notebook_remove_source: '{"notebook":"<笔记本id或标题>","title":"<源标题子串>"} — 源不可编辑，更新=删旧+重注',
       },
@@ -320,7 +323,7 @@ export class BrowserStudio {
 
   /** NotebookLM lane: query drafts text into the evidence dir; add_source pushes approved
       text back into the notebook so canon grows. list/create are ungated reads. */
-  private async notebookOp(scope: OpsScope, op: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write', args: Args): Promise<Out> {
+  private async notebookOp(scope: OpsScope, op: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write' | 'recover', args: Args): Promise<Out> {
     const outDir = this.outputDir(scope);
     mkdirSync(outDir, { recursive: true, mode: 0o700 });
     const timeoutMs = TIMEOUT.notebook;
@@ -370,6 +373,19 @@ export class BrowserStudio {
         scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file, chat };
         break;
       }
+      case 'recover': {
+        // Read-only retrieval from an authorized chat; ungated like list (no model
+        // quota consumed, nothing is sent). `turn` omitted lists the turn map;
+        // `turn` + `file` pulls the reply right after that user turn.
+        const chat = str(args, 'chat', 6, 200);
+        const turn = num(args, 'turn', 0, 1000);
+        if (turn !== undefined && !Number.isInteger(turn)) throw invalid('turn 需为整数轮次序号');
+        const file = args.file === undefined ? undefined : String(args.file);
+        if (file !== undefined && !MD_FILE.test(file)) throw invalid('file 只能是纯文件名 xxx.md');
+        if (turn !== undefined && file === undefined) throw invalid('带 turn 取回正文必须给 file（纯文件名 xxx.md）');
+        scriptArgs = { ...base, notebookOp: 'recover', chat, turn, file: file ?? base.file };
+        break;
+      }
     }
     const result = await this.enqueue(() => this.run('notebook', buildScript('notebook', scriptArgs), timeoutMs));
     if (!result.ok) {
@@ -378,13 +394,15 @@ export class BrowserStudio {
       const cls = code === 'login_required' ? 'not_configured' : code === 'limit_reached' ? 'limit_reached' : 'upstream_error';
       throw new CompanyError(cls, `notebook ${op} 失败：${result.message ?? '未知错误'}`);
     }
-    if ((op === 'query' || op === 'write') && !result.file) throw new CompanyError('upstream_error', `notebook ${op} 未产出文件`);
-    const evidenceBits = [op, scriptArgs.notebook ?? '', scriptArgs.title ?? '', scriptArgs.file ?? ''].join(' ').trim();
+    const needsFile = op === 'query' || op === 'write' || (op === 'recover' && scriptArgs.turn !== undefined);
+    if (needsFile && !result.file) throw new CompanyError('upstream_error', `notebook ${op} 未产出文件`);
+    const evidenceBits = [op, scriptArgs.notebook ?? '', scriptArgs.title ?? '', scriptArgs.file ?? '', scriptArgs.chat ?? '', scriptArgs.turn ?? ''].join(' ').trim();
     return { value: {
       op,
       notebook: result.notebook ?? scriptArgs.notebook,
       notebooks: result.notebooks,
       file: result.file, bytes: result.bytes, url: result.url, text: result.text,
+      turns: result.turns, sha256: result.sha256, source: result.source,
     }, audit: { action: 'ops_browser_notebook', evidence: `notebook_${op} ${evidenceBits}`.slice(0, 160) } };
   }
 
