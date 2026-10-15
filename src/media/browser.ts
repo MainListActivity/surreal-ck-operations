@@ -113,6 +113,39 @@ const RESULT_MARK = '__RESULT__';
 /** Last protocol line in one stream; a marker only counts at line start. */
 const pickResult = (text: string): string | undefined => text.split('\n').filter(l => l.startsWith(RESULT_MARK)).pop();
 
+// Supported RunResult field types; `notebook` is special-cased (id string or {id,title}).
+const RESULT_FIELD_TYPES: Record<string, 'boolean' | 'number' | 'string' | 'array'> = {
+  ok: 'boolean', code: 'string', message: 'string', file: 'string', bytes: 'number',
+  via: 'string', url: 'string', text: 'string', notebooks: 'array',
+};
+
+/**
+ * Strict RunResult parse: `ok` must be boolean, every supported field must carry its
+ * declared type, and unknown keys are tolerated only as scalars (extras are dropped by
+ * callers anyway). Anything malformed fails closed — a garbage marker never becomes
+ * a half-shaped result.
+ */
+function parseRunResult(line: string): RunResult | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(line.slice(RESULT_MARK.length)); } catch { return undefined; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj.ok !== 'boolean') return undefined;
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'notebook') {
+      if (typeof value !== 'string' && (value === null || typeof value !== 'object' || Array.isArray(value))) return undefined;
+      continue;
+    }
+    const want = RESULT_FIELD_TYPES[key];
+    if (want) {
+      if (want === 'array' ? !Array.isArray(value) : typeof value !== want) return undefined;
+      continue;
+    }
+    if (value !== null && typeof value === 'object') return undefined;
+  }
+  return obj as unknown as RunResult;
+}
+
 /**
  * One ego-browser subprocess run and its result contract; spawn is injectable so tests
  * exercise this real parser. `ego-browser nodejs` forwards all script output (console.log
@@ -120,6 +153,8 @@ const pickResult = (text: string): string | undefined => text.split('\n').filter
  * as fallback. Settles exactly once, highest priority first: spawn error → our SIGKILL
  * timeout → abnormal exit/signal → parsed marker → no marker. The SIGKILL backstop is
  * timeoutMs + graceMs (default 30s past the script's own deadline).
+ * Failure messages carry exit/stream metadata only — raw stderr and marker payloads can
+ * contain private page content and must never flow into errors or audit.
  */
 export function runWithSpawn(spawnFn: typeof spawn, bin: string, args: string[], timeoutMs: number, graceMs = 30_000): Promise<RunResult> {
   return new Promise<RunResult>((resolve) => {
@@ -137,30 +172,20 @@ export function runWithSpawn(spawnFn: typeof spawn, bin: string, args: string[],
     const kill = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs + graceMs);
     child.stdout.on('data', chunk => { out += chunk; });
     child.stderr.on('data', chunk => { err += chunk; });
-    child.on('error', error => settle({ ok: false, code: 'failed', message: `ego-browser 启动失败：${error.message}` }));
+    child.on('error', error => settle({ ok: false, code: 'failed', message: `ego-browser 启动失败：${String(error.message).slice(0, 120)}` }));
     child.on('close', (code, signal) => {
-      if (killed) { settle({ ok: false, code: 'failed', message: '脚本超时已终止' }); return; }
+      const meta = `，stdout ${out.length}B/stderr ${err.length}B`;
+      if (killed) { settle({ ok: false, code: 'failed', message: `脚本超时已终止${meta}` }); return; }
       if (code !== 0 || signal) {
         // Emit-then-crash exists (probe P8): under an abnormal exit a marker is diagnostic
-        // only, never a result.
-        const diag = (err || out).slice(-160);
-        const marker = pickResult(err) ?? pickResult(out);
-        const dropped = marker ? `；丢弃已产出结果 ${marker.slice(0, 120)}` : '';
-        settle({ ok: false, code: 'failed', message: `进程异常结束(${code === null ? `signal=${signal}` : `exit=${code}`})${diag ? `：${diag}` : ''}${dropped}` });
+        // only, never a result — flag its presence without echoing its content.
+        const dropped = (pickResult(err) ?? pickResult(out)) ? '，已产出结果被丢弃' : '';
+        settle({ ok: false, code: 'failed', message: `进程异常结束(${code === null ? `signal=${signal}` : `exit=${code}`}${meta})${dropped}` });
         return;
       }
       const line = pickResult(err) ?? pickResult(out);
-      if (!line) { settle({ ok: false, code: 'failed', message: `脚本无结果输出：${(err || out).slice(-200)}` }); return; }
-      try {
-        const parsed: unknown = JSON.parse(line.slice(RESULT_MARK.length));
-        if (!parsed || typeof parsed !== 'object' || typeof (parsed as RunResult).ok !== 'boolean') {
-          settle({ ok: false, code: 'failed', message: '结果解析失败' });
-          return;
-        }
-        settle(parsed as RunResult);
-      } catch {
-        settle({ ok: false, code: 'failed', message: '结果解析失败' });
-      }
+      if (!line) { settle({ ok: false, code: 'failed', message: `脚本无结果输出${meta}` }); return; }
+      settle(parseRunResult(line) ?? { ok: false, code: 'failed', message: '结果解析失败' });
     });
   });
 }
