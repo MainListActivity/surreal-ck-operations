@@ -9,13 +9,20 @@
 // `limit_reached` means the account-level quota said so in its own words.
 
 interface ScriptArgs {
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'notebook';
   prompt: string;
   outDir: string;
   file: string;
   refs: string[];
   seconds?: number;
   timeoutMs: number;
+  // notebook lane
+  notebookOp?: 'list' | 'create' | 'query' | 'add_source' | 'remove_source' | 'write' | 'recover';
+  notebook?: string;   // notebook id (from URL) or title substring
+  title?: string;      // source title / new notebook name / remove_source target substring
+  text?: string;       // source body for add_source
+  chat?: string;       // write op: existing Gemini chat id/url to continue the same conversation
+  turn?: number;       // recover op: turn-node index (USER-QUERY position in DOM order)
 }
 
 // Shared helpers injected into every provider script.
@@ -88,10 +95,86 @@ const hitLimit = (t) => /weekly limit|limit reached|rate limit|quota|try again l
 const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|create account/i.test(t || '');
 `;
 
+// Turn attribution for the Gemini chat surface (write/recover ops). The chat is a
+// DOM-ordered list of USER-QUERY / MODEL-RESPONSE custom elements; the model's own
+// action bar carries exactly `Copy` while the user bubble carries `Copy prompt` —
+// page-wide `aria-label*="Copy"` counts match BOTH, which is how the old write lane
+// returned the user's own instruction as the model answer. Everything here keys on
+// turn nodes and their own action bars, never on whole-page counts or body tails.
+// Exported so tests execute this same code against sanitized DOM fixtures.
+export const TURN_HELPERS = /* js */ `
+const turnNodes = () => [...document.querySelectorAll('user-query, model-response')];
+const turnRole = (el) => el && el.tagName === 'MODEL-RESPONSE' ? 'model' : el && el.tagName === 'USER-QUERY' ? 'user' : 'unknown';
+const btnLabel = (b) => ((b.getAttribute('aria-label') || '') + '').trim();
+const elVisible = (el) => !!el && !el.hidden && (typeof el.offsetParent === 'undefined' || el.offsetParent !== null || (el.getClientRects ? el.getClientRects().length > 0 : true));
+const replyCopyBtn = (el) => [...el.querySelectorAll('button[aria-label]')].find(b => /^copy$/i.test(btnLabel(b)));
+const fnv1a = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h.toString(36); };
+const stopBtnVisible = () => [...document.querySelectorAll('button')].some(b => /stop/i.test(btnLabel(b)) && elVisible(b));
+// MODEL-RESPONSE text: .response-content innerText, minus the screen-reader
+// 'Gemini said' label and the action-bar/icon lines around it.
+const responseText = (el) => {
+  const stop = /^(Thoughts|expand_more|expand_less|keep_pin|copy|thumb_up|thumb_down|save( to note)?|note_add|share|edit|delete|rate response|good response|bad response|more_horiz|Gemini said)\\s*$/i;
+  const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+|[。，、；：！？\\.,;:!?]+)\\s*$/i;
+  const root = el.querySelector('.response-content') || el;
+  const out = [];
+  for (const line of (root.innerText || '').split('\\n')) {
+    const t = line.trim();
+    if (stop.test(t)) { if (out.length === 0) continue; break; }
+    if (!drop.test(t)) out.push(line);
+  }
+  return out.join('\\n').replace(/^\\s*Gemini said\\s*/i, '').trim();
+};
+// One structural read of the chat vs a pre-submit baseline: a reply counts only
+// when a NEW MODEL-RESPONSE sits after the NEW last USER-QUERY.
+const chatProbe = (base) => {
+  const nodes = turnNodes();
+  const users = nodes.filter(n => turnRole(n) === 'user');
+  const models = nodes.filter(n => turnRole(n) === 'model');
+  const lastUser = users[users.length - 1] || null;
+  const lastModel = models[models.length - 1] || null;
+  const lastUserIdx = lastUser ? nodes.indexOf(lastUser) : -1;
+  const lastModelIdx = lastModel ? nodes.indexOf(lastModel) : -1;
+  const newUser = users.length > base.users && lastUserIdx > base.lastUserIdx;
+  const newModel = !!lastModel && lastModelIdx > lastUserIdx && lastModelIdx > base.lastModelIdx;
+  const text = newModel ? responseText(lastModel) : '';
+  return {
+    users: users.length, models: models.length, lastUserIdx, lastModelIdx, newUser, newModel,
+    hasCopy: newModel && !!replyCopyBtn(lastModel),
+    stopVisible: stopBtnVisible(),
+    hash: text ? fnv1a(text) : '', len: text.length, text,
+    tail: (document.body.innerText || '').slice(-800),
+  };
+};
+// Read-only turn map for recover: caller picks a USER-QUERY index, then pickReply
+// takes the MODEL-RESPONSE immediately after it (strict alternating order).
+const turnMap = () => ({
+  turns: turnNodes().map((n, i) => ({ i, role: turnRole(n), len: (((n.querySelector('.response-content') || n).innerText || '') + '').trim().length })),
+  stopVisible: stopBtnVisible(),
+});
+const pickReply = (turn) => {
+  const nodes = turnNodes();
+  if (!Number.isInteger(turn) || turn < 0 || turn >= nodes.length) return { err: 'out_of_range', nodes: nodes.length };
+  if (turnRole(nodes[turn]) !== 'user') return { err: 'not_user_turn', role: turnRole(nodes[turn]) };
+  const m = nodes[turn + 1];
+  if (!m || turnRole(m) !== 'model') return { err: 'no_reply' };
+  const text = responseText(m);
+  return { err: '', text, idx: turn + 1, hasCopy: !!replyCopyBtn(m), stopVisible: stopBtnVisible() };
+};
+// Extracted text that is a user bubble ('You said …') or echoes the prompt back
+// verbatim is not a model answer — fail closed, never write it as the artifact.
+const replyLooksFake = (text, prompt) => {
+  const squash = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  if (/^you said/i.test(squash(text))) return true;
+  const bare = (s) => (s || '').replace(/\\s+/g, '');
+  const p = bare(prompt);
+  return !!p && bare(text) === p;
+};
+`;
+
 // The runtime script: ARGS is interpolated by browser.ts as a JSON literal.
 export function buildScript(provider: string, a: ScriptArgs): string {
   const prelude = `const ARGS = ${JSON.stringify(a)};\n${HELPERS}\nconst providerSpace = 'sck-media-${provider}';\nconst task = await taskSpace(providerSpace);\nconst existing = await task.pages();\nconst p = existing[0] ?? await task.newPage();\n`;
-  const body = provider === 'gemini' ? gemini() : provider === 'chatgpt' ? chatgpt() : grok();
+  const body = provider === 'notebook' ? notebook() : provider === 'gemini' ? gemini() : provider === 'chatgpt' ? chatgpt() : grok();
   return prelude + body + `\n`;
 }
 
@@ -201,6 +284,418 @@ const saved = await saveImg(p, outPath);
 if (!saved) { fail('failed', '结果提取失败'); }
 const st = fs.statSync(saved);
 emit({ ok: true, file: saved, bytes: st.size, via: 'canvas' });
+`;
+}
+
+function notebook(): string {
+  return /* js */ `
+const HOME = 'https://notebook.google.com/';
+// Resolve ARGS.notebook: full id → direct URL; otherwise title substring scan on the home table.
+const openNotebook = async () => {
+  if (/^[0-9a-f-]{36}$/i.test(ARGS.notebook || '')) {
+    await p.goto(HOME + 'notebook/' + ARGS.notebook);
+    await p.waitForTimeout(5000);
+    return ARGS.notebook;
+  }
+  await p.goto(HOME);
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(4500);
+  const hit = await p.evaluate(({ q }) => {
+    const a = [...document.querySelectorAll('a[href^="/notebook/"]')].find(x => (x.innerText || '').includes(q));
+    return a ? { href: a.getAttribute('href'), title: (a.innerText || '').trim() } : null;
+  }, { q: ARGS.notebook });
+  if (!hit) { fail('failed', '找不到笔记本（按标题匹配）：' + ARGS.notebook); }
+  await p.goto('https://notebook.google.com' + hit.href);
+  await p.waitForTimeout(5000);
+  return hit.href.split('/').pop();
+};
+
+if (ARGS.notebookOp === 'list') {
+  await p.goto(HOME);
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(4500);
+  const rows = await p.evaluate(() => [...document.querySelectorAll('a[href^="/notebook/"]')].map(a => {
+    const tr = a.closest('tr');
+    const cells = tr ? [...tr.querySelectorAll('td')].map(c => (c.innerText || '').trim()) : [];
+    return { id: (a.getAttribute('href') || '').split('/').pop(), title: (a.innerText || '').trim(), sources: cells.find(c => /Sources?$/.test(c)) || undefined, created: cells.find(c => /20\\d\\d/.test(c)) || undefined };
+  }));
+  emit({ ok: true, notebooks: rows });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'create') {
+  await p.goto(HOME);
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(4000);
+  const made = await p.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')].find(b => /New notebook/i.test(b.innerText || b.getAttribute('aria-label') || ''));
+    if (btn) { btn.click(); return true; } return false;
+  });
+  if (!made) { fail('failed', '找不到 New notebook 按钮'); }
+  await p.waitForTimeout(6000);
+  const id = await p.evaluate(() => (location.pathname.match(/notebook\\/([0-9a-f-]+)/i) || [])[1] || '');
+  // Rename: the title is a visible text input ("Untitled notebook"). Programmatic
+  // value setting does not persist — real keystrokes + Enter are required.
+  if (ARGS.title) {
+    let focused = false;
+    const focusDeadline = Date.now() + 20000;
+    while (!focused && Date.now() < focusDeadline) {
+      focused = await p.evaluate(() => {
+        const tb = [...document.querySelectorAll('input[type="text"],input:not([type])')]
+          .find(e => e.offsetParent !== null && !/search|select/i.test(e.getAttribute('aria-label') || e.placeholder || ''));
+        if (!tb) return false;
+        tb.focus(); tb.select();
+        return true;
+      });
+      if (!focused) await p.waitForTimeout(2000);
+    }
+    if (focused) {
+      await p.keyboard.type(ARGS.title);
+      await p.keyboard.press('Enter');
+    }
+    await p.waitForTimeout(2500);
+    const finalTitle = await p.evaluate(() =>
+      ([...document.querySelectorAll('input[type="text"],input:not([type])')]
+        .find(e => e.offsetParent !== null && !/search|select/i.test(e.getAttribute('aria-label') || e.placeholder || '')) || {}).value
+      || ([...document.querySelectorAll('h2')].find(h => !/^(Sources|Studio)$/i.test(h.innerText || '')) || {}).innerText || '');
+    emit({ ok: true, notebook: { id, title: (finalTitle || '').trim() || ARGS.title }, url: 'https://notebook.google.com/notebook/' + id });
+    process.exit(0);
+  }
+  emit({ ok: true, notebook: { id, title: ARGS.title }, url: 'https://notebook.google.com/notebook/' + id });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'recover') {
+  // Read-only retrieval of an existing model reply: authorized chat + explicit
+  // user turn. Never types or sends a prompt. Emits provenance + sha256 so the
+  // recovered artifact stays auditable (same source rules as a live write).
+  const chatIdIn = ((ARGS.chat || '').match(/app\\/([0-9a-f]+)/i) || [])[1]
+    || (/^[0-9a-f]{6,}$/i.test(ARGS.chat || '') ? ARGS.chat : '');
+  if (!chatIdIn) { fail('failed', 'recover 需要既有 Gemini 会话的 chat id 或 url'); }
+  try { await p.goto('https://gemini.google.com/app/' + chatIdIn); } catch {}
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(5000);
+  const gBody = await bodyText(p);
+  if (loginWall(gBody)) { fail('login_required', 'gemini.google.com 需要重新登录'); }
+  const chatUrl0 = 'https://gemini.google.com/app/' + chatIdIn;
+  if (ARGS.turn === undefined || ARGS.turn === null) {
+    const map = await p.evaluate(() => {
+${TURN_HELPERS}
+      return turnMap();
+    });
+    emit({ ok: true, url: chatUrl0, turns: map.turns, stopVisible: map.stopVisible });
+    process.exit(0);
+  }
+  const pick = await p.evaluate(({ turn }) => {
+${TURN_HELPERS}
+    return pickReply(turn);
+  }, { turn: ARGS.turn });
+  if (pick.err === 'out_of_range') { fail('failed', '轮次序号越界（当前 ' + pick.nodes + ' 个节点；先不带 turn 调用查看轮次地图）'); }
+  if (pick.err === 'not_user_turn') { fail('failed', '节点 ' + ARGS.turn + ' 不是用户轮次（role=' + pick.role + '）'); }
+  if (pick.err === 'no_reply') { fail('failed', '该用户轮次之后没有模型答复'); }
+  if (pick.stopVisible) { fail('failed', '答复仍在生成中，稍后再取'); }
+  // Completion marker: a finished reply carries its own exact 'Copy' action.
+  // Thoughts-only / still-generating nodes have none — fail closed, never
+  // overwrite the previous valid artifact with partial content.
+  if (!pick.hasCopy) { fail('failed', '答复未见完成标记（无 Copy 动作），可能仍在生成，稍后再取'); }
+  if (!pick.text || pick.text.length < 10) { fail('failed', '答复提取为空'); }
+  await p.waitForTimeout(3000);
+  const again = await p.evaluate(({ turn }) => {
+${TURN_HELPERS}
+    return pickReply(turn);
+  }, { turn: ARGS.turn });
+  if (again.err || again.text !== pick.text) { fail('failed', '答复文本未稳定，未取回'); }
+  // Generation may (re)start between reads: the re-read must still show the
+  // reply as finished — no visible Stop, own Copy action still present.
+  if (again.stopVisible || !again.hasCopy) { fail('failed', '复读时答复仍在生成，未取回'); }
+  const fake = await p.evaluate(({ text }) => {
+${TURN_HELPERS}
+    return replyLooksFake(text, '');
+  }, { text: pick.text });
+  if (fake) { fail('failed', '取回的是用户轮文本，不是模型答复'); }
+  const tmp = outPath + '.tmp';
+  fs.writeFileSync(tmp, pick.text + '\\n\\n<!-- gemini-session: ' + chatUrl0 + ' recovered i' + pick.idx + ' -->\\n');
+  fs.renameSync(tmp, outPath);
+  const crypto = await import('node:crypto');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, url: chatUrl0, text: pick.text.slice(0, 30000), source: 'gemini:' + chatIdIn + '#i' + pick.idx, sha256: crypto.createHash('sha256').update(pick.text).digest('hex') });
+  process.exit(0);
+}
+
+const nbId = await openNotebook();
+await p.waitForTimeout(2000);
+const body0 = await bodyText(p);
+if (loginWall(body0)) { fail('login_required', 'notebook.google.com 需要重新登录'); }
+
+if (ARGS.notebookOp === 'add_source') {
+  // baseline source count so "inserted" is detected as +1, not "any sources exist"
+  const srcBase = await p.evaluate(() => Number((document.body.innerText.match(/(\\d+) sources?/i) || [0, 0])[1]) || document.querySelectorAll('input[type="checkbox"]').length);
+  let snap = await p.snapshot();
+  let addRef = refOf(snap, 'Add sources');
+  if (!addRef) {
+    const clicked = await p.evaluate(() => {
+      const btn = [...document.querySelectorAll('button')].find(b => /Add sources/i.test(b.innerText || b.getAttribute('aria-label') || ''));
+      if (btn) { btn.click(); return true; } return false;
+    });
+    if (!clicked) { fail('failed', '找不到 Add sources'); }
+  } else {
+    await p.click('@' + addRef, { label: 'add sources' }).catch(async () => {
+      await p.evaluate(() => [...document.querySelectorAll('button')].find(b => /Add sources/i.test(b.innerText || ''))?.click());
+    });
+  }
+  await p.waitForTimeout(1500);
+  const pasted = await p.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')].find(b => /Copied text/i.test(b.innerText || ''));
+    if (btn) { btn.click(); return true; } return false;
+  });
+  if (!pasted) { fail('failed', 'source 面板里没有 Copied text 选项'); }
+  let filled = false;
+  const fd = Date.now() + 20000;
+  while (!filled && Date.now() < fd) {
+    filled = await p.evaluate((arg) => {
+      const ta = [...document.querySelectorAll('textarea')].find(t => /Paste text here/i.test(t.placeholder || '') && t.offsetParent !== null)
+        || [...document.querySelectorAll('dialog textarea')].pop();
+      if (!ta) return false;
+      ta.focus();
+      ta.value = arg.text;
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }, { text: ARGS.text });
+    if (!filled) await p.waitForTimeout(1500);
+  }
+  if (!filled) { fail('failed', '找不到粘贴文本框'); }
+  await p.waitForTimeout(600);
+  const inserted = await p.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')].find(b => /^Insert$/i.test((b.innerText || '').trim()));
+    if (btn) { btn.click(); return true; } return false;
+  });
+  if (!inserted) { fail('failed', '找不到 Insert 按钮'); }
+  // wait for the source row to appear (count > baseline)
+  const t0 = Date.now();
+  let ok = false;
+  while (Date.now() - t0 < 45000) {
+    const n = await p.evaluate(() => Number((document.body.innerText.match(/(\\d+) sources?/i) || [0, 0])[1]) || 0);
+    if (n > srcBase) { ok = true; break; }
+    await p.waitForTimeout(2000);
+  }
+  if (!ok) { fail('failed', '源插入后未出现在列表'); }
+  emit({ ok: true, notebook: nbId, title: ARGS.title });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'remove_source') {
+  // Sources cannot be edited in place; volume consolidation relies on remove+re-add.
+  const target = ARGS.title || '';
+  let removedAny = false;
+  for (let round = 0; round < 20; round++) {
+    const label = await p.evaluate(({ q }) => {
+      const cb = [...document.querySelectorAll('input[type="checkbox"]')].find(c => {
+        const l = c.getAttribute('aria-label') || '';
+        return /^Select /.test(l) && !/all sources|chat sources/i.test(l) && l.toLowerCase().includes(q.toLowerCase());
+      });
+      if (!cb) return null;
+      const l = cb.getAttribute('aria-label');
+      let row = cb;
+      for (let i = 0; i < 8 && row; i++) { if (row.querySelectorAll && row.querySelectorAll('button').length) break; row = row.parentElement; }
+      [...row.querySelectorAll('button')].find(b => /^More$/i.test(b.getAttribute('aria-label') || ''))?.click();
+      return l;
+    }, { q: target });
+    if (!label) break;
+    await p.waitForTimeout(1000);
+    const clicked = await p.evaluate(() => {
+      const mi = [...document.querySelectorAll('[role="menuitem"],button')].find(b => /Remove note|Remove source|delete/i.test(b.innerText || ''));
+      if (!mi) return false;
+      mi.click(); return true;
+    });
+    if (!clicked) { fail('failed', '源菜单里没有 Remove 项'); }
+    await p.waitForTimeout(1200);
+    await p.evaluate(() => {
+      const btn = [...document.querySelectorAll('button')].find(b => /^(Remove|Delete|删除|确认)$/i.test((b.innerText || '').trim()));
+      btn?.click();
+    });
+    await p.waitForTimeout(2000);
+    removedAny = true;
+  }
+  if (!removedAny) { fail('failed', '找不到要删除的源：' + target); }
+  emit({ ok: true, notebook: nbId, title: target });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'write') {
+  // Draft inside the Gemini shell: gemini.google.com/notebook/<id> spawns a
+  // persistent Gemini chat grounded on this notebook's sources. ARGS.chat
+  // continues an existing conversation (one chapter = one session).
+  const chatIdIn = ((ARGS.chat || '').match(/app\\/([0-9a-f]+)/i) || [])[1]
+    || (/^[0-9a-f]{6,}$/i.test(ARGS.chat || '') ? ARGS.chat : '');
+  try { await p.goto(chatIdIn ? 'https://gemini.google.com/app/' + chatIdIn : 'https://gemini.google.com/notebook/' + nbId); } catch {}
+  try { await p.waitForLoadState('load'); } catch {}
+  await p.waitForTimeout(5000);
+  const gBody = await bodyText(p);
+  if (loginWall(gBody)) { fail('login_required', 'gemini.google.com 需要重新登录'); }
+  let sent = false;
+  const sendDeadline = Date.now() + 30000;
+  while (!sent && Date.now() < sendDeadline) {
+    sent = await p.evaluate(({ prompt }) => {
+      const tb = [...document.querySelectorAll('[contenteditable="true"], textarea')]
+        .find(e => e.offsetParent !== null && /prompt|Gemini|question/i.test(e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || ''))
+        || [...document.querySelectorAll('[contenteditable="true"], textarea')].filter(e => e.offsetParent !== null).pop();
+      if (!tb) return false;
+      tb.focus();
+      if (tb.tagName === 'TEXTAREA') { tb.value = prompt; tb.dispatchEvent(new Event('input', { bubbles: true })); }
+      else { tb.innerText = prompt; tb.dispatchEvent(new InputEvent('input', { bubbles: true })); }
+      return true;
+    }, { prompt: ARGS.prompt });
+    if (!sent) await p.waitForTimeout(2000);
+  }
+  if (!sent) { fail('failed', '找不到 Gemini 输入框'); }
+  await p.waitForTimeout(500);
+  // Baseline BEFORE submitting: which turns already exist. The new answer must
+  // be a NEW MODEL-RESPONSE after the NEW last USER-QUERY — page copy counts,
+  // body-tail text, older replies and our own prompt bubble never count.
+  const baseProbe = await p.evaluate(() => {
+${TURN_HELPERS}
+    const nodes = turnNodes();
+    const users = nodes.filter(n => turnRole(n) === 'user');
+    const models = nodes.filter(n => turnRole(n) === 'model');
+    return { users: users.length, lastUserIdx: users.length ? nodes.indexOf(users[users.length - 1]) : -1, lastModelIdx: models.length ? nodes.indexOf(models[models.length - 1]) : -1 };
+  });
+  const submitted = await p.evaluate(() => {
+    const btn = [...document.querySelectorAll('button')].find(b => /^(Submit|Send)$/i.test((b.getAttribute('aria-label') || b.innerText || '').trim()));
+    if (btn) { btn.click(); return true; } return false;
+  });
+  if (!submitted) await p.keyboard.press('Enter');
+  // Ready = new attributed MODEL-RESPONSE with its own Copy action rendered, no
+  // visible Stop, and identical text hash on three consecutive reads (~6s).
+  const w0 = Date.now();
+  let ready = false;
+  let stableReads = 0;
+  let lastHash = '';
+  let lastText = '';
+  while (Date.now() - w0 < ARGS.timeoutMs - 30000) {
+    const probe = await p.evaluate(({ base }) => {
+${TURN_HELPERS}
+      return chatProbe(base);
+    }, { base: baseProbe });
+    if (hitLimit(probe.tail)) { fail('limit_reached', 'Gemini 配额/限流：' + probe.tail.slice(-200)); }
+    if (loginWall(probe.tail)) { fail('login_required', 'Gemini 会话失效'); }
+    if (probe.newUser && probe.newModel && probe.hasCopy && !probe.stopVisible && probe.len >= 10) {
+      if (probe.hash === lastHash) { stableReads += 1; } else { stableReads = 0; lastHash = probe.hash; }
+      lastText = probe.text;
+      if (stableReads >= 2) { ready = true; break; }
+    } else { stableReads = 0; lastHash = ''; }
+    await p.waitForTimeout(3000);
+  }
+  // The prompt may already be on the page — never auto-resend; point at recover.
+  if (!ready) { fail('failed', '等待 Gemini 本轮答复超时：prompt 可能已发送（不自动重发；检查会话后可重试，或用 notebook_recover 只读取回既有答复）'); }
+  const fake = await p.evaluate(({ text, prompt }) => {
+${TURN_HELPERS}
+    return replyLooksFake(text, prompt);
+  }, { text: lastText, prompt: ARGS.prompt });
+  if (fake) { fail('failed', '取回内容不是模型答复（用户轮文本或与 prompt 相同）'); }
+  const chatId = await p.evaluate(() => (location.pathname.match(/app\\/([0-9a-f]+)/i) || [])[1] || '');
+  const chatUrl = chatId ? 'https://gemini.google.com/app/' + chatId : '';
+  // Confirmed reply only: candidate file then atomic rename — a failed run never
+  // clobbers the previous valid artifact. Session marker kept for continuation.
+  const tmp = outPath + '.tmp';
+  fs.writeFileSync(tmp, lastText + '\\n\\n<!-- gemini-session: ' + (chatUrl || 'unknown') + ' -->\\n');
+  fs.renameSync(tmp, outPath);
+  const crypto = await import('node:crypto');
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: lastText.slice(0, 30000), url: chatUrl || undefined, sha256: crypto.createHash('sha256').update(lastText).digest('hex') });
+  process.exit(0);
+}
+
+if (ARGS.notebookOp === 'query') {
+// notebook_query — fill via evaluate (snapshot refs for the query textarea vary by layout)
+const baseline = await p.evaluate(() => document.querySelectorAll('button[aria-label*="Copy model response" i]').length);
+let filled = false;
+const fillDeadline = Date.now() + 30000;
+while (!filled && Date.now() < fillDeadline) {
+  filled = await p.evaluate((arg) => {
+    const ta = [...document.querySelectorAll('textarea')].find(t => /Ask a question|create something|向来源提问/i.test(t.placeholder || '') && t.offsetParent !== null)
+      || [...document.querySelectorAll('textarea')].filter(t => t.offsetParent !== null).pop();
+    if (!ta) return false;
+    ta.focus();
+    ta.value = arg.prompt;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }, { prompt: ARGS.prompt });
+  if (!filled) await p.waitForTimeout(2000);
+}
+if (!filled) { fail('failed', '找不到 Query box（笔记本可能没加载完）'); }
+await p.waitForTimeout(800);
+const sent = await p.evaluate(() => {
+  const btn = [...document.querySelectorAll('button')].find(b => /Submit|Send/i.test(b.getAttribute('aria-label') || '') || /^arrow_forward$/.test((b.innerText || '').trim()));
+  if (btn && !btn.disabled) { btn.click(); return true; }
+  return false;
+});
+if (!sent) {
+  await p.evaluate(() => {
+    const ta = [...document.querySelectorAll('textarea')].find(t => /Ask a question|create something/i.test(t.placeholder || '') && t.offsetParent !== null);
+    if (ta) ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  });
+}
+const t0 = Date.now();
+let ready = false;
+let lastLen = -1; let stable = 0;
+while (Date.now() - t0 < ARGS.timeoutMs) {
+  const probe = await p.evaluate((arg) => {
+    const copies = document.querySelectorAll('button[aria-label*="Copy model response" i]').length;
+    const tail = document.body.innerText.slice(-800);
+    return { copies: copies > arg.base, n: copies, tail };
+  }, { base: baseline });
+  if (hitLimit(probe.tail)) { fail('limit_reached', 'NotebookLM 限流：' + probe.tail.slice(-200)); }
+  if (probe.copies) {
+    // streaming may continue after the copy button appears; require the response text to settle
+    const len = probe.tail.length;
+    if (len === lastLen) { stable += 1; if (stable >= 3) { ready = true; break; } } else { stable = 0; lastLen = len; }
+  }
+  await p.waitForTimeout(3000);
+}
+if (!ready) { fail('failed', '等待 NotebookLM 回复超时'); }
+let text = await p.evaluate(async () => {
+  const copies = [...document.querySelectorAll('button[aria-label*="Copy model response" i]')];
+  const btn = copies[copies.length - 1];
+  if (btn) btn.click();
+  await new Promise(r => setTimeout(r, 800));
+  try { return await navigator.clipboard.readText(); } catch { return null; }
+});
+if (!text || text.trim().length < 10) {
+  // DOM fallback: walk up from the last copy button to the message container,
+  // take innerText before the action bar, strip citation-number-only lines.
+  text = await p.evaluate(() => {
+    const copies = [...document.querySelectorAll('button[aria-label*="Copy model response" i]')];
+    const btn = copies[copies.length - 1];
+    if (!btn) return null;
+    const stop = /^(Thoughts|expand_more|expand_less|keep_pin|copy|thumb_up|thumb_down|save( to note)?|save message|note_add|share|edit|delete|rate response|good response|bad response)\s*$/i;
+    const drop = /^(more_horiz|subdirectory_arrow_right|arrow_forward|\\d+|[。，、；：！？\\.,;:!?]+)\s*$/i;
+    const clean = (el) => {
+      const out = [];
+      for (const line of el.innerText.split('\\n')) {
+        const t = line.trim();
+        if (stop.test(t)) {
+          if (out.length === 0) continue;   // Thoughts header sits above the response text
+          break;                          // action bar reached: everything below is chrome/suggestions
+        }
+        if (!drop.test(t)) out.push(line);
+      }
+      return out.join('\\n').trim();
+    };
+    // Climb until an ancestor yields real text — the button's first >30-char
+    // ancestor can be mat-card-actions which contains only icon labels.
+    let n = btn;
+    for (let i = 0; i < 10 && n; i++) {
+      const txt = clean(n);
+      if (txt.length >= 10) return txt;
+      n = n.parentElement;
+    }
+    return null;
+  });
+}
+if (!text || text.trim().length < 10) { fail('failed', '回复提取失败'); }
+fs.writeFileSync(outPath, text.trim() + '\\n');
+// Return the answer inline too so callers can use query as a lookup path
+// without reading the evidence file. Cap the payload; file keeps full text.
+emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: text.trim().slice(0, 30000) });
+}
 `;
 }
 

@@ -1,0 +1,49 @@
+{
+  "purpose": "gemini write-lane turn-attribution parser fixture (desensitized; real structure from app/298352bc8337e01f on 2026-10-15)",
+  "rule": "USER-QUERY bubbles carry aria-label 'Copy prompt'; MODEL-RESPONSE carries exact 'Copy'. Old script's `button[aria-label*=\"Copy\" i]` count+climb matches BOTH and grabs the user's own instruction.",
+  "turns": [
+    {
+      "i": 0,
+      "tag": "USER-QUERY",
+      "srLabel": "screen-reader-user-query-label",
+      "srTextPrefix": "You said",
+      "copyLabels": [
+        "Copy prompt"
+      ],
+      "textLen": 1548
+    },
+    {
+      "i": 1,
+      "tag": "MODEL-RESPONSE",
+      "srLabel": "screen-reader-model-response-label",
+      "srTextPrefix": "Gemini said",
+      "copyLabels": [
+        "Copy"
+      ],
+      "textLen": 8714
+    },
+    {
+      "i": 2,
+      "tag": "USER-QUERY",
+      "srLabel": "screen-reader-user-query-label",
+      "srTextPrefix": "You said",
+      "copyLabels": [
+        "Copy prompt"
+      ],
+      "textLen": 993
+    },
+    {
+      "i": 3,
+      "tag": "MODEL-RESPONSE",
+      "srLabel": "screen-reader-model-response-label",
+      "srTextPrefix": "Gemini said",
+      "copyLabels": [
+        "Copy"
+      ],
+      "textLen": 8784
+    }
+  ],
+  "completionSignal": "new MODEL-RESPONSE node after last USER-QUERY, containing button[aria-label='Copy' i] (exact label or /^Copy(?!\\s*prompt)/i), no visible Stop/control-generating button, innerText stable across ≥2 reads",
+  "extractionTarget": "last MODEL-RESPONSE > .response-content innerText, strip leading 'Gemini said' SR label",
+  "bugInstance": "old artifact media/ch07-v2.md sha256=3d58a5531e… head='You said 这是针对第一卷第07章…返修与精简指令' = turn-2 user instruction, captured because last Copy* match climbed into USER-QUERY container"
+}

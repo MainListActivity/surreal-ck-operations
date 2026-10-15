@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Roster, TaskAttachment, TaskView } from "../shared/types";
+import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -313,25 +313,63 @@ function Collapsible({ title, count, ctx, children, defaultOpen }: {
   );
 }
 
+const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
+export function normalizePulse(raw: unknown): Pulse {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const l24 = (o.last24h ?? {}) as Record<string, unknown>;
+  const ch = (o.churn ?? {}) as Record<string, unknown>;
+  return {
+    at: str(o.at),
+    paused: o.paused === true,
+    doing: arr<Record<string, unknown>>(o.doing).map(d => ({
+      taskId: str(d.taskId), title: str(d.title), employee: str(d.employee) || undefined,
+      role: str(d.role), discipline: str(d.discipline) || undefined, goal: str(d.goal) || undefined,
+      sinceMin: typeof d.sinceMin === "number" ? d.sinceMin : undefined,
+    })),
+    ready: arr<Record<string, unknown>>(o.ready).map(r => ({
+      taskId: str(r.taskId), title: str(r.title), role: str(r.role), discipline: str(r.discipline) || undefined,
+      waitingMin: num(r.waitingMin), unclaimableReason: str(r.unclaimableReason) || undefined,
+    })),
+    stuck: arr<Record<string, unknown>>(o.stuck).map(t => ({ taskId: str(t.taskId), title: str(t.title), reason: str(t.reason) })),
+    waiting: arr<Record<string, unknown>>(o.waiting).map(w => ({
+      taskId: str(w.taskId), kind: w.kind === "gate" ? "gate" : "question", title: str(w.title),
+      goal: str(w.goal) || undefined, hours: num(w.hours), downstream: num(w.downstream),
+    })),
+    recentDone: arr<Record<string, unknown>>(o.recentDone).map(d => ({
+      taskId: str(d.taskId), title: str(d.title), at: str(d.at), actor: str(d.actor) || undefined,
+    })),
+    last24h: { done: num(l24.done), returned: num(l24.returned), rolledBack: num(l24.rolledBack), rejected: num(l24.rejected), retired: num(l24.retired) },
+    resources: arr<unknown>(o.resources).map(str),
+    staffingAlerts: num(o.staffingAlerts),
+    churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
+    goals: arr<Record<string, unknown>>(o.goals).map(g => ({ title: str(g.title), days: num(g.days) })),
+  };
+}
+
 /** 动态页：一页回答「公司现在在干什么、什么卡住了、为什么」。 */
 function PulseTab({ ctx }: { ctx: Ctx }) {
   const s = makeStyles(ctx);
   const pulseRpc = useRpc(rpc.pulse);
   const data = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
-  const p = data.data;
-  const attention = (p?.waiting.length ?? 0) + (p?.stuck.length ?? 0) + (p?.ready.filter(r => r.unclaimableReason).length ?? 0) + (p?.resources.length ?? 0) + (p?.staffingAlerts ?? 0);
+  const loaded = data.data != null;
+  const p = useMemo(() => normalizePulse(data.data), [data.data]);
+  const attention = p.waiting.length + p.stuck.length + p.ready.filter(r => r.unclaimableReason).length + p.resources.length + p.staffingAlerts;
   return (
     <View style={{ gap: 12 }}>
       <View style={s.card}>
         <Text style={s.text}>
-          {p?.paused ? "派工已暂停" : "派工运行中"}
-          {p ? ` · 在办 ${p.doing.length} · 就绪 ${p.ready.length} · 卡住 ${p.stuck.length} · 待你处理 ${p.waiting.length}` : ""}
+          {p.paused ? "派工已暂停" : "派工运行中"}
+          {loaded ? ` · 在办 ${p.doing.length} · 就绪 ${p.ready.length} · 卡住 ${p.stuck.length} · 待你处理 ${p.waiting.length}` : ""}
         </Text>
         {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
       </View>
-      <Section title="正在办" count={p?.doing.length} ctx={ctx}>
-        {(p?.doing.length ?? 0) === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
-        {p?.doing.map(d => (
+      <Section title="正在办" count={p.doing.length} ctx={ctx}>
+        {p.doing.length === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
+        {p.doing.map(d => (
           <View key={d.taskId} style={s.card}>
             <Text style={s.text}>{d.title}</Text>
             <Text style={s.muted}>
@@ -341,25 +379,25 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
           </View>
         ))}
       </Section>
-      <Section title="待你处理" count={p?.waiting.length} ctx={ctx}>
-        {p?.waiting.map(w => (
+      <Section title="待你处理" count={p.waiting.length} ctx={ctx}>
+        {p.waiting.map(w => (
           <View key={w.taskId} style={s.card}>
             <Text style={s.text}>{w.kind === "gate" ? "批准" : "回答"} · {w.title}</Text>
             <Text style={s.muted}>已等 {w.hours < 1 ? `${Math.round(w.hours * 60)} 分钟` : `${w.hours.toFixed(1)} 小时`}{w.downstream ? ` · 卡住下游 ${w.downstream} 个任务` : ""}{w.goal ? ` · ${w.goal.slice(0, 40)}` : ""} · 到「收件箱」处理</Text>
           </View>
         ))}
       </Section>
-      <Section title="卡住" count={p?.stuck.length} ctx={ctx}>
-        {p?.stuck.map(t => (
+      <Section title="卡住" count={p.stuck.length} ctx={ctx}>
+        {p.stuck.map(t => (
           <View key={t.taskId} style={s.card}>
             <Text style={s.text}>{t.title}</Text>
             <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
           </View>
         ))}
       </Section>
-      <Section title="就绪待领" count={p?.ready.length} ctx={ctx}>
-        {(p?.ready.length ?? 0) === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
-        {p?.ready.map(r => (
+      <Section title="就绪待领" count={p.ready.length} ctx={ctx}>
+        {p.ready.length === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
+        {p.ready.map(r => (
           <View key={r.taskId} style={s.card}>
             <Text style={s.text}>{r.title}</Text>
             <Text style={s.muted}>
@@ -371,30 +409,30 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
           </View>
         ))}
       </Section>
-      <Section title="资源异常" count={(p?.resources.length ?? 0) + (p?.staffingAlerts ?? 0)} ctx={ctx}>
-        {(p?.resources.length ?? 0) === 0 && (p?.staffingAlerts ?? 0) === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
-        {p?.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
-        {(p?.staffingAlerts ?? 0) > 0 && <Text style={s.text}>有 {p!.staffingAlerts} 个岗位暂无可用员工（见收件箱提醒）</Text>}
+      <Section title="资源异常" count={p.resources.length + p.staffingAlerts} ctx={ctx}>
+        {p.resources.length === 0 && p.staffingAlerts === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
+        {p.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
+        {p.staffingAlerts > 0 && <Text style={s.text}>有 {p.staffingAlerts} 个岗位暂无可用员工（见收件箱提醒）</Text>}
       </Section>
       <Collapsible title="近 24 小时" ctx={ctx}>
         <View style={s.card}>
           <Text style={s.text}>
-            完成 {p?.last24h.done ?? 0} · 退回 {p?.last24h.returned ?? 0} · 驳回 {p?.last24h.rejected ?? 0} · 通道回滚 {p?.last24h.rolledBack ?? 0} · 退役 {p?.last24h.retired ?? 0}
+            完成 {p.last24h.done} · 退回 {p.last24h.returned} · 驳回 {p.last24h.rejected} · 通道回滚 {p.last24h.rolledBack} · 退役 {p.last24h.retired}
           </Text>
-          <Text style={s.muted}>员工流动：新建 {p?.churn.created ?? 0} · 退役 {p?.churn.retired ?? 0} · 认领失败 {p?.churn.claimLost ?? 0}</Text>
+          <Text style={s.muted}>员工流动：新建 {p.churn.created} · 退役 {p.churn.retired} · 认领失败 {p.churn.claimLost}</Text>
         </View>
       </Collapsible>
-      <Collapsible title="最近完成" count={p?.recentDone.length} ctx={ctx}>
+      <Collapsible title="最近完成" count={p.recentDone.length} ctx={ctx}>
         <View style={s.card}>
-          {(p?.recentDone.length ?? 0) === 0 && <Text style={s.muted}>暂无。</Text>}
-          {p?.recentDone.map(d => (
+          {p.recentDone.length === 0 && <Text style={s.muted}>暂无。</Text>}
+          {p.recentDone.map(d => (
             <Text key={d.taskId + d.at} style={s.muted}>{d.at.slice(5, 16).replace("T", " ")} · {d.actor ? `${d.actor} · ` : ""}{d.title.slice(0, 60)}</Text>
           ))}
         </View>
       </Collapsible>
-      <Collapsible title="在办目标" count={p?.goals.length} ctx={ctx}>
+      <Collapsible title="在办目标" count={p.goals.length} ctx={ctx}>
         <View style={s.card}>
-          {p?.goals.map((g, i) => <Text key={i} style={s.text}>{g.title.slice(0, 70)}{g.days > 0 ? `（已 ${g.days} 天）` : ""}</Text>)}
+          {p.goals.map((g, i) => <Text key={i} style={s.text}>{g.title.slice(0, 70)}{g.days > 0 ? `（已 ${g.days} 天）` : ""}</Text>)}
         </View>
       </Collapsible>
       {data.isLoading && <Text style={s.muted}>加载中…</Text>}

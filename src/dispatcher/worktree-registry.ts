@@ -209,12 +209,16 @@ export class WorktreeRegistry {
     if (!chosen && legacy && (intent.kind === 'code' || desired)) chosen = rows.find(r => r.path === legacy.path);
     // Whoever picks up the next task of a lane lands in the lane's tree; readers only join a lane that already exists.
     if (!chosen && lane && (desired || intent.kind === 'read')) chosen = rows.find(r => r.lane === lane && list.some(t => t.path === r.path));
-    const activeOn = (r: Row) => live.filter(f => String(f.tree.id) === String(r.id.id));
+    // 'recovery' refs are parked scene bookmarks of non-terminal tasks (e.g. a blocked task waiting
+    // for its rework): nothing is working in the tree, so they must not occupy it. Only 'active'
+    // refs (live session or still-assigned holder) serialize access; a parked owner's resumption
+    // re-enters through this same gate and queues behind whoever is active then.
+    const activeOn = (r: Row) => live.filter(f => String(f.tree.id) === String(r.id.id) && refState(f) === 'active');
     if (chosen && desired && chosen.branch !== desired) chosen = undefined;
     // Code never runs in the shared tree: it is the read/asset baseline and its branch is never switched.
     if (!chosen && !desired && shared && list.some(t => t.path === shared.path)) chosen = shared;
     if (intent.kind === 'assets') {
-      if (live.some(r => r.intent.kind === 'assets' && r.intent.paths!.some(a => intent.paths!.some(b => overlap(a, b))))) throw new CompanyError('worktree_busy', 'Authorized asset directories overlap; wait for current writer');
+      if (live.some(r => refState(r) === 'active' && r.intent.kind === 'assets' && r.intent.paths!.some(a => intent.paths!.some(b => overlap(a, b))))) throw new CompanyError('worktree_busy', 'Authorized asset directories overlap; wait for current writer');
       if (chosen && activeOn(chosen).some(r => r.intent.kind === 'code')) throw new CompanyError('worktree_busy', 'Shared repository has an active code writer; asset writes wait');
     }
     if (chosen && intent.kind === 'code' && task.currentEmployee !== actor.employeeId && activeOn(chosen).length) {
