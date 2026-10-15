@@ -1,10 +1,14 @@
 // sck-sync-attest is the owner-only landing entry for a free-trial sync-3 spend-approval
 // artifact. The boss feeds it console screenshots (billing plan + payment method, projects
-// page with the org marker, both carrying a timestamp); the tool hashes the evidence, reads the
-// sealed key's own org id through sck-vault (never the key), asks for device-owner confirmation
-// plus two typed attestations, then writes a single-use free-trial artifact into
-// <serviceHome>/private/sync/approvals/. Screenshot bytes never leave this process and are
-// never shown to employees or the model. vault/build.sh builds it alongside sck-vault.
+// page with the org marker, both carrying a timestamp) AND declares each file's real capture
+// time — never inferred from mtime or landing time. The tool hashes the evidence, binds every
+// file's SHA256 to its declared capturedAt, reads the sealed key's own org id through sck-vault
+// (never the key), asks for device-owner confirmation plus typed attestations, then writes a
+// single-use free-trial artifact into <serviceHome>/private/sync/approvals/. The artifact's
+// capturedAt is the EARLIEST evidence capture time, issuedAt is the landing time — re-landing
+// old screenshots can never refresh the 2h qualification window. Screenshot bytes never leave
+// this process and are never shown to employees or the model. vault/build.sh builds it
+// alongside sck-vault.
 import CryptoKit
 import Foundation
 import LocalAuthentication
@@ -152,12 +156,38 @@ func ask(_ question: String) -> Bool {
     return readLine(strippingNewline: true)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "yes"
 }
 
+/// The attestation freshness contract: evidence older than 2h (or in the future) cannot land.
+let JIT_MS: TimeInterval = 2 * 3600
+
+/// Parses the owner-declared capture time. Strict ISO-8601 with an explicit timezone is the
+/// only accepted shape (`YYYY-MM-DD[T| ]HH:MM[:SS[.fff]][Z|±HH:MM]`) — an ambiguous local time
+/// could silently mean a different instant, and mtimes/landing time are never consulted.
+func parseCapturedAt(_ raw: String) -> Date? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let pattern = "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,9})?)?(Z|[+-]\\d{2}:?\\d{2})$"
+    guard let re = try? NSRegularExpression(pattern: pattern),
+          let m = re.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+          m.numberOfRanges == 6 else { return nil }
+    let group = { (i: Int) -> String? in
+        let r = m.range(at: i)
+        guard r.location != NSNotFound, let range = Range(r, in: trimmed) else { return nil }
+        return String(trimmed[range])
+    }
+    guard let day = group(1), let hh = group(2), let mm = group(3), let zone = group(5) else { return nil }
+    let ss = group(4) ?? "00"
+    var tz = zone == "Z" ? "+00:00" : zone
+    if tz.count == 5 { tz.insert(":", at: tz.index(tz.startIndex, offsetBy: 3)) } // +0800 → +08:00
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: "\(day)T\(hh):\(mm):\(ss)\(tz)")
+}
+
 // MARK: Main
 
 func run() -> Never {
     guard runningFromInstallPath() else { fail("sck-sync-attest 只能从安装路径运行") }
     var project = "", taskId = "", videoSha = "", audioSha = "", remaining = ""
-    var evidence: [String] = []
+    var evidence: [(path: String, capturedRaw: String)] = []
     var args = Array(CommandLine.arguments.dropFirst())
     while let arg = args.first {
         args.removeFirst()
@@ -172,10 +202,13 @@ func run() -> Never {
         case "--video-sha256": videoSha = take().lowercased()
         case "--audio-sha256": audioSha = take().lowercased()
         case "--remaining": remaining = take()
-        case "--evidence": evidence.append(take())
+        // --evidence binds each file to the actual moment its screenshot was taken, as
+        // declared by the owner — the file's mtime and this landing time never substitute.
+        case "--evidence": evidence.append((path: take(), capturedRaw: take()))
         case "-h", "--help":
-            print("用法: sck-sync-attest --project <项目> --task <任务ID> --video-sha256 <hex> --audio-sha256 <hex> --remaining <本月sync-3剩余次数> --evidence <控制台截图> [--evidence ...]")
+            print("用法: sck-sync-attest --project <项目> --task <任务ID> --video-sha256 <hex> --audio-sha256 <hex> --remaining <本月sync-3剩余次数> --evidence <控制台截图> <采集时点ISO8601> [--evidence <截图> <时点> ...]")
             print("把 sync.so 控制台目证落盘为一个 free-trial 单次授权工件（private/sync/approvals/）；JIT≤2h、单次即作废、maxGenerations=1、maxJobSeconds=8。")
+            print("每份证据须声明真实采集时点（如 2026-10-15T10:30:00+08:00 或 ...Z；须带时区），缺失/非法/未来/超过 2h 均拒绝落件；工件 capturedAt 取最早证据时点。")
             exit(0)
         default:
             fail("未知参数 \(arg)（--help 看用法）")
@@ -188,8 +221,23 @@ func run() -> Never {
     }
     guard videoSha != audioSha else { fail("video 与 audio 的 SHA 不能相同") }
     guard let rest = Int(remaining), rest >= 1 else { fail("--remaining 需为 ≥1 的整数（老板从控制台读到的本月 sync-3 剩余次数）") }
-    let evidencePaths = Array(Set(evidence))
-    guard evidencePaths.count >= 2 else { fail("--evidence 至少两份：billing 页（plan+payment method）与 projects 页（含组织标识），截图需含时点") }
+
+    // Capture-time validation happens before any vault or filesystem side effect: every file
+    // must carry a declared, parseable, non-future, non-stale instant. One stale file in an
+    // otherwise fresh set still fails — the window belongs to the oldest evidence.
+    let now0 = Date()
+    var evidencePairs: [(path: String, capturedAt: Date)] = []
+    var seenPaths = Set<String>()
+    for item in evidence {
+        guard seenPaths.insert(item.path).inserted else { fail("证据路径重复：\(item.path)") }
+        guard let captured = parseCapturedAt(item.capturedRaw) else {
+            fail("证据采集时点缺失或非法（须为带时区的 ISO8601，如 2026-10-15T10:30:00+08:00）：\(item.path)")
+        }
+        guard captured.timeIntervalSince(now0) <= 60 else { fail("证据采集时点在未来（请核对截图上的时点）：\(item.path)") }
+        guard now0.timeIntervalSince(captured) <= JIT_MS else { fail("证据采集时点超过 2h JIT 窗口，须重新截图：\(item.path)") }
+        evidencePairs.append((path: item.path, capturedAt: captured))
+    }
+    guard evidencePairs.count >= 2 else { fail("--evidence 至少两份：billing 页（plan+payment method）与 projects 页（含组织标识），各声明截图上的真实采集时点") }
 
     // The sealed key's own org id: projects listed through the key prove membership; the boss
     // attests the console shows the same org. keyFp is a fingerprint, never the key.
@@ -217,20 +265,28 @@ func run() -> Never {
     guard orgIds.count == 1 else { fail("项目列表跨多个组织（\(orgIds.count) 个 organizationId），无法唯一绑定") }
     let accountOrg = orgIds.first!
 
-    // Evidence: hash only; the bytes themselves never leave this process.
+    // Evidence: hash only; the bytes themselves never leave this process. Each file's SHA256
+    // is bound to the owner-declared capture time checked above.
     var evidenceHashes: [String: String] = [:]
-    for path in evidencePaths {
+    var evidenceCapturedAt: [String: String] = [:]
+    for pair in evidencePairs {
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else {
-            fail("证据文件不存在：\(path)")
+        guard FileManager.default.fileExists(atPath: pair.path, isDirectory: &isDir), !isDir.boolValue else {
+            fail("证据文件不存在：\(pair.path)")
         }
-        guard let data = FileManager.default.contents(atPath: path), data.count > 0, data.count <= 64 << 20 else {
-            fail("证据文件不可读或超出大小上限：\(path)")
+        guard let data = FileManager.default.contents(atPath: pair.path), data.count > 0, data.count <= 64 << 20 else {
+            fail("证据文件不可读或超出大小上限：\(pair.path)")
         }
-        let name = URL(fileURLWithPath: path).lastPathComponent
+        let name = URL(fileURLWithPath: pair.path).lastPathComponent
         guard evidenceHashes[name] == nil else { fail("证据文件名重复：\(name)") }
         evidenceHashes[name] = sha256hex(data)
+        evidenceCapturedAt[name] = iso(pair.capturedAt)
     }
+    // The artifact's capturedAt is the EARLIEST declared evidence instant: the qualification
+    // window belongs to the oldest screenshot, so a fresh companion can never launder a stale
+    // one, and re-landing the same screenshots reproduces the same deadline.
+    let earliestCapture = evidencePairs.map { $0.capturedAt }.min()!
+    let timesUniform = Set(evidencePairs.map { $0.capturedAt.timeIntervalSince1970 }).count == 1
 
     guard Auth.confirm("落盘 sync-3 free-trial 单次授权工件（新增支出上限 0）") else { fail("未获得设备持有者确认") }
 
@@ -240,7 +296,14 @@ func run() -> Never {
       accountRef(keyFp): \(keyFp)
       accountOrg(key 侧 /v2/projects): \(accountOrg)
       输入绑定: video=\(videoSha.prefix(16))… audio=\(audioSha.prefix(16))…
-      证据哈希: \(evidenceHashes.keys.sorted().map { "\($0)=\(evidenceHashes[$0]!.prefix(16))…" }.joined(separator: ", "))
+      证据（文件名 → 声明采集时点 | sha256 前16）:
+    """)
+    for pair in evidencePairs {
+        let name = URL(fileURLWithPath: pair.path).lastPathComponent
+        note("      \(name) -> \(iso(pair.capturedAt)) | \(evidenceHashes[name]!.prefix(16))…")
+    }
+    note("""
+      工件 capturedAt(最早证据时点): \(iso(earliestCapture))
       上限: maxGenerations=1, maxJobSeconds=8, USD estimate 仅记录不作依据
     """)
 
@@ -249,6 +312,13 @@ func run() -> Never {
     }
     guard ask("② 确认控制台组织标识与上方 accountOrg 一致，且本月 sync-3 剩余次数 ≥ \(rest)") else {
         fail("已中止：组织归属或剩余次数未确认")
+    }
+    let sharedWhen = iso(earliestCapture)
+    let timeQuestion = timesUniform
+        ? "③ 确认上方所列全部证据均于同一实际采集时点 \(sharedWhen) 截取（以截图画面上的时点为准，非文件修改时间）"
+        : "③ 逐份确认上方所列采集时点均为各证据的实际截图时点（以截图画面上的时点为准，非文件修改时间）；任一不符请中止重跑"
+    guard ask(timeQuestion) else {
+        fail("已中止：证据采集时点未确认")
     }
 
     let now = Date()
@@ -270,8 +340,11 @@ func run() -> Never {
         "plan": "free",
         "paymentMethod": "none",
         "sync3Remaining": rest,
-        "capturedAt": iso(now),
+        // capturedAt = earliest real evidence instant (JIT measured from it), NOT the landing
+        // time; issuedAt independently records when this artifact was written.
+        "capturedAt": iso(earliestCapture),
         "evidenceHashes": evidenceHashes,
+        "evidenceCapturedAt": evidenceCapturedAt,
         "accountOrg": accountOrg,
         "issuedAt": iso(now),
         "expiresAt": iso(endOfUtcMonth(now)),
@@ -296,7 +369,7 @@ func run() -> Never {
     let entry: [String: Any] = [
         "ts": iso(now), "event": "attest", "approvalId": approvalId, "project": project, "taskId": taskId,
         "accountRef": keyFp, "accountOrg": accountOrg, "sync3Remaining": rest,
-        "evidence": evidenceHashes.keys.sorted(), "capturedAt": iso(now), "expiresAt": iso(endOfUtcMonth(now)),
+        "evidence": evidenceHashes.keys.sorted(), "capturedAt": iso(earliestCapture), "expiresAt": iso(endOfUtcMonth(now)),
         "by": "deviceOwnerAuthentication",
     ]
     if let line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) {
@@ -306,7 +379,7 @@ func run() -> Never {
     }
 
     note("\n已落盘 \(target)")
-    note("capturedAt 起 2h 内有效；提交成功立即消费作废；非绑定输入仍拒。")
+    note("最早证据时点 \(iso(earliestCapture)) 起 2h 内有效；提交成功立即消费作废；非绑定输入仍拒。")
     print(target)
     exit(0)
 }

@@ -69,7 +69,7 @@ const USAGE: Record<Exclude<SyncTool, 'sync_info'>, string> = {
 };
 const TIPS = [
   '输入先放到 <任务证据目录>/sync/in/，只接受 .mp4/.wav；上传按 SHA256 去重，同账户同项目命中直接复用 assetId',
-  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的授权工件放行——paid 按 USD 预算闸；free-trial 走 sck-sync-attest 控制台目证落盘（JIT≤2h、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA allowlist 绑定），env/声明一律不放行',
+  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的授权工件放行——paid 按 USD 预算闸；free-trial 走 sck-sync-attest 控制台目证落盘（每份证据须声明截图真实采集时点，JIT≤2h 自最早证据起算、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA allowlist 绑定），env/声明一律不放行',
   '上传、estimate、projects、generations、status、download 等零费用检查在无密钥时报 not_configured，如实上报不要绕过',
   'sync_projects/sync_generations 只证组织归属与已消耗：剩余次数上限无官方端点，绝不合成',
   'sync_status 的 wait 与 includeProgress 官方互斥，一次只能用一个',
@@ -93,7 +93,7 @@ interface Approval {
   maxJobSeconds: number; inputSha256Allowlist?: string[]; issuedAt: string; expiresAt: string;
   // free-trial attestation fields (required for that branch to qualify; ignored for paid):
   plan?: string; paymentMethod?: string; sync3Remaining?: number; capturedAt?: string;
-  evidenceHashes?: Record<string, string>; accountOrg?: string;
+  evidenceHashes?: Record<string, string>; evidenceCapturedAt?: Record<string, string>; accountOrg?: string;
   consumedAt?: string; consumedByActionId?: string;
 }
 type ActionState = 'reserved' | 'sending' | 'accepted' | 'unknown' | 'completed' | 'failed' | 'rejected' | 'void';
@@ -509,13 +509,25 @@ export class SyncStudio {
     const now = this.now();
     const captured = typeof a.capturedAt === 'string' ? Date.parse(a.capturedAt) : NaN;
     const hashes = a.evidenceHashes;
+    const times = a.evidenceCapturedAt;
+    const hashKeys = hashes ? Object.keys(hashes) : [];
+    const timeValues = times && typeof times === 'object'
+      ? Object.entries(times).filter(([k]) => hashKeys.includes(k)).map(([, v]) => (typeof v === 'string' ? Date.parse(v) : NaN))
+      : [];
+    // capturedAt is not a free-standing claim: it must equal the earliest declared per-evidence
+    // capture time, so neither a fresher artifact-level value nor a missing per-file binding can
+    // extend the JIT window beyond what the screenshots attest.
     return a.plan === 'free'
       && a.paymentMethod === 'none'
       && typeof a.sync3Remaining === 'number' && Number.isFinite(a.sync3Remaining) && a.sync3Remaining >= 1
       && Number.isFinite(captured) && captured <= now && now - captured <= FREE_TRIAL_JIT_MS
       && typeof a.accountOrg === 'string' && a.accountOrg.length >= 1 && a.accountOrg.length <= 128
-      && !!hashes && Object.keys(hashes).length > 0
+      && !!hashes && hashKeys.length > 0
       && Object.values(hashes).every(h => typeof h === 'string' && SHA256_HEX.test(h))
+      && !!times && typeof times === 'object' && !Array.isArray(times)
+      && Object.keys(times).length === hashKeys.length
+      && timeValues.length === hashKeys.length && timeValues.every(t => Number.isFinite(t) && t <= now)
+      && timeValues.length > 0 && Math.min(...timeValues) === captured
       && a.consumedAt === undefined
       && a.maxGenerations === 1
       && a.maxJobSeconds > 0 && a.maxJobSeconds <= FREE_TRIAL_MAX_JOB_SECONDS
@@ -668,7 +680,7 @@ export class SyncStudio {
             generation: freeTrialBound.some(a => this.freeTrialQualifies(a)) ? 'attested single-shot armed' : 'closed',
             boundArtifacts: freeTrialBound.length,
             consumedArtifacts: freeTrialBound.filter(a => a.consumedAt !== undefined).length,
-            note: '免费资格无官方核定端点；free-trial 工件=老板控制台目证落盘（sck-sync-attest）：JIT≤2h、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA 绑定；资格缺失/过期/不符一律 fail-closed',
+            note: '免费资格无官方核定端点；free-trial 工件=老板控制台目证落盘（sck-sync-attest）：JIT≤2h 按最早证据真实采集时点计、逐文件 SHA↔时点绑定、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA 绑定；资格缺失/过期/不符一律 fail-closed',
           },
           evidence: {
             source: 'vendor-marketing + authenticated probes + owner-attested approval artifacts',

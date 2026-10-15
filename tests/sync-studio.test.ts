@@ -140,12 +140,14 @@ const approval = (over: Record<string, unknown> = {}, name = 'ap-1.json') => {
 /** A fully-qualified owner console-attestation artifact, as sck-sync-attest would land it. */
 const freeTrial = (over: Record<string, unknown> = {}, name = 'ft-1.json') => {
   mkdirSync(priv('approvals'), { recursive: true, mode: 0o700 });
+  const captured = (over.capturedAt as string) ?? new Date(clock).toISOString();
   writeFileSync(join(priv('approvals'), name), JSON.stringify({
     schema: 'sync-spend-approval/1', approvalId: 'ft-1', issuer: 'owner', project: 'proj-1', taskId: 'task-1',
     accountRef: KEY_FP, kind: 'free-trial', models: ['sync-3'], maxGenerations: 1, maxUsdPerJob: 0, maxUsdTotal: 0,
     maxJobSeconds: 8, inputSha256Allowlist: [sha('v8'), sha('a8')],
-    plan: 'free', paymentMethod: 'none', sync3Remaining: 1, capturedAt: new Date(clock).toISOString(),
+    plan: 'free', paymentMethod: 'none', sync3Remaining: 1, capturedAt: captured,
     evidenceHashes: { 'billing.png': sha('shot-1'), 'projects.png': sha('shot-2') }, accountOrg: 'org-7c97',
+    evidenceCapturedAt: { 'billing.png': captured, 'projects.png': captured },
     issuedAt: new Date(clock - 60_000).toISOString(), expiresAt: new Date(clock + 3_600_000).toISOString(),
     ...over,
   }), { mode: 0o600 });
@@ -875,6 +877,14 @@ describe('free-trial attested single-shot branch', () => {
       ['allowlist misses audio', { inputSha256Allowlist: [assets.videoSha] }],
       ['allowlist misses video', { inputSha256Allowlist: [assets.audioSha] }],
       ['wrong model', { models: ['sync-2'] }],
+      // R1 rework: per-evidence capture-time binding. The artifact-level capturedAt must equal
+      // the earliest declared per-file instant — a freshened top value alone cannot launder it.
+      ['no per-evidence times', { evidenceCapturedAt: undefined }],
+      ['times/hashes key mismatch', { evidenceCapturedAt: { 'billing.png': new Date(clock).toISOString(), 'other.png': new Date(clock).toISOString() } }],
+      ['time value unparseable', { evidenceCapturedAt: { 'billing.png': 'junk', 'projects.png': new Date(clock).toISOString() } }],
+      ['a per-file time in future', { evidenceCapturedAt: { 'billing.png': new Date(clock + 3_600_000).toISOString(), 'projects.png': new Date(clock).toISOString() } }],
+      ['capturedAt fresher than oldest evidence', { capturedAt: new Date(clock).toISOString(), evidenceCapturedAt: { 'billing.png': new Date(clock - 30 * 60_000).toISOString(), 'projects.png': new Date(clock - 10 * 60_000).toISOString() } }],
+      ['re-landed fresh issuedAt, stale evidence', { issuedAt: new Date(clock).toISOString(), capturedAt: new Date(clock - 3 * 3_600_000).toISOString(), evidenceCapturedAt: { 'billing.png': new Date(clock - 3 * 3_600_000).toISOString(), 'projects.png': new Date(clock - 2 * 3_600_000).toISOString() } }],
     ];
     let seqNo = 0;
     for (const [label, over] of variants) {
@@ -889,6 +899,23 @@ describe('free-trial attested single-shot branch', () => {
     freeTrial({ approvalId: 'ft-real', ...bound }, 'ft-shadow.json');
     expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
     expect(kinds()).not.toContain('sync_generate');
+  });
+
+  test('the JIT window ages with the EARLIEST evidence instant: >2h later the gate is dead, zero upstream calls', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    const args = { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId };
+    const t1 = new Date(clock - 20 * 60_000).toISOString(); // evidence captured 20min ago
+    const t2 = new Date(clock - 5 * 60_000).toISOString();
+    freeTrial({ ...allowlisted(assets), capturedAt: t1, evidenceCapturedAt: { 'billing.png': t1, 'projects.png': t2 }, expiresAt: new Date(clock + 4 * 3_600_000).toISOString() });
+    // Within the window the artifact arms the gate…
+    const info = await call(s, 'sync_info') as any;
+    expect(info.account.freeTrial.generation).toBe('attested single-shot armed');
+    // …and once the oldest evidence crosses 2h, submission refuses before any upstream call.
+    clock += 2 * 3_600_000; // now: earliest evidence is ~2h20m old
+    expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toEqual([]);
+    expect((await call(s, 'sync_info') as any).account.freeTrial.generation).toBe('closed');
   });
 
   test('the bound input set is enforced: off-allowlist SHAs refuse even though the artifact qualifies', async () => {
