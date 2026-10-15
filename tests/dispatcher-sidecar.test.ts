@@ -19,7 +19,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
-  let next = 0, request = 0;
+  let next = 0, request = 0, now = 1000;
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string } = {}) => {
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
       kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy };
@@ -30,7 +30,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
   const wf = {
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
-    defs: async () => [def], serverNow: async () => 1000, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
+    defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => new Map(), lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
     defFailure: async () => { events.push('performance-failure'); return 1; },
     spawnInst: async () => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}` }; instances.push(i); return i; },
@@ -86,6 +86,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
   return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
+    setNow: (v: number) => { now = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -213,5 +214,32 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
     expect(w.agents.size).toBe(1);
+  });
+  test('an idle holder past stallMinutes loses the lease — the heartbeat cannot squat the task', async () => {
+    const w = world(); w.addTask('parked'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!;
+    expect(w.events).toContain(`claim:${inst.id}:parked`);
+    // The claimer's turn ended mid-claim (e.g. parked on a permission prompt): the
+    // sidecar heartbeat keeps the server lease fresh, so `expired` never fires.
+    w.agents.get(inst.paseoAgentId!)!.status = 'idle';
+    w.rows[0]!.progressAt = 1000;
+    await d.tick(); // fresh progress: idle grace is not a stall
+    expect(w.events).not.toContain('revoke:parked');
+    w.setNow(1000 + 91 * 60);
+    const r = await d.tick();
+    expect(w.events).toContain('revoke:parked');
+    // The idle session survives and is re-dispatched with the handover packet —
+    // reclaim frees the claim, it does not retire the instance.
+    expect(r.retired).not.toContain(inst.id);
+    expect(w.events.filter(e => e === `claim:${inst.id}:parked`).length).toBeGreaterThan(1);
+  });
+  test('a busy holder past stallMinutes is still stopped and revoked', async () => {
+    const w = world(); w.addTask('stuck'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!;
+    w.rows[0]!.progressAt = 1000;
+    w.setNow(1000 + 91 * 60);
+    await d.tick();
+    expect(w.events).toContain(`stop:${inst.paseoAgentId}`);
+    expect(w.events).toContain('revoke:stuck');
   });
 });

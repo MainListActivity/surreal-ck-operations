@@ -427,8 +427,9 @@ export class Dispatcher {
       const inst = byId.get(task.currentEmployee);
       const state = inst ? states.get(inst.id) : undefined;
       const expired = (task.leaseExpiresAt ?? 0) <= now;
+      const stale = task.progressAt !== undefined && now - task.progressAt > cfg.stallMinutes * 60;
       if (state === 'busy') {
-        if (task.progressAt && now - task.progressAt > cfg.stallMinutes * 60) {
+        if (stale) {
           await paseo.stop(inst!.paseoAgentId!).catch(() => undefined);
           await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，已中止其会话`, inst, report);
         } else if ((task.leaseExpiresAt ?? 0) - now < cfg.extendWithinSeconds &&
@@ -439,6 +440,12 @@ export class Dispatcher {
       }
       if (state === 'down' || state === 'exhausted') {
         await this.revoke(task, `员工 ${inst!.id} 的会话${state === 'exhausted' ? '所在订阅额度耗尽/限流' : '已中断'}`, inst, report);
+      } else if (stale) {
+        // A non-busy holder (typically a session whose turn ended mid-claim and went
+        // idle) produces no work, yet the sidecar heartbeat keeps the server lease
+        // fresh forever — `expired` never fires. Reclaim on progress stall instead:
+        // progress_at moves only on checkpoint, so staleness means parked work.
+        await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : '失联'}且超过 ${cfg.stallMinutes} 分钟没有 checkpoint`, inst, report);
       } else if (expired) {
         await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
       }
