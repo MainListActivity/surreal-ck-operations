@@ -394,6 +394,10 @@ ${TURN_HELPERS}
   if (pick.err === 'not_user_turn') { fail('failed', '节点 ' + ARGS.turn + ' 不是用户轮次（role=' + pick.role + '）'); }
   if (pick.err === 'no_reply') { fail('failed', '该用户轮次之后没有模型答复'); }
   if (pick.stopVisible) { fail('failed', '答复仍在生成中，稍后再取'); }
+  // Completion marker: a finished reply carries its own exact 'Copy' action.
+  // Thoughts-only / still-generating nodes have none — fail closed, never
+  // overwrite the previous valid artifact with partial content.
+  if (!pick.hasCopy) { fail('failed', '答复未见完成标记（无 Copy 动作），可能仍在生成，稍后再取'); }
   if (!pick.text || pick.text.length < 10) { fail('failed', '答复提取为空'); }
   await p.waitForTimeout(3000);
   const again = await p.evaluate(({ turn }) => {
@@ -401,6 +405,9 @@ ${TURN_HELPERS}
     return pickReply(turn);
   }, { turn: ARGS.turn });
   if (again.err || again.text !== pick.text) { fail('failed', '答复文本未稳定，未取回'); }
+  // Generation may (re)start between reads: the re-read must still show the
+  // reply as finished — no visible Stop, own Copy action still present.
+  if (again.stopVisible || !again.hasCopy) { fail('failed', '复读时答复仍在生成，未取回'); }
   const fake = await p.evaluate(({ text }) => {
 ${TURN_HELPERS}
     return replyLooksFake(text, '');
