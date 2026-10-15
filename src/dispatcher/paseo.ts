@@ -46,7 +46,7 @@ export interface PaseoGateway {
 }
 
 /** Paseo mode needed for unattended work; grok exposes no modes. */
-export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', devin: 'bypass', 'factory-droid': 'auto-high' };
+export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high' };
 
 export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo'): PaseoGateway {
   const run = async (args: string[], timeoutMs = 60_000): Promise<string> => {
