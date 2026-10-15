@@ -38,10 +38,15 @@ const replyFor = (req: Record<string, unknown>): Record<string, unknown> => {
 };
 
 // The mock vault lives in this process, so the attest binary must be spawned async:
-// a synchronous spawn would deadlock the event loop the server answers on.
-const run = async (args: string[], stdin = 'yes\nyes\nyes\n') => {
+// a synchronous spawn would deadlock the event loop the server answers on. `fixedNowMs`
+// engages the test-build-only clock seam (SCK_ATTEST_TEST_NOW); the production binary has no
+// such switch, and it is what makes ±1s boundary assertions deterministic instead of flaky.
+const run = async (args: string[], stdin = 'yes\nyes\nyes\n', fixedNowMs?: number) => {
   const proc = Bun.spawn([BIN, ...args], {
-    env: { ...process.env, SCK_VAULT_TEST_SOCKET: socket, SCK_ATTEST_TEST_HOME: home, SCK_VAULT_TEST_AUTO_APPROVE: '1' },
+    env: {
+      ...process.env, SCK_VAULT_TEST_SOCKET: socket, SCK_ATTEST_TEST_HOME: home, SCK_VAULT_TEST_AUTO_APPROVE: '1',
+      ...(fixedNowMs !== undefined ? { SCK_ATTEST_TEST_NOW: String(fixedNowMs) } : {}),
+    },
     stdin: Buffer.from(stdin), stdout: 'pipe', stderr: 'pipe',
   });
   const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -136,13 +141,35 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     expect(artifact.evidenceCapturedAt['projects.png']).toBe(artifact.capturedAt);
   });
 
-  test('the 2h boundary is symmetric: inside lands, past it refuses', async () => {
-    const inside = await run(baseArgs(iso(Date.now() - 2 * 3_600_000 + 10_000), T2()));
+  test('the 2h boundary is exact under a fixed clock: inside lands, past it refuses', async () => {
+    const fixedNow = Date.parse('2026-10-15T12:00:00.000Z');
+    // exactly 2h ago lands; 1s beyond refuses — no tolerance slack anywhere.
+    const inside = await run(baseArgs(iso(fixedNow - 2 * 3_600_000), iso(fixedNow - 60_000)), 'yes\nyes\nyes\n', fixedNow);
     expect(inside.exitCode).toBe(0);
     const target = [...inside.stdout.split('\n')].reverse().find(line => line.trim().endsWith('.json'))!.trim();
     const artifact = JSON.parse(readFileSync(target, 'utf8'));
-    expect(Date.now() - Date.parse(artifact.capturedAt)).toBeLessThanOrEqual(2 * 3_600_000 + 60_000);
-    expect((await run(baseArgs(iso(Date.now() - 2 * 3_600_000 - 10_000), T2()))).exitCode).toBe(1);
+    expect(artifact.capturedAt).toBe('2026-10-15T10:00:00Z');
+    expect((await run(baseArgs(iso(fixedNow - 2 * 3_600_000 - 1_000), iso(fixedNow - 60_000)), 'yes\nyes\nyes\n', fixedNow)).exitCode).toBe(1);
+  });
+
+  test('any future capture instant refuses before vault calls or artifacts — zero tolerance', async () => {
+    const fixedNow = Date.parse('2026-10-15T12:00:00.000Z');
+    const past = iso(fixedNow - 30 * 60_000);
+    calls = [];
+    const before = artifactFiles().length;
+    // +1/+30/+59/+61s into the future, each paired with a legitimately fresh file.
+    for (const ahead of [1_000, 30_000, 59_000, 61_000]) {
+      const res = await run(baseArgs(past, iso(fixedNow + ahead)), 'yes\nyes\nyes\n', fixedNow);
+      expect([ahead / 1000, res.exitCode]).toEqual([ahead / 1000, 1]);
+    }
+    // Sub-second future must refuse too — truncation may not launder it into "now".
+    const sub = await run(baseArgs(past, '2026-10-15T12:00:00.500Z'), 'yes\nyes\nyes\n', fixedNow);
+    expect(sub.exitCode).toBe(1);
+    // An instant exactly at the reference now is not future — it lands.
+    expect((await run(baseArgs('2026-10-15T12:00:00.000Z', past), 'yes\nyes\nyes\n', fixedNow)).exitCode).toBe(0);
+    expect(artifactFiles().length).toBe(before + 1); // only the exact-now run landed
+    expect(calls.filter(c => c.op === 'call' && c.kind === 'sync_projects')
+      .length).toBe(1); // refusals never reached the vault
   });
 
   test('stale, mixed, future, missing or malformed capture times all refuse without an artifact', async () => {

@@ -159,27 +159,42 @@ func ask(_ question: String) -> Bool {
 /// The attestation freshness contract: evidence older than 2h (or in the future) cannot land.
 let JIT_MS: TimeInterval = 2 * 3600
 
+/// Test builds only: a fixed reference instant so boundary cases (±1s around now/2h) are
+/// deterministic. The production binary has no such switch — real time is always Date().
+func attestNow() -> Date {
+    #if SCK_VAULT_TEST
+    if let raw = ProcessInfo.processInfo.environment["SCK_ATTEST_TEST_NOW"], let ms = Double(raw) {
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+    #endif
+    return Date()
+}
+
 /// Parses the owner-declared capture time. Strict ISO-8601 with an explicit timezone is the
 /// only accepted shape (`YYYY-MM-DD[T| ]HH:MM[:SS[.fff]][Z|±HH:MM]`) — an ambiguous local time
 /// could silently mean a different instant, and mtimes/landing time are never consulted.
+/// Fractional seconds are preserved (truncated to ms): dropping them would launder a
+/// sub-second future instant into an apparently-current one.
 func parseCapturedAt(_ raw: String) -> Date? {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    let pattern = "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,9})?)?(Z|[+-]\\d{2}:?\\d{2})$"
+    let pattern = "^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}):(\\d{2})(?::(\\d{2})(\\.\\d{1,9})?)?(Z|[+-]\\d{2}:?\\d{2})$"
     guard let re = try? NSRegularExpression(pattern: pattern),
           let m = re.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
-          m.numberOfRanges == 6 else { return nil }
+          m.numberOfRanges == 7 else { return nil }
     let group = { (i: Int) -> String? in
         let r = m.range(at: i)
         guard r.location != NSNotFound, let range = Range(r, in: trimmed) else { return nil }
         return String(trimmed[range])
     }
-    guard let day = group(1), let hh = group(2), let mm = group(3), let zone = group(5) else { return nil }
+    guard let day = group(1), let hh = group(2), let mm = group(3), let zone = group(6) else { return nil }
     let ss = group(4) ?? "00"
+    let fracDigits = group(5).map { String($0.dropFirst()) } ?? "0"
+    let frac = "." + String((fracDigits + "000").prefix(3)) // normalize to millis exactly
     var tz = zone == "Z" ? "+00:00" : zone
     if tz.count == 5 { tz.insert(":", at: tz.index(tz.startIndex, offsetBy: 3)) } // +0800 → +08:00
     let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime]
-    return formatter.date(from: "\(day)T\(hh):\(mm):\(ss)\(tz)")
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.date(from: "\(day)T\(hh):\(mm):\(ss)\(frac)\(tz)")
 }
 
 // MARK: Main
@@ -223,9 +238,10 @@ func run() -> Never {
     guard let rest = Int(remaining), rest >= 1 else { fail("--remaining 需为 ≥1 的整数（老板从控制台读到的本月 sync-3 剩余次数）") }
 
     // Capture-time validation happens before any vault or filesystem side effect: every file
-    // must carry a declared, parseable, non-future, non-stale instant. One stale file in an
-    // otherwise fresh set still fails — the window belongs to the oldest evidence.
-    let now0 = Date()
+    // must carry a declared, parseable, non-future, non-stale instant. The future check is
+    // strict — the declared instant is compared to the same-semantics Date the entry captured,
+    // with zero tolerance; one stale or future file in an otherwise fresh set still fails.
+    let now0 = attestNow()
     var evidencePairs: [(path: String, capturedAt: Date)] = []
     var seenPaths = Set<String>()
     for item in evidence {
@@ -233,7 +249,7 @@ func run() -> Never {
         guard let captured = parseCapturedAt(item.capturedRaw) else {
             fail("证据采集时点缺失或非法（须为带时区的 ISO8601，如 2026-10-15T10:30:00+08:00）：\(item.path)")
         }
-        guard captured.timeIntervalSince(now0) <= 60 else { fail("证据采集时点在未来（请核对截图上的时点）：\(item.path)") }
+        guard captured <= now0 else { fail("证据采集时点在未来（请核对截图上的时点）：\(item.path)") }
         guard now0.timeIntervalSince(captured) <= JIT_MS else { fail("证据采集时点超过 2h JIT 窗口，须重新截图：\(item.path)") }
         evidencePairs.append((path: item.path, capturedAt: captured))
     }
@@ -321,7 +337,7 @@ func run() -> Never {
         fail("已中止：证据采集时点未确认")
     }
 
-    let now = Date()
+    let now = attestNow()
     let approvalId = "ft-" + SHA256.hash(data: Data((UUID().uuidString + iso(now)).utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
     let artifact: [String: Any] = [
         "schema": "sync-spend-approval/1",
