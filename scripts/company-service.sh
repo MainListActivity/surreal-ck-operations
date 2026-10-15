@@ -65,32 +65,51 @@ case "$action" in
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
     cp "$(dirname "$0")/sck.sh" "$service_home/bin/sck"
     chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck"
+    # Query the existing plugin registration before changing active. If the
+    # dual-surface preflight cannot establish the current source, fail closed so
+    # the running release and its plugin remain a consistent pair.
+    PASEO="${PASEO:-/Applications/Paseo.app/Contents/Resources/bin/paseo}"
+    paseo_source=""
+    if [ -d "$release/plugin" ]; then
+      [ -x "$PASEO" ] || { echo "refused: Paseo CLI is unavailable; cannot synchronize the plugin surface" >&2; exit 1; }
+      if plugin_json=$("$PASEO" plugin ls sck-company --json 2>/dev/null) &&
+        paseo_source=$(printf '%s\n' "$plugin_json" | /usr/bin/python3 -c '
+import json, sys
+rows = json.load(sys.stdin) or []
+print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")' 2>/dev/null); then
+        :
+      else
+        echo "refused: unable to query sck-company plugin source; active release was not changed" >&2
+        exit 1
+      fi
+    fi
+
     prev_release=""
     if [ -L "$service_home/active" ]; then prev_release=$(readlink "$service_home/active"); fi
     ln -s "$release" "$service_home/active.next"
-    mv -h -f "$service_home/active.next" "$service_home/active"
+    # rename(2) swaps the symlink atomically without following it; `mv -h` is
+    # BSD-only and GNU `mv` would dereference the destination symlink instead.
+    RELEASE_LINK="$service_home/active" NEXT_LINK="$service_home/active.next" /usr/bin/python3 - <<'PY'
+import os
+os.rename(os.environ['NEXT_LINK'], os.environ['RELEASE_LINK'])
+PY
     # Dual-surface sync: the daemon resolves a plugin's registered source once —
     # `plugin reload` does not re-read ~/.paseo/config.json and `plugin install`
     # refuses an existing ID, so repointing is remove + install (a plugin-process
     # restart; sidecar adopt() recovers live channels across it). Only repoint
     # when the registered source lives under this service home.
-    PASEO="${PASEO:-/Applications/Paseo.app/Contents/Resources/bin/paseo}"
-    if [ -d "$release/plugin" ] && [ -x "$PASEO" ]; then
+    if [ -d "$release/plugin" ]; then
       want="$release/plugin"
-      cur=$("$PASEO" plugin ls sck-company --json 2>/dev/null | /usr/bin/python3 -c '
-import json, sys
-rows = json.load(sys.stdin) or []
-print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")')
-      case "$cur" in
+      case "$paseo_source" in
         "$want") "$PASEO" plugin reload sck-company >/dev/null 2>&1 || true ;;
-        "$service_home"*|""|"")
-          [ -n "$cur" ] && "$PASEO" plugin remove sck-company >/dev/null 2>&1
+        "$service_home"*|"")
+          [ -n "$paseo_source" ] && "$PASEO" plugin remove sck-company >/dev/null 2>&1
           if "$PASEO" plugin install "$want" --id sck-company >/dev/null 2>&1; then
             echo "plugin source -> $want"
           else
             echo "warning: plugin repoint failed; run 'paseo plugin install \"$want\" --id sck-company' manually" >&2
           fi ;;
-        *) echo "note: sck-company is registered outside the service home ($cur); leaving it as configured" >&2 ;;
+        *) echo "note: sck-company is registered outside the service home ($paseo_source); leaving it as configured" >&2 ;;
       esac
     fi
     for c in $components; do
@@ -106,20 +125,99 @@ print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", ""
     releases_dir="$service_home/releases"
     keep=" ${release##*/} ${prev_release##*/} "
     PASEO="${PASEO:-/Applications/Paseo.app/Contents/Resources/bin/paseo}"
-    cur_src=$("$PASEO" plugin ls sck-company --json 2>/dev/null | /usr/bin/python3 -c '
+    if [ -x "$PASEO" ]; then
+      if plugin_json=$("$PASEO" plugin ls sck-company --json 2>/dev/null); then
+        if cur_src=$(printf '%s\n' "$plugin_json" | /usr/bin/python3 -c '
 import json, sys
 rows = json.load(sys.stdin) or []
-print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")' 2>/dev/null)
-    case "$cur_src" in "$releases_dir"/*/plugin) keep="$keep $(basename "$(dirname "$cur_src")") ";; esac
-    spare=${SCK_RELEASE_KEEP:-1}
-    for d in $(ls -td "$releases_dir"/*/ 2>/dev/null); do
-      b=${d%/}; b=${b##*/}
-      case "$b" in *[!0-9a-f]*) continue;; esac
-      [ ${#b} -eq 40 ] || continue
-      case "$keep" in *" $b "*) continue;; esac
-      if [ "$spare" -gt 0 ]; then spare=$((spare - 1)); keep="$keep $b "; continue; fi
-      rm -rf "$d" && echo "release pruned: $b"
-    done
+print(((rows[0].get("installation") or {}).get("identity") or {}).get("path", "") if rows else "")' 2>/dev/null); then
+          case "$cur_src" in "$releases_dir"/*/plugin) keep="$keep $(basename "$(dirname "$cur_src")") ";; esac
+          spare=${SCK_RELEASE_KEEP:-1}
+          valid_spare=1
+          case "$spare" in
+            ''|*[!0-9]*)
+              echo "warning: invalid SCK_RELEASE_KEEP='$spare'; skipping release pruning" >&2
+              valid_spare=0
+              ;;
+          esac
+          if [ "$valid_spare" -eq 1 ]; then
+            spare=$(printf '%s' "$spare" | /usr/bin/sed 's/^0*//')
+            [ -n "$spare" ] || spare=0
+            # Emit only validated basenames so command substitution cannot split the
+            # default macOS service path at its spaces.
+            if release_names=$(/usr/bin/python3 - "$releases_dir" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+entries = []
+try:
+    with os.scandir(root) as children:
+        for child in children:
+            if not re.fullmatch(r'[0-9a-f]{40}', child.name):
+                continue
+            try:
+                if child.is_symlink() or not child.is_dir(follow_symlinks=False):
+                    continue
+                entries.append((child.stat(follow_symlinks=False).st_mtime, child.name))
+            except OSError:
+                continue
+except OSError:
+    raise SystemExit(1)
+
+for _, name in sorted(entries, key=lambda item: (-item[0], item[1])):
+    print(name)
+PY
+          ); then
+            for b in $release_names; do
+              case "$keep" in *" $b "*) continue;; esac
+              d="$releases_dir/$b"
+              [ -d "$d" ] && [ ! -L "$d" ] || continue
+              [ -f "$d/src/mcp/run.ts" ] && [ -f "$d/src/dispatcher/run.ts" ] && [ -d "$d/plugin" ] || {
+                echo "release retained: $b (incomplete snapshot)" >&2
+                continue
+              }
+              # Git worktrees remain protected; reclaim them through worktree
+              # lifecycle tooling instead of deleting their registered directory.
+              [ ! -e "$d/.git" ] || { echo "release retained: $b (registered Git worktree)" >&2; continue; }
+              # A running daemon may still hold a cwd, executable, or file under
+              # an older release. Treat an unavailable or indeterminate lsof
+              # check as a reason to retain rather than risk deleting live code.
+              if lsof_bin=$(command -v lsof 2>/dev/null); then
+                lsof_status=0
+                "$lsof_bin" +D "$d" >/dev/null 2>&1 || lsof_status=$?
+                case "$lsof_status" in
+                  0) echo "release retained: $b (open file handle)" >&2; continue ;;
+                  1) : ;;
+                  *) echo "release retained: $b (unable to verify open file handles)" >&2; continue ;;
+                esac
+              else
+                echo "release retained: $b (lsof unavailable)" >&2
+                continue
+              fi
+              if [ "$spare" -gt 0 ]; then spare=$((spare - 1)); keep="$keep $b "; continue; fi
+              if rm -rf "$d" && [ ! -e "$d" ]; then
+                echo "release pruned: $b"
+              else
+                echo "warning: failed to prune release: $b" >&2
+              fi
+            done
+          else
+            echo "warning: unable to enumerate releases; skipping release pruning" >&2
+          fi
+          else
+            echo "warning: invalid SCK_RELEASE_KEEP; skipping release pruning" >&2
+          fi
+        else
+          echo "warning: invalid sck-company plugin metadata; skipping release pruning" >&2
+        fi
+      else
+        echo "warning: unable to query sck-company plugin source; skipping release pruning" >&2
+      fi
+    else
+      echo "warning: Paseo CLI is unavailable; skipping release pruning" >&2
+    fi
     ;;
   start)
     for c in $components; do launchctl bootstrap "$domain" "$(plist "$c")"; done
