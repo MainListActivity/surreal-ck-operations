@@ -1,11 +1,13 @@
 // Sync-3 video media studio (sync.so). Employees hand this trusted code a video+audio pair from
 // their task evidence inbox; it uploads through sck-vault (the only key holder), quotes without
-// generating, and submits lip-sync jobs only under an owner paid spend-approval artifact — never
-// an env flag, and never a free-trial artifact: unverified free quotas are not spendable, so this
-// build keeps free-trial generation closed. Every call is lease- and role-gated, capped per project per day, audited, and writes
-// only into the task's own sync/ evidence folder. Authoritative bindings, spend approvals and the
-// submit state machine live in <serviceHome>/private/sync/ (0600, employees cannot write); the
-// ledger under evidence is a review mirror and never participates in authorization.
+// generating, and submits lip-sync jobs only under an owner spend-approval artifact — never an
+// env flag. Two artifact kinds can open the gate: `paid` (USD budget caps) and `free-trial`
+// (owner console attestation landed by sck-sync-attest: JIT≤2h, single-use, count-only, bound to
+// an input SHA allowlist). Every call is lease- and role-gated, capped per project per day,
+// audited, and writes only into the task's own sync/ evidence folder. Authoritative bindings,
+// spend approvals and the submit state machine live in <serviceHome>/private/sync/ (0600,
+// employees cannot write); the ledger under evidence is a review mirror and never participates
+// in authorization.
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmodSync, closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, writeSync } from 'node:fs';
@@ -14,7 +16,7 @@ import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import type { MediaVault, VaultReply } from './vault.ts';
 
-export const SYNC_TOOLS = ['sync_info', 'sync_models', 'sync_errors', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'] as const;
+export const SYNC_TOOLS = ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'] as const;
 export type SyncTool = typeof SYNC_TOOLS[number];
 
 type Args = Record<string, unknown>;
@@ -36,6 +38,9 @@ const RETRY_MAX = 5;           // bounded same-key retries after an unknown send
 const RETRY_BASE_MS = 10_000;  // exponential backoff base
 const RETRY_WINDOW_MS = 600_000;
 const REPLAY_DAYS = 7;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const FREE_TRIAL_JIT_MS = 2 * 3_600_000;      // attestation freshness window: capturedAt ≤ 2h at submit
+const FREE_TRIAL_MAX_JOB_SECONDS = 8;         // free-tier single-shot ceiling pinned to this D01
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 const notConfigured = () => new CompanyError('not_configured', 'Sync 密钥未配置：请老板运行 sck-vault setup sync，并确认 sck-vault 正在运行');
@@ -54,16 +59,19 @@ const UPLOAD_USAGE = '{"file":"<in/里的 xxx.mp4|xxx.wav>","sha256":"<内容SHA
 const USAGE: Record<Exclude<SyncTool, 'sync_info'>, string> = {
   sync_models: '{} 列出供应商可见模型（只读探测）',
   sync_errors: '{} 供应商机器可读错误目录（只读探测）',
+  sync_projects: '{"limit"?1-100,"cursor"?} 列密封 key 所属组织的项目（只读）：只证组织归属（控制台↔keyFp 绑定证据），不证计划/余量',
+  sync_generations: '{"since"?(ISO 默认当月初),"limit"?1-100,"cursor"?} 列本组织已消耗生成（只读）：只证消耗侧，不证剩余上限',
   sync_upload: UPLOAD_USAGE,
   sync_estimate: '{"durationSeconds","fps"?} 试算 或 {"videoAssetId","audioAssetId"?} 按已注册资产实测报价；零生成',
-  sync_generate: '{"videoAssetId","audioAssetId","outputFileName?":"xxx.mp4"} 提交 sync-3 口型任务：需老板 paid 授权工件（free-trial 本版不放行），model/sync_mode=silence/同长音画全部锁死；返回 actionId 与幂等键，同音画同参数重复调用归并同一动作',
+  sync_generate: '{"videoAssetId","audioAssetId","outputFileName?":"xxx.mp4"} 提交 sync-3 口型任务：需老板落盘的 paid 或 free-trial 授权工件，model/sync_mode=silence/同长音画全部锁死；返回 actionId 与幂等键，同音画同参数重复调用归并同一动作',
   sync_status: '{"actionId"|"generationId","wait?","timeout?"(1-10),"includeProgress?"} 查询本任务已提交动作；wait 与 includeProgress 互斥',
   sync_download: '{"actionId"|"generationId","file":"xxx.mp4"} 下载已完成结果到本任务 sync/ 目录',
 };
 const TIPS = [
   '输入先放到 <任务证据目录>/sync/in/，只接受 .mp4/.wav；上传按 SHA256 去重，同账户同项目命中直接复用 assetId',
-  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的 paid 授权工件放行；free-trial 工件本版不放行（真实免费资格未核定），env/声明也无法放行',
-  '上传、estimate、status、download 等零费用检查在无密钥时报 not_configured，如实上报不要绕过',
+  'generate 默认拒绝（payment_approval_required）：新增支出为 0，只有老板落盘的授权工件放行——paid 按 USD 预算闸；free-trial 走 sck-sync-attest 控制台目证落盘（JIT≤2h、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA allowlist 绑定），env/声明一律不放行',
+  '上传、estimate、projects、generations、status、download 等零费用检查在无密钥时报 not_configured，如实上报不要绕过',
+  'sync_projects/sync_generations 只证组织归属与已消耗：剩余次数上限无官方端点，绝不合成',
   'sync_status 的 wait 与 includeProgress 官方互斥，一次只能用一个',
   '所有查询/下载只认本任务台账绑定的 actionId/generationId，跨任务探测一律 forbidden',
 ];
@@ -83,6 +91,10 @@ interface Approval {
   schema: 'sync-spend-approval/1'; approvalId: string; issuer: 'owner'; project: string; taskId: string; accountRef: string;
   kind: 'paid' | 'free-trial'; models: string[]; maxGenerations: number; maxUsdPerJob: number; maxUsdTotal: number;
   maxJobSeconds: number; inputSha256Allowlist?: string[]; issuedAt: string; expiresAt: string;
+  // free-trial attestation fields (required for that branch to qualify; ignored for paid):
+  plan?: string; paymentMethod?: string; sync3Remaining?: number; capturedAt?: string;
+  evidenceHashes?: Record<string, string>; accountOrg?: string;
+  consumedAt?: string; consumedByActionId?: string;
 }
 type ActionState = 'reserved' | 'sending' | 'accepted' | 'unknown' | 'completed' | 'failed' | 'rejected' | 'void';
 interface SyncAction {
@@ -255,6 +267,8 @@ export class SyncStudio {
       sync_info: scope => this.info(scope),
       sync_models: scope => this.models(scope),
       sync_errors: scope => this.errors(scope),
+      sync_projects: (scope, args) => this.projects(scope, args),
+      sync_generations: (scope, args) => this.generations(scope, args),
       sync_upload: (scope, args) => this.upload(scope, args),
       sync_estimate: (scope, args) => this.estimate(scope, args),
       sync_generate: (scope, args) => this.generate(scope, args),
@@ -460,8 +474,12 @@ export class SyncStudio {
     let files: string[] = [];
     try { files = readdirSync(this.dirs.approvals); } catch { return []; }
     return files.filter(f => f.endsWith('.json'))
-      .map(f => asApproval(this.readJson(join(this.dirs.approvals, f))))
-      .filter((a): a is Approval => !!a);
+      .map(f => ({ file: f, approval: asApproval(this.readJson(join(this.dirs.approvals, f))) }))
+      // The contract stores each artifact at approvals/<approvalId>.json; enforcing filename =
+      // approvalId is what lets consumption update exactly the file that passed the gates.
+      .filter((entry): entry is { file: string; approval: Approval } =>
+        !!entry.approval && ID.test(entry.approval.approvalId) && entry.file === `${entry.approval.approvalId}.json`)
+      .map(entry => entry.approval);
   }
 
   /** Structurally-valid artifacts that bind this scope, this account and have not expired, newest first. */
@@ -474,13 +492,50 @@ export class SyncStudio {
   }
 
   /**
-   * Newest bound approval that can actually open the generate gate. Only `paid` artifacts qualify:
-   * free-trial generation is closed in this build — a free-trial artifact (even one carrying
-   * self-declared freeEvidence) can never satisfy the gate, so every such call deterministically
-   * fails payment_approval_required before any upstream sync_generate.
+   * Newest bound approval that can actually open the generate gate. `paid` artifacts qualify on
+   * their own, unchanged. `free-trial` artifacts additionally need the full owner console-
+   * attestation field set (landed by sck-sync-attest, never by an employee): fresh JIT capture,
+   * not yet consumed, pinned single-shot bounds and an input allowlist. Anything missing, stale,
+   * consumed or mismatched fails closed with payment_approval_required — self-declared
+   * freeEvidence-style fields do not count.
    */
   private validApproval(scope: OpsScope, keyFp: string, approvals = this.loadApprovals()): Approval | undefined {
-    return this.boundApprovals(scope, keyFp, approvals).find(a => a.kind === 'paid');
+    return this.boundApprovals(scope, keyFp, approvals)
+      .find(a => a.kind === 'paid' || this.freeTrialQualifies(a));
+  }
+
+  /** Free-trial qualification is all-or-nothing: every attested field must be present and sane. */
+  private freeTrialQualifies(a: Approval): boolean {
+    const now = this.now();
+    const captured = typeof a.capturedAt === 'string' ? Date.parse(a.capturedAt) : NaN;
+    const hashes = a.evidenceHashes;
+    return a.plan === 'free'
+      && a.paymentMethod === 'none'
+      && typeof a.sync3Remaining === 'number' && Number.isFinite(a.sync3Remaining) && a.sync3Remaining >= 1
+      && Number.isFinite(captured) && captured <= now && now - captured <= FREE_TRIAL_JIT_MS
+      && typeof a.accountOrg === 'string' && a.accountOrg.length >= 1 && a.accountOrg.length <= 128
+      && !!hashes && Object.keys(hashes).length > 0
+      && Object.values(hashes).every(h => typeof h === 'string' && SHA256_HEX.test(h))
+      && a.consumedAt === undefined
+      && a.maxGenerations === 1
+      && a.maxJobSeconds > 0 && a.maxJobSeconds <= FREE_TRIAL_MAX_JOB_SECONDS
+      && Array.isArray(a.inputSha256Allowlist) && a.inputSha256Allowlist.length > 0
+      && a.inputSha256Allowlist.every(s => typeof s === 'string' && SHA256_HEX.test(s));
+  }
+
+  /**
+   * Free-trial artifacts are single-use. Consumption is committed inside the same lock
+   * acquisition, after the reservation and BEFORE send-intent is persisted — once 'sending' is
+   * on disk the shot may already be upstream, so the artifact must already be spent and can
+   * never arm a second submit. A crash before this point leaves a provably-unsent reserved
+   * action (voided by reconcile) and an unconsumed artifact.
+   */
+  private consumeApproval(approval: Approval, actionId: string): void {
+    const path = join(this.dirs.approvals, `${approval.approvalId}.json`); // approvalId is ID- and filename-checked at load
+    const raw = this.readJson<Args>(path);
+    if (!raw || raw.approvalId !== approval.approvalId) throw approvalRequired('授权工件在消费前失效');
+    if (typeof raw.consumedAt === 'string') throw approvalRequired('free-trial 授权工件已被消费');
+    this.writeJson(path, { ...raw, consumedAt: iso(this.now()), consumedByActionId: actionId });
   }
 
   /**
@@ -576,7 +631,8 @@ export class SyncStudio {
     });
     const configured = status?.configured === true;
     const bound = status?.keyFp ? this.boundApprovals(scope, status.keyFp) : [];
-    const approval = bound.find(a => a.kind === 'paid');
+    const approval = status?.keyFp ? this.validApproval(scope, status.keyFp, bound) : undefined;
+    const freeTrialBound = bound.filter(a => a.kind === 'free-trial');
     const actions = this.listActions().filter(a => a.taskId === scope.taskId);
     const registry = this.readRegistry();
     let assets = 0;
@@ -608,10 +664,11 @@ export class SyncStudio {
           accountRef: status?.keyFp ?? null,
           approval: pick({ present: !!approval, approvalId: approval?.approvalId ?? null, kind: approval?.kind }),
           freeTrial: {
-            supported: false,
-            generation: 'closed',
-            boundArtifacts: bound.filter(a => a.kind === 'free-trial').length,
-            note: '免费资格无官方核定端点；本版 free-trial 工件（含自声明 freeEvidence）一律不放行生成',
+            supported: true,
+            generation: freeTrialBound.some(a => this.freeTrialQualifies(a)) ? 'attested single-shot armed' : 'closed',
+            boundArtifacts: freeTrialBound.length,
+            consumedArtifacts: freeTrialBound.filter(a => a.consumedAt !== undefined).length,
+            note: '免费资格无官方核定端点；free-trial 工件=老板控制台目证落盘（sck-sync-attest）：JIT≤2h、单次即作废、maxGenerations=1、maxJobSeconds≤8、输入 SHA 绑定；资格缺失/过期/不符一律 fail-closed',
           },
           evidence: {
             source: 'vendor-marketing + authenticated probes + owner-attested approval artifacts',
@@ -620,7 +677,7 @@ export class SyncStudio {
             missing: '账户级剩余次数/计划类型——无官方端点，绝不合成',
           },
           validity: '工件有效期见 approvals/<id>.json；marketing 口径随官方页面变动',
-          note: '无 paid 工件时 generate 恒拒（payment_approval_required）；free-trial 工件与 env/声明一律不放行',
+          note: '无有效授权工件时 generate 恒拒（payment_approval_required）；env 与自声明一律不放行',
         },
         quotas,
         bindings: { assets, actions: actions.length },
@@ -649,6 +706,97 @@ export class SyncStudio {
     return {
       value: { errors: Array.isArray(list) ? list : res },
       audit: { action: 'ops_sync_read', evidence: 'errors catalog probe' },
+    };
+  }
+
+  /**
+   * Org-side read for the console↔keyFp binding: the sealed key's own project list carries
+   * organizationId, which is what the owner's console screenshot must match. Whitelist fields
+   * only — nested generation objects (signed URLs) are dropped, never persisted.
+   */
+  private async projects(scope: OpsScope, args: Args): Promise<Out> {
+    const keyFp = await this.keyFp();
+    await this.capCheck(scope, 'read');
+    const limit = args.limit === undefined ? 100 : num(args, 'limit', 1, 100);
+    const cursor = optStr(args, 'cursor', 1, 512);
+    const res = record(await this.json<Args>('sync_projects', pick({ limit, cursor })));
+    const items = Array.isArray(res.items) ? res.items : [];
+    const projects = items.map(item => {
+      const p = record(item);
+      return pick({
+        id: typeof p.id === 'string' ? p.id : undefined,
+        name: typeof p.name === 'string' ? p.name : undefined,
+        organizationId: typeof p.organizationId === 'string' ? p.organizationId : undefined,
+        createdAt: typeof p.createdAt === 'string' ? p.createdAt : undefined,
+        updatedAt: typeof p.updatedAt === 'string' ? p.updatedAt : undefined,
+        generationsCount: typeof p.generationsCount === 'number' ? p.generationsCount : undefined,
+        completedGenerationsCount: typeof p.completedGenerationsCount === 'number' ? p.completedGenerationsCount : undefined,
+      });
+    }).filter(p => p.id !== undefined);
+    const organizationIds = [...new Set(projects.map(p => p.organizationId).filter((v): v is string => typeof v === 'string'))];
+    const nextCursor = typeof res.nextCursor === 'string' && res.nextCursor.length > 0 ? res.nextCursor : undefined;
+    this.mirror(scope, { op: 'projects', count: projects.length, organizations: organizationIds.length });
+    return {
+      value: pick({
+        accountRef: keyFp,
+        count: projects.length,
+        organizationIds,
+        projects,
+        nextCursor,
+        proves: '组织归属（控制台截图↔keyFp 绑定证据）；不证计划类型与剩余余量',
+      }),
+      audit: { action: 'ops_sync_read', evidence: `projects count=${projects.length} orgs=${organizationIds.length}` },
+    };
+  }
+
+  /**
+   * Consumption-side read: generations created inside the window (default = current UTC month).
+   * Proves what already ran, never what remains — upstream exposes no quota endpoint. Whitelist
+   * fields only: output/segment/synthesized/webhook URLs and input payloads never leave this.
+   */
+  private async generations(scope: OpsScope, args: Args): Promise<Out> {
+    await this.keyFp();
+    await this.capCheck(scope, 'read');
+    const limit = args.limit === undefined ? 100 : num(args, 'limit', 1, 100);
+    const cursor = optStr(args, 'cursor', 1, 512);
+    let since: number;
+    if (args.since === undefined) {
+      const at = new Date(this.now());
+      since = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), 1);
+    } else {
+      since = Date.parse(str(args, 'since', 4, 64));
+      if (!Number.isFinite(since)) throw invalid('since 需为可解析的 ISO 时间');
+    }
+    const res = await this.json<unknown>('sync_generations', pick({ limit, cursor }));
+    const raw = Array.isArray(res) ? res : record(res).items;
+    const list: unknown[] = Array.isArray(raw) ? raw : [];
+    const generations: Args[] = [];
+    for (const item of list) {
+      const g = record(item);
+      const createdAt = typeof g.createdAt === 'string' ? g.createdAt : undefined;
+      if (!createdAt || !Number.isFinite(Date.parse(createdAt)) || Date.parse(createdAt) < since) continue;
+      const row = pick({
+        id: typeof g.id === 'string' ? g.id : undefined,
+        model: typeof g.model === 'string' ? g.model : undefined,
+        status: typeof g.status === 'string' ? g.status : undefined,
+        errorCode: typeof g.errorCode === 'string' ? g.errorCode : undefined,
+        createdAt,
+        projectId: typeof g.projectId === 'string' ? g.projectId : undefined,
+        outputDuration: typeof g.outputDuration === 'number' ? g.outputDuration : undefined,
+      });
+      if (row.id !== undefined) generations.push(row);
+    }
+    const sync3 = generations.filter(g => g.model === MODEL).length;
+    this.mirror(scope, { op: 'generations', since: iso(since), count: generations.length, sync3 });
+    return {
+      value: pick({
+        window: { since: iso(since), until: iso(this.now()) },
+        count: generations.length,
+        sync3Count: sync3,
+        generations,
+        proves: '消耗侧事实（窗口内已发生的生成）；不证剩余上限——免费月度锚定组织创建日，以控制台为准',
+      }),
+      audit: { action: 'ops_sync_read', evidence: `generations since=${iso(since)} count=${generations.length} sync3=${sync3}` },
     };
   }
 
@@ -875,19 +1023,28 @@ export class SyncStudio {
     const fps = video.media.fps ?? 30;
     if (billable > this.maxJobSeconds) throw invalid(`计费时长 ${billable.toFixed(2)}s 超过 SCK_SYNC_MAX_JOB_SECONDS=${this.maxJobSeconds}s`);
 
-    // Gate 4 — owner paid spend-approval artifact; nothing else can ever open this gate.
+    // Gate 4 — owner spend-approval artifact; nothing else can ever open this gate.
     const approval = this.validApproval(scope, keyFp);
     if (!approval) {
-      const freeOnly = this.boundApprovals(scope, keyFp).length > 0;
+      const bound = this.boundApprovals(scope, keyFp);
+      const freeOnly = bound.length > 0 && bound.every(a => a.kind === 'free-trial');
       throw approvalRequired(freeOnly
-        ? 'free-trial 授权工件本版不放行生成（免费资格未经官方核定端点证明）；需要老板 paid 工件'
+        ? 'free-trial 授权工件不满足放行条件（资格字段缺失/捕获超 2h 窗/已消费/上限或绑定不符）；需要老板新目证工件或 paid 工件'
         : undefined);
     }
     if (billable > approval.maxJobSeconds) throw approvalRequired(`计费时长 ${billable.toFixed(2)}s 超过授权单任务上限 ${approval.maxJobSeconds}s`);
+    if (approval.kind === 'free-trial') {
+      const allow = approval.inputSha256Allowlist ?? [];
+      if (!allow.includes(video.sha256) || !allow.includes(audio.sha256)) {
+        throw approvalRequired('free-trial 工件绑定的输入 SHA 与本单不符（仅放行目证锁定的两路输入）');
+      }
+    }
 
     // Gate 5 — real upstream quote on measured inputs, never on employee-declared numbers.
+    // free-trial: the USD figure is recorded for the ledger but is NOT a pass criterion and no
+    // USD reservation applies — the attestation already pins the single free shot.
     const quote = await this.quote(billable, fps);
-    if (quote.usd > approval.maxUsdPerJob) {
+    if (approval.kind === 'paid' && quote.usd > approval.maxUsdPerJob) {
       throw approvalRequired(`报价 $${quote.usd.toFixed(4)} 超过授权单任务上限 $${approval.maxUsdPerJob}`);
     }
 
@@ -920,13 +1077,19 @@ export class SyncStudio {
       const budget = this.readBudget();
       const used = Object.values(budget.byAction).filter(b => b.approvalId === approval.approvalId)
         .reduce((sum, b) => ({ count: sum.count + b.count, usd: sum.usd + b.usd }), { count: 0, usd: 0 });
-      if (used.count + 1 > approval.maxGenerations || used.usd + quote.usd > approval.maxUsdTotal) {
+      // free-trial spends a count, not dollars: maxGenerations=1 and single-use consumption bound
+      // it; USD ceilings stay a paid-branch check only.
+      if (used.count + 1 > approval.maxGenerations ||
+          (live.kind === 'paid' && used.usd + quote.usd > live.maxUsdTotal)) {
         throw approvalRequired('授权次数或金额已用尽');
       }
       budget.byAction[actionId] = { count: 1, usd: quote.usd, approvalId: approval.approvalId };
       this.writeJson(this.dirs.budget, budget);
       this.writeJson(join(this.dirs.actions, `${actionId}.json`), action);
-      // Still inside the same lock hold: persist the send-intent before any upstream contact.
+      // Still inside the same lock hold: a free-trial artifact is spent the moment the shot is
+      // committed — before send-intent is persisted and long before the upstream reply exists.
+      if (live.kind === 'free-trial') this.consumeApproval(live, actionId);
+      // Persist the send-intent before any upstream contact.
       action.state = 'sending';
       action.sendIntentAt = iso(this.now());
       action.history.push({ state: 'sending', at: iso(this.now()), note: '发送意图持久化（同锁），此后可能已发送' });

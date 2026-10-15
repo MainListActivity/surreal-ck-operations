@@ -137,6 +137,23 @@ const approval = (over: Record<string, unknown> = {}, name = 'ap-1.json') => {
   }), { mode: 0o600 });
 };
 
+/** A fully-qualified owner console-attestation artifact, as sck-sync-attest would land it. */
+const freeTrial = (over: Record<string, unknown> = {}, name = 'ft-1.json') => {
+  mkdirSync(priv('approvals'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(priv('approvals'), name), JSON.stringify({
+    schema: 'sync-spend-approval/1', approvalId: 'ft-1', issuer: 'owner', project: 'proj-1', taskId: 'task-1',
+    accountRef: KEY_FP, kind: 'free-trial', models: ['sync-3'], maxGenerations: 1, maxUsdPerJob: 0, maxUsdTotal: 0,
+    maxJobSeconds: 8, inputSha256Allowlist: [sha('v8'), sha('a8')],
+    plan: 'free', paymentMethod: 'none', sync3Remaining: 1, capturedAt: new Date(clock).toISOString(),
+    evidenceHashes: { 'billing.png': sha('shot-1'), 'projects.png': sha('shot-2') }, accountOrg: 'org-7c97',
+    issuedAt: new Date(clock - 60_000).toISOString(), expiresAt: new Date(clock + 3_600_000).toISOString(),
+    ...over,
+  }), { mode: 0o600 });
+};
+
+/** The standard fixture pair's content SHAs — what an attested allowlist binds to. */
+const allowlisted = (assets: { videoSha: string; audioSha: string }) => ({ inputSha256Allowlist: [assets.videoSha, assets.audioSha] });
+
 const inbox = (taskId: string, name: string, bytes: Buffer) => {
   const dir = join(root, taskId, 'sync', 'in');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -201,10 +218,10 @@ describe('lease and role gates', () => {
     expect(info.configured.sync).toBe(true);
   });
 
-  test('the tool list carries all eight sync tools', () => {
+  test('the tool list carries all ten sync tools', () => {
     expect([...studio().tools]).toEqual([...SYNC_TOOLS]);
     expect([...studio().tools].sort()).toEqual(
-      ['sync_info', 'sync_models', 'sync_errors', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'].sort());
+      ['sync_info', 'sync_models', 'sync_errors', 'sync_projects', 'sync_generations', 'sync_upload', 'sync_estimate', 'sync_generate', 'sync_status', 'sync_download'].sort());
   });
 });
 
@@ -240,6 +257,87 @@ describe('sync_models / sync_errors', () => {
   test('unconfigured key refuses before any upstream call', async () => {
     syncConfigured = false;
     expect((await fail(call(studio(), 'sync_models'))).code).toBe('not_configured');
+    expect(vaultCalls).toEqual([]);
+  });
+});
+
+// ---------- org-side read probes ----------
+
+describe('sync_projects / sync_generations', () => {
+  test('projects returns whitelisted org-binding fields only and never leaks nested URLs', async () => {
+    reply = () => json({
+      items: [
+        {
+          id: 'proj-9', name: 'D01', organizationId: 'org-7c97', createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-15T00:00:00Z',
+          generationsCount: 3, completedGenerationsCount: 2, userId: 'user-1', visibility: 'private', mode: 'default',
+          generations: [{ id: 'gen-x', outputUrl: 'https://signed.example/leak?sig=SECRET' }],
+        },
+        { id: 'proj-8', name: 'other', organizationId: 'org-7c97', deletedAt: null },
+      ],
+      nextCursor: 'cursor-2',
+    });
+    const res = await call(studio(), 'sync_projects') as any;
+    expect(res.accountRef).toBe(KEY_FP);
+    expect(res.organizationIds).toEqual(['org-7c97']);
+    expect(res.count).toBe(2);
+    expect(res.nextCursor).toBe('cursor-2');
+    expect(res.projects[0]).toMatchObject({ id: 'proj-9', name: 'D01', organizationId: 'org-7c97', generationsCount: 3 });
+    // Nested generation blobs (signed URLs) and non-whitelisted fields are dropped by construction.
+    const text = JSON.stringify(res);
+    expect(text).not.toContain('outputUrl');
+    expect(text).not.toContain('signed.example');
+    expect(text).not.toContain('user-1');
+    expect(vaultCalls).toEqual([{ kind: 'sync_projects', params: { limit: 100 } }]);
+    const ledger = readFileSync(join(root, 'task-1', 'sync', 'ledger.jsonl'), 'utf8');
+    expect(ledger).toContain('"projects"');
+    expect(ledger).not.toContain('org-7c97');
+    expect(audits.at(-1)).toMatchObject({ action: 'ops_sync_read' });
+  });
+
+  test('projects passes limit/cursor through to the vault and honors the read cap', async () => {
+    reply = () => json({ items: [] });
+    await call(studio(), 'sync_projects', { limit: 10, cursor: 'abc/+/=' });
+    expect(vaultCalls.at(-1)).toEqual({ kind: 'sync_projects', params: { limit: 10, cursor: 'abc/+/=' } });
+    counts = { ops_sync_read: 240 };
+    expect((await fail(call(studio(), 'sync_projects'))).code).toBe('limit_reached');
+    expect(vaultCalls.filter(c => c.kind === 'sync_projects')).toHaveLength(1);
+  });
+
+  test('generations lists this month only, whitelists fields and counts sync-3 consumption', async () => {
+    const thisMonth = new Date(clock).toISOString();
+    const lastMonth = new Date(clock - 40 * 86_400_000).toISOString();
+    reply = () => json([
+      { id: 'gen-a', model: 'sync-3', status: 'COMPLETED', createdAt: thisMonth, outputDuration: 8, projectId: 'proj-9', outputUrl: 'https://signed.example/out?sig=LEAK', webhookUrl: 'https://hook.example/x', input: [{ type: 'video', url: 'https://in.example/v' }] },
+      { id: 'gen-b', model: 'sync-2', status: 'FAILED', errorCode: 'bad_input', createdAt: thisMonth, segmentOutputUrl: 'https://signed.example/seg' },
+      { id: 'gen-old', model: 'sync-3', status: 'COMPLETED', createdAt: lastMonth },
+    ]);
+    const res = await call(studio(), 'sync_generations') as any;
+    expect(res.count).toBe(2);
+    expect(res.sync3Count).toBe(1);
+    expect(res.generations.map((g: any) => g.id)).toEqual(['gen-a', 'gen-b']);
+    const text = JSON.stringify(res);
+    for (const leaked of ['signed.example', 'hook.example', 'in.example', 'outputUrl', 'webhookUrl', 'segmentOutputUrl', '"input"']) {
+      expect(text).not.toContain(leaked);
+    }
+    expect(res.window.since).toBe(new Date(Date.UTC(new Date(clock).getUTCFullYear(), new Date(clock).getUTCMonth(), 1)).toISOString());
+    expect(vaultCalls).toEqual([{ kind: 'sync_generations', params: { limit: 100 } }]);
+    expect(audits.at(-1)).toMatchObject({ action: 'ops_sync_read' });
+  });
+
+  test('generations honors an explicit since window and pass-through paging', async () => {
+    reply = () => json([
+      { id: 'gen-a', model: 'sync-3', status: 'COMPLETED', createdAt: new Date(clock - 10 * 86_400_000).toISOString() },
+    ]);
+    const res = await call(studio(), 'sync_generations', { since: new Date(clock - 20 * 86_400_000).toISOString(), limit: 25 }) as any;
+    expect(res.count).toBe(1);
+    expect(vaultCalls.at(-1)).toEqual({ kind: 'sync_generations', params: { limit: 25 } });
+    expect((await fail(call(studio(), 'sync_generations', { since: 'not-a-date' }))).code).toBe('invalid');
+  });
+
+  test('both org-side reads refuse without a configured key and emit no upstream call', async () => {
+    syncConfigured = false;
+    expect((await fail(call(studio(), 'sync_projects'))).code).toBe('not_configured');
+    expect((await fail(call(studio(), 'sync_generations'))).code).toBe('not_configured');
     expect(vaultCalls).toEqual([]);
   });
 });
@@ -691,10 +789,10 @@ describe('supplier errors and redaction', () => {
   });
 });
 
-// ---------- release-boundary rework (task aff27795): R1 free-trial closed, R2 SHA-identity dedup, R3 dir anchoring ----------
+// ---------- release-boundary rework (task aff27795): R1 attestation-gated free-trial, R2 SHA-identity dedup, R3 dir anchoring ----------
 
-describe('R1: free-trial generation stays closed', () => {
-  test('a free-trial artifact deterministically refuses before upstream, even with self-declared freeEvidence', async () => {
+describe('R1: free-trial requires the full attested field set', () => {
+  test('a free-trial artifact without attestation fields refuses before upstream, even with self-declared freeEvidence', async () => {
     const s = studio();
     const args = await seedAssets(s);
     approval({
@@ -706,9 +804,10 @@ describe('R1: free-trial generation stays closed', () => {
     expect(kinds()).not.toContain('sync_generate');
     const info = await call(s, 'sync_info') as any;
     expect(info.account.verdict).toBe('unproven');
-    expect(info.account.freeTrial.supported).toBe(false);
+    expect(info.account.freeTrial.supported).toBe(true);
+    expect(info.account.freeTrial.generation).toBe('closed');
     expect(info.account.freeTrial.boundArtifacts).toBe(1);
-    // A free-trial artifact is not a generation approval: the paid gate reports absent.
+    // A non-qualifying free-trial artifact is not a generation approval: the gate reports absent.
     expect(info.account.approval.present).toBe(false);
   });
 
@@ -719,6 +818,145 @@ describe('R1: free-trial generation stays closed', () => {
     const res = await call(s, 'sync_generate', args) as any;
     expect(res.status).toBe('accepted');
     expect(kinds().filter(k => k === 'sync_generate')).toHaveLength(1);
+  });
+});
+
+describe('free-trial attested single-shot branch', () => {
+  test('a fully-qualified artifact submits once, records USD only as information, and is consumed', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    // Zero USD caps cannot arm a paid artifact — the free-trial branch never compares them.
+    freeTrial(allowlisted(assets));
+    vaultCalls = [];
+    const res = await call(s, 'sync_generate', { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId }) as any;
+    expect(res.status).toBe('accepted');
+    expect(res.estimate.estimatedGenerationCostUsd).toBe(0.5); // recorded, never enforced
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toHaveLength(1);
+    const artifact = JSON.parse(readFileSync(priv('approvals/ft-1.json'), 'utf8'));
+    expect(artifact.consumedAt).toBeTruthy();
+    expect(artifact.consumedByActionId).toBe(res.actionId);
+    const info = await call(s, 'sync_info') as any;
+    expect(info.account.approval.present).toBe(false); // already consumed: nothing arms the gate
+    expect(info.account.freeTrial.consumedArtifacts).toBe(1);
+    // The same logical request still folds into the action (same-key reconciliation survives
+    // consumption), while any other input set hits the spent artifact.
+    const again = await call(s, 'sync_generate', { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId }) as any;
+    expect(again.actionId).toBe(res.actionId);
+    expect(again.deduped).toBe(true);
+    const video2 = mp4(6); inbox('task-1', 'v2.mp4', video2);
+    const audio2 = wav(6); inbox('task-1', 'a2.wav', audio2);
+    const v2 = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(video2) }) as any;
+    const a2 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(audio2) }) as any;
+    expect((await fail(call(s, 'sync_generate', { videoAssetId: v2.assetId, audioAssetId: a2.assetId }))).code).toBe('payment_approval_required');
+    expect(vaultCalls.filter(c => c.kind === 'sync_generate')).toHaveLength(1);
+  });
+
+  test('every missing/stale/consumed/mismatched attestation field fails closed', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    const args = { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId };
+    const bound = { inputSha256Allowlist: [assets.videoSha, assets.audioSha] };
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ['no plan', { plan: undefined }],
+      ['plan not free', { plan: 'pro' }],
+      ['card bound', { paymentMethod: 'card' }],
+      ['no remaining', { sync3Remaining: 0 }],
+      ['stale capture', { capturedAt: new Date(clock - 2 * 3_600_000 - 1).toISOString() }],
+      ['future capture', { capturedAt: new Date(clock + 3_600_000).toISOString() }],
+      ['no capture', { capturedAt: undefined }],
+      ['no evidence', { evidenceHashes: {} }],
+      ['bad evidence hash', { evidenceHashes: { 'billing.png': 'not-hex' } }],
+      ['no org', { accountOrg: undefined }],
+      ['consumed', { consumedAt: new Date(clock).toISOString(), consumedByActionId: 'act-x' }],
+      ['count cap >1', { maxGenerations: 2 }],
+      ['job cap >8', { maxJobSeconds: 9 }],
+      ['no allowlist', { inputSha256Allowlist: undefined }],
+      ['empty allowlist', { inputSha256Allowlist: [] }],
+      ['allowlist misses audio', { inputSha256Allowlist: [assets.videoSha] }],
+      ['allowlist misses video', { inputSha256Allowlist: [assets.audioSha] }],
+      ['wrong model', { models: ['sync-2'] }],
+    ];
+    let seqNo = 0;
+    for (const [label, over] of variants) {
+      seqNo += 1;
+      rmSync(priv('approvals'), { recursive: true, force: true });
+      freeTrial({ approvalId: `ft-v${seqNo}`, ...bound, ...over }, `ft-v${seqNo}.json`);
+      const err = await fail(call(s, 'sync_generate', args));
+      expect([label, err.code]).toEqual([label, 'payment_approval_required']);
+    }
+    // An artifact whose file name does not equal approvalId is ignored entirely.
+    rmSync(priv('approvals'), { recursive: true, force: true });
+    freeTrial({ approvalId: 'ft-real', ...bound }, 'ft-shadow.json');
+    expect((await fail(call(s, 'sync_generate', args))).code).toBe('payment_approval_required');
+    expect(kinds()).not.toContain('sync_generate');
+  });
+
+  test('the bound input set is enforced: off-allowlist SHAs refuse even though the artifact qualifies', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    const other = mp4(6); inbox('task-1', 'v2.mp4', other);
+    const otherAudio = wav(6); inbox('task-1', 'a2.wav', otherAudio);
+    const v2 = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(other) }) as any;
+    const a2 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(otherAudio) }) as any;
+    freeTrial(allowlisted(assets));
+    expect((await fail(call(s, 'sync_generate', { videoAssetId: v2.assetId, audioAssetId: a2.assetId }))).code).toBe('payment_approval_required');
+    expect(kinds()).not.toContain('sync_generate');
+  });
+
+  test('a confirmed billing refusal still spends the artifact: single use is committed at send-intent', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    freeTrial(allowlisted(assets));
+    const base = reply;
+    reply = call => call.kind === 'sync_generate' ? json({ code: 'free_tier_generations_exhausted', message: 'monthly free tier used' }, 402) : base(call);
+    const res = await call(s, 'sync_generate', { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId }) as any;
+    expect(res.status).toBe('rejected');
+    expect(readBudget().byAction).toEqual({});
+    const artifact = JSON.parse(readFileSync(priv('approvals/ft-1.json'), 'utf8'));
+    expect(artifact.consumedAt).toBeTruthy();
+    // Same inputs still fold into the finished action; different inputs hit the spent artifact.
+    const folded = await call(s, 'sync_generate', { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId }) as any;
+    expect(folded.actionId).toBe(res.actionId);
+    const video2 = mp4(6); inbox('task-1', 'v2.mp4', video2);
+    const audio2 = wav(6); inbox('task-1', 'a2.wav', audio2);
+    const v2 = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(video2) }) as any;
+    const a2 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(audio2) }) as any;
+    expect((await fail(call(s, 'sync_generate', { videoAssetId: v2.assetId, audioAssetId: a2.assetId }))).code).toBe('payment_approval_required');
+  });
+
+  test('an unknown send outcome keeps budget AND spends the artifact — no second submit can arm', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    freeTrial(allowlisted(assets));
+    const base = reply;
+    reply = call => call.kind === 'sync_generate' ? json({ code: 'IDEMPOTENCY_OUTCOME_UNKNOWN' }, 503) : base(call);
+    const res = await call(s, 'sync_generate', { videoAssetId: assets.videoAssetId, audioAssetId: assets.audioAssetId }) as any;
+    expect(res.status).toBe('unknown');
+    expect(readBudget().byAction[res.actionId]).toMatchObject({ count: 1 });
+    const artifact = JSON.parse(readFileSync(priv('approvals/ft-1.json'), 'utf8'));
+    expect(artifact.consumedAt).toBeTruthy();
+    // Different inputs under the same artifact: the gate is already dead.
+    const other = mp4(6); inbox('task-1', 'v2.mp4', other);
+    const otherAudio = wav(6); inbox('task-1', 'a2.wav', otherAudio);
+    const v2 = await call(s, 'sync_upload', { file: 'v2.mp4', sha256: sha(other) }) as any;
+    const a2 = await call(s, 'sync_upload', { file: 'a2.wav', sha256: sha(otherAudio) }) as any;
+    expect((await fail(call(s, 'sync_generate', { videoAssetId: v2.assetId, audioAssetId: a2.assetId }))).code).toBe('payment_approval_required');
+    // Same-key recheck still reconciles the original action without needing the artifact.
+    reply = call => call.kind === 'sync_generate' ? json({ id: 'gen-7', status: 'PENDING' }, 200, { 'idempotency-replayed': 'true' }) : base(call);
+    const status = await call(s, 'sync_status', { actionId: res.actionId }) as any;
+    expect(status.generationId).toBe('gen-7');
+    expect(status.state).toBe('completed'); // recheck bound gen-7, then the status poll saw COMPLETED
+  });
+
+  test('a qualifying free-trial artifact reports itself armed in sync_info', async () => {
+    const s = studio();
+    const assets = await seedAssets(s);
+    freeTrial(allowlisted(assets));
+    const info = await call(s, 'sync_info') as any;
+    expect(info.account.approval).toEqual({ present: true, approvalId: 'ft-1', kind: 'free-trial' });
+    expect(info.account.freeTrial.generation).toBe('attested single-shot armed');
+    expect(info.account.freeTrial.boundArtifacts).toBe(1);
+    expect(info.quotas.generate).toEqual({ used: 0, limit: 1 });
   });
 });
 
