@@ -561,7 +561,7 @@ func setup() -> Never {
     let key = line.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !key.isEmpty else { die("没有输入密钥") }
     guard Keychain.write(Data(key.utf8), provider) == errSecSuccess else { die("写入钥匙串失败") }
-    print("已保存到钥匙串（provider: \(provider)）。新编译的 sck-vault 第一次读取钥匙串时会弹窗，请选择「始终允许」。")
+    print("已保存到钥匙串（provider: \(provider)）。用稳定签名身份（SCK Vault Code Sign）构建的 sck-vault 只在首次读取钥匙串时弹窗一次；ad-hoc 构建则每次重建都会弹窗。出现弹窗请选「始终允许」。")
     exit(0)
 }
 

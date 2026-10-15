@@ -25,8 +25,32 @@ EOF
 mkdir -p "$(dirname "$out")"
 swiftc -O $flags "$here/main.swift" "$work/Generated.swift" -o "$work/sck-vault"
 swiftc -O $flags "$here/attest/main.swift" "$work/Generated.swift" -o "$work/sck-sync-attest"
-codesign -s - -f --options runtime "$work/sck-vault"
-codesign -s - -f --options runtime "$work/sck-sync-attest"
+# Signing identity: prefer the stable "SCK Vault Code Sign" certificate (self-signed,
+# kept in the login keychain). The Keychain item ACL then anchors on the signing
+# certificate, so rebuilt binaries stay trusted and no longer re-prompt. Ad-hoc
+# signing keeps the old behaviour: the ACL binds the exact cdhash and every rebuild
+# triggers one owner approval.
+# SCK_VAULT_SIGN=adhoc forces ad-hoc (tests keep Keychain out of the equation);
+# the default "auto" picks the stable identity for production builds; any other
+# value names the identity to sign with directly.
+case "${SCK_VAULT_SIGN:-auto}" in
+  adhoc) identity="" ;;
+  auto)
+    identity=""
+    if [ -z "$flags" ] && security find-identity -p codesigning 2>/dev/null | /usr/bin/grep -q 'SCK Vault Code Sign'; then
+      identity="SCK Vault Code Sign"
+    fi ;;
+  *) identity="$SCK_VAULT_SIGN" ;;
+esac
+if [ -n "$identity" ]; then
+  codesign -s "$identity" -f --options runtime "$work/sck-vault"
+  codesign -s "$identity" -f --options runtime "$work/sck-sync-attest"
+  echo "signed with: $identity (Keychain trust now survives rebuilds)"
+else
+  codesign -s - -f --options runtime "$work/sck-vault"
+  codesign -s - -f --options runtime "$work/sck-sync-attest"
+  echo "signed ad-hoc: next rebuild will re-prompt for Keychain access" >&2
+fi
 mv "$work/sck-vault" "$out"
 mv "$work/sck-sync-attest" "$attest_out"
 if [ -z "$flags" ]; then

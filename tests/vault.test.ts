@@ -302,7 +302,7 @@ describe('production build', () => {
     const elsewhere = join(home, 'copy');
     mkdirSync(elsewhere, { recursive: true });
     try {
-      const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh')], { env: { ...process.env, SCK_SERVICE_HOME: home }, stdout: 'pipe', stderr: 'pipe' });
+      const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh')], { env: { ...process.env, SCK_SERVICE_HOME: home, SCK_VAULT_SIGN: 'adhoc' }, stdout: 'pipe', stderr: 'pipe' });
       expect(build.exitCode).toBe(0);
       const copy = join(elsewhere, 'sck-vault');
       copyFileSync(join(home, 'bin', 'sck-vault'), copy);

@@ -241,7 +241,10 @@ cp <服务目录>/vault/org.surrealck.vault.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plist
 ```
 
-首次录入后正常不会弹窗。每次重新执行 `build.sh` 后，钥匙串会弹窗一次，因为信任绑定的是这份二进制的哈希。确认弹窗来自 sck-vault 后选择「始终允许」，然后执行 `launchctl kickstart -k gui/$(id -u)/org.surrealck.vault` 重启。
+首次录入后正常不会弹窗。签名决定信任粒度：
+
+- 登录钥匙串里存在 `SCK Vault Code Sign` 签名身份时，`build.sh` 自动用它签名，钥匙串信任锚在证书上，**重建二进制不再弹窗**。创建一次即可：生成自签名代码签名证书（代码签名 EKU）导入登录钥匙串。
+- 没有该身份时回退 ad-hoc 签名：信任绑定这份二进制的确切哈希，**每次重新执行 `build.sh` 后钥匙串弹窗一次**。确认弹窗来自 sck-vault 后选择「始终允许」，然后执行 `launchctl kickstart -k gui/$(id -u)/org.surrealck.vault` 重启。
 
 `build.sh` 与插件必须使用同一个服务目录：构建时用 `SCK_SERVICE_HOME` 指定，插件启动时使用同样的环境变量。
 
