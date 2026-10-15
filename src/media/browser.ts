@@ -48,6 +48,8 @@ export interface BrowserDeps {
   limits?: Partial<Record<Kind, number>>;
   /** Injected in tests; default runs `ego-browser nodejs -e <script>` as a subprocess. */
   runner?: Runner;
+  /** Injected in tests to drive the real runner's stream protocol with a fake child. */
+  spawn?: typeof spawn;
 }
 
 const invalid = (message: string) => new CompanyError('invalid', message);
@@ -107,23 +109,65 @@ function envLimits(): Partial<Record<Kind, number>> {
 
 const egoBin = (): string => process.env.SCK_EGO_BROWSER ?? join(process.env.HOME ?? '/nonexistent', '.local/bin/ego-browser');
 
-/** Default runner: one ego-browser nodejs subprocess per job; last __RESULT__ line wins. */
-const defaultRunner: Runner = (provider, script, timeoutMs) => new Promise<RunResult>((resolve) => {
-  const child = spawn(egoBin(), ['nodejs', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
-  let out = '';
-  let err = '';
-  const kill = setTimeout(() => child.kill('SIGKILL'), timeoutMs + 30_000);
-  child.stdout.on('data', chunk => { out += chunk; });
-  child.stderr.on('data', chunk => { err += chunk; });
-  child.on('error', error => { clearTimeout(kill); resolve({ ok: false, code: 'failed', message: `ego-browser 启动失败：${error.message}` }); });
-  child.on('close', () => {
-    clearTimeout(kill);
-    const line = out.split('\n').filter(l => l.startsWith('__RESULT__')).pop();
-    if (!line) { resolve({ ok: false, code: 'failed', message: `脚本无结果输出：${(err || out).slice(-200)}` }); return; }
-    try { resolve(JSON.parse(line.slice(10)) as RunResult); }
-    catch { resolve({ ok: false, code: 'failed', message: '结果解析失败' }); }
+const RESULT_MARK = '__RESULT__';
+/** Last protocol line in one stream; a marker only counts at line start. */
+const pickResult = (text: string): string | undefined => text.split('\n').filter(l => l.startsWith(RESULT_MARK)).pop();
+
+/**
+ * One ego-browser subprocess run and its result contract; spawn is injectable so tests
+ * exercise this real parser. `ego-browser nodejs` forwards all script output (console.log
+ * included) to its own stderr, so the __RESULT__ marker is read stderr-first with stdout
+ * as fallback. Settles exactly once, highest priority first: spawn error → our SIGKILL
+ * timeout → abnormal exit/signal → parsed marker → no marker. The SIGKILL backstop is
+ * timeoutMs + graceMs (default 30s past the script's own deadline).
+ */
+export function runWithSpawn(spawnFn: typeof spawn, bin: string, args: string[], timeoutMs: number, graceMs = 30_000): Promise<RunResult> {
+  return new Promise<RunResult>((resolve) => {
+    const child = spawnFn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    let killed = false;
+    let settled = false;
+    const settle = (result: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(kill);
+      resolve(result);
+    };
+    const kill = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs + graceMs);
+    child.stdout.on('data', chunk => { out += chunk; });
+    child.stderr.on('data', chunk => { err += chunk; });
+    child.on('error', error => settle({ ok: false, code: 'failed', message: `ego-browser 启动失败：${error.message}` }));
+    child.on('close', (code, signal) => {
+      if (killed) { settle({ ok: false, code: 'failed', message: '脚本超时已终止' }); return; }
+      if (code !== 0 || signal) {
+        // Emit-then-crash exists (probe P8): under an abnormal exit a marker is diagnostic
+        // only, never a result.
+        const diag = (err || out).slice(-160);
+        const marker = pickResult(err) ?? pickResult(out);
+        const dropped = marker ? `；丢弃已产出结果 ${marker.slice(0, 120)}` : '';
+        settle({ ok: false, code: 'failed', message: `进程异常结束(${code === null ? `signal=${signal}` : `exit=${code}`})${diag ? `：${diag}` : ''}${dropped}` });
+        return;
+      }
+      const line = pickResult(err) ?? pickResult(out);
+      if (!line) { settle({ ok: false, code: 'failed', message: `脚本无结果输出：${(err || out).slice(-200)}` }); return; }
+      try {
+        const parsed: unknown = JSON.parse(line.slice(RESULT_MARK.length));
+        if (!parsed || typeof parsed !== 'object' || typeof (parsed as RunResult).ok !== 'boolean') {
+          settle({ ok: false, code: 'failed', message: '结果解析失败' });
+          return;
+        }
+        settle(parsed as RunResult);
+      } catch {
+        settle({ ok: false, code: 'failed', message: '结果解析失败' });
+      }
+    });
   });
-});
+}
+
+/** Default runner: one ego-browser nodejs subprocess per job; last __RESULT__ line wins. */
+const defaultRunner = (spawnFn: typeof spawn): Runner => (_provider, script, timeoutMs) =>
+  runWithSpawn(spawnFn, egoBin(), ['nodejs', '-e', script], timeoutMs);
 
 export class BrowserStudio {
   readonly tools = BROWSER_TOOLS;
@@ -139,7 +183,7 @@ export class BrowserStudio {
     this.roles = deps.roles ?? envRoles() ?? DEFAULT_ROLES;
     this.limits = { ...DEFAULT_LIMITS, ...envLimits(), ...deps.limits };
     this.now = deps.now ?? Date.now;
-    this.run = deps.runner ?? defaultRunner;
+    this.run = deps.runner ?? defaultRunner(deps.spawn ?? spawn);
   }
 
   release(_employeeId: string): void {}
