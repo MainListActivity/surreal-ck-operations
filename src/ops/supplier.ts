@@ -449,9 +449,9 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   derivations.removedAccountAssertions = ['noPaymentInstrument', 'autoTopupDisabled'];
   notes.push('the revised contract dropped the account-level payment assertions noPaymentInstrument/autoTopupDisabled; their absence is contractual, not a gap more probing could close');
   if (!accountPlanFree) {
-    gaps.push({ field: 'account-plan-free', source: 'poolUsage', detail: accountPlan
-      ? 'authenticated account plan is not verified FREE for the bound API key'
-      : 'authenticated account plan source missing or unreadable; public copy and 404s cannot substitute' });
+    gaps.push({ field: 'accountPlanType', source: 'poolUsage', detail: accountPlan
+      ? 'authenticated account plan is not verified FREE for the bound API key (product gap: account-plan-free)'
+      : 'authenticated account plan source missing or unreadable; public copy and 404s cannot substitute (product gap: account-plan-free)' });
   }
   if (consoleTokenSource || authHops)
     derivations.consoleSession = { tokenSource: consoleTokenSource ?? 'unavailable', sessionExpiresAt: consoleSessionExpiresAt, hops: authHops ?? [] };
