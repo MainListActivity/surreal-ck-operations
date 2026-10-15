@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,12 +9,16 @@ import { VaultClient } from '../src/media/vault.ts';
 const ROOT = join(import.meta.dir, '..');
 const TEST_BIN = join(ROOT, 'vault', 'build', 'sck-vault-test');
 const SECRET = 'test-secret-7f3a-not-a-real-key';
+const SYNC_SECRET = 'test-secret-sync-9e1b-not-a-real-key';
 const OUT = 'output_format=mp3_44100_128';
 
 interface Seen { method: string; path: string; key: string | null; type: string | null; body: string }
+interface SyncSeen { method: string; path: string; key: string | null; xiKey: string | null; idem: string | null; body: string }
 const upstream: { seen: Seen[]; other: number } = { seen: [], other: 0 };
+const syncUpstream: { seen: SyncSeen[] } = { seen: [] };
 let upstreamPort = 0;
 let otherPort = 0;
+let syncPort = 0;
 let servers: Array<{ stop(force?: boolean): void }> = [];
 let dir = '';
 
@@ -27,7 +32,9 @@ async function startVault(socket: string) {
       ...process.env,
       SCK_VAULT_TEST_SOCKET: socket,
       SCK_VAULT_TEST_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+      SCK_VAULT_SYNC_TEST_BASE_URL: `http://127.0.0.1:${syncPort}`,
       SCK_VAULT_TEST_SECRET: SECRET,
+      SCK_VAULT_SYNC_TEST_SECRET: SYNC_SECRET,
     },
     stdout: 'ignore',
     stderr: 'pipe',
@@ -74,7 +81,33 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     });
     upstreamPort = up.port ?? 0;
     otherPort = other.port ?? 0;
-    servers = [up, other];
+    const sup = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      async fetch(req) {
+        const url = new URL(req.url);
+        const body = req.method === 'GET' ? '' : await req.text();
+        syncUpstream.seen.push({
+          method: req.method, path: url.pathname + url.search, body,
+          key: req.headers.get('x-api-key'), xiKey: req.headers.get('xi-api-key'),
+          idem: req.headers.get('idempotency-key'),
+        });
+        if (url.pathname === '/v2/models') return Response.json({ models: [{ id: 'sync-3' }] });
+        if (url.pathname === '/v2/errors') return Response.json([{ code: 'invalid_asset_id_format' }]);
+        if (url.pathname === '/v2/generations/estimate') return Response.json({ estimatedGenerationCost: 0.5 });
+        if (url.pathname === '/v2/generate' && req.method === 'POST') {
+          return Response.json({ id: 'gen-1', status: 'PENDING' }, { status: 201, headers: { 'idempotency-replayed': 'false' } });
+        }
+        if (url.pathname.startsWith('/v2/generate/gen-leak')) {
+          return new Response(`upstream echoed ${SYNC_SECRET} at https://signed.example/x?sig=abc`, { status: 500 });
+        }
+        if (url.pathname.startsWith('/v2/generate/')) return Response.json({ id: 'gen-1', status: 'COMPLETED' });
+        if (url.pathname === '/v2/generations/gen-1/download') return new Response('https://cdn.test/out.mp4?sig=x', { headers: { 'content-type': 'text/plain' } });
+        return new Response('not found', { status: 404 });
+      },
+    });
+    syncPort = sup.port ?? 0;
+    servers = [up, other, sup];
     const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh'), '--test'], { stdout: 'pipe', stderr: 'pipe' });
     expect(build.exitCode).toBe(0);
     vault = await startVault(socket);
@@ -87,8 +120,16 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test('status reports whether the vault holds a key', async () => {
-    expect(await client.status()).toEqual({ configured: true });
+  test('status reports per-provider configuration with non-secret fingerprints', async () => {
+    const status = await client.status();
+    expect(status).toMatchObject({ configured: true });
+    const fp = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 16);
+    expect(status.providers).toEqual({
+      elevenlabs: { configured: true, keyFp: fp(SECRET) },
+      sync: { configured: true, keyFp: fp(SYNC_SECRET) },
+    });
+    expect(JSON.stringify(status)).not.toContain(SECRET);
+    expect(JSON.stringify(status)).not.toContain(SYNC_SECRET);
   });
 
   test('a call reaches the upstream with the key, on the fixed endpoint', async () => {
@@ -137,6 +178,70 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     const result = runVault(['grant', '--kinds', 'tts', '--calls', '5'], socket);
     expect(result.exitCode).toBe(2);
     expect(result.stderr.toString() + result.stdout.toString()).toContain('用法');
+  });
+
+  test('sync kinds reach the sync upstream with the sync key and the x-api-key header', async () => {
+    const before = syncUpstream.seen.length;
+    const reply = await client.call('sync_models', {});
+    expect(reply.status).toBe(200);
+    expect(reply.body.toString()).toContain('sync-3');
+    const seen = syncUpstream.seen.at(-1)!;
+    expect(syncUpstream.seen.length).toBe(before + 1);
+    expect(seen).toMatchObject({ method: 'GET', path: '/v2/models', key: SYNC_SECRET, xiKey: null });
+  });
+
+  test('sync_generate carries the Idempotency-Key header out-of-body, and relays the replay flag', async () => {
+    const reply = await client.call('sync_generate', {
+      model: 'sync-3',
+      input: [{ type: 'video', assetId: 'ast-1' }, { type: 'audio', assetId: 'ast-2' }],
+      options: { sync_mode: 'silence' },
+      idempotencyKey: 'sck-test-key-01',
+    });
+    expect(reply.status).toBe(201);
+    expect(reply.headers?.['idempotency-replayed']).toBe('false');
+    const seen = syncUpstream.seen.at(-1)!;
+    expect(seen).toMatchObject({ method: 'POST', path: '/v2/generate', key: SYNC_SECRET, idem: 'sck-test-key-01' });
+    expect(JSON.parse(seen.body)).toEqual({
+      model: 'sync-3',
+      input: [{ type: 'video', assetId: 'ast-1' }, { type: 'audio', assetId: 'ast-2' }],
+      options: { sync_mode: 'silence' },
+    });
+  });
+
+  test('sync_get builds the mutually exclusive wait/progress queries and pins the model contract', async () => {
+    await client.call('sync_get', { id: 'gen-1', wait: true, timeout: 3 });
+    const waited = syncUpstream.seen.at(-1)!.path;
+    expect(waited.startsWith('/v2/generate/gen-1?')).toBe(true);
+    expect(waited).toContain('wait=true');
+    expect(waited).toContain('timeout=3');
+    await client.call('sync_get', { id: 'gen-1', include: 'progress' });
+    const progressed = syncUpstream.seen.at(-1)!.path;
+    expect(progressed.startsWith('/v2/generate/gen-1?')).toBe(true);
+    expect(progressed).toContain('include=progress');
+    const denied = await client.call('sync_get', { id: 'gen-1', wait: true, include: 'progress' }).catch((e: unknown) => e);
+    expect((denied as CompanyError).code).toBe('invalid');
+    const badModel = await client.call('sync_estimate', { model: 'sync-2', duration: 8 }).catch((e: unknown) => e);
+    expect((badModel as CompanyError).code).toBe('invalid');
+  });
+
+  test('sync_download_url hits the fixed download endpoint and returns the signed URL body verbatim', async () => {
+    const reply = await client.call('sync_download_url', { id: 'gen-1' });
+    expect(reply.status).toBe(200);
+    expect(reply.body.toString()).toBe('https://cdn.test/out.mp4?sig=x');
+    expect(syncUpstream.seen.at(-1)).toMatchObject({ method: 'GET', path: '/v2/generations/gen-1/download', key: SYNC_SECRET });
+    const bad = await client.call('sync_download_url', { id: '../../etc' }).catch((e: unknown) => e);
+    expect((bad as CompanyError).code).toBe('invalid');
+  });
+
+  test('the sync key is scrubbed out of an upstream body just like the elevenlabs key', async () => {
+    const reply = await client.call('sync_get', { id: 'gen-leak' });
+    expect(reply.status).toBe(500);
+    const text = reply.body.toString();
+    expect(text).toContain('[已遮盖]');
+    expect(text).not.toContain(SYNC_SECRET);
+    const audit = readFileSync(join(dir, 'audit.log'), 'utf8');
+    expect(audit).not.toContain(SYNC_SECRET);
+    expect(audit).toContain('"provider":"sync"');
   });
 
   test('a second vault cannot take over the socket of a running one', async () => {

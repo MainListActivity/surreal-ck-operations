@@ -3,9 +3,20 @@
 import { Socket } from 'node:net';
 import { CompanyError } from '../core-errors.ts';
 
-export interface VaultReply { status: number; contentType: string; body: Buffer }
+export interface VaultReply {
+  status: number;
+  contentType: string;
+  body: Buffer;
+  /** Whitelisted upstream headers (e.g. idempotency-replayed); never carries secrets. */
+  headers?: Record<string, string>;
+}
+export interface VaultStatus {
+  configured: boolean;
+  /** Per-provider state keyed by name; each entry carries a short SHA-256 fingerprint of the key on file. */
+  providers?: Record<string, { configured: boolean; keyFp?: string }>;
+}
 export interface MediaVault {
-  status(): Promise<{ configured: boolean }>;
+  status(): Promise<VaultStatus>;
   call(kind: string, params: Record<string, unknown>): Promise<VaultReply>;
 }
 
@@ -18,17 +29,29 @@ const CODES: Partial<Record<string, CompanyError['code']>> = {
 export class VaultClient implements MediaVault {
   constructor(private readonly socketPath: string) {}
 
-  async status(): Promise<{ configured: boolean }> {
+  async status(): Promise<VaultStatus> {
     const reply = await this.request({ op: 'status' });
-    return { configured: reply.configured === true };
+    const raw = reply.providers;
+    const providers = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? Object.fromEntries(Object.entries(raw as Record<string, any>).map(([name, item]) => [
+        name,
+        { configured: item?.configured === true, keyFp: typeof item?.keyFp === 'string' ? item.keyFp : undefined },
+      ]))
+      : undefined;
+    return { configured: reply.configured === true, providers };
   }
 
   async call(kind: string, params: Record<string, unknown>): Promise<VaultReply> {
     const reply = await this.request({ op: 'call', kind, params });
+    const raw = reply.headers;
+    const headers = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? Object.fromEntries(Object.entries(raw as Record<string, unknown>).map(([k, v]) => [k.toLowerCase(), String(v)]))
+      : undefined;
     return {
       status: Number(reply.status),
       contentType: String(reply.contentType ?? ''),
       body: Buffer.from(String(reply.bodyBase64 ?? ''), 'base64'),
+      headers,
     };
   }
 
