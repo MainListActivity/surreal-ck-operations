@@ -20,9 +20,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
-  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string } = {}) => {
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string } = {}) => {
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
-      kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy };
+      kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
       wtPaths.set(id, opts.worktreePath);
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
@@ -41,7 +41,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
   };
-  const owner = { applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => true };
+  const notices = new Map<string, string>();
+  const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); }, openNotices: async () => [], triagePending: async () => [],
+    raiseNotice: async (key: string, text: string) => { notices.set(key, text); return true; } };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
@@ -86,7 +88,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -259,5 +261,19 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w.setHost({ freeMemMb: 8192, freeDiskMb: 65536 });
     await d.tick();
     expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
+  });
+  test('staff notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
+    const w = world();
+    w.def.tracks = ['角色设计'];
+    w.addTask('synth', { discipline: '合成' });
+    const r = await w.dispatcher().tick();
+    expect(r.notices).toContain('staff:engineering');
+    const text = w.notices.get('staff:engineering')!;
+    expect(text).toContain('岗位轨不匹配');
+    expect(text).not.toContain('可新开但唤醒/创建失败');
+    // A task whose discipline the def covers still dispatches — the gate is the track only.
+    w.addTask('chars', { discipline: '角色设计' });
+    await w.dispatcher().tick();
+    expect(w.events.some(e => e === 'claim:employee-1:chars')).toBe(true);
   });
 });

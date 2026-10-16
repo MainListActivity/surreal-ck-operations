@@ -119,6 +119,15 @@ export interface StaffingInput {
   now: number;
 }
 
+// Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
+// Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
+// carry exactly the required track and the def must list it — empty tracks grants nothing.
+function trackOkFor(role: Role, task: SupervisedTask | undefined, tracks: string[] | undefined) {
+  const required = REQUIRED_TRACKS[role];
+  if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
+  return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
+}
+
 /**
  * The role+home candidate pool, evaluated with the exact predicates the tick uses.
  * Eligible entries carry weight + normalized share; ineligible ones carry `reason`.
@@ -141,14 +150,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const capReason = (provider: string): string | undefined =>
     p.quotaBlocked.get(provider) ?? (cap(provider) ? undefined : 'provider 无可用容量');
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
-  // Empty/absent tracks accept every discipline; untracked tasks keep plain role matching.
-  // Required-track roles (REQUIRED_TRACKS, e.g. screenwriter) are stricter: their tasks must
-  // carry exactly the required track and the def must list it — empty tracks grants nothing.
-  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) => {
-    const required = REQUIRED_TRACKS[p.role as Role];
-    if (required !== undefined) return task?.discipline === required && (tracks ?? []).includes(required);
-    return !task?.discipline || !tracks?.length || tracks.includes(task.discipline);
-  };
+  const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
+    trackOkFor(p.role as Role, task, tracks);
   const entries: StaffingEntry[] = [];
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;
@@ -644,13 +647,16 @@ export class Dispatcher {
       return prefer;
     };
 
-    const explainStaffing = (role: string, home: string): string => {
+    const explainStaffing = (role: string, home: string, task?: SupervisedTask): string => {
       const parts: string[] = [];
       const roleDefs = defs.filter(d => d.role === role);
       if (!roleDefs.length) parts.push('无该岗位编制');
       for (const d of roleDefs) {
         const name = `${d.provider}(${d.id})`;
         if (!d.enabled) { parts.push(`${name} 编制停用`); continue; }
+        // Keep reason precedence in lockstep with staffingPool: a track-mismatched def is
+        // never a real candidate, so saying '可新开' here would misread as a spawn bug.
+        if (!trackOkFor(role as Role, task, d.tracks)) { parts.push(`${name} 岗位轨不匹配`); continue; }
         if (resolveModel(d) === undefined) { parts.push(`${name}/${d.model} 模型槽位未解析`); continue; }
         const qb = quotaBlocked.get(d.provider);
         if (qb) { parts.push(`${name} ${qb}`); continue; }
@@ -713,7 +719,7 @@ export class Dispatcher {
           ? `；验收回避：${[...recusal.authors].sort().join('、') || '无'} 提交过本任务（硬回避）` +
             (recusal.hands.size ? `，${[...recusal.hands].sort().join('、')} 仅经手未提交（降权兜底，仍可作为最后候选）` : '')
           : '';
-        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home)}${recused}。任务 ${item.task.id} 等待中。`, report);
+        await this.notice(`staff:${item.role}`, `岗位 ${item.role} 暂无可用员工——${explainStaffing(item.role, home, item.task)}${recused}。任务 ${item.task.id} 等待中。`, report);
         continue;
       }
       await owner.resolveNotice(`staff:${item.role}`);
