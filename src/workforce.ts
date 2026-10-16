@@ -104,6 +104,10 @@ export interface CompanyConfig {
   ownerBriefHour: number;
   /** 同一任务在员工与经理之间 block→resume 往返达到该次数就不再自动循环，升级给老板；0 = 关闭。 */
   blockLoopLimit: number;
+  /** 宿主机空闲内存低于该 MB 数时暂停一切派工（新开与唤醒）；0 = 关闭。 */
+  minFreeMemMb: number;
+  /** 宿主机磁盘空闲低于该 MB 数时暂停一切派工；0 = 关闭。 */
+  minFreeDiskMb: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -112,6 +116,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
   quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  minFreeMemMb: 2048, minFreeDiskMb: 10240,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -237,6 +242,8 @@ export class Workforce {
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
       evalQuickLlm: row?.eval_quick_llm === true,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
+      minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
+      minFreeDiskMb: typeof row?.min_free_disk_mb === 'number' ? row.min_free_disk_mb : DEFAULT_CONFIG.minFreeDiskMb,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }

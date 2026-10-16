@@ -41,7 +41,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
   };
-  const owner = { applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => false };
+  const owner = { applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => true };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
@@ -76,8 +76,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
+  let host = { freeMemMb: 8192, freeDiskMb: 65536 };
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
-    env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+    env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host });
   const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
     const name = `${++request}.json`, dir = env.SCK_COMM_DIR!;
     writeFileSync(join(reqDir(dir), name), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
@@ -87,6 +88,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
   return { addTask, dispatcher, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
+    setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -241,5 +243,21 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(w.events).toContain(`stop:${inst.paseoAgentId}`);
     expect(w.events).toContain('revoke:stuck');
+  });
+  test('host below the free floors pauses all dispatch until water returns', async () => {
+    const w = world(); w.addTask('queued');
+    w.setHost({ freeMemMb: 128, freeDiskMb: 65536 });
+    const d = w.dispatcher();
+    const r = await d.tick();
+    expect(r.skipped).toBe('resources');
+    expect(r.notices).toContain('resources');
+    expect(w.events.filter(e => e.startsWith('spawn:') || e.startsWith('claim:'))).toHaveLength(0);
+    // Disk under the floor gates the same way.
+    w.setHost({ freeMemMb: 8192, freeDiskMb: 128 });
+    expect((await d.tick()).skipped).toBe('resources');
+    // Water back above the floor: the next tick dispatches normally.
+    w.setHost({ freeMemMb: 8192, freeDiskMb: 65536 });
+    await d.tick();
+    expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
   });
 });
