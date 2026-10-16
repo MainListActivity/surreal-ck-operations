@@ -96,6 +96,7 @@ export function company(): Promise<Company> {
     // logged-in accounts; sessions and any account secrets stay inside that browser profile.
     const { BrowserStudio } = await import("./vendor/src/media/browser.ts");
     const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence") });
+    const { hostResources } = await import("./vendor/src/dispatcher/host.ts");
     const sidecar = new SidecarPool({
       core, workforce, ops, media, browser, sync,
       runDir,
@@ -114,6 +115,9 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
+      // Host resource admission: free-memory/disk floors pause dispatch on the owner's
+      // machine; supervision still runs so stalled leases keep getting reclaimed.
+      hostResources: () => hostResources(serviceHome()),
       // WT02: bare call = 10-minute sweep (crash-orphan fallback); treeId+repo = event point.
       reclaimWorktrees: (input) => core.worktrees!.reclaimAll({
         trigger: input?.trigger ?? 'sweep', treeId: input?.treeId,

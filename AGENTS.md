@@ -8,4 +8,6 @@
 
 凭证文件只以路径使用。原始客户资料、密钥、token、.env 不进入任务证据、Issue 或输出。AI 不代替真人客户回执、老板授权或持牌专业意见。
 
+本机资源红线：宿主机是 16GB 无独显 Mac，不具备本地模型推理与重型媒体生产能力。员工禁止安装或运行本地模型权重、推理框架（torch/onnx/mlx 等）与 Python venv 做媒体生产；媒体生成、口型、配音、配乐与视频变换一律通过 `ops_*` 供应商工具完成。供应商无所需能力时用 report_blocker 如实报缺口，禁止降级为本地推理替代。模型权重、venv、chrome-headless 等运行环境产物不属于证据，不进证据目录。
+
 SurrealDB 依赖约定：本地测试与任何本地实例只使用公司 fork（`mainlistactivity/surrealdb`，镜像 `ghcr.io/mainlistactivity/surrealdb-native-quota`；本机二进制 `~/.surrealdb/surreal` 为 fork `1171dd01` 本地构建）。禁止用上游官方 surrealdb 跑测试或起本地实例，避免行为差异污染结论。

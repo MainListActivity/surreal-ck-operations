@@ -11,6 +11,7 @@ import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
+import type { HostResources } from './host.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
@@ -276,6 +277,11 @@ export interface DispatcherDeps {
    * instance's behalf, and records the agentId↔instance binding.
    */
   sidecar?: SidecarBridge;
+  /**
+   * Host free-resource probe (memory + disk in MB). When provided, ticks below the
+   * configured floors skip the whole dispatch pass; absent or throwing = no gate.
+   */
+  hostResources?: () => HostResources;
 }
 
 /** Narrow seam the Paseo plugin's per-agent supervisor implements. */
@@ -323,7 +329,7 @@ export interface TickReport {
   evals: string[];
   /** Jev decisions taken this tick, e.g. "triage:<goal>=quick", "release:<task>", "reroute:<task>". */
   decisions: string[];
-  skipped?: 'paused' | 'budget';
+  skipped?: 'paused' | 'budget' | 'resources';
 }
 
 export class Dispatcher {
@@ -523,6 +529,19 @@ export class Dispatcher {
     }
     await owner.resolveNotice('budget');
     if (cfg.paused) { report.skipped = 'paused'; return report; }
+
+    // Host resource admission: below the configured free floors a spawn/wake would
+    // starve every session already running on this host, so the entire dispatch
+    // pass waits. Supervision above already ran — stalled leases still get reclaimed.
+    // A probe error fails open (logged) rather than halting dispatch forever.
+    const host = this.hostResources();
+    if (host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb)) {
+      await this.notice('resources',
+        `宿主机资源不足，本轮暂停派工：空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工。`, report);
+      report.skipped = 'resources';
+      return report;
+    }
+    await owner.resolveNotice('resources');
 
     const busyBy = new Map<string, number>();
     let running = 0;
@@ -1097,6 +1116,13 @@ export class Dispatcher {
       }
     }
     return undefined;
+  }
+
+  /** Reads the host probe once; a broken probe fails open so a flaky stat can't deadlock dispatch. */
+  private hostResources(): HostResources | undefined {
+    if (!this.deps.hostResources) return undefined;
+    try { return this.deps.hostResources(); }
+    catch (error) { this.log(`host resources read failed: ${(error as Error).message}`); return undefined; }
   }
 
   private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport, trigger: 'revoke' | 'expire' = 'revoke') {
