@@ -23,6 +23,7 @@ interface ScriptArgs {
   text?: string;       // source body for add_source
   chat?: string;       // write op: existing Gemini chat id/url to continue the same conversation
   turn?: number;       // recover op: turn-node index (USER-QUERY position in DOM order)
+  model?: string;      // write op: required picker label substring; absent = page default
 }
 
 // Shared helpers injected into every provider script.
@@ -93,6 +94,45 @@ const saveVideo = async (page, dest, seconds) => {
 const bodyText = (page) => page.evaluate(() => document.body.innerText.slice(-1200));
 const hitLimit = (t) => /weekly limit|limit reached|rate limit|quota|try again later|Resets/i.test(t || '');
 const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|create account/i.test(t || '');
+`;
+
+// Gemini composer model picker (write op). The lane types prompts into whatever
+// model the page has selected — with no picker step every new chat lands on the
+// account default (Flash-Lite tier), silently degrading drafting quality. Three
+// sync steps so the caller controls pacing: open the pill, scan the menu, then
+// verify. Fail-closed: a missing picker/option aborts the write, never silently
+// writes on the wrong model. Exported so tests run the same code on a fake DOM.
+export const MODEL_PICKER = /* js */ `
+const mNorm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+const mVis = (el) => !!el && (typeof el.offsetParent === 'undefined' || el.offsetParent !== null || (el.getClientRects ? el.getClientRects().length > 0 : true));
+const mTier = /flash|lite|fast|thinking|pro|bard|nano|ultra|opus|sonnet|haiku|model|模型/i;
+const mPill = () => {
+  const box = [...document.querySelectorAll('[contenteditable="true"], textarea')].find(e => mVis(e));
+  let scope = document;
+  if (box) { let n = box; for (let i = 0; i < 6 && n; i++) n = n.parentElement || n.parent; scope = n || document; }
+  const cand = [...scope.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis);
+  return cand.find(e => /model|模型|change/i.test(e.getAttribute('aria-label') || ''))
+      || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40)
+      || [...document.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis)
+           .find(e => /model|模型/i.test(e.getAttribute('aria-label') || ''));
+};
+const openModelPicker = (want) => {
+  const pill = mPill();
+  if (!pill) return { err: 'no_picker' };
+  const cur = mNorm(pill.innerText) || mNorm(pill.getAttribute('aria-label'));
+  if (cur.toLowerCase().includes(want.toLowerCase())) return { ok: true, already: true, selected: cur };
+  pill.click();
+  return { ok: true, opened: true, before: cur };
+};
+const pickModelOption = (want) => {
+  const wantL = want.toLowerCase();
+  const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], mat-option, [role="menu"] li, [role="listbox"] li, [role="menu"] button')].filter(mVis);
+  const texts = [...new Set(items.map(i => mNorm(i.innerText)).filter(t => t && t.length <= 80))];
+  const hit = items.find(i => mNorm(i.innerText).toLowerCase().includes(wantL));
+  if (hit) { hit.click(); return { ok: true }; }
+  return texts.length ? { err: 'no_match', options: texts.slice(0, 12) } : { err: 'no_menu' };
+};
+const modelPillText = () => { const pill = mPill(); return pill ? (mNorm(pill.innerText) || mNorm(pill.getAttribute('aria-label'))) : ''; };
 `;
 
 // Turn attribution for the Gemini chat surface (write/recover ops). The chat is a
@@ -531,6 +571,46 @@ if (ARGS.notebookOp === 'write') {
   await p.waitForTimeout(5000);
   const gBody = await bodyText(p);
   if (loginWall(gBody)) { fail('login_required', 'gemini.google.com 需要重新登录'); }
+  // Model is asserted BEFORE the prompt goes in: a write on the wrong tier is
+  // worse than no write. Unavailable = abort, never a silent Flash-Lite draft.
+  let pickedModel = '';
+  if ((ARGS.model || '').trim()) {
+    const want = ARGS.model.trim();
+    let st = { err: 'no_picker' };
+    const pd = Date.now() + 20000;
+    while (Date.now() < pd) {
+      st = await p.evaluate(({ want }) => {
+${MODEL_PICKER}
+        return openModelPicker(want);
+      }, { want });
+      if (st.err !== 'no_picker') break;
+      await p.waitForTimeout(2500);
+    }
+    if (st.err === 'no_picker') { fail('model_unavailable', '找不到 Gemini 模型选择器，拒绝在未确认模型的情况下写作'); }
+    if (st.already) { pickedModel = st.selected; }
+    else {
+      let opt = { err: 'no_menu' };
+      const od = Date.now() + 12000;
+      while (Date.now() < od) {
+        opt = await p.evaluate(({ want }) => {
+${MODEL_PICKER}
+          return pickModelOption(want);
+        }, { want });
+        if (opt.err !== 'no_menu') break;
+        await p.waitForTimeout(800);
+      }
+      if (opt.err === 'no_match') { fail('model_unavailable', '模型 "' + want + '" 在选择器里不可用，当前可选：' + (opt.options || []).join('、')); }
+      if (opt.err === 'no_menu') { fail('model_unavailable', '模型选择器菜单未能打开'); }
+      await p.waitForTimeout(800);
+      pickedModel = await p.evaluate(() => {
+${MODEL_PICKER}
+        return modelPillText();
+      });
+      if (!pickedModel.toLowerCase().includes(want.toLowerCase())) {
+        fail('model_unavailable', '模型切换未生效：选择器显示 "' + pickedModel + '"，期望含 "' + want + '"');
+      }
+    }
+  }
   let sent = false;
   const sendDeadline = Date.now() + 30000;
   while (!sent && Date.now() < sendDeadline) {
@@ -599,7 +679,7 @@ ${TURN_HELPERS}
   fs.writeFileSync(tmp, lastText + '\\n\\n<!-- gemini-session: ' + (chatUrl || 'unknown') + ' -->\\n');
   fs.renameSync(tmp, outPath);
   const crypto = await import('node:crypto');
-  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: lastText.slice(0, 30000), url: chatUrl || undefined, sha256: crypto.createHash('sha256').update(lastText).digest('hex') });
+  emit({ ok: true, file: outPath, bytes: fs.statSync(outPath).size, notebook: nbId, text: lastText.slice(0, 30000), url: chatUrl || undefined, model: pickedModel || undefined, sha256: crypto.createHash('sha256').update(lastText).digest('hex') });
   process.exit(0);
 }
 

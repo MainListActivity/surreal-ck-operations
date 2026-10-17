@@ -95,7 +95,13 @@ export function company(): Promise<Company> {
     // Browser-session generation (ChatGPT/Gemini/Grok web UIs): ego-browser drives the owner's
     // logged-in accounts; sessions and any account secrets stay inside that browser profile.
     const { BrowserStudio } = await import("./vendor/src/media/browser.ts");
-    const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence") });
+    const browser = new BrowserStudio({ core, evidenceRoot: join(dirname(runDir), "evidence"),
+      // Gemini write lane: default composer model, owner-tunable via admin config.
+      notebookModel: async () => {
+        const [rows] = await db.db.query<[Array<{ media_notebook_model?: string }>]>(
+          `SELECT media_notebook_model FROM company_meta:config;`);
+        return rows?.[0]?.media_notebook_model;
+      } });
     const { hostResources } = await import("./vendor/src/dispatcher/host.ts");
     const sidecar = new SidecarPool({
       core, workforce, ops, media, browser, sync,
