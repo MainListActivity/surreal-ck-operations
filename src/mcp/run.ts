@@ -40,8 +40,12 @@ try {
       // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
       // through this MCP process must tear the Paseo side down together with the git tree instead
       // of leaving workspaces/projects behind. createSceneCleaner is idempotent, matching the
-      // plugin's semantics.
-      sceneCleaner: createSceneCleaner(createPaseoCli()),
+      // plugin's semantics. Employees in the scene retire with an honest reason first; the
+      // plugin's agent.archived listener does the in-process detach on its side.
+      sceneCleaner: createSceneCleaner(createPaseoCli(), {
+        insts: () => workforce.insts(),
+        retire: (id, reason) => workforce.retire(id, reason),
+      }),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
         ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
       reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'
