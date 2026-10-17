@@ -37,7 +37,7 @@ const MAX_REF_BYTES = 20 * 1024 * 1024;
 
 type Args = Record<string, unknown>;
 interface Out { value: unknown; audit?: { action: string; evidence: string } }
-interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown; text?: string; turns?: unknown; sha256?: string; source?: string }
+interface RunResult { ok: boolean; code?: string; message?: string; file?: string; bytes?: number; via?: string; notebook?: string; url?: string; notebooks?: unknown; text?: string; turns?: unknown; sha256?: string; source?: string; model?: string }
 type Runner = (provider: Provider, script: string, timeoutMs: number) => Promise<RunResult>;
 
 export interface BrowserDeps {
@@ -50,6 +50,8 @@ export interface BrowserDeps {
   runner?: Runner;
   /** Injected in tests to drive the real runner's stream protocol with a fake child. */
   spawn?: typeof spawn;
+  /** Company-wide default for the Gemini composer picker (company_meta:config.media_notebook_model). */
+  notebookModel?: () => Promise<string | undefined> | string | undefined;
 }
 
 const invalid = (message: string) => new CompanyError('invalid', message);
@@ -276,7 +278,7 @@ export class BrowserStudio {
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
         notebook_query: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md"} — 返回含 text 正文（≤30k），可直接当查询通道用',
-        notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md","chat"?:<既有会话id或url>} — Gemini 壳内写作；一章一个会话，续写/修订传 chat 回到同一会话',
+        notebook_write: '{"notebook":"<笔记本id或标题>","prompt","file":"draft.md","chat"?:<既有会话id或url>,"model"?:<选择器标签子串>} — Gemini 壳内写作；一章一个会话，续写/修订传 chat 回到同一会话；model 缺省取公司 media_notebook_model 配置',
         notebook_recover: '{"chat":"<gemini会话id或url>","turn"?:<节点序号>,"file"?:x.md} — 只读取回既有模型答复，绝不发送 prompt；不带 turn 只列轮次地图（USER-QUERY/MODEL-RESPONSE 的 i），带 turn+file 取该用户轮次之后紧跟的答复',
         notebook_add_source: '{"notebook":"<笔记本id或标题>","title":"v01-卷名","text":"<正文markdown>"}',
         notebook_remove_source: '{"notebook":"<笔记本id或标题>","title":"<源标题子串>"} — 源不可编辑，更新=删旧+重注',
@@ -370,7 +372,9 @@ export class BrowserStudio {
         const file = String(args.file ?? '');
         if (!MD_FILE.test(file)) throw invalid('file 只能是纯文件名 xxx.md');
         const chat = typeof args.chat === 'string' && args.chat.trim() ? args.chat.trim().slice(0, 200) : undefined;
-        scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file, chat };
+        const model = (typeof args.model === 'string' && args.model.trim() ? args.model.trim().slice(0, 60) : undefined)
+          ?? ((await this.deps.notebookModel?.()) || undefined);
+        scriptArgs = { ...base, notebookOp: 'write', notebook, prompt, file, chat, model };
         break;
       }
       case 'recover': {
@@ -402,7 +406,7 @@ export class BrowserStudio {
       notebook: result.notebook ?? scriptArgs.notebook,
       notebooks: result.notebooks,
       file: result.file, bytes: result.bytes, url: result.url, text: result.text,
-      turns: result.turns, sha256: result.sha256, source: result.source,
+      turns: result.turns, sha256: result.sha256, source: result.source, model: result.model,
     }, audit: { action: 'ops_browser_notebook', evidence: `notebook_${op} ${evidenceBits}`.slice(0, 160) } };
   }
 

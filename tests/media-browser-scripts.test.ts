@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildScript, TURN_HELPERS } from '../src/media/browser-scripts.ts';
+import { buildScript, TURN_HELPERS, MODEL_PICKER } from '../src/media/browser-scripts.ts';
 
 // Executable select/extract tests: the SAME in-page code the write/recover ops
 // inject into p.evaluate (TURN_HELPERS) is run here via `new Function` against a
@@ -464,6 +464,53 @@ describe('full generated scripts (page-stub executable)', () => {
   }, 20000);
 });
 
+describe('model picker (Gemini composer pill)', () => {
+  const pickers = (doc: FakeDocument): { openModelPicker: (w: string) => Record<string, unknown>;
+    pickModelOption: (w: string) => Record<string, unknown>; modelPillText: () => string } =>
+    new Function('document', `${MODEL_PICKER}\nreturn { openModelPicker, pickModelOption, modelPillText };`)(doc) as never;
+
+  // Composer: textarea + a 'Flash-Lite' pill; clicking opens mat-option rows.
+  const shellOf = (pillLabel = 'Flash-Lite') => {
+    const menu: El[] = [];
+    const pill = new El('button', { text: pillLabel, attrs: { 'aria-label': 'Model selector' } });
+    const mkOpt = (label: string) => {
+      const o = new El('mat-option', { text: label, attrs: { role: 'option' } });
+      o.onClick = () => { pill.ownText = label; };
+      return o;
+    };
+    for (const l of ['Flash-Lite', 'Fast', 'Gemini 3 Pro']) menu.push(mkOpt(l));
+    const root = new El('body');
+    const form = new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } }), pill);
+    root.add(form);
+    pill.onClick = () => menu.forEach(m => root.add(m));
+    return { root, doc: docOf(root) };
+  };
+
+  test('requested tier gets picked, verified against the pill', () => {
+    const { doc } = shellOf();
+    const p = pickers(doc);
+    expect(p.openModelPicker('pro')).toMatchObject({ ok: true, opened: true });
+    expect(p.pickModelOption('pro')).toMatchObject({ ok: true });
+    expect(p.modelPillText()).toBe('Gemini 3 Pro');
+  });
+  test('already-on model short-circuits without opening the menu', () => {
+    const { doc } = shellOf('Gemini 3 Pro');
+    expect(pickers(doc).openModelPicker('pro')).toMatchObject({ ok: true, already: true, selected: 'Gemini 3 Pro' });
+  });
+  test('missing option fails closed and lists what the menu actually offers', () => {
+    const { doc } = shellOf();
+    const p = pickers(doc);
+    p.openModelPicker('gemini9');
+    const r = p.pickModelOption('gemini9');
+    expect(r.err).toBe('no_match');
+    expect((r.options as string[]).join(' ')).toContain('Gemini 3 Pro');
+  });
+  test('no picker element → no_picker', () => {
+    const doc = docOf(new El('body').add(new El('div', { text: 'plain page' })));
+    expect(pickers(doc).openModelPicker('pro').err).toBe('no_picker');
+  });
+});
+
 describe('generated scripts parse (template-escape regression)', () => {
   // A broken escape (e.g. '\n' written into a single-quoted JS string) is a
   // SyntaxError at parse time — build every op and parse it like nodejs -e would.
@@ -480,6 +527,7 @@ describe('generated scripts parse (template-escape regression)', () => {
       nb({ notebookOp: 'remove_source', notebook: '梦痕纪元', title: 'v01' }),
       nb({ notebookOp: 'write', notebook: '梦痕纪元' }),
       nb({ notebookOp: 'write', notebook: '梦痕纪元', chat: 'https://gemini.google.com/app/298352bc8337e01f' }),
+      nb({ notebookOp: 'write', notebook: '梦痕纪元', model: 'pro' }),
       nb({ notebookOp: 'recover', chat: '298352bc8337e01f' }),
       nb({ notebookOp: 'recover', chat: '298352bc8337e01f', turn: 2 }),
     ]) expect(parse(script)).not.toThrow();

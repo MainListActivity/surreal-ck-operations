@@ -11,7 +11,7 @@ let counts: Record<string, number> = {};
 let audits: Array<{ task: string; action: string; evidence: string }> = [];
 let ran: Array<{ provider: string; script: string }> = [];
 // Scripted per-provider results, consumed in call order; last entry repeats.
-let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string; title?: string; turns?: unknown; sha256?: string; source?: string }> = [];
+let results: Array<{ ok: boolean; code?: string; message?: string; file?: string; bytes?: number; notebook?: string; url?: string; notebooks?: unknown; text?: string; title?: string; turns?: unknown; sha256?: string; source?: string; model?: string }> = [];
 let ref = '';
 
 const core = {
@@ -194,6 +194,32 @@ describe('notebook lane', () => {
     expect(ran.at(-1)!.script).toContain('gemini.google.com/app/');
     // 产物文件尾自动落会话标记，供返修补丁回到同一会话
     expect(ran.at(-1)!.script).toContain('gemini-session');
+  });
+
+  test('notebook_write model: explicit arg wins, company default applies, picked model surfaces', async () => {
+    const s = new BrowserStudio({ core: core as never, evidenceRoot: root, runner: async (provider, script) => {
+      ran.push({ provider, script });
+      const result = results.length > 1 ? results.shift()! : results[0];
+      if (result?.ok && !result.file) {
+        const name = script.match(/"file":"([^"]+)"/)?.[1] ?? 'x.png';
+        const file = join(root, 'task-1', 'media', name);
+        writeFileSync(file, 'px');
+        result.file = file; result.bytes = 2;
+      }
+      return result ?? { ok: false, code: 'failed', message: 'no scripted result' };
+    }, notebookModel: () => 'gemini 4' });
+    results = [{ ok: true, file: join(root, 'task-1', 'media', 'a.md'), bytes: 10, text: 'x', model: 'Gemini 4' }];
+    // explicit arg beats the company default
+    const v1 = await call(s, 'notebook_write', { notebook: 'nb', prompt: '根据卷一概要写第三章开场，文风与已写两章一致', file: 'a.md', model: 'pro' }) as any;
+    expect(ran.at(-1)!.script).toContain('"model":"pro"');
+    expect(v1.model).toBe('Gemini 4'); // picked label from the page travels back
+    // default kicks in when no arg
+    await call(s, 'notebook_write', { notebook: 'nb', prompt: '根据卷一概要写第三章开场，文风与已写两章一致', file: 'a.md' });
+    expect(ran.at(-1)!.script).toContain('"model":"gemini 4"');
+    // neither configured → no model key at all (page default preserved)
+    const s2 = studio();
+    await call(s2, 'notebook_write', { notebook: 'nb', prompt: '根据卷一概要写第三章开场，文风与已写两章一致', file: 'a.md' });
+    expect(ran.at(-1)!.script).not.toContain('"model"');
   });
 
   test('notebook_recover: authorized chat only, probe lists turns, turn+file extracts', async () => {
