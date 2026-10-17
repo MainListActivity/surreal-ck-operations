@@ -66,7 +66,13 @@ export function company(): Promise<Company> {
     const worktreeOpts = {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       // Three-layer same-death: a task worktree's Paseo workspaces/project die with the tree.
-      sceneCleaner: createSceneCleaner(paseo),
+      // Employee agents inside those workspaces are retired with an honest reason first —
+      // otherwise the workspace cascade archives them and the tick misreports 通道隔离.
+      sceneCleaner: createSceneCleaner(paseo, {
+        insts: () => workforce.insts(),
+        retire: (id, reason) => workforce.retire(id, reason),
+        detach: inst => { if (inst.paseoAgentId) sidecar.detachAgent(inst.paseoAgentId); },
+      }),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
         ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,
       reclaimEnabled: process.env.SCK_WORKTREE_RECLAIM === '0' || process.env.SCK_WORKTREE_RECLAIM === 'false'

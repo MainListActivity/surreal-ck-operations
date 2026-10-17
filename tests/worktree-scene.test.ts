@@ -10,22 +10,32 @@ interface FakePaseo {
   archived: string[];
   deleted: string[];
   archiveCalls: number;
+  agentsArchived: string[];
+  order: string[];
   fail: Record<string, string>;
   listWorkspaces(): Promise<PaseoWorkspaceInfo[]>;
   listProjects(): Promise<PaseoProjectInfo[]>;
   archiveWorkspace(id: string): Promise<void>;
   deleteProject(id: string): Promise<void>;
+  archive(agentId: string): Promise<void>;
 }
 
 const fakePaseo = (workspaces: PaseoWorkspaceInfo[], projects: PaseoProjectInfo[], fail: Record<string, string> = {}): FakePaseo => ({
-  workspaces, projects, archived: [], deleted: [], archiveCalls: 0, fail,
+  workspaces, projects, archived: [], deleted: [], archiveCalls: 0, agentsArchived: [], order: [], fail,
   async listWorkspaces() { return this.workspaces.filter(w => !this.archived.includes(w.workspaceId)); },
   async listProjects() { return this.projects.filter(p => !this.deleted.includes(p.projectId)); },
+  async archive(agentId: string) {
+    const failure = this.fail[`agent:${agentId}`];
+    if (failure) throw new Error(failure);
+    this.agentsArchived.push(agentId);
+    this.order.push(`agent:${agentId}`);
+  },
   async archiveWorkspace(id: string) {
     this.archiveCalls++;
     const failure = this.fail[`ws:${id}`];
     if (failure) throw new Error(failure);
     this.archived.push(id);
+    this.order.push(`ws:${id}`);
   },
   async deleteProject(id: string) {
     const failure = this.fail[`prj:${id}`];
@@ -127,6 +137,48 @@ test('CLI usage errors are real failures, not already-gone', async () => {
   });
   await expect(createSceneCleaner(arg)(tree)).rejects.toThrow('missing required argument');
   expect(arg.archived).toEqual([]);
+});
+
+test('employee instances inside the doomed tree retire with an honest reason before the workspace cascade', async () => {
+  const paseo = fakePaseo([ws('w-scene', tree)], []);
+  const detached: string[] = [];
+  const retired: Array<[string, string]> = [];
+  const clean = createSceneCleaner(paseo, {
+    insts: async () => [
+      { id: 'qa-1', cwd: tree, paseoAgentId: 'agent-1' },
+      { id: 'eng-2', cwd: join(tree, 'sub'), paseoAgentId: 'agent-2' },
+      { id: 'qa-3', cwd: join(dir, 'repo-sck-live-aaaaaaaa'), paseoAgentId: 'agent-3' },
+      { id: 'eng-4', paseoAgentId: 'agent-4' }, // no recorded cwd — not in this scene
+    ],
+    retire: async (id, reason) => { retired.push([id, reason]); },
+    detach: inst => { detached.push(inst.id); },
+  });
+  const result = await clean(tree);
+  expect(retired.map(([id]) => id).sort()).toEqual(['eng-2', 'qa-1']);
+  expect(retired.every(([, reason]) => reason.includes('场景回收'))).toBe(true);
+  expect(detached.sort()).toEqual(['eng-2', 'qa-1']);
+  expect(paseo.agentsArchived.sort()).toEqual(['agent-1', 'agent-2']);
+  // The agent's own archive lands before its workspace dies — a still-live session never
+  // outlives the retire reason written to its roster row.
+  expect(paseo.order.indexOf('agent:agent-1')).toBeLessThan(paseo.order.indexOf('ws:w-scene'));
+  expect(result).toEqual({ workspacesArchived: 1, projectsDeleted: 0, employeesRetired: 2 });
+});
+
+test('employee pre-retire failures do not block scene cleanup; already-retired rows count as handled', async () => {
+  const paseo = fakePaseo([ws('w-scene', tree)], [], { 'agent:agent-1': 'agent not found' });
+  const clean = createSceneCleaner(paseo, {
+    insts: async () => [{ id: 'qa-1', cwd: tree, paseoAgentId: 'agent-1' }],
+    retire: async () => { throw new Error('employee not found'); },
+  });
+  const result = await clean(tree);
+  expect(paseo.archived).toEqual(['w-scene']);
+  expect(result.employeesRetired).toBe(1);
+});
+
+test('without the employees dep the cleaner is unchanged and reports no retired employees', async () => {
+  const paseo = fakePaseo([ws('w-scene', tree)], []);
+  const result = await createSceneCleaner(paseo)(tree);
+  expect(result).toEqual({ workspacesArchived: 1, projectsDeleted: 0 });
 });
 
 rmSync(dir, { recursive: true, force: true });

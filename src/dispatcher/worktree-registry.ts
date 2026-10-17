@@ -13,7 +13,7 @@ import {
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
 export const worktreeId = (repo: string, path: string) => hash(`${repo}\0${path}`);
-export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number }
+export interface SceneCleanupResult { workspacesArchived?: number; projectsDeleted?: number; employeesRetired?: number }
 export interface RegistryOptions {
   opsRepo: string;
   /** When false, inventory still classifies but reclaim never deletes. Default: env/config enabled. */
@@ -502,7 +502,7 @@ export class WorktreeRegistry {
                 await this.audit({
                   scanId, repo, path: row.path, tree: row.id, event: 'scene_release', trigger: input.trigger,
                   ownership: { mode: row.mode }, decision: 'delete', result: 'success',
-                  reason: `paseo-workspaces-archived:${scene.workspacesArchived ?? 0};paseo-projects-deleted:${scene.projectsDeleted ?? 0}`,
+                  reason: `paseo-workspaces-archived:${scene.workspacesArchived ?? 0};paseo-projects-deleted:${scene.projectsDeleted ?? 0};employees-retired:${scene.employeesRetired ?? 0}`,
                 });
                 result.audited++;
               } catch (error) {

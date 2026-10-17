@@ -6,7 +6,16 @@ import { join, resolve, sep } from 'node:path';
 export interface AgentInfo { id: string; status: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
-export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number }
+export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number; employeesRetired?: number }
+
+/** The dispatcher-facing fields of an employee instance that scene cleanup needs. */
+export interface SceneEmployee { id: string; cwd?: string; paseoAgentId?: string | null }
+export interface SceneEmployees {
+  insts(): Promise<SceneEmployee[]>;
+  retire(id: string, reason: string): Promise<unknown>;
+  /** In-process sidecar cleanup — binding drop + quarantine — when the plugin process wires it. */
+  detach?(inst: SceneEmployee): void;
+}
 
 export interface SpawnInput {
   title: string;
@@ -167,11 +176,27 @@ const goneSceneError = (error: unknown) =>
  * the scene and retry at the next event point.
  */
 export function createSceneCleaner(
-  paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject'>,
+  paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject' | 'archive'>,
+  employees?: SceneEmployees,
 ): (treePath: string) => Promise<SceneCleanupResult> {
   return async (treePath) => {
     const target = canonicalPath(treePath);
     const failures: string[] = [];
+    // Employee agents live inside the scene's Paseo workspace, so the teardown below
+    // cascades onto them. Retire those instances first — their work scene is gone, so
+    // they can never take another task — and record the real cause on the roster row.
+    // Otherwise the archived agent fires agent.archived, the sidecar quarantines the
+    // instance, and the next tick blames a dead binding as 通道隔离.
+    let employeesRetired = 0;
+    if (employees) {
+      for (const inst of await employees.insts()) {
+        if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
+        employeesRetired++;
+        await employees.retire(inst.id, '场景回收：会话随任务现场销毁').catch(() => undefined);
+        employees.detach?.(inst);
+        if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
+      }
+    }
     const workspaces = await paseo.listWorkspaces();
     const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));
     let workspacesArchived = 0;
@@ -196,6 +221,6 @@ export function createSceneCleaner(
       }
     }
     if (failures.length) throw new Error(failures.join('; ').slice(0, 280));
-    return { workspacesArchived, projectsDeleted };
+    return { workspacesArchived, projectsDeleted, ...(employeesRetired ? { employeesRetired } : {}) };
   };
 }
