@@ -204,7 +204,10 @@ run('actual dispatcher and sidecar stage one registry source in claim.json, prom
     const dispatcher = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool, env: { opsRepo: path, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
     const result = await dispatcher.tick(); expect(result.woke).toHaveLength(1); expect(seen).toBeDefined();
     const claim = readJsonFile<ClaimResult>(join(seen!.env.SCK_COMM_DIR!, 'claim.json'))!;
-    expect(seen!.cwd).toBe(claim.worktree!.worktreePath); expect(seen!.prompt).toContain(claim.worktree!.worktreePath); expect(seen!.cwd).not.toBe(path);
+    // Sessions park on the private comm dir so scene reclaim can never kill them;
+    // the registered worktree reaches the agent through claim.json and the prompt.
+    expect(seen!.cwd).toBe(seen!.env.SCK_COMM_DIR);
+    expect(seen!.prompt).toContain(claim.worktree!.worktreePath); expect(seen!.cwd).not.toBe(claim.worktree!.worktreePath);
     expect(claim.worktree!.discipline).toContain('只读代码');
     expect(JSON.stringify(claim)).not.toContain('sck_'); expect(JSON.stringify(claim)).not.toContain(password);
     const [refs] = await db.db.query<[Array<{ employee: string }>]>('SELECT employee FROM worktree_ref WHERE task = $task;', { task: new RecordId('task', t.id) }); expect(refs).toHaveLength(1);

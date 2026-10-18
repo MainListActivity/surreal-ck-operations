@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -11,7 +11,7 @@ import { Workforce } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
-import { readJsonFile, reqDir, resDir, reportPath, blockerPath } from '../src/comm.ts';
+import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
@@ -67,30 +67,35 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(true);
     expect((await relay(oldEnv, 'ops_info')).ok).toBe(true);
     pool.detachAgent(old.paseoAgentId!); pool = makePool(); await pool.adopt(await wf.insts());
+    // Restart fencing: the rotated-out channel key and the minted credential are
+    // dead even though adopt() re-keyed the live session and kept its lease.
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(false);
     expect((await relay(oldEnv, 'ops_info')).ok).toBe(false);
     expect((await relay(oldEnv, 'review', { decision: 'accept', text: 'stale' })).ok).toBe(false);
-    writeFileSync(reportPath(oldEnv.SCK_COMM_DIR!), 'stale report'); writeFileSync(blockerPath(oldEnv.SCK_COMM_DIR!), 'stale blocker');
-    await pool.settle(old.paseoAgentId!);
-    const recovery = await makeDispatcher().tick();
-    expect(recovery.retired).toContain(old.id); expect(recovery.revoked).toContain(task.id); expect(recovery.woke).toHaveLength(1);
-    expect(releases).toBeGreaterThan(1);
     await expect(core.checkpoint(minted.get(old.id)!, oldProof, { text: 'replay', idempotencyKey: 'old-replay' })).rejects.toMatchObject({ code: 'unauthorized' });
     await expect(core.checkpoint(gm, oldProof, { text: 'lease replay', idempotencyKey: 'old-manager-proof' })).rejects.toBeDefined();
-    const fresh = (await wf.insts())[0]!, env = envs.get(fresh.paseoAgentId!)!;
-    const current = readJsonFile<ClaimResult>(join(env.SCK_COMM_DIR!, 'claim.json'))!;
-    expect(current.fence).toBeGreaterThan(oldClaim.fence); expect(current.deliveryId === oldClaim.deliveryId).toBe(false);
+    // The adopted inst keeps its lease: no retirement, no revoke, no fresh dispatch.
+    const recovery = await makeDispatcher().tick();
+    expect(recovery.retired).not.toContain(old.id);
+    expect(recovery.revoked).not.toContain(task.id);
+    expect(recovery.woke).toHaveLength(0);
+    expect(releases).toBeGreaterThan(0);
+    // It submits through the re-keyed channel — the agent picks the fresh key up
+    // from the binding pointer file on its next call, exactly like a real session.
+    const rebound = readFileSync(join(dir, 'comm-agents', old.paseoAgentId!), 'utf8').split('\n');
+    const env = { SCK_COMM_DIR: rebound[0], SCK_COMM_KEY: rebound[1] };
+    expect(env.SCK_COMM_KEY === oldEnv.SCK_COMM_KEY).toBe(false);
     expect((await relay(env, 'get_task_history', { taskId: task.id })).ok).toBe(true);
     expect((await relay(env, 'ops_info')).ok).toBe(true);
     expect((await relay(env, 'submit', { text: 'synthetic isolated delivery', idempotencyKey: 'new-submit' })).ok).toBe(true);
-    agentRows.get(fresh.paseoAgentId!)!.status = 'idle';
+    agentRows.get(old.paseoAgentId!)!.status = 'idle';
     await wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
     await makeDispatcher().tick();
     const qa = (await wf.insts()).find(i => i.role === 'qa')!, qaEnv = envs.get(qa.paseoAgentId!)!;
-    expect(qa.id === fresh.id).toBe(false);
+    expect(qa.id === old.id).toBe(false);
     expect((await relay(qaEnv, 'review', { decision: 'accept', text: 'Independent synthetic regression review', idempotencyKey: 'qa-accept' })).ok).toBe(true);
     const final = await core.getTask(gm, task.id); expect(final.state).toBe('done');
-    const history = await core.history(gm, task.id); expect(history.some(h => h.action === 'revoked')).toBe(true); expect(history.some(h => h.action === 'accept' && h.actor !== fresh.id)).toBe(true);
+    const history = await core.history(gm, task.id); expect(history.some(h => h.action === 'accept' && h.actor !== old.id)).toBe(true);
   } finally {
     for (const id of agentRows.keys()) pool?.detachAgent(id);
     await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
