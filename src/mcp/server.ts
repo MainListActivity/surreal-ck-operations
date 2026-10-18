@@ -168,9 +168,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.submit(token(ctx), proof(input), evidence(input))));
 
   server.registerTool('report_blocker', {
-    description: 'Block the current delivery for gm or owner input.',
-    inputSchema: z.object({ ...proofShape, ...evidenceShape, to: z.enum(['gm', 'owner']) }),
-  }, async (input, ctx) => run(token(ctx), () => core.block(token(ctx), proof(input), input.to, evidence(input))));
+    description: 'Block the current delivery for gm or owner input. For a subscription quota or rate limit, pass quotaResetsAt: the reset time the provider reported, as ISO 8601 with a timezone offset.',
+    inputSchema: z.object({ ...proofShape, ...evidenceShape, to: z.enum(['gm', 'owner']),
+      quotaResetsAt: z.string().min(1).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.block(token(ctx), proof(input), input.to, evidence(input), input.quotaResetsAt)));
 
   server.registerTool('review', {
     description: 'Independently accept or return the current review delivery.',

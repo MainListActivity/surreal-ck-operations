@@ -36,6 +36,24 @@ const LIST_CONTEXT_CHARS = 1200;
 const LIST_TASKS_LIMIT = 500;
 export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
 export const id = (table: string, value: string) => new RecordId(table, value);
+
+const QUOTA_RESET_MAX_MS = 14 * 24 * 3600_000;
+
+/**
+ * Parses a provider's quota reset instant reported by an employee into unix seconds. The text
+ * must carry an explicit offset, because a bare clock time is ambiguous across the company's
+ * timezone and the provider's.
+ */
+export function parseQuotaResetsAt(text: string, nowMs: number): number {
+  if (!/(Z|[+-]\d{2}:?\d{2})$/i.test(text.trim())) {
+    throw new CompanyError('invalid', 'quotaResetsAt needs an explicit timezone offset, e.g. 2026-10-18T10:12:00-04:00');
+  }
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) throw new CompanyError('invalid', 'quotaResetsAt is not a valid time');
+  if (ms <= nowMs) throw new CompanyError('invalid', 'quotaResetsAt must be in the future');
+  if (ms - nowMs > QUOTA_RESET_MAX_MS) throw new CompanyError('invalid', 'quotaResetsAt is more than 14 days away; check the timezone');
+  return Math.floor(ms / 1000);
+}
 export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
 
 /**
@@ -160,6 +178,8 @@ interface TaskRow {
   handover?: boolean;
   previous_employee?: string;
   progress_at?: number;
+  /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
+  quota_resets_at?: number | null;
   evaluated_at?: string;
   eval_via?: string;
   eval_attempts?: number;
@@ -1160,7 +1180,37 @@ export class SurrealCompanyCore implements CompanyCore {
       throw error;
     }
   }
-  block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence) { return this.transition(credential, proof, 'block', evidence, to); }
+  /**
+   * `quotaResetsAt` is set only for a subscription quota or rate-limit block. The task then stays
+   * quiet for gm until that instant, and the employee's provider leaves dispatch until then too.
+   */
+  async block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView> {
+    const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
+    const view = await this.transition(credential, proof, 'block', evidence, to);
+    await this.recordQuotaGate(credential, proof.taskId, until);
+    return view;
+  }
+
+  private async recordQuotaGate(credential: Credential, taskId: TaskId, until: number | undefined): Promise<void> {
+    if (until === undefined) {
+      await this.db.query('UPDATE ONLY $task SET quota_resets_at = NONE;', { task: id('task', taskId) });
+      return;
+    }
+    const actor = await this.authenticate(credential);
+    const who = await this.db.select<{ provider?: string }>(id('employee', actor.employeeId));
+    const provider = who?.provider;
+    if (!provider) {
+      await this.db.query('UPDATE ONLY $task SET quota_resets_at = $until;', { task: id('task', taskId), until });
+      return;
+    }
+    await this.db.query(`BEGIN;
+      UPDATE ONLY $task SET quota_resets_at = $until;
+      UPSERT $health MERGE { state: 'exhausted', until: $until, last_error: $error, changed_at: time::now() };
+      COMMIT;`, {
+      task: id('task', taskId), until, health: id('provider_health', provider),
+      error: 'quota reset reported by employee',
+    });
+  }
 
   /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
   async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {

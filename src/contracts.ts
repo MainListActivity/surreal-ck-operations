@@ -250,7 +250,7 @@ export interface CompanyCore {
    * let the lease expire, which already leaves review tasks claimable.
    */
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
-  block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence): Promise<TaskView>;
+  block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;

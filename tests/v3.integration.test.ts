@@ -1439,3 +1439,53 @@ test('manage tools: def_list/def_ensure/project_disciplines_update are manage-on
   const listed = (await core.listDefs(tokens.gm)).find(d => d.id === 'screenwriter-agy');
   expect(listed).toMatchObject({ role: 'screenwriter', provider: 'antigravity', tracks: ['编剧'], enabled: true });
 });
+
+test('quota gate: bad reset times are refused; a valid one keeps gm quiet until the reset, then one notice', async () => {
+  await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4 };");
+  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', priority: 10 });
+  const paseo = new FakePaseo();
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
+    rand: () => 0, notify: async () => {} });
+  const t = await core.createTask(tokens.gm, { title: 'Quota gate', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  // A fresh holder: earlier tests in this file leave eng-a with an active task.
+  const holder = await enrollment.enroll(`t-quota-${key()}`, 'engineering', ['execute', 'review']);
+  const claim = await core.claim(holder, t.id);
+  const evidence = () => ({ text: 'Synthetic quota block: subscription limit reached.', idempotencyKey: key() });
+  const taskRow = async () => {
+    const [rows] = await database.db.query<[Array<{ state: string; blocked_to?: string; quota_resets_at?: number | null }>]>(
+      'SELECT state, blocked_to, quota_resets_at FROM task WHERE id = $t;', { t: new RecordId('task', t.id) });
+    return rows[0];
+  };
+  const idleAll = () => { for (const agent of paseo.agents.keys()) paseo.set(agent, 'idle'); };
+
+  // A bare clock time is refused before the transition: the task stays with its holder.
+  await expect(core.block(holder, proofOf(claim), 'gm', evidence(), '2026-10-18T10:12:00'))
+    .rejects.toThrow('explicit timezone offset');
+  expect(await taskRow()).toMatchObject({ state: 'doing' });
+
+  const resetAt = new Date(Date.now() + 3600_000).toISOString();
+  await core.block(holder, proofOf(claim), 'gm', evidence(), resetAt);
+  expect(await taskRow()).toMatchObject({ state: 'blocked', blocked_to: 'gm', quota_resets_at: Math.floor(Date.parse(resetAt) / 1000) });
+
+  // gm hears about the block once.
+  let report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).toContain(t.id);
+
+  // Inside the gate the 15-minute redispatch does not re-announce the same version.
+  await database.db.query('UPDATE dispatch SET at = at - 7200 WHERE task = $task;', { task: t.id });
+  idleAll();
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
+
+  // The reset instant passes: gm gets exactly one notice to resume, then the cadence is quiet again.
+  await database.db.query('UPDATE ONLY $task SET quota_resets_at = $past;',
+    { task: new RecordId('task', t.id), past: Math.floor(Date.now() / 1000) - 60 });
+  idleAll();
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).toContain(t.id);
+  idleAll();
+  report = await dispatcher.tick();
+  expect(report.woke.map(w => w.task)).not.toContain(t.id);
+});
