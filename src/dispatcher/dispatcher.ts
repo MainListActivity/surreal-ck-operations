@@ -420,7 +420,10 @@ export class Dispatcher {
       if (status === 'idle') {
         states.set(inst.id, 'idle');
         if ((previous === 'running' || previous === 'error') && inst.provider) {
-          if (health.get(inst.provider)?.state === 'exhausted') await wf.markHealthy(inst.provider);
+          // A session ending says nothing about a quota window still open: the employee that reported
+          // the block goes idle right after it. Only a passed reset (or the probe) clears exhaustion.
+          const h = health.get(inst.provider);
+          if (h?.state === 'exhausted' && (h.until ?? 0) <= now) await wf.markHealthy(inst.provider);
           if (inst.def) await wf.defHealthy(inst.def);
         }
         continue;
@@ -797,7 +800,13 @@ export class Dispatcher {
     for (const task of gmBlocked) {
       const last = gmLastDispatches ? gmLastDispatches.get(`${task.id}:${task.version}`)
         : await wf.lastDispatch(task.id, task.version, 'gm-attention');
-      if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      // Quota-gated block: gm hears about it once, stays quiet until the reset instant, then gets one
+      // notice to resume. Inside the gate the 15-minute redispatch does not apply.
+      const quotaUntil = task.quotaResetsAt;
+      const gated = quotaUntil !== undefined && quotaUntil > now;
+      if (gated && last) continue;
+      const afterReset = quotaUntil !== undefined && !gated && (!last || last.at < quotaUntil);
+      if (!gated && last && now - last.at < cfg.redispatchMinutes * 60 && !afterReset) continue;
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
       pendingGm.push(task);
     }

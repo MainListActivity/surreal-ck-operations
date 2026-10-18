@@ -167,6 +167,8 @@ export interface SupervisedTask {
   leaseExpiresAt?: number;
   progressAt?: number;
   blockedTo?: 'gm' | 'owner';
+  /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
+  quotaResetsAt?: number;
   kind: string;
   title: string;
   evalAttempts: number;
@@ -201,7 +203,8 @@ const supervised = (row: TaskRow): SupervisedTask => {
     discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
     previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
-    progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined, kind: v.kind, title: v.title,
+    progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
+    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
     codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };

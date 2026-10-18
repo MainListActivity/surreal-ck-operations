@@ -56,7 +56,7 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
     const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。${usage}
 先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）；它也是你的会话宿主目录，不是任务现场——文件操作一律用登记工作区/comm 目录的绝对路径，不要在宿主目录写任务产物。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
 完成后：把交付说明写入 ${commDir}/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
-中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。
+中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。订阅额度用尽或限流导致的阻塞，另加 "quotaResetsAt"：平台给出的恢复时间，ISO 8601 且带时区偏移（如 "2026-10-18T10:12:00-04:00"），系统到点后才会重新派工。
 本轮只做这一项；写完 report.md 或报阻塞后结束本轮，不空转、不建 agent/定时器。`;
     return firstContact ? `${onboarding(inst, env, true, commDir)}\n\n${body}` : body;
   }
