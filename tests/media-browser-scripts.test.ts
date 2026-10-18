@@ -611,6 +611,71 @@ describe('model picker (Gemini composer pill)', () => {
     expect(p.modelPillText()).toBe('Flash-Lite');
     expect(clicks.n).toBe(0);
   });
+  // QA 第二轮返修（任务 a6513276）：侧栏与输入框的最近公共祖先是 body 之下的 div。
+  // 候选集须停在包住输入框与药丸、却不包住侧栏的那一层；侧栏按钮零点击。
+  const shellUnder = (side: El, pill?: El) => {
+    const clicks = { n: 0 };
+    side.onClick = () => { clicks.n += 1; };
+    const form = new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } }));
+    if (pill) form.add(pill);
+    const shell = new El('div', { attrs: { id: 'shell' } }).add(new El('nav').add(side), new El('main').add(form));
+    return { doc: docOf(new El('body').add(shell)), clicks };
+  };
+  test('QA r2 shell negative: sidebar Argon under a div → no_picker, zero clicks', () => {
+    const { doc, clicks } = shellUnder(new El('button', { text: 'Argon' }));
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  test('QA r2 shell negative: sidebar title containing 模型 → no_picker, zero clicks', () => {
+    const side = new El('button', { text: 'Cloudflare Worker 部署模型方案', attrs: { 'aria-label': 'More options for Cloudflare Worker 部署模型方案' } });
+    const { doc, clicks } = shellUnder(side);
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  test('QA r2 shell positive: composer pill beside sidebar Argon → pill opened, sidebar zero clicks', () => {
+    const pill = new El('button', { text: 'Flash-Lite', attrs: { 'aria-label': 'Open mode picker, currently Flash-Lite' } });
+    const { doc, clicks } = shellUnder(new El('button', { text: 'Argon' }), pill);
+    const p = pickers(doc);
+    expect(p.openModelPicker('Gemini 4')).toMatchObject({ ok: true, opened: true, before: 'Flash-Lite' });
+    expect(clicks.n).toBe(0);
+  });
+  test('sidebar row labelled "More options for …" is never a pill, even outside a landmark', () => {
+    const clicks = { n: 0 };
+    const row = new El('button', { text: 'Pro tips', attrs: { 'aria-label': 'More options for Pro tips' } });
+    row.onClick = () => { clicks.n += 1; };
+    const root = new El('body').add(new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } }), row));
+    expectNoPicker(pickers(docOf(root)), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  // 现场祖先形状：bard-sidenav-content 包住侧栏列表与对话区，输入框在其之下。
+  // 有药丸时药丸层先于 sidenav 命中；无药丸时在 sidenav 处停下，no_picker。
+  const liveSidenav = (tier: string | null) => {
+    const side = new El('button', { text: 'Cloudflare Worker 部署模型方案', attrs: { 'aria-label': 'More options for Cloudflare Worker 部署模型方案' } });
+    const clicks = { side: 0, pill: 0 };
+    side.onClick = () => { clicks.side += 1; };
+    const composer = new El('div', { attrs: { class: 'text-input-field simplified-input-area' } })
+      .add(new El('div').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } })));
+    if (tier) {
+      const pill = new El('button', { text: tier, attrs: { 'aria-label': `Open mode picker, currently ${tier}` } });
+      pill.onClick = () => { clicks.pill += 1; };
+      composer.add(new El('div', { attrs: { class: 'trailing-actions-wrapper' } }).add(pill));
+    }
+    const sidenav = new El('bard-sidenav-content').add(
+      new El('div').add(side),
+      new El('chat-window').add(new El('fieldset').add(composer)),
+    );
+    return { doc: docOf(new El('body').add(sidenav)), clicks };
+  };
+  test('live sidenav ancestor: the composer pill is opened, the sidebar row is never clicked', () => {
+    const { doc, clicks } = liveSidenav('Flash-Lite');
+    expect(pickers(doc).openModelPicker('Gemini 4')).toMatchObject({ ok: true, opened: true, before: 'Flash-Lite' });
+    expect(clicks).toEqual({ side: 0, pill: 1 });
+  });
+  test('live sidenav ancestor, composer without pill: no_picker, sidebar zero clicks', () => {
+    const { doc, clicks } = liveSidenav(null);
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks).toEqual({ side: 0, pill: 0 });
+  });
 });
 
 describe('generated scripts parse (template-escape regression)', () => {
