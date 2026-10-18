@@ -4,6 +4,9 @@ export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-de
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
 /** 'void' is terminal: retired work never re-enters dispatch and counts as satisfied in dependency evaluation. */
 export type TaskState = 'blocked' | 'ready' | 'doing' | 'review' | 'done' | 'void';
+/** Trusted retirement type, set only by server-side callers (session rotation, scene archive, failures),
+ * never taken from a free-text reason. rotation and archive end a session normally; failure and manual do not. */
+export type RetirementKind = 'rotation' | 'archive' | 'failure' | 'manual';
 /** 'owner' is the human company owner; only owner decisions can accept an owner-reviewed gate. */
 export type ReviewerRole = Role | 'owner';
 /** release：上线申请，由运营（或 Jev）决定是否上线；deploy：合入部署，由 qa 在生产实测验收。 */

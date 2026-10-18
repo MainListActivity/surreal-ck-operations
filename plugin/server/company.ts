@@ -70,7 +70,7 @@ export function company(): Promise<Company> {
       // otherwise the workspace cascade archives them and the tick misreports 通道隔离.
       sceneCleaner: createSceneCleaner(paseo, {
         insts: () => workforce.insts(),
-        retire: (id, reason) => workforce.retire(id, reason),
+        retire: (id, reason, kind) => workforce.retire(id, reason, kind),
         detach: inst => { if (inst.paseoAgentId) sidecar.detachAgent(inst.paseoAgentId); },
       }),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS

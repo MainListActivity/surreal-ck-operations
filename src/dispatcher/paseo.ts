@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import type { RetirementKind } from '../contracts.ts';
 
 export interface AgentInfo { id: string; status: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
@@ -12,7 +13,7 @@ export interface SceneCleanupResult { workspacesArchived: number; projectsDelete
 export interface SceneEmployee { id: string; cwd?: string; paseoAgentId?: string | null }
 export interface SceneEmployees {
   insts(): Promise<SceneEmployee[]>;
-  retire(id: string, reason: string): Promise<unknown>;
+  retire(id: string, reason: string, kind: RetirementKind): Promise<unknown>;
   /** In-process sidecar cleanup — binding drop + quarantine — when the plugin process wires it. */
   detach?(inst: SceneEmployee): void;
 }
@@ -192,7 +193,7 @@ export function createSceneCleaner(
       for (const inst of await employees.insts()) {
         if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
         employeesRetired++;
-        await employees.retire(inst.id, '场景回收：会话随任务现场销毁').catch(() => undefined);
+        await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive').catch(() => undefined);
         employees.detach?.(inst);
         if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
       }

@@ -29,8 +29,12 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
     return token;
   }
 
-  async revoke(employeeId: EmployeeId): Promise<void> {
-    await this.database.db.query('UPDATE $employee SET revoked = true, credential_digest = $digest;', {
+  /** Default is an explicit security revocation: security_revoked is never cleared, so it also covers a
+   * reviewer that was retired normally before. Scheduler retirement passes 'retirement' and only swaps the credential. */
+  async revoke(employeeId: EmployeeId, cause: 'security' | 'retirement' = 'security'): Promise<void> {
+    await this.database.db.query(cause === 'security'
+      ? 'UPDATE $employee SET revoked = true, security_revoked = true, credential_digest = $digest;'
+      : 'UPDATE $employee SET revoked = true, credential_digest = $digest;', {
       employee: new RecordId('employee', employeeId), digest: `revoked-${randomUUID()}`,
     });
   }

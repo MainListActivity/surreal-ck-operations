@@ -35,3 +35,5 @@ evidenceSchema 是按 `type` 判别的冻结联合。公司保留产品 PR175 �
 采样器 `sensenova-token-plan/2` 使用账户 console 的 `/tokenplan/pool-usage` 计划读回；以同一 console `/metered/api-keys` 对密封 API key 精确交叉绑定。`/v1/models` 只验证 key 活性与模型列表，不证明账户 FREE。官方计划页面须同时包含免费公测、付费档位即将上线、60,000积分/5小时、Free 公测正面标记；console governing pool 的硬顶须与核定配额一致，否则 blocked。猜测支付 URI 枚举纯为回执观测（paymentSurface 不作证明、不阻塞文档）：存活面漂移记 note 提请人工复核，付费档上线跳闸仍由官方页 marker 承担；枚举绝不证明支付绑定为空或账户自动充值已禁用。`ACCOUNT_PAYMENT_SOURCES` 注册表机制保留、维持空表，供应商出现官方账户级支付来源时再注册。回执 `accountPlanSource` 标来源与绑定，`removedAccountAssertions` 标明 noPaymentInstrument/autoTopupDisabled 系契约修订移除而非探测不足；缺计划/非 FREE/未绑定列 `accountPlanType` gap（对应产品 enable 缺口名 `account-plan-free`）。剩余额度未读回可 null 并记录 gap，不臆造数值。过期重置窗口闭锁，文档 expiresAt 取重置时刻与24小时上限的较早者。
 
 manifest.budget.autoTopupDisabled=true 和我方计量配置自动充值禁用保持；measurementCycle≤30、worstCost=0、原30台账和消费者预算门不在本次变更中放宽。JWT contractVersion=1、issuer/audience/alg/kid 和信任锚不变。
+
+评审人生命周期（FV06）：批准以审计行的 accept 评审人为准，其撤权状态按结构化字段判定，诊断、授权与密钥轮换共用同一规则。调度器正常轮换或归档（员工退役类型 `rotation` / `archive`）只使凭证失效，不撤销已形成的独立批准；显式安全撤权（管理员 revoke，写入不可回退的 `security_revoked`）、失败或人工退役、改动前写入的无类型退役（旧记录）一律拒绝。旧记录不自动追认，需要新的独立批准。

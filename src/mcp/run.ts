@@ -44,7 +44,7 @@ try {
       // plugin's agent.archived listener does the in-process detach on its side.
       sceneCleaner: createSceneCleaner(createPaseoCli(), {
         insts: () => workforce.insts(),
-        retire: (id, reason) => workforce.retire(id, reason),
+        retire: (id, reason, kind) => workforce.retire(id, reason, kind),
       }),
       orphanGraceDays: process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS
         ? Number(process.env.SCK_WORKTREE_ORPHAN_GRACE_DAYS) : undefined,

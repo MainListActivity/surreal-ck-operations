@@ -382,7 +382,7 @@ export class Dispatcher {
     const states = new Map<string, InstState>();
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
-        await wf.retire(inst.id, 'spawn did not bind a Paseo agent');
+        await wf.retire(inst.id, 'spawn did not bind a Paseo agent', 'failure');
         report.retired.push(inst.id);
         continue;
       }
@@ -493,7 +493,7 @@ export class Dispatcher {
         const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
           : staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
-        await wf.retire(inst.id, reason);
+        await wf.retire(inst.id, reason, 'rotation');
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
         if (staleModel && def) {
@@ -1042,7 +1042,7 @@ export class Dispatcher {
           if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
           else await sidecar?.releaseWorkspace?.(existing);
           claim = undefined;
-          await wf.retire(existing.id, 'managed worktree workspace changed');
+          await wf.retire(existing.id, 'managed worktree workspace changed', 'rotation');
           await paseo.archive(existing.paseoAgentId!);
           sidecar!.detachAgent(existing.paseoAgentId!);
           report.retired.push(existing.id);
@@ -1080,7 +1080,7 @@ export class Dispatcher {
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
-        await wf.retire(inst.id, 'allocation unavailable');
+        await wf.retire(inst.id, 'allocation unavailable', 'failure');
         sidecar?.detachAgent(inst.paseoAgentId ?? '');
         report.retired.push(inst.id);
         this.log(`allocation ${task?.id} waiting: ${(error as Error).message}`);
@@ -1088,7 +1088,7 @@ export class Dispatcher {
       }
       if (sidecar && task && !claim) {
         this.markDenied(task);
-        await wf.retire(inst.id, 'claim denied');
+        await wf.retire(inst.id, 'claim denied', 'failure');
         report.retired.push(inst.id);
         return undefined;
       }
@@ -1123,7 +1123,7 @@ export class Dispatcher {
         this.log(`spawn ${inst.id} failed: ${message}`);
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
-        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`);
+        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`, 'failure');
         report.retired.push(inst.id);
         // A quota-flavored spawn failure is the provider's problem, not the def's:
         // cool the provider down instead of eating a strike toward auto-disable.
@@ -1169,7 +1169,7 @@ export class Dispatcher {
   }
 
   private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true) {
-    await this.deps.workforce.retire(inst.id, reason);
+    await this.deps.workforce.retire(inst.id, reason, 'failure');
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
