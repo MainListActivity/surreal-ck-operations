@@ -12,6 +12,9 @@ import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 import type { HostResources } from './host.ts';
+import type { ArtifactTrigger } from './artifact-reclaim.ts';
+import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
+import { summarizeReclaim } from './artifact-sweeper.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
@@ -285,6 +288,13 @@ export interface DispatcherDeps {
    * configured floors skip the whole dispatch pass; absent or throwing = no gate.
    */
   hostResources?: () => HostResources;
+  /**
+   * Terminal-task artifact reclaim (evidence/deliverables lifecycle). Bare call = periodic
+   * normal-mode sweep; `{ targetFreeMb }` = pressure mode, oldest terminal work first until
+   * the real free-disk probe reaches the target. Undefined disables artifact reclaim.
+   */
+  reclaimArtifacts?: (input?: { trigger?: ArtifactTrigger; targetFreeMb?: number; dryRun?: boolean; taskId?: string }) =>
+    Promise<ArtifactReclaimResult>;
 }
 
 /** Narrow seam the Paseo plugin's per-agent supervisor implements. */
@@ -332,6 +342,8 @@ export interface TickReport {
   evals: string[];
   /** Jev decisions taken this tick, e.g. "triage:<goal>=quick", "release:<task>", "reroute:<task>". */
   decisions: string[];
+  /** Terminal-task artifacts trimmed this tick (see report.skipped === 'resources'). */
+  reclaimed?: { tasks: number; files: number; freedBytes: number; trigger: ArtifactTrigger; pressure: boolean };
   skipped?: 'paused' | 'budget' | 'resources';
 }
 
@@ -351,6 +363,9 @@ export class Dispatcher {
   private readonly taskDeny = new Map<string, { at: number; version?: number }>();
   private lastSweep = 0;
   private readonly keptLogged = new Set<string>();
+  /** Artifact reclaim cadence: slow and lazy in normal mode, prompt once disk is heading down. */
+  private lastArtifactSweep = 0;
+  private artifactPressure = false;
 
   constructor(private readonly deps: DispatcherDeps) {}
   private log(message: string) { this.deps.log?.(message); }
@@ -553,6 +568,28 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     const host = this.hostResources();
+    const underFloor = Boolean(host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb));
+    const headroom = cfg.artifactHeadroomMb ?? 0;
+    const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
+    if (underFloor || pressure) {
+      // Try to buy our way back with terminal-task artifacts before bailing out:
+      // no new task can run until free space recovers, and reclaim takes real free
+      // space away from nothing (clones only) while the probe is what decides.
+      if (this.deps.reclaimArtifacts) {
+        const targetFreeMb = cfg.minFreeDiskMb + (cfg.artifactHeadroomMb ?? 0);
+        const reclaimed = await this.deps.reclaimArtifacts({
+          trigger: underFloor ? 'pressure' : 'sweep', targetFreeMb, dryRun: false,
+        }).catch(error => { this.log(`artifact reclaim failed: ${(error as Error).message}`); return undefined; });
+        if (reclaimed && (reclaimed.trimmed.length || reclaimed.removedFiles)) {
+          this.log(`artifact reclaim ${reclaimed.runId}: ${summarizeReclaim(reclaimed)}`);
+          report.reclaimed = { tasks: new Set(reclaimed.trimmed.map(t => t.taskId)).size, files: reclaimed.removedFiles, freedBytes: reclaimed.freedBytes, trigger: reclaimed.trigger, pressure: reclaimed.mode === 'pressure' };
+          if (reclaimed.freeDiskMbAfter !== undefined) {
+            const refreshed = this.hostResources();
+            if (refreshed) Object.assign(host!, refreshed);
+          }
+        }
+      }
+    }
     if (host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb)) {
       await this.notice('resources',
         `宿主机资源不足，本轮暂停派工：空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工。`, report);
@@ -818,6 +855,22 @@ export class Dispatcher {
     }
 
     await this.sweep(now);
+    // Slow lazy pass over terminal-task artifacts: keeps evidence/deliverables from growing
+    // without bound. Skipped when the resource gate already reclaimed above (pressure path).
+    if (this.deps.reclaimArtifacts && !report.reclaimed) {
+      // `now` here is server time in seconds, not epoch ms: keep the cadence clock local.
+      const wall = Date.now();
+      if (wall - this.lastArtifactSweep >= 30 * 60_000) {
+        this.lastArtifactSweep = wall;
+        const reclaimed = await this.deps.reclaimArtifacts({ trigger: 'sweep', dryRun: false }).catch(error => {
+          this.log(`artifact reclaim failed: ${(error as Error).message}`); return undefined;
+        });
+        if (reclaimed && (reclaimed.trimmed.length || reclaimed.removedFiles)) {
+          this.log(`artifact reclaim ${reclaimed.runId}: ${summarizeReclaim(reclaimed)}`);
+          report.reclaimed = { tasks: new Set(reclaimed.trimmed.map(t => t.taskId)).size, files: reclaimed.removedFiles, freedBytes: reclaimed.freedBytes, trigger: reclaimed.trigger, pressure: false };
+        }
+      }
+    }
 
     // 5. Performance evaluation. Jev (System One decision model) scores the finished task in
     //    one ~500ms round trip; low-confidence or repeated failures escalate to an LLM eval

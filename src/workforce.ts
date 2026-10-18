@@ -108,6 +108,14 @@ export interface CompanyConfig {
   minFreeMemMb: number;
   /** 宿主机磁盘空闲低于该 MB 数时暂停一切派工；0 = 关闭。 */
   minFreeDiskMb: number;
+  /** 终态任务大文件回收（evidence/deliverables 生命周期）；false 只停自动回收，人工 admin reclaim-artifacts 仍可用。 */
+  artifactReclaimEnabled: boolean;
+  /** done 任务 evidence 终态后完整保留的天数。 */
+  artifactEvidenceGraceDays: number;
+  /** done 任务 deliverables 终态后完整保留的天数（老板可点的交付链接）。 */
+  artifactDeliverableGraceDays: number;
+  /** 空闲磁盘低于「下限 + 该值」MB 时提前按压力回收，免得撞上暂停派工的下限；0 = 只在撞下限时回收。 */
+  artifactHeadroomMb: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -117,6 +125,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
   quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
+  artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -244,6 +253,10 @@ export class Workforce {
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
       minFreeDiskMb: typeof row?.min_free_disk_mb === 'number' ? row.min_free_disk_mb : DEFAULT_CONFIG.minFreeDiskMb,
+      artifactReclaimEnabled: row?.artifact_reclaim_enabled !== false,
+      artifactEvidenceGraceDays: typeof row?.artifact_evidence_grace_days === 'number' ? row.artifact_evidence_grace_days : DEFAULT_CONFIG.artifactEvidenceGraceDays,
+      artifactDeliverableGraceDays: typeof row?.artifact_deliverable_grace_days === 'number' ? row.artifact_deliverable_grace_days : DEFAULT_CONFIG.artifactDeliverableGraceDays,
+      artifactHeadroomMb: typeof row?.artifact_headroom_mb === 'number' ? row.artifact_headroom_mb : DEFAULT_CONFIG.artifactHeadroomMb,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }
