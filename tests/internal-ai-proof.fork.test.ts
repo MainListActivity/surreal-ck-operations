@@ -8,6 +8,7 @@ import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { Workforce } from '../src/workforce.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
@@ -540,4 +541,100 @@ check('approval version cancellation and live task lease revocation fail closed'
   await database.db.query('UPDATE $task SET lease_expires_at = 0;',{task:new RecordId('task',consumerTask)});
   await expect(request('ops_internal_ai_trust')).rejects.toBeDefined();
   expect((await status(jwt)).valid).toBe(false);
+});
+/** FV06 批准生命周期：每个用例自带作者、评审、消费者与批准任务，不改动上方共享夹具。 */
+async function lifecycleApproval(label: string) {
+  const enroll = new LocalEnrollmentAdmin(database);
+  const authorId = `lc-${label}-author`, reviewerId = `lc-${label}-reviewer`, consumerId = `lc-${label}-consumer`;
+  const author = await enroll.enroll(authorId, 'engineering', ['execute', 'review']);
+  const reviewer = await enroll.enroll(reviewerId, 'qa', ['execute', 'review']);
+  const consumer = await enroll.enroll(consumerId, 'engineering', ['execute', 'review']);
+  const approval = await core.createTask(gm, {title:`Synthetic lifecycle ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
+  const claim = await core.claim(author, approval.id);
+  const f = await files(approval.id);
+  const prepared = await ops.call(author, approval.id, 'ops_internal_ai_prepare', {manifestPath:f.manifestPath, documentPath:f.documentPath}) as {approvalMarker:string};
+  await core.submit(author, {taskId:approval.id, deliveryId:claim.deliveryId, fence:claim.fence, expectedVersion:claim.task.version}, {text:'Synthetic reviewed files', idempotencyKey:randomUUID()});
+  const review = await core.claim(reviewer, approval.id);
+  await core.accept(reviewer, {taskId:approval.id, deliveryId:review.deliveryId, fence:review.fence, expectedVersion:review.task.version}, {text:prepared.approvalMarker, idempotencyKey:randomUUID()});
+  const consuming = await core.createTask(gm, {title:`Synthetic lifecycle consumer ${label}`, context:'Only test fixtures', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, dependencies:[approval.id], idempotencyKey:randomUUID()});
+  await core.claim(consumer, consuming.id);
+  return {approval: approval.id, consuming: consuming.id, authorId, reviewerId, consumerId, consumer, files: f};
+}
+type Lifecycle = Awaited<ReturnType<typeof lifecycleApproval>>;
+const lifecycleDiagnose = (c: Lifecycle) => ops.call(c.consumer, c.consuming, 'ops_internal_ai_approval_diagnose', {approvalTask:c.approval, manifestPath:c.files.manifestPath, documentPath:c.files.documentPath, activityId:'ui01-internal'}) as Promise<DiagnosticResult>;
+const lifecycleProve = (c: Lifecycle, key: string) => ops.call(c.consumer, c.consuming, 'ops_internal_ai_prove', {mode:'enable', approvalTask:c.approval, manifestPath:c.files.manifestPath, documentPath:c.files.documentPath, activityId:'ui01-internal', nonce:'nonce-lifecycle-'+key, idempotencyKey:key}) as Promise<Record<string,unknown>>;
+check('FV06 normal session rotation and archive keep a formed independent approval valid for diagnosis, approval and prove', async () => {
+  const workforce = new Workforce(database, dir);
+  for (const kind of ['rotation', 'archive'] as const) {
+    const c = await lifecycleApproval(kind);
+    await workforce.retire(c.reviewerId, `synthetic ${kind}`, kind);
+    expect(await lifecycleDiagnose(c)).toMatchObject({failure:'none', allApplicableChecksMatch:true, checks:{reviewerNotRevoked:{matched:true}, reviewerNotRetired:{matched:true}}});
+    await new CompanyProofStore(database.db, now).approval(c.approval, 'production', await loadProofFiles(dir, c.approval, c.files.manifestPath, c.files.documentPath));
+    expect(await lifecycleProve(c, `${kind}-enable`)).toMatchObject({paidCallsAllowed:1});
+  }
+});
+check('FV06 security revocation, unknown or failed retirement, forged audit and stale or raced evidence still fail closed without writes', async () => {
+  const workforce = new Workforce(database, dir), enroll = new LocalEnrollmentAdmin(database);
+  const writes = () => world.sql.filter(r => /^\s*(INSERT|UPDATE|DELETE|CREATE)\b/i.test(r.sql)).length;
+  const requestsBefore = world.requests.length, writesBefore = writes(), deliveredBefore = delivered;
+  // 显式安全撤权覆盖曾正常轮换的历史评审人。
+  const security = await lifecycleApproval('security');
+  await workforce.retire(security.reviewerId, 'synthetic rotation', 'rotation');
+  await enroll.revoke(security.reviewerId);
+  expect(await lifecycleDiagnose(security)).toMatchObject({failure:'reviewer-revoked', allApplicableChecksMatch:false});
+  await expect(lifecycleProve(security, 'security-enable')).rejects.toBeDefined();
+  // 改动前写入的退役记录没有可信类型：不自动追认，需要新批准。
+  const legacy = await lifecycleApproval('legacy');
+  await database.db.query('UPDATE $e SET retired = true, revoked = true, retired_reason = "pre-FV06";', {e:new RecordId('employee', legacy.reviewerId)});
+  expect(await lifecycleDiagnose(legacy)).toMatchObject({failure:'reviewer-revoked', allApplicableChecksMatch:false});
+  await expect(lifecycleProve(legacy, 'legacy-enable')).rejects.toBeDefined();
+  // 失败与手动退役都不是正常结束；之后的正常退役不能洗掉先发生的非正常退役。
+  const failed = await lifecycleApproval('failed');
+  await workforce.retire(failed.reviewerId, 'session error', 'failure');
+  await workforce.retire(failed.reviewerId, 'synthetic rotation after failure', 'rotation');
+  expect(await lifecycleDiagnose(failed)).toMatchObject({failure:'reviewer-revoked'});
+  const manual = await lifecycleApproval('manual');
+  await workforce.retire(manual.reviewerId, 'operator retire', 'manual');
+  expect(await lifecycleDiagnose(manual)).toMatchObject({failure:'reviewer-revoked'});
+  // 伪造的审计主体：即使评审人正常轮换也拒绝。
+  const forged = await lifecycleApproval('forged');
+  await workforce.retire(forged.reviewerId, 'synthetic rotation', 'rotation');
+  await database.db.query('UPDATE audit SET actor = $other WHERE task = $task AND action = "accept";', {task:new RecordId('task', forged.approval), other:new RecordId('employee', forged.consumerId)});
+  expect(await lifecycleDiagnose(forged)).toMatchObject({failure:'audit-actor-mismatch'});
+  // 过期证据：正常轮换不延长证据有效期。
+  const stale = await lifecycleApproval('stale');
+  await workforce.retire(stale.reviewerId, 'synthetic rotation', 'rotation');
+  const savedClock = clock;
+  clock += 2 * 3600_000;
+  try {
+    await database.db.query('UPDATE $t SET lease_expires_at = $far;', {t:new RecordId('task', stale.consuming), far:(clock + 3600_000) / 1000});
+    expect(await lifecycleDiagnose(stale)).toMatchObject({failure:'evidence-expired'});
+  } finally { clock = savedClock; }
+  // 同一时刻的两条接受审计没有唯一的最新评审：诊断拒绝合并不稳定快照。
+  const raced = await lifecycleApproval('raced');
+  await workforce.retire(raced.reviewerId, 'synthetic rotation', 'rotation');
+  const [audits] = await database.db.query<[Array<Record<string,unknown>>]>('SELECT * FROM audit WHERE task = $task AND action = "accept";', {task:new RecordId('task', raced.approval)});
+  const twin = new RecordId('audit', 'synthetic-lifecycle-twin');
+  await database.db.query('CREATE $id CONTENT $row;', {id:twin, row:{...audits[0]!, id:twin}});
+  try { expect(await lifecycleDiagnose(raced)).toMatchObject({failure:'snapshot-unstable'}); }
+  finally { await database.db.query('DELETE $id;', {id:twin}); }
+  // 拒绝例不产生产品写入、不把证明交给产品、不新增付费调用授权。
+  expect(delivered).toBe(deliveredBefore);
+  expect(world.requests.length).toBe(requestsBefore);
+  expect(writes()).toBe(writesBefore);
+});
+check('FV06 key rotation approval shares the reviewer lifecycle: normal retirement passes, security revocation rejects', async () => {
+  const enroll = new LocalEnrollmentAdmin(database);
+  const author = await enroll.enroll('lc-keyrot-author', 'engineering', ['execute', 'review']);
+  const reviewer = await enroll.enroll('lc-keyrot-reviewer', 'qa', ['execute', 'review']);
+  const task = await core.createTask(gm, {title:'Synthetic lifecycle key rotation', context:'Only isolated fixture', executorRole:'engineering', reviewerRole:'qa', goalId:PROOF_GOAL, idempotencyKey:randomUUID()});
+  const claim = await core.claim(author, task.id);
+  await core.submit(author, {taskId:task.id, deliveryId:claim.deliveryId, fence:claim.fence, expectedVersion:claim.task.version}, {text:'Rotate isolated test key', idempotencyKey:randomUUID()});
+  const review = await core.claim(reviewer, task.id);
+  await core.accept(reviewer, {taskId:task.id, deliveryId:review.deliveryId, fence:review.fence, expectedVersion:review.task.version}, {text:'company-internal-ai-key-rotation:v1:surreal_ck:production:'+trusted.kid, idempotencyKey:randomUUID()});
+  const store = new CompanyProofStore(database.db, now);
+  await new Workforce(database, dir).retire('lc-keyrot-reviewer', 'synthetic rotation', 'rotation');
+  await expect(store.rotationApproval(task.id, trusted.kid)).resolves.toBeUndefined();
+  await enroll.revoke('lc-keyrot-reviewer');
+  await expect(store.rotationApproval(task.id, trusted.kid)).rejects.toBeDefined();
 });
