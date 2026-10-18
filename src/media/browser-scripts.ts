@@ -101,8 +101,9 @@ const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|crea
 // account default (Flash-Lite tier), silently degrading drafting quality. Three
 // sync steps so the caller controls pacing: open the pill, scan the menu, then
 // verify. The pill lives near the composer and matches whole picker phrases only;
-// the search is scoped to the composer's own container (ancestor climb, stops at
-// body/html, no document fallback) so sidebar/nav lookalikes are never touched.
+// the search climbs from the composer and stops before body/html and before any
+// layer that is, or contains, a sidebar/nav landmark, so sidebar lookalikes never
+// enter the candidate set and are never clicked.
 // 'Gemini 4' resolves through its 'Argon' tier alias (pill, menu, verification).
 // Fail-closed: a missing picker/option aborts the write, never silently
 // writes on the wrong model. Exported so tests run the same code on a fake DOM.
@@ -115,18 +116,26 @@ const mVis = (el) => !!el && (typeof el.offsetParent === 'undefined' || el.offse
 // treat 'Argon' as the tier alias of the 'Gemini 4' request.
 const mPickerLabel = /mode picker|model picker|模型选择器/i;
 const mTier = /flash|lite|fast|thinking|pro|bard|nano|ultra|opus|sonnet|haiku|model|模型|argon/i;
+// Sidebar/nav landmarks. A layer that is one, or contains one, is never searched: the
+// Gemini sidenav (bard-sidenav-content) is an ancestor of the composer in the live DOM,
+// so its rows must stay out of the candidate set.
+const mSide = 'nav, aside, [role="navigation"], [role="complementary"], bard-sidenav, bard-sidenav-content, [class*="sidenav"], [class*="sidebar"], [class*="side-nav"]';
+const mIsSide = (el) => /^(nav|aside)$|sidenav|sidebar|side-nav/.test((el.tagName || '').toLowerCase())
+  || /navigation|complementary/.test(el.getAttribute('role') || '')
+  || /sidenav|sidebar|side-nav/.test(el.getAttribute('class') || '');
+// Sidebar conversation rows are labelled 'More options for <title>' and are never a pill.
+const mSideRow = (el) => /^more options for/i.test(el.getAttribute('aria-label') || '');
 const mPill = () => {
   const box = [...document.querySelectorAll('[contenteditable="true"], textarea')].find(e => mVis(e));
-  // Fail closed with no composer. With one, the search stays inside the composer's
-  // own container: climb ancestors one by one and stop dead at body/html — no
-  // document/body fallback, so nav/sidebar entries (which only share those global
-  // ancestors) can never be picked up or clicked.
+  // Fail closed with no composer. With one, climb its ancestors and stop dead at body/html
+  // and at the first layer that is, or holds, a sidebar/nav landmark. The candidate set stays
+  // in the composer's own layer: no document/body fallback, no sidebar rows, no clicks on them.
   if (!box) return null;
   let n = box.parentElement || box.parent;
   while (n) {
     const tag = (n.tagName || '').toLowerCase();
-    if (tag === 'body' || tag === 'html') return null;
-    const cand = [...n.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis);
+    if (tag === 'body' || tag === 'html' || mIsSide(n) || n.querySelector(mSide)) return null;
+    const cand = [...n.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(e => mVis(e) && !mSideRow(e));
     const hit = cand.find(e => mPickerLabel.test(e.getAttribute('aria-label') || ''))
         || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40);
     if (hit) return hit;
