@@ -101,6 +101,8 @@ const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|crea
 // account default (Flash-Lite tier), silently degrading drafting quality. Three
 // sync steps so the caller controls pacing: open the pill, scan the menu, then
 // verify. The pill lives near the composer and matches whole picker phrases only;
+// the search is scoped to the composer's own container (ancestor climb, stops at
+// body/html, no document fallback) so sidebar/nav lookalikes are never touched.
 // 'Gemini 4' resolves through its 'Argon' tier alias (pill, menu, verification).
 // Fail-closed: a missing picker/option aborts the write, never silently
 // writes on the wrong model. Exported so tests run the same code on a fake DOM.
@@ -115,11 +117,22 @@ const mPickerLabel = /mode picker|model picker|模型选择器/i;
 const mTier = /flash|lite|fast|thinking|pro|bard|nano|ultra|opus|sonnet|haiku|model|模型|argon/i;
 const mPill = () => {
   const box = [...document.querySelectorAll('[contenteditable="true"], textarea')].find(e => mVis(e));
-  let scope = document;
-  if (box) { let n = box; for (let i = 0; i < 6 && n; i++) n = n.parentElement || n.parent; scope = n || document; }
-  const cand = [...scope.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis);
-  return cand.find(e => mPickerLabel.test(e.getAttribute('aria-label') || ''))
-      || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40);
+  // Fail closed with no composer. With one, the search stays inside the composer's
+  // own container: climb ancestors one by one and stop dead at body/html — no
+  // document/body fallback, so nav/sidebar entries (which only share those global
+  // ancestors) can never be picked up or clicked.
+  if (!box) return null;
+  let n = box.parentElement || box.parent;
+  while (n) {
+    const tag = (n.tagName || '').toLowerCase();
+    if (tag === 'body' || tag === 'html') return null;
+    const cand = [...n.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis);
+    const hit = cand.find(e => mPickerLabel.test(e.getAttribute('aria-label') || ''))
+        || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40);
+    if (hit) return hit;
+    n = n.parentElement || n.parent;
+  }
+  return null;
 };
 // 'Gemini 4' ships as the 'Argon' tier: pill, menu rows and the post-switch check all
 // match through this alias, never by raw substring against the configured name.
