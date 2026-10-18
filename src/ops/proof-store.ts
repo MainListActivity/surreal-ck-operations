@@ -2,7 +2,7 @@ import { RecordId, type Surreal } from 'surrealdb';
 import type { OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { PROOF_GOAL, APPROVAL_MARKER } from './proof-contract.ts';
-import { emptyChecks, mark, type DiagnosticCheck, type CheckResult } from './approval-diagnosis.ts';
+import { emptyChecks, mark, normalRetirement, type DiagnosticCheck, type CheckResult, type ReviewerLifecycle } from './approval-diagnosis.ts';
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
 export type ApprovalReceipt = { taskId: string; version: number; action: 'accept' | 'owner_approve'; auditId: string; reviewer: string; digest: string };
@@ -10,7 +10,7 @@ export type Candidate = { task: RecordId; digest: string; manifest_hash: string;
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
 type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId };
 type ApprovalAuditRow = { id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number; at: unknown };
-type ApprovalSnapshot = { candidate?: Candidate; task?: ApprovalTaskRow; audit?: ApprovalAuditRow; reviewer?: { revoked: boolean; retired?: boolean }; ambiguous: boolean };
+type ApprovalSnapshot = { candidate?: Candidate; task?: ApprovalTaskRow; audit?: ApprovalAuditRow; reviewer?: ReviewerLifecycle; ambiguous: boolean };
 const denied = () => new CompanyError('forbidden', 'company approval or live lease unavailable');
 export class CompanyProofStore {
   constructor(private readonly db: Surreal, private readonly now: () => number = Date.now) {}
@@ -56,7 +56,7 @@ export class CompanyProofStore {
     if (diagnostic && audit?.action === 'accept' && audit.actor instanceof RecordId && String(audit.actor.table) !== 'employee') throw denied();
     let reviewer: ApprovalSnapshot['reviewer'];
     if (audit?.action === 'accept' && audit.actor instanceof RecordId) {
-      const [rows] = await this.db.query<[Array<NonNullable<ApprovalSnapshot['reviewer']>>]>('SELECT revoked, retired FROM $reviewer;', { reviewer: audit.actor });
+      const [rows] = await this.db.query<[Array<NonNullable<ApprovalSnapshot['reviewer']>>]>('SELECT revoked, retired, retired_kind, security_revoked FROM $reviewer;', { reviewer: audit.actor });
       reviewer = rows[0];
     }
     return { candidate: candidates[0], task: tasks[0], audit, reviewer,
@@ -89,8 +89,8 @@ export class CompanyProofStore {
       set('auditActorMatchesAcceptedBy', a.actor instanceof RecordId && !!t && String(a.actor.id) === t.accepted_by);
       set('reviewerIndependent', !!t && t.accepted_by !== t.submitted_by);
       set('reviewerExists', !!r);
-      set('reviewerNotRevoked', !!r && !r.revoked);
-      set('reviewerNotRetired', !!r && !r.retired);
+      set('reviewerNotRevoked', !!r && (!r.revoked || normalRetirement(r)));
+      set('reviewerNotRetired', !!r && (!r.retired || normalRetirement(r)));
     } else if (a?.action === 'owner_approve') {
       set('ownerAcceptedByMatches', !!t && t.accepted_by === 'owner');
       set('ownerReviewerRoleMatches', !!t && t.reviewer_role === 'owner');
@@ -120,8 +120,8 @@ export class CompanyProofStore {
     if (!t || !a || t.state !== 'done' || !['task','gate'].includes(t.kind) || String(t.goal?.id) !== PROOF_GOAL || String(t.project?.id) !== 'surreal_ck' || a.version !== t.version || !a.evidence.split(/\r?\n/).some(l => l.trim() === marker)) throw denied();
     if (a.action === 'accept') {
       if (!(a.actor instanceof RecordId) || String(a.actor.id) !== t.accepted_by || t.accepted_by === t.submitted_by) throw denied();
-      const who = await this.db.select<{revoked:boolean;retired?:boolean}>(a.actor);
-      if (!who || who.revoked || who.retired) throw denied();
+      const who = await this.db.select<ReviewerLifecycle>(a.actor);
+      if (!who || ((who.revoked || who.retired) && !normalRetirement(who))) throw denied();
     } else if (t.accepted_by !== 'owner' || t.reviewer_role !== 'owner') throw denied();
   }
 

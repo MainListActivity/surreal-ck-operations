@@ -136,7 +136,7 @@ try {
       break;
     }
     case 'retire': {
-      await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual');
+      await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual', 'manual');
       print({ action, employeeId: args[0], ok: true });
       break;
     }

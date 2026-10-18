@@ -730,7 +730,7 @@ test('gm defers a gm-blocked execute task onto dependencies: manager wake stops,
   expect(resumed.woke.find(w => w.task === qaTask.id)?.spawned).toBe(true);
   // Cleanup so later tests do not inherit a live qa def or a stray idle instance.
   await database.db.query("UPDATE employee_def SET enabled = false WHERE id = 'qa-codex';");
-  await workforce.retire((await workforce.insts()).find(i => i.def === 'qa-codex')!.id, 'defer 测试清理');
+  await workforce.retire((await workforce.insts()).find(i => i.def === 'qa-codex')!.id, 'defer 测试清理', 'manual');
 });
 
 test('defer_task_until refuses non-gm, owner blocks, review blocks, live leases, cycles, cross-goal and stale versions', async () => {

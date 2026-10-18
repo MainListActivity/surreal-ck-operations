@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { Principal, Role, TaskId } from './contracts.ts';
+import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
@@ -351,11 +351,13 @@ export class Workforce {
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
 
-  /** Retires an instance and revokes its credential, so a crashed session cannot act again. */
-  async retire(employeeId: string, reason: string): Promise<void> {
-    await this.db.query('UPDATE $e SET retired = true, retired_reason = $reason, retired_at = time::now();',
-      { e: id('employee', employeeId), reason });
-    await this.enrollment.revoke(employeeId);
+  /** Retires an instance and revokes its credential, so a crashed session cannot act again. The kind is
+   * recorded by the first retirement only: a later one cannot turn a non-normal retirement into a normal one. */
+  async retire(employeeId: string, reason: string, kind: RetirementKind): Promise<void> {
+    await this.db.query(`UPDATE $e SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
+      retired = true, retired_reason = $reason, retired_at = time::now();`,
+      { e: id('employee', employeeId), reason, kind });
+    await this.enrollment.revoke(employeeId, 'retirement');
   }
 
   async touchWake(employeeId: string): Promise<void> {

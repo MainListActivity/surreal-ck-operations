@@ -570,7 +570,12 @@ check('FV06 normal session rotation and archive keep a formed independent approv
     await workforce.retire(c.reviewerId, `synthetic ${kind}`, kind);
     expect(await lifecycleDiagnose(c)).toMatchObject({failure:'none', allApplicableChecksMatch:true, checks:{reviewerNotRevoked:{matched:true}, reviewerNotRetired:{matched:true}}});
     await new CompanyProofStore(database.db, now).approval(c.approval, 'production', await loadProofFiles(dir, c.approval, c.files.manifestPath, c.files.documentPath));
-    expect(await lifecycleProve(c, `${kind}-enable`)).toMatchObject({paidCallsAllowed:1});
+    const granted = await lifecycleProve(c, `${kind}-enable`) as {proofHandle:string;paidCallsAllowed:number};
+    expect(granted).toMatchObject({paidCallsAllowed:1});
+    // 交付与状态使用同一授权判定：正常轮换后的证明仍然有效。
+    const login = await ops.call(c.consumer, c.consuming, 'ops_login', {alias:'LCA04_OPS', audience:'ops'}) as {session:string};
+    await ops.call(c.consumer, c.consuming, 'ops_internal_ai_deliver', {proofHandle:granted.proofHandle, session:login.session});
+    expect((await status(delivered!)).valid).toBe(true);
   }
 });
 check('FV06 security revocation, unknown or failed retirement, forged audit and stale or raced evidence still fail closed without writes', async () => {
@@ -618,6 +623,17 @@ check('FV06 security revocation, unknown or failed retirement, forged audit and 
   await database.db.query('CREATE $id CONTENT $row;', {id:twin, row:{...audits[0]!, id:twin}});
   try { expect(await lifecycleDiagnose(raced)).toMatchObject({failure:'snapshot-unstable'}); }
   finally { await database.db.query('DELETE $id;', {id:twin}); }
+  // 自验：候选作者与提交人都是评审人本人，即使其身份正常轮换也拒绝。
+  const selfish = await lifecycleApproval('selfish');
+  await workforce.retire(selfish.reviewerId, 'synthetic rotation', 'rotation');
+  await database.db.query('UPDATE internal_ai_candidate SET author = $who WHERE task = $task; UPDATE $task SET submitted_by = $who;', {who:selfish.reviewerId, task:new RecordId('task', selfish.approval)});
+  expect(await lifecycleDiagnose(selfish)).toMatchObject({failure:'self-review'});
+  // 调用方租约被撤回：诊断与授权在读取批准之前即拒绝。
+  const withdrawn = await lifecycleApproval('withdrawn');
+  await workforce.retire(withdrawn.reviewerId, 'synthetic rotation', 'rotation');
+  await database.db.query('UPDATE $t SET lease_expires_at = 0;', {t:new RecordId('task', withdrawn.consuming)});
+  await expect(lifecycleDiagnose(withdrawn)).rejects.toBeDefined();
+  await expect(lifecycleProve(withdrawn, 'withdrawn-enable')).rejects.toBeDefined();
   // 拒绝例不产生产品写入、不把证明交给产品、不新增付费调用授权。
   expect(delivered).toBe(deliveredBefore);
   expect(world.requests.length).toBe(requestsBefore);

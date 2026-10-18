@@ -1,3 +1,4 @@
+import type { RetirementKind } from '../contracts.ts';
 /** 受控诊断：未评估项不能视为通过；禁止添加原始行或主体。 */
 export const diagnosticFailureByCheck = {
   "leaseCallerMatches": "lease-caller-mismatch",
@@ -70,4 +71,13 @@ export function diagnosis(checks: Record<DiagnosticCheck, CheckResult>, snapshot
   return { outcome: 'evaluated', checks, snapshotStable,
     allApplicableChecksMatch: !dependencyUnavailable && snapshotStable && !failure,
     failure: dependencyUnavailable ? 'dependency-unavailable' : !snapshotStable ? 'snapshot-unstable' : failure ? diagnosticFailureByCheck[failure] : 'none' };
+}
+
+/** 评审人生命周期的结构化字段，不含 reason 等自由文本。 */
+export type ReviewerLifecycle = Readonly<{ revoked: boolean; retired?: boolean; retired_kind?: string | null; security_revoked?: boolean | null }>;
+const NORMAL_RETIREMENTS: ReadonlySet<string> = new Set<RetirementKind>(['rotation', 'archive']);
+/** 正常会话退役（轮换/归档）不是安全撤权：只有退役类型可信为正常、且从未被显式安全撤权，才不影响已形成的批准。
+ * 失败/人工退役、改动前写入的无类型退役（旧记录）与显式撤权一律不成立；旧批准不自动追认，需要新批准。 */
+export function normalRetirement(r: ReviewerLifecycle): boolean {
+  return r.retired === true && r.security_revoked !== true && typeof r.retired_kind === 'string' && NORMAL_RETIREMENTS.has(r.retired_kind);
 }
