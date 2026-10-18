@@ -3,7 +3,7 @@ import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, Supervis
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
-import { UNATTENDED_MODE, type PaseoGateway } from './paseo.ts';
+import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
@@ -495,6 +495,7 @@ export class Dispatcher {
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
         await wf.retire(inst.id, reason);
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
+        await this.archiveInstScene(inst);
         if (staleModel && def) {
           await this.notice(`model-upgrade:${def.id}:${target}`,
             `编制 ${def.id} 的模型已升级到 ${target}（实例 ${inst.id} 等空闲旧模型会话已轮换，新任务将用新模型起会话）。`, report);
@@ -1031,7 +1032,13 @@ export class Dispatcher {
             return undefined;
           }
         }
-        if ((claim?.worktree ?? workspace) && existing.cwd !== (claim?.worktree ?? workspace)!.worktreePath) {
+        // Home-bound insts park their session on a private comm dir outside any
+        // task scene, so a worktree move is their normal case — wake, never
+        // retire. The retire+respawn below only applies to legacy tree-bound
+        // insts whose cwd still IS a worktree path.
+        const instHome = sidecar?.commDirFor(existing.id);
+        const sceneBound = !instHome || existing.cwd !== instHome;
+        if ((claim?.worktree ?? workspace) && sceneBound && existing.cwd !== (claim?.worktree ?? workspace)!.worktreePath) {
           if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
           else await sidecar?.releaseWorkspace?.(existing);
           claim = undefined;
@@ -1086,14 +1093,21 @@ export class Dispatcher {
         return undefined;
       }
       try {
+        // Employee sessions must outlive their task scene: the agent cwd is the
+        // instance's private comm dir, never a worktree path, so scene reclaim
+        // archives only task workspaces. The task's registered tree is carried
+        // in claim.json + the prompt instead. Legacy no-sidecar mode keeps the
+        // tree-bound cwd it always had.
+        const instHome = sidecar?.commDirFor(inst.id);
+        const spawnCwd = instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, workspaceTitle: `SCK · ${def.id}`,
+          mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd, workspaceTitle: instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
           env: spawnEnv,
           prompt: prompt(inst, true, claim, workspace),
         });
-        const cwd = (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
+        const cwd = spawnCwd;
         const repoHome = task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });
         sidecar?.bindAgent(inst.id, agentId);
@@ -1160,10 +1174,25 @@ export class Dispatcher {
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
     if (inst.paseoAgentId) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
+    await this.archiveInstScene(inst);
     report.retired.push(inst.id);
     this.log(`retired ${inst.id}: ${reason}`);
     const def = defs.find(d => d.id === inst.def);
     if (def && countFailure) await this.countDefFailure(def, report);
+  }
+
+  /**
+   * Home-bound insts park a Paseo workspace on their private comm dir; retiring
+   * must archive it or orphaned workspaces pile up in the Paseo roster.
+   * Tree-bound insts leave their workspace to the scene cleaner instead.
+   */
+  private async archiveInstScene(inst: EmployeeInst) {
+    const home = this.deps.sidecar?.commDirFor(inst.id);
+    if (!home || inst.cwd !== home) return;
+    const workspaces = await this.deps.paseo.listWorkspaces().catch(() => [] as PaseoWorkspaceInfo[]);
+    for (const w of workspaces.filter(w => w.cwd === home)) {
+      await this.deps.paseo.archiveWorkspace(w.workspaceId).catch(() => undefined);
+    }
   }
 
   private async countDefFailure(def: EmployeeDef, report: TickReport) {

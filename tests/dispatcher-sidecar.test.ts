@@ -34,7 +34,10 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     providerHealth: async () => new Map(), lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
     defFailure: async () => { events.push('performance-failure'); return 1; },
     spawnInst: async () => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}` }; instances.push(i); return i; },
-    bind: async (id: string, b: { agentId: string; cwd: string }) => { Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: b.agentId, cwd: b.cwd }); },
+    bind: async (id: string, b: { agentId: string; cwd: string; repoHome?: string }) => {
+      const { agentId, ...rest } = b;
+      Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: agentId, ...rest });
+    },
     retire: async (id: string) => { events.push(`retire:${id}`); retired.add(id); },
     rotate: async (id: string) => { events.push(`rotate:${id}`); return `rotated-${id}`; },
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
@@ -164,10 +167,40 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.retired).toContain('employee-9');
     const inst = w.instances.find(i => i.id !== 'employee-9')!;
     expect(w.events).toContain(`claim:${inst.id}:t1`);
-    expect(w.cwds.get(inst.paseoAgentId!)).toBe('/repo-task-t1');
+    // Home-bound spawn: the session parks on the instance's private comm dir so
+    // scene reclaim can never cascade-kill it; the worktree arrives via claim.json.
+    expect(w.cwds.get(inst.paseoAgentId!)).toBe(w.pool.commDirFor(inst.id));
     // The task stayed in review and is now held by the spawned reviewer.
     expect(w.views.get('t1')!.state).toBe('review');
     expect(w.views.get('t1')!.currentEmployee).toBe(inst.id);
+  });
+  test('a home-bound session wakes on a different worktree instead of retiring', async () => {
+    const w = world();
+    // A free session parked on its private comm dir — the shape bind() now records.
+    const home = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', repoHome: '/repo' } as EmployeeInst;
+    home.cwd = w.pool.commDirFor(home.id);
+    w.instances.push(home);
+    w.pool.env(home); w.pool.bindAgent(home.id, 'agent-9'); home.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    // Its new task lives on a tree the session has never seen — that is the normal case.
+    w.addTask('t1', { state: 'ready', worktreePath: '/repo-task-t1' });
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('claim:employee-9:t1');
+    expect(w.events).toContain('send:agent-9');
+    expect(r.retired).not.toContain('employee-9');
+    expect(r.woke.map(x => x.employee)).toContain('employee-9');
+    expect(w.views.get('t1')!.currentEmployee).toBe('employee-9');
+  });
+  test('a spawned instance binds its private comm dir as cwd, never the task worktree', async () => {
+    const w = world();
+    w.addTask('t1', { state: 'ready', worktreePath: '/repo-task-t1' });
+    await w.dispatcher().tick();
+    const inst = w.instances[0];
+    expect(inst.cwd).toBe(w.pool.commDirFor(inst.id));
+    expect(inst.repoHome).toBe('/repo');
+    // Scene reclaim only ever archives workspaces under the tree — never this one.
+    expect(inst.cwd!.startsWith('/repo-task-t1')).toBe(false);
   });
   test('releaseClaim on a review-state claim drops the lease without a reviewer return', async () => {
     const w = world();
