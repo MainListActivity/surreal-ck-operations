@@ -558,6 +558,59 @@ describe('model picker (Gemini composer pill)', () => {
     expect(p.pickModelOption('gemini9')).toMatchObject({ err: 'no_match' });
     expect(p.modelPillMatches('gemini9')).toBe(false);
   });
+  // QA 返修负例（qa-negative-real-dom.json 原样几何，任务 a6513276 第二轮）：
+  // 干扰项挂 body 直子 nav，作曲区在 main>form。mPill 必须无 composer 立即拒绝、
+  // 有 composer 时沿祖先搜到 body/html 即停——绝不回退 document/body 全页，
+  // 侧栏干扰项零点击。
+  const qaShell = (navButton: El) => {
+    const nav = new El('nav').add(navButton);
+    const main = new El('main').add(new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } })));
+    const root = new El('body').add(nav, main);
+    const clicks = { n: 0 };
+    navButton.onClick = () => { clicks.n += 1; };
+    return { doc: docOf(root), clicks };
+  };
+  const expectNoPicker = (p: ReturnType<typeof pickers>, want: string) => {
+    expect(p.openModelPicker(want)).toEqual({ err: 'no_picker' });
+    expect(p.modelPillText()).toBe('');
+    expect(p.modelPillMatches(want)).toBe(false);
+  };
+  test('QA negative 1 (no composer, nav pill labeled "Open mode picker"): no_picker, zero clicks', () => {
+    const navPill = new El('button', { text: 'Argon', attrs: { 'aria-label': 'Open mode picker, currently Argon' } });
+    const { doc, clicks } = qaShell(navPill);
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  test('QA negative 2 (composer without pill, nav Argon tier text): no_picker, zero clicks', () => {
+    const { doc, clicks } = qaShell(new El('button', { text: 'Argon' }));
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  test('QA negative 3 (composer without pill, sidebar More-options title): no_picker, zero clicks', () => {
+    const navBtn = new El('button', { text: 'Cloudflare Worker 部署模型方案', attrs: { 'aria-label': 'More options for Cloudflare Worker 部署模型方案' } });
+    const { doc, clicks } = qaShell(navBtn);
+    expectNoPicker(pickers(doc), 'Gemini 4');
+    expect(clicks.n).toBe(0);
+  });
+  test('deep composer boundary: pill in an ancestor above the textarea but below body is still found; body-level nav never enters', () => {
+    const pill = new El('button', { text: 'Flash-Lite', attrs: { 'aria-label': 'Open mode picker, currently Flash-Lite' } });
+    const nav = new El('nav').add(new El('button', { text: 'Argon' }));
+    const deep = new El('div').add(
+      new El('div').add(
+        new El('div').add(
+          new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } })),
+        ),
+        pill,
+      ),
+    );
+    const root = new El('body').add(nav, deep);
+    const clicks = { n: 0 };
+    (nav.children[0] as El).onClick = () => { clicks.n += 1; };
+    const p = pickers(docOf(root));
+    expect(p.openModelPicker('Gemini 4')).toMatchObject({ ok: true, opened: true, before: 'Flash-Lite' });
+    expect(p.modelPillText()).toBe('Flash-Lite');
+    expect(clicks.n).toBe(0);
+  });
 });
 
 describe('generated scripts parse (template-escape regression)', () => {
