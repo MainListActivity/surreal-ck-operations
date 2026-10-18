@@ -109,6 +109,26 @@ export function company(): Promise<Company> {
         return rows?.[0]?.media_notebook_model;
       } });
     const { hostResources } = await import("./vendor/src/dispatcher/host.ts");
+    const { ArtifactReclaimer, dbArtifactTasks } = await import("./vendor/src/dispatcher/artifact-sweeper.ts");
+    // Terminal-task artifact lifecycle (evidence/deliverables). Reclaimed against the same
+    // company_meta:config the operator edits, and stopped by SCK_ARTIFACT_RECLAIM=0.
+    const reclaimer = new ArtifactReclaimer({
+      home: serviceHome(),
+      tasks: dbArtifactTasks(db.db),
+      config: async () => {
+        const cfg = await workforce.config();
+        return {
+          artifactReclaimEnabled: cfg.artifactReclaimEnabled,
+          artifactEvidenceGraceDays: cfg.artifactEvidenceGraceDays,
+          artifactDeliverableGraceDays: cfg.artifactDeliverableGraceDays,
+          artifactHeadroomMb: cfg.artifactHeadroomMb,
+          minFreeDiskMb: cfg.minFreeDiskMb,
+        };
+      },
+      freeDiskMb: () => hostResources(serviceHome()).freeDiskMb,
+      env: process.env,
+      log: message => console.log(message),
+    });
     const sidecar = new SidecarPool({
       core, workforce, ops, media, browser, sync,
       runDir,
@@ -130,6 +150,12 @@ export function company(): Promise<Company> {
       // Host resource admission: free-memory/disk floors pause dispatch on the owner's
       // machine; supervision still runs so stalled leases keep getting reclaimed.
       hostResources: () => hostResources(serviceHome()),
+      // Terminal-task artifact lifecycle: the free-disk gate reclaims evidence/deliverables
+      // before it gives up, so a full disk stops halting dispatch instead of silently wedging it.
+      reclaimArtifacts: (input) => reclaimer.reclaim({
+        trigger: input?.trigger ?? 'sweep', targetFreeMb: input?.targetFreeMb,
+        dryRun: input?.dryRun, taskId: input?.taskId,
+      }),
       // WT02: bare call = 10-minute sweep (crash-orphan fallback); treeId+repo = event point.
       reclaimWorktrees: (input) => core.worktrees!.reclaimAll({
         trigger: input?.trigger ?? 'sweep', treeId: input?.treeId,

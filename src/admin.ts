@@ -1,4 +1,5 @@
 import { chmodSync, mkdirSync, openSync, readFileSync, writeSync, closeSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from './config.ts';
@@ -31,7 +32,10 @@ const usage = `Usage: pnpm run admin <command>
   secret set <项目> <环境> <名称> <角色,角色|-> [用途]
                                           从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
-  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）`;
+  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）
+  reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
+                                          回收终态任务的大文件（evidence/deliverables）；
+                                          缺省只演练不删，加 --execute 才真正动手，带目标 MB 则按压力模式回收`;
 
 const [action, ...args] = process.argv.slice(2);
 if (!action) throw new Error(usage);
@@ -166,6 +170,44 @@ try {
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
       await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: JSON.parse(value) } });
       print(await workforce.config());
+      break;
+    }
+    case 'reclaim-artifacts': {
+      // Operator entry for terminal-task artifact reclaim: dry-run by default, `--execute` to
+      // actually trim. SCK_ARTIFACT_RECLAIM=0 does not block an explicit operator run.
+      const flags = new Set(args.filter(a => a.startsWith('--')));
+      const positional = args.filter(a => !a.startsWith('--'));
+      const targetArg = positional.find(a => /^\d+$/.test(a));
+      const execute = flags.has('--execute');
+      const taskId = positional.find(a => /^[A-Za-z0-9_-]{1,128}$/.test(a));
+      const { ArtifactReclaimer, dbArtifactTasks, summarizeReclaim } = await import('./dispatcher/artifact-sweeper.ts');
+      const { hostResources } = await import('./dispatcher/host.ts');
+      const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
+      const reclaimer = new ArtifactReclaimer({
+        home,
+        tasks: dbArtifactTasks(database.db),
+        config: async () => {
+          const cfg = await workforce.config();
+          return {
+            artifactReclaimEnabled: cfg.artifactReclaimEnabled,
+            artifactEvidenceGraceDays: cfg.artifactEvidenceGraceDays,
+            artifactDeliverableGraceDays: cfg.artifactDeliverableGraceDays,
+            artifactHeadroomMb: cfg.artifactHeadroomMb,
+            minFreeDiskMb: cfg.minFreeDiskMb,
+          };
+        },
+        freeDiskMb: () => hostResources(home).freeDiskMb,
+        env: process.env,
+      });
+      const targetFreeMb = targetArg ? Number(targetArg) : undefined;
+      const result = await reclaimer.reclaim({
+        trigger: execute ? 'manual' : 'dry_run',
+        dryRun: !execute,
+        targetFreeMb,
+        taskId,
+        maxMs: 300_000,
+      });
+      print({ ...result, summary: summarizeReclaim(result), run: execute ? 'execute' : 'dry-run' });
       break;
     }
     default:

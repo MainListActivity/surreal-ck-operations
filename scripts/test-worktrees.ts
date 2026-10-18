@@ -16,6 +16,7 @@ try {
   const explicit = process.argv.slice(2).filter(arg => arg.endsWith('.test.ts'));
   const targets = explicit.length ? explicit : process.argv.includes('--all') ? [] : [
     'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
+    'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/mcp-run-reclaim.fork.test.ts', 'tests/paseo-dead-paths.test.ts',
     'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts',
@@ -24,7 +25,7 @@ try {
   ];
   const test = Bun.spawn(['bun', 'test', ...targets], { stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1',
   } });
   exit = await test.exited;
 } finally { server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); }
