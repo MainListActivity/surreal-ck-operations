@@ -466,8 +466,9 @@ describe('full generated scripts (page-stub executable)', () => {
 
 describe('model picker (Gemini composer pill)', () => {
   const pickers = (doc: FakeDocument): { openModelPicker: (w: string) => Record<string, unknown>;
-    pickModelOption: (w: string) => Record<string, unknown>; modelPillText: () => string } =>
-    new Function('document', `${MODEL_PICKER}\nreturn { openModelPicker, pickModelOption, modelPillText };`)(doc) as never;
+    pickModelOption: (w: string) => Record<string, unknown>; modelPillText: () => string;
+    modelPillMatches: (w: string) => boolean } =>
+    new Function('document', `${MODEL_PICKER}\nreturn { openModelPicker, pickModelOption, modelPillText, modelPillMatches };`)(doc) as never;
 
   // Composer: textarea + a 'Flash-Lite' pill; clicking opens mat-option rows.
   const shellOf = (pillLabel = 'Flash-Lite') => {
@@ -508,6 +509,54 @@ describe('model picker (Gemini composer pill)', () => {
   test('no picker element → no_picker', () => {
     const doc = docOf(new El('body').add(new El('div', { text: 'plain page' })));
     expect(pickers(doc).openModelPicker('pro').err).toBe('no_picker');
+  });
+  // 现场形状（任务 a6513276，2026-10-18）：作曲区药丸 aria-label 'Open mode picker,
+  // currently <tier>'、inner 显示当前档位；侧边栏有 'More options for …模型方案' 干扰项；
+  // 菜单真实五选项。want 'Gemini 4' 经 argon 别名命中 4 Argon，不点侧边栏、不点 Thinking/Flash。
+  const liveShell = (tier = 'Flash-Lite') => {
+    const menu: El[] = [];
+    const pill = new El('button', { text: tier, attrs: { 'aria-label': `Open mode picker, currently ${tier}` } });
+    const sidebar = new El('button', { attrs: { 'aria-label': 'More options for Cloudflare Worker 部署模型方案' } });
+    const mkOpt = (label: string) => {
+      const o = new El('mat-option', { text: label, attrs: { role: 'option' } });
+      o.onClick = () => { pill.ownText = label; };
+      return o;
+    };
+    for (const l of ['3.5 Flash-Lite Fastest answers', '3.8 Flash All-around help', '3.1 Pro Advanced reasoning', '4 Argon Complex tasks', 'Thinking level']) menu.push(mkOpt(l));
+    const root = new El('body');
+    const form = new El('form').add(new El('textarea', { attrs: { 'aria-label': 'Ask Gemini' } }), pill);
+    root.add(form, sidebar);
+    pill.onClick = () => menu.forEach(m => root.add(m));
+    return { doc: docOf(root), pill };
+  };
+  test('live composer shape: the pill next to the composer is found, the sidebar lookalike is ignored', () => {
+    const { doc, pill } = liveShell();
+    const p = pickers(doc);
+    expect(p.openModelPicker('Gemini 4')).toMatchObject({ ok: true, opened: true, before: 'Flash-Lite' });
+    expect(p.modelPillText()).toBe('Flash-Lite');
+    expect(p.modelPillMatches('gemini 4')).toBe(false);
+    expect(pill.onClick).toBeDefined();
+  });
+  test('live menu: pickModelOption(Gemini 4) selects 4 Argon Complex tasks via the alias, not Thinking level or Flash', () => {
+    const { doc } = liveShell();
+    const p = pickers(doc);
+    p.openModelPicker('Gemini 4');
+    expect(p.pickModelOption('Gemini 4')).toMatchObject({ ok: true });
+    expect(p.modelPillText()).toBe('4 Argon Complex tasks');
+    expect(p.modelPillMatches('Gemini 4')).toBe(true);
+  });
+  test('live alias: pill already Argon → already without opening the menu; lowercase want matches too', () => {
+    const { doc } = liveShell('Argon');
+    const p = pickers(doc);
+    expect(p.openModelPicker('Gemini 4')).toMatchObject({ ok: true, already: true, selected: 'Argon' });
+    expect(p.modelPillMatches('gemini 4')).toBe(true);
+  });
+  test('fail closed: an unavailable want opens but matches nothing, verification rejects (no alias wash)', () => {
+    const { doc } = liveShell();
+    const p = pickers(doc);
+    expect(p.openModelPicker('gemini9')).toMatchObject({ ok: true, opened: true });
+    expect(p.pickModelOption('gemini9')).toMatchObject({ err: 'no_match' });
+    expect(p.modelPillMatches('gemini9')).toBe(false);
   });
 });
 
