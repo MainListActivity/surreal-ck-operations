@@ -1,7 +1,7 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, Role } from '../contracts.ts';
+import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
@@ -388,8 +388,12 @@ export class Dispatcher {
       }
       if (this.deps.sidecar && !inst.credentialFile && !this.deps.sidecar.canReuse(inst)) {
         // Infrastructure failure, not a model/provider or employee performance failure.
+        // An archived session also loses its launch binding; the Paseo-reported archived
+        // status is the trusted structured normal-end signal (FV06) — only a live
+        // session whose binding is gone is real channel isolation.
         states.set(inst.id, 'down');
-        await this.retireBroken(inst, '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false);
+        const archived = (await paseo.status(inst.paseoAgentId).catch(() => undefined))?.status === 'archived';
+        await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure');
         await paseo.stop(inst.paseoAgentId).catch(() => undefined);
         await paseo.archive(inst.paseoAgentId).catch(() => undefined);
         continue;
@@ -422,6 +426,16 @@ export class Dispatcher {
         }
         states.set(inst.id, 'down');
         await this.retireBroken(inst, `session error: ${error.slice(0, 200) || 'unknown'}`, defs, report);
+        continue;
+      }
+      if (status === 'archived') {
+        // Trusted normal end (FV06): Paseo reports Archived=true authoritatively for an
+        // archived session even though it no longer appears in the roster. Session rotation
+        // and scene recycling retire a trusted kind before archiving; an archive that
+        // reaches the dispatcher first (plugin listener, manual archive) still ends the
+        // session normally and must not poison a formed approval with a failure kind.
+        states.set(inst.id, 'down');
+        await this.retireBroken(inst, 'Paseo 会话已归档（正常结束）', defs, report, false, 'archive');
         continue;
       }
       states.set(inst.id, 'down');
@@ -1168,8 +1182,8 @@ export class Dispatcher {
     }
   }
 
-  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true) {
-    await this.deps.workforce.retire(inst.id, reason, 'failure');
+  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure') {
+    await this.deps.workforce.retire(inst.id, reason, kind);
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
