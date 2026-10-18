@@ -100,39 +100,50 @@ const loginWall = (t) => /log in|sign in|sign up|couldn't load your account|crea
 // model the page has selected — with no picker step every new chat lands on the
 // account default (Flash-Lite tier), silently degrading drafting quality. Three
 // sync steps so the caller controls pacing: open the pill, scan the menu, then
-// verify. Fail-closed: a missing picker/option aborts the write, never silently
+// verify. The pill lives near the composer and matches whole picker phrases only;
+// 'Gemini 4' resolves through its 'Argon' tier alias (pill, menu, verification).
+// Fail-closed: a missing picker/option aborts the write, never silently
 // writes on the wrong model. Exported so tests run the same code on a fake DOM.
 export const MODEL_PICKER = /* js */ `
 const mNorm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
 const mVis = (el) => !!el && (typeof el.offsetParent === 'undefined' || el.offsetParent !== null || (el.getClientRects ? el.getClientRects().length > 0 : true));
-const mTier = /flash|lite|fast|thinking|pro|bard|nano|ultra|opus|sonnet|haiku|model|模型/i;
+// Composer pill matchers: the live label reads 'Open mode picker, currently Argon' —
+// match whole picker phrases only ('mode' alone is a substring of 'model', and bare
+// '模型' also hits unrelated sidebar entries like 'More options for …模型…'), and
+// treat 'Argon' as the tier alias of the 'Gemini 4' request.
+const mPickerLabel = /mode picker|model picker|模型选择器/i;
+const mTier = /flash|lite|fast|thinking|pro|bard|nano|ultra|opus|sonnet|haiku|model|模型|argon/i;
 const mPill = () => {
   const box = [...document.querySelectorAll('[contenteditable="true"], textarea')].find(e => mVis(e));
   let scope = document;
   if (box) { let n = box; for (let i = 0; i < 6 && n; i++) n = n.parentElement || n.parent; scope = n || document; }
   const cand = [...scope.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis);
-  return cand.find(e => /model|模型|change/i.test(e.getAttribute('aria-label') || ''))
-      || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40)
-      || [...document.querySelectorAll('button, [role="button"], mat-select, [role="combobox"]')].filter(mVis)
-           .find(e => /model|模型/i.test(e.getAttribute('aria-label') || ''));
+  return cand.find(e => mPickerLabel.test(e.getAttribute('aria-label') || ''))
+      || cand.find(e => mTier.test(mNorm(e.innerText)) && mNorm(e.innerText).length <= 40);
+};
+// 'Gemini 4' ships as the 'Argon' tier: pill, menu rows and the post-switch check all
+// match through this alias, never by raw substring against the configured name.
+const mAlias = (want, text) => {
+  const w = mNorm(want).toLowerCase(), t = mNorm(text).toLowerCase();
+  return !!w && !!t && (t.includes(w) || (w === 'gemini 4' && t.includes('argon')));
 };
 const openModelPicker = (want) => {
   const pill = mPill();
   if (!pill) return { err: 'no_picker' };
   const cur = mNorm(pill.innerText) || mNorm(pill.getAttribute('aria-label'));
-  if (cur.toLowerCase().includes(want.toLowerCase())) return { ok: true, already: true, selected: cur };
+  if (mAlias(want, cur)) return { ok: true, already: true, selected: cur };
   pill.click();
   return { ok: true, opened: true, before: cur };
 };
 const pickModelOption = (want) => {
-  const wantL = want.toLowerCase();
   const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], mat-option, [role="menu"] li, [role="listbox"] li, [role="menu"] button')].filter(mVis);
   const texts = [...new Set(items.map(i => mNorm(i.innerText)).filter(t => t && t.length <= 80))];
-  const hit = items.find(i => mNorm(i.innerText).toLowerCase().includes(wantL));
+  const hit = items.find(i => mAlias(want, mNorm(i.innerText)));
   if (hit) { hit.click(); return { ok: true }; }
   return texts.length ? { err: 'no_match', options: texts.slice(0, 12) } : { err: 'no_menu' };
 };
 const modelPillText = () => { const pill = mPill(); return pill ? (mNorm(pill.innerText) || mNorm(pill.getAttribute('aria-label'))) : ''; };
+const modelPillMatches = (want) => { const pill = mPill(); return !!pill && mAlias(want, mNorm(pill.innerText) || mNorm(pill.getAttribute('aria-label'))); };
 `;
 
 // Turn attribution for the Gemini chat surface (write/recover ops). The chat is a
@@ -606,8 +617,13 @@ ${MODEL_PICKER}
 ${MODEL_PICKER}
         return modelPillText();
       });
-      if (!pickedModel.toLowerCase().includes(want.toLowerCase())) {
-        fail('model_unavailable', '模型切换未生效：选择器显示 "' + pickedModel + '"，期望含 "' + want + '"。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口');
+      // Post-switch check shares the alias: pill 'Argon' satisfies want 'Gemini 4'.
+      const okModel = await p.evaluate(({ want }) => {
+${MODEL_PICKER}
+        return modelPillMatches(want);
+      }, { want });
+      if (!okModel) {
+        fail('model_unavailable', '模型切换未生效：选择器显示 "' + pickedModel + '"，期望 "' + want + '"（或其可用别名，如 Gemini 4 → Argon）。多为配额耗尽自动降档，禁止用低档模型写作：稍后重试，持续不可用则 report_blocker(to=gm) 上报缺口');
       }
     }
   }
