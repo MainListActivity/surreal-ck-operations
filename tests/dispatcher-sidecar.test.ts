@@ -38,7 +38,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       const { agentId, ...rest } = b;
       Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: agentId, ...rest });
     },
-    retire: async (id: string) => { events.push(`retire:${id}`); retired.add(id); },
+    retire: async (id: string, _reason: string, kind: string) => { events.push(`retire:${id}:${kind}`); retired.add(id); },
     rotate: async (id: string) => { events.push(`rotate:${id}`); return `rotated-${id}`; },
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
@@ -91,7 +91,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -308,5 +308,29 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w.addTask('chars', { discipline: '角色设计' });
     await w.dispatcher().tick();
     expect(w.events.some(e => e === 'claim:employee-1:chars')).toBe(true);
+  });
+  test('an archived session is a trusted normal end: retired as archive, not failure (FV06)', async () => {
+    const w = world(); w.addTask('archived'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!;
+    // The real archive entry: Paseo soft-deletes the session and the plugin listener
+    // detaches the launch binding — the next tick sees a lost binding and must consult
+    // the Paseo-reported archived status instead of assuming a broken session.
+    await w.paseo.archive(inst.paseoAgentId!);
+    await d.tick();
+    expect(w.events).toContain(`retire:${inst.id}:archive`);
+    expect(w.events).not.toContain(`retire:${inst.id}:failure`);
+  });
+  test('a crashed or isolated session still retires as failure (FV06 fail closed)', async () => {
+    const w = world(); w.addTask('crashed'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!;
+    w.agents.get(inst.paseoAgentId!)!.status = 'error';
+    await d.tick();
+    expect(w.events).toContain(`retire:${inst.id}:failure`);
+    // A launch binding lost without the archived signal is real channel isolation.
+    const w2 = world(); w2.addTask('isolated'); const d2 = w2.dispatcher(); await d2.tick();
+    const inst2 = w2.instances[0]!;
+    w2.pool.detachAgent(inst2.paseoAgentId!);
+    await d2.tick();
+    expect(w2.events).toContain(`retire:${inst2.id}:failure`);
   });
 });

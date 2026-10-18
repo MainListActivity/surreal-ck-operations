@@ -17,6 +17,9 @@ import { CompanyProofStore } from '../src/ops/proof-store.ts';
 import { TOKEN_PLAN_PLAN_TYPE_FREE, PROOF_GOAL, configurationDigest, sha256, APPROVAL_MARKER, type ProofManifest } from '../src/ops/proof-contract.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
 import { loadProofFiles } from '../src/ops/proof-files.ts';
+import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
+import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
+import type { OwnerDesk } from '../src/owner.ts';
 import { brokerConfig, FakeWorld, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_RESOURCE } from './support/ops-world.ts';
 import { disabledSenseNovaFixture } from './support/internal-ai-disabled-fixture.ts';
 const enabled = process.env.RUN_COMPANY_PROOF_FORK_TESTS === '1';
@@ -653,4 +656,43 @@ check('FV06 key rotation approval shares the reviewer lifecycle: normal retireme
   await expect(store.rotationApproval(task.id, trusted.kid)).resolves.toBeUndefined();
   await enroll.revoke('lc-keyrot-reviewer');
   await expect(store.rotationApproval(task.id, trusted.kid)).rejects.toBeDefined();
+});
+check('FV06 real archive entry: a dispatcher tick after the agent is archived keeps the approval; a crashed session still fails closed', async () => {
+  const workforce = new Workforce(database, dir);
+  const writes = () => world.sql.filter(r => /^\s*(INSERT|UPDATE|DELETE|CREATE)\b/i.test(r.sql)).length;
+  // 真实 Paseo 接缝：名册不含已归档会话，status 按服务端 Archived 标记报 'archived'。
+  const agentsMap = new Map<string, { id: string; status: string }>();
+  const paseo = {
+    list: async () => new Map([...agentsMap].filter(([, a]) => a.status !== 'archived').map(([k, a]) => [k, { id: a.id, status: a.status }] as const)),
+    status: async (id: string) => { const a = agentsMap.get(id); return a ? { status: a.status, pendingPermissions: 0 } : undefined; },
+    lastError: async () => 'session crashed', logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
+    spawn: async () => { throw new Error('fixture does not spawn'); }, send: async () => {}, stop: async () => {},
+    archive: async (id: string) => { const a = agentsMap.get(id); if (a) a.status = 'archived'; },
+    listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
+  } as unknown as PaseoGateway;
+  const owner = { applyPending: async () => [], resolveNotice: async () => true, openNotices: async () => [], triagePending: async () => [], raiseNotice: async () => true };
+  const dispatcher = new Dispatcher({ workforce, owner: owner as unknown as OwnerDesk, paseo, env: { opsRepo: dir, sckBin: 'sck', paseoBin: 'paseo' }, rand: () => 0 });
+  // 正常归档走真实入口：评审人实例绑定 Paseo 代理 → 代理被归档（名册消失、status=archived）→ tick 退役。
+  const archived = await lifecycleApproval('realarch');
+  await workforce.bind(archived.reviewerId, { agentId: 'agent-realarch', cwd: dir });
+  agentsMap.set('agent-realarch', { id: 'agent-realarch', status: 'idle' });
+  await paseo.archive('agent-realarch');
+  await dispatcher.tick();
+  const [kindRow] = await database.db.query<[Array<{ retired_kind: string }>]>('SELECT retired_kind FROM $e;', { e: new RecordId('employee', archived.reviewerId) });
+  expect(kindRow?.[0]?.retired_kind).toBe('archive');
+  expect(await lifecycleDiagnose(archived)).toMatchObject({ failure: 'none', allApplicableChecksMatch: true, checks: { reviewerNotRevoked: { matched: true }, reviewerNotRetired: { matched: true } } });
+  expect(await lifecycleProve(archived, 'realarch-enable')).toMatchObject({ paidCallsAllowed: 1 });
+  // 崩溃会话不是正常结束：error 状态仍按 failure 退役，批准 fail closed，零产品写入。
+  const crashed = await lifecycleApproval('realcrash');
+  await workforce.bind(crashed.reviewerId, { agentId: 'agent-realcrash', cwd: dir });
+  agentsMap.set('agent-realcrash', { id: 'agent-realcrash', status: 'error' });
+  const requestsBefore = world.requests.length, writesBefore = writes(), deliveredBefore = delivered;
+  await dispatcher.tick();
+  const [crashKind] = await database.db.query<[Array<{ retired_kind: string }>]>('SELECT retired_kind FROM $e;', { e: new RecordId('employee', crashed.reviewerId) });
+  expect(crashKind?.[0]?.retired_kind).toBe('failure');
+  expect(await lifecycleDiagnose(crashed)).toMatchObject({ failure: 'reviewer-revoked' });
+  await expect(lifecycleProve(crashed, 'realcrash-enable')).rejects.toBeDefined();
+  expect(delivered).toBe(deliveredBefore);
+  expect(world.requests.length).toBe(requestsBefore);
+  expect(writes()).toBe(writesBefore);
 });
