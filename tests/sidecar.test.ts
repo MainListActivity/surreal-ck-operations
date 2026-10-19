@@ -297,6 +297,32 @@ describe('sidecar', () => {
       .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
   });
 
+  test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused', async () => {
+    const i = inst('e14');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-14'));
+    // list_worktrees: null pageSize, cursor and taskId are absent, so the employee gets the legacy array for the lease task.
+    const legacy = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n1', 'list_worktrees', { pageSize: null, cursor: null, taskId: null });
+    expect(legacy.ok).toBe(true);
+    expect(Array.isArray(legacy.data)).toBe(true);
+    expect(wtCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: 'task-14' });
+    expect(pageCalls).toHaveLength(0);
+    // get_task_history: a null page size keeps the { history } shape; a null task id is refused, never read as "null".
+    const history = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n2', 'get_task_history', { taskId: 'task-14', pageSize: null, cursor: null });
+    expect(history).toMatchObject({ ok: true, data: { history: [] } });
+    const nullTask = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'get_task_history', { taskId: null });
+    expect(nullTask.ok).toBe(false);
+    expect(nullTask.error).toContain('taskId');
+    // get_context: null filters and a null task id are absent (legacy keys: this stub core has no contextView).
+    const context = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n4', 'get_context', { taskId: null, state: null, pageSize: null, cursor: null });
+    expect(context.ok).toBe(true);
+    expect(Object.keys(context.data as object).sort()).toEqual(['company', 'principal', 'tasks']);
+    // resume_task: a null task id is refused, and core never sees the string "null".
+    const resume = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n5', 'resume_task', { taskId: null });
+    expect(resume.ok).toBe(false);
+    expect(resume.error).toContain('taskId');
+  });
+
   test('ops sessions are dropped when the lease ends and when the agent is archived', async () => {
     const i = inst('e12');
     const env = pool.env(i);

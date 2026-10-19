@@ -13,9 +13,11 @@ import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts'
 import type { HistoryEntry, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import { queryDigest } from '../src/query-input.ts';
-import { RESPONSE_BUDGET_BYTES, guardRelayResponse, jsonBytes, sealCursor } from '../src/response-budget.ts';
+import { RESPONSE_BUDGET_BYTES, guardRelayResponse, jsonBytes, sealCursor, type ClaimEcho } from '../src/response-budget.ts';
 import { SnapshotStore } from '../src/snapshot-store.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { connectCompanyClient } from '../src/mcp/client';
+import { createMcpHttpService } from '../src/mcp/server';
 
 // SYS01 bounded reads on the isolated company fork started by scripts/test-worktrees.ts. Never production.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };
@@ -1191,5 +1193,37 @@ test('a delivery answers with all three legs inside one budget: each leg is cut 
     expect(leg.contextBytes).toBe(utf8(full));
     expect(leg.contextSha256).toBe(sha256(full));
     expect(Buffer.from(full, 'utf8').subarray(0, leg.contextNextOffset!).toString('utf8')).toBe(leg.context);
+  }
+});
+
+test('claim_next over MCP answers a claim whose context is over the budget: the lease comes back, the context is cut and flagged, and the whole text reassembles (SYS01, defect 1)', async () => {
+  // A claim commits before its answer is built (lease, audit, outbox, claim.json), so the answer must arrive whole, never as response_too_large.
+  const claimant = await enrollment.enroll(`qp-claim-${suffix}`, 'engineering', ['execute', 'review']);
+  const context = `认领回显 ${suffix} ` + '中'.repeat(19_000);
+  expect(utf8(context)).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+  const task = await core.createTask(gm, {
+    title: `认领回显样例 ${suffix}`, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('claim-echo'),
+  });
+  const service = createMcpHttpService({ core, port: 0 });
+  const connection = await connectCompanyClient({
+    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: claimant, clientName: 'sys01-claim-echo',
+  });
+  try {
+    const answer = await connection.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
+    expect(answer.structuredContent).toMatchObject({ ok: true });
+    const data = (answer.structuredContent as { data: ClaimEcho }).data;
+    expect(bytesOf(data)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(data).toMatchObject({ deliveryId: expect.any(String), fence: expect.any(Number), leaseExpiresAt: expect.any(String) });
+    expect(data.task).toMatchObject({ id: task.id, contextTruncated: true, contextBytes: utf8(context), contextSha256: sha256(context) });
+    expect(context.startsWith(data.task.context)).toBe(true);
+    expect(data.task.contextNextOffset).toBe(utf8(data.task.context));
+    // The lease is the one the claim committed; the rest of the text reads back whole, verified against its digest.
+    expect((await core.getTask(gm, task.id)).currentEmployee).toBe(`qp-claim-${suffix}`);
+    const whole = await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, claimant);
+    expect(whole.text).toBe(context);
+    expect(whole.sha256).toBe(sha256(context));
+  } finally {
+    await connection.close();
+    await service.close();
   }
 });

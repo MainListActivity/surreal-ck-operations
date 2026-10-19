@@ -4,7 +4,8 @@ import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
-import { jsonBytes, RESPONSE_BUDGET_BYTES } from '../response-budget';
+import { isPaged } from '../query-input';
+import { echoClaim, jsonBytes, RESPONSE_BUDGET_BYTES } from '../response-budget';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -93,20 +94,21 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const token = (ctx: { http?: { authInfo?: { token?: string } } }): Credential => ctx.http?.authInfo?.token ?? '';
 
   // SYS01: every paged read takes the same pageSize/cursor pair; the cursor is sealed to the caller and the query.
+  // null means absent on every read argument, as in core and the sidecar (same-source rule, one predicate: isPaged).
   const pageArgs = {
-    pageSize: z.number().int().min(1).max(100).optional(),
-    cursor: z.string().min(1).max(2048).optional(),
+    pageSize: z.number().int().min(1).max(100).nullish(),
+    cursor: z.string().min(1).max(2048).nullish(),
   };
   server.registerTool('get_context', {
     description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without pageSize or cursor the answer is complete (keys principal, company, tasks) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to true without paging and to false with it. A task context too large for one page is cut and flagged (contextTruncated, contextNextOffset); read the rest with read_task_text. A task read by taskId is whole or refused.',
     inputSchema: z.object({
-      taskId: z.string().min(1).max(200).optional(),
-      state: z.enum(states).optional(),
-      goalId: z.string().min(1).max(100).optional(),
-      role: z.enum(roles).optional(),
-      since: z.string().min(1).max(40).optional(),
-      includeCompany: z.boolean().optional(),
-      fields: z.array(z.string().min(1).max(60)).min(1).max(40).optional(),
+      taskId: z.string().min(1).max(200).nullish(),
+      state: z.enum(states).nullish(),
+      goalId: z.string().min(1).max(100).nullish(),
+      role: z.enum(roles).nullish(),
+      since: z.string().min(1).max(40).nullish(),
+      includeCompany: z.boolean().nullish(),
+      fields: z.array(z.string().min(1).max(60)).min(1).max(40).nullish(),
       ...pageArgs,
     }),
   }, async (input, ctx) => {
@@ -116,7 +118,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       return run(credential, async () => ({
         principal: await core.authenticate(credential),
         company: await core.companyBrief(credential),
-        tasks: input.taskId ? [await core.getTask(credential, input.taskId)] : await core.listTasks(credential, input.state),
+        tasks: input.taskId ? [await core.getTask(credential, input.taskId)] : await core.listTasks(credential, input.state ?? undefined),
       }));
     }
     return run(credential, () => core.contextView!(credential, input));
@@ -139,37 +141,37 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
     description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',
-    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), includeReleased: z.boolean().optional(), ...pageArgs }),
+    inputSchema: z.object({ taskId: z.string().min(1).max(200).nullish(), includeReleased: z.boolean().nullish(), ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => {
-    // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array shape.
-    const paged = input.pageSize !== undefined || input.cursor !== undefined;
-    if (paged && core.worktreePage) return core.worktreePage(token(ctx), input);
+    // C1 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 array shape.
+    if (isPaged(input) && core.worktreePage) return core.worktreePage(token(ctx), input);
     if (core.worktreeList) return core.worktreeList(token(ctx), input);
-    return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId) : Promise.resolve([]);
+    return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId ?? undefined) : Promise.resolve([]);
   }));
   server.registerTool('get_admin_summary', {
     description: 'gm only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
-    inputSchema: z.object({ since: z.string().min(1).max(40).optional(), goalId: z.string().min(1).max(100).optional() }),
+    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
     description: 'Read one byte segment of a task context (field context) or of one audit entry evidence (field evidence, auditId from get_task_history). Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       field: z.enum(['context', 'evidence']),
-      auditId: z.string().min(1).max(200).optional(),
-      offset: z.number().int().min(0).max(1_000_000_000).optional(),
-      limit: z.number().int().min(4).max(24576).optional(),
-      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+      auditId: z.string().min(1).max(200).nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(),
+      limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.taskText ? core.taskText(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('claim_next', {
-    description: 'Atomically claim a task from the authenticated employee queue.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional() }),
+    description: 'Atomically claim a task from the authenticated employee queue. The answer echoes the claim within the 48 KiB budget: deliveryId, fence and leaseExpiresAt always come back; a long context is cut and flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest.',
+    inputSchema: z.object({ taskId: z.string().min(1).nullish() }),
   }, async ({ taskId }, ctx) => {
     const credential = token(ctx);
     return run(credential, async () => {
-      if (taskId) return core.claim(credential, taskId);
+      // SYS01 (return of 04195c93): the claim has committed by now, so its answer is an echo; core keeps the whole claim for claim.json.
+      if (taskId) return echoClaim(await core.claim(credential, taskId));
       const principal = await core.authenticate(credential);
       const tasks = await core.listTasks(credential);
       const now = Date.now();
@@ -190,7 +192,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // The core remains the sole authority for concurrent claims and dependencies.
       for (const candidate of candidates) {
         try {
-          return await core.claim(credential, candidate.id);
+          return echoClaim(await core.claim(credential, candidate.id));
         } catch (error) {
           if (typeof error !== 'object' || error === null || !('code' in error) ||
             !['conflict', 'already_claimed', 'worktree_busy'].includes(String(error.code))) throw error;
@@ -270,9 +272,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
     description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Without pageSize or cursor it returns the complete history, oldest first, or response_too_large with retry guidance when it does not fit the 48 KiB budget (retry with pageSize 10, then cursor set to page.nextCursor). With pageSize or cursor, newest entries come first in pages that fit the budget; each page is returned oldest first. Evidence too large for a page is cut and flagged (evidenceTruncated, evidenceNextOffset), with evidenceBytes and evidenceSha256; read the full text with read_task_text (field evidence, auditId).',
     inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => {
-    // C2 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 bare array, complete or refused.
-    const paged = input.pageSize !== undefined || input.cursor !== undefined;
-    if (paged && core.historyView) return core.historyView(token(ctx), input.taskId, input);
+    // C2 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 bare array, complete or refused.
+    if (isPaged(input) && core.historyView) return core.historyView(token(ctx), input.taskId, input);
     return core.history(token(ctx), input.taskId);
   }));
 

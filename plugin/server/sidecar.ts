@@ -15,6 +15,7 @@ import { serviceHome } from "./env";
 import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
+import { isPaged, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -562,10 +563,12 @@ export class SidecarPool {
     switch (tool) {
       case "list_worktrees": {
         // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。SYS01：分页、紧凑引用。
+        // null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId，不把 null 变成 "null"。
         const actor = await core.authenticate(cred);
-        const scope = args.taskId !== undefined ? String(args.taskId) : actor.role === "gm" ? undefined : live().taskId;
+        const requested = parseWorktreeInput(args).taskId;
+        const scope = requested !== undefined ? requested : actor.role === "gm" ? undefined : live().taskId;
         // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
-        if ((args.pageSize !== undefined || args.cursor !== undefined) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
+        if (isPaged(args) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
         if (core.worktreeList) return core.worktreeList(cred, { ...args, taskId: scope });
         // Cores that predate SYS01 keep the old unpaged array.
         if (!core.listWorktrees) return [];
@@ -586,12 +589,14 @@ export class SidecarPool {
         return {
           principal: await core.authenticate(cred),
           company: await core.companyBrief(cred),
-          tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, args.state as never),
+          tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, (args.state ?? undefined) as never),
         };
-      case "get_task_history":
-        // C2 default: without pageSize or cursor the complete history (or response_too_large), in the pre-SYS01 { history } shape of this channel.
-        if ((args.pageSize !== undefined || args.cursor !== undefined) && core.historyView) return core.historyView(cred, String(args.taskId), args);
-        return { history: await core.history(cred, String(args.taskId)) };
+      case "get_task_history": {
+        // C2 default: without pageSize or cursor (null counts as absent) the complete history, or response_too_large, in the pre-SYS01 { history } shape of this channel.
+        const taskId = taskIdOf(args.taskId);
+        if (isPaged(args) && core.historyView) return core.historyView(cred, taskId, args);
+        return { history: await core.history(cred, taskId) };
+      }
       case "get_admin_summary": return core.adminSummary
         ? core.adminSummary(cred, args)
         : Promise.reject(Object.assign(new Error("core does not expose get_admin_summary"), { code: "temporarily_unavailable" }));
@@ -608,7 +613,7 @@ export class SidecarPool {
       case "create_delivery": return core.createDelivery(cred, args as never);
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      case "resume_task": return core.resume(cred, String(args.taskId), evidence());
+      case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
       case "retire_task": return core.retireTask(cred, args as never);
       case "task_project_update": return core.taskProjectUpdate

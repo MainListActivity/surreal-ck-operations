@@ -2,6 +2,7 @@
 // bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
 // multi-byte characters. Pure helpers only: no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import type { ClaimResult, ProjectView, TaskView } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
@@ -132,6 +133,84 @@ export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number
   // A context that is already cut stays cut: the rest of the text is not in this value.
   if (task.contextTruncated !== true && jsonBytes(echo(task.context, false)) <= limit) return echo(task.context, false);
   return echo(longestFittingPrefix(task.context, prefix => jsonBytes(echo(prefix, true)) <= limit), true);
+}
+
+// ---- Claim echo: the answer of claim_next. The claim has committed when its answer is built, so the answer is an echo, never an error. ----
+
+/** A claim's project over this many bytes is echoed in part (see echoClaim); the whole project stays in claim.json and get_context. */
+export const PROJECT_ECHO_BYTES = 8 * 1024;
+/** The least context a task keeps in a claim echo beyond its own fields. Below it the handover history is left out, and historyComplete turns false. */
+export const CLAIM_TASK_MIN_BYTES = 4 * 1024;
+/** The most bytes one list of a claim echo keeps: the dependencies, and the intent paths of the task and of its worktree. */
+export const CLAIM_LIST_ECHO_BYTES = 4 * 1024;
+const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 'rollback', 'pipeline'] as const;
+
+export type ClaimListName = 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+/** A list that a claim echo cut: its whole count, and the SHA-256 of its whole JSON. claim.json keeps the list whole. */
+export interface ListCut { count: number; sha256: string }
+
+/**
+ * A claim as an MCP caller receives it. task.worktree is left out: the worktree is the top-level field. projectTruncated marks a
+ * partial project, and listsTruncated names each list that was cut (absent when every list is whole).
+ */
+export interface ClaimEcho extends Omit<ClaimResult, 'project'> {
+  project?: Partial<ProjectView>;
+  projectTruncated?: boolean;
+  projectBytes?: number;
+  projectSha256?: string;
+  listsTruncated?: Partial<Record<ClaimListName, ListCut>>;
+}
+
+/** A list within CLAIM_LIST_ECHO_BYTES is kept whole. A longer one keeps its longest prefix, and `cuts` records its count and digest. */
+function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>): T[] {
+  if (jsonBytes(items) <= CLAIM_LIST_ECHO_BYTES) return [...items];
+  cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
+  return items.slice(0, fitCount(items, kept => kept, CLAIM_LIST_ECHO_BYTES));
+}
+
+/**
+ * The echo of a claim (SYS01, return of 04195c93). The claim has committed, so the echo never fails: deliveryId, fence and
+ * leaseExpiresAt always come back, and each variable part is bounded and says so. The handover window (16 KiB, see core) is left
+ * out when the task could not keep CLAIM_TASK_MIN_BYTES of context beside it; predecessors are at most six. Each list is cut to
+ * CLAIM_LIST_ECHO_BYTES: the dependencies, the task's intent paths and the worktree's intent paths. The project is echoed whole up
+ * to PROJECT_ECHO_BYTES, else by identity, else not at all. The task keeps what the other fields leave: a long context is cut and
+ * flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest. The remaining fixed fields are bounded at
+ * create time (title 200 characters, goal 100, context 20,000) or are identifiers and paths. core.claim keeps the whole claim for
+ * claim.json.
+ */
+export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
+  const { task: whole, project, ...fields } = claim;
+  const cuts: Partial<Record<ClaimListName, ListCut>> = {};
+  // task.worktree is the same assignment as the top-level worktree, so the echo carries it once.
+  const task: TaskView = { ...whole, dependencies: cutList(whole.dependencies, 'dependencies', cuts) };
+  delete task.worktree;
+  if (whole.workIntent?.paths) task.workIntent = { ...whole.workIntent, paths: cutList(whole.workIntent.paths, 'workIntentPaths', cuts) };
+  let head: Omit<ClaimEcho, 'task'> = { ...fields };
+  if (fields.worktree?.intent.paths) {
+    head.worktree = { ...fields.worktree, intent: { ...fields.worktree.intent, paths: cutList(fields.worktree.intent.paths, 'worktreePaths', cuts) } };
+  }
+  if (project !== undefined) {
+    const bytes = jsonBytes(project);
+    if (bytes <= PROJECT_ECHO_BYTES) {
+      head = { ...head, project };
+    } else {
+      const identity = Object.fromEntries(PROJECT_IDENTITY.filter(key => key in project).map(key => [key, project[key]])) as Partial<ProjectView>;
+      head = {
+        ...head,
+        ...(jsonBytes(identity) <= PROJECT_ECHO_BYTES ? { project: identity } : {}),
+        projectTruncated: true, projectBytes: bytes,
+        projectSha256: createHash('sha256').update(JSON.stringify(project)).digest('hex'),
+      };
+    }
+  }
+  if (Object.keys(cuts).length > 0) head = { ...head, listsTruncated: cuts };
+  // Room for the task: the budget less the other fields, measured with the task as null (4 bytes) and then swapped for the echo.
+  const room = (value: Omit<ClaimEcho, 'task'>) => RESPONSE_BUDGET_BYTES - (jsonBytes({ ok: true, data: { ...value, task: null } }) - 4);
+  // The task's own fields (title, intent, dependencies) are never cut. The history leaves first when the task could not keep
+  // CLAIM_TASK_MIN_BYTES of context beside its own fields.
+  const floor = jsonBytes(echoTaskContext(task, 0));
+  if (room(head) < floor + CLAIM_TASK_MIN_BYTES && head.history.length > 0) head = { ...head, history: [], historyComplete: false };
+  return { ...head, task: echoTaskContext(task, room(head)) };
 }
 
 // ---- Cursors: opaque, sealed with an HMAC, bound to a caller, a query and a stored listing, and time-limited. ----

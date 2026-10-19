@@ -19,7 +19,8 @@ const core = {
   async companyBrief() { return { directions: [], goals: [], paused: false }; },
   async listTasks() { return [task]; },
   async getTask() { return task; },
-  async claim() { return { task: { ...task, state: 'doing' as const, version: 2 }, deliveryId: 'delivery-1', fence: 1, leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() }; },
+  async claim() { return { task: { ...task, state: 'doing' as const, version: 2 }, deliveryId: 'delivery-1', fence: 1, leaseExpiresAt: new Date(Date.now() + 600_000).toISOString(), history: [] }; },
+  async history() { return []; },
   async createTask() { throw { code: 'forbidden' }; },
 } as unknown as CompanyCore;
 
@@ -58,6 +59,20 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     active = false;
     await expect(connection.client.callTool({ name: 'get_context', arguments: {} })).rejects.toThrow();
     active = true;
+  } finally { await connection.close(); }
+});
+
+test('null is absent on every MCP read argument, as in core and the sidecar (SYS01, defect 2)', async () => {
+  const connection = await connectCompanyClient({ url, credential: 'sck_valid', clientName: 'null-args-test' });
+  try {
+    const context = await connection.client.callTool({ name: 'get_context', arguments: {
+      taskId: null, state: null, goalId: null, role: null, since: null, includeCompany: null, fields: null, pageSize: null, cursor: null,
+    } });
+    expect(context.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' }, tasks: [task] } });
+    const worktrees = await connection.client.callTool({ name: 'list_worktrees', arguments: { taskId: null, includeReleased: null, pageSize: null, cursor: null } });
+    expect(worktrees.structuredContent).toEqual({ ok: true, data: [] });
+    const history = await connection.client.callTool({ name: 'get_task_history', arguments: { taskId: 'task-test', pageSize: null, cursor: null } });
+    expect(history.structuredContent).toEqual({ ok: true, data: [] });
   } finally { await connection.close(); }
 });
 

@@ -38,6 +38,17 @@ function optionalText(value: unknown, name: string, max: number): string | undef
   return value;
 }
 
+/**
+ * A required task id (get_task_history). null is not an id: it is refused, as a missing one is. Every layer that reads
+ * a task id from arguments (MCP schema, sidecar, core) takes the same rule, so null never becomes the string "null".
+ */
+export function taskIdOf(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200) {
+    throw invalid('taskId is required: a non-empty string up to 200 characters');
+  }
+  return value;
+}
+
 function optionalBoolean(value: unknown, name: string): boolean | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'boolean') throw invalid(`${name} must be true or false`);
