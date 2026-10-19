@@ -264,10 +264,12 @@ describe('sidecar', () => {
     const env = pool.env(i);
     await pool.claim(i, task('task-13'));
 
-    // 员工缺省：当前租约任务；显式 taskId 原样透传
-    const scoped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w1', 'list_worktrees', {});
-    expect(scoped.ok).toBe(true);
-    expect(wtCalls[0]).toEqual({ cred: 'tok-e13', taskId: 'task-13' });
+    // R8（GM 裁定 v25）：员工缺省不再回退到当前租约任务。改动原因：旧断言要求缺省回退到 task-13，与 core 的
+    // 「非 gm 且无 taskId 即 forbidden」相反。通道只把缺省 taskId 以 undefined 交给 core，由 core 判定拒绝；
+    // 本桩 core 不拒绝，所以这里只断言通道没有注入租约任务。显式 taskId 原样透传。
+    const unscoped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w1', 'list_worktrees', {});
+    expect(unscoped.ok).toBe(true);
+    expect(wtCalls[0]).toEqual({ cred: 'tok-e13', taskId: undefined });
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w2', 'list_worktrees', { taskId: 'task-other' });
     expect(wtCalls[1]).toEqual({ cred: 'tok-e13', taskId: 'task-other' });
 
@@ -297,16 +299,20 @@ describe('sidecar', () => {
       .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
   });
 
-  test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused', async () => {
+  test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused for get_task_history and resume_task', async () => {
     const i = inst('e14');
     const env = pool.env(i);
     await pool.claim(i, task('task-14'));
-    // list_worktrees: null pageSize, cursor and taskId are absent, so the employee gets the legacy array for the lease task.
+    // list_worktrees (R8): null pageSize, cursor and taskId are absent, so the call is unscoped (core refuses a non-gm).
+    // It never falls back to the lease task, and the null never reaches core as the string "null".
     const legacy = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n1', 'list_worktrees', { pageSize: null, cursor: null, taskId: null });
     expect(legacy.ok).toBe(true);
     expect(Array.isArray(legacy.data)).toBe(true);
-    expect(wtCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: 'task-14' });
+    expect(wtCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: undefined });
     expect(pageCalls).toHaveLength(0);
+    // A null task id with a real page size is paged and still unscoped: null taskId is absent, pageSize 5 is the paged branch.
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n6', 'list_worktrees', { taskId: null, pageSize: 5 });
+    expect(pageCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: undefined, pageSize: 5 });
     // get_task_history: a null page size keeps the { history } shape; a null task id is refused, never read as "null".
     const history = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n2', 'get_task_history', { taskId: 'task-14', pageSize: null, cursor: null });
     expect(history).toMatchObject({ ok: true, data: { history: [] } });

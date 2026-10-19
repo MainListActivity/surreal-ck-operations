@@ -153,10 +153,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
-    description: 'Read one byte segment of a task context (field context) or of one audit entry evidence (field evidence, auditId from get_task_history). Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
+    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or gm only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
-      field: z.enum(['context', 'evidence']),
+      field: z.enum(['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths']),
       auditId: z.string().min(1).max(200).nullish(),
       offset: z.number().int().min(0).max(1_000_000_000).nullish(),
       limit: z.number().int().min(4).max(24576).nullish(),
@@ -203,9 +203,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
   });
 
   server.registerTool('heartbeat', {
-    description: 'Extend the current delivery lease using the core server clock.',
+    description: 'Extend the current delivery lease using the core server clock. The answer echoes the task within the 48 KiB budget (deliveryId, fence and leaseExpiresAt always come back); a long context is cut and flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest.',
     inputSchema: z.object(proofShape),
-  }, async (input, ctx) => run(token(ctx), () => core.heartbeat(token(ctx), proof(input))));
+  }, async (input, ctx) => run(token(ctx), async () => echoClaim(await core.heartbeat(token(ctx), proof(input)))));
 
   server.registerTool('checkpoint', {
     description: 'Record resumable progress for the current delivery. Limited to a few per task per holder (checkpoint_limit); use heartbeat for liveness and merge progress notes.',

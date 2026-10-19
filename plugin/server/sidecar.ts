@@ -562,11 +562,9 @@ export class SidecarPool {
     }
     switch (tool) {
       case "list_worktrees": {
-        // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。SYS01：分页、紧凑引用。
-        // null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId，不把 null 变成 "null"。
-        const actor = await core.authenticate(cred);
-        const requested = parseWorktreeInput(args).taskId;
-        const scope = requested !== undefined ? requested : actor.role === "gm" ? undefined : live().taskId;
+        // R8：不带 taskId 即全局库存，只有 gm 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
+        // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId。
+        const scope = parseWorktreeInput(args).taskId;
         // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
         if (isPaged(args) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
         if (core.worktreeList) return core.worktreeList(cred, { ...args, taskId: scope });
@@ -634,7 +632,7 @@ export class SidecarPool {
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。
-        const taskId = args.taskId !== undefined ? String(args.taskId) : live().taskId;
+        const taskId = args.taskId !== undefined && args.taskId !== null ? String(args.taskId) : live().taskId;
         const { publishDeliverables } = await import("./vendor/src/deliverables.ts");
         return publishDeliverables({
           home: serviceHome(), taskId,

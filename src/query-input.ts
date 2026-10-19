@@ -132,14 +132,17 @@ export function parseWorktreeInput(input: Record<string, unknown>): {
   };
 }
 
-export const TEXT_FIELDS = ['context', 'evidence'] as const;
+/** Texts read_task_text returns. The list fields are the task's lists that a claim echo may cut (SYS01 R3). */
+export const TEXT_FIELDS = ['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths'] as const;
 export function parseTextInput(input: Record<string, unknown>): {
   taskId: string; field: (typeof TEXT_FIELDS)[number]; auditId?: string; offset: number; limit: number; expectSha256?: string;
 } {
   const taskId = optionalText(input.taskId, 'taskId', 200);
   if (!taskId) throw invalid('taskId is required');
   const field = input.field;
-  if (typeof field !== 'string' || !(TEXT_FIELDS as readonly string[]).includes(field)) throw invalid('field must be context or evidence');
+  if (typeof field !== 'string' || !(TEXT_FIELDS as readonly string[]).includes(field)) {
+    throw invalid(`field must be one of ${TEXT_FIELDS.join(', ')}`);
+  }
   const offset = input.offset === undefined || input.offset === null ? 0 : input.offset;
   if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0 || offset > 1e9) throw invalid('offset must be a non-negative integer');
   const limit = input.limit === undefined || input.limit === null ? undefined : input.limit;

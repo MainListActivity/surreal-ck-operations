@@ -234,9 +234,10 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
     id: 'proj', name: '项目', repoPath: '/repos/proj', defaultBranch: 'main', release: 'merge, then CI deploys',
     redLines: ['no secrets in evidence'], runbooks: [], envs: [], ...extra,
   });
-  const entry = (index: number): HistoryEntry => ({
+  // A whole entry as core returns it: the evidence is complete, with its size and digest (2,040 bytes at 680 characters).
+  const entry = (index: number, text = '证'.repeat(680)): HistoryEntry => ({
     auditId: `audit-${index}`, action: 'checkpoint', actor: 'eng-01', version: index, at: '2026-10-19T18:00:00.000Z',
-    evidence: '证'.repeat(680), evidenceTruncated: true,
+    evidence: text, evidenceBytes: utf8(text), evidenceSha256: sha256(text),
   });
   const claimWith = (context: string, claim: Partial<ClaimResult> = {}, task: Partial<TaskView> = {}): ClaimResult => ({
     task: {
@@ -267,22 +268,30 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
     const context = '甲'.repeat(19_000);
     const echo = echoClaim(claimWith(context, { history: Array.from({ length: 6 }, (_, i) => entry(i)), project: project() }));
     expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z', historyComplete: true });
-    expect(echo.history).toHaveLength(6);
+    expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z' });
+    // The context takes the room beside an 8 KiB history floor: the newest entries fill that floor, and the count shows what was left out.
+    expect(echo.history.length).toBeGreaterThanOrEqual(3);
+    expect(echo.history.length).toBeLessThan(6);
+    expect(echo.history.at(-1)).toMatchObject({ auditId: 'audit-5' });
+    expect(echo.historyComplete).toBe(false);
     expect(echo.task).toMatchObject({ contextTruncated: true, contextBytes: utf8(context), contextSha256: sha256(context) });
     expect(context.startsWith(echo.task.context)).toBe(true);
     expect(echo.task.contextNextOffset).toBe(utf8(echo.task.context));
     expect(Buffer.from(context, 'utf8').subarray(echo.task.contextNextOffset!).toString('utf8')).toBe(context.slice(echo.task.context.length));
   });
 
-  test('a project over PROJECT_ECHO_BYTES is echoed by identity with its size and digest; an identity over the cap is not echoed', () => {
+  test('a project over PROJECT_ECHO_BYTES is echoed in part: identity and the red lines stay, long text is capped; size and digest describe the whole project (SYS01 R3)', () => {
     const large = project({ notes: '注'.repeat(5_000), runbooks: Array.from({ length: 40 }, (_, i) => `runbook-${i}-${'r'.repeat(200)}`) });
     expect(jsonBytes(large)).toBeGreaterThan(PROJECT_ECHO_BYTES);
     const echo = echoClaim(claimWith('短正文', { project: large }));
-    expect(echo.project).toEqual({ id: 'proj', name: '项目', repoPath: '/repos/proj', defaultBranch: 'main', release: 'merge, then CI deploys' });
+    // The red lines are not dropped to make room for the identity: the project was over the cap, so the echo is flagged partial.
+    expect(echo.project).toEqual({
+      id: 'proj', name: '项目', repoPath: '/repos/proj', defaultBranch: 'main', release: 'merge, then CI deploys', redLines: ['no secrets in evidence'],
+    });
     expect(echo).toMatchObject({ projectTruncated: true, projectBytes: jsonBytes(large), projectSha256: sha256(JSON.stringify(large)) });
     const huge = echoClaim(claimWith('短正文', { project: project({ release: 'r'.repeat(PROJECT_ECHO_BYTES + 1) }) }));
-    expect(huge.project).toBeUndefined();
+    expect(huge.project).toMatchObject({ id: 'proj', redLines: ['no secrets in evidence'] });
+    expect(huge.project!.release!.length).toBeLessThan(PROJECT_ECHO_BYTES);
     expect(huge).toMatchObject({ projectTruncated: true, deliveryId: 'delivery-claim' });
     expect(envelope(huge)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   });
@@ -326,11 +335,76 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
     expect(Object.keys(echo.listsTruncated ?? {}).sort()).toEqual(['dependencies', 'workIntentPaths', 'worktreePaths']);
   });
 
-  test('history over the room left by the other fields is left out (historyComplete turns false); the lease and the task stay whole', () => {
-    // Core keeps the handover window at 16 KiB, so this is beyond any real claim: the echo still answers, as a safety net.
-    const echo = echoClaim(claimWith('短正文', { history: Array.from({ length: 30 }, (_, i) => entry(i)) }));
+  test('history fills the room the other fields leave: the newest entries that fit are kept whole, the boundary entry is cut, and the count says what is missing (SYS01 R3)', () => {
+    // Forty checkpoints of about 2 KiB each: a fixed 16 KiB window would keep seven of them.
+    const history = Array.from({ length: 40 }, (_, i) => entry(i));
+    const echo = echoClaim(claimWith('短正文', { history, historyComplete: false, historyCount: 40 }));
     expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, historyComplete: false, history: [] });
-    expect(echo.task).toMatchObject({ context: '短正文', contextTruncated: false });
+    expect(echo.history.length).toBeGreaterThan(16);
+    expect(jsonBytes(echo.history)).toBeGreaterThan(40 * 1024);
+    expect(echo.history.at(-1)).toEqual(entry(39));
+    expect(echo).toMatchObject({ historyComplete: false, historyCount: 40 });
+    // The kept entries are the newest, oldest first, with no repeats.
+    const ids = echo.history.map(item => Number(item.auditId?.slice('audit-'.length)));
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.at(-1)).toBe(39);
+  });
+
+  test('one entry over 2 KiB is not held to a 2 KiB preview: it keeps the room it can, cut at a character boundary, with its whole size and digest (SYS01 R3)', () => {
+    const text = '证'.repeat(30_000);
+    const echo = echoClaim(claimWith('短正文', { history: [entry(1, text)], historyComplete: true, historyCount: 1 }));
+    expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const [kept] = echo.history;
+    expect(kept).toMatchObject({ auditId: 'audit-1', evidenceTruncated: true, evidenceBytes: utf8(text), evidenceSha256: sha256(text) });
+    expect(utf8(kept!.evidence!)).toBeGreaterThan(40 * 1024);
+    expect(text.startsWith(kept!.evidence!)).toBe(true);
+    expect(kept!.evidenceNextOffset).toBe(utf8(kept!.evidence!));
+    expect(Buffer.from(text, 'utf8').subarray(kept!.evidenceNextOffset!).toString('utf8')).toBe(text.slice(kept!.evidence!.length));
+    expect(echo.historyComplete).toBe(false);
+  });
+
+  test('historyComplete is true only when every entry is kept whole and the count agrees with what was read', () => {
+    const three = [entry(1), entry(2), entry(3)];
+    expect(echoClaim(claimWith('短正文', { history: three, historyComplete: true, historyCount: 3 })).historyComplete).toBe(true);
+    expect(echoClaim(claimWith('短正文', { history: three, historyComplete: true, historyCount: 5 })).historyComplete).toBe(false);
+    expect(echoClaim(claimWith('短正文', { history: three, historyComplete: false, historyCount: 3 })).historyComplete).toBe(false);
+  });
+
+  test('a claim that read no history (a heartbeat echo) carries no historyComplete flag, so nothing claims the history was read', () => {
+    const echo = echoClaim(claimWith('短正文', { history: [], historyComplete: undefined }));
+    expect(echo.historyComplete).toBeUndefined();
+    expect(JSON.stringify(echo)).not.toContain('historyComplete');
+  });
+
+  test('history keeps an 8 KiB floor beside a long context, so a long context never empties the handover (SYS01 R3)', () => {
+    const history = Array.from({ length: 20 }, (_, i) => entry(i));
+    const echo = echoClaim(claimWith('甲'.repeat(19_000), { history, historyCount: 20, historyComplete: true }));
+    expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(echo.task.contextTruncated).toBe(true);
+    expect(jsonBytes(echo.history)).toBeGreaterThanOrEqual(7 * 1024);
+    expect(echo.history.length).toBeLessThan(20);
+    expect(echo.history.at(-1)?.auditId).toBe('audit-19');
+  });
+
+  test('whatever the sizes, the echo of a committed claim stays within the budget and keeps its lease fields (seeded sweep, SYS01 R3)', () => {
+    let seed = 20261019;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let round = 0; round < 60; round++) {
+      const context = '甲🙂'.repeat(next(9_000));
+      const history = Array.from({ length: next(45) }, (_, i) => entry(i, '证'.repeat(next(12_000))));
+      const dependencies = Array.from({ length: next(300) }, (_, i) => `task-${i}-${'d'.repeat(next(150))}`);
+      const paths = Array.from({ length: next(51) }, (_, i) => `${i}-${'路'.repeat(next(300))}`);
+      const worktree = worktreeOf(paths);
+      const echo = echoClaim(claimWith(context, {
+        worktree, history, historyCount: history.length + next(100), historyComplete: true,
+        predecessors: [], project: project({ release: '版'.repeat(next(9_000)), notes: '注'.repeat(next(20_000)) }),
+      }, { dependencies, workIntent: { kind: 'assets', paths }, worktree }));
+      expect(envelope(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      expect(echo).toMatchObject({ deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z' });
+    }
   });
 });

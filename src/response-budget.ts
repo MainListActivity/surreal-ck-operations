@@ -2,7 +2,7 @@
 // bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
 // multi-byte characters. Pure helpers only: no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import type { ClaimResult, ProjectView, TaskView } from './contracts.ts';
+import type { ClaimResult, HistoryEntry, ProjectView, TaskView } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
@@ -139,8 +139,15 @@ export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number
 
 /** A claim's project over this many bytes is echoed in part (see echoClaim); the whole project stays in claim.json and get_context. */
 export const PROJECT_ECHO_BYTES = 8 * 1024;
-/** The least context a task keeps in a claim echo beyond its own fields. Below it the handover history is left out, and historyComplete turns false. */
-export const CLAIM_TASK_MIN_BYTES = 4 * 1024;
+/**
+ * The least room the handover history keeps beside a long context (SYS01 R3). The context takes what the history leaves, so a
+ * long context cannot empty the handover: the newest entries fill this floor first, and the boundary entry keeps what fits.
+ */
+export const CLAIM_HISTORY_FLOOR_BYTES = 8 * 1024;
+/** Most bytes of each identity text of a partial project echo. The red lines keep the room that is left. */
+export const PROJECT_FIELD_ECHO_BYTES = 512;
+/** Most bytes of one red line in a partial project echo. */
+export const RED_LINE_ECHO_BYTES = 1024;
 /** The most bytes one list of a claim echo keeps: the dependencies, and the intent paths of the task and of its worktree. */
 export const CLAIM_LIST_ECHO_BYTES = 4 * 1024;
 const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 'rollback', 'pipeline'] as const;
@@ -169,48 +176,103 @@ function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Reco
 }
 
 /**
- * The echo of a claim (SYS01, return of 04195c93). The claim has committed, so the echo never fails: deliveryId, fence and
- * leaseExpiresAt always come back, and each variable part is bounded and says so. The handover window (16 KiB, see core) is left
- * out when the task could not keep CLAIM_TASK_MIN_BYTES of context beside it; predecessors are at most six. Each list is cut to
+ * Keeps the newest entries that fit `budget` bytes of JSON, oldest first. The entry at the boundary keeps the longest prefix of its
+ * evidence that fits; older entries are left out after it. `cut` is true when that prefix is partial.
+ */
+function fillHistory(entries: readonly HistoryEntry[], budget: number): { kept: HistoryEntry[]; cut: boolean } {
+  const kept: HistoryEntry[] = [];
+  let used = 2; // the array brackets
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!;
+    const comma = kept.length > 0 ? 1 : 0;
+    const size = jsonBytes(entry);
+    if (used + comma + size <= budget) {
+      kept.unshift(entry);
+      used += comma + size;
+      continue;
+    }
+    // Only whole evidence can be cut here: the size and digest of the whole text travel with the prefix.
+    if (entry.evidence === undefined || entry.evidenceTruncated === true) break;
+    const whole = entry.evidence;
+    const bytes = entry.evidenceBytes ?? utf8Bytes(whole);
+    const digest = entry.evidenceSha256 ?? createHash('sha256').update(whole).digest('hex');
+    const cutEntry = (text: string): HistoryEntry => ({
+      ...entry, evidence: text, evidenceBytes: bytes, evidenceSha256: digest, evidenceTruncated: true, evidenceNextOffset: utf8Bytes(text),
+    });
+    const room = budget - used - comma;
+    const prefix = longestFittingPrefix(whole, text => jsonBytes(cutEntry(text)) <= room);
+    if (prefix.length === 0) break;
+    kept.unshift(cutEntry(prefix));
+    return { kept, cut: true };
+  }
+  return { kept, cut: false };
+}
+
+/**
+ * The partial echo of a project over PROJECT_ECHO_BYTES: identity texts capped, then as many red lines as fit beside them.
+ * The red lines are never dropped for the identity. The project's size and digest describe the whole project.
+ */
+function partialProject(project: ProjectView): Partial<ProjectView> {
+  const identity: Record<string, unknown> = {};
+  for (const key of PROJECT_IDENTITY) {
+    if (!(key in project)) continue;
+    const value = project[key];
+    identity[key] = typeof value === 'string' ? utf8Prefix(value, PROJECT_FIELD_ECHO_BYTES).text : value;
+  }
+  const lines = (project.redLines ?? []).map(line => utf8Prefix(line, RED_LINE_ECHO_BYTES).text);
+  const room = Math.max(0, PROJECT_ECHO_BYTES - jsonBytes(identity));
+  return { ...identity, redLines: lines.slice(0, fitCount(lines, kept => kept, room)) } as Partial<ProjectView>;
+}
+
+/**
+ * The echo of a claim (SYS01, return of 04195c93, R3). The claim has committed, so the echo never fails: deliveryId, fence and
+ * leaseExpiresAt always come back, and each variable part is bounded and says so. Predecessors are at most six. Each list is cut to
  * CLAIM_LIST_ECHO_BYTES: the dependencies, the task's intent paths and the worktree's intent paths. The project is echoed whole up
- * to PROJECT_ECHO_BYTES, else by identity, else not at all. The task keeps what the other fields leave: a long context is cut and
- * flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest. The remaining fixed fields are bounded at
- * create time (title 200 characters, goal 100, context 20,000) or are identifiers and paths. core.claim keeps the whole claim for
- * claim.json.
+ * to PROJECT_ECHO_BYTES, else in part (identity, red lines; projectTruncated). The history fills what the other fields leave: the
+ * newest entries that fit are kept whole, the boundary entry keeps its longest prefix, and historyCount says how many entries the
+ * task holds. historyComplete is true only when every entry is kept whole and the count agrees. The context takes the room that is
+ * left: a cut context is flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest. core.claim keeps the
+ * whole claim for claim.json.
  */
 export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
-  const { task: whole, project, ...fields } = claim;
+  const { task: whole, project, history, historyComplete, historyCount, ...fields } = claim;
   const cuts: Partial<Record<ClaimListName, ListCut>> = {};
   // task.worktree is the same assignment as the top-level worktree, so the echo carries it once.
   const task: TaskView = { ...whole, dependencies: cutList(whole.dependencies, 'dependencies', cuts) };
   delete task.worktree;
   if (whole.workIntent?.paths) task.workIntent = { ...whole.workIntent, paths: cutList(whole.workIntent.paths, 'workIntentPaths', cuts) };
-  let head: Omit<ClaimEcho, 'task'> = { ...fields };
+  let head: Omit<ClaimEcho, 'task' | 'history'> = { ...fields };
   if (fields.worktree?.intent.paths) {
     head.worktree = { ...fields.worktree, intent: { ...fields.worktree.intent, paths: cutList(fields.worktree.intent.paths, 'worktreePaths', cuts) } };
   }
   if (project !== undefined) {
     const bytes = jsonBytes(project);
-    if (bytes <= PROJECT_ECHO_BYTES) {
-      head = { ...head, project };
-    } else {
-      const identity = Object.fromEntries(PROJECT_IDENTITY.filter(key => key in project).map(key => [key, project[key]])) as Partial<ProjectView>;
-      head = {
-        ...head,
-        ...(jsonBytes(identity) <= PROJECT_ECHO_BYTES ? { project: identity } : {}),
-        projectTruncated: true, projectBytes: bytes,
+    head = bytes <= PROJECT_ECHO_BYTES
+      ? { ...head, project }
+      : {
+        ...head, project: partialProject(project), projectTruncated: true, projectBytes: bytes,
         projectSha256: createHash('sha256').update(JSON.stringify(project)).digest('hex'),
       };
-    }
   }
   if (Object.keys(cuts).length > 0) head = { ...head, listsTruncated: cuts };
-  // Room for the task: the budget less the other fields, measured with the task as null (4 bytes) and then swapped for the echo.
-  const room = (value: Omit<ClaimEcho, 'task'>) => RESPONSE_BUDGET_BYTES - (jsonBytes({ ok: true, data: { ...value, task: null } }) - 4);
-  // The task's own fields (title, intent, dependencies) are never cut. The history leaves first when the task could not keep
-  // CLAIM_TASK_MIN_BYTES of context beside its own fields.
-  const floor = jsonBytes(echoTaskContext(task, 0));
-  if (room(head) < floor + CLAIM_TASK_MIN_BYTES && head.history.length > 0) head = { ...head, history: [], historyComplete: false };
-  return { ...head, task: echoTaskContext(task, room(head)) };
+  // Only a claim that read the history carries the history flags; a heartbeat reads none and carries neither.
+  const read = historyComplete !== undefined;
+  const flags: Partial<Pick<ClaimEcho, 'historyCount' | 'historyComplete'>> = {
+    ...(historyCount !== undefined ? { historyCount } : {}),
+    ...(read ? { historyComplete: false } : {}),
+  };
+  // Room for history and task together: the budget less everything else, measured with both as placeholders ([] and null).
+  // The placeholder false is wider than true, so the measure never undershoots the final answer.
+  const shell = jsonBytes({ ok: true, data: { ...head, ...flags, history: [], task: null } });
+  const room = RESPONSE_BUDGET_BYTES - shell + 6;
+  // The history takes what the whole context would leave, but never less than its floor. A long context is cut to what remains.
+  const budget = Math.min(room, Math.max(CLAIM_HISTORY_FLOOR_BYTES, room - jsonBytes(echoTaskContext(task, Number.POSITIVE_INFINITY))));
+  const { kept, cut } = fillHistory(history, budget);
+  // The task's own fields (title, intent, dependencies) are never cut; only its context is.
+  const echoed = echoTaskContext(task, room - jsonBytes(kept));
+  const count = historyCount ?? history.length;
+  const complete = read ? historyComplete === true && !cut && kept.length === count : undefined;
+  return { ...head, ...flags, ...(complete !== undefined ? { historyComplete: complete } : {}), history: kept, task: echoed };
 }
 
 // ---- Cursors: opaque, sealed with an HMAC, bound to a caller, a query and a stored listing, and time-limited. ----

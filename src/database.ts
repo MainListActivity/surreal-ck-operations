@@ -99,6 +99,8 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
     await this.db.query(loadSchema('021-query-snapshot.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
+    await this.db.query(loadSchema('022-snapshot-quota.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

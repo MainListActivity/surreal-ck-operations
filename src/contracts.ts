@@ -144,10 +144,17 @@ export interface WorktreePageView {
   page: PageInfo;
 }
 
-/** One byte segment of a task's context or of one audit entry's evidence (SYS01). */
+/**
+ * What read_task_text reads. context and evidence are text. project is the project environment as JSON (holder or gm only),
+ * and dependencies, workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
+ * read back whole (SYS01 R3).
+ */
+export type TaskTextField = 'context' | 'evidence' | 'project' | 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+
+/** One byte segment of a text read by read_task_text (SYS01). */
 export interface TaskTextSegment {
   taskId: string;
-  field: 'context' | 'evidence';
+  field: TaskTextField;
   auditId?: string;
   totalBytes: number;
   /** SHA-256 of the whole text, so a reader can verify a reassembly. */
@@ -216,10 +223,12 @@ export interface ClaimResult {
   fence: number;
   leaseExpiresAt: string;
   /**
-   * Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task: the newest entries that fit
-   * the handover window. historyComplete is false when older entries were left out; get_task_history pages the whole history.
+   * Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task, oldest first: the newest entries
+   * that core read. historyCount is the number of entries the task holds in all; historyComplete is true only when history holds
+   * every one of them. get_task_history pages the whole history (SYS01 R3).
    */
   history: HistoryEntry[];
+  historyCount?: number;
   historyComplete?: boolean;
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];

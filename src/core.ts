@@ -10,7 +10,7 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTaskContext, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Prefix, utf8Segment } from './response-budget.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTaskContext, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Segment } from './response-budget.ts';
 import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
@@ -32,9 +32,6 @@ export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: 'ç
 const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;
-const HISTORY_LIMIT = 40;
-const OPS_HISTORY_LIMIT = 15;
-const HISTORY_EVIDENCE_CHARS = 6000;
 const OPS_EVIDENCE_CHARS = 600;
 const LIST_CONTEXT_CHARS = 1200;
 const LIST_TASKS_LIMIT = 500;
@@ -289,9 +286,13 @@ const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
  */
 const COMPLETE_TASK_ROWS = 500;
 const COMPLETE_HISTORY_ROWS = 1000;
-/** Budget of the handover window in a claim result, and the evidence preview one of its entries carries. */
-const HANDOVER_BYTES = 16 * 1024;
-const HANDOVER_ITEM_BYTES = 2 * 1024;
+/**
+ * A claim reads at most this many of its task's newest protocol entries and newest ops entries for the handover (SYS01 R3).
+ * The whole history is counted, so a claim that read less says so: historyComplete is false and historyCount is the total.
+ * The echo of the claim fits as many of the entries it was given as the budget allows; get_task_history pages the rest.
+ */
+const HANDOVER_ROWS = 60;
+const HANDOVER_OPS_ROWS = 20;
 
 type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
@@ -799,8 +800,9 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async listWorktrees(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]> {
     const actor = await this.authorized(credential);
-    if (!this.worktrees) return [];
+    // Checked before the registry is consulted: a caller without a task and without gm is refused even when no registry exists (R8).
     if (!taskId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+    if (!this.worktrees) return [];
     if (taskId) {
       const task = await this.getTask(credential, taskId);
       const project = await this.taskProject(taskId);
@@ -871,7 +873,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
-      leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete,
+      leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
       project, worktree: taskView.worktree };
   }
@@ -959,38 +961,27 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * The handover window of a claim result: the newest protocol entries and the newest ops entries, oldest first, as many
-   * as fit HANDOVER_BYTES. A claim has already committed when its response is built, so the window is bounded rather than
-   * refused. historyComplete is false when older entries were left out. get_task_history pages the whole history.
+   * The handover window of a claim (SYS01 R3): the newest HANDOVER_ROWS protocol entries and the newest HANDOVER_OPS_ROWS ops
+   * entries, oldest first, each whole. historyCount is the task's entry count in all, read in the same transaction as the
+   * window, and historyComplete is true only when every entry was read. A claim has committed when its answer is built, so the
+   * window is bounded, never refused: the echo (echoClaim) keeps the entries its response can hold, and get_task_history
+   * pages the rest.
    */
-  private async handoverHistory(taskId: TaskId): Promise<{ history: HistoryEntry[]; historyComplete: boolean }> {
-    type Row = { id: RecordId; action: string; actor: unknown; evidence?: string; evidenceChars?: number; version?: number; cat: string };
+  private async handoverHistory(taskId: TaskId): Promise<{ history: HistoryEntry[]; historyComplete: boolean; historyCount: number }> {
     // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the handover.
-    const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
-      `SELECT id, action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, string::len(evidence ?? '') AS evidenceChars, version, at, <string>at AS cat
-         FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT $limit;
-       SELECT id, action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, string::len(evidence ?? '') AS evidenceChars, version, at, <string>at AS cat
-         FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $ops_limit;`,
-      { task: id('task', taskId), limit: HISTORY_LIMIT + 1, ops_limit: OPS_HISTORY_LIMIT + 1, ev_chars: HISTORY_EVIDENCE_CHARS }
-    );
-    let complete = protocol.length <= HISTORY_LIMIT && ops.length <= OPS_HISTORY_LIMIT;
-    const rows = [...protocol.slice(0, HISTORY_LIMIT), ...ops.slice(0, OPS_HISTORY_LIMIT)]
+    const read = await this.consistentRead<{ protocol: AuditHistoryRow[]; ops: AuditHistoryRow[]; count: number | null }>(`LET $protocol = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT $limit);
+      LET $ops = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $ops_limit);
+      LET $counted = (SELECT count() AS n FROM audit WHERE task = $task AND action != 'ops_call' GROUP ALL);
+      RETURN { read: { protocol: $protocol, ops: $ops, count: $counted[0].n ?? 0 } };`,
+    { task: id('task', taskId), limit: HANDOVER_ROWS + 1, ops_limit: HANDOVER_OPS_ROWS + 1 });
+    const rows = [...read.protocol.slice(0, HANDOVER_ROWS), ...read.ops.slice(0, HANDOVER_OPS_ROWS)]
       .sort((a, b) => (a.cat < b.cat ? 1 : a.cat > b.cat ? -1 : 0));
-    const kept: HistoryEntry[] = [];
-    for (const row of rows) {
-      const cut = utf8Prefix(row.evidence ?? '', HANDOVER_ITEM_BYTES);
-      const entry: HistoryEntry = {
-        auditId: asId(row.id), action: row.action, actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
-        version: row.version, at: row.cat,
-        ...(row.evidence ? { evidence: cut.text, evidenceTruncated: (row.evidenceChars ?? 0) > [...cut.text].length } : {}),
-      };
-      if (jsonBytes([entry, ...kept]) > HANDOVER_BYTES) {
-        complete = false;
-        break;
-      }
-      kept.unshift(entry);
-    }
-    return { history: kept, historyComplete: complete };
+    const historyCount = Number(read.count ?? 0);
+    const history = rows.map(row => historyEntry(row)).reverse();
+    const complete = read.protocol.length <= HANDOVER_ROWS && read.ops.length <= HANDOVER_OPS_ROWS && rows.length === historyCount;
+    return { history, historyComplete: complete, historyCount };
   }
 
   /** get_task_history without pageSize or cursor (C2): the complete history, oldest first, or a refusal when it does not fit. */
@@ -1273,17 +1264,19 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * read_task_text (SYS01): one byte segment of a task's context or of one audit entry's evidence. Segments
-   * never split a character and reassemble exactly; sha256 covers the whole text, so a reader can verify it.
+   * read_task_text (SYS01, R3): one byte segment of one text of a task. context and evidence are read as stored. project is the
+   * task's project environment as JSON, read by its holder and gm only. dependencies, workIntentPaths and worktreePaths are the
+   * task's lists as JSON arrays, the form a claim echo cuts them from. Segments never split a character and reassemble exactly;
+   * sha256 covers the whole text, so a reader can verify it.
    */
   async taskText(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment> {
     const params = parseTextInput(input);
-    await this.getTask(credential, params.taskId as TaskId);
+    const task = await this.getTask(credential, params.taskId as TaskId);
     let text: string;
     if (params.field === 'context') {
       const row = await this.db.select<TaskRow>(id('task', params.taskId));
       text = row?.context ?? '';
-    } else {
+    } else if (params.field === 'evidence') {
       if (!params.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
       // Routine ops_call rows are not audit history, so no history answer names them and they are not readable here either.
       const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
@@ -1291,6 +1284,21 @@ export class SurrealCompanyCore implements CompanyCore {
       const row = rows?.[0];
       if (!row || !row.task || asId(row.task) !== params.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
       text = row.evidence ?? '';
+    } else if (params.field === 'project') {
+      const actor = await this.authenticate(credential);
+      if (actor.role !== 'gm' && task.currentEmployee !== actor.employeeId) {
+        throw new CompanyError('forbidden', 'the project environment is read by the task holder or gm');
+      }
+      const project = await this.taskProject(params.taskId as TaskId);
+      if (!project) throw new CompanyError('not_found', 'the task has no project environment');
+      text = JSON.stringify(project);
+    } else {
+      const lists = {
+        dependencies: task.dependencies,
+        workIntentPaths: task.workIntent?.paths ?? [],
+        worktreePaths: task.worktree?.intent?.paths ?? [],
+      };
+      text = JSON.stringify(lists[params.field]);
     }
     const sha256 = HASH(text);
     // A reassembly pins the digest of the text it started with. A text that changed since is refused, never mixed in.

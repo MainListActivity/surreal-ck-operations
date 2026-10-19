@@ -76,6 +76,31 @@ test('null is absent on every MCP read argument, as in core and the sidecar (SYS
   } finally { await connection.close(); }
 });
 
+test('null never enters the paged branch on MCP: null paging routes to the unpaged core call, a real pageSize to the paged one (SYS01, R8)', async () => {
+  // A recording stub: the MCP layer must choose the branch from isPaged, so a null pageSize or cursor never reaches worktreePage/historyView.
+  const routed: string[] = [];
+  const recording = {
+    ...core,
+    worktreeList: async () => { routed.push('worktreeList'); return [] as never; },
+    worktreePage: async () => { routed.push('worktreePage'); return { worktrees: [], page: { returned: 0, hasMore: false } } as never; },
+    history: async () => { routed.push('history'); return []; },
+    historyView: async () => { routed.push('historyView'); return { history: [], page: { returned: 0, hasMore: false } } as never; },
+  } as unknown as CompanyCore;
+  const recorded = createMcpHttpService({ core: recording, port: 0 });
+  const connection = await connectCompanyClient({
+    url: new URL(`http://127.0.0.1:${recorded.port}/mcp`), credential: 'sck_valid', clientName: 'null-route-test',
+  });
+  try {
+    await connection.client.callTool({ name: 'list_worktrees', arguments: { taskId: null, includeReleased: null, pageSize: null, cursor: null } });
+    await connection.client.callTool({ name: 'get_task_history', arguments: { taskId: 'task-test', pageSize: null, cursor: null } });
+    expect(routed).toEqual(['worktreeList', 'history']);
+    await connection.client.callTool({ name: 'list_worktrees', arguments: { pageSize: 5 } });
+    expect(routed.at(-1)).toBe('worktreePage');
+    await connection.client.callTool({ name: 'get_task_history', arguments: { taskId: 'task-test', cursor: null, pageSize: 3 } });
+    expect(routed.at(-1)).toBe('historyView');
+  } finally { await connection.close(); await recorded.close(); }
+});
+
 test('every request rejects missing, wrong, revoked credential and foreign Host/Origin', async () => {
   const request = { method: 'POST', headers: { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' }, body: JSON.stringify({
     jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' } },
