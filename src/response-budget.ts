@@ -144,7 +144,8 @@ export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number
 export function echoTask(task: TaskView, limit: number = ITEM_BUDGET_BYTES): TaskView {
   // A share of the limit per list: the three lists, the fixed fields and the context must fit together.
   const share = Math.min(CLAIM_LIST_ECHO_BYTES, Math.floor(limit / 8));
-  const cuts: Partial<Record<ClaimListName, ListCut>> = {};
+  // An echo of an echo keeps the cuts of the earlier echo, so their counts and digests still describe the whole lists.
+  const cuts: Partial<Record<ClaimListName, ListCut>> = { ...task.listsTruncated };
   const echo: TaskView = { ...task };
   if (task.dependencies) echo.dependencies = cutList(task.dependencies, 'dependencies', cuts, share);
   if (task.workIntent?.paths) echo.workIntent = { ...task.workIntent, paths: cutList(task.workIntent.paths, 'workIntentPaths', cuts, share) };
@@ -188,11 +189,12 @@ export interface ClaimEcho extends Omit<ClaimResult, 'project'> {
 
 /**
  * A list within `budget` bytes (CLAIM_LIST_ECHO_BYTES unless a write echo gives it a share) is kept whole. A longer one keeps its
- * longest prefix, and `cuts` records its count and digest. claim.json and read_task_text keep the list whole.
+ * longest prefix, and `cuts` records its count and digest. A list that `cuts` already names was cut by an earlier echo: it stays
+ * partial, and keeps that echo's count and digest, which describe the whole list. claim.json and read_task_text keep the list whole.
  */
 function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>, budget: number = CLAIM_LIST_ECHO_BYTES): T[] {
-  if (jsonBytes(items) <= budget) return [...items];
-  cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
+  if (!cuts[name] && jsonBytes(items) <= budget) return [...items];
+  if (!cuts[name]) cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
   return items.slice(0, fitCount(items, kept => kept, budget));
 }
 

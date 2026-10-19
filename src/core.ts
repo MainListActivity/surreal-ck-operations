@@ -1434,7 +1434,8 @@ export class SurrealCompanyCore implements CompanyCore {
     const created: TaskView[] = [];
     let dependencies = [...new Set(input.dependencies ?? [])];
     for (const [index, spec] of specs.entries()) {
-      const task = await this.createTask(credential, {
+      // The leg is echoed once, below, at its share of the budget: an echo here too would cut its lists twice (SYS01 R3).
+      const task = await this.createTaskRecord(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
         project: input.project,

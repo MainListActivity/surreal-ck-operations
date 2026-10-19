@@ -1197,6 +1197,32 @@ test('a delivery answers with all three legs inside one budget: each leg is cut 
   }
 });
 
+test('a delivery whose first leg holds a long dependency list echoes the whole count and digest, cut once (SYS01 R3)', async () => {
+  const deliveryGoal = await owner.createGoal({ text: `依赖回显目标 ${suffix}`, source: 'owner:test', key: key('goal-dep-echo'), tier: 'standard' });
+  // 120 ids are over the share of the create answer, so that answer cuts the list; the leg answer then cuts the cut list again.
+  const dependencies: string[] = [];
+  for (let index = 0; index < 120; index += 1) {
+    const dependency = await core.createTask(gm, {
+      title: `依赖回显 ${suffix} ${index}`, context: '依赖正文', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(`dep-echo-${index}`),
+    });
+    dependencies.push(dependency.id);
+  }
+  const relayed = await relay('create_delivery', {
+    goalId: deliveryGoal.id, title: `依赖回显交付 ${suffix}`, spec: '需求正文字'.repeat(40), dependencies, idempotencyKey: key('dep-echo-delivery'),
+  }, args => core.createDelivery(gm, args as never));
+  expect(relayed.exit).toBe(0);
+  const legs = JSON.parse(relayed.out) as TaskView[];
+  expect(legs).toHaveLength(3);
+  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  // The first leg stores the whole list. Its echo keeps a prefix, and the count and digest describe the whole list.
+  const first = legs[0]!;
+  expect((await core.getTask(gm, first.id)).dependencies).toEqual(dependencies);
+  expect(first.listsTruncated).toEqual({ dependencies: { count: dependencies.length, sha256: sha256(JSON.stringify(dependencies)) } });
+  expect(first.dependencies.length).toBeGreaterThan(0);
+  expect(first.dependencies.length).toBeLessThan(dependencies.length);
+  expect(dependencies.slice(0, first.dependencies.length)).toEqual(first.dependencies);
+});
+
 test('claim_next over MCP answers a claim whose context is over the budget: the lease comes back, the context is cut and flagged, and the whole text reassembles (SYS01, defect 1)', async () => {
   // A claim commits before its answer is built (lease, audit, outbox, claim.json), so the answer must arrive whole, never as response_too_large.
   const claimant = await enrollment.enroll(`qp-claim-${suffix}`, 'engineering', ['execute', 'review']);

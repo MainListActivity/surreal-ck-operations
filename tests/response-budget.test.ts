@@ -257,6 +257,19 @@ describe('write echo (SYS01 R3, return of 04195c93)', () => {
     expect(echo.contextSha256).toBe(sha256(context));
     expect(echo.contextNextOffset).toBe(utf8(echo.context));
   });
+
+  test('an echo of an echo keeps the count and digest of the whole list, not of the list the first echo cut', () => {
+    // A write answer cuts a list to its share; a leg answer cuts it again. Both cut lists are prefixes of the whole one.
+    const dependencies = dependencyIds(200);
+    const legLimit = Math.floor(ITEM_BUDGET_BYTES / 3);
+    const first = echoTask(taskWith('短正文', { dependencies }));
+    const second = echoTask(first, legLimit);
+    expect(jsonBytes(second)).toBeLessThanOrEqual(legLimit);
+    expect(second.listsTruncated).toEqual({ dependencies: { count: 200, sha256: sha256(JSON.stringify(dependencies)) } });
+    expect(second.dependencies.length).toBeGreaterThan(0);
+    expect(second.dependencies.length).toBeLessThan(first.dependencies.length);
+    expect(second.dependencies).toEqual(dependencies.slice(0, second.dependencies.length));
+  });
 });
 
 describe('null arguments (SYS01, defect 2)', () => {
