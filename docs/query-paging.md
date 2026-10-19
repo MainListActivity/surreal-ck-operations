@@ -1,8 +1,8 @@
 # 管理查询的字节预算、快照分页与完整读取（SYS01）
 
-本文说明员工与经理通过 sck（comm 通道）和 MCP 读取任务、历史、工作树与公司汇总时的契约。依据为经理裁决 v15（2026-10-19，C1 至 C6，见第 6 节）。
+本文说明员工与经理（gm）通过 sck（comm 通道）和 MCP 读取任务、历史、工作树与公司汇总时的契约。依据为经理裁决 v15（2026-10-19，C1 至 C6，见第 6 节）与经理裁决 v25（SYS01 P0，任务 04195c93）：预算 R3、快照 R4、工作树范围 R8、null 语义、拆分项 R6 与 R7。第 2 节、第 4 节、第 6 节以 v25 为准。
 
-实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/021-query-snapshot.surql`。
+实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储与库内配额）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/021-query-snapshot.surql`（快照行）与 `schema/022-snapshot-quota.surql`（全库计数）。
 
 ## 1. 截断层定位（AC01）
 
@@ -21,23 +21,26 @@
 
 ## 2. 字节预算（AC03）
 
-- 预算按序列化后的 UTF-8 字节计算，不按字符串长度计算。`RESPONSE_BUDGET_BYTES` 为 48 KiB，覆盖整个 `{ok,data}` 响应。
-- 分页条目的截断阈值为 `ITEM_BUDGET_BYTES`，即 46 KiB（预算减去 2 KiB 的页信封余量）。条目本身不超过阈值时保持完整。
-- 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`。超过预算的成功响应替换为可恢复的 JSON 错误 `response_too_large`。comm 客户端退出码为 1，stdout 为一行 JSON。
+- 预算按序列化后的 UTF-8 字节计算，不按字符串长度计算。`RESPONSE_BUDGET_BYTES` 为 48 KiB（49152 字节），覆盖每个 MCP 或 sidecar 工具整个序列化响应，包括信封。
+- 46 KiB（`ITEM_BUDGET_BYTES`，预算减去 2 KiB 的页信封余量）只是内部余量，不是对外上限。条目本身不超过该余量时保持完整。
+- 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`。超过预算的成功响应替换为 JSON 错误 `response_too_large`（`retryable: false`，缩小查询后重试）。comm 客户端退出码为 1，stdout 为一行 JSON。
 - 完整读取从不截断（见第 3 节）。分页读取只在单条超过 46 KiB 时截断该条，并标注 `contextTruncated` 与 `contextNextOffset`（证据为 `evidenceTruncated` 与 `evidenceNextOffset`），其余部分用 `read_task_text` 按段读取。
 - `read_task_text` 每段默认 16 KiB，最大 24 KiB，最小 4 字节。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符。
 
-写接口的回显（SYS01）：转移、创建、释放、续做、延后、退役、项目换绑、仓库绑定与负责人决定返回的任务回显，同样受 46 KiB 限制。认领的回显见下段。回显中的 `context` 超出时截断并标注。`contextBytes` 与 `contextSha256` 始终描述完整正文。写入先于回显提交，回显不会使已提交的写入变成错误。`create_delivery` 把预算分给三条腿，每条腿不超过 `floor(46 KiB / 3)`。
+写接口的回显（SYS01，`echoTask`）：检查点、提交、验收、退回、阻塞（`report_blocker`）、创建、释放、续做、延后、退役、项目换绑、仓库绑定与负责人决定返回的任务回显，同样受预算限制。回显中的依赖列表（`dependencies`）与任务、工作树的意图路径（`workIntent.paths`、`worktree.intent.paths`）各取不超过 `min(4 KiB, 本次回显的字节上限 / 8)` 的最长前缀，超出的列表在 `listsTruncated` 中给出完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`），完整列表用 `read_task_text` 读取。之后 `context` 取剩余空间，超出时截断并标注（`contextTruncated`、`contextNextOffset`）。`contextBytes` 与 `contextSha256` 始终描述完整正文。`create_delivery` 把预算按腿数均分，每条腿不超过 `floor(46 KiB / 腿数)`。写接口的回显不含项目环境正文。
 
-认领回显（`claim_next`，缺陷 1）：认领在回显之前已经提交（租约、审计、出站事件与 `claim.json`），所以回显不能报错。`deliveryId`、`fence` 与 `leaseExpiresAt` 总是返回。可变部分各自有界，并标注：
+写入先于回显提交。正文（`context`）与列表超出时截断，所以正文长度与列表条数不会使已提交的写入失败。写入时依赖条数与项目文本大小均未设上限（R6、R7 未在本变更实现，见第 6 节），回显只能按上述规则截断。回显的其余固定字段未单独设字节上限。若整体仍超过 48 KiB，MCP 与通道会返回 `response_too_large`，此时写入已经提交，调用方须用 `get_context`（带 `taskId`）或 `get_task_history` 核对状态，不得重复提交。
+
+认领回显（`claim_next`，缺陷 1；心跳同源）：认领在回显之前已经提交（租约、审计、出站事件与 `claim.json`），所以回显不能报错。`deliveryId`、`fence` 与 `leaseExpiresAt` 总是返回。`expectedVersion` 不在认领回显中，版本号位于 `task.version`。可变部分各自有界，并标注：
 
 - `task.context` 超出时截断，标注 `contextTruncated` 与 `contextNextOffset`，其余用 `read_task_text` 读取。
-- `dependencies`、任务的 `workIntent.paths` 与工作树的 `worktree.intent.paths` 各不超过 4 KiB。超出时保留最长前缀，并在 `listsTruncated` 中给出该列表的完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`）。完整列表在 `claim.json` 中。
-- `project` 不超过 8 KiB 时完整返回。超出时只回显身份字段（`id`、`name`、`repoPath`、`defaultBranch`、`release`、`rollback`、`pipeline`），并标注 `projectTruncated`、`projectBytes` 与 `projectSha256`。身份本身超过 8 KiB 时不回显项目。
-- `history` 为核心层的交接窗口（16 KiB）。若任务留不下至少 4 KiB 上下文，则 `history` 留空，并标注 `historyComplete: false`。这是安全网，正常规模下不触发。
-- 工作树只在顶层 `worktree` 出现一次，`task.worktree` 不重复。
+- `dependencies`、任务的 `workIntent.paths` 与工作树的 `worktree.intent.paths` 各不超过 4 KiB（`CLAIM_LIST_ECHO_BYTES`）。超出时保留最长前缀，并在 `listsTruncated` 中给出该列表的完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`）。完整列表在 `claim.json` 中，可用 `read_task_text` 的 `dependencies`、`workIntentPaths`、`worktreePaths` 读取。
+- `project` 不超过 8 KiB 时完整返回。超出时只回显身份字段（`id`、`name`、`repoPath`、`defaultBranch`、`release`、`rollback`、`pipeline`，每个文本字段最多 512 字节）与红线（每条最多 1 KiB，放得下几条就留几条），并标注 `projectTruncated`、`projectBytes` 与 `projectSha256`。完整项目可用 `read_task_text` 的 `project` 读取（仅持有人与 gm）。
+- 交接历史（`history`）不是固定的 16 KiB 窗口。核心先读出最新的 60 条协议记录与 20 条运维记录（按条数，不按字节）。回显再按字节动态填充：最新条目优先，至少保留 8 KiB（`CLAIM_HISTORY_FLOOR_BYTES`），其余预算留给上下文。边界条目若放不下，只保留证据的最长前缀，并标注 `evidenceTruncated`、`evidenceBytes`、`evidenceSha256`、`evidenceNextOffset`。更早的条目不被编造，也不附 `nextOffset`。
+- `historyCount` 为任务历史的全部条数。`historyComplete` 只有在全部条目都以完整形式出现在回显中，且条数一致时才为 `true`。若核心窗口或回显预算使部分条目未出现，则为 `false`，完整历史用 `get_task_history` 分页读取。
+- 工作树只在顶层 `worktree` 出现一次，`task.worktree` 不重复。心跳的回显（MCP `heartbeat`）不含工作树：核心心跳结果没有顶层 `worktree`，`echoClaim` 删除 `task.worktree` 后无处补回（`src/response-budget.ts` 的 `echoClaim`，`src/core.ts` 的 `heartbeat`）。
 
-字节上界：标题不超过 200 字符，目标不超过 100 字符，`context` 不超过 20 000 字符（创建时限定）。列表、项目、前驱（最多 6 条）与交接窗口各有上限，`echoClaim` 以此在字节层保证回显不超过 48 KiB。其余固定字段（标识符、角色、状态、轨道名 `discipline`、工作树的仓库、分支与路径）未设字节上限，只受创建时的校验与文件系统路径长度约束，待经理裁决（第 6 节 R6 至 R8）。核心 `claim()` 仍返回完整认领，供 `claim.json` 与调度器使用。
+字节上界：标题不超过 200 字符，目标不超过 100 字符，`context` 不超过 20 000 字符（创建时限定）。认领回显中，前驱最多 6 条（核心 `predecessors` 按最近 6 条返回），交接窗口按上文动态填充，列表与项目按上文截断，`echoClaim` 把认领回显的可变部分限定在预算之内。存储层的依赖条数与项目文本大小尚无上限（见第 6 节 R6 与 R7），回显截断它们并以 `listsTruncated`、`projectTruncated` 标注。其余固定字段（标识符、角色、状态、轨道名 `discipline`、工作树的仓库、分支与路径）未设字节上限，只受创建时的校验与文件系统路径长度约束。核心 `claim()` 仍返回完整认领，供 `claim.json` 与调度器使用。
 
 ## 3. 工具与参数（AC02）
 
@@ -45,18 +48,26 @@
 |---|---|---|---|---|
 | `get_context` | `taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | `{ principal, company?, tasks }`，完整或拒绝 | `{ principal, company?, tasks, page }` | 员工见自己可见的任务；gm 见全部 |
 | `get_task_history` | `taskId`、`pageSize?`、`cursor?` | 通道为 `{ history }`，MCP 为裸数组（与 `8d03d35` 相同）；均为完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
-| `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 员工须带 taskId；gm 可全局 |
-| `read_task_text` | `taskId`、`field`（`context` 或 `evidence`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | — | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
-| `get_admin_summary` | `since?`、`goalId?` | — | `{ cutoffAt, since, goalId?, scope, tasks, audit, outboxSequence, integrity }`（第 5 节） | 仅 gm |
+| `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 非 gm 须带 taskId（缺省或 null 一律 `forbidden`）；gm 可全局 |
+| `read_task_text` | `taskId`、`field`（`context`、`evidence`、`project`、`dependencies`、`workIntentPaths`、`worktreePaths`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | 无 | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
+| `get_admin_summary` | `since?`、`goalId?` | 无 | `{ cutoffAt, since, goalId?, scope, tasks, audit, outboxSequence, integrity }`（第 5 节） | 仅 gm |
 
 要点：
 
-- `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。
+- `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`，并排除调用人自己提交的 `review` 任务（`taskRowsAt` 中的 `NOT (state = 'review' AND submitted_by = $me)`）。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。
 - `fields` 只能选白名单内的字段，未知字段返回 `invalid`。
 - `includeCompany` 缺省值取决于调用形态：旧调用缺省包含 `company` 块，分页调用缺省不包含，需显式传 `includeCompany: true`。
 - `taskId` 读取整条任务，`context` 完整返回，并附 `contextBytes` 与 `contextSha256`。超出预算时拒绝，并给出 `read_task_text` 的读取示例。与 `cursor` 同用会返回 `invalid`。
 - 旧调用的完整集合上限：任务 500 条，历史 1000 条。超过即拒绝为 `response_too_large`，并给出 `pageSize` 与 `cursor` 的重试示例。
 - `page` 字段：`pageSize`、`returned`、`hasMore`、`total`（快照内的总条数）、`snapshotAt`（快照读取时刻的数据库时间）、`budgetBytes`，以及 `hasMore` 为真时的 `nextCursor`。
+- 统计条数时，按 `page.nextCursor` 读完全部页，并累加每页的 `returned`（或数组长度）。`page.total` 是快照内的总数，可用来核对。
+- `pageSize` 取 1 至 100，缺省 25。`pageSize` 不属于游标的绑定，续页时可以改用另一个值，每次请求按它取行。
+- 每页的条数由预算决定，不一定等于 `pageSize`。`returned` 为本页实际条数。
+
+null 语义（MCP、sidecar 与核心一致）：
+
+- `pageSize`、`cursor`、`list_worktrees` 的 `taskId` 为 null 与缺省相同，即视为未提供。`get_context` 的 `taskId`、`state` 等筛选同样视为未提供。
+- `get_task_history` 的 `taskId` 为必填。null 被拒绝：MCP 在参数校验阶段拒绝（schema 不接受 null）；sidecar 经 `taskIdOf` 以 `invalid` 拒绝。核心的 `history` 与 `historyView` 接收的是已校验的字符串，本身不再检查 null，调用方须先校验。`read_task_text` 的 `taskId` 同样必填（`parseTextInput` 以 `invalid` 拒绝）。
 
 `read_task_text` 的要点：
 
@@ -66,7 +77,7 @@
 
 ## 4. 快照与游标（C4）
 
-分页读取的第一页时，服务端把匹配的行与返回字段一次性物化为一个快照（表 `query_snapshot` 与 `query_snapshot_row`，由 schema 021 新增）。此后每一页只读取已存储的行，不重新执行查询。
+分页读取的第一页时，服务端把匹配的行与返回字段一次性物化为一个快照（表 `query_snapshot` 与 `query_snapshot_row`，由 schema 021 新增；容量计数见第 4 节末段的 schema 022）。此后每一页只读取已存储的行，不重新执行查询。
 
 - 成员与字段固定。快照的成员、排序与返回字段在首页时刻确定。遍历中新增、状态变化、标题或其它字段变化、离开过滤集合、工作树登记增删，都不改变本次遍历的成员与字段。状态过滤的成员同样在首页时刻确定。
 - 每个任务在一次遍历中恰好出现一次，遍历中的写入不造成重复或遗漏。
@@ -90,20 +101,23 @@
 | `forbidden` | 游标属于他人、其它查询或其它读取类型；角色变化 | 从第一页重新开始 |
 | `unauthorized` | 身份已撤销 | 停止读取 |
 | `snapshot_gone` | 快照过期、被淘汰或已删除；游标已过期 | 不带游标重新开始 |
-| `temporarily_unavailable` | 快照容量已满，或快照未能写入 | 稍后重试 |
+| `temporarily_unavailable` | 全库快照容量已满，或同一身份的快照都还在写入且等待超时，或快照未能写入 | 稍后重试（`retryable: true`） |
 | `response_too_large` | 快照超过 5000 行或 8 MiB；单页信封或单条超过预算 | 收窄筛选后重试 |
 
-快照上限（`DEFAULT_SNAPSHOT_LIMITS`）：
+快照上限（`DEFAULT_SNAPSHOT_LIMITS`，v25 R4，代码中为固定值，没有运营配置项）：
 
-- 有效期 6 小时。
-- 每个快照最多 5000 行、8 MiB。
-- 每个身份最多 4 个快照。超过时淘汰该身份最旧的快照，其游标随后返回 `snapshot_gone`。
-- 全库最多 64 个快照。已满时拒绝新快照（`temporarily_unavailable`），不淘汰任何快照。
-- 全部快照合计最多 64 MiB。
+- 有效期 6 小时。游标的有效期与快照相同。
+- 每个快照最多 5000 行、8 MiB（UTF-8 字节）。超过时整体拒绝，不存部分。
+- 每个身份最多 4 个快照。超过时淘汰该身份最旧的已完成快照，其游标随后返回 `snapshot_gone`。仍在写入的快照保留其名额。
+- 全库最多 64 个快照。预留与已存快照都计入。已满时拒绝新快照（`temporarily_unavailable`），不淘汰任何快照。
+- 全部快照合计最多 64 MiB，同样计入预留。
+- 预留从准入起即计入上限。写入中的快照保留名额，直到提交、释放或超时。
+- 若某身份的快照全部仍在写入，该身份的新请求最多等待 5 秒，等待其中一个提交。超时返回 `temporarily_unavailable`。
 - 写入中的快照超过 5 分钟仍未完成，视为遗弃，连同其行一并删除。
-- 过期快照由 sweep 删除，表头与行一起删除。
+- 过期快照与遗弃快照由快照存储的清扫删除。清扫在每次新建快照时执行，也可直接调用存储的 `sweep`。当前没有定时任务调用它，过期快照占用的名额会在下一次新建快照时释放。
+- 释放恰好一次：快照行、表头与名额在同一事务中删除，并只扣减一次。
 
-准入上限只在单个进程内原子生效。另一进程的并发写入可能使上限被超过一个并发量（第 6 节 D2）。
+准入上限在数据库内强制执行，由单一记录 `query_snapshot_quota:global`（schema 022）计数。每次预留、淘汰与释放都在同一事务中改动计数并递增 `version`，写入前校验版本；提交只把快照状态改为 `ready`，不改计数。因此 MCP 服务与插件 sidecar 两个进程共用同一上限，上限是硬限制，不是软限制。全库已满时，被拒绝的请求不淘汰任何快照。
 
 ## 5. 汇总（C5，AC04）
 
@@ -111,7 +125,7 @@
 
 - `cutoffAt`：事务内读取的数据库时间（`time::now()`）。
 - `tasks`：每个任务在截止时刻所处状态的计数，可按 `goalId` 限定。`since` 不适用于任务计数。
-- `audit`：审计事件在 `[since, cutoffAt]` 内的动作计数。`since` 缺省为截止前 24 小时。给出 `goalId` 时只计该目标任务的事件。
+- `audit`：审计事件在 `[since, cutoffAt]` 内的动作计数。`since` 缺省为调用时服务端时钟的 24 小时前（在事务开始前计算，不随 `cutoffAt` 调整）。给出 `goalId` 时只计该目标任务的事件。
 - `outboxSequence`：与上述计数在同一事务内读取。
 - `scope`：逐项声明口径。它不是“窗口内新建或更新的任务数”。
 - `integrity.complete` 为真，当且仅当以下四项全部成立：`taskCountsMatchRows`（状态计数之和等于任务总数）、`auditCountsMatchRows`（动作计数之和等于审计总数）、`statesKnown`（所有状态均为已知状态）、`repeatableRead`（同一事务内第二次读取与第一次一致）。
@@ -132,16 +146,16 @@
 
 已记录的偏差：
 
-- D1（认领的交接窗口）：认领结果中的 `history` 限定为 16 KiB，每条证据预览 2 KiB。认领已经提交，提交后不能拒绝，所以窗口有界而非完整。`historyComplete` 为假时，表示较早的条目未包含在内，完整历史用 `get_task_history` 分页读取。这与 C2 的“完整或明确失败”措辞不同。复核建议按预算动态填充窗口（在 46 KiB 内尽量多地返回历史），或把认领列为 C2、C3 的例外。该选择待经理裁决（R3），本实现未自行裁定。
-- D2（准入原子性）：快照准入上限只在单个进程内原子生效（第 4 节）。复核认为不阻断。待经理裁决：接受，或要求跨进程原子（R4）。
+- D1（认领的交接窗口，已按 v25 R3 处理）：认领结果中的 `history` 不再是固定 16 KiB 窗口，而是按字节动态填充（第 2 节）。认领已经提交，提交后不能拒绝，所以回显有界而非完整。核心读取的窗口仍按条数限定（最新 60 条协议记录与 20 条运维记录）。`historyComplete` 为假时，表示较早的条目未包含在内，完整历史用 `get_task_history` 分页读取。这与 C2 的“完整或明确失败”措辞不同，认领作为已提交写入是 R3 的例外。
+- D2（准入原子性，已按 v25 R4 处理）：快照准入上限由数据库内的 `query_snapshot_quota:global` 版本校验执行，MCP 与插件 sidecar 两个进程共用（第 4 节）。跨进程用例（`tests/snapshot-quota.fork.test.ts`，经 `tests/snapshot-quota.child.ts` 由三个子进程并发准入 20 次）列入第 9.1 节的门禁。
 - D3（运行时）：证据覆盖 Bun 1.3.11 与部署运行时 Bun 1.4.2，见第 9 节。缺陷 1 的红灯只在 Bun 1.3.11 上取得，1.4.2 上未单独复现。
-- D4（核心认领的字节数）：`claim()` 的返回值仍是完整认领（写入 `claim.json`，供调度器使用），字节数可以超过预算。预算只约束 MCP 与 sidecar 的回显（`claim_next`）。复核脚本断言核心认领不超过预算，本实现不满足该断言，请复核确认这一口径。
+- D4（核心认领的字节数）：`claim()` 的返回值是完整认领（写入 `claim.json`，供调度器使用），字节数可以超过预算，它不是应答。预算约束的是 RPC 回显：MCP `claim_next` 与 `heartbeat` 的应答（`echoClaim`）。复核断言应针对 MCP 与通道的应答，不针对 `core.claim`。sidecar 没有 `claim_next` 与认领回显（见第 9.6 节）。请复核确认这一口径。
 
-待经理裁决的新发现（复核期间发现，本实现未改动）：
+拆分项与 v25 裁决（R6、R7 未在 SYS01 实现）：
 
-- R6（有界性）：`create_task` 的 `dependencies` 条数在 MCP schema 与 `createTask` 中无上限（`core.ts` 542 行只去重）；只有 defer 路径限为 1 至 20 条（`core.ts` 1841 行）。`workIntent.paths` 在 MCP schema 中无条数与长度限制，只由核心校验（资产类，最多 50 条，每条 300 字符）。标识符、角色、轨道名 `discipline`、工作树的仓库、分支与路径等固定字段未设字节上限。请经理裁决各字段的上限。
-- R7（项目自由文本）：`ProjectStore.upsert`（`projects.ts` 95 至 111 行）写入 `release`、`rollback`、`notes`、`runbooks` 时不做长度检查。认领回显中，项目超过 8 KiB 时只回显身份字段；存储层本身无界。请经理裁决上限。
-- R8（员工的工作树缺省范围）：sidecar 的 `list_worktrees` 对未带 taskId 的员工，回退到其当前租约任务（无租约时由核心拒绝）；核心 `listWorktrees`（`core.ts` 803 行）对非 gm 且未带 taskId 的调用一律拒绝。该差异在 HEAD 即已存在，本次未改动。请经理裁决以哪一方为准。
+- R6（有界性）：本轮未实现，拆分为三项链路。实现为工程 `d8069d8c-bebc-4df8-a7e5-bb608147825b`（工程到工程），发布申请为 `69e862fd-0acc-4f5d-9955-bdd7bd204ef8`（工程到产品），部署为 `9890243a-47c5-4b15-9505-cc03d4717c83`（工程到 QA）。部署依赖 SYS01 部署 `6b6cb5b9-dd3d-4a59-b611-c897a3ec67df`。裁定数值：`create_task` 的 `dependencies` 至多 50 条，按去重前的原始条数计。`workIntent.paths` 至多 50 条，每条至多 300 字符。当前代码中，`dependencies` 只去重（`src/core.ts` 第 543 行），无条数上限。`workIntent.paths` 的条数与长度只对 `kind: assets` 检查（`validateIntent`，`src/dispatcher/worktree-registry.ts` 第 95 至 98 行；核心在 `src/core.ts` 第 533 行调用），其它 `kind` 带 `paths` 即拒绝。以上裁定数值在拆分链交付前均未执行，写入时依赖条数不受限。标识符、角色、轨道名 `discipline`、工作树的仓库、分支与路径等固定字段仍无字节上限。
+- R7（项目自由文本）：裁定 `release` 与 `rollback` 各至多 16 KiB（UTF-8），`notes` 至多 32 KiB，`runbooks` 至多 50 条，每条 2 KiB，合计 32 KiB。现有超限数据不做追溯裁剪，变更的字段必须满足新上限，超限在写入前拒绝。当前 `ProjectStore.upsert`（`projects.ts` 约 95 至 111 行）未做长度检查。认领回显中，项目超过 8 KiB 时只回显身份与红线（第 2 节）。
+- R8（员工的工作树缺省范围，已在代码中落实）：sidecar 的 `list_worktrees` 不再回退到调用人的当前租约任务。核心 `listWorktrees`（`core.ts` 约 801 行）对非 gm 且未带 taskId（含 taskId 为 null）的调用一律 `forbidden`，MCP 与 sidecar 都经此判定。显式 taskId 走 `getTask` 授权与仓库范围。gm 保留全局读。员工与 QA 的指令须带 taskId。
 
 ## 7. 回滚隔离（RB01）
 
@@ -150,12 +164,15 @@
 | 新增状态 | 写入方 | 旧版表现 |
 |---|---|---|
 | `company_meta:cursor_key`（一条随机密钥） | 新版首次分页时创建 | 旧版不读取，忽略 |
-| `query_snapshot`、`query_snapshot_row`（schema 021，只新增表） | 新版分页读取时创建，6 小时后由新版 sweep 删除 | 旧版不读取，忽略 |
+| `query_snapshot`、`query_snapshot_row`（schema 021，只新增表） | 新版分页读取时创建，6 小时后由新版清扫删除 | 旧版不读取，忽略 |
+| `query_snapshot_quota:global`（schema 022，新增计数表，并为 `query_snapshot` 新增三个可缺省字段） | 新版快照存储首次使用时创建，之后随预留、提交、淘汰与释放更新 | 旧版不读取，忽略；既有快照行没有新字段时按 0 处理 |
 | 游标（只在响应中，不持久化） | 新版 | 旧版忽略 `pageSize` 与 `cursor`，返回旧的全量形态（可能超预算，但不误派工） |
-| 无新的任务状态，无新的 audit 或 outbox 动作 | — | 任务与历史按旧语义读取，调度与认领不受影响 |
-| 工具 `get_admin_summary`、`read_task_text` | — | 旧版返回 `unknown_tool` |
+| 无新的任务状态，无新的 audit 或 outbox 动作 | 无 | 任务与历史按旧语义读取，调度与认领不受影响 |
+| 工具 `get_admin_summary`、`read_task_text` | 无 | 旧版返回 `unknown_tool` |
 
 隔离 fork 演练（`tests/rollback-isolation.fork.test.ts`，8 项）：同一夹具分别写入两个隔离命名空间。A 只有旧版，B 先由新版写入（分页、汇总、工作树读取，以及快照过期清理）。两边都运行 `8d03d35` 的调度器与旧版客户端若干轮。旧版源码取自 `git archive 8d03d35`。
+
+该测试直接断言的内容：`cursor_key` 只在 B 出现，回滚运行后不变；快照表（`query_snapshot`、`query_snapshot_row`）在回滚运行前后不变；新读取前后任务、审计与出站表行数不变；过期快照的游标返回 `snapshot_gone`，清扫删除其表头与行并保留有效快照。它不直接断言 `query_snapshot_quota` 表。
 
 断言：
 
@@ -168,7 +185,7 @@
 
 阳性对照：旧版调度器认领了就绪任务（零误派工断言之外的正向检查）。
 
-红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言失败，结果为 7 通过、1 失败（终态树，`rework7-red-rb01-misdispatch-mutant.log`，退出码 1）。
+红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言应失败。前次树上的结果为 7 通过、1 失败（`rework7-red-rb01-misdispatch-mutant.log`，退出码 1）。本次门禁未重跑该突变，结果见第 9.4 节。
 
 未覆盖：真实 Paseo 员工会话（演练中为桩），以及真实 sidecar 与 sck 包装器（包装器执行部署版 `active` 目录下的客户端）。
 
@@ -189,80 +206,69 @@
 
 ## 9. 验证结果
 
-本节为本次复核修复的门禁结果（代码树 `9b281b05`，基线 `fdb0ee3`）。运行时：本机 Bun 1.3.11；部署运行时 Bun 1.4.2（`runtime-bun`，`bun --version` 实测为 1.4.2）。门禁脚本为 `sys01-gate-chain.sh`，逐步日志与退出码位于任务证据目录的 `sys01-gate-9b281b05/`（`sys01-wt-*.log`、`sys01-wt-summary.txt`）。门禁运行后代码与测试未再改动，之后只改文档；测试不读取文档。
+本节的门禁结果待 v25 实施后门禁，填写前所有结果均为待门禁后填写。此前树上的结果不适用于当前代码，已从本节移除。下列命令为本次门禁清单。运行时：本机 Bun 1.3.11；部署运行时 Bun 1.4.2（`runtime-bun`）。门禁日志与退出码的位置待门禁后填写。
 
 ### 9.1 门禁
 
 | 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
 |---|---|---|---|
-| 工具链 | `sh plugin/scripts/vendor.sh`；根目录 `bun x tsc --noEmit`；`plugin` 目录内 `bun x tsc --noEmit` | exit 0 | — |
-| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 24 pass / 0 fail | 24 pass / 0 fail |
-| 公司 fork 默认清单（27 文件，259 项） | `bun scripts/test-worktrees.ts` | 259 pass / 0 fail | 259 pass / 0 fail |
-| 公司 fork 分页与 RB01 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts` | 53 pass / 0 fail（分页 45 + RB01 8） | 53 pass / 0 fail（分页 45 + RB01 8） |
-| 桥接（11 文件，277 项） | `pnpm test:bridge` | 254 pass / 23 skip / 0 fail | 254 pass / 23 skip / 0 fail |
-| 服务（1 文件，12 项） | `pnpm test:service` | 12 pass / 0 fail | 12 pass / 0 fail |
-| 通道（9 文件，82 项） | `pnpm test:channel` | 81 pass / 1 skip / 0 fail | 81 pass / 1 skip / 0 fail |
-| 通信（3 文件，9 项） | `pnpm test:comm` | 8 pass / 1 skip / 0 fail | 8 pass / 1 skip / 0 fail |
-| 慢管道（新客户端绿，旧客户端红） | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 2 pass / 0 fail | 2 pass / 0 fail |
-| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 23 pass / 0 fail | 23 pass / 0 fail |
+| 工具链 | `sh plugin/scripts/vendor.sh`；根目录 `bun x tsc --noEmit`；`plugin` 目录内 `bun x tsc --noEmit` | 待门禁后填写 | 待门禁后填写 |
+| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 待门禁后填写 | 待门禁后填写 |
+| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 待门禁后填写 | 待门禁后填写 |
+| 公司 fork 分页、RB01、null 与快照配额 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 待门禁后填写 | 待门禁后填写 |
+| 桥接 | `pnpm test:bridge` | 待门禁后填写 | 待门禁后填写 |
+| 服务 | `pnpm test:service` | 待门禁后填写 | 待门禁后填写 |
+| 通道 | `pnpm test:channel` | 待门禁后填写 | 待门禁后填写 |
+| 通信 | `pnpm test:comm` | 待门禁后填写 | 待门禁后填写 |
+| 慢管道（新客户端绿，旧客户端红） | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 待门禁后填写 | 待门禁后填写 |
+| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 待门禁后填写 | 待门禁后填写 |
+| 复核脚本 v3（只读复现） | `bun scripts/test-worktrees.ts <证据目录>/indep-sys01-repro-v3.test.ts` | 待门禁后填写 | 待门禁后填写 |
 
 ### 9.2 跳过项
 
-- 桥接 23 项来自 `tests/internal-ai-proof.fork.test.ts`，由 `RUN_COMPANY_PROOF_FORK_TESTS=1` 门控。以该开关单独运行，23 项全部通过。
-- 通道 1 项是 `tests/dispatcher-sidecar.fork.test.ts` 的「restart quarantine」，由 `RUN_SCK_CHANNEL_FORK_TESTS=1` 门控。公司 fork 默认清单设置了该变量，并在其中通过（即本次修复的重启用例）。
-- 通信 1 项是慢管道红灯对照，由 `SCK_COMM_CONTROL=1` 门控。以该变量运行时两项全部通过（见 9.4）。
+- 以环境变量门控的用例：`tests/internal-ai-proof.fork.test.ts`（`RUN_COMPANY_PROOF_FORK_TESTS=1`）、`tests/dispatcher-sidecar.fork.test.ts` 的「restart quarantine」（`RUN_SCK_CHANNEL_FORK_TESTS=1`）、`tests/comm-slow-pipe.test.ts` 的红灯对照（`SCK_COMM_CONTROL=1`）。跳过数与以开关运行的结果待门禁后填写。
 
-以上跳过项都不遮盖本次必测项。
+待门禁后填写：确认跳过项不遮盖本次必测项。
 
 ### 9.3 AC03 与 AC05 数字
 
-以下数字取自本轮门禁日志（`sys01-gate-9b281b05/` 中的 `sys01-wt-fork-paging-rb01-*.log` 与 `sys01-wt-fork-default-*.log`），只作测得值。预算为 49152 字节（48 KiB）。
+预算为 49152 字节（48 KiB）。AC03 通道的页数与每页最大字节、AC05 的页数、每页最大字节与页耗时、legacy 拒绝响应与长详情的字节、堆基线与增量上界，均待门禁后填写。
 
-- 分页与 RB01 文件（公司 fork，881 条工作集）：
-  - Bun 1.3.11：AC03 通道 25 页，每页最大 49012 字节；legacy 拒绝响应 262 字节，长详情 545 字节。AC05 38 页，每页最大 48945 字节，页耗时 p50 2 ms、最大 245 ms；堆基线 21 MiB、峰值 22.5 MiB、GC 后 22.5 MiB，峰值增量上界 1.4 MiB。
-  - Bun 1.4.2：AC03 通道 29 页，每页最大 48937 字节；legacy 拒绝响应 262 字节，长详情 545 字节。AC05 38 页，每页最大 48954 字节，页耗时 p50 2 ms、最大 245 ms；堆基线 11.5 MiB、峰值 25.5 MiB、GC 后 10.8 MiB，峰值增量上界 14 MiB。
-- 默认清单（27 文件）：
-  - Bun 1.3.11：AC03 通道 27 页，每页最大 49030 字节。AC05 38 页，每页最大 48945 字节，页耗时 p50 2 ms、最大 275 ms；堆基线 28.7 MiB、峰值 30.7 MiB、GC 后 30.7 MiB，峰值增量上界 2 MiB。
-  - Bun 1.4.2：AC03 通道 27 页，每页最大 48937 字节。AC05 37 页，每页最大 48952 字节，页耗时 p50 2 ms、最大 271 ms；堆基线 18.3 MiB、峰值 29.1 MiB、GC 后 18.2 MiB，峰值增量上界 10.8 MiB。
-- 同一运行时内，分页文件运行与默认清单运行的 AC03 页数不同（Bun 1.3.11 为 25 与 27，Bun 1.4.2 为 29 与 27）。未核实原因，以测得值为准。
-- 堆基线随同一进程内先前运行的用例而变（上列基线为 21、11.5、28.7、18.3 MiB），因此只把增量上界当作测得值，不代表恒定内存。
-- 资源用例在状态迁移与归属变更用例之后运行，工作集已是 881 条。1000 条夹具的全量遍历由「the budget is 48 KiB of serialized UTF-8 and the working set holds at least the 1000-task fixture」与「a paged traversal yields every working-set task exactly once」覆盖。
+- 分页与 RB01 文件（公司 fork）：待门禁后填写（两种运行时各一组）。
+- 默认清单：待门禁后填写（两种运行时各一组）。
+- 堆基线随同一进程内先前运行的用例而变，因此只把增量上界当作测得值，不代表恒定内存。门禁时须记录每次运行的基线。
 
 ### 9.4 红灯与绿灯对照
 
-本轮（SYS01 复核的两项缺陷）：
+各突变的预期与结果如下。突变都是临时修改，门禁后须核对工作树中没有突变标记。
 
-- 缺陷 1（认领回显）：显式 id 路径改为不回显，直接返回核心完整认领。`tests/query-paging.integration.test.ts` 45 项中 44 pass / 1 fail，失败项为「claim_next over MCP …」，返回 `response_too_large`，退出码 1（`sys01-red-claim-echo-mutant.log`）。恢复回显后，分页与 RB01 共 53 pass / 0 fail（`sys01-wt-fork-paging-rb01-1311.log`）。
-- 缺陷 2（null 路由，MCP）：分页参数的 schema 退回 `.optional()`。`tests/mcp.transport.test.ts` 5 pass / 1 fail（`sys01-red-null-schema-mcp-mutant.log`）。恢复后 6 pass / 0 fail（`sys01-green-null-mcp.log`）。
-- 缺陷 2（null 路由，通道）：`list_worktrees` 的分页判断退回 HEAD 写法（`args.pageSize !== undefined || args.cursor !== undefined`，null 视为存在）。`tests/sidecar.test.ts` 18 pass / 1 fail（`sys01-red-null-routing-sidecar-mutant.log`）。恢复后 19 pass / 0 fail（`sys01-green-null-sidecar.log`）。
+- 缺陷 1（认领回显）突变：显式 id 路径不回显，直接返回核心完整认领。预期 `tests/query-paging.integration.test.ts` 的「claim_next over MCP …」用例失败（返回 `response_too_large`）。结果待门禁后填写。
+- 缺陷 2（null 路由，MCP）突变：分页参数的 schema 退回 `.optional()`。预期 `tests/mcp.transport.test.ts` 的 null 用例失败。结果待门禁后填写。
+- 缺陷 2（null 路由，通道）突变：`list_worktrees` 的分页判断退回 `args.pageSize !== undefined || args.cursor !== undefined`（null 视为存在）。预期 `tests/sidecar.test.ts` 的 null 用例失败。结果待门禁后填写。
+- RB01 误派工突变：把等待中的任务改为 `ready` 并清空依赖。预期零误派工断言失败。本次门禁未重跑该突变，前次树上的结果为 7 通过、1 失败（见第 7 节）。
 
-三组突变都是临时修改。通道文件恢复后与突变前的备份逐字节一致（`cmp`）；MCP 文件的分页 schema 恢复后，绿灯测试通过。恢复后工作树中没有突变标记。
+慢管道对照：新客户端的输出应为完整字节；旧客户端 `8d03d35` 在同一慢管道下应截断。两种运行时的结果待门禁后填写。
 
-本轮门禁内的慢管道对照（`sys01-wt-slowpipe-control-1311.log`、`sys01-wt-slowpipe-control-142.log`）：新客户端输出 1082845 / 1082845 字节（绿）；旧客户端 `8d03d35` 在同一慢管道下只输出 65536 字节，截断可复现（对照）。两种运行时结果相同。
+复核脚本 `indep-sys01-repro-v3.test.ts` 的只读复现结果待门禁后填写。复核断言的口径见 D4：核心 `claim()` 的完整认领按设计保留，字节断言应针对 MCP 与通道的应答。v2 脚本内复制的 HEAD 判断（`args.pageSize !== undefined || args.cursor !== undefined`）不是当前代码路径，v3 改为调用生产路径。当前代码用 `isPaged` 与 `parseWorktreeInput`，由 `tests/response-budget.test.ts`、`tests/sidecar.test.ts` 与 `tests/mcp.transport.test.ts` 覆盖。
 
-复核脚本 `indep-sys01-repro-v2.test.ts` 在本树上的只读复现（`sys01-reviewer-repro-v2-9b281b05.log`）：4 项中 1 项通过（心跳对照），3 项失败。
-
-- 失败 1 断言核心 `claim()` 的完整认领不超过预算，即 D4。核心完整认领按设计保留，供 `claim.json` 使用；MCP 回显的上限由 `tests/query-paging.integration.test.ts` 的 MCP 认领用例覆盖（本树通过）。
-- 失败 2、3 的分支是脚本内复制的 HEAD 判断（`args.pageSize !== undefined || args.cursor !== undefined`），不是当前代码路径。当前代码用 `isPaged` 与 `parseWorktreeInput`，由 `tests/response-budget.test.ts`（第 207 行）、`tests/sidecar.test.ts`（第 300 行）与 `tests/mcp.transport.test.ts`（第 65 行）覆盖，均通过。
-
-前序轮次的红灯（本轮未重跑）：
-
-- 误派工突变（RB01）：`rework7-red-rb01-misdispatch-mutant.log`，7 pass / 1 fail，零误派工断言失败。
-- 回显突变（写回显不受预算限制）：`rework7-red-echo-mutant-query-paging.log`，42 pass / 2 fail，两项写回显用例失败。
+前序轮次的突变结果（误派工突变 RB01、写回显不受预算限制的突变）本次门禁未重跑，以前次记录为准（第 7 节）。
 
 ### 9.5 RB01 回滚隔离
 
-隔离 fork 上 8 项全部通过：旧版发布树（`8d03d35`）读取新版数据，决策与无新版写入时一致；零误派工；`company_meta:cursor_key` 只在新版命名空间出现，回滚运行不改动它；快照表在回滚运行前后不变；过期快照由新版 sweep 删除；旧版忽略分页参数，新工具返回 `unknown_tool`。阳性对照（旧版认领就绪任务）同样通过。
+隔离 fork 的 8 项结果待门禁后填写。断言内容见第 7 节，包括零误派工、`cursor_key` 与快照表在回滚运行前后不变、过期快照的清扫，以及旧版忽略分页参数、新工具返回 `unknown_tool`。阳性对照（旧版认领就绪任务）的结果待门禁后填写。
 
 ### 9.6 未验证与限制
 
-- 缺陷 1 的红灯只在 Bun 1.3.11 上取得，Bun 1.4.2 上没有单独的红灯。
+- 缺陷 1 的红灯记录只在 Bun 1.3.11 上取得，Bun 1.4.2 上没有单独的红灯。当前代码树的红灯与绿灯待门禁后填写。
 - 缺陷 2 的回归在 MCP 传输层与通道层使用桩核心（`tests/mcp.transport.test.ts`、`tests/sidecar.test.ts`），fork 级（真实核心）的 null 用例未新增。核心只接收归一化后的 `undefined`，既有分页用例覆盖其行为。
-- 核心 `claim()` 的完整认领可超过预算（D4）。复核脚本 `indep-sys01-repro-v2` 对核心认领字节的断言因此不成立；有界的是 MCP 回显。请复核确认这一口径。
-- 认领回显的 `history` 窗口（16 KiB）与 C2 的措辞冲突，待 R3 裁决（D1）。
-- 快照准入的跨进程原子性未覆盖（D2，R4）。
-- 观察（非阻断）：快照清扫只在 `store()` 时进行；GoalView 与验收回复的字节大小未经预算验证。
-- 真实 Paseo 员工会话与真实 sck 端到端未执行。独立 QA（真实员工 sck 的全量读取、拒绝用例、分段 hash）由 QA `6b6cb5b9` 在部署后完成，本实现不声称已完成。
+- 核心 `claim()` 的完整认领可超过预算（D4）。有界的是 MCP `claim_next` 与 `heartbeat` 的应答。复核断言须据此修正，请复核确认这一口径。
+- 认领回显的 `history` 按字节动态填充（D1），不是固定 16 KiB 窗口。核心读取的窗口仍按条数限定（60 条协议记录与 20 条运维记录），`historyComplete` 为假时完整历史用 `get_task_history` 分页读取。
+- 快照准入的跨进程原子性（D2，R4）：实现已改为库内配额（第 4 节）。`tests/snapshot-quota.fork.test.ts` 与 `tests/snapshot-quota.child.ts` 为跨进程用例，列入默认清单与第 9.1 节的聚焦门禁，结果待门禁后填写。
+- sidecar 没有 `claim_next`（调度器代领，`plugin/server/sidecar.ts` 对员工侧调用直接拒绝），也没有认领回显。sidecar 的 `heartbeat` 回 `{ok:true}`，不回显租约；MCP 的 `heartbeat` 经 `echoClaim` 回显。
+- `release` 没有员工侧 MCP 工具，只经共享的 `echoTask` 回显路径；它由调度器的通道回滚（`releaseClaim`）调用。
+- 观察（非阻断）：快照清扫只在新建快照时进行，没有定时调用；GoalView 与验收回复的字节大小未经预算验证。
+- 公司 fork 的数据库引导（`src/database.ts`）在目标 namespace 已含无关资源时拒绝新建数据库（第 35 至 39 行）。RB01 隔离演练使用带随机后缀的独立 namespace（`tests/rollback-isolation.fork.test.ts`）。
+- 真实 Paseo 员工会话与真实 sidecar、sck 端到端未执行，AC05 的真实员工 QA 未执行。独立 QA（真实员工 sck 的全量读取、拒绝用例、分段 hash）由 QA `6b6cb5b9` 在部署后完成，本实现不声称已完成。
 - 发布前须核对实际 main 的包含关系（`8d03d35` 与 `f42d99b`），确认回滚目标包含所需修复。
 - 本次未部署，未调用 `ops_*`，未读取凭证。
 - 慢管道对照的 1000 条载荷由测试替身直接输出，不经过响应预算，只证明客户端的字节传输完整。预算由单元与公司 fork 用例覆盖。
