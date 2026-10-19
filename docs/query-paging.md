@@ -12,16 +12,16 @@
 service 运行时 Bun 1.4.2 与开发 Bun 1.3.11 下执行。结果：四个尺寸、两种读取时机、两种运行时全部完整可解析
 （`sys01-ac01-prefix-truncation-repro.log`）。因此 sck 进程、comm 请求/响应文件与 sidecar 写回均不截断。
 
-截断发生在调用方的输出捕获环节（边界 64 KiB 与 128 KiB 与 64 KiB 分块读取一致）。在 Paseo 包内未找到对应的
+截断发生在调用方的输出捕获环节（推断，未确认：截断点位于 64 KiB 与 128 KiB 附近，与按 64 KiB 分块的输出捕获相符）。在 Paseo 包内未找到对应的
 输出上限常量，这一点只能推断，未做真实终端链路的复现。无论截断位于哪一层，修复都是让每个响应都在 48 KiB 之内，
 从而低于两个边界。
 
-旧版基线（`5633438` 的源码，同一 1000 条任务的夹具，`sys01-ac01-base-measurement.log`）：
+旧版基线（`8d03d35` 的源码，同一 1000 条任务的夹具，`sys01-ac01-base-measurement.log`）：
 
 | 调用 | 字节数 | 条目数 | 超过 131072 |
 |---|---|---|---|
 | `get_context`（默认） | 212 642 | 500 | 是 |
-| `get_context state=ready` | 212 191 | 500 | 否（接近） |
+| `get_context state=ready` | 212 191 | 500 | 是 |
 | `get_task_history` | 483 384 | 31 | 是 |
 
 ## 2. 字节预算（AC03）
@@ -44,7 +44,7 @@ service 运行时 Bun 1.4.2 与开发 Bun 1.3.11 下执行。结果：四个尺�
 | `get_task_history` | `taskId`、`pageSize?`、`cursor?` | `{ history, page }`（页内按时间正序，页序为从新到旧） | 与 `get_task` 相同 |
 | `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | `{ worktrees, page }`，每项含 `releasedReferences` | 与原规则相同（员工须有 taskId；gm 可全局） |
 | `read_task_text` | `taskId`、`field`（`context` 或 `evidence`）、`auditId?`、`offset?`、`limit?` | `{ totalBytes, sha256, offset, bytes, nextOffset, text }` | 与 `get_task` 相同 |
-| `get_admin_summary` | `since?`（默认 24 小时）、`goalId?` | `{ cutoffAt, tasks, audit, outboxSequence, integrity }` | 仅 gm（其他角色 forbidden） |
+| `get_admin_summary` | `since?`（默认 24 小时）、`goalId?` | `{ cutoffAt, since, goalId?, tasks, audit, outboxSequence, integrity }` | 仅 gm（其他角色 forbidden） |
 
 `page` 包含 `pageSize`、`returned`、`hasMore`、`nextCursor?`、`snapshotAt` 与 `budgetBytes`。
 
@@ -65,6 +65,7 @@ service 运行时 Bun 1.4.2 与开发 Bun 1.3.11 下执行。结果：四个尺�
   需要完整稳定视图的调用方应当只按 `created_at` 或 `goalId` 过滤。
 - 历史按 `(at, id)` 倒序分页，审计行只追加，因此遍历稳定。
 - 工作树按路径排序分页。清单本身仍在每次请求时完整计算，只有响应是有界的。
+- 汇总先读 `cutoffAt` 与 `outboxSequence`，再读计数。截止时刻之前已提交的变更必定计入；之后的变更可能计入。计数按语句依次读取，不是单一事务快照。
 
 ## 4. 兼容性（有意的决定，请复核）
 

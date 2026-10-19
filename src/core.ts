@@ -1162,13 +1162,15 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const goal = params.goalId ? id('goal', params.goalId) : undefined;
-    const [states, actions, cutoff, sequence] = await this.db.query<[
-      Array<{ state: string; n: number }>, Array<{ action: string; n: number }>, string, number[],
+    // The cutoff and the outbox sequence are read before the counts: every change committed before them is
+    // counted. The statements are not one transaction, so changes committed after them may be counted too.
+    const [cutoff, sequence, states, actions] = await this.db.query<[
+      string, number[], Array<{ state: string; n: number }>, Array<{ action: string; n: number }>,
     ]>(
-      `SELECT state, count() AS n FROM task ${goal ? 'WHERE goal = $goal' : ''} GROUP BY state;
-       SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since GROUP BY action;
-       RETURN <string>time::now();
-       SELECT VALUE value FROM company_meta:outbox_counter;`,
+      `RETURN <string>time::now();
+       SELECT VALUE value FROM company_meta:outbox_counter;
+       SELECT state, count() AS n FROM task ${goal ? 'WHERE goal = $goal' : ''} GROUP BY state;
+       SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since GROUP BY action;`,
       { since, ...(goal ? { goal } : {}) });
     const tasks = Object.fromEntries((states ?? []).map(row => [row.state, Number(row.n)]));
     const audit = Object.fromEntries((actions ?? []).map(row => [row.action, Number(row.n)]));
@@ -1177,7 +1179,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return {
       cutoffAt: cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}), tasks, audit,
       outboxSequence: Number((sequence ?? [])[0] ?? 0),
-      integrity: { complete: true, method: 'group-by over full tables at cutoff', taskRows, auditRows },
+      integrity: { complete: true, method: 'group-by over full tables; cutoffAt and outboxSequence are read before the counts', taskRows, auditRows },
     };
   }
 
