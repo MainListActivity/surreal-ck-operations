@@ -250,29 +250,37 @@ export class SnapshotStore {
 
   /**
    * Writes the rows of a reserved listing, in batches. Each batch is one transaction that first takes its size off the
-   * reservation: a batch past the reserved rows or bytes, or into a listing no longer being built, is refused.
+   * reservation: a batch past the reserved rows or bytes, or into a listing no longer being built, is refused. A later call
+   * continues the numbering where the earlier one stopped. Each batch names the rows and bytes written before it, and is
+   * refused unless the record still says so, so two writers of one listing cannot number the same row.
    */
   async writeRows(reservation: SnapshotReservation, bodies: readonly string[]): Promise<void> {
     const record = new RecordId('query_snapshot', reservation.id);
+    const written = await this.db.select<{ written_rows?: number; written_bytes?: number }>(record);
+    let doneRows = written?.written_rows ?? 0;
+    let doneBytes = written?.written_bytes ?? 0;
     let batch: Array<{ snapshot: string; seq: number; body: string }> = [];
     let batchBytes = 0;
     const flush = async () => {
       if (batch.length === 0) return;
       const { outcome } = await this.transact(`BEGIN;
         LET $held = UPDATE ONLY $record SET written_rows = (written_rows ?? 0) + $count, written_bytes = (written_bytes ?? 0) + $size
-          WHERE state = 'building' AND (written_rows ?? 0) + $count <= row_count AND (written_bytes ?? 0) + $size <= byte_count
+          WHERE state = 'building' AND (written_rows ?? 0) = $fromRows AND (written_bytes ?? 0) = $fromBytes
+            AND (written_rows ?? 0) + $count <= row_count AND (written_bytes ?? 0) + $size <= byte_count
           RETURN AFTER;
         IF $held = NONE { THROW 'snapshot write refused' };
         INSERT INTO query_snapshot_row $rows;
-        COMMIT;`, { record, count: batch.length, size: batchBytes, rows: batch });
+        COMMIT;`, { record, count: batch.length, size: batchBytes, fromRows: doneRows, fromBytes: doneBytes, rows: batch });
       if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
+      doneRows += batch.length;
+      doneBytes += batchBytes;
       batch = [];
       batchBytes = 0;
     };
-    for (const [index, body] of bodies.entries()) {
+    for (const body of bodies) {
       const size = utf8Bytes(body);
       if (batch.length > 0 && batchBytes + size > BATCH_BYTES) await flush();
-      batch.push({ snapshot: reservation.id, seq: index + 1, body });
+      batch.push({ snapshot: reservation.id, seq: doneRows + batch.length + 1, body });
       batchBytes += size;
     }
     await flush();
