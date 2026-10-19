@@ -381,6 +381,8 @@ export class SurrealCompanyCore implements CompanyCore {
           // Goal acceptance guards THROW 'goal acceptance moved: …' when a preview basis drifted; that is a stale-snapshot conflict, not a generic failure.
           const moved = /goal acceptance moved: ([^'"\n]+)/i.exec(cause);
           if (moved) throw new CompanyError('conflict', `Goal acceptance moved: ${moved[1]!.trim()}; run goal_acceptance_preview again`);
+          // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
+          if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
@@ -727,6 +729,8 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t.state = 'review' {
         IF $t.submitted_by = $employee { THROW 'self review denied' };
+        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
+        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
@@ -1055,6 +1059,10 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
+      IF $t.state = 'review' {
+        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
+        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
+      };
       IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
       };

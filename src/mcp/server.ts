@@ -292,7 +292,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_acceptance_repair', {
-    description: 'gm only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→gm candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result.',
+    description: 'gm only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→gm candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result. The repairing gm cannot claim, accept, return or block the repaired candidate; another gm must review it.',
     inputSchema: z.object({
       goalId: z.string().min(1).max(100),
       expectedOldTaskId: z.string().min(1).max(200),

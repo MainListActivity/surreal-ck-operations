@@ -394,3 +394,25 @@ test('the repaired goal closes only after every dependency is done and the candi
   expect((await goalRow(f.goalId)).state).toBe('done');
   expect((await taskRow(f.manual)).state).toBe('void');
 });
+
+test('the repairing gm cannot claim or accept the candidate it repaired, and only another gm closes the goal', async () => {
+  const f = await incident();
+  await repair(inputFor(f, (await preview(f.goalId, f.candidate)).snapshot.hash, 'four-eyes'));
+  await complete(eng, productWorker, f.d0);
+  await complete(eng, qa, f.d1);
+  expect((await taskRow(f.candidate)).state).toBe('ready');
+  const claim = await core.claim(productWorker, f.candidate);
+  const submitted = await core.submit(productWorker, proofOf(claim), { text: '夹具：候选运营验收已提交，等待另一位经理独立复核。', idempotencyKey: key('submit') });
+  const inReview = await taskRow(f.candidate);
+  expect(inReview.state).toBe('review');
+  await expectRefused(core.claim(gm, submitted.id), 'self_review', /repair/);
+  await expect(core.accept(gm, { taskId: submitted.id, deliveryId: randomUUID(), fence: 1, expectedVersion: inReview.version },
+    { text: '夹具：修复者不得接收自己修复的候选，此次接收应被拒绝。', idempotencyKey: key('self-accept') })).rejects.toBeInstanceOf(CompanyError);
+  expect(await taskRow(f.candidate)).toMatchObject({ state: 'review', version: inReview.version });
+  expect(await countAudits(f.candidate, 'accept')).toBe(0);
+  expect((await goalRow(f.goalId)).state).toBe('active');
+  const review = await core.claim(gm2, submitted.id);
+  await core.accept(gm2, proofOf(review), { text: '夹具：另一位经理独立复核，逐项核对提交证据后接收候选。', idempotencyKey: key('accept') });
+  expect((await taskRow(f.candidate)).state).toBe('done');
+  expect((await goalRow(f.goalId)).state).toBe('done');
+});
