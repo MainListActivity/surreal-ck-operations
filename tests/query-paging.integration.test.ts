@@ -77,9 +77,7 @@ async function walk(fetchPage: (cursor?: string) => Promise<{ items: string[]; n
  * A real sck round trip: the comm client writes the request file, a stand-in sidecar answers through the
  * same guard the sidecar uses, and the client prints what it received. Only the sidecar's core call is stubbed.
  */
-async function relay(tool: string, args: Record<string, unknown>, answer: (input: Record<string, unknown>) => Promise<unknown>) {
-  const dir = mkdtempSync(join(tmpdir(), 'sys01-relay-'));
-  ensureCommDirs(dir);
+async function relay(tool: string, args: Record<string, unknown>, answer: (input: Record<string, unknown>) => Promise<unknown>, dir = newCommDir()) {
   const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
     cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, SCK_COMM_DIR: dir, SCK_COMM_KEY: 'sys01-relay-key' },
@@ -104,6 +102,38 @@ async function relay(tool: string, args: Record<string, unknown>, answer: (input
   const out = await new Response(child.stdout).text();
   const stderr = await new Response(child.stderr).text();
   return { out, stderr, exit: await child.exited };
+}
+
+/** The payload of a sealed cursor (v1.<payload>.<tag>), read without opening it, to compare what a cursor carries. */
+const cursorBody = (token: string): Record<string, unknown> => JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8'));
+
+function newCommDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'sys01-relay-'));
+  ensureCommDirs(dir);
+  return dir;
+}
+
+/**
+ * A caller that drops the connection: its request reaches the stand-in sidecar, the caller process is killed
+ * before any answer is read, and the answer lands in the comm directory with nobody waiting for it.
+ */
+async function relayAndDrop(dir: string, tool: string, args: Record<string, unknown>, answer: (input: Record<string, unknown>) => Promise<unknown>) {
+  const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+    env: { ...process.env, SCK_COMM_DIR: dir, SCK_COMM_KEY: 'sys01-relay-key' },
+  });
+  for (;;) {
+    const [file] = readdirSync(reqDir(dir)).filter(name => name.endsWith('.json'));
+    if (file) {
+      const request = JSON.parse(readFileSync(join(reqDir(dir), file), 'utf8')) as { args: Record<string, unknown> };
+      unlinkSync(join(reqDir(dir), file));
+      child.kill('SIGKILL');
+      await child.exited;
+      writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse({ ok: true, data: await answer(request.args) })));
+      return request.args;
+    }
+    await Bun.sleep(20);
+  }
 }
 
 beforeAll(async () => {
@@ -264,10 +294,25 @@ test('the gm summary counts the fixture at a cutoff, and everyone else is refuse
   const counted = Object.values(summary.tasks).reduce((sum, n) => sum + n, 0);
   expect(counted).toBe((rows ?? []).length);
   expect(summary.cutoffAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  expect(summary.scope.tasks).toContain('since does not apply');
   expect(summary.integrity.complete).toBe(true);
+  expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true });
   expect(summary.integrity.taskRows).toBe(counted);
   await expectRefused(core.adminSummary(eng, {}), 'forbidden', /Only gm/);
   await expectRefused(core.adminSummary(cs, {}), 'forbidden', /Only gm/);
+});
+
+test('audit counts cover [since, cutoffAt] and task counts ignore the window', async () => {
+  const wide = '2000-01-01T00:00:00.000Z';
+  const everything = await core.adminSummary(gm, { goalId, since: wide });
+  const [audits] = await database.db.query<[Array<{ n: number }>]>(
+    'SELECT count() AS n FROM audit WHERE at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
+    { since: wide, cutoff: everything.cutoffAt });
+  expect(everything.integrity.auditRows).toBeGreaterThan(0);
+  expect(everything.integrity.auditRows).toBe(audits?.[0]?.n ?? 0);
+  const future = await core.adminSummary(gm, { goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
+  expect(future.integrity.auditRows).toBe(0);
+  expect(future.tasks).toEqual(everything.tasks);
 });
 
 test('a role that may see no task gets an empty page and never the company listing', async () => {
@@ -372,6 +417,109 @@ test('list_worktrees is compact and paged: released references are counted, list
     const full = await core.worktreePage(gm, { pageSize: 5, includeReleased: true });
     expect(full.worktrees.every(worktree => (worktree.references as unknown[]).length === 5)).toBe(true);
     await expectRefused(core.worktreePage(gm, { pageSize: 25, includeReleased: true, cursor: first.page.nextCursor! }), 'forbidden', /another query/);
+  } finally {
+    core.listWorktrees = original;
+  }
+});
+
+test('a caller that drops mid-traversal retries the same cursor on a fresh connection and gets the same page (AC05)', async () => {
+  const expected = await workingIds(goalId);
+  const pageSize = 37;
+  const first = await core.contextView(gm, { goalId, pageSize });
+  const cursor = first.page.nextCursor!;
+  // The answer to this page is lost in transit: nothing is kept on the caller side, so it asks again.
+  const lost = await core.contextView(gm, { goalId, pageSize, cursor });
+  // A fresh connection (a new core with no state of its own) retries with the same cursor.
+  const fresh = new SurrealCompanyCore(database);
+  const retried = await fresh.contextView(gm, { goalId, pageSize, cursor });
+  // The retry is the same page: same tasks and snapshot; its next cursor differs only in the expiry it was issued with.
+  expect(JSON.parse(JSON.stringify(retried.tasks))).toEqual(JSON.parse(JSON.stringify(lost.tasks)));
+  expect(retried.page.snapshotAt).toBe(lost.page.snapshotAt);
+  expect(cursorBody(retried.page.nextCursor!)).toEqual({ ...cursorBody(lost.page.nextCursor!), exp: expect.any(Number) });
+  // Through real comm client processes: the first caller is killed after its request left, then a new process retries.
+  const dir = newCommDir();
+  const dropped = await relayAndDrop(dir, 'get_context', { goalId, pageSize, cursor }, args => core.contextView(gm, args));
+  expect(dropped).toEqual({ goalId, pageSize, cursor });
+  const relayed = await relay('get_context', { goalId, pageSize, cursor }, args => fresh.contextView(gm, args), dir);
+  expect(relayed.exit).toBe(0);
+  const page = JSON.parse(relayed.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
+  expect(page.tasks.map(task => String(task.id))).toEqual(lost.tasks.map(task => String(task.id)));
+  // Continuing from the retried page reaches every task of the snapshot exactly once.
+  const rest = await walk(async next => {
+    const more = await fresh.contextView(gm, { goalId, pageSize, ...(next ? { cursor: next } : {}) });
+    return { items: more.tasks.map(task => String(task.id)), nextCursor: more.page.nextCursor };
+  }, 500, page.page.nextCursor);
+  const seen = [...first.tasks.map(task => String(task.id)), ...page.tasks.map(task => String(task.id)), ...rest];
+  expect(new Set(seen).size).toBe(seen.length);
+  expect([...seen].sort()).toEqual([...expected].sort());
+});
+
+test('a full traversal keeps every response inside the budget and the heap flat (AC05 resource)', async () => {
+  const expected = await workingIds(goalId);
+  const pageSize = 25;
+  Bun.gc(true);
+  const heapBefore = process.memoryUsage().heapUsed;
+  let heapPeak = heapBefore;
+  const pages: Array<{ bytes: number; rows: number; ms: number }> = [];
+  const seen = await walk(async cursor => {
+    const started = performance.now();
+    const page = await core.contextView(gm, { goalId, pageSize, ...(cursor ? { cursor } : {}) });
+    const ms = performance.now() - started;
+    pages.push({ bytes: bytesOf(page), rows: page.tasks.length, ms });
+    heapPeak = Math.max(heapPeak, process.memoryUsage().heapUsed);
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page.nextCursor };
+  }, 500);
+  Bun.gc(true);
+  const heapAfter = process.memoryUsage().heapUsed;
+  const mib = (bytes: number) => Math.round((bytes / 1024 / 1024) * 10) / 10;
+  const timings = pages.map(page => page.ms).sort((a, b) => a - b);
+  const report = {
+    tasks: seen.length, pageSize, pages: pages.length, maxRows: Math.max(...pages.map(page => page.rows)),
+    maxPageBytes: Math.max(...pages.map(page => page.bytes)), budgetBytes: RESPONSE_BUDGET_BYTES,
+    pageMsP50: Math.round(timings[Math.floor(timings.length / 2)]!), pageMsMax: Math.round(timings.at(-1)!),
+    heapBeforeMiB: mib(heapBefore), heapAfterMiB: mib(heapAfter), heapPeakMiB: mib(heapPeak),
+  };
+  console.log(`AC05 resource ${JSON.stringify(report)}`);
+  expect(report.maxPageBytes).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  expect(report.maxRows).toBeLessThanOrEqual(pageSize);
+  expect(pages.length).toBeGreaterThanOrEqual(Math.ceil(expected.length / pageSize));
+  expect(new Set(seen).size).toBe(seen.length);
+  expect([...seen].sort()).toEqual([...expected].sort());
+  // A guard against unbounded accumulation across pages, not a performance target.
+  expect(heapPeak - heapBefore).toBeLessThan(64 * 1024 * 1024);
+});
+
+test('list_worktrees without pageSize or cursor keeps the array shape; an over-budget array is refused as JSON, never cut (C1)', async () => {
+  const view = (index: number, path: string) => ({
+    id: `wt-${index}`, repo: '/repo/ops', worktreePath: path, mode: 'exclusive', branch: `task/${index}`,
+    createdAt: '2026-10-19T00:00:00Z', lastUsedAt: '2026-10-19T00:00:00Z', status: 'present', deletable: false, reasons: [],
+    references: [
+      { taskId: `t${index}`, employee: 'eng', deliveryId: 'd', fence: 1, intent: { kind: 'code', lane: 'x' }, state: 'active', at: '2026-10-19T00:00:00Z' },
+      { taskId: `old${index}`, employee: 'eng', deliveryId: 'd', fence: 1, intent: { kind: 'code', lane: 'x' }, state: 'released', at: '2026-10-19T00:00:00Z' },
+    ],
+  });
+  const small = Array.from({ length: 60 }, (_, index) => view(index, `/tmp/wt-${String(index).padStart(3, '0')}`));
+  const original = core.listWorktrees;
+  try {
+    core.listWorktrees = async () => small as never;
+    const list = await core.worktreeList(gm, {});
+    expect(Array.isArray(list)).toBe(true);
+    expect(list.map(worktree => String(worktree.worktreePath))).toEqual(small.map(item => item.worktreePath));
+    expect(list.every(worktree => (worktree.references as unknown[]).length === 1 && worktree.releasedReferences === 1)).toBe(true);
+    const relayed = await relay('list_worktrees', {}, args => core.worktreeList(gm, args));
+    expect(relayed.exit).toBe(0);
+    expect(Array.isArray(JSON.parse(relayed.out))).toBe(true);
+    // An array cannot carry a page: over the budget it is refused whole, as JSON, and nothing is dropped silently.
+    const large = Array.from({ length: 300 }, (_, index) => view(index, `/tmp/large-${String(index).padStart(4, '0')}/${'路径'.repeat(24)}`));
+    core.listWorktrees = async () => large as never;
+    const refused = await relay('list_worktrees', {}, args => core.worktreeList(gm, args));
+    expect(refused.exit).toBe(1);
+    expect(JSON.parse(refused.out)).toMatchObject({ ok: false });
+    expect(refused.out).toContain('response_too_large');
+    // A paged call over the same inventory returns the page object, which always fits the budget.
+    const paged = await core.worktreePage(gm, { pageSize: 25 });
+    expect(Object.keys(paged).sort()).toEqual(['page', 'worktrees']);
+    expect(bytesOf(paged)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   } finally {
     core.listWorktrees = original;
   }

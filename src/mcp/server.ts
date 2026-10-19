@@ -134,11 +134,15 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.listWorktreeAudits(token(ctx), limit)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory: compact references (released ones are counted and listed only with includeReleased), paged by path within the 48 KiB budget. Task-scoped reads, or gm global reads. Returns { worktrees, page }.',
+    description: 'Authenticated persistent worktree inventory: compact references (released ones are counted and listed only with includeReleased). Without pageSize or cursor it returns the worktree array, refused as response_too_large when over the 48 KiB budget; with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), includeReleased: z.boolean().optional(), ...pageArgs }),
-  }, async (input, ctx) => run(token(ctx), () => core.worktreePage
-    ? core.worktreePage(token(ctx), input)
-    : core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId) : Promise.resolve([])));
+  }, async (input, ctx) => run(token(ctx), () => {
+    // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array shape.
+    const paged = input.pageSize !== undefined || input.cursor !== undefined;
+    if (paged && core.worktreePage) return core.worktreePage(token(ctx), input);
+    if (core.worktreeList) return core.worktreeList(token(ctx), input);
+    return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId) : Promise.resolve([]);
+  }));
   server.registerTool('get_admin_summary', {
     description: 'gm only: read-only company summary at a stated cutoff: task counts by state (optionally for one goal) and audit counts by action since a time (default: the last 24 hours), with the outbox sequence and an integrity flag. Never returns task text.',
     inputSchema: z.object({ since: z.string().min(1).max(40).optional(), goalId: z.string().min(1).max(100).optional() }),

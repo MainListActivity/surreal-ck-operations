@@ -24,5 +24,20 @@ jobs:
         working-directory: plugin
       - run: pnpm test:bridge
       - run: pnpm test:service
+      - run: pnpm test:comm
       # Fork integration is independently run on the company's installed fork.
       # No upstream database or private production credentials in hosted CI.
+  comm-pipe:
+    # The comm truncation reproduces through the company's macOS pipes, so the slow-pipe gate also runs on macOS.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:comm

@@ -564,7 +564,9 @@ export class SidecarPool {
         // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。SYS01：分页、紧凑引用。
         const actor = await core.authenticate(cred);
         const scope = args.taskId !== undefined ? String(args.taskId) : actor.role === "gm" ? undefined : live().taskId;
-        if (core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
+        // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
+        if ((args.pageSize !== undefined || args.cursor !== undefined) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
+        if (core.worktreeList) return core.worktreeList(cred, { ...args, taskId: scope });
         // Cores that predate SYS01 keep the old unpaged array.
         if (!core.listWorktrees) return [];
         return core.listWorktrees(cred, scope);

@@ -8,7 +8,7 @@ export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
 export const MAX_CURSOR_CHARS = 2048;
 
-const TASK_STATES: readonly TaskState[] = ['blocked', 'ready', 'doing', 'review', 'done', 'void'];
+export const TASK_STATES: readonly TaskState[] = ['blocked', 'ready', 'doing', 'review', 'done', 'void'];
 /** Top-level TaskView keys a caller may project. Anything else is refused. */
 export const TASK_FIELDS: readonly string[] = [
   'id', 'title', 'context', 'state', 'executorRole', 'reviewerRole', 'discipline', 'kind', 'goalId', 'projectOverlay',

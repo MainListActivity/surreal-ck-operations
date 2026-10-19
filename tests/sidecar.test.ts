@@ -22,6 +22,7 @@ const calls: Call[] = [];
 let employeeForGetTask = 'eng-x';
 let authRole = 'engineering';
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
+const pageCalls: Array<{ cred: string; taskId?: string; pageSize?: number }> = [];
 const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
 const auditCalls: Array<{ cred: string; limit?: number }> = [];
 const snap = (proof: LeaseProof): LeaseProof => ({ ...proof }); // record a copy; the pool mutates its proof between calls
@@ -40,6 +41,11 @@ const core = {
   getTask: async (_c: string, taskId: string) => ({ ...taskView(taskId), currentEmployee: employeeForGetTask }),
   history: async () => [],
   listWorktrees: async (c: string, taskId?: string) => { wtCalls.push({ cred: c, taskId }); return [] as never; },
+  worktreeList: async (c: string, input: { taskId?: string }) => { wtCalls.push({ cred: c, taskId: input.taskId }); return [] as never; },
+  worktreePage: async (c: string, input: { taskId?: string; pageSize?: number }) => {
+    pageCalls.push({ cred: c, taskId: input.taskId, pageSize: input.pageSize });
+    return { worktrees: [], page: { returned: 0, hasMore: false } } as never;
+  },
   reclaimWorktrees: async (c: string, input?: { dryRun?: boolean; repos?: string[] }) => {
     reclaimCalls.push({ cred: c, input });
     return { scanId: 's', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
@@ -100,6 +106,7 @@ beforeEach(() => {
   mediaCalls.length = 0;
   mediaReleased.length = 0;
   wtCalls.length = 0;
+  pageCalls.length = 0;
   reclaimCalls.length = 0;
   auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
@@ -268,6 +275,13 @@ describe('sidecar', () => {
     authRole = 'gm';
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w3', 'list_worktrees', {});
     expect(wtCalls[2]).toEqual({ cred: 'tok-e13', taskId: undefined });
+
+    // C1：不带 pageSize/cursor 仍返回数组；带分页参数才走 worktreePage，返回 { worktrees, page }
+    const legacy = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w8', 'list_worktrees', {});
+    expect(Array.isArray(legacy.data)).toBe(true);
+    const paged = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w9', 'list_worktrees', { pageSize: 5 });
+    expect(paged.data).toEqual({ worktrees: [], page: { returned: 0, hasMore: false } });
+    expect(pageCalls).toEqual([{ cred: 'tok-e13', taskId: undefined, pageSize: 5 }]);
 
     // 回收（dry-run 透传）与审计查询；写全量回收同样透传，由 core 做 gm 门控
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w4', 'reclaim_worktrees', { dryRun: true, repos: ['/repo/a'] });

@@ -11,7 +11,7 @@ import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import { DETAIL_TEXT_BYTES, PAGE_BUDGET_BYTES, PREVIEW_BYTES, SEGMENT_DEFAULT_BYTES, fitCount, openCursor, sealCursor, utf8Bytes, utf8Prefix, utf8Segment } from './response-budget.ts';
-import { parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest } from './query-input.ts';
+import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 
@@ -290,6 +290,17 @@ const COMPANY_PROJECTS_BYTES = 4 * 1024;
 interface ScannedTask { row: TaskRow; cat: string; aid: string; contextChars: number }
 type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
+
+/** Compact references, sorted by path so that pages are stable. Released references are counted, and listed only when asked. */
+function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolean): WorktreeCompact[] {
+  return [...all]
+    .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
+    .map(worktree => ({
+      ...worktree,
+      references: includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released'),
+      releasedReferences: worktree.references.filter(reference => reference.state === 'released').length,
+    }));
+}
 
 const pick = (value: Record<string, unknown>, fields?: readonly string[]): Record<string, unknown> =>
   fields ? Object.fromEntries(fields.filter(field => field in value).map(field => [field, value[field]])) : value;
@@ -1102,15 +1113,8 @@ export class SurrealCompanyCore implements CompanyCore {
       }
       after = body.id;
     }
-    const all = await this.listWorktrees(credential, params.taskId as TaskId | undefined);
-    const compact: WorktreeCompact[] = [...all]
-      .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
-      .filter(worktree => after === undefined || worktree.worktreePath > after)
-      .map(worktree => ({
-        ...worktree,
-        references: params.includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released'),
-        releasedReferences: worktree.references.filter(reference => reference.state === 'released').length,
-      }));
+    const compact = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased)
+      .filter(worktree => after === undefined || worktree.worktreePath > after);
     const window = compact.slice(0, params.pageSize);
     const hasMore = compact.length > params.pageSize;
     const build = (kept: readonly WorktreeCompact[]): WorktreePageView => {
@@ -1123,6 +1127,16 @@ export class SurrealCompanyCore implements CompanyCore {
       return { worktrees: [...kept], page };
     };
     return build(window.slice(0, this.fitPage(window, build, 'worktree page')));
+  }
+
+  /**
+   * list_worktrees without pageSize or cursor (C1 default): the pre-SYS01 array, in the same compact form as a page.
+   * An array cannot carry a page, so a reply over the budget is refused as response_too_large, never cut.
+   */
+  async worktreeList(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreeCompact[]> {
+    await this.authenticate(credential);
+    const params = parseWorktreeInput(input);
+    return compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
   }
 
   /**
@@ -1162,24 +1176,59 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const goal = params.goalId ? id('goal', params.goalId) : undefined;
-    // The cutoff and the outbox sequence are read before the counts: every change committed before them is
-    // counted. The statements are not one transaction, so changes committed after them may be counted too.
-    const [cutoff, sequence, states, actions] = await this.db.query<[
-      string, number[], Array<{ state: string; n: number }>, Array<{ action: string; n: number }>,
-    ]>(
-      `RETURN <string>time::now();
-       SELECT VALUE value FROM company_meta:outbox_counter;
-       SELECT state, count() AS n FROM task ${goal ? 'WHERE goal = $goal' : ''} GROUP BY state;
-       SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since GROUP BY action;`,
-      { since, ...(goal ? { goal } : {}) });
-    const tasks = Object.fromEntries((states ?? []).map(row => [row.state, Number(row.n)]));
-    const audit = Object.fromEntries((actions ?? []).map(row => [row.action, Number(row.n)]));
+    // One transaction reads the cutoff, the outbox sequence and every count, so they describe one database state.
+    // The cutoff is fixed first: task counts are each task's state at that instant, and audit counts cover the
+    // window [since, cutoff]. A summary is returned only when the transaction committed.
+    const where = goal ? 'WHERE goal = $goal' : '';
+    const query = `BEGIN TRANSACTION;
+      LET $cutoff = time::now();
+      LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
+      LET $states = (SELECT state, count() AS n FROM task ${where} GROUP BY state);
+      LET $taskTotal = (SELECT count() AS n FROM task ${where} GROUP ALL)[0].n;
+      LET $actions = (SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since AND at <= $cutoff GROUP BY action);
+      LET $auditTotal = (SELECT count() AS n FROM audit WHERE at >= <datetime>$since AND at <= $cutoff GROUP ALL)[0].n;
+      RETURN { cutoff: <string>$cutoff, outbox: $outbox, states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal };
+      COMMIT TRANSACTION;`;
+    type SummaryRead = {
+      cutoff: string; outbox?: number | null;
+      states?: Array<{ state?: string | null; n: number }>; taskTotal?: number | null;
+      actions?: Array<{ action?: string | null; n: number }>; auditTotal?: number | null;
+    };
+    let responses;
+    try {
+      responses = await this.db.query<unknown[]>(query, { since, ...(goal ? { goal } : {}) }).responses();
+    } catch {
+      throw new CompanyError('temporarily_unavailable', 'summary read did not complete; retry', true);
+    }
+    const read = responses.every(response => response.success)
+      ? responses.map(response => response.result).find((value): value is SummaryRead => typeof value === 'object' && value !== null && 'cutoff' in value)
+      : undefined;
+    if (!read) throw new CompanyError('temporarily_unavailable', 'summary read did not complete; retry', true);
+    const tasks: Record<string, number> = {};
+    for (const row of read.states ?? []) tasks[row.state == null ? 'unknown' : String(row.state)] = Number(row.n);
+    const audit: Record<string, number> = {};
+    for (const row of read.actions ?? []) audit[row.action == null ? 'unknown' : String(row.action)] = Number(row.n);
     const taskRows = Object.values(tasks).reduce((sum, n) => sum + n, 0);
     const auditRows = Object.values(audit).reduce((sum, n) => sum + n, 0);
+    const unknownStates = Object.keys(tasks).filter(state => !TASK_STATES.includes(state as TaskState));
+    const checks = {
+      taskCountsMatchRows: taskRows === Number(read.taskTotal ?? 0),
+      auditCountsMatchRows: auditRows === Number(read.auditTotal ?? 0),
+      statesKnown: unknownStates.length === 0,
+    };
     return {
-      cutoffAt: cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}), tasks, audit,
-      outboxSequence: Number((sequence ?? [])[0] ?? 0),
-      integrity: { complete: true, method: 'group-by over full tables; cutoffAt and outboxSequence are read before the counts', taskRows, auditRows },
+      cutoffAt: read.cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}),
+      scope: {
+        tasks: goal ? 'tasks of this goal, each in the state it holds at cutoffAt; since does not apply to them'
+          : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
+        audit: 'audit entries with at from since up to cutoffAt',
+      },
+      tasks, audit, outboxSequence: Number(read.outbox ?? 0),
+      integrity: {
+        complete: Object.values(checks).every(Boolean),
+        method: 'one BEGIN…COMMIT transaction: cutoff, outbox sequence and counts read together; each count is checked against the rows it grouped',
+        taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
+      },
     };
   }
 

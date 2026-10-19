@@ -145,10 +145,21 @@ export interface AdminSummary {
   cutoffAt: string;
   since: string;
   goalId?: string;
+  /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
+  scope: { tasks: string; audit: string };
   tasks: Record<string, number>;
   audit: Record<string, number>;
   outboxSequence: number;
-  integrity: { complete: boolean; method: string; taskRows: number; auditRows: number };
+  integrity: {
+    /** True only when every row in scope is grouped under a known state and each count matches the rows it covers. */
+    complete: boolean;
+    method: string;
+    taskRows: number;
+    auditRows: number;
+    checks: { taskCountsMatchRows: boolean; auditCountsMatchRows: boolean; statesKnown: boolean };
+    /** Present only when a task row carries a state outside the known set. */
+    unknownStates?: string[];
+  };
 }
 
 export interface CreateTask {
@@ -386,6 +397,8 @@ export interface CompanyCore {
   contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
   historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
   worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
+  /** list_worktrees without pageSize or cursor: the pre-SYS01 array, in the same compact form as a page. */
+  worktreeList?(credential: Credential, input: Record<string, unknown>): Promise<unknown[]>;
   taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
   adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
