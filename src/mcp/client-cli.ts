@@ -1,9 +1,23 @@
 import { randomBytes } from 'node:crypto';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJsonFile, reqDir, resDir, writeFileAtomic, type CommResponse } from '../comm.ts';
 import { connectCompanyClient } from './client';
 import { readPrivateCredential } from './credential-file';
+
+/** Writes every byte to stdout before the process may exit: a pipe that is not drained yet must not cut the output. */
+function writeStdout(text: string): void {
+  const bytes = Buffer.from(text, 'utf8');
+  let offset = 0;
+  while (offset < bytes.length) {
+    try {
+      offset += writeSync(1, bytes, offset, bytes.length - offset);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EAGAIN') throw error;
+      Bun.sleepSync(2);
+    }
+  }
+}
 
 const [command, name, json] = Bun.argv.slice(2);
 if (!['list', 'call'].includes(command ?? '')) throw new Error('usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
@@ -35,11 +49,20 @@ if (comm) {
     const res = readJsonFile<CommResponse>(resFile);
     if (res) {
       try { unlinkSync(resFile); } catch { /* consumed race */ }
-      if (!res.ok) { process.stderr.write(`${res.error ?? 'comm request failed'}\n`); process.exit(1); }
-      process.stdout.write(`${JSON.stringify(res.data ?? null)}\n`);
+      if (!res.ok) {
+        // Stdout stays JSON for every outcome; the human-readable reason also goes to stderr (SYS01).
+        writeStdout(`${JSON.stringify({ ok: false, error: res.error ?? 'comm request failed' })}\n`);
+        process.stderr.write(`${res.error ?? 'comm request failed'}\n`);
+        process.exit(1);
+      }
+      writeStdout(`${JSON.stringify(res.data ?? null)}\n`);
       process.exit(0);
     }
-    if (Date.now() > deadline) { process.stderr.write('comm request timed out\n'); process.exit(1); }
+    if (Date.now() > deadline) {
+      writeStdout(`${JSON.stringify({ ok: false, error: 'comm request timed out' })}\n`);
+      process.stderr.write('comm request timed out\n');
+      process.exit(1);
+    }
     await Bun.sleep(200);
   }
 }
@@ -60,7 +83,7 @@ try {
   const result = command === 'list'
     ? await connection.client.listTools()
     : await connection.client.callTool({ name: name!, arguments: json ? JSON.parse(json) : {} });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  writeStdout(`${JSON.stringify(result)}\n`);
 } finally {
   await connection.close();
 }

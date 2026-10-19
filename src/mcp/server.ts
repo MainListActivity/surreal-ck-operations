@@ -4,6 +4,7 @@ import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
+import { jsonBytes, RESPONSE_BUDGET_BYTES } from '../response-budget';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -53,6 +54,10 @@ function toolError(error: unknown) {
 }
 
 function toolResult(data: unknown) {
+  // SYS01: a response over the byte budget becomes a recoverable, JSON-legal error, never a cut stream.
+  if (jsonBytes({ ok: true, data }) > RESPONSE_BUDGET_BYTES) {
+    return toolError({ code: 'response_too_large', message: 'response exceeds the 48 KiB budget; narrow the query with pageSize or a cursor' });
+  }
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(data) }],
     structuredContent: { ok: true, data },
@@ -83,16 +88,34 @@ function registerTools(server: McpServer, core: CompanyCore) {
   };
   const token = (ctx: { http?: { authInfo?: { token?: string } } }): Credential => ctx.http?.authInfo?.token ?? '';
 
+  // SYS01: every paged read takes the same pageSize/cursor pair; the cursor is sealed to the caller and the query.
+  const pageArgs = {
+    pageSize: z.number().int().min(1).max(100).optional(),
+    cursor: z.string().min(1).max(2048).optional(),
+  };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and available company tasks.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional(), state: z.enum(states).optional() }),
-  }, async ({ taskId, state }, ctx) => {
+    description: 'Show the authenticated employee and company tasks, one page at a time within the 48 KiB response budget. Pass page.nextCursor back to continue. Long context is previewed; read the rest with read_task_text. Calls without pageSize or cursor keep the old keys (principal, company, tasks).',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200).optional(),
+      state: z.enum(states).optional(),
+      goalId: z.string().min(1).max(100).optional(),
+      role: z.enum(roles).optional(),
+      since: z.string().min(1).max(40).optional(),
+      includeCompany: z.boolean().optional(),
+      fields: z.array(z.string().min(1).max(60)).min(1).max(40).optional(),
+      ...pageArgs,
+    }),
+  }, async (input, ctx) => {
     const credential = token(ctx);
-    return run(credential, async () => ({
-      principal: await core.authenticate(credential),
-      company: await core.companyBrief(credential),
-      tasks: taskId ? [await core.getTask(credential, taskId)] : await core.listTasks(credential, state),
-    }));
+    if (!core.contextView) {
+      // Cores that predate SYS01 keep the single-shot listing.
+      return run(credential, async () => ({
+        principal: await core.authenticate(credential),
+        company: await core.companyBrief(credential),
+        tasks: input.taskId ? [await core.getTask(credential, input.taskId)] : await core.listTasks(credential, input.state),
+      }));
+    }
+    return run(credential, () => core.contextView!(credential, input));
   });
 
   server.registerTool('reclaim_worktrees', {
@@ -111,9 +134,25 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.listWorktreeAudits(token(ctx), limit)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory and git reconciliation; task-scoped reads or gm global reads.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional() }),
-  }, async ({ taskId }, ctx) => run(token(ctx), () => core.listWorktrees ? core.listWorktrees(token(ctx), taskId) : Promise.resolve([])));
+    description: 'Authenticated persistent worktree inventory: compact references (released ones are counted and listed only with includeReleased), paged by path within the 48 KiB budget. Task-scoped reads, or gm global reads. Returns { worktrees, page }.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), includeReleased: z.boolean().optional(), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), () => core.worktreePage
+    ? core.worktreePage(token(ctx), input)
+    : core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId) : Promise.resolve([])));
+  server.registerTool('get_admin_summary', {
+    description: 'gm only: read-only company summary at a stated cutoff: task counts by state (optionally for one goal) and audit counts by action since a time (default: the last 24 hours), with the outbox sequence and an integrity flag. Never returns task text.',
+    inputSchema: z.object({ since: z.string().min(1).max(40).optional(), goalId: z.string().min(1).max(100).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('read_task_text', {
+    description: 'Read one byte segment of a task context (field context) or of one audit entry evidence (field evidence, auditId from get_task_history). Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      field: z.enum(['context', 'evidence']),
+      auditId: z.string().min(1).max(200).optional(),
+      offset: z.number().int().min(0).max(1_000_000_000).optional(),
+      limit: z.number().int().min(4).max(24576).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskText ? core.taskText(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('claim_next', {
     description: 'Atomically claim a task from the authenticated employee queue.',
@@ -219,9 +258,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.updateProjectDisciplines(token(ctx), input)));
 
   server.registerTool('get_task_history', {
-    description: 'Read the audited history of a task: claims, checkpoints, submissions, returns, owner decisions and handover packets.',
-    inputSchema: z.object({ taskId: z.string().min(1) }),
-  }, async ({ taskId }, ctx) => run(token(ctx), () => core.history(token(ctx), taskId)));
+    description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Newest entries come first, in pages that fit the 48 KiB budget (page.nextCursor continues); each page is returned oldest first. Long evidence is previewed with its length and SHA-256; read the full text with read_task_text.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), async () => core.historyView
+    ? core.historyView(token(ctx), input.taskId, input)
+    : { history: await core.history(token(ctx), input.taskId) }));
 
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;

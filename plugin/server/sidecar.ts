@@ -14,6 +14,7 @@ import {
 import { serviceHome } from "./env";
 import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
+import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -30,6 +31,8 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
+  // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
+  "get_admin_summary", "read_task_text",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -558,11 +561,13 @@ export class SidecarPool {
     }
     switch (tool) {
       case "list_worktrees": {
-        if (!core.listWorktrees) return [];
-        if (args.taskId !== undefined) return core.listWorktrees(cred, String(args.taskId));
-        // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。
+        // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。SYS01：分页、紧凑引用。
         const actor = await core.authenticate(cred);
-        return core.listWorktrees(cred, actor.role === "gm" ? undefined : live().taskId);
+        const scope = args.taskId !== undefined ? String(args.taskId) : actor.role === "gm" ? undefined : live().taskId;
+        if (core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
+        // Cores that predate SYS01 keep the old unpaged array.
+        if (!core.listWorktrees) return [];
+        return core.listWorktrees(cred, scope);
       }
       case "reclaim_worktrees": return core.reclaimWorktrees
         ? core.reclaimWorktrees(cred, {
@@ -573,13 +578,23 @@ export class SidecarPool {
       case "list_worktree_audits": return core.listWorktreeAudits
         ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
         : [];
+      // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the old keys (principal, company, tasks).
       case "get_context":
+        if (core.contextView) return core.contextView(cred, args);
         return {
           principal: await core.authenticate(cred),
           company: await core.companyBrief(cred),
           tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, args.state as never),
         };
-      case "get_task_history": return { history: await core.history(cred, String(args.taskId)) };
+      case "get_task_history":
+        if (core.historyView) return core.historyView(cred, String(args.taskId), args);
+        return { history: await core.history(cred, String(args.taskId)) };
+      case "get_admin_summary": return core.adminSummary
+        ? core.adminSummary(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose get_admin_summary"), { code: "temporarily_unavailable" }));
+      case "read_task_text": return core.taskText
+        ? core.taskText(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose read_task_text"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
@@ -674,6 +689,7 @@ export class SidecarPool {
               : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
-    writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));
+    // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(res)));
   }
 }

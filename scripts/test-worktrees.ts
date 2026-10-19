@@ -22,7 +22,7 @@ try {
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/pipelines.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/loop-breaker.fork.test.ts', 'tests/owner-commands.fork.test.ts',
-    'tests/goal-acceptance-repair.integration.test.ts',
+    'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts',
   ];
   const test = Bun.spawn(['bun', 'test', ...targets], { stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,

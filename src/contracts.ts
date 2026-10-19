@@ -87,9 +87,68 @@ export interface TaskView {
 export interface HistoryEntry {
   action: string;
   actor: string;
+  /** Preview of the evidence text (at most 2 KiB UTF-8); the full text is read through read_task_text. */
   evidence?: string;
   version?: number;
   at: string;
+  /** Audit row id, the handle read_task_text takes for the full evidence (SYS01). */
+  auditId?: string;
+  evidenceBytes?: number;
+  evidenceSha256?: string;
+  evidenceTruncated?: boolean;
+}
+
+/** Paging metadata shared by every bounded read (SYS01). Pages stay inside the response byte budget. */
+export interface PageInfo {
+  pageSize: number;
+  returned: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  /** Database time the traversal's snapshot was taken at; rows created later are outside it. */
+  snapshotAt?: string;
+  budgetBytes: number;
+}
+
+export interface ContextView {
+  principal: Principal;
+  company?: unknown;
+  tasks: Array<Record<string, unknown>>;
+  page: PageInfo;
+}
+
+export interface HistoryPageView {
+  history: HistoryEntry[];
+  page: PageInfo;
+}
+
+export interface WorktreePageView {
+  worktrees: Array<Record<string, unknown>>;
+  page: PageInfo;
+}
+
+/** One byte segment of a task's context or of one audit entry's evidence (SYS01). */
+export interface TaskTextSegment {
+  taskId: string;
+  field: 'context' | 'evidence';
+  auditId?: string;
+  totalBytes: number;
+  /** SHA-256 of the whole text, so a reader can verify a reassembly. */
+  sha256: string;
+  offset: number;
+  bytes: number;
+  nextOffset: number | null;
+  text: string;
+}
+
+/** gm-only read-only summary (SYS01): counts at a cutoff, never task text. */
+export interface AdminSummary {
+  cutoffAt: string;
+  since: string;
+  goalId?: string;
+  tasks: Record<string, number>;
+  audit: Record<string, number>;
+  outboxSequence: number;
+  integrity: { complete: boolean; method: string; taskRows: number; auditRows: number };
 }
 
 export interface CreateTask {
@@ -323,6 +382,12 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
+  contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
+  historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
+  worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
+  taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
+  adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;

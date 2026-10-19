@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -10,6 +10,9 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
+import { DETAIL_TEXT_BYTES, PAGE_BUDGET_BYTES, PREVIEW_BYTES, SEGMENT_DEFAULT_BYTES, fitCount, openCursor, sealCursor, utf8Bytes, utf8Prefix, utf8Segment } from './response-budget.ts';
+import { parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest } from './query-input.ts';
+import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -274,6 +277,55 @@ const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   submitted: Boolean(row.submitted_by), leaseHolder: isLeased(row) ? row.current_employee : undefined,
   dependencies: (row.dependencies ?? []).map(asId).sort(),
 });
+
+// ---- Bounded reads (SYS01). Each page fits the response byte budget; cursors are sealed and bound. ----
+const CURSOR_TTL_MS = 6 * 60 * 60 * 1000;
+/** Characters fetched per task row for a list page; the byte preview is then cut to PREVIEW_BYTES. */
+const CONTEXT_PREVIEW_CHARS = 300;
+const HISTORY_PREVIEW_BYTES = 2048;
+const COMPANY_DIRECTIONS_BYTES = 8 * 1024;
+const COMPANY_GOALS_BYTES = 12 * 1024;
+const COMPANY_PROJECTS_BYTES = 4 * 1024;
+
+interface ScannedTask { row: TaskRow; cat: string; aid: string; contextChars: number }
+type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
+interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
+
+const pick = (value: Record<string, unknown>, fields?: readonly string[]): Record<string, unknown> =>
+  fields ? Object.fromEntries(fields.filter(field => field in value).map(field => [field, value[field]])) : value;
+
+function listTaskView(scanned: ScannedTask, fields?: readonly string[]): Record<string, unknown> {
+  const full = view(scanned.row);
+  const cut = utf8Prefix(full.context, PREVIEW_BYTES);
+  return pick({ ...full, context: cut.text, contextChars: scanned.contextChars, contextTruncated: scanned.contextChars > [...cut.text].length }, fields);
+}
+
+function detailTaskView(task: TaskView, fields?: readonly string[]): Record<string, unknown> {
+  const total = utf8Bytes(task.context);
+  const cut = utf8Prefix(task.context, DETAIL_TEXT_BYTES);
+  return pick({ ...task, context: cut.text, contextBytes: total, contextSha256: HASH(task.context), contextTruncated: cut.bytes < total }, fields);
+}
+
+function historyEntry(row: AuditHistoryRow): HistoryEntry {
+  const full = row.evidence ?? '';
+  const cut = utf8Prefix(full, HISTORY_PREVIEW_BYTES);
+  return {
+    auditId: asId(row.id), action: row.action, actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
+    version: row.version, at: row.cat,
+    ...(row.evidence ? { evidence: cut.text, evidenceBytes: cut.total, evidenceSha256: HASH(full), evidenceTruncated: cut.bytes < cut.total } : {}),
+  };
+}
+
+/** The company block keeps the same keys as before, with each list bounded and its full count reported. */
+function boundCompany(brief: CompanyBrief) {
+  const directions = brief.directions.slice(0, fitCount(brief.directions, rows => rows, COMPANY_DIRECTIONS_BYTES));
+  const goals = brief.goals.slice(0, fitCount(brief.goals, rows => rows, COMPANY_GOALS_BYTES));
+  const projects = brief.projects.slice(0, fitCount(brief.projects, rows => rows, COMPANY_PROJECTS_BYTES));
+  return {
+    paused: brief.paused, directions, directionsTotal: brief.directions.length,
+    goals, goalsTotal: brief.goals.length, projects, projectsTotal: brief.projects.length,
+  };
+}
 
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
@@ -875,6 +927,258 @@ export class SurrealCompanyCore implements CompanyCore {
   async history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]> {
     await this.getTask(credential, taskId);
     return this.readHistory(taskId);
+  }
+
+  /** Per-key cursor secret: one row in company_meta, created on first use and never returned to callers. */
+  private async cursorKey(): Promise<Buffer> {
+    const record = id('company_meta', 'cursor_key');
+    const existing = await this.db.select<{ key?: string }>(record);
+    if (existing?.key) return Buffer.from(existing.key, 'base64url');
+    const key = randomBytes(32);
+    try {
+      await this.db.query('CREATE ONLY $record CONTENT { key: $key, created_at: time::now() };', { record, key: key.toString('base64url') });
+      return key;
+    } catch {
+      const again = await this.db.select<{ key?: string }>(record);
+      if (!again?.key) throw new CompanyError('temporarily_unavailable', 'cursor key unavailable; retry the read', true);
+      return Buffer.from(again.key, 'base64url');
+    }
+  }
+
+  /** Database clock at the start of a traversal; rows created after it are outside that traversal. */
+  private async snapshotNow(): Promise<string> {
+    const [now] = await this.db.query<[string]>('RETURN <string>time::now();');
+    return now;
+  }
+
+  /** The largest prefix of `window` that serializes within the page budget; a page never comes back empty. */
+  private fitPage<T>(window: readonly T[], build: (kept: readonly T[]) => unknown, what: string): number {
+    const kept = fitCount(window, build, PAGE_BUDGET_BYTES);
+    if (kept === 0 && window.length > 0) throw new CompanyError('temporarily_unavailable', `${what} cannot fit the response budget`, true);
+    return kept;
+  }
+
+  /**
+   * get_context (SYS01): the working set or one task, as bounded pages. Calls that name neither pageSize
+   * nor cursor keep the pre-SYS01 shape (principal, company, tasks) and get the first budgeted page.
+   */
+  async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
+    const actor = await this.authenticate(credential);
+    const params = parseContextInput(input);
+    const company = params.includeCompany ? boundCompany(await this.companyBrief(credential)) : undefined;
+    if (params.taskId !== undefined) {
+      const task = detailTaskView(await this.getTask(credential, params.taskId as TaskId), params.fields);
+      return {
+        principal: actor, ...(company ? { company } : {}), tasks: [task],
+        page: { pageSize: 1, returned: 1, hasMore: false, budgetBytes: PAGE_BUDGET_BYTES },
+      };
+    }
+    const digest = queryDigest('context', { state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null });
+    const key = await this.cursorKey();
+    let snap: string;
+    let after: { at: string; id: string } | undefined;
+    if (params.cursor !== undefined) {
+      const body = openCursor(params.cursor, key, Date.now());
+      if (body.k !== 'context' || body.c !== actor.employeeId || body.q !== digest || body.snap === undefined) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
+      }
+      snap = body.snap;
+      after = body.at !== undefined && body.id !== undefined ? { at: body.at, id: body.id } : undefined;
+    } else {
+      snap = await this.snapshotNow();
+    }
+    const scanned = await this.scanTasks(actor, params, snap, after);
+    const window = scanned.slice(0, params.pageSize);
+    const hasMore = scanned.length > params.pageSize;
+    const build = (rows: readonly ScannedTask[]): ContextView => {
+      const last = rows.at(-1);
+      const more = rows.length < window.length || hasMore;
+      const tasks = rows
+        .filter(row => !(row.row.state === 'review' && row.row.submitted_by === actor.employeeId))
+        .map(row => listTaskView(row, params.fields));
+      const page: PageInfo = {
+        pageSize: params.pageSize, returned: tasks.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES, snapshotAt: snap,
+        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'context', c: actor.employeeId, q: digest, snap, at: last.cat, id: last.aid, exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
+      };
+      return { principal: actor, ...(company ? { company } : {}), tasks, page };
+    };
+    return build(window.slice(0, this.fitPage(window, build, 'context page')));
+  }
+
+  /** One keyset page of the visible working set, newest first. Scanned rows are kept even when filtered out, so the cursor never skips them. */
+  private async scanTasks(actor: Principal, params: ReturnType<typeof parseContextInput>, snap: string, after?: { at: string; id: string }): Promise<ScannedTask[]> {
+    const where: string[] = [params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']"];
+    const vars: Record<string, unknown> = { ctx: CONTEXT_PREVIEW_CHARS, limit: params.pageSize + 1, snap };
+    if (params.state) vars.state = params.state;
+    if (actor.role !== 'gm') {
+      where.push('(executor_role = $myrole OR reviewer_role = $myrole)');
+      vars.myrole = actor.role;
+    }
+    if (params.role) {
+      where.push('(executor_role = $qrole OR reviewer_role = $qrole)');
+      vars.qrole = params.role;
+    }
+    if (params.goalId) {
+      where.push('goal = $goal');
+      vars.goal = id('goal', params.goalId);
+    }
+    if (params.since) {
+      where.push('created_at >= <datetime>$since');
+      vars.since = params.since;
+    }
+    where.push('created_at <= <datetime>$snap');
+    if (after) {
+      where.push('(created_at < <datetime>$at OR (created_at = <datetime>$at AND id < $aid))');
+      vars.at = after.at;
+      vars.aid = id('task', after.id);
+    }
+    const [rows] = await this.db.query<[Array<TaskRow & { cat: string; contextChars?: number }>]>(
+      `SELECT *, string::slice(context ?? '', 0, $ctx) AS context, string::len(context ?? '') AS contextChars, <string>created_at AS cat
+       FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit;`, vars);
+    return (rows ?? []).map(row => ({ row, cat: row.cat, aid: asId(row.id), contextChars: row.contextChars ?? 0 }));
+  }
+
+  /**
+   * get_task_history (SYS01): audited entries newest first, one budgeted page at a time; each page is
+   * returned oldest first, as before. Long evidence is previewed with its length and SHA-256; the full text
+   * comes from read_task_text.
+   */
+  async historyView(credential: Credential, taskId: TaskId, input: Record<string, unknown> = {}): Promise<HistoryPageView> {
+    const actor = await this.authenticate(credential);
+    await this.getTask(credential, taskId);
+    const params = parseHistoryInput(input);
+    const digest = queryDigest('history', { taskId });
+    const key = await this.cursorKey();
+    let snap: string;
+    let after: { at: string; id: string } | undefined;
+    if (params.cursor !== undefined) {
+      const body = openCursor(params.cursor, key, Date.now());
+      if (body.k !== 'history' || body.c !== actor.employeeId || body.q !== digest || body.snap === undefined) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
+      }
+      snap = body.snap;
+      after = body.at !== undefined && body.id !== undefined ? { at: body.at, id: body.id } : undefined;
+    } else {
+      snap = await this.snapshotNow();
+    }
+    const where = ['task = $task', "action != 'ops_call'", 'at <= <datetime>$snap'];
+    const vars: Record<string, unknown> = { task: id('task', taskId), snap, limit: params.pageSize + 1 };
+    if (after) {
+      where.push('(at < <datetime>$at OR (at = <datetime>$at AND id < $aid))');
+      vars.at = after.at;
+      vars.aid = id('audit', after.id);
+    }
+    const [rows] = await this.db.query<[AuditHistoryRow[]]>(
+      `SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit WHERE ${where.join(' AND ')} ORDER BY at DESC, id DESC LIMIT $limit;`, vars);
+    const scanned = rows ?? [];
+    const window = scanned.slice(0, params.pageSize);
+    const hasMore = scanned.length > params.pageSize;
+    const build = (kept: readonly AuditHistoryRow[]): HistoryPageView => {
+      const last = kept.at(-1);
+      const more = kept.length < window.length || hasMore;
+      const page: PageInfo = {
+        pageSize: params.pageSize, returned: kept.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES, snapshotAt: snap,
+        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'history', c: actor.employeeId, q: digest, snap, at: last.cat, id: asId(last.id), exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
+      };
+      return { history: kept.map(historyEntry).reverse(), page };
+    };
+    return build(window.slice(0, this.fitPage(window, build, 'history page')));
+  }
+
+  /**
+   * list_worktrees (SYS01): compact references (released ones are counted, listed only when asked), sorted
+   * and paged by worktree path. The inventory itself is still computed in full; only the response is bounded.
+   */
+  async worktreePage(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreePageView> {
+    const actor = await this.authenticate(credential);
+    const params = parseWorktreeInput(input);
+    const digest = queryDigest('worktrees', { taskId: params.taskId ?? null, includeReleased: params.includeReleased });
+    const key = await this.cursorKey();
+    let after: string | undefined;
+    if (params.cursor !== undefined) {
+      const body = openCursor(params.cursor, key, Date.now());
+      if (body.k !== 'worktrees' || body.c !== actor.employeeId || body.q !== digest) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
+      }
+      after = body.id;
+    }
+    const all = await this.listWorktrees(credential, params.taskId as TaskId | undefined);
+    const compact: WorktreeCompact[] = [...all]
+      .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
+      .filter(worktree => after === undefined || worktree.worktreePath > after)
+      .map(worktree => ({
+        ...worktree,
+        references: params.includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released'),
+        releasedReferences: worktree.references.filter(reference => reference.state === 'released').length,
+      }));
+    const window = compact.slice(0, params.pageSize);
+    const hasMore = compact.length > params.pageSize;
+    const build = (kept: readonly WorktreeCompact[]): WorktreePageView => {
+      const last = kept.at(-1);
+      const more = kept.length < window.length || hasMore;
+      const page: PageInfo = {
+        pageSize: params.pageSize, returned: kept.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES,
+        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'worktrees', c: actor.employeeId, q: digest, id: last.worktreePath, exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
+      };
+      return { worktrees: [...kept], page };
+    };
+    return build(window.slice(0, this.fitPage(window, build, 'worktree page')));
+  }
+
+  /**
+   * read_task_text (SYS01): one byte segment of a task's context or of one audit entry's evidence. Segments
+   * never split a character and reassemble exactly; sha256 covers the whole text, so a reader can verify it.
+   */
+  async taskText(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment> {
+    const params = parseTextInput(input);
+    await this.getTask(credential, params.taskId as TaskId);
+    let text: string;
+    if (params.field === 'context') {
+      const row = await this.db.select<TaskRow>(id('task', params.taskId));
+      text = row?.context ?? '';
+    } else {
+      if (!params.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
+      const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
+        'SELECT task, evidence FROM audit WHERE id = $aid;', { aid: id('audit', params.auditId) });
+      const row = rows?.[0];
+      if (!row || !row.task || asId(row.task) !== params.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
+      text = row.evidence ?? '';
+    }
+    const segment = utf8Segment(text, params.offset, params.limit ?? SEGMENT_DEFAULT_BYTES);
+    return {
+      taskId: params.taskId, field: params.field, ...(params.auditId ? { auditId: params.auditId } : {}),
+      totalBytes: segment.total, sha256: HASH(text), offset: segment.offset, bytes: segment.bytes,
+      nextOffset: segment.next, text: segment.text,
+    };
+  }
+
+  /**
+   * get_admin_summary (SYS01, gm only): full-table counts by state and by audit action in a time window,
+   * plus the cutoff time and the outbox sequence it was read at. Nothing here carries task text.
+   */
+  async adminSummary(credential: Credential, input: Record<string, unknown> = {}): Promise<AdminSummary> {
+    const actor = await this.authenticate(credential);
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may read the company summary');
+    const params = parseSummaryInput(input);
+    const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const goal = params.goalId ? id('goal', params.goalId) : undefined;
+    const [states, actions, cutoff, sequence] = await this.db.query<[
+      Array<{ state: string; n: number }>, Array<{ action: string; n: number }>, string, number[],
+    ]>(
+      `SELECT state, count() AS n FROM task ${goal ? 'WHERE goal = $goal' : ''} GROUP BY state;
+       SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since GROUP BY action;
+       RETURN <string>time::now();
+       SELECT VALUE value FROM company_meta:outbox_counter;`,
+      { since, ...(goal ? { goal } : {}) });
+    const tasks = Object.fromEntries((states ?? []).map(row => [row.state, Number(row.n)]));
+    const audit = Object.fromEntries((actions ?? []).map(row => [row.action, Number(row.n)]));
+    const taskRows = Object.values(tasks).reduce((sum, n) => sum + n, 0);
+    const auditRows = Object.values(audit).reduce((sum, n) => sum + n, 0);
+    return {
+      cutoffAt: cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}), tasks, audit,
+      outboxSequence: Number((sequence ?? [])[0] ?? 0),
+      integrity: { complete: true, method: 'group-by over full tables at cutoff', taskRows, auditRows },
+    };
   }
 
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
