@@ -1057,6 +1057,7 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     // A complete traversal through the channel: every page whole and inside the budget, every task exactly once.
     const expected = await workingIds(goalId);
     const seen: string[] = [];
+    const pageBytes: number[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < 200; page++) {
       const reply = await call('get_context', { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
@@ -1064,6 +1065,7 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
       expect(Buffer.byteLength(reply.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
       const body = JSON.parse(reply.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
       seen.push(...body.tasks.map(task => String(task.id)));
+      pageBytes.push(Buffer.byteLength(reply.out, 'utf8'));
       if (!body.page.nextCursor) break;
       cursor = body.page.nextCursor;
     }
@@ -1095,6 +1097,19 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     }
     expect(pieces.join('')).toBe(longText);
     expect(pinned).toBe(sha256(longText));
+    // Legacy detail through the channel (C3): a context over the budget is refused with the read_task_text route, a short one whole.
+    const longDetail = await call('get_context', { taskId: longTask.id });
+    expect(longDetail.exit).toBe(1);
+    expect(longDetail.out).toContain('read_task_text');
+    const shortContext = '短正文 🙂 中文';
+    const shortTask = await core.createTask(gm, {
+      title: '通道短正文样例', context: shortContext, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('e2e-short'),
+    });
+    const shortDetail = await call('get_context', { taskId: shortTask.id });
+    expect(shortDetail.exit).toBe(0);
+    expect((JSON.parse(shortDetail.out) as { tasks: Array<{ context: string }> }).tasks[0]!.context).toBe(shortContext);
+    // Byte evidence for the report: the largest page and the refused legacy list, against the budget.
+    console.log(`AC03 channel bytes ${JSON.stringify({ tasks: expected.length, pages: pageBytes.length, maxPageBytes: Math.max(...pageBytes), refusedLegacyBytes: Buffer.byteLength(refused.out, 'utf8'), longDetailBytes: Buffer.byteLength(longDetail.out, 'utf8'), budgetBytes: RESPONSE_BUDGET_BYTES })}`);
     // Task history and worktrees keep their channel shapes when asked without paging.
     const history = await call('get_task_history', { taskId: longTask.id });
     expect(history.exit).toBe(0);

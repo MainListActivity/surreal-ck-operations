@@ -85,7 +85,7 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 - `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
 - `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
 - 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。预览健康与监听进程按下节检查。
+- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。任务数超过 48 KiB 预算时，无分页参数的 `get_context` 报 `response_too_large`，这不是故障，改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读取。预览健康与监听进程按下节检查。
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
 
@@ -161,7 +161,9 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依据；租约过期/交接只释放员工 fence，非终态保留 recovery；done 后 exclusive 干净树可事件触发删除，shared 与保护树保留；脏树与未合并分支不强制删除。孤儿宽限默认 7 天（`SCK_WORKTREE_ORPHAN_GRACE_DAYS` / `company_meta:config.worktree_orphan_grace_days`），时钟用 last_released_at → last_used_at → created_at。调度器沿用既有 10 分钟 sweep，不新建定时器。紧急关闭：`SCK_WORKTREE_RECLAIM=0`。审计表 schema 012 `worktree_audit` 可查。细节与演练见 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。
 
-查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；GM 可不传 taskId 查询全局。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。不带 `pageSize`、`cursor` 时返回数组，超出 48 KiB 预算则报 `response_too_large`；带分页参数时返回 `{worktrees, page}`（该形态待经理裁决，见 [query-paging.md](./query-paging.md) 第 3、4 节）。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。
+查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；GM 可不传 taskId 查询全局。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。不带 `pageSize`、`cursor` 时返回完整数组，超出 48 KiB 预算则报 `response_too_large`，不截尾；带分页参数时返回 `{worktrees, page}`，按 `page.nextCursor` 逐页读完再统计（见 [query-paging.md](./query-paging.md) 第 3、4 节）。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。
+
+管理查询（SYS01）：`get_context`、`get_task_history`、`list_worktrees` 的分页、预算与 `read_task_text` 分段读取，以及 GM 专用的 `get_admin_summary`（口径与完整性标志），见 [query-paging.md](./query-paging.md)。发布后的真实员工 sck 最终验收由 QA 任务 `6b6cb5b9` 执行。
 
 本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)：
 

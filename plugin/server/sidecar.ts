@@ -642,6 +642,14 @@ export class SidecarPool {
     }
   }
 
+  /** Stops this pool's sweeper and keepalives, as a process exit would. A replacement pool over the same run
+   *  directory must be the only one answering it, so a restarted pool closes its predecessor first. */
+  close(): void {
+    for (const instId of [...this.beats.keys()]) this.stopBeat(instId);
+    if (this.sweeper) clearInterval(this.sweeper);
+    this.sweeper = undefined;
+  }
+
   private ensureSweeper(): void {
     if (this.sweeper) return;
     const sweep = setInterval(() => this.sweep(), this.deps.sweepMs ?? SWEEP_MS);

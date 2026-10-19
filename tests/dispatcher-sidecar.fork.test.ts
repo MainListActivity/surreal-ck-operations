@@ -66,7 +66,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const oldProof: LeaseProof = { taskId: task.id, deliveryId: oldClaim.deliveryId, fence: oldClaim.fence, expectedVersion: oldClaim.task.version };
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(true);
     expect((await relay(oldEnv, 'ops_info')).ok).toBe(true);
-    pool.detachAgent(old.paseoAgentId!); pool = makePool(); await pool.adopt(await wf.insts());
+    pool.detachAgent(old.paseoAgentId!); pool.close(); pool = makePool(); await pool.adopt(await wf.insts());
     // Restart fencing: the rotated-out channel key and the minted credential are
     // dead even though adopt() re-keyed the live session and kept its lease.
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(false);
@@ -98,6 +98,6 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const history = await core.history(gm, task.id); expect(history.some(h => h.action === 'accept' && h.actor !== old.id)).toBe(true);
   } finally {
     for (const id of agentRows.keys()) pool?.detachAgent(id);
-    await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
+    pool?.close(); await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
   }
 }, 30000);
