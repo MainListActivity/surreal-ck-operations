@@ -200,6 +200,69 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
+/** gm (manage): read-only dry-run of the acceptance reference repair for a quick/software goal. */
+export interface GoalAcceptancePreview {
+  goalId: string;
+  /** Candidate 运营验收 task (kind task, product executor, gm reviewer) that would take over the references. */
+  candidateTaskId?: TaskId;
+}
+
+/** gm (manage): commit the acceptance reference repair; compare-and-set on the preview snapshot. */
+export interface GoalAcceptanceRepair {
+  goalId: string;
+  /** The voided task the goal's manual/acceptance references must still point at. */
+  expectedOldTaskId: TaskId;
+  candidateTaskId: TaskId;
+  /** snapshot.hash from goal_acceptance_preview; any drift in the repair basis refuses the commit. */
+  snapshotHash: string;
+  /** Business reason, audited with the before and after references. */
+  text: string;
+  idempotencyKey: string;
+}
+
+export interface GoalAcceptanceTask {
+  id: TaskId;
+  title: string;
+  state: TaskState;
+  executorRole: Role;
+  reviewerRole: ReviewerRole;
+  kind: TaskKind;
+  version: number;
+  blockedTo?: 'gm' | 'owner';
+  submitted: boolean;
+  leaseHolder?: string;
+  dependencies: TaskId[];
+}
+
+export interface GoalAcceptanceView {
+  goal: {
+    id: string; title: string; state: GoalView['state']; tier?: GoalTier; pipeline: string; project?: string;
+    tasks: Record<string, string>; anchors: TaskId[];
+  };
+  /** The live manual/acceptance task the goal points at (expected to be void before a repair). */
+  replaced?: GoalAcceptanceTask;
+  /** Goal work that is neither done nor void; the candidate must depend on all of it. */
+  unfinished: GoalAcceptanceTask[];
+  candidate?: GoalAcceptanceTask & { missing: TaskId[] };
+  diff: {
+    manual: { from?: TaskId; to?: TaskId }; acceptance: { from?: TaskId; to?: TaskId };
+    anchors: { from: TaskId[]; to: TaskId[] };
+  };
+  /** Every rule the repair would break; empty when the repair is ready. */
+  violations: Array<{ code: string; message: string }>;
+  ready: boolean;
+  snapshot: { version: 1; hash: string };
+}
+
+export interface GoalAcceptanceResult {
+  goalId: string;
+  replacedTaskId: TaskId;
+  candidate: GoalAcceptanceTask;
+  anchors: TaskId[];
+  snapshotHash: string;
+  repairedAt: string;
+}
+
 /** deliveryId + fence are mandatory for every write after claim. */
 export interface LeaseProof {
   taskId: TaskId;
@@ -256,6 +319,10 @@ export interface CompanyCore {
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
   /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
+  /** gm (manage): read-only dry-run of repointing a quick/software goal's acceptance reference; writes nothing. */
+  goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
+  /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
+  goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
