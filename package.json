@@ -16,7 +16,7 @@
     "company": "bun src/owner-cli.ts",
     "dispatcher": "bun src/dispatcher/run.ts",
     "test:channel": "bun test tests/dispatcher-sidecar.test.ts tests/dispatcher-sidecar.fork.test.ts tests/sidecar.test.ts tests/sidecar-late-lease.test.ts tests/sidecar-plugin-integration.test.ts tests/credential-file.test.ts tests/scrub.test.ts tests/weighted-order.test.ts tests/worktree-lock.test.ts",
-    "test:bridge": "bun test tests/approval-lifecycle.test.ts tests/proof-mirror.test.ts tests/ops-supplier.test.ts tests/internal-ai-proof.test.ts tests/internal-ai-proof.fork.test.ts tests/ops-broker.test.ts tests/ops-units.test.ts tests/sidecar.test.ts tests/plugin-preview.test.ts",
+    "test:bridge": "bun test tests/approval-lifecycle.test.ts tests/ops-login-transport.test.ts tests/proof-mirror.test.ts tests/ops-supplier.test.ts tests/internal-ai-proof.test.ts tests/internal-ai-proof.fork.test.ts tests/ops-broker.test.ts tests/ops-units.test.ts tests/sidecar.test.ts tests/plugin-preview.test.ts",
     "test:service": "bun test tests/company-service.test.ts",
     "test:worktrees": "bun scripts/test-worktrees.ts"
   },
@@ -24,7 +24,8 @@
     "@modelcontextprotocol/client": "2.1.0",
     "@modelcontextprotocol/server": "2.1.0",
     "zod": "^4.6.5",
-    "surrealdb": "2.0.8"
+    "surrealdb": "2.0.8",
+    "undici": "7.30.1"
   },
   "devDependencies": {
     "bun-types": "1.3.12",

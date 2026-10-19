@@ -17,7 +17,7 @@ import {
 import { egoBrowserInjector, oidcUserEntry, type BrowserInjector } from './browser.ts';
 import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlaneEnv } from './config.ts';
 import { cloudflareD1, type D1Client } from './d1.ts';
-import type { Fetcher } from './fetcher.ts';
+import { opsFetch, type Fetcher } from './fetcher.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
@@ -364,7 +364,7 @@ export class OpsBroker {
     const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
     const lanPort = Number(process.env.SCK_PREVIEW_PORT ?? 18777);
     const sigPort = Number(process.env.SCK_PREVIEW_SIGNED_PORT ?? 18778);
-    const doFetch = this.deps.fetch ?? fetch;
+    const doFetch = this.deps.fetch ?? opsFetch;
     const probe = async (port: number): Promise<{ running: boolean; uptime?: number; error?: string }> => {
       try {
         const res = await doFetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(800) });
@@ -396,7 +396,7 @@ export class OpsBroker {
     const started = this.now();
     let response: Response;
     try {
-      response = await (this.deps.fetch ?? fetch)(url, { redirect: 'manual', signal: AbortSignal.timeout(15_000) });
+      response = await (this.deps.fetch ?? opsFetch)(url, { redirect: 'manual', signal: AbortSignal.timeout(15_000) });
     } catch (error) {
       return { value: { url, reachable: false, error: (error as Error).name } };
     }

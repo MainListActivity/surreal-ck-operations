@@ -1,5 +1,5 @@
 import { CompanyError } from '../core-errors.ts';
-import type { Fetcher } from './fetcher.ts';
+import { opsFetch, type Fetcher } from './fetcher.ts';
 
 export interface D1Client {
   /** One parameterised statement; returns result rows (empty for writes). */
@@ -21,7 +21,7 @@ export interface D1Options {
  * fixed SQL with bound parameters, so employees cannot reach arbitrary statements.
  */
 export function cloudflareD1(options: D1Options): D1Client {
-  const fetcher = options.fetch ?? fetch;
+  const fetcher = options.fetch ?? opsFetch;
   const url = `${(options.baseUrl ?? 'https://api.cloudflare.com/client/v4').replace(/\/+$/, '')}/accounts/${encodeURIComponent(options.accountId)}/d1/database/${encodeURIComponent(options.databaseId)}/query`;
   return {
     async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {

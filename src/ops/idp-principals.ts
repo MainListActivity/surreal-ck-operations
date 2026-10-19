@@ -5,7 +5,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 import type { D1Client } from './d1.ts';
-import { describeTransportFailure, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
@@ -195,7 +195,7 @@ export async function idpAdminRequest(
   let response: Response;
   let raw: string;
   try {
-    response = await (options.fetch ?? fetch)(`${idpOrigin}${request.path}`, {
+    response = await (options.fetch ?? opsFetch)(`${idpOrigin}${request.path}`, {
       method: request.method,
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       body,

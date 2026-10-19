@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, isTlsTrustFailure, opsFetch, type Fetcher } from './fetcher.ts';
 
 /** Raised when the IdP refuses the login; `reason` is the IdP's error code, never a credential. */
 export class LoginError extends CompanyError {
@@ -38,12 +38,15 @@ export interface LoginOptions {
   stepTimeoutMs?: number;
   /** Limit for all attempts together; tests shrink it. */
   budgetMs?: number;
+  /** Time that must remain before a second attempt starts; tests shrink it with the budget. */
+  retryMinLeftMs?: number;
   channel?: LoginChannel;
 }
 
 const MAX_HOPS = 8;
 const MAX_ATTEMPTS = 2;
 // The IdP and the product are reached over a WAN where a single request of 5-10s happens; a healthy login takes 8-17s in total.
+// Every step's signal caps its connect too (the transport's connect limit, 20s, only ever cuts earlier), so a slow connect spends the step and the budget.
 const STEP_TIMEOUT_MS = 25_000;
 // All attempts together stay well inside the 120s an employee waits for one tool call, which also has to list workspaces afterwards.
 const BUDGET_MS = 75_000;
@@ -98,6 +101,8 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
   } catch (error) {
     const { detail } = describeTransportFailure(error, ms);
     io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
+    // An untrusted certificate fails the same way on every attempt, so it is final and never retried.
+    if (isTlsTrustFailure(error)) throw fail(what, `TLS certificate not trusted: ${detail}`);
     throw new Unavailable(what, detail);
   }
 }
@@ -239,7 +244,7 @@ export async function passwordLogin(
   const stepMs = options.stepTimeoutMs ?? STEP_TIMEOUT_MS;
   const left = () => budgetMs - (Date.now() - started);
   const io: Io = {
-    fetcher: options.fetch ?? fetch,
+    fetcher: options.fetch ?? opsFetch,
     step: () => {
       const ms = Math.min(stepMs, Math.max(left(), MIN_STEP_MS));
       return { signal: AbortSignal.timeout(ms), ms };
@@ -253,7 +258,7 @@ export async function passwordLogin(
       return await signIn(config, username, password, channel, io, options.now ?? Date.now);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
-      if (attempt >= MAX_ATTEMPTS || left() < RETRY_MIN_LEFT_MS) {
+      if (attempt >= MAX_ATTEMPTS || left() < (options.retryMinLeftMs ?? RETRY_MIN_LEFT_MS)) {
         const trace = formatTrace(io);
         const attempts = attempt > 1 ? `; gave up after ${attempt} attempts` : '';
         throw new CompanyError('upstream_error',
