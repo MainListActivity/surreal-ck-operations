@@ -21,7 +21,7 @@ rtk proxy pnpm run test:worktrees
 
 此实现 PR 不合入部署，也不伪称生产已验证。经理在上线批准后安排演练任务与已有编制，QA 使用正常派工通道，不调管理接口、不自行创建员工，不读取凭证。所有 task 创建都由 manager 的已有 `create_task` 权限完成，任务标题标识 WT01 演练；任务工作范围由 workIntent 明示，写测试只在临时演练仓库的 test 目录，不能用业务数据。若项目需要新的演练仓库登记由 GM 配置 project，QA 上报依赖，不能绕权。
 
-1. 经理先取 `list_worktrees {}` 保存登记数/有效引用数和 audit 时间；记录 active MCP release commit、插件运行 commit/vendor/schema 011 哈希、running、`/ready`、`get_context`。
+1. 经理先取 `list_worktrees {}` 保存登记数/有效引用数和 audit 时间（默认返回完整数组；超出预算报 `response_too_large` 时改用 `pageSize`/`cursor` 逐页统计）；记录 active MCP release commit、插件运行 commit/vendor/schema 011 哈希、running、`/ready`、`get_context`。
 2. 排两项 QA 或 GM read 任务，第一项正常提交后第二项才解锁。两位持有人在自己的 claim.json 记录 `worktree.worktreePath/mode/branch`，第二项应同路径。通过 `list_worktrees {taskId}` 查询第一项 released、第二项 active，记录准确员工及任务 ID。
 3. 排两项串行 engineering code 任务：第一项在其登记任务分支提交小测试文件并正常提交；第二项依赖第一项完成且 shared 没有其它活动引用。期望同路径、不同 task 分支，第二分支基线不包含第一任务提交。PR/提交必须各自独立。
 4. 排两个无依赖 engineering code 任务，由调度器正常并行派发。第一项保持在办现场时才释放第二项；期望路径不同（第二 exclusive），第一路径/branch 未迁移。各在授权临时目录写不同标记，读回自己的标记，不能出现对方未提交改动。
