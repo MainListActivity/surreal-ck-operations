@@ -8,7 +8,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { describeTransportFailure, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
 import { evidenceSchema, sha256, TOKEN_PLAN_PLAN_TYPE_FREE } from './proof-contract.ts';
 import { clip, redactJson } from './redact.ts';
 
@@ -243,7 +243,7 @@ function governingPool(pools: PoolFacts[]): PoolFacts | undefined {
 }
 
 export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<SupplierSampleResult> {
-  const fetcher = input.fetch ?? fetch;
+  const fetcher = input.fetch ?? opsFetch;
   const now = input.now ?? Date.now;
   const sampledMs = now();
   const sampledAt = new Date(sampledMs).toISOString();

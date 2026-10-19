@@ -1,6 +1,6 @@
 import { CompanyError } from '../core-errors.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
 
 export const PRODUCT_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type ProductMethod = typeof PRODUCT_METHODS[number];
@@ -69,7 +69,7 @@ export async function productRequest(
   let response: Response;
   let raw: string;
   try {
-    response = await (options.fetch ?? fetch)(`${config.product.url}${path}`, {
+    response = await (options.fetch ?? opsFetch)(`${config.product.url}${path}`, {
       method,
       headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
       body,
