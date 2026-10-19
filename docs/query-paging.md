@@ -148,8 +148,8 @@ null 语义（MCP、sidecar 与核心一致）：
 
 - D1（认领的交接窗口，已按 v25 R3 处理）：认领结果中的 `history` 不再是固定 16 KiB 窗口，而是按字节动态填充（第 2 节）。认领已经提交，提交后不能拒绝，所以回显有界而非完整。核心读取的窗口仍按条数限定（最新 60 条协议记录与 20 条运维记录）。`historyComplete` 为假时，表示较早的条目未包含在内，完整历史用 `get_task_history` 分页读取。这与 C2 的“完整或明确失败”措辞不同，认领作为已提交写入是 R3 的例外。
 - D2（准入原子性，已按 v25 R4 处理）：快照准入上限由数据库内的 `query_snapshot_quota:global` 版本校验执行，MCP 与插件 sidecar 两个进程共用（第 4 节）。跨进程用例（`tests/snapshot-quota.fork.test.ts`，经 `tests/snapshot-quota.child.ts` 由三个子进程并发准入 20 次）列入第 9.1 节的门禁。
-- D3（运行时）：证据覆盖 Bun 1.3.11 与部署运行时 Bun 1.4.2，见第 9 节。缺陷 1 的红灯只在 Bun 1.3.11 上取得，1.4.2 上未单独复现。
-- D4（核心认领的字节数）：`claim()` 的返回值是完整认领（写入 `claim.json`，供调度器使用），字节数可以超过预算，它不是应答。预算约束的是 RPC 回显：MCP `claim_next` 与 `heartbeat` 的应答（`echoClaim`）。复核断言应针对 MCP 与通道的应答，不针对 `core.claim`。sidecar 没有 `claim_next` 与认领回显（见第 9.6 节）。请复核确认这一口径。
+- D3（运行时）：证据覆盖 Bun 1.3.11 与部署运行时 Bun 1.4.2，见第 9 节。两种运行时的门禁与红灯结果一致（见第 9 节）。
+- D4（核心认领的字节数）：`claim()` 的返回值是完整认领（写入 `claim.json`，供调度器使用），字节数可以超过预算，它不是 RPC 应答。预算约束的是 RPC 回显：MCP `claim_next` 与 `heartbeat` 的应答（`echoClaim`）。复核断言针对 MCP 与通道的应答，不针对 `core.claim`。这一层次已由经理裁决 v25 确认。sidecar 没有 `claim_next` 与认领回显（见第 9.6 节）。
 
 拆分项与 v25 裁决（R6、R7 未在 SYS01 实现）：
 
@@ -185,7 +185,7 @@ null 语义（MCP、sidecar 与核心一致）：
 
 阳性对照：旧版调度器认领了就绪任务（零误派工断言之外的正向检查）。
 
-红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言应失败。前次树上的结果为 7 通过、1 失败（`rework7-red-rb01-misdispatch-mutant.log`，退出码 1）。本次门禁未重跑该突变，结果见第 9.4 节。
+红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言应失败。本次门禁在 HEAD `6b517b8` 上重跑了该突变，两种运行时均为 7 通过、1 失败（见第 9.4 节）。
 
 未覆盖：真实 Paseo 员工会话（演练中为桩），以及真实 sidecar 与 sck 包装器（包装器执行部署版 `active` 目录下的客户端）。
 
@@ -200,75 +200,105 @@ null 语义（MCP、sidecar 与核心一致）：
 | AC03 传输 | `response-budget.ts` 的 `fitCount`、`utf8Prefix`、`utf8Segment`、`guardRelayResponse`、`echoTaskContext`；`sidecar.ts` 的 `handle()`；`mcp/server.ts` 的 `toolResult`；`client-cli.ts` 的 `writeStdout` | 单元：`tests/response-budget.test.ts`。集成：超预算拒绝，长文本段拼接，中文与 emoji 段拼接，写回显的红灯对照（第 9 节） |
 | AC04 汇总 | `core.ts` 的 `adminSummary` | 集成：计数与 cutoff，窗口口径，并发写入下的完整性，非 gm 拒绝 |
 | AC05 证明 | 以上全部位置 | 1000 条夹具全量遍历；长文本段拼接的 sha256 校验；断线后同游标重试；资源占用的测得上界（第 9 节） |
-| 缺陷 1（认领回显，SYS01 复核） | `src/mcp/server.ts` 的 `claim_next`（显式 id 与队列两条路径都经 `echoClaim`）；`response-budget.ts` 的 `echoClaim`、`cutList` | 单元：`tests/response-budget.test.ts` 的认领回显用例（列表截断与计数、完整 JSON 的 sha256、合法上限、历史安全网）。集成：`tests/query-paging.integration.test.ts` 的「claim_next over MCP …」，经真实 MCP HTTP 服务与真实核心认领 19 000 字符上下文，并以 `reassemble` 校验全文。红灯：显式 id 路径不回显（直接返回核心完整认领），该测试 1 失败，返回 `response_too_large`。绿灯见第 9 节 |
-| 缺陷 2（null 路由，SYS01 复核） | `src/query-input.ts` 的 `isPaged`、`taskIdOf`、`parseWorktreeInput`；`src/mcp/server.ts` 的 `pageArgs` 与各 `.nullish()` 参数；`plugin/server/sidecar.ts` 的 `list_worktrees`、`get_task_history`、`get_context`、`resume_task` | 单元：`tests/response-budget.test.ts` 的 null 参数用例。MCP：`tests/mcp.transport.test.ts` 的「null is absent on every MCP read argument…」。通道：`tests/sidecar.test.ts` 的「null is absent on the sidecar relay…」。红灯：MCP 分页参数退回 `.optional()`，传入 null 的测试 1 失败；通道的 `list_worktrees` 分页判断退回 HEAD 写法（`args.pageSize !== undefined || args.cursor !== undefined`，null 视为存在），通道测试 1 失败。绿灯见第 9 节 |
+| 缺陷 1（认领回显，SYS01 复核） | `src/mcp/server.ts` 的 `claim_next`（显式 id 与队列两条路径都经 `echoClaim`）；`response-budget.ts` 的 `echoClaim`、`cutList` | 单元：`tests/response-budget.test.ts` 的认领回显用例（列表截断与计数、完整 JSON 的 sha256、合法上限、历史安全网）。集成：`tests/query-paging.integration.test.ts` 的「claim_next over MCP …」，经真实 MCP HTTP 服务与真实核心认领 19 000 字符上下文，并以 `reassemble` 校验全文。红灯：显式 id 路径不回显（直接返回核心完整认领），该测试与另外两项 R3 用例失败（47 通过、3 失败），返回 `response_too_large`。绿灯见第 9 节 |
+| 缺陷 2（null 路由，SYS01 复核） | `src/query-input.ts` 的 `isPaged`、`taskIdOf`、`parseWorktreeInput`；`src/mcp/server.ts` 的 `pageArgs` 与各 `.nullish()` 参数；`plugin/server/sidecar.ts` 的 `list_worktrees`、`get_task_history`、`get_context`、`resume_task` | 单元：`tests/response-budget.test.ts` 的 null 参数用例。MCP：`tests/mcp.transport.test.ts` 的「null is absent on every MCP read argument…」。通道：`tests/sidecar.test.ts` 的「null is absent on the sidecar relay…」。fork 级（真实核心）：`tests/null-absent.fork.test.ts`（9 项）。红灯：MCP 分页参数退回 `.optional()`，两个 null 用例失败（5 通过、2 失败）；通道的 `list_worktrees` 分页判断退回 HEAD 写法（`args.pageSize !== undefined \|\| args.cursor !== undefined`，null 视为存在），通道 null 用例失败（18 通过、1 失败）。绿灯见第 9 节 |
 | RB01 | 第 7 节 | 隔离 fork 8 项；误派工红灯 7 通过、1 失败 |
 
 ## 9. 验证结果
 
-本节的门禁结果待 v25 实施后门禁，填写前所有结果均为待门禁后填写。此前树上的结果不适用于当前代码，已从本节移除。下列命令为本次门禁清单。运行时：本机 Bun 1.3.11；部署运行时 Bun 1.4.2（`runtime-bun`）。门禁日志与退出码的位置待门禁后填写。
+本节是经理裁决 v25 之后的门禁与红灯对照结果。门禁脚本为 `v25/gate-chain-v25.sh`，在 HEAD `6b517b8` 上运行，开始于 2026-10-19 21:20:59Z，结束于 21:29:46Z。开始与结束时工作树变更计数均为 0，树索引前后一致。门禁之后的提交只改本文档，不改变被测代码。
+
+红灯脚本为 `v25/red-controls-v25.sh`，在同一 HEAD 上运行（21:30:37Z 至 21:32:06Z）。每个突变运行后都已还原，`v25/red/red-summary.txt` 中每项均有还原记录，还原后工作树干净。
+
+证据包 `v25/` 包含门禁汇总 `gate-summary.txt`、各步骤日志 `gate-wt-<步骤>-<运行时>.log`、红灯汇总 `red/red-summary.txt` 与各突变日志。证据包的发布链接见 PR #1468 正文与交付报告。
+
+运行时：默认 Bun 1.3.11；部署运行时 Bun 1.4.2（`runtime-bun`）；pnpm 10.32.1。除工具链外，每个步骤在两种运行时上各运行一次。
 
 ### 9.1 门禁
 
 | 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
 |---|---|---|---|
-| 工具链 | `sh plugin/scripts/vendor.sh`；根目录 `bun x tsc --noEmit`；`plugin` 目录内 `bun x tsc --noEmit` | 待门禁后填写 | 待门禁后填写 |
-| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 待门禁后填写 | 待门禁后填写 |
-| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 待门禁后填写 | 待门禁后填写 |
-| 公司 fork 分页、RB01、null 与快照配额 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 待门禁后填写 | 待门禁后填写 |
-| 桥接 | `pnpm test:bridge` | 待门禁后填写 | 待门禁后填写 |
-| 服务 | `pnpm test:service` | 待门禁后填写 | 待门禁后填写 |
-| 通道 | `pnpm test:channel` | 待门禁后填写 | 待门禁后填写 |
-| 通信 | `pnpm test:comm` | 待门禁后填写 | 待门禁后填写 |
-| 慢管道（新客户端绿，旧客户端红） | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 待门禁后填写 | 待门禁后填写 |
-| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 待门禁后填写 | 待门禁后填写 |
-| 复核脚本 v3（只读复现） | `bun scripts/test-worktrees.ts <证据目录>/indep-sys01-repro-v3.test.ts` | 待门禁后填写 | 待门禁后填写 |
+| 工具链 | `sh plugin/scripts/vendor.sh`；根目录与 `plugin` 目录的 `bun x tsc --noEmit` | 三项均 exit 0（只运行一次） | 不重复运行 |
+| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 33 通过、0 失败 | 33 通过、0 失败 |
+| 桥接 | `pnpm test:bridge` | 263 通过、23 跳过、0 失败（286 项，11 个文件） | 263 通过、23 跳过、0 失败 |
+| 服务 | `pnpm test:service` | 12 通过、0 失败 | 12 通过、0 失败 |
+| 通信 | `pnpm test:comm` | 8 通过、1 跳过、0 失败（9 项，3 个文件） | 8 通过、1 跳过、0 失败 |
+| 通道 | `pnpm test:channel` | 81 通过、1 跳过、0 失败（82 项，9 个文件） | 81 通过、1 跳过、0 失败 |
+| 慢管道对照 | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 2 通过、0 失败 | 2 通过、0 失败 |
+| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 23 通过、0 失败 | 23 通过、0 失败 |
+| 公司 fork 聚焦（分页、RB01、null、快照配额） | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 77 通过、0 失败（4 个文件：分页 50、RB01 8、null 9、快照配额 10） | 77 通过、0 失败 |
+| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 284 通过、0 失败（29 个文件） | 284 通过、0 失败 |
+| 复核脚本 v3（只读复现） | `bun scripts/test-worktrees.ts <证据包>/indep-sys01-repro-v3.test.ts` | 8 通过、0 失败 | 8 通过、0 失败 |
 
 ### 9.2 跳过项
 
-- 以环境变量门控的用例：`tests/internal-ai-proof.fork.test.ts`（`RUN_COMPANY_PROOF_FORK_TESTS=1`）、`tests/dispatcher-sidecar.fork.test.ts` 的「restart quarantine」（`RUN_SCK_CHANNEL_FORK_TESTS=1`）、`tests/comm-slow-pipe.test.ts` 的红灯对照（`SCK_COMM_CONTROL=1`）。跳过数与以开关运行的结果待门禁后填写。
+跳过项都由环境变量门控。每一项都在对应的启用步骤中运行并通过，没有遮盖本次必测项。
 
-待门禁后填写：确认跳过项不遮盖本次必测项。
+- 桥接 23 项：`tests/internal-ai-proof.fork.test.ts`，由 `RUN_COMPANY_PROOF_FORK_TESTS` 门控。桥接步骤未设置该变量。`proof-fork` 步骤设置后运行，两种运行时均为 23 通过。
+- 通道 1 项：`tests/dispatcher-sidecar.fork.test.ts` 的「company fork: restart quarantine, actual lease fencing, fresh dispatch and independent review」，由 `RUN_SCK_CHANNEL_FORK_TESTS` 门控。公司 fork 默认清单中同一用例实际运行，两种运行时均通过。
+- 通信 1 项：`tests/comm-slow-pipe.test.ts` 的「control: the 8d03d35 client cuts the same answer at the pipe buffer」，由 `SCK_COMM_CONTROL` 门控。`slowpipe-control` 步骤设置后运行，两种运行时的 2 项均通过。
 
 ### 9.3 AC03 与 AC05 数字
 
-预算为 49152 字节（48 KiB）。AC03 通道的页数与每页最大字节、AC05 的页数、每页最大字节与页耗时、legacy 拒绝响应与长详情的字节、堆基线与增量上界，均待门禁后填写。
+预算为 49 152 字节（48 KiB），按序列化后的 UTF-8 字节计。下表取自门禁日志中 `AC03 channel bytes` 与 `AC05 resource` 的输出。它们是本次运行的测得值，不是固定指标。
 
-- 分页与 RB01 文件（公司 fork）：待门禁后填写（两种运行时各一组）。
-- 默认清单：待门禁后填写（两种运行时各一组）。
-- 堆基线随同一进程内先前运行的用例而变，因此只把增量上界当作测得值，不代表恒定内存。门禁时须记录每次运行的基线。
+AC03 通道（`tests/query-paging.integration.test.ts` 中经真实 sidecar 与 comm 客户端的全量遍历，881 条任务）：
+
+| 运行 | 所在门禁 | 页数 | 每页最大字节 | 旧调用整表超预算的拒绝响应字节 | 超长 context 的旧详情拒绝响应字节 |
+|---|---|---|---|---|---|
+| Bun 1.3.11 | 公司 fork 聚焦 | 27 | 49 021 | 262 | 545 |
+| Bun 1.4.2 | 公司 fork 聚焦 | 27 | 49 012 | 262 | 545 |
+| Bun 1.3.11 | 公司 fork 默认清单 | 27 | 48 976 | 262 | 545 |
+| Bun 1.4.2 | 公司 fork 默认清单 | 28 | 49 021 | 262 | 545 |
+
+AC05 资源（同一文件的 AC05 资源用例，881 条任务，`pageSize` 为 25，全量遍历 38 页）：
+
+| 运行 | 所在门禁 | 每页最大字节 | 页耗时 P50 / 最大（ms） | 堆基线（MiB） | GC 后堆（MiB） | 堆增量上界（MiB） |
+|---|---|---|---|---|---|---|
+| Bun 1.3.11 | 公司 fork 聚焦 | 48 945 | 1 / 238 | 49.2 | 32.1 | 0 |
+| Bun 1.4.2 | 公司 fork 聚焦 | 48 945 | 2 / 249 | 20.4 | 20.3 | 10.5 |
+| Bun 1.3.11 | 公司 fork 默认清单 | 48 954 | 2 / 272 | 45.4 | 22.4 | 0 |
+| Bun 1.4.2 | 公司 fork 默认清单 | 48 954 | 2 / 274 | 20.3 | 20.2 | 11.1 |
+
+- 所有页的字节都低于 49 152。
+- 堆基线随同一进程内先前运行的用例而变，因此只把增量上界当作测得值，不代表恒定内存占用。
+- 页耗时为用例内测得的每页耗时。
 
 ### 9.4 红灯与绿灯对照
 
-各突变的预期与结果如下。突变都是临时修改，门禁后须核对工作树中没有突变标记。
+四个突变都在 HEAD `6b517b8` 上运行。每个突变都是临时修改，运行后已还原。
 
-- 缺陷 1（认领回显）突变：显式 id 路径不回显，直接返回核心完整认领。预期 `tests/query-paging.integration.test.ts` 的「claim_next over MCP …」用例失败（返回 `response_too_large`）。结果待门禁后填写。
-- 缺陷 2（null 路由，MCP）突变：分页参数的 schema 退回 `.optional()`。预期 `tests/mcp.transport.test.ts` 的 null 用例失败。结果待门禁后填写。
-- 缺陷 2（null 路由，通道）突变：`list_worktrees` 的分页判断退回 `args.pageSize !== undefined || args.cursor !== undefined`（null 视为存在）。预期 `tests/sidecar.test.ts` 的 null 用例失败。结果待门禁后填写。
-- RB01 误派工突变：把等待中的任务改为 `ready` 并清空依赖。预期零误派工断言失败。本次门禁未重跑该突变，前次树上的结果为 7 通过、1 失败（见第 7 节）。
+| 突变 | 预期失败的测试 | Bun 1.3.11 | Bun 1.4.2 |
+|---|---|---|---|
+| C1 缺陷 1（认领回显）：`src/mcp/server.ts` 的显式 taskId 路径不经 `echoClaim`，直接返回核心完整认领 | `tests/query-paging.integration.test.ts`：MCP `claim_next` 超预算上下文用例、16 KiB 以上历史用例、长项目与依赖及 paths 用例 | 47 通过、3 失败（共 50） | 47 通过、3 失败（共 50） |
+| C2 缺陷 2（null，MCP）：分页参数的 schema 退回 `.optional()` | `tests/mcp.transport.test.ts`：null 缺省用例、「null 不进入分页分支」用例 | 5 通过、2 失败（共 7） | 5 通过、2 失败（共 7） |
+| C3 缺陷 2（null，通道）：`list_worktrees` 的分页判断退回 HEAD 写法，即对 pageSize 与 cursor 做 undefined 判断，null 视为存在 | `tests/sidecar.test.ts`：通道 null 用例 | 18 通过、1 失败（共 19） | 18 通过、1 失败（共 19） |
+| C4 RB01 误派工：等待中的任务改为 `ready` 并清空依赖。使用临时副本 `tests/rb01-red-mutant.fork.test.ts`，用后删除 | `tests/rollback-isolation.fork.test.ts`：零误派工断言 | 7 通过、1 失败（共 8） | 7 通过、1 失败（共 8） |
 
-慢管道对照：新客户端的输出应为完整字节；旧客户端 `8d03d35` 在同一慢管道下应截断。两种运行时的结果待门禁后填写。
-
-复核脚本 `indep-sys01-repro-v3.test.ts` 的只读复现结果待门禁后填写。复核断言的口径见 D4：核心 `claim()` 的完整认领按设计保留，字节断言应针对 MCP 与通道的应答。v2 脚本内复制的 HEAD 判断（`args.pageSize !== undefined || args.cursor !== undefined`）不是当前代码路径，v3 改为调用生产路径。当前代码用 `isPaged` 与 `parseWorktreeInput`，由 `tests/response-budget.test.ts`、`tests/sidecar.test.ts` 与 `tests/mcp.transport.test.ts` 覆盖。
-
-前序轮次的突变结果（误派工突变 RB01、写回显不受预算限制的突变）本次门禁未重跑，以前次记录为准（第 7 节）。
+- 每个突变的失败项都与预期一致。C1 的三项失败分别对应缺陷 1、R3 历史截断、R3 项目与依赖及 paths 回显。
+- 写回显无界突变在前序轮次记录为 42 通过、2 失败，对应的是前序代码。它未在当前树上重跑，结果不代表当前代码。
 
 ### 9.5 RB01 回滚隔离
 
-隔离 fork 的 8 项结果待门禁后填写。断言内容见第 7 节，包括零误派工、`cursor_key` 与快照表在回滚运行前后不变、过期快照的清扫，以及旧版忽略分页参数、新工具返回 `unknown_tool`。阳性对照（旧版认领就绪任务）的结果待门禁后填写。
+隔离 fork 的 8 项（`tests/rollback-isolation.fork.test.ts`）在两种运行时上均为 8 通过、0 失败。其中阳性对照（旧版认领就绪任务）通过，零误派工断言通过，旧版读取新版数据时分页参数被忽略、新工具返回 `unknown_tool`。
+
+红灯 C4（见 9.4）在两种运行时上均为 7 通过、1 失败，失败项正是零误派工断言。
 
 ### 9.6 未验证与限制
 
-- 缺陷 1 的红灯记录只在 Bun 1.3.11 上取得，Bun 1.4.2 上没有单独的红灯。当前代码树的红灯与绿灯待门禁后填写。
-- 缺陷 2 的回归在 MCP 传输层与通道层使用桩核心（`tests/mcp.transport.test.ts`、`tests/sidecar.test.ts`），fork 级（真实核心）的 null 用例未新增。核心只接收归一化后的 `undefined`，既有分页用例覆盖其行为。
-- 核心 `claim()` 的完整认领可超过预算（D4）。有界的是 MCP `claim_next` 与 `heartbeat` 的应答。复核断言须据此修正，请复核确认这一口径。
-- 认领回显的 `history` 按字节动态填充（D1），不是固定 16 KiB 窗口。核心读取的窗口仍按条数限定（60 条协议记录与 20 条运维记录），`historyComplete` 为假时完整历史用 `get_task_history` 分页读取。
-- 快照准入的跨进程原子性（D2，R4）：实现已改为库内配额（第 4 节）。`tests/snapshot-quota.fork.test.ts` 与 `tests/snapshot-quota.child.ts` 为跨进程用例，列入默认清单与第 9.1 节的聚焦门禁，结果待门禁后填写。
-- sidecar 没有 `claim_next`（调度器代领，`plugin/server/sidecar.ts` 对员工侧调用直接拒绝），也没有认领回显。sidecar 的 `heartbeat` 回 `{ok:true}`，不回显租约；MCP 的 `heartbeat` 经 `echoClaim` 回显。
-- `release` 没有员工侧 MCP 工具，只经共享的 `echoTask` 回显路径；它由调度器的通道回滚（`releaseClaim`）调用。
-- 观察（非阻断）：快照清扫只在新建快照时进行，没有定时调用；GoalView 与验收回复的字节大小未经预算验证。
-- 公司 fork 的数据库引导（`src/database.ts`）在目标 namespace 已含无关资源时拒绝新建数据库（第 35 至 39 行）。RB01 隔离演练使用带随机后缀的独立 namespace（`tests/rollback-isolation.fork.test.ts`）。
-- 真实 Paseo 员工会话与真实 sidecar、sck 端到端未执行，AC05 的真实员工 QA 未执行。独立 QA（真实员工 sck 的全量读取、拒绝用例、分段 hash）由 QA `6b6cb5b9` 在部署后完成，本实现不声称已完成。
+- 缺陷 1 的红灯（C1）在两种运行时上均已取得。前次只在 Bun 1.3.11 上取得。
+- 缺陷 2 的 fork 级（真实核心）null 用例已补：`tests/null-absent.fork.test.ts`，9 项，两种运行时均通过。覆盖范围：非 gm 不带 taskId 的 `list_worktrees` 在 MCP、sidecar、core 三层均为 `forbidden`，null 与缺省相同；租约任务不作为回退范围；显式 taskId 的授权、无权与不存在；gm 全局读；分页；`get_context`、`get_task_history`、`claim_next`、`heartbeat` 的 null 缺省。MCP 与通道的桩核心用例（`tests/mcp.transport.test.ts`、`tests/sidecar.test.ts`）仍保留。
+- 核心 `claim()` 的完整认领可超过预算（D4）。有界的是 MCP `claim_next` 与 `heartbeat` 的应答。复核脚本 v3 的断言已按此层次修正。
+- 认领回显的 `history` 按字节动态填充（D1），不是固定 16 KiB 窗口。核心读取的窗口仍按条数限定（60 条协议记录与 20 条运维记录）。`historyComplete` 为假时，完整历史用 `get_task_history` 分页读取。
+- 快照准入的跨进程原子性（D2，R4）由库内配额计数实现。`tests/snapshot-quota.fork.test.ts` 的 10 项在两种运行时上均通过，包括三个子进程并发准入 20 次、SIGKILL 后的清理、释放恰好一次。
+- sidecar 没有 `claim_next`（调度器代领，员工侧调用直接拒绝），也没有认领回显。sidecar 的 `heartbeat` 回 `{ok:true}`，不回显租约。MCP 的 `heartbeat` 经 `echoClaim` 回显。
+- `release` 没有员工侧 MCP 工具，只经共享的 `echoTask` 回显路径。它由调度器的通道回滚（`releaseClaim`）调用。
+- null 的未决差异（待经理裁定，不在本次范围）：`reclaim_worktrees` 的 MCP 参数为 `.optional()`，传 null 被 zod 拒绝。sidecar 把 null 与缺省同样处理（`dryRun` 取 `=== true`），即执行回收，不是只读预演。`list_worktree_audits` 在 MCP 与 sidecar 上一致，null 视为缺省。
+- MCP 对 `pageSize` 为 0 或 101 的调用由 zod 直接拒绝，错误不带结构化 `code`。core 与 sidecar 返回 `invalid`。
+- 观察（非阻断）：快照清扫只在新建快照时进行，没有定时调用。GoalView 与验收回复的字节大小未经预算验证。sidecar 中的 `.stale-<时间戳>` 后缀未在文档中说明。
+- 写回显无界突变未在当前树上重跑。长依赖列表（`create_delivery`）与 50 条长 paths（`create_task`）的回显用例在门禁中通过（`tests/query-paging.integration.test.ts`）。
+- 公司 fork 的数据库引导（`src/database.ts`）在目标 namespace 已含无关资源时拒绝新建数据库。RB01 隔离演练与快照配额用例使用带随机后缀的独立 namespace。
+- 真实 Paseo 员工会话与真实 sidecar、sck 端到端未执行。AC05 的真实员工 sck QA 未执行。独立 QA（真实员工 sck 的全量读取、拒绝用例、分段 hash）由 QA `6b6cb5b9` 在部署后完成。本实现不声称已完成。
 - 发布前须核对实际 main 的包含关系（`8d03d35` 与 `f42d99b`），确认回滚目标包含所需修复。
 - 本次未部署，未调用 `ops_*`，未读取凭证。
 - 慢管道对照的 1000 条载荷由测试替身直接输出，不经过响应预算，只证明客户端的字节传输完整。预算由单元与公司 fork 用例覆盖。
