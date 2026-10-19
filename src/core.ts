@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -254,6 +254,27 @@ function requireReviewer(role: string): asserts role is ReviewerRole {
   if (role !== 'owner') requireRole(role);
 }
 
+/** Fields the acceptance repair reads from task rows; keeps context text out of the preview. */
+const GOAL_ACCEPTANCE_TASK_FIELDS = 'id, title, state, executor_role, reviewer_role, kind, version, dependencies, blocked_to, submitted_by, current_employee, lease_expires_at, goal, project';
+type GoalAcceptanceTaskRow = Pick<TaskRow, 'id' | 'title' | 'state' | 'executor_role' | 'reviewer_role' | 'kind' | 'version' | 'dependencies' | 'blocked_to' | 'submitted_by' | 'current_employee' | 'lease_expires_at' | 'goal' | 'project'>;
+interface GoalAcceptanceGoalRow {
+  id: RecordId; title: string; state: string; tier?: string; pipeline?: string; project?: RecordId;
+  anchors?: RecordId[]; tasks?: { intake?: RecordId; plan?: RecordId; manual?: RecordId; acceptance?: RecordId };
+}
+interface GoalAcceptanceCheck { code: 'not_found' | 'invalid' | 'conflict' | 'forbidden'; message: string }
+interface GoalAcceptanceState {
+  view: GoalAcceptanceView; checks: GoalAcceptanceCheck[]; hash: string;
+  candidate?: GoalAcceptanceTaskRow; oldId?: string; unfinishedIds: string[];
+}
+const isLeased = (row: { current_employee?: string; lease_expires_at?: number }) =>
+  Boolean(row.current_employee) && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
+const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
+  id: asId(row.id), title: row.title, state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
+  kind: row.kind ?? 'task', version: row.version, blockedTo: row.blocked_to ?? undefined,
+  submitted: Boolean(row.submitted_by), leaseHolder: isLeased(row) ? row.current_employee : undefined,
+  dependencies: (row.dependencies ?? []).map(asId).sort(),
+});
+
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
@@ -344,7 +365,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return view(prior.result);
   }
 
-  private async txTask(query: string, vars: Record<string, unknown>): Promise<TaskRow> {
+  private async txTask<T = TaskRow>(query: string, vars: Record<string, unknown>): Promise<T> {
     try {
       for (let attempt = 0; attempt < 5; attempt++) {
         const responses = await this.db.query<unknown[]>(query, vars).responses();
@@ -357,6 +378,11 @@ export class SurrealCompanyCore implements CompanyCore {
             continue;
           }
           if (/conflict/i.test(cause)) throw new CompanyError('temporarily_unavailable', 'Database contention; retry request', true);
+          // Goal acceptance guards THROW 'goal acceptance moved: …' when a preview basis drifted; that is a stale-snapshot conflict, not a generic failure.
+          const moved = /goal acceptance moved: ([^'"\n]+)/i.exec(cause);
+          if (moved) throw new CompanyError('conflict', `Goal acceptance moved: ${moved[1]!.trim()}; run goal_acceptance_preview again`);
+          // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
+          if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
           if (/discipline track denied/i.test(cause)) throw new CompanyError('forbidden', 'Employee definition does not cover the task discipline');
           if (/leased by another|already has active task/i.test(cause)) throw new CompanyError('already_claimed', 'Task or employee already leased');
@@ -373,7 +399,7 @@ export class SurrealCompanyCore implements CompanyCore {
           throw new CompanyError('conflict', 'Task changed or transaction conflicted');
         }
         const result = responses.map(response => response.success ? response.result : undefined);
-        const row = result.at(-2) as TaskRow | undefined;
+        const row = result.at(-2) as T | undefined;
         if (!row) throw new CompanyError('conflict', 'Transaction returned no task');
         return row;
       }
@@ -703,6 +729,8 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t.state = 'review' {
         IF $t.submitted_by = $employee { THROW 'self review denied' };
+        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
+        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
@@ -1031,6 +1059,10 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
+      IF $t.state = 'review' {
+        LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
+        IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
+      };
       IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
       };
@@ -1472,6 +1504,233 @@ export class SurrealCompanyCore implements CompanyCore {
       await this.worktrees.reclaimEvent(task.worktree.id, 'retire').catch(() => undefined);
     }
     return task;
+  }
+
+  /**
+   * Read-only dry-run of the acceptance reference repair (goal_acceptance_preview). Shows the live
+   * manual/acceptance/anchors references, the unfinished goal work, the candidate checks and the
+   * snapshot hash that goal_acceptance_repair must echo back. Writes nothing.
+   */
+  async goalAcceptancePreview(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may review goal acceptance references');
+    requireText(input.goalId, 'goal', 1, 100);
+    if (input.candidateTaskId !== undefined) requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
+    return (await this.goalAcceptanceState(input.goalId, input.candidateTaskId)).view;
+  }
+
+  /**
+   * gm only (manage): repoints a quick/software goal's manual/acceptance references and anchors from an
+   * erroneously voided acceptance task to a blocked product→gm candidate that waits on all unfinished goal
+   * work. Every basis the preview checks is re-verified inside one compare-and-set transaction (goal refs and
+   * anchors, the void task, the candidate's version and state, the unfinished-work set), and the write lands
+   * with audit, outbox and the idempotency row. The voided task keeps its state and history. The repair never
+   * releases leases, never marks the goal done, and never treats a void as approval.
+   */
+  async goalAcceptanceRepair(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may repair goal acceptance references');
+    requireText(input.goalId, 'goal', 1, 100);
+    requireText(input.expectedOldTaskId, 'expectedOldTaskId', 1, 200);
+    requireText(input.candidateTaskId, 'candidateTaskId', 1, 200);
+    requireText(input.text, 'text', 4, 8000);
+    if (typeof input.snapshotHash !== 'string' || !/^[0-9a-f]{64}$/.test(input.snapshotHash)) {
+      throw new CompanyError('invalid', 'Invalid snapshotHash');
+    }
+    const idem = this.idemId(actor.employeeId, 'goal_acceptance_repair', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, expectedOldTaskId: input.expectedOldTaskId,
+      candidateTaskId: input.candidateTaskId, snapshotHash: input.snapshotHash, text: input.text }));
+    const replayed = await this.replayStored<GoalAcceptanceResult>(idem, digest);
+    if (replayed) return replayed;
+
+    const state = await this.goalAcceptanceState(input.goalId, input.candidateTaskId, input.expectedOldTaskId);
+    if (state.checks.length) {
+      throw new CompanyError(state.checks[0]!.code, state.checks.map(check => check.message).join('; '));
+    }
+    if (state.hash !== input.snapshotHash) {
+      throw new CompanyError('conflict', 'Goal acceptance snapshot moved; run goal_acceptance_preview again');
+    }
+    const candidate = state.candidate!;
+    const oldId = state.oldId!;
+    const result: GoalAcceptanceResult = {
+      goalId: input.goalId, replacedTaskId: oldId, candidate: briefTask(candidate),
+      anchors: [input.candidateTaskId], snapshotHash: state.hash, repairedAt: new Date().toISOString(),
+    };
+    const vars = {
+      actor: id('employee', actor.employeeId), goal: id('goal', input.goalId), old: id('task', oldId),
+      candidate: id('task', input.candidateTaskId), cand_version: candidate.version,
+      expected_unfinished: state.unfinishedIds.map(taskId => id('task', taskId)),
+      idem, digest, result,
+      evidence: `${input.text}\n[goal_acceptance] goal=${input.goalId} replaced=${oldId} candidate=${input.candidateTaskId} snapshot=${state.hash}`,
+      evidence_old: `替换为运营验收 task:${input.candidateTaskId}；goal=${input.goalId}；snapshot=${state.hash}`,
+      audit: id('audit', randomUUID()), audit_old: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      goal_key: input.goalId, old_key: oldId, candidate_key: input.candidateTaskId,
+    };
+    try {
+      await this.txTask<GoalAcceptanceResult>(`BEGIN;
+        LET $who = SELECT * FROM ONLY $actor;
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+        LET $g = SELECT * FROM ONLY $goal;
+        IF $g = NONE { THROW 'goal acceptance moved: goal not found' };
+        IF $g.state != 'active' { THROW 'goal acceptance moved: goal is not active' };
+        IF $g.tier != 'quick' OR ($g.pipeline ?? 'software') != 'software' { THROW 'goal acceptance moved: goal is not quick software' };
+        IF $g.tasks.manual != $old OR $g.tasks.acceptance != $old { THROW 'goal acceptance moved: references changed' };
+        IF array::len(array::filter($g.anchors ?? [], |$a| $a != $old)) > 0 { THROW 'goal acceptance moved: anchors changed' };
+        LET $o = SELECT * FROM ONLY $old;
+        IF $o = NONE OR $o.state != 'void' OR $o.reviewer_role = 'owner' { THROW 'goal acceptance moved: replaced task changed' };
+        LET $c = SELECT * FROM ONLY $candidate;
+        IF $c = NONE OR $c.version != $cand_version { THROW 'goal acceptance moved: candidate changed' };
+        IF $c.state != 'blocked' OR $c.blocked_to != NONE OR $c.submitted_by != NONE OR ($c.current_employee != NONE AND $c.lease_expires_at > time::unix(time::now())) { THROW 'goal acceptance moved: candidate is not blocked and unleased' };
+        LET $unfinished = SELECT VALUE id FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'] AND id != $candidate;
+        IF array::len($unfinished) != array::len($expected_unfinished) OR array::len(array::filter($unfinished, |$u| $u NOT IN $expected_unfinished)) > 0 { THROW 'goal acceptance moved: unfinished goal work changed' };
+        IF array::len(array::filter($unfinished, |$u| $u NOT IN ($c.dependencies ?? []))) > 0 { THROW 'goal acceptance moved: candidate misses unfinished goal work' };
+        LET $dependents = SELECT VALUE id FROM task WHERE state NOT IN ['done', 'void'] AND $candidate IN (dependencies ?? []);
+        IF array::len($dependents) > 0 { THROW 'goal acceptance moved: candidate would form a cycle' };
+        UPDATE ONLY $goal SET tasks.manual = $candidate, tasks.acceptance = $candidate, anchors = [$candidate];
+        CREATE ONLY $audit CONTENT { task: $candidate, actor: $actor, action: 'goal_acceptance_repair', evidence: $evidence, version: $c.version, at: time::now() };
+        CREATE ONLY $audit_old CONTENT { task: $old, actor: $actor, action: 'goal_acceptance_replaced', evidence: $evidence_old, version: $o.version, at: time::now() };
+        LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE ONLY $outbox CONTENT { task: $candidate, kind: 'goal_acceptance_repaired', sequence: $sequence.value, payload: { goal: $goal_key, replaced: $old_key, candidate: $candidate_key }, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $result };
+        RETURN $result;
+        COMMIT;`, vars);
+      return result;
+    } catch (error) {
+      const replayedAfterFailure = await this.replayStored<GoalAcceptanceResult>(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
+   * Shared read path for the preview and the repair gate: loads the goal, its references, the unfinished
+   * goal work and the candidate; evaluates every acceptance rule; and hashes the basis the repair compares
+   * against. Reads only.
+   */
+  private async goalAcceptanceState(goalId: string, candidateTaskId?: string, expectedOldTaskId?: string): Promise<GoalAcceptanceState> {
+    const goalRef = id('goal', goalId);
+    const goal = await this.db.select<GoalAcceptanceGoalRow>(goalRef);
+    if (!goal) throw new CompanyError('not_found', 'goal not found');
+    const refs = goal.tasks ?? {};
+    const manualId = refs.manual ? asId(refs.manual) : undefined;
+    const acceptanceId = refs.acceptance ? asId(refs.acceptance) : undefined;
+    const anchorIds = (goal.anchors ?? []).map(asId);
+    const oldId = manualId ?? acceptanceId;
+    const referenced = [...new Set([manualId, acceptanceId, ...anchorIds])].filter((x): x is string => Boolean(x));
+    const [referencedRows] = await this.db.query<[GoalAcceptanceTaskRow[]]>(
+      `SELECT ${GOAL_ACCEPTANCE_TASK_FIELDS} FROM task WHERE id IN $ids;`, { ids: referenced.map(x => id('task', x)) });
+    const oldRow = oldId ? (referencedRows ?? []).find(row => asId(row.id) === oldId) : undefined;
+    const [unfinishedRows] = await this.db.query<[GoalAcceptanceTaskRow[]]>(
+      `SELECT ${GOAL_ACCEPTANCE_TASK_FIELDS} FROM task WHERE goal = $goal AND state NOT IN ['done', 'void'] ORDER BY id;`, { goal: goalRef });
+    const [ownerRows] = await this.db.query<[Array<{ id: RecordId }>]>(
+      "SELECT id FROM task WHERE goal = $goal AND reviewer_role = 'owner' AND state != 'done';", { goal: goalRef });
+    const candidate = candidateTaskId ? await this.db.select<GoalAcceptanceTaskRow>(id('task', candidateTaskId)) : undefined;
+    const candidateDeps = (candidate?.dependencies ?? []).map(asId);
+    type DepRow = { id: RecordId; goal?: RecordId; state: TaskState; reviewer_role: ReviewerRole };
+    const depRows = candidateDeps.length
+      ? (await this.db.query<[DepRow[]]>('SELECT id, goal, state, reviewer_role FROM task WHERE id IN $deps;',
+          { deps: candidateDeps.map(x => id('task', x)) }))[0] ?? []
+      : [];
+    const depById = new Map(depRows.map(row => [asId(row.id), row] as const));
+    // A dependency path back to the candidate would make it wait on itself.
+    let cycle = false;
+    if (candidate && candidateTaskId && candidateDeps.length) {
+      const seen = new Set<string>(candidateDeps);
+      let frontier = candidateDeps;
+      while (frontier.length && !cycle) {
+        const [rows] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
+          'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(x => id('task', x)) });
+        const next = (rows ?? []).flatMap(row => (row.dependencies ?? []).map(asId));
+        if (next.includes(candidateTaskId)) cycle = true;
+        frontier = [...new Set(next)].filter(x => !seen.has(x));
+        for (const x of frontier) seen.add(x);
+      }
+    }
+
+    const unfinishedIds = unfinishedRows.map(row => asId(row.id)).filter(x => x !== candidateTaskId);
+    const missing = candidate ? unfinishedIds.filter(x => !candidateDeps.includes(x)) : [];
+    const checks: GoalAcceptanceCheck[] = [];
+    const deny = (code: GoalAcceptanceCheck['code'], message: string) => { checks.push({ code, message }); };
+    const pipeline = goal.pipeline ?? 'software';
+    const project = goal.project ? asId(goal.project) : undefined;
+    if (goal.state !== 'active') deny('conflict', `goal is ${goal.state}, not active`);
+    if (goal.tier !== 'quick') deny('invalid', 'goal tier must be quick');
+    if (pipeline !== 'software') deny('invalid', 'goal pipeline must be software');
+    if (!oldId) deny('conflict', 'goal has no manual or acceptance reference');
+    if (manualId !== acceptanceId) deny('conflict', 'manual and acceptance must reference the same task');
+    if (expectedOldTaskId !== undefined && expectedOldTaskId !== oldId) deny('conflict', 'goal acceptance reference moved: expected task differs');
+    if (oldId && !oldRow) deny('not_found', 'replaced acceptance task not found');
+    if (oldRow) {
+      if (oldRow.state !== 'void') deny('conflict', `replaced acceptance task must be void, found ${oldRow.state}`);
+      if (oldRow.reviewer_role === 'owner') deny('invalid', 'owner-reviewed acceptance is not repaired by this tool');
+    }
+    if (anchorIds.some(anchor => anchor !== oldId)) deny('conflict', 'goal anchors name tasks other than the replaced acceptance');
+    if (ownerRows.length) deny('invalid', 'goal has an owner acceptance gate; this repair does not apply');
+    if (!candidateTaskId) deny('invalid', 'candidateTaskId is required');
+    else if (!candidate) deny('not_found', 'candidate task not found');
+    else {
+      if (candidateTaskId === oldId) deny('invalid', 'candidate must differ from the replaced task');
+      if (!candidate.goal || asId(candidate.goal) !== goalId) deny('invalid', 'candidate belongs to another goal');
+      if ((candidate.project ? asId(candidate.project) : undefined) !== project) deny('invalid', 'candidate project must match the goal project');
+      if ((candidate.kind ?? 'task') !== 'task') deny('invalid', 'candidate must be kind task');
+      if (candidate.executor_role !== 'product' || candidate.reviewer_role !== 'gm') {
+        deny('invalid', 'candidate must be executed by product and reviewed by gm');
+      }
+      if (candidate.state !== 'blocked') deny('conflict', `candidate must be blocked, found ${candidate.state}`);
+      if (candidate.blocked_to) deny('conflict', 'candidate is blocked to gm or owner');
+      if (candidate.submitted_by) deny('conflict', 'candidate already has a submission');
+      if (isLeased(candidate)) deny('conflict', 'candidate holds an active lease');
+      if (candidateDeps.includes(candidateTaskId)) deny('invalid', 'candidate must not depend on itself');
+      for (const dep of candidateDeps) {
+        const row = depById.get(dep);
+        if (!row) deny('not_found', `candidate dependency ${dep} not found`);
+        else if (!row.goal || asId(row.goal) !== goalId) deny('invalid', `candidate dependency ${dep} is outside the goal`);
+        else if (row.reviewer_role === 'owner' && row.state !== 'done') deny('invalid', `candidate depends on unapproved owner gate ${dep}`);
+      }
+      if (missing.length) deny('invalid', `candidate does not depend on unfinished goal work: ${missing.join(', ')}`);
+      if (cycle) deny('invalid', 'candidate would form a dependency cycle');
+    }
+
+    const hash = HASH(JSON.stringify({
+      v: 1,
+      goal: { id: goalId, state: goal.state, tier: goal.tier ?? null, pipeline, project: project ?? null,
+        manual: manualId ?? null, acceptance: acceptanceId ?? null, anchors: [...anchorIds].sort() },
+      replaced: oldRow ? { id: oldId, state: oldRow.state, executor: oldRow.executor_role, reviewer: oldRow.reviewer_role } : null,
+      candidate: candidate && candidateTaskId ? { id: candidateTaskId, state: candidate.state, version: candidate.version,
+        executor: candidate.executor_role, reviewer: candidate.reviewer_role, kind: candidate.kind ?? 'task',
+        goal: candidate.goal ? asId(candidate.goal) : null, project: candidate.project ? asId(candidate.project) : null,
+        blockedTo: candidate.blocked_to ?? null, submitted: Boolean(candidate.submitted_by), leased: isLeased(candidate),
+        dependencies: [...candidateDeps].sort() } : null,
+      unfinished: [...unfinishedIds].sort(),
+      ownerGates: (ownerRows ?? []).map(row => asId(row.id)).sort(),
+    }));
+    const view: GoalAcceptanceView = {
+      goal: {
+        id: goalId, title: goal.title, state: goal.state as GoalView['state'], tier: goal.tier as GoalTier | undefined,
+        pipeline, project,
+        tasks: Object.fromEntries(Object.entries(refs).filter(([, ref]) => ref).map(([key, ref]) => [key, asId(ref!)])),
+        anchors: anchorIds,
+      },
+      replaced: oldRow ? briefTask(oldRow) : undefined,
+      unfinished: unfinishedRows.filter(row => asId(row.id) !== candidateTaskId).map(briefTask),
+      candidate: candidate && candidateTaskId ? { ...briefTask(candidate), missing } : undefined,
+      diff: {
+        manual: { from: manualId, to: candidateTaskId ?? manualId },
+        acceptance: { from: acceptanceId, to: candidateTaskId ?? acceptanceId },
+        anchors: { from: anchorIds, to: candidateTaskId ? [candidateTaskId] : anchorIds },
+      },
+      violations: checks.map(check => ({ code: check.code, message: check.message })),
+      ready: checks.length === 0,
+      snapshot: { version: 1, hash },
+    };
+    return { view, checks, hash, candidate: candidate && candidateTaskId ? candidate : undefined, oldId, unfinishedIds };
+  }
+
+  private async replayStored<T>(ident: RecordId, payloadDigest: string): Promise<T | undefined> {
+    const prior = await this.db.select<{ payload_digest: string; result: T }>(ident);
+    if (!prior) return undefined;
+    if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+    return prior.result;
   }
 
   /**

@@ -284,6 +284,27 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
 
+  server.registerTool('goal_acceptance_preview', {
+    description: 'gm only (manage): read-only dry-run for repointing a quick/software goal whose manual/acceptance reference still points at an erroneously voided acceptance task. Returns the live references, the unfinished goal work, the candidate checks and the snapshot hash that goal_acceptance_repair must echo. Writes nothing.',
+    inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalAcceptancePreview
+    ? core.goalAcceptancePreview(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_acceptance_repair', {
+    description: 'gm only (manage): commit the acceptance reference repair in one audited compare-and-set transaction. Repoints manual/acceptance and anchors from the expected void task to a blocked product→gm candidate that depends on all unfinished goal work. Needs the snapshotHash from goal_acceptance_preview, a reason and an idempotencyKey; the same key with the same payload returns the original result. The repairing gm cannot claim, accept, return or block the repaired candidate; another gm must review it.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100),
+      expectedOldTaskId: z.string().min(1).max(200),
+      candidateTaskId: z.string().min(1).max(200),
+      snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
+      text: z.string().min(4).max(8000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalAcceptanceRepair
+    ? core.goalAcceptanceRepair(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('task_project_update', {
     description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({

@@ -28,6 +28,8 @@ const BASE_TOOLS = [
   "task_project_update",
   // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
   "bind_task_code_repo",
+  // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
+  "goal_acceptance_preview", "goal_acceptance_repair",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -597,6 +599,12 @@ export class SidecarPool {
       case "bind_task_code_repo": return core.bindTaskCodeRepo
         ? core.bindTaskCodeRepo(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose bind_task_code_repo"), { code: "temporarily_unavailable" }));
+      case "goal_acceptance_preview": return core.goalAcceptancePreview
+        ? core.goalAcceptancePreview(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_preview"), { code: "temporarily_unavailable" }));
+      case "goal_acceptance_repair": return core.goalAcceptanceRepair
+        ? core.goalAcceptanceRepair(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);
