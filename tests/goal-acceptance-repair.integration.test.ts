@@ -163,6 +163,17 @@ test('preview is read-only, reports the repair basis, and is limited to gm with 
   await expectRefused(preview(`no-such-goal-${suffix}`, f.candidate), 'not_found', /goal not found/);
 });
 
+test('repair is limited to gm with manage, and refusals write nothing', async () => {
+  const f = await incident();
+  const input = inputFor(f, (await preview(f.goalId, f.candidate)).snapshot.hash, 'authz');
+  await expectRefused(repair(input, productManage), 'forbidden', /Only gm/);
+  await expectRefused(repair(input, gmNoManage), 'forbidden', /Capability denied/);
+  await expectRefused(repair(input, eng), 'forbidden', /Capability denied/);
+  expect(asId((await goalRow(f.goalId)).tasks.manual)).toBe(f.manual);
+  expect(await countAudits(f.candidate, 'goal_acceptance_repair')).toBe(0);
+  expect(await countOutbox(f.candidate, 'goal_acceptance_repaired')).toBe(0);
+});
+
 test('gm repair repoints references and anchors in one audited step, keeps the voided task, and later work anchors to the candidate', async () => {
   const f = await incident();
   const voidBefore = await taskRow(f.manual);
