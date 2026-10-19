@@ -27,8 +27,10 @@ const RETRYABLE = new Set(['temporarily_unavailable', 'comm_timeout', 'comm_unav
  * goes to stderr, and the exit status is 1. `code` is the recoverable error class.
  */
 function fail(code: string, message: string): never {
+  // A sidecar refusal already reads "code: reason"; keep that text once rather than repeating the code.
+  const error = message.startsWith(`${code}:`) ? message : `${code}: ${message}`;
   try {
-    writeStdout(`${JSON.stringify({ ok: false, code, error: `${code}: ${message}`, retryable: RETRYABLE.has(code) })}\n`);
+    writeStdout(`${JSON.stringify({ ok: false, code, error, retryable: RETRYABLE.has(code) })}\n`);
   } catch {
     // The reader has gone away; the exit status still reports the failure.
   }

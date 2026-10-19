@@ -102,7 +102,7 @@ test('a sidecar refusal keeps its code and reason, as JSON on stdout', async () 
   const out = await new Response(child.stdout).text();
   const err = await new Response(child.stderr).text();
   expect(await child.exited).toBe(1);
-  expect(oneJsonLine(out)).toMatchObject({ ok: false, code: 'invalid', retryable: false });
+  expect(oneJsonLine(out)).toMatchObject({ ok: false, code: 'invalid', error: 'invalid: pageSize must be an integer from 1 to 100', retryable: false });
   expect(err).toContain('pageSize');
   rmSync(dir, { recursive: true, force: true });
 });
