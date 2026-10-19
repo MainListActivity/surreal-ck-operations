@@ -67,8 +67,8 @@
   需要完整稳定视图的调用方应当只按 `created_at` 或 `goalId` 过滤。
 - 历史按 `(at, id)` 倒序分页，审计行只追加，因此遍历稳定。
 - 工作树按路径排序分页。清单本身仍在每次请求时完整计算，只有响应是有界的。
-- 汇总先读 `cutoffAt` 与 `outboxSequence`，再读计数。截止时刻之前已提交的变更必定计入；之后的变更可能计入。计数按语句依次读取，不是单一事务快照。
-  任务计数（`scope.tasks`）是截止时刻的全表状态；`since` 只限定审计计数（`scope.audit`）（待经理裁决，C5）。`integrity.complete` 仅在每行都归入已知状态且计数与行数一致时为真。
+- 汇总在一个 `BEGIN…COMMIT` 事务内读取：事务内先取 `cutoffAt`（`time::now()`）与 outbox 序号，再读状态计数与审计计数。事务未提交时返回可恢复的 `temporarily_unavailable`，不返回部分结果。事务隔离依赖 SurrealDB 的语义；并发写入下的一致性未做专项验证。
+  任务计数（`scope.tasks`）是截止时刻的全表状态；`since` 只限定审计计数（`scope.audit`）（待经理裁决，C5）。`integrity.checks` 三项全部为真时 `integrity.complete` 为真：任务状态计数之和等于任务总数，审计动作计数之和等于审计总数，所有状态均为已知状态。
 
 ## 4. 兼容性（有意的决定，请复核）
 
