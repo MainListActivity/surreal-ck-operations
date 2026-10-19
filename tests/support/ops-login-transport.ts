@@ -4,7 +4,7 @@
 // and no key material is committed (the CA is generated per run in a temp directory).
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +21,10 @@ export function makeTestPki(): TestPki {
   openssl(['req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', 'leaf.key', '-out', 'leaf.csr', '-subj', '/CN=127.0.0.1']);
   writeFileSync(join(dir, 'leaf.ext'), 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n');
   openssl(['x509', '-req', '-in', 'leaf.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'leaf.pem', '-days', '2', '-extfile', 'leaf.ext']);
-  return { ca: readFileSync(join(dir, 'ca.pem'), 'utf8'), cert: readFileSync(join(dir, 'leaf.pem'), 'utf8'), key: readFileSync(join(dir, 'leaf.key'), 'utf8') };
+  const pki = { ca: readFileSync(join(dir, 'ca.pem'), 'utf8'), cert: readFileSync(join(dir, 'leaf.pem'), 'utf8'), key: readFileSync(join(dir, 'leaf.key'), 'utf8') };
+  // The key only has to live in memory: never leave throwaway key material behind in the temp directory.
+  rmSync(dir, { recursive: true, force: true });
+  return pki;
 }
 
 /** Milliseconds to hold the n-th accepted connection (1-based) before any byte reaches the IdP. */
