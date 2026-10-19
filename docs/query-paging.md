@@ -34,7 +34,7 @@
 | 工具 | 参数 | 旧调用（不带 pageSize、cursor） | 分页调用（带 pageSize 或 cursor） | 权限 |
 |---|---|---|---|---|
 | `get_context` | `taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | `{ principal, company?, tasks }`，完整或拒绝 | `{ principal, company?, tasks, page }` | 员工见自己可见的任务；gm 见全部 |
-| `get_task_history` | `taskId`、`pageSize?`、`cursor?` | `{ history }`，完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
+| `get_task_history` | `taskId`、`pageSize?`、`cursor?` | 通道为 `{ history }`，MCP 为裸数组（与 `8d03d35` 相同）；均为完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
 | `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 员工须带 taskId；gm 可全局 |
 | `read_task_text` | `taskId`、`field`（`context` 或 `evidence`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | — | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
 | `get_admin_summary` | `since?`、`goalId?` | — | `{ cutoffAt, since, goalId?, scope, tasks, audit, outboxSequence, integrity }`（第 5 节） | 仅 gm |
@@ -151,7 +151,7 @@
 
 阳性对照：旧版调度器认领了就绪任务（零误派工断言之外的正向检查）。
 
-红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言失败，结果为 7 通过、1 失败（`rework5-red-rb01-misdispatch-mutant.log`）。
+红灯对照（误派工突变）：把等待中的任务改为 `ready` 并清空依赖，零误派工断言失败，结果为 7 通过、1 失败（终态树，`rework7-red-rb01-misdispatch-mutant.log`，退出码 1）。
 
 未覆盖：真实 Paseo 员工会话（演练中为桩），以及真实 sidecar 与 sck 包装器（包装器执行部署版 `active` 目录下的客户端）。
 
@@ -199,7 +199,8 @@
 
 - AC03 通道字节（真实 sidecar、comm 客户端、公司 fork，881 条工作集）：Bun 1.3.11 为 `{"tasks":881,"pages":29,"maxPageBytes":48976,"refusedLegacyBytes":262,"longDetailBytes":545,"budgetBytes":49152}`；Bun 1.4.2 默认清单为 `{"tasks":881,"pages":27,"maxPageBytes":48937,"refusedLegacyBytes":262,"longDetailBytes":545,"budgetBytes":49152}`。
 - AC05 资源（881 条，pageSize 25，38 页）：Bun 1.3.11 每页最大 48945 字节，页耗时 p50 2 ms、最大 275 ms，堆基线 51.5 MiB、峰值 51.5 MiB、GC 后 31.7 MiB，峰值增量上界 0 MiB。Bun 1.4.2 每页最大 48954 字节，页耗时 p50 2 ms、最大 273 ms，堆基线 18.5 MiB、峰值 28.5 MiB、GC 后 18.5 MiB，峰值增量上界 9.9 MiB。
-- 两次运行的堆基线不同，因为同一进程共享堆。上界是测得值，不代表恒定内存。
+- 另有一组 Bun 1.4.2 数字：单独运行分页与 RB01 文件（`rework6-rt142-fork-query-paging-rb01.log`）时，AC05 每页最大 48945 字节，页耗时 p50 2 ms、最大 249 ms，堆基线 6 MiB、峰值 16.1 MiB、GC 后 6 MiB、峰值增量上界 10.1 MiB；AC03 每页最大 49003 字节，页数 29。
+- 堆基线随同一进程内先前运行的用例而变（三次运行分别为 51.5、18.5、6 MiB），因此只把上界当作测得值，不代表恒定内存。
 - 资源用例在状态迁移与归属变更用例之后运行，工作集已是 881 条。全量遍历（不少于 1000 条）由「a paged traversal yields every working-set task exactly once」覆盖。
 
 ### 9.4 慢管道与红灯对照
@@ -211,11 +212,11 @@
 
 ### 9.5 RB01 回滚隔离
 
-隔离 fork 上 8 项全部通过：旧版发布树（`8d03d351`）读取新版数据，决策与无新版写入时一致；零误派工；`company_meta:cursor_key` 只在新版命名空间出现，回滚运行不改动它；快照表在回滚运行前后不变；过期快照由新版 sweep 删除；旧版忽略分页参数，新工具返回 `unknown_tool`。阳性对照（旧版认领就绪任务）同样通过。
+隔离 fork 上 8 项全部通过：旧版发布树（`8d03d35`）读取新版数据，决策与无新版写入时一致；零误派工；`company_meta:cursor_key` 只在新版命名空间出现，回滚运行不改动它；快照表在回滚运行前后不变；过期快照由新版 sweep 删除；旧版忽略分页参数，新工具返回 `unknown_tool`。阳性对照（旧版认领就绪任务）同样通过。
 
 ### 9.6 未验证与限制
 
 - 真实 Paseo 员工会话在 RB01 中为桩。真实 sidecar 与 sck 包装器的端到端，部署后由 QA `6b6cb5b9` 以真实员工 sck 完成（包装器当前执行部署版）。
 - 独立 QA（真实员工 sck 的全量读取、拒绝用例、分段 hash）尚未执行，本实现不声称已完成。
-- 发布前须核对实际 main 的包含关系（`8d03d351` 与 `f42d99b`），确认回滚目标包含所需修复。
+- 发布前须核对实际 main 的包含关系（`8d03d35` 与 `f42d99b`），确认回滚目标包含所需修复。
 - 本次未部署，未调用 `ops_*`，未读取凭证。
