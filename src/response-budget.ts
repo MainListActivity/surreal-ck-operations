@@ -2,7 +2,7 @@
 // bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
 // multi-byte characters. Pure helpers only: no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import type { ClaimResult, HistoryEntry, ProjectView, TaskView } from './contracts.ts';
+import type { ClaimResult, HistoryEntry, ListCut, ProjectView, TaskView } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
@@ -135,6 +135,26 @@ export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number
   return echo(longestFittingPrefix(task.context, prefix => jsonBytes(echo(prefix, true)) <= limit), true);
 }
 
+/**
+ * The echo of a task that a write returns (SYS01 R3). The write is committed before its echo is built, so the echo never turns it
+ * into an error, whatever the task holds. Each list of the task (dependencies, the intent paths of the task and of its worktree)
+ * keeps its longest prefix within a share of the limit, and each cut is flagged in listsTruncated with the whole count and digest.
+ * The context then takes the room that is left (echoTaskContext). read_task_text returns any cut list or context whole.
+ */
+export function echoTask(task: TaskView, limit: number = ITEM_BUDGET_BYTES): TaskView {
+  // A share of the limit per list: the three lists, the fixed fields and the context must fit together.
+  const share = Math.min(CLAIM_LIST_ECHO_BYTES, Math.floor(limit / 8));
+  const cuts: Partial<Record<ClaimListName, ListCut>> = {};
+  const echo: TaskView = { ...task };
+  if (task.dependencies) echo.dependencies = cutList(task.dependencies, 'dependencies', cuts, share);
+  if (task.workIntent?.paths) echo.workIntent = { ...task.workIntent, paths: cutList(task.workIntent.paths, 'workIntentPaths', cuts, share) };
+  if (task.worktree?.intent?.paths) {
+    echo.worktree = { ...task.worktree, intent: { ...task.worktree.intent, paths: cutList(task.worktree.intent.paths, 'worktreePaths', cuts, share) } };
+  }
+  if (Object.keys(cuts).length > 0) echo.listsTruncated = cuts;
+  return echoTaskContext(echo, limit);
+}
+
 // ---- Claim echo: the answer of claim_next. The claim has committed when its answer is built, so the answer is an echo, never an error. ----
 
 /** A claim's project over this many bytes is echoed in part (see echoClaim); the whole project stays in claim.json and get_context. */
@@ -153,8 +173,6 @@ export const CLAIM_LIST_ECHO_BYTES = 4 * 1024;
 const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 'rollback', 'pipeline'] as const;
 
 export type ClaimListName = 'dependencies' | 'workIntentPaths' | 'worktreePaths';
-/** A list that a claim echo cut: its whole count, and the SHA-256 of its whole JSON. claim.json keeps the list whole. */
-export interface ListCut { count: number; sha256: string }
 
 /**
  * A claim as an MCP caller receives it. task.worktree is left out: the worktree is the top-level field. projectTruncated marks a
@@ -168,11 +186,14 @@ export interface ClaimEcho extends Omit<ClaimResult, 'project'> {
   listsTruncated?: Partial<Record<ClaimListName, ListCut>>;
 }
 
-/** A list within CLAIM_LIST_ECHO_BYTES is kept whole. A longer one keeps its longest prefix, and `cuts` records its count and digest. */
-function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>): T[] {
-  if (jsonBytes(items) <= CLAIM_LIST_ECHO_BYTES) return [...items];
+/**
+ * A list within `budget` bytes (CLAIM_LIST_ECHO_BYTES unless a write echo gives it a share) is kept whole. A longer one keeps its
+ * longest prefix, and `cuts` records its count and digest. claim.json and read_task_text keep the list whole.
+ */
+function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>, budget: number = CLAIM_LIST_ECHO_BYTES): T[] {
+  if (jsonBytes(items) <= budget) return [...items];
   cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
-  return items.slice(0, fitCount(items, kept => kept, CLAIM_LIST_ECHO_BYTES));
+  return items.slice(0, fitCount(items, kept => kept, budget));
 }
 
 /**

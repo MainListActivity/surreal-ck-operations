@@ -1271,7 +1271,7 @@ function sckCall(pool: SidecarPool, label: string, credential: string) {
   };
 }
 
-test('claim_next over MCP with no taskId claims from the queue: a 57 KB Chinese and emoji context is echoed whole in the budget, and the heartbeat echoes the same lease (SYS01 R3)', async () => {
+test('claim_next over MCP with no taskId claims from the queue: a 57 KB Chinese and emoji context is cut and flagged inside the budget, reassembles whole through read_task_text, and the heartbeat echoes the same lease (SYS01 R3)', async () => {
   const holder = await designerCredential('queue');
   // createTask caps a context at 20,000 UTF-16 units; this one is 19,914 units and 57,7xx UTF-8 bytes (CJK 3 bytes, emoji 4 bytes).
   const context = `队列认领 ${suffix} ` + '中'.repeat(17_900) + '🙂'.repeat(1_000);
@@ -1421,6 +1421,36 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     expect(JSON.parse((await reassemble({ taskId: task.id, field: 'project', limit: 16 * 1024 }, gm)).text)).toEqual(wholeProject);
   } finally {
     pool.close();
+    await session.close();
+  }
+});
+
+test('create_task over MCP with 50 long asset paths: the committed write answers inside the budget, its cut list is flagged with the whole count and digest, and the whole list reads back through read_task_text (SYS01 R3)', async () => {
+  // 50 relative directories of 300 characters each (892 bytes): the longest list validateIntent accepts. The list alone is about 45 KB.
+  const paths = Array.from({ length: 50 }, (_, i) => `${String(i).padStart(3, '0')}-${'甲'.repeat(296)}`);
+  expect(utf8(JSON.stringify(paths))).toBeGreaterThan(40 * 1024);
+  const session = await mcpSession(gm);
+  try {
+    const answer = await session.client.callTool({
+      name: 'create_task',
+      arguments: {
+        title: `写入回显样例 ${suffix}`, context: `写入回显 ${suffix}`, executorRole: 'concept-design', reviewerRole: 'qa',
+        workIntent: { kind: 'assets', paths }, idempotencyKey: key('write-echo-lists'),
+      },
+    });
+    expect(answer.structuredContent).toMatchObject({ ok: true });
+    const created = (answer.structuredContent as { data: TaskView }).data;
+    expect(bytesOf(created)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(created.workIntent).toMatchObject({ kind: 'assets' });
+    expect(created.workIntent!.paths!.length).toBeGreaterThan(0);
+    expect(created.workIntent!.paths!.length).toBeLessThan(50);
+    expect(created.workIntent!.paths).toEqual(paths.slice(0, created.workIntent!.paths!.length));
+    expect(created.listsTruncated).toEqual({ workIntentPaths: { count: 50, sha256: sha256(JSON.stringify(paths)) } });
+    // The commit stands: the whole list is stored, and read_task_text returns it whole, verified against the digest.
+    const stored = await reassemble({ taskId: created.id, field: 'workIntentPaths', limit: 16 * 1024 }, gm);
+    expect(sha256(stored.text)).toBe(sha256(JSON.stringify(paths)));
+    expect(JSON.parse(stored.text)).toEqual(paths);
+  } finally {
     await session.close();
   }
 });

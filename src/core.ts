@@ -10,7 +10,7 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTaskContext, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Segment } from './response-budget.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Segment } from './response-budget.ts';
 import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
@@ -504,7 +504,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /** A created task answers with its context bounded to the item budget (SYS01); the create itself is not affected. */
   async createTask(credential: Credential, input: CreateTask): Promise<TaskView> {
-    return echoTaskContext(await this.createTaskRecord(credential, input));
+    return echoTask(await this.createTaskRecord(credential, input));
   }
 
   private async createTaskRecord(credential: Credential, input: CreateTask): Promise<TaskView> {
@@ -1446,7 +1446,7 @@ export class SurrealCompanyCore implements CompanyCore {
       created.push(task);
       dependencies = [task.id];
     }
-    return created.map(task => echoTaskContext(task, legLimit));
+    return created.map(task => echoTask(task, legLimit));
   }
 
   // ---- 受控编制管理工具（manage = gm/product） ----
@@ -1529,7 +1529,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
     const source = await this.relayActor(credential, input.ownerQuote);
-    return echoTaskContext(await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
+    return echoTask(await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
       note: `${input.note}\n老板原话：${input.ownerQuote}` }));
   }
 
@@ -1543,7 +1543,7 @@ export class SurrealCompanyCore implements CompanyCore {
     credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
     evidence?: Evidence, to?: 'gm' | 'owner'
   ): Promise<TaskView> {
-    return echoTaskContext(await this.transitionRecord(credential, proof, action, evidence, to));
+    return echoTask(await this.transitionRecord(credential, proof, action, evidence, to));
   }
 
   private async transitionRecord(
@@ -1685,7 +1685,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * reviewer return; handover markers from earlier holders are left untouched.
    */
   async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
-    return echoTaskContext(await this.releaseRecord(credential, proof, evidence));
+    return echoTask(await this.releaseRecord(credential, proof, evidence));
   }
 
   private async releaseRecord(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
@@ -1786,7 +1786,7 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
-    return echoTaskContext(await this.resumeRecord(credential, taskId, evidence));
+    return echoTask(await this.resumeRecord(credential, taskId, evidence));
   }
 
   private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
@@ -1833,7 +1833,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * the task resumes immediately under the same safe execute semantics as resume.
    */
   async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
-    return echoTaskContext(await this.deferTaskUntilRecord(credential, input));
+    return echoTask(await this.deferTaskUntilRecord(credential, input));
   }
 
   private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
@@ -1954,7 +1954,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * returning the current view; 'done' tasks refuse (their audit trail stands).
    */
   async retireTask(credential: Credential, input: RetireTask): Promise<TaskView> {
-    return echoTaskContext(await this.retireTaskRecord(credential, input));
+    return echoTask(await this.retireTaskRecord(credential, input));
   }
 
   private async retireTaskRecord(credential: Credential, input: RetireTask): Promise<TaskView> {
@@ -2281,7 +2281,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * claim allocates a fresh task branch in the target repo.
    */
   async taskProjectUpdate(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
-    return echoTaskContext(await this.taskProjectUpdateRecord(credential, input));
+    return echoTask(await this.taskProjectUpdateRecord(credential, input));
   }
 
   private async taskProjectUpdateRecord(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
@@ -2344,7 +2344,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
    */
   async bindTaskCodeRepo(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
-    return echoTaskContext(await this.bindTaskCodeRepoRecord(credential, input));
+    return echoTask(await this.bindTaskCodeRepoRecord(credential, input));
   }
 
   private async bindTaskCodeRepoRecord(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {

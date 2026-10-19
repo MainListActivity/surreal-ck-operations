@@ -135,9 +135,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 })));
   server.registerTool('list_worktree_audits', {
     description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
-    inputSchema: z.object({ limit: z.number().int().min(1).max(500).optional() }),
+    // A null limit is absent, as on the sidecar (read-only audit list; reclaim_worktrees is left as it is).
+    inputSchema: z.object({ limit: z.number().int().min(1).max(500).nullish() }),
   }, async ({ limit }, ctx) => run(token(ctx), () => core.listWorktreeAudits
-    ? core.listWorktreeAudits(token(ctx), limit)
+    ? core.listWorktreeAudits(token(ctx), limit ?? undefined)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
     description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',

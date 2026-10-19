@@ -90,7 +90,15 @@ export interface TaskView {
   contextSha256?: string;
   contextTruncated?: boolean;
   contextNextOffset?: number;
+  /**
+   * Set on a write's echo (SYS01 R3) and on a claim's task: each list that was cut to its leading part, with the whole count and
+   * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
+   */
+  listsTruncated?: Partial<Record<'dependencies' | 'workIntentPaths' | 'worktreePaths', ListCut>>;
 }
+
+/** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
+export interface ListCut { count: number; sha256: string }
 
 export interface HistoryEntry {
   action: string;
