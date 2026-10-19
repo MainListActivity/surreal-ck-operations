@@ -62,7 +62,7 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
   }
   const body = `【派工】任务 ${task.id}「${task.title}」需要你${mode}。
 1. 领取：${tool(inst, env, false).replace('<工具名>', 'claim_next').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
-   返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history。凭证不交给员工，旧凭证文件模式也没有运维工具；需要账号或生产登录的工作 report_blocker to=gm 说明。${task.row.handover ? `
+   返回的 history 包含前任进度、交接包、验收退回意见和老板决定，先完整阅读；如需更早记录用 get_task_history；返回 response_too_large 时加 {"pageSize":10}，再用 page.nextCursor 逐页翻页，超长证据用 read_task_text。凭证不交给员工，旧凭证文件模式也没有运维工具；需要账号或生产登录的工作 report_blocker to=gm 说明。${task.row.handover ? `
    返回的 predecessors 列出历任持有员工的 Paseo 会话；交接包只截取了最后几十条日志，需要更早或完整上下文时直接读前任完整时间线：
    '${env.paseoBin}' logs <agentId> --tail 400 --no-color（去掉 --tail 看全部）。` : ''}
 2. 按岗位协议完成：执行→submit；验收→review(accept/return)；自己定不了→report_blocker(to=gm)；只有花钱、签约、对外联系、公司方向和项目红线才 report_blocker(to=owner)。
@@ -79,6 +79,7 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
 1. 读取任务与历史：
    ${call.replace('<工具名>', 'get_task_history').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
    ${call.replace('<工具名>', 'get_context').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
+   若 get_task_history 返回 response_too_large，给同一参数加 {"pageSize":10}，再把返回的 page.nextCursor 作为 cursor 逐页读取，直到 page.hasMore 为 false；任务正文或超长证据用 read_task_text 分段读取。
    history 里出现的员工编号（claim/checkpoint/submit/review/revoked 的 actor 或 payload）即参与者；dispatcher、owner、gm-relay 不是员工，不评分。
 2. 对每位参与者按 1–5 分打分（可以取 0.5 步进）：quality 交付质量、evidence 证据是否真实完整、discipline 流程纪律（是否及时 checkpoint、按协议操作、是否中断导致交接）、timeliness 推进效率，再加 overall 总分与 notes 评语。
    被中断收回租约的员工 discipline/timeliness 应偏低；接手交接并完成好的员工可给高分。评审的是这一轮的行为，不看资历。你的评分会进入该员工定义的 avg_score，直接影响同类员工以后接到任务的概率，请客观。
@@ -93,7 +94,7 @@ export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: Pr
   const workspace = ctx?.worktree ? `只读登记工作区：${ctx.worktree.worktreePath}；${ctx.worktree.discipline}\n` : '';
   const body = `${workspace}【经理待办】以下任务被员工阻塞并交给经理处理：
 ${list}
-逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
+逐个用 get_task_history 读取阻塞原因（返回 response_too_large 时加 pageSize，按 page.nextCursor 翻页），协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
 你有决定权：技术方案、拆分、上线（运营定不了时）、查得到的事实都由你决定并写进恢复说明，不要转给老板。
 只有花钱、签约、对外联系、公司方向和项目红线才让原员工 report_blocker(to=owner)，并写明你已查过哪些来源。处理完结束本轮。
 调用方式：${tool(inst, env, ctx?.comm ?? false)}`;

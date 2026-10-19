@@ -50,6 +50,13 @@ function optionalIso(value: unknown, name: string): string | undefined {
   return text;
 }
 
+/**
+ * A call that names pageSize or cursor is paged. Any other call is a legacy call: it keeps the pre-SYS01 keys and
+ * asks for the complete answer, which is returned whole or refused as response_too_large.
+ */
+export const isPaged = (input: Record<string, unknown>): boolean =>
+  (input.pageSize !== undefined && input.pageSize !== null) || (input.cursor !== undefined && input.cursor !== null);
+
 export interface ContextParams {
   taskId?: string;
   state?: TaskState;
@@ -60,8 +67,8 @@ export interface ContextParams {
   cursor?: string;
   includeCompany: boolean;
   fields?: string[];
-  /** True for a call that names neither pageSize nor cursor: the pre-SYS01 shape stays available. */
-  legacyShape: boolean;
+  /** True when the call names pageSize or cursor. Any other call asks for the complete answer (legacy). */
+  paged: boolean;
 }
 
 export function parseContextInput(input: Record<string, unknown>): ContextParams {
@@ -83,6 +90,7 @@ export function parseContextInput(input: Record<string, unknown>): ContextParams
   }
   const pageSize = pageSizeOf(input.pageSize);
   const cursor = cursorOf(input.cursor);
+  const paged = isPaged(input);
   return {
     taskId: optionalText(input.taskId, 'taskId', 200),
     state: state as TaskState | undefined,
@@ -91,20 +99,21 @@ export function parseContextInput(input: Record<string, unknown>): ContextParams
     since: optionalIso(input.since, 'since'),
     pageSize,
     cursor,
-    includeCompany: optionalBoolean(input.includeCompany, 'includeCompany') ?? (input.pageSize === undefined && input.cursor === undefined),
+    includeCompany: optionalBoolean(input.includeCompany, 'includeCompany') ?? !paged,
     fields,
-    legacyShape: input.pageSize === undefined && input.cursor === undefined,
+    paged,
   };
 }
 
-export function parseHistoryInput(input: Record<string, unknown>): { pageSize: number; cursor?: string } {
-  return { pageSize: pageSizeOf(input.pageSize), cursor: cursorOf(input.cursor) };
+export function parseHistoryInput(input: Record<string, unknown>): { paged: boolean; pageSize: number; cursor?: string } {
+  return { paged: isPaged(input), pageSize: pageSizeOf(input.pageSize), cursor: cursorOf(input.cursor) };
 }
 
 export function parseWorktreeInput(input: Record<string, unknown>): {
-  taskId?: string; pageSize: number; cursor?: string; includeReleased: boolean;
+  paged: boolean; taskId?: string; pageSize: number; cursor?: string; includeReleased: boolean;
 } {
   return {
+    paged: isPaged(input),
     taskId: optionalText(input.taskId, 'taskId', 200),
     pageSize: pageSizeOf(input.pageSize),
     cursor: cursorOf(input.cursor),
@@ -114,7 +123,7 @@ export function parseWorktreeInput(input: Record<string, unknown>): {
 
 export const TEXT_FIELDS = ['context', 'evidence'] as const;
 export function parseTextInput(input: Record<string, unknown>): {
-  taskId: string; field: (typeof TEXT_FIELDS)[number]; auditId?: string; offset: number; limit: number;
+  taskId: string; field: (typeof TEXT_FIELDS)[number]; auditId?: string; offset: number; limit: number; expectSha256?: string;
 } {
   const taskId = optionalText(input.taskId, 'taskId', 200);
   if (!taskId) throw invalid('taskId is required');
@@ -126,9 +135,15 @@ export function parseTextInput(input: Record<string, unknown>): {
   if (limit !== undefined && (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 4 || limit > 24 * 1024)) {
     throw invalid('limit must be an integer from 4 to 24576 bytes');
   }
+  const expectSha256 = optionalText(input.expectSha256, 'expectSha256', 64);
+  if (expectSha256 !== undefined && !/^[0-9a-f]{64}$/.test(expectSha256)) throw invalid('expectSha256 must be a lowercase hex SHA-256 digest');
+  // A segment past offset 0 must pin the digest the reassembly started with, so a text changed in between is refused (C3).
+  if (offset > 0 && expectSha256 === undefined) {
+    throw invalid('expectSha256 is required past offset 0: pass the sha256 returned by the first segment of this text');
+  }
   return {
     taskId, field: field as (typeof TEXT_FIELDS)[number], auditId: optionalText(input.auditId, 'auditId', 200),
-    offset, limit: (limit as number | undefined) ?? 16 * 1024,
+    offset, limit: (limit as number | undefined) ?? 16 * 1024, expectSha256,
   };
 }
 
@@ -136,7 +151,7 @@ export function parseSummaryInput(input: Record<string, unknown>): { since?: str
   return { since: optionalIso(input.since, 'since'), goalId: optionalText(input.goalId, 'goalId', 100) };
 }
 
-/** Digest of the filters a cursor is bound to. Page size and projection are not part of the binding. */
+/** Digest of the query a cursor is bound to: its filters and its projection (fields). The page size is not part of it. */
 export function queryDigest(kind: string, filters: Record<string, unknown>): string {
   const canonical = JSON.stringify(Object.keys(filters).sort().map(key => [key, filters[key] ?? null]));
   return createHash('sha256').update(`${kind}\0${canonical}`).digest('hex');

@@ -1,15 +1,24 @@
 import { describe, expect, test } from 'bun:test';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { CompanyError } from '../src/core-errors.ts';
 import {
-  PAGE_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, fitCount, guardRelayResponse, jsonBytes, openCursor, sealCursor, utf8Prefix, utf8Segment,
+  RESPONSE_BUDGET_BYTES, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Prefix, utf8Segment,
 } from '../src/response-budget.ts';
 import { cursorOf, pageSizeOf, parseContextInput, parseHistoryInput, parseTextInput, queryDigest, TASK_FIELDS } from '../src/query-input.ts';
 
 describe('byte budget (SYS01)', () => {
-  test('the budget is 48 KiB and the paged block keeps headroom for the envelope', () => {
+  test('the budget is 48 KiB of serialized UTF-8 for the whole envelope', () => {
     expect(RESPONSE_BUDGET_BYTES).toBe(48 * 1024);
-    expect(PAGE_BUDGET_BYTES).toBeLessThan(RESPONSE_BUDGET_BYTES);
+  });
+
+  test('one check covers every response: exactly 48 KiB passes, one byte more is refused (C2)', () => {
+    const base = jsonBytes({ ok: true, data: { blob: '' } });
+    const exact = { ok: true, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base) } };
+    expect(jsonBytes(exact)).toBe(RESPONSE_BUDGET_BYTES);
+    expect(guardRelayResponse(exact)).toBe(exact);
+    const over = { ok: true, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base + 1) } };
+    expect(jsonBytes(over)).toBe(RESPONSE_BUDGET_BYTES + 1);
+    expect(guardRelayResponse(over)).toMatchObject({ ok: false });
   });
 
   test('sizes are counted in UTF-8 bytes of the serialized JSON, not in characters', () => {
@@ -63,10 +72,23 @@ describe('byte budget (SYS01)', () => {
     expect(fitCount([], rows => rows, 10)).toBe(0);
   });
 
+  test('a text that is over budget on its own keeps the longest prefix that fits, cut between characters and counted as JSON (C3)', () => {
+    const text = '中文🙂字符"\n'.repeat(4000);
+    const fits = (prefix: string) => jsonBytes({ id: 'x', context: prefix, contextTruncated: true }) <= RESPONSE_BUDGET_BYTES;
+    const kept = longestFittingPrefix(text, fits);
+    expect(text.startsWith(kept)).toBe(true);
+    expect(fits(kept)).toBe(true);
+    expect(fits([...text].slice(0, [...kept].length + 1).join(''))).toBe(false);
+    expect(Buffer.from(kept, 'utf8').toString('utf8')).toBe(kept);
+    expect(longestFittingPrefix('abc', fits)).toBe('abc');
+    expect(longestFittingPrefix('中', () => false)).toBe('');
+  });
+
   test('the relay guard turns an over-budget success into a recoverable, JSON-legal error', () => {
     const guarded = guardRelayResponse({ ok: true, data: { blob: '中文🙂'.repeat(20_000) } });
     expect(guarded.ok).toBe(false);
     expect(String((guarded as { error?: string }).error)).toContain('response_too_large');
+    expect(guarded).toMatchObject({ ok: false, code: 'response_too_large', retryable: false });
     expect(JSON.parse(JSON.stringify(guarded))).toMatchObject({ ok: false });
     const small = { ok: true, data: { n: 1 } };
     expect(guardRelayResponse(small)).toBe(small);
@@ -78,8 +100,7 @@ describe('byte budget (SYS01)', () => {
 describe('cursors (SYS01)', () => {
   const key = randomBytes(32);
   const body = {
-    v: 1 as const, k: 'context' as const, c: 'eng-1', q: 'digest', snap: '2026-10-19T00:00:00Z',
-    at: '2026-10-19T00:00:00.000000001Z', id: 'task-1', exp: Date.now() + 60_000,
+    v: 1 as const, k: 'context' as const, c: 'eng-1', q: 'digest', sid: randomUUID(), seq: 40, exp: Date.now() + 60_000,
   };
 
   test('a sealed cursor round-trips and verifies', () => {
@@ -88,7 +109,7 @@ describe('cursors (SYS01)', () => {
     expect(openCursor(token, key, Date.now())).toEqual(body);
   });
 
-  test('tampering, a foreign key, malformed input and expiry are each refused with their own reason', () => {
+  test('tampering, a foreign key and malformed input are refused as invalid; an expired cursor names a gone listing (C4)', () => {
     const token = sealCursor(body, key);
     const altered = token.slice(0, 4) + (token[4] === 'A' ? 'B' : 'A') + token.slice(5);
     expect(() => openCursor(altered, key, Date.now())).toThrow(/verification/);
@@ -96,12 +117,21 @@ describe('cursors (SYS01)', () => {
     expect(() => openCursor('v1.onlyonepart', key, Date.now())).toThrow(/malformed/);
     expect(() => openCursor('v2.a.b', key, Date.now())).toThrow(/malformed/);
     expect(() => openCursor('x'.repeat(5000), key, Date.now())).toThrow(/malformed/);
+    expect(() => openCursor(sealCursor({ ...body, seq: -1 }, key), key, Date.now())).toThrow(/malformed/);
+    expect(() => openCursor(sealCursor({ ...body, sid: undefined as never }, key), key, Date.now())).toThrow(/malformed/);
     expect(() => openCursor(token, key, body.exp + 1)).toThrow(/expired/);
-    try {
-      openCursor(altered, key, Date.now());
-    } catch (error) {
-      expect(error).toBeInstanceOf(CompanyError);
-      expect((error as CompanyError).code).toBe('invalid');
+    const refusals: Array<[() => unknown, CompanyError['code']]> = [
+      [() => openCursor(altered, key, Date.now()), 'invalid'],
+      [() => openCursor(token, key, body.exp + 1), 'snapshot_gone'],
+    ];
+    for (const [attempt, code] of refusals) {
+      try {
+        attempt();
+        throw new Error('expected a refusal');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CompanyError);
+        expect((error as CompanyError).code).toBe(code);
+      }
     }
   });
 });
@@ -133,16 +163,18 @@ describe('argument parsing (SYS01)', () => {
     expect(TASK_FIELDS).not.toContain('password');
   });
 
-  test('the legacy shape applies only when neither pageSize nor cursor is named', () => {
-    expect(parseContextInput({}).legacyShape).toBe(true);
+  test('the paged shape applies only when pageSize or cursor is named; any other call is legacy (C1, C2)', () => {
+    expect(parseContextInput({}).paged).toBe(false);
     expect(parseContextInput({}).includeCompany).toBe(true);
-    expect(parseContextInput({ pageSize: 5 }).legacyShape).toBe(false);
+    expect(parseContextInput({ pageSize: 5 }).paged).toBe(true);
     expect(parseContextInput({ pageSize: 5 }).includeCompany).toBe(false);
     expect(parseContextInput({ pageSize: 5, includeCompany: true }).includeCompany).toBe(true);
-    expect(parseContextInput({ cursor: 'v1.a.b' }).legacyShape).toBe(false);
+    expect(parseContextInput({ cursor: 'v1.a.b' }).paged).toBe(true);
+    expect(parseHistoryInput({}).paged).toBe(false);
+    expect(parseHistoryInput({ pageSize: 3 }).paged).toBe(true);
   });
 
-  test('history and text arguments are bounded', () => {
+  test('history and text arguments are bounded; expectSha256 must be a lowercase SHA-256 digest (C3)', () => {
     expect(parseHistoryInput({}).pageSize).toBe(25);
     expect(() => parseHistoryInput({ pageSize: 0 })).toThrow(/pageSize/);
     expect(() => parseTextInput({ taskId: 't', field: 'bogus' })).toThrow(/field/);
@@ -150,6 +182,13 @@ describe('argument parsing (SYS01)', () => {
     expect(() => parseTextInput({ taskId: 't', field: 'context', limit: 999_999 })).toThrow(/limit/);
     expect(() => parseTextInput({ field: 'context' })).toThrow(/taskId/);
     expect(parseTextInput({ taskId: 't', field: 'context' })).toMatchObject({ offset: 0, limit: 16 * 1024 });
+    const digest = 'a'.repeat(64);
+    expect(parseTextInput({ taskId: 't', field: 'context', expectSha256: digest })).toMatchObject({ expectSha256: digest });
+    // A read past offset 0 must pin the digest of the text it started with, so two versions are never mixed (C3).
+    expect(() => parseTextInput({ taskId: 't', field: 'context', offset: 4 })).toThrow(/expectSha256/);
+    expect(parseTextInput({ taskId: 't', field: 'context', offset: 4, expectSha256: digest })).toMatchObject({ offset: 4 });
+    expect(() => parseTextInput({ taskId: 't', field: 'context', expectSha256: 'A'.repeat(64) })).toThrow(/expectSha256/);
+    expect(() => parseTextInput({ taskId: 't', field: 'context', expectSha256: 'abc' })).toThrow(/expectSha256/);
   });
 
   test('query digests ignore key order and change with every filter', () => {

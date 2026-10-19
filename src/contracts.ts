@@ -82,29 +82,47 @@ export interface TaskView {
   lineage?: TaskId;
   /** 1-based version number inside the lineage (v1 has none until superseded). */
   revisionNo?: number;
+  /**
+   * Set on a write's echo (SYS01): the size and digest of the whole context, and whether `context` holds only its leading part.
+   * A cut context continues at contextNextOffset in read_task_text, which verifies the text against contextSha256.
+   */
+  contextBytes?: number;
+  contextSha256?: string;
+  contextTruncated?: boolean;
+  contextNextOffset?: number;
 }
 
 export interface HistoryEntry {
   action: string;
   actor: string;
-  /** Preview of the evidence text (at most 2 KiB UTF-8); the full text is read through read_task_text. */
+  /**
+   * Evidence text. A complete answer carries it whole. A paged answer carries it whole too, unless the entry alone
+   * cannot fit a page: then evidenceTruncated is true, and read_task_text continues at evidenceNextOffset (C3).
+   */
   evidence?: string;
   version?: number;
   at: string;
   /** Audit row id, the handle read_task_text takes for the full evidence (SYS01). */
   auditId?: string;
+  /** Size and digest of the full evidence, whether or not the text above is cut. */
   evidenceBytes?: number;
   evidenceSha256?: string;
   evidenceTruncated?: boolean;
+  /** Byte offset where read_task_text continues the evidence; present only when evidenceTruncated is true. */
+  evidenceNextOffset?: number;
 }
 
-/** Paging metadata shared by every bounded read (SYS01). Pages stay inside the response byte budget. */
+/**
+ * Paging metadata of a paged answer (SYS01). A complete (legacy) answer carries no page: it is the whole set or it is
+ * refused as response_too_large. total is the stored listing's row count; snapshotAt is the database time it was read at.
+ */
 export interface PageInfo {
   pageSize: number;
   returned: number;
   hasMore: boolean;
   nextCursor?: string;
-  /** Database time the traversal's snapshot was taken at; rows created later are outside it. */
+  total?: number;
+  /** Database time the listing was read at. The listing reflects the database as it stood then. */
   snapshotAt?: string;
   budgetBytes: number;
 }
@@ -113,7 +131,7 @@ export interface ContextView {
   principal: Principal;
   company?: unknown;
   tasks: Array<Record<string, unknown>>;
-  page: PageInfo;
+  page?: PageInfo;
 }
 
 export interface HistoryPageView {
@@ -142,7 +160,9 @@ export interface TaskTextSegment {
 
 /** gm-only read-only summary (SYS01): counts at a cutoff, never task text. */
 export interface AdminSummary {
+  /** Database time of the read. Every count reflects the database as it stood then. */
   cutoffAt: string;
+  /** Start of the audit window, [since, cutoffAt]. Declared even when the task counts ignore it. */
   since: string;
   goalId?: string;
   /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
@@ -151,12 +171,15 @@ export interface AdminSummary {
   audit: Record<string, number>;
   outboxSequence: number;
   integrity: {
-    /** True only when every row in scope is grouped under a known state and each count matches the rows it covers. */
+    /**
+     * True only when the read was consistent (its two in-transaction reads agree), every row is grouped under a
+     * known state, and each count matches the rows it covers. Otherwise false: retry the summary.
+     */
     complete: boolean;
     method: string;
     taskRows: number;
     auditRows: number;
-    checks: { taskCountsMatchRows: boolean; auditCountsMatchRows: boolean; statesKnown: boolean };
+    checks: { taskCountsMatchRows: boolean; auditCountsMatchRows: boolean; statesKnown: boolean; repeatableRead: boolean };
     /** Present only when a task row carries a state outside the known set. */
     unknownStates?: string[];
   };
@@ -192,8 +215,12 @@ export interface ClaimResult {
   deliveryId: DeliveryId;
   fence: number;
   leaseExpiresAt: string;
-  /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
+  /**
+   * Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task: the newest entries that fit
+   * the handover window. historyComplete is false when older entries were left out; get_task_history pages the whole history.
+   */
   history: HistoryEntry[];
+  historyComplete?: boolean;
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */

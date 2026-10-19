@@ -1,17 +1,22 @@
 // Byte budget for every employee-facing response (SYS01). Sizes are counted on the serialized UTF-8
 // bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
 // multi-byte characters. Pure helpers only: no database, no transport.
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { CompanyError } from './core-errors.ts';
+import { MAX_CURSOR_CHARS } from './query-input.ts';
 
-/** Hard ceiling for one serialized relay response (the whole `{ok,data}` envelope), in UTF-8 bytes. */
+/**
+ * Hard ceiling for one serialized relay response (the whole `{ok,data}` envelope), in UTF-8 bytes. Every
+ * bounded read, complete or paged, is measured this way; no response is cut to fit.
+ */
 export const RESPONSE_BUDGET_BYTES = 48 * 1024;
-/** What a paged data block may use: the rest is headroom for the envelope and the transport. */
-export const PAGE_BUDGET_BYTES = RESPONSE_BUDGET_BYTES - 1024;
-/** Preview of a long text field inside a list page; the full text is read through read_task_text. */
-export const PREVIEW_BYTES = 512;
-/** Preview of a long text field in a single-task detail; longer text is segmented. */
-export const DETAIL_TEXT_BYTES = 16 * 1024;
+/**
+ * Bytes of a page kept back for its envelope (principal, page information, cursor). An item of a page is cut only when
+ * it cannot fit the budget less this reserve; an item between the reserve and the whole budget stays whole (C3).
+ */
+export const PAGE_ENVELOPE_BYTES = 2 * 1024;
+/** Most serialized bytes one item of a page may take: a task in a listing, or one audit entry. */
+export const ITEM_BUDGET_BYTES = RESPONSE_BUDGET_BYTES - PAGE_ENVELOPE_BYTES;
 /** Default and maximum size of one text segment returned by read_task_text. */
 export const SEGMENT_DEFAULT_BYTES = 16 * 1024;
 export const SEGMENT_MAX_BYTES = 24 * 1024;
@@ -65,37 +70,88 @@ export function fitCount<T>(items: readonly T[], build: (kept: readonly T[]) => 
 }
 
 /**
- * Last line of defence on the relay path. A successful response over the budget is replaced by a
- * recoverable, JSON-legal error, so an oversize value can never reach the caller as a cut byte stream.
+ * Longest prefix of `text`, cut between two characters, for which `fits(prefix)` holds. `fits` must hold for every
+ * shorter prefix too, as a serialized size does: it is searched by bisection. Used for an item that is over budget on
+ * its own: it keeps as much of its text as fits, and the rest is read by segment.
  */
-export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string }>(res: T): T | { ok: false; error: string } {
+export function longestFittingPrefix(text: string, fits: (prefix: string) => boolean): string {
+  const points = [...text];
+  let lo = 0;
+  let hi = points.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(points.slice(0, mid).join(''))) lo = mid;
+    else hi = mid - 1;
+  }
+  return points.slice(0, lo).join('');
+}
+
+/**
+ * Last line of defence on the relay path. A successful response over the budget is replaced by a
+ * recoverable, JSON-legal error with its code, so an oversize value can never reach the caller as a cut byte stream.
+ */
+export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string }>(res: T):
+  T | { ok: false; code: 'response_too_large'; retryable: false; error: string } {
   if (!res.ok) return res;
   const bytes = jsonBytes(res);
   if (bytes <= RESPONSE_BUDGET_BYTES) return res;
-  return { ok: false, error: `response_too_large: ${bytes} bytes exceed the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow the query with pageSize or a cursor` };
+  return {
+    ok: false, code: 'response_too_large', retryable: false,
+    error: `response_too_large: ${bytes} bytes exceed the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow the query with pageSize or a cursor`,
+  };
 }
 
-// ---- Cursors: opaque, sealed with an HMAC, bound to a caller and a query, and time-limited. ----
+// ---- Write echoes: a committed write answers with the task it changed, and that echo must fit the budget too (SYS01). ----
+
+/** The fields of a task echo that describe its context; see echoTaskContext. */
+export interface TaskEchoFields {
+  context: string;
+  /** Size of the whole context in UTF-8 bytes, whether or not `context` is cut. */
+  contextBytes?: number;
+  /** SHA-256 of the whole context: read_task_text verifies every segment against it. */
+  contextSha256?: string;
+  /** True when `context` holds only the leading part of the whole text. */
+  contextTruncated?: boolean;
+  /** Byte offset where read_task_text continues the context; present only when contextTruncated is true. */
+  contextNextOffset?: number;
+}
+
+/**
+ * The echo of a task that a write returns. The write is committed before its echo is built, so the echo must never
+ * turn a committed write into an error: the context stays whole when the task fits `limit`, and is otherwise cut at the
+ * longest prefix that fits and flagged. contextBytes and contextSha256 always describe the whole context. An echo of an
+ * echo cuts the same way, which lets one response share its budget between several tasks.
+ */
+export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number = ITEM_BUDGET_BYTES): T {
+  const bytes = task.contextBytes ?? utf8Bytes(task.context);
+  const sha256 = task.contextSha256 ?? createHash('sha256').update(task.context).digest('hex');
+  const echo = (context: string, truncated: boolean): T => ({
+    ...task, context, contextBytes: bytes, contextSha256: sha256, contextTruncated: truncated,
+    ...(truncated ? { contextNextOffset: utf8Bytes(context) } : {}),
+  });
+  // A context that is already cut stays cut: the rest of the text is not in this value.
+  if (task.contextTruncated !== true && jsonBytes(echo(task.context, false)) <= limit) return echo(task.context, false);
+  return echo(longestFittingPrefix(task.context, prefix => jsonBytes(echo(prefix, true)) <= limit), true);
+}
+
+// ---- Cursors: opaque, sealed with an HMAC, bound to a caller, a query and a stored listing, and time-limited. ----
 
 export interface CursorBody {
   /** Format version. */
   v: 1;
-  /** Which read produced the cursor (context, history or worktrees). */
+  /** Which listing the cursor continues (context, history or worktrees). */
   k: 'context' | 'history' | 'worktrees';
   /** Employee the cursor was issued to. */
   c: string;
-  /** Digest of the query the cursor belongs to (filters only, not the page size). */
+  /** Digest of the query the cursor belongs to (filters only, not the page size or projection). */
   q: string;
-  /** Snapshot instant: rows created after it are outside the traversal. */
-  snap?: string;
-  /** Sort position: the last row already delivered (the next page starts after it). */
-  at?: string;
-  id?: string;
-  /** Expiry, epoch milliseconds. */
+  /** Stored listing (query_snapshot id) the traversal reads from. */
+  sid: string;
+  /** Position of the last row already delivered; the next page starts after it. */
+  seq: number;
+  /** Expiry, epoch milliseconds: the listing's own expiry, so both end together. */
   exp: number;
 }
-
-const MAX_CURSOR_CHARS = 2048;
 
 export function sealCursor(body: CursorBody, key: Buffer): string {
   const payload = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
@@ -120,9 +176,11 @@ export function openCursor(token: string, key: Buffer, now: number): CursorBody 
   } catch {
     throw new CompanyError('invalid', 'cursor is malformed');
   }
-  if (body.v !== 1 || typeof body.exp !== 'number' || typeof body.c !== 'string' || typeof body.q !== 'string') {
+  if (body.v !== 1 || typeof body.exp !== 'number' || typeof body.c !== 'string' || typeof body.q !== 'string'
+    || typeof body.sid !== 'string' || typeof body.seq !== 'number' || !Number.isInteger(body.seq) || body.seq < 0) {
     throw new CompanyError('invalid', 'cursor is malformed');
   }
-  if (body.exp <= now) throw new CompanyError('invalid', 'cursor expired; start the listing again');
+  // The cursor expires with its listing: an expired cursor names a listing that is gone, so the caller starts again.
+  if (body.exp <= now) throw new CompanyError('snapshot_gone', 'cursor expired: its listing is gone; start the listing again without cursor', false);
   return body;
 }

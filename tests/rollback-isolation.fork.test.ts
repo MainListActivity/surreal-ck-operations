@@ -11,8 +11,9 @@ import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
-import { SurrealCompanyCore, id } from '../src/core.ts';
+import { SurrealCompanyCore, asId, id } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { SnapshotStore } from '../src/snapshot-store.ts';
 import { Workforce } from '../src/workforce.ts';
 
 const ROOT = join(import.meta.dir, '..');
@@ -34,6 +35,7 @@ type Outcome = {
 };
 
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+const pick = (record: Record<string, number>, keys: string[]) => Object.fromEntries(keys.map(key => [key, record[key]]));
 const cursorKeyRow = (database: CompanyDatabase) => database.db.select<{ key: string }>(id('company_meta', 'cursor_key'));
 
 async function countRows(database: CompanyDatabase, table: string): Promise<number> {
@@ -125,10 +127,15 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
   let forkB: CompanyDatabase | undefined;
   const seededVersions = new Map<string, number>();
   const counts: Record<'A' | 'B', Record<string, number>> = { A: {}, B: {} };
+  const afterNewReads: Record<string, number> = {};
+  const afterRollback: Record<'A' | 'B', Record<string, number>> = { A: {}, B: {} };
   const outcomes = {} as { A: Outcome; B: Outcome };
   let cursorKeyA: string | undefined;
   let cursorKeyB: string | undefined;
   let cursorKeyBAfterRollback: string | undefined;
+  const afterSweep: Record<string, number> = {};
+  let swept = 0;
+  let expectedGone: unknown;
 
   beforeAll(async () => {
     oldRoot = mkdtempSync(join(tmpdir(), 'rb01-old-'));
@@ -141,26 +148,45 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
     forkB = await openFork(namespaceB);
     await seedFixture(forkA, scratch);
     const seededB = await seedFixture(forkB, scratch);
+    const tables = ['task', 'audit', 'outbox', 'query_snapshot', 'query_snapshot_row'];
     for (const [label, database] of [['A', forkA], ['B', forkB]] as const) {
-      for (const table of ['task', 'audit', 'outbox']) counts[label][table] = await countRows(database, table);
+      for (const table of tables) counts[label][table] = await countRows(database, table);
     }
     const [seedRows] = await forkB.db.query<[Array<{ title: string; version: number }>]>('SELECT title, version FROM task;');
     for (const row of seedRows ?? []) seededVersions.set(row.title, row.version);
     cursorKeyA = (await cursorKeyRow(forkA))?.key ? 'present' : undefined;
-    // The new version's write: a paged read whose continuation is sealed creates company_meta:cursor_key. Namespace B only.
+    // The new version's writes: paged reads whose continuations are sealed create company_meta:cursor_key and stored
+    // listings (context, history, worktrees). Namespace B only.
     const page = await seededB.core.contextView(seededB.gm, { pageSize: 2 });
-    expect(page.page.nextCursor).toBeString();
+    expect(page.page?.nextCursor).toBeString();
     await seededB.core.adminSummary(seededB.gm, {});
     await seededB.core.worktreePage(seededB.gm, { pageSize: 1 });
+    const [ready] = await forkB.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE title = 'rb01-ready';");
+    const history = await seededB.core.historyView(seededB.gm, asId(ready![0]!.id), { pageSize: 1 });
+    expect(history.history.length).toBeGreaterThan(0);
+    // Counted after the new reads: they may store listings, never task, audit or outbox rows.
+    for (const table of tables) afterNewReads[table] = await countRows(forkB, table);
+    // Expiry and sweep (C4): a listing taken with a 500 ms lifetime expires on its own. Its cursor is then refused as
+    // snapshot_gone, and the sweep removes its header and rows. The listings above keep their normal lifetime.
+    const shortLived = new SurrealCompanyCore(forkB, { snapshots: { ttlMs: 500 } });
+    const brief = await shortLived.contextView(seededB.gm, { pageSize: 2 });
+    await Bun.sleep(700);
+    expectedGone = await shortLived.contextView(seededB.gm, { pageSize: 2, cursor: brief.page!.nextCursor! })
+      .then(() => undefined, (error: unknown) => error);
+    swept = await new SnapshotStore(forkB.db).sweep();
+    for (const table of tables) afterSweep[table] = await countRows(forkB, table);
     const keyB = await cursorKeyRow(forkB);
     cursorKeyB = keyB?.key ? sha(keyB.key) : undefined;
     outcomes.A = await runPrevious(namespaceA, oldRoot);
     outcomes.B = await runPrevious(namespaceB, oldRoot);
+    for (const table of tables) afterRollback.B[table] = await countRows(forkB, table);
+    for (const table of tables) afterRollback.A[table] = await countRows(forkA, table);
     const keyAfter = await cursorKeyRow(forkB);
     cursorKeyBAfterRollback = keyAfter?.key ? sha(keyAfter.key) : undefined;
     if (process.env.SCK_RB01_EVIDENCE_DIR) {
       writeFileSync(join(process.env.SCK_RB01_EVIDENCE_DIR, 'rb01-rollback-results.json'), JSON.stringify({
         previousRelease: OLD_RELEASE, ticks: TICKS, seededVersions: Object.fromEntries(seededVersions), rowCounts: counts,
+        rowCountsAfterNewReads: afterNewReads, rowCountsAfterSweep: afterSweep, sweptListings: swept, rowCountsAfterRollback: afterRollback,
         cursorKeyDigest: { aBeforeRollback: cursorKeyA, bBeforeRollback: cursorKeyB, bAfterRollback: cursorKeyBAfterRollback },
         outcomes,
       }, null, 2));
@@ -187,8 +213,22 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
   test('the new version writes one persisted record, company_meta:cursor_key, and only namespace B has it', () => {
     expect(cursorKeyA).toBeUndefined();
     expect(cursorKeyB).toBeDefined();
-    // The new reads changed no task, audit or outbox rows.
+    // Both namespaces were seeded identically before any new read.
     expect(counts.B).toEqual(counts.A);
+    // The new reads changed no task, audit or outbox rows. They stored listings in B only (snapshot census).
+    expect(pick(afterNewReads, ['task', 'audit', 'outbox'])).toEqual(pick(counts.B, ['task', 'audit', 'outbox']));
+    expect(counts.A.query_snapshot).toBe(0);
+    expect(counts.A.query_snapshot_row).toBe(0);
+    expect(afterNewReads.query_snapshot).toBeGreaterThan(0);
+    expect(afterNewReads.query_snapshot_row).toBeGreaterThan(0);
+  });
+
+  test('a listing past its lifetime is refused as snapshot_gone, and the sweep removes its header and rows, leaving the live listings', () => {
+    expect((expectedGone as { code?: string } | undefined)?.code).toBe('snapshot_gone');
+    expect(swept).toBeGreaterThanOrEqual(1);
+    expect(pick(afterSweep, ['query_snapshot', 'query_snapshot_row'])).toEqual(pick(afterNewReads, ['query_snapshot', 'query_snapshot_row']));
+    expect(afterSweep.query_snapshot).toBeGreaterThan(0);
+    expect(afterSweep.query_snapshot_row).toBeGreaterThan(0);
   });
 
   test('the previous runtime boots on new-version data and decides the same with or without the new write', () => {
@@ -249,9 +289,10 @@ run('RB01 rollback isolation: previous release against new-version data', () => 
     }
   });
 
-  test('the cursor secret written by the new version is untouched by the rollback runs', () => {
+  test('the cursor secret and the stored listings written by the new version are untouched by the rollback runs', () => {
     expect(cursorKeyB).toBeDefined();
     expect(cursorKeyBAfterRollback).toBe(cursorKeyB);
     expect(cursorKeyA).toBeUndefined();
+    expect(pick(afterRollback.B, ['query_snapshot', 'query_snapshot_row'])).toEqual(pick(afterSweep, ['query_snapshot', 'query_snapshot_row']));
   });
 });

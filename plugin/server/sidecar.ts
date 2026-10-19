@@ -589,7 +589,8 @@ export class SidecarPool {
           tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, args.state as never),
         };
       case "get_task_history":
-        if (core.historyView) return core.historyView(cred, String(args.taskId), args);
+        // C2 default: without pageSize or cursor the complete history (or response_too_large), in the pre-SYS01 { history } shape of this channel.
+        if ((args.pageSize !== undefined || args.cursor !== undefined) && core.historyView) return core.historyView(cred, String(args.taskId), args);
         return { history: await core.history(cred, String(args.taskId)) };
       case "get_admin_summary": return core.adminSummary
         ? core.adminSummary(cred, args)

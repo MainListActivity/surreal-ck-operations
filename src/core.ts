@@ -10,9 +10,10 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { DETAIL_TEXT_BYTES, PAGE_BUDGET_BYTES, PREVIEW_BYTES, SEGMENT_DEFAULT_BYTES, fitCount, openCursor, sealCursor, utf8Bytes, utf8Prefix, utf8Segment } from './response-budget.ts';
-import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest } from './query-input.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTaskContext, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Prefix, utf8Segment } from './response-budget.ts';
+import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
+import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -278,20 +279,32 @@ const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   dependencies: (row.dependencies ?? []).map(asId).sort(),
 });
 
-// ---- Bounded reads (SYS01). Each page fits the response byte budget; cursors are sealed and bound. ----
-const CURSOR_TTL_MS = 6 * 60 * 60 * 1000;
-/** Characters fetched per task row for a list page; the byte preview is then cut to PREVIEW_BYTES. */
-const CONTEXT_PREVIEW_CHARS = 300;
-const HISTORY_PREVIEW_BYTES = 2048;
-const COMPANY_DIRECTIONS_BYTES = 8 * 1024;
-const COMPANY_GOALS_BYTES = 12 * 1024;
-const COMPANY_PROJECTS_BYTES = 4 * 1024;
+// ---- Bounded reads (SYS01). Every response, complete or paged, fits the 48 KiB budget measured as serialized
+// UTF-8. A complete answer is returned whole or refused (C2, C3); a paged answer reads a stored listing (C4). ----
+// Items of a page keep their whole text unless that item alone cannot fit a page (ITEM_BUDGET_BYTES); then it is cut and flagged.
+// A complete answer is never cut: it is returned whole or refused as response_too_large.
+/**
+ * A complete answer reads at most this many rows before it is refused. Each task or audit item serializes to well over
+ * 100 bytes, so one more row than this could not fit the budget anyway.
+ */
+const COMPLETE_TASK_ROWS = 500;
+const COMPLETE_HISTORY_ROWS = 1000;
+/** Budget of the handover window in a claim result, and the evidence preview one of its entries carries. */
+const HANDOVER_BYTES = 16 * 1024;
+const HANDOVER_ITEM_BYTES = 2 * 1024;
 
-interface ScannedTask { row: TaskRow; cat: string; aid: string; contextChars: number }
 type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
 
-/** Compact references, sorted by path so that pages are stable. Released references are counted, and listed only when asked. */
+const tooLarge = (message: string) => new CompanyError('response_too_large', message);
+/** A complete answer: returned whole when its `{ok,data}` envelope fits the budget, refused otherwise. Never cut. */
+function completeOrRefuse<T>(value: T, what: string, guidance: string): T {
+  const bytes = jsonBytes({ ok: true, data: value });
+  if (bytes > RESPONSE_BUDGET_BYTES) throw tooLarge(`${what} is ${bytes} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
+  return value;
+}
+
+/** Compact references, sorted by path so that listings are stable. Released references are counted, and listed only when asked. */
 function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolean): WorktreeCompact[] {
   return [...all]
     .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
@@ -305,37 +318,45 @@ function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolea
 const pick = (value: Record<string, unknown>, fields?: readonly string[]): Record<string, unknown> =>
   fields ? Object.fromEntries(fields.filter(field => field in value).map(field => [field, value[field]])) : value;
 
-function listTaskView(scanned: ScannedTask, fields?: readonly string[]): Record<string, unknown> {
-  const full = view(scanned.row);
-  const cut = utf8Prefix(full.context, PREVIEW_BYTES);
-  return pick({ ...full, context: cut.text, contextChars: scanned.contextChars, contextTruncated: scanned.contextChars > [...cut.text].length }, fields);
+/**
+ * A list item: the task as the caller projects it, with the size and digest of its whole context. The item is whole unless
+ * `cutLong` is set and the item alone cannot fit a page (ITEM_BUDGET_BYTES); then its context is cut at the longest prefix that fits and flagged
+ * (contextTruncated, contextNextOffset), and read_task_text returns the rest from that offset. A complete answer never cuts.
+ */
+function listItem(row: TaskRow, fields: readonly string[] | undefined, cutLong: boolean): Record<string, unknown> {
+  const task = view(row);
+  const body: Record<string, unknown> = {
+    ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context), contextTruncated: false,
+  };
+  if (!cutLong || typeof body.context !== 'string' || jsonBytes(body) <= ITEM_BUDGET_BYTES) return body;
+  const cut = (prefix: string): Record<string, unknown> => ({ ...body, context: prefix, contextTruncated: true, contextNextOffset: utf8Bytes(prefix) });
+  return cut(longestFittingPrefix(body.context, prefix => jsonBytes(cut(prefix)) <= ITEM_BUDGET_BYTES));
 }
 
+/** A task read by id, whole: the full context, with its size and digest so that a reassembly can be verified. */
 function detailTaskView(task: TaskView, fields?: readonly string[]): Record<string, unknown> {
-  const total = utf8Bytes(task.context);
-  const cut = utf8Prefix(task.context, DETAIL_TEXT_BYTES);
-  return pick({ ...task, context: cut.text, contextBytes: total, contextSha256: HASH(task.context), contextTruncated: cut.bytes < total }, fields);
+  return { ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context) };
 }
 
-function historyEntry(row: AuditHistoryRow): HistoryEntry {
-  const full = row.evidence ?? '';
-  const cut = utf8Prefix(full, HISTORY_PREVIEW_BYTES);
-  return {
+/**
+ * One audit entry. The evidence is whole unless `limit` (the entry's own serialized size) would be exceeded; then the
+ * longest prefix that fits is kept and flagged, and evidenceNextOffset tells read_task_text where to continue. The size
+ * and digest always describe the full text, so the reassembly can be checked.
+ */
+function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
+  const head = {
     auditId: asId(row.id), action: row.action, actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
     version: row.version, at: row.cat,
-    ...(row.evidence ? { evidence: cut.text, evidenceBytes: cut.total, evidenceSha256: HASH(full), evidenceTruncated: cut.bytes < cut.total } : {}),
   };
-}
-
-/** The company block keeps the same keys as before, with each list bounded and its full count reported. */
-function boundCompany(brief: CompanyBrief) {
-  const directions = brief.directions.slice(0, fitCount(brief.directions, rows => rows, COMPANY_DIRECTIONS_BYTES));
-  const goals = brief.goals.slice(0, fitCount(brief.goals, rows => rows, COMPANY_GOALS_BYTES));
-  const projects = brief.projects.slice(0, fitCount(brief.projects, rows => rows, COMPANY_PROJECTS_BYTES));
-  return {
-    paused: brief.paused, directions, directionsTotal: brief.directions.length,
-    goals, goalsTotal: brief.goals.length, projects, projectsTotal: brief.projects.length,
-  };
+  if (!row.evidence) return head;
+  const full = row.evidence;
+  const total = utf8Bytes(full);
+  const entry = (text: string, cut: boolean): HistoryEntry => ({
+    ...head, evidence: text, evidenceBytes: total, evidenceSha256: HASH(full), evidenceTruncated: cut,
+    ...(cut ? { evidenceNextOffset: utf8Bytes(text) } : {}),
+  });
+  if (limit === undefined || jsonBytes(entry(full, false)) <= limit) return entry(full, false);
+  return entry(longestFittingPrefix(full, text => jsonBytes(entry(text, true)) <= limit), true);
 }
 
 export class SurrealCompanyCore implements CompanyCore {
@@ -343,7 +364,7 @@ export class SurrealCompanyCore implements CompanyCore {
   readonly checkpointLimit: number;
   /** Optional pre-submit check of implementation deliveries; returns why the submission cannot go to review. */
   private readonly submitCheck?: SubmitCheck;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits> }) {
     this.submitCheck = options?.submitCheck;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
@@ -355,10 +376,13 @@ export class SurrealCompanyCore implements CompanyCore {
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
+    this.snapshots = new SnapshotStore(database.db, options?.snapshots);
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
   private readonly projects: ProjectStore;
+  /** Stored listings behind the paged reads (C4). */
+  private readonly snapshots: SnapshotStore;
   /** Manage tools reuse the workforce writer; absent in processes that never wire one. */
   private readonly workforce?: Workforce;
   private get db() { return this.database.db; }
@@ -477,7 +501,12 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
+  /** A created task answers with its context bounded to the item budget (SYS01); the create itself is not affected. */
   async createTask(credential: Credential, input: CreateTask): Promise<TaskView> {
+    return echoTaskContext(await this.createTaskRecord(credential, input));
+  }
+
+  private async createTaskRecord(credential: Credential, input: CreateTask): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
     requireText(input.title, 'title', 3, 200);
@@ -840,8 +869,9 @@ export class SurrealCompanyCore implements CompanyCore {
     });
     const taskView = view(row);
     const project = await this.taskProject(taskId);
+    const handover = await this.handoverHistory(taskId);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
-      leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
+      leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete,
       predecessors: await this.predecessors(taskId, actor.employeeId),
       project, worktree: taskView.worktree };
   }
@@ -917,27 +947,62 @@ export class SurrealCompanyCore implements CompanyCore {
     return allowed;
   }
 
-  private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
-    type Row = { action: string; actor: unknown; evidence?: string; version?: number; at: unknown };
-    // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the
-    // handover history; routine `ops_call` reads are never shown.
-    const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
-      `SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT $limit;
-       SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC LIMIT $ops_limit;`,
-      { task: id('task', taskId), limit: HISTORY_LIMIT, ops_limit: OPS_HISTORY_LIMIT, ev_chars: HISTORY_EVIDENCE_CHARS }
-    );
-    const rows = [...protocol, ...ops].sort((a, b) => (String(a.at) < String(b.at) ? 1 : String(a.at) > String(b.at) ? -1 : 0));
-    return rows.reverse().map(row => ({
-      action: row.action,
-      actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
-      evidence: row.evidence ? String(row.evidence).slice(0, HISTORY_EVIDENCE_CHARS) : undefined,
-      version: row.version, at: String(row.at),
-    }));
+  /**
+   * Audit entries of one task, newest first, read in one consistent read with the database time. Routine ops_call
+   * reads are not audit history and are left out of every history answer.
+   */
+  private async historyRowsAt(taskId: TaskId, limit: number): Promise<{ at: string; rows: AuditHistoryRow[] }> {
+    return this.consistentRead<{ at: string; rows: AuditHistoryRow[] }>(`LET $at = <string>time::now();
+      LET $rows = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $limit);
+      RETURN { read: { at: $at, rows: $rows } };`, { task: id('task', taskId), limit });
   }
 
+  /**
+   * The handover window of a claim result: the newest protocol entries and the newest ops entries, oldest first, as many
+   * as fit HANDOVER_BYTES. A claim has already committed when its response is built, so the window is bounded rather than
+   * refused. historyComplete is false when older entries were left out. get_task_history pages the whole history.
+   */
+  private async handoverHistory(taskId: TaskId): Promise<{ history: HistoryEntry[]; historyComplete: boolean }> {
+    type Row = { id: RecordId; action: string; actor: unknown; evidence?: string; evidenceChars?: number; version?: number; cat: string };
+    // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the handover.
+    const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
+      `SELECT id, action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, string::len(evidence ?? '') AS evidenceChars, version, at, <string>at AS cat
+         FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT $limit;
+       SELECT id, action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, string::len(evidence ?? '') AS evidenceChars, version, at, <string>at AS cat
+         FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $ops_limit;`,
+      { task: id('task', taskId), limit: HISTORY_LIMIT + 1, ops_limit: OPS_HISTORY_LIMIT + 1, ev_chars: HISTORY_EVIDENCE_CHARS }
+    );
+    let complete = protocol.length <= HISTORY_LIMIT && ops.length <= OPS_HISTORY_LIMIT;
+    const rows = [...protocol.slice(0, HISTORY_LIMIT), ...ops.slice(0, OPS_HISTORY_LIMIT)]
+      .sort((a, b) => (a.cat < b.cat ? 1 : a.cat > b.cat ? -1 : 0));
+    const kept: HistoryEntry[] = [];
+    for (const row of rows) {
+      const cut = utf8Prefix(row.evidence ?? '', HANDOVER_ITEM_BYTES);
+      const entry: HistoryEntry = {
+        auditId: asId(row.id), action: row.action, actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
+        version: row.version, at: row.cat,
+        ...(row.evidence ? { evidence: cut.text, evidenceTruncated: (row.evidenceChars ?? 0) > [...cut.text].length } : {}),
+      };
+      if (jsonBytes([entry, ...kept]) > HANDOVER_BYTES) {
+        complete = false;
+        break;
+      }
+      kept.unshift(entry);
+    }
+    return { history: kept, historyComplete: complete };
+  }
+
+  /** get_task_history without pageSize or cursor (C2): the complete history, oldest first, or a refusal when it does not fit. */
   async history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]> {
     await this.getTask(credential, taskId);
-    return this.readHistory(taskId);
+    const { rows } = await this.historyRowsAt(taskId, COMPLETE_HISTORY_ROWS + 1);
+    if (rows.length > COMPLETE_HISTORY_ROWS) {
+      throw tooLarge(`task ${taskId} has more than ${COMPLETE_HISTORY_ROWS} audit entries; read them with get_task_history, pageSize and page.nextCursor`);
+    }
+    const entries = rows.map(row => historyEntry(row)).reverse();
+    return completeOrRefuse(entries, `the history of task ${taskId} (${entries.length} entries)`,
+      'retry with {"pageSize":10} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false; read the evidence of one large entry with read_task_text {"taskId","field":"evidence","auditId","offset":0}, then offset = nextOffset with the expectSha256 of the first segment');
   }
 
   /** Per-key cursor secret: one row in company_meta, created on first use and never returned to callers. */
@@ -956,74 +1021,46 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
-  /** Database clock at the start of a traversal; rows created after it are outside that traversal. */
-  private async snapshotNow(): Promise<string> {
+  /** Database clock now: the time a listing is stamped with. */
+  private async dbNow(): Promise<string> {
     const [now] = await this.db.query<[string]>('RETURN <string>time::now();');
     return now;
   }
 
-  /** The largest prefix of `window` that serializes within the page budget; a page never comes back empty. */
-  private fitPage<T>(window: readonly T[], build: (kept: readonly T[]) => unknown, what: string): number {
-    const kept = fitCount(window, build, PAGE_BUDGET_BYTES);
-    if (kept === 0 && window.length > 0) throw new CompanyError('temporarily_unavailable', `${what} cannot fit the response budget`, true);
-    return kept;
+  /**
+   * Runs `statements`, which end in RETURN { read: … }, inside one BEGIN…COMMIT and returns that value, so every row and
+   * time in it comes from one database state. A failed statement is retryable.
+   */
+  private async consistentRead<T>(statements: string, vars: Record<string, unknown>): Promise<T> {
+    let responses;
+    try {
+      responses = await this.db.query<unknown[]>(`BEGIN TRANSACTION;\n${statements}\nCOMMIT TRANSACTION;`, vars).responses();
+    } catch {
+      throw new CompanyError('temporarily_unavailable', 'read did not complete; retry', true);
+    }
+    const found = responses.every(response => response.success)
+      ? responses.map(response => response.result).find((value): value is { read: T } => typeof value === 'object' && value !== null && 'read' in value)
+      : undefined;
+    if (!found) throw new CompanyError('temporarily_unavailable', 'read did not complete; retry', true);
+    return found.read;
   }
 
   /**
-   * get_context (SYS01): the working set or one task, as bounded pages. Calls that name neither pageSize
-   * nor cursor keep the pre-SYS01 shape (principal, company, tasks) and get the first budgeted page.
+   * Task rows for the context queries: the filters, the default states and the role scope, newest first, in one consistent
+   * read. The read counts the matches and the characters of their context first; the whole rows are read only when that
+   * length is within `cap` (bytes are never fewer than characters), so a read that will be refused never loads the text.
    */
-  async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
-    const actor = await this.authenticate(credential);
-    const params = parseContextInput(input);
-    const company = params.includeCompany ? boundCompany(await this.companyBrief(credential)) : undefined;
-    if (params.taskId !== undefined) {
-      const task = detailTaskView(await this.getTask(credential, params.taskId as TaskId), params.fields);
-      return {
-        principal: actor, ...(company ? { company } : {}), tasks: [task],
-        page: { pageSize: 1, returned: 1, hasMore: false, budgetBytes: PAGE_BUDGET_BYTES },
-      };
-    }
-    const digest = queryDigest('context', { state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null });
-    const key = await this.cursorKey();
-    let snap: string;
-    let after: { at: string; id: string } | undefined;
-    if (params.cursor !== undefined) {
-      const body = openCursor(params.cursor, key, Date.now());
-      if (body.k !== 'context' || body.c !== actor.employeeId || body.q !== digest || body.snap === undefined) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
-      }
-      snap = body.snap;
-      after = body.at !== undefined && body.id !== undefined ? { at: body.at, id: body.id } : undefined;
-    } else {
-      snap = await this.snapshotNow();
-    }
-    const scanned = await this.scanTasks(actor, params, snap, after);
-    const window = scanned.slice(0, params.pageSize);
-    const hasMore = scanned.length > params.pageSize;
-    const build = (rows: readonly ScannedTask[]): ContextView => {
-      const last = rows.at(-1);
-      const more = rows.length < window.length || hasMore;
-      const tasks = rows
-        .filter(row => !(row.row.state === 'review' && row.row.submitted_by === actor.employeeId))
-        .map(row => listTaskView(row, params.fields));
-      const page: PageInfo = {
-        pageSize: params.pageSize, returned: tasks.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES, snapshotAt: snap,
-        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'context', c: actor.employeeId, q: digest, snap, at: last.cat, id: last.aid, exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
-      };
-      return { principal: actor, ...(company ? { company } : {}), tasks, page };
-    };
-    return build(window.slice(0, this.fitPage(window, build, 'context page')));
-  }
-
-  /** One keyset page of the visible working set, newest first. Scanned rows are kept even when filtered out, so the cursor never skips them. */
-  private async scanTasks(actor: Principal, params: ReturnType<typeof parseContextInput>, snap: string, after?: { at: string; id: string }): Promise<ScannedTask[]> {
-    const where: string[] = [params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']"];
-    const vars: Record<string, unknown> = { ctx: CONTEXT_PREVIEW_CHARS, limit: params.pageSize + 1, snap };
+  private async taskRowsAt(actor: Principal, params: ContextParams, limit: number, cap: number):
+    Promise<{ at: string; count: number; textLength: number; rows: TaskRow[] }> {
+    const where: string[] = [
+      params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']",
+      "NOT (state = 'review' AND submitted_by = $me)",
+    ];
+    const vars: Record<string, unknown> = { cap, limit, me: actor.employeeId };
     if (params.state) vars.state = params.state;
     if (actor.role !== 'gm') {
       where.push('(executor_role = $myrole OR reviewer_role = $myrole)');
-      vars.myrole = actor.role;
+      vars.myrole = actor.role ?? '';
     }
     if (params.role) {
       where.push('(executor_role = $qrole OR reviewer_role = $qrole)');
@@ -1037,106 +1074,202 @@ export class SurrealCompanyCore implements CompanyCore {
       where.push('created_at >= <datetime>$since');
       vars.since = params.since;
     }
-    where.push('created_at <= <datetime>$snap');
-    if (after) {
-      where.push('(created_at < <datetime>$at OR (created_at = <datetime>$at AND id < $aid))');
-      vars.at = after.at;
-      vars.aid = id('task', after.id);
+    const read = await this.consistentRead<{ at: string; count: number; textLength: number; rows?: TaskRow[] | null }>(`LET $at = <string>time::now();
+      LET $probe = (SELECT id, created_at, string::len(context ?? '') AS textLength FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit);
+      LET $n = array::len($probe);
+      LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textLength) END;
+      LET $full = IF $n = 0 OR $total > $cap THEN [] ELSE (SELECT * FROM task WHERE id IN $probe.id ORDER BY created_at DESC, id DESC) END;
+      RETURN { read: { at: $at, count: $n, textLength: $total, rows: $full } };`, vars);
+    const count = Number(read.count ?? 0);
+    const textLength = Number(read.textLength ?? 0);
+    const rows = read.rows ?? [];
+    // Within the cap every match is loaded. A short load would drop tasks silently, so it is refused as retryable instead.
+    if (textLength <= cap && rows.length !== count) {
+      throw new CompanyError('temporarily_unavailable', 'task listing read did not complete; retry', true);
     }
-    const [rows] = await this.db.query<[Array<TaskRow & { cat: string; contextChars?: number }>]>(
-      `SELECT *, string::slice(context ?? '', 0, $ctx) AS context, string::len(context ?? '') AS contextChars, <string>created_at AS cat
-       FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit;`, vars);
-    return (rows ?? []).map(row => ({ row, cat: row.cat, aid: asId(row.id), contextChars: row.contextChars ?? 0 }));
+    return { at: read.at, count, textLength, rows };
+  }
+
+  /** Stores the working set as a context listing. Its membership and its projection are fixed by this one read. */
+  private async contextListing(actor: Principal, params: ContextParams, digest: string): Promise<SnapshotHeader> {
+    const { limits } = this.snapshots;
+    const { at, count, textLength, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes);
+    if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
+    if (textLength > limits.maxBytes) {
+      throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
+    }
+    return this.snapshots.create({
+      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt: at,
+      bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))),
+    });
   }
 
   /**
-   * get_task_history (SYS01): audited entries newest first, one budgeted page at a time; each page is
-   * returned oldest first, as before. Long evidence is previewed with its length and SHA-256; the full text
-   * comes from read_task_text.
+   * One page of a stored listing (C4). The first page (no cursor) stores the listing through `create`; a later page
+   * resumes after the cursor's position. Every page re-checks the caller, the kind, the query and the role. The page
+   * holds as many of the next rows as fit the budget, and its cursor continues after the last row it delivered.
+   */
+  private async listingPage<T, R>(args: {
+    actor: Principal; kind: SnapshotKind; digest: string; pageSize: number; cursor?: string;
+    create: () => Promise<SnapshotHeader>;
+    parse: (body: string) => T;
+    respond: (items: readonly T[], page: PageInfo) => R;
+    /** What the caller can change when the page envelope alone is over the budget (for example includeCompany). */
+    envelopeGuidance: string;
+  }): Promise<R> {
+    const { actor, kind, digest, pageSize } = args;
+    const key = await this.cursorKey();
+    let sid: string;
+    let after: number;
+    if (args.cursor === undefined) {
+      sid = (await args.create()).id;
+      after = 0;
+    } else {
+      const body = openCursor(args.cursor, key, Date.now());
+      if (body.k !== kind || body.c !== actor.employeeId || body.q !== digest) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
+      }
+      sid = body.sid;
+      after = body.seq;
+    }
+    const { header, rows } = await this.snapshots.read({
+      id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
+    });
+    const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
+    const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
+      const last = kept.at(-1)?.seq ?? after;
+      const hasMore = last < header.rows;
+      const page: PageInfo = {
+        pageSize, returned: kept.length, hasMore, total: header.rows, snapshotAt: header.takenAt, budgetBytes: RESPONSE_BUDGET_BYTES,
+        ...(hasMore ? { nextCursor: sealCursor({ v: 1, k: kind, c: actor.employeeId, q: digest, sid, seq: last, exp: header.expiresMs }, key) } : {}),
+      };
+      return args.respond(kept.map(item => item.value), page);
+    };
+    const bare = jsonBytes({ ok: true, data: build([]) });
+    if (bare > RESPONSE_BUDGET_BYTES) {
+      throw tooLarge(`the page envelope alone is ${bare} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${args.envelopeGuidance}`);
+    }
+    const kept = fitCount(items, subset => ({ ok: true, data: build(subset as ReadonlyArray<{ seq: number; value: T }>) }), RESPONSE_BUDGET_BYTES);
+    if (kept === 0 && items.length > 0) {
+      throw tooLarge('one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
+    }
+    return completeOrRefuse(build(items.slice(0, kept)), 'this page', args.envelopeGuidance);
+  }
+
+  /**
+   * get_context (SYS01, C2 to C4). Without pageSize or cursor the answer is complete: the working set, or one task with its
+   * whole context. It is refused as response_too_large when it does not fit the budget. With pageSize or cursor it is one
+   * page of a stored listing; a task read by id is never paged and takes no cursor.
+   */
+  async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
+    const actor = await this.authenticate(credential);
+    const params = parseContextInput(input);
+    const company = params.includeCompany ? await this.companyBrief(credential) : undefined;
+    const withCompany = company ? { company } : {};
+    if (params.taskId !== undefined) {
+      if (params.cursor !== undefined) throw new CompanyError('invalid', 'a cursor pages a listing; one task is read without it');
+      const task = await this.getTask(credential, params.taskId as TaskId);
+      const view: ContextView = {
+        principal: actor, ...withCompany, tasks: [detailTaskView(task, params.fields)],
+        ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
+      };
+      return completeOrRefuse(view, `task ${task.id}`,
+        `read its context with read_task_text {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null; the whole text has sha256 ${HASH(task.context)}${company ? '; or pass includeCompany false to omit the company block' : ''}`);
+    }
+    if (!params.paged) {
+      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
+      const { count, textLength, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
+      if (count > COMPLETE_TASK_ROWS) throw tooLarge(`more than ${COMPLETE_TASK_ROWS} tasks match; ${guidance}`);
+      if (textLength > RESPONSE_BUDGET_BYTES) {
+        throw tooLarge(`the matching tasks hold ${textLength} characters of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
+      }
+      const view: ContextView = { principal: actor, ...withCompany, tasks: rows.map(row => listItem(row, params.fields, false)) };
+      return completeOrRefuse(view, `the working set (${rows.length} tasks)`, guidance);
+    }
+    const digest = queryDigest('context', {
+      state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
+    });
+    return this.listingPage<Record<string, unknown>, ContextView>({
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
+      create: () => this.contextListing(actor, params, digest),
+      parse: body => JSON.parse(body) as Record<string, unknown>,
+      respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
+      envelopeGuidance: company ? 'pass includeCompany false, which leaves the company block out of every page' : 'narrow the query with state, goalId, role or since',
+    });
+  }
+
+  /**
+   * get_task_history with pageSize or cursor (SYS01, C4): one page of the task's stored history. Pages run newest first;
+   * the entries within a page are returned oldest first. Evidence that cannot fit a page is cut and flagged, and
+   * read_task_text gives the rest.
    */
   async historyView(credential: Credential, taskId: TaskId, input: Record<string, unknown> = {}): Promise<HistoryPageView> {
     const actor = await this.authenticate(credential);
     await this.getTask(credential, taskId);
     const params = parseHistoryInput(input);
     const digest = queryDigest('history', { taskId });
-    const key = await this.cursorKey();
-    let snap: string;
-    let after: { at: string; id: string } | undefined;
-    if (params.cursor !== undefined) {
-      const body = openCursor(params.cursor, key, Date.now());
-      if (body.k !== 'history' || body.c !== actor.employeeId || body.q !== digest || body.snap === undefined) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
-      }
-      snap = body.snap;
-      after = body.at !== undefined && body.id !== undefined ? { at: body.at, id: body.id } : undefined;
-    } else {
-      snap = await this.snapshotNow();
-    }
-    const where = ['task = $task', "action != 'ops_call'", 'at <= <datetime>$snap'];
-    const vars: Record<string, unknown> = { task: id('task', taskId), snap, limit: params.pageSize + 1 };
-    if (after) {
-      where.push('(at < <datetime>$at OR (at = <datetime>$at AND id < $aid))');
-      vars.at = after.at;
-      vars.aid = id('audit', after.id);
-    }
-    const [rows] = await this.db.query<[AuditHistoryRow[]]>(
-      `SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit WHERE ${where.join(' AND ')} ORDER BY at DESC, id DESC LIMIT $limit;`, vars);
-    const scanned = rows ?? [];
-    const window = scanned.slice(0, params.pageSize);
-    const hasMore = scanned.length > params.pageSize;
-    const build = (kept: readonly AuditHistoryRow[]): HistoryPageView => {
-      const last = kept.at(-1);
-      const more = kept.length < window.length || hasMore;
-      const page: PageInfo = {
-        pageSize: params.pageSize, returned: kept.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES, snapshotAt: snap,
-        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'history', c: actor.employeeId, q: digest, snap, at: last.cat, id: asId(last.id), exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
-      };
-      return { history: kept.map(historyEntry).reverse(), page };
-    };
-    return build(window.slice(0, this.fitPage(window, build, 'history page')));
+    return this.listingPage<HistoryEntry, HistoryPageView>({
+      actor, kind: 'history', digest, pageSize: params.pageSize, cursor: params.cursor,
+      create: async () => {
+        const { at, rows } = await this.historyRowsAt(taskId, this.snapshots.limits.maxRows + 1);
+        if (rows.length > this.snapshots.limits.maxRows) {
+          throw tooLarge(`task ${taskId} has more than ${this.snapshots.limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
+        }
+        return this.snapshots.create({
+          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '', takenAt: at,
+          bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))),
+        });
+      },
+      parse: body => JSON.parse(body) as HistoryEntry,
+      respond: (history, page) => ({ history: [...history].reverse(), page }),
+      envelopeGuidance: 'use a smaller pageSize',
+    });
   }
 
   /**
-   * list_worktrees (SYS01): compact references (released ones are counted, listed only when asked), sorted
-   * and paged by worktree path. The inventory itself is still computed in full; only the response is bounded.
+   * list_worktrees with pageSize or cursor (SYS01, C1 and C4): one page of a stored inventory. References are compact:
+   * released ones are counted, and listed only with includeReleased. Rows are sorted by path. Every call re-checks access.
    */
   async worktreePage(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreePageView> {
     const actor = await this.authenticate(credential);
     const params = parseWorktreeInput(input);
+    await this.worktreeScope(credential, actor, params.taskId);
     const digest = queryDigest('worktrees', { taskId: params.taskId ?? null, includeReleased: params.includeReleased });
-    const key = await this.cursorKey();
-    let after: string | undefined;
-    if (params.cursor !== undefined) {
-      const body = openCursor(params.cursor, key, Date.now());
-      if (body.k !== 'worktrees' || body.c !== actor.employeeId || body.q !== digest) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
-      }
-      after = body.id;
-    }
-    const compact = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased)
-      .filter(worktree => after === undefined || worktree.worktreePath > after);
-    const window = compact.slice(0, params.pageSize);
-    const hasMore = compact.length > params.pageSize;
-    const build = (kept: readonly WorktreeCompact[]): WorktreePageView => {
-      const last = kept.at(-1);
-      const more = kept.length < window.length || hasMore;
-      const page: PageInfo = {
-        pageSize: params.pageSize, returned: kept.length, hasMore: more, budgetBytes: PAGE_BUDGET_BYTES,
-        ...(more && last ? { nextCursor: sealCursor({ v: 1, k: 'worktrees', c: actor.employeeId, q: digest, id: last.worktreePath, exp: Date.now() + CURSOR_TTL_MS }, key) } : {}),
-      };
-      return { worktrees: [...kept], page };
-    };
-    return build(window.slice(0, this.fitPage(window, build, 'worktree page')));
+    return this.listingPage<Record<string, unknown>, WorktreePageView>({
+      actor, kind: 'worktrees', digest, pageSize: params.pageSize, cursor: params.cursor,
+      create: async () => {
+        const takenAt = await this.dbNow();
+        const inventory = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
+        if (inventory.length > this.snapshots.limits.maxRows) {
+          throw tooLarge(`${inventory.length} worktrees are registered, above the ${this.snapshots.limits.maxRows}-row listing limit`);
+        }
+        return this.snapshots.create({
+          owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt,
+          bodies: inventory.map(item => JSON.stringify(item)),
+        });
+      },
+      parse: body => JSON.parse(body) as Record<string, unknown>,
+      respond: (worktrees, page) => ({ worktrees: [...worktrees], page }),
+      envelopeGuidance: 'use a smaller pageSize, or narrow with taskId',
+    });
   }
 
   /**
-   * list_worktrees without pageSize or cursor (C1 default): the pre-SYS01 array, in the same compact form as a page.
-   * An array cannot carry a page, so a reply over the budget is refused as response_too_large, never cut.
+   * list_worktrees without pageSize or cursor (C1): the complete compact inventory as one array, in the same form as a
+   * page. It is refused as response_too_large when it does not fit the budget; it is never cut.
    */
   async worktreeList(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreeCompact[]> {
     await this.authenticate(credential);
     const params = parseWorktreeInput(input);
-    return compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
+    const list = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
+    return completeOrRefuse(list, `the worktree inventory (${list.length} worktrees)`,
+      'read it with list_worktrees, pageSize and page.nextCursor, or pass taskId to narrow it');
+  }
+
+  /** Re-checks, on every worktree read, what it needs: access to the task, or gm for the global inventory. */
+  private async worktreeScope(credential: Credential, actor: Principal, taskId?: string): Promise<void> {
+    if (taskId !== undefined) await this.getTask(credential, taskId as TaskId);
+    else if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
   }
 
   /**
@@ -1152,23 +1285,30 @@ export class SurrealCompanyCore implements CompanyCore {
       text = row?.context ?? '';
     } else {
       if (!params.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
+      // Routine ops_call rows are not audit history, so no history answer names them and they are not readable here either.
       const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
-        'SELECT task, evidence FROM audit WHERE id = $aid;', { aid: id('audit', params.auditId) });
+        "SELECT task, evidence FROM audit WHERE id = $aid AND action != 'ops_call';", { aid: id('audit', params.auditId) });
       const row = rows?.[0];
       if (!row || !row.task || asId(row.task) !== params.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
       text = row.evidence ?? '';
     }
-    const segment = utf8Segment(text, params.offset, params.limit ?? SEGMENT_DEFAULT_BYTES);
+    const sha256 = HASH(text);
+    // A reassembly pins the digest of the text it started with. A text that changed since is refused, never mixed in.
+    if (params.expectSha256 !== undefined && params.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the ${params.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
+    }
+    const segment = utf8Segment(text, params.offset, params.limit);
     return {
       taskId: params.taskId, field: params.field, ...(params.auditId ? { auditId: params.auditId } : {}),
-      totalBytes: segment.total, sha256: HASH(text), offset: segment.offset, bytes: segment.bytes,
+      totalBytes: segment.total, sha256, offset: segment.offset, bytes: segment.bytes,
       nextOffset: segment.next, text: segment.text,
     };
   }
 
   /**
-   * get_admin_summary (SYS01, gm only): full-table counts by state and by audit action in a time window,
-   * plus the cutoff time and the outbox sequence it was read at. Nothing here carries task text.
+   * get_admin_summary (SYS01, C5, gm only): counts by state and by audit action in a window, with the cutoff time and the
+   * outbox sequence. The counts are read twice inside one transaction. integrity.complete is true only when the two reads
+   * agree and each count matches the rows it grouped. Nothing here carries task text.
    */
   async adminSummary(credential: Credential, input: Record<string, unknown> = {}): Promise<AdminSummary> {
     const actor = await this.authenticate(credential);
@@ -1176,38 +1316,47 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseSummaryInput(input);
     const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const goal = params.goalId ? id('goal', params.goalId) : undefined;
-    // One transaction reads the cutoff, the outbox sequence and every count, so they describe one database state.
-    // The cutoff is fixed first: task counts are each task's state at that instant, and audit counts cover the
-    // window [since, cutoff]. A summary is returned only when the transaction committed.
-    const where = goal ? 'WHERE goal = $goal' : '';
-    const query = `BEGIN TRANSACTION;
-      LET $cutoff = time::now();
-      LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
-      LET $states = (SELECT state, count() AS n FROM task ${where} GROUP BY state);
-      LET $taskTotal = (SELECT count() AS n FROM task ${where} GROUP ALL)[0].n;
-      LET $actions = (SELECT action, count() AS n FROM audit WHERE at >= <datetime>$since AND at <= $cutoff GROUP BY action);
-      LET $auditTotal = (SELECT count() AS n FROM audit WHERE at >= <datetime>$since AND at <= $cutoff GROUP ALL)[0].n;
-      RETURN { cutoff: <string>$cutoff, outbox: $outbox, states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal };
-      COMMIT TRANSACTION;`;
-    type SummaryRead = {
-      cutoff: string; outbox?: number | null;
+    // One transaction. The cutoff is the database time at its start. Task counts are each task's state at that cutoff and
+    // ignore since. Audit counts cover [since, cutoff]; with a goal, only the audit entries of that goal's tasks.
+    const taskWhere = goal ? 'WHERE goal = $goal' : '';
+    const auditWhere = goal ? 'task IN $goalTasks AND at >= <datetime>$since AND at <= $cutoff' : 'at >= <datetime>$since AND at <= $cutoff';
+    const counts = (n: string) => `LET $states${n} = (SELECT state, count() AS n FROM task ${taskWhere} GROUP BY state);
+      LET $taskTotal${n} = (SELECT count() AS n FROM task ${taskWhere} GROUP ALL)[0].n;
+      LET $actions${n} = (SELECT action, count() AS n FROM audit WHERE ${auditWhere} GROUP BY action);
+      LET $auditTotal${n} = (SELECT count() AS n FROM audit WHERE ${auditWhere} GROUP ALL)[0].n;`;
+    type Counts = {
       states?: Array<{ state?: string | null; n: number }>; taskTotal?: number | null;
       actions?: Array<{ action?: string | null; n: number }>; auditTotal?: number | null;
     };
-    let responses;
-    try {
-      responses = await this.db.query<unknown[]>(query, { since, ...(goal ? { goal } : {}) }).responses();
-    } catch {
-      throw new CompanyError('temporarily_unavailable', 'summary read did not complete; retry', true);
-    }
-    const read = responses.every(response => response.success)
-      ? responses.map(response => response.result).find((value): value is SummaryRead => typeof value === 'object' && value !== null && 'cutoff' in value)
-      : undefined;
-    if (!read) throw new CompanyError('temporarily_unavailable', 'summary read did not complete; retry', true);
+    type SummaryRead = Counts & { cutoff: string; outbox?: number | null; again?: Counts };
+    const read = await this.consistentRead<SummaryRead>(`LET $cutoff = time::now();
+      LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
+      ${goal ? 'LET $goalTasks = (SELECT VALUE id FROM task WHERE goal = $goal);' : ''}
+      ${counts('')}
+      ${counts('_again')}
+      RETURN { read: {
+        cutoff: <string>$cutoff, outbox: $outbox,
+        states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal,
+        again: { states: $states_again, taskTotal: $taskTotal_again, actions: $actions_again, auditTotal: $auditTotal_again },
+      } };`, { since, ...(goal ? { goal } : {}) });
+    // Both reads are compared in one canonical order, so a difference in row order alone is not reported as a change.
+    const canonical = (c: Counts) => JSON.stringify([
+      [...(c.states ?? [])].map(row => [String(row.state ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      Number(c.taskTotal ?? 0),
+      [...(c.actions ?? [])].map(row => [String(row.action ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      Number(c.auditTotal ?? 0),
+    ]);
+    const repeatableRead = canonical(read) === canonical(read.again ?? {});
     const tasks: Record<string, number> = {};
-    for (const row of read.states ?? []) tasks[row.state == null ? 'unknown' : String(row.state)] = Number(row.n);
+    for (const row of read.states ?? []) {
+      const key = row.state == null ? 'unknown' : String(row.state);
+      tasks[key] = (tasks[key] ?? 0) + Number(row.n);
+    }
     const audit: Record<string, number> = {};
-    for (const row of read.actions ?? []) audit[row.action == null ? 'unknown' : String(row.action)] = Number(row.n);
+    for (const row of read.actions ?? []) {
+      const key = row.action == null ? 'unknown' : String(row.action);
+      audit[key] = (audit[key] ?? 0) + Number(row.n);
+    }
     const taskRows = Object.values(tasks).reduce((sum, n) => sum + n, 0);
     const auditRows = Object.values(audit).reduce((sum, n) => sum + n, 0);
     const unknownStates = Object.keys(tasks).filter(state => !TASK_STATES.includes(state as TaskState));
@@ -1215,18 +1364,19 @@ export class SurrealCompanyCore implements CompanyCore {
       taskCountsMatchRows: taskRows === Number(read.taskTotal ?? 0),
       auditCountsMatchRows: auditRows === Number(read.auditTotal ?? 0),
       statesKnown: unknownStates.length === 0,
+      repeatableRead,
     };
     return {
       cutoffAt: read.cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}),
       scope: {
         tasks: goal ? 'tasks of this goal, each in the state it holds at cutoffAt; since does not apply to them'
           : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
-        audit: 'audit entries with at from since up to cutoffAt',
+        audit: goal ? "audit entries of this goal's tasks with at from since up to cutoffAt" : 'audit entries with at from since up to cutoffAt',
       },
       tasks, audit, outboxSequence: Number(read.outbox ?? 0),
       integrity: {
         complete: Object.values(checks).every(Boolean),
-        method: 'one BEGIN…COMMIT transaction: cutoff, outbox sequence and counts read together; each count is checked against the rows it grouped',
+        method: 'one BEGIN…COMMIT transaction: cutoff, outbox sequence and counts read together; counts read twice must agree (repeatableRead), and each count must match the rows it grouped; task counts ignore since, audit counts cover [since, cutoffAt]',
         taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
       },
     };
@@ -1270,6 +1420,8 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     const specs = deliveryChain(input.title, input.spec);
+    // The legs are returned together: each echo gets an equal share of the item budget, so the whole answer fits (SYS01).
+    const legLimit = Math.floor(ITEM_BUDGET_BYTES / specs.length);
     const lane = input.lane ?? `delivery-${HASH(input.idempotencyKey).slice(0, 8)}`;
     const created: TaskView[] = [];
     let dependencies = [...new Set(input.dependencies ?? [])];
@@ -1286,7 +1438,7 @@ export class SurrealCompanyCore implements CompanyCore {
       created.push(task);
       dependencies = [task.id];
     }
-    return created;
+    return created.map(task => echoTaskContext(task, legLimit));
   }
 
   // ---- 受控编制管理工具（manage = gm/product） ----
@@ -1369,8 +1521,8 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
     const source = await this.relayActor(credential, input.ownerQuote);
-    return this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
-      note: `${input.note}\n老板原话：${input.ownerQuote}` });
+    return echoTaskContext(await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
+      note: `${input.note}\n老板原话：${input.ownerQuote}` }));
   }
 
   async relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void> {
@@ -1378,7 +1530,15 @@ export class SurrealCompanyCore implements CompanyCore {
     await this.owner.addDirection({ text: input.text, source, key: `${source}:${input.idempotencyKey}` });
   }
 
+  /** Lease writes answer with their task echoed within the budget (SYS01): the write is already committed, so its echo never fails it. */
   private async transition(
+    credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
+    evidence?: Evidence, to?: 'gm' | 'owner'
+  ): Promise<TaskView> {
+    return echoTaskContext(await this.transitionRecord(credential, proof, action, evidence, to));
+  }
+
+  private async transitionRecord(
     credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
     evidence?: Evidence, to?: 'gm' | 'owner'
   ): Promise<TaskView> {
@@ -1517,6 +1677,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * reviewer return; handover markers from earlier holders are left untouched.
    */
   async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
+    return echoTaskContext(await this.releaseRecord(credential, proof, evidence));
+  }
+
+  private async releaseRecord(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
     const actor = await this.authorized(credential);
     if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
       throw new CompanyError('invalid', 'Invalid lease proof');
@@ -1614,6 +1778,10 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
+    return echoTaskContext(await this.resumeRecord(credential, taskId, evidence));
+  }
+
+  private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
@@ -1649,7 +1817,6 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-  /**
    * gm only: re-point an execute-phase gm block at the dependency graph. The task keeps
    * state 'blocked' — it never re-enters the dispatcher's gm-attention loop or the work
    * queues — but `blocked_to` clears, which is exactly what UNLOCK_SQL needs to flip it
@@ -1658,6 +1825,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * the task resumes immediately under the same safe execute semantics as resume.
    */
   async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
+    return echoTaskContext(await this.deferTaskUntilRecord(credential, input));
+  }
+
+  private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may defer blocked tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -1775,6 +1946,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * returning the current view; 'done' tasks refuse (their audit trail stands).
    */
   async retireTask(credential: Credential, input: RetireTask): Promise<TaskView> {
+    return echoTaskContext(await this.retireTaskRecord(credential, input));
+  }
+
+  private async retireTaskRecord(credential: Credential, input: RetireTask): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only gm or product may retire tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -2098,6 +2273,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * claim allocates a fresh task branch in the target repo.
    */
   async taskProjectUpdate(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    return echoTaskContext(await this.taskProjectUpdateRecord(credential, input));
+  }
+
+  private async taskProjectUpdateRecord(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may rebind task projects');
     requireText(input.taskId, 'task', 1, 200);
@@ -2157,6 +2336,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
    */
   async bindTaskCodeRepo(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    return echoTaskContext(await this.bindTaskCodeRepoRecord(credential, input));
+  }
+
+  private async bindTaskCodeRepoRecord(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may bind a task code repo');
     requireText(input.taskId, 'task', 1, 200);

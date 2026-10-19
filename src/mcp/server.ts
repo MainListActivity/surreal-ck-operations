@@ -46,10 +46,14 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
+  // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
+  const message = code !== 'internal_error' && typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
+    ? error.message.slice(0, 500)
+    : '';
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: code }],
-    structuredContent: { ok: false, code, retryable },
+    content: [{ type: 'text' as const, text: message ? `${code}: ${message}` : code }],
+    structuredContent: { ok: false, code, retryable, error: message || code },
   };
 }
 
@@ -94,7 +98,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     cursor: z.string().min(1).max(2048).optional(),
   };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and company tasks, one page at a time within the 48 KiB response budget. Pass page.nextCursor back to continue. Long context is previewed; read the rest with read_task_text. Calls without pageSize or cursor keep the old keys (principal, company, tasks).',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without pageSize or cursor the answer is complete (keys principal, company, tasks) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to true without paging and to false with it. A task context too large for one page is cut and flagged (contextTruncated, contextNextOffset); read the rest with read_task_text. A task read by taskId is whole or refused.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200).optional(),
       state: z.enum(states).optional(),
@@ -134,7 +138,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.listWorktreeAudits(token(ctx), limit)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory: compact references (released ones are counted and listed only with includeReleased). Without pageSize or cursor it returns the worktree array, refused as response_too_large when over the 48 KiB budget; with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',
+    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), includeReleased: z.boolean().optional(), ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => {
     // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array shape.
@@ -144,17 +148,18 @@ function registerTools(server: McpServer, core: CompanyCore) {
     return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId) : Promise.resolve([]);
   }));
   server.registerTool('get_admin_summary', {
-    description: 'gm only: read-only company summary at a stated cutoff: task counts by state (optionally for one goal) and audit counts by action since a time (default: the last 24 hours), with the outbox sequence and an integrity flag. Never returns task text.',
+    description: 'gm only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
     inputSchema: z.object({ since: z.string().min(1).max(40).optional(), goalId: z.string().min(1).max(100).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('read_task_text', {
-    description: 'Read one byte segment of a task context (field context) or of one audit entry evidence (field evidence, auditId from get_task_history). Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character.',
+    description: 'Read one byte segment of a task context (field context) or of one audit entry evidence (field evidence, auditId from get_task_history). Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       field: z.enum(['context', 'evidence']),
       auditId: z.string().min(1).max(200).optional(),
       offset: z.number().int().min(0).max(1_000_000_000).optional(),
       limit: z.number().int().min(4).max(24576).optional(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.taskText ? core.taskText(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
 
@@ -262,11 +267,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.updateProjectDisciplines(token(ctx), input)));
 
   server.registerTool('get_task_history', {
-    description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Newest entries come first, in pages that fit the 48 KiB budget (page.nextCursor continues); each page is returned oldest first. Long evidence is previewed with its length and SHA-256; read the full text with read_task_text.',
+    description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Without pageSize or cursor it returns the complete history, oldest first, or response_too_large with retry guidance when it does not fit the 48 KiB budget (retry with pageSize 10, then cursor set to page.nextCursor). With pageSize or cursor, newest entries come first in pages that fit the budget; each page is returned oldest first. Evidence too large for a page is cut and flagged (evidenceTruncated, evidenceNextOffset), with evidenceBytes and evidenceSha256; read the full text with read_task_text (field evidence, auditId).',
     inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),
-  }, async (input, ctx) => run(token(ctx), async () => core.historyView
-    ? core.historyView(token(ctx), input.taskId, input)
-    : { history: await core.history(token(ctx), input.taskId) }));
+  }, async (input, ctx) => run(token(ctx), () => {
+    // C2 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 bare array, complete or refused.
+    const paged = input.pageSize !== undefined || input.cursor !== undefined;
+    if (paged && core.historyView) return core.historyView(token(ctx), input.taskId, input);
+    return core.history(token(ctx), input.taskId);
+  }));
 
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;

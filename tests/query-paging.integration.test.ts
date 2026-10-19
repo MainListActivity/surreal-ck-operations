@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -10,8 +10,12 @@ import { CompanyError, SurrealCompanyCore, asId, id } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
-import { RESPONSE_BUDGET_BYTES, guardRelayResponse, jsonBytes, sealCursor } from '../src/response-budget.ts';
+import type { HistoryEntry, TaskView } from '../src/contracts.ts';
+import type { EmployeeInst } from '../src/workforce.ts';
 import { queryDigest } from '../src/query-input.ts';
+import { RESPONSE_BUDGET_BYTES, guardRelayResponse, jsonBytes, sealCursor } from '../src/response-budget.ts';
+import { SnapshotStore } from '../src/snapshot-store.ts';
+import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 
 // SYS01 bounded reads on the isolated company fork started by scripts/test-worktrees.ts. Never production.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };
@@ -32,6 +36,7 @@ let gm: string;
 let eng: string;
 let cs: string;
 let goalId: string;
+let smallGoalId: string;
 let expectedWorking: string[] = [];
 
 /** `count` code points of mixed Chinese and emoji, starting with `prefix` (never splits a surrogate pair). */
@@ -41,6 +46,8 @@ function codePoints(count: number, prefix = ''): string {
 }
 
 const bytesOf = (value: unknown): number => jsonBytes({ ok: true, data: value });
+const utf8 = (text: string): number => Buffer.byteLength(text, 'utf8');
+const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
 
 async function expectRefused(promise: Promise<unknown>, code: CompanyError['code'], pattern: RegExp) {
   const error = await promise.then(() => undefined, (reason: unknown) => reason);
@@ -60,9 +67,22 @@ async function countRows(table: string): Promise<number> {
   return rows?.[0]?.n ?? 0;
 }
 
-/** Walks every page of one listing, checking each page against the byte budget as it arrives. */
-async function walk(fetchPage: (cursor?: string) => Promise<{ items: string[]; nextCursor?: string }>, limit = 500, start?: string): Promise<string[]> {
-  const seen: string[] = [];
+/** Audit rows of one task that history answers can name: every entry except routine ops_call reads. */
+async function historyRows(taskId: string): Promise<number> {
+  const [rows] = await database.db.query<[Array<{ n: number }>]>(
+    "SELECT count() AS n FROM audit WHERE task = $task AND action != 'ops_call' GROUP ALL;", { task: id('task', taskId) });
+  return rows?.[0]?.n ?? 0;
+}
+
+async function addAudit(taskId: string, evidence: string): Promise<void> {
+  await database.db.query(
+    'CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", evidence: $evidence, version: 1, at: time::now() };',
+    { task: id('task', taskId), actor: id('employee', ids.gm), evidence });
+}
+
+/** Follows every page of one traversal and returns all items, in order. Each page is checked as it arrives. */
+async function drain<T>(fetchPage: (cursor?: string) => Promise<{ items: T[]; nextCursor?: string }>, start?: string, limit = 500): Promise<T[]> {
+  const seen: T[] = [];
   let cursor: string | undefined = start;
   for (let page = 0; page < limit; page++) {
     const next = await fetchPage(cursor);
@@ -71,6 +91,38 @@ async function walk(fetchPage: (cursor?: string) => Promise<{ items: string[]; n
     cursor = next.nextCursor;
   }
   throw new Error('traversal did not finish within the page limit');
+}
+
+/** Every page of one history traversal, checked against the budget. */
+async function historyEntries(taskId: string): Promise<HistoryEntry[]> {
+  return drain(async cursor => {
+    const view = await core.historyView(gm, taskId, { pageSize: 9, ...(cursor ? { cursor } : {}) });
+    expect(bytesOf(view)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    return { items: view.history, nextCursor: view.page.nextCursor };
+  });
+}
+
+/**
+ * Reads one text field in byte segments. The digest of the first segment is pinned on every later one, so a text
+ * that changed mid-way is refused rather than mixed in. Every segment is whole UTF-8.
+ */
+async function reassemble(args: { taskId: string; field: 'context' | 'evidence'; auditId?: string; limit: number }, credential = gm) {
+  const pieces: Buffer[] = [];
+  let offset: number | null = 0;
+  let pinned: string | undefined;
+  let totalBytes = -1;
+  let segments = 0;
+  while (offset !== null) {
+    const segment = await core.taskText(credential, { ...args, offset, ...(pinned ? { expectSha256: pinned } : {}) });
+    expect(segment.bytes).toBeLessThanOrEqual(args.limit);
+    expect(segment.text).not.toContain('\uFFFD');
+    pinned ??= segment.sha256;
+    totalBytes = segment.totalBytes;
+    pieces.push(Buffer.from(segment.text, 'utf8'));
+    offset = segment.nextOffset;
+    segments++;
+  }
+  return { text: Buffer.concat(pieces).toString('utf8'), totalBytes, sha256: pinned!, segments };
 }
 
 /**
@@ -153,172 +205,452 @@ beforeAll(async () => {
     });
   }
   expectedWorking = await workingIds(goalId);
+  // A second goal with three tasks of its own (tiering adds the triage template's tasks): its whole working set fits the budget.
+  const small = await owner.createGoal({ text: `分页小目标 ${suffix}`, source: 'owner:test', key: key('goal-small'), tier: 'standard' });
+  smallGoalId = small.id;
+  for (let i = 0; i < 3; i++) {
+    await core.createTask(gm, {
+      title: `小目标样例 ${i} ${unit}`, context: i === 0 ? codePoints(6000, '较长正文 ') : `短正文 ${i}`,
+      executorRole: 'engineering', reviewerRole: 'qa', goalId: smallGoalId, idempotencyKey: key(`small${i}`),
+    });
+  }
 }, 1_200_000);
 
 afterAll(async () => { await database.close(); });
 
-test('the budget is 48 KiB of serialized UTF-8 and the paged working set is at least the 1000-task fixture', () => {
-  expect(RESPONSE_BUDGET_BYTES).toBe(49_152);
+test('the budget is 48 KiB of serialized UTF-8 and the working set holds at least the 1000-task fixture', () => {
+  expect(RESPONSE_BUDGET_BYTES).toBe(48 * 1024);
   expect(expectedWorking.length).toBeGreaterThanOrEqual(TOTAL);
 });
 
-test('legacy get_context keeps its keys and returns a budgeted first page with a continuation', async () => {
-  const legacy = await core.contextView(gm, { goalId });
-  expect(Object.keys(legacy)).toEqual(expect.arrayContaining(['principal', 'company', 'tasks', 'page']));
-  expect(legacy.page.hasMore).toBe(true);
-  expect(legacy.tasks.length).toBeGreaterThan(0);
-  expect(legacy.tasks.length).toBeLessThan(TOTAL);
+test('legacy get_context over the whole working set is refused as response_too_large, never a partial list (C2)', async () => {
+  await expectRefused(core.contextView(gm, { goalId }), 'response_too_large', /pageSize/);
+});
+
+test('legacy get_context answers whole when the set fits: the old keys, every task, and no page (C2)', async () => {
+  // The goal's working set is read from the database: a tiered goal also gets its triage template tasks.
+  const members = await workingIds(smallGoalId);
+  expect(members.length).toBeGreaterThanOrEqual(3);
+  const legacy = await core.contextView(gm, { goalId: smallGoalId });
+  expect(Object.keys(legacy).sort()).toEqual(['company', 'principal', 'tasks']);
+  expect(legacy.page).toBeUndefined();
+  expect(legacy.tasks.map(task => String(task.id)).sort()).toEqual([...members].sort());
   expect(bytesOf(legacy)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  expect(legacy.page.nextCursor).toBeString();
+  // A complete answer carries whole contexts, never a preview: the long one of this goal is returned in full (C2, C3).
+  const long = legacy.tasks.find(task => String(task.context).startsWith('较长正文'));
+  expect(String(long?.context).length).toBeGreaterThanOrEqual(6000);
+  expect(long?.contextTruncated).toBe(false);
+  expect(long?.contextBytes).toBe(utf8(String(long?.context)));
+  expect(long?.contextSha256).toBe(sha256(String(long?.context)));
+  expect(legacy.tasks.every(task => task.contextTruncated === false)).toBe(true);
+});
+
+test('the company block is never trimmed: a legacy answer whose brief breaks the budget is refused, and a page carries it only on request (C2)', async () => {
+  const original = core.companyBrief;
+  const bulky = { directions: [], goals: [{ text: '超'.repeat(20_000) }], projects: [], paused: false } as never;
+  try {
+    core.companyBrief = async () => bulky;
+    await expectRefused(core.contextView(gm, { goalId: smallGoalId }), 'response_too_large', /budget/);
+    const page = await core.contextView(gm, { goalId: smallGoalId, pageSize: 100 });
+    expect(page).not.toHaveProperty('company');
+    expect(page.tasks.length).toBe(await workingIds(smallGoalId).then(ids => ids.length));
+    await expectRefused(core.contextView(gm, { goalId: smallGoalId, pageSize: 5, includeCompany: true }), 'response_too_large', /budget/);
+  } finally {
+    core.companyBrief = original;
+  }
+  const withBrief = await core.contextView(gm, { goalId: smallGoalId, pageSize: 5, includeCompany: true });
+  expect(withBrief).toHaveProperty('company');
+});
+
+test('legacy get_task_history is the complete history with whole evidence when it fits, and refused when it does not (C2, C3)', async () => {
+  const small = await core.createTask(gm, {
+    title: '历史小样例', context: '历史小样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-small'),
+  });
+  await addAudit(small.id, codePoints(12_000, '完整证据 '));
+  const whole = await core.history(gm, small.id);
+  expect(Array.isArray(whole)).toBe(true);
+  expect(whole.length).toBe(await historyRows(small.id));
+  const full = whole.find(entry => entry.evidence?.startsWith('完整证据'));
+  expect(full?.evidence).toBe(codePoints(12_000, '完整证据 '));
+  expect(full?.evidenceTruncated).toBe(false);
+  const big = await core.createTask(gm, {
+    title: '历史大样例', context: '历史大样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-big'),
+  });
+  for (let i = 0; i < 30; i++) await addAudit(big.id, codePoints(6_000, `证据第${i}条 `));
+  await expectRefused(core.history(gm, big.id), 'response_too_large', /pageSize/);
+});
+
+test('get_context by taskId returns the whole context when it fits, with its size and digest (C3)', async () => {
+  const text = codePoints(9_000, '中等正文 ');
+  const task = await core.createTask(gm, {
+    title: '中等正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('medium'),
+  });
+  const detail = await core.contextView(gm, { taskId: task.id });
+  const view = detail.tasks[0]!;
+  expect(view.context).toBe(text);
+  expect(view.contextBytes).toBe(utf8(text));
+  expect(view.contextSha256).toBe(sha256(text));
+  expect(detail.page).toBeUndefined();
+  expect(bytesOf(detail)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+});
+
+test('a context over the budget is refused whole with read_task_text guidance; segments verify, a changed text is refused, and each read is permission-checked (C3)', async () => {
+  const text = '中'.repeat(19_000); // 57,000 bytes: above the 48 KiB budget
+  const task = await core.createTask(gm, {
+    title: '超大正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('huge'),
+  });
+  await expectRefused(core.contextView(gm, { taskId: task.id }), 'response_too_large', /read_task_text/);
+  const first = await core.taskText(gm, { taskId: task.id, field: 'context', offset: 0, limit: 8_192 });
+  expect(first.totalBytes).toBe(utf8(text));
+  expect(first.sha256).toBe(sha256(text));
+  const whole = await reassemble({ taskId: task.id, field: 'context', limit: 8_192 });
+  expect(whole.text).toBe(text);
+  expect(whole.totalBytes).toBe(utf8(text));
+  expect(whole.sha256).toBe(sha256(text));
+  // The text changes between two segments: a read still pinned to the old digest is refused, never mixed.
+  await database.db.query('UPDATE ONLY $task SET context = $context;', { task: id('task', task.id), context: `${text} 已修改` });
+  await expectRefused(core.taskText(gm, { taskId: task.id, field: 'context', offset: first.nextOffset!, limit: 8_192, expectSha256: first.sha256 }), 'conflict', /changed/);
+  // Access is checked on every read: a role with no access to this task is refused even mid-reassembly.
+  await expectRefused(core.taskText(cs, { taskId: task.id, field: 'context', offset: 0 }), 'forbidden', /access denied/);
+  // A digest of the wrong form is refused before any read.
+  await expectRefused(core.taskText(gm, { taskId: task.id, field: 'context', expectSha256: 'not-a-digest' }), 'invalid', /expectSha256/);
+});
+
+test('a text reassembles exactly from 4-byte segments of mixed Chinese and emoji, with its digest verified (C3)', async () => {
+  const text = '中文🙂字符'.repeat(60);
+  const task = await core.createTask(gm, {
+    title: '分段样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('tiny'),
+  });
+  const whole = await reassemble({ taskId: task.id, field: 'context', limit: 4 });
+  expect(whole.text).toBe(text);
+  expect(whole.totalBytes).toBe(utf8(text));
+  expect(whole.sha256).toBe(sha256(text));
+  expect(whole.segments).toBeGreaterThanOrEqual(utf8(text) / 4);
+});
+
+test('a read past offset 0 must pin the digest of its first segment, so two versions of one text are never mixed (C3)', async () => {
+  const text = '中文🙂字符'.repeat(40);
+  const task = await core.createTask(gm, {
+    title: '版本样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('version'),
+  });
+  await expectRefused(core.taskText(gm, { taskId: task.id, field: 'context', offset: 8, limit: 16 }), 'invalid', /expectSha256/);
+  const first = await core.taskText(gm, { taskId: task.id, field: 'context', offset: 0, limit: 16 });
+  const second = await core.taskText(gm, { taskId: task.id, field: 'context', offset: first.nextOffset!, limit: 16, expectSha256: first.sha256 });
+  expect(second.sha256).toBe(first.sha256);
+  await database.db.query('UPDATE ONLY $task SET context = $context;', { task: id('task', task.id), context: `${text} 另一版` });
+  await expectRefused(core.taskText(gm, { taskId: task.id, field: 'context', offset: second.nextOffset!, limit: 16, expectSha256: first.sha256 }), 'conflict', /changed/);
 });
 
 test('a paged traversal yields every working-set task exactly once, each page inside the budget', async () => {
-  const seen = await walk(async cursor => {
+  const expected = await workingIds(goalId);
+  const seen = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, pageSize: 37, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page.nextCursor };
+    // Every item is whole unless it cannot fit a page on its own (C3). A cut item is flagged, and its size describes the full text.
+    for (const task of page.tasks) {
+      if (task.contextTruncated === true) {
+        expect(typeof task.contextNextOffset).toBe('number');
+        expect(Number(task.contextBytes)).toBeGreaterThan(utf8(String(task.context)));
+        continue;
+      }
+      expect(task.contextBytes).toBe(utf8(String(task.context)));
+      expect(task.contextSha256).toBe(sha256(String(task.context)));
+    }
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect(new Set(seen).size).toBe(seen.length);
-  expect([...seen].sort()).toEqual([...expectedWorking].sort());
+  expect([...seen].sort()).toEqual([...expected].sort());
+});
+
+test('a page item larger than the page budget on its own is cut at a character boundary and flagged; its rest reads by segment and the traversal goes on (C3, AC03)', async () => {
+  const goal = await owner.createGoal({ text: `超大条目目标 ${suffix}`, source: 'owner:test', key: key('goal-oversize'), tier: 'standard' });
+  const text = '超'.repeat(20_000); // 60,000 bytes: larger than one page item on its own
+  const big = await core.createTask(gm, {
+    title: `超大条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('oversize'),
+  });
+  for (let i = 0; i < 4; i++) {
+    await core.createTask(gm, {
+      title: `超大目标样例 ${i} ${unit}`, context: `短正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key(`oversize-${i}`),
+    });
+  }
+  // A complete answer over this goal is refused, since the set does not fit whole (C2).
+  await expectRefused(core.contextView(gm, { goalId: goal.id }), 'response_too_large', /pageSize/);
+  const expected = await workingIds(goal.id);
+  const items: Array<Record<string, unknown>> = [];
+  const seen = await drain(async cursor => {
+    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 3, ...(cursor ? { cursor } : {}) });
+    expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    items.push(...(page.tasks as Array<Record<string, unknown>>));
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+  });
+  expect([...seen].sort()).toEqual([...expected].sort());
+  const cut = items.find(task => task.id === big.id)!;
+  expect(cut.contextTruncated).toBe(true);
+  expect(cut.contextBytes).toBe(utf8(text));
+  expect(cut.contextSha256).toBe(sha256(text));
+  const prefix = String(cut.context);
+  expect(text.startsWith(prefix)).toBe(true);
+  expect(cut.contextNextOffset).toBe(utf8(prefix));
+  expect(items.filter(task => task !== cut).every(task => task.contextTruncated === false)).toBe(true);
+  // The rest reads by segment from the flagged offset, pinned to the digest; the prefix plus the rest is the whole text.
+  let rest = '';
+  let offset: number | null = cut.contextNextOffset as number;
+  while (offset !== null) {
+    const segment = await core.taskText(gm, { taskId: big.id, field: 'context', offset, limit: 8_192, expectSha256: sha256(text) });
+    rest += segment.text;
+    offset = segment.nextOffset;
+  }
+  expect(prefix + rest).toBe(text);
+});
+
+test('a page item between 32 KiB and the page budget stays whole, for context and for evidence (C3)', async () => {
+  const goal = await owner.createGoal({ text: `中等条目目标 ${suffix}`, source: 'owner:test', key: key('goal-medium'), tier: 'standard' });
+  const text = '超'.repeat(14_000); // 42,000 bytes: above 32 KiB, still one page item
+  const medium = await core.createTask(gm, {
+    title: `中等条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('medium-item'),
+  });
+  await addAudit(medium.id, text);
+  const expected = await workingIds(goal.id);
+  const delivered: Array<Record<string, unknown>> = [];
+  const seen = await drain(async cursor => {
+    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
+    expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    delivered.push(...(page.tasks as Array<Record<string, unknown>>));
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+  });
+  expect([...seen].sort()).toEqual([...expected].sort());
+  const whole = delivered.find(task => task.id === medium.id)!;
+  expect(whole.context).toBe(text);
+  expect(whole.contextTruncated).toBe(false);
+  expect(whole.contextBytes).toBe(utf8(text));
+  expect(whole.contextSha256).toBe(sha256(text));
+  const entries = await historyEntries(medium.id);
+  const evidence = entries.find(entry => entry.evidence === text);
+  expect(evidence).toBeDefined();
+  expect(evidence!.evidenceTruncated).toBe(false);
+  expect(evidence!.evidenceBytes).toBe(utf8(text));
+  expect(evidence!.evidenceSha256).toBe(sha256(text));
+});
+
+test('every page re-checks the caller: an identity revoked mid-traversal is refused on its next page as unauthorized (C4)', async () => {
+  const revoked = `qp-revoked-${suffix}`;
+  const credential = await enrollment.enroll(revoked, 'gm', ['execute', 'review', 'manage']);
+  const first = await core.contextView(credential, { goalId, pageSize: 5 });
+  expect(first.page?.nextCursor).toBeDefined();
+  await enrollment.revoke(revoked, 'security');
+  await expectRefused(core.contextView(credential, { goalId, pageSize: 5, cursor: first.page!.nextCursor }), 'unauthorized', /Invalid credential/);
+});
+
+test('a gm summary read while writers run is one consistent read: every answer passes its integrity checks (C5)', async () => {
+  const writers = Promise.all(Array.from({ length: 3 }, (_, w) => (async () => {
+    for (let i = 0; i < 5; i++) {
+      const task = await core.createTask(gm, {
+        title: `汇总并发样例 ${w}-${i} ${unit}`, context: `并发写入 ${w}-${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`sum-${w}-${i}`),
+      });
+      await addAudit(task.id, `并发审计 ${w}-${i}`);
+    }
+  })()));
+  const answers: Array<Awaited<ReturnType<typeof core.adminSummary>>> = [];
+  while (answers.length < 8) answers.push(await core.adminSummary(gm, { goalId }));
+  await writers;
+  for (const summary of answers) {
+    expect(summary.integrity.complete).toBe(true);
+    expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true, repeatableRead: true });
+  }
+  // After the writers finish, the summary counts every task of the goal that the database holds.
+  const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM task WHERE goal = $goal GROUP ALL;', { goal: id('goal', goalId) });
+  const final = await core.adminSummary(gm, { goalId });
+  expect(final.integrity.complete).toBe(true);
+  expect(final.integrity.taskRows).toBe(rows?.[0]?.n ?? 0);
+});
+
+test('a gm summary read while tasks change state and audit entries arrive is one consistent read: the task total holds, audit counts never fall (C5)', async () => {
+  const busy = await owner.createGoal({ text: `汇总移动目标 ${suffix}`, source: 'owner:test', key: key('goal-summary-moves'), tier: 'standard' });
+  // The goal needs at least six tasks of its own for the writers to move between states.
+  for (let i = 0; i < 6; i++) {
+    await core.createTask(gm, {
+      title: `汇总移动样例 ${i} ${unit}`, context: `移动前的正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId: busy.id, idempotencyKey: key(`moves-${i}`),
+    });
+  }
+  const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE goal = $goal;', { goal: id('goal', busy.id) });
+  const members = (rows ?? []).map(row => asId(row.id));
+  const total = members.length;
+  expect(total).toBeGreaterThanOrEqual(6);
+  const writers = (async () => {
+    for (let round = 0; round < 6; round++) {
+      // Half the goal's tasks move between states on every round; the number of tasks never changes.
+      const state = round % 2 === 0 ? 'done' : 'ready';
+      await database.db.query('UPDATE task SET state = $state WHERE id IN $ids;', { state, ids: members.slice(0, Math.ceil(total / 2)).map(member => id('task', member)) });
+      await addAudit(members[round % total]!, `汇总移动审计 ${round}`);
+    }
+  })();
+  const answers: Array<Awaited<ReturnType<typeof core.adminSummary>>> = [];
+  while (answers.length < 10) answers.push(await core.adminSummary(gm, { goalId: busy.id }));
+  await writers;
+  let previousAudit = -1;
+  let previousCutoff = '';
+  for (const summary of answers) {
+    expect(summary.integrity.complete).toBe(true);
+    expect(summary.integrity.taskRows).toBe(total);
+    expect(Object.values(summary.tasks).reduce((sum, n) => sum + n, 0)).toBe(total);
+    expect(summary.integrity.auditRows).toBeGreaterThanOrEqual(previousAudit);
+    expect(summary.cutoffAt >= previousCutoff).toBe(true);
+    previousAudit = summary.integrity.auditRows;
+    previousCutoff = summary.cutoffAt;
+  }
+  // Once the writers have finished, a fresh read counts every audit entry they wrote and agrees with the rows.
+  const final = await core.adminSummary(gm, { goalId: busy.id });
+  expect(final.integrity.complete).toBe(true);
+  expect(final.integrity.auditRows).toBeGreaterThanOrEqual(previousAudit);
+  expect(final.integrity.auditRows).toBeGreaterThanOrEqual(6);
 });
 
 test('UTF-8 survives every page: Chinese titles and emoji parse back intact', async () => {
-  const page = await core.contextView(gm, { goalId, pageSize: 20 });
-  const parsed = JSON.parse(JSON.stringify(page)) as typeof page;
-  expect(parsed.tasks.some(task => String(task.title).includes('分页样例') && String(task.title).includes('🙂'))).toBe(true);
-  for (const task of parsed.tasks) expect(String(task.context)).not.toContain('�');
+  const titles: string[] = [];
+  await drain(async cursor => {
+    const page = await core.contextView(gm, { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
+    const parsed = JSON.parse(JSON.stringify(page)) as typeof page;
+    for (const task of parsed.tasks) {
+      expect(String(task.context)).not.toContain('�');
+      titles.push(String(task.title));
+    }
+    return { items: parsed.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+  });
+  expect(titles.some(title => title.includes('分页样例') && title.includes('🙂'))).toBe(true);
 });
 
 test('a traversal keeps its snapshot: rows created mid-way are excluded and in-place updates neither repeat nor drop rows', async () => {
-  const snapshot = [...expectedWorking];
+  const snapshot = await workingIds(goalId);
   const first = await core.contextView(gm, { goalId, pageSize: 50 });
+  const late: string[] = [];
   for (let i = 0; i < 3; i++) {
-    await core.createTask(gm, {
+    const created = await core.createTask(gm, {
       title: `迟到样例 ${i}`, context: `创建于快照之后 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`late${i}`),
     });
+    late.push(created.id);
   }
   await database.db.query('UPDATE task SET title = title + " · 已更新" WHERE goal = $goal;', { goal: id('goal', goalId) });
   // Continue from the first page's cursor: the traversal started before the mid-way writes above.
-  const rest = await walk(async cursor => {
+  const rest = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, pageSize: 50, ...(cursor ? { cursor } : {}) });
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page.nextCursor };
-  }, 500, first.page.nextCursor);
-  const seen = [...first.tasks.map(task => String(task.id)), ...rest];
+    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+  }, first.page!.nextCursor);
+  const everything = [...first.tasks, ...rest];
+  const seen = everything.map(task => String(task.id));
   expect(new Set(seen).size).toBe(seen.length);
   expect(seen.every(taskId => snapshot.includes(taskId))).toBe(true);
   expect(seen.length).toBe(snapshot.length);
+  expect(seen.some(taskId => late.includes(taskId))).toBe(false);
+  // The listing shows the titles it was taken with, not the ones written after it.
+  expect(everything.some(task => String(task.title).includes('已更新'))).toBe(false);
 });
 
-test('cursors are bound to the caller and the query, are sealed, and expire', async () => {
+test('cursors are bound to the caller and the query, are sealed, and expire with their listing (C4)', async () => {
   const first = await core.contextView(gm, { goalId, pageSize: 10 });
-  const token = first.page.nextCursor!;
+  const token = first.page!.nextCursor!;
   await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: token.replace(/\.[^.]+$/, '.') }), 'invalid', /verification|malformed/);
   await expectRefused(core.contextView(eng, { goalId, pageSize: 10, cursor: token }), 'forbidden', /another caller/);
   await expectRefused(core.contextView(gm, { goalId, state: 'ready', pageSize: 10, cursor: token }), 'forbidden', /another query/);
+  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, fields: ['id'], cursor: token }), 'forbidden', /another query/);
   const flipped = token.slice(0, -2) + (token.endsWith('AA') ? 'BB' : 'AA');
   await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: flipped }), 'invalid', /verification|malformed/);
-  // An expired cursor, sealed with the stored key, is refused with its own reason.
+  // A cursor sealed with the stored key but already past its expiry names a listing that is gone.
   const keyRow = await database.db.select<{ key: string }>(id('company_meta', 'cursor_key'));
   const sealKey = Buffer.from(keyRow!.key, 'base64url');
   const expired = sealCursor({
-    v: 1, k: 'context', c: ids.gm, q: queryDigest('context', { state: null, goalId, role: null, since: null }),
-    snap: new Date().toISOString(), exp: Date.now() - 1_000,
+    v: 1, k: 'context', c: ids.gm, q: queryDigest('context', { state: null, goalId, role: null, since: null, fields: null }),
+    sid: randomUUID(), seq: 0, exp: Date.now() - 1_000,
   }, sealKey);
-  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: expired }), 'invalid', /expired/);
+  await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: expired }), 'snapshot_gone', /expired/);
   // The unmodified cursor still works for its own caller and query.
   const again = await core.contextView(gm, { goalId, pageSize: 10, cursor: token });
   expect(again.tasks.length).toBeGreaterThan(0);
 });
 
-test('a long single task is previewed with its size and digest, and its full text reassembles from byte segments', async () => {
-  const text = codePoints(12_000, '长篇正文开头 ');
-  const task = await core.createTask(gm, {
-    title: '超长正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('long'),
-  });
-  const detail = await core.contextView(gm, { taskId: task.id });
-  const view = detail.tasks[0]!;
-  expect(view.contextTruncated).toBe(true);
-  expect(Number(view.contextBytes)).toBeGreaterThan(16_384);
-  expect(bytesOf(detail)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-  const pieces: Buffer[] = [];
-  let offset: number | null = 0;
-  while (offset !== null) {
-    const segment = await core.taskText(gm, { taskId: task.id, field: 'context', offset, limit: 8_192 });
-    expect(segment.bytes).toBeLessThanOrEqual(8_192);
-    pieces.push(Buffer.from(segment.text, 'utf8'));
-    offset = segment.nextOffset;
-  }
-  const assembled = Buffer.concat(pieces).toString('utf8');
-  expect(assembled).toBe(text);
-  expect(createHash('sha256').update(assembled).digest('hex')).toBe(String(view.contextSha256));
+test('a listing taken under one role is refused under another, and resumes once the role is back (C4)', async () => {
+  const first = await core.contextView(gm, { goalId, pageSize: 5 });
+  const token = first.page!.nextCursor!;
+  const record = id('query_snapshot', String(cursorBody(token).sid));
+  await database.db.query('UPDATE ONLY $record SET role = "engineering";', { record });
+  await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: token }), 'forbidden', /another role/);
+  await database.db.query('UPDATE ONLY $record SET role = "gm";', { record });
+  const resumed = await core.contextView(gm, { goalId, pageSize: 5, cursor: token });
+  expect(resumed.tasks.length).toBe(5);
 });
 
-test('task history pages stay inside the budget, previews carry size and digest, and evidence reassembles by segments', async () => {
+test('task history pages stay inside the budget and yield every entry once; evidence over the page budget is cut, flagged and reassembles (C2, C3, C4)', async () => {
   const task = await core.createTask(gm, {
     title: '历史分页样例', context: '历史分页夹具', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist'),
   });
-  const taskRecord = id('task', task.id);
-  const actorRecord = id('employee', ids.gm);
-  for (let i = 0; i < 30; i++) {
-    await database.db.query(
-      'CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", evidence: $evidence, version: 1, at: time::now() };',
-      { task: taskRecord, actor: actorRecord, evidence: `${codePoints(6_000, `证据第${i}条 `)}` });
-  }
-  const seen = await walk(async cursor => {
-    const page = await core.historyView(gm, task.id, { pageSize: 9, ...(cursor ? { cursor } : {}) });
-    expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
-    return { items: page.history.map(entry => String(entry.auditId)), nextCursor: page.page.nextCursor };
-  });
-  expect(new Set(seen).size).toBe(seen.length);
-  const checkpoints = await core.historyView(gm, task.id, { pageSize: 100 });
-  const sample = checkpoints.history.find(entry => entry.action === 'checkpoint' && entry.evidenceTruncated)!;
-  expect(sample).toBeDefined();
-  expect(sample.evidenceBytes).toBeGreaterThan(2048);
-  expect(sample.evidence!.length).toBeLessThan(2048);
-  const pieces: Buffer[] = [];
-  let offset: number | null = 0;
+  for (let i = 0; i < 29; i++) await addAudit(task.id, codePoints(6_000, `证据第${i}条 `));
+  const oversized = '超'.repeat(20_000); // 60,000 bytes: larger than a page can hold on its own
+  await addAudit(task.id, oversized);
+  const entries = await historyEntries(task.id);
+  expect(new Set(entries.map(entry => entry.auditId)).size).toBe(entries.length);
+  expect(entries.length).toBe(await historyRows(task.id));
+  const cut = entries.find(entry => entry.evidenceTruncated === true);
+  expect(cut).toBeDefined();
+  expect(cut!.evidenceBytes).toBe(utf8(oversized));
+  expect(cut!.evidenceSha256).toBe(sha256(oversized));
+  expect(utf8(cut!.evidence!)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  expect(oversized.startsWith(cut!.evidence!)).toBe(true);
+  expect(cut!.evidenceNextOffset).toBe(utf8(cut!.evidence!));
+  // The rest reads by segment from the flagged offset, pinned to the digest; prefix plus rest is the whole evidence.
+  let rest = '';
+  let offset: number | null = cut!.evidenceNextOffset as number;
   while (offset !== null) {
-    const segment = await core.taskText(gm, { taskId: task.id, field: 'evidence', auditId: sample.auditId, offset, limit: 4_096 });
-    pieces.push(Buffer.from(segment.text, 'utf8'));
+    const segment = await core.taskText(gm, { taskId: task.id, field: 'evidence', auditId: cut!.auditId, offset, limit: 4_096, expectSha256: sha256(oversized) });
+    rest += segment.text;
     offset = segment.nextOffset;
   }
-  const full = Buffer.concat(pieces).toString('utf8');
-  expect(Buffer.byteLength(full, 'utf8')).toBe(sample.evidenceBytes!);
-  expect(createHash('sha256').update(full).digest('hex')).toBe(sample.evidenceSha256!);
-  expect(seen.length).toBeGreaterThanOrEqual(30);
+  expect(cut!.evidence! + rest).toBe(oversized);
 });
 
-test('the gm summary counts the fixture at a cutoff, and everyone else is refused', async () => {
+test('the gm summary counts the fixture at a cutoff, reads repeatably, and everyone else is refused (C5)', async () => {
   const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM task WHERE goal = $goal;', { goal: id('goal', goalId) });
   const summary = await core.adminSummary(gm, { goalId });
   const counted = Object.values(summary.tasks).reduce((sum, n) => sum + n, 0);
   expect(counted).toBe((rows ?? []).length);
   expect(summary.cutoffAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  expect(summary.since).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  expect(summary.goalId).toBe(goalId);
   expect(summary.scope.tasks).toContain('since does not apply');
   expect(summary.integrity.complete).toBe(true);
-  expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true });
+  expect(summary.integrity.checks).toEqual({ taskCountsMatchRows: true, auditCountsMatchRows: true, statesKnown: true, repeatableRead: true });
   expect(summary.integrity.taskRows).toBe(counted);
   await expectRefused(core.adminSummary(eng, {}), 'forbidden', /Only gm/);
   await expectRefused(core.adminSummary(cs, {}), 'forbidden', /Only gm/);
 });
 
-test('audit counts cover [since, cutoffAt] and task counts ignore the window', async () => {
+test('audit counts cover [since, cutoffAt] and task counts ignore the window; with goalId the audit counts are that goal\'s (C5, AC04)', async () => {
   const wide = '2000-01-01T00:00:00.000Z';
   const everything = await core.adminSummary(gm, { goalId, since: wide });
+  // With goalId the audit counts are that goal's tasks' entries, so they are counted here through those tasks.
   const [audits] = await database.db.query<[Array<{ n: number }>]>(
+    'SELECT count() AS n FROM audit WHERE task IN (SELECT VALUE id FROM task WHERE goal = $goal) AND at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
+    { goal: id('goal', goalId), since: wide, cutoff: everything.cutoffAt });
+  const [allAudits] = await database.db.query<[Array<{ n: number }>]>(
     'SELECT count() AS n FROM audit WHERE at >= <datetime>$since AND at <= <datetime>$cutoff GROUP ALL;',
     { since: wide, cutoff: everything.cutoffAt });
+  expect(everything.since).toBe(wide);
+  expect(everything.scope.audit).toContain('this goal');
   expect(everything.integrity.auditRows).toBeGreaterThan(0);
   expect(everything.integrity.auditRows).toBe(audits?.[0]?.n ?? 0);
-  const future = await core.adminSummary(gm, { goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
+  expect(everything.integrity.auditRows).toBeLessThan(allAudits?.[0]?.n ?? 0);
+  const futureSince = new Date(Date.now() + 3_600_000).toISOString();
+  const future = await core.adminSummary(gm, { goalId, since: futureSince });
+  expect(future.since).toBe(futureSince);
   expect(future.integrity.auditRows).toBe(0);
   expect(future.tasks).toEqual(everything.tasks);
 });
 
-test('a role that may see no task gets an empty page and never the company listing', async () => {
+test('a role that may see no task gets an empty page, and an empty legacy answer, never the company listing', async () => {
   const page = await core.contextView(cs, { goalId, pageSize: 5 });
   expect(page.tasks).toEqual([]);
-  expect(page.page.hasMore).toBe(false);
+  expect(page.page!.hasMore).toBe(false);
+  const legacy = await core.contextView(cs, { goalId });
+  expect(legacy.tasks).toEqual([]);
+  expect(legacy.page).toBeUndefined();
 });
 
 test('invalid arguments are refused before any query runs', async () => {
@@ -335,14 +667,23 @@ test('invalid arguments are refused before any query runs', async () => {
   await expectRefused(core.taskText(gm, { taskId: 'missing', field: 'context', limit: 999_999 }), 'invalid', /limit/);
 });
 
-test('reads add no task, audit or outbox state: the only new row is the cursor secret (RB01)', async () => {
+test('reads add no task, audit or outbox state; the only new rows are stored listings and the cursor secret (RB01)', async () => {
+  const listingIds = async () => {
+    const [rows] = await database.db.query<[Array<{ id: RecordId }>]>('SELECT id FROM query_snapshot;');
+    return (rows ?? []).map(row => String(row.id.id));
+  };
   const before = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
+  const listingsBefore = await listingIds();
   await core.contextView(gm, { goalId, pageSize: 10 });
   await core.historyView(gm, expectedWorking[0]!, { pageSize: 5 });
   await core.adminSummary(gm, { goalId });
   await core.worktreePage(gm, { pageSize: 5 });
   const after = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
   expect(after).toEqual(before);
+  // Each paged first page stored exactly one listing. The per-identity cap may evict older listings of the same caller,
+  // so the check is on the new listings, not on the total.
+  const created = (await listingIds()).filter(listing => !listingsBefore.includes(listing));
+  expect(created.length).toBe(3);
   const keyRow = await database.db.select<{ key?: string }>(id('company_meta', 'cursor_key'));
   expect(keyRow?.key).toBeString();
 });
@@ -373,13 +714,14 @@ test('an invalid query comes back as a JSON error with the reason on stderr', as
   expect(relayed.stderr).toContain('pageSize');
 });
 
-test('state, role, goal and time filters narrow the listing and the cursor stays bound to them', async () => {
-  const readyDb = (await database.db.query<[Array<{ id: RecordId }>]>(
-    "SELECT id FROM task WHERE goal = $goal AND state = 'ready';", { goal: id('goal', goalId) }))[0]!.map(row => asId(row.id));
-  const readySeen = await walk(async cursor => {
+test('state, role and time filters narrow the listing, and the cursor stays bound to them', async () => {
+  const [readyRows] = await database.db.query<[Array<{ id: RecordId }>]>(
+    "SELECT id FROM task WHERE goal = $goal AND state = 'ready';", { goal: id('goal', goalId) });
+  const readyDb = (readyRows ?? []).map(row => asId(row.id));
+  const readySeen = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, state: 'ready', pageSize: 100, ...(cursor ? { cursor } : {}) });
     expect(page.tasks.every(task => task.state === 'ready')).toBe(true);
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page.nextCursor };
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect([...readySeen].sort()).toEqual([...readyDb].sort());
   const engineering = await core.contextView(gm, { goalId, role: 'engineering', pageSize: 100 });
@@ -387,11 +729,11 @@ test('state, role, goal and time filters narrow the listing and the cursor stays
   expect(engineering.tasks.length).toBeGreaterThan(0);
   const future = await core.contextView(gm, { goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
   expect(future.tasks).toEqual([]);
-  const someCursor = (await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 })).page.nextCursor!;
+  const someCursor = (await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 })).page!.nextCursor!;
   await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: someCursor }), 'forbidden', /another query/);
 });
 
-test('list_worktrees is compact and paged: released references are counted, listed only on request, and the cursor is bound', async () => {
+test('list_worktrees is compact and paged: released references are counted, listed only on request, and the cursor is bound (C1, C4)', async () => {
   const reference = (taskId: string, state: string) => ({
     taskId, employee: 'eng', deliveryId: 'd', fence: 1, intent: { kind: 'code', lane: 'x' }, state, at: '2026-10-19T00:00:00Z',
   });
@@ -407,10 +749,10 @@ test('list_worktrees is compact and paged: released references are counted, list
     expect(first.worktrees.length).toBe(25);
     expect(first.worktrees.every(worktree => (worktree.references as unknown[]).length === 1)).toBe(true);
     expect(first.worktrees.every(worktree => worktree.releasedReferences === 4)).toBe(true);
-    const rest = await walk(async cursor => {
+    const rest = await drain(async cursor => {
       const page = await core.worktreePage(gm, { pageSize: 25, ...(cursor ? { cursor } : {}) });
       return { items: page.worktrees.map(worktree => String(worktree.worktreePath)), nextCursor: page.page.nextCursor };
-    }, 100, first.page.nextCursor);
+    }, first.page.nextCursor);
     const all = [...first.worktrees.map(worktree => String(worktree.worktreePath)), ...rest];
     expect(new Set(all).size).toBe(60);
     expect(all).toEqual(views.map(view => view.worktreePath).sort());
@@ -422,20 +764,48 @@ test('list_worktrees is compact and paged: released references are counted, list
   }
 });
 
+test('a worktree listing keeps its rows while the registry changes between pages (C4)', async () => {
+  const view = (index: number, root: string) => ({
+    id: `${root}-${index}`, repo: '/repo/ops', worktreePath: `/tmp/${root}-${String(index).padStart(3, '0')}`, mode: 'exclusive', branch: `task/${root}${index}`,
+    createdAt: '2026-10-19T00:00:00Z', lastUsedAt: '2026-10-19T00:00:00Z', status: 'present', deletable: false, reasons: [],
+    references: [{ taskId: `t-${root}-${index}`, employee: 'eng', deliveryId: 'd', fence: 1, intent: { kind: 'code', lane: 'x' }, state: 'active', at: '2026-10-19T00:00:00Z' }],
+  });
+  const before = Array.from({ length: 60 }, (_, index) => view(index, 'before'));
+  const after = Array.from({ length: 80 }, (_, index) => view(index, 'after'));
+  const original = core.listWorktrees;
+  try {
+    core.listWorktrees = async () => before as never;
+    const first = await core.worktreePage(gm, { pageSize: 20 });
+    // The registry changes between the pages of one traversal.
+    core.listWorktrees = async () => after as never;
+    const rest = await drain(async cursor => {
+      const page = await core.worktreePage(gm, { pageSize: 20, ...(cursor ? { cursor } : {}) });
+      return { items: page.worktrees.map(worktree => String(worktree.worktreePath)), nextCursor: page.page.nextCursor };
+    }, first.page.nextCursor);
+    const all = [...first.worktrees.map(worktree => String(worktree.worktreePath)), ...rest];
+    expect(all).toEqual(before.map(item => item.worktreePath).sort());
+    // A new listing reads the registry as it now stands.
+    const fresh = await core.worktreePage(gm, { pageSize: 100 });
+    expect(fresh.page.total).toBe(80);
+  } finally {
+    core.listWorktrees = original;
+  }
+});
+
 test('a caller that drops mid-traversal retries the same cursor on a fresh connection and gets the same page (AC05)', async () => {
   const expected = await workingIds(goalId);
   const pageSize = 37;
   const first = await core.contextView(gm, { goalId, pageSize });
-  const cursor = first.page.nextCursor!;
+  const cursor = first.page!.nextCursor!;
   // The answer to this page is lost in transit: nothing is kept on the caller side, so it asks again.
   const lost = await core.contextView(gm, { goalId, pageSize, cursor });
   // A fresh connection (a new core with no state of its own) retries with the same cursor.
   const fresh = new SurrealCompanyCore(database);
   const retried = await fresh.contextView(gm, { goalId, pageSize, cursor });
-  // The retry is the same page: same tasks and snapshot; its next cursor differs only in the expiry it was issued with.
+  // The retry is the same page of the same listing: same tasks, same snapshot, same continuation.
   expect(JSON.parse(JSON.stringify(retried.tasks))).toEqual(JSON.parse(JSON.stringify(lost.tasks)));
-  expect(retried.page.snapshotAt).toBe(lost.page.snapshotAt);
-  expect(cursorBody(retried.page.nextCursor!)).toEqual({ ...cursorBody(lost.page.nextCursor!), exp: expect.any(Number) });
+  expect(retried.page!.snapshotAt).toBe(lost.page!.snapshotAt);
+  expect(cursorBody(retried.page!.nextCursor!)).toEqual(cursorBody(lost.page!.nextCursor!));
   // Through real comm client processes: the first caller is killed after its request left, then a new process retries.
   const dir = newCommDir();
   const dropped = await relayAndDrop(dir, 'get_context', { goalId, pageSize, cursor }, args => core.contextView(gm, args));
@@ -444,31 +814,71 @@ test('a caller that drops mid-traversal retries the same cursor on a fresh conne
   expect(relayed.exit).toBe(0);
   const page = JSON.parse(relayed.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
   expect(page.tasks.map(task => String(task.id))).toEqual(lost.tasks.map(task => String(task.id)));
-  // Continuing from the retried page reaches every task of the snapshot exactly once.
-  const rest = await walk(async next => {
+  // Continuing from the retried page reaches every task of the listing exactly once.
+  const rest = await drain(async next => {
     const more = await fresh.contextView(gm, { goalId, pageSize, ...(next ? { cursor: next } : {}) });
-    return { items: more.tasks.map(task => String(task.id)), nextCursor: more.page.nextCursor };
-  }, 500, page.page.nextCursor);
+    return { items: more.tasks.map(task => String(task.id)), nextCursor: more.page!.nextCursor };
+  }, page.page.nextCursor);
   const seen = [...first.tasks.map(task => String(task.id)), ...page.tasks.map(task => String(task.id)), ...rest];
   expect(new Set(seen).size).toBe(seen.length);
   expect([...seen].sort()).toEqual([...expected].sort());
 });
 
-test('a full traversal keeps every response inside the budget and the heap flat (AC05 resource)', async () => {
+test('state moves, goal and role changes, and new tasks mid-traversal change nothing the listing delivers (C4)', async () => {
+  const members = await workingIds(goalId);
+  const [before] = await database.db.query<[Array<{ id: RecordId; state: string; executor_role: string }>]>(
+    'SELECT id, state, executor_role FROM task WHERE goal = $goal;', { goal: id('goal', goalId) });
+  const stateAt = new Map((before ?? []).map(row => [asId(row.id), row.state]));
+  const roleAt = new Map((before ?? []).map(row => [asId(row.id), row.executor_role]));
+  const first = await core.contextView(gm, { goalId, pageSize: 40 });
+  const other = await owner.createGoal({ text: `分页另一目标 ${suffix}`, source: 'owner:test', key: key('goal-other'), tier: 'standard' });
+  // Mid-way: 100 tasks finish, 50 move to another goal, 50 change executor role, and three new tasks arrive.
+  const finished = members.slice(0, 100).map(member => id('task', member));
+  const moved = members.slice(100, 150).map(member => id('task', member));
+  const rerolled = members.slice(150, 200).map(member => id('task', member));
+  await database.db.query('UPDATE task SET state = "done" WHERE id IN $ids;', { ids: finished });
+  await database.db.query('UPDATE task SET goal = $goal WHERE id IN $ids;', { goal: id('goal', other.id), ids: moved });
+  await database.db.query('UPDATE task SET executor_role = "qa" WHERE id IN $ids;', { ids: rerolled });
+  const newcomers: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const created = await core.createTask(gm, {
+      title: `中途样例 ${i}`, context: `中途新增 ${i}`, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key(`mid${i}`),
+    });
+    newcomers.push(created.id);
+  }
+  const rest = await drain(async cursor => {
+    const page = await core.contextView(gm, { goalId, pageSize: 40, ...(cursor ? { cursor } : {}) });
+    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+  }, first.page!.nextCursor);
+  const delivered = [...first.tasks, ...rest];
+  const seen = delivered.map(task => String(task.id));
+  expect(new Set(seen).size).toBe(seen.length);
+  expect([...seen].sort()).toEqual([...members].sort());
+  expect(seen.some(taskId => newcomers.includes(taskId))).toBe(false);
+  // Each delivered row shows the state, goal and role it had when the listing was taken.
+  for (const task of delivered) {
+    const taskId = String(task.id);
+    expect(task.state).toBe(stateAt.get(taskId));
+    expect(task.goalId).toBe(goalId);
+    expect(task.executorRole).toBe(roleAt.get(taskId));
+  }
+});
+
+test('a full traversal keeps every page inside the budget; heap growth is a measured upper bound (AC05 resource)', async () => {
   const expected = await workingIds(goalId);
   const pageSize = 25;
   Bun.gc(true);
   const heapBefore = process.memoryUsage().heapUsed;
   let heapPeak = heapBefore;
   const pages: Array<{ bytes: number; rows: number; ms: number }> = [];
-  const seen = await walk(async cursor => {
+  const seen = await drain(async cursor => {
     const started = performance.now();
     const page = await core.contextView(gm, { goalId, pageSize, ...(cursor ? { cursor } : {}) });
     const ms = performance.now() - started;
     pages.push({ bytes: bytesOf(page), rows: page.tasks.length, ms });
     heapPeak = Math.max(heapPeak, process.memoryUsage().heapUsed);
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page.nextCursor };
-  }, 500);
+    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+  });
   Bun.gc(true);
   const heapAfter = process.memoryUsage().heapUsed;
   const mib = (bytes: number) => Math.round((bytes / 1024 / 1024) * 10) / 10;
@@ -477,7 +887,8 @@ test('a full traversal keeps every response inside the budget and the heap flat 
     tasks: seen.length, pageSize, pages: pages.length, maxRows: Math.max(...pages.map(page => page.rows)),
     maxPageBytes: Math.max(...pages.map(page => page.bytes)), budgetBytes: RESPONSE_BUDGET_BYTES,
     pageMsP50: Math.round(timings[Math.floor(timings.length / 2)]!), pageMsMax: Math.round(timings.at(-1)!),
-    heapBeforeMiB: mib(heapBefore), heapAfterMiB: mib(heapAfter), heapPeakMiB: mib(heapPeak),
+    heapBaselineMiB: mib(heapBefore), heapPeakMiB: mib(heapPeak), heapAfterGcMiB: mib(heapAfter),
+    heapDeltaUpperBoundMiB: mib(heapPeak - heapBefore),
   };
   console.log(`AC05 resource ${JSON.stringify(report)}`);
   expect(report.maxPageBytes).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
@@ -487,6 +898,64 @@ test('a full traversal keeps every response inside the budget and the heap flat 
   expect([...seen].sort()).toEqual([...expected].sort());
   // A guard against unbounded accumulation across pages, not a performance target.
   expect(heapPeak - heapBefore).toBeLessThan(64 * 1024 * 1024);
+});
+
+test('a listing past its expiry is refused as snapshot_gone, and the sweep removes it with its rows (C4)', async () => {
+  const first = await core.contextView(gm, { goalId, pageSize: 3 });
+  const token = first.page!.nextCursor!;
+  const sid = String(cursorBody(token).sid);
+  await database.db.query('UPDATE ONLY $record SET expires_ms = 0;', { record: id('query_snapshot', sid) });
+  await expectRefused(core.contextView(gm, { goalId, pageSize: 3, cursor: token }), 'snapshot_gone', /start the listing again/);
+  const store = new SnapshotStore(database.db);
+  expect(await store.sweep()).toBeGreaterThanOrEqual(1);
+  const gone = await database.db.select(id('query_snapshot', sid));
+  expect(gone ?? null).toBeNull();
+  const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot_row WHERE snapshot = $snapshot GROUP ALL;', { snapshot: sid });
+  expect(rows?.[0]?.n ?? 0).toBe(0);
+});
+
+test('an identity past its listing cap loses its oldest listing, which then fails as snapshot_gone (C4)', async () => {
+  const first = await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 });
+  const oldest = first.page!.nextCursor!;
+  // Six more listings for the same identity, each under its own query, push the first past the cap of four.
+  for (let i = 0; i < 6; i++) {
+    await core.contextView(gm, { goalId, since: new Date(Date.now() - (i + 1) * 60_000).toISOString(), pageSize: 5 });
+  }
+  await expectRefused(core.contextView(gm, { goalId, state: 'ready', pageSize: 5, cursor: oldest }), 'snapshot_gone', /start the listing again/);
+  const [owned] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot WHERE owner = $owner GROUP ALL;', { owner: ids.gm });
+  expect(owned?.[0]?.n ?? 0).toBeLessThanOrEqual(4);
+});
+
+test('a store at its listing capacity refuses the new listing as temporarily_unavailable and evicts nothing (C4)', async () => {
+  const store = new SnapshotStore(database.db);
+  await store.sweep();
+  const census = await store.census();
+  const owner = `qp-cap-${suffix}`;
+  const tight = new SnapshotStore(database.db, { maxListings: census.listings + 1, maxPerOwner: 4 });
+  const now = new Date().toISOString();
+  const body = [JSON.stringify({ n: 1 })];
+  const held = await tight.create({ owner, kind: 'context', digest: 'cap-held', role: 'gm', takenAt: now, bodies: body });
+  await expectRefused(
+    tight.create({ owner, kind: 'context', digest: 'cap-refused', role: 'gm', takenAt: now, bodies: body }),
+    'temporarily_unavailable', /capacity/);
+  expect((await tight.census()).listings).toBe(census.listings + 1);
+  const read = await tight.read({ id: held.id, owner, kind: 'context', digest: 'cap-held', role: 'gm', after: 0, limit: 10 });
+  expect(read.rows.length).toBe(1);
+  await tight.remove(held.id);
+});
+
+test('a listing abandoned while it was being written is swept with its rows (C4)', async () => {
+  const store = new SnapshotStore(database.db);
+  const abandoned = randomUUID();
+  await database.db.query(
+    'CREATE ONLY $record CONTENT { owner: "qp-abandoned", kind: "context", digest: "abandoned", role: "gm", state: "building", row_count: 1, byte_count: 2, taken_at: "2026-01-01T00:00:00Z", created_ms: 1, expires_ms: 9999999999999 };',
+    { record: id('query_snapshot', abandoned) });
+  await database.db.query('CREATE query_snapshot_row CONTENT { snapshot: $snapshot, seq: 1, body: "{}" };', { snapshot: abandoned });
+  await store.sweep();
+  const gone = await database.db.select(id('query_snapshot', abandoned));
+  expect(gone ?? null).toBeNull();
+  const [rows] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot_row WHERE snapshot = $snapshot GROUP ALL;', { snapshot: abandoned });
+  expect(rows?.[0]?.n ?? 0).toBe(0);
 });
 
 test('list_worktrees without pageSize or cursor keeps the array shape; an over-budget array is refused as JSON, never cut (C1)', async () => {
@@ -522,5 +991,190 @@ test('list_worktrees without pageSize or cursor keeps the array shape; an over-b
     expect(bytesOf(paged)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   } finally {
     core.listWorktrees = original;
+  }
+});
+
+test('concurrent traversals with writers: each listing is delivered exactly once, with no duplicate and no miss, and each row shows its state at the listing (C4)', async () => {
+  const concurrent = await owner.createGoal({ text: `并发目标 ${suffix}`, source: 'owner:test', key: key('goal-conc'), tier: 'standard' });
+  for (let i = 0; i < 120; i++) {
+    await core.createTask(gm, {
+      title: `并发样例 ${i} ${unit}`, context: `并发正文 ${i}`, executorRole: 'engineering', reviewerRole: 'qa',
+      goalId: concurrent.id, idempotencyKey: key(`conc${i}`),
+    });
+  }
+  const sizes = [7, 13, 30];
+  // Three first pages at once: their listings are stored together, through the one admission queue.
+  const firsts = await Promise.all(sizes.map(pageSize => core.contextView(gm, { goalId: concurrent.id, pageSize })));
+  // The writers start only now, so the membership and the states the listings hold are those of this instant.
+  const members = await workingIds(concurrent.id);
+  const [stateRows] = await database.db.query<[Array<{ id: RecordId; state: string }>]>(
+    'SELECT id, state FROM task WHERE goal = $goal;', { goal: id('goal', concurrent.id) });
+  const stateAt = new Map((stateRows ?? []).map(row => [asId(row.id), row.state]));
+  const writers = (async () => {
+    for (let round = 0; round < 3; round++) {
+      await database.db.query('UPDATE task SET title = title + " · 并发更新" WHERE goal = $goal;', { goal: id('goal', concurrent.id) });
+    }
+    await database.db.query('UPDATE task SET state = "done" WHERE id IN $ids;', { ids: members.slice(0, 40).map(member => id('task', member)) });
+  })();
+  // Each traversal continues from its own first page while the writers run.
+  const rests = await Promise.all(firsts.map((first, index) => drain(async cursor => {
+    const page = await core.contextView(gm, { goalId: concurrent.id, pageSize: sizes[index]!, ...(cursor ? { cursor } : {}) });
+    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+  }, first.page!.nextCursor)));
+  await writers;
+  firsts.forEach((first, index) => {
+    const delivered = [...first.tasks, ...rests[index]!];
+    const seen = delivered.map(task => String(task.id));
+    expect(new Set(seen).size).toBe(seen.length);
+    expect([...seen].sort()).toEqual([...members].sort());
+    expect(first.page!.total).toBe(members.length);
+    for (const task of delivered) expect(task.state).toBe(stateAt.get(String(task.id)));
+  });
+  // A second connection reads the same page as the first, at the same time: both get the same tasks.
+  const fresh = new SurrealCompanyCore(database);
+  const cursor = firsts[0]!.page!.nextCursor!;
+  const [mine, theirs] = await Promise.all([
+    core.contextView(gm, { goalId: concurrent.id, pageSize: sizes[0], cursor }),
+    fresh.contextView(gm, { goalId: concurrent.id, pageSize: sizes[0], cursor }),
+  ]);
+  expect(JSON.stringify(theirs.tasks)).toBe(JSON.stringify(mine.tasks));
+});
+
+test('the real sidecar and comm client carry a traversal and the legacy answers, whole or refused, through the fork (AC01, AC03, C1 to C3)', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'sys01-sidecar-'));
+  try {
+    // The pool holds the credential it is given and never rotates it, so the workforce stub is never asked for one.
+    const pool = new SidecarPool({ core, workforce: { rotate: async () => gm } as unknown as SidecarDeps['workforce'], runDir, sweepMs: 5 });
+    const channel = pool.env({ id: `qp-e2e-${suffix}`, credential: gm } as unknown as EmployeeInst);
+    const call = async (tool: string, args: Record<string, unknown>) => {
+      const child = Bun.spawn([process.execPath, join(ROOT, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
+        cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+        env: { ...process.env, SCK_COMM_DIR: channel.SCK_COMM_DIR, SCK_COMM_KEY: channel.SCK_COMM_KEY },
+      });
+      const [out, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { out, stderr, exit };
+    };
+    // A complete traversal through the channel: every page whole and inside the budget, every task exactly once.
+    const expected = await workingIds(goalId);
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 200; page++) {
+      const reply = await call('get_context', { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
+      expect(reply.exit).toBe(0);
+      expect(Buffer.byteLength(reply.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      const body = JSON.parse(reply.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
+      seen.push(...body.tasks.map(task => String(task.id)));
+      if (!body.page.nextCursor) break;
+      cursor = body.page.nextCursor;
+    }
+    expect(new Set(seen).size).toBe(seen.length);
+    expect([...seen].sort()).toEqual([...expected].sort());
+    // Legacy answers through the same channel: whole when they fit, refused as JSON when they do not.
+    const whole = await call('get_context', { goalId: smallGoalId });
+    expect(whole.exit).toBe(0);
+    expect(Object.keys(JSON.parse(whole.out) as object).sort()).toEqual(['company', 'principal', 'tasks']);
+    const refused = await call('get_context', { goalId });
+    expect(refused.exit).toBe(1);
+    expect(JSON.parse(refused.out)).toMatchObject({ ok: false });
+    expect(refused.out).toContain('response_too_large');
+    // A long text read in byte segments through the channel reassembles to the exact text, verified by its digest.
+    const longText = '中'.repeat(19_000);
+    const longTask = await core.createTask(gm, {
+      title: '通道长正文样例', context: longText, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('e2e-long'),
+    });
+    const pieces: string[] = [];
+    let offset: number | null = 0;
+    let pinned: string | undefined;
+    for (let segment = 0; offset !== null && segment < 500; segment++) {
+      const reply = await call('read_task_text', { taskId: longTask.id, field: 'context', offset, limit: 8192, ...(pinned ? { expectSha256: pinned } : {}) });
+      expect(reply.exit).toBe(0);
+      const part = JSON.parse(reply.out) as { text: string; sha256: string; nextOffset: number | null };
+      pinned ??= part.sha256;
+      pieces.push(part.text);
+      offset = part.nextOffset;
+    }
+    expect(pieces.join('')).toBe(longText);
+    expect(pinned).toBe(sha256(longText));
+    // Task history and worktrees keep their channel shapes when asked without paging.
+    const history = await call('get_task_history', { taskId: longTask.id });
+    expect(history.exit).toBe(0);
+    expect(Object.keys(JSON.parse(history.out) as object)).toEqual(['history']);
+    const worktrees = await call('list_worktrees', {});
+    expect(worktrees.exit).toBe(0);
+    expect(Array.isArray(JSON.parse(worktrees.out))).toBe(true);
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test('a burst of first pages for one caller stays within its cap, and a listing the burst evicts is refused, never completed short (C4)', async () => {
+  const earliest = new Date(Date.now() - 100 * 3_600_000).toISOString();
+  const first = await core.contextView(gm, { goalId, pageSize: 5, since: earliest });
+  const token = first.page!.nextCursor!;
+  // Eight first pages at once under eight different queries: each is admitted in turn, never past the cap.
+  const burst = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+    core.contextView(gm, { goalId, pageSize: 5, since: new Date(Date.now() - (index + 1) * 3_600_000).toISOString() })));
+  expect(burst.every(page => page.tasks.length === 5 && page.page!.hasMore)).toBe(true);
+  const [owned] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot WHERE owner = $owner GROUP ALL;', { owner: ids.gm });
+  expect(owned?.[0]?.n ?? 0).toBeLessThanOrEqual(4);
+  // The burst evicted the first listing: its next page is refused as gone, not answered with a short page.
+  await expectRefused(core.contextView(gm, { goalId, pageSize: 5, since: earliest, cursor: token }), 'snapshot_gone', /start the listing again/);
+});
+
+test('a write answers with its task inside the budget: a long context is cut and flagged, the committed create and checkpoint report it truthfully, and the replay agrees (SYS01)', async () => {
+  // Chinese text is 3 bytes a character: 19,500 characters are 58,500 bytes, above the whole budget on their own.
+  const context = '字'.repeat(19_500);
+  expect(utf8(context)).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+  // Through the relay the create's answer must arrive whole, never as response_too_large after the task exists.
+  const created = await relay('create_task', {
+    title: `回显样例 ${suffix} 长正文`, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('echo-create'),
+  }, args => core.createTask(gm, args as never));
+  expect(created.exit).toBe(0);
+  const task = JSON.parse(created.out) as TaskView;
+  expect(bytesOf(task)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  expect(task.contextTruncated).toBe(true);
+  expect(task.contextBytes).toBe(utf8(context));
+  expect(task.contextSha256).toBe(sha256(context));
+  expect(context.startsWith(task.context)).toBe(true);
+  expect(task.contextNextOffset).toBe(utf8(task.context));
+  // The claim keeps the whole text: claim.json is the holder's copy, not a budgeted answer.
+  const claim = await core.claim(eng, task.id);
+  expect(claim.task.context).toBe(context);
+  const proof = { taskId: task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: claim.task.version };
+  // The checkpoint commits, answers within the budget, and its replay answers the same echo.
+  const checkpointArgs = { text: `长正文的检查点：${'证'.repeat(40)}`, idempotencyKey: key('echo-cp') };
+  const checkpoint = await relay('checkpoint', checkpointArgs, args => core.checkpoint(eng, proof, {
+    text: String(args.text), idempotencyKey: String(args.idempotencyKey),
+  }));
+  expect(checkpoint.exit).toBe(0);
+  const echoed = JSON.parse(checkpoint.out) as TaskView;
+  expect(echoed.version).toBe(proof.expectedVersion + 1);
+  expect(echoed.contextTruncated).toBe(true);
+  expect(echoed.contextSha256).toBe(sha256(context));
+  expect(await core.checkpoint(eng, proof, checkpointArgs)).toEqual(echoed);
+  // The stored text stays whole, and a reassembly from the first segment verifies it.
+  expect((await core.getTask(gm, task.id)).context).toBe(context);
+  const whole = await reassemble({ taskId: task.id, field: 'context', limit: 16 * 1024 }, eng);
+  expect(whole.text).toBe(context);
+  expect(whole.sha256).toBe(sha256(context));
+});
+
+test('a delivery answers with all three legs inside one budget: each leg is cut to its share and flagged, and its text verifies (SYS01)', async () => {
+  const deliveryGoal = await owner.createGoal({ text: `回显交付目标 ${suffix}`, source: 'owner:test', key: key('goal-echo'), tier: 'standard' });
+  // Every leg carries the whole spec, so each leg is over its share of the budget on its own.
+  const spec = '需求正文字'.repeat(1_500);
+  const relayed = await relay('create_delivery', {
+    goalId: deliveryGoal.id, title: `回显交付 ${suffix}`, spec, idempotencyKey: key('echo-delivery'),
+  }, args => core.createDelivery(gm, args as never));
+  expect(relayed.exit).toBe(0);
+  const legs = JSON.parse(relayed.out) as TaskView[];
+  expect(legs).toHaveLength(3);
+  expect(bytesOf(legs)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  for (const leg of legs) {
+    const full = (await core.getTask(gm, leg.id)).context;
+    expect(leg.contextTruncated).toBe(true);
+    expect(leg.contextBytes).toBe(utf8(full));
+    expect(leg.contextSha256).toBe(sha256(full));
+    expect(Buffer.from(full, 'utf8').subarray(0, leg.contextNextOffset!).toString('utf8')).toBe(leg.context);
   }
 });
