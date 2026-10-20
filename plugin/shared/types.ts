@@ -90,6 +90,15 @@ export interface Pulse {
   staffingAlerts: number;
   churn: { created: number; retired: number; claimLost: number };
   goals: Array<{ title: string; days: number }>;
+  /** Truncation markers for the bounded lists above: how many items existed, and whether the answer left some out. */
+  bounds: { dispatchBlocked: ListBound; goalBlockers: ListBound };
+}
+
+/** A bounded list's truncation marker. `total` is the count before the cap; `truncated` is true when `shown < total`. */
+export interface ListBound {
+  total: number;
+  shown: number;
+  truncated: boolean;
 }
 
 /** One regular file inside a task's evidenceDir (<serviceHome>/evidence/<taskId>). */
@@ -161,8 +170,9 @@ export interface GoalRootBlockerView {
   /** Unfinished tasks waiting on this root, directly or through other tasks. */
   impact: number;
   dependencyPath: Array<{ taskId: string; title: string }>;
-  people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string };
-  reasons: Array<{ code: string; text: string; candidates: string[]; owner: "gm" | "owner"; recovery: string; nextTrigger: string }>;
+  /** People behind the root. `peopleOmitted` counts the names the row left out. */
+  people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  reasons: DispatchReasonView[];
 }
 
 /** One dispatch-blocked conclusion from the latest tick, owner-facing. Same summary text as the notice for that episode. */
@@ -176,7 +186,22 @@ export interface DispatchBlockedView {
   feasible: boolean;
   since?: string;
   waitingMinutes: number;
-  reasons: Array<{ code: string; text: string; candidates: string[]; owner: "gm" | "owner"; recovery: string; nextTrigger: string }>;
+  reasons: DispatchReasonView[];
+}
+
+/** One effective reason in an owner-facing row. `candidatesOmitted` counts the candidates the row left out. */
+export interface DispatchReasonView {
+  code: string;
+  text: string;
+  candidates: string[];
+  candidatesOmitted?: number;
+  owner: "gm" | "owner";
+  /** The source the code was read from, for example "contribution-audit". */
+  basis: string;
+  recovery: string;
+  /** Structured recovery actions; `executable` is false when no operations tool performs the action. */
+  actions: Array<{ authority: "gm" | "owner"; label: string; tool?: string; executable: boolean }>;
+  nextTrigger: string;
 }
 
 export interface Roster {
@@ -192,6 +217,8 @@ export interface Roster {
   reviewPools: ReviewStaffingPoolView[];
   /** Dispatch-blocked verdicts from the latest tick: the roster and the tick cannot disagree. */
   dispatchBlocked: DispatchBlockedView[];
+  /** Truncation marker for `dispatchBlocked`: the verdicts the tick held, and whether the list left some out. */
+  bounds: { dispatchBlocked: ListBound };
   /** When the tick last observed sessions; roster status is that observation, not a second read. */
   sessionsObservedAt?: string;
 }

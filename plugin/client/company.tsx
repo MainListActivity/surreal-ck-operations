@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
+import type { Brief, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -317,17 +317,32 @@ const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 /** A goal root's people; an absent or malformed block reads as nobody bound, never as an invented name. */
-const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string } => {
+const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
   const p = (v ?? {}) as Record<string, unknown>;
   return { implementer: str(p.implementer) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
-    submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined };
+    submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined, peopleOmitted: num(p.peopleOmitted) || undefined };
 };
+/** A bounded list's truncation marker; a missing marker reads as complete, with nothing left out. */
+const bound = (v: unknown): { total: number; shown: number; truncated: boolean } => {
+  const b = (v ?? {}) as Record<string, unknown>;
+  return { total: num(b.total), shown: num(b.shown), truncated: b.truncated === true };
+};
+/** Reason rows as the owner reads them; a malformed row keeps safe defaults, and the page reads only typed fields. */
+const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unknown>>(v).map(r => ({
+  code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
+  candidatesOmitted: num(r.candidatesOmitted) || undefined,
+  owner: r.owner === "owner" ? "owner" : "gm", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+  actions: arr<Record<string, unknown>>(r.actions).map(a => ({
+    authority: a.authority === "owner" ? "owner" : "gm", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
+  })),
+}));
 
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
   const o = (raw ?? {}) as Record<string, unknown>;
   const l24 = (o.last24h ?? {}) as Record<string, unknown>;
   const ch = (o.churn ?? {}) as Record<string, unknown>;
+  const marks = (o.bounds ?? {}) as Record<string, unknown>;
   return {
     at: str(o.at),
     paused: o.paused === true,
@@ -359,20 +374,15 @@ export function normalizePulse(raw: unknown): Pulse {
       others: num(b.others), impact: num(b.impact),
       dependencyPath: arr<Record<string, unknown>>(b.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
       people: goalPeople(b.people),
-      reasons: arr<Record<string, unknown>>(b.reasons).map(r => ({
-        code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
-        owner: r.owner === "owner" ? "owner" : "gm", recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
-      })),
+      reasons: reasonRows(b.reasons),
     })),
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
       taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", summary: str(v.summary),
       feasible: v.feasible === true, since: str(v.since) || undefined, waitingMinutes: num(v.waitingMinutes),
-      reasons: arr<Record<string, unknown>>(v.reasons).map(r => ({
-        code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
-        owner: r.owner === "owner" ? "owner" : "gm", recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
-      })),
+      reasons: reasonRows(v.reasons),
     })),
+    bounds: { dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers) },
   };
 }
 
@@ -765,6 +775,9 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   return (
     <View style={{ gap: 12 }}>
       {goals.length === 0 && <Text style={s.muted}>没有进行中的目标。</Text>}
+      {pulse.bounds.goalBlockers.truncated && (
+        <Text style={s.muted}>根阻点只列出 {pulse.bounds.goalBlockers.shown} 个目标，共 {pulse.bounds.goalBlockers.total} 个；其余目标的根阻点未在此列出。</Text>
+      )}
       {goals.map(g => (
         <View key={g.id} style={s.card}>
           <Pressable style={s.row} onPress={() => setOpenGoal(openGoal === g.id ? undefined : g.id)}>
@@ -785,7 +798,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
               <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
               {(blockers.find(b => b.goalId === g.id)?.reasons ?? []).map((r, i) => (
                 <Text key={i} style={s.muted}>
-                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
+                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}{r.candidatesOmitted ? `；另有 ${r.candidatesOmitted} 个候选未列出` : ""}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
                 </Text>
               ))}
               {blockers.find(b => b.goalId === g.id) && (() => {
@@ -796,7 +809,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                       <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(p => p.title).join(" → ")}</Text>
                     )}
                     <Text style={s.muted}>
-                      实现者：{root.people.implementer ?? "未绑定"}；作者：{root.people.authors.join("、") || "无"}；复核者：{root.people.reviewers.join("、") || "无"}；最后提交：{root.people.submitter ?? "无"}{root.people.submitCommit ? `（提交 ${root.people.submitCommit}）` : ""}
+                      实现者：{root.people.implementer ?? "未绑定"}；作者：{root.people.authors.join("、") || "无"}；复核者：{root.people.reviewers.join("、") || "无"}；最后提交：{root.people.submitter ?? "无"}{root.people.submitCommit ? `（提交 ${root.people.submitCommit}）` : ""}{root.people.peopleOmitted ? `；另有 ${root.people.peopleOmitted} 人未列出` : ""}
                     </Text>
                     <Text style={s.muted}>数据时点：{pulse.at ? `${pulse.at.slice(5, 16).replace("T", " ")}（UTC）` : "未知"}</Text>
                   </View>

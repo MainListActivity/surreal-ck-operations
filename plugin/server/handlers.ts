@@ -28,19 +28,6 @@ const resolveSlot = (entry: any, match: (id: string) => { family: string; versio
   return best?.id;
 };
 
-/**
- * Owner view of the tick's dispatch-blocked verdicts. Only blocked work is listed: dispatchable work has no verdict,
- * so the roster and pulse show exactly what the latest pass held back and why.
- */
-const dispatchBlockedView = (verdicts: import("./vendor/src/dispatcher/dispatcher").DispatchVerdict[]) =>
-  verdicts
-    .filter(v => !v.dispatchable)
-    .map(v => ({
-      taskId: v.taskId, goalId: v.goalId, title: v.title, phase: v.phase, summary: v.summary,
-      feasible: v.feasible, since: v.since, waitingMinutes: v.waitingMinutes,
-      reasons: v.reasons.map(r => ({ code: r.code, text: r.text, candidates: r.candidates, owner: r.owner, recovery: r.recovery, nextTrigger: r.nextTrigger })),
-    }));
-
 export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.inbox, async () => (await company()).owner.inbox());
   server.handle(rpc.brief, async () => (await company()).owner.brief());
@@ -185,6 +172,7 @@ export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo, dispatcher } = await company();
     const { staffingPool, quotaBlockedProviders, reviewStaffingPreviews } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { dispatchBlockedList } = await import("./vendor/src/dispatcher/dispatch-list.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const cfg = await workforce.config();
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
@@ -228,6 +216,7 @@ export function registerHandlers(server: PluginServerContext): void {
     })).filter(p => p.entries.length));
     const reviewPools = (await reviewStaffingPreviews(tasks, poolBase, workforce))
       .map(p => ({ ...p, entries: entriesView(p.entries) }));
+    const blocked = dispatchBlockedList(dispatcher.dispatchVerdicts());
 
     return {
       paused: cfg.paused,
@@ -249,14 +238,15 @@ export function registerHandlers(server: PluginServerContext): void {
       pools,
       reviewPools,
       sessionsObservedAt: observed.at ? new Date(observed.at).toISOString() : undefined,
-      dispatchBlocked: dispatchBlockedView(dispatcher.dispatchVerdicts()),
+      dispatchBlocked: blocked.items,
+      bounds: { dispatchBlocked: blocked.bound },
     };
   });
 
   server.handle(rpc.pulse, async () => {
     const { db, owner, workforce, dispatcher } = await company();
     const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
-    const { goalRootBlockers } = await import("./vendor/src/dispatcher/dispatch-blocked.ts");
+    const { dispatchBlockedList, goalBlockerList } = await import("./vendor/src/dispatcher/dispatch-list.ts");
     const { readGoalRootFacts } = await import("./vendor/src/dispatcher/goal-roots.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
@@ -323,16 +313,20 @@ export function registerHandlers(server: PluginServerContext): void {
       `SELECT task, task.title AS title, at, actor FROM audit WHERE action IN ['accept','owner_approve'] ORDER BY at DESC LIMIT 8;`);
 
     const readyIds = new Set(ready.map(r => r.taskId));
-    // Goal cards name each root's people and waiting chain: read for the root tasks only. A failed read keeps the
-    // verdict-only card rather than failing the whole pulse.
-    const goalFacts = await readGoalRootFacts(db.db, workforce, goalRootBlockers(verdicts).map(root => root.taskId),
+    // Goal cards name each root's people and waiting chain: read for the roots the bounded list shows only. A failed read
+    // keeps the verdict-only card rather than failing the whole pulse.
+    const shownRoots = goalBlockerList(verdicts).items.map(root => root.taskId);
+    const goalFacts = await readGoalRootFacts(db.db, workforce, shownRoots,
       message => console.warn(message)).catch(error => { console.warn(`goal root facts failed: ${(error as Error).message}`); return undefined; });
+    const dispatchBlocked = dispatchBlockedList(verdicts);
+    const goalBlockers = goalBlockerList(verdicts, goalFacts);
     return {
       at: new Date(now).toISOString(),
       paused: !!cfg.paused,
       doing, ready,
-      dispatchBlocked: dispatchBlockedView(verdicts),
-      goalBlockers: goalRootBlockers(verdicts, goalFacts),
+      dispatchBlocked: dispatchBlocked.items,
+      goalBlockers: goalBlockers.items,
+      bounds: { dispatchBlocked: dispatchBlocked.bound, goalBlockers: goalBlockers.bound },
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),

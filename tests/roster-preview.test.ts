@@ -4,6 +4,7 @@ import type { ContributionFacts } from '../src/contributors.ts';
 import type { InstState, StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import type { SupervisedTask } from '../src/workforce.ts';
 import type { Pulse, Roster } from '../plugin/shared/types.ts';
+import { CANDIDATE_LIMIT, LIST_BYTE_BUDGET, LIST_ITEM_LIMIT } from '../src/dispatcher/dispatch-list.ts';
 
 const defs: StaffingInput['defs'] = [{ id: 'd1', role: 'engineering', provider: 'codex', model: 'm1',
   enabled: true, maxInstances: 3, priority: 100, weight: 10, scored: 0, errorStreak: 0 }];
@@ -181,4 +182,49 @@ test('pulse RPC: a ready task carries the tick execute verdict reason only while
     const dispatchable = await callPulse();
     expect(dispatchable.ready.find(r => r.taskId === readyTask.id)?.unclaimableReason).toBeUndefined();
   } finally { taskRows = [task]; verdicts = []; }
+});
+
+// SYS-DISP R3 (AC02/AC03): a large tick never makes the roster or pulse answer unbounded. Count and bytes stay inside the
+// budgets, and each marker says how many verdicts the tick held.
+const bytesOf = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+const blockedSample = (count: number, goalOf?: (i: number) => string): DispatchVerdict[] => {
+  const at = Date.now();
+  return Array.from({ length: count }, (_, i) => evaluateDispatch({ taskId: `big-${i}`, title: `大样本任务 ${i}`, phase: 'execute',
+    role: 'engineering', home: '/ops', goalId: goalOf?.(i),
+    entries: Array.from({ length: 60 }, (_, c) => ({ key: `big-${i}-c${c}`, eligible: false, code: 'session_busy' as const })),
+    checkedAt: at, since: at - (i % 90) * 60_000 }));
+};
+
+test('roster RPC: a large tick is bounded by count and bytes, and the marker says what was left out', async () => {
+  verdicts = blockedSample(1_500);
+  try {
+    const response = await callRoster();
+    expect(response.dispatchBlocked.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
+    expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
+    expect(response.bounds.dispatchBlocked).toEqual({ total: 1_500, shown: response.dispatchBlocked.length, truncated: true });
+    expect(response.dispatchBlocked[0]!.reasons[0]!.candidates).toHaveLength(CANDIDATE_LIMIT);
+    expect(response.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBe(60 - CANDIDATE_LIMIT);
+  } finally { verdicts = []; }
+});
+
+test('pulse RPC: a large tick bounds the dispatch-blocked list with its marker', async () => {
+  verdicts = blockedSample(1_500);
+  try {
+    const response = await callPulse();
+    expect(response.dispatchBlocked.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
+    expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
+    expect(response.bounds.dispatchBlocked).toEqual({ total: 1_500, shown: response.dispatchBlocked.length, truncated: true });
+    expect(response.bounds.goalBlockers).toEqual({ total: 0, shown: 0, truncated: false });
+  } finally { verdicts = []; }
+});
+
+test('pulse RPC: a large goal sample bounds the goal-root list and keeps the longest waits first', async () => {
+  verdicts = blockedSample(300, i => `goal-${String(i).padStart(3, '0')}`);
+  try {
+    const response = await callPulse();
+    expect(response.goalBlockers.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
+    expect(bytesOf(response.goalBlockers)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
+    expect(response.bounds.goalBlockers).toEqual({ total: 300, shown: response.goalBlockers.length, truncated: true });
+    expect(response.goalBlockers[0]!.goalId).toBe('goal-089');
+  } finally { verdicts = []; }
 });

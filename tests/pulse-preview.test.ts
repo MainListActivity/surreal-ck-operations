@@ -25,7 +25,9 @@ const full: Pulse = {
   goalBlockers: [],
   dispatchBlocked: [{ taskId: 't2', title: '就绪任务', summary: '就绪任务：执行无法派工（会话占用中或异常）', phase: 'execute',
     feasible: true, since: '2026-10-15T03:30:00Z', waitingMinutes: 30,
-    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'gm', recovery: '等待在办任务完成', nextTrigger: '候选会话空闲' }] }],
+    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'gm', basis: 'tick-snapshot',
+      recovery: '等待在办任务完成', nextTrigger: '候选会话空闲', actions: [{ authority: 'gm', label: '等待在办任务完成', executable: false }] }] }],
+  bounds: { dispatchBlocked: { total: 1, shown: 1, truncated: false }, goalBlockers: { total: 0, shown: 0, truncated: false } },
 };
 
 test('normalizePulse: 完整响应原样通过', () => {
@@ -35,6 +37,26 @@ test('normalizePulse: 完整响应原样通过', () => {
   expect(p.dispatchBlocked[0]).toMatchObject({ taskId: 't2', phase: 'execute', feasible: true, waitingMinutes: 30 });
   expect(p.dispatchBlocked[0]!.reasons[0]!.code).toBe('session_busy');
   expect(p.staffingAlerts).toBe(1);
+});
+
+test('normalizePulse: truncation markers, omitted counts and reason actions survive the wire', () => {
+  const p = normalizePulse({
+    ...full,
+    bounds: { dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } },
+    goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'execute', summary: '等待', feasible: true, waitingMinutes: 30,
+      others: 0, impact: 2, dependencyPath: [], people: { authors: ['a'], reviewers: [], peopleOmitted: 788 },
+      reasons: [{ code: 'session_busy', text: '忙', candidates: ['x'], candidatesOmitted: 54, owner: 'gm', basis: 'tick-snapshot', recovery: '等待', nextTrigger: '空闲',
+        actions: [{ authority: 'owner', label: '老板充值', executable: false }] }] }],
+  });
+  expect(p.bounds).toEqual({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } });
+  expect(p.goalBlockers[0]!.people).toMatchObject({ authors: ['a'], peopleOmitted: 788 });
+  expect(p.goalBlockers[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'gm',
+    actions: [{ authority: 'owner', label: '老板充值', executable: false }] });
+  expect(p.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBeUndefined();
+});
+
+test('normalizePulse: a response without markers reads as complete, with nothing left out', () => {
+  expect(normalizePulse({}).bounds).toEqual({ dispatchBlocked: { total: 0, shown: 0, truncated: false }, goalBlockers: { total: 0, shown: 0, truncated: false } });
 });
 
 test('normalizePulse: 畸形/缺字段输入收敛为安全视图模型，不再抛错', () => {
