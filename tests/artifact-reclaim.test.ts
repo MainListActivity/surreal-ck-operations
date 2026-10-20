@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  artifactPolicyFrom, artifactReclaimEnabledFrom, decideArtifact, keepsFile,
-  TOMBSTONE, trimArtifactDir, type ArtifactPolicy,
+  artifactPolicyFrom, artifactReclaimEnabledFrom, artifactReclaimHardStop, decideArtifact, keepsFile,
+  parseReclaimCliArgs, TOMBSTONE, trimArtifactDir, type ArtifactPolicy,
 } from '../src/dispatcher/artifact-reclaim.ts';
 
 const DAY = 86_400_000;
@@ -183,5 +183,28 @@ describe('trimArtifactDir', () => {
     });
     expect(result.partial).toBe(true);
     expect(readdirSync(join(home, 'evidence', 'task-e'))).not.toContain(TOMBSTONE);
+  });
+});
+describe('operator CLI arguments', () => {
+  test('a bare number is a free-disk target, never a task id', () => {
+    // The 2026-10-20 incident: `reclaim-artifacts 20480` matched both the target
+    // and the task-id pattern, so the run filtered on a task that did not exist
+    // and reported zero candidates under pressure.
+    expect(parseReclaimCliArgs(['20480'])).toEqual({ execute: false, taskId: undefined, targetFreeMb: 20480 });
+  });
+
+  test('task ids and --execute parse independently', () => {
+    expect(parseReclaimCliArgs(['--execute', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee']))
+      .toEqual({ execute: true, taskId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', targetFreeMb: undefined });
+    expect(parseReclaimCliArgs(['--execute', '20480']))
+      .toEqual({ execute: true, taskId: undefined, targetFreeMb: 20480 });
+    expect(parseReclaimCliArgs([])).toEqual({ execute: false, taskId: undefined, targetFreeMb: undefined });
+  });
+
+  test('only 0/false is the env hard stop', () => {
+    expect(artifactReclaimHardStop({ SCK_ARTIFACT_RECLAIM: '0' })).toBe(true);
+    expect(artifactReclaimHardStop({ SCK_ARTIFACT_RECLAIM: 'false' })).toBe(true);
+    expect(artifactReclaimHardStop({ SCK_ARTIFACT_RECLAIM: '1' })).toBe(false);
+    expect(artifactReclaimHardStop({})).toBe(false);
   });
 });
