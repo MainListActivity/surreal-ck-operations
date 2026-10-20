@@ -15,6 +15,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
+import type { SnapshotBuildStats } from '../src/snapshot-store.ts';
 
 const args = process.argv.slice(2);
 const label = args[0] ?? 'run';
@@ -146,6 +147,19 @@ function percentile(values: number[], p: number): number {
 }
 const summary = (values: number[]) => ({ n: values.length, p50Ms: round(percentile(values, 50)), p95Ms: round(percentile(values, 95)), maxMs: round(Math.max(...values)) });
 const codeOf = (error: unknown): string => (error instanceof CompanyError ? error.code : String(error).slice(0, 120));
+/** Costs of a set of builds: outcomes, the spread of each phase in milliseconds, and the mean batch count. */
+const buildSummary = (stats: SnapshotBuildStats[]) => {
+  const outcomes: Record<string, number> = {};
+  for (const stat of stats) outcomes[stat.outcome] = (outcomes[stat.outcome] ?? 0) + 1;
+  if (stats.length === 0) return { n: 0, outcomes };
+  const spread = (pick: (stat: SnapshotBuildStats) => number) => summary(stats.map(pick));
+  return {
+    n: stats.length, outcomes,
+    totalMs: spread(stat => stat.totalMs), serverMs: spread(stat => stat.serverMs), loadMs: spread(stat => stat.loadMs),
+    writeMs: spread(stat => stat.writeMs), commitMs: spread(stat => stat.commitMs),
+    batchesMean: round(stats.reduce((sum, stat) => sum + stat.batches, 0) / stats.length),
+  };
+};
 
 async function main() {
   const dir = mkdtempSync(join(tmpdir(), 'sck-snapshot-measure-'));
@@ -164,7 +178,12 @@ async function main() {
     await database.db.use({ namespace: NS });
     await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
     await database.bootstrap();
-    const core = new SurrealCompanyCore(database, BATCH_KIB > 0 ? { snapshots: { batchBytes: BATCH_KIB * 1024 } } : undefined);
+    // Every listing build reports its phases and the server time of its statements (SnapshotBuildStats).
+    const buildLog: SnapshotBuildStats[] = [];
+    const core = new SurrealCompanyCore(database, {
+      ...(BATCH_KIB > 0 ? { snapshots: { batchBytes: BATCH_KIB * 1024 } } : {}),
+      snapshotObserve: stats => { buildLog.push(stats); },
+    });
     const enrollment = new LocalEnrollmentAdmin(database);
     const gm = await enrollment.enroll('measure-gm', 'gm', ['execute', 'review', 'manage']);
     // Two engineers, one per control worker: an employee holds one lease at a time, so one credential cannot claim in parallel.
@@ -202,6 +221,7 @@ async function main() {
     const before = { ...counters };
     let rssPeak = process.memoryUsage().rss;
     const sampler = setInterval(() => { rssPeak = Math.max(rssPeak, process.memoryUsage().rss); }, 10);
+    const firstFrom = buildLog.length;
     const firstStart = performance.now();
     let outcome = 'ok';
     let answer = 0;
@@ -218,6 +238,11 @@ async function main() {
     result.firstPage = {
       outcome, seconds: round((performance.now() - firstStart) / 1000), pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
       wireDownBytes: counters.down - before.down, wireUpBytes: counters.up - before.up, clientRssPeakMb: round(rssPeak / 1048576),
+      builds: buildLog.slice(firstFrom).map(stat => ({
+        outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, loadMs: round(stat.loadMs),
+        reserveMs: round(stat.reserveMs), writeMs: round(stat.writeMs), commitMs: round(stat.commitMs), totalMs: round(stat.totalMs),
+        serverMs: round(stat.serverMs),
+      })),
     };
 
     // ---- control requests: claim, read, heartbeat, release, two workers, each sample timed; failures are counted, not hidden ----
@@ -249,17 +274,21 @@ async function main() {
         }
       };
       const buildOutcomes: Record<string, number> = {};
+      const from = buildLog.length;
+      let finished = false;
+      const workers = Promise.all([worker(engs[0]!), worker(engs[1]!)]);
+      // Listings are built back to back until the control requests finish, so every control sample overlaps a build.
       const builds = withBuild ? (async () => {
-        // Listings are built back to back while the control requests run, so every control sample overlaps a build.
-        for (let round = 0; round < 3; round++) {
+        while (!finished) {
           const key = await core.contextView(gm, { pageSize: 25 }).then(() => 'ok', error => codeOf(error));
           buildOutcomes[key] = (buildOutcomes[key] ?? 0) + 1;
         }
       })() : Promise.resolve();
-      await Promise.all([worker(engs[0]!), worker(engs[1]!), builds]);
+      try { await workers; } finally { finished = true; }
+      await builds;
       return {
         claim: summary(timings.claim), read: summary(timings.read), heartbeat: summary(timings.heartbeat), release: summary(timings.release),
-        errors, ...(withBuild ? { builds: buildOutcomes } : {}),
+        errors, ...(withBuild ? { builds: buildOutcomes, buildStats: buildSummary(buildLog.slice(from)) } : {}),
       };
     };
     const baseline = await runControl(controls.slice(0, SAMPLES), false);
