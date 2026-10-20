@@ -11,14 +11,15 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
-import type { HistoryEntry, TaskTextField, TaskView } from '../src/contracts.ts';
+import type { HistoryEntry, TaskTextField, TaskTextSegment, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import { queryDigest } from '../src/query-input.ts';
-import { RESPONSE_BUDGET_BYTES, guardRelayResponse, jsonBytes, sealCursor, type ClaimEcho } from '../src/response-budget.ts';
+import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse, sealCursor, type ClaimEcho } from '../src/response-budget.ts';
 import { SnapshotStore } from '../src/snapshot-store.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { connectCompanyClient } from '../src/mcp/client';
 import { createMcpHttpService } from '../src/mcp/server';
+import { countingFetch, lastBody } from './support/mcp-wire.ts';
 
 // SYS01 bounded reads on the isolated company fork started by scripts/test-worktrees.ts. Never production.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };
@@ -48,7 +49,7 @@ function codePoints(count: number, prefix = ''): string {
   return prefix + body;
 }
 
-const bytesOf = (value: unknown): number => jsonBytes({ ok: true, data: value });
+const bytesOf = (value: unknown): number => answerBytes(value);
 const utf8 = (text: string): number => Buffer.byteLength(text, 'utf8');
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
 
@@ -1257,14 +1258,15 @@ test('claim_next over MCP answers a claim whose context is over the budget: the 
     title: `认领回显样例 ${suffix}`, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key('claim-echo'),
   });
   const service = createMcpHttpService({ core, port: 0 });
+  const wire = countingFetch();
   const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: claimant, clientName: 'sys01-claim-echo',
+    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential: claimant, clientName: 'sys01-claim-echo', fetch: wire.fetch,
   });
   try {
     const answer = await connection.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
     expect(answer.structuredContent).toMatchObject({ ok: true });
     const data = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(bytesOf(data)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(typeof data.deliveryId).toBe('string');
     expect(typeof data.fence).toBe('number');
     expect(typeof data.leaseExpiresAt).toBe('string');
@@ -1288,14 +1290,16 @@ test('claim_next over MCP answers a claim whose context is over the budget: the 
 
 const designerCredential = (label: string) => enrollment.enroll(`qp-${label}-${suffix}`, 'concept-design', ['execute', 'review']);
 
-/** A real MCP client on a fresh HTTP service, for one caller. */
+/** A real MCP client on a fresh HTTP service, for one caller. `bodies` counts the whole response of each tools/call (SYS01, F5). */
 async function mcpSession(credential: string) {
   const service = createMcpHttpService({ core, port: 0 });
+  const wire = countingFetch();
   const connection = await connectCompanyClient({
-    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential, clientName: `sys01-r3-${suffix}`,
+    url: new URL(`http://127.0.0.1:${service.port}/mcp`), credential, clientName: `sys01-r3-${suffix}`, fetch: wire.fetch,
   });
   return {
     client: connection.client,
+    bodies: wire.bodies,
     close: async () => { await connection.close(); await service.close(); },
   };
 }
@@ -1336,7 +1340,7 @@ test('claim_next over MCP with no taskId claims from the queue: a 57 KB Chinese 
     expect(answer.structuredContent).toMatchObject({ ok: true });
     const claim = (answer.structuredContent as { data: ClaimEcho }).data;
     expect(claim.task.id).toBe(task.id);
-    expect(bytesOf(claim)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     // The lease fields are read out and checked one by one: Bun's toMatchObject writes its matchers into the object it checks.
     const { deliveryId, fence } = claim;
     expect(typeof deliveryId).toBe('string');
@@ -1349,7 +1353,7 @@ test('claim_next over MCP with no taskId claims from the queue: a 57 KB Chinese 
     });
     expect(beat.structuredContent).toMatchObject({ ok: true });
     const lease = (beat.structuredContent as { data: ClaimEcho }).data;
-    expect(bytesOf(lease)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(lease.deliveryId).toBe(deliveryId);
     expect(lease.fence).toBe(fence);
     expect(typeof lease.leaseExpiresAt).toBe('string');
@@ -1385,7 +1389,7 @@ test('a claim over more than 16 KiB of history echoes the newest entries that fi
     const answer = await session.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
     expect(answer.structuredContent).toMatchObject({ ok: true });
     const claim = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(bytesOf(claim)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     const count = await historyRows(task.id);
     expect(count).toBeGreaterThan(70);
     expect(claim.historyCount).toBe(count);
@@ -1435,7 +1439,7 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     const answer = await session.client.callTool({ name: 'claim_next', arguments: { taskId: task.id } });
     expect(answer.structuredContent).toMatchObject({ ok: true });
     const claim = (answer.structuredContent as { data: ClaimEcho }).data;
-    expect(bytesOf(claim)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(claim.projectTruncated).toBe(true);
     expect(claim.projectBytes).toBe(utf8(JSON.stringify(wholeProject)));
     expect(claim.projectSha256).toBe(sha256(JSON.stringify(wholeProject)));
@@ -1491,7 +1495,7 @@ test('create_task over MCP with 50 long asset paths: the committed write answers
     });
     expect(answer.structuredContent).toMatchObject({ ok: true });
     const created = (answer.structuredContent as { data: TaskView }).data;
-    expect(bytesOf(created)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(created.workIntent).toMatchObject({ kind: 'assets' });
     expect(created.workIntent!.paths!.length).toBeGreaterThan(0);
     expect(created.workIntent!.paths!.length).toBeLessThan(50);
@@ -1501,6 +1505,44 @@ test('create_task over MCP with 50 long asset paths: the committed write answers
     const stored = await reassemble({ taskId: created.id, field: 'workIntentPaths', limit: 16 * 1024 }, gm);
     expect(sha256(stored.text)).toBe(sha256(JSON.stringify(paths)));
     expect(JSON.parse(stored.text)).toEqual(paths);
+  } finally {
+    await session.close();
+  }
+});
+
+test('read_task_text over MCP: a 57 KB Chinese and emoji context reads back in 24 KiB segments, each whole MCP response stays within 48 KiB, and the segments reassemble to the original (SYS01, F5)', async () => {
+  const context = `分段读取 ${suffix} ` + '中'.repeat(17_900) + '🙂'.repeat(1_000);
+  expect(utf8(context)).toBeGreaterThan(56 * 1024);
+  const task = await core.createTask(gm, {
+    title: `分段读取样例 ${suffix}`, context, executorRole: 'concept-design', reviewerRole: 'qa', idempotencyKey: key('segments-mcp'),
+  });
+  const session = await mcpSession(gm);
+  try {
+    const pieces: Buffer[] = [];
+    let offset: number | null = 0;
+    let expectSha256: string | undefined;
+    let segments = 0;
+    while (offset !== null) {
+      const answer = await session.client.callTool({
+        name: 'read_task_text',
+        arguments: { taskId: task.id, field: 'context', offset, limit: 24 * 1024, ...(expectSha256 ? { expectSha256 } : {}) },
+      });
+      expect(answer.structuredContent).toMatchObject({ ok: true });
+      // The whole response of this segment is inside the budget, text copy and frame included.
+      expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      const segment = (answer.structuredContent as { data: TaskTextSegment }).data;
+      expect(segment.totalBytes).toBe(utf8(context));
+      expect(segment.sha256).toBe(sha256(context));
+      pieces.push(Buffer.from(segment.text, 'utf8'));
+      expectSha256 = segment.sha256;
+      offset = segment.nextOffset;
+      segments++;
+      expect(segments).toBeLessThan(20);
+    }
+    expect(segments).toBeGreaterThan(1);
+    const whole = Buffer.concat(pieces).toString('utf8');
+    expect(whole).toBe(context);
+    expect(sha256(whole)).toBe(sha256(context));
   } finally {
     await session.close();
   }

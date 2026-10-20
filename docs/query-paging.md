@@ -21,11 +21,11 @@
 
 ## 2. 字节预算（AC03）
 
-- 预算按序列化后的 UTF-8 字节计算，不按字符串长度计算。`RESPONSE_BUDGET_BYTES` 为 48 KiB（49152 字节），覆盖每个 MCP 或 sidecar 工具整个序列化响应，包括信封。
+- 预算按序列化后的 UTF-8 字节计算，不按字符串长度计算。`RESPONSE_BUDGET_BYTES` 为 48 KiB（49152 字节），覆盖每个 MCP 或 sidecar 工具的整条序列化应答。测量函数为 `answerBytes`：MCP 结果的 JSON 字节（答案只在 `structuredContent` 中，`content` 只有一句说明）加上 256 字节的 JSON-RPC 帧预留（`RESPONSE_FRAME_BYTES`）。中继、分页、分段与回显都用这一个测量（F5）。
 - 46 KiB（`ITEM_BUDGET_BYTES`，预算减去 2 KiB 的页信封余量）只是内部余量，不是对外上限。条目本身不超过该余量时保持完整。
-- 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`。超过预算的成功响应替换为 JSON 错误 `response_too_large`（`retryable: false`，缩小查询后重试）。comm 客户端退出码为 1，stdout 为一行 JSON。
+- 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`，两者都按 `answerBytes` 计。超过预算的成功响应替换为 JSON 错误 `response_too_large`（`retryable: false`，缩小查询后重试）。comm 客户端退出码为 1，stdout 为一行 JSON。
 - 完整读取从不截断（见第 3 节）。分页读取只在单条超过 46 KiB 时截断该条，并标注 `contextTruncated` 与 `contextNextOffset`（证据为 `evidenceTruncated` 与 `evidenceNextOffset`），其余部分用 `read_task_text` 按段读取。
-- `read_task_text` 每段默认 16 KiB，最大 24 KiB，最小 4 字节，且不超过 `limit` 原始字节。段长同时按整条应答（`{ok,data}`）序列化后的字节计：JSON 把控制字符写成 6 字节、引号写成 2 字节，所以控制字符或引号密集的正文，段会短于 `limit`，每条应答都不超过 48 KiB（F2）。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符；`sha256` 为整段正文的摘要。
+- `read_task_text` 每段默认 16 KiB，最大 24 KiB，最小 4 字节，且不超过 `limit` 原始字节。段长同时按整条应答的 `answerBytes` 计：JSON 把控制字符写成 6 字节、引号写成 2 字节，所以控制字符或引号密集的正文，段会短于 `limit`，每条应答都不超过 48 KiB（F2）。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符；`sha256` 为整段正文的摘要。
 
 写接口的回显（SYS01，`echoTask`）：检查点、提交、验收、退回、阻塞（`report_blocker`）、创建、释放、续做、延后、退役、项目换绑、仓库绑定与负责人决定返回的任务回显，同样受预算限制。回显中的依赖列表（`dependencies`）与任务、工作树的意图路径（`workIntent.paths`、`worktree.intent.paths`）各取不超过 `min(4 KiB, 本次回显的字节上限 / 8)` 的最长前缀，超出的列表在 `listsTruncated` 中给出完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`），完整列表用 `read_task_text` 读取。之后 `context` 取剩余空间，超出时截断并标注（`contextTruncated`、`contextNextOffset`）。`contextBytes` 与 `contextSha256` 始终描述完整正文。`create_delivery` 把预算按腿数均分，每条腿不超过 `floor(46 KiB / 腿数)`。写接口的回显不含项目环境正文。
 
@@ -337,4 +337,64 @@ gm v25 在本任务内的条目（R3、R4、R8）已在 c8a48e1 实现，本轮�
 - 真实 Paseo 会话、真实 sidecar 与 sck 端到端未在本轮执行。慢管道对照仍是测试替身。
 - 真实员工 sck QA（`6b6cb5b9`）与上线申请（`1c7544fa`）不在本次范围。本轮未部署，未调用 `ops_*`，未读取凭证。
 - 本轮没有自我复核，验收由另一位工程师完成。
-- MCP 结果同时携带 `content` 文本与 `structuredContent`，线上载荷约为答案的两倍。48 KiB 预算按答案 `{ok,data}` 计算，直连与通道只打印答案。是否去掉文本副本属于另行决策，本轮未改。
+- MCP 结果同时携带 `content` 文本与 `structuredContent`，线上载荷约为答案的两倍。本节的 48 KiB 预算按答案 `{ok,data}` 计算，没有覆盖整包。该缺陷由 v40 的 F5 返工处理，见第 9.8 节。
+
+### 9.8 v40：复核 F5 返工（整包 48 KiB，答案只放 structuredContent）
+
+本节记录经理复核 v39 退回后的返工结果。复核人（`engineering-claude-e3d236`）提出 F5（AC03）：完整 MCP 工具结果超过 49,152 字节。被测代码为 `134eb2a` 加本次提交的 F5 改动。门禁在工作树中运行，开始于 2026-10-20 01:25:29Z，代码摘要为 `e5143aa9d655f7610a12cea4a1d308c373b2a37ba3090b3551c9ad5413262ba4`。证据位于 `round-v40/`：`gate-v40.sh`（门禁脚本）、`gate-summary.txt`（每步退出码与运行时）、`gate-<步骤>-<运行时>.log`（逐步日志），以及红绿对照日志 `red-f5-*.log` 与 `green-f5-*.log`。
+
+#### F5 的缺陷、修复与回归
+
+| 编号 | 复核缺陷（v39） | 红灯 | 修复 | 绿灯与回归 |
+|---|---|---|---|---|
+| F5 整包超限（AC03） | `toolResult` 同时写 `content` 文本副本与 `structuredContent`，守卫只量答案。复核人复现：答案 24,812 字节通过守卫，整包为 49,709 字节；40 KiB 答案整包为 82,477 字节 | HEAD 的 `src/mcp/server.ts` 加本次其余改动：`tests/mcp.transport.test.ts` 的 F5 用例失败，收到 50,026 > 49,152，7 通过、1 失败。`tests/query-paging.integration.test.ts` 的 read_task_text 经 MCP 用例，见下表 | 方案 (a)：`content` 只含 `ANSWER_NOTE`，答案只在 `structuredContent`（`{ok:true,data}`）中。`answerBytes(data)` 为答案结果的 JSON 字节加 `RESPONSE_FRAME_BYTES`（256）。`toolResult` 的守卫，以及中继、分页、分段、回显的整体尺寸，都按这一测量。认领回显内的单个列表按 JSON 字节截取，其总量由整体测量约束 | `tests/mcp.transport.test.ts` 的 F5 用例：24、25、40 KiB 答案整包不超过 49,152 并完整返回，50 KiB 答案返回 `response_too_large`（8 通过、0 失败）。`tests/response-budget.test.ts` 的「the answer is carried once」：答案在结果中只出现一次，帧不超过预留。查询分页集成的 MCP 用例改为计量整包（`tests/support/mcp-wire.ts`）。read_task_text 经 MCP：57 KB 中英与 emoji 正文按 24 KiB 段读回，每段整包不超过 49,152，段拼接的 sha256 与原文一致 |
+
+#### 红绿对照
+
+| 对照 | 运行时 | 结果 | 日志 |
+|---|---|---|---|
+| MCP 整包，HEAD `server.ts` | Bun 1.3.11 | 7 通过、1 失败，收到 50,026 > 49,152 | `red-f5-mcp-wire-1311.log` |
+| MCP 整包，HEAD `server.ts` | Bun 1.4.2 | 7 通过、1 失败，收到 50,026 > 49,152 | `red-f5-mcp-wire-142.log` |
+| MCP 整包，本次树 | Bun 1.3.11 | 8 通过、0 失败 | `green-f5-mcp-wire-1311.log` |
+| MCP 整包，本次树 | Bun 1.4.2 | 8 通过、0 失败 | `green-f5-mcp-wire-142.log` |
+| 公司 fork 的 `tests/query-paging.integration.test.ts`（53 项），HEAD `server.ts` | Bun 1.3.11 | 49 通过、4 失败：read_task_text 段收到 49,740 > 49,152；另三项认领与历史回显的整包收到 97,630、97,630、98,528，是同一缺陷 | `red-f5-readtext-mcp-1311.log` |
+| 公司 fork 的 `tests/query-paging.integration.test.ts`（53 项），HEAD `server.ts` | Bun 1.4.2 | 49 通过、4 失败：与 Bun 1.3.11 相同，段为 49,740 字节，三项回显为 97,630、97,630、98,528 字节 | `red-f5-readtext-mcp-142.log` |
+
+红灯副本取自本次树，只把 `src/mcp/server.ts` 换回 `134eb2a` 的版本。副本位于 `/tmp`，不在产品仓库中。
+
+#### 门禁（v40）
+
+| 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
+|---|---|---|---|
+| 工具链 | `sh plugin/scripts/vendor.sh`；根与 `plugin` 的 `bun x tsc --noEmit` | 三项退出 0 | 不单独运行 |
+| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 40 通过、0 失败 | 40 通过、0 失败 |
+| 桥接 | `pnpm test:bridge` | 270 通过、23 跳过、0 失败（293 项，11 个文件） | 同左 |
+| 服务 | `pnpm test:service` | 12 通过、0 失败 | 同左 |
+| 通信 | `pnpm test:comm` | 9 通过、1 跳过、0 失败（10 项，3 个文件） | 同左 |
+| 通道 | `pnpm test:channel` | 81 通过、1 跳过、0 失败（82 项，9 个文件） | 同左 |
+| 慢管道对照 | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 2 通过、0 失败 | 同左 |
+| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 23 通过、0 失败 | 同左 |
+| 公司 fork 聚焦 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 80 通过、0 失败（4 个文件） | 同左 |
+| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 288 通过、0 失败（29 个文件） | 288 通过、0 失败（29 个文件） |
+
+#### 方案 (a) 的决定（待经理确认）
+
+- 选 (a)：MCP 结果不再附 JSON 文本副本。`content` 只含一句说明，答案只在 `structuredContent` 中。
+- 理由：整包按 48 KiB 计时，若保留文本副本，答案上限只能降到约 24 KiB（方案 (b)）。这会改变分页、段、回显的全部尺寸，并使 `get_context` 的默认页变小。
+- 代价：只读取 `content` 文本的第三方 MCP 客户端只会看到说明文字，需改读 `structuredContent`。MCP 规范建议为兼容旧客户端同时返回文本副本，本仓库未采用。
+- 仓库内没有读取 `content` 副本的代码。已核对：`sck` 直连（`printAnswer` 只打印 `structuredContent.data`）、通道中继（`plugin/server/sidecar.ts` 经 vendored `guardRelayResponse`）、`scripts/live-mcp-check.ts` 与全部测试，都读 `structuredContent`。
+- 若经理选 (b)：保留文本副本，MCP 答案预算降到约 24 KiB，并同步修改分页、段与回显的测量，然后重跑本节全部门禁与红绿对照。
+
+#### R3 的字面口径
+
+经理裁决 v25 的 R3 要求 48 KiB 覆盖完整序列化的 MCP 或 sidecar 工具响应，含信封。本次按整包计：`answerBytes` 为 MCP 结果（说明文字与 `structuredContent`）的 JSON 字节，加 256 字节的 JSON-RPC 帧预留（`RESPONSE_FRAME_BYTES`）。帧预留是估计值，覆盖 `jsonrpc`、`id`、`result` 包装与 SSE 行，不是逐字节测量。经真实 HTTP 的整包字节由 `countingFetch` 与 `lastBody` 实测并断言。sidecar 中继同样按这一测量判定，因此偏保守：comm 客户端实际只打印答案。这是对 R3 的解释，待经理确认。
+
+#### 残留与未验证（v40）
+
+- 残留（非阻断，复核人 v39 记录）：N1，守卫的 `response_too_large` 提示对所有工具都建议缩小 `pageSize`，对不分页的工具不完全适用。N2，`list_worktree_audits` 没有分页。N3，非任务写入的回显没有上限，归 SYS01-R67 链（R7）。
+- 新头 SHA 的 PR CI 在推送后核对，结果记录于 PR 正文与交付报告。
+- 真实 Paseo 会话、真实 sidecar 与 sck 端到端未在本轮执行。红绿对照与慢管道对照使用真实客户端与真实 HTTP，sidecar 仍为替身。
+- 真实员工 sck QA（`6b6cb5b9`）与上线申请（`1c7544fa`）不在本次范围。本轮未部署，未调用 `ops_*`，未读取凭证。
+- 方案 (a) 对只读 `content` 的第三方客户端的影响，待经理确认。
+- `reclaim_worktrees` 的 `dryRun` 为 null 的语义仍待经理裁定（见第 9.6 节），不在本次范围。
+- 本轮没有自我复核，验收由另一位工程师完成。

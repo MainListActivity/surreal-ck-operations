@@ -5,7 +5,7 @@ import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '..
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
 import { isPaged } from '../query-input';
-import { echoClaim, jsonBytes, RESPONSE_BUDGET_BYTES } from '../response-budget';
+import { answerBytes, answerResult, echoClaim, RESPONSE_BUDGET_BYTES } from '../response-budget';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -59,14 +59,12 @@ function toolError(error: unknown) {
 }
 
 function toolResult(data: unknown) {
-  // SYS01: a response over the byte budget becomes a recoverable, JSON-legal error, never a cut stream.
-  if (jsonBytes({ ok: true, data }) > RESPONSE_BUDGET_BYTES) {
+  // SYS01: a response over the byte budget becomes a recoverable, JSON-legal error, never a cut stream. The budget counts the
+  // whole tool result with its frame (answerBytes), and the answer is carried once, in structuredContent (SYS01, F5).
+  if (answerBytes(data) > RESPONSE_BUDGET_BYTES) {
     return toolError({ code: 'response_too_large', message: 'response exceeds the 48 KiB budget; narrow the query with pageSize or a cursor' });
   }
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data) }],
-    structuredContent: { ok: true, data },
-  };
+  return answerResult(data);
 }
 
 function evidence(input: { text: string; idempotencyKey: string }): Evidence {

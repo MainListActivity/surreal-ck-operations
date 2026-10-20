@@ -3,8 +3,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { ClaimResult, HistoryEntry, ProjectView, TaskView, WorktreeAssignment } from '../src/contracts.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import {
-  CLAIM_LIST_ECHO_BYTES, ITEM_BUDGET_BYTES, PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, echoClaim, echoTask, fitCount, guardRelayResponse, jsonBytes,
-  longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Prefix, utf8Segment,
+  CLAIM_LIST_ECHO_BYTES, ITEM_BUDGET_BYTES, PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, answerResult, echoClaim, echoTask, fitCount,
+  guardRelayResponse, jsonBytes, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Prefix, utf8Segment,
 } from '../src/response-budget.ts';
 import {
   cursorOf, isPaged, pageSizeOf, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, TASK_FIELDS, taskIdOf,
@@ -15,14 +15,24 @@ describe('byte budget (SYS01)', () => {
     expect(RESPONSE_BUDGET_BYTES).toBe(48 * 1024);
   });
 
-  test('one check covers every response: exactly 48 KiB passes, one byte more is refused (C2)', () => {
-    const base = jsonBytes({ ok: true, data: { blob: '' } });
-    const exact = { ok: true, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base) } };
-    expect(jsonBytes(exact)).toBe(RESPONSE_BUDGET_BYTES);
+  test('one check covers every answer: exactly 48 KiB as it is sent passes, one byte more is refused (C2, F5)', () => {
+    const base = answerBytes({ blob: '' });
+    const exact = { ok: true as const, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base) } };
+    expect(answerBytes(exact.data)).toBe(RESPONSE_BUDGET_BYTES);
     expect(guardRelayResponse(exact)).toBe(exact);
-    const over = { ok: true, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base + 1) } };
-    expect(jsonBytes(over)).toBe(RESPONSE_BUDGET_BYTES + 1);
-    expect(guardRelayResponse(over)).toMatchObject({ ok: false });
+    const over = { ok: true as const, data: { blob: 'a'.repeat(RESPONSE_BUDGET_BYTES - base + 1) } };
+    expect(answerBytes(over.data)).toBe(RESPONSE_BUDGET_BYTES + 1);
+    expect(guardRelayResponse(over)).toMatchObject({ ok: false, code: 'response_too_large' });
+  });
+
+  test('the answer is carried once: the MCP result is the note plus structuredContent, and its frame fits the reserve (F5)', () => {
+    const data = { blob: '甲'.repeat(2_000) };
+    expect(answerResult(data).structuredContent).toEqual({ ok: true, data });
+    const wire = JSON.stringify(answerResult(data));
+    expect(wire.split(data.blob).length - 1).toBe(1);
+    // The JSON-RPC message around one result, as an SSE event: the frame the reserve covers.
+    const frame = `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: answerResult(data) })}\n\n`;
+    expect(Buffer.byteLength(frame, 'utf8')).toBeLessThanOrEqual(answerBytes(data));
   });
 
   test('sizes are counted in UTF-8 bytes of the serialized JSON, not in characters', () => {
@@ -68,12 +78,12 @@ describe('byte budget (SYS01)', () => {
 
   test('fitCount keeps the largest prefix that fits and nothing that does not', () => {
     const items = Array.from({ length: 200 }, (_, index) => ({ index, text: '中'.repeat(40) }));
-    const kept = fitCount(items, rows => rows, 4000);
+    const kept = fitCount(items, rows => jsonBytes(rows), 4000);
     expect(kept).toBeGreaterThan(0);
     expect(jsonBytes(items.slice(0, kept))).toBeLessThanOrEqual(4000);
     expect(jsonBytes(items.slice(0, kept + 1))).toBeGreaterThan(4000);
-    expect(fitCount(items, rows => rows, 1)).toBe(0);
-    expect(fitCount([], rows => rows, 10)).toBe(0);
+    expect(fitCount(items, rows => jsonBytes(rows), 1)).toBe(0);
+    expect(fitCount([], rows => jsonBytes(rows), 10)).toBe(0);
   });
 
   test('a text that is over budget on its own keeps the longest prefix that fits, cut between characters and counted as JSON (C3)', () => {
@@ -123,7 +133,7 @@ describe('read_task_text segments (SYS01, F2): a segment is sized by its seriali
       const answer = answerOf(segment);
       expect(guardRelayResponse(answer)).toBe(answer);
       pieces.push(Buffer.from(segment.text, 'utf8'));
-      sizes.push(jsonBytes(answer));
+      sizes.push(answerBytes(answer.data));
       offset = segment.next;
     }
     expect(Buffer.concat(pieces).equals(Buffer.from(text, 'utf8'))).toBe(true);
@@ -303,7 +313,7 @@ describe('write echo (SYS01 R3, return of 04195c93)', () => {
     const dependencies = dependencyIds(1_000);
     const paths = Array.from({ length: 50 }, (_, i) => cjkPath(i));
     const echo = echoTask(taskWith('短正文', { dependencies, paths, worktreePaths: paths }));
-    expect(jsonBytes({ ok: true, data: echo })).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    expect(answerBytes(echo)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     expect(echo).toMatchObject({ id: 'task-write', title: '写入回显', context: '短正文', contextTruncated: false, version: 5, fence: 3 });
     // Each cut list keeps its leading part; the count and the digest describe the whole list, which read_task_text returns.
     expect(echo.listsTruncated).toEqual({
@@ -399,7 +409,7 @@ describe('claim echo (SYS01, return of 04195c93)', () => {
     deliveryId: 'delivery-claim', fence: 3, leaseExpiresAt: '2026-10-19T19:00:00.000Z', history: [], historyComplete: true,
     ...claim,
   });
-  const envelope = (data: unknown): number => jsonBytes({ ok: true, data });
+  const envelope = (data: unknown): number => answerBytes(data);
 
   test('a claim within the budget is echoed whole: lease, history, project and worktree come back as they are', () => {
     const worktree = worktreeOf();

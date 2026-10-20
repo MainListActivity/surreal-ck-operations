@@ -10,7 +10,7 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
 import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
@@ -298,9 +298,9 @@ type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
 
 const tooLarge = (message: string) => new CompanyError('response_too_large', message);
-/** A complete answer: returned whole when its `{ok,data}` envelope fits the budget, refused otherwise. Never cut. */
+/** A complete answer: returned whole when it fits the budget as it is sent (answerBytes), refused otherwise. Never cut. */
 function completeOrRefuse<T>(value: T, what: string, guidance: string): T {
-  const bytes = jsonBytes({ ok: true, data: value });
+  const bytes = answerBytes(value);
   if (bytes > RESPONSE_BUDGET_BYTES) throw tooLarge(`${what} is ${bytes} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
   return value;
 }
@@ -1136,11 +1136,11 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       return args.respond(kept.map(item => item.value), page);
     };
-    const bare = jsonBytes({ ok: true, data: build([]) });
+    const bare = answerBytes(build([]));
     if (bare > RESPONSE_BUDGET_BYTES) {
       throw tooLarge(`the page envelope alone is ${bare} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${args.envelopeGuidance}`);
     }
-    const kept = fitCount(items, subset => ({ ok: true, data: build(subset as ReadonlyArray<{ seq: number; value: T }>) }), RESPONSE_BUDGET_BYTES);
+    const kept = fitCount(items, subset => answerBytes(build(subset as ReadonlyArray<{ seq: number; value: T }>)), RESPONSE_BUDGET_BYTES);
     if (kept === 0 && items.length > 0) {
       throw tooLarge('one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
     }

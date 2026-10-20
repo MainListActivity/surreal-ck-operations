@@ -7,13 +7,18 @@ import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
 /**
- * Hard ceiling for one serialized relay response (the whole `{ok,data}` envelope), in UTF-8 bytes. Every
- * bounded read, complete or paged, is measured this way; no response is cut to fit.
+ * Hard ceiling for one response, in UTF-8 bytes: an answer as it is sent, measured by answerBytes (the MCP tool result with
+ * its frame, or the relayed answer). Every bounded read, complete or paged, is measured this way; no response is cut to fit.
  */
 export const RESPONSE_BUDGET_BYTES = 48 * 1024;
 /**
- * Bytes of a page kept back for its envelope (principal, page information, cursor). An item of a page is cut only when
- * it cannot fit the budget less this reserve; an item between the reserve and the whole budget stays whole (C3).
+ * Bytes the JSON-RPC message adds around a tool result (jsonrpc, id, result wrapper, SSE line). They are reserved inside the
+ * budget, so the whole HTTP body stays within RESPONSE_BUDGET_BYTES, not only the tool result (SYS01, F5).
+ */
+export const RESPONSE_FRAME_BYTES = 256;
+/**
+ * Bytes of a page kept back for its envelope (principal, page information, cursor, and the answer's own wrapper). An item of
+ * a page is cut only when it cannot fit the budget less this reserve; an item between the reserve and the whole budget stays whole (C3).
  */
 export const PAGE_ENVELOPE_BYTES = 2 * 1024;
 /** Most serialized bytes one item of a page may take: a task in a listing, or one audit entry. */
@@ -24,6 +29,26 @@ export const SEGMENT_MAX_BYTES = 24 * 1024;
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 export const jsonBytes = (value: unknown): number => utf8Bytes(JSON.stringify(value));
+
+/**
+ * The note that stands in for a text copy of an answer in an MCP tool result. The answer itself is only in structuredContent
+ * (SYS01, F5): a text copy beside it doubled every response past the budget.
+ */
+export const ANSWER_NOTE = 'The answer is in structuredContent (ok, data). This result has no text copy of it, so the whole response stays within 48 KiB.';
+
+/** The MCP tool result that carries one answer: the answer in structuredContent, and ANSWER_NOTE as its only content. */
+export function answerResult(data: unknown): { content: { type: 'text'; text: string }[]; structuredContent: { ok: true; data: unknown } } {
+  return { content: [{ type: 'text', text: ANSWER_NOTE }], structuredContent: { ok: true, data } };
+}
+
+/**
+ * The bytes one answer takes on the wire: its tool result plus the frame reserved around it. Every answer budget is checked
+ * against this one measure, on MCP, on the sidecar relay, in pages, segments and echoes, so one answer is admitted or refused
+ * the same way on every path.
+ */
+export function answerBytes(data: unknown): number {
+  return jsonBytes(answerResult(data)) + RESPONSE_FRAME_BYTES;
+}
 
 const isContinuation = (byte: number | undefined): boolean => byte !== undefined && (byte & 0xc0) === 0x80;
 
@@ -90,24 +115,25 @@ export function textSegmentAnswer(head: TaskTextHead, segment: Utf8Segment): Tas
 }
 
 /**
- * One read_task_text segment, cut so that its whole `{ok, data}` answer fits the response budget (SYS01, F2). JSON writes
- * a control character as six bytes and a quote as two, so a byte count alone can overflow the budget: the segment keeps
- * the longest prefix whose serialized answer fits, and never more than `limit` raw bytes.
+ * One read_task_text segment, cut so that its whole answer fits the response budget as it is sent (answerBytes; SYS01, F2).
+ * JSON writes a control character as six bytes and a quote as two, so a byte count alone can overflow the budget: the
+ * segment keeps the longest prefix whose serialized answer fits, and never more than `limit` raw bytes.
  */
 export function textSegment(text: string, offset: number, limit: number, head: TaskTextHead): Utf8Segment {
-  return utf8Segment(text, offset, limit, segment => jsonBytes({ ok: true, data: textSegmentAnswer(head, segment) }) <= RESPONSE_BUDGET_BYTES);
+  return utf8Segment(text, offset, limit, segment => answerBytes(textSegmentAnswer(head, segment)) <= RESPONSE_BUDGET_BYTES);
 }
 
 /**
- * Largest k such that `build(items.slice(0, k))` serializes within `limit` bytes. `build` must grow
- * with k (it is searched by bisection). Returns 0 when even the empty page does not fit.
+ * Largest k such that `bytesOf(items.slice(0, k))` is within `limit` bytes. `bytesOf` must grow with k (it is searched by
+ * bisection). Returns 0 when even the empty list does not fit. A page is sized as it is sent, for example
+ * `fitCount(items, kept => answerBytes(build(kept)), RESPONSE_BUDGET_BYTES)`.
  */
-export function fitCount<T>(items: readonly T[], build: (kept: readonly T[]) => unknown, limit: number): number {
+export function fitCount<T>(items: readonly T[], bytesOf: (kept: readonly T[]) => number, limit: number): number {
   let lo = 0;
   let hi = items.length;
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
-    if (jsonBytes(build(items.slice(0, mid))) <= limit) lo = mid;
+    if (bytesOf(items.slice(0, mid)) <= limit) lo = mid;
     else hi = mid - 1;
   }
   return lo;
@@ -131,13 +157,14 @@ export function longestFittingPrefix(text: string, fits: (prefix: string) => boo
 }
 
 /**
- * Last line of defence on the relay path. A successful response over the budget is replaced by a
- * recoverable, JSON-legal error with its code, so an oversize value can never reach the caller as a cut byte stream.
+ * Last line of defence on the relay path. A successful answer over the budget, measured as the MCP path measures it
+ * (answerBytes of its data), is replaced by a recoverable, JSON-legal error with its code, so an oversize value can never
+ * reach the caller as a cut byte stream.
  */
 export function guardRelayResponse<T extends { ok: boolean; data?: unknown; error?: string }>(res: T):
   T | { ok: false; code: 'response_too_large'; retryable: false; error: string } {
   if (!res.ok) return res;
-  const bytes = jsonBytes(res);
+  const bytes = answerBytes(res.data);
   if (bytes <= RESPONSE_BUDGET_BYTES) return res;
   return {
     ok: false, code: 'response_too_large', retryable: false,
@@ -238,7 +265,7 @@ export interface ClaimEcho extends Omit<ClaimResult, 'project'> {
 function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>, budget: number = CLAIM_LIST_ECHO_BYTES): T[] {
   if (!cuts[name] && jsonBytes(items) <= budget) return [...items];
   if (!cuts[name]) cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
-  return items.slice(0, fitCount(items, kept => kept, budget));
+  return items.slice(0, fitCount(items, kept => jsonBytes(kept), budget));
 }
 
 /**
@@ -287,7 +314,7 @@ function partialProject(project: ProjectView): Partial<ProjectView> {
   }
   const lines = (project.redLines ?? []).map(line => utf8Prefix(line, RED_LINE_ECHO_BYTES).text);
   const room = Math.max(0, PROJECT_ECHO_BYTES - jsonBytes(identity));
-  return { ...identity, redLines: lines.slice(0, fitCount(lines, kept => kept, room)) } as Partial<ProjectView>;
+  return { ...identity, redLines: lines.slice(0, fitCount(lines, kept => jsonBytes(kept), room)) } as Partial<ProjectView>;
 }
 
 /**
@@ -329,7 +356,7 @@ export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
   };
   // Room for history and task together: the budget less everything else, measured with both as placeholders ([] and null).
   // The placeholder false is wider than true, so the measure never undershoots the final answer.
-  const shell = jsonBytes({ ok: true, data: { ...head, ...flags, history: [], task: null } });
+  const shell = answerBytes({ ...head, ...flags, history: [], task: null });
   const room = RESPONSE_BUDGET_BYTES - shell + 6;
   // The history takes what the whole context would leave, but never less than its floor. A long context is cut to what remains.
   const budget = Math.min(room, Math.max(CLAIM_HISTORY_FLOOR_BYTES, room - jsonBytes(echoTaskContext(task, Number.POSITIVE_INFINITY))));

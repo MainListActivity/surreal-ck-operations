@@ -2,6 +2,8 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import type { CompanyCore, Principal, TaskView } from '../src/contracts';
 import { connectCompanyClient } from '../src/mcp/client';
 import { createMcpHttpService } from '../src/mcp/server';
+import { RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
+import { countingFetch, lastBody } from './support/mcp-wire.ts';
 
 const principal: Principal = { employeeId: 'ai-01', role: 'ai-content', capabilities: ['execute', 'review'] };
 const task: TaskView = {
@@ -164,6 +166,27 @@ test('gate token guards the public endpoint before bearer auth', async () => {
     const foreignHostHeaders = { ...okHeaders, Host: 'evil.example' };
     expect((await fetch(u, { ...init, headers: foreignHostHeaders })).status).toBe(403);
   } finally { await gated.close(); }
+});
+
+test('the whole MCP response, not only its answer, is held to 48 KiB: 24, 25 and 40 KiB answers arrive whole, a 50 KiB one is refused (SYS01, F5)', async () => {
+  for (const size of [24 * 1024, 25 * 1024, 40 * 1024, 50 * 1024]) {
+    const context = 'a'.repeat(size);
+    const sized = createMcpHttpService({ core: { ...core, getTask: async () => ({ ...task, context }) } as unknown as CompanyCore, port: 0 });
+    const wire = countingFetch();
+    const connection = await connectCompanyClient({
+      url: new URL(`http://127.0.0.1:${sized.port}/mcp`), credential: 'sck_valid', clientName: 'f5-wire', fetch: wire.fetch,
+    });
+    try {
+      const answer = await connection.client.callTool({ name: 'get_context', arguments: { taskId: task.id } });
+      // The client receives the whole body of the call: frame, text note and answer. It must stay within the budget.
+      expect(lastBody(wire)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      if (size < 50 * 1024) expect(answer.structuredContent).toMatchObject({ ok: true, data: { tasks: [{ id: task.id, context }] } });
+      else expect(answer.structuredContent).toMatchObject({ ok: false, code: 'response_too_large' });
+    } finally {
+      await connection.close();
+      await sized.close();
+    }
+  }
 });
 
 test('health and readiness remain separate from MCP authentication', async () => {

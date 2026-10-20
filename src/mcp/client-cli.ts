@@ -61,8 +61,8 @@ function argumentsOf(json: string | undefined): Record<string, unknown> {
 
 /**
  * The one answer a direct call prints, in the shape comm mode prints (SYS01 AC03): the data on success, and on failure
- * the refusal line with exit 1. The MCP result repeats the answer as text as well as structuredContent, so printing the
- * whole result printed every answer twice and could pass the 48 KiB budget.
+ * the refusal line with exit 1. The MCP result carries the answer in structuredContent; its text is only a note. Printing the
+ * whole result would print that note beside the answer, so only the answer is printed.
  */
 function printAnswer(result: unknown): void {
   const { structuredContent, isError } = result as { structuredContent?: unknown; isError?: boolean };
