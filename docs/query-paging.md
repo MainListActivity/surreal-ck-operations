@@ -224,7 +224,7 @@ null 语义（MCP、sidecar 与核心一致）：
 
 运行时：默认 Bun 1.3.11；部署运行时 Bun 1.4.2（`runtime-bun`）；pnpm 10.32.1。除工具链外，每个步骤在两种运行时上各运行一次。
 
-### 9.1 门禁
+### 9.1 门禁（v40 轮次的数字，已由 9.9 取代）
 
 | 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
 |---|---|---|---|
@@ -408,3 +408,26 @@ gm v25 在本任务内的条目（R3、R4、R8）已在 c8a48e1 实现，本轮�
 - 只读 `content` 的第三方客户端：方案 (b) 下它读到的是与 `structuredContent` 相同的 JSON 文本，不再只看到说明文字（经理裁定 v44）。
 - `reclaim_worktrees` 的 null 语义已由经理裁定 v44 确定，见第 3 节与第 9.6 节。
 - 本轮没有自我复核，验收由另一位工程师完成。
+
+### 9.9 r6：复核 v47 退回项 D1–D3（代码提交 7f328f0，取代 9.1 的数字）
+
+接手返修后的门禁与线上红绿对照。完整说明见交付报告第 3、4、6 节；探针脚本与原始输出在证据目录 `r6-probes/`。
+
+| 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
+|---|---|---|---|
+| 工具链 | `sh plugin/scripts/vendor.sh`；根与 `plugin` 的 `tsc --noEmit` | 三项 exit 0（只运行一次） | 未重复运行 |
+| 单元（响应预算与 MCP 传输） | `bun test tests/response-budget.test.ts tests/mcp.transport.test.ts` | 64 通过、0 失败 | 64 通过、0 失败 |
+| 桥接 | `pnpm test:bridge` | 282 通过、23 跳过、0 失败 | 282 通过、23 跳过、0 失败 |
+| 服务 | `pnpm test:service` | 12 通过、0 失败 | 12 通过、0 失败 |
+| 通信 | `pnpm test:comm` | 9 通过、1 跳过、0 失败 | 9 通过、1 跳过、0 失败 |
+| 通道 | `pnpm test:channel` | 82 通过、1 跳过、0 失败 | 82 通过、1 跳过、0 失败 |
+| 慢管道对照 | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 2 通过、0 失败 | 2 通过、0 失败 |
+| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 23 通过、0 失败 | 23 通过、0 失败 |
+| 公司 fork 聚焦 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 81 通过、0 失败 | 81 通过、0 失败 |
+| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 295 通过、0 失败 | 295 通过、0 失败 |
+
+- D1：成功结果的 `content[0].text` 为答案 JSON，与 `structuredContent.data` 相等（线上 337 字节；82c145f 为 125 字节说明）。
+- D2：请求 id 序列化后超过 128 字节，在任何工具执行前以 HTTP 400 拒绝（JSON-RPC `-32600`，id null）；帧预留 256 = 外壳 56 + id 128 + 余量 72。82c145f 上 199 字符 id 的整帧为 49,153 字节，越界。
+- D3：`reclaim_worktrees` 的 `dryRun` 与 `repos` 在 MCP、sidecar、core 三层经 `parseReclaimInput` 统一校验；`null`、非布尔值与非法 `repos` 返回 `invalid`，`reclaimAll` 调用 0 次。82c145f 上 sidecar 把 `dryRun: null` 当作真实回收。
+- AC01 基线（8d03d35，未改动树，1000 条夹具）：`get_context` 无过滤 212,642 字节、返回 500 条（列表以 `LIMIT 500` 静默截断）；`get_task_history` 483,385 字节；均超过 131,072 字节。
+- 残余 N1–N3 见交付报告第 7 节：`list_worktree_audits` 的文案与分页，以及 SYS01-R67 链。
