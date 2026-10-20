@@ -584,7 +584,8 @@ export class SidecarPool {
         ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
         : [];
       // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the task keys; the company block is in an answer only
-      // when includeCompany is true (AC-A, the same default as core). A core without contextView answers the same keys.
+      // when includeCompany is true (AC-A, the same default as core). A core without contextView answers the same keys, and ignores
+      // scope and paging (SYS01 AC-A note): scope "company" is answered only by a core with contextView.
       case "get_context": {
         if (core.contextView) return core.contextView(cred, args);
         const withCompany = args.includeCompany === true;

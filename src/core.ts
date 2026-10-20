@@ -1211,22 +1211,25 @@ export class SurrealCompanyCore implements CompanyCore {
    * is listed exactly once, in a stable order, and a part carries its item's length and SHA-256 so the reader can check the join.
    */
   private async companyContextView(credential: Credential, actor: Principal, params: ContextParams): Promise<ContextView> {
-    const brief = await this.companyBrief(credential);
     const section = params.section;
     const named = section === undefined ? {} : { section };
     if (!params.paged) {
-      const view: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(brief, section) };
+      const view: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(await this.companyBrief(credential), section) };
       return completeOrRefuse(view, 'the company block',
         'read it in pages: {"scope":"company","pageSize":25}, then {"scope":"company","pageSize":25,"cursor":"<page.nextCursor>"} until page.hasMore is false; or one section with "section"');
     }
     const digest = queryDigest('company', { section: section ?? null });
-    const takenAt = new Date().toISOString();
     return this.listingPage<CompanyPart, ContextView>({
       actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
-      create: () => this.snapshots.create({
-        owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt,
-        bodies: companyParts(brief, section).map(part => JSON.stringify(part)), guidance: 'read one section with section',
-      }),
+      // The block is read only when a listing is made: a cursor page reads the stored listing and never the block.
+      create: async () => {
+        const brief = await this.companyBrief(credential);
+        const takenAt = new Date().toISOString();
+        return this.snapshots.create({
+          owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt,
+          bodies: companyParts(brief, section).map(part => JSON.stringify(part)), guidance: 'read one section with section',
+        });
+      },
       parse: body => JSON.parse(body) as CompanyPart,
       respond: (parts, page) => ({ principal: actor, scope: 'company', ...named, parts: [...parts], page }),
       envelopeGuidance: 'use a smaller pageSize',

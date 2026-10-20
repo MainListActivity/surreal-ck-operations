@@ -367,3 +367,44 @@ test('AC-A 30683-byte sample (sidecar channel): pages reassemble, the legacy ans
     rmSync(runDir, { recursive: true, force: true });
   }
 });
+
+test('R4 Chinese byte overflow (core): tasks under the budget in characters but over it in UTF-8 bytes are refused before their text is loaded, and page back whole', async () => {
+  const fx = await fresh();
+  const since = new Date(Date.now() - 1_000).toISOString();
+  // Three tasks of 7000 CJK characters each: about 21000 characters, under the 49152 budget, but about 63000 UTF-8 bytes, over it.
+  const contexts = [0, 1, 2].map(index => `样例 ${index} ${'中'.repeat(7_000)}`);
+  const characters = contexts.reduce((sum, text) => sum + [...text].length, 0);
+  const bytes = contexts.reduce((sum, text) => sum + Buffer.byteLength(text, 'utf8'), 0);
+  expect(characters).toBeLessThan(RESPONSE_BUDGET_BYTES);
+  expect(bytes).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+  const ids: string[] = [];
+  for (const [index, context] of contexts.entries()) {
+    const task = await fx.core.createTask(fx.gm, {
+      title: `R4 中文字节 ${index}`, context, executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `r4-${suffix}-${index}`,
+    });
+    ids.push(task.id);
+  }
+  // The byte total is read first, and no task text is loaded while it is over the budget.
+  const reads = spyOn(fx.core as unknown as { consistentRead: (...args: unknown[]) => unknown }, 'consistentRead');
+  try {
+    await expectRefused(fx.core.contextView(fx.gm, { state: 'ready', since }), 'response_too_large',
+      new RegExp(`bytes of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget`));
+    const probes = (await Promise.all(reads.mock.results.map(result => result.value as Promise<Record<string, unknown>>)))
+      .filter(read => 'textBytes' in read);
+    expect(probes).toHaveLength(1);
+    expect(Number(probes[0]!.textBytes)).toBe(bytes);
+    expect(probes[0]!.rows).toEqual([]);
+  } finally {
+    reads.mockRestore();
+  }
+  // Read a page at a time, the same tasks come back whole, each answer inside the budget.
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const view = await fx.core.contextView(fx.gm, { state: 'ready', since, pageSize: 1, ...(cursor ? { cursor } : {}) });
+    expect(answerBytes(view)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    seen.push(...(view.tasks ?? []).map(task => String(task.id)));
+    cursor = view.page?.hasMore ? view.page.nextCursor : undefined;
+  } while (cursor);
+  expect(seen.sort()).toEqual([...ids].sort());
+});

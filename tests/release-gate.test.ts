@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expect, test } from 'bun:test';
@@ -21,6 +21,14 @@ function fakeBun(path: string, version: string, label: string) {
   chmodSync(path, 0o755);
 }
 
+// The gate's first check is `uname -s` (Darwin only). Each run's uname answers `-s` with FAKE_KERNEL (Darwin unless a test sets it) and
+// runs the real uname for anything else, so the refusal cases reach their own checks on any host.
+function fakeUname(path: string) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '#!/bin/sh\n[ "$1" = -s ] && { echo "${FAKE_KERNEL:-Darwin}"; exit 0; }\nexec /usr/bin/uname "$@"\n');
+  chmodSync(path, 0o755);
+}
+
 function serviceHome(): string {
   const home = mkdtempSync(join(tmpdir(), 'sck-release-gate-'));
   mkdirSync(join(home, 'private'), { recursive: true });
@@ -30,10 +38,12 @@ function serviceHome(): string {
   return home;
 }
 
-// Every run gets a PATH whose bun reports 1.3.11, an empty SCK_BUN and a HOME without a Bun, so only the resolution under test picks a runtime.
+// Every run gets a PATH whose bun reports 1.3.11 and whose uname reports Darwin for -s, an empty SCK_BUN and a HOME without a Bun,
+// so only the resolution under test picks a runtime and the scripts' own checks decide each outcome.
 function env(home: string, extra: Record<string, string> = {}) {
   const pathBin = join(home, 'path-bin');
   fakeBun(join(pathBin, 'bun'), PATH_BUN, 'path');
+  fakeUname(join(pathBin, 'uname'));
   return {
     ...process.env,
     SCK_SERVICE_HOME: home,
@@ -117,13 +127,71 @@ test('a failed run, another commit, another Bun version or a non-darwin host doe
   }
 });
 
-test('the release gate refuses a relative path, a name that is not a commit sha, and a missing slow-pipe test', () => {
+test('the release gate refuses a relative path, a name that is not a commit sha, and a missing slow-pipe test, each for its own reason', () => {
   const home = serviceHome();
   try {
-    expect(sh(GATE, ['slow-pipe', 'relative/release'], home).code).toBe(2);
-    expect(sh(GATE, ['slow-pipe', '/tmp/not-a-sha'], home).code).toBe(2);
-    expect(sh(GATE, ['slow-pipe', `/tmp/${SHA}`], home).code).toBe(2);
-    expect(sh(GATE, ['unknown-gate', `/tmp/${SHA}`], home).code).toBe(2);
+    const relative = sh(GATE, ['slow-pipe', 'relative/release'], home);
+    expect(relative.code).toBe(2);
+    expect(relative.err).toContain('Release path must be absolute');
+
+    const notSha = sh(GATE, ['slow-pipe', '/tmp/not-a-sha'], home);
+    expect(notSha.code).toBe(2);
+    expect(notSha.err).toContain("release dir 'not-a-sha' is not a commit sha");
+    const short = sh(GATE, ['slow-pipe', `/tmp/${'a'.repeat(39)}`], home);
+    expect(short.code).toBe(2);
+    expect(short.err).toContain('is not a 40-character commit sha');
+
+    const noTest = sh(GATE, ['slow-pipe', `/tmp/${SHA}`], home);
+    expect(noTest.code).toBe(2);
+    expect(noTest.err).toContain('has no tests/comm-slow-pipe.test.ts');
+
+    const unknown = sh(GATE, ['unknown-gate', `/tmp/${SHA}`], home);
+    expect(unknown.code).toBe(2);
+    expect(unknown.err).toContain('unknown gate: unknown-gate');
+
+    // A refused run writes nothing: the gates directory is created only after every check has passed.
+    expect(existsSync(join(home, 'gates'))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the release gate refuses to run off macOS before it looks at the release', () => {
+  const home = serviceHome();
+  try {
+    const run = sh(GATE, ['slow-pipe', `/tmp/${SHA}`], home, { FAKE_KERNEL: 'Linux' });
+    expect(run.code).toBe(2);
+    expect(run.err).toContain('the slow-pipe gate runs on macOS only');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The gate's own record, end to end: a passing run writes the record check-gate accepts for this commit and runtime, and a red run
+// replaces it with a failing record that check-gate refuses. The record step runs /usr/bin/python3, so the test is skipped without it.
+test.skipIf(!existsSync('/usr/bin/python3'))('a gate run writes the record check-gate reads: a pass opens the gate, a red run closes it', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    writeFileSync(join(release, 'tests', 'comm-slow-pipe.test.ts'), '');
+    // Stand-in for `bun test` on the pinned runtime: it exits with FAKE_TEST_RC (0 unless a run sets it) and reports the control mode.
+    const pinned = join(home, 'runtime-bun', 'bin', 'bun');
+    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "slow-pipe stand-in, control=${SCK_COMM_CONTROL:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
+    chmodSync(pinned, 0o755);
+    const recordFile = join(home, 'gates', 'comm-slow-pipe', `${SHA}.json`);
+
+    const pass = sh(GATE, ['slow-pipe', release], home);
+    expect(pass.code).toBe(0);
+    expect(pass.out).toContain(`comm-slow-pipe pass for ${SHA} on bun ${PINNED}`);
+    expect(readFileSync(join(home, 'gates', 'comm-slow-pipe', `${SHA}.log`), 'utf8')).toContain('control=1');
+    expect(JSON.parse(readFileSync(recordFile, 'utf8'))).toMatchObject({ gate: 'comm-slow-pipe', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
+
+    const red = sh(GATE, ['slow-pipe', release], home, { FAKE_TEST_RC: '1' });
+    expect(red.code).toBe(1);
+    expect(JSON.parse(readFileSync(recordFile, 'utf8'))).toMatchObject({ result: 'fail', exitCode: 1 });
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

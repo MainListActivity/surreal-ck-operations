@@ -122,6 +122,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     const credential = token(ctx);
     if (!core.contextView) {
       // Cores that predate SYS01 keep the single-shot listing, with the same defaults: the company block only when includeCompany is true.
+      // This branch ignores scope and paging (SYS01 AC-A note), so scope "company" is answered only by a core with contextView.
       const withCompany = input.includeCompany === true;
       return run(credential, async () => ({
         principal: await core.authenticate(credential),
