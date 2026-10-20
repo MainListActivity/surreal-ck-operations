@@ -8,8 +8,9 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
-import { independenceHit, readIndependenceSnapshot } from '../src/independence.ts';
-import { Workforce } from '../src/workforce.ts';
+import { independenceHit, readIndependenceSnapshot, type IndependenceScope } from '../src/independence.ts';
+import { Workforce, type EmployeeDef, type EmployeeInst, type SupervisedTask } from '../src/workforce.ts';
+import { staffingPool, type InstState } from '../src/dispatcher/dispatcher.ts';
 import type { ClaimResult, SetIndependence } from '../src/contracts.ts';
 
 // SYS-DISP IR01-IR05 on the real core and the company fork. A dependent task (an independent review) is never taken, submitted or
@@ -294,4 +295,60 @@ test('review decisions are gated too: a reviewer who became a source contributor
   const held = await core.getTask(tokens.gm, dependent.id);
   expect(held.state).toBe('review');
   expect(held.currentEmployee).toBe('t-indep');
+});
+
+/** Candidate pool of an engineering dispatch over the policy fixtures: the registered definitions and their instances. */
+const poolDef = (id: string): EmployeeDef => ({ id, role: 'engineering', provider: 'codex', model: 'm1', enabled: true,
+  maxInstances: 4, priority: 100, weight: 10, scored: 0, errorStreak: 0 });
+const poolInst = (id: string, def: string): EmployeeInst => ({ id, role: 'engineering', def, provider: 'codex', model: 'm1',
+  paseoAgentId: `ag-${id}` });
+const POOL_INSTS = [poolInst('t-src', 'eng-factory'), poolInst('t-alias', 'eng-factory'), poolInst('t-indep', 'eng-claude'),
+  poolInst('t-explicit', 'eng-qa'), poolInst('t-exec', 'eng-exec')];
+const POOL_DEFS = ['eng-factory', 'eng-claude', 'eng-qa', 'eng-exec'].map(id => poolDef(id));
+const POOL_STATES = new Map<string, InstState>(POOL_INSTS.map((inst): [string, InstState] => [inst.id, 'idle']));
+const pool = (task: SupervisedTask, independence: IndependenceScope | undefined) => staffingPool({
+  role: 'engineering', home: '/ops/repo', opsRepo: '/ops/repo', sidecar: false, now: 1_000_000,
+  defs: POOL_DEFS, insts: POOL_INSTS, states: POOL_STATES, holding: new Set(), health: new Map(), quotaBlocked: new Map(),
+  busyBy: new Map(), providerMax: { codex: 9 }, slots: new Map(), task, independence,
+});
+const entryOf = (entries: ReturnType<typeof staffingPool>, key: string) => entries.find(entry => entry.key === key);
+
+test('the candidate pool built from the stored policy drops a contributor that appears after the policy, and its alias, on the next pass', async () => {
+  const parent = await engineering('parent authored after the policy for the candidate pool');
+  const dependent = await engineering('dependent whose candidates are read on every pass');
+  await setPolicy(dependent.id, [parent.id]);
+  const dispatchPass = async () => {
+    const task = await core.getTask(tokens.gm, dependent.id);
+    return pool({ id: dependent.id } as unknown as SupervisedTask, await workforce.independenceScope(task.independence, 'execute'));
+  };
+  // Before the source has any contributor, its employee is an ordinary candidate.
+  expect(entryOf(await dispatchPass(), 't-src')).toMatchObject({ eligible: true });
+
+  await authorParent('src', parent.id);
+  const entries = await dispatchPass();
+  expect(entryOf(entries, 't-src')).toMatchObject({ eligible: false, code: 'independence_conflict' });
+  expect(entryOf(entries, 't-alias')).toMatchObject({ eligible: false, code: 'independence_conflict' });
+  expect(entryOf(entries, 'spawn:eng-factory')).toMatchObject({ eligible: false, code: 'independence_conflict' });
+  expect(entryOf(entries, 't-indep')).toMatchObject({ eligible: true });
+  expect(entryOf(entries, 'spawn:eng-claude')).toMatchObject({ eligible: true });
+});
+
+test('an unreadable source history refuses the submit fail-closed: the lease stays put, nothing is written, and the same submit lands once history reads', async () => {
+  const parent = await engineering('parent whose history is unreadable at submit');
+  const dependent = await engineering('dependent submitted while the source history is unreadable');
+  await setPolicy(dependent.id, [parent.id]);
+  const claimed = await core.claim(tokens.indep, dependent.id);
+  const before = await core.getTask(tokens.gm, dependent.id);
+
+  seam.source = async (taskId: string) => { if (taskId === parent.id) throw new Error('audit read failed'); };
+  try {
+    const refusal = await failureOf(core.submit(tokens.indep, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() }));
+    expect(refusal.code).toBe('temporarily_unavailable');
+    expect(refusal.retryable).toBe(true);
+  } finally {
+    seam.source = undefined;
+  }
+  expect(await core.getTask(tokens.gm, dependent.id)).toMatchObject({ state: 'doing', currentEmployee: 't-indep', version: before.version });
+
+  expect((await core.submit(tokens.indep, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() })).state).toBe('review');
 });
