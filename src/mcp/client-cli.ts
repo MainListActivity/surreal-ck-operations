@@ -59,6 +59,25 @@ function argumentsOf(json: string | undefined): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/**
+ * The one answer a direct call prints, in the shape comm mode prints (SYS01 AC03): the data on success, and on failure
+ * the refusal line with exit 1. The MCP result repeats the answer as text as well as structuredContent, so printing the
+ * whole result printed every answer twice and could pass the 48 KiB budget.
+ */
+function printAnswer(result: unknown): void {
+  const { structuredContent, isError } = result as { structuredContent?: unknown; isError?: boolean };
+  const answer = structuredContent as { ok?: unknown; data?: unknown; code?: unknown; error?: unknown } | undefined;
+  if (typeof answer !== 'object' || answer === null || typeof answer.ok !== 'boolean') {
+    fail('internal_error', 'the company service answered without a structured result');
+  }
+  if (answer.ok === false || isError === true) {
+    const code = typeof answer.code === 'string' && /^[a-z][a-z0-9_]{1,63}$/.test(answer.code) ? answer.code : 'internal_error';
+    const reason = typeof answer.error === 'string' && answer.error !== code ? answer.error : 'the call was refused without a reason';
+    fail(code, reason);
+  }
+  writeStdout(`${JSON.stringify(answer.data ?? null)}\n`);
+}
+
 async function main(): Promise<void> {
   const [command, name, json] = Bun.argv.slice(2);
   if (!['list', 'call'].includes(command ?? '')) fail('invalid_arguments', 'usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
@@ -132,7 +151,11 @@ async function main(): Promise<void> {
     fail('upstream_error', `tool call failed: ${String((error as Error).message ?? error).slice(0, 300)}`);
   }
   await connection.close().catch(() => undefined);
-  writeStdout(`${JSON.stringify(result)}\n`);
+  if (command === 'list') {
+    writeStdout(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  printAnswer(result);
 }
 
 main().catch((error: unknown) => fail('internal_error', error instanceof Error ? error.message : String(error)));

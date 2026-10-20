@@ -2,7 +2,7 @@
 // bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
 // multi-byte characters. Pure helpers only: no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import type { ClaimResult, HistoryEntry, ListCut, ProjectView, TaskView } from './contracts.ts';
+import type { ClaimResult, HistoryEntry, ListCut, ProjectView, TaskTextField, TaskTextSegment, TaskView } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
@@ -36,23 +36,66 @@ export function utf8Prefix(text: string, limit: number): { text: string; bytes: 
   return { text: buf.subarray(0, end).toString('utf8'), bytes: end, total: buf.length };
 }
 
-/**
- * One segment of `text` starting at byte `offset` (moved forward to a character boundary when it lands
- * inside a character) and at most `limit` bytes long. `next` is the offset of the following segment, or
- * null at the end. Segments of one text concatenate back to the original bytes exactly.
- */
-export function utf8Segment(text: string, offset: number, limit: number): {
+/** One segment of a text: where it starts, how many bytes it takes, and where the next one begins (null at the end). */
+export interface Utf8Segment {
   text: string; offset: number; bytes: number; next: number | null; total: number;
-} {
+}
+
+/**
+ * One segment of `text` starting at byte `offset` (moved forward to a character boundary when it lands inside a
+ * character). It is at most `limit` bytes long, ends on a character boundary, and `fits` holds for it: a caller passes
+ * the serialized size of the answer the segment goes into (see textSegment). Segments of one text concatenate back to
+ * the original bytes exactly. `fits` is searched by bisection, so it must hold for every shorter segment too.
+ */
+export function utf8Segment(text: string, offset: number, limit: number, fits: (segment: Utf8Segment) => boolean = () => true): Utf8Segment {
   const buf = Buffer.from(text, 'utf8');
   let start = Math.min(Math.max(0, Math.floor(offset)), buf.length);
   while (start < buf.length && isContinuation(buf[start])) start++;
-  let end = Math.min(buf.length, start + Math.max(4, Math.floor(limit)));
-  if (end < buf.length) while (end > start && isContinuation(buf[end])) end--;
-  return {
+  const at = (end: number): Utf8Segment => ({
     text: buf.subarray(start, end).toString('utf8'), offset: start, bytes: end - start,
     next: end < buf.length ? end : null, total: buf.length,
+  });
+  if (start >= buf.length) return at(buf.length);
+  // Each character boundary the raw limit allows, in order. The first one lies within 4 bytes, so one character always fits.
+  const reach = Math.min(buf.length, start + Math.max(4, Math.floor(limit)));
+  const ends: number[] = [];
+  for (let end = start + 1; end <= reach; end++) {
+    if (end === buf.length || !isContinuation(buf[end])) ends.push(end);
+  }
+  let lo = 0;
+  let hi = ends.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(at(ends[mid]!))) lo = mid;
+    else hi = mid - 1;
+  }
+  return at(ends[lo]!);
+}
+
+/** What names a read_task_text answer: the task and field read, the audit entry of evidence, and the digest of the whole text. */
+export interface TaskTextHead {
+  taskId: string;
+  field: TaskTextField;
+  auditId?: string;
+  sha256: string;
+}
+
+/** The answer read_task_text gives for one segment. core builds every answer this way, so the budget checks measure the real shape. */
+export function textSegmentAnswer(head: TaskTextHead, segment: Utf8Segment): TaskTextSegment {
+  return {
+    taskId: head.taskId, field: head.field, ...(head.auditId ? { auditId: head.auditId } : {}),
+    totalBytes: segment.total, sha256: head.sha256, offset: segment.offset, bytes: segment.bytes,
+    nextOffset: segment.next, text: segment.text,
   };
+}
+
+/**
+ * One read_task_text segment, cut so that its whole `{ok, data}` answer fits the response budget (SYS01, F2). JSON writes
+ * a control character as six bytes and a quote as two, so a byte count alone can overflow the budget: the segment keeps
+ * the longest prefix whose serialized answer fits, and never more than `limit` raw bytes.
+ */
+export function textSegment(text: string, offset: number, limit: number, head: TaskTextHead): Utf8Segment {
+  return utf8Segment(text, offset, limit, segment => jsonBytes({ ok: true, data: textSegmentAnswer(head, segment) }) <= RESPONSE_BUDGET_BYTES);
 }
 
 /**

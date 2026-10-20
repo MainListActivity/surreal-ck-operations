@@ -10,7 +10,7 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, utf8Bytes, utf8Segment } from './response-budget.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
 import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
@@ -1305,12 +1305,9 @@ export class SurrealCompanyCore implements CompanyCore {
     if (params.expectSha256 !== undefined && params.expectSha256 !== sha256) {
       throw new CompanyError('conflict', `the ${params.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
     }
-    const segment = utf8Segment(text, params.offset, params.limit);
-    return {
-      taskId: params.taskId, field: params.field, ...(params.auditId ? { auditId: params.auditId } : {}),
-      totalBytes: segment.total, sha256, offset: segment.offset, bytes: segment.bytes,
-      nextOffset: segment.next, text: segment.text,
-    };
+    // Sized by the serialized answer, so escaped control characters and quotes cannot push it past the budget (F2).
+    const head = { taskId: params.taskId, field: params.field, ...(params.auditId ? { auditId: params.auditId } : {}), sha256 };
+    return textSegmentAnswer(head, textSegment(text, params.offset, params.limit, head));
   }
 
   /**

@@ -119,6 +119,9 @@ async function reassemble(args: { taskId: string; field: TaskTextField; auditId?
     const segment = await core.taskText(credential, { ...args, offset, ...(pinned ? { expectSha256: pinned } : {}) });
     expect(segment.bytes).toBeLessThanOrEqual(args.limit);
     expect(segment.text).not.toContain('\uFFFD');
+    // Every segment is also an answer the relay sends whole, so it must pass the same guard (SYS01, F2).
+    const answer = { ok: true as const, data: segment };
+    expect(guardRelayResponse(answer)).toBe(answer);
     pinned ??= segment.sha256;
     totalBytes = segment.totalBytes;
     pieces.push(Buffer.from(segment.text, 'utf8'));
@@ -329,6 +332,28 @@ test('a text reassembles exactly from 4-byte segments of mixed Chinese and emoji
   expect(whole.totalBytes).toBe(utf8(text));
   expect(whole.sha256).toBe(sha256(text));
   expect(whole.segments).toBeGreaterThanOrEqual(utf8(text) / 4);
+});
+
+test('a control-heavy or quote-dense text reads back whole through read_task_text, and every segment answer passes the relay guard (SYS01, F2)', async () => {
+  // JSON writes a control character as six bytes and a quote as two. A context stops at 20,000 characters, so the escapes alone
+  // push the whole text past 48 KiB (120,000 bytes of control characters, 80,000 of the mix): it must be read in segments.
+  for (const text of ['\u0001'.repeat(20_000), '"\u0001'.repeat(10_000)]) {
+    const task = await core.createTask(gm, {
+      title: '转义样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('escape'),
+    });
+    const whole = await reassemble({ taskId: task.id, field: 'context', limit: 24 * 1024 });
+    expect(whole.text).toBe(text);
+    expect(whole.totalBytes).toBe(utf8(text));
+    expect(whole.sha256).toBe(sha256(text));
+    expect(whole.segments).toBeGreaterThan(1);
+  }
+});
+
+test('a since that SurrealDB would refuse is invalid on every read that takes it, and a zoned time is normalized before the query (SYS01, F3)', async () => {
+  await expectRefused(core.contextView(gm, { since: 'October 19, 2026', pageSize: 5 }), 'invalid', /since/);
+  await expectRefused(core.adminSummary(gm, { since: '2026/10/19' }), 'invalid', /since/);
+  const summary = await core.adminSummary(gm, { since: '2026-10-19T08:00:00+08:00' });
+  expect(JSON.stringify(summary)).toContain('2026-10-19T00:00:00.000Z');
 });
 
 test('a read past offset 0 must pin the digest of its first segment, so two versions of one text are never mixed (C3)', async () => {

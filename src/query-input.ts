@@ -55,10 +55,27 @@ function optionalBoolean(value: unknown, name: string): boolean | undefined {
   return value;
 }
 
+/**
+ * A date (UTC midnight) or a date-time with a zone designator. A time without a zone reads as local time, which differs by
+ * machine, so it is refused. Date.parse also accepts forms that the SurrealDB datetime cast refuses (F3): the value is
+ * checked against the ISO shape first, and the query gets its canonical UTC form.
+ */
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2}))?$/;
+
+/** Date.parse rolls a day the month does not have into the next month (2026-02-29 reads as 2026-03-01), so the day must exist. */
+function dayExists(text: string): boolean {
+  const [year, month, day] = text.slice(0, 10).split('-').map(Number) as [number, number, number];
+  const probe = new Date(0);
+  probe.setUTCFullYear(year, month - 1, day);
+  return probe.getUTCFullYear() === year && probe.getUTCMonth() === month - 1 && probe.getUTCDate() === day;
+}
+
 function optionalIso(value: unknown, name: string): string | undefined {
   const text = optionalText(value, name, 40);
-  if (text !== undefined && Number.isNaN(Date.parse(text))) throw invalid(`${name} must be an ISO 8601 time`);
-  return text;
+  if (text === undefined) return undefined;
+  const ms = ISO_TIME.test(text) && dayExists(text) ? Date.parse(text) : Number.NaN;
+  if (!Number.isFinite(ms)) throw invalid(`${name} must be an ISO 8601 date, or a date-time with a zone such as 2026-10-19T00:00:00Z`);
+  return new Date(ms).toISOString();
 }
 
 /**

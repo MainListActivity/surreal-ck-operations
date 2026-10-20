@@ -25,7 +25,7 @@
 - 46 KiB（`ITEM_BUDGET_BYTES`，预算减去 2 KiB 的页信封余量）只是内部余量，不是对外上限。条目本身不超过该余量时保持完整。
 - 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`。超过预算的成功响应替换为 JSON 错误 `response_too_large`（`retryable: false`，缩小查询后重试）。comm 客户端退出码为 1，stdout 为一行 JSON。
 - 完整读取从不截断（见第 3 节）。分页读取只在单条超过 46 KiB 时截断该条，并标注 `contextTruncated` 与 `contextNextOffset`（证据为 `evidenceTruncated` 与 `evidenceNextOffset`），其余部分用 `read_task_text` 按段读取。
-- `read_task_text` 每段默认 16 KiB，最大 24 KiB，最小 4 字节。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符。
+- `read_task_text` 每段默认 16 KiB，最大 24 KiB，最小 4 字节，且不超过 `limit` 原始字节。段长同时按整条应答（`{ok,data}`）序列化后的字节计：JSON 把控制字符写成 6 字节、引号写成 2 字节，所以控制字符或引号密集的正文，段会短于 `limit`，每条应答都不超过 48 KiB（F2）。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符；`sha256` 为整段正文的摘要。
 
 写接口的回显（SYS01，`echoTask`）：检查点、提交、验收、退回、阻塞（`report_blocker`）、创建、释放、续做、延后、退役、项目换绑、仓库绑定与负责人决定返回的任务回显，同样受预算限制。回显中的依赖列表（`dependencies`）与任务、工作树的意图路径（`workIntent.paths`、`worktree.intent.paths`）各取不超过 `min(4 KiB, 本次回显的字节上限 / 8)` 的最长前缀，超出的列表在 `listsTruncated` 中给出完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`），完整列表用 `read_task_text` 读取。之后 `context` 取剩余空间，超出时截断并标注（`contextTruncated`、`contextNextOffset`）。`contextBytes` 与 `contextSha256` 始终描述完整正文。`create_delivery` 把预算按腿数均分，每条腿不超过 `floor(46 KiB / 腿数)`。写接口的回显不含项目环境正文。
 
@@ -54,7 +54,7 @@
 
 要点：
 
-- `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`，并排除调用人自己提交的 `review` 任务（`taskRowsAt` 中的 `NOT (state = 'review' AND submitted_by = $me)`）。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。
+- `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`，并排除调用人自己提交的 `review` 任务（`taskRowsAt` 中的 `NOT (state = 'review' AND submitted_by = $me)`）。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。`since`（`get_context` 与 `get_admin_summary` 同此口径）只接受 ISO 8601 日期（按 UTC 零点）或带时区的时间（`Z` 或 `±hh:mm`），查询前归一为 UTC 的 `toISOString()` 形式。`October 19, 2026`、`2026/10/19`、RFC 2822 日期、无时区的时间与不存在的日期（如 `2026-02-30`）返回 `invalid`，不再误报为可重试的 `temporarily_unavailable`（F3）。
 - `fields` 只能选白名单内的字段，未知字段返回 `invalid`。
 - `includeCompany` 缺省值取决于调用形态：旧调用缺省包含 `company` 块，分页调用缺省不包含，需显式传 `includeCompany: true`。
 - `taskId` 读取整条任务，`context` 完整返回，并附 `contextBytes` 与 `contextSha256`。超出预算时拒绝，并给出 `read_task_text` 的读取示例。与 `cursor` 同用会返回 `invalid`。
@@ -302,3 +302,39 @@ AC05 资源（同一文件的 AC05 资源用例，881 条任务，`pageSize` 为
 - 发布前须核对实际 main 的包含关系（`8d03d35` 与 `f42d99b`），确认回滚目标包含所需修复。
 - 本次未部署，未调用 `ops_*`，未读取凭证。
 - 慢管道对照的 1000 条载荷由测试替身直接输出，不经过响应预算，只证明客户端的字节传输完整。预算由单元与公司 fork 用例覆盖。
+
+### 9.7 v35：复核 F1–F4 返工的门禁与红绿结果
+
+本节记录经理复核 v34 退回后的返工结果。被测代码为 `c8a48e1` 加本次提交的 F1–F4 改动。门禁顺序与复核人的 `gate.sh` 相同，在工作树中运行，未使用隔离副本。证据位于 `round-v35/`：`gate-v35.sh`（第一段脚本）、`gate-summary.txt`（运行记录，含被停止的后台运行与前台重跑的行）、`gate-final-summary.txt`（每步最终退出码与计数）、`gate-<步骤>-<运行时>.log`（逐步日志）。第一段脚本在 fork-default-1311 处被停止（2026-10-20 约 00:12Z），之后的步骤改为前台执行，命令与脚本相同。下表数字取每步最后一次运行的结果。
+
+| 门禁 | 命令 | Bun 1.3.11 | Bun 1.4.2 |
+|---|---|---|---|
+| vendor、根 tsc、插件 tsc | `sh plugin/scripts/vendor.sh`；`bun x tsc --noEmit`；`cd plugin && bun x tsc --noEmit` | 退出 0 | 未单独运行（与复核脚本相同，只在默认运行时执行） |
+| 单元（响应预算） | `bun test tests/response-budget.test.ts` | 39 通过、0 失败 | 39 通过、0 失败 |
+| 桥接 | `pnpm test:bridge` | 269 通过、23 跳过、0 失败（292 项，11 个文件） | 同左 |
+| 服务 | `pnpm test:service` | 12 通过、0 失败 | 同左 |
+| 通信 | `pnpm test:comm` | 9 通过、1 跳过、0 失败（10 项，3 个文件） | 同左 |
+| 通道 | `pnpm test:channel` | 81 通过、1 跳过、0 失败（82 项，9 个文件） | 同左 |
+| 慢管道对照 | `SCK_COMM_CONTROL=1 bun test tests/comm-slow-pipe.test.ts` | 2 通过、0 失败 | 同左 |
+| 内部 AI 证明（公司 fork） | `RUN_COMPANY_PROOF_FORK_TESTS=1 bun scripts/test-worktrees.ts tests/internal-ai-proof.fork.test.ts` | 23 通过、0 失败 | 同左 |
+| 公司 fork 聚焦 | `bun scripts/test-worktrees.ts tests/query-paging.integration.test.ts tests/rollback-isolation.fork.test.ts tests/null-absent.fork.test.ts tests/snapshot-quota.fork.test.ts` | 79 通过、0 失败（分页 52、RB01 8、null 9、快照配额 10） | 同左 |
+| 公司 fork 默认清单 | `bun scripts/test-worktrees.ts` | 286 通过、0 失败（29 个文件） | 同左 |
+
+F1–F4 的红灯与绿灯对照如下。
+
+| 编号 | 复核缺陷（v34） | 红灯 | 修复 | 绿灯与回归 |
+|---|---|---|---|---|
+| F1 直连输出 | 直连 `call` 把同一答案打印两遍（整份 CallToolResult） | 前次运行：直连输出 60,484 字节，超过 49,152（复核人同形态复现为 53,966）。终端记录未归档；把 `src/mcp/client-cli.ts` 换回 c8a48e1 版本即可复现 | `printAnswer`：成功只打印 `data`；失败打印一行 JSON 并以退出码 1 结束；`list` 不变 | `tests/comm-client.test.ts`「a direct call prints one answer…」：一行、不超过 49,152 字节、失败的退出码与原因 |
+| F2 分段超预算 | `read_task_text` 按原始字节切段，JSON 转义后信封超过 48 KiB | 复核人复现：16 KiB 控制字符段的信封 98,519 字节，24 KiB 引号段的信封 49,367 字节，均被守卫拒绝。本轮单元红灯为导入失败（缺少 `textSegment` 等导出） | `utf8Segment` 增加 `fits` 二分；`textSegment` 按序列化的 `{ok,data}` 装入预算；`core.taskText` 接入 | `tests/response-budget.test.ts`「read_task_text segments (SYS01, F2)」4 项，含原始段反例；`tests/query-paging.integration.test.ts`「control-heavy or quote-dense text」（20,000 字符夹具，逐段过守卫并校验 sha256 重组） |
+| F3 since | `since` 只用 `Date.parse` 校验，非法格式被接受后误报可重试的 `temporarily_unavailable` | 前次红灯：`October 19, 2026` 被接受。本轮探针：`Date.parse("2026-02-29")` 滚动为 `2026-03-01` | `optionalIso`：ISO 形状校验与日历日存在性校验，归一为 `toISOString()`，其余返回 `invalid` | `tests/response-budget.test.ts`「since (SYS01, F3)」2 项；`tests/query-paging.integration.test.ts`「a since that SurrealDB would refuse…」 |
+| F4 运行手册 | `docs/qa/worktree-allocation.md` 第 2 步查 released 引用但未带 `includeReleased` | 文档缺口，无自动化红灯 | 第 2、7 步补 `includeReleased:true`；`docs/company-service-operations.md` 补非 gm 必须带 taskId 与 released 说明 | 文档审阅，无自动化测试 |
+
+gm v25 在本任务内的条目（R3、R4、R8）已在 c8a48e1 实现，本轮未改动：R3 见第 8 节的回显用例，R4 见 `tests/snapshot-quota.fork.test.ts`（10 项），R8 见 `tests/null-absent.fork.test.ts`（9 项）。R6 与 R7 属于 SYS01-R67 链，不在本 PR。
+
+未验证与限制（v35）：
+
+- 新头 SHA 的 PR CI 在推送后核对，结果记录于 PR 正文与交付报告。
+- 真实 Paseo 会话、真实 sidecar 与 sck 端到端未在本轮执行。慢管道对照仍是测试替身。
+- 真实员工 sck QA（`6b6cb5b9`）与上线申请（`1c7544fa`）不在本次范围。本轮未部署，未调用 `ops_*`，未读取凭证。
+- 本轮没有自我复核，验收由另一位工程师完成。
+- MCP 结果同时携带 `content` 文本与 `structuredContent`，线上载荷约为答案的两倍。48 KiB 预算按答案 `{ok,data}` 计算，直连与通道只打印答案。是否去掉文本副本属于另行决策，本轮未改。

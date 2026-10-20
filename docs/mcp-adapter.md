@@ -8,7 +8,7 @@
 
 工具：`get_context`、`claim_next`、`heartbeat`、`checkpoint`、`submit`、`report_blocker`、`review`、`create_task`、`resume_task`。`claim_next` 无 ID 时先考虑本人可验的 review，再考虑本岗位 ready；数据库内并发裁决仍以核心 `claim` 为准。`create_task` 与 `resume_task` 即使出现在工具列表，也只能由核心的 manage 权限执行。员工 enroll/revoke 遵循 #24 冻结契约 `EnrollmentAdmin`，由本机受控管理命令处理，不向普通 MCP tool 暴露。
 
-CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL_FILE`（仅文件 owner 可读），执行 `pnpm run mcp:client -- list` 或 `pnpm run mcp:client -- call get_context '{}'`。受控环境也可传 `SCK_EMPLOYEE_CREDENTIAL`；若同时提供，文件优先。客户端通过官方 `Client.connect` 初始化并使用 `listTools`/`callTool`；可用于已有员工真实领取、提交与独立验收。运行命令时不要在命令行参数或 shell 历史中直接写凭证。
+CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL_FILE`（仅文件 owner 可读），执行 `pnpm run mcp:client -- list` 或 `pnpm run mcp:client -- call get_context '{}'`。受控环境也可传 `SCK_EMPLOYEE_CREDENTIAL`；若同时提供，文件优先。直连 `call` 只向 stdout 打印一份答案（与通道模式相同）：成功时为返回数据，失败时为一行 `{"ok":false,"code",…}` 并以退出码 1 结束（SYS01 AC03，F1）。客户端通过官方 `Client.connect` 初始化并使用 `listTools`/`callTool`；可用于已有员工真实领取、提交与独立验收。运行命令时不要在命令行参数或 shell 历史中直接写凭证。
 
 启动入口：设置 `SCK_MCP_PORT`（1–65535）并执行 `pnpm run mcp:serve`。进程读取 #24 的 `SCK_PRODUCT_ENV`/数据库配置，连接并 bootstrap 公司库，然后监听本机端口。若同时设置 `SCK_PROJECTOR_CREDENTIAL_FILE`（GM 凭证私有文件）和 `SCK_GITHUB_REPOSITORY=owner/repo`，同进程启动 GitHub outbox worker；投影状态默认 `.runtime/gh-projection.json`，可用 `SCK_PROJECTION_STATE_FILE` 指定。缺少配对配置会拒绝启动。SIGINT/SIGTERM 会停止 worker、HTTP 服务并关闭数据库连接。常驻与进程监管属于 #27。
 

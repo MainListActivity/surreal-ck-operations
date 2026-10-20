@@ -3,6 +3,8 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
+import type { CompanyCore } from '../src/contracts.ts';
+import { createMcpHttpService } from '../src/mcp/server.ts';
 
 // The comm client's own refusals (SYS01 AC03): every outcome is one line of JSON on stdout, with a recoverable
 // code and the reason on stderr. Each case runs the real client file; no network is needed for these paths.
@@ -120,4 +122,41 @@ test('a sidecar answer passes through as one JSON line, Chinese and emoji intact
   expect(out).toBe(`${JSON.stringify(data)}\n`);
   expect(oneJsonLine(out)).toEqual(data);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('a direct call prints one answer: the data within the budget on success; one refusal line and exit 1 on failure (SYS01 AC03, F1)', async () => {
+  // A bounded get_context page of 60 tasks, about 26 KB as the relay sends it. The MCP result carries the same answer
+  // twice (as text and as structuredContent); printing the whole result doubled it past the 48 KiB budget.
+  const principal = { employeeId: 'gm-01', role: 'gm', capabilities: ['execute', 'review'] };
+  const data = {
+    principal,
+    tasks: Array.from({ length: 60 }, (_, i) => ({ id: `task:${i}`, title: `样例 ${i} 中文🙂`, state: 'ready', context: `正文 "${i}" ${'x'.repeat(400)}` })),
+    page: { pageSize: 60, returned: 60, hasMore: false, total: 60 },
+  };
+  const core = {
+    async authenticate(credential: string) {
+      if (credential !== 'sck_direct_valid') throw { code: 'unauthorized' };
+      return principal;
+    },
+    async contextView(_credential: string, input: Record<string, unknown>) {
+      if (input.taskId === 'missing') throw Object.assign(new Error('no such task'), { code: 'not_found' });
+      return data;
+    },
+  } as unknown as CompanyCore;
+  const service = createMcpHttpService({ core, port: 0 });
+  const env = { SCK_MCP_URL: `http://127.0.0.1:${service.port}/mcp`, SCK_EMPLOYEE_CREDENTIAL: 'sck_direct_valid' };
+  try {
+    const answered = await client(['call', 'get_context', '{"pageSize":60}'], env);
+    expect(answered.exit).toBe(0);
+    expect(answered.out.trimEnd().split('\n')).toHaveLength(1);
+    expect(Buffer.byteLength(answered.out, 'utf8')).toBeLessThanOrEqual(49_152);
+    expect(JSON.parse(answered.out)).toEqual(data);
+
+    const refused = await client(['call', 'get_context', '{"taskId":"missing"}'], env);
+    expect(refused.exit).toBe(1);
+    expect(oneJsonLine(refused.out)).toEqual({ ok: false, code: 'not_found', error: 'not_found: no such task', retryable: false });
+    expect(refused.err).toContain('no such task');
+  } finally {
+    await service.close();
+  }
 });

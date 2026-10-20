@@ -4,10 +4,10 @@ import type { ClaimResult, HistoryEntry, ProjectView, TaskView, WorktreeAssignme
 import { CompanyError } from '../src/core-errors.ts';
 import {
   CLAIM_LIST_ECHO_BYTES, ITEM_BUDGET_BYTES, PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, echoClaim, echoTask, fitCount, guardRelayResponse, jsonBytes,
-  longestFittingPrefix, openCursor, sealCursor, utf8Prefix, utf8Segment,
+  longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Prefix, utf8Segment,
 } from '../src/response-budget.ts';
 import {
-  cursorOf, isPaged, pageSizeOf, parseContextInput, parseHistoryInput, parseTextInput, parseWorktreeInput, queryDigest, TASK_FIELDS, taskIdOf,
+  cursorOf, isPaged, pageSizeOf, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, TASK_FIELDS, taskIdOf,
 } from '../src/query-input.ts';
 
 describe('byte budget (SYS01)', () => {
@@ -98,6 +98,60 @@ describe('byte budget (SYS01)', () => {
     expect(guardRelayResponse(small)).toBe(small);
     const failed = { ok: false, error: 'invalid: pageSize' };
     expect(guardRelayResponse(failed)).toBe(failed);
+  });
+});
+
+describe('read_task_text segments (SYS01, F2): a segment is sized by its serialized answer, not by its raw bytes alone', () => {
+  const head = { taskId: 'task-f2', field: 'context' as const, sha256: createHash('sha256').update('f2').digest('hex') };
+  const answerOf = (segment: ReturnType<typeof utf8Segment>) => ({ ok: true as const, data: textSegmentAnswer(head, segment) });
+
+  /**
+   * Reads the whole text in segments, as a caller does. Every answer must pass the relay guard unchanged, every segment
+   * must be non-empty and make progress, and the segments must rebuild the text byte for byte. Returns the serialized
+   * size of each answer.
+   */
+  function walk(text: string, limit: number): number[] {
+    const pieces: Buffer[] = [];
+    const sizes: number[] = [];
+    let offset: number | null = 0;
+    while (offset !== null) {
+      const segment = textSegment(text, offset, limit, head);
+      expect(segment.bytes).toBeGreaterThan(0);
+      expect(segment.bytes).toBeLessThanOrEqual(limit);
+      expect(segment.text).not.toContain('\uFFFD');
+      if (segment.next !== null) expect(segment.next).toBeGreaterThan(offset);
+      const answer = answerOf(segment);
+      expect(guardRelayResponse(answer)).toBe(answer);
+      pieces.push(Buffer.from(segment.text, 'utf8'));
+      sizes.push(jsonBytes(answer));
+      offset = segment.next;
+    }
+    expect(Buffer.concat(pieces).equals(Buffer.from(text, 'utf8'))).toBe(true);
+    return sizes;
+  }
+
+  test('control characters: JSON writes each one as six bytes, yet every answer fits the budget and the segments rebuild the text', () => {
+    const sizes = walk('\u0001'.repeat(60_000), 24 * 1024);
+    expect(sizes.length).toBeGreaterThan(2);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  });
+
+  test('quotes: JSON writes each one as two bytes, so a quote-dense segment is shorter than its limit and still fits', () => {
+    const sizes = walk('"'.repeat(60_000), 24 * 1024);
+    expect(sizes.length).toBeGreaterThan(2);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  });
+
+  test('Chinese text and emoji keep whole characters and fit; ASCII prose keeps the full limit in every segment', () => {
+    expect(Math.max(...walk('中文正文，包含标点与emoji🙂。'.repeat(3_000), 16 * 1024))).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const prose = 'evidence line of prose, with ordinary words and punctuation.\n'.repeat(2_000);
+    expect(textSegment(prose, 0, 16 * 1024, head).bytes).toBe(16 * 1024);
+    walk(prose, 16 * 1024);
+  });
+
+  test('negative control: a raw 24 KiB segment of control characters is refused by the relay guard, which is the defect', () => {
+    const raw = utf8Segment('\u0001'.repeat(60_000), 0, 24 * 1024);
+    expect(guardRelayResponse(answerOf(raw))).toMatchObject({ ok: false, code: 'response_too_large' });
   });
 });
 
@@ -200,6 +254,34 @@ describe('argument parsing (SYS01)', () => {
     expect(queryDigest('context', { goalId: 'g1', state: 'ready' })).toBe(a);
     expect(queryDigest('context', { state: 'ready', goalId: 'g2' })).not.toBe(a);
     expect(queryDigest('history', { state: 'ready', goalId: 'g1' })).not.toBe(a);
+  });
+});
+
+describe('since (SYS01, F3): a time is an ISO 8601 date, or a date-time with a zone, normalized to UTC before it is queried', () => {
+  /** The error class a refusal carries, or undefined when the parse accepts the input. */
+  const refusalOf = (parse: () => unknown): string | undefined => {
+    try {
+      parse();
+      return undefined;
+    } catch (error) {
+      return error instanceof CompanyError ? error.code : 'not-a-company-error';
+    }
+  };
+
+  test('a zoned time or a date normalizes to the UTC instant, in the form SurrealDB datetime accepts', () => {
+    expect(parseContextInput({ since: '2026-10-19T08:00:00+08:00' }).since).toBe('2026-10-19T00:00:00.000Z');
+    expect(parseContextInput({ since: '2026-10-19T00:00:00Z' }).since).toBe('2026-10-19T00:00:00.000Z');
+    expect(parseContextInput({ since: '2026-10-19' }).since).toBe('2026-10-19T00:00:00.000Z');
+    expect(parseContextInput({ since: '2028-02-29' }).since).toBe('2028-02-29T00:00:00.000Z');
+    expect(parseSummaryInput({ since: '2026-10-19T00:00:00.123Z' }).since).toBe('2026-10-19T00:00:00.123Z');
+    expect(parseContextInput({ since: null }).since).toBeUndefined();
+  });
+
+  test('a form SurrealDB refuses, a time without a zone, or an impossible date is invalid before any query, never temporarily_unavailable', () => {
+    for (const since of ['October 19, 2026', '2026/10/19', 'Mon, 19 Oct 2026 00:00:00 GMT', '2026-10-19T00:00:00', '2026-13-40', '2026-02-29', '2026-02-30', '2026-04-31', 'yesterday']) {
+      expect(refusalOf(() => parseContextInput({ since })), since).toBe('invalid');
+      expect(refusalOf(() => parseSummaryInput({ since })), since).toBe('invalid');
+    }
   });
 });
 
