@@ -14,7 +14,7 @@ import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoT
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
-import { SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
+import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
@@ -283,6 +283,10 @@ interface GoalAcceptanceState {
 }
 const isLeased = (row: { current_employee?: string; lease_expires_at?: number }) =>
   Boolean(row.current_employee) && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
+/** Which projects' environments one reader may see in a company block (SYS01 M3). `key` names that view, so a stored listing is read only under the same one. */
+interface EnvView { key: string; visible: (project: string) => boolean }
+/** A project as a reader without environment access sees it: the identity fields as they are, the environments withheld. */
+const withheldEnvs = (project: ProjectView): ProjectView => ({ ...project, envs: [], envsWithheld: true });
 const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   id: asId(row.id), title: row.title, state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
   kind: row.kind ?? 'task', version: row.version, blockedTo: row.blocked_to ?? undefined,
@@ -1153,9 +1157,10 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $n = array::len($probe);
       LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textBytes) END;
       LET $full = IF $n = 0 OR $total > $cap THEN [] ELSE (SELECT * FROM task WHERE id IN $probe.id ORDER BY created_at DESC, id DESC) END;
-      RETURN { read: { at: $at, count: $n, textBytes: $total, rows: $full } };`, vars, db);
+      RETURN { read: { at: $at, count: $n, textBytes: $total, rows: array::flatten([$full]) } };`, vars, db);
     const count = Number(read.count ?? 0);
     const textBytes = Number(read.textBytes ?? 0);
+    // The query wraps the rows in array::flatten: a lone match comes back as one object, not as a one-element array.
     const rows = read.rows ?? [];
     // Within the cap every match is loaded. A short load would drop tasks silently, so it is refused as retryable instead.
     if (textBytes <= cap && rows.length !== count) {
@@ -1164,14 +1169,26 @@ export class SurrealCompanyCore implements CompanyCore {
     return { at: read.at, count, textBytes, rows };
   }
 
+  /** The instant (epoch milliseconds) by which a listing call must have answered: its build deadline and the cleanup budget, from its start. */
+  private replyAt(startedAt: number): number {
+    return startedAt + this.snapshots.limits.buildDeadlineMs + CLEANUP_BUDGET_MS;
+  }
+
+  /** `work` answers by `at`, or the caller gets a recoverable temporarily_unavailable. A stalled read is left to finish on its own. */
+  private async bounded<T>(work: Promise<T>, at: number): Promise<T> {
+    const value = await untilAt(work, at);
+    if (value === undefined) throw new CompanyError('temporarily_unavailable', 'the database did not answer in time; retry shortly', true);
+    return value as T;
+  }
+
   /**
    * Stores the working set as a context listing. Its membership and its projection are fixed by one read, which runs on the
    * build channel inside the build deadline (SYS01 AC-D): the main connection stays free for control requests meanwhile.
    */
-  private async contextListing(actor: Principal, params: ContextParams, digest: string): Promise<SnapshotHeader> {
+  private async contextListing(actor: Principal, params: ContextParams, digest: string, startedAt: number): Promise<SnapshotHeader> {
     const { limits } = this.snapshots;
     return this.snapshots.build({
-      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '',
+      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', startedAt,
       guidance: 'narrow with state, goalId, role or since, or leave fields out',
       load: async db => {
         const { at, count, textBytes, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
@@ -1191,30 +1208,44 @@ export class SurrealCompanyCore implements CompanyCore {
    */
   private async listingPage<T, R>(args: {
     actor: Principal; kind: SnapshotKind; digest: string; pageSize: number; cursor?: string;
-    create: () => Promise<SnapshotHeader>;
+    /** When the tool call started: every wait of this page, the build and the reads included, ends by replyAt(startedAt). */
+    startedAt: number;
+    /** The refusal for a cursor that no longer matches the caller's access (for example a project-environment view that changed). */
+    mismatch?: string;
+    create: (startedAt: number) => Promise<SnapshotHeader>;
     parse: (body: string) => T;
     respond: (items: readonly T[], page: PageInfo) => R;
     /** What the caller can change when the page envelope alone is over the budget (for example includeCompany). */
     envelopeGuidance: string;
   }): Promise<R> {
     const { actor, kind, digest, pageSize } = args;
-    const key = await this.cursorKey();
+    const replyAt = this.replyAt(args.startedAt);
+    const key = await this.bounded(this.cursorKey(), replyAt);
     let sid: string;
     let after: number;
+    let stored: string | undefined;
     if (args.cursor === undefined) {
-      sid = (await args.create()).id;
+      stored = (await args.create(args.startedAt)).id;
+      sid = stored;
       after = 0;
     } else {
       const body = openCursor(args.cursor, key, Date.now());
       if (body.k !== kind || body.c !== actor.employeeId || body.q !== digest) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another query');
+        throw new CompanyError('forbidden', args.mismatch ?? 'cursor belongs to another caller or another query');
       }
       sid = body.sid;
       after = body.seq;
     }
-    const { header, rows } = await this.snapshots.read({
+    const read = await untilAt(this.snapshots.read({
       id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
-    });
+    }), replyAt);
+    if (read === undefined) {
+      // The caller has no time left to wait for a release, so a listing this call stored is released in the background. A release
+      // that fails is left for the sweep, and the caller is told to retry.
+      if (stored !== undefined) void this.snapshots.release(stored).catch(() => undefined);
+      throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
+    }
+    const { header, rows } = read;
     const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
     const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
       const last = kept.at(-1)?.seq ?? after;
@@ -1242,12 +1273,13 @@ export class SurrealCompanyCore implements CompanyCore {
    * page of a stored listing; a task read by id is never paged and takes no cursor.
    */
   async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
+    const startedAt = Date.now();
     const actor = await this.authenticate(credential);
     const params = parseContextInput(input);
-    if (params.scope === 'company') return this.companyContextView(credential, actor, params);
+    if (params.scope === 'company') return this.companyContextView(credential, actor, params, startedAt);
     // A task answer carries the company block only when includeCompany is true (AC-A). Every task answer says whether it does, and how
     // the block is read in pages, so the directions are always one call away.
-    const company = params.includeCompany ? await this.companyBrief(credential) : undefined;
+    const company = params.includeCompany ? await this.bounded(this.companyBrief(credential), this.replyAt(startedAt)) : undefined;
     const withCompany = { ...(company ? { company } : {}), companyIncluded: company !== undefined, companyRead: COMPANY_READ };
     if (params.taskId !== undefined) {
       if (params.cursor !== undefined) throw new CompanyError('invalid', 'a cursor pages a listing; one task is read without it');
@@ -1273,8 +1305,8 @@ export class SurrealCompanyCore implements CompanyCore {
       state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
     });
     return this.listingPage<Record<string, unknown>, ContextView>({
-      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
-      create: () => this.contextListing(actor, params, digest),
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: started => this.contextListing(actor, params, digest, started),
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
       envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
@@ -1286,23 +1318,29 @@ export class SurrealCompanyCore implements CompanyCore {
    * section named, is returned whole or refused. With paging it is one page of parts (company-context.ts): every part of every item
    * is listed exactly once, in a stable order, and a part carries its item's length and SHA-256 so the reader can check the join.
    */
-  private async companyContextView(credential: Credential, actor: Principal, params: ContextParams): Promise<ContextView> {
+  private async companyContextView(credential: Credential, actor: Principal, params: ContextParams, startedAt: number): Promise<ContextView> {
     const section = params.section;
     const named = section === undefined ? {} : { section };
+    const replyAt = this.replyAt(startedAt);
+    // The block and the listing digest are built from the same view of the project environments (SYS01 M3), so a stored listing
+    // is read only by the reader and under the access it was taken with.
+    const view = await this.bounded(this.envView(actor), replyAt);
     if (!params.paged) {
-      const view: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(await this.companyBrief(credential), section) };
-      return completeOrRefuse(view, 'the company block',
+      const brief = await this.bounded(this.companyBriefAs(view), replyAt);
+      const answer: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(brief, section) };
+      return completeOrRefuse(answer, 'the company block',
         'read it in pages: {"scope":"company","pageSize":25}, then {"scope":"company","pageSize":25,"cursor":"<page.nextCursor>"} until page.hasMore is false; or one section with "section"');
     }
-    const digest = queryDigest('company', { section: section ?? null });
+    const digest = queryDigest('company', { section: section ?? null, envs: view.key });
     return this.listingPage<CompanyPart, ContextView>({
-      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      mismatch: 'cursor belongs to another caller or query, or was taken under other access to project environments; start the listing again without cursor',
       // The block is read only when a listing is made: a cursor page reads the stored listing and never the block.
-      create: async () => {
-        const brief = await this.companyBrief(credential);
+      create: async started => {
+        const brief = await this.bounded(this.companyBriefAs(view), this.replyAt(started));
         const takenAt = new Date().toISOString();
         return this.snapshots.create({
-          owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt,
+          owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt, startedAt: started,
           bodies: companyParts(brief, section).map(part => JSON.stringify(part)), guidance: 'read one section with section',
         });
       },
@@ -1318,16 +1356,17 @@ export class SurrealCompanyCore implements CompanyCore {
    * read_task_text gives the rest.
    */
   async historyView(credential: Credential, taskId: TaskId, input: Record<string, unknown> = {}): Promise<HistoryPageView> {
+    const startedAt = Date.now();
     const actor = await this.authenticate(credential);
     await this.getTask(credential, taskId);
     const params = parseHistoryInput(input);
     const digest = queryDigest('history', { taskId });
     return this.listingPage<HistoryEntry, HistoryPageView>({
-      actor, kind: 'history', digest, pageSize: params.pageSize, cursor: params.cursor,
-      create: () => {
+      actor, kind: 'history', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: started => {
         const { limits } = this.snapshots;
         return this.snapshots.build({
-          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '',
+          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '', startedAt: started,
           guidance: 'read the evidence of large entries with read_task_text',
           load: async db => {
             const { at, rows } = await this.historyRowsAt(taskId, limits.maxRows + 1, db);
@@ -1353,16 +1392,18 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseWorktreeInput(input);
     await this.worktreeScope(credential, actor, params.taskId);
     const digest = queryDigest('worktrees', { taskId: params.taskId ?? null, includeReleased: params.includeReleased });
+    const startedAt = Date.now();
     return this.listingPage<Record<string, unknown>, WorktreePageView>({
-      actor, kind: 'worktrees', digest, pageSize: params.pageSize, cursor: params.cursor,
-      create: async () => {
-        const takenAt = await this.dbNow();
-        const inventory = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
+      actor, kind: 'worktrees', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: async started => {
+        const replyAt = this.replyAt(started);
+        const takenAt = await this.bounded(this.dbNow(), replyAt);
+        const inventory = compactWorktrees(await this.bounded(this.listWorktrees(credential, params.taskId as TaskId | undefined), replyAt), params.includeReleased);
         if (inventory.length > this.snapshots.limits.maxRows) {
           throw tooLarge(`${inventory.length} worktrees are registered, above the ${this.snapshots.limits.maxRows}-row listing limit`);
         }
         return this.snapshots.create({
-          owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt,
+          owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt, startedAt: started,
           bodies: inventory.map(item => JSON.stringify(item)), guidance: 'narrow with taskId',
         });
       },
@@ -1413,8 +1454,10 @@ export class SurrealCompanyCore implements CompanyCore {
       text = row.evidence ?? '';
     } else if (params.field === 'project') {
       const actor = await this.authenticate(credential);
-      if (actor.role !== 'gm' && task.currentEmployee !== actor.employeeId) {
-        throw new CompanyError('forbidden', 'the project environment is read by the task holder or gm');
+      // The holder reads it only while the lease is valid, the same rule as the company block (SYS01 M3).
+      const holds = task.currentEmployee === actor.employeeId && Date.parse(task.leaseExpiresAt ?? '') > Date.now();
+      if (actor.role !== 'gm' && !holds) {
+        throw new CompanyError('forbidden', 'the project environment is read by gm or the holder of a valid task lease');
       }
       const project = await this.taskProject(params.taskId as TaskId);
       if (!project) throw new CompanyError('not_found', 'the task has no project environment');
@@ -1561,9 +1604,32 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
+  /**
+   * The company block as the credential's holder may read it. Projects keep their identity fields for everyone; their environments
+   * (names, URLs and credential aliases with roles) are shown only to gm and to the holder of a valid lease on one of their tasks
+   * (SYS01 M3). The owner's console reads the full block through OwnerDesk.brief, which is unchanged.
+   */
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
-    await this.authorized(credential);
-    return this.owner.brief();
+    const actor = await this.authorized(credential);
+    return this.companyBriefAs(await this.envView(actor));
+  }
+
+  private async companyBriefAs(view: EnvView): Promise<CompanyBrief> {
+    const brief = await this.owner.brief();
+    return { ...brief, projects: brief.projects.map(project => (view.visible(project.id) ? project : withheldEnvs(project))) };
+  }
+
+  /** Which project environments a reader may see: all for gm; otherwise those of the projects of tasks it holds under a valid lease. */
+  private async envView(actor: Principal): Promise<EnvView> {
+    if (actor.role === 'gm') return { key: 'all', visible: () => true };
+    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
+      'SELECT project AS project, goal.project AS goal_project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
+      { employee: actor.employeeId, now: Math.floor(Date.now() / 1000) });
+    const held = new Set((rows ?? []).flatMap(row => {
+      const project = row.project ?? row.goal_project;
+      return project ? [String(project.id)] : [];
+    }));
+    return { key: [...held].sort().join(','), visible: project => held.has(project) };
   }
 
   private async relayActor(credential: Credential, ownerQuote: string): Promise<string> {

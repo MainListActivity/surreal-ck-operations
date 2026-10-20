@@ -48,7 +48,7 @@
 
 | 工具 | 参数 | 旧调用（不带 pageSize、cursor） | 分页调用（带 pageSize 或 cursor） | 权限 |
 |---|---|---|---|---|
-| `get_context` | `scope?`（`tasks` 缺省，或 `company`）、`section?`（仅 `scope: company`，`directions`、`goals`、`projects`）、`taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`（缺省 `false`）、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | 任务：`{ principal, companyIncluded, companyRead, tasks, company? }`，完整或拒绝；`scope: company`：`{ principal, scope, section?, company }`，完整或拒绝 | 任务：`{ principal, companyIncluded, companyRead, tasks, company?, page }`；`scope: company`：`{ principal, scope, section?, parts, page }` | 员工见自己可见的任务；gm 见全部；公司块对所有已认证身份可读 |
+| `get_context` | `scope?`（`tasks` 缺省，或 `company`）、`section?`（仅 `scope: company`，`directions`、`goals`、`projects`）、`taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`（缺省 `false`）、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | 任务：`{ principal, companyIncluded, companyRead, tasks, company? }`，完整或拒绝；`scope: company`：`{ principal, scope, section?, company }`，完整或拒绝 | 任务：`{ principal, companyIncluded, companyRead, tasks, company?, page }`；`scope: company`：`{ principal, scope, section?, parts, page }` | 员工见自己可见的任务；gm 见全部；公司块对所有已认证身份可读，但项目环境（`envs`、凭证别名与角色）仅 gm 与持有该项目有效任务租约的员工可见，其它人得到空 `envs` 与 `envsWithheld: true` |
 | `get_task_history` | `taskId`、`pageSize?`、`cursor?` | 通道为 `{ history }`，MCP 为裸数组（与 `8d03d35` 相同）；均为完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
 | `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 非 gm 须带 taskId（缺省或 null 一律 `forbidden`）；gm 可全局 |
 | `read_task_text` | `taskId`、`field`（`context`、`evidence`、`project`、`dependencies`、`workIntentPaths`、`worktreePaths`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | 无 | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
@@ -59,7 +59,7 @@
 - `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`，并排除调用人自己提交的 `review` 任务（`taskRowsAt` 中的 `NOT (state = 'review' AND submitted_by = $me)`）。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。`since`（`get_context` 与 `get_admin_summary` 同此口径）只接受 ISO 8601 日期（按 UTC 零点）或带时区的时间（`Z` 或 `±hh:mm`），查询前归一为 UTC 的 `toISOString()` 形式。`October 19, 2026`、`2026/10/19`、RFC 2822 日期、无时区的时间与不存在的日期（如 `2026-02-30`）返回 `invalid`，不再误报为可重试的 `temporarily_unavailable`（F3）。
 - `fields` 只能选白名单内的字段，未知字段返回 `invalid`。
 - `includeCompany` 缺省为 `false`（显式 `false` 同义），旧调用与分页调用一致，不随任务答复返回公司块。每个任务答复都带 `companyIncluded`（本答复是否含 `company`）与 `companyRead`（读取公司块的参数 `{"scope":"company","pageSize":25}`）。`includeCompany: true` 只在整包装得下时返回公司块，否则整体拒绝并指路分页。
-- 公司块读取（`scope: company`，AC-A）：不带 `pageSize`、`cursor` 时返回完整块（或 `section` 指定的一节），超预算则 `response_too_large`。带 `pageSize` 或 `cursor` 时返回一页条目段 `parts`：每段是某一条目（`meta`、`directions`、`goals`、`projects` 的一项）的 JSON 文本的一段，不超过 16 KiB，带 `offset`、`totalBytes`、`sha256`（整条目 JSON 的 UTF-8 字节数与 SHA-256）。读取方按 `section` 与 `key` 归组，按 `part` 升序拼接 `json`，校验拼接后的字节数与 `sha256` 后再解析；缺段、重复段或校验不符即拒绝，不得当作较短的条目。逐页续读直到 `page.hasMore` 为 false。游标绑定调用人与查询条件（`section`），他人或其它查询使用返回 `forbidden`，篡改返回 `invalid`，过期返回 `snapshot_gone`。
+- 公司块读取（`scope: company`，AC-A）：不带 `pageSize`、`cursor` 时返回完整块（或 `section` 指定的一节），超预算则 `response_too_large`。带 `pageSize` 或 `cursor` 时返回一页条目段 `parts`：每段是某一条目（`meta`、`directions`、`goals`、`projects` 的一项）的 JSON 文本的一段，不超过 16 KiB，带 `offset`、`totalBytes`、`sha256`（整条目 JSON 的 UTF-8 字节数与 SHA-256）。读取方按 `section` 与 `key` 归组，按 `part` 升序拼接 `json`，校验拼接后的字节数与 `sha256` 后再解析；缺段、重复段或校验不符即拒绝，不得当作较短的条目。逐页续读直到 `page.hasMore` 为 false。游标绑定调用人与查询条件（`section`），他人或其它查询使用返回 `forbidden`，篡改返回 `invalid`，过期返回 `snapshot_gone`。游标还绑定项目环境的可见范围：持有有效租约时取得的快照，租约结束后续读返回 `forbidden`，不再带出环境段。这里的“完整”指调用人受权可见的字段完整：无权者看到的项目身份完整，环境段不返回。
 - `taskId` 读取整条任务，`context` 完整返回，并附 `contextBytes` 与 `contextSha256`。超出预算时拒绝，并给出 `read_task_text` 的读取示例。与 `cursor` 同用会返回 `invalid`。
 - 旧调用的完整集合上限：任务 500 条，历史 1000 条。超过即拒绝为 `response_too_large`，并给出 `pageSize` 与 `cursor` 的重试示例。
 - `page` 字段：`pageSize`、`returned`、`hasMore`、`total`（快照内的总条数）、`snapshotAt`（快照读取时刻的数据库时间）、`budgetBytes`，以及 `hasMore` 为真时的 `nextCursor`。
@@ -105,7 +105,7 @@ null 语义（MCP、sidecar 与核心一致）：
 | `forbidden` | 游标属于他人、其它查询或其它读取类型；角色变化 | 从第一页重新开始 |
 | `unauthorized` | 身份已撤销 | 停止读取 |
 | `snapshot_gone` | 快照过期、被淘汰或已删除；游标已过期 | 不带游标重新开始 |
-| `temporarily_unavailable` | 全库快照容量已满，或同一身份的快照都还在写入且等待超时，或快照未能写入 | 稍后重试（`retryable: true`） |
+| `temporarily_unavailable` | 全库快照容量已满，或同一身份的快照都还在写入且等待超时，或快照构建超过 10 秒截止，或构建连接排队超过 2 秒，或快照未能写入 | 稍后重试（`retryable: true`）；答复最迟在 13 秒内返回（`REPLY_CEILING_MS`），收到后可换更窄的筛选再试 |
 | `response_too_large` | 快照超过 5000 行或 8 MiB；单页信封或单条超过预算 | 收窄筛选后重试 |
 
 快照上限（`DEFAULT_SNAPSHOT_LIMITS`，v25 R4，代码中为固定值，没有运营配置项）：
@@ -116,10 +116,20 @@ null 语义（MCP、sidecar 与核心一致）：
 - 全库最多 64 个快照。预留与已存快照都计入。已满时拒绝新快照（`temporarily_unavailable`），不淘汰任何快照。
 - 全部快照合计最多 64 MiB，同样计入预留。
 - 预留从准入起即计入上限。写入中的快照保留名额，直到提交、释放或超时。
-- 若某身份的快照全部仍在写入，该身份的新请求最多等待 5 秒，等待其中一个提交。超时返回 `temporarily_unavailable`。
+- 若某身份的快照全部仍在写入，该身份的新请求最多等待 5 秒（且不超过本次构建的 10 秒截止），等待其中一个提交。超时返回 `temporarily_unavailable`。
 - 写入中的快照超过 5 分钟仍未完成，视为遗弃，连同其行一并删除。
 - 过期快照与遗弃快照由快照存储的清扫删除。清扫在每次新建快照时执行，也可直接调用存储的 `sweep`。当前没有定时任务调用它，过期快照占用的名额会在下一次新建快照时释放。
 - 释放恰好一次：快照行、表头与名额在同一事务中删除，并只扣减一次。
+
+快照构建的时限与答复上界（SYS01 M1）：
+
+- 构建截止 10 秒（`buildDeadlineMs`），从工具调用开始计时，包括连接、读取、预留、每批写入与提交。截止后不再开始新语句；在途语句最多再等 500 毫秒（`IN_FLIGHT_WAIT_MS`），之后关闭它的连接。
+- 预留的释放在截止后 2 秒内完成（`RELEASE_UNTIL_MS`），在独立的释放通道上执行，不占用构建连接，也不受构建连接上限约束。来不及完成的释放，在 3 秒内（`CLEANUP_BUDGET_MS`）标记为待清扫，下一次清扫释放一次。
+- 调用方在截止后至多等待 3 秒（`CLEANUP_BUDGET_MS`），因此答复最迟在 13 秒内返回（`REPLY_CEILING_MS`）。超时后不再在后台建快照；在途连接在后台关闭，已预留的配额由释放或清扫归还。
+- 构建连接全进程最多 4 个（`MAX_BUILD_CONNECTIONS`）。拿不到连接的构建排队超过 2 秒即返回 `temporarily_unavailable`（`BUILD_QUEUE_MS`）。
+- 读取超过 5 秒仍未返回的，放弃该连接，在新连接上重试一次（`loadHedgeMs`）；重试仍超时则构建失败。
+- 释放与清扫在构建之外各有 3 秒上限（`RELEASE_DEADLINE_MS`），超时即标记待清扫。
+- 受限链路（例如 50 KiB/s）上，超过 10 秒可传输量的大工作集会以 `temporarily_unavailable` 明确拒绝。这是可恢复的拒绝，不是数据损坏。请按答复指引收窄 `state`、`goalId`、`role`、`since`，或用 `fields` 减少每行字节后重试。
 
 准入上限在数据库内强制执行，由单一记录 `query_snapshot_quota:global`（schema 022）计数。每次预留、淘汰与释放都在同一事务中改动计数并递增 `version`，写入前校验版本；提交只把快照状态改为 `ready`，不改计数。因此 MCP 服务与插件 sidecar 两个进程共用同一上限，上限是硬限制，不是软限制。全库已满时，被拒绝的请求不淘汰任何快照。
 

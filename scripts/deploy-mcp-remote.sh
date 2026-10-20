@@ -20,7 +20,8 @@ host=${SCK_REMOTE_HOST:-ubuntu@129.146.179.37}
 deploy_key=${SCK_DEPLOY_KEY:-$HOME/.ssh/sck-deploy-ed25519}
 ssh_opts="-o IdentitiesOnly=yes -o IdentityFile=$deploy_key -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-sck-deploy-%h -o ControlPersist=300"
 commit=${1:-$(git rev-parse HEAD)}
-remote_home=/opt/sck-company
+# SCK_REMOTE_HOME lets tests/ci-gates.test.ts run this script against a sandbox; unset, it is the production path.
+remote_home=${SCK_REMOTE_HOME:-/opt/sck-company}
 port=${SCK_MCP_PORT:-38473}
 public_host=${SCK_MCP_PUBLIC_HOST:-data.maplayer.top}
 bun_version=${SCK_BUN_VERSION:-1.4.2}

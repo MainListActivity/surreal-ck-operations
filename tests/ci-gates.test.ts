@@ -53,6 +53,79 @@ test('no workflow runs on a hosted macOS runner, and the release gate for the sl
 const deploy = join(ROOT, 'scripts/deploy-mcp-remote.sh');
 const deploySha = '0123456789abcdef0123456789abcdef01234567';
 
+// SYS01 AC-B (manager ruling v31, M2): the remote Bun check is run, not only ordered. The real deploy script runs against a sandbox:
+// ssh, scp, sudo and the account tools are stubs; the remote home, the deploy key and the product env are sandbox paths (the key is
+// never read); the ssh stub ends a run at its first payload step, so nothing reaches the switch.
+function runDeploy(sandbox: string, remoteBun: string) {
+  const bin = join(sandbox, 'bin');
+  const home = join(sandbox, 'home');
+  const remote = join(sandbox, 'remote');
+  const log = join(sandbox, 'remote.log');
+  const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout.trim();
+  const stub = (name: string, body: string) => {
+    writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+    chmodSync(join(bin, name), 0o755);
+  };
+  mkdirSync(bin);
+  mkdirSync(join(home, 'gates/comm-slow-pipe'), { recursive: true });
+  writeFileSync(join(home, 'gates/comm-slow-pipe', `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
+  writeFileSync(join(sandbox, 'product.env'), 'SURREAL_ROOT_USER=stub\nSURREAL_ROOT_PASS=stub\n');
+  writeFileSync(join(sandbox, 'deploy.key'), '');
+  const remoteBunPath = join(remote, 'runtime-bun/bin/bun');
+  mkdirSync(join(remote, 'runtime-bun/bin'), { recursive: true });
+  writeFileSync(remoteBunPath, `#!/bin/sh\n[ "$1" = --version ] && echo '${remoteBun}'\nexit 0\n`);
+  chmodSync(remoteBunPath, 0o755);
+  stub('ssh', `while [ "$1" = -o ]; do shift 2; done\nshift\necho "ssh: $*" >> '${log}'\ncase "$*" in\n  *releases/*) echo 'stub: deploy stopped at the payload step' >&2; exit 255 ;;\nesac\nexec sh -c "$*"`);
+  stub('scp', `echo "scp: $*" >> '${log}'`);
+  stub('sudo', 'while [ "$1" = -u ]; do shift 2; done\nexec "$@"');
+  stub('id', 'exit 0');
+  stub('chown', 'exit 0');
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SCK_')));
+  const result = spawnSync('sh', [deploy, sha], {
+    encoding: 'utf8',
+    env: {
+      ...inherited,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      SCK_SERVICE_HOME: home,
+      SCK_PRODUCT_ENV: join(sandbox, 'product.env'),
+      SCK_DEPLOY_KEY: join(sandbox, 'deploy.key'),
+      SCK_REMOTE_HOST: 'deploy-test.invalid',
+      SCK_REMOTE_HOME: remote,
+    },
+  });
+  return { status: result.status, stderr: result.stderr, log: existsSync(log) ? readFileSync(log, 'utf8') : '', remote };
+}
+
+test('the remote Bun check refuses a runtime that is not the gated version, before any payload upload or switch', () => {
+  for (const reported of ['1.3.11', '']) {
+    const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
+    try {
+      const run = runDeploy(sandbox, reported);
+      expect(run.log, `bun '${reported}': the remote check was reached`).toContain('ssh: sudo bash -s');
+      expect(run.status, `bun '${reported}': refused`).not.toBe(0);
+      expect(run.stderr, `bun '${reported}': reason`).toContain('refused: remote bun');
+      expect(run.log, `bun '${reported}': no payload step`).not.toContain('releases/');
+      expect(run.log, `bun '${reported}': no scp`).not.toContain('scp:');
+      expect(existsSync(join(run.remote, 'current')), `bun '${reported}': no switch`).toBe(false);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  }
+}, 20_000);
+
+test('a remote runtime of the gated version passes the check and reaches the payload step, without a switch', () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-bun-'));
+  try {
+    const run = runDeploy(sandbox, '1.4.2');
+    expect(run.stderr, 'the check passed').not.toContain('refused');
+    expect(run.stderr, 'the run stopped at its first payload step').toContain('stub: deploy stopped at the payload step');
+    expect(run.log, 'the payload step was reached').toContain('releases/');
+    expect(existsSync(join(run.remote, 'current')), 'no switch before the stop').toBe(false);
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}, 20_000);
+
 test('the deploy script checks the release gate before any remote step', () => {
   const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
   const gate = lines.findIndex(line => line.startsWith('release_gate_ok "$commit"'));

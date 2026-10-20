@@ -327,6 +327,11 @@ export interface ProjectView {
   runbooks: string[];
   notes?: string;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
+  /**
+   * Set on a company block read by someone who may not see the environments (SYS01 M3): `envs` is then empty, not the project's
+   * list. The owner's console never sets it.
+   */
+  envsWithheld?: true;
 }
 
 export interface CreateDelivery {

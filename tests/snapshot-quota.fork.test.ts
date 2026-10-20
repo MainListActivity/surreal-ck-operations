@@ -10,8 +10,11 @@ import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase, MAX_BUILD_CONNECTIONS } from '../src/database.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import {
-  DEFAULT_SNAPSHOT_LIMITS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation, type SnapshotStoreOptions,
+  CLEANUP_BUDGET_MS, DEFAULT_SNAPSHOT_LIMITS, REPLY_CEILING_MS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation,
+  type SnapshotStoreOptions,
 } from '../src/snapshot-store.ts';
+import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { SurrealCompanyCore } from '../src/core.ts';
 import type { ChildJob } from './snapshot-quota.child.ts';
 
 setDefaultTimeout(60_000);
@@ -73,6 +76,11 @@ const fails = <T>(results: Settled<T>[]): Array<Extract<Settled<T>, { ok: false 
   results.flatMap(result => (result.ok ? [] : [result]));
 const overlapping = (windows: Array<{ start: number; end: number }>): boolean =>
   windows.some((a, i) => windows.slice(i + 1).some(b => a.start <= b.end && b.start <= a.end));
+/** Polls every 20 ms until `check` holds or `ms` has passed. The caller asserts afterwards, so a state that never settles still fails. */
+const settled = async (check: () => boolean, ms: number): Promise<void> => {
+  const until = Date.now() + ms;
+  while (!check() && Date.now() < until) await Bun.sleep(20);
+};
 
 /** Reads one line-prefixed message from a child's stdout; other lines (SDK logs) are skipped. */
 function lineReader(stream: ReadableStream<Uint8Array>) {
@@ -442,12 +450,13 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   expect(writes).toBeGreaterThan(0);
   expect(writes).toBeLessThan(20);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
-  // Nothing starts once the build has given up. The statement in flight finished within the cleanup wait, so its connection was kept.
+  // Nothing starts once the build has given up. The statement in flight finished within IN_FLIGHT_WAIT_MS, so its connection closed idle.
   const atGiveUp = statements.length;
   await Bun.sleep(600);
   expect(statements.length).toBe(atGiveUp);
-  // The build's connection and the release's connection were each closed with nothing in flight.
-  expect(closes).toEqual([false, false]);
+  // The build's connection closed when its write was abandoned at the deadline, so it may still have been busy; the release
+  // opened and closed a connection of its own. The count of closes is what is checked here.
+  expect(closes).toHaveLength(2);
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
   expect(await quotaOf(store)).toEqual(baseline);
 
@@ -458,7 +467,7 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   expect(await quotaOf(store)).toEqual(baseline);
 });
 
-test('(k) a statement still in flight after the cleanup wait closes its connection; the build ends as temporarily_unavailable and releases its room', async () => {
+test('(k) a reserved write still in flight at the deadline is abandoned: its connection closes with it in flight, the build ends as temporarily_unavailable at the deadline, and its room is released', async () => {
   const holder: { db?: Surreal } = {};
   const observed: Array<{ outcome: string }> = [];
   let hold = true;
@@ -489,10 +498,12 @@ test('(k) a statement still in flight after the cleanup wait closes its connecti
   expect(error).toBeInstanceOf(CompanyError);
   expect((error as CompanyError).code).toBe('temporarily_unavailable');
   expect((error as CompanyError).retryable).toBe(true);
-  // The 2-second deadline passes first, then the 2-second cleanup wait, and only then is the connection closed, still busy.
-  expect(elapsed).toBeGreaterThanOrEqual(3_900);
-  expect(elapsed).toBeLessThan(6_000);
-  // The build's own connection closed with its statement still in flight; the release then opened and closed one of its own.
+  // The write is abandoned at the 2-second deadline; the connection closes still busy, and the release (on a connection of its
+  // own) follows at once. The caller is answered within the 3-second cleanup budget, and in practice at the deadline.
+  expect(elapsed).toBeGreaterThanOrEqual(1_900);
+  expect(elapsed).toBeLessThan(2_600);
+  // The build's own connection closed with its write still in flight (the build abandons a statement at its deadline); the
+  // release then opened and closed one of its own.
   expect(closes).toHaveLength(2);
   expect(closes[0]).toBe(true);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', release: 'released' });
@@ -682,6 +693,8 @@ test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a buil
   expect(elapsed).toBeLessThan(3_500);
   const headers = await Promise.all(holding);
   expect(headers.map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
+  // A build frees its slot once its connection has closed, in the background: the caller never waits for that close.
+  await settled(() => db.buildConnectionStats().slotsInUse === 0, 6_000);
   expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, queued: 0 });
   expect(await store.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
 });
@@ -730,10 +743,170 @@ test('(s) a release whose connection opens only after its deadline still marks t
   expect(await plain.census()).toEqual({ listings: 0, rows: 0 });
 });
 
-test('(t) the default limits are the reviewed ones: 5000 rows, 8 MiB per listing, 4 per identity, 64 listings, 64 MiB, 64 KiB batches, a 10 second build deadline, a 5 second hedge, 4 build connections', () => {
+test('(t) the default limits are the reviewed ones: 5000 rows, 8 MiB per listing, 4 per identity, 64 listings, 64 MiB, 64 KiB batches, a 10 second build deadline, a 5 second hedge, 4 build connections, a 3 second cleanup budget and a 13 second reply ceiling', () => {
   expect(DEFAULT_SNAPSHOT_LIMITS).toMatchObject({
     maxRows: 5000, maxBytes: 8 * KB * KB, maxPerOwner: 4, maxListings: 64, maxTotalBytes: 64 * KB * KB,
     batchBytes: 64 * KB, buildDeadlineMs: 10_000, loadHedgeMs: 5_000,
   });
   expect(MAX_BUILD_CONNECTIONS).toBe(4);
+  // Everything a listing caller waits for after its build deadline ends within the cleanup budget, so the reply is bounded.
+  expect(CLEANUP_BUDGET_MS).toBe(3_000);
+  expect(REPLY_CEILING_MS).toBe(13_000);
+});
+
+test('(u) a reserved listing whose commit stalls is cut at the deadline: its room is released, nothing is kept, and the caller is answered at the deadline', async () => {
+  const holder: { db?: Surreal } = {};
+  const observed: Array<{ outcome: string; release: string }> = [];
+  let hold = true;
+  // One entry per connection the build closed: true when a statement was still in flight at that time.
+  const closes: boolean[] = [];
+  let holding = 0;
+  const { db, store } = await fresh({ buildDeadlineMs: 2_000 }, {
+    channel: {
+      open: async () => ({
+        db: throughChannel(holder.db!, async sql => {
+          // Every row is written, then the commit never answers: the listing is reserved and stuck at its last step.
+          if (hold && sql.includes("SET state = 'ready'")) {
+            holding++;
+            await new Promise<never>(() => undefined);
+          }
+        }),
+        close: async () => { closes.push(holding > 0); },
+      }),
+    },
+    observe: stats => observed.push(stats),
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  const started = performance.now();
+  const error = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+    .then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  expect(elapsed).toBeGreaterThanOrEqual(1_900);
+  expect(elapsed).toBeLessThan(2_600);
+  expect(closes[0]).toBe(true);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', release: 'released' });
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+
+  hold = false;
+  const header = await store.create({ owner: 'u-owner', kind: 'context', digest: 'dig-u-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  expect(await store.release(header.id)).toBe('released');
+  expect(await quotaOf(store)).toEqual(baseline);
+});
+
+test('(v) a reserved write that stalls, with its release stuck as well, is answered within the cleanup budget: the listing keeps its room, is marked due, and the next sweep frees it once', async () => {
+  const holder: { db?: Surreal } = {};
+  let stuck = true;
+  const { db, store } = await fresh({ buildDeadlineMs: 2_000 }, {
+    channel: {
+      open: async () => ({
+        db: throughChannel(holder.db!, async sql => {
+          if (!stuck) return;
+          if (sql.includes('INSERT INTO query_snapshot_row')) await new Promise<never>(() => undefined);
+          // The release's delete never answers either; the marking statement still does.
+          if (sql.includes('DELETE query_snapshot WHERE id')) await new Promise<never>(() => undefined);
+        }),
+        close: async () => undefined,
+      }),
+    },
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  const started = performance.now();
+  const error = await store.create({ owner: 'v-owner', kind: 'context', digest: 'dig-v', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+    .then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  // The release runs until RELEASE_UNTIL_MS (2 seconds) past the 2-second deadline; a release still running then is marked and counted pending.
+  expect(elapsed).toBeGreaterThanOrEqual(3_800);
+  expect(elapsed).toBeLessThan(4_600);
+  // The listing still holds its room: its header and its reservation are counted, and it is marked due at once.
+  const held = await quotaOf(store);
+  expect(held.listings).toBe(baseline.listings + 1);
+  expect(held.quotaListings).toBe(baseline.quotaListings + 1);
+  expect(await store.backlog()).toEqual({ due: 1, listings: 1 });
+  // The next sweep frees the listing and its room, exactly once.
+  stuck = false;
+  expect(await store.sweep()).toBe(1);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+  expect(await store.backlog()).toEqual({ due: 0, listings: 0 });
+});
+
+test('(w) a build connection that opens after the build deadline is closed without a statement on it, and the caller is answered at the in-flight wait', async () => {
+  const holder: { db?: Surreal } = {};
+  const statements: string[] = [];
+  const events: string[] = [];
+  let opens = 0;
+  const { db, store } = await fresh({ buildDeadlineMs: 2_000 }, {
+    channel: {
+      open: async () => {
+        const index = ++opens;
+        // The first connection is late: it opens 3 seconds in, after the build's 2-second deadline.
+        if (index === 1) await Bun.sleep(3_000);
+        events.push(`open ${index}`);
+        return {
+          db: throughChannel(holder.db!, async sql => { statements.push(`${index} ${sql.slice(0, 24)}`); }),
+          close: async () => { events.push(`close ${index}`); },
+        };
+      },
+    },
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  const started = performance.now();
+  const error = await store.create({ owner: 'w-owner', kind: 'context', digest: 'dig-w', role: 'gm', takenAt: TAKEN_AT, bodies: ['late'] })
+    .then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  // Answered at the 2-second deadline plus the 0.5-second in-flight wait, long before the connection opens.
+  expect(elapsed).toBeGreaterThanOrEqual(2_400);
+  expect(elapsed).toBeLessThan(2_900);
+  // The late connection opens, is closed at once, and carries nothing; no second connection is opened for the build.
+  await Bun.sleep(1_000);
+  expect(events).toEqual(['open 1', 'close 1']);
+  expect(statements).toEqual([]);
+  expect(opens).toBe(1);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+});
+
+test('(x) a build queued behind saturated build slots is cut at its own deadline, not at the queue wait, and the slots it never took are untouched', async () => {
+  const { db } = await fresh();
+  // As in (q), the row write of each holding build takes 4 seconds, so the slots are still taken when the queued build gives up.
+  const slow = {
+    open: async () => {
+      const link = await db.buildChannel.open();
+      return {
+        db: throughChannel(link.db, async sql => { if (sql.includes('INSERT INTO query_snapshot_row')) await Bun.sleep(4_000); }),
+        close: link.close,
+      };
+    },
+  };
+  const holdingStore = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow });
+  const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
+    holdingStore.create({ owner: `x-${index}`, kind: 'context', digest: `dig-x-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
+  await Bun.sleep(300);
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  // A build with a 1-second deadline waits in the queue for a slot, which the queue would grant only after 2 seconds.
+  const queued = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 1_000 }, { channel: db.buildChannel });
+  const started = performance.now();
+  const error = await queued.create({ owner: 'x-queued', kind: 'context', digest: 'dig-x-queued', role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] })
+    .then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  // Answered at the 1-second deadline plus the 0.5-second in-flight wait for the queued connection.
+  expect(elapsed).toBeGreaterThanOrEqual(1_300);
+  expect(elapsed).toBeLessThan(1_900);
+  expect((await Promise.all(holding)).map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
+  // The queued build's wait ends with the queue (2 seconds) and its entry leaves the queue; no connection is left behind.
+  await Bun.sleep(2_200);
+  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, queued: 0 });
+  expect(await holdingStore.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
 });

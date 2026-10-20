@@ -1505,7 +1505,7 @@ test('a claim with a long project, dependency list and intent paths echoes each 
     expect(JSON.parse(viaSidecar.out)).toMatchObject({ field: 'project', sha256: claim.projectSha256 });
     const refused = await theirs('read_task_text', { taskId: task.id, field: 'project', offset: 0, limit: 16 * 1024 });
     expect(refused.exit).toBe(1);
-    expect(refused.out).toContain('holder or gm');
+    expect(refused.out).toContain('gm or the holder of a valid task lease');
     // A page of this task's history through the sidecar stays inside the budget.
     const history = await mine('get_task_history', { taskId: task.id, pageSize: 5 });
     expect(history.exit).toBe(0);
