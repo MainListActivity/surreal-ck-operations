@@ -98,7 +98,7 @@ export function validateIntent(intent: WorkIntent | undefined): void {
     if (typeof p !== 'string' || isAbsolute(p) || p.length > 300 || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
   }
 }
-const overlap = (a: string, b: string) => {
+export const overlap = (a: string, b: string) => {
   a = a.toLocaleLowerCase('en-US'); b = b.toLocaleLowerCase('en-US');
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 };

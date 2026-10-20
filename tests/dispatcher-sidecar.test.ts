@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type SupervisedTask, type Workforce } from '../src/workforce.ts';
-import type { CompanyCore, TaskView, LeaseProof } from '../src/contracts.ts';
+import type { CompanyCore, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
+import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
 import type { SidecarDeps } from '../plugin/server/sidecar.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
@@ -22,13 +23,16 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
   // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
   const held = new Set<string>(), scopeUnreadable = new Set<string>();
+  // Authorised asset directories per task, and live assets holds of other writers: the registry's own overlap rule decides (B1).
+  const assetPaths = new Map<string, string[]>(), assetHolds: Array<{ paths: string[]; holder: WriteScopeHolder }> = [];
   const authorsOf = new Map<string, string[]>();
   // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
   const unreadable = new Set<string>();
   // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
-  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string } = {}) => {
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
+    if (opts.assets) assetPaths.set(id, opts.assets);
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
       kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
@@ -67,6 +71,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const core = {
     writeScopeOf: async (id: string) => {
       if (scopeUnreadable.has(id)) throw new Error('write scope unreadable');
+      const need = assetPaths.get(id) ?? [];
+      const overlapping = assetHolds.filter(h => h.paths.some(a => need.some(b => overlap(a, b))));
+      if (overlapping.length) return overlapping.map(h => h.holder);
       return held.has(id) ? [{ taskId: 'writer-1', employee: 'employee-7', intent: 'code' }] : [];
     },
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
@@ -117,7 +124,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable, authorsOf, unreadable, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable,
+    holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
+    authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
@@ -514,6 +523,38 @@ describe('R1: a write scope held by another writer is a verdict, never a spawn c
     expect(w.instances).toHaveLength(0);
     expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
     expect(w.notices.get('dispatch-blocked:blind:execute')).toContain('不能判定');
+  });
+  test('an assets scope overlapping another writer waits as write_scope: the holder is named to gm, no spawn, no claim, never a wake failure', async () => {
+    const w = world(); w.addTask('assets-overlap', { assets: ['docs/brand/logo'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const blocked = await d.tick();
+    expect(blocked.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'assets-overlap')!;
+    expect(verdict).toMatchObject({ dispatchable: false, workflowState: 'ready' });
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 asset-w1 · employee-7'] })]);
+    expect(verdict.reasons.some(reason => reason.code === 'wake_failed')).toBe(false);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:assets-overlap:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).toContain('任务 asset-w1 · employee-7');
+    expect(text).not.toContain('派工未能唤醒');
+    w.freeAssets(); w.setNow(1_360);
+    const freed = await d.tick();
+    expect(freed.woke.map(x => x.task)).toContain('assets-overlap');
+    expect(w.notices.has('dispatch-blocked:assets-overlap:execute')).toBe(false);
+  });
+  test('an assets scope on a disjoint directory of the same writer is not blocked: the claim proceeds', async () => {
+    const w = world(); w.addTask('assets-disjoint', { assets: ['docs/press'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const r = await d.tick();
+    expect(r.woke.map(x => x.task)).toContain('assets-disjoint');
+    expect(w.events).toContain('claim:employee-1:assets-disjoint');
+    expect(d.dispatchVerdicts().some(v => v.taskId === 'assets-disjoint')).toBe(false);
   });
 });
 

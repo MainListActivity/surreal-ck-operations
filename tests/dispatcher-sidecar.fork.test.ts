@@ -260,6 +260,12 @@ run('company fork: a bound implementer runs out of quota, the task waits without
     expect(verdict).toMatchObject({ dispatchable: false, feasible: true, eligibleCount: 0 });
     expect(verdict.reasons.map(r => r.code)).toEqual(['implementer_mismatch', 'quota']);
     expect(verdict.reasons.find(r => r.code === 'quota')?.candidates).toEqual([A.id]);
+    // The quota reason carries the recovery time the provider health record holds (ISO 8601), never the concurrency-full text (AC02).
+    const [healthRows] = await w.db.db.query<[Array<{ until: number }>]>('SELECT until FROM provider_health:codex;');
+    const quota = verdict.reasons.find(r => r.code === 'quota')!;
+    expect(quota.until).toBe(new Date(healthRows![0]!.until * 1000).toISOString());
+    expect(quota.text).toContain('恢复时间');
+    expect(quota.text).not.toContain('并发已满');
     expect((await w.wf.insts()).filter(i => i.role === 'engineering')).toHaveLength(1);
     // A fresh episode waits five minutes before it becomes an owner notice; repeated ticks keep one open item.
     expect((await w.tick()).notices).not.toContain(`dispatch-blocked:${task.id}:execute`);
