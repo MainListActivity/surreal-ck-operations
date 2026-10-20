@@ -34,6 +34,20 @@ export interface GlobalBlock {
   text: string;
 }
 
+/** Who may take a recovery action: the manager (gm, with the manage capability) or the owner. */
+export type RecoveryAuthority = 'gm' | 'owner';
+
+/**
+ * One way out of a block. `tool` names the operations tool that performs it (sck call <tool>). `executable` is false when no
+ * tool performs it: the owner or manager acts outside the system and reports back.
+ */
+export interface RecoveryAction {
+  authority: RecoveryAuthority;
+  label: string;
+  tool?: string;
+  executable: boolean;
+}
+
 export interface DispatchReason {
   code: BlockCode;
   text: string;
@@ -41,6 +55,10 @@ export interface DispatchReason {
   owner: 'gm' | 'owner';
   recovery: string;
   nextTrigger: string;
+  /** The source the code was read from, so a reader can tell which fact the conclusion rests on (for example "contribution-audit"). */
+  basis: string;
+  /** Structured recovery actions with their authority; the text in `recovery` says the same in words. */
+  actions: RecoveryAction[];
 }
 
 export interface DispatchVerdict {
@@ -166,6 +184,40 @@ const NEXT: Record<BlockCode, string> = {
   unknown: '状态与审计读取恢复',
 };
 
+/** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
+const BASIS: Record<BlockCode, string> = {
+  paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
+  implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', author_recusal: 'contribution-audit',
+  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
+  credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
+  quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
+  def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
+};
+
+/** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
+const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
+  paused: [{ authority: 'gm', label: '经理解除全局暂停', executable: false }],
+  budget: [{ authority: 'owner', label: '老板充值，或等待额度恢复', executable: false }],
+  resources: [{ authority: 'gm', label: '清理宿主机磁盘或等待水位恢复', executable: false }],
+  max_running: [{ authority: 'gm', label: '等待在办会话结束，或经理调高 max_running', executable: false }],
+  implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
+  implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
+  author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
+  no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
+  session_busy: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
+  held: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
+  assigned: [{ authority: 'gm', label: '下一轮派工自动处理', executable: false }],
+  credential_file: [{ authority: 'gm', label: '等待该实例退役，新实例接任务', executable: false }],
+  track_mismatch: [{ authority: 'gm', label: '经理用 def_ensure 调整编制轨', tool: 'def_ensure', executable: true }],
+  model_slot: [{ authority: 'gm', label: '等待模型槽位刷新，或经理检查订阅', executable: false }],
+  quota: [{ authority: 'owner', label: '老板充值，或等待额度与健康恢复', executable: false }],
+  provider_capacity: [{ authority: 'gm', label: '等待在办任务释放该订阅并发', executable: false }],
+  seat_full: [{ authority: 'gm', label: '经理用 def_ensure 调高 maxInstances 扩编', tool: 'def_ensure', executable: true }],
+  def_disabled: [{ authority: 'gm', label: '经理用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
+  wake_failed: [{ authority: 'gm', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
+  unknown: [{ authority: 'gm', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
+};
+
 const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };
 
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -202,6 +254,8 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
       owner: OWNER[code],
       recovery: RECOVERY[code],
       nextTrigger: NEXT[code],
+      basis: BASIS[code],
+      actions: ACTIONS[code].map(action => ({ ...action })),
     }));
   // Pass-wide gates clear by themselves. A candidate list holding only owner-decision codes never does, and neither does an
   // unknown state: nobody can tell whether it will, so it is material at once.

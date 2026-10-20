@@ -262,6 +262,26 @@ export function contributionTimeline(events: readonly ContributionEvent[], open?
   });
 }
 
+/**
+ * The newest `limit` audit rows of a task, oldest first among them, with the total row count so a reader can see how much was
+ * cut. Same row filter as readAuditTimeline. Roles of the kept rows do not change: a row's phase is inferred from later rows
+ * and the open lease, and the newest rows always include every later row a kept row needs.
+ */
+export async function readAuditTimelineWindow(db: Surreal, taskId: string, limit: number, open?: OpenLease): Promise<{ entries: TimelineEntry[]; total: number }> {
+  const [counted, rows] = await db.query<[Array<{ n: number }>, Array<{ action: string; actor?: unknown; phase?: string | null; at?: unknown; version?: number | null }>]>(
+    `SELECT count() AS n FROM audit WHERE task = $task AND action != 'ops_call' GROUP ALL;
+     SELECT id, action, actor, phase, at, version FROM audit WHERE task = $task AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $limit;`,
+    { task: new RecordId('task', taskId), limit });
+  const events: ContributionEvent[] = (rows ?? []).reverse().map(row => ({
+    action: row.action,
+    actor: employeeOf(row.actor),
+    phase: row.phase === 'execute' || row.phase === 'review' ? row.phase : undefined,
+    at: isoOf(row.at),
+    version: typeof row.version === 'number' ? row.version : undefined,
+  }));
+  return { entries: contributionTimeline(events, open), total: counted?.[0]?.n ?? events.length };
+}
+
 /** Read of a task's full audit stream for the timeline (every action except routine ops calls). */
 export async function readAuditTimeline(db: Surreal, taskId: string, limit = 300, open?: OpenLease): Promise<TimelineEntry[]> {
   const [rows] = await db.query<[Array<{ action: string; actor?: unknown; phase?: string | null; at?: unknown; version?: number | null }>]>(

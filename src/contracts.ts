@@ -308,13 +308,21 @@ export interface OutboxEvent {
 export interface ContributorDryRunView {
   readOnly: true;
   checkedAt: string;
+  /** UTF-8 JSON bytes the whole answer is held to (SYS-DISP, SYS01 budget). */
+  budgetBytes: number;
+  /** True when at least one task's timeline was cut to fit `budgetBytes`; the cut is marked per task. */
+  truncated: boolean;
   tasks: Array<{
     taskId: string; found: boolean; title?: string; state?: TaskState; version?: number;
     executorRole?: string; reviewerRole?: string; currentEmployee?: string; lastSubmitter?: string;
     status?: 'bound' | 'proposal' | 'manager_decision' | 'fresh'; implementer?: string; suggestedImplementer?: string;
     authors?: string[]; reviewers?: string[]; excluded?: string[];
     unknown?: Array<{ actor: string; action: string; at?: string; reason: string }>; note?: string;
+    /** The newest rows that fit, oldest first. `timelineTotal` counts every row of the task; `timelineShown` is how many are here. */
     timeline?: Array<{ at: string; version?: number; actor?: string; action: string; phase?: string; phaseSource?: string; role: string }>;
+    timelineTotal?: number;
+    timelineShown?: number;
+    timelineTruncated?: boolean;
   }>;
 }
 

@@ -134,3 +134,31 @@ test('an author never reviews its own work, even while a reviewer holds the leas
   await expect(core.claim(tokens['eng-a'], task.id)).rejects.toMatchObject({ code: 'self_review' });
   expect((await core.getTask(tokens.gm, task.id)).currentEmployee).toBeUndefined();
 });
+
+test('dry-run answer is bounded (R3): 20 tasks with 200 audit rows each stay within 24 KiB, keep the newest rows, and mark every cut', async () => {
+  const ids: string[] = [];
+  for (let n = 0; n < 20; n++) ids.push((await newTask(`SYS-DISP dry-run bound ${n}`)).id);
+  // Synthetic non-contribution rows: they fill the timeline without changing any authorship fact.
+  for (const taskId of ids) {
+    await database.db.query(`FOR $i IN 0..200 { CREATE audit CONTENT { task: $task, actor: 'system:fixture', action: 'fixture_note', evidence: $evidence, version: $i, at: time::now() }; };`,
+      { task: new RecordId('task', taskId), evidence: 'synthetic timeline row for the dry-run bound' });
+  }
+  const view = await core.contributorDryRun!(tokens.gm, { taskIds: ids });
+  const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8');
+  expect(view.budgetBytes).toBe(24 * 1024);
+  expect(bytes).toBeLessThanOrEqual(24 * 1024);
+  expect(view.truncated).toBe(true);
+  for (const row of view.tasks) {
+    expect(row.found).toBe(true);
+    expect(row.timelineTotal).toBeGreaterThan(200);
+    expect(row.timelineShown).toBe(row.timeline!.length);
+    expect(row.timelineTruncated).toBe(true);
+    expect(row.timeline!.length).toBeLessThan(row.timelineTotal!);
+  }
+  // A task with few rows is answered whole and not marked.
+  const small = await newTask('SYS-DISP dry-run small');
+  const whole = await core.contributorDryRun!(tokens.gm, { taskIds: [small.id] });
+  expect(whole.truncated).toBe(false);
+  expect(whole.tasks[0]!.timelineTruncated).toBe(false);
+  expect(whole.tasks[0]!.timelineShown).toBe(whole.tasks[0]!.timelineTotal);
+});

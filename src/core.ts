@@ -11,7 +11,7 @@ import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
-import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimeline, readContributionView, type ContributionView } from './contributors.ts';
+import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -36,6 +36,11 @@ const HISTORY_EVIDENCE_CHARS = 6000;
 const OPS_EVIDENCE_CHARS = 600;
 const LIST_CONTEXT_CHARS = 1200;
 const LIST_TASKS_LIMIT = 500;
+/** A contributor dry-run answer is held to this many UTF-8 JSON bytes (24 KiB). The MCP result carries the JSON both as text and as
+ *  structuredContent in this lane, so twice this figure stays inside the 48 KiB response budget (SYS01). */
+const DRY_RUN_BYTE_BUDGET = 24 * 1024;
+/** Newest audit rows read per task for the dry-run. Rows beyond what fits the budget are cut and marked (timelineTotal). */
+const DRY_RUN_TIMELINE_ROWS = 200;
 export const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
 export const id = (table: string, value: string) => new RecordId(table, value);
 
@@ -945,23 +950,40 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!Array.isArray(input.taskIds) || input.taskIds.length === 0 || input.taskIds.length > 20) {
       throw new CompanyError('invalid', 'taskIds must hold 1 to 20 task ids');
     }
-    const tasks: ContributorDryRunView['tasks'] = [];
+    const rows: ContributorDryRunView['tasks'] = [];
     for (const taskId of input.taskIds) {
       requireText(taskId, 'taskId', 1, 200);
       const row = await this.db.select<TaskRow>(id('task', taskId));
       if (!row) {
-        tasks.push({ taskId, found: false });
+        rows.push({ taskId, found: false });
         continue;
       }
       const { facts, version } = await readContributionView(this.db, taskId);
-      tasks.push({
+      const window = await readAuditTimelineWindow(this.db, taskId, DRY_RUN_TIMELINE_ROWS, openLeaseOf(row.current_employee, row.state));
+      rows.push({
         found: true, title: row.title, state: row.state, version, executorRole: row.executor_role,
         reviewerRole: row.reviewer_role, currentEmployee: row.current_employee, lastSubmitter: row.submitted_by,
         ...proposeImplementer(taskId, facts, row.implementer ?? undefined),
-        timeline: await readAuditTimeline(this.db, taskId, 200, openLeaseOf(row.current_employee, row.state)),
+        timeline: window.entries, timelineTotal: window.total,
       });
     }
-    return { readOnly: true, checkedAt: new Date().toISOString(), tasks };
+    // The whole answer is held to DRY_RUN_BYTE_BUDGET: every task keeps its newest rows, and the number kept halves until the JSON fits.
+    const answer = (keep: number): ContributorDryRunView => {
+      const tasks = rows.map(task => {
+        if (!task.timeline) return { ...task };
+        const shown = Math.min(keep, task.timeline.length);
+        return { ...task, timeline: task.timeline.slice(task.timeline.length - shown), timelineShown: shown,
+          timelineTruncated: shown < (task.timelineTotal ?? shown) };
+      });
+      return { readOnly: true, checkedAt: new Date().toISOString(), budgetBytes: DRY_RUN_BYTE_BUDGET,
+        truncated: tasks.some(task => task.timelineTruncated === true), tasks };
+    };
+    let keep = DRY_RUN_TIMELINE_ROWS;
+    for (;;) {
+      const view = answer(keep);
+      if (keep === 0 || Buffer.byteLength(JSON.stringify(view), 'utf8') <= DRY_RUN_BYTE_BUDGET) return view;
+      keep = Math.floor(keep / 2);
+    }
   }
 
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
@@ -1702,7 +1724,8 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /**
    * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
-   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase. One compare-and-set
+   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
+   * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
    * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
    * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
    * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
@@ -1744,7 +1767,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
       IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
       IF $t.version != $seen { THROW 'implementer takeover moved: contribution history changed' };
-      IF $t.state NOT IN ['ready', 'doing', 'blocked'] { THROW 'implementer takeover moved: task is not in execute phase' };
+      IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
       LET $to = SELECT * FROM ONLY $target;
       IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
       LET $to_tracks = $to.def.tracks ?? [];

@@ -325,9 +325,20 @@ export class OwnerDesk {
     return !existing || Boolean(existing.resolved_at);
   }
 
-  async resolveNotice(key: string): Promise<void> {
-    await this.db.query('UPDATE $record SET resolved_at = time::now() WHERE resolved_at = NONE;',
-      { record: id('owner_notice', HASH(key).slice(0, 24)) });
+  /**
+   * Ends an open notice. With `audit`, the end is written to the task's audit stream in the same transaction, and only when
+   * this call actually closed the notice, so repeated ends (ticks, restarts) write nothing further (SYS-DISP AC03).
+   */
+  async resolveNotice(key: string, audit?: { task: string; evidence: string }): Promise<void> {
+    const record = id('owner_notice', HASH(key).slice(0, 24));
+    if (!audit) {
+      await this.db.query('UPDATE $record SET resolved_at = time::now() WHERE resolved_at = NONE;', { record });
+      return;
+    }
+    await this.db.query(`BEGIN TRANSACTION;
+      LET $closed = (UPDATE $record SET resolved_at = time::now() WHERE resolved_at = NONE RETURN AFTER);
+      IF array::len($closed) > 0 { CREATE audit CONTENT { task: $task, actor: 'system:dispatcher', action: 'dispatch_unblocked', evidence: $evidence, at: time::now() } };
+      COMMIT TRANSACTION;`, { record, task: id('task', audit.task), evidence: audit.evidence });
   }
 
   async openNotices(): Promise<OwnerNotice[]> {

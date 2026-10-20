@@ -479,7 +479,7 @@ export class Dispatcher {
     const persisted = task.dispatchBlockedPhase === phase;
     if (!had && !persisted) return;
     if (persisted) await this.deps.workforce.setDispatchBlock(task.id, undefined);
-    await this.deps.owner.resolveNotice(`dispatch-blocked:${key}`);
+    await this.deps.owner.resolveNotice(`dispatch-blocked:${key}`, { task: task.id, evidence: `dispatch-blocked ${phase} episode ended: dispatched` });
   }
 
   /**
@@ -500,7 +500,7 @@ export class Dispatcher {
     for (const [key, { taskId, phase, persisted }] of ended) {
       this.verdicts.delete(key);
       if (persisted) await this.deps.workforce.setDispatchBlock(taskId, undefined);
-      await this.deps.owner.resolveNotice(`dispatch-blocked:${key}`);
+      await this.deps.owner.resolveNotice(`dispatch-blocked:${key}`, { task: taskId, evidence: `dispatch-blocked ${phase} episode ended: work left the queue` });
     }
   }
 

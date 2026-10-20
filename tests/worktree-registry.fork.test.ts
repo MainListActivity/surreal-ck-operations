@@ -16,6 +16,10 @@ import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { readJsonFile } from '../src/comm.ts';
 
 setDefaultTimeout(30000);
+// Forces a task's lease past its end. Lease stamps are whole seconds (time::unix), so a short real lease is not a dependable
+// clock: a 1 s lease can already be over when the next step runs, or still open after a short sleep (WT02 intermittent failure).
+const lapseLease = (taskId: string) =>
+  db.db.query('UPDATE ONLY $task SET lease_expires_at = time::unix(time::now()) - 1;', { task: new RecordId('task', taskId) });
 const run = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
 let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, gm: string;
 let count = 0;
@@ -283,7 +287,7 @@ run('managed allocator keeps expired-lease takeover semantics and preserves scen
   const path = repo(), core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path } });
   const eng = await employee('engineering'), next = await employee('engineering');
   const t = await task(core, 'engineering'), a = await core.claim(eng, t.id);
-  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await Bun.sleep(1100);
+  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await lapseLease(t.id);
   const recovery = coreFor(path); await handOver(recovery, t.id, next, 'expired-lease');
   const b = await recovery.claim(next, t.id); expect(b.fence).toBeGreaterThan(a.fence); expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
   expect(readFileSync(join(b.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('expired dirty scene');
@@ -349,7 +353,7 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
   const t = await task(core, 'engineering');
   const a = await core.claim(eng, t.id);
   writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'recovery scene');
-  await Bun.sleep(1100);
+  await lapseLease(t.id);
   const invAfterExpire = await core.listWorktrees(gm);
   expect(invAfterExpire.find(w => w.id === a.worktree!.id)!.references.some(r => r.state === 'recovery' || r.state === 'active')).toBe(true);
   expect(existsSync(a.worktree!.worktreePath)).toBe(true);

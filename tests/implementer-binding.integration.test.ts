@@ -152,3 +152,23 @@ test('AC06 implementer takeover refusals: wrong phase, wrong target, same implem
     expectedVersion: version, reason: '替代复核人不能是作者', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
   expect(await task(t.id)).toMatchObject({ state: 'ready', implementer: 't-eng-a' });
 });
+
+test('AC04 (R4): a block raised in review does not open the execute-phase takeover; a block raised in execute does', async () => {
+  // Blocked in review: the phase that resumes is review, so a manager's takeover of code is refused and the bound implementer stays.
+  const inReview = await newTask('AC04 复核阶段阻塞不可接手');
+  await deliver(tokens['eng-a'], inReview.id);
+  const reviewClaim = await core.claim(tokens['eng-b'], inReview.id);
+  await core.block(tokens['eng-b'], proofOf(reviewClaim), 'gm', { text: 'SYNTHETIC review-phase block for the AC04 takeover refusal.', idempotencyKey: key() });
+  const blocked = await task(inReview.id);
+  expect(blocked).toMatchObject({ state: 'blocked', implementer: 't-eng-a' });
+  await expect(core.implementerTakeover(tokens.gm, { taskId: inReview.id, toEmployee: 't-eng-c', expectedVersion: blocked.version,
+    reason: 'SYNTHETIC takeover of a review-phase block, must be refused', idempotencyKey: key() })).rejects.toMatchObject({ code: 'conflict' });
+  expect(await task(inReview.id)).toMatchObject({ state: 'blocked', implementer: 't-eng-a', version: blocked.version });
+  // Blocked in execute: the phase that resumes is execute, so the same takeover is allowed.
+  const inExecute = await newTask('AC04 执行阶段阻塞可接手');
+  const first = await core.claim(tokens['eng-a'], inExecute.id);
+  await core.block(tokens['eng-a'], proofOf(first), 'gm', { text: 'SYNTHETIC execute-phase block for the AC04 takeover allowance.', idempotencyKey: key() });
+  const taken = await core.implementerTakeover(tokens.gm, { taskId: inExecute.id, toEmployee: 't-eng-b', expectedVersion: (await task(inExecute.id)).version,
+    reason: 'SYNTHETIC takeover of an execute-phase block, allowed', idempotencyKey: key() });
+  expect(taken).toMatchObject({ implementer: 't-eng-b', state: 'blocked' });
+});
