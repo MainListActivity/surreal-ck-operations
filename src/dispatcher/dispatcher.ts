@@ -16,6 +16,7 @@ import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
+import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
 import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
@@ -134,6 +135,11 @@ export interface StaffingInput {
    * A fresh task (no implementer, not ambiguous) has no gate; the first claimant becomes the implementer.
    */
   implementer?: ExecuteGate;
+  /**
+   * Independence scope of this task at this stage (SYS-DISP IR02): the employees and definitions it excludes, or unverifiable when the
+   * source history cannot be read. Excluded candidates are never eligible, whatever their continuity, weight or fallback.
+   */
+  independence?: IndependenceScope;
   defs: EmployeeDef[];
   insts: EmployeeInst[];
   states: ReadonlyMap<string, InstState>;
@@ -201,6 +207,15 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (p.implementer.implementer && id !== p.implementer.implementer) return ['implementer_mismatch', BLOCK_TEXT.implementer_mismatch];
     return undefined;
   };
+  // Independence (SYS-DISP IR02): an excluded employee or a sibling of an excluded definition never takes the task, and a scope that
+  // cannot be read blocks every candidate as unknown. Same-source is read from registered employee and definition only.
+  const independenceBlock = (employee: string | undefined, def: string | undefined): Block | undefined => {
+    const scope = p.independence;
+    if (!scope) return undefined;
+    if (scope.kind === 'unverifiable') return ['unknown', BLOCK_TEXT.unknown];
+    const hit = independenceHit(scope.index, employee, def);
+    return hit ? ['independence_conflict', independenceText(hit)] : undefined;
+  };
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
     trackOkFor(p.role as Role, task, tracks);
@@ -212,6 +227,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     // Recusal and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
       gate(inst.id) ??
+      independenceBlock(inst.id, inst.def) ??
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
@@ -232,6 +248,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
       gate(undefined) ??
+      independenceBlock(undefined, def.id) ??
       (p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
@@ -286,17 +303,19 @@ export interface ReviewStaffingPreview {
 /** Task-scoped estimate; the public role/home pool stays independent of review recusal. */
 export async function reviewStaffingPreviews(
   tasks: readonly SupervisedTask[],
-  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'recusal'>,
-  workforce: Pick<Workforce, 'contributors'>,
+  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'recusal' | 'independence'>,
+  workforce: Pick<Workforce, 'contributors' | 'independenceScope'>,
 ): Promise<ReviewStaffingPreview[]> {
   const previews: ReviewStaffingPreview[] = [];
   for (const task of tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)) {
     const recusal = await readReviewRecusal(workforce, task);
     const home = task.repoPath ?? base.opsRepo;
+    const independence = task.independence ? await workforce.independenceScope(task.independence, 'review') : undefined;
     const entries = staffingPool({ ...base, role: task.reviewerRole, home, task,
-      excludeSubmitter: true, recusal });
+      excludeSubmitter: true, recusal, independence });
     previews.push({ taskId: task.id, title: task.title, purpose: 'review', role: task.reviewerRole, home,
-      status: recusal === undefined ? 'history_unavailable' : entries.some(entry => entry.eligible) ? 'ready' : 'blocked',
+      status: recusal === undefined || independence?.kind === 'unverifiable' ? 'history_unavailable'
+        : entries.some(entry => entry.eligible) ? 'ready' : 'blocked',
       entries: recusal === undefined
         ? entries.map(e => ({ ...e, eligible: false, share: 0, code: 'unknown' as const, reason: BLOCK_TEXT.unknown }))
         : entries });
@@ -438,7 +457,7 @@ export interface TickReport {
  * owner-facing answers are measured against the same function the tick uses.
  */
 export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar: boolean; log?: (message: string) => void },
-  verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince'>, at = Date.now()): Promise<DispatchSnapshot> {
+  verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince' | 'independenceScope'>, at = Date.now()): Promise<DispatchSnapshot> {
   const busyBy = new Map<string, number>();
   for (const inst of p.insts) {
     if (p.states.get(inst.id) !== 'busy') continue;
@@ -833,6 +852,13 @@ export class Dispatcher {
       ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
+    // Independence scopes (SYS-DISP IR02): each work item whose policy names its stage reads its exclusion once per pass, from the same
+    // audit stream the claim gate reads. An unreadable source blocks that task's pool as unknown; it is never read as clear.
+    const independence = new Map<string, IndependenceScope>();
+    for (const item of work) {
+      const scope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, item.purpose) : undefined;
+      if (scope) independence.set(`${item.purpose}:${item.task.id}`, scope);
+    }
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
@@ -911,7 +937,8 @@ export class Dispatcher {
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned, reserved,
-        implementer: executeGateFor(executeGates, role, task, excludeSubmitter) });
+        implementer: executeGateFor(executeGates, role, task, excludeSubmitter),
+        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined });
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
       recusal?: ReviewRecusal, reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, excludeSubmitter, recusal, reserved).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
@@ -1028,8 +1055,10 @@ export class Dispatcher {
           await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
           continue;
         }
+        // The future review of this task is judged with its review-stage independence too, so capacity is never reserved for a reviewer the policy excludes.
+        const reviewScope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, 'review') : undefined;
         const reviewPlan = (recusal: ReviewRecusal, pool: EmployeeInst[] = insts) => reviewPlanOf(staffingPool({ ...poolBase,
-          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal }));
+          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal, independence: reviewScope }));
         const plan = reviewPlan(authors);
         if (!plan.feasible) {
           const blocked = poolFor(item.role, home, item.task).map(entry => entry.eligible

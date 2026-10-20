@@ -3,11 +3,12 @@ import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
+import type { IndependencePolicy, IndependenceStage, Principal, RetirementKind, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 import { readContributors, type ContributionFacts } from './contributors.ts';
+import { readIndependenceScope, type IndependenceScope } from './independence.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -167,6 +168,8 @@ export interface SupervisedTask {
   previousEmployee?: string;
   /** Explicit code implementer; derived implementers come from contributors (see contributors.ts). */
   implementer?: string;
+  /** Independence policy (SYS-DISP IR01): the dispatcher reads its exclusion per pass (IR02). */
+  independence?: IndependencePolicy;
   /** Open dispatch-blocked episode: the phase it blocks and when it began (unix seconds). */
   dispatchBlockedPhase?: string;
   dispatchBlockedSince?: number;
@@ -210,7 +213,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
   return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
     discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-    previousEmployee: row.previous_employee ?? undefined, implementer: row.implementer ?? undefined,
+    previousEmployee: row.previous_employee ?? undefined, implementer: row.implementer ?? undefined, independence: v.independence,
     dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
@@ -426,6 +429,14 @@ export class Workforce {
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
   async evalState(taskId: TaskId): Promise<EvalState> {
     return collectEvalState(this.db, taskId);
+  }
+
+  /**
+   * The exclusion a task's independence policy names at one stage (SYS-DISP IR02): undefined when the policy does not name the stage.
+   * An unreadable source comes back as unverifiable, so the pool blocks it rather than reading it as clear.
+   */
+  async independenceScope(policy: IndependencePolicy | undefined, stage: IndependenceStage): Promise<IndependenceScope | undefined> {
+    return readIndependenceScope(this.db, policy, stage);
   }
 
   /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */

@@ -74,6 +74,8 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
   implementer?: EmployeeId;
+  /** Independence policy (SYS-DISP IR01): contributors of the source tasks, and named employees, may not take or decide this task. */
+  independence?: IndependencePolicy;
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -203,6 +205,44 @@ export interface RetireTask {
 }
 
 /** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
+/** The phase a policy applies to: taking and writing code (execute), or deciding a review. */
+export type IndependenceStage = 'execute' | 'review';
+
+/**
+ * Which contributors of a source task count. `execute_handlers`: every execute-phase handler of the source (its authors, including a
+ * claim that never submitted, and its implementer). `all_handlers`: those plus every reviewer of the source.
+ */
+export type IndependenceMode = 'execute_handlers' | 'all_handlers';
+
+/** Who may not take or decide a task: the contributors of its source tasks and the employees a manager names (SYS-DISP IR01). */
+export interface IndependencePolicy {
+  /** Format version. Only 1 is understood; any other value fails closed. */
+  schema: 1;
+  /** Starts at 1 and rises by one with every accepted change. */
+  revision: number;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  /** Employees named explicitly (for example a code author or QA). Their registered definition's siblings are excluded too. */
+  excluded: EmployeeId[];
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
+export interface SetIndependence {
+  taskId: TaskId;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  excluded?: EmployeeId[];
+  reason: string;
+  /** Compare-and-set: refuse when the task version has moved. */
+  expectedVersion: number;
+  idempotencyKey: string;
+}
+
 export interface ImplementerTakeover {
   taskId: TaskId;
   /** Takes over code work; must hold the task's execute role and capability. */
@@ -366,6 +406,8 @@ export interface CompanyCore {
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
+  setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
   /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;

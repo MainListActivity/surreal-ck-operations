@@ -32,6 +32,8 @@ const BASE_TOOLS = [
   "goal_acceptance_preview", "goal_acceptance_repair",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
+  // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
+  "independence_set",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
 ];
@@ -615,6 +617,9 @@ export class SidecarPool {
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
+      case "independence_set": return core.setIndependence
+        ? core.setIndependence(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose independence_set"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

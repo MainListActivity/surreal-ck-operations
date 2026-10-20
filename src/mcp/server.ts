@@ -45,10 +45,13 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
+  // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
+  const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
+    ? error.details : undefined;
   return {
     isError: true,
     content: [{ type: 'text' as const, text: code }],
-    structuredContent: { ok: false, code, retryable },
+    structuredContent: { ok: false, code, retryable, ...(details ? { details } : {}) },
   };
 }
 
@@ -324,6 +327,22 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.implementerTakeover
     ? core.implementerTakeover(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('independence_set', {
+    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers) and the named employees, and same-definition siblings of either, may not take the task (execute) or decide it (review). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),
+      sources: z.array(z.string().min(1).max(200)).max(20),
+      mode: z.enum(['execute_handlers', 'all_handlers']),
+      excluded: z.array(z.string().min(1).max(200)).max(100).optional(),
+      reason: z.string().min(1).max(2048),
+      expectedVersion: z.number().int().positive(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIndependence
+    ? core.setIndependence(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_project_update', {

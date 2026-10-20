@@ -1,5 +1,6 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
+import type { IndependencePolicy } from './contracts.ts';
 
 /**
  * Who has touched an engineering task's code, derived from the task's audit stream.
@@ -168,10 +169,16 @@ export function openLeaseOf(holder: string | null | undefined, state: string | n
   return { actor: holder, phase: state === 'review' ? 'review' : 'execute' };
 }
 
-/** The facts and the task version they were read at. `version` is undefined when the task does not exist. */
+/**
+ * The facts, the task version they were read at, the task state and its independence policy. All four are read in one transaction,
+ * so a policy change (which bumps the version) is never seen without the version it moved to. `version` is undefined when the task
+ * does not exist.
+ */
 export interface ContributionView {
   facts: ContributionFacts;
   version?: number;
+  state?: string;
+  policy?: IndependencePolicy;
 }
 
 interface ContributionRead {
@@ -179,6 +186,7 @@ interface ContributionRead {
   version?: number | null;
   state?: string | null;
   holder?: string | null;
+  policy?: IndependencePolicy | null;
   rows?: Array<{ action: string; actor?: unknown; phase?: string | null; at?: unknown }> | null;
 }
 
@@ -189,9 +197,9 @@ interface ContributionRead {
  */
 export async function readContributionView(db: Surreal, taskId: string): Promise<ContributionView> {
   const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
-    LET $row = SELECT implementer, version, state, current_employee AS holder FROM ONLY $task;
+    LET $row = SELECT implementer, version, state, current_employee AS holder, independence AS policy FROM ONLY $task;
     LET $rows = SELECT action, actor, phase, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at ASC;
-    RETURN { read: { implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, rows: $rows } };
+    RETURN { read: { implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, policy: $row.policy, rows: $rows } };
     COMMIT TRANSACTION;`,
   { task: new RecordId('task', taskId), actions: [...CONTRIBUTION_ACTIONS] }).responses();
   const found = responses.every(response => response.success)
@@ -210,6 +218,8 @@ export async function readContributionView(db: Surreal, taskId: string): Promise
   return {
     facts: deriveContributors(events, read.implementer ?? undefined, open),
     version: typeof read.version === 'number' ? read.version : undefined,
+    state: read.state ?? undefined,
+    policy: read.policy ?? undefined,
   };
 }
 

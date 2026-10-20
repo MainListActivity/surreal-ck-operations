@@ -140,6 +140,16 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
 
+## 独立性策略（independence_set）
+
+经理（manage 能力）可为任务写入独立性策略（SYS-DISP IR01–IR03）：来源任务的经手人，以及点名的员工（及其同一登记编制的员工），不能接手（`execute`）或裁决（`review`）该任务。策略与任务版本一起存放，无策略的旧任务行为不变。
+
+- 字段：`stages`（`execute` / `review`，非空）；`sources`（来源任务 ID，原始条数至多 20）；`mode`（`execute_handlers`：来源的全部执行阶段经手人，含只领取未提交者与实现负责人；`all_handlers`：再加上来源的复核人）；`excluded`（点名回避的员工 ID，原始条数至多 100）；`reason`（非空，至多 2048 UTF-8 字节）。序列化后整个策略不超过 8 KiB。
+- 写入：`expectedVersion` 比较并交换；任务有未到期租约时拒绝，不静默改策略；同一 `idempotencyKey` 且载荷相同则回放原结果，载荷不同则冲突。自引用、来源不存在、未知员工、非法参数均拒绝。非 manage 能力的调用返回 `forbidden`。
+- 同源判定只用已登记的员工 ID 与员工定义（`employee.def`）。不从 agent、会话或工作区推断身份，也不识别未登记的身份关联。
+- 执行：调度每轮按来源的最新贡献历史过滤候选，包括 `previousEmployee`、Jev 选择与补位，因此被排除者不会因为连续性或优先级重新入选。领取、提交与裁决在事务内带来源版本守卫：来源在读取后有变动即拒绝并重读。来源不可读时失败关闭：不授租约，候选标记为 `unknown`，恢复后自动重判。
+- 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_def`）、角色与审计引用（不含凭证）。
+
 ## 运行参数
 
 `company_meta:config`（`pnpm run admin config <key> <json>` 或直接写库）：

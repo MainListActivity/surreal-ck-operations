@@ -24,7 +24,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
-  | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'no_candidate'
+  | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'independence_conflict' | 'no_candidate'
   | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity';
 
@@ -114,7 +114,7 @@ export interface EvaluateInput {
 
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
-  'author_recusal', 'implementer_mismatch', 'implementer_unresolved', 'track_mismatch',
+  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'track_mismatch',
   'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
 ]);
 
@@ -127,6 +127,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
   implementer_unresolved: '多个作者且无实现负责人，需经理指定',
   author_recusal: '本任务作者（写过或提交过）不能复核',
+  independence_conflict: '来源任务的经手人或经理指定回避的员工不能接手或复核，且暂无其它合格候选',
   no_candidate: '该岗位与仓库下没有任何编制或员工',
   session_busy: '会话占用中或异常',
   held: '持有在办任务',
@@ -145,7 +146,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 
 const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
   paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
-  implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', no_candidate: 'gm',
+  implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',
   session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
@@ -159,6 +160,7 @@ const RECOVERY: Record<BlockCode, string> = {
   implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
   implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
   author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
+  independence_conflict: '经理增补独立候选人选（编制扩容或新员工），来源经手人不能接手或复核',
   no_candidate: '经理为该岗位或仓库增加编制或员工',
   session_busy: '等待在办任务完成或租约到期',
   held: '等待在办任务完成或租约到期',
@@ -183,6 +185,7 @@ const NEXT: Record<BlockCode, string> = {
   implementer_mismatch: '绑定实现负责人可派工，或经理接手',
   implementer_unresolved: '经理记录实现负责人',
   author_recusal: '出现独立候选人选',
+  independence_conflict: '出现独立于来源任务的合格候选人选',
   no_candidate: '新增编制或员工',
   session_busy: '候选会话空闲',
   held: '在办租约结束或任务完成',
@@ -203,6 +206,7 @@ const NEXT: Record<BlockCode, string> = {
 const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
   implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', author_recusal: 'contribution-audit',
+  independence_conflict: 'contribution-audit',
   no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
@@ -219,6 +223,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
   implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
   author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
+  independence_conflict: [{ authority: 'gm', label: '经理用 def_ensure 增补独立编制，或新增员工（来源经手人不能接手）', tool: 'def_ensure', executable: true }],
   no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
   session_busy: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
   held: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],

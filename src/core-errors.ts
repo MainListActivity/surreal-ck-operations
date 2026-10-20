@@ -5,6 +5,8 @@ export class CompanyError extends Error {
       'not_configured' | 'payment_approval_required' | 'upstream_error' | 'login_failed' | 'limit_reached',
     message: string,
     readonly retryable = false,
+    /** Structured reason a caller can act on (independence conflicts name the task, source and employee). Never credentials. */
+    readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = 'CompanyError';

@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -12,6 +12,7 @@ import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
+import { normalizeIndependence, readEmployeeDefs, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -207,10 +208,22 @@ interface TaskRow {
   superseded_by?: RecordId;
   lineage?: RecordId;
   revision_no?: number;
+  /** Independence policy (schema 023, SYS-DISP IR01): written only by setIndependence, read with the contribution facts. */
+  independence?: IndependenceRow | null;
+  /** Version this task was last checked against as a source of a dependent's gated write (schema 023). */
+  independence_guard?: number | null;
 }
+
+/** A stored policy: the API shape, with `setAt` as the driver returns it (a Date, or a string in tests). */
+type IndependenceRow = Omit<IndependencePolicy, 'setAt'> & { setAt: Date | string };
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export type { TaskRow };
+
+/** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
+function policyView(policy: IndependenceRow): IndependencePolicy {
+  return { ...policy, setAt: policy.setAt instanceof Date ? policy.setAt.toISOString() : String(policy.setAt) };
+}
 
 export function view(row: TaskRow): TaskView {
   return {
@@ -229,6 +242,7 @@ export function view(row: TaskRow): TaskView {
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
+    independence: row.independence ? policyView(row.independence) : undefined,
     workIntent: row.work_intent, worktree: row.worktree,
     revises: row.revises ? asId(row.revises) : undefined,
     supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
@@ -288,6 +302,23 @@ const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   dependencies: (row.dependencies ?? []).map(asId).sort(),
 });
 
+/**
+ * Source guard of a gated lease write (SYS-DISP IR03). Every source the gate read must still be at the version it was read at, or the
+ * write is refused and the caller re-reads. The write also stamps each source: a concurrent authorship change on a source always bumps
+ * its version in the same transaction, so the two conflict instead of one landing between the read and the other's commit.
+ */
+const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
+        IF (SELECT VALUE version FROM ONLY $g.task) != $g.version { THROW 'contribution history moved: independence source' };
+        UPDATE ONLY $g.task SET independence_guard = $g.version;
+      };`;
+
+/** The gate one stage reads: the exclusion index and the source versions the write must be guarded by. */
+interface IndependenceGate {
+  taskId: string;
+  index: IndependenceIndex;
+  guards: Array<{ task: RecordId; version: number }>;
+}
+
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
@@ -295,9 +326,11 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly submitCheck?: SubmitCheck;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; contributionReadHook?: (taskId: string) => Promise<void> }) {
+  private readonly independenceReadHook?: (taskId: string) => Promise<void>;
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void> }) {
     this.submitCheck = options?.submitCheck;
     this.contributionReadHook = options?.contributionReadHook;
+    this.independenceReadHook = options?.independenceReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
@@ -404,6 +437,12 @@ export class SurrealCompanyCore implements CompanyCore {
           if (takeover) {
             const kind = takeover[1]!.toLowerCase();
             throw new CompanyError(kind === 'moved' ? 'conflict' : 'invalid', `Implementer takeover ${kind}: ${takeover[2]!.trim()}`);
+          }
+          // Independence policy writes: a moved version or a live lease is a conflict; a closed task is invalid; the actor is denied.
+          const independence = /independence (moved|refused|invalid|denied): ([^'"\n]+)/i.exec(cause);
+          if (independence) {
+            const kind = independence[1]!.toLowerCase();
+            throw new CompanyError(kind === 'denied' ? 'forbidden' : kind === 'invalid' ? 'invalid' : 'conflict', `Independence ${kind}: ${independence[2]!.trim()}`);
           }
           // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
           if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
@@ -706,6 +745,8 @@ export class SurrealCompanyCore implements CompanyCore {
       if (facts.ambiguous) throw new CompanyError('forbidden', 'Task claim denied: implementer unresolved, manager takeover required');
       if (facts.implementer && facts.implementer !== actor.employeeId) throw new CompanyError('forbidden', 'Task claim denied: bound to another implementer');
     }
+    // Independence (SYS-DISP IR03): refused before a worktree is allocated, exactly as the claim transaction would refuse it.
+    await this.refuseIndependent(await this.independenceGate(taskId, task.independence, reviewing ? 'review' : 'execute'), actor.employeeId);
     const project = await this.taskProject(taskId);
     // Code-repo routing: an explicit binding wins over the business project repo; the
     // business `project` itself stays with taskProject for claim.json/opsScope.
@@ -759,12 +800,39 @@ export class SurrealCompanyCore implements CompanyCore {
    * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale
    * facts is never accepted (SYS-DISP AC04, AC06).
    */
-  private async withContributionRetry<T>(taskId: string, attempt: (contrib: ContributionView) => Promise<T>): Promise<T> {
+  /**
+   * The independence gate of one stage (SYS-DISP IR03): the exclusion read now, and the source versions the write must be guarded by.
+   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A source that cannot be
+   * read or does not exist refuses here; nothing is written.
+   */
+  private async independenceGate(taskId: string, policy: IndependencePolicy | undefined,
+    stage: IndependenceStage | undefined): Promise<IndependenceGate | undefined> {
+    if (!policy || !stage || !policy.stages.includes(stage)) return undefined;
+    const snapshot = await readIndependenceSnapshot(this.db, policy, this.independenceReadHook);
+    return { taskId, index: snapshot.index, guards: snapshot.sources.map(source => ({ task: id('task', source.taskId), version: source.version })) };
+  }
+
+  /** Refuses `employee` when the gate excludes them: `forbidden`, with the structured conflict in `details`. Writes nothing. */
+  private async refuseIndependent(gate: IndependenceGate | undefined, employee: string): Promise<void> {
+    if (!gate) return;
+    const def = (await readEmployeeDefs(this.db, [employee])).get(employee);
+    await refuseIfExcluded(this.db, gate.taskId, gate.index, employee, def);
+  }
+
+  /**
+   * Runs one lease transaction against fresh facts. A stage the policy names is gated before the write: a contributor of a source is
+   * refused with the structured conflict, and the write carries the source guards, so a source that moved since the read refuses it
+   * and the whole check runs again (CONTRIBUTION_MOVED). Other stages and legacy tasks run exactly as before.
+   */
+  private async withContributionRetry<T>(taskId: string, actor: string, stageOf: (state?: string) => IndependenceStage | undefined,
+    attempt: (contrib: ContributionView, gate?: IndependenceGate) => Promise<T>): Promise<T> {
     for (let round = 0; ; round++) {
       const contrib = await readContributionView(this.db, taskId);
+      const gate = await this.independenceGate(taskId, contrib.policy, stageOf(contrib.state));
       await this.contributionReadHook?.(taskId);
       try {
-        return await attempt(contrib);
+        await this.refuseIndependent(gate, actor);
+        return await attempt(contrib, gate);
       } catch (error) {
         if (round < 4 && isContributionMoved(error)) continue;
         throw error;
@@ -774,7 +842,8 @@ export class SurrealCompanyCore implements CompanyCore {
 
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
-    const row = await this.withContributionRetry(taskId, contrib => this.txTask(`BEGIN;
+    const row = await this.withContributionRetry(taskId, actor.employeeId, state => state === 'review' ? 'review' : 'execute',
+      (contrib, gate) => this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
@@ -782,6 +851,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
+      ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
         IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
@@ -836,6 +906,7 @@ export class SurrealCompanyCore implements CompanyCore {
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
       excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
+      indep_guards: gate?.guards ?? [],
     }));
     const taskView = view(row);
     const project = await this.taskProject(taskId);
@@ -1169,6 +1240,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
+      ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
         IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
@@ -1232,14 +1304,17 @@ export class SurrealCompanyCore implements CompanyCore {
       ${idem ? 'CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
       COMMIT;`;
+    // Gated stages (SYS-DISP IR03): submit is an execute write; accept and return are review decisions. Other actions take no gate.
+    const gatedStage: IndependenceStage | undefined = action === 'submit' ? 'execute' : action === 'accept' || action === 'return' ? 'review' : undefined;
     try {
-      const row = await this.withContributionRetry(proof.taskId, contrib => this.txTask(query, {
+      const row = await this.withContributionRetry(proof.taskId, actor.employeeId, () => gatedStage, (contrib, gate) => this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
         ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
+        indep_guards: gate?.guards ?? [],
       }));
       return view(row);
     } catch (error) {
@@ -1731,6 +1806,67 @@ export class SurrealCompanyCore implements CompanyCore {
    * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
    * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
    */
+  /**
+   * Manager write of a task's independence policy (SYS-DISP IR01). Manage capability only. Creates the first policy, or replaces the
+   * current one under a compare-and-set on the task version. Refused while the task is leased, so a lease is never changed silently.
+   * An accepted write bumps the revision and the version in one transaction with its audit row; the same key and payload replay.
+   */
+  async setIndependence(credential: Credential, input: SetIndependence): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    requireText(input.taskId, 'taskId', 1, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const fields = normalizeIndependence({ taskId: input.taskId, stages: input.stages, sources: input.sources, mode: input.mode,
+      excluded: input.excluded, reason: input.reason });
+    const idem = this.idemId(actor.employeeId, 'independence_set', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, ...fields, expectedVersion: input.expectedVersion }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const current = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    if (current.state === 'done' || current.state === 'void') throw new CompanyError('invalid', 'Independence invalid: task is closed');
+    if (current.version !== input.expectedVersion) throw new CompanyError('conflict', 'Independence moved: task version changed; re-read and retry');
+    if (current.current_employee && (current.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
+      throw new CompanyError('conflict', 'Independence refused: the task is leased; release it or wait for the lease to end');
+    }
+    for (const source of fields.sources) {
+      if (!(await this.db.select<TaskRow>(id('task', source)))) throw new CompanyError('not_found', `Independence source not found: ${source}`);
+    }
+    for (const employee of fields.excluded) {
+      if (!(await this.db.select<EmployeeRow>(id('employee', employee)))) throw new CompanyError('invalid', `Independence excluded employee not found: ${employee}`);
+    }
+    const revision = (current.independence?.revision ?? 0) + 1;
+    const evidence = `${input.reason}\n[independence_set] task=${input.taskId} revision=${revision} stages=${fields.stages.join(',')} mode=${fields.mode} sources=${fields.sources.join(',') || 'none'} excluded=${fields.excluded.join(',') || 'none'} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'independence denied: actor revoked or forbidden' };
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'independence invalid: task not found' };
+      IF $t.version != $expected { THROW 'independence moved: task version changed' };
+      IF $t.state IN ['done', 'void'] { THROW 'independence invalid: task is closed' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'independence refused: task is leased' };
+      LET $next = UPDATE ONLY $task SET
+        independence = { schema: 1, revision: $revision, stages: $stages, sources: $sources, mode: $mode, excluded: $excluded, reason: $reason, setBy: $employee, setAt: time::now() },
+        version = $t.version + 1
+        RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'independence_set', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: id('task', input.taskId), expected: input.expectedVersion,
+      revision, stages: fields.stages, sources: fields.sources, mode: fields.mode, excluded: fields.excluded, reason: fields.reason,
+      evidence, digest, idem, audit: id('audit', randomUUID()),
+    };
+    try {
+      return view(await this.txTask<TaskRow>(query, vars));
+    } catch (error) {
+      const replayedAfterFailure = await this.replay(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
   async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may take over a task implementer');
