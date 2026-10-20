@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "AGENT_NOT_FOUND",
+    "message": "Agent not found: <id>",
+    "details": "Use \"paseo ls\" to list available agents"
+  }
+}

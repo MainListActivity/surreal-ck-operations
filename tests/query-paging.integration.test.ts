@@ -502,7 +502,7 @@ test('every page re-checks the caller: an identity revoked mid-traversal is refu
   const credential = await enrollment.enroll(revoked, 'gm', ['execute', 'review', 'manage']);
   const first = await core.contextView(credential, { goalId, pageSize: 5 });
   expect(first.page?.nextCursor).toBeDefined();
-  await enrollment.revoke(revoked, 'security');
+  await enrollment.revoke(revoked);
   await expectRefused(core.contextView(credential, { goalId, pageSize: 5, cursor: first.page!.nextCursor }), 'unauthorized', /Invalid credential/);
 });
 

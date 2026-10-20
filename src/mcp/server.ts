@@ -377,6 +377,27 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.goalAcceptanceRepair(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('contributor_dryrun', {
+    description: 'gm only, read-only: for up to 20 tasks, who authored and reviewed each one from its audit stream, the implementer status with a suggestion that writes nothing, and the audit timeline with each row role. Use it before any implementer repair; it never changes a lease, submitter, gate or history.',
+    inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(20) }),
+  }, async (input, ctx) => run(token(ctx), () => core.contributorDryRun
+    ? core.contributorDryRun(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('implementer_takeover', {
+    description: 'gm only (manage): record a new code implementer for an execute-phase engineering task whose bound implementer cannot continue (withdrawn, departed, durable quota or runtime failure). Compare-and-set on expectedVersion. A current reviewer taking over needs a named independent replacementReviewer. Authorship is never removed; a lease held by someone else is revoked in the same write. The same idempotencyKey with the same payload returns the original result.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      toEmployee: z.string().min(1).max(200),
+      replacementReviewer: z.string().min(1).max(200).optional(),
+      expectedVersion: z.number().int().positive(),
+      reason: z.string().min(8).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.implementerTakeover
+    ? core.implementerTakeover(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('task_project_update', {
     description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({

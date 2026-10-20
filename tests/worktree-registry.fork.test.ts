@@ -16,6 +16,10 @@ import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { readJsonFile } from '../src/comm.ts';
 
 setDefaultTimeout(30000);
+// Forces a task's lease past its end. Lease stamps are whole seconds (time::unix), so a short real lease is not a dependable
+// clock: a 1 s lease can already be over when the next step runs, or still open after a short sleep (WT02 intermittent failure).
+const lapseLease = (taskId: string) =>
+  db.db.query('UPDATE ONLY $task SET lease_expires_at = time::unix(time::now()) - 1;', { task: new RecordId('task', taskId) });
 const run = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
 let dir: string, port: number, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, gm: string;
 let count = 0;
@@ -66,6 +70,13 @@ const coreFor = (path: string) => {
   return core;
 };
 async function employee(role: Role) { return new LocalEnrollmentAdmin(db).enroll(`fixture-${role}-${++count}`, role, ['execute', 'review']); }
+/** SYS-DISP AC04: a successor takes a bound engineering task's code only through the manager's explicit takeover. */
+async function handOver(c: SurrealCompanyCore, taskId: string, successor: string, label: string) {
+  const version = (await c.getTask(gm, taskId)).version;
+  await c.implementerTakeover(gm, { taskId, toEmployee: (await c.authenticate(successor)).employeeId, expectedVersion: version,
+    reason: `Synthetic manager handover for the ${label} fixture, after the bound implementer lost its lease.`, idempotencyKey: `handover-${label}-${++count}` });
+}
+
 async function task(core: SurrealCompanyCore, role: Role, intent?: WorkIntent) {
   return core.createTask(gm, { title: `Worktree fixture ${++count}`, context: 'Isolated local integration fixture, never production', executorRole: role, reviewerRole: 'qa', workIntent: intent, idempotencyKey: `fixture-task-${count}` });
 }
@@ -161,7 +172,8 @@ run('restart persistence, revoked handover preserves dirty scene and fencing; le
   await new Workforce(db, join(dir, 'unused')).revokeLease(t.id, actor, 'fixture handover', 'fixture previous employee stopped');
   expect((await core.listWorktrees(gm)).find(w => w.id === first.worktree!.id)!.reasons).toContain('unfinished-scene');
   await db.close(); server.kill(); await server.exited; await start();
-  const restarted = coreFor(path), second = await restarted.claim(successor, t.id);
+  const restarted = coreFor(path); await handOver(restarted, t.id, successor, 'restart');
+  const second = await restarted.claim(successor, t.id);
   expect(second.worktree!.worktreePath).toBe(legacy); expect(second.fence).toBeGreaterThan(first.fence); expect(readFileSync(join(legacy, 'source.txt'), 'utf8')).toBe('old scene');
   await expect(restarted.checkpoint(eng, proof(first), { text: 'stale fixture proof', idempotencyKey: 'stale-worktree-proof' })).rejects.toBeDefined();
   const inv = await restarted.listWorktrees(gm); expect(inv.find(w => w.id === second.worktree!.id)!.references.filter(r => r.state === 'active')).toHaveLength(1);
@@ -275,8 +287,9 @@ run('managed allocator keeps expired-lease takeover semantics and preserves scen
   const path = repo(), core = new SurrealCompanyCore(db, { leaseSeconds: 1, worktrees: { opsRepo: path } });
   const eng = await employee('engineering'), next = await employee('engineering');
   const t = await task(core, 'engineering'), a = await core.claim(eng, t.id);
-  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await Bun.sleep(1100);
-  const recovery = coreFor(path), b = await recovery.claim(next, t.id); expect(b.fence).toBeGreaterThan(a.fence); expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
+  writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'expired dirty scene'); await lapseLease(t.id);
+  const recovery = coreFor(path); await handOver(recovery, t.id, next, 'expired-lease');
+  const b = await recovery.claim(next, t.id); expect(b.fence).toBeGreaterThan(a.fence); expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
   expect(readFileSync(join(b.worktree!.worktreePath, 'source.txt'), 'utf8')).toBe('expired dirty scene');
   await expect(core.checkpoint(eng, proof(a), { text: 'stale after takeover', idempotencyKey: 'managed-expired-stale' })).rejects.toBeDefined();
   await submit(recovery, next, b);
@@ -340,10 +353,11 @@ run('WT02: lease expire keeps recovery scene; orphan past grace reclaims managed
   const t = await task(core, 'engineering');
   const a = await core.claim(eng, t.id);
   writeFileSync(join(a.worktree!.worktreePath, 'source.txt'), 'recovery scene');
-  await Bun.sleep(1100);
+  await lapseLease(t.id);
   const invAfterExpire = await core.listWorktrees(gm);
   expect(invAfterExpire.find(w => w.id === a.worktree!.id)!.references.some(r => r.state === 'recovery' || r.state === 'active')).toBe(true);
   expect(existsSync(a.worktree!.worktreePath)).toBe(true);
+  await handOver(core, t.id, next, 'wt02');
   const b = await core.claim(next, t.id);
   expect(b.worktree!.worktreePath).toBe(a.worktree!.worktreePath);
   await acceptDone(core, next, b);
@@ -645,6 +659,23 @@ run('LANE: a task waits instead of sharing the lane tree with another active wri
   const lonely = await core.claim(qa, (await laneTask(core, goal, 'qa', 'docs', 'read')).id);
   expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
   await submit(core, a, first); await submit(core, qa, lonely);
+}, 30000);
+run('LANE: the write-scope preflight names the writer that refuses the claim, changes nothing, and clears once that writer submits', async () => {
+  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering');
+  const goal = await laneGoal(core, 'preflight');
+  const t1 = await laneTask(core, goal, 'engineering', 'ledger', 'code'), t2 = await laneTask(core, goal, 'engineering', 'ledger', 'code');
+  const first = await core.claim(a, t1.id);
+  const writerId = (await core.authenticate(b)).employeeId;
+  const holders = await core.writeScopeOf(t2.id, writerId);
+  expect(holders).toEqual([{ taskId: t1.id, employee: (await core.authenticate(a)).employeeId, intent: 'code' }]);
+  expect(await core.writeScopeOf(t2.id, writerId)).toEqual(holders);
+  await expect(core.claim(b, t2.id)).rejects.toMatchObject({ code: 'worktree_busy' });
+  expect((await core.getTask(gm, t2.id)).state).toBe('ready');
+  await submit(core, a, first);
+  expect(await core.writeScopeOf(t2.id, writerId)).toEqual([]);
+  const second = await core.claim(b, t2.id);
+  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
+  await submit(core, b, second);
 }, 30000);
 run('LANE: a blocked task keeps its scene but does not lock the lane — a rework claim enters the parked tree, and an active writer still serializes', async () => {
   const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering');

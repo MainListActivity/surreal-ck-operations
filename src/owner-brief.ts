@@ -1,3 +1,5 @@
+import type { DispatchBlockedRow } from './dispatcher/dispatch-list.ts';
+
 /** What is waiting on the owner (a gate to approve or a question to answer) and what it holds up. */
 export interface WaitingItem {
   taskId: string;
@@ -23,7 +25,8 @@ export interface BriefData {
   capacity: RoleCapacity[];
   /** Employee instances opened/closed in the last 24h; a high lost-claim count means the scheduler is thrashing. */
   churn: { created: number; retired: number; claimLost: number };
-  staffingAlerts: number;
+  /** The latest pass's blocked work: how many items are blocked, and the first rows the brief names (most urgent first). */
+  dispatchBlocked: { total: number; rows: DispatchBlockedRow[] };
 }
 
 /** Hours of waiting at which a reminder is (re)raised; after the last step a new one every 24h. */
@@ -46,6 +49,17 @@ export function agingText(item: WaitingItem, hours: number): string {
   return `已等你 ${formatAge(hours)}：${what}《${short(item.title, 60)}》${goal}${holds}。任务 ${item.taskId}。查看：company owner inbox`;
 }
 
+const PHASE_NAME = { execute: '执行', review: '复核' } as const;
+const WORKFLOW_NAME = { ready: '就绪', doing: '在办无人持有', review: '待复核' } as const;
+
+/** One blocked item as the brief names it: what, which phase and workflow state, every reason, the wait, who acts, what unblocks it. */
+export function dispatchLine(row: DispatchBlockedRow): string {
+  const reasons = row.reasons.map(reason => reason.text).join('；') || row.summary;
+  const owner = row.reasons.some(reason => reason.owner === 'owner') ? '老板' : 'gm';
+  const next = [...new Set(row.reasons.map(reason => reason.nextTrigger))].join('；');
+  return `《${short(row.title, 40)}》（${PHASE_NAME[row.phase]}·${WORKFLOW_NAME[row.workflowState]}）：${reasons}；已等 ${row.waitingMinutes} 分钟；负责：${owner}；下一触发：${next || '待定'}`;
+}
+
 export function renderBrief(data: BriefData): { summary: string; text: string } {
   const oldest = data.waiting.reduce((max, item) => Math.max(max, item.hours), 0);
   const summary = `每日简报 ${data.date}：待你处理 ${data.waiting.length} 项${data.waiting.length ? `（最久 ${formatAge(oldest)}）` : ''}｜异常卡滞 ${data.stuck.length}｜近24小时完成 ${data.last24h.done}`;
@@ -63,12 +77,18 @@ export function renderBrief(data: BriefData): { summary: string; text: string } 
     lines.push('', '【在办目标】');
     for (const goal of data.goals.slice(0, 8)) lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天）`);
   }
+  // Every blocked item of the latest pass is named here, with its own reason and owner. The brief does not count notices.
+  if (data.dispatchBlocked.total) {
+    lines.push('', `【无法派工】共 ${data.dispatchBlocked.total} 项（同一份结论，见岗位页面）`);
+    for (const row of data.dispatchBlocked.rows) lines.push(`- ${dispatchLine(row)}`);
+    const rest = data.dispatchBlocked.total - data.dispatchBlocked.rows.length;
+    if (rest > 0) lines.push(`- 另有 ${rest} 项未逐条列出，见岗位页面`);
+  }
   const short_ = data.capacity.filter(c => c.usable < c.total);
-  if (short_.length || data.resources.length || data.staffingAlerts) {
+  if (short_.length || data.resources.length) {
     lines.push('', '【产能】');
     for (const c of short_) lines.push(`- ${c.role}：${c.usable === 0 ? '当前没有任何可用编制' : `可用编制 ${c.usable}/${c.total}`}（${c.down.join('；')}）`);
     for (const item of data.resources) lines.push(`- ${item}`);
-    if (data.staffingAlerts) lines.push(`- 有 ${data.staffingAlerts} 个岗位暂无可用员工（见提醒）`);
   }
   lines.push('', `【员工流动】近24小时新建实例 ${data.churn.created}，退役 ${data.churn.retired}${data.churn.claimLost ? `（认领失败 ${data.churn.claimLost}）` : ''}`);
   return { summary, text: lines.join('\n') };

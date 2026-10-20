@@ -67,13 +67,23 @@ export interface Inbox {
  * 公司动态一页答「发生了什么」：谁在干什么、什么卡住了、为什么没人领、
  * 最近做完了什么、资源有没有异常。全部来自任务服务与调度器同一套判定。
  */
+/** The lists of the pulse answer that carry a truncation marker (see the bounds field). */
+export type PulseListName = "dispatchBlocked" | "goalBlockers" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "goals" | "resources";
+
 export interface Pulse {
+  /** When this answer was built (request time). Live lists (doing, stuck, waiting, ...) read as of this instant. */
   at: string;
+  /** When the dispatch conclusions were checked: the pass's snapshot. Dispatch lists and the ready queue are as of this instant. */
+  dispatchAt?: string;
   paused: boolean;
   /** state=doing 的任务 */
   doing: Array<{ taskId: string; title: string; employee?: string; role: string; discipline?: string; goal?: string; sinceMin?: number }>;
-  /** 就绪但还没被领走的任务；unclaimableReason 是全候选不可派时的主因 */
+  /** 就绪但还没被领走的任务；unclaimableReason 是 tick 对 execute 阶段的不可派原因（与公司通知同文） */
   ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
+  /** 本轮 tick 判定派不出去的工作（execute 与 review 两阶段），与公司通知同源 */
+  dispatchBlocked: DispatchBlockedView[];
+  /** 每个目标的根阻点（同一服务端评估器），目标卡直接显示 */
+  goalBlockers: GoalRootBlockerView[];
   /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   /** 等老板拍板/回答（带已等时长与下游受阻数） */
@@ -83,9 +93,17 @@ export interface Pulse {
   last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
   /** 订阅健康/低额度异常行（正常时为空） */
   resources: string[];
-  staffingAlerts: number;
   churn: { created: number; retired: number; claimLost: number };
   goals: Array<{ title: string; days: number }>;
+  /** Truncation markers for every list above: how many items existed, and whether the answer left some out. */
+  bounds: Record<PulseListName, ListBound>;
+}
+
+/** A bounded list's truncation marker. `total` is the count before the cap; `truncated` is true when `shown < total`. */
+export interface ListBound {
+  total: number;
+  shown: number;
+  truncated: boolean;
 }
 
 /** One regular file inside a task's evidenceDir (<serviceHome>/evidence/<taskId>). */
@@ -123,6 +141,8 @@ export interface StaffingEntryView {
   share: number;
   eligible: boolean;
   reason?: string;
+  /** Machine code behind `reason`, the same code the dispatch-blocked verdict groups by. */
+  code?: string;
   model?: string;
 }
 
@@ -138,7 +158,66 @@ export interface ReviewStaffingPoolView extends StaffingPoolView {
   taskId: string;
   title: string;
   purpose: "review";
-  status: "ready" | "history_unavailable";
+  status: "ready" | "blocked" | "history_unavailable";
+}
+
+/** The root blocker of one goal card: the verdict it names first, and the other blocked work behind the goal. */
+export interface GoalRootBlockerView {
+  goalId: string;
+  taskId: string;
+  title: string;
+  phase: "execute" | "review";
+  summary: string;
+  feasible: boolean;
+  since?: string;
+  waitingMinutes: number;
+  others: number;
+  /** Blocked work of this goal, the root included: the 无法派工 count, shown apart from the normal waits (impact). */
+  undispatchable: number;
+  /** The root's workflow state (ready, doing or review), its eligible-candidate count, and when its conclusion was checked. */
+  workflowState: "ready" | "doing" | "review";
+  eligibleCount: number;
+  checkedAt: string;
+  /** Unfinished tasks waiting on this root, directly or through other tasks. */
+  impact: number;
+  dependencyPath: Array<{ taskId: string; title: string }>;
+  /** People behind the root. `peopleOmitted` counts the names the row left out. */
+  people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  reasons: DispatchReasonView[];
+}
+
+/** One dispatch-blocked conclusion from the latest tick, owner-facing. Same summary text as the notice for that episode. */
+export interface DispatchBlockedView {
+  taskId: string;
+  goalId?: string;
+  title: string;
+  phase: "execute" | "review";
+  /** The task's workflow state (ready, doing or review). The row itself is the dispatch status: it is blocked. */
+  workflowState: "ready" | "doing" | "review";
+  summary: string;
+  /** When the conclusion was checked (ISO 8601). Eligible candidates at that check: zero for every row, stated explicitly. */
+  checkedAt: string;
+  eligibleCount: number;
+  /** False when the block is material at once (owner decision needed, or candidate state unknown). */
+  feasible: boolean;
+  since?: string;
+  waitingMinutes: number;
+  reasons: DispatchReasonView[];
+}
+
+/** One effective reason in an owner-facing row. `candidatesOmitted` counts the candidates the row left out. */
+export interface DispatchReasonView {
+  code: string;
+  text: string;
+  candidates: string[];
+  candidatesOmitted?: number;
+  owner: "gm" | "owner";
+  /** The source the code was read from, for example "contribution-audit". */
+  basis: string;
+  recovery: string;
+  /** Structured recovery actions; `executable` is false when no operations tool performs the action. */
+  actions: Array<{ authority: "gm" | "owner"; label: string; tool?: string; executable: boolean }>;
+  nextTrigger: string;
 }
 
 export interface Roster {
@@ -152,6 +231,14 @@ export interface Roster {
   /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
   pools: StaffingPoolView[];
   reviewPools: ReviewStaffingPoolView[];
+  /** Dispatch-blocked verdicts from the latest tick: the roster and the tick cannot disagree. */
+  dispatchBlocked: DispatchBlockedView[];
+  /** Truncation marker for every list above: how many items existed, and whether the answer left some out. */
+  bounds: Record<"dispatchBlocked" | "reviewPools" | "pools" | "instances" | "defs" | "usage" | "health", ListBound>;
+  /** When the tick last observed sessions; roster status is that observation, not a second read. */
+  sessionsObservedAt?: string;
+  /** When the pass's snapshot was taken: the pools, review previews and dispatch-blocked rows above are as of this instant. */
+  dispatchAt?: string;
 }
 
 export interface ModelOption {

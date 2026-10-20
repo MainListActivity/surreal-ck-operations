@@ -164,11 +164,26 @@ test('employee instances inside the doomed tree retire with an honest reason bef
   expect(result).toEqual({ workspacesArchived: 1, projectsDeleted: 0, employeesRetired: 2 });
 });
 
-test('employee pre-retire failures do not block scene cleanup; already-retired rows count as handled', async () => {
-  const paseo = fakePaseo([ws('w-scene', tree)], [], { 'agent:agent-1': 'agent not found' });
+test('an employee retirement that fails for any reason keeps its session and holds back the tree teardown: no detach, no archive, no workspace teardown', async () => {
+  const paseo = fakePaseo([ws('w-scene', tree)], []);
+  const detached: string[] = [];
   const clean = createSceneCleaner(paseo, {
     insts: async () => [{ id: 'qa-1', cwd: tree, paseoAgentId: 'agent-1' }],
     retire: async () => { throw new Error('employee not found'); },
+    detach: inst => { detached.push(inst.id); },
+  });
+  await expect(clean(tree)).rejects.toThrow('scene kept: employee retirement not completed for qa-1');
+  expect(detached).toEqual([]);
+  expect(paseo.agentsArchived).toEqual([]);
+  expect(paseo.archived).toEqual([]);
+  expect(paseo.deleted).toEqual([]);
+});
+
+test('an already-retired employee is idempotent: its retirement counts as handled and the scene is released', async () => {
+  const paseo = fakePaseo([ws('w-scene', tree)], [], { 'agent:agent-1': 'agent not found' });
+  const clean = createSceneCleaner(paseo, {
+    insts: async () => [{ id: 'qa-1', cwd: tree, paseoAgentId: 'agent-1' }],
+    retire: async () => undefined,
   });
   const result = await clean(tree);
   expect(paseo.archived).toEqual(['w-scene']);

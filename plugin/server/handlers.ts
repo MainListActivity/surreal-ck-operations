@@ -6,6 +6,7 @@ import { company } from "./company";
 import { refreshModels, refreshQuota } from "./dispatch";
 import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
+import type { Pulse, Roster } from "../shared/types";
 
 const SOURCE = "owner:paseo-plugin";
 
@@ -170,14 +171,15 @@ export function registerHandlers(server: PluginServerContext): void {
   });
 
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
-    const { db, workforce, opsRepo } = await company();
-    const { staffingPool, quotaBlockedProviders, reviewStaffingPreviews } = await import("./vendor/src/dispatcher/dispatcher.ts");
-    const { readProviderQuotas } = await import("./dispatch.ts");
+    const { db, workforce, opsRepo, dispatcher } = await company();
+    const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { rosterAnswer } = await import("./vendor/src/dispatcher/roster-answer.ts");
     const cfg = await workforce.config();
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
-    const agents = paseo ? await paseo.agents.list() : { entries: [] };
-    const statusById = new Map<string, string>(
-      (agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
+    // Session status, staffing pools, review previews and dispatch-blocked rows are the pass's own snapshot (SYS-DISP R4). The roster
+    // never recomputes them from the live database, so it cannot disagree with the dispatch decisions of the same pass.
+    const observed = dispatcher.sessionSnapshot();
+    const snapshot = dispatcher.dispatchSnapshot();
     const usageEntries = paseo ? await refreshQuota(paseo, await company()).catch(() => []) : [];
     const modelSlots = paseo ? await refreshModels(paseo, await company()).catch(() => ({} as Record<string, string>)) : {};
     const resolveDisplay = (d: { provider: string; model?: string }): string | undefined =>
@@ -187,43 +189,13 @@ export function registerHandlers(server: PluginServerContext): void {
     const defs = await workforce.defs();
     const insts = await workforce.insts();
     const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
-
-    // Staffing preview: recompute the exact inputs the tick derives, then call the same
-    // staffingPool — the numbers the owner sees are the numbers dispatch picks by.
-    type InstState = import("./vendor/src/dispatcher/dispatcher").InstState;
-    const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
-    const states = new Map<string, InstState>();
-    for (const inst of insts) {
-      const st = inst.paseoAgentId ? statusById.get(inst.paseoAgentId) ?? "missing" : "missing";
-      states.set(inst.id,
-        st === "running" || st === "initializing" ? "busy" :
-        st === "idle" ? "idle" :
-        st === "error" && healthMap.get(inst.provider ?? "")?.state === "exhausted" ? "exhausted" : "down");
-    }
-    const tasks = await workforce.tasks();
-    const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
-    const busyBy = new Map<string, number>();
-    for (const inst of insts) {
-      if (states.get(inst.id) !== "busy") continue;
-      busyBy.set(inst.provider ?? "", (busyBy.get(inst.provider ?? "") ?? 0) + 1);
-    }
-    const quotaBlocked = quotaBlockedProviders(await readProviderQuotas({ db }), cfg, Date.now());
-    const slots = new Map(Object.entries(modelSlots));
-    const homes = [...new Set([opsRepo, ...insts.map(i => i.cwd ?? opsRepo), ...tasks.map(t => t.repoPath ?? opsRepo)])];
-    const roles = [...new Set([...defs.map(d => d.role), ...insts.map(i => i.role)])];
-    const now = Math.floor(Date.now() / 1000);
-    const poolBase = { defs, insts, states, holding, health: healthMap,
-      quotaBlocked, busyBy, providerMax: cfg.providerMax, slots, opsRepo, sidecar: true, now };
     const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
       entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,
-        eligible: e.eligible, reason: e.reason, model: e.model }));
-    const pools = roles.flatMap(role => homes.map(home => ({
-      role, home, entries: entriesView(staffingPool({ ...poolBase, role, home })),
-    })).filter(p => p.entries.length));
-    const reviewPools = (await reviewStaffingPreviews(tasks, poolBase, workforce))
-      .map(p => ({ ...p, entries: entriesView(p.entries) }));
-
-    return {
+        eligible: e.eligible, reason: e.reason, code: e.code, model: e.model }));
+    const pools = snapshot.pools.map(p => ({ role: p.role, home: p.home, entries: entriesView(p.entries) }));
+    const reviewPools = snapshot.reviewPools.map(p => ({ ...p, entries: entriesView(p.entries) }));
+    // Every list goes to rosterAnswer, which caps each one by count and bytes and reports the marker (SYS-DISP R6, AC06).
+    return rosterAnswer({
       paused: cfg.paused,
       opsRepo,
       usage: usageEntries.map((u: any) => ({
@@ -237,17 +209,22 @@ export function registerHandlers(server: PluginServerContext): void {
       })),
       instances: insts.map(i => ({
         id: i.id, def: i.def, role: i.role, provider: i.provider, cwd: i.cwd,
-        agentId: i.paseoAgentId, agentStatus: i.paseoAgentId ? statusById.get(i.paseoAgentId) : undefined,
+        agentId: i.paseoAgentId, agentStatus: observed.sessions.get(i.id)?.status,
       })),
       health: healthView,
       pools,
       reviewPools,
-    };
+      sessionsObservedAt: observed.at ? new Date(observed.at).toISOString() : undefined,
+      dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined,
+      dispatchBlocked: dispatchBlockedRows(snapshot.verdicts),
+    }) as unknown as Roster;
   });
-
-  server.handle(rpc.pulse, async (_input: unknown, { paseo }: { paseo: any }) => {
-    const { db, owner, workforce, opsRepo } = await company();
-    const { staffingPool, quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
+  server.handle(rpc.pulse, async () => {
+    const { db, owner, workforce, dispatcher } = await company();
+    const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { dispatchBlockedRows, goalBlockerList, goalBlockerRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { pulseAnswer } = await import("./vendor/src/dispatcher/pulse-answer.ts");
+    const { readGoalRootFacts } = await import("./vendor/src/dispatcher/goal-roots.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const { RecordId } = await import("surrealdb");
@@ -256,38 +233,19 @@ export function registerHandlers(server: PluginServerContext): void {
     const nowS = Math.floor(now / 1000);
     const cfg = await workforce.config();
 
-    // Same inputs the dispatcher tick derives: the "why unclaimed" answer below is
-    // the identical staffingPool verdict, not a parallel reimplementation.
+    // Dispatch lists and the ready queue are the pass's own snapshot (SYS-DISP R4): the verdicts the tick acted on, as of dispatchAt.
+    // Live lists (doing, stuck, waiting, resources, goals) read the database now and are labelled by `at`. Every list is capped.
+    const snapshot = dispatcher.dispatchSnapshot();
+    const verdicts = snapshot.verdicts;
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
-    const agents = paseo ? await paseo.agents.list() : { entries: [] };
-    const statusById = new Map<string, string>((agents.entries ?? []).map((a: any) => [a.id, a.status ?? "unknown"]));
-    const modelSlots = paseo ? await refreshModels(paseo, await company()).catch(() => ({} as Record<string, string>)) : {};
     const defs = await workforce.defs();
-    const insts = await workforce.insts();
     const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
-    type InstState = import("./vendor/src/dispatcher/dispatcher").InstState;
     const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
-    const states = new Map<string, InstState>();
-    for (const inst of insts) {
-      const st = inst.paseoAgentId ? statusById.get(inst.paseoAgentId) ?? "missing" : "missing";
-      states.set(inst.id,
-        st === "running" || st === "initializing" ? "busy" :
-        st === "idle" ? "idle" :
-        st === "error" && healthMap.get(inst.provider ?? "")?.state === "exhausted" ? "exhausted" : "down");
-    }
-    const tasks = await workforce.tasks();
-    const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
-    const busyBy = new Map<string, number>();
-    for (const inst of insts) {
-      if (states.get(inst.id) !== "busy") continue;
-      busyBy.set(inst.provider ?? "", (busyBy.get(inst.provider ?? "") ?? 0) + 1);
-    }
     const quotaBlocked = quotaBlockedProviders(await readProviderQuotas({ db }), cfg, now);
-    const poolBase = { defs, insts, states, holding, health: healthMap, quotaBlocked, busyBy,
-      providerMax: cfg.providerMax, slots: new Map(Object.entries(modelSlots)), opsRepo, sidecar: true, now: nowS };
+    const executeBlock = new Map(verdicts.filter(v => v.phase === "execute").map(v => [v.taskId, v]));
 
     const brief = await owner.briefData(now, localDate(new Date(now)),
-      roleCapacity(defs, quotaBlocked, healthMap, nowS));
+      roleCapacity(defs, quotaBlocked, healthMap, nowS), verdicts);
 
     const [doingRows] = await db.db.query<[any[]]>(
       `SELECT id, title, executor_role, discipline, current_employee, goal.title AS goal_title FROM task WHERE state = 'doing';`);
@@ -306,50 +264,44 @@ export function registerHandlers(server: PluginServerContext): void {
       };
     });
 
-    // Ready queue with the dominant "nobody can take this" reason when the whole
-    // pool is ineligible: this is what silent starvation looks like to the owner.
-    // Batch the per-task audit lookups: a ready queue of N tasks used to cost N
-    // sequential round trips, stalling the single ~50KB/s WSS channel for minutes.
-    const readyTasks = tasks.filter(t => t.state === "ready");
-    const [readyAudits] = readyTasks.length ? await db.db.query<[any[]]>(
-      `SELECT task, at FROM audit WHERE task IN $ids
-       AND action IN ['create','dependency_unlocked','return','release','revoke','resume'] ORDER BY at DESC;`,
-      { ids: readyTasks.map(t => new RecordId("task", t.id)) }) : [[]];
-    const readyAt = new Map<string, unknown>();
-    for (const a of readyAudits ?? []) { const k = asId(a.task); if (!readyAt.has(k)) readyAt.set(k, a.at); }
-    const ready = [] as Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
-    for (const t of readyTasks) {
-      const at = readyAt.get(t.id);
-      const waitingMin = at ? Math.max(0, Math.round((now - Date.parse(String(at))) / 60_000)) : 0;
-      const pool = staffingPool({ ...poolBase, role: t.executorRole, home: t.repoPath ?? opsRepo, task: t });
-      let unclaimableReason: string | undefined;
-      if (pool.length && !pool.some(e => e.eligible)) {
-        const counts = new Map<string, number>();
-        for (const e of pool) counts.set(e.reason ?? "未知", (counts.get(e.reason ?? "未知") ?? 0) + 1);
-        unclaimableReason = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
-      } else if (!pool.length) {
-        unclaimableReason = "该岗位没有任何编制";
-      }
-      ready.push({ taskId: t.id, title: t.title, role: t.executorRole, discipline: t.discipline, waitingMin, unclaimableReason });
-    }
+    // Ready queue: from the snapshot, so membership and reasons are the pass's. A wait is measured to the snapshot's instant.
+    const ready = snapshot.ready.map(item => {
+      const block = executeBlock.get(item.taskId);
+      return {
+        taskId: item.taskId, title: item.title, role: item.role, discipline: item.discipline,
+        waitingMin: item.readySince !== undefined && snapshot.at ? Math.max(0, Math.round((snapshot.at - item.readySince) / 60_000)) : 0,
+        unclaimableReason: block && !block.dispatchable
+          ? block.reasons.map(reason => reason.text).join("；") || block.summary
+          : undefined,
+      };
+    });
 
     const [recentDone] = await db.db.query<[any[]]>(
       `SELECT task, task.title AS title, at, actor FROM audit WHERE action IN ['accept','owner_approve'] ORDER BY at DESC LIMIT 8;`);
 
     const readyIds = new Set(ready.map(r => r.taskId));
-    return {
+    // Goal cards name each root's people and waiting chain, read now for the roots the bounded list shows. A failed read keeps the
+    // verdict-only card rather than failing the whole pulse.
+    const roots = goalBlockerList(verdicts);
+    const goalFacts = await readGoalRootFacts(db.db, workforce, roots.items.map(root => root.taskId),
+      message => console.warn(message)).catch(error => { console.warn(`goal root facts failed: ${(error as Error).message}`); return undefined; });
+    // Every row goes to pulseAnswer, which caps the list and reports the whole count (SYS-DISP R6).
+    return pulseAnswer({
       at: new Date(now).toISOString(),
+      dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined,
       paused: !!cfg.paused,
-      doing, ready,
+      doing,
+      ready,
+      dispatchBlocked: dispatchBlockedRows(verdicts),
+      goalBlockers: goalBlockerRows(verdicts, goalFacts),
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),
-      last24h: brief.last24h,
-      resources: brief.resources ?? [],
-      staffingAlerts: brief.staffingAlerts ?? 0,
-      churn: brief.churn,
       goals: brief.goals ?? [],
-    };
+      resources: brief.resources ?? [],
+      last24h: brief.last24h,
+      churn: brief.churn,
+    }) as unknown as Pulse;
   });
 
   server.handle(rpc.providerOptions, async (_input: unknown, { paseo }: { paseo: any }) => {

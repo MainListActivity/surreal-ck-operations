@@ -11,6 +11,7 @@ import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
 import type { Role } from './contracts.ts';
+import { CompanyError } from './core-errors.ts';
 
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
@@ -49,7 +50,15 @@ try {
   const workforce = new Workforce(database, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '.runtime', 'credentials')));
   switch (action) {
     case 'revoke': {
-      await admin.revoke(args[0]!);
+      // The same gate as retirement (LocalEnrollmentAdmin.revoke): a refusal writes nothing and exits non-zero with its stable code.
+      try {
+        await admin.revoke(args[0]!);
+      } catch (error) {
+        if (!(error instanceof CompanyError) || error.code !== 'retire_refused') throw error;
+        print({ action, employeeId: args[0], ok: false, code: error.code, message: error.message, details: error.details });
+        process.exitCode = 1;
+        break;
+      }
       print({ action, employeeId: args[0], ok: true });
       break;
     }
@@ -141,7 +150,15 @@ try {
       break;
     }
     case 'retire': {
-      await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual', 'manual');
+      // The same gate as every other retirement (workforce.retire): a refusal writes nothing and exits non-zero with its stable code.
+      try {
+        await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual', 'manual');
+      } catch (error) {
+        if (!(error instanceof CompanyError) || error.code !== 'retire_refused') throw error;
+        print({ action, employeeId: args[0], ok: false, code: error.code, message: error.message, details: error.details });
+        process.exitCode = 1;
+        break;
+      }
       print({ action, employeeId: args[0], ok: true });
       break;
     }

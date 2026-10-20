@@ -12,7 +12,7 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
+import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
@@ -34,6 +34,10 @@ const BASE_TOOLS = [
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text",
+  // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
+  "implementer_takeover",
+  // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
+  "contributor_dryrun",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -97,6 +101,8 @@ export class SidecarPool {
   private readonly processing = new Set<string>();
   private sweeper?: ReturnType<typeof setInterval>;
 
+  /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
+  private readonly denials = new Map<string, string>();
   constructor(private readonly deps: SidecarDeps) {}
   private log(message: string) { this.deps.log?.(message); }
 
@@ -223,6 +229,16 @@ export class SidecarPool {
     }
   }
 
+  /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
+  claimDenial(instId: string): string | undefined {
+    return this.denials.get(instId);
+  }
+
+  /** Write-scope preflight through the core: read-only, under the same rules as the claim it precedes. */
+  writeScope(task: SupervisedTask, employeeId?: string): Promise<WriteScopeHolder[]> {
+    return this.deps.core.writeScopeOf(task.id, employeeId);
+  }
+
   /** Claims the task as the instance and stages claim.json in its comm dir. */
   async claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined> {
     // Legacy instances still carry a credential file their agent reads directly;
@@ -244,12 +260,14 @@ export class SidecarPool {
     }
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
+    this.denials.delete(inst.id);
     try {
       result = await this.deps.core.claim(cred, task.id);
     } catch (error) {
       const code = (error as { code?: string }).code ?? "";
       if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) {
         this.log(`claim ${task.id} denied for ${inst.id}: ${code} (${(error as Error).message?.slice(0, 160)})`);
+        this.denials.set(inst.id, code);
         return undefined;
       }
       throw error;
@@ -634,6 +652,12 @@ export class SidecarPool {
       case "goal_acceptance_repair": return core.goalAcceptanceRepair
         ? core.goalAcceptanceRepair(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
+      case "contributor_dryrun": return core.contributorDryRun
+        ? core.contributorDryRun(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
+      case "implementer_takeover": return core.implementerTakeover
+        ? core.implementerTakeover(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

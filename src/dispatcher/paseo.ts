@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { RetirementKind } from '../contracts.ts';
+import { CompanyError } from '../core-errors.ts';
 
 export interface AgentInfo { id: string; status: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
@@ -35,6 +36,11 @@ export interface SpawnInput {
 /** The dispatcher's only view of Paseo. Implemented by the paseo CLI; faked in tests. */
 export interface PaseoGateway {
   list(): Promise<Map<string, AgentInfo>>;
+  /**
+   * `undefined` only when the CLI confirms the agent does not exist (AGENT_NOT_FOUND). When the CLI could not answer
+   * (non-zero exit, timeout, non-JSON or empty stdout, no Status field) the status is `'unknown'`: the dispatcher must
+   * neither dispatch to it nor treat it as missing, idle or busy.
+   */
   status(agentId: string): Promise<{ status: string; pendingPermissions: number } | undefined>;
   lastError(agentId: string): Promise<string>;
   logsTail(agentId: string, entries: number): Promise<string>;
@@ -58,13 +64,47 @@ export interface PaseoGateway {
 /** Paseo mode needed for unattended work; grok exposes no modes. */
 export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high' };
 
-export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo'): PaseoGateway {
-  const run = async (args: string[], timeoutMs = 60_000): Promise<string> => {
+/** A Paseo CLI call that did not answer: non-zero exit, a spawn failure, or a timeout. `stderr` is what the CLI wrote. */
+export class PaseoCliError extends Error {
+  constructor(message: string, readonly stderr: string, readonly timedOut: boolean) {
+    super(message);
+    this.name = 'PaseoCliError';
+  }
+}
+
+/** Observation gap: the CLI did not give a usable answer. Never a substitute for idle or busy. */
+const UNOBSERVED = { status: 'unknown', pendingPermissions: 0 } as const;
+
+/** The CLI's own not-found answer: `{"error":{"code":"AGENT_NOT_FOUND",...}}` on stderr, exit 1. */
+const isAgentNotFound = (error: unknown): boolean => {
+  if (!(error instanceof PaseoCliError)) return false;
+  try {
+    return (JSON.parse(error.stderr) as { error?: { code?: unknown } }).error?.code === 'AGENT_NOT_FOUND';
+  } catch {
+    return false;
+  }
+};
+
+export function createPaseoCli(
+  bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo',
+  options: { timeoutMs?: number } = {},
+): PaseoGateway {
+  const defaultTimeoutMs = options.timeoutMs ?? 60_000;
+  const run = async (args: string[], timeoutMs = defaultTimeoutMs): Promise<string> => {
     const child = Bun.spawn([bin, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
-    const timer = setTimeout(() => child.kill(), timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Race the timeout against the streams: a wrapper that keeps stdout open after being killed must not hang the caller.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        child.kill();
+        reject(new PaseoCliError(`paseo ${args[0]} timed out after ${timeoutMs} ms`, '', true));
+      }, timeoutMs);
+    });
+    const finished = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    finished.catch(() => undefined);
     try {
-      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      if (code !== 0) throw new Error(`paseo ${args[0]} failed (exit ${code}): ${err.trim().slice(0, 300)}`);
+      const [out, err, code] = await Promise.race([finished, timedOut]);
+      if (code !== 0) throw new PaseoCliError(`paseo ${args[0]} failed (exit ${code}): ${err.trim().slice(0, 300)}`, err, false);
       return out.trim();
     } finally {
       clearTimeout(timer);
@@ -95,13 +135,25 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
       return new Map(rows.map(r => [r.id, { id: r.id, status: r.status }]));
     },
     async status(agentId) {
+      let text: string;
       try {
-        const row = await json<{ Status: string; Archived?: boolean; PendingPermissions?: unknown[] }>(['inspect', agentId]);
-        // An archived session still reports its last status; it can no longer take work.
-        return { status: row.Archived ? 'archived' : row.Status, pendingPermissions: row.PendingPermissions?.length ?? 0 };
-      } catch {
-        return undefined;
+        text = await run(['inspect', agentId, '--json']);
+      } catch (error) {
+        return isAgentNotFound(error) ? undefined : { ...UNOBSERVED };
       }
+      let row: unknown;
+      try {
+        row = JSON.parse(text);
+      } catch {
+        return { ...UNOBSERVED };
+      }
+      if (typeof row !== 'object' || row === null) return { ...UNOBSERVED };
+      const fields = row as { Status?: unknown; Archived?: unknown; PendingPermissions?: unknown };
+      const pendingPermissions = Array.isArray(fields.PendingPermissions) ? fields.PendingPermissions.length : 0;
+      // An archived session still reports its last status; it can no longer take work.
+      if (fields.Archived === true) return { status: 'archived', pendingPermissions };
+      if (typeof fields.Status !== 'string' || fields.Status === '') return { ...UNOBSERVED };
+      return { status: fields.Status, pendingPermissions };
     },
     async lastError(agentId) {
       const text = await run(['logs', agentId, '--tail', '8', '--no-color']).catch(() => '');
@@ -169,12 +221,19 @@ const withinTree = (candidate: string, root: string) => candidate === root || ca
 const goneSceneError = (error: unknown) =>
   /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
 
+/** The stable code of a failed employee retirement, or a short message for an unknown failure. It is kept on the scene for the retry. */
+const failureLabel = (error: unknown): string =>
+  error instanceof CompanyError ? error.code : (error instanceof Error ? error.message : String(error)).slice(0, 80);
+
 /**
  * Release the Paseo side of a task scene: archive every workspace whose cwd points at the
  * tree, then delete each project rooted at the tree that no longer hosts a live workspace.
  * Both steps are idempotent — a missing object counts as done. Every object is attempted so
  * one failure does not mask the others; the collected failures throw so the caller can keep
- * the scene and retry at the next event point.
+ * the scene and retry at the next event point. An employee whose retirement does not complete,
+ * for any reason, keeps its own session (no detach, no archive) and holds back the teardown of the
+ * whole tree: no workspace or project is torn down while it remains (SYS-DISP R1). Employees already
+ * retired in the same tree are detached and archived as usual.
  */
 export function createSceneCleaner(
   paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject' | 'archive'>,
@@ -189,14 +248,24 @@ export function createSceneCleaner(
     // Otherwise the archived agent fires agent.archived, the sidecar quarantines the
     // instance, and the next tick blames a dead binding as 通道隔离.
     let employeesRetired = 0;
+    const kept: string[] = [];
     if (employees) {
       for (const inst of await employees.insts()) {
         if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
+        try {
+          await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive');
+        } catch (error) {
+          // Refused (in-flight work is still here) or failed for another reason (the facts are unconfirmed). Either way the session
+          // stays: no detach, no archive, and the teardown below does not run for this tree.
+          kept.push(`${inst.id}（${failureLabel(error)}）`);
+          continue;
+        }
         employeesRetired++;
-        await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive').catch(() => undefined);
         employees.detach?.(inst);
         if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
       }
+      // The workspace teardown below ends every session in the tree, so a tree with an employee not retired waits for a retry, with its cause.
+      if (kept.length) throw new CompanyError('temporarily_unavailable', `scene kept: employee retirement not completed for ${kept.join('、')}`, true);
     }
     const workspaces = await paseo.listWorkspaces();
     const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
-import { quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst } from '../src/workforce.ts';
+import { executeGateFor, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
+import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 import type { ProviderQuota } from '../src/contracts.ts';
 
 const OPS = '/ops/repo';
@@ -46,9 +47,22 @@ test('pool: busy / holding / legacy instances are ineligible with reasons', () =
     holding: new Set(['i2']),
   }));
   const by = new Map(entries.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
-  expect(by.get('i1')!.reason).toBe('会话占用中/异常');
-  expect(by.get('i2')!.reason).toBe('持有在办任务');
-  expect(by.get('i3')!.reason).toBe('凭证文件实例不可接新任务');
+  expect(by.get('i1')!.reason).toBe(BLOCK_TEXT.session_busy);
+  expect(by.get('i1')!.code).toBe('session_busy');
+  expect(by.get('i2')!.reason).toBe(BLOCK_TEXT.held);
+  expect(by.get('i3')!.reason).toBe(BLOCK_TEXT.credential_file);
+});
+
+test('pool: a session nobody observed is unknown, never reported as busy', () => {
+  const d = def('d1');
+  const pool = staffingPool(base({ defs: [d], insts: [inst('i1')], states: new Map([['i1', 'unknown']]) }));
+  const reuse = pool.find(e => e.kind === 'reuse')!;
+  expect(reuse.eligible).toBe(false);
+  expect(reuse.code).toBe('unknown');
+  expect(reuse.reason).toBe(BLOCK_TEXT.unknown);
+  // No state entry at all is the same observation gap, not a busy session.
+  const absent = staffingPool(base({ defs: [d], insts: [inst('i1')], states: new Map() })).find(e => e.kind === 'reuse')!;
+  expect(absent.code).toBe('unknown');
 });
 
 test('pool: legacy instance does not consume a maxInstances seat in sidecar mode', () => {
@@ -59,7 +73,7 @@ test('pool: legacy instance does not consume a maxInstances seat in sidecar mode
   expect(spawn.eligible).toBe(true);   // seat free despite the live legacy inst
   // Non-sidecar mode: the same inst would consume the seat.
   const pool2 = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'idle']]), sidecar: false }));
-  expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('实例数 1/1 已满');
+  expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('编制席位已满（1/1 个实例，仓库 repo）');
 });
 
 test('pool: model drift and unresolved slots are ineligible', () => {
@@ -71,11 +85,12 @@ test('pool: model drift and unresolved slots are ineligible', () => {
     providerMax: { codex: 3, devin: 2 },
     slots: new Map([['devin:fast', 'devin-new']]),
   }));
-  expect(pool.find(e => e.kind === 'reuse')!.reason).toBe('模型槽位已漂移');
+  expect(pool.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.model_slot);
   expect(pool.find(e => e.kind === 'spawn')!.model).toBe('devin-new');
   // Slot missing → spawn entry ineligible.
   const noSlot = staffingPool(base({ defs: [auto], insts: [], providerMax: { devin: 2 } }));
-  expect(noSlot.find(e => e.kind === 'spawn')!.reason).toBe('模型槽位未解析');
+  expect(noSlot.find(e => e.kind === 'spawn')!.reason).toBe(BLOCK_TEXT.model_slot);
+  expect(noSlot.find(e => e.kind === 'spawn')!.code).toBe('model_slot');
 });
 
 test('pool: provider capacity and quota block both reuse and spawn', () => {
@@ -83,11 +98,13 @@ test('pool: provider capacity and quota block both reuse and spawn', () => {
   const i = inst('i1');
   const full = staffingPool(base({ defs: [d], insts: [i],
     states: new Map([['i1', 'idle']]), providerMax: { codex: 1 }, busyBy: new Map([['codex', 1]]) }));
-  expect(full.every(e => e.reason === 'provider 无可用容量')).toBe(true);
+  expect(full.every(e => e.reason === BLOCK_TEXT.provider_capacity)).toBe(true);
+  expect(full.every(e => e.code === 'provider_capacity')).toBe(true);
   // Quota circuit-break reports the quota reason itself, not the generic capacity one.
   const quota = staffingPool(base({ defs: [d], insts: [i],
     states: new Map([['i1', 'idle']]), quotaBlocked: new Map([['codex', '额度不足（周/月额度 0%<2%）']]) }));
   expect(quota.every(e => e.reason === '额度不足（周/月额度 0%<2%）')).toBe(true);
+  expect(quota.every(e => e.code === 'quota')).toBe(true);
 });
 
 test('pool: exhausted inst is reusable only while the provider is in probe window', () => {
@@ -96,9 +113,33 @@ test('pool: exhausted inst is reusable only while the provider is in probe windo
   const exhausted = new Map([['codex', { provider: 'codex', state: 'exhausted' as const, until: 2_000_000, failures: 1 }]]);
   const cooling = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'exhausted']]), health: exhausted }));
   expect(cooling.find(e => e.kind === 'reuse')!.eligible).toBe(false);
+  // A cooling quota-exhausted session is quota, not busy: the owner tops up or waits for recovery, not for a free seat.
+  expect(cooling.find(e => e.kind === 'reuse')!.code).toBe('quota');
   const probing = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'exhausted']]),
     health: new Map([['codex', { provider: 'codex', state: 'exhausted' as const, until: 999_999, failures: 1 }]]) }));
   expect(probing.find(e => e.kind === 'reuse')!.eligible).toBe(true);
+});
+
+test('pool: an unreadable execute history blocks every candidate as unknown, never as busy or free', () => {
+  const d = def('d1');
+  const pool = staffingPool(base({
+    defs: [d], insts: [inst('eng-a')], states: new Map([['eng-a', 'idle']]),
+    task: {} as StaffingInput['task'], implementer: { unresolved: true, unknown: true },
+  }));
+  expect(pool.length).toBe(2);
+  expect(pool.every(e => !e.eligible && e.code === 'unknown' && e.reason === BLOCK_TEXT.unknown)).toBe(true);
+});
+
+test('pool: the execute gate reaches only the task executor role, never a review pool or a manager anchor', () => {
+  const gates = new Map([['t1', { implementer: 'eng-impl', unresolved: false }]]);
+  const task = { id: 't1', executorRole: 'engineering' } as SupervisedTask;
+  expect(executeGateFor(gates, 'engineering', task)).toEqual({ implementer: 'eng-impl', unresolved: false });
+  // A reviewer, or a gm pool anchored on the same engineering task, is not an execute pool.
+  expect(executeGateFor(gates, 'qa', task)).toBeUndefined();
+  expect(executeGateFor(gates, 'gm', task)).toBeUndefined();
+  // Review of the task never carries the gate, even for the executor role, and no task means no gate.
+  expect(executeGateFor(gates, 'engineering', task, true)).toBeUndefined();
+  expect(executeGateFor(gates, 'engineering')).toBeUndefined();
 });
 
 test('pool: submitter excluded only for review work', () => {
@@ -106,32 +147,31 @@ test('pool: submitter excluded only for review work', () => {
   const i = inst('i1');
   const task = { submittedBy: 'i1' } as StaffingInput['task'];
   const review = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task, excludeSubmitter: true }));
-  expect(review.find(e => e.kind === 'reuse')!.reason).toBe('提交者回避');
+  expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
+  expect(review.find(e => e.kind === 'reuse')!.code).toBe('author_recusal');
   const impl = staffingPool(base({ defs: [d], insts: [i], states: new Map([['i1', 'idle']]), task }));
   expect(impl.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
-test('pool: review hard-excludes submitters while claim-only hands stay eligible at demoted weight', () => {
+test('pool: review hard-excludes every author; other candidates keep their full weight', () => {
   const d = def('d1', { weight: 10 });
-  const author = inst('eng-author');   // submits>0：交付作者，硬回避
-  const hand = inst('eng-hand');       // 仅 claim 未提交：降权兜底
+  const author = inst('eng-author');     // submitted this task: hard recusal
+  const reviewer = inst('eng-reviewer'); // reviewed before, never wrote code: not an author
   const fresh = inst('eng-fresh');
   const task = { submittedBy: 'eng-rework' } as StaffingInput['task'];
   const pool = staffingPool(base({
-    defs: [d], insts: [author, hand, fresh],
-    states: new Map([['eng-author', 'idle'], ['eng-hand', 'idle'], ['eng-fresh', 'idle']]),
+    defs: [d], insts: [author, reviewer, fresh],
+    states: new Map([['eng-author', 'idle'], ['eng-reviewer', 'idle'], ['eng-fresh', 'idle']]),
     task, excludeSubmitter: true,
-    recusal: { authors: new Set(['eng-author', 'eng-rework']), hands: new Set(['eng-hand']) },
+    recusal: { authors: new Set(['eng-author', 'eng-rework']) },
   }));
   const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
   expect(by.get('eng-author')!.eligible).toBe(false);
-  expect(by.get('eng-author')!.reason).toBe('提交过本任务，验收回避');
+  expect(by.get('eng-author')!.code).toBe('author_recusal');
+  expect(by.get('eng-author')!.reason).toBe(BLOCK_TEXT.author_recusal);
+  expect(by.get('eng-reviewer')!.eligible).toBe(true);
+  expect(by.get('eng-reviewer')!.weight).toBeCloseTo(by.get('eng-fresh')!.weight);
   expect(by.get('eng-fresh')!.eligible).toBe(true);
-  // 经手人仍可派（不硬阻断），但权重降到 15%，share 明显低于干净候选。
-  expect(by.get('eng-hand')!.eligible).toBe(true);
-  expect(by.get('eng-hand')!.note).toBe('经手过本任务，降权兜底');
-  expect(by.get('eng-hand')!.weight).toBeCloseTo(by.get('eng-fresh')!.weight * 0.15);
-  expect(by.get('eng-hand')!.share).toBeLessThan(by.get('eng-fresh')!.share);
 });
 
 test('pool: without a recusal set (execute path or read failure) recusal is unchanged', () => {
@@ -144,9 +184,41 @@ test('pool: without a recusal set (execute path or read failure) recusal is unch
   // review 且贡献者读取失败（空集）：提交者仍由 excludeSubmitter 兜底拦住。
   const review = staffingPool(base({
     defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]),
-    task, excludeSubmitter: true, recusal: { authors: new Set<string>(), hands: new Set<string>() },
+    task, excludeSubmitter: true, recusal: { authors: new Set<string>() },
   }));
-  expect(review.find(e => e.kind === 'reuse')!.reason).toBe('提交者回避');
+  expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
+});
+
+test('pool: execute gate admits only the bound implementer; spawns and other employees are implementer_mismatch', () => {
+  const d = def('d1');
+  const implementer = inst('eng-impl');
+  const other = inst('eng-other');
+  const pool = staffingPool(base({
+    defs: [d], insts: [implementer, other],
+    states: new Map([['eng-impl', 'idle'], ['eng-other', 'idle']]),
+    task: {} as StaffingInput['task'],
+    implementer: { implementer: 'eng-impl', unresolved: false },
+  }));
+  const by = new Map(pool.map(e => [e.key, e]));
+  expect(by.get('eng-impl')!.eligible).toBe(true);
+  expect(by.get('eng-other')!.eligible).toBe(false);
+  expect(by.get('eng-other')!.code).toBe('implementer_mismatch');
+  expect(by.get('spawn:d1')!.code).toBe('implementer_mismatch');
+});
+
+test('pool: an unresolved execute gate blocks every candidate; a gate without a block leaves routing unchanged', () => {
+  const d = def('d1');
+  const a = inst('eng-a');
+  const unresolved = staffingPool(base({
+    defs: [d], insts: [a], states: new Map([['eng-a', 'idle']]),
+    implementer: { unresolved: true },
+  }));
+  expect(unresolved.every(e => !e.eligible)).toBe(true);
+  expect(unresolved.every(e => e.code === 'implementer_unresolved')).toBe(true);
+  const fresh = staffingPool(base({
+    defs: [d], insts: [a], states: new Map([['eng-a', 'idle']]), implementer: { unresolved: false },
+  }));
+  expect(fresh.find(e => e.kind === 'reuse')!.eligible).toBe(true);
 });
 
 test('pool: scope is per role+home; other homes/roles do not appear', () => {

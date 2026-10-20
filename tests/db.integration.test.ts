@@ -129,8 +129,13 @@ test('real DB: expired lease fences old writer, dependencies and blocked recover
   await expect(core.checkpoint(engC, oldProof, {
     text: 'Expired lease must not write this checkpoint.', idempotencyKey: `expired-${suffix}`,
   })).rejects.toMatchObject({ code: 'lease_expired' });
+  // The bound implementer's lease expired: another engineer takes the code only through an explicit manager takeover (SYS-DISP AC04).
+  await core.implementerTakeover(gm, { taskId: parent.id, toEmployee: (await core.authenticate(engD)).employeeId,
+    expectedVersion: (await core.getTask(gm, parent.id)).version, reason: 'Synthetic manager takeover after the bound implementer lease expired.',
+    idempotencyKey: `takeover-${suffix}` });
   const newClaim = await core.claim(engD, parent.id);
-  expect(newClaim.fence).toBe(firstClaim.fence + 1);
+  // The takeover fences the expired lease once, and the successor's claim fences once more.
+  expect(newClaim.fence).toBe(firstClaim.fence + 2);
   await expect(core.submit(engC, oldProof, {
     text: 'Fenced old execution must not deliver this task.', idempotencyKey: `fenced-${suffix}`,
   })).rejects.toBeInstanceOf(CompanyError);
