@@ -76,6 +76,8 @@ export interface Pulse {
   ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
   /** 本轮 tick 判定派不出去的工作（execute 与 review 两阶段），与公司通知同源 */
   dispatchBlocked: DispatchBlockedView[];
+  /** 每个目标的根阻点（同一服务端评估器），目标卡直接显示 */
+  goalBlockers: GoalRootBlockerView[];
   /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   /** 等老板拍板/回答（带已等时长与下游受阻数） */
@@ -143,6 +145,20 @@ export interface ReviewStaffingPoolView extends StaffingPoolView {
   title: string;
   purpose: "review";
   status: "ready" | "history_unavailable";
+}
+
+/** The root blocker of one goal card: the verdict it names first, and the other blocked work behind the goal. */
+export interface GoalRootBlockerView {
+  goalId: string;
+  taskId: string;
+  title: string;
+  phase: "execute" | "review";
+  summary: string;
+  feasible: boolean;
+  since?: string;
+  waitingMinutes: number;
+  others: number;
+  reasons: Array<{ code: string; text: string; candidates: string[]; owner: "gm" | "owner"; recovery: string; nextTrigger: string }>;
 }
 
 /** One dispatch-blocked conclusion from the latest tick, owner-facing. Same summary text as the notice for that episode. */

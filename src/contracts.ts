@@ -301,6 +301,23 @@ export interface OutboxEvent {
   createdAt: string;
 }
 
+/**
+ * gm dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
+ * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
+ */
+export interface ContributorDryRunView {
+  readOnly: true;
+  checkedAt: string;
+  tasks: Array<{
+    taskId: string; found: boolean; title?: string; state?: TaskState; version?: number;
+    executorRole?: string; reviewerRole?: string; currentEmployee?: string; lastSubmitter?: string;
+    status?: 'bound' | 'proposal' | 'manager_decision' | 'fresh'; implementer?: string; suggestedImplementer?: string;
+    authors?: string[]; reviewers?: string[]; excluded?: string[];
+    unknown?: Array<{ actor: string; action: string; at?: string; reason: string }>; note?: string;
+    timeline?: Array<{ at: string; version?: number; actor?: string; action: string; phase?: string; phaseSource?: string; role: string }>;
+  }>;
+}
+
 export interface CompanyCore {
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
@@ -341,6 +358,8 @@ export interface CompanyCore {
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
+  contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;

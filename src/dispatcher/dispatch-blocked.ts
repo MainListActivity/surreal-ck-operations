@@ -233,3 +233,37 @@ export function dispatchNoticeText(verdict: DispatchVerdict): string {
   const recovery = verdict.reasons.map(reason => `${reason.owner === 'gm' ? 'gm' : '老板'}：${reason.recovery}`).join('；');
   return `${verdict.summary}。自 ${verdict.since ?? verdict.checkedAt} 起等待。原因：${reasons}。下一触发：${next || '待定'}。处理：${recovery}。`;
 }
+
+/** A goal card's root blocker: the verdict the card names first, and how much other blocked work sits behind the same goal. */
+export interface GoalRootBlocker {
+  goalId: string;
+  taskId: string;
+  title: string;
+  phase: DispatchPhase;
+  summary: string;
+  /** False when the block is material at once (see DispatchVerdict.feasible). */
+  feasible: boolean;
+  waitingMinutes: number;
+  since?: string;
+  /** Other blocked work behind the same goal. */
+  others: number;
+  reasons: DispatchReason[];
+}
+
+/**
+ * One root blocker per goal, from the latest pass's verdicts. A material block (an owner or manager decision, or an unknown
+ * state) is named before a waiting one, then the longest wait. Dispatchable work has no verdict and never appears here.
+ */
+export function goalRootBlockers(verdicts: readonly DispatchVerdict[]): GoalRootBlocker[] {
+  const byGoal = new Map<string, DispatchVerdict[]>();
+  for (const verdict of verdicts) {
+    if (verdict.dispatchable || !verdict.goalId) continue;
+    byGoal.set(verdict.goalId, [...(byGoal.get(verdict.goalId) ?? []), verdict]);
+  }
+  return [...byGoal].sort(([a], [b]) => a.localeCompare(b)).map(([goalId, list]) => {
+    const ranked = [...list].sort((a, b) => Number(a.feasible) - Number(b.feasible) || b.waitingMinutes - a.waitingMinutes || a.taskId.localeCompare(b.taskId));
+    const root = ranked[0]!;
+    return { goalId, taskId: root.taskId, title: root.title, phase: root.phase, summary: root.summary, feasible: root.feasible,
+      waitingMinutes: root.waitingMinutes, since: root.since, others: list.length - 1, reasons: root.reasons };
+  });
+}

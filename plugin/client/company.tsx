@@ -347,6 +347,15 @@ export function normalizePulse(raw: unknown): Pulse {
     staffingAlerts: num(o.staffingAlerts),
     churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
     goals: arr<Record<string, unknown>>(o.goals).map(g => ({ title: str(g.title), days: num(g.days) })),
+    goalBlockers: arr<Record<string, unknown>>(o.goalBlockers).map(b => ({
+      goalId: str(b.goalId), taskId: str(b.taskId), title: str(b.title), phase: b.phase === "review" ? "review" : "execute",
+      summary: str(b.summary), feasible: b.feasible === true, since: str(b.since) || undefined, waitingMinutes: num(b.waitingMinutes),
+      others: num(b.others),
+      reasons: arr<Record<string, unknown>>(b.reasons).map(r => ({
+        code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
+        owner: r.owner === "owner" ? "owner" : "gm", recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+      })),
+    })),
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
       taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", summary: str(v.summary),
@@ -740,6 +749,10 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const queryClient = useQueryClient();
   const refreshAll = () => { void tasksQuery.refetch(); void detailQuery.refetch(); void queryClient.invalidateQueries(); };
   const goals = (brief?.goals ?? []).filter((g: GoalView) => g.state !== "cancelled");
+  // Goal cards read the same pulse as the queue: the root blocker is the server's conclusion, not a second computation.
+  const pulseRpc = useRpc(rpc.pulse);
+  const pulseQuery = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
+  const blockers = useMemo(() => normalizePulse(pulseQuery.data).goalBlockers, [pulseQuery.data]);
   return (
     <View style={{ gap: 12 }}>
       {goals.length === 0 && <Text style={s.muted}>没有进行中的目标。</Text>}
@@ -750,9 +763,22 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
             <View style={s.badge}><Text style={s.badgeText}>{g.tier ?? "?"}</Text></View>
             <View style={s.badge}><Text style={s.badgeText}>{g.state}</Text></View>
           </Pressable>
+          {blockers.find(b => b.goalId === g.id) && (() => {
+            const root = blockers.find(b => b.goalId === g.id)!;
+            return (
+              <Text style={s.muted}>
+                {root.feasible ? "等待派工" : "无法派工"}：{root.title}（{root.phase === "review" ? "复核" : "执行"}）。{root.summary}。已等待 {root.waitingMinutes} 分钟{root.others > 0 ? `；另有 ${root.others} 项` : ""}
+              </Text>
+            );
+          })()}
           {openGoal === g.id && (
             <View style={{ gap: 4 }}>
               <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
+              {(blockers.find(b => b.goalId === g.id)?.reasons ?? []).map((r, i) => (
+                <Text key={i} style={s.muted}>
+                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
+                </Text>
+              ))}
               {(tasksQuery.data?.tasks ?? []).map(t => (
                 <View key={t.id}>
                   <TaskRow task={t} ctx={ctx} depth={0} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />

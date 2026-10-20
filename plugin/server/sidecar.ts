@@ -32,6 +32,8 @@ const BASE_TOOLS = [
   "goal_acceptance_preview", "goal_acceptance_repair",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
+  // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
+  "contributor_dryrun",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -607,6 +609,9 @@ export class SidecarPool {
       case "goal_acceptance_repair": return core.goalAcceptanceRepair
         ? core.goalAcceptanceRepair(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
+      case "contributor_dryrun": return core.contributorDryRun
+        ? core.contributorDryRun(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));

@@ -256,6 +256,7 @@ export function registerHandlers(server: PluginServerContext): void {
   server.handle(rpc.pulse, async () => {
     const { db, owner, workforce, dispatcher } = await company();
     const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { goalRootBlockers } = await import("./vendor/src/dispatcher/dispatch-blocked.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const { RecordId } = await import("surrealdb");
@@ -326,6 +327,7 @@ export function registerHandlers(server: PluginServerContext): void {
       paused: !!cfg.paused,
       doing, ready,
       dispatchBlocked: dispatchBlockedView(verdicts),
+      goalBlockers: goalRootBlockers(verdicts),
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),
