@@ -1,0 +1,283 @@
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Surreal } from 'surrealdb';
+import { CompanyDatabase } from '../src/database.ts';
+import { SurrealCompanyCore } from '../src/core.ts';
+import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
+import { OwnerDesk } from '../src/owner.ts';
+import { passLedger, waitForDrain } from '../src/dispatch-pause.ts';
+import { connectCompanyClient } from '../src/mcp/client.ts';
+import { createMcpHttpService } from '../src/mcp/server.ts';
+import type { LeaseProof, Principal, Role, TaskView } from '../src/contracts.ts';
+
+setDefaultTimeout(60000);
+// Isolated company fork on a private RocksDB store: no production data, credentials or dispatcher.
+const run = process.env.RUN_SCK_DISPATCH_PAUSE_TESTS === '1' ? test : test.skip;
+let dir: string, server: ReturnType<typeof Bun.spawn>, db: CompanyDatabase, core: SurrealCompanyCore, owner: OwnerDesk;
+let gmA: string, gmB: string, product: string, count = 0, people = 0;
+
+const enrollAs = (role: Role, capabilities: Principal['capabilities']) =>
+  new LocalEnrollmentAdmin(db).enroll(`pause-${role}-${++people}`, role, capabilities);
+const key = () => `pause-key-${++count}-${crypto.randomUUID()}`;
+const task = (extra: Record<string, unknown> = {}) => core.createTask(gmA, {
+  title: `暂停测试任务 ${++count}`, context: 'fixture', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(), ...extra,
+} as never);
+const status = () => core.dispatchStatus(gmA);
+const pause = (credential: string, expectedEpoch: number, reason = '维护停派测试', drainTimeoutSeconds = 10) =>
+  core.setDispatchPause(credential, { paused: true, expectedEpoch, reason, idempotencyKey: key(), drainTimeoutSeconds });
+const restore = (credential: string, expectedEpoch: number, reason = '维护结束恢复派工') =>
+  core.setDispatchPause(credential, { paused: false, expectedEpoch, reason, idempotencyKey: key() });
+const ensureOpen = async () => { const s = await status(); if (s.paused) await restore(gmA, s.epoch); };
+const outboxCounter = async () => {
+  const [row] = await db.db.query<[{ value?: number } | undefined]>('SELECT * FROM ONLY company_meta:outbox_counter;');
+  return row?.value ?? 0;
+};
+
+beforeAll(async () => {
+  if (process.env.RUN_SCK_DISPATCH_PAUSE_TESTS !== '1') return;
+  dir = realpathSync(mkdtempSync(join(tmpdir(), 'sck-dispatch-pause-')));
+  const listener = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  const port = listener.port!; listener.stop(true);
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', 'fixture-only', '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
+  db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'dispatch_pause_fixture', database: 'control_plane' });
+  await db.connect(); await db.bootstrap();
+  core = new SurrealCompanyCore(db); owner = new OwnerDesk(db);
+  gmA = await enrollAs('gm', ['execute', 'review', 'manage']);
+  gmB = await enrollAs('gm', ['execute', 'review', 'manage']);
+  product = await enrollAs('product', ['manage']);
+});
+afterAll(async () => {
+  if (!dir) return;
+  await db.close(); server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true });
+});
+
+run('only a gm with manage reads or changes the dispatch pause, and bad input is refused before any write', async () => {
+  const before = await status();
+  const engineer = await enrollAs('engineering', ['execute', 'review']);
+  for (const credential of [product, engineer]) {
+    await expect(core.dispatchStatus(credential)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(core.setDispatchPause(credential, { paused: true, expectedEpoch: before.epoch, reason: '非经理尝试停派', idempotencyKey: key(), drainTimeoutSeconds: 10 }))
+      .rejects.toMatchObject({ code: 'forbidden' });
+  }
+  await expect(core.setDispatchPause(gmA, { paused: true, expectedEpoch: -1, reason: '纪元越界', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+  await expect(core.setDispatchPause(gmA, { paused: true, expectedEpoch: before.epoch, reason: '超时过短', idempotencyKey: key(), drainTimeoutSeconds: 5 }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  await expect(core.setDispatchPause(gmA, { paused: true, expectedEpoch: before.epoch, reason: 'x', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+  expect(await status()).toMatchObject({ paused: false, epoch: before.epoch });
+});
+
+run('compare-and-set: a stale or future epoch conflicts and changes nothing; a second gm cannot overwrite the first', async () => {
+  await ensureOpen();
+  const s0 = await status();
+  expect(await pause(gmA, s0.epoch)).toMatchObject({ operation: 'dispatch_pause', paused: true, epoch: s0.epoch + 1, before: { paused: false, epoch: s0.epoch }, replayed: false });
+  // Pausing while already paused keeps the epoch: only a change of the paused value moves it.
+  expect(await pause(gmB, s0.epoch + 1)).toMatchObject({ paused: true, epoch: s0.epoch + 1, before: { paused: true, epoch: s0.epoch + 1 } });
+  // The first gm's stale view and a future epoch both conflict.
+  await expect(pause(gmA, s0.epoch)).rejects.toMatchObject({ code: 'conflict' });
+  await expect(pause(gmA, s0.epoch + 5)).rejects.toMatchObject({ code: 'conflict' });
+  expect(await status()).toMatchObject({ paused: true, epoch: s0.epoch + 1 });
+  expect(await restore(gmB, s0.epoch + 1)).toMatchObject({ operation: 'dispatch_restore', paused: false, epoch: s0.epoch + 2, drained: null });
+  // A restore from a stale view does not reopen over a later change made by another gm.
+  await expect(restore(gmA, s0.epoch + 1)).rejects.toMatchObject({ code: 'conflict' });
+  expect(await status()).toMatchObject({ paused: false, epoch: s0.epoch + 2 });
+});
+
+run('idempotency: the same key and payload replays the stored result; the same key with another payload conflicts', async () => {
+  await ensureOpen();
+  const s0 = await status();
+  const k = key();
+  const input = { paused: true, expectedEpoch: s0.epoch, reason: '幂等测试停派', idempotencyKey: k, drainTimeoutSeconds: 10 };
+  const first = await core.setDispatchPause(gmA, input);
+  const replay = await core.setDispatchPause(gmA, input);
+  expect(replay).toMatchObject({ replayed: true, operationId: first.operationId, epoch: first.epoch, paused: true });
+  await expect(core.setDispatchPause(gmA, { ...input, reason: '另一个理由' })).rejects.toMatchObject({ code: 'conflict' });
+  expect(await status()).toMatchObject({ paused: true, epoch: s0.epoch + 1 });
+  const [rows] = await db.db.query<[Array<{ id: unknown }>]>(
+    "SELECT id FROM audit WHERE action = 'dispatch_pause' AND evidence CONTAINS '幂等测试停派';");
+  expect(rows.length).toBe(1);
+  await restore(gmA, s0.epoch + 1);
+});
+
+run('a pause refuses new leases; the holder keeps heartbeat, checkpoint and submit; a review lease waits for the restore', async () => {
+  await ensureOpen();
+  const holder = await enrollAs('engineering', ['execute', 'review']);
+  const newcomer = await enrollAs('engineering', ['execute', 'review']);
+  const reviewer = await enrollAs('qa', ['execute', 'review']);
+  const first = await task();
+  const lease = await core.claim(holder, first.id);
+  let proof: LeaseProof = { taskId: first.id, deliveryId: lease.deliveryId, fence: lease.fence, expectedVersion: lease.task.version };
+  const s0 = await status();
+  expect(await pause(gmA, s0.epoch)).toMatchObject({ paused: true, epoch: s0.epoch + 1, drained: { drained: true, blocking: 0 } });
+  const second = await task();
+  await expect(core.claim(newcomer, second.id)).rejects.toMatchObject({ code: 'dispatch_paused' });
+  expect(await core.getTask(gmA, second.id)).toMatchObject({ state: 'ready' });
+  const beat = await core.heartbeat(holder, proof);
+  proof = { ...proof, expectedVersion: beat.task.version };
+  const note = await core.checkpoint(holder, proof, { text: '暂停期间继续开发并记录检查点：接口与测试框架已完成，下一步补齐验证。', idempotencyKey: key() });
+  proof = { ...proof, expectedVersion: note.version };
+  expect(await core.submit(holder, proof, { text: '暂停期间提交交付：实现与测试均已完成，等待独立复核。', idempotencyKey: key() })).toMatchObject({ state: 'review' });
+  // Review is a new lease for the reviewer, so it waits for the restore.
+  await expect(core.claim(reviewer, first.id)).rejects.toMatchObject({ code: 'dispatch_paused' });
+  await restore(gmA, s0.epoch + 1);
+  const review = await core.claim(reviewer, first.id);
+  const accepted = await core.accept(reviewer, { taskId: first.id, deliveryId: review.deliveryId, fence: review.fence, expectedVersion: review.task.version },
+    { text: '独立复核通过：逐项核对暂停屏障与续租行为，结论一致。', idempotencyKey: key() });
+  expect(accepted).toMatchObject({ state: 'done' });
+});
+
+run('drain: an old pass that runs past the bound keeps paused with drained=false; the same key then reports drained once it ends', async () => {
+  await ensureOpen();
+  const s0 = await status();
+  const pass = await passLedger(db.db, 'fixture-host:drain-timeout').begin();
+  await pass.setEpoch(s0.epoch);
+  const input = { paused: true, expectedEpoch: s0.epoch, reason: '排空超时测试', idempotencyKey: key(), drainTimeoutSeconds: 10 };
+  const first = await core.setDispatchPause(gmA, input);
+  expect(first).toMatchObject({ paused: true, epoch: s0.epoch + 1, drained: { drained: false, blocking: 1 } });
+  expect(first.drained!.waitedMs).toBeGreaterThanOrEqual(10000);
+  expect(await status()).toMatchObject({ paused: true, epoch: s0.epoch + 1, oldRunning: 1 });
+  await pass.end('done');
+  expect(await core.setDispatchPause(gmA, input)).toMatchObject({ replayed: true, operationId: first.operationId, drained: { drained: true, blocking: 0 } });
+  await restore(gmA, s0.epoch + 1);
+});
+
+run('drain succeeds only after the old pass has ended, inside the bounded wait', async () => {
+  await ensureOpen();
+  const s0 = await status();
+  const pass = await passLedger(db.db, 'fixture-host:drain-ok').begin();
+  await pass.setEpoch(s0.epoch);
+  const ending = Bun.sleep(300).then(() => pass.end('done'));
+  const paused = await pause(gmA, s0.epoch);
+  await ending;
+  expect(paused).toMatchObject({ paused: true, epoch: s0.epoch + 1, drained: { drained: true, blocking: 0 } });
+  await restore(gmA, s0.epoch + 1);
+});
+
+run('a drain wait whose ledger reads fail never reports drained', async () => {
+  const broken = { query: () => { throw new Error('synthetic ledger read failure'); } } as unknown as Surreal;
+  await expect(waitForDrain(broken, 3, 60, 5)).resolves.toMatchObject({ drained: false, blocking: null });
+});
+
+run('the pass ledger shows each running pass with its epoch, and drops it when the pass ends', async () => {
+  await ensureOpen();
+  const epoch = (await status()).epoch;
+  const instance = 'fixture-host:ledger';
+  const pass = await passLedger(db.db, instance).begin();
+  const started = await status();
+  expect(started.runningPasses.find(p => p.instance === instance)).toMatchObject({ epoch: null });
+  // A pass that has not recorded its epoch counts as old, so a pause waits for it.
+  expect(started.oldRunning).toBeGreaterThanOrEqual(1);
+  await pass.setEpoch(epoch);
+  expect((await status()).runningPasses.find(p => p.instance === instance)).toMatchObject({ epoch });
+  await pass.end('done');
+  expect((await status()).runningPasses.some(p => p.instance === instance)).toBe(false);
+});
+
+run('owner RPC pause and owner_command resume move the same epoch and write the same audited transition', async () => {
+  await ensureOpen();
+  const before = await status();
+  const base = await outboxCounter();
+  await owner.setPaused(true);
+  expect(await status()).toMatchObject({ paused: true, epoch: before.epoch + 1 });
+  await db.db.query("CREATE owner_command CONTENT { kind: 'resume', text: '维护结束，恢复派工', status: 'pending', source: 'test', created_at: time::now() };");
+  const applied = await owner.applyPending();
+  expect(applied.at(-1)).toMatchObject({ kind: 'resume', status: 'applied' });
+  expect(await status()).toMatchObject({ paused: false, epoch: before.epoch + 2 });
+  const [rows] = await db.db.query<[Array<{ action: string; actor: string; evidence: string }>]>(
+    "SELECT action, actor, evidence, sequence FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] AND sequence > $base ORDER BY sequence;", { base });
+  expect(rows.map(row => [row.action, row.actor])).toEqual([['dispatch_pause', 'owner'], ['dispatch_restore', 'owner']]);
+  expect(rows[0]!.evidence).toContain('paseo_rpc');
+  expect(rows[1]!.evidence).toContain('owner_command');
+});
+
+run('claims racing a pause: each committed lease sits in an interval that the outbox order places before the pause', async () => {
+  await ensureOpen();
+  const base = await outboxCounter();
+  const open = await status();
+  const tasks: TaskView[] = [], holders: string[] = [];
+  for (let i = 0; i < 8; i++) { tasks.push(await task()); holders.push(await enrollAs('engineering', ['execute', 'review'])); }
+  const claims = tasks.map((t, i) => core.claim(holders[i]!, t.id).then(
+    () => 'lease',
+    (error: { code?: string }) => `refused:${error.code ?? 'unknown'}`));
+  const cycles = (async () => {
+    for (let round = 0; round < 3; round++) {
+      for (let attempt = 0; ; attempt++) {
+        const s = await status();
+        try {
+          await core.setDispatchPause(gmA, { paused: !s.paused, expectedEpoch: s.epoch, reason: '竞争测试切换', idempotencyKey: key(), drainTimeoutSeconds: 10 });
+          break;
+        } catch (error) {
+          if ((error as { code?: string }).code !== 'conflict' || attempt >= 5) throw error;
+        }
+      }
+    }
+  })();
+  const [outcomes] = await Promise.all([Promise.all(claims), cycles]);
+  const leased = outcomes.filter(outcome => outcome === 'lease').length;
+  const refused = outcomes.filter(outcome => outcome !== 'lease');
+  console.log(`race outcomes: ${leased} leased, ${refused.length} refused (${[...new Set(refused)].join(', ')})`);
+  expect(refused.every(outcome => outcome === 'refused:dispatch_paused' || outcome === 'refused:conflict')).toBe(true);
+  expect(leased + refused.length).toBe(tasks.length);
+  const [changes] = await db.db.query<[Array<{ sequence: number; paused: boolean }>]>(
+    "SELECT sequence, paused FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] AND sequence > $base ORDER BY sequence;", { base });
+  const [leases] = await db.db.query<[Array<{ sequence: number }>]>(
+    "SELECT sequence FROM outbox WHERE kind = 'claimed' AND sequence > $base ORDER BY sequence;", { base });
+  expect(changes.length).toBe(3);
+  expect(leases.length).toBe(leased);
+  for (const lease of leases) {
+    const prior = changes.filter(change => change.sequence < lease.sequence).at(-1);
+    expect(prior?.paused ?? open.paused).toBe(false);
+  }
+  await ensureOpen();
+});
+
+run('a claim transaction that read the config before a pause committed conflicts with it, and its retry sees the pause', async () => {
+  await ensureOpen();
+  const open = await status();
+  // The statements claimLease runs: read the config, write the shared gate, take an outbox sequence. The sleep is the window.
+  const window = (ms: number) => `BEGIN;
+    LET $cfg = SELECT paused, pause_epoch FROM ONLY company_meta:config;
+    LET $held = sleep(${ms}ms);
+    UPSERT company_meta:dispatch_gate MERGE { last_lease_at: time::now() };
+    LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+    RETURN { paused: $cfg.paused ?? false, sequence: $sequence.value };
+    COMMIT;`;
+  const stale = db.db.query<unknown[]>(window(400)).responses();
+  await Bun.sleep(100);
+  await pause(gmA, open.epoch);
+  const outcome = await stale;
+  expect(outcome.some(response => !response.success && /conflict/i.test(String((response as { error?: { message?: string } }).error?.message)))).toBe(true);
+  const retry = await db.db.query<unknown[]>(window(1)).responses();
+  expect(retry.at(-2)).toMatchObject({ success: true, result: { paused: true } });
+  await restore(gmA, open.epoch + 1);
+});
+
+run('MCP transport: dispatch tools are listed; a gm reads status and pauses and restores; an engineer is refused', async () => {
+  const service = createMcpHttpService({ core: core as never, port: 0 });
+  const url = new URL(`http://127.0.0.1:${service.port}/mcp`);
+  const engineer = await enrollAs('engineering', ['execute', 'review']);
+  try {
+    const gm = await connectCompanyClient({ url, credential: gmA, clientName: 'dispatch-pause-test' });
+    try {
+      const tools = (await gm.client.listTools()).tools.map(tool => tool.name);
+      expect(tools).toEqual(expect.arrayContaining(['dispatch_pause', 'dispatch_restore', 'dispatch_status']));
+      const before = await gm.client.callTool({ name: 'dispatch_status', arguments: {} });
+      expect(before.structuredContent).toMatchObject({ ok: true, data: { paused: false } });
+      const epoch = (before.structuredContent as { data: { epoch: number } }).data.epoch;
+      const paused = await gm.client.callTool({ name: 'dispatch_pause', arguments: { expectedEpoch: epoch, reason: 'MCP 维护停派', idempotencyKey: key(), drainTimeoutSeconds: 10 } });
+      expect(paused.structuredContent).toMatchObject({ ok: true, data: { paused: true, epoch: epoch + 1 } });
+      const stale = await gm.client.callTool({ name: 'dispatch_restore', arguments: { expectedEpoch: epoch, reason: 'MCP 过期恢复', idempotencyKey: key() } });
+      expect(stale.structuredContent).toMatchObject({ ok: false, code: 'conflict' });
+      const restored = await gm.client.callTool({ name: 'dispatch_restore', arguments: { expectedEpoch: epoch + 1, reason: 'MCP 恢复派工', idempotencyKey: key() } });
+      expect(restored.structuredContent).toMatchObject({ ok: true, data: { paused: false, epoch: epoch + 2 } });
+    } finally { await gm.close(); }
+    const denied = await connectCompanyClient({ url, credential: engineer, clientName: 'dispatch-pause-denied' });
+    try {
+      expect((await denied.client.callTool({ name: 'dispatch_status', arguments: {} })).structuredContent).toMatchObject({ ok: false, code: 'forbidden' });
+      expect((await denied.client.callTool({ name: 'dispatch_pause', arguments: { expectedEpoch: 0, reason: '非经理停派', idempotencyKey: key() } })).structuredContent)
+        .toMatchObject({ ok: false, code: 'forbidden' });
+    } finally { await denied.close(); }
+  } finally { await service.close(); }
+});

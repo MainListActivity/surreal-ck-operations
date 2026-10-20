@@ -60,6 +60,18 @@ export interface PauseResult {
   sequence: number;
 }
 
+interface StatementResponse { success: boolean; error?: { message?: string } }
+
+/**
+ * The failure a batch reports: the statement that failed, not the statements a cancelled transaction then refused to run
+ * (their "not executed" messages come first in the list). Same selection as core's txTask.
+ */
+function causeOf(responses: StatementResponse[]): Error | undefined {
+  const failures = responses.filter(response => !response.success).map(response => response.error?.message ?? 'unknown error');
+  const cause = failures.find(message => !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? failures[0];
+  return cause === undefined ? undefined : new Error(cause);
+}
+
 /** Writes the pause state, bumping the epoch only when the paused value changes. Retries write-write conflicts. */
 export async function writePause(db: Surreal, write: PauseWrite): Promise<PauseResult> {
   const action = write.paused ? 'dispatch_pause' : 'dispatch_restore';
@@ -69,7 +81,8 @@ export async function writePause(db: Surreal, write: PauseWrite): Promise<PauseR
   for (let attempt = 0; attempt < COMMIT_ATTEMPTS; attempt++) {
     try {
       const responses = await db.query<unknown[]>(PAUSE_TXN, vars).responses();
-      for (const response of responses) if (!response.success) throw new Error(response.error.message);
+      const cause = causeOf(responses);
+      if (cause) throw cause;
       const row = responses.at(-2);
       const result = row && row.success ? row.result as PauseResult | undefined : undefined;
       if (!result || result.operation !== action) throw new Error('dispatch pause returned no result');
@@ -87,7 +100,8 @@ export async function writePause(db: Surreal, write: PauseWrite): Promise<PauseR
 /** Runs one or more statements and throws on the first failed statement, so ledger and status reads never fail silently. */
 async function run(db: Surreal, query: string, vars: Record<string, unknown>): Promise<unknown[]> {
   const responses = await db.query<unknown[]>(query, vars).responses();
-  for (const response of responses) if (!response.success) throw new Error(response.error.message);
+  const cause = causeOf(responses);
+  if (cause) throw cause;
   return responses.map(response => (response.success ? response.result : undefined));
 }
 
@@ -159,8 +173,10 @@ export function defaultPassInstance(): string {
 export function passLedger(db: Surreal, instance = defaultPassInstance()): PassLedger {
   return {
     async begin() {
-      const [rows] = await run(db, `CREATE dispatch_pass CONTENT { instance: $instance, state: 'running', epoch: NONE,
-        started_at: time::now() } RETURN id;`, { instance }) as [Array<{ id: RecordId }> | undefined];
+      // Finished passes older than a day are pruned here (no timer); a running row is never pruned, so drain stays fail-closed.
+      const [, rows] = await run(db, `DELETE dispatch_pass WHERE state != 'running' AND finished_at < time::now() - 1d;
+        CREATE dispatch_pass CONTENT { instance: $instance, state: 'running', epoch: NONE, started_at: time::now() } RETURN id;`,
+        { instance }) as [unknown, Array<{ id: RecordId }> | undefined];
       const pass = rows?.[0]?.id;
       if (!pass) throw new Error('dispatch pass ledger write returned no id');
       return {
