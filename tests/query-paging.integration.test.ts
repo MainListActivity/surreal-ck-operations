@@ -217,7 +217,7 @@ beforeAll(async () => {
   smallGoalId = small.id;
   for (let i = 0; i < 3; i++) {
     await core.createTask(gm, {
-      title: `小目标样例 ${i} ${unit}`, context: i === 0 ? codePoints(6000, '较长正文 ') : `短正文 ${i}`,
+      title: `小目标样例 ${i} ${unit}`, context: i === 0 ? codePoints(1_500, '较长正文 ') : `短正文 ${i}`,
       executorRole: 'engineering', reviewerRole: 'qa', goalId: smallGoalId, idempotencyKey: key(`small${i}`),
     });
   }
@@ -245,7 +245,7 @@ test('legacy get_context answers whole when the set fits: the old keys, every ta
   expect(bytesOf(legacy)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   // A complete answer carries whole contexts, never a preview: the long one of this goal is returned in full (C2, C3).
   const long = legacy.tasks.find(task => String(task.context).startsWith('较长正文'));
-  expect(String(long?.context).length).toBeGreaterThanOrEqual(6000);
+  expect(long?.context).toBe(codePoints(1_500, '较长正文 '));
   expect(long?.contextTruncated).toBe(false);
   expect(long?.contextBytes).toBe(utf8(String(long?.context)));
   expect(long?.contextSha256).toBe(sha256(String(long?.context)));
@@ -273,12 +273,12 @@ test('legacy get_task_history is the complete history with whole evidence when i
   const small = await core.createTask(gm, {
     title: '历史小样例', context: '历史小样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-small'),
   });
-  await addAudit(small.id, codePoints(12_000, '完整证据 '));
+  await addAudit(small.id, codePoints(3_000, '完整证据 '));
   const whole = await core.history(gm, small.id);
   expect(Array.isArray(whole)).toBe(true);
   expect(whole.length).toBe(await historyRows(small.id));
   const full = whole.find(entry => entry.evidence?.startsWith('完整证据'));
-  expect(full?.evidence).toBe(codePoints(12_000, '完整证据 '));
+  expect(full?.evidence).toBe(codePoints(3_000, '完整证据 '));
   expect(full?.evidenceTruncated).toBe(false);
   const big = await core.createTask(gm, {
     title: '历史大样例', context: '历史大样例正文', executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('hist-big'),
@@ -288,7 +288,7 @@ test('legacy get_task_history is the complete history with whole evidence when i
 });
 
 test('get_context by taskId returns the whole context when it fits, with its size and digest (C3)', async () => {
-  const text = codePoints(9_000, '中等正文 ');
+  const text = codePoints(4_000, '中等正文 ');
   const task = await core.createTask(gm, {
     title: '中等正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('medium'),
   });
@@ -391,6 +391,39 @@ test('a paged traversal yields every working-set task exactly once, each page in
   expect([...seen].sort()).toEqual([...expected].sort());
 });
 
+test('a listing item whose dependency list alone exceeds a page keeps the leading dependencies, flags listsTruncated, and reads the whole list back (SYS01 R3)', async () => {
+  const goal = await owner.createGoal({ text: `长依赖目标 ${suffix}`, source: 'owner:test', key: key('goal-deps'), tier: 'standard' });
+  const wide = await core.createTask(gm, {
+    title: `长依赖样例 ${suffix}`, context: '短正文', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('wide-deps'),
+  });
+  // A goal's acceptance task depends on every task of the goal: 900 identifiers are about 36 KiB of JSON, 72 KiB in both copies.
+  const deps = expectedWorking.slice(0, 900);
+  await database.db.query('UPDATE $task SET dependencies = $deps;', { task: id('task', wide.id), deps: deps.map(dep => id('task', dep)) });
+  const delivered: Array<Record<string, unknown>> = [];
+  let cursor: string | undefined;
+  for (let guard = 0; guard < 50; guard++) {
+    const page = await core.contextView(gm, { goalId: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
+    expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    delivered.push(...(page.tasks as Array<Record<string, unknown>>));
+    cursor = page.page!.nextCursor;
+    if (!page.page!.hasMore) break;
+  }
+  const item = delivered.find(task => task.id === wide.id);
+  expect(item).toBeDefined();
+  const kept = item!.dependencies as string[];
+  expect(kept.length).toBeGreaterThan(0);
+  expect(kept.length).toBeLessThan(deps.length);
+  expect(kept).toEqual(deps.slice(0, kept.length));
+  expect(item!.listsTruncated).toEqual({ dependencies: { count: deps.length, sha256: sha256(JSON.stringify(deps)) } });
+  // The context of this item is whole: the cut list made room for it.
+  expect(item!.contextTruncated).toBe(false);
+  expect(item!.context).toBe('短正文');
+  // The whole list reads back through read_task_text, verified by its digest.
+  const whole = await reassemble({ taskId: wide.id, field: 'dependencies', limit: 16 * 1024 });
+  expect(whole.sha256).toBe(sha256(JSON.stringify(deps)));
+  expect(JSON.parse(whole.text) as string[]).toEqual(deps);
+});
+
 test('a page item larger than the page budget on its own is cut at a character boundary and flagged; its rest reads by segment and the traversal goes on (C3, AC03)', async () => {
   const goal = await owner.createGoal({ text: `超大条目目标 ${suffix}`, source: 'owner:test', key: key('goal-oversize'), tier: 'standard' });
   const text = '超'.repeat(20_000); // 60,000 bytes: larger than one page item on its own
@@ -432,9 +465,9 @@ test('a page item larger than the page budget on its own is cut at a character b
   expect(prefix + rest).toBe(text);
 });
 
-test('a page item between 32 KiB and the page budget stays whole, for context and for evidence (C3)', async () => {
+test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays whole for context and for evidence (C3)', async () => {
   const goal = await owner.createGoal({ text: `中等条目目标 ${suffix}`, source: 'owner:test', key: key('goal-medium'), tier: 'standard' });
-  const text = '超'.repeat(14_000); // 42,000 bytes: above 32 KiB, still one page item
+  const text = '超'.repeat(6_000); // 18,000 bytes: 36 KiB in the text and in the JSON copy, still one page item
   const medium = await core.createTask(gm, {
     title: `中等条目 ${unit}`, context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key('medium-item'),
   });
@@ -996,7 +1029,8 @@ test('list_worktrees without pageSize or cursor keeps the array shape; an over-b
       { taskId: `old${index}`, employee: 'eng', deliveryId: 'd', fence: 1, intent: { kind: 'code', lane: 'x' }, state: 'released', at: '2026-10-19T00:00:00Z' },
     ],
   });
-  const small = Array.from({ length: 60 }, (_, index) => view(index, `/tmp/wt-${String(index).padStart(3, '0')}`));
+  // 40 compact entries are about 35 KiB in both copies: the largest complete array the budget admits for this shape.
+  const small = Array.from({ length: 40 }, (_, index) => view(index, `/tmp/wt-${String(index).padStart(3, '0')}`));
   const original = core.listWorktrees;
   try {
     core.listWorktrees = async () => small as never;
@@ -1372,7 +1406,8 @@ test('a claim over more than 16 KiB of history echoes the newest entries that fi
   const task = await core.createTask(gm, {
     title: `历史回显样例 ${suffix}`, context: '短正文', executorRole: 'concept-design', reviewerRole: 'qa', idempotencyKey: key('history-echo'),
   });
-  // Seeded history, oldest first: 70 entries of about 900 bytes, and one entry of 90 KB that is 30th from the newest.
+  // Seeded history, oldest first: 70 entries of about 250 bytes (about 1 KiB each in both copies), and one entry of 96 KB that is
+  // 30th from the newest. The 29 newer entries fit the echo room whole, so the big entry is the boundary, cut at its longest prefix.
   const base = Date.parse('2026-10-18T08:00:00Z');
   const at = (i: number) => new Date(base + i * 60_000).toISOString();
   const big = codePoints(30_000, `大条目 ${suffix} `);
@@ -1381,7 +1416,7 @@ test('a claim over more than 16 KiB of history echoes the newest entries that fi
     if (i === 40) {
       bigId = await seedAudit(task.id, big, at(i));
     } else {
-      await seedAudit(task.id, `历史条目 ${i} ${suffix} ` + '证'.repeat(300), at(i));
+      await seedAudit(task.id, `历史条目 ${i} ${suffix} ` + '证'.repeat(60), at(i));
     }
   }
   const session = await mcpSession(holder);

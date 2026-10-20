@@ -15,7 +15,7 @@ import { serviceHome } from "./env";
 import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
-import { isPaged, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
+import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -572,12 +572,14 @@ export class SidecarPool {
         if (!core.listWorktrees) return [];
         return core.listWorktrees(cred, scope);
       }
-      case "reclaim_worktrees": return core.reclaimWorktrees
-        ? core.reclaimWorktrees(cred, {
-            dryRun: args.dryRun === true,
-            repos: Array.isArray(args.repos) ? args.repos.map(String) : undefined,
-          })
-        : { scanId: "", removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+      case "reclaim_worktrees": {
+        // Strict, as on MCP and in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are
+        // refused before any tree is touched. A non-list repos used to widen silently into a reclaim of every repository.
+        const params = parseReclaimInput(args);
+        return core.reclaimWorktrees
+          ? core.reclaimWorktrees(cred, params)
+          : { scanId: "", removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
+      }
       case "list_worktree_audits": return core.listWorktreeAudits
         ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
         : [];
@@ -696,7 +698,10 @@ export class SidecarPool {
       ? { ok: false, error: "malformed request" }
       : this.quarantined.has(instId) || !this.keys.has(instId) || req.key !== this.keys.get(instId)
         ? { ok: false, error: "stale comm key; this session predates a plugin restart" }
-        : await this.dispatch(instId, req.tool, req.args ?? {}, false, request)
+        // SYS01, D3: a null argument object is absent for reads, but for reclaim it is refused: a null never starts a real reclaim.
+        : req.tool === "reclaim_worktrees" && req.args === null
+          ? { ok: false, error: "invalid: reclaim arguments must be one object" }
+          : await this.dispatch(instId, req.tool, req.args ?? {}, false, request)
             .catch((error: unknown) => SidecarPool.isAuthError(error)
               // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
               ? this.dispatch(instId, req.tool, req.args ?? {}, true, request)

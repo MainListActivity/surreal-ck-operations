@@ -165,13 +165,14 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 
 管理查询分页与预算（SYS01，v25）：运营需要知道以下行为。
 
-- `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量包括 MCP 结果的说明文字与帧（`answerBytes`），答案只在 `structuredContent` 中。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
+- `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量为 MCP 结果的 JSON 字节加 256 字节帧预留（`answerBytes`），答案的文本副本与 `structuredContent` 两份都计入。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
 - 需要统计或遍历全部条目时，带 `pageSize`（1 至 100，缺省 25）逐页读取，直到 `page.hasMore` 为 false，并累加每页的 `returned`。`page.total` 为快照内的总数，可用于核对。每页条数由预算决定，可能少于 `pageSize`。
 - 分页快照由数据库统一计数，MCP 与插件 sidecar 共用上限：每身份 4 个，全库 64 个，合计 64 MiB；单个快照最多 5000 行或 8 MiB，有效期 6 小时。上限在代码中固定，没有运营配置项。
 - 全库快照已满时返回 `temporarily_unavailable`，可重试。同一身份的快照全部仍在写入时，请求最多等待 5 秒。超过 5 分钟仍未完成的快照视为遗弃并删除。持续出现容量错误时，核对 `query_snapshot` 表的行数与 `query_snapshot_quota:global` 的 `listings`、`bytes` 计数是否一致。
 - 长文本用 `read_task_text` 按字节段读取，每段默认 16 KiB、最大 24 KiB。第二段起必须带首段返回的 `expectSha256`，若原文已变，返回 `conflict`，须从 `offset: 0` 重读。
-- 写入先于回显提交。回显按预算裁切正文与列表；只有固定字段本身超出预算时，调用方才会收到 `response_too_large`。此时写入已经提交，用 `get_context`（带 `taskId`）核对状态，不得重复提交。
+- 写入先于回显提交。回显先裁切超长列表（依赖、意图路径，标注 `listsTruncated`，完整列表用 `read_task_text` 读取），再裁切正文（标注 `contextTruncated`）；其余顶层文本字段超过 2 KiB 时同样裁切并标注。只有整条应答仍超过 49 152 字节时，调用方才会收到 `response_too_large`。此时写入已经提交，用 `get_context`（带 `taskId`）核对状态，不得重复提交。
 - 全局库存只有 gm 可读，即不带 `taskId` 的 `list_worktrees`。非 gm 角色必须带 `taskId`，缺省或 null 一律返回 `forbidden`。
+- `reclaim_worktrees` 参数严格（经理裁定 v44）：`dryRun` 只接受 true、false 或省略（省略即回收）；整包 null、`dryRun` 为 null 或字符串、`repos` 不是路径列表，一律返回 `invalid`，不触碰任何工作树。
 
 QA 步骤对应如下。统计工作树数量时，先以 gm 身份执行 `list_worktrees` 分页读取，或对具体任务带 `taskId` 读取。遇到 `response_too_large` 时改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读完。`get_admin_summary` 为 gm 专用的只读汇总，口径与完整性标志见 [query-paging.md](./query-paging.md) 第 5 节。发布后的真实员工 sck 最终验收由 QA 任务 `6b6cb5b9` 执行。
 

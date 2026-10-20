@@ -1,6 +1,7 @@
 // Counts the bytes an MCP client receives for each tools/call (SYS01, F5). The count is the whole HTTP body of the
-// call: the JSON-RPC frame, the tool result (text note and structuredContent) and the answer inside it. A budget
-// measured on the answer alone missed the text copy that doubled the body, so the tests measure the body.
+// call: the SSE lines and the JSON-RPC frame, the tool result (its text copy, which is the answer's JSON, and its
+// structuredContent) and the answer inside it. A budget measured on the answer alone missed the text copy that
+// doubled the body, so the tests measure the body.
 
 export type WireCount = { bodies: number[] };
 

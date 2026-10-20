@@ -4,8 +4,8 @@ import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
-import { isPaged } from '../query-input';
-import { answerBytes, answerResult, echoClaim, RESPONSE_BUDGET_BYTES } from '../response-budget';
+import { isPaged, parseReclaimInput } from '../query-input';
+import { answerBytes, answerResult, echoClaim, MAX_REQUEST_ID_BYTES, oversizeRequestId, RESPONSE_BUDGET_BYTES } from '../response-budget';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -51,18 +51,25 @@ function toolError(error: unknown) {
   const message = code !== 'internal_error' && typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
     ? error.message.slice(0, 500)
     : '';
+  const structured = { ok: false as const, code, retryable, error: message || code };
+  // The text copy is the same JSON as structuredContent, for refusals as for answers, so every result parses the same way (SYS01, D1).
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: message ? `${code}: ${message}` : code }],
-    structuredContent: { ok: false, code, retryable, error: message || code },
+    content: [{ type: 'text' as const, text: JSON.stringify(structured) }],
+    structuredContent: structured,
   };
 }
 
 function toolResult(data: unknown) {
   // SYS01: a response over the byte budget becomes a recoverable, JSON-legal error, never a cut stream. The budget counts the
-  // whole tool result with its frame (answerBytes), and the answer is carried once, in structuredContent (SYS01, F5).
-  if (answerBytes(data) > RESPONSE_BUDGET_BYTES) {
-    return toolError({ code: 'response_too_large', message: 'response exceeds the 48 KiB budget; narrow the query with pageSize or a cursor' });
+  // whole tool result with its frame (answerBytes). The answer's JSON is the text, and the same data is in structuredContent,
+  // so both copies are counted (SYS01, D1).
+  const bytes = answerBytes(data);
+  if (bytes > RESPONSE_BUDGET_BYTES) {
+    return toolError({
+      code: 'response_too_large',
+      message: `response is ${bytes} bytes, over the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow it with pageSize and cursor, a taskId, or read_task_text for one long text`,
+    });
   }
   return answerResult(data);
 }
@@ -98,7 +105,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     cursor: z.string().min(1).max(2048).nullish(),
   };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without pageSize or cursor the answer is complete (keys principal, company, tasks) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to true without paging and to false with it. A task context too large for one page is cut and flagged (contextTruncated, contextNextOffset); read the rest with read_task_text. A task read by taskId is whole or refused.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without pageSize or cursor the answer is complete (keys principal, company, tasks) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to true without paging and to false with it. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200).nullish(),
       state: z.enum(states).nullish(),
@@ -123,14 +130,20 @@ function registerTools(server: McpServer, core: CompanyCore) {
   });
 
   server.registerTool('reclaim_worktrees', {
-    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees.',
+    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees. A value other than the documented ones is refused as invalid before any tree is touched.',
     inputSchema: z.object({
-      dryRun: z.boolean().optional(),
-      repos: z.array(z.string()).optional(),
+      // The rule is parseReclaimInput, shared with core and the sidecar (SYS01, D3). The schema documents the shape only: a schema
+      // error would be a plain-text refusal, while parseReclaimInput gives the same structured `invalid` on every layer.
+      dryRun: z.unknown().optional().describe('true for a dry run; omit to reclaim. Any other value is refused as invalid.'),
+      repos: z.unknown().optional().describe('Optional list of repository paths, each a non-empty string. Any other value is refused as invalid.'),
     }),
-  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => core.reclaimWorktrees
-    ? core.reclaimWorktrees(token(ctx), { dryRun, repos })
-    : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 })));
+  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => {
+    // SYS01, D3: checked before any tree is touched.
+    const params = parseReclaimInput({ dryRun, repos });
+    return core.reclaimWorktrees
+      ? core.reclaimWorktrees(token(ctx), params)
+      : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 });
+  }));
   server.registerTool('list_worktree_audits', {
     description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
     // A null limit is absent, as on the sidecar (read-only audit list; reclaim_worktrees is left as it is).
@@ -486,6 +499,17 @@ export function createMcpHttpService(options: McpServiceOptions) {
           });
         }
         if (!principal) return new Response('Unauthorized', { status: 401 });
+        // SYS01, D2: a request id over MAX_REQUEST_ID_BYTES is refused before any tool runs, since the frame reserve of the budget
+        // assumes that bound. Nothing is written for the refused request, and its refusal carries a null id: no valid id is known.
+        if (req.method === 'POST') {
+          const oversize = oversizeRequestId(await req.clone().text());
+          if (oversize !== undefined) {
+            return new Response(JSON.stringify({
+              jsonrpc: '2.0', id: null,
+              error: { code: -32600, message: `request id is ${oversize} bytes; ids are limited to ${MAX_REQUEST_ID_BYTES} bytes` },
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
+        }
         const response = await handler.fetch(req, { authInfo: { token: cred, clientId: principal.employeeId, scopes: [] } });
         mark('handler');
         return response;

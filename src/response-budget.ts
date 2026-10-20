@@ -1,53 +1,95 @@
-// Byte budget for every employee-facing response (SYS01). Sizes are counted on the serialized UTF-8
-// bytes, never on JavaScript string length, because a 64 KiB consumer cut lands on bytes and splits
-// multi-byte characters. Pure helpers only: no database, no transport.
+// Byte budget for every employee-facing response (SYS01). Sizes are counted on the serialized UTF-8 bytes, never on
+// JavaScript string length, because a consumer cut lands on bytes and splits multi-byte characters. Pure helpers only:
+// no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import type { ClaimResult, HistoryEntry, ListCut, ProjectView, TaskTextField, TaskTextSegment, TaskView } from './contracts.ts';
+import type { ClaimResult, FieldCut, HistoryEntry, ListCut, ProjectView, TaskTextField, TaskTextSegment, TaskView } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
 /**
- * Hard ceiling for one response, in UTF-8 bytes: an answer as it is sent, measured by answerBytes (the MCP tool result with
- * its frame, or the relayed answer). Every bounded read, complete or paged, is measured this way; no response is cut to fit.
+ * Hard ceiling for one response, in UTF-8 bytes, as it is sent: on the MCP path the whole HTTP body (see RESPONSE_FRAME_BYTES),
+ * on the sidecar path the relayed answer. Every bounded read, complete or paged, is measured by answerBytes. No response is cut to fit.
  */
 export const RESPONSE_BUDGET_BYTES = 48 * 1024;
 /**
- * Bytes the JSON-RPC message adds around a tool result (jsonrpc, id, result wrapper, SSE line). They are reserved inside the
- * budget, so the whole HTTP body stays within RESPONSE_BUDGET_BYTES, not only the tool result (SYS01, F5).
+ * The bytes the JSON-RPC message adds around one tool result on the wire, without the request id: the SSE lines `event: message`
+ * and `data: ` with the blank line that ends the event (23 bytes), and `{"result":`, `,"jsonrpc":"2.0","id":` and the closing
+ * brace (33 bytes). Measured on the real endpoint (SYS01, D2).
+ */
+export const SSE_RPC_FRAME_BYTES = 56;
+/**
+ * The largest request id the service accepts, as serialized JSON: a number, or a string whose quoted form (escapes counted as
+ * written) is at most this many bytes. The id is echoed in every response, so this bound is what makes the frame reserve hold.
+ * A request with a larger id is refused before any tool runs: nothing is written for it, and its refusal carries a null id.
+ */
+export const MAX_REQUEST_ID_BYTES = 128;
+/**
+ * Bytes reserved inside the budget for the frame around an answer: the SSE and JSON-RPC envelope (SSE_RPC_FRAME_BYTES) plus the
+ * largest accepted request id (MAX_REQUEST_ID_BYTES), with 72 bytes to spare. So an answer that fits the budget as answerBytes
+ * measures it is at most RESPONSE_BUDGET_BYTES - 72 bytes on the wire, whatever id an accepted request carries (SYS01, D2).
  */
 export const RESPONSE_FRAME_BYTES = 256;
 /**
  * Bytes of a page kept back for its envelope (principal, page information, cursor, and the answer's own wrapper). An item of
- * a page is cut only when it cannot fit the budget less this reserve; an item between the reserve and the whole budget stays whole (C3).
+ * a page is cut only when it cannot fit the data budget less this reserve; an item between the reserve and the whole budget stays whole (C3).
  */
 export const PAGE_ENVELOPE_BYTES = 2 * 1024;
-/** Most serialized bytes one item of a page may take: a task in a listing, or one audit entry. */
-export const ITEM_BUDGET_BYTES = RESPONSE_BUDGET_BYTES - PAGE_ENVELOPE_BYTES;
-/** Default and maximum size of one text segment returned by read_task_text. */
+/** Default and maximum size of one text segment returned by read_task_text, in raw UTF-8 bytes. */
 export const SEGMENT_DEFAULT_BYTES = 16 * 1024;
 export const SEGMENT_MAX_BYTES = 24 * 1024;
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 export const jsonBytes = (value: unknown): number => utf8Bytes(JSON.stringify(value));
+/**
+ * The bytes a value takes inside an answer, where it appears twice (SYS01, D1): once as JSON in structuredContent, and once as the
+ * text copy, which is the same JSON escaped as a string. The two quotes that wrap the text copy belong to the wrapper, not to the value.
+ * Both copies add up part by part (an object or array costs the sum of its entries and separators, in each copy), so the budget of a
+ * composite answer can be split between its parts, and every cut below is sized in these bytes.
+ */
+export const dualBytes = (value: unknown): number => jsonBytes(value) + utf8Bytes(JSON.stringify(JSON.stringify(value))) - 2;
 
 /**
- * The note that stands in for a text copy of an answer in an MCP tool result. The answer itself is only in structuredContent
- * (SYS01, F5): a text copy beside it doubled every response past the budget.
+ * The MCP tool result that carries one answer (SYS01, D1). content[0].text is the answer's JSON, the same text the service sent
+ * before SYS01 (8d03d35), and structuredContent holds { ok: true, data } for clients that read it. Both carry the same data.
  */
-export const ANSWER_NOTE = 'The answer is in structuredContent (ok, data). This result has no text copy of it, so the whole response stays within 48 KiB.';
-
-/** The MCP tool result that carries one answer: the answer in structuredContent, and ANSWER_NOTE as its only content. */
 export function answerResult(data: unknown): { content: { type: 'text'; text: string }[]; structuredContent: { ok: true; data: unknown } } {
-  return { content: [{ type: 'text', text: ANSWER_NOTE }], structuredContent: { ok: true, data } };
+  const value = data === undefined ? null : data;
+  return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: { ok: true, data: value } };
 }
 
 /**
- * The bytes one answer takes on the wire: its tool result plus the frame reserved around it. Every answer budget is checked
- * against this one measure, on MCP, on the sidecar relay, in pages, segments and echoes, so one answer is admitted or refused
- * the same way on every path.
+ * The bytes one answer takes on the wire inside the budget: its MCP tool result, both copies included, plus the frame reserved
+ * around it. Every answer budget is checked against this one measure, on MCP, on the sidecar relay, in pages, segments and echoes,
+ * so one answer is admitted or refused the same way on every path.
  */
 export function answerBytes(data: unknown): number {
   return jsonBytes(answerResult(data)) + RESPONSE_FRAME_BYTES;
+}
+
+/** The bytes of an answer around its data (the wrapper of both copies), and so the dual bytes the data itself may take. */
+export const ANSWER_WRAPPER_BYTES = jsonBytes(answerResult(null)) - dualBytes(null);
+/** Dual bytes the data of one answer may take: answerBytes(data) fits RESPONSE_BUDGET_BYTES exactly when dualBytes(data) fits this. */
+export const DATA_BUDGET_BYTES = RESPONSE_BUDGET_BYTES - RESPONSE_FRAME_BYTES - ANSWER_WRAPPER_BYTES;
+/** Dual bytes one item of a page may take: a task in a listing, or one audit entry. */
+export const ITEM_BUDGET_BYTES = DATA_BUDGET_BYTES - PAGE_ENVELOPE_BYTES;
+
+/**
+ * The serialized size of the first request id that is larger than MAX_REQUEST_ID_BYTES, in the body of a JSON-RPC request
+ * (a single message or a batch), or undefined when every id is within the bound. A body that is not JSON is not judged here.
+ */
+export function oversizeRequestId(body: string): number | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
+    if (typeof message !== 'object' || message === null || !('id' in message) || message.id === undefined) continue;
+    const bytes = jsonBytes(message.id);
+    if (bytes > MAX_REQUEST_ID_BYTES) return bytes;
+  }
+  return undefined;
 }
 
 const isContinuation = (byte: number | undefined): boolean => byte !== undefined && (byte & 0xc0) === 0x80;
@@ -116,8 +158,8 @@ export function textSegmentAnswer(head: TaskTextHead, segment: Utf8Segment): Tas
 
 /**
  * One read_task_text segment, cut so that its whole answer fits the response budget as it is sent (answerBytes; SYS01, F2).
- * JSON writes a control character as six bytes and a quote as two, so a byte count alone can overflow the budget: the
- * segment keeps the longest prefix whose serialized answer fits, and never more than `limit` raw bytes.
+ * JSON writes a control character as six bytes and a quote as two, and the text copy escapes them again, so a byte count alone can
+ * overflow the budget: the segment keeps the longest prefix whose serialized answer fits, and never more than `limit` raw bytes.
  */
 export function textSegment(text: string, offset: number, limit: number, head: TaskTextHead): Utf8Segment {
   return utf8Segment(text, offset, limit, segment => answerBytes(textSegmentAnswer(head, segment)) <= RESPONSE_BUDGET_BYTES);
@@ -189,8 +231,8 @@ export interface TaskEchoFields {
 
 /**
  * The echo of a task that a write returns. The write is committed before its echo is built, so the echo must never
- * turn a committed write into an error: the context stays whole when the task fits `limit`, and is otherwise cut at the
- * longest prefix that fits and flagged. contextBytes and contextSha256 always describe the whole context. An echo of an
+ * turn a committed write into an error: the context stays whole when the task fits `limit` (dual bytes), and is otherwise cut at
+ * the longest prefix that fits and flagged. contextBytes and contextSha256 always describe the whole context. An echo of an
  * echo cuts the same way, which lets one response share its budget between several tasks.
  */
 export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number = ITEM_BUDGET_BYTES): T {
@@ -201,22 +243,45 @@ export function echoTaskContext<T extends TaskEchoFields>(task: T, limit: number
     ...(truncated ? { contextNextOffset: utf8Bytes(context) } : {}),
   });
   // A context that is already cut stays cut: the rest of the text is not in this value.
-  if (task.contextTruncated !== true && jsonBytes(echo(task.context, false)) <= limit) return echo(task.context, false);
-  return echo(longestFittingPrefix(task.context, prefix => jsonBytes(echo(prefix, true)) <= limit), true);
+  if (task.contextTruncated !== true && dualBytes(echo(task.context, false)) <= limit) return echo(task.context, false);
+  return echo(longestFittingPrefix(task.context, prefix => dualBytes(echo(prefix, true)) <= limit), true);
+}
+
+/** A text field of a task echo other than the context may take this many dual bytes; a longer one is cut and named (fieldsTruncated). */
+export const TASK_FIELD_ECHO_BYTES = 2 * 1024;
+
+/**
+ * Keeps each text field of a task within TASK_FIELD_ECHO_BYTES. A longer one keeps its longest prefix that fits, and fieldsTruncated
+ * names it with the size and digest of its whole value. A claim or a write has committed, so no task, whatever its titles hold, may
+ * turn its confirmation into an error. The context is left to echoTaskContext, which read_task_text completes.
+ */
+function boundTaskFields(task: TaskView): TaskView {
+  const echo: Record<string, unknown> = { ...task };
+  const cut: Record<string, FieldCut> = {};
+  for (const [name, value] of Object.entries(task)) {
+    if (name === 'context' || name === 'fieldsTruncated' || typeof value !== 'string') continue;
+    if (dualBytes(value) <= TASK_FIELD_ECHO_BYTES) continue;
+    echo[name] = longestFittingPrefix(value, prefix => dualBytes(prefix) <= TASK_FIELD_ECHO_BYTES);
+    cut[name] = { bytes: utf8Bytes(value), sha256: createHash('sha256').update(value).digest('hex') };
+  }
+  // A copy either way: echoTask edits the result in place, and the caller's task must stay as it was.
+  if (Object.keys(cut).length === 0) return { ...task };
+  return { ...echo, fieldsTruncated: { ...task.fieldsTruncated, ...cut } } as TaskView;
 }
 
 /**
  * The echo of a task that a write returns (SYS01 R3). The write is committed before its echo is built, so the echo never turns it
- * into an error, whatever the task holds. Each list of the task (dependencies, the intent paths of the task and of its worktree)
- * keeps its longest prefix within a share of the limit, and each cut is flagged in listsTruncated with the whole count and digest.
- * The context then takes the room that is left (echoTaskContext). read_task_text returns any cut list or context whole.
+ * into an error, whatever the task holds. Each text field is bounded (boundTaskFields). Each list of the task (dependencies, the
+ * intent paths of the task and of its worktree) keeps its longest prefix within a share of the limit, and each cut is flagged in
+ * listsTruncated with the whole count and digest. The context then takes the room that is left (echoTaskContext). read_task_text
+ * returns any cut list or context whole.
  */
 export function echoTask(task: TaskView, limit: number = ITEM_BUDGET_BYTES): TaskView {
   // A share of the limit per list: the three lists, the fixed fields and the context must fit together.
   const share = Math.min(CLAIM_LIST_ECHO_BYTES, Math.floor(limit / 8));
   // An echo of an echo keeps the cuts of the earlier echo, so their counts and digests still describe the whole lists.
   const cuts: Partial<Record<ClaimListName, ListCut>> = { ...task.listsTruncated };
-  const echo: TaskView = { ...task };
+  const echo: TaskView = boundTaskFields(task);
   if (task.dependencies) echo.dependencies = cutList(task.dependencies, 'dependencies', cuts, share);
   if (task.workIntent?.paths) echo.workIntent = { ...task.workIntent, paths: cutList(task.workIntent.paths, 'workIntentPaths', cuts, share) };
   if (task.worktree?.intent?.paths) {
@@ -228,18 +293,23 @@ export function echoTask(task: TaskView, limit: number = ITEM_BUDGET_BYTES): Tas
 
 // ---- Claim echo: the answer of claim_next. The claim has committed when its answer is built, so the answer is an echo, never an error. ----
 
-/** A claim's project over this many bytes is echoed in part (see echoClaim); the whole project stays in claim.json and get_context. */
+/**
+ * The shares of a claim echo, in dual bytes (see dualBytes). At most 28 KiB of the data budget is shared out: the project 8 KiB,
+ * the three lists 4 KiB each, and the history floor 8 KiB. These are worst cases, not usual sizes. The fixed fields and the context
+ * take what is left, about 19 KiB of dual bytes (roughly 9 KiB of plain text) in the worst case; a test holds the sum to this.
+ */
+/** A claim's project over this many dual bytes is echoed in part (see echoClaim); the whole project stays in claim.json and get_context. */
 export const PROJECT_ECHO_BYTES = 8 * 1024;
 /**
  * The least room the handover history keeps beside a long context (SYS01 R3). The context takes what the history leaves, so a
  * long context cannot empty the handover: the newest entries fill this floor first, and the boundary entry keeps what fits.
  */
 export const CLAIM_HISTORY_FLOOR_BYTES = 8 * 1024;
-/** Most bytes of each identity text of a partial project echo. The red lines keep the room that is left. */
+/** Most dual bytes of each identity text of a partial project echo. The red lines keep the room that is left. */
 export const PROJECT_FIELD_ECHO_BYTES = 512;
-/** Most bytes of one red line in a partial project echo. */
+/** Most dual bytes of one red line in a partial project echo. */
 export const RED_LINE_ECHO_BYTES = 1024;
-/** The most bytes one list of a claim echo keeps: the dependencies, and the intent paths of the task and of its worktree. */
+/** The most dual bytes one list of a claim echo keeps: the dependencies, and the intent paths of the task and of its worktree. */
 export const CLAIM_LIST_ECHO_BYTES = 4 * 1024;
 const PROJECT_IDENTITY = ['id', 'name', 'repoPath', 'defaultBranch', 'release', 'rollback', 'pipeline'] as const;
 
@@ -258,27 +328,28 @@ export interface ClaimEcho extends Omit<ClaimResult, 'project'> {
 }
 
 /**
- * A list within `budget` bytes (CLAIM_LIST_ECHO_BYTES unless a write echo gives it a share) is kept whole. A longer one keeps its
+ * A list within `budget` dual bytes (CLAIM_LIST_ECHO_BYTES unless a write echo gives it a share) is kept whole. A longer one keeps its
  * longest prefix, and `cuts` records its count and digest. A list that `cuts` already names was cut by an earlier echo: it stays
  * partial, and keeps that echo's count and digest, which describe the whole list. claim.json and read_task_text keep the list whole.
  */
 function cutList<T>(items: readonly T[], name: ClaimListName, cuts: Partial<Record<ClaimListName, ListCut>>, budget: number = CLAIM_LIST_ECHO_BYTES): T[] {
-  if (!cuts[name] && jsonBytes(items) <= budget) return [...items];
+  if (!cuts[name] && dualBytes(items) <= budget) return [...items];
   if (!cuts[name]) cuts[name] = { count: items.length, sha256: createHash('sha256').update(JSON.stringify(items)).digest('hex') };
-  return items.slice(0, fitCount(items, kept => jsonBytes(kept), budget));
+  return items.slice(0, fitCount(items, kept => dualBytes(kept), budget));
 }
 
 /**
- * Keeps the newest entries that fit `budget` bytes of JSON, oldest first. The entry at the boundary keeps the longest prefix of its
- * evidence that fits; older entries are left out after it. `cut` is true when that prefix is partial.
+ * Keeps the newest entries that fit `budget` dual bytes, oldest first. The entry at the boundary keeps the longest prefix of its
+ * evidence that fits; older entries are left out after it. `cut` is true when that prefix is partial. The array's brackets cost 4
+ * dual bytes, and each comma after the first entry costs 2 (one in each copy).
  */
 function fillHistory(entries: readonly HistoryEntry[], budget: number): { kept: HistoryEntry[]; cut: boolean } {
   const kept: HistoryEntry[] = [];
-  let used = 2; // the array brackets
+  let used = dualBytes([]);
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index]!;
-    const comma = kept.length > 0 ? 1 : 0;
-    const size = jsonBytes(entry);
+    const comma = kept.length > 0 ? 2 : 0;
+    const size = dualBytes(entry);
     if (used + comma + size <= budget) {
       kept.unshift(entry);
       used += comma + size;
@@ -293,7 +364,7 @@ function fillHistory(entries: readonly HistoryEntry[], budget: number): { kept: 
       ...entry, evidence: text, evidenceBytes: bytes, evidenceSha256: digest, evidenceTruncated: true, evidenceNextOffset: utf8Bytes(text),
     });
     const room = budget - used - comma;
-    const prefix = longestFittingPrefix(whole, text => jsonBytes(cutEntry(text)) <= room);
+    const prefix = longestFittingPrefix(whole, text => dualBytes(cutEntry(text)) <= room);
     if (prefix.length === 0) break;
     kept.unshift(cutEntry(prefix));
     return { kept, cut: true };
@@ -310,11 +381,13 @@ function partialProject(project: ProjectView): Partial<ProjectView> {
   for (const key of PROJECT_IDENTITY) {
     if (!(key in project)) continue;
     const value = project[key];
-    identity[key] = typeof value === 'string' ? utf8Prefix(value, PROJECT_FIELD_ECHO_BYTES).text : value;
+    identity[key] = typeof value === 'string'
+      ? longestFittingPrefix(value, prefix => dualBytes(prefix) <= PROJECT_FIELD_ECHO_BYTES)
+      : value;
   }
-  const lines = (project.redLines ?? []).map(line => utf8Prefix(line, RED_LINE_ECHO_BYTES).text);
-  const room = Math.max(0, PROJECT_ECHO_BYTES - jsonBytes(identity));
-  return { ...identity, redLines: lines.slice(0, fitCount(lines, kept => jsonBytes(kept), room)) } as Partial<ProjectView>;
+  const lines = (project.redLines ?? []).map(line => longestFittingPrefix(line, prefix => dualBytes(prefix) <= RED_LINE_ECHO_BYTES));
+  const kept = lines.slice(0, fitCount(lines, subset => dualBytes({ ...identity, redLines: subset }), PROJECT_ECHO_BYTES));
+  return { ...identity, redLines: kept } as Partial<ProjectView>;
 }
 
 /**
@@ -325,25 +398,25 @@ function partialProject(project: ProjectView): Partial<ProjectView> {
  * newest entries that fit are kept whole, the boundary entry keeps its longest prefix, and historyCount says how many entries the
  * task holds. historyComplete is true only when every entry is kept whole and the count agrees. The context takes the room that is
  * left: a cut context is flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest. core.claim keeps the
- * whole claim for claim.json.
+ * whole claim for claim.json. Every size is dual (see dualBytes), so the echo is exactly what answerBytes measures.
  */
 export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
   const { task: whole, project, history, historyComplete, historyCount, ...fields } = claim;
   const cuts: Partial<Record<ClaimListName, ListCut>> = {};
   // task.worktree is the same assignment as the top-level worktree, so the echo carries it once.
-  const task: TaskView = { ...whole, dependencies: cutList(whole.dependencies, 'dependencies', cuts) };
-  delete task.worktree;
-  if (whole.workIntent?.paths) task.workIntent = { ...whole.workIntent, paths: cutList(whole.workIntent.paths, 'workIntentPaths', cuts) };
+  const bare: TaskView = { ...whole, dependencies: cutList(whole.dependencies, 'dependencies', cuts) };
+  delete bare.worktree;
+  if (whole.workIntent?.paths) bare.workIntent = { ...whole.workIntent, paths: cutList(whole.workIntent.paths, 'workIntentPaths', cuts) };
+  const task = boundTaskFields(bare);
   let head: Omit<ClaimEcho, 'task' | 'history'> = { ...fields };
   if (fields.worktree?.intent.paths) {
     head.worktree = { ...fields.worktree, intent: { ...fields.worktree.intent, paths: cutList(fields.worktree.intent.paths, 'worktreePaths', cuts) } };
   }
   if (project !== undefined) {
-    const bytes = jsonBytes(project);
-    head = bytes <= PROJECT_ECHO_BYTES
+    head = dualBytes(project) <= PROJECT_ECHO_BYTES
       ? { ...head, project }
       : {
-        ...head, project: partialProject(project), projectTruncated: true, projectBytes: bytes,
+        ...head, project: partialProject(project), projectTruncated: true, projectBytes: jsonBytes(project),
         projectSha256: createHash('sha256').update(JSON.stringify(project)).digest('hex'),
       };
   }
@@ -354,18 +427,22 @@ export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
     ...(historyCount !== undefined ? { historyCount } : {}),
     ...(read ? { historyComplete: false } : {}),
   };
-  // Room for history and task together: the budget less everything else, measured with both as placeholders ([] and null).
-  // The placeholder false is wider than true, so the measure never undershoots the final answer.
-  const shell = answerBytes({ ...head, ...flags, history: [], task: null });
-  const room = RESPONSE_BUDGET_BYTES - shell + 6;
+  // The room left for history and task, in dual bytes. The placeholders [] and null hold their places in the shell, and the
+  // placeholder false is wider than the true that may replace it, so the measure never undershoots the final answer.
+  const shell = { ...head, ...flags, history: [], task: null };
+  const room = DATA_BUDGET_BYTES - dualBytes(shell) + dualBytes([]) + dualBytes(null);
   // The history takes what the whole context would leave, but never less than its floor. A long context is cut to what remains.
-  const budget = Math.min(room, Math.max(CLAIM_HISTORY_FLOOR_BYTES, room - jsonBytes(echoTaskContext(task, Number.POSITIVE_INFINITY))));
+  const budget = Math.min(room, Math.max(CLAIM_HISTORY_FLOOR_BYTES, room - dualBytes(echoTaskContext(task, Number.POSITIVE_INFINITY))));
   const { kept, cut } = fillHistory(history, budget);
-  // The task's own fields (title, intent, dependencies) are never cut; only its context is.
-  const echoed = echoTaskContext(task, room - jsonBytes(kept));
+  // The task's own fields (title, intent, dependencies) are never cut here; only its context is.
+  const echoed = echoTaskContext(task, room - dualBytes(kept));
   const count = historyCount ?? history.length;
   const complete = read ? historyComplete === true && !cut && kept.length === count : undefined;
-  return { ...head, ...flags, ...(complete !== undefined ? { historyComplete: complete } : {}), history: kept, task: echoed };
+  const answer = { ...head, ...flags, ...(complete !== undefined ? { historyComplete: complete } : {}), history: kept, task: echoed };
+  if (answerBytes(answer) <= RESPONSE_BUDGET_BYTES) return answer;
+  // Not reachable: every part above is bounded. The claim has committed, so its confirmation is kept whatever happens: the
+  // history and the context are left out, and historyComplete says so.
+  return { ...head, ...flags, ...(read ? { historyComplete: false } : {}), history: [], task: echoTaskContext(task, 0) };
 }
 
 // ---- Cursors: opaque, sealed with an HMAC, bound to a caller, a query and a stored listing, and time-limited. ----

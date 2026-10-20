@@ -95,10 +95,18 @@ export interface TaskView {
    * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
    */
   listsTruncated?: Partial<Record<'dependencies' | 'workIntentPaths' | 'worktreePaths', ListCut>>;
+  /**
+   * Set on a task echo (SYS01 R3): each text field other than the context that was cut to its leading part, with the size and the
+   * SHA-256 of its whole value. The whole value is not readable through read_task_text.
+   */
+  fieldsTruncated?: Record<string, FieldCut>;
 }
 
 /** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
 export interface ListCut { count: number; sha256: string }
+
+/** A text field of a task echo that was cut: the UTF-8 size of its whole value, and the SHA-256 of that value (SYS01 R3). */
+export interface FieldCut { bytes: number; sha256: string }
 
 export interface HistoryEntry {
   action: string;

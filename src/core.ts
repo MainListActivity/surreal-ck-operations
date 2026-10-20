@@ -10,8 +10,8 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, echoTask, fitCount, jsonBytes, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
-import { TASK_STATES, parseContextInput, parseHistoryInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
+import { TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
@@ -321,17 +321,19 @@ const pick = (value: Record<string, unknown>, fields?: readonly string[]): Recor
 
 /**
  * A list item: the task as the caller projects it, with the size and digest of its whole context. The item is whole unless
- * `cutLong` is set and the item alone cannot fit a page (ITEM_BUDGET_BYTES); then its context is cut at the longest prefix that fits and flagged
- * (contextTruncated, contextNextOffset), and read_task_text returns the rest from that offset. A complete answer never cuts.
+ * `cutLong` is set and the item alone cannot fit a page (ITEM_BUDGET_BYTES, in dual bytes: the item is in the answer's text and in
+ * its JSON). Then it is echoed as a write echo is (echoTask): its lists are cut to their share and flagged (listsTruncated), and
+ * its context takes the room that is left, cut and flagged (contextTruncated, contextNextOffset). A goal's acceptance task depends
+ * on every task of the goal, so its dependency list alone can exceed a page; cutting only the context could never deliver it (SYS01).
+ * read_task_text returns any cut list or context whole. A complete answer never cuts.
  */
 function listItem(row: TaskRow, fields: readonly string[] | undefined, cutLong: boolean): Record<string, unknown> {
   const task = view(row);
   const body: Record<string, unknown> = {
     ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context), contextTruncated: false,
   };
-  if (!cutLong || typeof body.context !== 'string' || jsonBytes(body) <= ITEM_BUDGET_BYTES) return body;
-  const cut = (prefix: string): Record<string, unknown> => ({ ...body, context: prefix, contextTruncated: true, contextNextOffset: utf8Bytes(prefix) });
-  return cut(longestFittingPrefix(body.context, prefix => jsonBytes(cut(prefix)) <= ITEM_BUDGET_BYTES));
+  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) return body;
+  return echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
 }
 
 /** A task read by id, whole: the full context, with its size and digest so that a reassembly can be verified. */
@@ -340,8 +342,8 @@ function detailTaskView(task: TaskView, fields?: readonly string[]): Record<stri
 }
 
 /**
- * One audit entry. The evidence is whole unless `limit` (the entry's own serialized size) would be exceeded; then the
- * longest prefix that fits is kept and flagged, and evidenceNextOffset tells read_task_text where to continue. The size
+ * One audit entry. The evidence is whole unless `limit` (the entry's own size in dual bytes, see dualBytes) would be exceeded;
+ * then the longest prefix that fits is kept and flagged, and evidenceNextOffset tells read_task_text where to continue. The size
  * and digest always describe the full text, so the reassembly can be checked.
  */
 function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
@@ -356,8 +358,8 @@ function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
     ...head, evidence: text, evidenceBytes: total, evidenceSha256: HASH(full), evidenceTruncated: cut,
     ...(cut ? { evidenceNextOffset: utf8Bytes(text) } : {}),
   });
-  if (limit === undefined || jsonBytes(entry(full, false)) <= limit) return entry(full, false);
-  return entry(longestFittingPrefix(full, text => jsonBytes(entry(text, true)) <= limit), true);
+  if (limit === undefined || dualBytes(entry(full, false)) <= limit) return entry(full, false);
+  return entry(longestFittingPrefix(full, text => dualBytes(entry(text, true)) <= limit), true);
 }
 
 export class SurrealCompanyCore implements CompanyCore {
@@ -1165,7 +1167,7 @@ export class SurrealCompanyCore implements CompanyCore {
         ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
       };
       return completeOrRefuse(view, `task ${task.id}`,
-        `read its context with read_task_text {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null; the whole text has sha256 ${HASH(task.context)}${company ? '; or pass includeCompany false to omit the company block' : ''}`);
+        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? '; or pass includeCompany false to omit the company block' : ''}`);
     }
     if (!params.paged) {
       const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
@@ -1769,12 +1771,18 @@ export class SurrealCompanyCore implements CompanyCore {
     });
   }
 
-  /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
+  /**
+   * GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep.
+   * Order: the credential, then the arguments (parseReclaimInput, SYS01 D3), then the gm role. The arguments come before the role,
+   * as on MCP and the sidecar, so a malformed call gets the same invalid refusal from any caller. A bad argument never reaches
+   * reclaimAll, so no tree is touched.
+   */
   async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {
     const actor = await this.authorized(credential);
+    const params = parseReclaimInput(input);
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree reclaim requires gm');
     if (!this.worktrees) return { scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
-    return this.worktrees.reclaimAll({ trigger: input?.dryRun ? 'dry_run' : 'manual', dryRun: input?.dryRun, repos: input?.repos });
+    return this.worktrees.reclaimAll({ trigger: params.dryRun ? 'dry_run' : 'manual', dryRun: params.dryRun, repos: params.repos });
   }
 
   async listWorktreeAudits(credential: Credential, limit = 100) {

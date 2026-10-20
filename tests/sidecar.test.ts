@@ -91,7 +91,7 @@ const media = {
   release: (employeeId: string) => { mediaReleased.push(employeeId); },
 };
 
-const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown>) => {
+const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown> | null) => {
   writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
   await until(() => existsSync(join(resDir(envDir), `${name}.json`)));
   return readJsonFile<{ ok: boolean; data?: unknown; error?: string }>(join(resDir(envDir), `${name}.json`))!;
@@ -297,6 +297,33 @@ describe('sidecar', () => {
     const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w7', '__list__', {});
     expect((listed.data as { tools: string[] }).tools)
       .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
+  });
+
+  test('reclaim_worktrees is strict on the sidecar relay as in core and MCP (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are refused before the registry runs', async () => {
+    const i = inst('e15');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-15'));
+    const before = reclaimCalls.length;
+    const refused: Array<[string, Record<string, unknown>]> = [
+      ['dry-null', { dryRun: null }], ['dry-string', { dryRun: 'true' }], ['dry-one', { dryRun: 1 }], ['dry-zero', { dryRun: 0 }],
+      ['dry-empty', { dryRun: '' }], ['repos-string', { repos: '/repo/a' }], ['repos-null', { repos: null }],
+      ['repos-number', { repos: 5 }], ['repos-blank', { repos: [' '] }], ['repos-element', { repos: [7] }],
+    ];
+    for (const [name, args] of refused) {
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `bad-${name}`, 'reclaim_worktrees', args);
+      expect({ name, ok: res.ok }).toEqual({ name, ok: false });
+    }
+    // A null argument object is refused too: the relay does not read it as absent and reclaim.
+    const nullArgs = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'bad-args-null', 'reclaim_worktrees', null);
+    expect({ name: 'args-null', ok: nullArgs.ok, error: nullArgs.error?.slice(0, 7) }).toEqual({ name: 'args-null', ok: false, error: 'invalid' });
+    expect(reclaimCalls.length).toBe(before);
+    // An omitted dryRun is a reclaim and dryRun true a dry run, under the same rule as core and MCP.
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-reclaim', 'reclaim_worktrees', {});
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-dry', 'reclaim_worktrees', { dryRun: true });
+    expect(reclaimCalls.slice(before)).toEqual([
+      { cred: 'tok-e15', input: { dryRun: false } },
+      { cred: 'tok-e15', input: { dryRun: true } },
+    ]);
   });
 
   test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused for get_task_history and resume_task', async () => {

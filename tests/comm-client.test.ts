@@ -125,14 +125,17 @@ test('a sidecar answer passes through as one JSON line, Chinese and emoji intact
 });
 
 test('a direct call prints one answer: the data within the budget on success; one refusal line and exit 1 on failure (SYS01 AC03, F1)', async () => {
-  // A bounded get_context page of 60 tasks, about 26 KB as the relay sends it. The MCP result carries the same answer
-  // twice (as text and as structuredContent); printing the whole result doubled it past the 48 KiB budget.
+  // The same 60-task page with 200-character contexts fits. The MCP result carries the answer twice (as text and as
+  // structuredContent), and the 48 KiB budget counts both copies, so the direct call prints the answer once and it is
+  // within the budget. With 400-character contexts the whole result is over the budget and is refused as one line.
   const principal = { employeeId: 'gm-01', role: 'gm', capabilities: ['execute', 'review'] };
-  const data = {
+  const page = (contextLength: number) => ({
     principal,
-    tasks: Array.from({ length: 60 }, (_, i) => ({ id: `task:${i}`, title: `样例 ${i} 中文🙂`, state: 'ready', context: `正文 "${i}" ${'x'.repeat(400)}` })),
+    tasks: Array.from({ length: 60 }, (_, i) => ({ id: `task:${i}`, title: `样例 ${i} 中文🙂`, state: 'ready', context: `正文 "${i}" ${'x'.repeat(contextLength)}` })),
     page: { pageSize: 60, returned: 60, hasMore: false, total: 60 },
-  };
+  });
+  const fits = page(200);
+  let answer: unknown = fits;
   const core = {
     async authenticate(credential: string) {
       if (credential !== 'sck_direct_valid') throw { code: 'unauthorized' };
@@ -140,7 +143,7 @@ test('a direct call prints one answer: the data within the budget on success; on
     },
     async contextView(_credential: string, input: Record<string, unknown>) {
       if (input.taskId === 'missing') throw Object.assign(new Error('no such task'), { code: 'not_found' });
-      return data;
+      return answer;
     },
   } as unknown as CompanyCore;
   const service = createMcpHttpService({ core, port: 0 });
@@ -150,7 +153,13 @@ test('a direct call prints one answer: the data within the budget on success; on
     expect(answered.exit).toBe(0);
     expect(answered.out.trimEnd().split('\n')).toHaveLength(1);
     expect(Buffer.byteLength(answered.out, 'utf8')).toBeLessThanOrEqual(49_152);
-    expect(JSON.parse(answered.out)).toEqual(data);
+    expect(JSON.parse(answered.out)).toEqual(fits);
+
+    answer = page(400);
+    const oversized = await client(['call', 'get_context', '{"pageSize":60}'], env);
+    expect(oversized.exit).toBe(1);
+    expect(oneJsonLine(oversized.out)).toMatchObject({ ok: false, code: 'response_too_large', retryable: false });
+    expect(oversized.err).toContain('49152-byte budget');
 
     const refused = await client(['call', 'get_context', '{"taskId":"missing"}'], env);
     expect(refused.exit).toBe(1);

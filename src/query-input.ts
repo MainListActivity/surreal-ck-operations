@@ -149,6 +149,26 @@ export function parseWorktreeInput(input: Record<string, unknown>): {
   };
 }
 
+/** A repository path a reclaim may name: a non-empty string no longer than a filesystem path can be. */
+const isRepoPath = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0 && value.length <= 4096;
+
+/**
+ * Arguments of reclaim_worktrees (SYS01, D3). One rule on every layer (MCP, sidecar, core): an omitted dryRun is a reclaim, and
+ * dryRun, when given, must be true or false, so null, "true", 1 and 0 are refused. repos, when given, is a list of paths, and
+ * anything else (a string, a null, a number inside the list) is refused. A refused call touches no tree: the value is never read
+ * as a default, so a bad value cannot widen into a reclaim of every repository.
+ */
+export function parseReclaimInput(input: unknown): { dryRun: boolean; repos?: string[] } {
+  if (input === undefined) return { dryRun: false };
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) throw invalid('reclaim arguments must be one object');
+  const { dryRun, repos } = input as Record<string, unknown>;
+  if (dryRun !== undefined && typeof dryRun !== 'boolean') throw invalid('dryRun must be true or false; leave it out to reclaim');
+  if (repos !== undefined && (!Array.isArray(repos) || !repos.every(isRepoPath))) {
+    throw invalid('repos must be a list of repository paths, each a non-empty string');
+  }
+  return { dryRun: dryRun === true, ...(repos !== undefined ? { repos: [...repos] } : {}) };
+}
+
 /** Texts read_task_text returns. The list fields are the task's lists that a claim echo may cut (SYS01 R3). */
 export const TEXT_FIELDS = ['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths'] as const;
 export function parseTextInput(input: Record<string, unknown>): {
