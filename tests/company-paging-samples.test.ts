@@ -53,7 +53,7 @@ function unitsOf(units: number, prefix = ''): string {
 
 type Credential = Parameters<SurrealCompanyCore['contextView']>[0];
 type Fixture = {
-  core: SurrealCompanyCore; owner: OwnerDesk; projects: ProjectStore; enrollment: LocalEnrollmentAdmin;
+  database: CompanyDatabase; core: SurrealCompanyCore; owner: OwnerDesk; projects: ProjectStore; enrollment: LocalEnrollmentAdmin;
   gm: Credential; eng: Credential;
 };
 
@@ -68,7 +68,7 @@ async function fresh(): Promise<Fixture> {
   const gm = await enrollment.enroll(`cp-gm-${suffix}-${seq}`, 'gm', ['execute', 'review', 'manage']);
   const eng = await enrollment.enroll(`cp-eng-${suffix}-${seq}`, 'engineering', ['execute', 'review']);
   return {
-    core: new SurrealCompanyCore(database), owner: new OwnerDesk(database), projects: new ProjectStore(database.db), enrollment, gm, eng,
+    database, core: new SurrealCompanyCore(database), owner: new OwnerDesk(database), projects: new ProjectStore(database.db), enrollment, gm, eng,
   };
 }
 
@@ -101,7 +101,8 @@ function expectPartsWellFormed(parts: CompanyPart[]) {
 }
 
 /** The operations sample: 9000 + 6000 bytes of directions, 7000 + 3000 bytes of goals, a project with a 4000-byte runbook, then a
- *  final direction sized so the block is exactly OPERATIONS_BLOCK_BYTES. A one-character probe measures the per-direction overhead. */
+ *  final direction sized so the block is exactly OPERATIONS_BLOCK_BYTES. The final direction is written short and then lengthened in
+ *  place. Its `at` is a nanosecond timestamp whose text drops trailing zeros, so the overhead of one direction is not that of another. */
 async function operationsSample(fx: Fixture): Promise<CompanyBrief> {
   await fx.owner.addDirection({ text: textOf(9000, '方向一 '), source: 'owner:test', key: `ops-${suffix}-dir-a` });
   await fx.owner.addDirection({ text: textOf(6000, '方向二 🙂 '), source: 'owner:test', key: `ops-${suffix}-dir-b` });
@@ -110,14 +111,12 @@ async function operationsSample(fx: Fixture): Promise<CompanyBrief> {
   await fx.projects.upsert({
     id: `ops-proj-${suffix}`, name: '样本项目', repoPath: '/fixture/ops', release: 'local', envs: [], runbooks: [textOf(4000, '运行手册 "引号" ')],
   });
-  const before = blockBytes(await fx.core.companyBrief(fx.gm));
-  // Probe: two ASCII characters (the owner desk needs at least two) in a direction with a key of the same length as the tuning key below.
-  await fx.owner.addDirection({ text: 'xx', source: 'owner:test', key: `tune-${suffix}-1` });
-  const probed = blockBytes(await fx.core.companyBrief(fx.gm));
-  const overhead = probed - before - 2;
-  const tuning = OPERATIONS_BLOCK_BYTES - probed - overhead;
-  expect(tuning).toBeGreaterThan(0);
-  await fx.owner.addDirection({ text: 'y'.repeat(tuning), source: 'owner:test', key: `tune-${suffix}-2` });
+  // The owner desk needs at least two characters, so the tuning direction starts as 'yy'. Each 'y' is one byte of JSON and is not
+  // escaped, so lengthening the text by n characters grows the block by exactly n bytes, and the `at` written with it stays as it is.
+  await fx.owner.addDirection({ text: 'yy', source: 'owner:test', key: `tune-${suffix}` });
+  const short = blockBytes(await fx.core.companyBrief(fx.gm));
+  expect(short).toBeLessThan(OPERATIONS_BLOCK_BYTES);
+  await fx.database.db.query("UPDATE direction SET text = $text WHERE text = 'yy';", { text: 'y'.repeat(OPERATIONS_BLOCK_BYTES - short + 2) });
   const brief = await fx.core.companyBrief(fx.gm);
   expect(blockBytes(brief)).toBe(OPERATIONS_BLOCK_BYTES);
   return brief;
