@@ -20,6 +20,27 @@ unload() {
 }
 plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 
+# Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs a passing comm-slow-pipe record, made on darwin with
+# the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the switch; nothing is read from a hosted runner.
+gate_record() { echo "$service_home/gates/comm-slow-pipe/$1.json"; }
+check_gate() {
+  record=$(gate_record "$1")
+  [ -f "$record" ] || return 1
+  bun_now=$(bun --version 2>/dev/null) || return 1
+  /usr/bin/python3 - "$record" "$1" "$bun_now" <<'PY'
+import json, sys
+record, sha, bun = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(record, encoding='utf-8') as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+ok = (data.get('gate') == 'comm-slow-pipe' and data.get('sha') == sha and data.get('bun') == bun
+      and data.get('platform') == 'darwin' and data.get('result') == 'pass')
+sys.exit(0 if ok else 1)
+PY
+}
+
 write_plist() {
   SERVICE_HOME="$service_home" PLIST="$(plist "$1")" LABEL="$(label "$1")" COMPONENT="$1" /usr/bin/python3 - <<'PY'
 import os, plistlib
@@ -60,6 +81,8 @@ case "$action" in
     git -C "$ops_repo" fetch origin main --quiet 2>/dev/null || echo "warning: git fetch failed; checking against last-known origin/main" >&2
     git -C "$ops_repo" merge-base --is-ancestor "$sha" origin/main 2>/dev/null || {
       echo "refused: $sha is not on origin/main — merge the change into main first, then cut the release from main HEAD" >&2; exit 1; }
+    check_gate "$sha" || {
+      echo "refused: no passing comm-slow-pipe gate for $sha on bun $(bun --version 2>/dev/null || echo unknown) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
@@ -240,8 +263,13 @@ PY
       rm -f "$(plist "$c")"
     done
     ;;
+  check-gate)
+    sha=${2:?usage: company-service.sh check-gate <40-character release sha>}
+    check_gate "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(bun --version 2>/dev/null || echo unknown)" >&2; exit 1; }
+    echo "gate ok: $sha on bun $(bun --version)"
+    ;;
   *)
-    echo 'usage: company-service.sh install <release> | start | stop | restart | status | uninstall  (SCK_COMPONENTS=mcp by default; "mcp dispatcher" only for the legacy standalone dispatcher)' >&2
+    echo 'usage: company-service.sh install <release> | check-gate <sha> | start | stop | restart | status | uninstall  (SCK_COMPONENTS=mcp by default; "mcp dispatcher" only for the legacy standalone dispatcher)' >&2
     exit 1
     ;;
 esac

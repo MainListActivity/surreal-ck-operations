@@ -29,3 +29,13 @@ test('the comm gate runs the client and slow pipe regressions, and CI runs the c
   for (const file of ['tests/comm-client.test.ts', 'tests/comm-slow-pipe.test.ts', 'tests/ci-gates.test.ts']) expect(comm).toContain(file);
   expect(readFileSync(join(ROOT, '.github/workflows/quality-gate.yml'), 'utf8')).toContain('pnpm test:comm');
 });
+
+// SYS01 AC-B: the macOS slow-pipe regression is no longer a hosted paid job. It runs at release time through the local gate, and
+// install refuses a release that has no passing record for it. No workflow may name a hosted macOS runner again.
+test('no workflow runs on a hosted macOS runner, and the release gate for the slow pipe exists', () => {
+  for (const workflow of ['quality-gate.yml', 'channel-quality.yml']) {
+    expect(readFileSync(join(ROOT, '.github/workflows', workflow), 'utf8')).not.toContain('macos');
+  }
+  expect(existsSync(join(ROOT, 'scripts/release-gate.sh'))).toBe(true);
+  expect(readFileSync(join(ROOT, 'scripts/release-gate.sh'), 'utf8')).toContain('tests/comm-slow-pipe.test.ts');
+});
