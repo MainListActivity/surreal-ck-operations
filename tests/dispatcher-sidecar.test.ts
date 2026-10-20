@@ -19,6 +19,8 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
   const authorsOf = new Map<string, string[]>();
+  // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
+  const unreadable = new Set<string>();
   // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
@@ -46,7 +48,10 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
     // Authors are set per task by the test (authorsOf); no implementer is bound, so no execute gate applies.
-    contributors: async (taskId: string) => ({ authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: authorsOf.get(taskId) ?? [] }),
+    contributors: async (taskId: string) => {
+      if (unreadable.has(taskId)) throw new Error('audit history unreadable');
+      return { authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: authorsOf.get(taskId) ?? [] };
+    },
     setDispatchBlock: async (id: string, phase?: string, since?: number) => {
       Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
     },
@@ -98,7 +103,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, authorsOf, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -381,5 +386,105 @@ describe('R1: review capacity before an engineering execute claim', () => {
     const r = await w.dispatcher().tick();
     expect(w.events).toContain('claim:employee-8:rework');
     expect(r.decisions).toContain('reserve:rework=employee-9');
+  });
+});
+
+describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
+  // Idle engineers in this fixture's home (or another repo's home), each with its own agent and fixed id.
+  const engineers = (w: ReturnType<typeof world>, ids: string[], repoHome?: string) => {
+    for (const id of ids) {
+      const agent = `agent-${id}`;
+      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, repoHome } as EmployeeInst;
+      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
+      w.agents.set(agent, { id: agent, status: 'idle' });
+    }
+  };
+  test('ten repeated ticks, with a restart in the middle, keep one blocked episode: no claim, one notice, one persisted start', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('ten');
+    let d = w.dispatcher();
+    const notes = new Set<string>(), starts = new Set<number | undefined>(), texts = new Set<string>();
+    for (let n = 0; n < 10; n++) {
+      if (n === 5) d = w.dispatcher();
+      w.setNow(1_000_000 + n * 60);
+      const r = await d.tick();
+      expect(r.woke).toHaveLength(0);
+      for (const key of r.notices) notes.add(key);
+      starts.add(w.rows.find(t => t.id === 'ten')!.dispatchBlockedSince);
+      texts.add(w.notices.get('dispatch-blocked:ten:execute')!);
+    }
+    expect(w.events.filter(e => e.startsWith('claim:') || e.startsWith('spawn:') || e.startsWith('send:'))).toEqual([]);
+    expect(w.instances).toHaveLength(0);
+    expect([...notes]).toEqual(['dispatch-blocked:ten:execute']);
+    expect([...starts]).toEqual([1_000_000]);
+    expect(texts.size).toBe(1);
+    expect(w.notices.size).toBe(1);
+  });
+  test('an unreadable contributor history holds the claim as unknown, and the episode clears once the history reads again', async () => {
+    const w = world(); w.addTask('replay'); w.unreadable.add('replay');
+    const held = await w.dispatcher().tick();
+    expect(held.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:replay:execute')).toContain('状态或贡献者历史读取失败');
+    w.unreadable.delete('replay'); w.setNow(1_000_060);
+    const resumed = await w.dispatcher().tick();
+    expect(resumed.woke.map(x => x.task)).toContain('replay');
+    expect(w.events).toContain('claim:employee-1:replay');
+    expect(w.notices.has('dispatch-blocked:replay:execute')).toBe(false);
+  });
+  test('A, B and C all recused with the seats full: no claim, the review capacity root cause is named, and one more seat clears it', async () => {
+    const w = world(); w.def.maxInstances = 3; w.addTask('abc');
+    const ids = ['employee-8', 'employee-9', 'employee-10'];
+    engineers(w, ids);
+    w.authorsOf.set('abc', ids);
+    const blocked = await w.dispatcher().tick();
+    expect(blocked.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    // A full seat can still free up, so the block waits; the owner hears about it once the five-minute threshold passes.
+    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
+    w.setNow(1_300);
+    const waited = await w.dispatcher().tick();
+    expect(waited.notices).toContain('dispatch-blocked:abc:execute');
+    expect(w.notices.get('dispatch-blocked:abc:execute')).toContain('后续独立复核缺合格人选');
+    w.def.maxInstances = 4; w.setNow(1_360);
+    const resumed = await w.dispatcher().tick();
+    expect(resumed.woke.map(x => x.task)).toContain('abc');
+    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
+  });
+  test('a task with no reviewer role cannot prove an independent review: it is blocked as review capacity and never claimed', async () => {
+    const w = world(); w.addTask('norole');
+    Object.assign(w.rows.find(t => t.id === 'norole')!, { reviewerRole: undefined });
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:norole:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('an engineer bound to another repo cannot review this task, so the only seat is not spent on its claim', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('bound');
+    engineers(w, ['employee-8'], '/other-repo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(1);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:bound:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('a failed Paseo spawn releases the claim and retires the seat as a failure, waits as wake_failed, and clears on the next good pass', async () => {
+    const w = world(); w.addTask('spawnfail');
+    const spawn = w.paseo.spawn;
+    w.paseo.spawn = async () => { throw new Error('paseo daemon unreachable'); };
+    const failed = await w.dispatcher().tick();
+    expect(failed.woke).toHaveLength(0);
+    expect(failed.retired).toContain('employee-1');
+    expect(w.events).toContain('retire:employee-1:failure');
+    expect(w.rows.find(t => t.id === 'spawnfail')!.currentEmployee).toBeUndefined();
+    // Spawn failures are not material at once: the owner hears about them after the five-minute threshold.
+    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
+    w.setNow(1_300);
+    const again = await w.dispatcher().tick();
+    expect(again.notices).toContain('dispatch-blocked:spawnfail:execute');
+    expect(w.notices.get('dispatch-blocked:spawnfail:execute')).toContain('派工未能唤醒或创建会话');
+    w.paseo.spawn = spawn; w.setNow(1_360);
+    const recovered = await w.dispatcher().tick();
+    expect(recovered.woke.map(x => x.task)).toContain('spawnfail');
+    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
   });
 });

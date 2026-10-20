@@ -42,6 +42,19 @@ test('one candidate that can take the review makes the preview ready', async () 
   expect(p.entries.some(entry => entry.eligible)).toBe(true);
 });
 
+test('A, B and C all recused, the only reviewer seat full and its provider out of quota: blocked, every recusal kept, nothing ready', async () => {
+  // R3: the preview names each recused author and the capacity that is missing, so the page shows the root cause.
+  const authors = { contributors: async () => ({ excluded: ['emp-a', 'emp-b', 'emp-c'] }) } as unknown as Pick<Workforce, 'contributors'>;
+  const engineer = (id: string) => ({ ...reviewer, id }) as EmployeeInst;
+  const p = await preview({ defs: [{ ...def, maxInstances: 3 }], insts: ['emp-a', 'emp-b', 'emp-c'].map(engineer),
+    states: new Map([['emp-a', 'idle' as const], ['emp-b', 'idle' as const], ['emp-c', 'idle' as const]]),
+    quotaBlocked: new Map([['claude', 'quota reset pending']]) }, authors);
+  expect(p.status).toBe('blocked');
+  expect(p.entries.filter(entry => entry.code === 'author_recusal')).toHaveLength(3);
+  expect(p.entries.some(entry => entry.code === 'seat_full' || entry.code === 'quota')).toBe(true);
+  expect(p.entries.every(entry => !entry.eligible)).toBe(true);
+});
+
 test('an unreadable author history is history_unavailable, and every candidate reads as unknown', async () => {
   const p = await preview({ defs: [def], insts: [reviewer], states: new Map([['emp-reviewer', 'idle' as const]]) }, unreadable);
   expect(p.status).toBe('history_unavailable');
