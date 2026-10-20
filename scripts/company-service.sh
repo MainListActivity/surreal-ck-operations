@@ -9,6 +9,7 @@ service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCom
 domain="gui/$(id -u)"
 action=${1:-}
 components=${SCK_COMPONENTS:-mcp}
+. "$(dirname "$0")/bun-runtime.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -23,10 +24,16 @@ plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 # Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs a passing comm-slow-pipe record, made on darwin with
 # the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the switch; nothing is read from a hosted runner.
 gate_record() { echo "$service_home/gates/comm-slow-pipe/$1.json"; }
+# The version of the runtime the services run with (scripts/bun-runtime.sh), or "unknown" when it cannot report one.
+runtime_version() {
+  resolve_bun "$service_home"
+  rv=$("$BUN" --version 2>/dev/null) && [ -n "$rv" ] && echo "$rv" || echo unknown
+}
 check_gate() {
   record=$(gate_record "$1")
   [ -f "$record" ] || return 1
-  bun_now=$(bun --version 2>/dev/null) || return 1
+  bun_now=$(runtime_version)
+  [ "$bun_now" != unknown ] || return 1
   /usr/bin/python3 - "$record" "$1" "$bun_now" <<'PY'
 import json, sys
 record, sha, bun = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -82,12 +89,13 @@ case "$action" in
     git -C "$ops_repo" merge-base --is-ancestor "$sha" origin/main 2>/dev/null || {
       echo "refused: $sha is not on origin/main — merge the change into main first, then cut the release from main HEAD" >&2; exit 1; }
     check_gate "$sha" || {
-      echo "refused: no passing comm-slow-pipe gate for $sha on bun $(bun --version 2>/dev/null || echo unknown) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
+      echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
     cp "$(dirname "$0")/sck.sh" "$service_home/bin/sck"
-    chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck"
+    cp "$(dirname "$0")/bun-runtime.sh" "$service_home/bin/bun-runtime.sh"
+    chmod 700 "$service_home/bin/run.sh" "$service_home/bin/sck" "$service_home/bin/bun-runtime.sh"
     # Query the existing plugin registration before changing active. If the
     # dual-surface preflight cannot establish the current source, fail closed so
     # the running release and its plugin remain a consistent pair.
@@ -265,8 +273,8 @@ PY
     ;;
   check-gate)
     sha=${2:?usage: company-service.sh check-gate <40-character release sha>}
-    check_gate "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(bun --version 2>/dev/null || echo unknown)" >&2; exit 1; }
-    echo "gate ok: $sha on bun $(bun --version)"
+    check_gate "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version)" >&2; exit 1; }
+    echo "gate ok: $sha on bun $(runtime_version)"
     ;;
   *)
     echo 'usage: company-service.sh install <release> | check-gate <sha> | start | stop | restart | status | uninstall  (SCK_COMPONENTS=mcp by default; "mcp dispatcher" only for the legacy standalone dispatcher)' >&2
