@@ -144,7 +144,7 @@ export interface ReviewStaffingPoolView extends StaffingPoolView {
   taskId: string;
   title: string;
   purpose: "review";
-  status: "ready" | "history_unavailable";
+  status: "ready" | "blocked" | "history_unavailable";
 }
 
 /** The root blocker of one goal card: the verdict it names first, and the other blocked work behind the goal. */
@@ -158,6 +158,10 @@ export interface GoalRootBlockerView {
   since?: string;
   waitingMinutes: number;
   others: number;
+  /** Unfinished tasks waiting on this root, directly or through other tasks. */
+  impact: number;
+  dependencyPath: Array<{ taskId: string; title: string }>;
+  people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string };
   reasons: Array<{ code: string; text: string; candidates: string[]; owner: "gm" | "owner"; recovery: string; nextTrigger: string }>;
 }
 

@@ -268,7 +268,11 @@ export interface ReviewStaffingPreview {
   purpose: 'review';
   role: string;
   home: string;
-  status: 'ready' | 'history_unavailable';
+  /**
+   * ready: a candidate can take the review now. blocked: no candidate qualifies, and entries say why (zero candidates are never
+   * ready). history_unavailable: the author history could not be read, so every candidate reads as unknown.
+   */
+  status: 'ready' | 'blocked' | 'history_unavailable';
   entries: StaffingEntry[];
 }
 
@@ -285,7 +289,7 @@ export async function reviewStaffingPreviews(
     const entries = staffingPool({ ...base, role: task.reviewerRole, home, task,
       excludeSubmitter: true, recusal });
     previews.push({ taskId: task.id, title: task.title, purpose: 'review', role: task.reviewerRole, home,
-      status: recusal === undefined ? 'history_unavailable' : 'ready',
+      status: recusal === undefined ? 'history_unavailable' : entries.some(entry => entry.eligible) ? 'ready' : 'blocked',
       entries: recusal === undefined
         ? entries.map(e => ({ ...e, eligible: false, share: 0, code: 'unknown' as const, reason: BLOCK_TEXT.unknown }))
         : entries });

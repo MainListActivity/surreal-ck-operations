@@ -288,7 +288,25 @@ export function dispatchNoticeText(verdict: DispatchVerdict): string {
   return `${verdict.summary}。自 ${verdict.since ?? verdict.checkedAt} 起等待。原因：${reasons}。下一触发：${next || '待定'}。处理：${recovery}。`;
 }
 
-/** A goal card's root blocker: the verdict the card names first, and how much other blocked work sits behind the same goal. */
+/** Who a goal root is attached to: the bound implementer, the authors and reviewers from the contribution history, and the last submit. */
+export interface GoalRootPeople {
+  implementer?: string;
+  authors: string[];
+  reviewers: string[];
+  submitter?: string;
+  /** The commit the last submit evidence names, when it names one. Free text in the evidence, not a structured field. */
+  submitCommit?: string;
+}
+
+/** Facts a goal card names beyond the verdicts: the waiting graph of unfinished goal work, titles, and each root's people. */
+export interface GoalRootFacts {
+  /** Unfinished goal tasks and the task ids each one depends on. */
+  dependencies: ReadonlyMap<string, readonly string[]>;
+  titles: ReadonlyMap<string, string>;
+  people: ReadonlyMap<string, GoalRootPeople>;
+}
+
+/** A goal card's root blocker: the verdict the card names first, and how much work waits behind it. */
 export interface GoalRootBlocker {
   goalId: string;
   taskId: string;
@@ -299,16 +317,58 @@ export interface GoalRootBlocker {
   feasible: boolean;
   waitingMinutes: number;
   since?: string;
-  /** Other blocked work behind the same goal. */
+  /** Other blocked work behind the same goal, from this pass's verdicts. */
   others: number;
+  /** Unfinished tasks waiting on this root, directly or through other tasks: the "影响 N 项后续" count. */
+  impact: number;
+  /** The longest waiting chain from the root: the root first, then each task that waits on the one before it. Bounded. */
+  dependencyPath: Array<{ taskId: string; title: string }>;
+  people: GoalRootPeople;
   reasons: DispatchReason[];
+}
+
+const NO_PEOPLE: GoalRootPeople = { authors: [], reviewers: [] };
+const PATH_LIMIT = 8;
+
+/** The commit a submit evidence text names: the last 7 to 40 hex digits after 提交 or commit. Undefined when it names none. */
+export function submitCommitOf(evidence: string): string | undefined {
+  const named = [...evidence.matchAll(/(?:提交|commit)\D{0,12}?\b([0-9a-f]{7,40})\b/gi)];
+  return named.at(-1)?.[1]?.toLowerCase();
+}
+
+/** Unfinished tasks that wait on `root` through dependency edges (count), and the longest such chain from the root. */
+function waitingBehind(root: string, facts?: GoalRootFacts): { count: number; path: string[] } {
+  if (!facts) return { count: 0, path: [root] };
+  const waiters = new Map<string, string[]>();
+  for (const [task, deps] of facts.dependencies) {
+    for (const dep of deps) waiters.set(dep, [...(waiters.get(dep) ?? []), task]);
+  }
+  const depth = new Map<string, number>([[root, 0]]);
+  const parent = new Map<string, string>();
+  const queue = [root];
+  let deepest = root;
+  for (let i = 0; i < queue.length; i++) {
+    const current = queue[i]!;
+    for (const next of [...(waiters.get(current) ?? [])].sort()) {
+      if (depth.has(next)) continue;
+      depth.set(next, depth.get(current)! + 1);
+      parent.set(next, current);
+      queue.push(next);
+      const d = depth.get(next)!;
+      if (d > depth.get(deepest)! || (d === depth.get(deepest)! && next < deepest)) deepest = next;
+    }
+  }
+  const path = [deepest];
+  while (path[0] !== root && parent.has(path[0]!)) path.unshift(parent.get(path[0]!)!);
+  return { count: queue.length - 1, path: path.slice(0, PATH_LIMIT) };
 }
 
 /**
  * One root blocker per goal, from the latest pass's verdicts. A material block (an owner or manager decision, or an unknown
  * state) is named before a waiting one, then the longest wait. Dispatchable work has no verdict and never appears here.
+ * `facts` adds the impact count, the waiting chain and the people; without it those fields are empty.
  */
-export function goalRootBlockers(verdicts: readonly DispatchVerdict[]): GoalRootBlocker[] {
+export function goalRootBlockers(verdicts: readonly DispatchVerdict[], facts?: GoalRootFacts): GoalRootBlocker[] {
   const byGoal = new Map<string, DispatchVerdict[]>();
   for (const verdict of verdicts) {
     if (verdict.dispatchable || !verdict.goalId) continue;
@@ -317,7 +377,11 @@ export function goalRootBlockers(verdicts: readonly DispatchVerdict[]): GoalRoot
   return [...byGoal].sort(([a], [b]) => a.localeCompare(b)).map(([goalId, list]) => {
     const ranked = [...list].sort((a, b) => Number(a.feasible) - Number(b.feasible) || b.waitingMinutes - a.waitingMinutes || a.taskId.localeCompare(b.taskId));
     const root = ranked[0]!;
+    const behind = waitingBehind(root.taskId, facts);
+    const titleOf = (taskId: string) => (taskId === root.taskId ? root.title : (facts?.titles.get(taskId) ?? taskId));
     return { goalId, taskId: root.taskId, title: root.title, phase: root.phase, summary: root.summary, feasible: root.feasible,
-      waitingMinutes: root.waitingMinutes, since: root.since, others: list.length - 1, reasons: root.reasons };
+      waitingMinutes: root.waitingMinutes, since: root.since, others: list.length - 1, impact: behind.count,
+      dependencyPath: behind.path.map(taskId => ({ taskId, title: titleOf(taskId) })),
+      people: facts?.people.get(root.taskId) ?? NO_PEOPLE, reasons: root.reasons };
   });
 }

@@ -316,6 +316,12 @@ function Collapsible({ title, count, ctx, children, defaultOpen }: {
 const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
+/** A goal root's people; an absent or malformed block reads as nobody bound, never as an invented name. */
+const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string } => {
+  const p = (v ?? {}) as Record<string, unknown>;
+  return { implementer: str(p.implementer) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
+    submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined };
+};
 
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
@@ -350,7 +356,9 @@ export function normalizePulse(raw: unknown): Pulse {
     goalBlockers: arr<Record<string, unknown>>(o.goalBlockers).map(b => ({
       goalId: str(b.goalId), taskId: str(b.taskId), title: str(b.title), phase: b.phase === "review" ? "review" : "execute",
       summary: str(b.summary), feasible: b.feasible === true, since: str(b.since) || undefined, waitingMinutes: num(b.waitingMinutes),
-      others: num(b.others),
+      others: num(b.others), impact: num(b.impact),
+      dependencyPath: arr<Record<string, unknown>>(b.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
+      people: goalPeople(b.people),
       reasons: arr<Record<string, unknown>>(b.reasons).map(r => ({
         code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
         owner: r.owner === "owner" ? "owner" : "gm", recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
@@ -752,7 +760,8 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   // Goal cards read the same pulse as the queue: the root blocker is the server's conclusion, not a second computation.
   const pulseRpc = useRpc(rpc.pulse);
   const pulseQuery = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
-  const blockers = useMemo(() => normalizePulse(pulseQuery.data).goalBlockers, [pulseQuery.data]);
+  const pulse = useMemo(() => normalizePulse(pulseQuery.data), [pulseQuery.data]);
+  const blockers = pulse.goalBlockers;
   return (
     <View style={{ gap: 12 }}>
       {goals.length === 0 && <Text style={s.muted}>没有进行中的目标。</Text>}
@@ -767,7 +776,7 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
             const root = blockers.find(b => b.goalId === g.id)!;
             return (
               <Text style={s.muted}>
-                {root.feasible ? "等待派工" : "无法派工"}：{root.title}（{root.phase === "review" ? "复核" : "执行"}）。{root.summary}。已等待 {root.waitingMinutes} 分钟{root.others > 0 ? `；另有 ${root.others} 项` : ""}
+                {root.feasible ? "等待派工" : "无法派工"}：{root.title}（{root.phase === "review" ? "复核" : "执行"}）。{root.summary}。已等待 {root.waitingMinutes} 分钟{root.impact > 0 ? `；影响 ${root.impact} 项后续` : ""}{root.others > 0 ? `；同目标另有 ${root.others} 项阻塞` : ""}
               </Text>
             );
           })()}
@@ -779,6 +788,20 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                   {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
                 </Text>
               ))}
+              {blockers.find(b => b.goalId === g.id) && (() => {
+                const root = blockers.find(b => b.goalId === g.id)!;
+                return (
+                  <View style={{ gap: 4 }}>
+                    {root.dependencyPath.length > 1 && (
+                      <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(p => p.title).join(" → ")}</Text>
+                    )}
+                    <Text style={s.muted}>
+                      实现者：{root.people.implementer ?? "未绑定"}；作者：{root.people.authors.join("、") || "无"}；复核者：{root.people.reviewers.join("、") || "无"}；最后提交：{root.people.submitter ?? "无"}{root.people.submitCommit ? `（提交 ${root.people.submitCommit}）` : ""}
+                    </Text>
+                    <Text style={s.muted}>数据时点：{pulse.at ? `${pulse.at.slice(5, 16).replace("T", " ")}（UTC）` : "未知"}</Text>
+                  </View>
+                );
+              })()}
               {(tasksQuery.data?.tasks ?? []).map(t => (
                 <View key={t.id}>
                   <TaskRow task={t} ctx={ctx} depth={0} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />
@@ -1113,6 +1136,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     <Text style={s.muted}>项目：{p.home}</Text>
                     {p.status === "history_unavailable" && (
                       <Text style={s.text}>贡献者历史读取失败：候选不可派，中选率 0%，等待安全候选。</Text>
+                    )}
+                    {p.status === "blocked" && (
+                      <Text style={s.text}>无合格复核人选：没有候选可以复核，任务不会被派工，原因见下方。</Text>
                     )}
                     {p.entries.length === 0 && <Text style={s.muted}>暂无候选，任务继续等待。</Text>}
                     {p.entries.map(e => (

@@ -257,6 +257,7 @@ export function registerHandlers(server: PluginServerContext): void {
     const { db, owner, workforce, dispatcher } = await company();
     const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
     const { goalRootBlockers } = await import("./vendor/src/dispatcher/dispatch-blocked.ts");
+    const { readGoalRootFacts } = await import("./vendor/src/dispatcher/goal-roots.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const { RecordId } = await import("surrealdb");
@@ -322,12 +323,16 @@ export function registerHandlers(server: PluginServerContext): void {
       `SELECT task, task.title AS title, at, actor FROM audit WHERE action IN ['accept','owner_approve'] ORDER BY at DESC LIMIT 8;`);
 
     const readyIds = new Set(ready.map(r => r.taskId));
+    // Goal cards name each root's people and waiting chain: read for the root tasks only. A failed read keeps the
+    // verdict-only card rather than failing the whole pulse.
+    const goalFacts = await readGoalRootFacts(db.db, workforce, goalRootBlockers(verdicts).map(root => root.taskId),
+      message => console.warn(message)).catch(error => { console.warn(`goal root facts failed: ${(error as Error).message}`); return undefined; });
     return {
       at: new Date(now).toISOString(),
       paused: !!cfg.paused,
       doing, ready,
       dispatchBlocked: dispatchBlockedView(verdicts),
-      goalBlockers: goalRootBlockers(verdicts),
+      goalBlockers: goalRootBlockers(verdicts, goalFacts),
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),
