@@ -11,6 +11,8 @@
  * while one applies, because the tick returns before it looks at them.
  */
 
+import type { WriteScopeHolder } from '../contracts.ts';
+
 /** execute: the implementer writes code. review: an independent reviewer accepts or returns. */
 export type DispatchPhase = 'execute' | 'review';
 
@@ -26,19 +28,28 @@ export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
   | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'no_candidate'
   | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
-  | 'quota' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity';
+  | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
+  | 'write_scope';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
   key: string;
   eligible: boolean;
   code?: BlockCode;
+  /** Recovery time of a quota block, ISO 8601. Undefined when no time can be proven: the verdict then says it is unknown. */
+  until?: string;
+  /** The owner-facing detail of this candidate's block (the seat count, the cooldown), when the block has one. */
+  reason?: string;
 }
 
-/** A gate that applies to the whole pass (paused, budget, resources, concurrency cap), not to one candidate. */
+/**
+ * A gate that applies to the whole pass (paused, budget, resources, concurrency cap), or to the candidates it names. A write
+ * scope held by another writer names that writer; the default is the whole pass.
+ */
 export interface GlobalBlock {
   code: BlockCode;
   text: string;
+  candidates?: readonly string[];
 }
 
 /** Who may take a recovery action: the manager (gm, with the manage capability) or the owner. */
@@ -66,6 +77,8 @@ export interface DispatchReason {
   basis: string;
   /** Structured recovery actions with their authority; the text in `recovery` says the same in words. */
   actions: RecoveryAction[];
+  /** Recovery time of a quota reason, ISO 8601. Absent when unknown: the text then says 恢复时间未知, and no time is invented. */
+  until?: string;
 }
 
 export interface DispatchVerdict {
@@ -108,6 +121,8 @@ export interface EvaluateInput {
   since?: number;
   /** The task's workflow state; defaults from the phase (execute is ready, review is review). */
   workflowState?: WorkflowState;
+  /** Same-role employees of other repositories that this pool left out: named in the summary of a block, never a reason of their own. */
+  otherRepo?: number;
   /** Evaluation time, unix milliseconds. */
   checkedAt: number;
 }
@@ -141,6 +156,8 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   wake_failed: '派工未能唤醒或创建会话，下一轮重试',
   unknown: '状态或贡献者历史读取失败，不能判定（不视为忙），恢复后自动重判',
   review_capacity: '后续独立复核缺合格人选：合格复核人不能同时实现，且无合规空余席位',
+  write_scope: '同线或重叠目录的在办写者占用了工作树，代码写权须等待',
+  probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
 };
 
 const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
@@ -149,6 +166,7 @@ const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
   session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
+  write_scope: 'gm', probe_busy: 'gm',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
@@ -173,6 +191,8 @@ const RECOVERY: Record<BlockCode, string> = {
   wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
   unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
   review_capacity: '经理为复核岗位增补编制或员工；不能由作者自验，也不能让实现人兼任本任务复核',
+  write_scope: '等待同线或重叠目录的在办写者结束，或经理拆线',
+  probe_busy: '等待单次探测会话结束，探测结果决定恢复或再次冷却',
 };
 
 const NEXT: Record<BlockCode, string> = {
@@ -197,6 +217,8 @@ const NEXT: Record<BlockCode, string> = {
   wake_failed: '下一轮唤醒成功',
   unknown: '状态与审计读取恢复',
   review_capacity: '出现不同于实现人的合格复核人选，或复核岗位有合规空余席位',
+  write_scope: '同线或重叠目录的在办写者结束，或经理拆线',
+  probe_busy: '探测会话结束',
 };
 
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
@@ -208,6 +230,7 @@ const BASIS: Record<BlockCode, string> = {
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
   review_capacity: 'tick:review-capacity',
+  write_scope: 'tick:worktree-scope', probe_busy: 'tick:provider-health',
 };
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
@@ -233,6 +256,8 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   wake_failed: [{ authority: 'gm', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
   unknown: [{ authority: 'gm', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
   review_capacity: [{ authority: 'gm', label: '经理用 def_ensure 为复核岗位与仓库增加编制（不新增订阅）', tool: 'def_ensure', executable: true }],
+  write_scope: [{ authority: 'gm', label: '等待同线或重叠目录的在办写者结束，或经理拆线', executable: false }],
+  probe_busy: [{ authority: 'gm', label: '等待单次探测会话结束', executable: false }],
 };
 
 const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };
@@ -260,7 +285,7 @@ export interface ReviewPlan {
 }
 
 /** Capacity states that do not make a reviewer illegal: they clear when the seat frees up or the state reads again. */
-const CAPACITY: ReadonlySet<BlockCode> = new Set<BlockCode>(['session_busy', 'held', 'assigned', 'quota', 'provider_capacity', 'unknown']);
+const CAPACITY: ReadonlySet<BlockCode> = new Set<BlockCode>(['session_busy', 'held', 'assigned', 'quota', 'probe_busy', 'provider_capacity', 'unknown']);
 
 /**
  * SYS-DISP AC05 (R1): whether the independent review after an execute claim has a legal path. Authors never count, and neither
@@ -276,6 +301,34 @@ export function reviewPlanOf(pool: readonly ReviewPoolEntry[]): ReviewPlan {
   const eligibleNow = legalEntries.filter(entry => entry.eligible).map(entry => entry.key).sort();
   const reserve = !spareSeat && legal.length > 0 ? (eligibleNow[0] ?? legal[0]) : undefined;
   return { feasible: legal.length > 0 || spareSeat, legal, spareSeat, reserve };
+}
+
+/** The owner-facing name of a write-scope holder: a writer names its task by the first eight characters of the id. */
+export function holderLabel(holder: WriteScopeHolder): string {
+  if (holder.intent === 'read') return `读取会话 · ${holder.employee}`;
+  return holder.taskId ? `任务 ${holder.taskId.slice(0, 8)} · ${holder.employee}` : `写者会话 · ${holder.employee}`;
+}
+
+/**
+ * Recovery time of a quota group: the earliest known time. A candidate without a provable time could recover at any moment,
+ * so one unknown candidate makes the whole group unknown rather than yielding the earliest known time.
+ */
+function quotaUntil(list: readonly EvaluatedEntry[]): string | undefined {
+  if (list.length === 0 || list.some(entry => entry.until === undefined)) return undefined;
+  return list.map(entry => entry.until!).sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+}
+
+/** The repository a verdict is about, by its name: the last segment of its home path. */
+export const repoName = (home: string) => home.split('/').filter(Boolean).pop() ?? home;
+
+/** Owner-facing text of one reason. Quota and seat reasons read their candidates, so the verdict states the facts it rests on. */
+function reasonText(code: BlockCode, list: readonly EvaluatedEntry[], until: string | undefined, home: string): string {
+  if (code === 'quota') return `${BLOCK_TEXT.quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
+  if (code === 'seat_full') {
+    return [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；')
+      || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
+  }
+  return BLOCK_TEXT[code];
 }
 
 /** Evaluates one task phase. Pure: the same inputs always produce the same verdict and summary text. */
@@ -296,20 +349,27 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
       if (!entry.eligible) addCandidate(entry.code ?? 'unknown', entry.key);
     }
   }
-  for (const gate of globals) addCandidate(gate.code, '*');
+  for (const gate of globals) for (const candidate of gate.candidates ?? ['*']) addCandidate(gate.code, candidate);
   const dispatchable = globals.length === 0 && entries !== undefined && eligibleCount > 0;
+  // Candidate details come from the pool only when no pass-wide gate applies: the tick returns before it reads them.
+  const pool = globals.length === 0 ? entries ?? [] : [];
   const reasons: DispatchReason[] = dispatchable ? [] : [...grouped.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([code, candidates]) => ({
-      code,
-      text: BLOCK_TEXT[code],
-      candidates: candidates.sort(),
-      owner: OWNER[code],
-      recovery: RECOVERY[code],
-      nextTrigger: NEXT[code],
-      basis: BASIS[code],
-      actions: ACTIONS[code].map(action => ({ ...action })),
-    }));
+    .map(([code, candidates]) => {
+      const list = pool.filter(entry => !entry.eligible && (entry.code ?? 'unknown') === code);
+      const until = code === 'quota' ? quotaUntil(list) : undefined;
+      return {
+        code,
+        text: reasonText(code, list, until, input.home),
+        candidates: candidates.sort(),
+        owner: OWNER[code],
+        recovery: RECOVERY[code],
+        nextTrigger: NEXT[code],
+        basis: BASIS[code],
+        actions: ACTIONS[code].map(action => ({ ...action })),
+        ...(until ? { until } : {}),
+      };
+    });
   // Pass-wide gates clear by themselves. A candidate list holding only owner-decision codes never does, and neither does an
   // unknown state: nobody can tell whether it will, so it is material at once.
   const materialCode = (code: BlockCode = 'unknown') => code === 'unknown' || PERMANENT.has(code);
@@ -317,9 +377,11 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
     ? globals.every(gate => !materialCode(gate.code))
     : entries !== undefined && entries.some(entry => !entry.eligible && !materialCode(entry.code)));
   const phase = PHASE_LABEL[input.phase];
+  // The repository filter is a hard scope, not a reason: other-repo employees are named, never waited on.
+  const outside = input.otherRepo ? `；另有 ${input.otherRepo} 名同岗位员工属其他仓库，不参与本仓库派工` : '';
   const summary = dispatchable
     ? `${input.title}：${phase}可派工`
-    : `${input.title}：${phase}无法派工（${reasons.map(reason => reason.text).join('；') || '原因未知'}）`;
+    : `${input.title}：${phase}无法派工（${reasons.map(reason => reason.text).join('；') || '原因未知'}${outside}）`;
   const since = input.since ?? input.checkedAt;
   return {
     noticeKey: `dispatch-blocked:${input.taskId}:${input.phase}`,

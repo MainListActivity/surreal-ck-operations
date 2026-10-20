@@ -17,7 +17,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
-  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
+  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
+  // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
+  const held = new Set<string>(), scopeUnreadable = new Set<string>();
   const authorsOf = new Map<string, string[]>();
   // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
   const unreadable = new Set<string>();
@@ -61,8 +63,13 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     raiseNotice: async (key: string, text: string) => { notices.set(key, text); return true; } };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
+    writeScopeOf: async (id: string) => {
+      if (scopeUnreadable.has(id)) throw new Error('write scope unreadable');
+      return held.has(id) ? [{ taskId: 'writer-1', employee: 'employee-7', intent: 'code' }] : [];
+    },
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
-      if (denied.has(id)) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error('scene is busy'), { code: 'worktree_busy' }); }
+      const refusal = denied.get(id);
+      if (refusal) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error(`refused: ${refusal}`), { code: refusal }); }
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
@@ -103,7 +110,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, authorsOf, unreadable, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable, authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -240,8 +247,8 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(w.events).toContain('return:t3');
     expect(w.views.get('t3')!.state).toBe('ready');
   });
-  test('a task-side claim denial cools the task instead of churning disposable instances', async () => {
-    const w = world(); w.addTask('jammed'); w.denied.add('jammed');
+  test('a generic claim refusal cools the task instead of churning disposable instances (write scope is no cooldown, see R1)', async () => {
+    const w = world(); w.addTask('jammed'); w.denied.set('jammed', 'forbidden');
     const d = w.dispatcher();
     const r1 = await d.tick();
     // First attempt spawned one instance, was refused, retired it.
@@ -389,6 +396,70 @@ describe('R1: review capacity before an engineering execute claim', () => {
   });
 });
 
+describe('R1: a write scope held by another writer is a verdict, never a spawn churn or a wake failure', () => {
+  test('a scope held by another writer waits as write_scope: no spawn, no claim, the holder is named, and the claim follows once it ends', async () => {
+    const w = world(); w.addTask('scoped'); w.held.add('scoped');
+    const d = w.dispatcher();
+    const held = await d.tick();
+    expect(held.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:') || e.startsWith('send:'))).toBe(false);
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'scoped')!;
+    expect(verdict.dispatchable).toBe(false);
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 writer-1 · employee-7'] })]);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:scoped:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).toContain('任务 writer-1 · employee-7');
+    expect(text).not.toContain('派工未能唤醒');
+    w.held.delete('scoped'); w.setNow(1_360);
+    const freed = await d.tick();
+    expect(freed.woke.map(x => x.task)).toContain('scoped');
+    expect(w.notices.has('dispatch-blocked:scoped:execute')).toBe(false);
+  });
+  test('a claim refused for the write scope at claim time is write_scope, not wake_failed, and earns no cooldown', async () => {
+    const w = world(); w.addTask('raced'); w.denied.set('raced', 'worktree_busy');
+    const d = w.dispatcher();
+    const lost = await d.tick();
+    expect(lost.woke).toHaveLength(0);
+    expect(w.events).toContain('claim-denied:employee-1:raced');
+    // The seat spawned for the refused claim is released as write scope held, not as a claim denial.
+    expect(lost.retired).toEqual(['employee-1']);
+    expect(w.events).toContain('retire:employee-1:failure');
+    expect(w.notices.has('dispatch-blocked:raced:execute')).toBe(false);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:raced:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).not.toContain('派工未能唤醒');
+    // No cooldown: once the refusal clears, the next pass claims without waiting for a version bump.
+    w.denied.delete('raced'); w.setNow(1_360);
+    const resumed = await d.tick();
+    expect(resumed.woke.map(x => x.task)).toContain('raced');
+  });
+  test('a refused claim on a reused seat keeps the seat: nothing is spawned or retired', async () => {
+    const w = world(); w.addTask('reused'); w.denied.set('reused', 'worktree_busy');
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('claim-denied:employee-9:reused');
+    expect(w.events.some(e => e.startsWith('spawn:'))).toBe(false);
+    expect(r.retired).toEqual([]);
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(1);
+  });
+  test('an unreadable write scope is unknown: never free, never a claim, and the owner reads that the state is undecided', async () => {
+    const w = world(); w.addTask('blind'); w.scopeUnreadable.add('blind');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:blind:execute')).toContain('不能判定');
+  });
+});
+
 describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
   // Idle engineers in this fixture's home (or another repo's home), each with its own agent and fixed id.
   const engineers = (w: ReturnType<typeof world>, ids: string[], repoHome?: string) => {
@@ -486,5 +557,28 @@ describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
     const recovered = await w.dispatcher().tick();
     expect(recovered.woke.map(x => x.task)).toContain('spawnfail');
     expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
+  });
+  test('a same-role engineer of another repo is never woken: the target repo takes its own legal seat (R3 hard filter)', async () => {
+    const w = world(); w.def.maxInstances = 2; w.addTask('local');
+    engineers(w, ['employee-8'], '/other-repo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke.map(x => x.task)).toContain('local');
+    expect(w.events).toContain('claim:employee-1:local');
+    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
+  });
+  test('a zero-candidate verdict names the other-repo engineers it left out, while its reasons stay in this repo', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('home-busy');
+    Object.assign(w.rows.find(t => t.id === 'home-busy')!, { reviewerRole: 'owner' });
+    engineers(w, ['employee-9']);
+    w.agents.set('agent-employee-9', { id: 'agent-employee-9', status: 'running' });
+    engineers(w, ['employee-8'], '/other-repo');
+    const d = w.dispatcher();
+    await d.tick();
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'home-busy')!;
+    expect(verdict.dispatchable).toBe(false);
+    expect(verdict.reasons.map(r => r.code)).toEqual(['seat_full', 'session_busy']);
+    expect(verdict.reasons.find(r => r.code === 'seat_full')!.text).toContain('仓库 fixture');
+    expect(verdict.summary).toContain('另有 1 名同岗位员工属其他仓库，不参与本仓库派工');
+    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
   });
 });

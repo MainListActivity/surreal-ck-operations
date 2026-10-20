@@ -16,7 +16,7 @@ import type { ContributorDryRunView } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
-import type { WorkIntent, WorktreeAssignment, WorktreeView } from './contracts.ts';
+import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
 export { CompanyError };
 
@@ -725,6 +725,20 @@ export class SurrealCompanyCore implements CompanyCore {
       const worktree = await this.worktrees!.allocate(repo, list, fresh, actor, allocProject);
       return this.claimLease(actor, taskId, worktree);
     });
+  }
+
+  /**
+   * Read-only write-scope preflight for the dispatcher (SYS-DISP R1): the holders that would refuse an execute claim of this task
+   * now, under the claim's own rules. Takes no repo lock and writes nothing; the claim stays the authority.
+   */
+  async writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]> {
+    if (!this.worktrees) return [];
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const task = view(row);
+    const project = await this.taskProject(taskId);
+    const { repo, list } = await this.worktrees.identity(task.codeRepoPath ?? project?.repoPath ?? this.worktrees.options.opsRepo);
+    return this.worktrees.writeScope(repo, list, task, { employeeId: employeeId ?? '', role: task.executorRole });
   }
 
   async readWorkspace(credential: Credential, taskId?: TaskId, project?: string): Promise<WorktreeAssignment | undefined> {

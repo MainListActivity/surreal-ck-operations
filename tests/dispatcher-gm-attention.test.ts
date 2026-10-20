@@ -114,6 +114,8 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     canReuse: () => true,
     detachAgent: () => {},
     claim: async () => undefined,
+    writeScope: async () => [],
+    claimDenial: () => undefined,
     bindAgent: () => {},
     commDirFor: () => '/tmp/comm',
     releaseClaim: async () => {},
