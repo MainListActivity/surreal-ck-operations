@@ -14,6 +14,13 @@
 /** execute: the implementer writes code. review: an independent reviewer accepts or returns. */
 export type DispatchPhase = 'execute' | 'review';
 
+/**
+ * The workflow state of the work item the conclusion is about: the task's own state (what the workflow says), kept apart from the
+ * dispatch status (`dispatchable`, what the pass decided). An execute item is `ready`, or `doing` when its holder is gone; a review
+ * item is `review`.
+ */
+export type WorkflowState = 'ready' | 'doing' | 'review';
+
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
@@ -70,6 +77,8 @@ export interface DispatchVerdict {
   role: string;
   home: string;
   dispatchable: boolean;
+  /** The task's workflow state (see WorkflowState). Dispatch status is `dispatchable`, never this. */
+  workflowState: WorkflowState;
   eligibleCount: number;
   /** Every effective reason; empty only when the task is dispatchable. */
   reasons: DispatchReason[];
@@ -97,6 +106,8 @@ export interface EvaluateInput {
   globalBlocks?: readonly GlobalBlock[];
   /** Episode start, unix milliseconds. Defaults to checkedAt (a fresh episode). */
   since?: number;
+  /** The task's workflow state; defaults from the phase (execute is ready, review is review). */
+  workflowState?: WorkflowState;
   /** Evaluation time, unix milliseconds. */
   checkedAt: number;
 }
@@ -314,6 +325,7 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
     noticeKey: `dispatch-blocked:${input.taskId}:${input.phase}`,
     taskId: input.taskId, goalId: input.goalId, title: input.title, phase: input.phase, role: input.role, home: input.home,
     dispatchable, eligibleCount, reasons, feasible,
+    workflowState: input.workflowState ?? (input.phase === 'execute' ? 'ready' : 'review'),
     checkedAt: iso(input.checkedAt),
     since: dispatchable ? undefined : iso(since),
     waitingMinutes: dispatchable ? 0 : Math.max(0, Math.floor((input.checkedAt - since) / 60_000)),
@@ -359,8 +371,14 @@ export interface GoalRootBlocker {
   feasible: boolean;
   waitingMinutes: number;
   since?: string;
+  /** Blocked work of this goal in the pass, the root included: the 无法派工 count, shown apart from the normal waits (impact). */
+  undispatchable: number;
   /** Other blocked work behind the same goal, from this pass's verdicts. */
   others: number;
+  /** The root's workflow state, eligible-candidate count and the instant its conclusion was checked (its own checkedAt). */
+  workflowState: WorkflowState;
+  eligibleCount: number;
+  checkedAt: string;
   /** Unfinished tasks waiting on this root, directly or through other tasks: the "影响 N 项后续" count. */
   impact: number;
   /** The longest waiting chain from the root: the root first, then each task that waits on the one before it. Bounded. */
@@ -422,7 +440,8 @@ export function goalRootBlockers(verdicts: readonly DispatchVerdict[], facts?: G
     const behind = waitingBehind(root.taskId, facts);
     const titleOf = (taskId: string) => (taskId === root.taskId ? root.title : (facts?.titles.get(taskId) ?? taskId));
     return { goalId, taskId: root.taskId, title: root.title, phase: root.phase, summary: root.summary, feasible: root.feasible,
-      waitingMinutes: root.waitingMinutes, since: root.since, others: list.length - 1, impact: behind.count,
+      waitingMinutes: root.waitingMinutes, since: root.since, others: list.length - 1, undispatchable: list.length, impact: behind.count,
+      workflowState: root.workflowState, eligibleCount: root.eligibleCount, checkedAt: root.checkedAt,
       dependencyPath: behind.path.map(taskId => ({ taskId, title: titleOf(taskId) })),
       people: facts?.people.get(root.taskId) ?? NO_PEOPLE, reasons: root.reasons };
   });

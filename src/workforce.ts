@@ -439,6 +439,21 @@ export class Workforce {
       { task: id('task', taskId), phase: phase ?? null, since: since ?? null });
   }
 
+  /** When each ready task last became ready (unix milliseconds), read in one query. Tasks with no such audit row are absent. */
+  async readySince(taskIds: readonly string[]): Promise<Map<string, number>> {
+    const since = new Map<string, number>();
+    if (taskIds.length === 0) return since;
+    const [rows] = await this.db.query<[Array<{ task: unknown; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $ids
+       AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC;`,
+      { ids: taskIds.map(taskId => id('task', taskId)) });
+    for (const row of rows ?? []) {
+      const key = asId(row.task);
+      if (!since.has(key) && row.at !== undefined && row.at !== null) since.set(key, Date.parse(String(row.at)));
+    }
+    return since;
+  }
+
   /** Record a Jev-produced evaluation: scorecards + evaluated_at + audit/outbox + rolling averages. */
   async recordJevEvaluation(
     taskId: TaskId, judge: string, summary: string,

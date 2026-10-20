@@ -67,8 +67,14 @@ export interface Inbox {
  * 公司动态一页答「发生了什么」：谁在干什么、什么卡住了、为什么没人领、
  * 最近做完了什么、资源有没有异常。全部来自任务服务与调度器同一套判定。
  */
+/** The lists of the pulse answer that carry a truncation marker (see the bounds field). */
+export type PulseListName = "dispatchBlocked" | "goalBlockers" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "goals" | "resources";
+
 export interface Pulse {
+  /** When this answer was built (request time). Live lists (doing, stuck, waiting, ...) read as of this instant. */
   at: string;
+  /** When the dispatch conclusions were checked: the pass's snapshot. Dispatch lists and the ready queue are as of this instant. */
+  dispatchAt?: string;
   paused: boolean;
   /** state=doing 的任务 */
   doing: Array<{ taskId: string; title: string; employee?: string; role: string; discipline?: string; goal?: string; sinceMin?: number }>;
@@ -87,11 +93,10 @@ export interface Pulse {
   last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
   /** 订阅健康/低额度异常行（正常时为空） */
   resources: string[];
-  staffingAlerts: number;
   churn: { created: number; retired: number; claimLost: number };
   goals: Array<{ title: string; days: number }>;
-  /** Truncation markers for the bounded lists above: how many items existed, and whether the answer left some out. */
-  bounds: { dispatchBlocked: ListBound; goalBlockers: ListBound };
+  /** Truncation markers for every list above: how many items existed, and whether the answer left some out. */
+  bounds: Record<PulseListName, ListBound>;
 }
 
 /** A bounded list's truncation marker. `total` is the count before the cap; `truncated` is true when `shown < total`. */
@@ -167,6 +172,12 @@ export interface GoalRootBlockerView {
   since?: string;
   waitingMinutes: number;
   others: number;
+  /** Blocked work of this goal, the root included: the 无法派工 count, shown apart from the normal waits (impact). */
+  undispatchable: number;
+  /** The root's workflow state (ready, doing or review), its eligible-candidate count, and when its conclusion was checked. */
+  workflowState: "ready" | "doing" | "review";
+  eligibleCount: number;
+  checkedAt: string;
   /** Unfinished tasks waiting on this root, directly or through other tasks. */
   impact: number;
   dependencyPath: Array<{ taskId: string; title: string }>;
@@ -181,7 +192,12 @@ export interface DispatchBlockedView {
   goalId?: string;
   title: string;
   phase: "execute" | "review";
+  /** The task's workflow state (ready, doing or review). The row itself is the dispatch status: it is blocked. */
+  workflowState: "ready" | "doing" | "review";
   summary: string;
+  /** When the conclusion was checked (ISO 8601). Eligible candidates at that check: zero for every row, stated explicitly. */
+  checkedAt: string;
+  eligibleCount: number;
   /** False when the block is material at once (owner decision needed, or candidate state unknown). */
   feasible: boolean;
   since?: string;
@@ -221,6 +237,8 @@ export interface Roster {
   bounds: { dispatchBlocked: ListBound };
   /** When the tick last observed sessions; roster status is that observation, not a second read. */
   sessionsObservedAt?: string;
+  /** When the pass's snapshot was taken: the pools, review previews and dispatch-blocked rows above are as of this instant. */
+  dispatchAt?: string;
 }
 
 export interface ModelOption {

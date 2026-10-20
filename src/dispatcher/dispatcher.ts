@@ -16,7 +16,7 @@ import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
@@ -385,6 +385,37 @@ interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: strin
 export interface ObservedSession { agentId?: string; status: string; state: InstState }
 export interface SessionSnapshot { at: number; sessions: ReadonlyMap<string, ObservedSession> }
 
+/** One ready work item as the pass saw it. `readySince` is unix milliseconds, absent when no audit row says when it became ready. */
+export interface ReadyItem { taskId: string; title: string; role: string; discipline?: string; readySince?: number }
+
+/**
+ * The owner's view of one pass (SYS-DISP R4). Verdicts, pools, review previews and the ready queue are read from the pass that
+ * produced them, so the roster, the pulse and the daily brief agree with the dispatch decisions and with each other. `at` is the
+ * instant the snapshot was taken (unix milliseconds; 0 before the first pass).
+ */
+export interface DispatchSnapshot {
+  at: number;
+  verdicts: DispatchVerdict[];
+  pools: Array<{ role: string; home: string; entries: StaffingEntry[] }>;
+  reviewPools: ReviewStaffingPreview[];
+  ready: ReadyItem[];
+}
+
+const emptySnapshot = (): DispatchSnapshot => ({ at: 0, verdicts: [], pools: [], reviewPools: [], ready: [] });
+
+/** What a pass read before it decided. The snapshot is taken from these at the end of the tick, so every view shares them. */
+export interface PassInputs {
+  now: number;
+  cfg: CompanyConfig;
+  defs: EmployeeDef[];
+  insts: EmployeeInst[];
+  states: Map<string, InstState>;
+  health: Map<string, ProviderHealth>;
+  quotaBlocked: Map<string, string>;
+  tasks: SupervisedTask[];
+  slots: Map<string, string>;
+}
+
 export interface TickReport {
   commands: number;
   revoked: string[];
@@ -399,6 +430,40 @@ export interface TickReport {
   /** Terminal-task artifacts trimmed this tick (see report.skipped === 'resources'). */
   reclaimed?: { tasks: number; files: number; freedBytes: number; trigger: ArtifactTrigger; pressure: boolean };
   skipped?: 'paused' | 'budget' | 'resources';
+}
+
+/**
+ * The snapshot of one pass (SYS-DISP R4): staffing pools, review previews and the ready queue, evaluated from the inputs that pass
+ * read and the verdicts it recorded. The tick builds it at the end of every pass; tests build it from their own inputs, so the
+ * owner-facing answers are measured against the same function the tick uses.
+ */
+export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar: boolean; log?: (message: string) => void },
+  verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince'>, at = Date.now()): Promise<DispatchSnapshot> {
+  const busyBy = new Map<string, number>();
+  for (const inst of p.insts) {
+    if (p.states.get(inst.id) !== 'busy') continue;
+    busyBy.set(inst.provider ?? '', (busyBy.get(inst.provider ?? '') ?? 0) + 1);
+  }
+  const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
+  const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
+    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
+  const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
+  const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
+  const pools = roles.flatMap(role => homes.map(home => ({ role, home, entries: staffingPool({ ...poolBase, role, home }) })))
+    .filter(pool => pool.entries.length > 0);
+  const reviewPools = await reviewStaffingPreviews(p.tasks, poolBase, wf);
+  const readyTasks = p.tasks.filter(t => t.state === 'ready');
+  // A failed read leaves the waits unknown (no readySince), and the conclusions of the pass still stand.
+  let since = new Map<string, number>();
+  try {
+    since = await wf.readySince(readyTasks.map(t => t.id));
+  } catch (error) {
+    opts.log?.(`ready-since read failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const ready = readyTasks.map((t): ReadyItem => ({
+    taskId: t.id, title: t.title, role: t.executorRole as string, discipline: t.discipline, readySince: since.get(t.id),
+  }));
+  return { at, verdicts: [...verdicts], pools, reviewPools, ready };
 }
 
 export class Dispatcher {
@@ -439,6 +504,16 @@ export class Dispatcher {
     return this.observed;
   }
 
+  /** The latest pass's snapshot. The owner-facing roster and pulse read it, never the live database, for dispatch conclusions. */
+  private snapshot: DispatchSnapshot = emptySnapshot();
+
+  dispatchSnapshot(): DispatchSnapshot {
+    return this.snapshot;
+  }
+
+  /** Inputs of the pass in progress, set once the pass has read its sessions, tasks and gates (see pass). */
+  private passInputs?: PassInputs;
+
   /**
    * Stores this pass's verdict for a work item and persists the episode start when the block is new or moved. A repeated
    * tick or a restart keeps the same start, so the waiting time never resets silently. `now` is server time in unix
@@ -448,6 +523,7 @@ export class Dispatcher {
     entries: EvaluatedEntry[] | undefined, now: number, globalBlocks: GlobalBlock[] = []): Promise<{ verdict: DispatchVerdict; since: number }> {
     const since = task.dispatchBlockedPhase === phase && task.dispatchBlockedSince ? task.dispatchBlockedSince : now;
     const verdict = evaluateDispatch({ taskId: task.id, goalId: task.goalId, title: task.title, phase, home, entries, globalBlocks,
+      workflowState: task.state === 'review' ? 'review' : task.state === 'doing' ? 'doing' : 'ready',
       role: phase === 'execute' ? task.executorRole : task.reviewerRole, since: since * 1000, checkedAt: now * 1000 });
     this.verdicts.set(`${task.id}:${phase}`, verdict);
     if (task.dispatchBlockedPhase !== phase || task.dispatchBlockedSince !== since) {
@@ -539,7 +615,24 @@ export class Dispatcher {
     return gates;
   }
 
+  /**
+   * One dispatch pass, then the snapshot and the daily brief, both taken from that pass (SYS-DISP R1, R4). A pass that returns early
+   * (paused, budget, resources) still gets its snapshot, so the owner sees the global gate that held it.
+   */
   async tick(): Promise<TickReport> {
+    this.passInputs = undefined;
+    const report = await this.pass();
+    // The pass set the inputs through `this`, which control-flow analysis cannot see across the await: the assertion is the contract.
+    const inputs = this.passInputs as PassInputs | undefined;
+    if (inputs) {
+      this.snapshot = await this.buildSnapshot(inputs);
+      await this.dailyBrief(inputs.now, inputs.cfg, report, this.snapshot.verdicts)
+        .catch(error => this.log(`daily brief failed: ${(error as Error).message}`));
+    }
+    return report;
+  }
+
+  private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
@@ -719,10 +812,12 @@ export class Dispatcher {
       insts = insts.filter(i => !report.retired.includes(i.id));
     }
 
+    // What this pass has read before it decides. The snapshot and the daily brief are taken from these at the end of the tick.
+    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap };
+
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
     await this.ownerAging(now, report).catch(error => this.log(`owner aging failed: ${(error as Error).message}`));
-    await this.dailyBrief(now, cfg, report).catch(error => this.log(`daily brief failed: ${(error as Error).message}`));
 
     // 4. Work that needs an employee.
     const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
@@ -1543,8 +1638,15 @@ export class Dispatcher {
     }
   }
 
-  /** One brief per local day, from the configured hour on; survives restarts via the stored notice key. */
-  private async dailyBrief(now: number, cfg: CompanyConfig, report: TickReport) {
+  /** The snapshot of this pass: the inputs it read, and the verdicts it recorded. */
+  private async buildSnapshot(p: PassInputs): Promise<DispatchSnapshot> {
+    const { workforce: wf, env } = this.deps;
+    return snapshotOf(p, { opsRepo: env.opsRepo, sidecar: !!this.deps.sidecar, log: message => this.log(message) },
+      [...this.verdicts.values()], wf);
+  }
+
+  /** One brief per local day, from the configured hour on; survives restarts via the stored notice key. `verdicts` are this pass's. */
+  private async dailyBrief(now: number, cfg: CompanyConfig, report: TickReport, verdicts: DispatchVerdict[] = []) {
     if (cfg.ownerBriefHour < 0) return;
     const at = new Date(now * 1000);
     const date = localDate(at);
@@ -1555,7 +1657,7 @@ export class Dispatcher {
     const { workforce: wf } = this.deps;
     const quotaRows = await this.deps.quota?.().catch(() => [] as ProviderQuota[]) ?? [];
     const capacity = roleCapacity(await wf.defs(), quotaBlockedProviders(quotaRows, cfg, Date.now()), await wf.providerHealth(), now);
-    const { summary, text } = renderBrief(await owner.briefData(now * 1000, date, capacity));
+    const { summary, text } = renderBrief(await owner.briefData(now * 1000, date, capacity, verdicts));
     await this.notice(key, text, report, { force: true, popup: summary });
     this.briefedOn = date;
     for (const notice of await owner.openNotices()) {

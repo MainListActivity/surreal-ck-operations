@@ -7,6 +7,8 @@ import { ProjectStore } from './projects.ts';
 import type { BriefData, RoleCapacity, WaitingItem } from './owner-brief.ts';
 import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requireText, RESOLVE_DEP_SQL, UNLOCK_CHILDREN_SQL, UNLOCK_SQL, view, type IdempotencyRow, type TaskRow } from './core.ts';
 import { assertRoleContract, loadContract } from './role-contract.ts';
+import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
+import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -63,6 +65,14 @@ const EMIT_CREATED = (task: string) => `
   CREATE outbox CONTENT { task: ${task}, kind: 'created', sequence: $seq.value, payload: { state: ${task}.state }, at: time::now() };`;
 
 /** Owner-side operations. Used by the owner CLI, the dispatcher (owner_command table) and gm relay. */
+/** The brief names this many blocked items; the rest are counted in `total` and said so, never dropped silently. */
+const BRIEF_DISPATCH_ROWS = 12;
+
+const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'] => {
+  const list = dispatchBlockedList(verdicts, BRIEF_DISPATCH_ROWS);
+  return { total: list.bound.total, rows: list.items };
+};
+
 export class OwnerDesk {
   constructor(private readonly database: CompanyDatabase) {}
   private get db() { return this.database.db; }
@@ -481,13 +491,17 @@ export class OwnerDesk {
   }
 
   /** Everything the daily brief reports, read straight from the task service (no model involved). */
-  async briefData(nowMs: number, date: string, capacity: RoleCapacity[] = []): Promise<BriefData> {
+  /**
+   * `dispatch` is the latest pass's blocked verdicts, the same list the roster and pulse show (SYS-DISP R1). The brief lists each
+   * one; it does not count dispatch notices, which are a subset raised only once an item is material or has waited five minutes.
+   */
+  async briefData(nowMs: number, date: string, capacity: RoleCapacity[] = [], dispatch: DispatchVerdict[] = []): Promise<BriefData> {
     const sinceIso = new Date(nowMs - 86_400_000).toISOString();
     const waiting = (await this.waitingOnOwner()).map(item => ({ ...item, hours: (nowMs - item.sinceMs) / 3_600_000 }));
-    const [blocked, ready, counts, goals, health, quotas, staffing, opened, closed] = await this.db.query<[
+    const [blocked, ready, counts, goals, health, quotas, opened, closed] = await this.db.query<[
       Array<{ id: RecordId; title: string; dependencies?: RecordId[] }>, Array<{ id: RecordId; title: string }>,
       Array<{ action: string; mechanical?: boolean; n: number }>, Array<{ title: string; created_at: unknown }>,
-      Array<{ id: RecordId; state: string; last_error?: string }>, Array<{ id: RecordId; lowest_pct?: number }>, Array<{ key: string }>,
+      Array<{ id: RecordId; state: string; last_error?: string }>, Array<{ id: RecordId; lowest_pct?: number }>,
       Array<{ n: number }>, Array<{ reason?: string; n: number }>,
     ]>(`SELECT id, title, dependencies FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(dependencies ?? []) > 0;
       SELECT id, title FROM task WHERE state = 'ready';
@@ -495,7 +509,6 @@ export class OwnerDesk {
       SELECT title, created_at FROM goal WHERE state = 'active' ORDER BY created_at;
       SELECT id, state, last_error FROM provider_health;
       SELECT id, lowest_pct FROM company_meta WHERE lowest_pct != NONE;
-      SELECT key FROM owner_notice WHERE resolved_at = NONE AND string::starts_with(key, 'dispatch-blocked:');
       SELECT count() AS n FROM employee WHERE role != NONE AND created_at > <datetime>$since GROUP ALL;
       SELECT retired_reason AS reason, count() AS n FROM employee WHERE retired = true AND retired_at > <datetime>$since GROUP BY retired_reason;`, { since: sinceIso });
     const stuck: BriefData['stuck'] = [];
@@ -529,7 +542,7 @@ export class OwnerDesk {
     ];
     return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rolledBack, rejected: n('owner_reject'), retired: n('retire') },
       goals: goals.map(g => ({ title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)) })),
-      resources, capacity, staffingAlerts: staffing.length,
+      resources, capacity, dispatchBlocked: briefDispatch(dispatch),
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };
   }
 

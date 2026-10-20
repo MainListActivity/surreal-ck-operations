@@ -3,7 +3,7 @@
  * keeps at most LIST_ITEM_LIMIT items within LIST_BYTE_BUDGET serialized bytes, and every candidate or people list keeps a few
  * names. Nothing is cut silently: `bound` reports the count before the cap and whether the answer left items out.
  */
-import { goalRootBlockers, type DispatchPhase, type DispatchReason, type DispatchVerdict, type GoalRootFacts, type RecoveryAction } from './dispatch-blocked.ts';
+import { goalRootBlockers, type DispatchPhase, type DispatchReason, type DispatchVerdict, type GoalRootFacts, type RecoveryAction, type WorkflowState } from './dispatch-blocked.ts';
 
 /** Items per list. */
 export const LIST_ITEM_LIMIT = 40;
@@ -45,8 +45,14 @@ export interface DispatchBlockedRow {
   goalId?: string;
   title: string;
   phase: DispatchPhase;
+  /** The task's workflow state (ready or review); the dispatch status is the row itself: every row is blocked. */
+  workflowState: WorkflowState;
   summary: string;
   feasible: boolean;
+  /** When the conclusion was checked (the tick that produced it), ISO 8601. The row is that conclusion, not the request time. */
+  checkedAt: string;
+  /** Eligible candidates at the check: 0 for every row, stated so a reader sees the zero rather than a missing field. */
+  eligibleCount: number;
   since?: string;
   waitingMinutes: number;
   reasons: ReasonRow[];
@@ -57,11 +63,18 @@ export interface GoalBlockerRow {
   taskId: string;
   title: string;
   phase: DispatchPhase;
+  workflowState: WorkflowState;
   summary: string;
   feasible: boolean;
+  /** The root's conclusion time (ISO 8601): the goal card's data time. */
+  checkedAt: string;
+  eligibleCount: number;
   since?: string;
   waitingMinutes: number;
+  /** Blocked work of the goal, the root included: 无法派工 is this count, shown apart from the normal waits (impact). */
+  undispatchable: number;
   others: number;
+  /** Unfinished tasks waiting on this root through dependencies: normal waiting, not a dispatch failure. */
   impact: number;
   dependencyPath: Array<{ taskId: string; title: string }>;
   people: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
@@ -100,12 +113,17 @@ const byPriority = (a: DispatchVerdict, b: DispatchVerdict) =>
   || a.taskId.localeCompare(b.taskId) || a.phase.localeCompare(b.phase);
 
 /** Blocked work from the latest pass. Dispatchable work has no verdict, so it is never listed. */
-export function dispatchBlockedList(verdicts: readonly DispatchVerdict[]): BoundedList<DispatchBlockedRow> {
-  const rows = verdicts.filter(v => !v.dispatchable).sort(byPriority).map((v): DispatchBlockedRow => ({
+export function dispatchBlockedRows(verdicts: readonly DispatchVerdict[]): DispatchBlockedRow[] {
+  return verdicts.filter(v => !v.dispatchable).sort(byPriority).map((v): DispatchBlockedRow => ({
     taskId: v.taskId, goalId: v.goalId, title: v.title, phase: v.phase, summary: v.summary, feasible: v.feasible,
+    workflowState: v.workflowState, eligibleCount: v.eligibleCount, checkedAt: v.checkedAt,
     since: v.since, waitingMinutes: v.waitingMinutes, reasons: v.reasons.map(reasonRow),
   }));
-  return boundList(rows);
+}
+
+/** The bounded view of dispatchBlockedRows: at most `limit` rows and LIST_BYTE_BUDGET bytes, with the marker. */
+export function dispatchBlockedList(verdicts: readonly DispatchVerdict[], limit = LIST_ITEM_LIMIT): BoundedList<DispatchBlockedRow> {
+  return boundList(dispatchBlockedRows(verdicts), limit);
 }
 
 /** Material blocks first, then the longest wait, then goal id: the order the goal tab reads its roots in. */
@@ -116,7 +134,7 @@ const goalPriority = (a: GoalBlockerRow, b: GoalBlockerRow) =>
  * One root blocker per goal, with people capped. Without facts the people and impact fields stay empty. Rows are ranked
  * before the cap, so a cut drops the least urgent roots.
  */
-export function goalBlockerList(verdicts: readonly DispatchVerdict[], facts?: GoalRootFacts): BoundedList<GoalBlockerRow> {
+export function goalBlockerRows(verdicts: readonly DispatchVerdict[], facts?: GoalRootFacts): GoalBlockerRow[] {
   const rows = goalRootBlockers(verdicts, facts).map((root): GoalBlockerRow => {
     const authors = capValues(root.people.authors, PEOPLE_LIMIT);
     const reviewers = capValues(root.people.reviewers, PEOPLE_LIMIT);
@@ -124,10 +142,16 @@ export function goalBlockerList(verdicts: readonly DispatchVerdict[], facts?: Go
     return {
       goalId: root.goalId, taskId: root.taskId, title: root.title, phase: root.phase, summary: root.summary, feasible: root.feasible,
       since: root.since, waitingMinutes: root.waitingMinutes, others: root.others, impact: root.impact,
+      undispatchable: root.undispatchable, workflowState: root.workflowState, eligibleCount: root.eligibleCount, checkedAt: root.checkedAt,
       dependencyPath: root.dependencyPath,
       people: { ...root.people, authors: authors.values, reviewers: reviewers.values, ...(omitted ? { peopleOmitted: omitted } : {}) },
       reasons: root.reasons.map(reasonRow),
     };
   });
-  return boundList(rows.sort(goalPriority));
+  return rows.sort(goalPriority);
+}
+
+/** The bounded view of goalBlockerRows: at most `limit` rows and LIST_BYTE_BUDGET bytes, with the marker. */
+export function goalBlockerList(verdicts: readonly DispatchVerdict[], facts?: GoalRootFacts, limit = LIST_ITEM_LIMIT): BoundedList<GoalBlockerRow> {
+  return boundList(goalBlockerRows(verdicts, facts), limit);
 }
