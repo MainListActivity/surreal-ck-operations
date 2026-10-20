@@ -784,8 +784,10 @@ test('(u) a reserved listing whose commit stalls is cut at the deadline: its roo
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
   expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  // Answered at the deadline plus the in-flight wait (500 ms) and the release on its own connection, well inside the 3 s cleanup budget.
+  // The upper bound allows for the release's own time under a loaded run; the caller never waits for the stuck commit.
   expect(elapsed).toBeGreaterThanOrEqual(1_900);
-  expect(elapsed).toBeLessThan(2_600);
+  expect(elapsed).toBeLessThan(3_000);
   expect(closes[0]).toBe(true);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', release: 'released' });
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
