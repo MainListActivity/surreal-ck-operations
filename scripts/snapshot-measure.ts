@@ -59,6 +59,8 @@ interface Link { client?: Side; upstream?: Side; down: Uint8Array[]; up: Uint8Ar
  */
 function startProxy(targetPort: number, rate: number) {
   const links = new Set<Link>();
+  // Every connection the proxy carries: opened and closed as the sockets really open and close, so a build's connections show here.
+  const connections = { opened: 0, closed: 0, open: 0, peakOpen: 0 };
   const allowance: Record<Dir, number> = { down: 0, up: 0 };
   const perTick = (rate * TICK_MS) / 1000;
   let turn = 0;
@@ -66,6 +68,8 @@ function startProxy(targetPort: number, rate: number) {
     if (link.closed) return;
     link.closed = true;
     links.delete(link);
+    connections.closed++;
+    connections.open--;
     try { link.client?.end(); } catch { /* already closed */ }
     try { link.upstream?.end(); } catch { /* already closed */ }
   };
@@ -108,6 +112,9 @@ function startProxy(targetPort: number, rate: number) {
         const link: Link = { client, down: [], up: [], closed: false };
         client.data = link;
         links.add(link);
+        connections.opened++;
+        connections.open++;
+        connections.peakOpen = Math.max(connections.peakOpen, connections.open);
         Bun.connect({
           hostname: '127.0.0.1', port: targetPort,
           socket: {
@@ -127,7 +134,7 @@ function startProxy(targetPort: number, rate: number) {
       error(client) { closeLink(client.data); },
     },
   });
-  return { port: server.port, stop: () => { if (timer) clearInterval(timer); for (const link of links) closeLink(link); server.stop(true); } };
+  return { port: server.port, connections, stop: () => { if (timer) clearInterval(timer); for (const link of links) closeLink(link); server.stop(true); } };
 }
 
 async function startFork(dir: string, password: string): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -154,12 +161,14 @@ const codeOf = (error: unknown): string => (error instanceof CompanyError ? erro
 const buildSummary = (stats: SnapshotBuildStats[]) => {
   const outcomes: Record<string, number> = {};
   for (const stat of stats) outcomes[stat.outcome] = (outcomes[stat.outcome] ?? 0) + 1;
-  if (stats.length === 0) return { n: 0, outcomes };
+  const releases: Record<string, number> = {};
+  for (const stat of stats) releases[stat.release] = (releases[stat.release] ?? 0) + 1;
+  if (stats.length === 0) return { n: 0, outcomes, releases };
   const spread = (pick: (stat: SnapshotBuildStats) => number) => summary(stats.map(pick));
   return {
-    n: stats.length, outcomes,
+    n: stats.length, outcomes, releases,
     totalMs: spread(stat => stat.totalMs), serverMs: spread(stat => stat.serverMs), loadMs: spread(stat => stat.loadMs),
-    writeMs: spread(stat => stat.writeMs), commitMs: spread(stat => stat.commitMs),
+    writeMs: spread(stat => stat.writeMs), commitMs: spread(stat => stat.commitMs), releaseMs: spread(stat => stat.releaseMs),
     batchesMean: round(stats.reduce((sum, stat) => sum + stat.batches, 0) / stats.length),
   };
 };
@@ -223,6 +232,7 @@ async function main() {
 
     // ---- first page of the GM working set: the listing is built, then its first page is read ----
     const before = { ...counters };
+    const connBefore = { ...proxy.connections };
     let rssPeak = process.memoryUsage().rss;
     const sampler = setInterval(() => { rssPeak = Math.max(rssPeak, process.memoryUsage().rss); }, 10);
     const firstFrom = buildLog.length;
@@ -239,13 +249,21 @@ async function main() {
     } finally {
       clearInterval(sampler);
     }
+    // The timing and the wire counts are taken before the settle below, so the settle is not part of either.
+    const firstSeconds = round((performance.now() - firstStart) / 1000);
+    const wireDownBytes = counters.down - before.down;
+    const wireUpBytes = counters.up - before.up;
+    // Real socket evidence: the proxy counts each connection it carries. The settle lets this build's closes reach the proxy.
+    await Bun.sleep(100);
+    const connAfter = { ...proxy.connections };
     result.firstPage = {
-      outcome, seconds: round((performance.now() - firstStart) / 1000), pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
-      wireDownBytes: counters.down - before.down, wireUpBytes: counters.up - before.up, clientRssPeakMb: round(rssPeak / 1048576),
+      outcome, seconds: firstSeconds, pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
+      wireDownBytes, wireUpBytes, clientRssPeakMb: round(rssPeak / 1048576),
+      connections: { opened: connAfter.opened - connBefore.opened, closed: connAfter.closed - connBefore.closed, openAfter: connAfter.open },
       builds: buildLog.slice(firstFrom).map(stat => ({
         outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, attempts: stat.loadAttempts, loadMs: round(stat.loadMs),
         reserveMs: round(stat.reserveMs), writeMs: round(stat.writeMs), commitMs: round(stat.commitMs), totalMs: round(stat.totalMs),
-        serverMs: round(stat.serverMs),
+        serverMs: round(stat.serverMs), release: stat.release, releaseMs: round(stat.releaseMs),
       })),
     };
 
@@ -298,6 +316,7 @@ async function main() {
     const baseline = await runControl(controls.slice(0, SAMPLES), false);
     const disturbed = await runControl(controls.slice(SAMPLES, 2 * SAMPLES), true);
     result.control = { baseline, disturbed };
+    result.proxyConnections = { ...proxy.connections };
     result.finishedAt = new Date().toISOString();
   } finally {
     await database.close().catch(() => undefined);

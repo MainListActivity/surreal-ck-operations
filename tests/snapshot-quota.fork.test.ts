@@ -729,3 +729,11 @@ test('(s) a release whose connection opens only after its deadline still marks t
   expect(await plain.sweep()).toBe(1);
   expect(await plain.census()).toEqual({ listings: 0, rows: 0 });
 });
+
+test('(t) the default limits are the reviewed ones: 5000 rows, 8 MiB per listing, 4 per identity, 64 listings, 64 MiB, 64 KiB batches, a 10 second build deadline, a 5 second hedge, 4 build connections', () => {
+  expect(DEFAULT_SNAPSHOT_LIMITS).toMatchObject({
+    maxRows: 5000, maxBytes: 8 * KB * KB, maxPerOwner: 4, maxListings: 64, maxTotalBytes: 64 * KB * KB,
+    batchBytes: 64 * KB, buildDeadlineMs: 10_000, loadHedgeMs: 5_000,
+  });
+  expect(MAX_BUILD_CONNECTIONS).toBe(4);
+});

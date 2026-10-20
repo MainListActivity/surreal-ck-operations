@@ -104,6 +104,8 @@ export interface SnapshotBuildStats {
   loadAttempts: number;
   /** How the reservation of a failed build was released: 'none' when nothing was reserved, 'pending' when the release ran out of time and the listing waits for the sweep. */
   release: 'none' | 'released' | 'absent' | 'pending';
+  /** Time the release of a failed build took, in milliseconds: 0 when nothing was reserved. */
+  releaseMs: number;
 }
 
 export interface SnapshotHeader {
@@ -238,7 +240,7 @@ export class SnapshotStore {
     const account: BuildAccount = { serverMs: 0, batches: 0 };
     const stats: SnapshotBuildStats = {
       outcome: 'failed', kind: input.kind, rows: 0, bytes: 0, batches: 0, loadMs: 0, reserveMs: 0, writeMs: 0, commitMs: 0, totalMs: 0, serverMs: 0,
-      loadAttempts: 1, release: 'none',
+      loadAttempts: 1, release: 'none', releaseMs: 0,
     };
     const signal: BuildSignal = { cancelled: false };
     const state = { expired: false, reserved: false, ended: false };
@@ -338,7 +340,11 @@ export class SnapshotStore {
       }
       // The build's connections close before its release opens one of its own, so a release never waits on this build's slot.
       await closeLinks();
-      if (state.reserved) stats.release = await this.releaseOn(id);
+      if (state.reserved) {
+        const releaseStarted = performance.now();
+        stats.release = await this.releaseOn(id);
+        stats.releaseMs = performance.now() - releaseStarted;
+      }
       stats.outcome = state.expired ? 'timed_out' : error instanceof CompanyError ? 'refused' : 'failed';
       throw error instanceof CompanyError ? error : unavailable('the listing could not be stored; retry the read');
     } finally {
