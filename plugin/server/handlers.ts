@@ -6,7 +6,7 @@ import { company } from "./company";
 import { refreshModels, refreshQuota } from "./dispatch";
 import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
-import type { Pulse } from "../shared/types";
+import type { Pulse, Roster } from "../shared/types";
 
 const SOURCE = "owner:paseo-plugin";
 
@@ -172,7 +172,8 @@ export function registerHandlers(server: PluginServerContext): void {
 
   server.handle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo, dispatcher } = await company();
-    const { dispatchBlockedList } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { rosterAnswer } = await import("./vendor/src/dispatcher/roster-answer.ts");
     const cfg = await workforce.config();
     const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
     // Session status, staffing pools, review previews and dispatch-blocked rows are the pass's own snapshot (SYS-DISP R4). The roster
@@ -193,9 +194,8 @@ export function registerHandlers(server: PluginServerContext): void {
         eligible: e.eligible, reason: e.reason, code: e.code, model: e.model }));
     const pools = snapshot.pools.map(p => ({ role: p.role, home: p.home, entries: entriesView(p.entries) }));
     const reviewPools = snapshot.reviewPools.map(p => ({ ...p, entries: entriesView(p.entries) }));
-    const blocked = dispatchBlockedList(snapshot.verdicts);
-
-    return {
+    // Every list goes to rosterAnswer, which caps each one by count and bytes and reports the marker (SYS-DISP R6, AC06).
+    return rosterAnswer({
       paused: cfg.paused,
       opsRepo,
       usage: usageEntries.map((u: any) => ({
@@ -216,9 +216,8 @@ export function registerHandlers(server: PluginServerContext): void {
       reviewPools,
       sessionsObservedAt: observed.at ? new Date(observed.at).toISOString() : undefined,
       dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined,
-      dispatchBlocked: blocked.items,
-      bounds: { dispatchBlocked: blocked.bound },
-    };
+      dispatchBlocked: dispatchBlockedRows(snapshot.verdicts),
+    }) as unknown as Roster;
   });
   server.handle(rpc.pulse, async () => {
     const { db, owner, workforce, dispatcher } = await company();

@@ -33,7 +33,7 @@ export async function readGoalRootFacts(db: Surreal, workforce: Pick<Workforce, 
       log(`goal root people: contributors read failed for ${root}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const [submits] = await db.query<[Array<{ actor?: unknown; evidence?: string | null }>]>(
-      "SELECT actor, evidence FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;",
+      "SELECT actor, evidence, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;",
       { task: new RecordId('task', root) });
     const last = submits?.[0];
     people.set(root, {

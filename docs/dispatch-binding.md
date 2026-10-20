@@ -60,15 +60,20 @@
 自动化用例按层区分真实与替身。替身层的结论不能当作真实环境的证明。
 
 - **真实**：SurrealDB（公司 fork 二进制、隔离库）、核心（claim、transition、implementer_takeover、contributor_dryrun、审计与版本 CAS）、调度器（`Dispatcher.tick`）、`SidecarPool` 与通信目录的请求和回应。`tests/dispatcher-sidecar.fork.test.ts` 在这些真实层上覆盖：接手后续做、两轮返工、额度恢复与通知消警、老板门、轮换保留实现人、legacy 行 fail-closed。
-- **替身**：Paseo 网关（内存中的会话表，状态与最后错误由测试设置，不调用真实 paseo）；`sck` 进程（测试直接写请求并读回应，不启动 sck）；运维工具（桩，只报可用）；额度耗尽由测试注入错误文本。
-- **10 次重复 tick（含一次重启）**：`tests/dispatcher-sidecar.test.ts` 的 R3 用例以真实 Dispatcher 与 SidecarPool 运行，核心、工作区与 Paseo 为内存替身。它证明不认领、不唤醒、通知键只留一条；它不证明真实数据库上的去重。
+- **替身**：公司 fork 用例中的 Paseo 网关为内存会话表（状态与最后错误由测试设置，可置为 `unknown`）；`sck` 进程（测试直接写请求并读回应，不启动 sck）；运维工具（桩，只报可用）；额度耗尽由测试注入错误文本。真实 CLI 的契约见下条。
+- **Paseo 真实 CLI 契约**：`tests/fixtures/paseo/` 为 paseo 0.12.0 只读采样的脱敏样本（版本、采样时间、命令与退出码见该目录 README）。`tests/paseo-contract.test.ts` 用假 CLI 脚本，经真实 `createPaseoCli` 与 `Dispatcher.tick` 验证：非零退出、非 JSON、超时、空输出与缺少 `Status` 均得到 `unknown`，且不退役、不归档、不派工。只有 CLI 明确返回 `AGENT_NOT_FOUND` 时，会话才视为缺失。
+- **10 次重复 tick（含一次重启）**：`tests/dispatch-episode.fork.test.ts` 在公司 fork 真实数据库上运行十次 tick，中间重启一次，直接查库断言通知、任务行、审计行、派工行与 `dispatch_blocked_since`；原因变化时同一条通知更新文本。`tests/dispatcher-sidecar.test.ts` 的 R3 用例仍为内存替身，只作补充。
+- **未知状态与审计读取失败**：同一文件中，会话状态为 `unknown` 时任务保持就绪、不派工、不显示为忙碌，实现人不被退役；状态恢复后续做，并写入 `dispatch_unblocked` 审计行。契约审计读取失败时结论同为 `unknown`，恢复后自动消警。
+- **复核容量与 04195c93 重放**：`tests/review-capacity-replay.fork.test.ts` 在真实核心与调度器上运行。作者 A、B、C 全部回避、席位已满、额度为 0 时，花名册与脉冲给出同一根因，三人的复核认领被拒绝；第四复核人 D 被唤醒，真实核心接受其认领。04195c93 的已保存历史经产品推导函数只读重放，结论为 `manager_decision`，不写库。
 - **未覆盖或仅部分覆盖**：
-  - 真实 Paseo 的会话状态与错误契约：只有 fixture 形状的契约回归（`tests/paseo-contract.test.ts`），没有实时对接。
-  - 公司 fork 真实数据库上的 10 次重复 tick：未做。
-  - 额度与未知状态在真实数据库上的重放：仅额度恢复一例。
-  - AC05 复核容量预留：覆盖唯一合格复核人保留、新开席位模拟、派工失败回退，未做完整重放。
-  - 桌面端页面的目视检查：未做，仅有插件类型检查与纯函数测试。
+  - Paseo 只采样了 0.12.0 版本与上列只读命令；其他版本、`workspace create` 的返回形状与 `LastUsage` 字段未验证。
+  - `paseo ls` 失败时整轮 tick 抛错：不派工、不退役，但不会把各会话逐个标记为 `unknown`。该行为未改，待定。
+  - 会话状态为 `closed` 时仍按既有规则退役（`session closed`），是否符合预期待经理确认。
+  - AC05 复核容量：04195c93 为只读重放；A/B/C 场景在替身网关与注入额度行的环境中运行，生产环境的完整重放未做。
+  - 桌面端页面的目视检查：未做，仅有插件类型检查、纯函数测试与渲染文本测试（代码级证据）。
+  - 变异检查：移除 `implementer_mismatch` 闸门时 4 项测试失败，移除 `implementer_unresolved` 闸门时 2 项测试失败（结果记录在任务证据中）。
   - AC07 发布腿：不在本 PR 内。
 - “影响 N 项后续”是未完成、且直接或经其它任务间接等待该根阻点的任务数（依赖链计数，见 `src/dispatcher/dispatch-blocked.ts`）。
 - 历史行缺阶段时，无法判定的行按作者处理，任务进入 `manager_decision`，需经理接手。这是 fail-closed 的设计，不是缺陷。
 - 扩编（如临时增加一个工程席位）与额度决定属于经理与老板，不由本规则自动完成。
+- 手工归档（`src/admin.ts` 的 retire 命令，即 `workforce.retire` 的 manual 路径）不检查在办任务，也不检查该员工是否为任何任务的当前持有人或绑定实现人。操作前须由经理确认该员工不在在办或待复核任务上；否则先经 `implementer_takeover` 改派，或释放租约。自动轮换不退役持有人与绑定实现人（`src/dispatcher/dispatcher.ts` 轮换段），历史不可读时整轮不轮换。

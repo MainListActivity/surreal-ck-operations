@@ -35,6 +35,11 @@ export interface SpawnInput {
 /** The dispatcher's only view of Paseo. Implemented by the paseo CLI; faked in tests. */
 export interface PaseoGateway {
   list(): Promise<Map<string, AgentInfo>>;
+  /**
+   * `undefined` only when the CLI confirms the agent does not exist (AGENT_NOT_FOUND). When the CLI could not answer
+   * (non-zero exit, timeout, non-JSON or empty stdout, no Status field) the status is `'unknown'`: the dispatcher must
+   * neither dispatch to it nor treat it as missing, idle or busy.
+   */
   status(agentId: string): Promise<{ status: string; pendingPermissions: number } | undefined>;
   lastError(agentId: string): Promise<string>;
   logsTail(agentId: string, entries: number): Promise<string>;
@@ -58,13 +63,47 @@ export interface PaseoGateway {
 /** Paseo mode needed for unattended work; grok exposes no modes. */
 export const UNATTENDED_MODE: Record<string, string | undefined> = { codex: 'full-access', claude: 'bypassPermissions', devin: 'bypass', 'factory-droid': 'auto-high' };
 
-export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo'): PaseoGateway {
-  const run = async (args: string[], timeoutMs = 60_000): Promise<string> => {
+/** A Paseo CLI call that did not answer: non-zero exit, a spawn failure, or a timeout. `stderr` is what the CLI wrote. */
+export class PaseoCliError extends Error {
+  constructor(message: string, readonly stderr: string, readonly timedOut: boolean) {
+    super(message);
+    this.name = 'PaseoCliError';
+  }
+}
+
+/** Observation gap: the CLI did not give a usable answer. Never a substitute for idle or busy. */
+const UNOBSERVED = { status: 'unknown', pendingPermissions: 0 } as const;
+
+/** The CLI's own not-found answer: `{"error":{"code":"AGENT_NOT_FOUND",...}}` on stderr, exit 1. */
+const isAgentNotFound = (error: unknown): boolean => {
+  if (!(error instanceof PaseoCliError)) return false;
+  try {
+    return (JSON.parse(error.stderr) as { error?: { code?: unknown } }).error?.code === 'AGENT_NOT_FOUND';
+  } catch {
+    return false;
+  }
+};
+
+export function createPaseoCli(
+  bin = process.env.SCK_PASEO_BIN ?? '/Applications/Paseo.app/Contents/Resources/bin/paseo',
+  options: { timeoutMs?: number } = {},
+): PaseoGateway {
+  const defaultTimeoutMs = options.timeoutMs ?? 60_000;
+  const run = async (args: string[], timeoutMs = defaultTimeoutMs): Promise<string> => {
     const child = Bun.spawn([bin, ...args], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
-    const timer = setTimeout(() => child.kill(), timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Race the timeout against the streams: a wrapper that keeps stdout open after being killed must not hang the caller.
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        child.kill();
+        reject(new PaseoCliError(`paseo ${args[0]} timed out after ${timeoutMs} ms`, '', true));
+      }, timeoutMs);
+    });
+    const finished = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    finished.catch(() => undefined);
     try {
-      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      if (code !== 0) throw new Error(`paseo ${args[0]} failed (exit ${code}): ${err.trim().slice(0, 300)}`);
+      const [out, err, code] = await Promise.race([finished, timedOut]);
+      if (code !== 0) throw new PaseoCliError(`paseo ${args[0]} failed (exit ${code}): ${err.trim().slice(0, 300)}`, err, false);
       return out.trim();
     } finally {
       clearTimeout(timer);
@@ -95,13 +134,25 @@ export function createPaseoCli(bin = process.env.SCK_PASEO_BIN ?? '/Applications
       return new Map(rows.map(r => [r.id, { id: r.id, status: r.status }]));
     },
     async status(agentId) {
+      let text: string;
       try {
-        const row = await json<{ Status: string; Archived?: boolean; PendingPermissions?: unknown[] }>(['inspect', agentId]);
-        // An archived session still reports its last status; it can no longer take work.
-        return { status: row.Archived ? 'archived' : row.Status, pendingPermissions: row.PendingPermissions?.length ?? 0 };
-      } catch {
-        return undefined;
+        text = await run(['inspect', agentId, '--json']);
+      } catch (error) {
+        return isAgentNotFound(error) ? undefined : { ...UNOBSERVED };
       }
+      let row: unknown;
+      try {
+        row = JSON.parse(text);
+      } catch {
+        return { ...UNOBSERVED };
+      }
+      if (typeof row !== 'object' || row === null) return { ...UNOBSERVED };
+      const fields = row as { Status?: unknown; Archived?: unknown; PendingPermissions?: unknown };
+      const pendingPermissions = Array.isArray(fields.PendingPermissions) ? fields.PendingPermissions.length : 0;
+      // An archived session still reports its last status; it can no longer take work.
+      if (fields.Archived === true) return { status: 'archived', pendingPermissions };
+      if (typeof fields.Status !== 'string' || fields.Status === '') return { ...UNOBSERVED };
+      return { status: fields.Status, pendingPermissions };
     },
     async lastError(agentId) {
       const text = await run(['logs', agentId, '--tail', '8', '--no-color']).catch(() => '');

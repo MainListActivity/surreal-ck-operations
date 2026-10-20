@@ -176,7 +176,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     p.states.get(inst.id) === 'idle' ||
     (p.states.get(inst.id) === 'exhausted' && availabilityOf(p.health.get(inst.provider ?? ''), p.now) === 'probe');
   /** A session that is not ready: unknown, quota-exhausted, or busy/abnormal. Each one is a different owner action. */
-  const notReady = (state: InstState | undefined): Block => state === 'unknown' ? ['unknown', BLOCK_TEXT.unknown]
+  const notReady = (state: InstState | undefined): Block => state === undefined || state === 'unknown' ? ['unknown', BLOCK_TEXT.unknown]
     : state === 'exhausted' ? ['quota', BLOCK_TEXT.quota] : ['session_busy', BLOCK_TEXT.session_busy];
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
@@ -677,6 +677,12 @@ export class Dispatcher {
         continue;
       }
       const status = agents.get(inst.paseoAgentId)?.status ?? (await paseo.status(inst.paseoAgentId))?.status ?? 'missing';
+      if (status === 'unknown') {
+        // The CLI could not answer (SYS-DISP B4): not idle, not busy, not missing. Keep the session and the last observed status.
+        states.set(inst.id, 'unknown');
+        observedStatus.set(inst.id, status);
+        continue;
+      }
       const previous = this.lastStatus.get(inst.paseoAgentId);
       this.lastStatus.set(inst.paseoAgentId, status);
       observedStatus.set(inst.id, status);
@@ -753,7 +759,7 @@ export class Dispatcher {
         // idle) produces no work, yet the sidecar heartbeat keeps the server lease
         // fresh forever — `expired` never fires. Reclaim on progress stall instead:
         // progress_at moves only on checkpoint, so staleness means parked work.
-        await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : '失联'}且超过 ${cfg.stallMinutes} 分钟没有 checkpoint`, inst, report);
+        await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : state === 'unknown' ? '状态未知' : '失联'}且超过 ${cfg.stallMinutes} 分钟没有 checkpoint`, inst, report);
       } else if (expired) {
         await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
       }

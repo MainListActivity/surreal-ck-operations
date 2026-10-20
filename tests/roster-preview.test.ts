@@ -6,6 +6,7 @@ import type { SupervisedTask } from '../src/workforce.ts';
 import type { Pulse, PulseListName, Roster } from '../plugin/shared/types.ts';
 import { CANDIDATE_LIMIT, LIST_BYTE_BUDGET, LIST_ITEM_LIMIT } from '../src/dispatcher/dispatch-list.ts';
 import { PULSE_BUDGET_BYTES, PULSE_LIST_CAPS } from '../src/dispatcher/pulse-answer.ts';
+import { ROSTER_BUDGET_BYTES, ROSTER_LIST_CAPS, rosterAnswer as boundRosterAnswer, type RosterListName } from '../src/dispatcher/roster-answer.ts';
 
 const defs: StaffingInput['defs'] = [{ id: 'd1', role: 'engineering', provider: 'codex', model: 'm1',
   enabled: true, maxInstances: 3, priority: 100, weight: 10, scored: 0, errorStreak: 0 }];
@@ -220,8 +221,8 @@ test('roster RPC: a large tick is bounded by count and bytes, and the marker say
   verdicts = blockedSample(1_500);
   try {
     const response = await callRoster();
-    expect(response.dispatchBlocked.length).toBeLessThanOrEqual(LIST_ITEM_LIMIT);
-    expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(LIST_BYTE_BUDGET);
+    expect(response.dispatchBlocked.length).toBeLessThanOrEqual(ROSTER_LIST_CAPS.dispatchBlocked.items);
+    expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(ROSTER_LIST_CAPS.dispatchBlocked.bytes);
     expect(response.bounds.dispatchBlocked).toEqual({ total: 1_500, shown: response.dispatchBlocked.length, truncated: true });
     expect(response.dispatchBlocked[0]!.reasons[0]!.candidates).toHaveLength(CANDIDATE_LIMIT);
     expect(response.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBe(60 - CANDIDATE_LIMIT);
@@ -324,4 +325,52 @@ test('pulse RPC: with every list full, the whole answer stays within the 48 KiB 
     }
     expect(bytesOf(response)).toBeLessThanOrEqual(PULSE_BUDGET_BYTES);
   } finally { taskRows = [task]; verdicts = []; briefOverride = undefined; doingOverride = []; recentOverride = []; }
+});
+
+// SYS-DISP R6 (AC06, B1): the roster answer is bounded like the pulse. A backlog of 120 review tasks fills the review previews and,
+// with one home per task, the staffing pools. Each list keeps its cap and says what it left out, and the whole answer fits the budget.
+const reviewBacklog = (count: number) => Array.from({ length: count }, (_, i) => ({ id: `review-${i}`, title: `独立验收 ${i} ${'长标题'.repeat(30)}`,
+  state: 'review', reviewerRole: 'engineering', submittedBy: 'rework-submitter', repoPath: `/proj-${i}` }) as SupervisedTask);
+
+test('roster RPC: a 120-task review backlog is bounded by count and bytes, and the whole answer stays within the 48 KiB budget', async () => {
+  taskRows = reviewBacklog(120);
+  verdicts = blockedSample(1_500);
+  try {
+    const response = await callRoster();
+    expect(Object.keys(response.bounds).sort()).toEqual(Object.keys(ROSTER_LIST_CAPS).sort());
+    expect(response.reviewPools[0]!.taskId).toBe('review-0');
+    expect(response.reviewPools.length).toBeLessThanOrEqual(ROSTER_LIST_CAPS.reviewPools.items);
+    expect(bytesOf(response.reviewPools)).toBeLessThanOrEqual(ROSTER_LIST_CAPS.reviewPools.bytes);
+    expect(response.bounds.reviewPools).toEqual({ total: 120, shown: response.reviewPools.length, truncated: true });
+    expect(bytesOf(response.pools)).toBeLessThanOrEqual(ROSTER_LIST_CAPS.pools.bytes);
+    expect(response.bounds.pools.shown).toBe(response.pools.length);
+    expect(response.bounds.pools.total).toBeGreaterThan(response.pools.length);
+    expect(bytesOf(response.dispatchBlocked)).toBeLessThanOrEqual(ROSTER_LIST_CAPS.dispatchBlocked.bytes);
+    expect(bytesOf(response)).toBeLessThanOrEqual(ROSTER_BUDGET_BYTES);
+  } finally { taskRows = [task]; verdicts = []; }
+});
+
+test('roster page JSX states how many review previews the answer left out', async () => {
+  taskRows = reviewBacklog(120);
+  try {
+    const response = await callRoster();
+    // The text helper joins the children of each node with spaces, so the markers are compared without whitespace.
+    const text = renderText(response).replace(/\s+/g, '');
+    expect(text).toContain(`复核候选只列出${response.reviewPools.length}项，共120项。`);
+    expect(text).toContain(`候选池只列出${response.pools.length}个，共${response.bounds.pools.total}个。`);
+  } finally { taskRows = [task]; }
+});
+
+test('roster answer: with every list full, each list keeps its cap and the whole answer stays within the 48 KiB budget', () => {
+  const lists = Object.fromEntries((Object.keys(ROSTER_LIST_CAPS) as RosterListName[]).map(name =>
+    [name, Array.from({ length: 500 }, (_, i) => ({ key: `${name}-${i}`, text: '长标题'.repeat(40), n: i }))]));
+  const answer = boundRosterAnswer({ paused: false, opsRepo: '/ops', sessionsObservedAt: new Date().toISOString(),
+    dispatchAt: new Date().toISOString(), ...lists } as Parameters<typeof boundRosterAnswer>[0]);
+  for (const name of Object.keys(ROSTER_LIST_CAPS) as RosterListName[]) {
+    const list = answer[name];
+    expect(list.length).toBeLessThanOrEqual(ROSTER_LIST_CAPS[name].items);
+    expect(bytesOf(list)).toBeLessThanOrEqual(ROSTER_LIST_CAPS[name].bytes);
+    expect(answer.bounds[name]).toEqual({ total: 500, shown: list.length, truncated: true });
+  }
+  expect(bytesOf(answer)).toBeLessThanOrEqual(ROSTER_BUDGET_BYTES);
 });

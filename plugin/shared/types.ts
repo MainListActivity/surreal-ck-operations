@@ -233,8 +233,8 @@ export interface Roster {
   reviewPools: ReviewStaffingPoolView[];
   /** Dispatch-blocked verdicts from the latest tick: the roster and the tick cannot disagree. */
   dispatchBlocked: DispatchBlockedView[];
-  /** Truncation marker for `dispatchBlocked`: the verdicts the tick held, and whether the list left some out. */
-  bounds: { dispatchBlocked: ListBound };
+  /** Truncation marker for every list above: how many items existed, and whether the answer left some out. */
+  bounds: Record<"dispatchBlocked" | "reviewPools" | "pools" | "instances" | "defs" | "usage" | "health", ListBound>;
   /** When the tick last observed sessions; roster status is that observation, not a second read. */
   sessionsObservedAt?: string;
   /** When the pass's snapshot was taken: the pools, review previews and dispatch-blocked rows above are as of this instant. */

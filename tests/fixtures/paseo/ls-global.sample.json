@@ -1,0 +1,32 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000011",
+    "shortId": "0000000",
+    "name": "<name>",
+    "provider": "<provider>",
+    "thinking": "<thinking>",
+    "status": "idle",
+    "cwd": "/fixture/cwd",
+    "created": "<iso-8601-utc>"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000012",
+    "shortId": "0000000",
+    "name": "<name>",
+    "provider": "<provider>",
+    "thinking": "<thinking>",
+    "status": "running",
+    "cwd": "/fixture/cwd",
+    "created": "<iso-8601-utc>"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000013",
+    "shortId": "0000000",
+    "name": "<name>",
+    "provider": "<provider>",
+    "thinking": "<thinking>",
+    "status": "closed",
+    "cwd": "/fixture/cwd",
+    "created": "<iso-8601-utc>"
+  }
+]

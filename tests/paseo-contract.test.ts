@@ -1,59 +1,182 @@
 import { afterAll, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPaseoCli } from '../src/dispatcher/paseo.ts';
+import { createPaseoCli, type PaseoGateway } from '../src/dispatcher/paseo.ts';
+import { Dispatcher, type DispatcherDeps } from '../src/dispatcher/dispatcher.ts';
+import { DEFAULT_CONFIG, type EmployeeDef, type EmployeeInst } from '../src/workforce.ts';
 
-// SYS-DISP AC02 (R5): the adapter the tick reads Paseo through, checked against the shapes the local CLI really returns.
-// `paseo ls -g --json` is an array of rows with a lowercase `status`; `paseo inspect <id> --json` is an object with capitalized
-// `Status` and `Archived`. A fake CLI serves exactly those shapes (identifiers replaced, no session content). An idle session
-// must read as idle through both paths, so the roster and the dispatcher cannot disagree about it.
+// SYS-DISP AC02 / B4: the adapter the tick reads Paseo through, checked against the shapes the local Paseo CLI really returns
+// (CLI 0.12.0). The fixtures in tests/fixtures/paseo are redacted: enum values, booleans, nulls and key structure are real,
+// strings are placeholders, identifiers are synthetic. See tests/fixtures/paseo/README.md for the sampling record.
+// Negative cases run through a fake CLI that fails in one controlled way; each one must read as `unknown`, never as idle or busy.
+const FIXTURES = join(import.meta.dir, 'fixtures', 'paseo');
+const fixture = (name: string) => readFileSync(join(FIXTURES, name), 'utf8');
+const fixturePath = (name: string) => join(FIXTURES, name);
+
+const IDLE = '00000000-0000-4000-8000-000000000011';
+const RUNNING = '00000000-0000-4000-8000-000000000012';
+const CLOSED = '00000000-0000-4000-8000-000000000013';
+const UNKNOWN_AGENT = '00000000-0000-4000-8000-000000000099';
+const AGENT = '00000000-0000-4000-8000-0000000000a1';
+const NO_STATUS = '00000000-0000-4000-8000-0000000000a2';
+
 const dir = mkdtempSync(join(tmpdir(), 'sck-paseo-contract-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-const iso = '2026-10-20T01:00:00Z';
-const lsRow = (id: string, status: string) => ({ id, shortId: id.slice(-5), name: id, provider: 'claude', thinking: 'medium', status, cwd: '/fixture/repo', created: iso });
-const inspectRow = (id: string, status: string, archived: boolean) => ({
-  Id: id, Name: id, Provider: 'claude', Model: 'fixture', Thinking: 'medium', Status: status, Archived: archived,
-  ArchivedAt: archived ? iso : null, Mode: '', Cwd: '/fixture/repo', CreatedAt: iso, UpdatedAt: iso, LastUsage: null,
-  Capabilities: {}, AvailableModes: [], PendingPermissions: [], Worktree: null, ParentAgentId: null,
-});
+const archivedPath = join(dir, 'inspect-archived.json');
+writeFileSync(archivedPath, JSON.stringify({ ...JSON.parse(fixture('inspect-idle.sample.json')), Id: IDLE, Archived: true, ArchivedAt: '<iso-8601-utc>' }));
 
-writeFileSync(join(dir, 'ls.json'), JSON.stringify([lsRow('agent-idle-1', 'idle'), lsRow('agent-run-1', 'running'), lsRow('agent-closed-1', 'closed')]));
-for (const body of [inspectRow('agent-idle-1', 'idle', false), inspectRow('agent-run-1', 'running', false), inspectRow('agent-archived-1', 'idle', true)]) {
-  writeFileSync(join(dir, `inspect-${body.Id}.json`), JSON.stringify(body));
+let seq = 0;
+/**
+ * A fake `paseo`. `ls` answers with `lsBody`; `inspect <id>` runs the shell body registered for that id. Any other id gets the
+ * CLI's real not-found answer (exit 1, AGENT_NOT_FOUND on stderr).
+ */
+function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('ls-global.sample.json')}'`): string {
+  const bin = join(dir, `paseo-${++seq}`);
+  const arms = Object.entries(inspect).map(([id, body]) => `      ${id}) ${body} ;;`).join('\n');
+  writeFileSync(bin, [
+    '#!/bin/sh',
+    'case "$1" in',
+    `  ls) ${lsBody} ;;`,
+    '  inspect)',
+    '    case "$2" in',
+    arms,
+    `      *) cat '${fixturePath('stderr-agent-not-found.sample.json')}' >&2; exit 1 ;;`,
+    '    esac ;;',
+    '  *) echo "unexpected subcommand" >&2; exit 2 ;;',
+    'esac',
+    '',
+  ].join('\n'));
+  chmodSync(bin, 0o755);
+  return bin;
 }
-const bin = join(dir, 'paseo');
-writeFileSync(bin, `#!/bin/sh
-case "$1" in
-  ls) cat "${dir}/ls.json" ;;
-  inspect)
-    if [ -f "${dir}/inspect-$2.json" ]; then cat "${dir}/inspect-$2.json"; else echo "agent not found" >&2; exit 1; fi ;;
-  *) echo "unexpected: $*" >&2; exit 2 ;;
-esac
-`);
-chmodSync(bin, 0o755);
-const paseo = createPaseoCli(bin);
+
+const inspectOf = (id: string) => `cat '${fixturePath(`inspect-${id === IDLE ? 'idle' : id === RUNNING ? 'running' : 'closed'}.sample.json`)}'`;
+const NONZERO = `echo '{"error":{"code":"INSPECT_FAILED","message":"<synthetic non-zero exit>"}}' >&2; exit 1`;
+const NON_JSON = `echo 'Paseo daemon is starting'; exit 0`;
+const SLEEP = `sleep 6`;
+const EMPTY = `exit 0`;
+const MISSING_STATUS = `echo '{"Id":"${NO_STATUS}","Archived":false,"PendingPermissions":[]}'; exit 0`;
+
+const FIXTURE_LIST_STATUSES = ['idle', 'running', 'closed'];
+
+test('calibration: the redacted fixtures keep the real key sets and enum values', () => {
+  const ls = JSON.parse(fixture('ls-global.sample.json')) as Array<Record<string, unknown>>;
+  expect(ls.map(r => r.status)).toEqual(FIXTURE_LIST_STATUSES);
+  for (const row of ls) {
+    expect(Object.keys(row).sort()).toEqual(['created', 'cwd', 'id', 'name', 'provider', 'shortId', 'status', 'thinking']);
+    expect(row.shortId).toBe(String(row.id).slice(0, 7));
+  }
+  for (const name of ['inspect-idle', 'inspect-running', 'inspect-closed']) {
+    const row = JSON.parse(fixture(`${name}.sample.json`)) as Record<string, unknown>;
+    expect(Object.keys(row).sort()).toEqual(['Archived', 'ArchivedAt', 'AvailableModes', 'Capabilities', 'CreatedAt', 'Cwd', 'Id', 'LastUsage',
+      'Mode', 'Model', 'Name', 'ParentAgentId', 'PendingPermissions', 'Provider', 'Status', 'Thinking', 'UpdatedAt', 'Worktree']);
+    expect(typeof row.Status).toBe('string');
+    expect(typeof row.Archived).toBe('boolean');
+    expect(Array.isArray(row.PendingPermissions)).toBe(true);
+  }
+  const ws = JSON.parse(fixture('workspace-ls.sample.json')) as Array<Record<string, unknown>>;
+  expect(ws.map(w => w.isolation).sort()).toEqual(['local', 'worktree']);
+});
 
 test('the list the tick reads keeps the real statuses: idle stays idle, running stays running, closed is not idle', async () => {
-  const rows = await paseo.list();
-  expect(rows.get('agent-idle-1')?.status).toBe('idle');
-  expect(rows.get('agent-run-1')?.status).toBe('running');
-  expect(rows.get('agent-closed-1')?.status).toBe('closed');
-  // Archived sessions leave the list, so the tick falls back to the per-agent read for them.
-  expect(rows.has('agent-archived-1')).toBe(false);
+  const rows = await createPaseoCli(fakeCli({})).list();
+  expect(rows.get(IDLE)?.status).toBe('idle');
+  expect(rows.get(RUNNING)?.status).toBe('running');
+  expect(rows.get(CLOSED)?.status).toBe('closed');
 });
 
-test('the per-agent fallback reads the real inspect shape and agrees with the list for the same idle session', async () => {
-  expect(await paseo.status('agent-idle-1')).toEqual({ status: 'idle', pendingPermissions: 0 });
-  expect((await paseo.list()).get('agent-idle-1')?.status).toBe('idle');
-  expect(await paseo.status('agent-run-1')).toEqual({ status: 'running', pendingPermissions: 0 });
+test('the per-agent read uses the real inspect shape and agrees with the list for the same idle session', async () => {
+  const paseo = createPaseoCli(fakeCli({ [IDLE]: inspectOf(IDLE), [RUNNING]: inspectOf(RUNNING), [CLOSED]: inspectOf(CLOSED) }));
+  expect(await paseo.status(IDLE)).toEqual({ status: 'idle', pendingPermissions: 0 });
+  expect((await paseo.list()).get(IDLE)?.status).toBe('idle');
+  expect(await paseo.status(RUNNING)).toEqual({ status: 'running', pendingPermissions: 0 });
+  expect(await paseo.status(CLOSED)).toEqual({ status: 'closed', pendingPermissions: 0 });
 });
 
 test('an archived session reports archived through the fallback, whatever its last status says', async () => {
-  expect((await paseo.status('agent-archived-1'))?.status).toBe('archived');
+  const paseo = createPaseoCli(fakeCli({ [IDLE]: `cat '${archivedPath}'` }));
+  expect((await paseo.status(IDLE))?.status).toBe('archived');
 });
 
-test('an agent the CLI does not know reads as undefined, never as idle', async () => {
-  expect(await paseo.status('agent-unknown-1')).toBeUndefined();
+test('an agent the CLI confirms does not exist reads as undefined, never as idle', async () => {
+  expect(await createPaseoCli(fakeCli({})).status(UNKNOWN_AGENT)).toBeUndefined();
 });
+
+// B4 negatives at the gateway: a CLI that did not answer is `unknown`, not `undefined` (which the dispatcher reads as missing).
+test('B4a: a non-zero exit from the CLI reads as unknown', async () => {
+  expect(await createPaseoCli(fakeCli({ [AGENT]: NONZERO }), { timeoutMs: 2000 }).status(AGENT)).toEqual({ status: 'unknown', pendingPermissions: 0 });
+});
+
+test('B4b: stdout that is not JSON reads as unknown', async () => {
+  expect(await createPaseoCli(fakeCli({ [AGENT]: NON_JSON }), { timeoutMs: 2000 }).status(AGENT)).toEqual({ status: 'unknown', pendingPermissions: 0 });
+});
+
+test('B4c: a timeout reads as unknown and returns promptly', async () => {
+  const started = Date.now();
+  expect(await createPaseoCli(fakeCli({ [AGENT]: SLEEP }), { timeoutMs: 200 }).status(AGENT)).toEqual({ status: 'unknown', pendingPermissions: 0 });
+  expect(Date.now() - started).toBeLessThan(2000);
+});
+
+test('B4d: empty stdout, or a reply without a Status field, reads as unknown', async () => {
+  const paseo = createPaseoCli(fakeCli({ [AGENT]: EMPTY, [NO_STATUS]: MISSING_STATUS }), { timeoutMs: 2000 });
+  expect(await paseo.status(AGENT)).toEqual({ status: 'unknown', pendingPermissions: 0 });
+  expect(await paseo.status(NO_STATUS)).toEqual({ status: 'unknown', pendingPermissions: 0 });
+});
+
+// The dispatcher-level check: one real tick with a single instance, read back through the dispatcher's own state mapping.
+const DEF: EmployeeDef = { id: 'test', role: 'engineering', provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
+
+async function observe(body: string) {
+  const bin = fakeCli({ [AGENT]: body }, 'echo []');
+  // Generous enough for a shell spawn on a loaded machine; only the SLEEP body is meant to hit it.
+  const cli = createPaseoCli(bin, { timeoutMs: 2000 });
+  const events: string[] = [];
+  const paseo: PaseoGateway = {
+    ...cli,
+    stop: async id => { events.push(`stop:${id}`); },
+    archive: async id => { events.push(`archive:${id}`); },
+    send: async id => { events.push(`send:${id}`); },
+    spawn: async () => { events.push('spawn'); return 'agent-new'; },
+  };
+  const inst = { id: 'employee-1', def: DEF.id, role: DEF.role, provider: DEF.provider, model: DEF.model, credential: 'fixture-1', paseoAgentId: AGENT } as unknown as EmployeeInst;
+  const workforce = {
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
+    defs: async () => [DEF], serverNow: async () => 1000, insts: async () => [inst], tasks: async () => [], providerHealth: async () => new Map(),
+    retire: async (id: string, _reason: string, kind: string) => { events.push(`retire:${id}:${kind}`); },
+    defFailure: async () => { events.push('defFailure'); return 1; },
+  };
+  const owner = { applyPending: async () => [], openNotices: async () => [], triagePending: async () => [], resolveNotice: async () => {}, raiseNotice: async () => true };
+  const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: bin }, rand: () => 0 } as unknown as DispatcherDeps);
+  const report = await dispatcher.tick();
+  const session = dispatcher.sessionSnapshot().sessions.get(inst.id);
+  return { state: session?.state, status: session?.status, retired: report.retired, events };
+}
+
+const untouched = (events: string[]) => events.every(e => !/^(retire|archive|stop|send|spawn)/.test(e));
+
+const DISPATCHER_TEST_MS = 30_000;
+
+test('B4 dispatcher: each unanswered CLI case maps to the unknown state, with no retirement, archive, stop or dispatch', async () => {
+  for (const [name, body] of [['non-zero exit', NONZERO], ['non-JSON stdout', NON_JSON], ['timeout', SLEEP], ['empty stdout', EMPTY], ['missing Status', MISSING_STATUS]] as const) {
+    const seen = await observe(body);
+    expect({ name, state: seen.state, status: seen.status }).toEqual({ name, state: 'unknown', status: 'unknown' });
+    expect({ name, retired: seen.retired }).toEqual({ name, retired: [] });
+    expect({ name, untouched: untouched(seen.events) }).toEqual({ name, untouched: true });
+  }
+}, DISPATCHER_TEST_MS);
+
+test('B4 dispatcher control: a CLI-confirmed missing agent still retires as before (down)', async () => {
+  const seen = await observe(`cat '${fixturePath('stderr-agent-not-found.sample.json')}' >&2; exit 1`);
+  expect(seen.state).toBe('down');
+  expect(seen.events).toContain(`retire:employee-1:failure`);
+}, DISPATCHER_TEST_MS);
+
+test('B4 dispatcher control: idle, running and archived keep their states', async () => {
+  expect((await observe(inspectOf(IDLE))).state).toBe('idle');
+  expect((await observe(inspectOf(RUNNING))).state).toBe('busy');
+  const archived = await observe(`cat '${archivedPath}'`);
+  expect(archived.state).toBe('down');
+  expect(archived.events).toContain('retire:employee-1:archive');
+}, DISPATCHER_TEST_MS);

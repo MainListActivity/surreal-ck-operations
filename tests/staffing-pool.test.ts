@@ -60,6 +60,9 @@ test('pool: a session nobody observed is unknown, never reported as busy', () =>
   expect(reuse.eligible).toBe(false);
   expect(reuse.code).toBe('unknown');
   expect(reuse.reason).toBe(BLOCK_TEXT.unknown);
+  // No state entry at all is the same observation gap, not a busy session.
+  const absent = staffingPool(base({ defs: [d], insts: [inst('i1')], states: new Map() })).find(e => e.kind === 'reuse')!;
+  expect(absent.code).toBe('unknown');
 });
 
 test('pool: legacy instance does not consume a maxInstances seat in sidecar mode', () => {

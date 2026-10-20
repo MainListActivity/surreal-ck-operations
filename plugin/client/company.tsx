@@ -1111,11 +1111,13 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
           problems.push(`编制已停用：${d.id}`);
         for (const i of insts.filter(i => i.agentStatus && !["running", "idle", "initializing"].includes(i.agentStatus)))
           problems.push(`实例会话异常：${i.id.split("⟨").pop()?.replace("⟩", "")}（${i.agentStatus}）`);
+        // A list the answer cut short may hide a problem, so "一切正常" is only said when nothing was cut.
+        const cut = [r?.bounds?.usage, r?.bounds?.health, r?.bounds?.defs, r?.bounds?.instances].some(b => b?.truncated);
         return (
           <>
             <Section title="需要处理" count={problems.length} ctx={ctx}>
               <View style={s.card}>
-                {problems.length === 0 && <Text style={s.muted}>一切正常。</Text>}
+                {problems.length === 0 && <Text style={s.muted}>{cut ? "已列出的项正常；部分列表已截断，未列出的项未参与判断。" : "一切正常。"}</Text>}
                 {problems.map((p, i) => <Text key={i} style={[s.text, { color: "#d97706" }]}>{p}</Text>)}
               </View>
             </Section>
@@ -1139,6 +1141,8 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 {health.map(h => (
                   <Text key={h.provider} style={s.muted}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
                 ))}
+                {r?.bounds?.usage?.truncated && <Text style={s.muted}>额度只列出 {r.bounds.usage.shown} 项，共 {r.bounds.usage.total} 项。</Text>}
+                {r?.bounds?.health?.truncated && <Text style={s.muted}>健康只列出 {r.bounds.health.shown} 项，共 {r.bounds.health.total} 项。</Text>}
               </View>
             </Collapsible>
             <Section title="员工编制" count={defs.length} ctx={ctx}>
@@ -1183,6 +1187,8 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     </Collapsible>
                   );
                 })}
+              {r?.bounds?.defs?.truncated && <Text style={s.muted}>编制只列出 {r.bounds.defs.shown} 项，共 {r.bounds.defs.total} 项，未列出的编制不在上方。</Text>}
+              {r?.bounds?.instances?.truncated && <Text style={s.muted}>实例只列出 {r.bounds.instances.shown} 个，共 {r.bounds.instances.total} 个，未列出的实例不在上方。</Text>}
             </Section>
             <Section title={editDef ? `编辑 ${editDef.id}` : "注册员工"} ctx={ctx}>
               <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
@@ -1212,6 +1218,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     ))}
                   </View>
                 ))}
+                {r?.bounds?.reviewPools?.truncated && (
+                  <Text style={s.muted}>复核候选只列出 {r.bounds.reviewPools.shown} 项，共 {r.bounds.reviewPools.total} 项。</Text>
+                )}
                 {(r?.pools ?? []).filter(p => p.entries.length).map(p => (
                   <View key={`${p.role}@${p.home}`} style={{ gap: 2, marginTop: 8 }}>
                     <Text style={s.muted}>池 {ROLE_LABEL[p.role] ?? p.role}@{p.home === r?.opsRepo ? "运营仓库" : p.home.split("/").pop()}</Text>
@@ -1224,6 +1233,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     ))}
                   </View>
                 ))}
+                {r?.bounds?.pools?.truncated && (
+                  <Text style={s.muted}>候选池只列出 {r.bounds.pools.shown} 个，共 {r.bounds.pools.total} 个。</Text>
+                )}
               </View>
             </Collapsible>
           </>

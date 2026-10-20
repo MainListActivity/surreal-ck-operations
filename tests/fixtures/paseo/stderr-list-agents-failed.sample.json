@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "LIST_AGENTS_FAILED",
+    "message": "Failed to list agents: <redacted>"
+  }
+}
