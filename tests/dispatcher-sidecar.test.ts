@@ -10,6 +10,8 @@ import type { OwnerDesk } from '../src/owner.ts';
 import type { SidecarDeps } from '../plugin/server/sidecar.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath, blockerPath } from '../src/comm.ts';
+import type { ArtifactReclaimResult } from '../src/dispatcher/artifact-sweeper.ts';
+import type { ArtifactTrigger } from '../src/dispatcher/artifact-reclaim.ts';
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 function world(role: EmployeeDef['role'] = 'engineering') {
@@ -101,8 +103,13 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
   let host = { freeMemMb: 8192, freeDiskMb: 65536 };
+  // Artifact reclaim seam for the resource-gate tests; absent by default so the
+  // existing gate test keeps exercising the "no reclaim wired" path.
+  type ReclaimInput = { trigger?: ArtifactTrigger; targetFreeMb?: number; dryRun?: boolean; taskId?: string; emergency?: boolean };
+  let reclaim: ((input?: ReclaimInput) => Promise<ArtifactReclaimResult>) | undefined;
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
-    env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host });
+    env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
+    ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}) });
   const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
     const name = `${++request}.json`, dir = env.SCK_COMM_DIR!;
     writeFileSync(join(reqDir(dir), name), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
@@ -113,6 +120,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable, authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
+    setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -351,6 +359,55 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w2.pool.detachAgent(inst2.paseoAgentId!);
     await d2.tick();
     expect(w2.events).toContain(`retire:${inst2.id}:failure`);
+  });
+
+  test('gate reclaims terminal artifacts first and dispatches in the same tick', async () => {
+    const w = world(); w.addTask('queued');
+    w.setHost({ freeMemMb: 8192, freeDiskMb: 128 });
+    let seen: { emergency?: boolean; targetFreeMb?: number } | undefined;
+    w.setReclaim(async input => {
+      seen = input as { emergency?: boolean; targetFreeMb?: number };
+      // Reclaim freed real blocks: the probe the dispatcher re-reads must see them.
+      w.setHost({ freeMemMb: 8192, freeDiskMb: 65536 });
+      return { runId: 'run-1', trigger: 'pressure', dryRun: false, mode: 'pressure',
+        trimmed: [{ kind: 'evidence', taskId: 'old', reason: 'disk-pressure', removedFiles: 3, removedBytes: 1024,
+          keptFiles: 0, keptBytes: 0, errors: 0, partial: false }],
+        skipped: {}, removedFiles: 3, freedBytes: 1024, truncated: false, errors: 0,
+        freeDiskMbBefore: 128, freeDiskMbAfter: 65536 };
+    });
+    const r = await w.dispatcher().tick();
+    expect(seen?.emergency).toBe(true);
+    expect(seen?.targetFreeMb).toBeGreaterThan(0);
+    expect(r.skipped).toBeUndefined();
+    expect(r.reclaimed?.tasks).toBe(1);
+    expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
+  });
+
+  test('gate with reclaim disabled by config names the switch and blocks', async () => {
+    const w = world(); w.addTask('queued');
+    w.setHost({ freeMemMb: 8192, freeDiskMb: 128 });
+    w.setReclaim(async () => ({ runId: 'run-2', trigger: 'pressure', dryRun: false, mode: 'pressure',
+      trimmed: [], skipped: {}, removedFiles: 0, freedBytes: 0, truncated: false, errors: 0,
+      disabled: true, disabledReason: 'config' }));
+    const r = await w.dispatcher().tick();
+    expect(r.skipped).toBe('resources');
+    expect(r.notices).toContain('resources');
+    expect(r.notices).toContain('resources-reclaim-blocked');
+    expect(w.notices.get('resources')).toContain('artifact_reclaim_enabled=false');
+    expect(w.notices.get('resources-reclaim-blocked')).toContain('artifact_reclaim_enabled=false');
+    expect(w.events.some(e => e.startsWith('claim:'))).toBe(false);
+  });
+
+  test('gate with the env hard stop points the notice at SCK_ARTIFACT_RECLAIM=0', async () => {
+    const w = world(); w.addTask('queued');
+    w.setHost({ freeMemMb: 8192, freeDiskMb: 128 });
+    w.setReclaim(async () => ({ runId: 'run-3', trigger: 'pressure', dryRun: false, mode: 'pressure',
+      trimmed: [], skipped: {}, removedFiles: 0, freedBytes: 0, truncated: false, errors: 0,
+      disabled: true, disabledReason: 'env' }));
+    const r = await w.dispatcher().tick();
+    expect(r.skipped).toBe('resources');
+    expect(w.notices.get('resources')).toContain('SCK_ARTIFACT_RECLAIM=0');
+    expect(w.notices.get('resources-reclaim-blocked')).toContain('SCK_ARTIFACT_RECLAIM=0');
   });
 });
 

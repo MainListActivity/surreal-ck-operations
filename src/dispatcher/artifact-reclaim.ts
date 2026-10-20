@@ -94,6 +94,28 @@ export function artifactReclaimEnabledFrom(env: NodeJS.ProcessEnv, config?: Pick
   return config?.artifactReclaimEnabled ?? true;
 }
 
+/** The env kill switch is the only thing that also stops emergency (resource-gate) reclaim. */
+export function artifactReclaimHardStop(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.SCK_ARTIFACT_RECLAIM;
+  return raw === '0' || raw === 'false';
+}
+
+export interface ReclaimCliArgs { execute: boolean; taskId?: string; targetFreeMb?: number }
+
+/**
+ * Operator CLI arguments. A bare number is a free-disk target, never a task id:
+ * task ids are UUIDs and never all digits, so the old two `find` calls both matched
+ * a target like `20480` and filtered the run down to a task that does not exist.
+ */
+export function parseReclaimCliArgs(args: string[]): ReclaimCliArgs {
+  const execute = args.includes('--execute');
+  const positional = args.filter(a => !a.startsWith('--'));
+  const isTarget = (a: string) => /^\d+$/.test(a);
+  const target = positional.find(isTarget);
+  const taskId = positional.find(a => !isTarget(a) && /^[A-Za-z0-9_-]{1,128}$/.test(a));
+  return { execute, taskId, targetFreeMb: target === undefined ? undefined : Number(target) };
+}
+
 export function artifactPolicyFrom(config: ArtifactConfigInput, env: NodeJS.ProcessEnv, now: Date): ArtifactPolicy {
   return {
     ...DEFAULT_ARTIFACT_RULES,

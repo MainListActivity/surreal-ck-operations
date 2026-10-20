@@ -257,7 +257,8 @@ export function startDispatch(server: PluginServerContext): () => void {
         const report = await ctx.dispatcher.tick();
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-          report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0);
+          report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
+          report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
         await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();");
       } catch (error) {
