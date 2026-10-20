@@ -3,7 +3,7 @@ import { appendFile, lstat, mkdir, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Surreal } from 'surrealdb';
 import {
-  artifactPolicyFrom, decideArtifact, TASK_DIR, TOMBSTONE, trimArtifactDir,
+  artifactPolicyFrom, artifactReclaimHardStop, decideArtifact, TASK_DIR, TOMBSTONE, trimArtifactDir,
   type ArtifactConfigInput, type ArtifactKind, type ArtifactMode, type ArtifactProtection, type ArtifactTrigger,
 } from './artifact-reclaim.ts';
 
@@ -34,6 +34,12 @@ export interface ArtifactReclaimInput {
   taskId?: string;
   /** Re-scan directories that already carry a tombstone. */
   force?: boolean;
+  /**
+   * Emergency (resource-gate) reclaim: run even when `artifact_reclaim_enabled` is false —
+   * the alternative is a company that stops dispatching. The env kill switch
+   * SCK_ARTIFACT_RECLAIM=0 still wins, because that is an explicit host-level stop.
+   */
+  emergency?: boolean;
   /** Wall-clock budget; whatever is left is picked up by the next run. */
   maxMs?: number;
 }
@@ -59,6 +65,8 @@ export interface ArtifactReclaimResult {
   mode: ArtifactMode;
   /** Reclaim is switched off (config or SCK_ARTIFACT_RECLAIM=0) and this was an automatic run. */
   disabled?: boolean;
+  /** Which switch stopped it: the env hard stop, or the config soft switch. */
+  disabledReason?: 'config' | 'env';
   /** Another run in this process was still going. */
   busy?: boolean;
   trimmed: ArtifactTrimmed[];
@@ -119,10 +127,21 @@ export class ArtifactReclaimer {
     const { home } = this.deps;
     const now = (this.deps.now ?? (() => new Date()))();
     const base = artifactPolicyFrom(await this.deps.config(), this.deps.env ?? process.env, now);
-    // The kill switch stops automatic runs; an operator running it by hand (or previewing) still can.
+    // Two switches with different reach:
+    //   - SCK_ARTIFACT_RECLAIM=0 (env) is a host-level hard stop: routine sweeps and
+    //     gate-triggered emergency reclaim both stop. An operator run still answers.
+    //   - artifact_reclaim_enabled=false (config) only stops routine sweeps. A gate
+    //     emergency still runs — a halted company must be able to free its own disk —
+    //     and pressure mode already spares direct dependencies.
+    const hardStop = artifactReclaimHardStop(this.deps.env ?? process.env);
     const automatic = input.trigger === 'sweep' || input.trigger === 'pressure';
-    const policy = { ...base, enabled: base.enabled || !automatic };
-    if (!policy.enabled) { result.disabled = true; return; }
+    const enabled = !automatic || (!hardStop && (base.enabled || input.emergency === true));
+    const policy = { ...base, enabled };
+    if (!policy.enabled) {
+      result.disabled = true;
+      result.disabledReason = hardStop ? 'env' : 'config';
+      return;
+    }
     result.freeDiskMbBefore = this.probe();
 
     const tasks = await this.deps.tasks.tasks();
@@ -219,7 +238,9 @@ const SKIP_TEXT: Record<string, string> = {
 
 /** One line for logs and the owner notice. */
 export function summarizeReclaim(result: ArtifactReclaimResult): string {
-  if (result.disabled) return '终态产物回收已关闭（artifact_reclaim_enabled / SCK_ARTIFACT_RECLAIM）';
+  if (result.disabled) return result.disabledReason === 'env'
+    ? '终态产物回收被环境硬停（SCK_ARTIFACT_RECLAIM=0）'
+    : '终态产物回收已关闭（artifact_reclaim_enabled=false）';
   const gb = (bytes: number) => `${(bytes / 1_073_741_824).toFixed(1)} GB`;
   const parts: string[] = [];
   const tasks = new Set(result.trimmed.map(t => t.taskId)).size;

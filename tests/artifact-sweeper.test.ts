@@ -104,7 +104,7 @@ describe('normal sweeps', () => {
     expect(result.skipped['task-not-terminal']).toBe(1);
     expect(result.skipped['within-grace']).toBe(1);
     for (const keep of ['recent', 'open', 'needed']) {
-      expect(readdirSync(join(w.home, 'evidence', keep))).toEqual(['note.md', 'payload.bin']);
+      expect(readdirSync(join(w.home, 'evidence', keep)).sort()).toEqual(['note.md', 'payload.bin']);
     }
   });
 
@@ -135,7 +135,7 @@ describe('normal sweeps', () => {
     expect(result.dryRun).toBe(true);
     expect(result.trimmed[0]).toMatchObject({ taskId: 'old', removedBytes: 3 * MB });
     expect(result.removedFiles).toBe(1);
-    expect(readdirSync(join(w.home, 'evidence', 'old'))).toEqual(['note.md', 'payload.bin']);
+    expect(readdirSync(join(w.home, 'evidence', 'old')).sort()).toEqual(['note.md', 'payload.bin']);
     // Nothing was written to the ledger either.
     expect(readdirSync(join(w.home, 'logs'))).toEqual([]);
   });
@@ -259,5 +259,47 @@ describe('operational shape', () => {
     const idle = summarizeReclaim(await w.reclaimer.reclaim({ trigger: 'sweep' }));
     expect(idle).toContain('没有可回收的终态任务产物');
     expect(idle).toContain('仍在宽限期内 1');
+  });
+});
+describe('emergency reclaim and the two switches', () => {
+  /** Build a reclaimer against a fixed home so each switch combination gets a fresh tree. */
+  const make = (home: string, env: Record<string, string>, enabled: boolean) => new ArtifactReclaimer({
+    home, tasks: source({ old: settled() }),
+    config: async () => ({ artifactReclaimEnabled: enabled, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7 }),
+    now: () => now, env,
+  });
+
+  test('gate-triggered emergency reclaim ignores the config switch', async () => {
+    const w = harness({ old: settled() });
+    seed(w.home, 'evidence', 'old', 3 * MB);
+    w.setFree(128);
+    const r = await make(w.home, {}, false).reclaim({ trigger: 'pressure', targetFreeMb: 20_480, emergency: true });
+    expect(r.disabled).toBeUndefined();
+    expect(r.trimmed.map(t => t.taskId)).toEqual(['old']);
+    expect(existsSync(join(w.home, 'evidence', 'old', 'payload.bin'))).toBe(false);
+  });
+
+  test('routine sweeps stay off when the config switch is off', async () => {
+    const w = harness({ old: settled() });
+    seed(w.home, 'evidence', 'old', 3 * MB);
+    const r = await make(w.home, {}, false).reclaim({ trigger: 'sweep' });
+    expect(r.disabled).toBe(true);
+    expect(r.disabledReason).toBe('config');
+    expect(r.trimmed).toHaveLength(0);
+    expect(summarizeReclaim(r)).toContain('artifact_reclaim_enabled=false');
+    expect(existsSync(join(w.home, 'evidence', 'old', 'payload.bin'))).toBe(true);
+  });
+
+  test('the env hard stop beats emergency reclaim and says so', async () => {
+    const w = harness({ old: settled() });
+    seed(w.home, 'evidence', 'old', 3 * MB);
+    w.setFree(128);
+    const r = await make(w.home, { SCK_ARTIFACT_RECLAIM: '0' }, true)
+      .reclaim({ trigger: 'pressure', targetFreeMb: 20_480, emergency: true });
+    expect(r.disabled).toBe(true);
+    expect(r.disabledReason).toBe('env');
+    expect(r.trimmed).toHaveLength(0);
+    expect(summarizeReclaim(r)).toContain('SCK_ARTIFACT_RECLAIM=0');
+    expect(existsSync(join(w.home, 'evidence', 'old', 'payload.bin'))).toBe(true);
   });
 });

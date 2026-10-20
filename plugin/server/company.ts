@@ -154,7 +154,7 @@ export function company(): Promise<Company> {
       // before it gives up, so a full disk stops halting dispatch instead of silently wedging it.
       reclaimArtifacts: (input) => reclaimer.reclaim({
         trigger: input?.trigger ?? 'sweep', targetFreeMb: input?.targetFreeMb,
-        dryRun: input?.dryRun, taskId: input?.taskId,
+        dryRun: input?.dryRun, taskId: input?.taskId, emergency: input?.emergency,
       }),
       // WT02: bare call = 10-minute sweep (crash-orphan fallback); treeId+repo = event point.
       reclaimWorktrees: (input) => core.worktrees!.reclaimAll({
