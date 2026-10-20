@@ -9,6 +9,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { Workforce } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
+import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
@@ -337,3 +338,104 @@ run('company fork: session rotation never retires the bound implementer of an ac
     await w.close();
   }
 }, 60000);
+
+// SYS-DISP R6(a) (AC04/AC06): a real tick. The bound implementer loses its lease to a quota stop, the manager hands the task to another
+// engineer, the tick wakes that engineer and never the old one, and the same independent reviewer accepts the work.
+run('company fork: the bound implementer loses its lease, the manager hands the task to another engineer, the tick wakes that engineer, and the same independent reviewer accepts', async () => {
+  const w = await startCompanyFork('takeover');
+  try {
+    // Only the codex engineer exists at first, so A claims the task and the first claim binds it.
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'takeover to another engineer', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-takeover' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect(A.provider).toBe('codex');
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id, implementer: A.id });
+    // A grok engineer appears for another task while the codex seat is full. It is the handover target C, and it finishes its own work first.
+    await w.wf.upsertDef('fixture-eng-grok', { role: 'engineering', provider: 'grok', model: 'fixture', maxInstances: 1 });
+    const warm = await w.core.createTask(w.gm, { title: 'the grok engineer finishes its own work first', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-takeover-warm' });
+    const warmWake = await w.tick();
+    const C = (await w.wf.insts()).find(i => i.provider === 'grok')!;
+    expect(warmWake.woke.find(x => x.task === warm.id)).toMatchObject({ employee: C.id, spawned: true });
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery by the grok engineer', idempotencyKey: 'warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    // The warm-up task goes to the qa reviewer B, who accepts it. B is the reviewer of the original task too.
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up task', idempotencyKey: 'warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // A's codex subscription runs out mid-task: the lease is revoked and the task waits in ready, still bound to A.
+    w.errors.set(A.paseoAgentId!, 'Your workspace is out of credits. Add credits to continue.');
+    w.agentRows.get(A.paseoAgentId!)!.status = 'error';
+    const exhausted = await w.tick();
+    expect(exhausted.exhausted).toEqual(['codex']);
+    expect(exhausted.revoked).toEqual([task.id]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: A.id });
+    // The manager hands the task to C, which is neither its author nor its reviewer.
+    const taken = await w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: (await w.core.getTask(w.gm, task.id)).version,
+      reason: 'A 的 codex 额度用尽，经理指定 C 续做本任务', idempotencyKey: 'takeover-to-c' });
+    expect(taken).toMatchObject({ state: 'ready', implementer: C.id });
+    // The tick wakes C and never A: the bound-implementer gate keeps A out while codex is still exhausted.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+    // C continues the work and submits.
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery by the new implementer C', idempotencyKey: 'c-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    // Codex recovers and A's stale session is idle. The review goes to B, the same reviewer, and B accepts.
+    await w.db.db.query('UPDATE provider_health:codex SET until = 0;');
+    w.errors.delete(A.paseoAgentId!);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    const review = await w.tick();
+    expect(review.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: B.id, spawned: false })]);
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review after the takeover', idempotencyKey: 'c-accept' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'done', implementer: C.id });
+    // The record: A and C both wrote the task, C is the bound implementer, and B reviewed it without ever authoring it.
+    const facts = await w.wf.contributors(task.id);
+    expect(facts.implementer).toBe(C.id);
+    expect([...facts.authors].sort()).toEqual([A.id, C.id].sort());
+    expect(facts.reviewers).toEqual([B.id]);
+    expect(facts.excluded).not.toContain(B.id);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R6(b) (AC04/AC06): legacy authors with no recorded implementer fail closed through the real tick and the real core. The
+// conclusion is visible with its reason, nobody is woken, and the core refuses a claim by a fresh engineer.
+run('company fork: legacy authors without a recorded implementer fail closed, the conclusion is visible, nobody is woken, and the core refuses a claim', async () => {
+  const w = await startCompanyFork('legacy');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'legacy authors and no recorded implementer', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-legacy' });
+    // Two legacy authors. Their rows carry no phase, and the task never recorded an implementer. Actors are employee records,
+    // as production audit rows are written: the derivation reads only employee actors, so plain strings would be dropped.
+    const legacyOne = new RecordId('employee', 'legacy-author-one'), legacyTwo = new RecordId('employee', 'legacy-author-two');
+    await w.db.db.query(`CREATE audit CONTENT { task: $task, actor: $one, action: 'claim', evidence: 'legacy row without phase', version: 2, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $one, action: 'submit', evidence: 'legacy row without phase', version: 3, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $two, action: 'claim', evidence: 'legacy row without phase', version: 4, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $two, action: 'submit', evidence: 'legacy row without phase', version: 5, at: time::now() };`,
+    { task: new RecordId('task', task.id), one: legacyOne, two: legacyTwo });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts.ambiguous).toBe(true);
+    expect(facts.implementer).toBeUndefined();
+    expect(facts.authors).toEqual(['legacy-author-one', 'legacy-author-two']);
+    // Nobody is woken. The gate blocks every candidate, and the conclusion names the unresolved implementer with its notice.
+    const tick = await w.tick();
+    expect(tick.woke.find(x => x.task === task.id)).toBeUndefined();
+    const verdict = w.verdicts().find(v => v.taskId === task.id && v.phase === 'execute')!;
+    expect(verdict).toMatchObject({ dispatchable: false, feasible: false, workflowState: 'ready' });
+    expect(verdict.reasons.map(r => r.code)).toContain('implementer_unresolved');
+    expect(tick.notices).toContain(`dispatch-blocked:${task.id}:execute`);
+    // The core refuses a claim by a fresh engineer as well: the manager has to record the implementer first.
+    const fresh = await w.wf.spawnInst((await w.wf.defs()).find(d => d.id === 'fixture-eng')!);
+    await expect(w.core.claim(fresh.credential!, task.id)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)).toBeUndefined();
+  } finally {
+    await w.close();
+  }
+}, 90000);
