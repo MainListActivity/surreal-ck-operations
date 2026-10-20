@@ -384,7 +384,7 @@ export class SurrealCompanyCore implements CompanyCore {
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
-    this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, observe: options?.snapshotObserve });
+    this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, releaseChannel: database.releaseChannel, observe: options?.snapshotObserve });
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -1045,11 +1045,11 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /**
    * Task rows for the context queries: the filters, the default states and the role scope, newest first, in one consistent
-   * read. The read counts the matches and the characters of their context first; the whole rows are read only when that
-   * length is within `cap` (bytes are never fewer than characters), so a read that will be refused never loads the text.
+   * read. The read counts the matches and the UTF-8 bytes of their context first (bytes::len, the size the listing stores), and
+   * the whole rows are read only when that total is within `cap`, so a read that will be refused never loads the text.
    */
   private async taskRowsAt(actor: Principal, params: ContextParams, limit: number, cap: number, db?: Surreal):
-    Promise<{ at: string; count: number; textLength: number; rows: TaskRow[] }> {
+    Promise<{ at: string; count: number; textBytes: number; rows: TaskRow[] }> {
     const where: string[] = [
       params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']",
       "NOT (state = 'review' AND submitted_by = $me)",
@@ -1072,20 +1072,20 @@ export class SurrealCompanyCore implements CompanyCore {
       where.push('created_at >= <datetime>$since');
       vars.since = params.since;
     }
-    const read = await this.consistentRead<{ at: string; count: number; textLength: number; rows?: TaskRow[] | null }>(`LET $at = <string>time::now();
-      LET $probe = (SELECT id, created_at, string::len(context ?? '') AS textLength FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit);
+    const read = await this.consistentRead<{ at: string; count: number; textBytes: number; rows?: TaskRow[] | null }>(`LET $at = <string>time::now();
+      LET $probe = (SELECT id, created_at, bytes::len(<bytes>(context ?? '')) AS textBytes FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit);
       LET $n = array::len($probe);
-      LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textLength) END;
+      LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textBytes) END;
       LET $full = IF $n = 0 OR $total > $cap THEN [] ELSE (SELECT * FROM task WHERE id IN $probe.id ORDER BY created_at DESC, id DESC) END;
-      RETURN { read: { at: $at, count: $n, textLength: $total, rows: $full } };`, vars, db);
+      RETURN { read: { at: $at, count: $n, textBytes: $total, rows: $full } };`, vars, db);
     const count = Number(read.count ?? 0);
-    const textLength = Number(read.textLength ?? 0);
+    const textBytes = Number(read.textBytes ?? 0);
     const rows = read.rows ?? [];
     // Within the cap every match is loaded. A short load would drop tasks silently, so it is refused as retryable instead.
-    if (textLength <= cap && rows.length !== count) {
+    if (textBytes <= cap && rows.length !== count) {
       throw new CompanyError('temporarily_unavailable', 'task listing read did not complete; retry', true);
     }
-    return { at: read.at, count, textLength, rows };
+    return { at: read.at, count, textBytes, rows };
   }
 
   /**
@@ -1098,9 +1098,9 @@ export class SurrealCompanyCore implements CompanyCore {
       owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '',
       guidance: 'narrow with state, goalId, role or since, or leave fields out',
       load: async db => {
-        const { at, count, textLength, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
+        const { at, count, textBytes, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
         if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
-        if (textLength > limits.maxBytes) {
+        if (textBytes > limits.maxBytes) {
           throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
         }
         return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
@@ -1185,10 +1185,10 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     if (!params.paged) {
       const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
-      const { count, textLength, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
+      const { count, textBytes, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
       if (count > COMPLETE_TASK_ROWS) throw tooLarge(`more than ${COMPLETE_TASK_ROWS} tasks match; ${guidance}`);
-      if (textLength > RESPONSE_BUDGET_BYTES) {
-        throw tooLarge(`the matching tasks hold ${textLength} characters of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
+      if (textBytes > RESPONSE_BUDGET_BYTES) {
+        throw tooLarge(`the matching tasks hold ${textBytes} bytes of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
       }
       const view: ContextView = { principal: actor, ...withCompany, tasks: rows.map(row => listItem(row, params.fields, false)) };
       return completeOrRefuse(view, `the working set (${rows.length} tasks)`, company ? `${guidance}; or ${COMPANY_PAGED_HINT}` : guidance);

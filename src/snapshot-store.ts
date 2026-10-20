@@ -12,10 +12,13 @@
 // delete found the listing, so every listing is released exactly once.
 //
 // A build (SYS01 AC-D) runs on connections of its own, so a large build never queues ahead of control requests on the main
-// connection. Each read attempt opens one, and a build closes only its own. Reads, pages, releases and sweeps stay on the
-// main connection. A build has a deadline (buildDeadlineMs). Past it no further statement is started, the statement in
-// flight gets a short wait to finish, its connection is closed if it is still running, what was reserved is released, and
-// the caller gets temporarily_unavailable.
+// connection. Each read attempt opens one, and a build closes only its own. Its reservation, quota and sweep statements run on
+// those connections too, and so does its release when it fails. A release or sweep opens a connection through the release
+// channel, which is outside the build cap, so a saturated build pool cannot hold it back. Pages (read) and the test helpers (begin, writeRows, commit, census, accounting) use the
+// main connection. A build has a deadline (buildDeadlineMs). Past it no further statement is started, the statement in flight
+// gets a short wait to finish, its connection is closed if it is still running, what was reserved is released, and the caller
+// gets temporarily_unavailable. A release has a deadline of its own (RELEASE_DEADLINE_MS): past it the listing is marked for the
+// sweep, the release is counted as pending, and the caller gets temporarily_unavailable.
 import { randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
@@ -77,6 +80,8 @@ export interface SnapshotChannel {
 export interface SnapshotStoreOptions {
   /** Where builds run. The default is the store's own connection, which a build never closes. */
   channel?: SnapshotChannel;
+  /** Where releases and sweeps run. The default is `channel`. Keep it outside the build cap, so a saturated build pool cannot hold a release back. */
+  releaseChannel?: SnapshotChannel;
   /** Told what every build cost, stored or not. Used by the measurements; a listing's contents are never passed on. */
   observe?: (stats: SnapshotBuildStats) => void;
 }
@@ -97,6 +102,8 @@ export interface SnapshotBuildStats {
   serverMs: number;
   /** Reads of the rows: 2 when the first read was abandoned for a new connection after loadHedgeMs. */
   loadAttempts: number;
+  /** How the reservation of a failed build was released: 'none' when nothing was reserved, 'pending' when the release ran out of time and the listing waits for the sweep. */
+  release: 'none' | 'released' | 'absent' | 'pending';
 }
 
 export interface SnapshotHeader {
@@ -160,12 +167,14 @@ interface BuildAccount { serverMs: number; batches: number }
 interface BuildSignal { cancelled: boolean }
 
 const QUOTA = new RecordId('query_snapshot_quota', 'global');
-/** Reservations, and releases, tried before the caller is told to retry. Each try reads the quota again. */
-const RESERVE_ATTEMPTS = 50;
 /** How long one transaction keeps retrying after a concurrent write conflicts with it. */
 const TRANSACTION_WAIT_MS = 10 * 1000;
 /** A cancelled build gives the statement it has in flight this long to finish before that connection is closed. */
 const CLEANUP_WAIT_MS = 2 * 1000;
+/** Longest one release may take, from opening its connection to its last statement. Past it the listing is left for the sweep. */
+const RELEASE_DEADLINE_MS = 3 * 1000;
+/** Longest the marking of a timed-out release for the sweep may take. */
+const MARK_WAIT_MS = 1 * 1000;
 
 const headerOf = (row: HeaderRow): SnapshotHeader => ({
   id: String(row.id.id), owner: row.owner, kind: row.kind, digest: row.digest, role: row.role,
@@ -176,6 +185,12 @@ const unavailable = (message: string) => new CompanyError('temporarily_unavailab
 const timedOut = (deadlineMs: number, guidance: string) => new CompanyError('temporarily_unavailable',
   `the listing was not built within ${Math.round(deadlineMs / 1000)} seconds, so it was cancelled and nothing was kept; ${guidance}, then retry`, true);
 const pause = () => Bun.sleep(1 + Math.floor(Math.random() * 8));
+/** `work` settles before `at` (epoch milliseconds) with its value or its error; otherwise the result is undefined and `work` is left running. */
+const untilAt = <T>(work: Promise<T>, at: number): Promise<T | undefined> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([work, new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.max(0, at - Date.now())); })])
+    .finally(() => clearTimeout(timer));
+};
 /** Milliseconds of server time in one statement's query statistics. */
 const serverMsOf = (stats: { duration?: { nanoseconds?: bigint } } | undefined): number =>
   Number(stats?.duration?.nanoseconds ?? 0) / 1_000_000;
@@ -184,10 +199,12 @@ export class SnapshotStore {
   readonly limits: SnapshotLimits;
   private quotaReady?: Promise<void>;
   private readonly channel: SnapshotChannel;
+  private readonly releaseChannel: SnapshotChannel;
 
   constructor(private readonly db: Surreal, limits: Partial<SnapshotLimits> = {}, private readonly options: SnapshotStoreOptions = {}) {
     this.limits = { ...DEFAULT_SNAPSHOT_LIMITS, ...limits };
     this.channel = options.channel ?? { open: async () => ({ db, close: async () => undefined }) };
+    this.releaseChannel = options.releaseChannel ?? this.channel;
   }
 
   /**
@@ -221,7 +238,7 @@ export class SnapshotStore {
     const account: BuildAccount = { serverMs: 0, batches: 0 };
     const stats: SnapshotBuildStats = {
       outcome: 'failed', kind: input.kind, rows: 0, bytes: 0, batches: 0, loadMs: 0, reserveMs: 0, writeMs: 0, commitMs: 0, totalMs: 0, serverMs: 0,
-      loadAttempts: 1,
+      loadAttempts: 1, release: 'none',
     };
     const signal: BuildSignal = { cancelled: false };
     const state = { expired: false, reserved: false, ended: false };
@@ -318,9 +335,10 @@ export class SnapshotStore {
         let patience: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([flight.settled, new Promise<void>(resolve => { patience = setTimeout(resolve, CLEANUP_WAIT_MS); })]);
         clearTimeout(patience);
-        if (!flight.done) await closeLinks();
       }
-      if (state.reserved) await this.release(id).catch(() => undefined);
+      // The build's connections close before its release opens one of its own, so a release never waits on this build's slot.
+      await closeLinks();
+      if (state.reserved) stats.release = await this.releaseOn(id);
       stats.outcome = state.expired ? 'timed_out' : error instanceof CompanyError ? 'refused' : 'failed';
       throw error instanceof CompanyError ? error : unavailable('the listing could not be stored; retry the read');
     } finally {
@@ -389,14 +407,25 @@ export class SnapshotStore {
     await this.commitOn(this.db, reservation);
   }
 
-  /** Releases one listing: its header, its rows and its room go together. A listing already gone frees nothing. */
+  /**
+   * Releases one listing: its header, its rows and its room go together. A listing already gone frees nothing. The release runs
+   * on a connection of its own from the release channel, within RELEASE_DEADLINE_MS. Past that the listing is marked for the
+   * sweep and the call throws temporarily_unavailable.
+   */
   async release(id: string): Promise<'released' | 'absent'> {
-    return this.drop(id, '', {});
+    const outcome = await this.releaseOn(id);
+    if (outcome === 'pending') throw unavailable('the listing could not be released within the deadline; it is left for the sweep, retry shortly');
+    return outcome;
   }
 
-  /** Removes listings past their expiry and listings abandoned while still being written. */
+  /** Removes listings past their expiry and listings abandoned while still being written. Runs on a release-channel connection. */
   async sweep(now = Date.now()): Promise<number> {
-    return this.sweepNow(now);
+    const link = await this.releaseChannel.open();
+    try {
+      return await this.sweepOn(link.db, now);
+    } finally {
+      await link.close().catch(() => undefined);
+    }
   }
 
   /** Deletes one listing and all of its rows. */
@@ -413,7 +442,7 @@ export class SnapshotStore {
 
   /** The quota record beside what the stored listings add up to, for tests and the RB01 drill. */
   async accounting(): Promise<SnapshotAccounting> {
-    await this.ensureQuota();
+    await this.ensureQuotaOn(this.db);
     const quota = (await this.db.select<QuotaRow>(QUOTA)) ?? { listings: 0, bytes: 0, version: 0, seq: 0 };
     const [totals] = await this.db.query<[Array<{ n: number; bytes: number }>]>(
       'SELECT count() AS n, math::sum(byte_count) AS bytes FROM query_snapshot GROUP ALL;');
@@ -428,13 +457,13 @@ export class SnapshotStore {
     if (input.rows > limits.maxRows || input.bytes > limits.maxBytes) {
       throw new CompanyError('response_too_large', `this listing has ${input.rows} rows (${input.bytes} bytes), above the ${limits.maxRows}-row or ${limits.maxBytes}-byte listing limit; narrow it with state, goalId, role or since`);
     }
-    await this.sweepNow(now);
+    await this.sweepOn(db, now);
     const id = input.id ?? randomUUID();
     const record = new RecordId('query_snapshot', id);
     const expiresMs = now + limits.ttlMs;
     const deadline = Date.now() + limits.reserveWaitMs;
     while (Date.now() < deadline) {
-      await this.ensureQuota();
+      await this.ensureQuotaOn(db);
       // The quota is read before the owner's listings. Any change after this read moves the version, and the swap below then fails.
       const quota = await db.select<QuotaRow>(QUOTA);
       if (!quota) throw unavailable('listing capacity is unavailable; retry shortly');
@@ -528,16 +557,16 @@ export class SnapshotStore {
     if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
   }
 
-  private async sweepNow(now: number): Promise<number> {
+  private async sweepOn(db: Surreal, now: number): Promise<number> {
     const built = now - this.limits.buildTimeoutMs;
-    const [stale] = await this.db.query<[Array<{ id: RecordId }>]>(
+    const [stale] = await db.query<[Array<{ id: RecordId }>]>(
       "SELECT id FROM query_snapshot WHERE expires_ms <= $now OR (state = 'building' AND created_ms <= $built) LIMIT 100;",
       { now, built });
     let released = 0;
     for (const row of stale ?? []) {
       // The stale test is repeated inside the release transaction, so a listing committed in the meantime stays.
-      const outcome = await this.drop(String(row.id.id),
-        "AND (expires_ms <= $now OR (state = 'building' AND created_ms <= $built))", { now, built });
+      const outcome = await this.dropOn(db, String(row.id.id),
+        "AND (expires_ms <= $now OR (state = 'building' AND created_ms <= $built))", { now, built }, Date.now() + RELEASE_DEADLINE_MS);
       if (outcome === 'released') released++;
     }
     return released;
@@ -545,34 +574,73 @@ export class SnapshotStore {
 
   /**
    * Deletes one listing, its rows and its room in one transaction. The room is subtracted only when the delete found the
-   * listing, so concurrent releases of one listing subtract it once: the loser finds nothing and frees nothing.
+   * listing, so concurrent releases of one listing subtract it once: the loser finds nothing and frees nothing. Runs on `db`
+   * until `deadline`. Out of time, the listing is marked for the sweep (due at once) and the result is 'pending'.
    */
-  private async drop(key: string, where: string, vars: Record<string, unknown>): Promise<'released' | 'absent'> {
-    for (let attempt = 0; attempt < RESERVE_ATTEMPTS; attempt++) {
-      await this.ensureQuota();
+  private async dropOn(db: Surreal, key: string, where: string, vars: Record<string, unknown>, deadline: number):
+    Promise<'released' | 'absent' | 'pending'> {
+    while (Date.now() < deadline) {
       // A delete that finds nothing throws, which rolls the whole transaction back: nothing is subtracted twice.
-      const { outcome } = await this.transact(this.db, `BEGIN;
+      const { outcome } = await this.transact(db, `BEGIN;
         LET $gone = (DELETE query_snapshot WHERE id = $record ${where} RETURN BEFORE);
         IF array::len($gone) = 0 { THROW 'snapshot absent' };
         UPDATE ONLY $quota SET version += 1, listings -= 1, bytes -= $gone[0].byte_count;
         DELETE query_snapshot_row WHERE snapshot = $key RETURN NONE;
-        COMMIT;`, { ...vars, record: new RecordId('query_snapshot', key), key, quota: QUOTA });
+        COMMIT;`, { ...vars, record: new RecordId('query_snapshot', key), key, quota: QUOTA }, undefined, deadline);
       if (outcome === 'done') return 'released';
       if (outcome === 'refused') return 'absent';
       await pause();
     }
-    throw unavailable('a listing could not be released yet; the next sweep will retry');
+    console.error(`snapshot listing ${key} was not released within ${RELEASE_DEADLINE_MS} ms; it is left for the sweep`);
+    await this.markForSweep(db, key);
+    return 'pending';
+  }
+
+  /** Marks a listing for the sweep: expired and abandoned at once. Waits at most MARK_WAIT_MS, and logs a mark that does not complete. */
+  private async markForSweep(db: Surreal, id: string): Promise<void> {
+    const marked = await untilAt(db.query('UPDATE $record SET created_ms = 0, expires_ms = 0 RETURN NONE;',
+      { record: new RecordId('query_snapshot', id) }).then(() => true, () => false), Date.now() + MARK_WAIT_MS);
+    if (marked !== true) console.error(`snapshot listing ${id} could not be marked for the sweep; it stays until it expires`);
+  }
+
+  /**
+   * Releases one listing on a connection of its own from the release channel, within RELEASE_DEADLINE_MS, counting the time it
+   * takes to open that connection. Any failure is counted as pending: the listing is marked for the sweep and nothing is thrown.
+   * A connection that opens only after the deadline still marks it, and is then closed.
+   */
+  private async releaseOn(id: string): Promise<'released' | 'absent' | 'pending'> {
+    const deadline = Date.now() + RELEASE_DEADLINE_MS;
+    const opening = this.releaseChannel.open();
+    const link = await untilAt(opening.catch(() => undefined), deadline);
+    if (!link) {
+      void opening.then(async late => {
+        await this.markForSweep(late.db, id);
+        await late.close().catch(() => undefined);
+      }, () => undefined);
+      console.error(`snapshot listing ${id} was not released: no connection opened within ${RELEASE_DEADLINE_MS} ms; it is left for the sweep`);
+      return 'pending';
+    }
+    try {
+      return await this.dropOn(link.db, id, '', {}, deadline);
+    } catch (error) {
+      console.error(`snapshot listing ${id} was not released (${(error as Error).message}); it is left for the sweep`);
+      await this.markForSweep(link.db, id);
+      return 'pending';
+    } finally {
+      await link.close().catch(() => undefined);
+    }
   }
 
   /**
    * Runs one transaction: a batch of statements that commits or does nothing. A conflict with a concurrent write is tried
-   * again here. A refusal comes back to the caller, which decides what it means. Server time is added to `account`.
+   * again here. A refusal comes back to the caller, which decides what it means. Server time is added to `account`. Attempts
+   * end at `until`: a statement still unanswered then is left to its connection, and the result is 'conflict'.
    */
-  private async transact(db: Surreal, query: string, vars: Record<string, unknown>, account?: BuildAccount):
-    Promise<{ outcome: 'done' | 'moved' | 'refused' | 'conflict' }> {
-    const deadline = Date.now() + TRANSACTION_WAIT_MS;
-    for (let attempt = 0; Date.now() < deadline; attempt++) {
-      const responses = await db.query<unknown[]>(query, vars).responses();
+  private async transact(db: Surreal, query: string, vars: Record<string, unknown>, account?: BuildAccount,
+    until = Date.now() + TRANSACTION_WAIT_MS): Promise<{ outcome: 'done' | 'moved' | 'refused' | 'conflict' }> {
+    for (let attempt = 0; Date.now() < until; attempt++) {
+      const responses = await untilAt(db.query<unknown[]>(query, vars).responses(), until);
+      if (!responses) return { outcome: 'conflict' };
       if (account) account.serverMs += responses.reduce((sum, response) => sum + serverMsOf(response.stats), 0);
       const failures = responses.filter(response => !response.success);
       if (failures.length === 0) return { outcome: 'done' };
@@ -587,11 +655,14 @@ export class SnapshotStore {
     return { outcome: 'conflict' };
   }
 
-  /** Creates the quota record on first use. INSERT IGNORE leaves an existing record, and its totals, as they are. */
-  private ensureQuota(): Promise<void> {
+  /**
+   * Creates the quota record on first use, on the connection of the caller that first needs it. INSERT IGNORE leaves an
+   * existing record, and its totals, as they are.
+   */
+  private ensureQuotaOn(db: Surreal): Promise<void> {
     this.quotaReady ??= (async () => {
       try {
-        await this.db.query('INSERT IGNORE INTO query_snapshot_quota $rows;', {
+        await db.query('INSERT IGNORE INTO query_snapshot_quota $rows;', {
           rows: [{ id: QUOTA, listings: 0, bytes: 0, version: 0, seq: 0 }],
         });
       } catch (error) {

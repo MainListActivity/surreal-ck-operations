@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
-import { CompanyDatabase } from '../src/database.ts';
+import { CompanyDatabase, MAX_BUILD_CONNECTIONS } from '../src/database.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import {
   DEFAULT_SNAPSHOT_LIMITS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation, type SnapshotStoreOptions,
@@ -446,8 +446,8 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   const atGiveUp = statements.length;
   await Bun.sleep(600);
   expect(statements.length).toBe(atGiveUp);
-  // The one connection was closed when the build ended, with nothing in flight.
-  expect(closes).toEqual([false]);
+  // The build's connection and the release's connection were each closed with nothing in flight.
+  expect(closes).toEqual([false, false]);
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
   expect(await quotaOf(store)).toEqual(baseline);
 
@@ -492,8 +492,10 @@ test('(k) a statement still in flight after the cleanup wait closes its connecti
   // The 2-second deadline passes first, then the 2-second cleanup wait, and only then is the connection closed, still busy.
   expect(elapsed).toBeGreaterThanOrEqual(3_900);
   expect(elapsed).toBeLessThan(6_000);
-  expect(closes).toEqual([true]);
-  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
+  // The build's own connection closed with its statement still in flight; the release then opened and closed one of its own.
+  expect(closes).toHaveLength(2);
+  expect(closes[0]).toBe(true);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', release: 'released' });
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
   expect(await quotaOf(store)).toEqual(baseline);
 
@@ -592,4 +594,138 @@ test('(n) a build whose read is abandoned closes only its own connection: a conc
   expect(await store.release(headerStalled.id)).toBe('released');
   expect(await store.release(headerOther.id)).toBe('released');
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+});
+
+test('(o) a release that cannot finish within its deadline is left for the sweep: temporarily_unavailable, marked due, and the next sweep frees it', async () => {
+  const holder: { db?: Surreal } = {};
+  let hang = false;
+  const { db, store } = await fresh({}, {
+    channel: {
+      open: async () => ({
+        db: throughChannel(holder.db!, async sql => {
+          // Only the release's delete never answers; the marking statement and the sweep still run.
+          if (hang && sql.includes('DELETE query_snapshot WHERE id')) await new Promise<never>(() => undefined);
+        }),
+        close: async () => undefined,
+      }),
+    },
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  const header = await store.create({ owner: 'o-owner', kind: 'context', digest: 'dig-o', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  hang = true;
+  const started = performance.now();
+  const error = await store.release(header.id).then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  expect((error as CompanyError).retryable).toBe(true);
+  // The 3-second release deadline, then the marking, which is given at most one second.
+  expect(elapsed).toBeGreaterThanOrEqual(2_900);
+  expect(elapsed).toBeLessThan(4_800);
+  expect(await store.census()).toEqual({ listings: 1, rows: 1 });
+  // Marked due at once: the next sweep frees the listing and its room, exactly once.
+  hang = false;
+  expect(await store.sweep()).toBe(1);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+});
+
+test('(p) a build and a sweep run on their own connections: a main connection that refuses every statement does not stop them', async () => {
+  const { db, store } = await fresh({ ttlMs: 1 });
+  // A listing that has expired by the time the next build starts, so the build's sweep has work to do on its own connection.
+  await store.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p-old', role: 'gm', takenAt: TAKEN_AT, bodies: ['expired'] });
+  await Bun.sleep(5);
+  const refused: string[] = [];
+  const main = new Proxy({}, {
+    get: (_target, property) => () => {
+      refused.push(String(property));
+      throw new Error('the main connection was used by a build or a sweep');
+    },
+  }) as unknown as Surreal;
+  const isolated = new SnapshotStore(main, { reserveWaitMs: 10_000 }, { channel: db.buildChannel });
+  const header = await isolated.create({ owner: 'p-owner', kind: 'context', digest: 'dig-p', role: 'gm', takenAt: TAKEN_AT, bodies: ['fresh'] });
+  expect(header.rows).toBe(1);
+  expect(await isolated.sweep()).toBe(0);
+  expect(await isolated.release(header.id)).toBe('released');
+  expect(refused).toEqual([]);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+});
+
+test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a build with no slot within the queue wait is refused, and the slots come back', async () => {
+  const { db } = await fresh();
+  // The row write of each build takes 4 seconds, so the builds holding slots still hold them when the next build queues.
+  // Only that write is slowed: the reservation statements run at full speed, so the builds do not contend for the quota.
+  const slow = {
+    open: async () => {
+      const link = await db.buildChannel.open();
+      return {
+        db: throughChannel(link.db, async sql => { if (sql.includes('INSERT INTO query_snapshot_row')) await Bun.sleep(4_000); }),
+        close: link.close,
+      };
+    },
+  };
+  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow });
+  const make = (owner: string) => store.create({ owner, kind: 'context', digest: `dig-${owner}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] });
+  const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) => make(`q-${index}`));
+  await Bun.sleep(300);
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  const started = performance.now();
+  const refused = await make('q-extra').then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(refused).toBeInstanceOf(CompanyError);
+  expect((refused as CompanyError).code).toBe('temporarily_unavailable');
+  expect((refused as CompanyError).retryable).toBe(true);
+  expect((refused as CompanyError).message).toMatch(/busy: 4 are running/);
+  // Refused after the 2-second queue wait, while the builds ahead of it still run.
+  expect(elapsed).toBeGreaterThanOrEqual(1_900);
+  expect(elapsed).toBeLessThan(3_500);
+  const headers = await Promise.all(holding);
+  expect(headers.map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
+  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, queued: 0 });
+  expect(await store.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
+});
+
+test('(r) a release is not held back by saturated build slots: with every slot taken, a release frees its listing at once', async () => {
+  const { db } = await fresh();
+  const plain = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
+  const kept = await plain.create({ owner: 'r-owner', kind: 'context', digest: 'dig-r', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  // As in (q), the row write of each build takes 4 seconds, so the builds holding slots still hold them during the release.
+  const slow = {
+    open: async () => {
+      const link = await db.buildChannel.open();
+      return {
+        db: throughChannel(link.db, async sql => { if (sql.includes('INSERT INTO query_snapshot_row')) await Bun.sleep(4_000); }),
+        close: link.close,
+      };
+    },
+  };
+  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 30_000 }, { channel: slow, releaseChannel: db.releaseChannel });
+  const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
+    store.create({ owner: `r-${index}`, kind: 'context', digest: `dig-r-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
+  await Bun.sleep(300);
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  const started = performance.now();
+  expect(await plain.release(kept.id)).toBe('released');
+  expect(performance.now() - started).toBeLessThan(2_000);
+  expect((await Promise.all(holding)).map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
+  expect(await plain.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
+});
+
+test('(s) a release whose connection opens only after its deadline still marks the listing, and the next sweep frees it', async () => {
+  const { db } = await fresh();
+  const plain = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
+  const header = await plain.create({ owner: 's-owner', kind: 'context', digest: 'dig-s', role: 'gm', takenAt: TAKEN_AT, bodies: ['kept'] });
+  // The release connection opens 3.5 seconds in, after the 3-second release deadline.
+  const late = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, {
+    channel: db.buildChannel,
+    releaseChannel: { open: async () => { await Bun.sleep(3_500); return db.releaseChannel.open(); } },
+  });
+  const error = await late.release(header.id).then(() => undefined, (reason: unknown) => reason);
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  // The late connection marks the listing once it opens, then closes; the next sweep frees it, exactly once.
+  await Bun.sleep(1_500);
+  expect(await plain.sweep()).toBe(1);
+  expect(await plain.census()).toEqual({ listings: 0, rows: 0 });
 });
