@@ -12,7 +12,7 @@ import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
-import { normalizeIndependence, readEmployeeDefs, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
+import { normalizeIndependence, policyFault, readEmployeeDefs, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -810,18 +810,16 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * Runs one lease transaction against a fresh contribution view. When the facts it was built from moved under it (another
-   * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale
-   * facts is never accepted (SYS-DISP AC04, AC06).
-   */
-  /**
    * The independence gate of one stage (SYS-DISP IR03): the exclusion read now, and the source versions the write must be guarded by.
-   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A source that cannot be
-   * read or does not exist refuses here; nothing is written.
+   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A policy this build cannot
+   * enforce refuses here whatever its stages; a source that cannot be read or does not exist refuses too. Nothing is written.
    */
   private async independenceGate(taskId: string, policy: IndependencePolicy | undefined,
     stage: IndependenceStage | undefined): Promise<IndependenceGate | undefined> {
-    if (!policy || !stage || !policy.stages.includes(stage)) return undefined;
+    if (!policy || !stage) return undefined;
+    const fault = policyFault(policy);
+    if (fault !== undefined) throw new CompanyError('forbidden', fault);
+    if (!policy.stages.includes(stage)) return undefined;
     const snapshot = await readIndependenceSnapshot(this.db, policy, this.independenceReadHook);
     return { taskId, index: snapshot.index, guards: snapshot.sources.map(source => ({ task: id('task', source.taskId), version: source.version })) };
   }
@@ -834,9 +832,11 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * Runs one lease transaction against fresh facts. A stage the policy names is gated before the write: a contributor of a source is
-   * refused with the structured conflict, and the write carries the source guards, so a source that moved since the read refuses it
-   * and the whole check runs again (CONTRIBUTION_MOVED). Other stages and legacy tasks run exactly as before.
+   * Runs one lease transaction against fresh facts (SYS-DISP AC04, AC06). When the facts it was built from moved under it (another
+   * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale facts is
+   * never accepted. A stage the policy names is gated before the write: a contributor of a source is refused with the structured
+   * conflict, and the write carries the source guards, so a source that moved since the read refuses it and the whole check runs
+   * again (CONTRIBUTION_MOVED). Other stages and legacy tasks run exactly as before.
    */
   private async withContributionRetry<T>(taskId: string, actor: string, stageOf: (state?: string) => IndependenceStage | undefined,
     attempt: (contrib: ContributionView, gate?: IndependenceGate) => Promise<T>): Promise<T> {
@@ -1812,15 +1812,6 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
-   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
-   * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
-   * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
-   * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
-   * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
-   * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
-   */
-  /**
    * Manager write of a task's independence policy (SYS-DISP IR01). Manage capability only. Creates the first policy, or replaces the
    * current one under a compare-and-set on the task version. Refused while the task is leased, so a lease is never changed silently.
    * An accepted write bumps the revision and the version in one transaction with its audit row; the same key and payload replay.
@@ -1881,6 +1872,15 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
+  /**
+   * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
+   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
+   * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
+   * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
+   * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
+   * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
+   * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
+   */
   async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may take over a task implementer');

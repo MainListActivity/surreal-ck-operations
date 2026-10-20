@@ -86,6 +86,14 @@ const authorParent = async (author: 'src' | 'alias', parentId: string) => {
   await core.submit(tokens[author]!, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() });
 };
 
+// R1 (v18 return): migration 023 must be loaded by the bootstrap of an empty database, not only exist as a file.
+test('a fresh bootstrap loads the independence migration: task has both fields and the schema marker reads 23', async () => {
+  const [info] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
+  expect(Object.keys(info?.fields ?? {})).toEqual(expect.arrayContaining(['independence', 'independence_guard']));
+  const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
+  expect(marker?.[0]?.schema_version).toBe(23);
+});
+
 test('G5 replay: a source authored after the policy is a conflict at claim; the independent engineer still claims', async () => {
   const parent = await engineering('parent authored after the policy (3a9b0b3c analog)');
   const dependent = await engineering('independent review created before the parent claim (G5 analog)');
@@ -197,9 +205,14 @@ test('concurrent takeover of the source and claim of the dependent never leave a
       core.implementerTakeover(tokens.gm, { taskId: parent.id, toEmployee: 't-indep', expectedVersion: await versionOf(parent.id),
         reason: '经理指定 indep 接手源任务（并发轮次）', idempotencyKey: key() }),
     ]);
-    if (claimed.status !== 'fulfilled') continue;
-    const submitted = await core.submit(tokens.indep, proofOf(claimed.value), { text: EVIDENCE, idempotencyKey: key() }).then(() => true, () => false);
-    if (taken.status === 'fulfilled') expect(submitted).toBe(false);
+    // Both races settle before the submit, so a takeover that landed is already visible to the submit gate. Every round asserts the
+    // same exact outcome: a claim that lost the race is refused with a structured error, and the submit lands only when the claim was
+    // granted and the takeover did not land.
+    expect(claimed.status === 'fulfilled' || claimed.reason instanceof CompanyError).toBe(true);
+    const submitted = claimed.status === 'fulfilled'
+      ? await core.submit(tokens.indep, proofOf(claimed.value), { text: EVIDENCE, idempotencyKey: key() }).then(() => true, () => false)
+      : false;
+    expect(submitted).toBe(claimed.status === 'fulfilled' && taken.status !== 'fulfilled');
   }
 });
 
@@ -370,6 +383,31 @@ test('a policy version this build does not read fails closed: the claim is refus
   const entries = pool({ id: dependent.id } as unknown as SupervisedTask, scope);
   expect(entries.length).toBeGreaterThan(0);
   expect(entries.every(entry => !entry.eligible && entry.code === 'unknown')).toBe(true);
+});
+
+test('an incomplete stored policy fails closed: a missing, empty, unknown or mistyped field refuses the claim and reads every candidate as unknown', async () => {
+  const parent = await engineering('parent under an incomplete stored policy');
+  for (const corruption of [
+    'independence.stages = NONE', 'independence.stages = []', 'independence.stages = ["merge"]', 'independence.mode = "bogus"',
+    'independence.sources = NONE', 'independence.excluded = "t-src"',
+  ]) {
+    const dependent = await engineering(`dependent whose stored policy is corrupt: ${corruption}`);
+    await setPolicy(dependent.id, [parent.id]);
+    await database.db.query(`UPDATE ONLY $task SET ${corruption};`, { task: new RecordId('task', dependent.id) });
+
+    const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
+    expect(refusal.code).toBe('forbidden');
+    expect(refusal.message).toContain('incomplete');
+    expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+
+    // The stage list cannot be trusted, so the policy is unverifiable at every stage, not only at the ones it names.
+    const stored = (await core.getTask(tokens.gm, dependent.id)).independence;
+    expect(await workforce.independenceScope(stored, 'execute')).toMatchObject({ kind: 'unverifiable' });
+    expect(await workforce.independenceScope(stored, 'review')).toMatchObject({ kind: 'unverifiable' });
+    const entries = pool({ id: dependent.id } as unknown as SupervisedTask, await workforce.independenceScope(stored, 'execute'));
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.every(entry => !entry.eligible && entry.code === 'unknown')).toBe(true);
+  }
 });
 
 test('a source record that no longer exists refuses the claim as not found, and the verdict names that source', async () => {

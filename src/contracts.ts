@@ -212,7 +212,6 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
-/** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
 /** The phase a policy applies to: taking and writing code (execute), or deciding a review. */
 export type IndependenceStage = 'execute' | 'review';
 
@@ -251,6 +250,7 @@ export interface SetIndependence {
   idempotencyKey: string;
 }
 
+/** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
 export interface ImplementerTakeover {
   taskId: TaskId;
   /** Takes over code work; must hold the task's execute role and capability. */

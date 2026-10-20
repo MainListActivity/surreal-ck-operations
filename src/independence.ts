@@ -192,13 +192,31 @@ async function readSource(db: Surreal, taskId: TaskId, hook?: (taskId: TaskId) =
   }
 }
 
+const isIdList = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === 'string');
+
 /**
- * The exclusion a policy reads now. A policy this build does not understand refuses (fail closed). A source that cannot be read
- * refuses as temporarily unavailable, and a source that does not exist refuses as not found: the caller never gets a partial index.
+ * Why a stored policy cannot be enforced by this build, or undefined when it can. An unknown version refuses, and so does a record
+ * missing or mistyping a field the write path always sets: an incomplete policy never reads as no policy.
+ */
+export function policyFault(policy: IndependencePolicy): string | undefined {
+  if (policy.schema !== 1) return `Independence policy version ${String(policy.schema)} is not understood; refusing`;
+  if (!Array.isArray(policy.stages) || policy.stages.length === 0 || !policy.stages.every(stage => STAGES.includes(stage))) {
+    return 'Independence policy is incomplete (stages); refusing';
+  }
+  if (!MODES.includes(policy.mode)) return 'Independence policy is incomplete (mode); refusing';
+  if (!isIdList(policy.sources) || !isIdList(policy.excluded)) return 'Independence policy is incomplete (sources or excluded); refusing';
+  if (policy.sources.length + policy.excluded.length === 0) return 'Independence policy is incomplete (no source or excluded employee); refusing';
+  return undefined;
+}
+
+/**
+ * The exclusion a policy reads now. A policy this build cannot enforce refuses (fail closed, see policyFault). A source that cannot be
+ * read refuses as temporarily unavailable, and a source that does not exist refuses as not found: the caller never gets a partial index.
  */
 export async function readIndependenceSnapshot(db: Surreal, policy: IndependencePolicy,
   hook?: (taskId: TaskId) => Promise<void>): Promise<IndependenceSnapshot> {
-  if (policy.schema !== 1) throw new CompanyError('forbidden', `Independence policy version ${String(policy.schema)} is not understood; refusing`);
+  const fault = policyFault(policy);
+  if (fault !== undefined) throw new CompanyError('forbidden', fault);
   const sources: IndependenceSnapshot['sources'] = [];
   for (const taskId of policy.sources) {
     const view = await readSource(db, taskId, hook);
@@ -217,12 +235,16 @@ export async function readIndependenceSnapshot(db: Surreal, policy: Independence
 }
 
 /**
- * The scope a dispatch pass reads for one task at one stage. Undefined when the policy does not apply at that stage (legacy tasks and
- * other stages are unchanged). A snapshot that cannot be read is unverifiable, so the pool blocks it instead of reading it as clear.
+ * The scope a dispatch pass reads for one task at one stage. Undefined when a readable policy does not apply at that stage (legacy
+ * tasks and other stages are unchanged). A policy this build cannot enforce is unverifiable at every stage, because its stages cannot
+ * be trusted, and so is a snapshot that cannot be read: the pool blocks both instead of reading them as clear.
  */
 export async function readIndependenceScope(db: Surreal, policy: IndependencePolicy | undefined,
   stage: IndependenceStage): Promise<IndependenceScope | undefined> {
-  if (!policy || !policy.stages.includes(stage)) return undefined;
+  if (!policy) return undefined;
+  const fault = policyFault(policy);
+  if (fault !== undefined) return { kind: 'unverifiable', reason: fault };
+  if (!policy.stages.includes(stage)) return undefined;
   try {
     return { kind: 'index', index: (await readIndependenceSnapshot(db, policy)).index };
   } catch (error) {
