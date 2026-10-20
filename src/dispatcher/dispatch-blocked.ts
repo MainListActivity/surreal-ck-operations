@@ -19,7 +19,7 @@ export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
   | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'no_candidate'
   | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
-  | 'quota' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown';
+  | 'quota' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -104,7 +104,7 @@ export interface EvaluateInput {
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
   'author_recusal', 'implementer_mismatch', 'implementer_unresolved', 'track_mismatch',
-  'credential_file', 'def_disabled', 'no_candidate',
+  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
 ]);
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
@@ -129,6 +129,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   def_disabled: '编制已停用',
   wake_failed: '派工未能唤醒或创建会话，下一轮重试',
   unknown: '状态或贡献者历史读取失败，不能判定（不视为忙），恢复后自动重判',
+  review_capacity: '后续独立复核缺合格人选：合格复核人不能同时实现，且无合规空余席位',
 };
 
 const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
@@ -136,6 +137,7 @@ const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
   implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', no_candidate: 'gm',
   session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
+  review_capacity: 'gm',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
@@ -159,6 +161,7 @@ const RECOVERY: Record<BlockCode, string> = {
   def_disabled: '经理重新启用编制或更换编制',
   wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
   unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
+  review_capacity: '经理为复核岗位增补编制或员工；不能由作者自验，也不能让实现人兼任本任务复核',
 };
 
 const NEXT: Record<BlockCode, string> = {
@@ -182,6 +185,7 @@ const NEXT: Record<BlockCode, string> = {
   def_disabled: '编制重新启用',
   wake_failed: '下一轮唤醒成功',
   unknown: '状态与审计读取恢复',
+  review_capacity: '出现不同于实现人的合格复核人选，或复核岗位有合规空余席位',
 };
 
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
@@ -192,6 +196,7 @@ const BASIS: Record<BlockCode, string> = {
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
+  review_capacity: 'tick:review-capacity',
 };
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
@@ -216,6 +221,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   def_disabled: [{ authority: 'gm', label: '经理用 def_ensure 重新启用编制', tool: 'def_ensure', executable: true }],
   wake_failed: [{ authority: 'gm', label: '检查 Paseo 会话与插件日志，下一轮自动重试', executable: false }],
   unknown: [{ authority: 'gm', label: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判', executable: false }],
+  review_capacity: [{ authority: 'gm', label: '经理用 def_ensure 为复核岗位与仓库增加编制（不新增订阅）', tool: 'def_ensure', executable: true }],
 };
 
 const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };
@@ -224,6 +230,42 @@ const iso = (ms: number) => new Date(ms).toISOString();
 
 /** A pass-wide gate with its owner-facing text. */
 export const globalBlock = (code: BlockCode): GlobalBlock => ({ code, text: BLOCK_TEXT[code] });
+
+/** A reviewer pool entry as the review plan reads it: a reuse candidate, or a spawnable def, for the reviewer role and home. */
+export interface ReviewPoolEntry {
+  key: string;
+  kind: 'reuse' | 'spawn';
+  eligible: boolean;
+  code?: BlockCode;
+}
+
+/** The independent review an execute claim needs. `reserve` is the one reuse reviewer kept for the task: logical only, no lease. */
+export interface ReviewPlan {
+  feasible: boolean;
+  /** Reuse candidates that fit the reviewer role, home, track and def, whatever their capacity this minute. Sorted. */
+  legal: string[];
+  spareSeat: boolean;
+  reserve?: string;
+}
+
+/** Capacity states that do not make a reviewer illegal: they clear when the seat frees up or the state reads again. */
+const CAPACITY: ReadonlySet<BlockCode> = new Set<BlockCode>(['session_busy', 'held', 'assigned', 'quota', 'provider_capacity', 'unknown']);
+
+/**
+ * SYS-DISP AC05 (R1): whether the independent review after an execute claim has a legal path. Authors never count, and neither
+ * does a reviewer whose role, home, track or def rules out new work (those need an owner or manager edit). A legal reuse
+ * reviewer or a spare seat (a reviewer def with room for a new instance, even when its provider is in quota or at its
+ * concurrency cap) keeps the path open. With no spare seat, one legal reviewer is reserved: the execute pool must not pick it,
+ * so the task keeps a reviewer who is not its implementer. Nothing here creates a lease.
+ */
+export function reviewPlanOf(pool: readonly ReviewPoolEntry[]): ReviewPlan {
+  const legalEntries = pool.filter(entry => entry.kind === 'reuse' && (entry.eligible || (entry.code !== undefined && CAPACITY.has(entry.code))));
+  const legal = legalEntries.map(entry => entry.key).sort();
+  const spareSeat = pool.some(entry => entry.kind === 'spawn' && (entry.eligible || entry.code === 'quota' || entry.code === 'provider_capacity'));
+  const eligibleNow = legalEntries.filter(entry => entry.eligible).map(entry => entry.key).sort();
+  const reserve = !spareSeat && legal.length > 0 ? (eligibleNow[0] ?? legal[0]) : undefined;
+  return { feasible: legal.length > 0 || spareSeat, legal, spareSeat, reserve };
+}
 
 /** Evaluates one task phase. Pure: the same inputs always produce the same verdict and summary text. */
 export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {

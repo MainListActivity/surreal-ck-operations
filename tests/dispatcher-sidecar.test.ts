@@ -18,7 +18,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
-  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
+  const authorsOf = new Map<string, string[]>();
+  // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
+  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
   const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string } = {}) => {
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
@@ -43,8 +45,8 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
-    // No audit history in this fixture: no authors, no implementer, so no gate and no recusal apply.
-    contributors: async () => ({ authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: [] }),
+    // Authors are set per task by the test (authorsOf); no implementer is bound, so no execute gate applies.
+    contributors: async (taskId: string) => ({ authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: authorsOf.get(taskId) ?? [] }),
     setDispatchBlock: async (id: string, phase?: string, since?: number) => {
       Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
     },
@@ -96,7 +98,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, authorsOf, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -337,5 +339,47 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w2.pool.detachAgent(inst2.paseoAgentId!);
     await d2.tick();
     expect(w2.events).toContain(`retire:${inst2.id}:failure`);
+  });
+});
+
+describe('R1: review capacity before an engineering execute claim', () => {
+  // Two idle engineers fill both seats of the fixture def.
+  const twoEngineers = (w: ReturnType<typeof world>) => {
+    for (const [id, agent] of [['employee-8', 'agent-8'], ['employee-9', 'agent-9']] as const) {
+      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}` } as EmployeeInst;
+      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
+      w.agents.set(agent, { id: agent, status: 'idle' });
+    }
+  };
+  test('a single engineering seat holds the claim: no independent reviewer exists after it', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('solo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(r.notices).toContain('dispatch-blocked:solo:execute');
+    expect(w.notices.get('dispatch-blocked:solo:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('a spare seat keeps the claim: the implementer takes one seat and a second stays free for review', async () => {
+    const w = world(); w.addTask('spare');
+    await w.dispatcher().tick();
+    expect(w.events).toContain('claim:employee-1:spare');
+    expect(w.views.get('spare')!.currentEmployee).toBe('employee-1');
+  });
+  test('a reserved reviewer is never picked to implement the task', async () => {
+    const w = world(); twoEngineers(w); w.addTask('held');
+    const r = await w.dispatcher().tick();
+    const reserved = r.decisions.find(d => d.startsWith('reserve:held='))?.split('=')[1];
+    const claimed = w.events.find(e => e.startsWith('claim:') && e.endsWith(':held'))?.split(':')[1];
+    expect(reserved).toBeDefined();
+    expect(claimed).toBeDefined();
+    expect(claimed).not.toBe(reserved);
+    expect(w.views.get('held')!.currentEmployee).toBe(claimed);
+  });
+  test('an author may implement a rework, and the reserved reviewer is the other engineer', async () => {
+    const w = world(); twoEngineers(w); w.addTask('rework'); w.authorsOf.set('rework', ['employee-8']);
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('claim:employee-8:rework');
+    expect(r.decisions).toContain('reserve:rework=employee-9');
   });
 });

@@ -16,7 +16,7 @@ import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
@@ -139,6 +139,11 @@ export interface StaffingInput {
   states: ReadonlyMap<string, InstState>;
   holding: ReadonlySet<string>;
   assigned?: ReadonlySet<string>;
+  /**
+   * Entry keys held back by review capacity (R1): an instance id, or `spawn:<defId>`. Logical only: nothing is leased,
+   * and the execute pool of this task never picks them.
+   */
+  reserved?: ReadonlySet<string>;
   health: ReadonlyMap<string, ProviderHealth>;
   quotaBlocked: ReadonlyMap<string, string>;
   busyBy: ReadonlyMap<string, number>;
@@ -209,6 +214,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       gate(inst.id) ??
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
+      (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       (!ready(inst) ? notReady(p.states.get(inst.id)) : undefined) ??
       (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
@@ -226,6 +232,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
       gate(undefined) ??
+      (p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
@@ -800,15 +807,17 @@ export class Dispatcher {
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
       providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
-    const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal) =>
-      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned,
+    const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
+      reserved?: ReadonlySet<string>) =>
+      staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned, reserved,
         implementer: executeGateFor(executeGates, role, task, excludeSubmitter) });
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
-      recusal?: ReviewRecusal) =>
-      poolFor(role, home, task, excludeSubmitter, recusal).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
+      recusal?: ReviewRecusal, reserved?: ReadonlySet<string>) =>
+      poolFor(role, home, task, excludeSubmitter, recusal, reserved).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
     // Every pool read names whether it is review work, so the execute gate can never leak into a reviewer spawn.
-    const eligibleDefs = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
-      poolFor(role, home, task, forReview).flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    const eligibleDefs = (role: string, home: string, task?: SupervisedTask, forReview = false,
+      reserved?: ReadonlySet<string>) =>
+      poolFor(role, home, task, forReview, undefined, reserved).flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -821,9 +830,9 @@ export class Dispatcher {
       await owner.resolveNotice('model-unresolved');
     }
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
-      recusal?: ReviewRecusal, anchorHome?: string) => {
+      recusal?: ReviewRecusal, anchorHome?: string, reserved?: ReadonlySet<string>) => {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
-      const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal);
+      const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal, reserved);
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       // Review work never hits this: an author's former holder is already out; a claim-only
@@ -836,19 +845,21 @@ export class Dispatcher {
       const pool = usable.filter(i => i.id !== avoid);
       return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
     };
-    const spawnable = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
-      weightedOrder(eligibleDefs(role, home, task, forReview), effectiveWeight, rand);
+    const spawnable = (role: string, home: string, task?: SupervisedTask, forReview = false,
+      reserved?: ReadonlySet<string>) =>
+      weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
     // Review 派工的作者在进 Jev 前就已从 reuse 候选剔除（staffingPool 的回避名单），其余候选都可被选中；
     // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
-    const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal): Promise<AssignPreference | undefined> => {
+    const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal,
+      reserved?: ReadonlySet<string>): Promise<AssignPreference | undefined> => {
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       const cacheKey = `${item.purpose}:${item.task.id}`;
       const avoided = this.staffAvoid.get(cacheKey);
       const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
-      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', recusal).filter(i => !dodged(i.id));
-      const spawn = eligibleDefs(item.role, home, item.task, item.purpose === 'review').filter(d => !dodged(`spawn:${d.id}`));
+      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', recusal, reserved).filter(i => !dodged(i.id));
+      const spawn = eligibleDefs(item.role, home, item.task, item.purpose === 'review', reserved).filter(d => !dodged(`spawn:${d.id}`));
       if (reuse.length + spawn.length < 2) return undefined;
       // Same candidate set → same verdict; only call Jev when the fingerprint moved.
       const fp = `${item.role}|${item.task.version}|` +
@@ -906,6 +917,41 @@ export class Dispatcher {
       }
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      // SYS-DISP AC05 (R1): an engineering execute claim must leave the review that follows a legal path: a legal reuse
+      // reviewer who is not the implementer, or a compliant spare seat. Otherwise nothing is claimed and the block goes to the
+      // manager. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
+      let reserved: ReadonlySet<string> | undefined;
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && item.task.reviewerRole !== 'owner') {
+        const authors = await readReviewRecusal(wf, item.task, message => this.log(message));
+        if (authors === undefined) {
+          await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
+          continue;
+        }
+        const reviewPlan = (recusal: ReviewRecusal, pool: EmployeeInst[] = insts) => reviewPlanOf(staffingPool({ ...poolBase,
+          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal }));
+        const plan = reviewPlan(authors);
+        if (!plan.feasible) {
+          const blocked = poolFor(item.role, home, item.task).map(entry => entry.eligible
+            ? { ...entry, eligible: false, code: 'review_capacity' as const }
+            : entry);
+          await this.settleBlocked(item.task, 'execute', home,
+            [...blocked, { key: '*', eligible: false, code: 'review_capacity' as const }], now, report);
+          continue;
+        }
+        // An execute spawn takes a new seat of its def. That seat is not spare: the review must still have a reviewer
+        // once it is counted, otherwise the spawn is held for this task.
+        const held = new Set<string>(plan.reserve ? [plan.reserve] : []);
+        for (const entry of poolFor(item.role, home, item.task)) {
+          if (entry.kind !== 'spawn' || !entry.eligible) continue;
+          const seat = { id: `pending:${entry.key}`, def: entry.ref, role: item.role, provider: entry.provider,
+            model: entry.model, repoHome: home, cwd: home } as EmployeeInst;
+          if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]) }, [...insts, seat]).feasible) held.add(entry.key);
+        }
+        if (held.size) {
+          reserved = held;
+          for (const key of held) report.decisions.push(`reserve:${item.task.id}=${key}`);
+        }
+      }
       // 验收独立性：review 派工先取本任务回避名单——提交过本任务的作者硬回避
       // （验收自己的交付等于没验收），仅 claim 过未提交的经手人降权兜底、不硬阻断。
       // 历史读失败时名单未知：记为 unknown 并留在队列，不派复核；读取恢复后自动继续。
@@ -914,8 +960,12 @@ export class Dispatcher {
         await this.settleBlocked(item.task, 'review', home, undefined, now, report);
         continue;
       }
-      const prefer = await routeEmployee(item, recusal);
-      const result = await this.assign(item.role, item.task, last?.employee, pick, spawnable,
+      const prefer = await routeEmployee(item, recusal, reserved);
+      const pickItem = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
+        pickRecusal?: ReviewRecusal, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickRecusal, anchorHome, reserved);
+      const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
+        spawnable(role, home, task, forReview, reserved);
+      const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
           { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
       if (!result) {
@@ -929,8 +979,9 @@ export class Dispatcher {
           map.set(key, now + 30 * 60 * 1000);
           this.staffAvoid.set(cacheKey, map);
         }
-        // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool.
-        const entries = poolFor(item.role, home, item.task, item.purpose === 'review', recusal).map(entry => entry.eligible
+        // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
+        // review capacity stay review_capacity here: they were never candidates, so they are not a wake failure.
+        const entries = poolFor(item.role, home, item.task, item.purpose === 'review', recusal, reserved).map(entry => entry.eligible
           ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
           : entry);
         await this.settleBlocked(item.task, item.purpose, home, entries, now, report);

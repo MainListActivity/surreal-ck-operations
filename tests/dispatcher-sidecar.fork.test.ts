@@ -59,6 +59,8 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
       for (let n = 0; n < 200 && !existsSync(join(resDir(env.SCK_COMM_DIR!), file)); n++) await Bun.sleep(5);
       const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
     };
+    // The engineering claim needs a legal independent review after it (R1): a qa seat stays spare for that review.
+    await wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await core.createTask(gm, { title: 'isolated channel recovery', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create' });
     await makeDispatcher().tick();
     const old = (await wf.insts())[0]!, oldEnv = envs.get(old.paseoAgentId!)!;
@@ -66,7 +68,8 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const oldProof: LeaseProof = { taskId: task.id, deliveryId: oldClaim.deliveryId, fence: oldClaim.fence, expectedVersion: oldClaim.task.version };
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(true);
     expect((await relay(oldEnv, 'ops_info')).ok).toBe(true);
-    pool.detachAgent(old.paseoAgentId!); pool = makePool(); await pool.adopt(await wf.insts());
+    // A restart is a process exit in production: the replaced pool stops sweeping the directories the new pool now owns.
+    pool.detachAgent(old.paseoAgentId!); pool.close(); pool = makePool(); await pool.adopt(await wf.insts());
     // Restart fencing: the rotated-out channel key and the minted credential are
     // dead even though adopt() re-keyed the live session and kept its lease.
     expect((await relay(oldEnv, 'get_task_history', { taskId: task.id })).ok).toBe(false);
@@ -89,7 +92,6 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     expect((await relay(env, 'ops_info')).ok).toBe(true);
     expect((await relay(env, 'submit', { text: 'synthetic isolated delivery', idempotencyKey: 'new-submit' })).ok).toBe(true);
     agentRows.get(old.paseoAgentId!)!.status = 'idle';
-    await wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
     await makeDispatcher().tick();
     const qa = (await wf.insts()).find(i => i.role === 'qa')!, qaEnv = envs.get(qa.paseoAgentId!)!;
     expect(qa.id === old.id).toBe(false);

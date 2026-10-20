@@ -641,6 +641,14 @@ export class SidecarPool {
     this.sweeper = sweep;
   }
 
+  /** Stops this pool's sweeper and keepalives. A replaced pool is closed like an exited process, so it stops answering directories the new pool owns. */
+  close(): void {
+    if (this.sweeper) clearInterval(this.sweeper);
+    this.sweeper = undefined;
+    for (const beat of this.beats.values()) clearInterval(beat);
+    this.beats.clear();
+  }
+
   private sweep(): void {
     // Keep answering our ended/detached channels, but do not drain directories
     // owned by another pool (e.g. the replacement process during a restart).

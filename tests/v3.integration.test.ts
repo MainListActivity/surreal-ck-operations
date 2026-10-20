@@ -818,6 +818,8 @@ test('dispatcher spawns instances in the workspace of the goal project and only 
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
   await database.db.query("UPDATE employee_def SET enabled = false WHERE role = 'engineering';");
   await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 4 });
+  // 实现任务的后续复核岗位是 product：执行派工前需要一个可派的 product 席位（R1）。
+  await workforce.upsertDef('product-codex', { role: 'product', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
   await new ProjectStore(database.db).upsert({ id: 'wsproj', name: 'WS', repoPath: '/repo/wsproj', release: 'CI', envs: [{ name: 'production' }] });
   const goal = await owner.createGoal({ text: '工作区归属测试', source: 'owner:test', key: key(), tier: 'quick', project: 'wsproj' });
   const impl = (await core.listTasks(tokens.gm)).find(t => t.goalId === goal.id && t.state === 'ready')!;
@@ -836,6 +838,7 @@ test('dispatcher still spawns for a project when the def is at capacity in anoth
   await database.db.query('DELETE provider_health;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 } };");
   await workforce.upsertDef('engineering-devin', { role: 'engineering', provider: 'devin', model: 'swe-2-high', thinking: 'high', maxInstances: 1 });
+  await workforce.upsertDef('product-codex', { role: 'product', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
   const opsInst = await workforce.spawnInst((await workforce.defs()).find(d => d.id === 'engineering-devin')!);
   await workforce.bind(opsInst.id, { agentId: 'ops-eng-agent', cwd: '/ops' });
   await new ProjectStore(database.db).upsert({ id: 'wsproj2', name: 'WS2', repoPath: '/repo/wsproj2', release: 'CI', envs: [{ name: 'production' }] });
@@ -948,6 +951,8 @@ test('dispatcher: an unreadable contributor history holds review and fresh execu
   await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
   await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
   const paseo = new FakePaseo();
+  // t2 的复核岗位是 qa：执行派工前需要一个可派的 qa 席位（R1）。
+  await workforce.upsertDef('qa-codex', { role: 'qa', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
   // Jev 派工咨询记录：异常读取期间 review 不得进入 Jev 选人（fail-closed）；恢复后候选也不得含贡献者。
   const jevDispatches: Array<{ purpose?: string; taskId?: string; candidates?: Record<string, string> }> = [];
   const jev: JevClient = {
@@ -1075,6 +1080,8 @@ test('dispatcher: quota below floor blocks a provider until the snapshot recover
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 }, quota_floor_pct: 8 };");
   await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
   const paseo = new FakePaseo();
+  // 复核岗位同样走 grok 额度熔断：qa 席位存在即保留复核路径（R1），预算暂停语义不变。
+  await workforce.upsertDef('qa-grok', { role: 'qa', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
   let lowestPct: number | undefined = 3;
   let sessionPct: number | undefined;
   let weeklyPct: number | undefined;
@@ -1255,6 +1262,8 @@ test('model slots: auto defs resolve to newest family model; stale idle instance
   // and the owner is told; the existing current-model instance still serves work.
   paseo.set([...paseo.agents][1][0], 'idle');
   delete slots['codex:sol'];
+  // 模型槽位消失后 codex 编制不能新开；第二个工程席位保留独立复核路径，inst2 仍可执行（R1）。
+  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 1 });
   await mkTask('slot 任务四');
   report = await dispatcher.tick();
   expect(report.woke.filter(w => w.spawned)).toHaveLength(0);
