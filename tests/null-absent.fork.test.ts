@@ -333,7 +333,7 @@ test('get_context: null arguments are absent on MCP and on the sidecar, and a nu
   const withNulls = await viaMcp(holderB, 'get_context', nulls);
   expect(absent.ok).toBe(true);
   expect(withNulls.ok).toBe(true);
-  expect(keysOf(withNulls.data)).toEqual(['company', 'principal', 'tasks']);
+  expect(keysOf(withNulls.data)).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
   expect(keysOf(withNulls.data)).toEqual(keysOf(absent.data));
   expect(taskIdsOf(withNulls.data)).toEqual(taskIdsOf(absent.data));
   expect(taskIdsOf(withNulls.data)).toContain(queueB.id);

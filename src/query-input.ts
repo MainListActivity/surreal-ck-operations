@@ -85,7 +85,18 @@ function optionalIso(value: unknown, name: string): string | undefined {
 export const isPaged = (input: Record<string, unknown>): boolean =>
   (input.pageSize !== undefined && input.pageSize !== null) || (input.cursor !== undefined && input.cursor !== null);
 
+/** get_context reads either the task working set (the default) or the company block (SYS01 AC-A). */
+export const CONTEXT_SCOPES = ['tasks', 'company'] as const;
+export type ContextScope = (typeof CONTEXT_SCOPES)[number];
+/** Sections of the company block that scope company narrows to. The meta part (paused) is always read. */
+export const COMPANY_SECTIONS = ['directions', 'goals', 'projects'] as const;
+export type CompanySection = (typeof COMPANY_SECTIONS)[number];
+/** Arguments that name a task filter. They are refused with scope company rather than ignored. */
+const TASK_ONLY_CONTEXT_ARGUMENTS = ['taskId', 'state', 'goalId', 'role', 'since', 'fields', 'includeCompany'] as const;
+
 export interface ContextParams {
+  scope: ContextScope;
+  section?: CompanySection;
   taskId?: string;
   state?: TaskState;
   goalId?: string;
@@ -93,6 +104,7 @@ export interface ContextParams {
   since?: string;
   pageSize: number;
   cursor?: string;
+  /** Tasks scope only. Default false (SYS01 AC-A): the company block is read with scope company, or asked for here. */
   includeCompany: boolean;
   fields?: string[];
   /** True when the call names pageSize or cursor. Any other call asks for the complete answer (legacy). */
@@ -100,6 +112,24 @@ export interface ContextParams {
 }
 
 export function parseContextInput(input: Record<string, unknown>): ContextParams {
+  const scope = input.scope === undefined || input.scope === null ? 'tasks' : input.scope;
+  if (scope !== 'tasks' && scope !== 'company') throw invalid(`scope must be one of ${CONTEXT_SCOPES.join(', ')}`);
+  const pageSize = pageSizeOf(input.pageSize);
+  const cursor = cursorOf(input.cursor);
+  const paged = isPaged(input);
+  if (scope === 'company') {
+    for (const name of TASK_ONLY_CONTEXT_ARGUMENTS) {
+      if (input[name] !== undefined && input[name] !== null) {
+        throw invalid(`${name} filters tasks; with scope company only section, pageSize and cursor are read`);
+      }
+    }
+    const section = input.section === undefined || input.section === null ? undefined : input.section;
+    if (section !== undefined && !(COMPANY_SECTIONS as readonly unknown[]).includes(section)) {
+      throw invalid(`section must be one of ${COMPANY_SECTIONS.join(', ')}`);
+    }
+    return { scope, section: section as CompanySection | undefined, pageSize, cursor, includeCompany: true, paged };
+  }
+  if (input.section !== undefined && input.section !== null) throw invalid('section is read with scope company');
   const state = input.state === undefined || input.state === null ? undefined : input.state;
   if (state !== undefined && (typeof state !== 'string' || !TASK_STATES.includes(state as TaskState))) {
     throw invalid(`state must be one of ${TASK_STATES.join(', ')}`);
@@ -116,10 +146,8 @@ export function parseContextInput(input: Record<string, unknown>): ContextParams
     }
     fields = [...new Set(input.fields as string[])];
   }
-  const pageSize = pageSizeOf(input.pageSize);
-  const cursor = cursorOf(input.cursor);
-  const paged = isPaged(input);
   return {
+    scope,
     taskId: optionalText(input.taskId, 'taskId', 200),
     state: state as TaskState | undefined,
     goalId: optionalText(input.goalId, 'goalId', 100),
@@ -127,7 +155,7 @@ export function parseContextInput(input: Record<string, unknown>): ContextParams
     since: optionalIso(input.since, 'since'),
     pageSize,
     cursor,
-    includeCompany: optionalBoolean(input.includeCompany, 'includeCompany') ?? !paged,
+    includeCompany: optionalBoolean(input.includeCompany, 'includeCompany') ?? false,
     fields,
     paged,
   };

@@ -262,7 +262,8 @@ describe('argument parsing (SYS01)', () => {
 
   test('the paged shape applies only when pageSize or cursor is named; any other call is legacy (C1, C2)', () => {
     expect(parseContextInput({}).paged).toBe(false);
-    expect(parseContextInput({}).includeCompany).toBe(true);
+    // AC-A: the company block is not part of a task answer unless asked for, paged or not.
+    expect(parseContextInput({}).includeCompany).toBe(false);
     expect(parseContextInput({ pageSize: 5 }).paged).toBe(true);
     expect(parseContextInput({ pageSize: 5 }).includeCompany).toBe(false);
     expect(parseContextInput({ pageSize: 5, includeCompany: true }).includeCompany).toBe(true);

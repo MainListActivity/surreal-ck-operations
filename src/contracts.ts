@@ -143,10 +143,44 @@ export interface PageInfo {
   budgetBytes: number;
 }
 
+/**
+ * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction, goal
+ * and project is one item: its JSON text is cut into parts of a page's size, in order. A reader joins the `json` of the parts of one
+ * (section, key) item, checks the joined UTF-8 length against `totalBytes` and its SHA-256 against `sha256`, then parses it.
+ */
+export interface CompanyPart {
+  section: 'meta' | 'directions' | 'goals' | 'projects';
+  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a goal or project. */
+  key: string;
+  /** 0-based position of this part among the parts of its item. */
+  part: number;
+  /** How many parts the item has. */
+  parts: number;
+  /** Byte offset of this part in the item's JSON text. */
+  offset: number;
+  /** Byte length and SHA-256 (hex) of the whole item JSON text. */
+  totalBytes: number;
+  sha256: string;
+  /** This part of the item's JSON text, cut on UTF-8 character boundaries. */
+  json: string;
+}
+
+/**
+ * get_context answer (SYS01). A task answer carries `tasks`, `companyIncluded` and `companyRead` (the arguments that read the company
+ * block in pages). A company answer carries `scope: 'company'` and either `company` (complete) or `parts` with `page` (paged).
+ */
 export interface ContextView {
   principal: Principal;
+  /** The company block: with includeCompany true on a task answer, or a complete scope-company answer. */
   company?: unknown;
-  tasks: Array<Record<string, unknown>>;
+  /** Whether a task answer carries the company block (AC-A: false unless includeCompany is true). */
+  companyIncluded?: boolean;
+  /** How to read the company block in pages: the get_context arguments that return it, one page at a time. */
+  companyRead?: { scope: 'company'; pageSize: number };
+  scope?: 'tasks' | 'company';
+  section?: 'directions' | 'goals' | 'projects';
+  parts?: CompanyPart[];
+  tasks?: Array<Record<string, unknown>>;
   page?: PageInfo;
 }
 

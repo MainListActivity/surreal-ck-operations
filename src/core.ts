@@ -11,8 +11,9 @@ import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
-import { TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
-import type { AdminSummary, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
+import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
+import { companyBlock, companyParts } from './company-context.ts';
+import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 
@@ -298,6 +299,10 @@ type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?
 interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
 
 const tooLarge = (message: string) => new CompanyError('response_too_large', message);
+/** The arguments that read the company block in pages, named in every task answer (SYS01 AC-A). */
+const COMPANY_READ = { scope: 'company' as const, pageSize: DEFAULT_PAGE_SIZE };
+/** Guidance when a task answer that carries the company block is too large: leave the block out, and read it on its own. */
+const COMPANY_PAGED_HINT = 'pass includeCompany false, and read the company block in pages with {"scope":"company","pageSize":25}';
 /** A complete answer: returned whole when it fits the budget as it is sent (answerBytes), refused otherwise. Never cut. */
 function completeOrRefuse<T>(value: T, what: string, guidance: string): T {
   const bytes = answerBytes(value);
@@ -1157,8 +1162,11 @@ export class SurrealCompanyCore implements CompanyCore {
   async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
     const actor = await this.authenticate(credential);
     const params = parseContextInput(input);
+    if (params.scope === 'company') return this.companyContextView(credential, actor, params);
+    // A task answer carries the company block only when includeCompany is true (AC-A). Every task answer says whether it does, and how
+    // the block is read in pages, so the directions are always one call away.
     const company = params.includeCompany ? await this.companyBrief(credential) : undefined;
-    const withCompany = company ? { company } : {};
+    const withCompany = { ...(company ? { company } : {}), companyIncluded: company !== undefined, companyRead: COMPANY_READ };
     if (params.taskId !== undefined) {
       if (params.cursor !== undefined) throw new CompanyError('invalid', 'a cursor pages a listing; one task is read without it');
       const task = await this.getTask(credential, params.taskId as TaskId);
@@ -1167,7 +1175,7 @@ export class SurrealCompanyCore implements CompanyCore {
         ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
       };
       return completeOrRefuse(view, `task ${task.id}`,
-        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? '; or pass includeCompany false to omit the company block' : ''}`);
+        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
     }
     if (!params.paged) {
       const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
@@ -1177,7 +1185,7 @@ export class SurrealCompanyCore implements CompanyCore {
         throw tooLarge(`the matching tasks hold ${textLength} characters of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
       }
       const view: ContextView = { principal: actor, ...withCompany, tasks: rows.map(row => listItem(row, params.fields, false)) };
-      return completeOrRefuse(view, `the working set (${rows.length} tasks)`, guidance);
+      return completeOrRefuse(view, `the working set (${rows.length} tasks)`, company ? `${guidance}; or ${COMPANY_PAGED_HINT}` : guidance);
     }
     const digest = queryDigest('context', {
       state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
@@ -1187,7 +1195,35 @@ export class SurrealCompanyCore implements CompanyCore {
       create: () => this.contextListing(actor, params, digest),
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
-      envelopeGuidance: company ? 'pass includeCompany false, which leaves the company block out of every page' : 'narrow the query with state, goalId, role or since',
+      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
+    });
+  }
+
+  /**
+   * get_context with scope company (SYS01 AC-A): the company block, complete or in stored pages. Without paging the block, or the one
+   * section named, is returned whole or refused. With paging it is one page of parts (company-context.ts): every part of every item
+   * is listed exactly once, in a stable order, and a part carries its item's length and SHA-256 so the reader can check the join.
+   */
+  private async companyContextView(credential: Credential, actor: Principal, params: ContextParams): Promise<ContextView> {
+    const brief = await this.companyBrief(credential);
+    const section = params.section;
+    const named = section === undefined ? {} : { section };
+    if (!params.paged) {
+      const view: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(brief, section) };
+      return completeOrRefuse(view, 'the company block',
+        'read it in pages: {"scope":"company","pageSize":25}, then {"scope":"company","pageSize":25,"cursor":"<page.nextCursor>"} until page.hasMore is false; or one section with "section"');
+    }
+    const digest = queryDigest('company', { section: section ?? null });
+    const takenAt = new Date().toISOString();
+    return this.listingPage<CompanyPart, ContextView>({
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
+      create: () => this.snapshots.create({
+        owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt,
+        bodies: companyParts(brief, section).map(part => JSON.stringify(part)),
+      }),
+      parse: body => JSON.parse(body) as CompanyPart,
+      respond: (parts, page) => ({ principal: actor, scope: 'company', ...named, parts: [...parts], page }),
+      envelopeGuidance: 'use a smaller pageSize',
     });
   }
 

@@ -105,8 +105,10 @@ function registerTools(server: McpServer, core: CompanyCore) {
     cursor: z.string().min(1).max(2048).nullish(),
   };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without pageSize or cursor the answer is complete (keys principal, company, tasks) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to true without paging and to false with it. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
+      scope: z.enum(['tasks', 'company']).nullish(),
+      section: z.enum(['directions', 'goals', 'projects']).nullish(),
       taskId: z.string().min(1).max(200).nullish(),
       state: z.enum(states).nullish(),
       goalId: z.string().min(1).max(100).nullish(),
@@ -119,10 +121,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => {
     const credential = token(ctx);
     if (!core.contextView) {
-      // Cores that predate SYS01 keep the single-shot listing.
+      // Cores that predate SYS01 keep the single-shot listing, with the same defaults: the company block only when includeCompany is true.
+      const withCompany = input.includeCompany === true;
       return run(credential, async () => ({
         principal: await core.authenticate(credential),
-        company: await core.companyBrief(credential),
+        companyIncluded: withCompany,
+        companyRead: { scope: 'company', pageSize: 25 },
+        ...(withCompany ? { company: await core.companyBrief(credential) } : {}),
         tasks: input.taskId ? [await core.getTask(credential, input.taskId)] : await core.listTasks(credential, input.state ?? undefined),
       }));
     }

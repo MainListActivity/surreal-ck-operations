@@ -239,17 +239,18 @@ test('legacy get_context answers whole when the set fits: the old keys, every ta
   const members = await workingIds(smallGoalId);
   expect(members.length).toBeGreaterThanOrEqual(3);
   const legacy = await core.contextView(gm, { goalId: smallGoalId });
-  expect(Object.keys(legacy).sort()).toEqual(['company', 'principal', 'tasks']);
+  expect(Object.keys(legacy).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
+  expect(legacy.companyIncluded).toBe(false);
   expect(legacy.page).toBeUndefined();
-  expect(legacy.tasks.map(task => String(task.id)).sort()).toEqual([...members].sort());
+  expect(legacy.tasks!.map(task => String(task.id)).sort()).toEqual([...members].sort());
   expect(bytesOf(legacy)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   // A complete answer carries whole contexts, never a preview: the long one of this goal is returned in full (C2, C3).
-  const long = legacy.tasks.find(task => String(task.context).startsWith('较长正文'));
+  const long = legacy.tasks!.find(task => String(task.context).startsWith('较长正文'));
   expect(long?.context).toBe(codePoints(1_500, '较长正文 '));
   expect(long?.contextTruncated).toBe(false);
   expect(long?.contextBytes).toBe(utf8(String(long?.context)));
   expect(long?.contextSha256).toBe(sha256(String(long?.context)));
-  expect(legacy.tasks.every(task => task.contextTruncated === false)).toBe(true);
+  expect(legacy.tasks!.every(task => task.contextTruncated === false)).toBe(true);
 });
 
 test('the company block is never trimmed: a legacy answer whose brief breaks the budget is refused, and a page carries it only on request (C2)', async () => {
@@ -257,10 +258,12 @@ test('the company block is never trimmed: a legacy answer whose brief breaks the
   const bulky = { directions: [], goals: [{ text: '超'.repeat(20_000) }], projects: [], paused: false } as never;
   try {
     core.companyBrief = async () => bulky;
-    await expectRefused(core.contextView(gm, { goalId: smallGoalId }), 'response_too_large', /budget/);
+    // AC-A: the block is not in a task answer by default, so the bulky block is only in an answer that asks for it.
+    expect((await core.contextView(gm, { goalId: smallGoalId })).companyIncluded).toBe(false);
+    await expectRefused(core.contextView(gm, { goalId: smallGoalId, includeCompany: true }), 'response_too_large', /budget/);
     const page = await core.contextView(gm, { goalId: smallGoalId, pageSize: 100 });
     expect(page).not.toHaveProperty('company');
-    expect(page.tasks.length).toBe(await workingIds(smallGoalId).then(ids => ids.length));
+    expect(page.tasks!.length).toBe(await workingIds(smallGoalId).then(ids => ids.length));
     await expectRefused(core.contextView(gm, { goalId: smallGoalId, pageSize: 5, includeCompany: true }), 'response_too_large', /budget/);
   } finally {
     core.companyBrief = original;
@@ -293,7 +296,7 @@ test('get_context by taskId returns the whole context when it fits, with its siz
     title: '中等正文样例', context: text, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key('medium'),
   });
   const detail = await core.contextView(gm, { taskId: task.id });
-  const view = detail.tasks[0]!;
+  const view = detail.tasks![0]!;
   expect(view.context).toBe(text);
   expect(view.contextBytes).toBe(utf8(text));
   expect(view.contextSha256).toBe(sha256(text));
@@ -376,7 +379,7 @@ test('a paged traversal yields every working-set task exactly once, each page in
     const page = await core.contextView(gm, { goalId, pageSize: 37, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     // Every item is whole unless it cannot fit a page on its own (C3). A cut item is flagged, and its size describes the full text.
-    for (const task of page.tasks) {
+    for (const task of page.tasks!) {
       if (task.contextTruncated === true) {
         expect(typeof task.contextNextOffset).toBe('number');
         expect(Number(task.contextBytes)).toBeGreaterThan(utf8(String(task.context)));
@@ -385,7 +388,7 @@ test('a paged traversal yields every working-set task exactly once, each page in
       expect(task.contextBytes).toBe(utf8(String(task.context)));
       expect(task.contextSha256).toBe(sha256(String(task.context)));
     }
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect(new Set(seen).size).toBe(seen.length);
   expect([...seen].sort()).toEqual([...expected].sort());
@@ -443,7 +446,7 @@ test('a page item larger than the page budget on its own is cut at a character b
     const page = await core.contextView(gm, { goalId: goal.id, pageSize: 3, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     items.push(...(page.tasks as Array<Record<string, unknown>>));
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect([...seen].sort()).toEqual([...expected].sort());
   const cut = items.find(task => task.id === big.id)!;
@@ -478,7 +481,7 @@ test('a page item of 18 KiB of text, 36 KiB in both copies of the answer, stays 
     const page = await core.contextView(gm, { goalId: goal.id, pageSize: 2, ...(cursor ? { cursor } : {}) });
     expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
     delivered.push(...(page.tasks as Array<Record<string, unknown>>));
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect([...seen].sort()).toEqual([...expected].sort());
   const whole = delivered.find(task => task.id === medium.id)!;
@@ -572,11 +575,11 @@ test('UTF-8 survives every page: Chinese titles and emoji parse back intact', as
   await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, pageSize: 100, ...(cursor ? { cursor } : {}) });
     const parsed = JSON.parse(JSON.stringify(page)) as typeof page;
-    for (const task of parsed.tasks) {
+    for (const task of parsed.tasks!) {
       expect(String(task.context)).not.toContain('�');
       titles.push(String(task.title));
     }
-    return { items: parsed.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    return { items: parsed.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect(titles.some(title => title.includes('分页样例') && title.includes('🙂'))).toBe(true);
 });
@@ -595,9 +598,9 @@ test('a traversal keeps its snapshot: rows created mid-way are excluded and in-p
   // Continue from the first page's cursor: the traversal started before the mid-way writes above.
   const rest = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, pageSize: 50, ...(cursor ? { cursor } : {}) });
-    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+    return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor);
-  const everything = [...first.tasks, ...rest];
+  const everything = [...first.tasks!, ...rest];
   const seen = everything.map(task => String(task.id));
   expect(new Set(seen).size).toBe(seen.length);
   expect(seen.every(taskId => snapshot.includes(taskId))).toBe(true);
@@ -626,7 +629,7 @@ test('cursors are bound to the caller and the query, are sealed, and expire with
   await expectRefused(core.contextView(gm, { goalId, pageSize: 10, cursor: expired }), 'snapshot_gone', /expired/);
   // The unmodified cursor still works for its own caller and query.
   const again = await core.contextView(gm, { goalId, pageSize: 10, cursor: token });
-  expect(again.tasks.length).toBeGreaterThan(0);
+  expect(again.tasks!.length).toBeGreaterThan(0);
 });
 
 test('a listing taken under one role is refused under another, and resumes once the role is back (C4)', async () => {
@@ -637,7 +640,7 @@ test('a listing taken under one role is refused under another, and resumes once 
   await expectRefused(core.contextView(gm, { goalId, pageSize: 5, cursor: token }), 'forbidden', /another role/);
   await database.db.query('UPDATE ONLY $record SET role = "gm";', { record });
   const resumed = await core.contextView(gm, { goalId, pageSize: 5, cursor: token });
-  expect(resumed.tasks.length).toBe(5);
+  expect(resumed.tasks!.length).toBe(5);
 });
 
 test('task history pages stay inside the budget and yield every entry once; evidence over the page budget is cut, flagged and reassembles (C2, C3, C4)', async () => {
@@ -782,13 +785,13 @@ test('state, role and time filters narrow the listing, and the cursor stays boun
   const readyDb = (readyRows ?? []).map(row => asId(row.id));
   const readySeen = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, state: 'ready', pageSize: 100, ...(cursor ? { cursor } : {}) });
-    expect(page.tasks.every(task => task.state === 'ready')).toBe(true);
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    expect(page.tasks!.every(task => task.state === 'ready')).toBe(true);
+    return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   expect([...readySeen].sort()).toEqual([...readyDb].sort());
   const engineering = await core.contextView(gm, { goalId, role: 'engineering', pageSize: 100 });
-  expect(engineering.tasks.every(task => task.executorRole === 'engineering' || task.reviewerRole === 'engineering')).toBe(true);
-  expect(engineering.tasks.length).toBeGreaterThan(0);
+  expect(engineering.tasks!.every(task => task.executorRole === 'engineering' || task.reviewerRole === 'engineering')).toBe(true);
+  expect(engineering.tasks!.length).toBeGreaterThan(0);
   const future = await core.contextView(gm, { goalId, since: new Date(Date.now() + 3_600_000).toISOString() });
   expect(future.tasks).toEqual([]);
   const someCursor = (await core.contextView(gm, { goalId, state: 'ready', pageSize: 5 })).page!.nextCursor!;
@@ -875,13 +878,13 @@ test('a caller that drops mid-traversal retries the same cursor on a fresh conne
   const relayed = await relay('get_context', { goalId, pageSize, cursor }, args => fresh.contextView(gm, args), dir);
   expect(relayed.exit).toBe(0);
   const page = JSON.parse(relayed.out) as { tasks: Array<{ id: unknown }>; page: { nextCursor?: string } };
-  expect(page.tasks.map(task => String(task.id))).toEqual(lost.tasks.map(task => String(task.id)));
+  expect(page.tasks!.map(task => String(task.id))).toEqual(lost.tasks!.map(task => String(task.id)));
   // Continuing from the retried page reaches every task of the listing exactly once.
   const rest = await drain(async next => {
     const more = await fresh.contextView(gm, { goalId, pageSize, ...(next ? { cursor: next } : {}) });
-    return { items: more.tasks.map(task => String(task.id)), nextCursor: more.page!.nextCursor };
+    return { items: more.tasks!.map(task => String(task.id)), nextCursor: more.page!.nextCursor };
   }, page.page.nextCursor);
-  const seen = [...first.tasks.map(task => String(task.id)), ...page.tasks.map(task => String(task.id)), ...rest];
+  const seen = [...first.tasks!.map(task => String(task.id)), ...page.tasks!.map(task => String(task.id)), ...rest];
   expect(new Set(seen).size).toBe(seen.length);
   expect([...seen].sort()).toEqual([...expected].sort());
 });
@@ -910,9 +913,9 @@ test('state moves, goal and role changes, and new tasks mid-traversal change not
   }
   const rest = await drain(async cursor => {
     const page = await core.contextView(gm, { goalId, pageSize: 40, ...(cursor ? { cursor } : {}) });
-    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+    return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor);
-  const delivered = [...first.tasks, ...rest];
+  const delivered = [...first.tasks!, ...rest];
   const seen = delivered.map(task => String(task.id));
   expect(new Set(seen).size).toBe(seen.length);
   expect([...seen].sort()).toEqual([...members].sort());
@@ -937,9 +940,9 @@ test('a full traversal keeps every page inside the budget; heap growth is a meas
     const started = performance.now();
     const page = await core.contextView(gm, { goalId, pageSize, ...(cursor ? { cursor } : {}) });
     const ms = performance.now() - started;
-    pages.push({ bytes: bytesOf(page), rows: page.tasks.length, ms });
+    pages.push({ bytes: bytesOf(page), rows: page.tasks!.length, ms });
     heapPeak = Math.max(heapPeak, process.memoryUsage().heapUsed);
-    return { items: page.tasks.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
+    return { items: page.tasks!.map(task => String(task.id)), nextCursor: page.page!.nextCursor };
   });
   Bun.gc(true);
   const heapAfter = process.memoryUsage().heapUsed;
@@ -1082,11 +1085,11 @@ test('concurrent traversals with writers: each listing is delivered exactly once
   // Each traversal continues from its own first page while the writers run.
   const rests = await Promise.all(firsts.map((first, index) => drain(async cursor => {
     const page = await core.contextView(gm, { goalId: concurrent.id, pageSize: sizes[index]!, ...(cursor ? { cursor } : {}) });
-    return { items: page.tasks, nextCursor: page.page!.nextCursor };
+    return { items: page.tasks ?? [], nextCursor: page.page!.nextCursor };
   }, first.page!.nextCursor)));
   await writers;
   firsts.forEach((first, index) => {
-    const delivered = [...first.tasks, ...rests[index]!];
+    const delivered = [...first.tasks!, ...rests[index]!];
     const seen = delivered.map(task => String(task.id));
     expect(new Set(seen).size).toBe(seen.length);
     expect([...seen].sort()).toEqual([...members].sort());
@@ -1137,7 +1140,7 @@ test('the real sidecar and comm client carry a traversal and the legacy answers,
     // Legacy answers through the same channel: whole when they fit, refused as JSON when they do not.
     const whole = await call('get_context', { goalId: smallGoalId });
     expect(whole.exit).toBe(0);
-    expect(Object.keys(JSON.parse(whole.out) as object).sort()).toEqual(['company', 'principal', 'tasks']);
+    expect(Object.keys(JSON.parse(whole.out) as object).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
     const refused = await call('get_context', { goalId });
     expect(refused.exit).toBe(1);
     expect(JSON.parse(refused.out)).toMatchObject({ ok: false });
@@ -1192,7 +1195,7 @@ test('a burst of first pages for one caller stays within its cap, and a listing 
   // Eight first pages at once under eight different queries: each is admitted in turn, never past the cap.
   const burst = await Promise.all(Array.from({ length: 8 }, (_, index) =>
     core.contextView(gm, { goalId, pageSize: 5, since: new Date(Date.now() - (index + 1) * 3_600_000).toISOString() })));
-  expect(burst.every(page => page.tasks.length === 5 && page.page!.hasMore)).toBe(true);
+  expect(burst.every(page => page.tasks!.length === 5 && page.page!.hasMore)).toBe(true);
   const [owned] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM query_snapshot WHERE owner = $owner GROUP ALL;', { owner: ids.gm });
   expect(owned?.[0]?.n ?? 0).toBeLessThanOrEqual(4);
   // The burst evicted the first listing: its next page is refused as gone, not answered with a short page.

@@ -583,14 +583,19 @@ export class SidecarPool {
       case "list_worktree_audits": return core.listWorktreeAudits
         ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
         : [];
-      // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the old keys (principal, company, tasks).
-      case "get_context":
+      // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the task keys; the company block is in an answer only
+      // when includeCompany is true (AC-A, the same default as core). A core without contextView answers the same keys.
+      case "get_context": {
         if (core.contextView) return core.contextView(cred, args);
+        const withCompany = args.includeCompany === true;
         return {
           principal: await core.authenticate(cred),
-          company: await core.companyBrief(cred),
+          companyIncluded: withCompany,
+          companyRead: { scope: "company", pageSize: 25 },
+          ...(withCompany ? { company: await core.companyBrief(cred) } : {}),
           tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, (args.state ?? undefined) as never),
         };
+      }
       case "get_task_history": {
         // C2 default: without pageSize or cursor (null counts as absent) the complete history, or response_too_large, in the pre-SYS01 { history } shape of this channel.
         const taskId = taskIdOf(args.taskId);

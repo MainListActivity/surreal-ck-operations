@@ -349,7 +349,7 @@ describe('sidecar', () => {
     // get_context: null filters and a null task id are absent (legacy keys: this stub core has no contextView).
     const context = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n4', 'get_context', { taskId: null, state: null, pageSize: null, cursor: null });
     expect(context.ok).toBe(true);
-    expect(Object.keys(context.data as object).sort()).toEqual(['company', 'principal', 'tasks']);
+    expect(Object.keys(context.data as object).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
     // resume_task: a null task id is refused, and core never sees the string "null".
     const resume = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n5', 'resume_task', { taskId: null });
     expect(resume.ok).toBe(false);
