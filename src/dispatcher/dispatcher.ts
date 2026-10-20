@@ -235,7 +235,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const independenceBlock = (employee: string | undefined, def: string | undefined): Block | undefined => {
     const scope = p.independence;
     if (!scope) return undefined;
-    if (scope.kind === 'unverifiable') return ['unknown', BLOCK_TEXT.unknown];
+    if (scope.kind === 'unverifiable') {
+      // A named source says whose history cannot be read: the candidate is unknown, never clear and never busy.
+      return ['unknown', scope.source === undefined ? BLOCK_TEXT.unknown
+        : `来源任务 ${scope.source} 的贡献者历史读取失败或不存在，不能判定独立性（不视为忙），恢复后自动重判`];
+    }
     const hit = independenceHit(scope.index, employee, def);
     return hit ? ['independence_conflict', independenceText(hit)] : undefined;
   };

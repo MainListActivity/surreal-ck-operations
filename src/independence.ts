@@ -100,8 +100,11 @@ export interface IndependenceIndex {
   byDef: Map<string, IndependenceHit>;
 }
 
-/** What one stage of one task reads: the exclusion, or unverifiable when a source could not be read. Unverifiable never means clear. */
-export type IndependenceScope = { kind: 'index'; index: IndependenceIndex } | { kind: 'unverifiable'; reason: string };
+/**
+ * What one stage of one task reads: the exclusion, or unverifiable when a source could not be read. Unverifiable never means clear.
+ * `source` names the source task whose history is unreadable or missing, when the failure can be pinned to one source.
+ */
+export type IndependenceScope = { kind: 'index'; index: IndependenceIndex } | { kind: 'unverifiable'; reason: string; source?: TaskId };
 
 /** Contributors of a source for the policy mode. `execute_handlers` is every execute-phase handler; `all_handlers` adds the reviewers. */
 function contributorsOf(facts: ContributionFacts, mode: IndependenceMode): Array<[EmployeeId, ContributorRole]> {
@@ -185,7 +188,7 @@ async function readSource(db: Surreal, taskId: TaskId, hook?: (taskId: TaskId) =
     await hook?.(taskId);
     return await readContributionView(db, taskId);
   } catch {
-    throw new CompanyError('temporarily_unavailable', `Independence source history unreadable: ${taskId}; retry`, true);
+    throw new CompanyError('temporarily_unavailable', `Independence source history unreadable: ${taskId}; retry`, true, { source: taskId });
   }
 }
 
@@ -199,7 +202,7 @@ export async function readIndependenceSnapshot(db: Surreal, policy: Independence
   const sources: IndependenceSnapshot['sources'] = [];
   for (const taskId of policy.sources) {
     const view = await readSource(db, taskId, hook);
-    if (view.version === undefined) throw new CompanyError('not_found', `Independence source not found: ${taskId}`);
+    if (view.version === undefined) throw new CompanyError('not_found', `Independence source not found: ${taskId}`, false, { source: taskId });
     sources.push({ taskId, version: view.version, facts: view.facts });
   }
   const employees = unique([...policy.excluded, ...sources.flatMap(source => [...source.facts.excluded, ...source.facts.reviewers])]);
@@ -223,7 +226,8 @@ export async function readIndependenceScope(db: Surreal, policy: IndependencePol
   try {
     return { kind: 'index', index: (await readIndependenceSnapshot(db, policy)).index };
   } catch (error) {
-    return { kind: 'unverifiable', reason: error instanceof Error ? error.message : String(error) };
+    const source = error instanceof CompanyError ? error.details?.source : undefined;
+    return { kind: 'unverifiable', reason: error instanceof Error ? error.message : String(error), ...(typeof source === 'string' ? { source } : {}) };
   }
 }
 

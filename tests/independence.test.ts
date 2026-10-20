@@ -139,3 +139,12 @@ test('dispatch: an unreadable source history blocks every candidate as unknown, 
   expect(entries.every(e => e.code === 'unknown')).toBe(true);
   expect(entries[0]!.reason).toBe(BLOCK_TEXT.unknown);
 });
+
+test('dispatch: an unreadable source names itself in the candidate reason, and still blocks every candidate as unknown', () => {
+  const entries = staffingPool(base({
+    defs: [def('eng-claude')], insts: [inst('t-indep')], states: new Map([['t-indep', 'idle']]),
+    independence: { kind: 'unverifiable', reason: 'Independence source history unreadable: P; retry', source: 'P' },
+  }));
+  expect(entries.every(e => !e.eligible && e.code === 'unknown')).toBe(true);
+  expect(entries[0]!.reason).toContain('来源任务 P');
+});

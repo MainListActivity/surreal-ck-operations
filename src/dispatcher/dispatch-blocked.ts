@@ -326,13 +326,18 @@ function quotaUntil(list: readonly EvaluatedEntry[]): string | undefined {
 /** The repository a verdict is about, by its name: the last segment of its home path. */
 export const repoName = (home: string) => home.split('/').filter(Boolean).pop() ?? home;
 
-/** Owner-facing text of one reason. Quota and seat reasons read their candidates, so the verdict states the facts it rests on. */
+/** The distinct owner-facing reasons of a group's candidates, sorted, so a repeated tick reads the same. */
+const detailsOf = (list: readonly EvaluatedEntry[]): string =>
+  [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；');
+
+/**
+ * Owner-facing text of one reason. Quota, seat and independence reasons read their candidates, so the verdict states the facts it
+ * rests on: an independence conflict names its source task and excluded employee, and an unreadable source names itself.
+ */
 function reasonText(code: BlockCode, list: readonly EvaluatedEntry[], until: string | undefined, home: string): string {
   if (code === 'quota') return `${BLOCK_TEXT.quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
-  if (code === 'seat_full') {
-    return [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；')
-      || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
-  }
+  if (code === 'seat_full') return detailsOf(list) || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
+  if (code === 'independence_conflict' || code === 'unknown') return detailsOf(list) || BLOCK_TEXT[code];
   return BLOCK_TEXT[code];
 }
 

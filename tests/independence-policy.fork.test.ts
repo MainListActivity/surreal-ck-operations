@@ -11,6 +11,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { independenceHit, readIndependenceSnapshot, type IndependenceScope } from '../src/independence.ts';
 import { Workforce, type EmployeeDef, type EmployeeInst, type SupervisedTask } from '../src/workforce.ts';
 import { staffingPool, type InstState } from '../src/dispatcher/dispatcher.ts';
+import { dispatchNoticeText, evaluateDispatch } from '../src/dispatcher/dispatch-blocked.ts';
 import type { ClaimResult, SetIndependence } from '../src/contracts.ts';
 
 // SYS-DISP IR01-IR05 on the real core and the company fork. A dependent task (an independent review) is never taken, submitted or
@@ -351,4 +352,60 @@ test('an unreadable source history refuses the submit fail-closed: the lease sta
   expect(await core.getTask(tokens.gm, dependent.id)).toMatchObject({ state: 'doing', currentEmployee: 't-indep', version: before.version });
 
   expect((await core.submit(tokens.indep, proofOf(claimed), { text: EVIDENCE, idempotencyKey: key() })).state).toBe('review');
+});
+
+test('a policy version this build does not read fails closed: the claim is refused and every candidate reads as unknown', async () => {
+  const parent = await engineering('parent under a policy version this build does not read');
+  const dependent = await engineering('dependent whose stored policy version is unknown');
+  await setPolicy(dependent.id, [parent.id]);
+  await database.db.query('UPDATE ONLY $task SET independence.schema = 2;', { task: new RecordId('task', dependent.id) });
+
+  const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
+  expect(refusal.code).toBe('forbidden');
+  expect(refusal.message).toContain('not understood');
+  expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+
+  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  expect(scope).toMatchObject({ kind: 'unverifiable' });
+  const entries = pool({ id: dependent.id } as unknown as SupervisedTask, scope);
+  expect(entries.length).toBeGreaterThan(0);
+  expect(entries.every(entry => !entry.eligible && entry.code === 'unknown')).toBe(true);
+});
+
+test('a source record that no longer exists refuses the claim as not found, and the verdict names that source', async () => {
+  const gone = 'task-source-removed';
+  const parent = await engineering('parent whose record is removed after the policy');
+  const dependent = await engineering('dependent whose source record is gone');
+  await setPolicy(dependent.id, [parent.id]);
+  await database.db.query('UPDATE ONLY $task SET independence.sources = [$gone];', { task: new RecordId('task', dependent.id), gone });
+
+  const refusal = await failureOf(core.claim(tokens.indep, dependent.id));
+  expect(refusal.code).toBe('not_found');
+  expect(refusal.message).toContain(gone);
+  expect((await core.getTask(tokens.gm, dependent.id)).currentEmployee).toBeUndefined();
+
+  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  expect(scope).toMatchObject({ kind: 'unverifiable', source: gone });
+  const verdict = evaluateDispatch({ taskId: dependent.id, title: 'dependent', phase: 'execute', role: 'engineering', home: '/ops/repo',
+    entries: pool({ id: dependent.id } as unknown as SupervisedTask, scope), checkedAt: 1_000_000 });
+  expect(verdict).toMatchObject({ dispatchable: false, feasible: false });
+  expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'unknown' })]);
+  expect(verdict.reasons[0]!.text).toContain(gone);
+});
+
+test('the verdict and its notice name the source task and each excluded candidate, read from the stored policy', async () => {
+  const parent = await engineering('parent whose contributor the verdict must name');
+  await authorParent('src', parent.id);
+  const dependent = await engineering('dependent whose excluded candidates are the only ones left');
+  await setPolicy(dependent.id, [parent.id]);
+  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  // Only the excluded candidates are left in the pool, so the verdict must say why none of them can take the task.
+  const excluded = pool({ id: dependent.id } as unknown as SupervisedTask, scope).filter(entry => !entry.eligible);
+  const verdict = evaluateDispatch({ taskId: dependent.id, title: 'dependent', phase: 'execute', role: 'engineering', home: '/ops/repo',
+    entries: excluded, checkedAt: 1_000_000 });
+  expect(verdict).toMatchObject({ dispatchable: false, feasible: false });
+  expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'independence_conflict', candidates: expect.arrayContaining(['t-src', 't-alias']) })]);
+  expect(verdict.reasons[0]!.text).toContain(parent.id);
+  expect(verdict.reasons[0]!.text).toContain('t-src');
+  expect(dispatchNoticeText(verdict)).toContain(parent.id);
 });
