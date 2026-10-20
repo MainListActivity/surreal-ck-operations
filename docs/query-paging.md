@@ -48,7 +48,7 @@
 
 | 工具 | 参数 | 旧调用（不带 pageSize、cursor） | 分页调用（带 pageSize 或 cursor） | 权限 |
 |---|---|---|---|---|
-| `get_context` | `taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | `{ principal, company?, tasks }`，完整或拒绝 | `{ principal, company?, tasks, page }` | 员工见自己可见的任务；gm 见全部 |
+| `get_context` | `scope?`（`tasks` 缺省，或 `company`）、`section?`（仅 `scope: company`，`directions`、`goals`、`projects`）、`taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`（缺省 `false`）、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | 任务：`{ principal, companyIncluded, companyRead, tasks, company? }`，完整或拒绝；`scope: company`：`{ principal, scope, section?, company }`，完整或拒绝 | 任务：`{ principal, companyIncluded, companyRead, tasks, company?, page }`；`scope: company`：`{ principal, scope, section?, parts, page }` | 员工见自己可见的任务；gm 见全部；公司块对所有已认证身份可读 |
 | `get_task_history` | `taskId`、`pageSize?`、`cursor?` | 通道为 `{ history }`，MCP 为裸数组（与 `8d03d35` 相同）；均为完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
 | `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 非 gm 须带 taskId（缺省或 null 一律 `forbidden`）；gm 可全局 |
 | `read_task_text` | `taskId`、`field`（`context`、`evidence`、`project`、`dependencies`、`workIntentPaths`、`worktreePaths`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | 无 | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
@@ -58,7 +58,8 @@
 
 - `get_context` 缺省的工作集是 `ready`、`doing`、`review`、`blocked`，并排除调用人自己提交的 `review` 任务（`taskRowsAt` 中的 `NOT (state = 'review' AND submitted_by = $me)`）。`state` 给定时只看该状态。`since` 按任务创建时间（`created_at`）下限过滤。`since`（`get_context` 与 `get_admin_summary` 同此口径）只接受 ISO 8601 日期（按 UTC 零点）或带时区的时间（`Z` 或 `±hh:mm`），查询前归一为 UTC 的 `toISOString()` 形式。`October 19, 2026`、`2026/10/19`、RFC 2822 日期、无时区的时间与不存在的日期（如 `2026-02-30`）返回 `invalid`，不再误报为可重试的 `temporarily_unavailable`（F3）。
 - `fields` 只能选白名单内的字段，未知字段返回 `invalid`。
-- `includeCompany` 缺省值取决于调用形态：旧调用缺省包含 `company` 块，分页调用缺省不包含，需显式传 `includeCompany: true`。
+- `includeCompany` 缺省为 `false`（显式 `false` 同义），旧调用与分页调用一致，不随任务答复返回公司块。每个任务答复都带 `companyIncluded`（本答复是否含 `company`）与 `companyRead`（读取公司块的参数 `{"scope":"company","pageSize":25}`）。`includeCompany: true` 只在整包装得下时返回公司块，否则整体拒绝并指路分页。
+- 公司块读取（`scope: company`，AC-A）：不带 `pageSize`、`cursor` 时返回完整块（或 `section` 指定的一节），超预算则 `response_too_large`。带 `pageSize` 或 `cursor` 时返回一页条目段 `parts`：每段是某一条目（`meta`、`directions`、`goals`、`projects` 的一项）的 JSON 文本的一段，不超过 16 KiB，带 `offset`、`totalBytes`、`sha256`（整条目 JSON 的 UTF-8 字节数与 SHA-256）。读取方按 `section` 与 `key` 归组，按 `part` 升序拼接 `json`，校验拼接后的字节数与 `sha256` 后再解析；缺段、重复段或校验不符即拒绝，不得当作较短的条目。逐页续读直到 `page.hasMore` 为 false。游标绑定调用人与查询条件（`section`），他人或其它查询使用返回 `forbidden`，篡改返回 `invalid`，过期返回 `snapshot_gone`。
 - `taskId` 读取整条任务，`context` 完整返回，并附 `contextBytes` 与 `contextSha256`。超出预算时拒绝，并给出 `read_task_text` 的读取示例。与 `cursor` 同用会返回 `invalid`。
 - 旧调用的完整集合上限：任务 500 条，历史 1000 条。超过即拒绝为 `response_too_large`，并给出 `pageSize` 与 `cursor` 的重试示例。
 - `page` 字段：`pageSize`、`returned`、`hasMore`、`total`（快照内的总条数）、`snapshotAt`（快照读取时刻的数据库时间）、`budgetBytes`，以及 `hasMore` 为真时的 `nextCursor`。
@@ -148,7 +149,7 @@ null 语义（MCP、sidecar 与核心一致）：
 按经理裁决 v15：
 
 - C1（`list_worktrees`）：旧调用保留数组形态，且必须是完整集合。超预算时拒绝，不截断。显式分页返回 `{ worktrees, page }`。
-- C2（`get_context`、`get_task_history` 旧调用）：完整或明确失败。超预算不返回第一页，不返回不完整的列表。公司块不被裁剪，超预算时整体拒绝，并提示改用分页或 `includeCompany: false`。
+- C2（`get_context`、`get_task_history` 旧调用）：完整或明确失败。超预算不返回第一页，不返回不完整的列表。任务答复缺省不含公司块（`includeCompany` 缺省 `false`），公司块的大小不会让任务查询超限。公司块本身不被裁剪：整块超预算时对 `scope: company` 整体拒绝，并指向 `{"scope":"company","pageSize":25}` 分页读取。
 - C3（旧详情与历史）：整体不超过 48 KiB 时完整返回全文，包括超过 16 KiB 的 `context` 与证据。超出时拒绝，并给出 `read_task_text` 的入口（`taskId`、`field`、`auditId`）与分段、sha256 重组的方法。旧调用不返回预览。
 - C4（状态过滤遍历）：采用不可变快照，成员在首页时刻固定（第 4 节）。
 - C5（汇总）：按第 5 节的口径。`tasks` 为截止时刻的存量，`audit` 为 `[since, cutoffAt]`。

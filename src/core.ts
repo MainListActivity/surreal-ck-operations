@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { RecordId } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
@@ -14,7 +14,7 @@ import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoT
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
-import { SnapshotStore, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
+import { SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits } from './snapshot-store.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -372,7 +372,7 @@ export class SurrealCompanyCore implements CompanyCore {
   readonly checkpointLimit: number;
   /** Optional pre-submit check of implementation deliveries; returns why the submission cannot go to review. */
   private readonly submitCheck?: SubmitCheck;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits> }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void }) {
     this.submitCheck = options?.submitCheck;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
@@ -384,7 +384,7 @@ export class SurrealCompanyCore implements CompanyCore {
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
-    this.snapshots = new SnapshotStore(database.db, options?.snapshots);
+    this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, observe: options?.snapshotObserve });
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -960,11 +960,11 @@ export class SurrealCompanyCore implements CompanyCore {
    * Audit entries of one task, newest first, read in one consistent read with the database time. Routine ops_call
    * reads are not audit history and are left out of every history answer.
    */
-  private async historyRowsAt(taskId: TaskId, limit: number): Promise<{ at: string; rows: AuditHistoryRow[] }> {
+  private async historyRowsAt(taskId: TaskId, limit: number, db?: Surreal): Promise<{ at: string; rows: AuditHistoryRow[] }> {
     return this.consistentRead<{ at: string; rows: AuditHistoryRow[] }>(`LET $at = <string>time::now();
       LET $rows = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
         WHERE task = $task AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $limit);
-      RETURN { read: { at: $at, rows: $rows } };`, { task: id('task', taskId), limit });
+      RETURN { read: { at: $at, rows: $rows } };`, { task: id('task', taskId), limit }, db);
   }
 
   /**
@@ -1029,10 +1029,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * Runs `statements`, which end in RETURN { read: … }, inside one BEGIN…COMMIT and returns that value, so every row and
    * time in it comes from one database state. A failed statement is retryable.
    */
-  private async consistentRead<T>(statements: string, vars: Record<string, unknown>): Promise<T> {
+  private async consistentRead<T>(statements: string, vars: Record<string, unknown>, db: Surreal = this.db): Promise<T> {
     let responses;
     try {
-      responses = await this.db.query<unknown[]>(`BEGIN TRANSACTION;\n${statements}\nCOMMIT TRANSACTION;`, vars).responses();
+      responses = await db.query<unknown[]>(`BEGIN TRANSACTION;\n${statements}\nCOMMIT TRANSACTION;`, vars).responses();
     } catch {
       throw new CompanyError('temporarily_unavailable', 'read did not complete; retry', true);
     }
@@ -1048,7 +1048,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * read. The read counts the matches and the characters of their context first; the whole rows are read only when that
    * length is within `cap` (bytes are never fewer than characters), so a read that will be refused never loads the text.
    */
-  private async taskRowsAt(actor: Principal, params: ContextParams, limit: number, cap: number):
+  private async taskRowsAt(actor: Principal, params: ContextParams, limit: number, cap: number, db?: Surreal):
     Promise<{ at: string; count: number; textLength: number; rows: TaskRow[] }> {
     const where: string[] = [
       params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']",
@@ -1077,7 +1077,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $n = array::len($probe);
       LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textLength) END;
       LET $full = IF $n = 0 OR $total > $cap THEN [] ELSE (SELECT * FROM task WHERE id IN $probe.id ORDER BY created_at DESC, id DESC) END;
-      RETURN { read: { at: $at, count: $n, textLength: $total, rows: $full } };`, vars);
+      RETURN { read: { at: $at, count: $n, textLength: $total, rows: $full } };`, vars, db);
     const count = Number(read.count ?? 0);
     const textLength = Number(read.textLength ?? 0);
     const rows = read.rows ?? [];
@@ -1088,17 +1088,23 @@ export class SurrealCompanyCore implements CompanyCore {
     return { at: read.at, count, textLength, rows };
   }
 
-  /** Stores the working set as a context listing. Its membership and its projection are fixed by this one read. */
+  /**
+   * Stores the working set as a context listing. Its membership and its projection are fixed by one read, which runs on the
+   * build channel inside the build deadline (SYS01 AC-D): the main connection stays free for control requests meanwhile.
+   */
   private async contextListing(actor: Principal, params: ContextParams, digest: string): Promise<SnapshotHeader> {
     const { limits } = this.snapshots;
-    const { at, count, textLength, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes);
-    if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
-    if (textLength > limits.maxBytes) {
-      throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
-    }
-    return this.snapshots.create({
-      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt: at,
-      bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))),
+    return this.snapshots.build({
+      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '',
+      guidance: 'narrow with state, goalId, role or since, or leave fields out',
+      load: async db => {
+        const { at, count, textLength, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
+        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
+        if (textLength > limits.maxBytes) {
+          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
+        }
+        return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
+      },
     });
   }
 
@@ -1219,7 +1225,7 @@ export class SurrealCompanyCore implements CompanyCore {
       actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor,
       create: () => this.snapshots.create({
         owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt,
-        bodies: companyParts(brief, section).map(part => JSON.stringify(part)),
+        bodies: companyParts(brief, section).map(part => JSON.stringify(part)), guidance: 'read one section with section',
       }),
       parse: body => JSON.parse(body) as CompanyPart,
       respond: (parts, page) => ({ principal: actor, scope: 'company', ...named, parts: [...parts], page }),
@@ -1239,14 +1245,18 @@ export class SurrealCompanyCore implements CompanyCore {
     const digest = queryDigest('history', { taskId });
     return this.listingPage<HistoryEntry, HistoryPageView>({
       actor, kind: 'history', digest, pageSize: params.pageSize, cursor: params.cursor,
-      create: async () => {
-        const { at, rows } = await this.historyRowsAt(taskId, this.snapshots.limits.maxRows + 1);
-        if (rows.length > this.snapshots.limits.maxRows) {
-          throw tooLarge(`task ${taskId} has more than ${this.snapshots.limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
-        }
-        return this.snapshots.create({
-          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '', takenAt: at,
-          bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))),
+      create: () => {
+        const { limits } = this.snapshots;
+        return this.snapshots.build({
+          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '',
+          guidance: 'read the evidence of large entries with read_task_text',
+          load: async db => {
+            const { at, rows } = await this.historyRowsAt(taskId, limits.maxRows + 1, db);
+            if (rows.length > limits.maxRows) {
+              throw tooLarge(`task ${taskId} has more than ${limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
+            }
+            return { takenAt: at, bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))) };
+          },
         });
       },
       parse: body => JSON.parse(body) as HistoryEntry,
@@ -1274,7 +1284,7 @@ export class SurrealCompanyCore implements CompanyCore {
         }
         return this.snapshots.create({
           owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt,
-          bodies: inventory.map(item => JSON.stringify(item)),
+          bodies: inventory.map(item => JSON.stringify(item)), guidance: 'narrow with taskId',
         });
       },
       parse: body => JSON.parse(body) as Record<string, unknown>,

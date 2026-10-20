@@ -176,9 +176,57 @@ export class CompanyDatabase {
     return this.reconnecting;
   }
 
+  private buildSocket: Surreal | undefined;
+  private buildOpening: Promise<Surreal> | undefined;
+
+  /**
+   * The channel snapshot builds run on (SYS01 AC-D): a second socket to the same namespace and database. A large build then
+   * never queues ahead of control requests on the main socket. The socket is probed before each build and reopened when the
+   * probe fails; abort drops it with whatever it is still waiting for.
+   */
+  readonly buildChannel = {
+    connection: (): Promise<Surreal> => this.openBuildConnection(),
+    abort: (): Promise<void> => this.dropBuildConnection(),
+  };
+
+  private openBuildConnection(): Promise<Surreal> {
+    this.buildOpening ??= this.connectBuildSocket().finally(() => { this.buildOpening = undefined; });
+    return this.buildOpening;
+  }
+
+  private async connectBuildSocket(): Promise<Surreal> {
+    const current = this.buildSocket;
+    if (current) {
+      try {
+        await CompanyDatabase.withTimeout(current.query('INFO FOR DB;'), 5_000, 'build probe');
+        return current;
+      } catch {
+        await this.dropBuildConnection();
+      }
+    }
+    const socket = new Surreal();
+    await CompanyDatabase.withTimeout(this.openSocket(socket), 15_000, 'build connect');
+    this.buildSocket = socket;
+    return socket;
+  }
+
+  private async openSocket(socket: Surreal): Promise<void> {
+    await socket.connect(this.config.url, {
+      authentication: { username: this.config.rootUser, password: this.config.rootPassword },
+    });
+    await socket.use({ namespace: this.config.namespace, database: this.config.database });
+  }
+
+  private async dropBuildConnection(): Promise<void> {
+    const socket = this.buildSocket;
+    this.buildSocket = undefined;
+    if (socket) await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'build close').catch(() => {});
+  }
+
   async close(): Promise<void> {
     clearInterval(this.keepalive);
     this.keepalive = undefined;
+    await this.dropBuildConnection();
     // engine.close() awaits a 'disconnected' event that never arrives when the peer
     // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
     await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});

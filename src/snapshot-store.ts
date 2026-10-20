@@ -10,6 +10,11 @@
 // change makes it read again. A reservation counts toward the caps from the moment it is made, so a listing still being
 // written holds its room. A release deletes a listing and subtracts it in one transaction, and subtracts only when that
 // delete found the listing, so every listing is released exactly once.
+//
+// A build (SYS01 AC-D) runs on a channel: a connection of its own, so a large build never queues ahead of control requests
+// on the main connection. Reads, pages, releases and sweeps stay on the main connection. A build has a deadline
+// (buildDeadlineMs). Past it no further statement is started, the statement in flight gets a short wait to finish, the
+// channel is dropped if it is still running, what was reserved is released, and the caller gets temporarily_unavailable.
 import { randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
@@ -34,6 +39,10 @@ export interface SnapshotLimits {
   buildTimeoutMs: number;
   /** A reservation whose owner holds only listings still being written waits this long for one to commit. */
   reserveWaitMs: number;
+  /** UTF-8 bytes written per transaction while a listing is stored. A smaller batch holds the channel for less time per statement. */
+  batchBytes: number;
+  /** Wall-clock time one listing build may take, from its first read to its commit. Past it the build is cancelled (see build). */
+  buildDeadlineMs: number;
 }
 
 export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
@@ -45,7 +54,39 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   maxTotalBytes: 64 * 1024 * 1024,
   buildTimeoutMs: 5 * 60 * 1000,
   reserveWaitMs: 5 * 1000,
+  batchBytes: 64 * 1024,
+  buildDeadlineMs: 10 * 1000,
 };
+
+/** The connection a build runs on. The store asks for it at the start of each build, and drops it when a build is cancelled. */
+export interface SnapshotChannel {
+  connection(): Promise<Surreal>;
+  /** Drops the connection with whatever it is still waiting for; the next build opens a new one. */
+  abort(): Promise<void>;
+}
+
+export interface SnapshotStoreOptions {
+  /** Where builds run. The default is the store's own connection. */
+  channel?: SnapshotChannel;
+  /** Told what every build cost, stored or not. Used by the measurements; a listing's contents are never passed on. */
+  observe?: (stats: SnapshotBuildStats) => void;
+}
+
+/** What one build cost: client phase times, the server's time for its statements, and what it stored or why it stopped. */
+export interface SnapshotBuildStats {
+  outcome: 'stored' | 'timed_out' | 'refused' | 'failed';
+  kind: SnapshotKind;
+  rows: number;
+  bytes: number;
+  batches: number;
+  loadMs: number;
+  reserveMs: number;
+  writeMs: number;
+  commitMs: number;
+  totalMs: number;
+  /** Sum of the server's own durations for the statements of this build (query statistics), in milliseconds. */
+  serverMs: number;
+}
 
 export interface SnapshotHeader {
   id: string;
@@ -102,13 +143,18 @@ interface HeaderRow {
 
 interface QuotaRow { listings: number; bytes: number; version: number; seq: number }
 
+/** Server-side time of the statements in one build, added up as they run. */
+interface BuildAccount { serverMs: number; batches: number }
+/** Set when a build is cancelled, so that no further batch is started. */
+interface BuildSignal { cancelled: boolean }
+
 const QUOTA = new RecordId('query_snapshot_quota', 'global');
-/** Rows are written in statements of at most this many bytes, well under the request body limit. */
-const BATCH_BYTES = 512 * 1024;
 /** Reservations, and releases, tried before the caller is told to retry. Each try reads the quota again. */
 const RESERVE_ATTEMPTS = 50;
 /** How long one transaction keeps retrying after a concurrent write conflicts with it. */
 const TRANSACTION_WAIT_MS = 10 * 1000;
+/** A cancelled build gives the statement it has in flight this long to finish before the channel is dropped. */
+const CLEANUP_WAIT_MS = 2 * 1000;
 
 const headerOf = (row: HeaderRow): SnapshotHeader => ({
   id: String(row.id.id), owner: row.owner, kind: row.kind, digest: row.digest, role: row.role,
@@ -116,14 +162,21 @@ const headerOf = (row: HeaderRow): SnapshotHeader => ({
 });
 
 const unavailable = (message: string) => new CompanyError('temporarily_unavailable', message, true);
+const timedOut = (deadlineMs: number, guidance: string) => new CompanyError('temporarily_unavailable',
+  `the listing was not built within ${Math.round(deadlineMs / 1000)} seconds, so it was cancelled and nothing was kept; ${guidance}, then retry`, true);
 const pause = () => Bun.sleep(1 + Math.floor(Math.random() * 8));
+/** Milliseconds of server time in one statement's query statistics. */
+const serverMsOf = (stats: { duration?: { nanoseconds?: bigint } } | undefined): number =>
+  Number(stats?.duration?.nanoseconds ?? 0) / 1_000_000;
 
 export class SnapshotStore {
   readonly limits: SnapshotLimits;
   private quotaReady?: Promise<void>;
+  private readonly channel: SnapshotChannel;
 
-  constructor(private readonly db: Surreal, limits: Partial<SnapshotLimits> = {}) {
+  constructor(private readonly db: Surreal, limits: Partial<SnapshotLimits> = {}, private readonly options: SnapshotStoreOptions = {}) {
     this.limits = { ...DEFAULT_SNAPSHOT_LIMITS, ...limits };
+    this.channel = options.channel ?? { connection: async () => db, abort: async () => undefined };
   }
 
   /**
@@ -131,24 +184,100 @@ export class SnapshotStore {
    * (response_too_large) rather than stored partly. A write that fails part-way releases what it reserved.
    */
   async create(input: {
-    owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; bodies: readonly string[];
+    owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; bodies: readonly string[]; guidance?: string;
   }, now = Date.now()): Promise<SnapshotHeader> {
-    const bytes = input.bodies.reduce((sum, body) => sum + utf8Bytes(body), 0);
-    const reservation = await this.begin({
-      owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, takenAt: input.takenAt,
-      rows: input.bodies.length, bytes,
+    return this.build({
+      owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, guidance: input.guidance ?? 'narrow the query',
+      load: async () => ({ takenAt: input.takenAt, bodies: input.bodies }),
     }, now);
-    try {
-      await this.writeRows(reservation, input.bodies);
-      await this.commit(reservation);
-    } catch (error) {
-      await this.release(reservation.id);
-      throw error instanceof CompanyError ? error : unavailable('the listing could not be stored; retry the read');
-    }
-    return {
-      id: reservation.id, owner: reservation.owner, kind: reservation.kind, digest: reservation.digest, role: reservation.role,
-      rows: reservation.rows, bytes: reservation.bytes, takenAt: reservation.takenAt, expiresMs: reservation.expiresMs,
+  }
+
+  /**
+   * Builds a listing. `load` reads its rows on the channel and returns them with the time they were read at. The whole build
+   * (the read, the reservation, every batch and the commit) must finish within buildDeadlineMs. Past that deadline no further
+   * statement is started; the one in flight gets CLEANUP_WAIT_MS to finish, and the channel is dropped if it has not; what was
+   * reserved is released; and the caller gets temporarily_unavailable, with `guidance` on how to narrow the query. Errors
+   * from `load` (for example response_too_large) pass through unchanged.
+   */
+  async build(input: {
+    owner: string; kind: SnapshotKind; digest: string; role: string; guidance: string;
+    load: (db: Surreal) => Promise<{ takenAt: string; bodies: readonly string[] }>;
+  }, now = Date.now()): Promise<SnapshotHeader> {
+    const started = performance.now();
+    const id = randomUUID();
+    const account: BuildAccount = { serverMs: 0, batches: 0 };
+    const stats: SnapshotBuildStats = {
+      outcome: 'failed', kind: input.kind, rows: 0, bytes: 0, batches: 0, loadMs: 0, reserveMs: 0, writeMs: 0, commitMs: 0, totalMs: 0, serverMs: 0,
     };
+    const signal: BuildSignal = { cancelled: false };
+    const state = { expired: false, reserved: false };
+    // The step in flight: `done` turns true when it settles, whatever its outcome.
+    const flight = { done: true, settled: Promise.resolve() };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        state.expired = true;
+        signal.cancelled = true;
+        reject(timedOut(this.limits.buildDeadlineMs, input.guidance));
+      }, this.limits.buildDeadlineMs);
+    });
+    expired.catch(() => undefined);
+    const within = <T>(work: Promise<T>): Promise<T> => {
+      flight.done = false;
+      flight.settled = work.then(() => undefined, () => undefined).then(() => { flight.done = true; });
+      return Promise.race([work, expired]);
+    };
+    // No new step starts once the deadline has passed, even when the deadline passed between two awaits.
+    const live = () => {
+      if (signal.cancelled) throw timedOut(this.limits.buildDeadlineMs, input.guidance);
+    };
+    try {
+      const db = await within(this.channel.connection());
+      live();
+      const loadStarted = performance.now();
+      const loaded = await within(input.load(db));
+      stats.loadMs = performance.now() - loadStarted;
+      stats.rows = loaded.bodies.length;
+      stats.bytes = loaded.bodies.reduce((sum, body) => sum + utf8Bytes(body), 0);
+      live();
+      // From here a reservation may exist even if its statement is cut short, so the release below always runs.
+      state.reserved = true;
+      const reserveStarted = performance.now();
+      const reservation = await within(this.beginOn(db, {
+        id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, takenAt: loaded.takenAt,
+        rows: stats.rows, bytes: stats.bytes,
+      }, now, account));
+      stats.reserveMs = performance.now() - reserveStarted;
+      const writeStarted = performance.now();
+      await within(this.writeRowsOn(db, reservation, loaded.bodies, account, signal));
+      stats.writeMs = performance.now() - writeStarted;
+      live();
+      const commitStarted = performance.now();
+      await within(this.commitOn(db, reservation, account));
+      stats.commitMs = performance.now() - commitStarted;
+      stats.outcome = 'stored';
+      return {
+        id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, rows: reservation.rows,
+        bytes: reservation.bytes, takenAt: reservation.takenAt, expiresMs: reservation.expiresMs,
+      };
+    } catch (error) {
+      signal.cancelled = true;
+      if (!flight.done) {
+        let patience: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([flight.settled, new Promise<void>(resolve => { patience = setTimeout(resolve, CLEANUP_WAIT_MS); })]);
+        clearTimeout(patience);
+        if (!flight.done) await this.channel.abort().catch(() => undefined);
+      }
+      if (state.reserved) await this.release(id).catch(() => undefined);
+      stats.outcome = state.expired ? 'timed_out' : error instanceof CompanyError ? 'refused' : 'failed';
+      throw error instanceof CompanyError ? error : unavailable('the listing could not be stored; retry the read');
+    } finally {
+      clearTimeout(timer);
+      stats.batches = account.batches;
+      stats.serverMs = account.serverMs;
+      stats.totalMs = performance.now() - started;
+      this.options.observe?.(stats);
+    }
   }
 
   /**
@@ -188,64 +317,7 @@ export class SnapshotStore {
   async begin(input: {
     owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; rows: number; bytes: number;
   }, now = Date.now()): Promise<SnapshotReservation> {
-    const { limits } = this;
-    if (input.rows > limits.maxRows || input.bytes > limits.maxBytes) {
-      throw new CompanyError('response_too_large', `this listing has ${input.rows} rows (${input.bytes} bytes), above the ${limits.maxRows}-row or ${limits.maxBytes}-byte listing limit; narrow it with state, goalId, role or since`);
-    }
-    await this.sweepNow(now);
-    const id = randomUUID();
-    const record = new RecordId('query_snapshot', id);
-    const expiresMs = now + limits.ttlMs;
-    const deadline = Date.now() + limits.reserveWaitMs;
-    while (Date.now() < deadline) {
-      await this.ensureQuota();
-      // The quota is read before the owner's listings. Any change after this read moves the version, and the swap below then fails.
-      const quota = await this.db.select<QuotaRow>(QUOTA);
-      if (!quota) throw unavailable('listing capacity is unavailable; retry shortly');
-      const [mine] = await this.db.query<[Array<{ id: RecordId; state: string; byte_count: number; created_seq?: number }>]>(
-        'SELECT id, state, byte_count, created_seq FROM query_snapshot WHERE owner = $owner ORDER BY created_seq ASC;', { owner: input.owner });
-      const held = mine ?? [];
-      // Only committed listings are evicted, oldest first. A listing still being written belongs to a request that is
-      // waiting for it, so it keeps its room; when every listing the owner holds is still being written, this
-      // reservation waits for one of them to commit.
-      const excess = Math.max(0, held.length + 1 - limits.maxPerOwner);
-      const evict = held.filter(old => old.state === 'ready').slice(0, excess);
-      if (evict.length < excess) {
-        await pause();
-        continue;
-      }
-      const listings = quota.listings - evict.length + 1;
-      const totalBytes = quota.bytes - evict.reduce((sum, old) => sum + old.byte_count, 0) + input.bytes;
-      if (listings > limits.maxListings || totalBytes > limits.maxTotalBytes) {
-        throw unavailable('listing capacity is full; retry shortly');
-      }
-      const { outcome } = await this.transact(`BEGIN;
-        LET $moved = UPDATE ONLY $quota SET version += 1, seq += 1, listings = $listings, bytes = $totalBytes
-          WHERE version = $version RETURN AFTER;
-        IF $moved = NONE { THROW 'snapshot quota moved' };
-        FOR $old IN $evict {
-          DELETE query_snapshot_row WHERE snapshot = $old.key;
-          DELETE $old.record;
-        };
-        CREATE ONLY $record CONTENT {
-          owner: $owner, kind: $kind, digest: $digest, role: $role, state: 'building', row_count: $rows, byte_count: $bytes,
-          taken_at: $takenAt, created_ms: $now, expires_ms: $expires, created_seq: $moved.seq, written_rows: 0, written_bytes: 0
-        };
-        COMMIT;`, {
-        quota: QUOTA, version: quota.version, listings, totalBytes,
-        evict: evict.map(old => ({ key: String(old.id.id), record: old.id })),
-        record, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, rows: input.rows,
-        bytes: input.bytes, takenAt: input.takenAt, now, expires: expiresMs,
-      });
-      if (outcome === 'done') {
-        return {
-          id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, takenAt: input.takenAt,
-          rows: input.rows, bytes: input.bytes, expiresMs,
-        };
-      }
-      await pause();
-    }
-    throw unavailable('listing capacity is busy; retry shortly');
+    return this.beginOn(this.db, input, now);
   }
 
   /**
@@ -255,45 +327,12 @@ export class SnapshotStore {
    * refused unless the record still says so, so two writers of one listing cannot number the same row.
    */
   async writeRows(reservation: SnapshotReservation, bodies: readonly string[]): Promise<void> {
-    const record = new RecordId('query_snapshot', reservation.id);
-    const written = await this.db.select<{ written_rows?: number; written_bytes?: number }>(record);
-    let doneRows = written?.written_rows ?? 0;
-    let doneBytes = written?.written_bytes ?? 0;
-    let batch: Array<{ snapshot: string; seq: number; body: string }> = [];
-    let batchBytes = 0;
-    const flush = async () => {
-      if (batch.length === 0) return;
-      const { outcome } = await this.transact(`BEGIN;
-        LET $held = UPDATE ONLY $record SET written_rows = (written_rows ?? 0) + $count, written_bytes = (written_bytes ?? 0) + $size
-          WHERE state = 'building' AND (written_rows ?? 0) = $fromRows AND (written_bytes ?? 0) = $fromBytes
-            AND (written_rows ?? 0) + $count <= row_count AND (written_bytes ?? 0) + $size <= byte_count
-          RETURN AFTER;
-        IF $held = NONE { THROW 'snapshot write refused' };
-        INSERT INTO query_snapshot_row $rows;
-        COMMIT;`, { record, count: batch.length, size: batchBytes, fromRows: doneRows, fromBytes: doneBytes, rows: batch });
-      if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
-      doneRows += batch.length;
-      doneBytes += batchBytes;
-      batch = [];
-      batchBytes = 0;
-    };
-    for (const body of bodies) {
-      const size = utf8Bytes(body);
-      if (batch.length > 0 && batchBytes + size > BATCH_BYTES) await flush();
-      batch.push({ snapshot: reservation.id, seq: doneRows + batch.length + 1, body });
-      batchBytes += size;
-    }
-    await flush();
+    await this.writeRowsOn(this.db, reservation, bodies, { serverMs: 0, batches: 0 });
   }
 
   /** Makes a reserved listing readable, once every reserved row and byte is written. */
   async commit(reservation: SnapshotReservation): Promise<void> {
-    const { outcome } = await this.transact(`BEGIN;
-      LET $ready = UPDATE ONLY $record SET state = 'ready'
-        WHERE state = 'building' AND (written_rows ?? 0) = $rows AND (written_bytes ?? 0) = $bytes RETURN AFTER;
-      IF $ready = NONE { THROW 'snapshot commit refused' };
-      COMMIT;`, { record: new RecordId('query_snapshot', reservation.id), rows: reservation.rows, bytes: reservation.bytes });
-    if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
+    await this.commitOn(this.db, reservation);
   }
 
   /** Releases one listing: its header, its rows and its room go together. A listing already gone frees nothing. */
@@ -328,6 +367,113 @@ export class SnapshotStore {
     return { quota, listings: totals?.[0]?.n ?? 0, bytes: totals?.[0]?.bytes ?? 0, rows: rows?.[0]?.n ?? 0 };
   }
 
+  private async beginOn(db: Surreal, input: {
+    id?: string; owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; rows: number; bytes: number;
+  }, now: number, account?: BuildAccount): Promise<SnapshotReservation> {
+    const { limits } = this;
+    if (input.rows > limits.maxRows || input.bytes > limits.maxBytes) {
+      throw new CompanyError('response_too_large', `this listing has ${input.rows} rows (${input.bytes} bytes), above the ${limits.maxRows}-row or ${limits.maxBytes}-byte listing limit; narrow it with state, goalId, role or since`);
+    }
+    await this.sweepNow(now);
+    const id = input.id ?? randomUUID();
+    const record = new RecordId('query_snapshot', id);
+    const expiresMs = now + limits.ttlMs;
+    const deadline = Date.now() + limits.reserveWaitMs;
+    while (Date.now() < deadline) {
+      await this.ensureQuota();
+      // The quota is read before the owner's listings. Any change after this read moves the version, and the swap below then fails.
+      const quota = await db.select<QuotaRow>(QUOTA);
+      if (!quota) throw unavailable('listing capacity is unavailable; retry shortly');
+      const [mine] = await db.query<[Array<{ id: RecordId; state: string; byte_count: number; created_seq?: number }>]>(
+        'SELECT id, state, byte_count, created_seq FROM query_snapshot WHERE owner = $owner ORDER BY created_seq ASC;', { owner: input.owner });
+      const held = mine ?? [];
+      // Only committed listings are evicted, oldest first. A listing still being written belongs to a request that is
+      // waiting for it, so it keeps its room; when every listing the owner holds is still being written, this
+      // reservation waits for one of them to commit.
+      const excess = Math.max(0, held.length + 1 - limits.maxPerOwner);
+      const evict = held.filter(old => old.state === 'ready').slice(0, excess);
+      if (evict.length < excess) {
+        await pause();
+        continue;
+      }
+      const listings = quota.listings - evict.length + 1;
+      const totalBytes = quota.bytes - evict.reduce((sum, old) => sum + old.byte_count, 0) + input.bytes;
+      if (listings > limits.maxListings || totalBytes > limits.maxTotalBytes) {
+        throw unavailable('listing capacity is full; retry shortly');
+      }
+      const { outcome } = await this.transact(db, `BEGIN;
+        LET $moved = UPDATE ONLY $quota SET version += 1, seq += 1, listings = $listings, bytes = $totalBytes
+          WHERE version = $version RETURN AFTER;
+        IF $moved = NONE { THROW 'snapshot quota moved' };
+        FOR $old IN $evict {
+          DELETE query_snapshot_row WHERE snapshot = $old.key RETURN NONE;
+          DELETE $old.record;
+        };
+        CREATE ONLY $record CONTENT {
+          owner: $owner, kind: $kind, digest: $digest, role: $role, state: 'building', row_count: $rows, byte_count: $bytes,
+          taken_at: $takenAt, created_ms: $now, expires_ms: $expires, created_seq: $moved.seq, written_rows: 0, written_bytes: 0
+        };
+        COMMIT;`, {
+        quota: QUOTA, version: quota.version, listings, totalBytes,
+        evict: evict.map(old => ({ key: String(old.id.id), record: old.id })),
+        record, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, rows: input.rows,
+        bytes: input.bytes, takenAt: input.takenAt, now, expires: expiresMs,
+      }, account);
+      if (outcome === 'done') {
+        return {
+          id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, takenAt: input.takenAt,
+          rows: input.rows, bytes: input.bytes, expiresMs,
+        };
+      }
+      await pause();
+    }
+    throw unavailable('listing capacity is busy; retry shortly');
+  }
+
+  private async writeRowsOn(db: Surreal, reservation: SnapshotReservation, bodies: readonly string[], account: BuildAccount,
+    signal?: BuildSignal): Promise<void> {
+    const record = new RecordId('query_snapshot', reservation.id);
+    const written = await db.select<{ written_rows?: number; written_bytes?: number }>(record);
+    let doneRows = written?.written_rows ?? 0;
+    let doneBytes = written?.written_bytes ?? 0;
+    let batch: Array<{ snapshot: string; seq: number; body: string }> = [];
+    let batchBytes = 0;
+    const flush = async () => {
+      if (batch.length === 0) return;
+      if (signal?.cancelled) throw new Error('listing build cancelled');
+      const { outcome } = await this.transact(db, `BEGIN;
+        LET $held = UPDATE ONLY $record SET written_rows = (written_rows ?? 0) + $count, written_bytes = (written_bytes ?? 0) + $size
+          WHERE state = 'building' AND (written_rows ?? 0) = $fromRows AND (written_bytes ?? 0) = $fromBytes
+            AND (written_rows ?? 0) + $count <= row_count AND (written_bytes ?? 0) + $size <= byte_count
+          RETURN AFTER;
+        IF $held = NONE { THROW 'snapshot write refused' };
+        INSERT INTO query_snapshot_row $rows RETURN NONE;
+        COMMIT;`, { record, count: batch.length, size: batchBytes, fromRows: doneRows, fromBytes: doneBytes, rows: batch }, account);
+      if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
+      account.batches++;
+      doneRows += batch.length;
+      doneBytes += batchBytes;
+      batch = [];
+      batchBytes = 0;
+    };
+    for (const body of bodies) {
+      const size = utf8Bytes(body);
+      if (batch.length > 0 && batchBytes + size > this.limits.batchBytes) await flush();
+      batch.push({ snapshot: reservation.id, seq: doneRows + batch.length + 1, body });
+      batchBytes += size;
+    }
+    await flush();
+  }
+
+  private async commitOn(db: Surreal, reservation: SnapshotReservation, account?: BuildAccount): Promise<void> {
+    const { outcome } = await this.transact(db, `BEGIN;
+      LET $ready = UPDATE ONLY $record SET state = 'ready'
+        WHERE state = 'building' AND (written_rows ?? 0) = $rows AND (written_bytes ?? 0) = $bytes RETURN AFTER;
+      IF $ready = NONE { THROW 'snapshot commit refused' };
+      COMMIT;`, { record: new RecordId('query_snapshot', reservation.id), rows: reservation.rows, bytes: reservation.bytes }, account);
+    if (outcome !== 'done') throw unavailable('the listing could not be stored; retry the read');
+  }
+
   private async sweepNow(now: number): Promise<number> {
     const built = now - this.limits.buildTimeoutMs;
     const [stale] = await this.db.query<[Array<{ id: RecordId }>]>(
@@ -351,11 +497,11 @@ export class SnapshotStore {
     for (let attempt = 0; attempt < RESERVE_ATTEMPTS; attempt++) {
       await this.ensureQuota();
       // A delete that finds nothing throws, which rolls the whole transaction back: nothing is subtracted twice.
-      const { outcome } = await this.transact(`BEGIN;
+      const { outcome } = await this.transact(this.db, `BEGIN;
         LET $gone = (DELETE query_snapshot WHERE id = $record ${where} RETURN BEFORE);
         IF array::len($gone) = 0 { THROW 'snapshot absent' };
         UPDATE ONLY $quota SET version += 1, listings -= 1, bytes -= $gone[0].byte_count;
-        DELETE query_snapshot_row WHERE snapshot = $key;
+        DELETE query_snapshot_row WHERE snapshot = $key RETURN NONE;
         COMMIT;`, { ...vars, record: new RecordId('query_snapshot', key), key, quota: QUOTA });
       if (outcome === 'done') return 'released';
       if (outcome === 'refused') return 'absent';
@@ -366,12 +512,14 @@ export class SnapshotStore {
 
   /**
    * Runs one transaction: a batch of statements that commits or does nothing. A conflict with a concurrent write is tried
-   * again here. A refusal comes back to the caller, which decides what it means.
+   * again here. A refusal comes back to the caller, which decides what it means. Server time is added to `account`.
    */
-  private async transact(query: string, vars: Record<string, unknown>): Promise<{ outcome: 'done' | 'moved' | 'refused' | 'conflict' }> {
+  private async transact(db: Surreal, query: string, vars: Record<string, unknown>, account?: BuildAccount):
+    Promise<{ outcome: 'done' | 'moved' | 'refused' | 'conflict' }> {
     const deadline = Date.now() + TRANSACTION_WAIT_MS;
     for (let attempt = 0; Date.now() < deadline; attempt++) {
-      const responses = await this.db.query<unknown[]>(query, vars).responses();
+      const responses = await db.query<unknown[]>(query, vars).responses();
+      if (account) account.serverMs += responses.reduce((sum, response) => sum + serverMsOf(response.stats), 0);
       const failures = responses.filter(response => !response.success);
       if (failures.length === 0) return { outcome: 'done' };
       const cause = failures.map(response => response.error.message)
