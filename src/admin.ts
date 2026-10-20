@@ -8,6 +8,7 @@ import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { SEED_DEFS } from './seed.ts';
 import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
+import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
 import type { Role } from './contracts.ts';
 
@@ -175,11 +176,8 @@ try {
     case 'reclaim-artifacts': {
       // Operator entry for terminal-task artifact reclaim: dry-run by default, `--execute` to
       // actually trim. SCK_ARTIFACT_RECLAIM=0 does not block an explicit operator run.
-      const flags = new Set(args.filter(a => a.startsWith('--')));
-      const positional = args.filter(a => !a.startsWith('--'));
-      const targetArg = positional.find(a => /^\d+$/.test(a));
-      const execute = flags.has('--execute');
-      const taskId = positional.find(a => /^[A-Za-z0-9_-]{1,128}$/.test(a));
+      // A bare number is a free-disk target, never a task id (see parseReclaimCliArgs).
+      const { execute, taskId, targetFreeMb } = parseReclaimCliArgs(args);
       const { ArtifactReclaimer, dbArtifactTasks, summarizeReclaim } = await import('./dispatcher/artifact-sweeper.ts');
       const { hostResources } = await import('./dispatcher/host.ts');
       const home = process.env.SCK_SERVICE_HOME ?? join(homedir(), 'Library/Application Support/SurrealCKCompany');
@@ -199,7 +197,6 @@ try {
         freeDiskMb: () => hostResources(home).freeDiskMb,
         env: process.env,
       });
-      const targetFreeMb = targetArg ? Number(targetArg) : undefined;
       const result = await reclaimer.reclaim({
         trigger: execute ? 'manual' : 'dry_run',
         dryRun: !execute,
