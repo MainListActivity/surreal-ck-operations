@@ -518,7 +518,14 @@ export function createMcpHttpService(options: McpServiceOptions) {
         if (options.gateToken) {
           let expected: string | undefined;
           try {
-            expected = await options.gateToken();
+            // The gate lookup is part of a listing answer's wait too, so it is cut at the same reply ceiling (SYS01 M1).
+            const lookup = options.gateToken().then(value => ({ value }));
+            const found = SNAPSHOT_TOOLS.has(currentTool() ?? '') ? await untilAt(lookup, arrivedAt() + REPLY_CEILING_MS) : await lookup;
+            if (found === undefined) {
+              mark('gate lookup not done within the reply ceiling');
+              return new Response('Service unavailable', { status: 503 });
+            }
+            expected = found.value;
             mark('gate');
           } catch {
             mark('gate lookup failed');
