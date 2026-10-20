@@ -4,6 +4,9 @@ import type { CompanyDatabase } from './database.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
 import { CompanyError, ROLES } from './core.ts';
 
+/** The digest a revocation writes in place of the credential digest: it matches no token, so the old credential dies. */
+export const revokedCredentialDigest = (): string => `revoked-${randomUUID()}`;
+
 /** Local root-only enrollment API. Never pass this object to the MCP adapter. */
 export class LocalEnrollmentAdmin implements EnrollmentAdmin {
   constructor(private readonly database: CompanyDatabase) {}
@@ -35,7 +38,7 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
     await this.database.db.query(cause === 'security'
       ? 'UPDATE $employee SET revoked = true, security_revoked = true, credential_digest = $digest;'
       : 'UPDATE $employee SET revoked = true, credential_digest = $digest;', {
-      employee: new RecordId('employee', employeeId), digest: `revoked-${randomUUID()}`,
+      employee: new RecordId('employee', employeeId), digest: revokedCredentialDigest(),
     });
   }
 }

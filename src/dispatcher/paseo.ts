@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { RetirementKind } from '../contracts.ts';
+import { isRetireRefused } from '../retirement.ts';
 
 export interface AgentInfo { id: string; status: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
@@ -240,14 +241,22 @@ export function createSceneCleaner(
     // Otherwise the archived agent fires agent.archived, the sidecar quarantines the
     // instance, and the next tick blames a dead binding as 通道隔离.
     let employeesRetired = 0;
+    const refusedEmployees: string[] = [];
     if (employees) {
       for (const inst of await employees.insts()) {
         if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
+        try {
+          await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive');
+        } catch (error) {
+          // The retirement gate refused: this employee still has in-flight work here, so its session is left alone (no detach, no archive).
+          if (isRetireRefused(error)) { refusedEmployees.push(inst.id); continue; }
+        }
         employeesRetired++;
-        await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive').catch(() => undefined);
         employees.detach?.(inst);
         if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
       }
+      // The workspace teardown below ends every session in the tree, so a tree with a refused employee is kept for a later retry.
+      if (refusedEmployees.length) throw new Error(`scene kept: employee retirement refused for ${refusedEmployees.join(', ')} (unfinished work)`);
     }
     const workspaces = await paseo.listWorkspaces();
     const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));

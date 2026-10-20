@@ -5,9 +5,10 @@ import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
-import { LocalEnrollmentAdmin } from './enrollment.ts';
+import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
-import { readContributors, type ContributionFacts } from './contributors.ts';
+import { CONTRIBUTION_ACTIONS, readContributors, type ContributionFacts } from './contributors.ts';
+import { FINISHED_STATES, readRetirementCandidates, retireRefused, retirementRefusals, type RetirementCandidate } from './retirement.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -227,7 +228,12 @@ export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
 
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
-  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string) {
+  /**
+   * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
+   * write, so a test can land a claim or takeover in exactly that window.
+   */
+  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string,
+    private readonly retirementHook?: (employeeId: string) => Promise<void>) {
     this.enrollment = new LocalEnrollmentAdmin(database);
   }
   private get db() { return this.database.db; }
@@ -377,13 +383,64 @@ export class Workforce {
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
 
-  /** Retires an instance and revokes its credential, so a crashed session cannot act again. The kind is
-   * recorded by the first retirement only: a later one cannot turn a non-normal retirement into a normal one. */
+  /**
+   * Retires an instance and revokes its credential, so a crashed session cannot act again. This is the one boundary every
+   * retirement passes (admin CLI, dispatcher and scene cleaner). An employee who still holds a lease or is bound
+   * to unfinished work is refused with RETIRE_REFUSED before any write (see retirement.ts). An accepted retirement is one
+   * transaction that re-derives the employee's unfinished relations and writes only if they are the ones the decision saw
+   * (see retireTransaction). The kind is recorded by the first retirement only: a later one cannot turn a non-normal
+   * retirement into a normal one.
+   */
   async retire(employeeId: string, reason: string, kind: RetirementKind): Promise<void> {
-    await this.db.query(`UPDATE $e SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
-      retired = true, retired_reason = $reason, retired_at = time::now();`,
-      { e: id('employee', employeeId), reason, kind });
-    await this.enrollment.revoke(employeeId, 'retirement');
+    const [exists] = await this.db.query<[unknown]>('SELECT VALUE id FROM ONLY $e;', { e: id('employee', employeeId) });
+    if (!exists) throw new CompanyError('not_found', 'Employee not found');
+    for (let attempt = 0; ; attempt++) {
+      const candidates = await readRetirementCandidates(this.db, employeeId);
+      const refusals = retirementRefusals(employeeId, candidates);
+      if (refusals.length) throw retireRefused(employeeId, refusals);
+      await this.retirementHook?.(employeeId);
+      try {
+        await this.retireTransaction(employeeId, reason, kind, candidates);
+        return;
+      } catch (error) {
+        const cause = error instanceof Error ? error.message : String(error);
+        if (!/retire moved|conflict/i.test(cause)) throw error;
+        if (attempt >= 4) throw new CompanyError('temporarily_unavailable', 'Retirement facts moved while deciding; retry', true);
+        await Bun.sleep(10 * (attempt + 1));
+      }
+    }
+  }
+
+  /**
+   * One transaction, decided on what it reads itself. It recomputes the employee's unfinished relations (holder, implementer, and
+   * tasks it wrote contribution rows on). The set must be exactly the decided one, so a relation that appears or disappears
+   * refuses the write, and so does a candidate whose version moved. A claim or takeover that binds the employee writes the
+   * employee record too (claimLease sets `active_task`, implementerTakeover sets `implementer_bound_at`), so a binding that
+   * commits during this transaction conflicts with the retirement write instead of slipping past it.
+   */
+  private async retireTransaction(employeeId: string, reason: string, kind: RetirementKind, candidates: readonly RetirementCandidate[]): Promise<void> {
+    const responses = await this.db.query<unknown[]>(`BEGIN TRANSACTION;
+      LET $touched = SELECT VALUE task FROM audit WHERE actor = $employee AND action IN $actions;
+      LET $live = SELECT VALUE id FROM task WHERE state NOT IN $finished AND (current_employee = $key OR implementer = $key OR id IN $touched);
+      IF array::len($live) != $expected OR array::len(array::complement($live, $ids)) > 0 { THROW 'retire moved: task set changed' };
+      FOR $c IN $candidates {
+        LET $seen = SELECT VALUE version FROM ONLY $c.id;
+        IF $seen = NONE OR $seen != $c.version { THROW 'retire moved: task facts changed' };
+      };
+      UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
+        retired = true, retired_reason = $reason, retired_at = time::now(),
+        revoked = true, credential_digest = $digest;
+      COMMIT TRANSACTION;`, {
+      employee: new RecordId('employee', employeeId), key: employeeId, kind, reason, digest: revokedCredentialDigest(),
+      actions: [...CONTRIBUTION_ACTIONS], finished: FINISHED_STATES, expected: candidates.length,
+      ids: candidates.map(candidate => new RecordId('task', candidate.taskId)),
+      candidates: candidates.map(candidate => ({ id: new RecordId('task', candidate.taskId), version: candidate.version })),
+    }).responses();
+    const failures = responses.filter(response => !response.success);
+    if (failures.length) {
+      throw new Error(failures.map(response => response.error.message)
+        .find(message => !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'retirement transaction failed');
+    }
   }
 
   async touchWake(employeeId: string): Promise<void> {

@@ -16,6 +16,7 @@ import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
+import { isRetireRefused } from '../retirement.ts';
 import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
@@ -457,6 +458,8 @@ export interface TickReport {
   extended: string[];
   woke: Array<{ task: string; employee: string; spawned: boolean }>;
   retired: string[];
+  /** Instances whose retirement the shared gate refused this tick (SYS-DISP R1): nothing was written for them; see the log. */
+  refused?: string[];
   exhausted: string[];
   notices: string[];
   evals: string[];
@@ -698,7 +701,7 @@ export class Dispatcher {
 
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -724,8 +727,7 @@ export class Dispatcher {
     const observedStatus = new Map<string, string>();
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
-        await wf.retire(inst.id, 'spawn did not bind a Paseo agent', 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
       }
       if (this.deps.sidecar && !inst.credentialFile && !this.deps.sidecar.canReuse(inst)) {
@@ -735,7 +737,7 @@ export class Dispatcher {
         // session whose binding is gone is real channel isolation.
         states.set(inst.id, 'down');
         const archived = (await paseo.status(inst.paseoAgentId).catch(() => undefined))?.status === 'archived';
-        await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure');
+        if (!await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure')) continue;
         await paseo.stop(inst.paseoAgentId).catch(() => undefined);
         await paseo.archive(inst.paseoAgentId).catch(() => undefined);
         continue;
@@ -869,7 +871,7 @@ export class Dispatcher {
         const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
           : staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
-        await wf.retire(inst.id, reason, 'rotation');
+        if (!await this.retireGated(inst, reason, 'rotation', report)) continue;
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
         if (staleModel && def) {
@@ -1529,7 +1531,8 @@ export class Dispatcher {
           if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
           else await sidecar?.releaseWorkspace?.(existing);
           claim = undefined;
-          await wf.retire(existing.id, 'managed worktree workspace changed', 'rotation');
+          // A refused retirement keeps this session: no respawn over it and no wake into the stale tree this pass.
+          if (!await this.retireGated(existing, 'managed worktree workspace changed', 'rotation', report)) return undefined;
           await paseo.archive(existing.paseoAgentId!);
           sidecar!.detachAgent(existing.paseoAgentId!);
           report.retired.push(existing.id);
@@ -1569,9 +1572,10 @@ export class Dispatcher {
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
-        await wf.retire(inst.id, 'allocation unavailable', 'failure');
-        sidecar?.detachAgent(inst.paseoAgentId ?? '');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, 'allocation unavailable', 'failure', report)) {
+          sidecar?.detachAgent(inst.paseoAgentId ?? '');
+          report.retired.push(inst.id);
+        }
         this.log(`allocation ${task?.id} waiting: ${(error as Error).message}`);
         return undefined;
       }
@@ -1579,8 +1583,7 @@ export class Dispatcher {
         // A scope lost at claim time is task-wide: no other def is tried, and the unbound seat is released.
         const scopeLost = sidecar.claimDenial(inst.id) === 'worktree_busy';
         if (scopeLost) this.scopeDenied.add(task.id); else this.markDenied(task);
-        await wf.retire(inst.id, scopeLost ? 'write scope held' : 'claim denied', 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, scopeLost ? 'write scope held' : 'claim denied', 'failure', report)) report.retired.push(inst.id);
         return undefined;
       }
       try {
@@ -1614,8 +1617,7 @@ export class Dispatcher {
         this.log(`spawn ${inst.id} failed: ${message}`);
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
-        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`, 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, `spawn failed: ${message.slice(0, 200)}`, 'failure', report)) report.retired.push(inst.id);
         // A quota-flavored spawn failure is the provider's problem, not the def's:
         // cool the provider down instead of eating a strike toward auto-disable.
         if (EXHAUSTED_PATTERN.test(message)) {
@@ -1659,8 +1661,25 @@ export class Dispatcher {
     }
   }
 
-  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure') {
-    await this.deps.workforce.retire(inst.id, reason, kind);
+  /**
+   * Retires through the shared gate (SYS-DISP R1). A refusal writes nothing: the instance keeps its session, credential and lease,
+   * so the caller must not archive, detach or respawn it, and the tick reports it as refused instead of retired. Returns false then.
+   */
+  private async retireGated(inst: EmployeeInst, reason: string, kind: RetirementKind, report: TickReport): Promise<boolean> {
+    try {
+      await this.deps.workforce.retire(inst.id, reason, kind);
+      return true;
+    } catch (error) {
+      if (!isRetireRefused(error)) throw error;
+      report.refused?.push(inst.id);
+      this.log(`retire ${inst.id} refused (${reason}): ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /** Returns false when the gate refused the retirement; the session is then left in place (see retireGated). */
+  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure'): Promise<boolean> {
+    if (!await this.retireGated(inst, reason, kind, report)) return false;
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
@@ -1670,6 +1689,7 @@ export class Dispatcher {
     this.log(`retired ${inst.id}: ${reason}`);
     const def = defs.find(d => d.id === inst.def);
     if (def && countFailure) await this.countDefFailure(def, report);
+    return true;
   }
 
   /**

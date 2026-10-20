@@ -172,6 +172,10 @@ export function openLeaseOf(holder: string | null | undefined, state: string | n
 export interface ContributionView {
   facts: ContributionFacts;
   version?: number;
+  /** The task's state, open holder and explicit implementer, read in the same transaction as the facts (retirement gate). */
+  state?: string;
+  holder?: string;
+  explicitImplementer?: string;
 }
 
 interface ContributionRead {
@@ -210,6 +214,9 @@ export async function readContributionView(db: Surreal, taskId: string): Promise
   return {
     facts: deriveContributors(events, read.implementer ?? undefined, open),
     version: typeof read.version === 'number' ? read.version : undefined,
+    state: read.state ?? undefined,
+    holder: read.holder ?? undefined,
+    explicitImplementer: read.implementer ?? undefined,
   };
 }
 

@@ -1744,6 +1744,8 @@ export class SurrealCompanyCore implements CompanyCore {
    * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
    * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
    * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
+   * The target's employee record is written in the same transaction, so a concurrent retirement of the target conflicts
+   * with this takeover instead of both succeeding (retirement.ts, Workforce.retire).
    */
   async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
@@ -1801,6 +1803,7 @@ export class SurrealCompanyCore implements CompanyCore {
         version = $t.version + 1
         RETURN AFTER;
       IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
+      UPDATE ONLY $target SET implementer_bound_at = time::now();
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
