@@ -53,6 +53,7 @@ export function company(): Promise<Company> {
     const { SyncStudio } = await import("./vendor/src/media/sync.ts");
     const { VaultClient } = await import("./vendor/src/media/vault.ts");
     const { Dispatcher } = await import("./vendor/src/dispatcher/dispatcher.ts");
+    const { passLedger } = await import("./vendor/src/dispatch-pause.ts");
     const { createPaseoCli, createSceneCleaner } = await import("./vendor/src/dispatcher/paseo.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
 
@@ -147,6 +148,8 @@ export function company(): Promise<Company> {
       notify: process.env.SCK_NOTIFY === "0" ? undefined : notify,
       log: message => console.log(message),
       jev: jevFromEnv(),
+      // Dispatch pass ledger: the maintenance pause waits (bounded) for passes that started under an older epoch.
+      passes: passLedger(db.db),
       // Host resource admission: free-memory/disk floors pause dispatch on the owner's
       // machine; supervision still runs so stalled leases keep getting reclaimed.
       hostResources: () => hostResources(serviceHome()),
