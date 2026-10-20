@@ -45,6 +45,14 @@ function makeRelease(releases: string, sha: string, withGit = false) {
   return dir;
 }
 
+// The install refuses a release without a passing comm-slow-pipe record for its SHA on the Bun version on PATH (scripts/release-gate.sh).
+// The fixture pins both so it does not depend on the host Bun; the gate runner itself is covered by tests/release-gate.test.ts.
+function writeGateRecord(serviceHome: string, sha: string) {
+  const dir = join(serviceHome, 'gates', 'comm-slow-pipe');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.3.11', platform: 'darwin', result: 'pass' }));
+}
+
 function fixture(): Fixture {
   const root = mkdtempSync(join(tmpdir(), 'sck-company-service-'));
   const home = join(root, 'home with spaces');
@@ -79,6 +87,8 @@ function fixture(): Fixture {
   executable(join(fakeBin, 'git'), '#!/bin/sh\nexit 0\n');
   executable(join(fakeBin, 'launchctl'), '#!/bin/sh\ncase "$1" in print) exit 1;; *) exit 0;; esac\n');
   executable(join(fakeBin, 'lsof'), '#!/bin/sh\n[ "${FAKE_LSOF_ERROR:-0}" = 1 ] && exit 2\n[ "${FAKE_LSOF_OPEN:-0}" = 1 ] && { printf \'open\n\'; exit 0; }\nexit 1\n');
+  executable(join(fakeBin, 'bun'), '#!/bin/sh\necho 1.3.11\n');
+  writeGateRecord(serviceHome, SHAS.current);
   const fakePaseo = join(root, 'fake paseo');
   executable(fakePaseo, `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_PASEO_LOG"
@@ -193,6 +203,21 @@ for (const [mode, label] of [
     }
   });
 }
+
+test('install refuses a release without a passing comm-slow-pipe gate and leaves active unchanged', () => {
+  const f = fixture();
+  try {
+    rmSync(join(f.serviceHome, 'gates'), { recursive: true, force: true });
+    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain('no passing comm-slow-pipe gate');
+    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
+    expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+  } finally {
+    cleanup(f);
+  }
+});
 
 test('an open file handle protects a candidate release from pruning', () => {
   const f = fixture();
