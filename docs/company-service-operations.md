@@ -215,6 +215,30 @@ pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|o
 
 同一个任务在员工与经理之间反复"阻塞 → 经理处理 → 再阻塞"（`block` 审计），达到 `block_loop_limit`（默认 5）次，调度器不再叫醒经理，而是把任务转成老板的问题：写明往返次数和最近三次阻塞原因，老板回复后任务按回复继续，并重新计数。`pnpm run admin config block_loop_limit <n>` 调整，`0` 关闭。起因：一个生产实测任务曾在 18 小时内往返 19 次、换了 18 个员工，每轮都在重复同样的失败。
 
+## 终态产物回收与资源闸门自救
+
+`evidence/<任务ID>/` 与 `deliverables/<任务ID>/` 是工作存储，不是长期档案。终态（done/void）任务的这两个目录按任务生命周期回收：宽限期 evidence 3 天、deliverables 7 天、作废任务 1 天，时钟取该任务最后一条审计，永远不取文件 mtime；只删大文件（媒体、压缩包、依赖/VCS 目录），保留小型文本与 `.reclaimed.json` 墓碑。派工闸门（`min_free_disk_mb`，默认 10240 MB）每轮先做一次压力回收，目标水位是 `min_free_disk_mb + artifact_headroom_mb`（默认共 20 GB）；水位达标后自动恢复派工。
+
+**两级开关，语义不同**
+
+| 开关 | 位置 | 作用 |
+|---|---|---|
+| `artifact_reclaim_enabled` | `company_meta:config` | 关闭**例行**回收（30 分钟惰性 sweep、普通 sweep 触发）。资源闸门触发的**紧急回收不受它影响**——否则磁盘一低就会把公司锁死。 |
+| `SCK_ARTIFACT_RECLAIM=0` | 服务环境（两面都要设） | 硬停，连紧急回收一起停。此时闸门阻塞期间会发 `resources-reclaim-blocked` 通告（强制提醒），写明是哪一级开关停的。 |
+
+**运维命令**
+
+```sh
+pnpm run admin reclaim-artifacts                      # 只读试算（dry-run，受配置开关约束以外的自动路径不适用）
+pnpm run admin reclaim-artifacts 20480                # 压力模式试算：目标空闲 20480 MB
+pnpm run admin reclaim-artifacts --execute            # 真的回收（人工运行不受配置开关限制）
+pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
+```
+
+参数里的裸数字一律是目标空闲 MB，不是任务 ID（任务 ID 是 UUID）。回收台账在 `<服务目录>/logs/artifact-reclaim.jsonl`，每次运行一行汇总，被删目录各一行。目标目录只接受 `<根>/<任务ID>` 这一层普通目录：符号链接不跟随、不删除，越界与非法 ID 直接拒绝。
+
+2026-10-20 事故：`artifact_reclaim_enabled` 被人工置为 false（无审计记录），磁盘降到 8.8 GB 后闸门连续阻塞全部派工十余小时，两个 ready 任务无人接手。修复后紧急回收绕过配置开关，闸门不会再被软开关死锁；此后该开关只影响例行清理频率。
+
 ## 老板作废、解锁与取消目标
 
 ```sh
