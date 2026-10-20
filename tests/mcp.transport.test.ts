@@ -48,6 +48,10 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('goal_acceptance_preview');
     expect(tools).toContain('goal_acceptance_repair');
     expect(tools).toContain('implementer_takeover');
+    // Dispatch maintenance rides the same surface; gm-only enforcement lives in core (see dispatch-pause.fork.test.ts).
+    expect(tools).toContain('dispatch_pause');
+    expect(tools).toContain('dispatch_restore');
+    expect(tools).toContain('dispatch_status');
     const result = await connection.client.callTool({ name: 'get_context', arguments: { employeeId: 'gm-01', role: 'gm' } });
     expect(result.structuredContent).toMatchObject({ ok: true, data: { principal: { employeeId: 'ai-01' } } });
     const claim = await connection.client.callTool({ name: 'claim_next', arguments: {} });

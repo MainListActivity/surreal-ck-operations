@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Surreal } from 'surrealdb';
@@ -8,9 +8,12 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { passLedger, waitForDrain } from '../src/dispatch-pause.ts';
+import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
 import { connectCompanyClient } from '../src/mcp/client.ts';
 import { createMcpHttpService } from '../src/mcp/server.ts';
+import { SidecarPool } from '../plugin/server/sidecar.ts';
 import type { LeaseProof, Principal, Role, TaskView } from '../src/contracts.ts';
+import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
 setDefaultTimeout(60000);
 // Isolated company fork on a private RocksDB store: no production data, credentials or dispatcher.
@@ -280,4 +283,68 @@ run('MCP transport: dispatch tools are listed; a gm reads status and pauses and 
         .toMatchObject({ ok: false, code: 'forbidden' });
     } finally { await denied.close(); }
   } finally { await service.close(); }
+});
+
+run('sidecar on the real core: a paused claim is denied; a restarted channel keeps the same lease through the pause', async () => {
+  await ensureOpen();
+  // workforce.rotate stands in for a restart: the same credential stays valid, so the lease proof is what must survive.
+  const credentials = new Map<string, string>();
+  const workforce = { rotate: async (id: string) => credentials.get(id)! };
+  const runDir = join(dir, 'sidecar-comm');
+  const makePool = () => new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 50, sweepMs: 10 });
+  const channelInst = async (credential: string): Promise<EmployeeInst> => {
+    const actor = await core.authenticate(credential);
+    credentials.set(actor.employeeId, credential);
+    return { id: actor.employeeId, role: 'engineering', credential } as unknown as EmployeeInst;
+  };
+  const supervised = (view: TaskView) => ({ id: view.id, title: view.title, state: 'ready', executorRole: 'engineering', row: {} }) as unknown as SupervisedTask;
+  const relayTo = async (env: Record<string, string>, tool: string, args: Record<string, unknown>) => {
+    const name = `${++count}.json`;
+    writeFileSync(join(reqDir(env.SCK_COMM_DIR!), name), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
+    for (let n = 0; n < 400 && !existsSync(join(resDir(env.SCK_COMM_DIR!), name)); n++) await Bun.sleep(5);
+    return readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), name))!;
+  };
+  const holder = await channelInst(await enrollAs('engineering', ['execute', 'review']));
+  const newcomer = await channelInst(await enrollAs('engineering', ['execute', 'review']));
+  const heldTask = await task();
+  const queuedTask = await task();
+  let pool = makePool();
+  try {
+    const holderEnv = pool.env(holder);
+    pool.bindAgent(holder.id, 'agent-holder');
+    const held = await pool.claim(holder, supervised(heldTask));
+    expect(held).toBeDefined();
+    pool.env(newcomer);
+    pool.bindAgent(newcomer.id, 'agent-newcomer');
+
+    const s0 = await status();
+    expect(await pause(gmA, s0.epoch)).toMatchObject({ paused: true, drained: { drained: true, blocking: 0 } });
+    await expect(pool.claim(newcomer, supervised(queuedTask))).resolves.toBeUndefined();
+    expect(pool.claimDenial(newcomer.id)).toBe('dispatch_paused');
+
+    // The held lease keeps renewing and checkpointing under the pause.
+    const before = await core.getTask(gmA, heldTask.id);
+    expect((await relayTo(holderEnv, 'checkpoint', { text: '暂停期间继续实现：通道续租与检查点不受影响。' })).ok).toBe(true);
+    // Lease expiry is stored in whole seconds: wait past one boundary so a renewal shows.
+    await Bun.sleep(1100);
+    const renewed = await core.getTask(gmA, heldTask.id);
+    expect(Date.parse(renewed.leaseExpiresAt!)).toBeGreaterThan(Date.parse(before.leaseExpiresAt!));
+
+    // A restart re-keys the channel and rebuilds the same proof; no new lease is minted while paused.
+    pool.close();
+    const restarted = { ...holder, paseoAgentId: 'agent-holder' } as EmployeeInst;
+    pool = makePool();
+    await pool.adopt([restarted]);
+    pool.env(newcomer);
+    expect(await core.getTask(gmA, heldTask.id)).toMatchObject({ currentEmployee: holder.id, deliveryId: held!.deliveryId, fence: held!.fence });
+    expect((await relayTo(pool.env(restarted), 'checkpoint', { text: '重启后沿同一租约继续，检查点仍用原证明写入。' })).ok).toBe(true);
+    await expect(pool.claim(newcomer, supervised(queuedTask))).resolves.toBeUndefined();
+    expect(pool.claimDenial(newcomer.id)).toBe('dispatch_paused');
+
+    // After the restore the same channel takes the queued task.
+    await restore(gmA, (await status()).epoch);
+    await expect(pool.claim(newcomer, supervised(queuedTask))).resolves.toMatchObject({ deliveryId: expect.any(String) });
+  } finally {
+    pool.close();
+  }
 });
