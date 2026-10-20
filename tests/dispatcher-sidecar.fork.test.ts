@@ -377,17 +377,18 @@ run('company fork: the bound implementer loses its lease, the manager hands the 
     const taken = await w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: (await w.core.getTask(w.gm, task.id)).version,
       reason: 'A 的 codex 额度用尽，经理指定 C 续做本任务', idempotencyKey: 'takeover-to-c' });
     expect(taken).toMatchObject({ state: 'ready', implementer: C.id });
-    // The tick wakes C and never A: the bound-implementer gate keeps A out while codex is still exhausted.
+    // Codex recovers and A's session is idle again, so A is otherwise eligible for the task. Only the bound-implementer gate keeps A out.
+    await w.db.db.query('UPDATE provider_health:codex SET until = 0;');
+    w.errors.delete(A.paseoAgentId!);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    // The tick wakes C and never A.
     const handover = await w.tick();
     expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
     // C continues the work and submits.
     expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery by the new implementer C', idempotencyKey: 'c-submit' })).ok).toBe(true);
     w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
-    // Codex recovers and A's stale session is idle. The review goes to B, the same reviewer, and B accepts.
-    await w.db.db.query('UPDATE provider_health:codex SET until = 0;');
-    w.errors.delete(A.paseoAgentId!);
-    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    // The review goes to B, the same reviewer, and B accepts.
     const review = await w.tick();
     expect(review.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: B.id, spawned: false })]);
     expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review after the takeover', idempotencyKey: 'c-accept' })).ok).toBe(true);
