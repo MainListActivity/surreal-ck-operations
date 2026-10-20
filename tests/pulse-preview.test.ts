@@ -22,12 +22,17 @@ const full: Pulse = {
   staffingAlerts: 1,
   churn: { created: 2, retired: 2, claimLost: 5 },
   goals: [{ title: '梦痕纪元宣传片', days: 4 }],
+  dispatchBlocked: [{ taskId: 't2', title: '就绪任务', summary: '就绪任务：执行无法派工（会话占用中或异常）', phase: 'execute',
+    feasible: true, since: '2026-10-15T03:30:00Z', waitingMinutes: 30,
+    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'gm', recovery: '等待在办任务完成', nextTrigger: '候选会话空闲' }] }],
 };
 
 test('normalizePulse: 完整响应原样通过', () => {
   const p = normalizePulse(full);
   expect(p.doing[0]!.title).toBe('在办任务');
   expect(p.waiting[0]!.hours).toBe(19.2);
+  expect(p.dispatchBlocked[0]).toMatchObject({ taskId: 't2', phase: 'execute', feasible: true, waitingMinutes: 30 });
+  expect(p.dispatchBlocked[0]!.reasons[0]!.code).toBe('session_busy');
   expect(p.staffingAlerts).toBe(1);
 });
 

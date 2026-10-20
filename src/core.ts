@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -11,6 +11,7 @@ import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
+import { readContributors } from './contributors.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
@@ -177,6 +178,11 @@ interface TaskRow {
   code_repo_path?: string;
   handover?: boolean;
   previous_employee?: string;
+  /** Bound code implementer: set at the first execute claim or by an explicit gm takeover (schemaless). */
+  implementer?: string;
+  /** Open dispatch-blocked episode (schemaless): the phase it blocks and when it began, unix seconds. */
+  dispatch_blocked_phase?: string | null;
+  dispatch_blocked_since?: number | null;
   progress_at?: number;
   /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
   quota_resets_at?: number | null;
@@ -216,6 +222,7 @@ export function view(row: TaskRow): TaskView {
     blockedTo: row.blocked_to,
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
+    implementer: row.implementer ?? undefined,
     workIntent: row.work_intent, worktree: row.worktree,
     revises: row.revises ? asId(row.revises) : undefined,
     supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
@@ -381,6 +388,12 @@ export class SurrealCompanyCore implements CompanyCore {
           // Goal acceptance guards THROW 'goal acceptance moved: …' when a preview basis drifted; that is a stale-snapshot conflict, not a generic failure.
           const moved = /goal acceptance moved: ([^'"\n]+)/i.exec(cause);
           if (moved) throw new CompanyError('conflict', `Goal acceptance moved: ${moved[1]!.trim()}; run goal_acceptance_preview again`);
+          // Implementer takeover: 'moved' is a stale basis (CAS), 'invalid' is an ineligible target; both are checked before the generic denied/forbidden match.
+          const takeover = /implementer takeover (moved|invalid): ([^'"\n]+)/i.exec(cause);
+          if (takeover) {
+            const kind = takeover[1]!.toLowerCase();
+            throw new CompanyError(kind === 'moved' ? 'conflict' : 'invalid', `Implementer takeover ${kind}: ${takeover[2]!.trim()}`);
+          }
           // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
           if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
           if (/self review/i.test(cause)) throw new CompanyError('self_review', 'Employee cannot review own delivery');
@@ -670,6 +683,12 @@ export class SurrealCompanyCore implements CompanyCore {
         (task.discipline && actor.tracks?.length && !actor.tracks.includes(task.discipline))) {
       throw new CompanyError('forbidden', 'Task claim denied');
     }
+    if (!reviewing && task.executorRole === 'engineering') {
+      // Engineering execute is bound to one implementer (contributors.ts): refuse before a worktree is allocated.
+      const facts = await readContributors(this.db, taskId);
+      if (facts.ambiguous) throw new CompanyError('forbidden', 'Task claim denied: implementer unresolved, manager takeover required');
+      if (facts.implementer && facts.implementer !== actor.employeeId) throw new CompanyError('forbidden', 'Task claim denied: bound to another implementer');
+    }
     const project = await this.taskProject(taskId);
     // Code-repo routing: an explicit binding wins over the business project repo; the
     // business `project` itself stays with taskProject for claim.json/opsScope.
@@ -720,6 +739,7 @@ export class SurrealCompanyCore implements CompanyCore {
 
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
+    const facts = await readContributors(this.db, taskId);
     const row = await this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
@@ -728,12 +748,17 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t.state = 'review' {
-        IF $t.submitted_by = $employee { THROW 'self review denied' };
+        IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
         IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       } ELSE {
         IF 'execute' NOT IN $who.capabilities OR $t.executor_role != $who.role { THROW 'execute denied' };
+        IF $t.executor_role = 'engineering' {
+          LET $owner = IF $t.implementer != NONE THEN $t.implementer ELSE $bound END;
+          IF $owner = '' AND $ambiguous { THROW 'execute denied: implementer unresolved, manager takeover required' };
+          IF $owner != '' AND $owner != $employee { THROW 'execute denied: bound to another implementer' };
+        };
       };
       IF $t.current_employee != NONE AND $t.lease_expires_at > $now AND $t.current_employee != $employee { THROW 'leased by another employee' };
       LET $def_tracks = $who.def.tracks ?? [];
@@ -747,6 +772,7 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
         current_employee = $employee,
+        implementer = IF $t.state != 'review' AND $t.executor_role = 'engineering' AND $t.implementer = NONE THEN $employee ELSE $t.implementer END,
         delivery_id = IF $same THEN $t.delivery_id ELSE $delivery END,
         lease_expires_at = $now + $lease_seconds,
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
@@ -761,7 +787,7 @@ export class SurrealCompanyCore implements CompanyCore {
           delivery: $next.delivery_id, fence: $next.fence, intent: $assignment.intent, at: time::now() };
       };
       IF !$same {
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END, evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
@@ -774,6 +800,7 @@ export class SurrealCompanyCore implements CompanyCore {
       // 必配轨岗位（screenwriter）：要求任务轨恰为必配轨且编制 tracks 显式覆盖——
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
+      excluded: facts.excluded, bound: facts.implementer ?? '', ambiguous: facts.ambiguous,
     });
     const taskView = view(row);
     const project = await this.taskProject(taskId);
@@ -1045,6 +1072,7 @@ export class SurrealCompanyCore implements CompanyCore {
         if (reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${reason}`);
       }
     }
+    const facts = await readContributors(this.db, proof.taskId);
     const flags = {
       heartbeat: action === 'heartbeat', checkpoint: action === 'checkpoint',
       submit: action === 'submit', accept: action === 'accept', returning: action === 'return',
@@ -1063,23 +1091,32 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
         IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
       };
+      LET $owner = IF $t.implementer != NONE THEN $t.implementer ELSE $bound END;
       IF $submit OR (($heartbeat OR $checkpoint) AND $t.state != 'review') {
         IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'execute denied' };
+        IF $t.executor_role = 'engineering' {
+          IF $owner = '' AND $ambiguous { THROW 'execute denied: implementer unresolved, manager takeover required' };
+          IF $owner != $employee { THROW 'execute denied: not the bound implementer' };
+        };
       };
       IF ($heartbeat OR $checkpoint) AND $t.state = 'review' {
-        IF $t.submitted_by = $employee { THROW 'self review denied' };
+        IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
         IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'review denied' };
       };
       IF $accept OR $returning {
-        IF $t.submitted_by = $employee { THROW 'self review denied' };
+        IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
         IF 'review' NOT IN $who.capabilities OR $t.state != 'review' OR $t.reviewer_role != $who.role { THROW 'review denied' };
       };
       IF $block {
         IF $t.state = 'review' {
-          IF $t.submitted_by = $employee { THROW 'self review denied' };
+          IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
           IF 'review' NOT IN $who.capabilities OR $t.reviewer_role != $who.role { THROW 'block denied' };
         } ELSE {
           IF 'execute' NOT IN $who.capabilities OR $t.state != 'doing' OR $t.executor_role != $who.role { THROW 'block denied' };
+          IF $t.executor_role = 'engineering' {
+            IF $owner = '' AND $ambiguous { THROW 'block denied: implementer unresolved, manager takeover required' };
+            IF $owner != $employee { THROW 'block denied: not the bound implementer' };
+          };
         };
       };
       IF $checkpoint AND $checkpoint_limit > 0 {
@@ -1106,7 +1143,7 @@ export class SurrealCompanyCore implements CompanyCore {
         ${UNLOCK_SQL}
       };
       IF !$heartbeat {
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now() };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: $action, sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       };
@@ -1119,6 +1156,7 @@ export class SurrealCompanyCore implements CompanyCore {
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
         ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        excluded: facts.excluded, bound: facts.implementer ?? '', ambiguous: facts.ambiguous,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
       });
       return view(row);
@@ -1185,7 +1223,7 @@ export class SurrealCompanyCore implements CompanyCore {
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         version = $t.version + 1 RETURN AFTER;
       UPDATE employee SET active_task = NONE WHERE id = $actor AND active_task = $task;
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'released', sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
@@ -1597,6 +1635,90 @@ export class SurrealCompanyCore implements CompanyCore {
       return result;
     } catch (error) {
       const replayedAfterFailure = await this.replayStored<GoalAcceptanceResult>(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
+   * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
+   * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase. One compare-and-set
+   * transaction re-checks every basis: the task version, the new implementer's role, execute capability and track,
+   * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
+   * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
+   * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
+   */
+  async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may take over a task implementer');
+    requireText(input.taskId, 'taskId', 1, 200);
+    requireText(input.toEmployee, 'toEmployee', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    if (input.replacementReviewer !== undefined) requireText(input.replacementReviewer, 'replacementReviewer', 1, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const idem = this.idemId(actor.employeeId, 'implementer_takeover', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, toEmployee: input.toEmployee,
+      replacementReviewer: input.replacementReviewer ?? '', expectedVersion: input.expectedVersion, reason: input.reason }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const current = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    if (current.executor_role !== 'engineering') {
+      throw new CompanyError('invalid', 'implementer takeover invalid: only engineering tasks have a code implementer');
+    }
+    const facts = await readContributors(this.db, input.taskId);
+    if (input.toEmployee === facts.implementer) throw new CompanyError('invalid', 'implementer takeover invalid: employee is already the implementer');
+    if (facts.reviewers.includes(input.toEmployee) && !input.replacementReviewer) {
+      throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer becoming implementer needs a named independent replacement reviewer');
+    }
+    if (input.replacementReviewer && (input.replacementReviewer === input.toEmployee || facts.excluded.includes(input.replacementReviewer))) {
+      throw new CompanyError('invalid', 'implementer takeover invalid: replacement reviewer must be independent of every author');
+    }
+    const evidence = `${input.reason}\n[implementer_takeover] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} replacementReviewer=${input.replacementReviewer ?? 'none'} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
+      IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
+      IF $t.state NOT IN ['ready', 'doing', 'blocked'] { THROW 'implementer takeover moved: task is not in execute phase' };
+      LET $to = SELECT * FROM ONLY $target;
+      IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
+      LET $to_tracks = $to.def.tracks ?? [];
+      IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
+      IF $replacement != NONE {
+        LET $rep = SELECT * FROM ONLY $replacement;
+        IF $rep = NONE OR $rep.revoked = true OR 'review' NOT IN $rep.capabilities OR $rep.role != $t.reviewer_role { THROW 'implementer takeover invalid: replacement reviewer cannot review this task' };
+        IF $rep.id IN $excluded_ids { THROW 'implementer takeover invalid: replacement reviewer must be independent of every author' };
+      };
+      LET $holder = $t.current_employee;
+      LET $next = UPDATE ONLY $task SET
+        implementer = $target_key,
+        current_employee = NONE,
+        delivery_id = NONE,
+        lease_expires_at = NONE,
+        fence = IF $holder != NONE THEN $t.fence + 1 ELSE $t.fence END,
+        version = $t.version + 1
+        RETURN AFTER;
+      IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), task: id('task', input.taskId), expected: input.expectedVersion,
+      target: id('employee', input.toEmployee), target_key: input.toEmployee,
+      replacement: input.replacementReviewer ? id('employee', input.replacementReviewer) : undefined,
+      excluded_ids: [...new Set([...facts.excluded, input.toEmployee])].map(employee => id('employee', employee)),
+      evidence, digest, idem, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+    };
+    try {
+      return view(await this.txTask<TaskRow>(query, vars));
+    } catch (error) {
+      const replayedAfterFailure = await this.replay(idem, digest);
       if (replayedAfterFailure) return replayedAfterFailure;
       throw error;
     }

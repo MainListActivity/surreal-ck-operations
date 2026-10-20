@@ -1,0 +1,235 @@
+/**
+ * Dispatch-blocked evaluator: one server-side conclusion for why a task cannot be dispatched in its phase.
+ * The tick, the manager notices, the roster and task cards, and the daily brief all read this result, so
+ * they cannot disagree. Pure on purpose: callers pass the staffing entries and global gates they already
+ * computed. `entries` undefined without a global gate means the candidate state could not be read (unknown,
+ * never "busy").
+ *
+ * A task with zero eligible candidates is never dispatchable. Every effective reason code is reported with
+ * the candidates it applies to, so an early coarse reason (busy, quota) cannot hide author recusal.
+ * Pass-wide gates (pause, budget, resources, concurrency cap) are reported alone: candidates are not read
+ * while one applies, because the tick returns before it looks at them.
+ */
+
+/** execute: the implementer writes code. review: an independent reviewer accepts or returns. */
+export type DispatchPhase = 'execute' | 'review';
+
+/** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
+export type BlockCode =
+  | 'paused' | 'budget' | 'resources' | 'max_running'
+  | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'no_candidate'
+  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
+  | 'quota' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown';
+
+/** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
+export interface EvaluatedEntry {
+  key: string;
+  eligible: boolean;
+  code?: BlockCode;
+}
+
+/** A gate that applies to the whole pass (paused, budget, resources, concurrency cap), not to one candidate. */
+export interface GlobalBlock {
+  code: BlockCode;
+  text: string;
+}
+
+export interface DispatchReason {
+  code: BlockCode;
+  text: string;
+  candidates: string[];
+  owner: 'gm' | 'owner';
+  recovery: string;
+  nextTrigger: string;
+}
+
+export interface DispatchVerdict {
+  noticeKey: string;
+  taskId: string;
+  goalId?: string;
+  title: string;
+  phase: DispatchPhase;
+  role: string;
+  home: string;
+  dispatchable: boolean;
+  eligibleCount: number;
+  /** Every effective reason; empty only when the task is dispatchable. */
+  reasons: DispatchReason[];
+  /**
+   * False when the block is material at once: no candidate can become eligible without an owner decision (e.g. no
+   * independent reviewer), or the candidate state is unknown (nobody can tell whether the work is merely busy).
+   */
+  feasible: boolean;
+  checkedAt: string;
+  since?: string;
+  waitingMinutes: number;
+  /** Stable one-line conclusion: no volatile numbers, so a repeated tick yields the same text. */
+  summary: string;
+}
+
+export interface EvaluateInput {
+  taskId: string;
+  goalId?: string;
+  title: string;
+  phase: DispatchPhase;
+  role: string;
+  home: string;
+  /** undefined without a global gate: the candidate state could not be read (unknown). */
+  entries?: readonly EvaluatedEntry[];
+  globalBlocks?: readonly GlobalBlock[];
+  /** Episode start, unix milliseconds. Defaults to checkedAt (a fresh episode). */
+  since?: number;
+  /** Evaluation time, unix milliseconds. */
+  checkedAt: number;
+}
+
+/** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
+const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
+  'author_recusal', 'implementer_mismatch', 'implementer_unresolved', 'track_mismatch',
+  'credential_file', 'def_disabled', 'no_candidate',
+]);
+
+/** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
+export const BLOCK_TEXT: Record<BlockCode, string> = {
+  paused: '全局暂停派工',
+  budget: '订阅额度耗尽或限流',
+  resources: '宿主机资源低于水位',
+  max_running: '全局在办会话已达上限，等待空位',
+  implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
+  implementer_unresolved: '多个作者且无实现负责人，需经理指定',
+  author_recusal: '本任务作者（写过或提交过）不能复核',
+  no_candidate: '该岗位与仓库下没有任何编制或员工',
+  session_busy: '会话占用中或异常',
+  held: '持有在办任务',
+  assigned: '本轮已分配',
+  credential_file: '凭证文件实例不可接新任务',
+  track_mismatch: '岗位轨不匹配',
+  model_slot: '模型槽位未解析或已漂移',
+  quota: '订阅额度或健康冷却中',
+  provider_capacity: '订阅并发已满',
+  seat_full: '编制席位已满',
+  def_disabled: '编制已停用',
+  wake_failed: '派工未能唤醒或创建会话，下一轮重试',
+  unknown: '状态或贡献者历史读取失败，不能判定（不视为忙），恢复后自动重判',
+};
+
+const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
+  paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
+  implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', no_candidate: 'gm',
+  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
+  quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
+};
+
+const RECOVERY: Record<BlockCode, string> = {
+  paused: '经理解除全局暂停',
+  budget: '老板充值，或等待额度恢复',
+  resources: '清理宿主机磁盘或等待水位恢复',
+  max_running: '等待在办会话结束，或经理调高 max_running',
+  implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
+  implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
+  author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
+  no_candidate: '经理为该岗位或仓库增加编制或员工',
+  session_busy: '等待在办任务完成或租约到期',
+  held: '等待在办任务完成或租约到期',
+  assigned: '下一轮派工自动处理',
+  credential_file: '等待该实例退役，新实例接任务',
+  track_mismatch: '经理调整编制轨或任务轨',
+  model_slot: '等待模型槽位刷新，或经理检查订阅',
+  quota: '等待订阅额度或健康恢复；老板可充值',
+  provider_capacity: '等待在办任务释放该订阅并发',
+  seat_full: '经理扩编（maxInstances）或等待席位释放',
+  def_disabled: '经理重新启用编制或更换编制',
+  wake_failed: '检查 Paseo 会话与插件日志，下一轮自动重试',
+  unknown: '检查 Paseo 插件、运行时日志与审计读取，恢复后自动重判',
+};
+
+const NEXT: Record<BlockCode, string> = {
+  paused: '全局暂停解除',
+  budget: '额度恢复或老板充值',
+  resources: '宿主机水位恢复',
+  max_running: '在办会话数低于上限',
+  implementer_mismatch: '绑定实现负责人可派工，或经理接手',
+  implementer_unresolved: '经理记录实现负责人',
+  author_recusal: '出现独立候选人选',
+  no_candidate: '新增编制或员工',
+  session_busy: '候选会话空闲',
+  held: '在办租约结束或任务完成',
+  assigned: '下一轮派工',
+  credential_file: '实例退役',
+  track_mismatch: '编制轨或任务轨调整',
+  model_slot: '模型槽位解析',
+  quota: '订阅额度或健康恢复',
+  provider_capacity: '订阅并发释放',
+  seat_full: '编制席位释放或扩编',
+  def_disabled: '编制重新启用',
+  wake_failed: '下一轮唤醒成功',
+  unknown: '状态与审计读取恢复',
+};
+
+const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };
+
+const iso = (ms: number) => new Date(ms).toISOString();
+
+/** A pass-wide gate with its owner-facing text. */
+export const globalBlock = (code: BlockCode): GlobalBlock => ({ code, text: BLOCK_TEXT[code] });
+
+/** Evaluates one task phase. Pure: the same inputs always produce the same verdict and summary text. */
+export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
+  const globals = input.globalBlocks ?? [];
+  const entries = input.entries;
+  const eligibleCount = entries ? entries.filter(entry => entry.eligible).length : 0;
+  const grouped = new Map<BlockCode, string[]>();
+  const addCandidate = (code: BlockCode, candidate: string) => {
+    const list = grouped.get(code) ?? [];
+    if (!list.includes(candidate)) list.push(candidate);
+    grouped.set(code, list);
+  };
+  if (globals.length === 0) {
+    if (entries === undefined) addCandidate('unknown', '*');
+    else if (entries.length === 0) addCandidate('no_candidate', '*');
+    for (const entry of entries ?? []) {
+      if (!entry.eligible) addCandidate(entry.code ?? 'unknown', entry.key);
+    }
+  }
+  for (const gate of globals) addCandidate(gate.code, '*');
+  const dispatchable = globals.length === 0 && entries !== undefined && eligibleCount > 0;
+  const reasons: DispatchReason[] = dispatchable ? [] : [...grouped.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([code, candidates]) => ({
+      code,
+      text: BLOCK_TEXT[code],
+      candidates: candidates.sort(),
+      owner: OWNER[code],
+      recovery: RECOVERY[code],
+      nextTrigger: NEXT[code],
+    }));
+  // Pass-wide gates clear by themselves. A candidate list holding only owner-decision codes never does, and neither does an
+  // unknown state: nobody can tell whether it will, so it is material at once.
+  const materialCode = (code: BlockCode = 'unknown') => code === 'unknown' || PERMANENT.has(code);
+  const feasible = dispatchable || (globals.length > 0
+    ? globals.every(gate => !materialCode(gate.code))
+    : entries !== undefined && entries.some(entry => !entry.eligible && !materialCode(entry.code)));
+  const phase = PHASE_LABEL[input.phase];
+  const summary = dispatchable
+    ? `${input.title}：${phase}可派工`
+    : `${input.title}：${phase}无法派工（${reasons.map(reason => reason.text).join('；') || '原因未知'}）`;
+  const since = input.since ?? input.checkedAt;
+  return {
+    noticeKey: `dispatch-blocked:${input.taskId}:${input.phase}`,
+    taskId: input.taskId, goalId: input.goalId, title: input.title, phase: input.phase, role: input.role, home: input.home,
+    dispatchable, eligibleCount, reasons, feasible,
+    checkedAt: iso(input.checkedAt),
+    since: dispatchable ? undefined : iso(since),
+    waitingMinutes: dispatchable ? 0 : Math.max(0, Math.floor((input.checkedAt - since) / 60_000)),
+    summary,
+  };
+}
+
+/** Owner-facing notice text. Built from stable fields only, so repeated ticks update nothing. */
+export function dispatchNoticeText(verdict: DispatchVerdict): string {
+  const reasons = verdict.reasons.map(reason =>
+    `${reason.text}（${reason.candidates.filter(c => c !== '*').join('、') || '全局'}）`).join('；');
+  const next = verdict.reasons.map(reason => reason.nextTrigger).filter((v, i, all) => all.indexOf(v) === i).join('；');
+  const recovery = verdict.reasons.map(reason => `${reason.owner === 'gm' ? 'gm' : '老板'}：${reason.recovery}`).join('；');
+  return `${verdict.summary}。自 ${verdict.since ?? verdict.checkedAt} 起等待。原因：${reasons}。下一触发：${next || '待定'}。处理：${recovery}。`;
+}

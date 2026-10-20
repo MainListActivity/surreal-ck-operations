@@ -243,30 +243,42 @@ test('instruct owner_command lands as a ready gm task carrying the owner text, i
   expect(again.find(r => r.kind === 'instruct')!.result).toBe(`task=${taskId}`);
 });
 
-test('revoked lease hands over to a same-role employee with history; old session is fenced out', async () => {
+test('revoked lease: a same-role colleague is refused until gm takes over; the takeover keeps history and fences the old session', async () => {
   const t = await core.createTask(tokens.gm, { title: 'Handover task', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
   const first = await core.claim(tokens['eng-a'], t.id);
   const cp = await core.checkpoint(tokens['eng-a'], proofOf(first), { text: '已完成接口草稿与数据结构，下一步编写 tests/api.test.ts 的单元测试。', idempotencyKey: key() });
   await database.db.query(`UPDATE employee SET paseo_agent_id = 'sess-eng-a', provider = 'codex' WHERE id = $e;`,
     { e: new RecordId('employee', 't-eng-a') });
-  expect(await workforce.revokeLease(t.id, 't-eng-a', '会话额度耗尽', '【交接包】最后日志：写到 tests/api.test.ts')).toBe(true);
-  expect(await task(t.id)).toMatchObject({ state: 'ready', handover: true, previousEmployee: 't-eng-a' });
-  await expect(core.submit(tokens['eng-a'], proofOf(first, cp.version), { text: 'Stale session writes must fail.', idempotencyKey: key() }))
-    .rejects.toBeDefined();
-  const second = await core.claim(tokens['eng-b'], t.id);
-  expect(second.fence).toBe(first.fence + 1);
-  // Successor sees the predecessor's Paseo session id and can pull its full transcript.
-  expect(second.predecessors).toEqual(expect.arrayContaining([
-    expect.objectContaining({ employee: 't-eng-a', agentId: 'sess-eng-a', provider: 'codex' })]));
-  expect(second.predecessors?.map(p => p.employee)).not.toContain('t-eng-b');
-  // Restore invisibility: an agent id on a seeded employee would make the dispatcher adopt it as an instance.
-  await database.db.query(`UPDATE employee SET paseo_agent_id = NONE, provider = NONE WHERE id = $e;`,
-    { e: new RecordId('employee', 't-eng-a') });
-  expect(second.history.map(h => h.action)).toEqual(expect.arrayContaining(['claim', 'checkpoint', 'revoked']));
-  expect(second.history.find(h => h.action === 'revoked')?.evidence).toContain('tests/api.test.ts');
-  const submitted = await core.submit(tokens['eng-b'], proofOf(second), { text: 'Continued from handover.', idempotencyKey: key() });
-  expect(submitted.handover).toBeUndefined();
+  // A leftover agent id makes the dispatcher adopt t-eng-a as a live instance and retire it, so every exit clears it.
+  try {
+    expect(await workforce.revokeLease(t.id, 't-eng-a', '会话额度耗尽', '【交接包】最后日志：写到 tests/api.test.ts')).toBe(true);
+    expect(await task(t.id)).toMatchObject({ state: 'ready', handover: true, previousEmployee: 't-eng-a', implementer: 't-eng-a' });
+    await expect(core.submit(tokens['eng-a'], proofOf(first, cp.version), { text: 'Stale session writes must fail.', idempotencyKey: key() }))
+      .rejects.toBeDefined();
+    // The first execute claim bound eng-a as the implementer, so a same-role colleague cannot take the code by claiming.
+    await expect(core.claim(tokens['eng-b'], t.id)).rejects.toMatchObject({ code: 'forbidden' });
+    // Only gm can hand over; a colleague's attempt to take over is refused by capability.
+    const expectedVersion = (await task(t.id)).version;
+    await expect(core.implementerTakeover(tokens['eng-b'], { taskId: t.id, toEmployee: 't-eng-b', expectedVersion,
+      reason: '同岗位员工自行尝试接手', idempotencyKey: key() })).rejects.toMatchObject({ code: 'forbidden' });
+    const taken = await core.implementerTakeover(tokens.gm, { taskId: t.id, toEmployee: 't-eng-b', expectedVersion,
+      reason: '原实现者会话额度耗尽，经理指定 eng-b 接手', idempotencyKey: key() });
+    expect(taken).toMatchObject({ state: 'ready', implementer: 't-eng-b' });
+    const second = await core.claim(tokens['eng-b'], t.id);
+    expect(second.fence).toBe(first.fence + 1);
+    // Successor sees the predecessor's Paseo session id and can pull its full transcript.
+    expect(second.predecessors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ employee: 't-eng-a', agentId: 'sess-eng-a', provider: 'codex' })]));
+    expect(second.predecessors?.map(p => p.employee)).not.toContain('t-eng-b');
+    expect(second.history.map(h => h.action)).toEqual(expect.arrayContaining(['claim', 'checkpoint', 'revoked', 'implementer_takeover']));
+    expect(second.history.find(h => h.action === 'revoked')?.evidence).toContain('tests/api.test.ts');
+    const submitted = await core.submit(tokens['eng-b'], proofOf(second), { text: 'Continued from handover.', idempotencyKey: key() });
+    expect(submitted.handover).toBeUndefined();
+  } finally {
+    await database.db.query(`UPDATE employee SET paseo_agent_id = NONE, provider = NONE WHERE id = $e;`,
+      { e: new RecordId('employee', 't-eng-a') });
+  }
   // A long review (e.g. walking through the acceptance manual) can checkpoint too, and hands over the same way.
   const reviewer = await core.claim(tokens.qa, t.id);
   const reviewCp = await core.checkpoint(tokens.qa, proofOf(reviewer), { text: '已按手册完成第 1-3 步，第 4 步待验证支付回调。', idempotencyKey: key() });
@@ -302,7 +314,7 @@ class FakePaseo implements PaseoGateway {
   set(id: string, status: string, error = '') { const a = this.agents.get(id)!; a.status = status; a.error = error; }
 }
 
-test('dispatcher: spawn from defs, fail over on exhausted subscription, budget pause, probe recovery, no self review', async () => {
+test('dispatcher: spawn from defs, a bound implementer is not replaced when its subscription runs out, budget pause, probe recovery', async () => {
   // Isolate from tasks created by earlier tests in this file.
   await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4 };");
@@ -334,28 +346,30 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   report = await dispatcher.tick();
   expect(report.exhausted).toEqual(['codex']);
   expect(report.revoked).toEqual([t.id]);
-  expect(report.woke).toHaveLength(1);
-  expect(report.woke[0].employee.startsWith('engineering-grok-')).toBe(true);
-  const grokAgent = [...paseo.agents.keys()][1];
-  expect(paseo.agents.get(grokAgent)!.spawn!.prompt).toContain('接手续做');
+  // Codex is the bound implementer, so no other engineer is woken for the code work; the lease waits in ready.
+  expect(report.woke).toHaveLength(0);
+  expect(await task(t.id)).toMatchObject({ state: 'ready', implementer: codexInst.employee, handover: true });
   const history = await core.history(tokens.gm, t.id);
   expect(history.find(h => h.action === 'revoked')?.evidence).toContain('git commit -m wip');
-  // The stale error state must not keep extending the cooldown.
+  // The verdict names every effective reason from the same pass: the exhausted bound session, and the spawn gate on others.
+  const verdict = dispatcher.dispatchVerdicts().find(v => v.taskId === t.id && v.phase === 'execute')!;
+  expect(verdict).toMatchObject({ dispatchable: false, feasible: true, eligibleCount: 0 });
+  expect(verdict.reasons.map(r => r.code)).toEqual(['implementer_mismatch', 'quota']);
+  expect(verdict.reasons.find(r => r.code === 'quota')?.candidates).toEqual([codexInst.employee]);
+  // A fresh episode waits for the five-minute window; the stale error state must not keep extending the cooldown.
+  expect(report.notices).not.toContain(`dispatch-blocked:${t.id}:execute`);
   expect((await dispatcher.tick()).exhausted).toEqual([]);
 
-  // Grok employee continues and submits; review must go to someone other than the submitter.
-  const grokEmployee = report.woke[0].employee;
-  const takeover = await core.claim(tokenOf(grokEmployee), t.id);
-  expect(takeover.task.handover).toBe(true);
-  await core.submit(tokenOf(grokEmployee), proofOf(takeover), { text: 'Finished after takeover.', idempotencyKey: key() });
-  paseo.set(grokAgent, 'idle');
+  // Five minutes into the episode the owner gets one notice for the task and phase; repeated ticks keep one open item.
+  await database.db.query('UPDATE $t SET dispatch_blocked_since = time::unix(time::now()) - 400;', { t: new RecordId('task', t.id) });
   report = await dispatcher.tick();
-  // Only candidates: the submitter (excluded) and the exhausted codex instance; nobody is available.
-  expect(report.woke).toHaveLength(0);
-  expect(report.notices).toContain('staff:engineering');
+  expect(report.notices).toContain(`dispatch-blocked:${t.id}:execute`);
+  for (let i = 0; i < 9; i++) await dispatcher.tick();
+  expect((await owner.openNotices()).filter(n => n.key === `dispatch-blocked:${t.id}:execute`)).toHaveLength(1);
 
-  // Grok also runs out: every subscription is exhausted → one budget notice, dispatch paused.
-  paseo.set(grokAgent, 'error', 'Rate limit reached, try again later');
+  // Grok has no session in this scenario, so its subscription is marked exhausted directly. Every subscription is
+  // now out: one budget notice, dispatch paused.
+  await workforce.markExhausted('grok', 'Rate limit reached, try again later');
   const bump = await core.createTask(tokens.gm, { title: 'Budget probe', context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'qa', idempotencyKey: key() });
   report = await dispatcher.tick();
@@ -364,14 +378,13 @@ test('dispatcher: spawn from defs, fail over on exhausted subscription, budget p
   expect((await dispatcher.tick()).notices).not.toContain('budget');
   expect(notices.filter(n => n.includes('所有订阅')).length).toBe(1);
 
-  // Codex only claimed/checkpointed the task; the production baseline permits
-  // claim-only hands as demoted review fallback while excluding the submitter.
-  // With no fresh candidate available, probe recovery can review t.
+  // Probe recovery: the bound implementer resumes its own task, and dispatching it clears the episode notice.
   await database.db.query("UPDATE provider_health:codex SET until = 0;");
   report = await dispatcher.tick();
   expect(report.skipped).toBeUndefined();
   expect(report.woke.map(w => w.employee)).toEqual([codexInst.employee]);
   expect(report.woke[0].task).toBe(t.id);
+  expect((await owner.openNotices()).some(n => n.key === `dispatch-blocked:${t.id}:execute`)).toBe(false);
   paseo.set(codexAgent, 'idle');
   await dispatcher.tick();
   expect((await workforce.providerHealth()).get('codex')?.state).toBe('healthy');
@@ -659,16 +672,18 @@ test('dispatcher: jev triages goals, approves safe releases and reroutes owner q
   expect((await owner.inbox()).questions.map(q => q.task.id)).toContain(ask.id);
 });
 
-test('a task blocked while doing returns to ready on resume so the dispatcher can pick it up', async () => {
-  const t = await core.createTask(tokens.gm, { title: '阻塞后恢复', context: '验证恢复后重新可领取', executorRole: 'engineering',
+test('a task blocked while doing resumes to its bound implementer; a colleague cannot claim the code meanwhile', async () => {
+  const t = await core.createTask(tokens.gm, { title: '阻塞后恢复', context: '验证恢复后由绑定实现者重新领取', executorRole: 'engineering',
     reviewerRole: 'engineering', idempotencyKey: key() });
   const held = await core.claim(tokens['eng-a'], t.id);
   await core.block(tokens['eng-a'], proofOf(held), 'gm', { text: '缺少一个前置信息，需要经理协调补充后再恢复本任务继续执行。', idempotencyKey: key() });
   const resumed = await core.resume(tokens.gm, t.id, { text: '经理决定：按原方案继续执行，缺少的前置信息已经补充完整。', idempotencyKey: key() });
   expect(resumed.state).toBe('ready');
-  const reb = await core.claim(tokens['eng-b'], t.id);
+  // AC04: the first execute claim bound eng-a as implementer, so the resumed code work stays with eng-a; AC06: a colleague is refused.
+  await expect(core.claim(tokens['eng-b'], t.id)).rejects.toMatchObject({ code: 'forbidden' });
+  const reb = await core.claim(tokens['eng-a'], t.id);
   expect(reb.task.state).toBe('doing');
-  await core.submit(tokens['eng-b'], proofOf(reb), { text: 'Resumed and delivered after the block.', idempotencyKey: key() });
+  await core.submit(tokens['eng-a'], proofOf(reb), { text: 'Resumed and delivered after the block.', idempotencyKey: key() });
 });
 
 test('a task whose dependencies are already done is created ready', async () => {
@@ -923,7 +938,7 @@ test('dispatcher: review hard-excludes authors but falls back to claim-only prio
   expect((await task(t.id)).state).toBe('review');
 });
 
-test('dispatcher: review stays queued while contributor history read fails and resumes when it recovers', async () => {
+test('dispatcher: an unreadable contributor history holds review and fresh execute, and both resume when it recovers', async () => {
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');
   await database.db.query('DELETE owner_notice;');
@@ -958,7 +973,7 @@ test('dispatcher: review stays queued while contributor history read fails and r
   await core.submit(tokenOf(exec.employee), proofOf(claim), { text: '实现完成：代码在任务分支，测试通过，等待独立验收。', idempotencyKey: key() });
   paseo.set(execAgent, 'idle');
 
-  // Review 派给非贡献者 E2；E2 领取（audit 记下 claim，成为非提交人贡献者）后租约被收回。
+  // Review 派给非作者 E2；E2 领取复核（review 阶段 claim 记为复核人而非作者）后租约被收回。
   report = await dispatcher.tick();
   const reviewer = report.woke.find(w => w.task === t.id)!;
   expect(reviewer.spawned).toBe(true);
@@ -967,30 +982,35 @@ test('dispatcher: review stays queued while contributor history read fails and r
   await workforce.revokeLease(t.id, reviewer.employee, '会话中断（测试模拟）', '交接包');
   paseo.set(reviewerAgent, 'idle');
 
-  // 贡献者历史读取失败：回避名单未知 → fail-closed。E2（非提交人前持有人）不得被重新唤醒，
-  // review 留在队列，owner 收件箱通知说明读取失败；Jev 不参与该 review 的选人；execute 派工不受影响。
-  const savedEvalState = workforce.evalState.bind(workforce);
-  workforce.evalState = async () => { throw new Error('synthetic contributor history read failure'); };
+  // 贡献者历史读取失败：回避名单未知 → fail-closed。review 留在队列，E2 不得在名单未知时被派回；
+  // owner 收件箱即刻通知（unknown 即刻可见）；Jev 不参与该 review 的选人。
+  // execute 同样 fail-closed（AC04）：新工程任务的实现者绑定读不到，不派给猜测的候选，待历史恢复后再派。
+  const t2 = await core.createTask(tokens.gm, { title: '执行连续性', context: 'synthetic', executorRole: 'engineering',
+    reviewerRole: 'qa', idempotencyKey: key() });
+  const savedContributors = workforce.contributors.bind(workforce);
+  workforce.contributors = async () => { throw new Error('synthetic contributor history read failure'); };
   try {
-    const t2 = await core.createTask(tokens.gm, { title: '执行连续性', context: 'synthetic', executorRole: 'engineering',
-      reviewerRole: 'qa', idempotencyKey: key() });
     report = await dispatcher.tick();
     expect(report.woke.map(w => w.task)).not.toContain(t.id);
-    expect(report.woke.map(w => w.task)).toContain(t2.id);
-    expect(report.notices).toContain(`contributors:${t.id}`);
+    expect(report.woke.map(w => w.task)).not.toContain(t2.id);
+    expect(report.notices).toContain(`dispatch-blocked:${t.id}:review`);
+    expect(report.notices).toContain(`dispatch-blocked:${t2.id}:execute`);
     expect(jevDispatches.filter(d => d.purpose === 'review' && d.taskId === t.id)).toHaveLength(0);
   } finally {
-    workforce.evalState = savedEvalState;
+    workforce.contributors = savedContributors;
   }
   expect((await task(t.id)).state).toBe('review');
 
   // 读取恢复：失败通知自动清除，回避名单生效——E1（作者）硬回避；
-  // E2（复核过的前持有人、仅 claim 未提交）降权兜底，复核派回 E2 继续而非死等。
+  // E2（只复核、从未写代码）仍是合格复核人，复核派回 E2 继续而非死等。
   report = await dispatcher.tick();
-  expect((await owner.openNotices()).some(n => n.key === `contributors:${t.id}`)).toBe(false);
+  expect((await owner.openNotices()).some(n => n.key === `dispatch-blocked:${t.id}:review`)).toBe(false);
   const rewoke = report.woke.find(w => w.task === t.id)!;
   expect(rewoke.employee).toBe(reviewer.employee);
   expect(rewoke.spawned).toBe(false);
+  // The fresh execute task is dispatched once its history reads again, and its episode notice clears.
+  expect(report.woke.map(w => w.task)).toContain(t2.id);
+  expect((await owner.openNotices()).some(n => n.key === `dispatch-blocked:${t2.id}:execute`)).toBe(false);
   // Jev 若参与选人，候选里不出现作者；经手人可保留（带 prior 标记）。
   for (const d of jevDispatches.filter(d => d.taskId === t.id)) {
     expect(Object.keys(d.candidates ?? [])).not.toContain(exec.employee);

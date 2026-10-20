@@ -30,6 +30,8 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
+  // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
+  "implementer_takeover",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -605,6 +607,9 @@ export class SidecarPool {
       case "goal_acceptance_repair": return core.goalAcceptanceRepair
         ? core.goalAcceptanceRepair(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_acceptance_repair"), { code: "temporarily_unavailable" }));
+      case "implementer_takeover": return core.implementerTakeover
+        ? core.implementerTakeover(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

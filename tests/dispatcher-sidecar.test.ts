@@ -43,6 +43,11 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
+    // No audit history in this fixture: no authors, no implementer, so no gate and no recusal apply.
+    contributors: async () => ({ authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: [] }),
+    setDispatchBlock: async (id: string, phase?: string, since?: number) => {
+      Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
+    },
   };
   const notices = new Map<string, string>();
   const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); }, openNotices: async () => [], triagePending: async () => [],
@@ -295,13 +300,13 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
   });
-  test('staff notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
+  test('dispatch-blocked notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
     const w = world();
     w.def.tracks = ['角色设计'];
     w.addTask('synth', { discipline: '合成' });
     const r = await w.dispatcher().tick();
-    expect(r.notices).toContain('staff:engineering');
-    const text = w.notices.get('staff:engineering')!;
+    expect(r.notices).toContain('dispatch-blocked:synth:execute');
+    const text = w.notices.get('dispatch-blocked:synth:execute')!;
     expect(text).toContain('岗位轨不匹配');
     expect(text).not.toContain('可新开但唤醒/创建失败');
     // A task whose discipline the def covers still dispatches — the gate is the track only.

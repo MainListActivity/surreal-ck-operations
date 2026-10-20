@@ -484,7 +484,7 @@ export class OwnerDesk {
       SELECT title, created_at FROM goal WHERE state = 'active' ORDER BY created_at;
       SELECT id, state, last_error FROM provider_health;
       SELECT id, lowest_pct FROM company_meta WHERE lowest_pct != NONE;
-      SELECT key FROM owner_notice WHERE resolved_at = NONE AND string::starts_with(key, 'staff:');
+      SELECT key FROM owner_notice WHERE resolved_at = NONE AND string::starts_with(key, 'dispatch-blocked:');
       SELECT count() AS n FROM employee WHERE role != NONE AND created_at > <datetime>$since GROUP ALL;
       SELECT retired_reason AS reason, count() AS n FROM employee WHERE retired = true AND retired_at > <datetime>$since GROUP BY retired_reason;`, { since: sinceIso });
     const stuck: BriefData['stuck'] = [];

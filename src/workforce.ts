@@ -7,6 +7,7 @@ import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
+import { readContributors, type ContributionFacts } from './contributors.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -164,6 +165,11 @@ export interface SupervisedTask {
   currentEmployee?: string;
   submittedBy?: string;
   previousEmployee?: string;
+  /** Explicit code implementer; derived implementers come from contributors (see contributors.ts). */
+  implementer?: string;
+  /** Open dispatch-blocked episode: the phase it blocks and when it began (unix seconds). */
+  dispatchBlockedPhase?: string;
+  dispatchBlockedSince?: number;
   leaseExpiresAt?: number;
   progressAt?: number;
   blockedTo?: 'gm' | 'owner';
@@ -171,6 +177,8 @@ export interface SupervisedTask {
   quotaResetsAt?: number;
   kind: string;
   title: string;
+  /** Goal this task belongs to; dispatch-blocked conclusions carry it so goal cards can show the root blocker. */
+  goalId?: string;
   evalAttempts: number;
   jevReleaseVersion?: number;
   jevRouteVersion?: number;
@@ -202,9 +210,11 @@ const supervised = (row: TaskRow): SupervisedTask => {
   return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
     discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-    previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+    previousEmployee: row.previous_employee ?? undefined, implementer: row.implementer ?? undefined,
+    dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
+    leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
-    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title,
+    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
     codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };
@@ -416,6 +426,17 @@ export class Workforce {
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
   async evalState(taskId: TaskId): Promise<EvalState> {
     return collectEvalState(this.db, taskId);
+  }
+
+  /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */
+  async contributors(taskId: TaskId): Promise<ContributionFacts> {
+    return readContributors(this.db, taskId);
+  }
+
+  /** Persists or clears a task's open dispatch-blocked episode (phase and start, unix seconds). */
+  async setDispatchBlock(taskId: TaskId, phase: string | undefined, since?: number): Promise<void> {
+    await this.db.query('UPDATE $task SET dispatch_blocked_phase = $phase, dispatch_blocked_since = $since;',
+      { task: id('task', taskId), phase: phase ?? null, since: since ?? null });
   }
 
   /** Record a Jev-produced evaluation: scorecards + evaluated_at + audit/outbox + rolling averages. */

@@ -347,6 +347,15 @@ export function normalizePulse(raw: unknown): Pulse {
     staffingAlerts: num(o.staffingAlerts),
     churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
     goals: arr<Record<string, unknown>>(o.goals).map(g => ({ title: str(g.title), days: num(g.days) })),
+    dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
+      taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
+      phase: v.phase === "review" ? "review" : "execute", summary: str(v.summary),
+      feasible: v.feasible === true, since: str(v.since) || undefined, waitingMinutes: num(v.waitingMinutes),
+      reasons: arr<Record<string, unknown>>(v.reasons).map(r => ({
+        code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
+        owner: r.owner === "owner" ? "owner" : "gm", recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+      })),
+    })),
   };
 }
 

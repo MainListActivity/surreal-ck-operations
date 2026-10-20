@@ -72,8 +72,10 @@ export interface Pulse {
   paused: boolean;
   /** state=doing 的任务 */
   doing: Array<{ taskId: string; title: string; employee?: string; role: string; discipline?: string; goal?: string; sinceMin?: number }>;
-  /** 就绪但还没被领走的任务；unclaimableReason 是全候选不可派时的主因 */
+  /** 就绪但还没被领走的任务；unclaimableReason 是 tick 对 execute 阶段的不可派原因（与公司通知同文） */
   ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
+  /** 本轮 tick 判定派不出去的工作（execute 与 review 两阶段），与公司通知同源 */
+  dispatchBlocked: DispatchBlockedView[];
   /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   /** 等老板拍板/回答（带已等时长与下游受阻数） */
@@ -123,6 +125,8 @@ export interface StaffingEntryView {
   share: number;
   eligible: boolean;
   reason?: string;
+  /** Machine code behind `reason`, the same code the dispatch-blocked verdict groups by. */
+  code?: string;
   model?: string;
 }
 
@@ -141,6 +145,20 @@ export interface ReviewStaffingPoolView extends StaffingPoolView {
   status: "ready" | "history_unavailable";
 }
 
+/** One dispatch-blocked conclusion from the latest tick, owner-facing. Same summary text as the notice for that episode. */
+export interface DispatchBlockedView {
+  taskId: string;
+  goalId?: string;
+  title: string;
+  phase: "execute" | "review";
+  summary: string;
+  /** False when the block is material at once (owner decision needed, or candidate state unknown). */
+  feasible: boolean;
+  since?: string;
+  waitingMinutes: number;
+  reasons: Array<{ code: string; text: string; candidates: string[]; owner: "gm" | "owner"; recovery: string; nextTrigger: string }>;
+}
+
 export interface Roster {
   paused: boolean;
   /** The operations repo; pools whose home equals this render as the default project. */
@@ -152,6 +170,10 @@ export interface Roster {
   /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
   pools: StaffingPoolView[];
   reviewPools: ReviewStaffingPoolView[];
+  /** Dispatch-blocked verdicts from the latest tick: the roster and the tick cannot disagree. */
+  dispatchBlocked: DispatchBlockedView[];
+  /** When the tick last observed sessions; roster status is that observation, not a second read. */
+  sessionsObservedAt?: string;
 }
 
 export interface ModelOption {

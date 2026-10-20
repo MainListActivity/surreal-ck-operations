@@ -72,6 +72,8 @@ export interface TaskView {
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
+  /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
+  implementer?: EmployeeId;
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -200,6 +202,20 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
+/** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
+export interface ImplementerTakeover {
+  taskId: TaskId;
+  /** Takes over code work; must hold the task's execute role and capability. */
+  toEmployee: EmployeeId;
+  /** Required when toEmployee is a current reviewer: a different, independent engineer that will review. */
+  replacementReviewer?: EmployeeId;
+  /** Compare-and-set: refuse when the task version has moved. */
+  expectedVersion: number;
+  /** Why the bound implementer is replaced; audited. */
+  reason: string;
+  idempotencyKey: string;
+}
+
 /** gm (manage): read-only dry-run of the acceptance reference repair for a quick/software goal. */
 export interface GoalAcceptancePreview {
   goalId: string;
@@ -323,6 +339,8 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
+  implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
