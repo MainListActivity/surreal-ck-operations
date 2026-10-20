@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // CI gate guard (SYS01 review defect 1). A missing space once glued two test paths into one token, so the bridge
@@ -33,8 +33,14 @@ test('the comm gate runs the client and slow pipe regressions, and CI runs the c
 // SYS01 AC-B: the macOS slow-pipe regression is no longer a hosted paid job. It runs at release time through the local gate, and
 // install refuses a release that has no passing record for it. No workflow may name a hosted macOS runner again.
 test('no workflow runs on a hosted macOS runner, and the release gate for the slow pipe exists', () => {
-  for (const workflow of ['quality-gate.yml', 'channel-quality.yml']) {
-    expect(readFileSync(join(ROOT, '.github/workflows', workflow), 'utf8')).not.toContain('macos');
+  // Every workflow file, not a fixed list: a new file must not name a macOS runner either. Comment lines are skipped, so a note
+  // that says "macOS" does not count as a runner label.
+  const dir = join(ROOT, '.github/workflows');
+  const workflows = readdirSync(dir).filter(file => /\.ya?ml$/.test(file));
+  expect(workflows.length).toBeGreaterThan(0);
+  for (const workflow of workflows) {
+    const jobs = readFileSync(join(dir, workflow), 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
+    expect(jobs.join('\n'), `${workflow}: names no macOS runner`).not.toMatch(/macos/i);
   }
   expect(existsSync(join(ROOT, 'scripts/release-gate.sh'))).toBe(true);
   expect(readFileSync(join(ROOT, 'scripts/release-gate.sh'), 'utf8')).toContain('tests/comm-slow-pipe.test.ts');
