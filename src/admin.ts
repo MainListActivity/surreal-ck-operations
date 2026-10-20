@@ -50,7 +50,15 @@ try {
   const workforce = new Workforce(database, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '.runtime', 'credentials')));
   switch (action) {
     case 'revoke': {
-      await admin.revoke(args[0]!);
+      // The same gate as retirement (LocalEnrollmentAdmin.revoke): a refusal writes nothing and exits non-zero with its stable code.
+      try {
+        await admin.revoke(args[0]!);
+      } catch (error) {
+        if (!(error instanceof CompanyError) || error.code !== 'retire_refused') throw error;
+        print({ action, employeeId: args[0], ok: false, code: error.code, message: error.message, details: error.details });
+        process.exitCode = 1;
+        break;
+      }
       print({ action, employeeId: args[0], ok: true });
       break;
     }

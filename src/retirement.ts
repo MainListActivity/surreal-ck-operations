@@ -4,8 +4,9 @@ import { CONTRIBUTION_ACTIONS, readContributionView, type ContributionFacts } fr
 
 /**
  * The retirement gate (SYS-DISP R1). Retiring an employee revokes its credential, so the refusal rules sit at the one boundary
- * every retirement passes through (`Workforce.retire`: admin CLI, dispatcher rotation and failure paths, scene archive, MCP and
- * plugin), not in the callers. An employee is refused while:
+ * every credential change passes (`gateCredentialChange`): `Workforce.retire` (admin CLI, dispatcher rotation and failure paths,
+ * scene archive, MCP and plugin) and the admin revocation (`LocalEnrollmentAdmin.revoke`), not in the callers. An employee is
+ * refused while:
  *  - it holds a task lease, in any phase (`active_lease`);
  *  - it is the explicit implementer of an unfinished task: ready rework, review wait and blocked (dependency or manager wait)
  *    alike (`bound_implementer`);
@@ -13,7 +14,7 @@ import { CONTRIBUTION_ACTIONS, readContributionView, type ContributionFacts } fr
  *    one of several authors with no implementer recorded (`implementer_unresolved`). Unknown-phase legacy rows count as authors,
  *    as contributors.ts does (fail-closed).
  * Reviewers who are not authors never block, and finished or voided tasks never block. The refusal is decided before any write,
- * and the write re-checks every task version the decision used, in the same transaction (see Workforce.retire).
+ * and the write re-checks every task version the decision used, in the same transaction.
  */
 export const RETIRE_REFUSED = 'retire_refused';
 
@@ -53,29 +54,43 @@ export function retirementRefusals(employeeId: string, candidates: readonly Reti
   });
 }
 
-const idsOf = (reasons: readonly RetireRefusalItem[], reason: RetireRefusalReason): string =>
-  [...new Set(reasons.filter(item => item.reason === reason).map(item => item.taskId))].join('、');
+/**
+ * The legal next step for one group of refusals. A takeover (`implementer_takeover`) exists for the execute phase only (ready,
+ * doing, blocked), so a review-phase group never names it: it waits for the review, or for the review's return to execute work.
+ * No group names a way around the gate, and none says that releasing a lease ends a binding.
+ */
+function legalActionFor(phase: 'execute' | 'review', reason: RetireRefusalReason, ids: string): string {
+  if (phase === 'review') {
+    if (reason === 'active_lease') return `任务 ${ids} 处于复核阶段且该员工持有复核租约：等待复核完成；租约过期后由调度器收回，并重新安排独立复核。复核阶段不能提前接手，也没有受权的提前释放入口，需要提前退役时报经理`;
+    if (reason === 'bound_implementer') return `任务 ${ids} 处于复核阶段且该员工为实现人：等待复核完成（通过则结束，退回则回到执行阶段）；回到执行阶段后，才可由经理按执行阶段规则交接实现人`;
+    return `任务 ${ids} 处于复核阶段且缺少实现人字段：等待复核完成；退回到执行阶段后，经理核对贡献记录，再按执行阶段规则记录唯一实现人`;
+  }
+  if (reason === 'active_lease') return `任务 ${ids} 仍有租约：等待任务结束（完成或作废）。租约过期或被收回不会解除该员工与任务的关系（实现人或作者），需要提前退役时，经理用 implementer_takeover 把实现人交接给其他工程员工，原租约随之撤销`;
+  if (reason === 'bound_implementer') return `任务 ${ids} 绑定该员工为实现人且尚未结束（返修或阻塞中）：等待任务结束；需要提前退役时，经理用 implementer_takeover 把实现人交接给其他工程员工`;
+  if (reason === 'legacy_implementer') return `任务 ${ids} 缺少实现人字段，无法在线确认：经理用 contributor_dryrun 核对贡献记录后，用 implementer_takeover 记录唯一实现人，或等待任务结束`;
+  return `任务 ${ids} 有多位作者且无实现人：经理用 contributor_dryrun 核对后，用 implementer_takeover 记录唯一实现人，或等待任务结束`;
+}
 
-/** The legal next steps for each refusal reason. Each one ends the relation; none is a way around the gate. */
+/** The legal next steps, one per phase and reason, with the task ids of that group. Each one ends the relation; none goes around the gate. */
 export function retirementLegalActions(reasons: readonly RetireRefusalItem[]): string[] {
-  const actions: string[] = [];
-  const lease = idsOf(reasons, 'active_lease');
-  if (lease) actions.push(`任务 ${lease} 仍有租约：等待任务结束（完成或作废），或等租约过期被调度器收回；需要提前退役时，经理先用 implementer_takeover 受控交接。`);
-  const bound = idsOf(reasons, 'bound_implementer');
-  if (bound) actions.push(`任务 ${bound} 绑定该员工为实现人且尚未结束（返修、待复核或阻塞中）：等待任务结束；需要提前退役时，经理先用 implementer_takeover 把实现人交接给其他工程员工。`);
-  const legacy = idsOf(reasons, 'legacy_implementer');
-  if (legacy) actions.push(`任务 ${legacy} 缺少实现人字段，无法在线确认：经理核实贡献记录后用 implementer_takeover 记录实现人，或等待任务结束。`);
-  const unresolved = idsOf(reasons, 'implementer_unresolved');
-  if (unresolved) actions.push(`任务 ${unresolved} 有多位作者且无实现人：经理用 implementer_takeover 记录唯一实现人，或等待任务结束。`);
-  return actions;
+  const groups = new Map<string, { phase: 'execute' | 'review'; reason: RetireRefusalReason; ids: string[] }>();
+  for (const item of reasons) {
+    const key = `${item.phase}:${item.reason}`;
+    const group = groups.get(key) ?? { phase: item.phase, reason: item.reason, ids: [] };
+    if (!group.ids.includes(item.taskId)) group.ids.push(item.taskId);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map(group => legalActionFor(group.phase, group.reason, group.ids.join('、')));
 }
 
 /** The stable refusal. No write has happened: the credential stays valid and the lease, fence and task are untouched. */
-export function retireRefused(employeeId: string, reasons: readonly RetireRefusalItem[]): CompanyError {
+export function retireRefused(employeeId: string, reasons: readonly RetireRefusalItem[], operation: 'retire' | 'revoke' = 'retire'): CompanyError {
   const summary = reasons.map(item => `${item.taskId}（${item.phase === 'review' ? '复核阶段' : '执行阶段'}，${item.state}，${item.reason}）`).join('；');
   const legalActions = retirementLegalActions(reasons);
-  return new CompanyError(RETIRE_REFUSED, `员工 ${employeeId} 仍有在办任务，暂不退役，凭证保持有效：${summary}。合法动作：${legalActions.join('')}`, false, {
-    employeeId, reasons: [...reasons], legalActions,
+  const numbered = legalActions.map((action, index) => `${index + 1}）${action}`).join('；');
+  const verb = operation === 'revoke' ? '撤销凭证' : '退役';
+  return new CompanyError(RETIRE_REFUSED, `员工 ${employeeId} 仍有在办任务，暂不${verb}，凭证保持有效：${summary}。合法动作：${numbered}。`, false, {
+    employeeId, operation, reasons: [...reasons], legalActions,
   });
 }
 
@@ -106,4 +121,63 @@ export async function readRetirementCandidates(db: Surreal, employeeId: string):
       explicitImplementer: view.explicitImplementer, facts: view.facts });
   }
   return candidates;
+}
+
+/** One change to the credential that the gate guards: a statement on the employee record, run in the decision's transaction. */
+export interface CredentialChange {
+  operation: 'retire' | 'revoke';
+  statement: string;
+  vars: Record<string, unknown>;
+}
+
+/**
+ * The one boundary every credential change passes (SYS-DISP R1): the retirement and the admin revocation alike. It decides on the
+ * unfinished relations and refuses before any write. An accepted change is one transaction that re-derives those relations and
+ * writes only if they are exactly the decided ones at the decided versions (see writeGuarded). `afterDecision` is a test seam for
+ * deterministic interleavings. A claim or takeover that binds the employee writes the employee record too, so it conflicts with the
+ * change instead of slipping past it.
+ */
+export async function gateCredentialChange(db: Surreal, employeeId: string, change: CredentialChange,
+  afterDecision?: (employeeId: string) => Promise<void>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    const candidates = await readRetirementCandidates(db, employeeId);
+    const refusals = retirementRefusals(employeeId, candidates);
+    if (refusals.length) throw retireRefused(employeeId, refusals, change.operation);
+    await afterDecision?.(employeeId);
+    try {
+      await writeGuarded(db, employeeId, candidates, change);
+      return;
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      if (!/retire moved|conflict/i.test(cause)) throw error;
+      if (attempt >= 4) throw new CompanyError('temporarily_unavailable', 'Credential facts moved while deciding; retry', true);
+      await Bun.sleep(10 * (attempt + 1));
+    }
+  }
+}
+
+/** One transaction: the relations and versions must still be the decided ones, then the credential change is written. */
+async function writeGuarded(db: Surreal, employeeId: string, candidates: readonly RetirementCandidate[], change: CredentialChange): Promise<void> {
+  const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
+    LET $touched = SELECT VALUE task FROM audit WHERE actor = $employee AND action IN $actions;
+    LET $live = SELECT VALUE id FROM task WHERE state NOT IN $finished AND (current_employee = $key OR implementer = $key OR id IN $touched);
+    IF array::len($live) != $expected OR array::len(array::complement($live, $ids)) > 0 { THROW 'retire moved: task set changed' };
+    FOR $c IN $candidates {
+      LET $seen = SELECT VALUE version FROM ONLY $c.id;
+      IF $seen = NONE OR $seen != $c.version { THROW 'retire moved: task facts changed' };
+    };
+    ${change.statement}
+    COMMIT TRANSACTION;`, {
+    ...change.vars, employee: new RecordId('employee', employeeId), key: employeeId, actions: [...CONTRIBUTION_ACTIONS],
+    finished: FINISHED_STATES, expected: candidates.length,
+    ids: candidates.map(candidate => new RecordId('task', candidate.taskId)),
+    candidates: candidates.map(candidate => ({ id: new RecordId('task', candidate.taskId), version: candidate.version })),
+  }).responses();
+  const failures = responses.filter(response => !response.success);
+  if (failures.length) {
+    // A THROW of the decision's facts names its cause. A commit that lost to a concurrent write names none: it is a moved decision too,
+    // so the caller re-decides (and refuses with the stable code if a relation now exists) instead of surfacing a generic failure.
+    throw new Error(failures.map(response => response.error.message)
+      .find(message => !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'retire moved: transaction did not commit');
+  }
 }

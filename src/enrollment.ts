@@ -3,13 +3,15 @@ import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Credential, EmployeeId, EnrollmentAdmin, Principal, Role } from './contracts.ts';
 import { CompanyError, ROLES } from './core.ts';
+import { gateCredentialChange } from './retirement.ts';
 
 /** The digest a revocation writes in place of the credential digest: it matches no token, so the old credential dies. */
 export const revokedCredentialDigest = (): string => `revoked-${randomUUID()}`;
 
 /** Local root-only enrollment API. Never pass this object to the MCP adapter. */
 export class LocalEnrollmentAdmin implements EnrollmentAdmin {
-  constructor(private readonly database: CompanyDatabase) {}
+  /** `afterDecision` is a test seam (see gateCredentialChange); production passes nothing. */
+  constructor(private readonly database: CompanyDatabase, private readonly afterDecision?: (employeeId: EmployeeId) => Promise<void>) {}
 
   async enroll(employeeId: EmployeeId, role: Role, capabilities: Principal['capabilities']): Promise<Credential> {
     if (!/^[a-z0-9][a-z0-9-]{2,79}$/.test(employeeId)) throw new CompanyError('invalid', 'Invalid employee ID');
@@ -32,13 +34,17 @@ export class LocalEnrollmentAdmin implements EnrollmentAdmin {
     return token;
   }
 
-  /** Default is an explicit security revocation: security_revoked is never cleared, so it also covers a
-   * reviewer that was retired normally before. Scheduler retirement passes 'retirement' and only swaps the credential. */
-  async revoke(employeeId: EmployeeId, cause: 'security' | 'retirement' = 'security'): Promise<void> {
-    await this.database.db.query(cause === 'security'
-      ? 'UPDATE $employee SET revoked = true, security_revoked = true, credential_digest = $digest;'
-      : 'UPDATE $employee SET revoked = true, credential_digest = $digest;', {
-      employee: new RecordId('employee', employeeId), digest: revokedCredentialDigest(),
-    });
+  /**
+   * The explicit security revocation (admin revoke). It passes the same retirement gate as a retirement: refused while the employee
+   * holds a lease or is bound to unfinished work, before any write. An accepted revocation keeps security_revoked, and it never
+   * sets the retirement mark, so it cannot read as an ordinary retirement. security_revoked is never cleared, so it also covers a
+   * reviewer that was retired normally before.
+   */
+  async revoke(employeeId: EmployeeId): Promise<void> {
+    await gateCredentialChange(this.database.db, employeeId, {
+      operation: 'revoke',
+      statement: 'UPDATE $employee SET revoked = true, security_revoked = true, credential_digest = $digest;',
+      vars: { digest: revokedCredentialDigest() },
+    }, this.afterDecision);
   }
 }

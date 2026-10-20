@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { RetirementKind } from '../contracts.ts';
-import { isRetireRefused } from '../retirement.ts';
+import { CompanyError } from '../core-errors.ts';
 
 export interface AgentInfo { id: string; status: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
@@ -221,12 +221,17 @@ const withinTree = (candidate: string, root: string) => candidate === root || ca
 const goneSceneError = (error: unknown) =>
   /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
 
+/** The stable code of a failed employee retirement, or a short message for an unknown failure. It is kept on the scene for the retry. */
+const failureLabel = (error: unknown): string =>
+  error instanceof CompanyError ? error.code : (error instanceof Error ? error.message : String(error)).slice(0, 80);
+
 /**
  * Release the Paseo side of a task scene: archive every workspace whose cwd points at the
  * tree, then delete each project rooted at the tree that no longer hosts a live workspace.
  * Both steps are idempotent — a missing object counts as done. Every object is attempted so
  * one failure does not mask the others; the collected failures throw so the caller can keep
- * the scene and retry at the next event point.
+ * the scene and retry at the next event point. An employee whose retirement does not complete,
+ * for any reason, keeps the whole scene: nothing is detached, archived or torn down (SYS-DISP R1).
  */
 export function createSceneCleaner(
   paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject' | 'archive'>,
@@ -241,22 +246,24 @@ export function createSceneCleaner(
     // Otherwise the archived agent fires agent.archived, the sidecar quarantines the
     // instance, and the next tick blames a dead binding as 通道隔离.
     let employeesRetired = 0;
-    const refusedEmployees: string[] = [];
+    const kept: string[] = [];
     if (employees) {
       for (const inst of await employees.insts()) {
         if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
         try {
           await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive');
         } catch (error) {
-          // The retirement gate refused: this employee still has in-flight work here, so its session is left alone (no detach, no archive).
-          if (isRetireRefused(error)) { refusedEmployees.push(inst.id); continue; }
+          // Refused (in-flight work is still here) or failed for another reason (the facts are unconfirmed). Either way the session
+          // stays: no detach, no archive, and the teardown below does not run for this tree.
+          kept.push(`${inst.id}（${failureLabel(error)}）`);
+          continue;
         }
         employeesRetired++;
         employees.detach?.(inst);
         if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
       }
-      // The workspace teardown below ends every session in the tree, so a tree with a refused employee is kept for a later retry.
-      if (refusedEmployees.length) throw new Error(`scene kept: employee retirement refused for ${refusedEmployees.join(', ')} (unfinished work)`);
+      // The workspace teardown below ends every session in the tree, so a tree with an employee not retired waits for a retry, with its cause.
+      if (kept.length) throw new CompanyError('temporarily_unavailable', `scene kept: employee retirement not completed for ${kept.join('、')}`, true);
     }
     const workspaces = await paseo.listWorkspaces();
     const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));

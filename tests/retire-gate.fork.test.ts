@@ -266,8 +266,10 @@ test('(g2) a legacy task with several authors and no implementer: every author i
     { task: new RecordId('task', t.id), actor: employeeRef(second) });
   for (const who of [first, second]) {
     const error = await refusal(workforce.retire(who, WHY, 'manual'));
-    expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, reason: 'implementer_unresolved' })]);
-    expect(error.details?.legalActions.join('\n')).toContain('implementer_takeover');
+    expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'review', phase: 'review', reason: 'implementer_unresolved' })]);
+    // The task waits for its review, and the takeover is an execute-phase action only (SYS-DISP F-D): the legal action says to wait.
+    expect(error.details?.legalActions.join('\n')).not.toContain('implementer_takeover');
+    expect(error.details?.legalActions.join('\n')).toContain('复核');
     expect(await isRetired(who)).toBe(false);
   }
 });
