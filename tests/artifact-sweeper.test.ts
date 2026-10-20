@@ -104,7 +104,7 @@ describe('normal sweeps', () => {
     expect(result.skipped['task-not-terminal']).toBe(1);
     expect(result.skipped['within-grace']).toBe(1);
     for (const keep of ['recent', 'open', 'needed']) {
-      expect(readdirSync(join(w.home, 'evidence', keep))).toEqual(['note.md', 'payload.bin']);
+      expect(readdirSync(join(w.home, 'evidence', keep)).sort()).toEqual(['note.md', 'payload.bin']);
     }
   });
 
@@ -135,7 +135,7 @@ describe('normal sweeps', () => {
     expect(result.dryRun).toBe(true);
     expect(result.trimmed[0]).toMatchObject({ taskId: 'old', removedBytes: 3 * MB });
     expect(result.removedFiles).toBe(1);
-    expect(readdirSync(join(w.home, 'evidence', 'old'))).toEqual(['note.md', 'payload.bin']);
+    expect(readdirSync(join(w.home, 'evidence', 'old')).sort()).toEqual(['note.md', 'payload.bin']);
     // Nothing was written to the ledger either.
     expect(readdirSync(join(w.home, 'logs'))).toEqual([]);
   });
