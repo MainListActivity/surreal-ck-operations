@@ -1,16 +1,17 @@
 // Measures the snapshot listing path (SYS01 AC-D) on an isolated company fork. It starts its own fork instance in a temporary
-// directory (never production). Setup is written straight to that fork and timed as seeding. The measured requests go through a
-// counting TCP proxy, so the bytes it reports are the bytes on the socket in each direction, not a JSON.stringify estimate. With
-// --rate the proxy carries each direction at that many bytes per second in total, across all connections through it, split
-// fairly between them in 1 KiB pieces. That is a simulated constraint (the WSS channel to the production database is documented
-// at about 50 KiB/s), and the output labels it as such.
+// directory (never production). Setup is written straight to that fork and timed as seeding, reported apart from the requests.
+// The measured requests go through a counting TCP proxy, so the bytes it reports are the bytes on the socket in each direction,
+// not a JSON.stringify estimate. With a rate the proxy carries each direction at that many bytes per second in total, across
+// all connections through it, split fairly between them in 1 KiB pieces. That is a simulated constraint (the WSS channel to the
+// production database is documented at about 50 KiB/s), and the output labels it as such.
 //
 // Each attempt is one first-page request: a new listing is built on the seeded store and its first page is read. Attempts run
 // one after another on the same store, and every attempt is reported, refusals included. Control requests (claim, read,
-// heartbeat, release) run afterwards: the baseline first, then while listings are built back to back.
+// heartbeat, release) run afterwards: the baseline first, then while listings are built back to back. Each rate in --rates is
+// one phase of this sequence, run in order on the same seeded store, so a fixture is seeded once for all of its phases.
 //
 // Usage: bun scripts/snapshot-measure.ts <label> [--tasks N] [--context-bytes B] [--samples K] [--attempts A]
-//          [--rate BYTES_PER_SECOND] [--batch-kib K] [--direct] [--no-hedge] [--out FILE]
+//          [--rates BPS[,BPS...] | --rate BPS] [--batch-kib K] [--direct] [--no-hedge] [--out FILE]
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -32,11 +33,16 @@ const TASKS = flag('tasks', 300);
 const CONTEXT_BYTES = flag('context-bytes', 2800);
 const SAMPLES = flag('samples', 12);
 const ATTEMPTS = flag('attempts', 12);
-const RATE = flag('rate', 0);
+// One phase per rate, run in order on the same seeded store. 0 is unconstrained loopback.
+const RATES: number[] = args.includes('--rates')
+  ? String(args[args.indexOf('--rates') + 1]).split(',').map(Number)
+  : [flag('rate', 0)];
+if (RATES.some(rate => !Number.isFinite(rate) || rate < 0)) throw new Error('--rates takes non-negative numbers, for example 0,51200');
 const BATCH_KIB = flag('batch-kib', 0);
 // --direct connects to the fork without the proxy; --no-hedge leaves the first read of a listing unabandoned (diagnosis only).
 const DIRECT = args.includes('--direct');
 const NO_HEDGE = args.includes('--no-hedge');
+if (DIRECT && RATES.some(rate => rate > 0)) throw new Error('--direct carries no proxy, so it cannot be combined with a rate');
 const outAt = args.indexOf('--out');
 const OUT = outAt >= 0 ? args[outAt + 1]!
   : join(homedir(), 'Library/Application Support/SurrealCKCompany/evidence/e1becaaa-4ff9-48a3-abfc-95ed04ade911/review-measure', `${label}.json`);
@@ -58,17 +64,18 @@ interface Side { write(data: Uint8Array): number; end(): void }
 interface Link { client?: Side; upstream?: Side; down: Uint8Array[]; up: Uint8Array[]; closed: boolean }
 
 /**
- * A TCP proxy in front of the fork. Bytes are counted as they are written to each side. Without a rate, bytes pass straight through.
+ * A TCP proxy in front of the fork. Bytes are counted as they are written to each side. At rate 0 bytes pass straight through.
  * With a rate, each direction carries at most `rate` bytes per second in total: every tick adds its share to an allowance (unused
  * allowance carries over for at most two ticks), and the allowance is spent one piece at a time, round robin across the connections
- * that have bytes waiting, so a small request is not queued behind a large transfer on another connection.
+ * that have bytes waiting, so a small request is not queued behind a large transfer on another connection. setRate changes the rate
+ * for the bytes that follow; leaving the constrained mode sends what is queued at once.
  */
-function startProxy(targetPort: number, rate: number) {
+function startProxy(targetPort: number, initialRate: number) {
   const links = new Set<Link>();
   // Every connection the proxy carries: opened and closed as the sockets really open and close, so a build's connections show here.
   const connections = { opened: 0, closed: 0, open: 0, peakOpen: 0 };
   const allowance: Record<Dir, number> = { down: 0, up: 0 };
-  const perTick = (rate * TICK_MS) / 1000;
+  let rate = initialRate;
   let turn = 0;
   const closeLink = (link: Link) => {
     if (link.closed) return;
@@ -105,12 +112,15 @@ function startProxy(targetPort: number, rate: number) {
       if (!wrote) return;
     }
   };
-  const timer = rate > 0 ? setInterval(() => {
+  // The tick runs for the life of the proxy and does nothing while the proxy is unconstrained.
+  const timer = setInterval(() => {
+    if (rate <= 0) return;
+    const share = (rate * TICK_MS) / 1000;
     for (const dir of ['down', 'up'] as const) {
-      allowance[dir] = Math.min(allowance[dir] + perTick, 2 * perTick);
+      allowance[dir] = Math.min(allowance[dir] + share, 2 * share);
       send(dir, false);
     }
-  }, TICK_MS) : undefined;
+  }, TICK_MS);
   const server = Bun.listen<Link>({
     hostname: '127.0.0.1', port: 0,
     socket: {
@@ -140,7 +150,17 @@ function startProxy(targetPort: number, rate: number) {
       error(client) { closeLink(client.data); },
     },
   });
-  return { port: server.port, connections, stop: () => { if (timer) clearInterval(timer); for (const link of links) closeLink(link); server.stop(true); } };
+  return {
+    port: server.port,
+    connections,
+    setRate: (next: number) => {
+      rate = next;
+      allowance.down = 0;
+      allowance.up = 0;
+      if (rate <= 0) { send('down', true); send('up', true); }
+    },
+    stop: () => { clearInterval(timer); for (const link of links) closeLink(link); server.stop(true); },
+  };
 }
 
 async function startFork(dir: string, password: string): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -183,16 +203,17 @@ async function main() {
   const dir = mkdtempSync(join(tmpdir(), 'sck-snapshot-measure-'));
   const password = `measure-${randomUUID()}`;
   const fork = await startFork(dir, password);
-  const proxy = startProxy(fork.port, RATE);
+  const proxy = startProxy(fork.port, 0);
   // Setup goes straight to the fork, so seeding is not paced by the simulated rate; only the measured requests are.
   const seeder = new CompanyDatabase({ url: `ws://127.0.0.1:${fork.port}/rpc`, rootUser: 'root', rootPassword: password, namespace: NS, database: 'control_plane' });
   const database = new CompanyDatabase({ url: `ws://127.0.0.1:${DIRECT ? fork.port : proxy.port}/rpc`, rootUser: 'root', rootPassword: password, namespace: NS, database: 'control_plane' });
   const result: Record<string, unknown> = {
-    label, runtime: `bun ${Bun.version}`, tasks: TASKS, contextBytes: CONTEXT_BYTES, samples: SAMPLES, attempts: ATTEMPTS, rateBytesPerSecond: RATE,
-    channel: RATE > 0 ? 'simulated constraint: the proxy shares the rate across all connections in each direction (not a measurement of the production WSS channel)' : 'loopback, unconstrained',
+    label, runtime: `bun ${Bun.version}`, commit: process.env.SCK_MEASURE_COMMIT ?? 'not recorded', tasks: TASKS, contextBytes: CONTEXT_BYTES,
+    samples: SAMPLES, attempts: ATTEMPTS, pageSize: 25, rates: RATES,
     batchKiB: BATCH_KIB > 0 ? BATCH_KIB : 'default', startedAt: new Date().toISOString(),
-    route: DIRECT ? 'direct to the fork, no proxy' : 'through the counting proxy', loadHedgeMs: NO_HEDGE ? 'disabled (diagnosis only)' : DEFAULT_SNAPSHOT_LIMITS.loadHedgeMs,
-    method: 'each first-page attempt builds a new listing on the same seeded store and reads its first page; the fork is not restarted between attempts',
+    route: DIRECT ? 'direct to the fork, no proxy' : 'through the counting proxy',
+    loadHedgeMs: NO_HEDGE ? 'disabled (diagnosis only)' : DEFAULT_SNAPSHOT_LIMITS.loadHedgeMs,
+    method: 'each first-page attempt builds a new listing on the same seeded store and reads its first page; the fork is not restarted between attempts or phases',
   };
   try {
     await seeder.connect();
@@ -225,8 +246,9 @@ async function main() {
       await retried(() => seedCore.createTask(gm, { title: `测量样例 ${index} ${unit}`, context: textOf(CONTEXT_BYTES, `样例 ${index} `),
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `measure-${label}-${index}-${randomUUID()}` }));
     }
+    // Two control tasks per sample and per phase, so no control request reuses a task another phase has released.
     const controls: string[] = [];
-    for (let index = 0; index < 2 * SAMPLES; index++) {
+    for (let index = 0; index < 2 * SAMPLES * RATES.length; index++) {
       const task = await retried(() => seedCore.createTask(gm, { title: `控制样例 ${index}`, context: '控制样例正文',
         executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `control-${label}-${index}-${randomUUID()}` }));
       controls.push(task.id);
@@ -235,8 +257,8 @@ async function main() {
     result.seedRetries = seedRetries;
     await seeder.close().catch(() => undefined);
 
-    // The measured connection: through the counting proxy, or direct with --direct.
-    // connect() only opens the socket; the namespace and database must be selected before the first query (else "Specify a namespace to use").
+    // The measured connection: through the counting proxy, or direct with --direct. Its namespace and database are selected first:
+    // connect() only opens the socket, and the first query on it fails with "Specify a namespace to use" otherwise.
     await database.connect();
     await database.useDatabase();
     const buildLog: SnapshotBuildStats[] = [];
@@ -244,58 +266,6 @@ async function main() {
       snapshots: { ...(BATCH_KIB > 0 ? { batchBytes: BATCH_KIB * 1024 } : {}), ...(NO_HEDGE ? { loadHedgeMs: 2 * 60 * 60 * 1000 } : {}) },
       snapshotObserve: stats => { buildLog.push(stats); },
     });
-
-    // ---- first page of the GM working set: one listing built and read per attempt; every outcome is kept ----
-    const attempts: Array<Record<string, unknown>> = [];
-    for (let index = 0; index < ATTEMPTS; index++) {
-      const before = { ...counters };
-      const connBefore = { ...proxy.connections };
-      const from = buildLog.length;
-      let rssPeak = process.memoryUsage().rss;
-      const sampler = setInterval(() => { rssPeak = Math.max(rssPeak, process.memoryUsage().rss); }, 10);
-      const started = performance.now();
-      let outcome = 'ok';
-      let answer = 0;
-      let rows = 0;
-      try {
-        const page = await core.contextView(gm, { pageSize: 25 });
-        answer = answerBytes(page);
-        rows = page.tasks?.length ?? 0;
-      } catch (error) {
-        outcome = error instanceof CompanyError ? `${error.code}: ${error.message.slice(0, 200)}` : String(error);
-      } finally {
-        clearInterval(sampler);
-      }
-      // The timing and the wire counts are taken before the settle below, so the settle is not part of either.
-      const ms = Math.round(performance.now() - started);
-      const wireDownBytes = counters.down - before.down;
-      const wireUpBytes = counters.up - before.up;
-      await Bun.sleep(100);
-      const connAfter = { ...proxy.connections };
-      attempts.push({
-        attempt: index + 1, outcome, ms, pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
-        wireDownBytes, wireUpBytes, clientRssPeakMb: round(rssPeak / 1048576),
-        connections: { opened: connAfter.opened - connBefore.opened, closed: connAfter.closed - connBefore.closed, openAfter: connAfter.open },
-        builds: buildLog.slice(from).map(stat => ({
-          outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, attempts: stat.loadAttempts, loadMs: round(stat.loadMs),
-          reserveMs: round(stat.reserveMs), writeMs: round(stat.writeMs), commitMs: round(stat.commitMs), totalMs: round(stat.totalMs),
-          serverMs: round(stat.serverMs), release: stat.release, releaseMs: round(stat.releaseMs),
-        })),
-      });
-    }
-    const isRefused = (outcome: unknown) => String(outcome).startsWith('temporarily_unavailable');
-    const okMs = attempts.filter(item => item.outcome === 'ok').map(item => item.ms as number);
-    const refusedMs = attempts.filter(item => isRefused(item.outcome)).map(item => item.ms as number);
-    result.firstPage = {
-      attempts,
-      summary: {
-        n: attempts.length, ok: okMs.length, temporarilyUnavailable: refusedMs.length,
-        otherErrors: attempts.filter(item => item.outcome !== 'ok' && !isRefused(item.outcome)).length,
-        allMs: attempts.length > 0 ? summary(attempts.map(item => item.ms as number)) : null,
-        okMs: okMs.length > 0 ? summary(okMs) : null,
-        refusedMs: refusedMs.length > 0 ? summary(refusedMs) : null,
-      },
-    };
 
     // ---- control requests: claim, read, heartbeat, release, two workers, each sample timed; failures are counted, not hidden ----
     const runControl = async (slice: string[], withBuild: boolean) => {
@@ -343,9 +313,75 @@ async function main() {
         errors, ...(withBuild ? { builds: buildOutcomes, buildStats: buildSummary(buildLog.slice(from)) } : {}),
       };
     };
-    const baseline = await runControl(controls.slice(0, SAMPLES), false);
-    const disturbed = await runControl(controls.slice(SAMPLES, 2 * SAMPLES), true);
-    result.control = { baseline, disturbed };
+
+    // ---- one phase: the first-page attempts at one rate, then the control requests at that rate ----
+    const runPhase = async (rate: number, controlTasks: string[]) => {
+      proxy.setRate(rate);
+      // ---- first page of the GM working set: one listing built and read per attempt; every outcome is kept ----
+      const attempts: Array<Record<string, unknown>> = [];
+      for (let index = 0; index < ATTEMPTS; index++) {
+        const before = { ...counters };
+        const connBefore = { ...proxy.connections };
+        const from = buildLog.length;
+        let rssPeak = process.memoryUsage().rss;
+        const sampler = setInterval(() => { rssPeak = Math.max(rssPeak, process.memoryUsage().rss); }, 10);
+        const started = performance.now();
+        let outcome = 'ok';
+        let answer = 0;
+        let rows = 0;
+        try {
+          const page = await core.contextView(gm, { pageSize: 25 });
+          answer = answerBytes(page);
+          rows = page.tasks?.length ?? 0;
+        } catch (error) {
+          outcome = error instanceof CompanyError ? `${error.code}: ${error.message.slice(0, 200)}` : String(error);
+        } finally {
+          clearInterval(sampler);
+        }
+        // The timing and the wire counts are taken before the settle below, so the settle is not part of either.
+        const ms = Math.round(performance.now() - started);
+        const wireDownBytes = counters.down - before.down;
+        const wireUpBytes = counters.up - before.up;
+        await Bun.sleep(100);
+        const connAfter = { ...proxy.connections };
+        attempts.push({
+          attempt: index + 1, outcome, ms, pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
+          wireDownBytes, wireUpBytes, clientRssPeakMb: round(rssPeak / 1048576),
+          connections: { opened: connAfter.opened - connBefore.opened, closed: connAfter.closed - connBefore.closed, openAfter: connAfter.open },
+          builds: buildLog.slice(from).map(stat => ({
+            outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, attempts: stat.loadAttempts, loadMs: round(stat.loadMs),
+            reserveMs: round(stat.reserveMs), writeMs: round(stat.writeMs), commitMs: round(stat.commitMs), totalMs: round(stat.totalMs),
+            serverMs: round(stat.serverMs), release: stat.release, releaseMs: round(stat.releaseMs),
+          })),
+        });
+      }
+      const isRefused = (outcome: unknown) => String(outcome).startsWith('temporarily_unavailable');
+      const okMs = attempts.filter(item => item.outcome === 'ok').map(item => item.ms as number);
+      const refusedMs = attempts.filter(item => isRefused(item.outcome)).map(item => item.ms as number);
+      const firstPage = {
+        attempts,
+        summary: {
+          n: attempts.length, ok: okMs.length, temporarilyUnavailable: refusedMs.length,
+          otherErrors: attempts.filter(item => item.outcome !== 'ok' && !isRefused(item.outcome)).length,
+          allMs: attempts.length > 0 ? summary(attempts.map(item => item.ms as number)) : null,
+          okMs: okMs.length > 0 ? summary(okMs) : null,
+          refusedMs: refusedMs.length > 0 ? summary(refusedMs) : null,
+        },
+      };
+      const baseline = await runControl(controlTasks.slice(0, SAMPLES), false);
+      const disturbed = await runControl(controlTasks.slice(SAMPLES, 2 * SAMPLES), true);
+      return {
+        rateBytesPerSecond: rate,
+        channel: rate > 0 ? 'simulated constraint: the proxy shares the rate across all connections in each direction (not a measurement of the production WSS channel)' : 'loopback, unconstrained',
+        firstPage, control: { baseline, disturbed },
+      };
+    };
+
+    const phases: Array<Record<string, unknown>> = [];
+    for (const [phaseIndex, rate] of RATES.entries()) {
+      phases.push(await runPhase(rate, controls.slice(phaseIndex * 2 * SAMPLES, (phaseIndex + 1) * 2 * SAMPLES)));
+    }
+    result.phases = phases;
     result.proxyConnections = { ...proxy.connections };
     result.finishedAt = new Date().toISOString();
   } finally {
