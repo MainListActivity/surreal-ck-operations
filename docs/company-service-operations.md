@@ -80,6 +80,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 `install` 校验 main 祖先关系、切 `active`，并在插件已登记于本服务目录时自动执行 `plugin remove` + `plugin install <release>/plugin --id sck-company` 完成重指——daemon 只在登记时解析来源路径，`reload` 不重读 config、`install` 不允许覆盖既有 ID，所以重指只能走 remove+install（插件进程重启，sidecar `adopt()` 会恢复在编通道与活租约）。已指向本次 release 时 install 只做 reload。插件登记在服务目录之外的路径（如开发树）时 install 不干预，只提示。不要继续加载 v3 checkout，也不要另装 launchd dispatcher。任何一步失败，按第 5 节恢复两面后再修复。
 
+SYS-DISP 维护补修（afdb562c）之后：首次切换到带 `dispatch_pause` 的 release 用静默窗口程序，之后的维护停派只用 `dispatch_pause`/`dispatch_status`/`dispatch_restore`，全程见 [派工维护运行手册](./dispatch-maintenance-runbook.md)。注意 install 的实际顺序是先重指插件、再重启 MCP；上文命令块中「/ready 后再手工 plugin install」只适用于 install 未自动重指的情形（例如插件登记在服务目录之外，install 只提示不干预）。
+
 ### 4. 双面验证与恢复派工
 
 - `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
@@ -96,10 +98,10 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```sh
 rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_PREVIOUS_RELEASE/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
 rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
-rtk proxy "$PASEO_CLI" plugin install "$SCK_PREVIOUS_RELEASE/plugin" --id sck-company
-rtk proxy "$PASEO_CLI" plugin reload sck-company
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
+
+注意：插件登记在服务目录内时，上面那条 `install` 已自动完成插件重指（remove+install），**不要再手工执行 `plugin install`**——ID 已存在会失败；用 `plugin ls` 核对 SOURCE 与 DIRECTORY 即可。仅当 install 输出 `warning: plugin repoint failed` 时才手工 remove+install，步骤见 [派工维护运行手册](./dispatch-maintenance-runbook.md) 的 R3。
 
 回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 
