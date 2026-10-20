@@ -5,12 +5,12 @@
 import { afterAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { RecordId } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import {
-  DEFAULT_SNAPSHOT_LIMITS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation,
+  DEFAULT_SNAPSHOT_LIMITS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation, type SnapshotStoreOptions,
 } from '../src/snapshot-store.ts';
 import type { ChildJob } from './snapshot-quota.child.ts';
 
@@ -32,13 +32,13 @@ const opened: CompanyDatabase[] = [];
 const spawned: Proc[] = [];
 
 /** One fresh namespace and database, bootstrapped by the normal company path (schema 001 to 022). */
-async function fresh(limits: Partial<SnapshotLimits> = {}) {
+async function fresh(limits: Partial<SnapshotLimits> = {}, options: SnapshotStoreOptions = {}) {
   const namespace = `sck_snapq_${suffix}_${++seq}`;
   const db = new CompanyDatabase({ ...loadDatabaseConfig(), namespace, database: DATABASE });
   opened.push(db);
   await db.connect();
   await db.bootstrap();
-  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, ...limits });
+  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, ...limits }, options);
   return { namespace, db, store };
 }
 
@@ -139,6 +139,21 @@ const quotaOf = async (store: SnapshotStore) => {
   const acct = await store.accounting();
   return { listings: acct.listings, bytes: acct.bytes, rows: acct.rows, quotaListings: acct.quota.listings, quotaBytes: acct.quota.bytes };
 };
+
+/** A build connection whose statements first wait for `before`, so a test can slow a build down or hold one statement. */
+const throughChannel = (db: Surreal, before: (sql: string) => Promise<void>): Surreal => new Proxy(db, {
+  get(target, prop) {
+    if (prop !== 'query') {
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+    return (sql: string, vars?: Record<string, unknown>) => ({
+      then: (onOk: (value: unknown) => unknown, onFail?: (reason: unknown) => unknown) =>
+        (async () => { await before(sql); return target.query(sql, vars); })().then(onOk, onFail),
+      responses: async () => { await before(sql); return target.query(sql, vars).responses(); },
+    });
+  },
+});
 
 afterAll(async () => {
   for (const proc of spawned) {
@@ -386,4 +401,91 @@ test('(i) an expired listing is released by the sweep that finds it, exactly onc
   expect(await quotaOf(store)).toEqual({ listings: 0, bytes: 0, rows: 0, quotaListings: 0, quotaBytes: 0 });
   await expect(store.read({ id: header.id, owner: 'i-owner', kind: 'context', digest: 'dig-i', role: 'gm', after: 0, limit: 10 }, now + 1_000))
     .rejects.toMatchObject({ code: 'snapshot_gone' });
+});
+
+test('(j) a build past its deadline is cancelled: no statement starts after it, nothing is kept, the room is released, and the store builds again', async () => {
+  const holder: { db?: Surreal } = {};
+  const statements: string[] = [];
+  const observed: Array<{ outcome: string }> = [];
+  let slow = true;
+  let aborts = 0;
+  const { db, store } = await fresh({ buildDeadlineMs: 2_000, batchBytes: 4 * KB }, {
+    channel: {
+      connection: async () => throughChannel(holder.db!, async sql => {
+        statements.push(sql);
+        if (slow) await Bun.sleep(250);
+      }),
+      abort: async () => { aborts++; },
+    },
+    observe: stats => observed.push(stats),
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  // Twenty batches of four 1 KiB rows, about five seconds of statements: the 2-second deadline falls in the middle of the writes.
+  const bodies = Array.from({ length: 80 }, (_, index) => `${index}`.padEnd(KB, 'x'));
+  const started = performance.now();
+  const error = await store.build({
+    owner: 'j-owner', kind: 'context', digest: 'dig-j', role: 'gm', guidance: 'narrow the query', load: async () => ({ takenAt: TAKEN_AT, bodies }),
+  }).then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  expect((error as CompanyError).retryable).toBe(true);
+  expect((error as CompanyError).message).toMatch(/not built within 2 seconds, so it was cancelled and nothing was kept; narrow the query, then retry/);
+  expect(elapsed).toBeLessThan(4_000);
+  const writes = statements.filter(sql => sql.includes('INSERT INTO query_snapshot_row')).length;
+  expect(writes).toBeGreaterThan(0);
+  expect(writes).toBeLessThan(20);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
+  // Nothing starts once the build has given up. The statement in flight finished within the cleanup wait, so the channel was kept.
+  const atGiveUp = statements.length;
+  await Bun.sleep(600);
+  expect(statements.length).toBe(atGiveUp);
+  expect(aborts).toBe(0);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+
+  slow = false;
+  const header = await store.create({ owner: 'j-owner', kind: 'context', digest: 'dig-j-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  expect(header.rows).toBe(1);
+  expect(await store.release(header.id)).toBe('released');
+  expect(await quotaOf(store)).toEqual(baseline);
+});
+
+test('(k) a statement still in flight after the cleanup wait drops the channel; the build ends as temporarily_unavailable and releases its room', async () => {
+  const holder: { db?: Surreal } = {};
+  const observed: Array<{ outcome: string }> = [];
+  let hold = true;
+  let aborts = 0;
+  const { db, store } = await fresh({ buildDeadlineMs: 2_000 }, {
+    channel: {
+      connection: async () => throughChannel(holder.db!, async sql => {
+        // The row write never answers while `hold` is set, so the build is stuck inside its one batch.
+        if (hold && sql.includes('INSERT INTO query_snapshot_row')) await new Promise<never>(() => undefined);
+      }),
+      abort: async () => { aborts++; },
+    },
+    observe: stats => observed.push(stats),
+  });
+  holder.db = db.db;
+  const baseline = await quotaOf(store);
+  const started = performance.now();
+  const error = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k', role: 'gm', takenAt: TAKEN_AT, bodies: ['abc', 'def'] })
+    .then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  expect((error as CompanyError).retryable).toBe(true);
+  // The 2-second deadline passes first, then the 2-second cleanup wait, and only then is the channel dropped.
+  expect(elapsed).toBeGreaterThanOrEqual(3_900);
+  expect(elapsed).toBeLessThan(6_000);
+  expect(aborts).toBe(1);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+  expect(await quotaOf(store)).toEqual(baseline);
+
+  hold = false;
+  const header = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
+  expect(await store.release(header.id)).toBe('released');
+  expect(await quotaOf(store)).toEqual(baseline);
 });
