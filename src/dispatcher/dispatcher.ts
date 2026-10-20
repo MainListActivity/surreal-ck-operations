@@ -1,7 +1,7 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
-import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role } from '../contracts.ts';
+import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
 import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
@@ -17,7 +17,7 @@ import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
@@ -93,8 +93,8 @@ export function executeGateFor(gates: ReadonlyMap<string, ExecuteGate>, role: st
   return task && !excludeSubmitter && role === task.executorRole ? gates.get(task.id) : undefined;
 }
 
-/** A candidate's block: its stable code and the owner-facing text. */
-type Block = [BlockCode, string];
+/** A candidate's block: its stable code, the owner-facing text, and the recovery time (ISO 8601) when one is provable. */
+type Block = [BlockCode, string, string?];
 /** A dispatch-blocked episode becomes an owner notice after this long, or at once when no candidate can ever qualify. */
 const BLOCK_NOTICE_MS = 5 * 60_000;
 
@@ -117,6 +117,8 @@ export interface StaffingEntry {
   reason?: string;
   /** Machine code for `reason`; the dispatch-blocked evaluator groups and escalates by it. */
   code?: BlockCode;
+  /** Recovery time of a quota block, ISO 8601. Absent when no time can be proven. */
+  until?: string;
 }
 
 export interface StaffingInput {
@@ -181,19 +183,40 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const ready = (inst: EmployeeInst) =>
     p.states.get(inst.id) === 'idle' ||
     (p.states.get(inst.id) === 'exhausted' && availabilityOf(p.health.get(inst.provider ?? ''), p.now) === 'probe');
+  /**
+   * A provider in quota or health cooldown: the percent floor (no provable recovery time), or the health cooldown, which
+   * ends at its recorded `until` (server seconds). Quota, never concurrency-full.
+   */
+  const quotaOf = (provider: string): Block | undefined => {
+    const floor = p.quotaBlocked.get(provider);
+    if (floor) return ['quota', floor];
+    const health = p.health.get(provider);
+    if (availabilityOf(health, p.now) !== 'down') return undefined;
+    const until = new Date((health?.until ?? 0) * 1000).toISOString();
+    return ['quota', `${BLOCK_TEXT.quota}，恢复时间 ${until}`, until];
+  };
   /** A session that is not ready: unknown, quota-exhausted, or busy/abnormal. Each one is a different owner action. */
-  const notReady = (state: InstState | undefined): Block => state === undefined || state === 'unknown' ? ['unknown', BLOCK_TEXT.unknown]
-    : state === 'exhausted' ? ['quota', BLOCK_TEXT.quota] : ['session_busy', BLOCK_TEXT.session_busy];
+  const notReady = (state: InstState | undefined, provider: string): Block => {
+    if (state === undefined || state === 'unknown') return ['unknown', BLOCK_TEXT.unknown];
+    if (state === 'exhausted') return quotaOf(provider) ?? ['quota', `${BLOCK_TEXT.quota}，恢复时间未知`];
+    return ['session_busy', BLOCK_TEXT.session_busy];
+  };
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
     const target = def && resolveSlot(def);
     return !target || !inst.model || inst.model === target;
   };
   const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
-  /** Quota circuit-break and full subscription concurrency are separate codes: owners act on them differently. */
+  /**
+   * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
+   * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
+   */
   const capHit = (provider: string): Block | undefined => {
-    const quota = p.quotaBlocked.get(provider);
-    if (quota) return ['quota', quota];
+    const quota = quotaOf(provider);
+    if (quota) return quota;
+    if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
+      return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+    }
     return cap(provider) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
   /**
@@ -231,7 +254,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
-      (!ready(inst) ? notReady(p.states.get(inst.id)) : undefined) ??
+      (!ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
@@ -240,7 +263,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       capHit(inst.provider ?? '');
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
-      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0] });
+      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
   for (const def of p.defs) {
     if (def.role !== p.role) continue;
@@ -253,15 +276,23 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      (seats >= def.maxInstances ? ['seat_full', `实例数 ${seats}/${def.maxInstances} 已满`] : undefined) ??
+      (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
       capHit(def.provider);
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
-      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0] });
+      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
   for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
   return entries;
+}
+
+/**
+ * Same-role employees whose repository is not `home`. The pool never reads them (a hard repository filter, SYS-DISP R3), so a
+ * verdict only states how many it left out.
+ */
+export function otherRepoCount(insts: readonly EmployeeInst[], role: string, home: string, opsRepo: string): number {
+  return insts.filter(inst => inst.role === role && (inst.repoHome ?? inst.cwd ?? opsRepo) !== home).length;
 }
 
 /**
@@ -376,6 +407,10 @@ export interface SidecarBridge {
   detachAgent(agentId: string): void;
   /** Claims the task as the instance and stages claim.json; undefined = lost the race. */
   claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined>;
+  /** Write-scope preflight of the task's execute claim: the holders that would refuse it now, empty when none. Rejects when unreadable. */
+  writeScope(task: SupervisedTask, employeeId?: string): Promise<WriteScopeHolder[]>;
+  /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
+  claimDenial(instId: string): string | undefined;
   /** Records the freshly spawned Paseo agentId for this instance. */
   readWorkspace?(inst: EmployeeInst, taskId?: string, project?: string): Promise<WorktreeAssignment | undefined>;
   releaseWorkspace?(inst: EmployeeInst): Promise<void>;
@@ -510,10 +545,39 @@ export class Dispatcher {
 
   /** Dispatch-blocked conclusions from the latest pass, keyed by task and phase. Dispatchable work is absent. */
   private readonly verdicts = new Map<string, DispatchVerdict>();
+  /** Tasks whose claim lost the write scope to another writer in this pass: settled as write_scope, never as a wake failure. */
+  private readonly scopeDenied = new Set<string>();
 
   /** Server-side dispatch-blocked conclusions from the latest pass; the roster, task cards and brief read these. */
   dispatchVerdicts(): DispatchVerdict[] {
     return [...this.verdicts.values()];
+  }
+
+  /**
+   * The write scope an execute claim of this task needs, read before any spawn or claim (SYS-DISP R1). Undefined when it is
+   * free. An unreadable scope is unknown: never free, never busy.
+   */
+  private async writeScopeBlock(task: SupervisedTask): Promise<GlobalBlock | undefined> {
+    const sidecar = this.deps.sidecar;
+    if (!sidecar) return undefined;
+    try {
+      const holders = await sidecar.writeScope(task, task.currentEmployee);
+      return holders.length ? { code: 'write_scope', text: BLOCK_TEXT.write_scope, candidates: holders.map(holder => holderLabel(holder)) } : undefined;
+    } catch (error) {
+      this.log(`write scope of ${task.id} unreadable: ${(error as Error).message}`);
+      return { code: 'unknown', text: BLOCK_TEXT.unknown };
+    }
+  }
+
+  /** Candidate-level preflight before any spawn or claim: true when this candidate's claim would be refused for write scope. */
+  private async scopeBlocked(task: SupervisedTask, employeeId?: string): Promise<boolean> {
+    if (!this.deps.sidecar) return false;
+    try {
+      return (await this.deps.sidecar.writeScope(task, employeeId)).length > 0;
+    } catch (error) {
+      this.log(`write scope of ${task.id} unreadable: ${(error as Error).message}`);
+      return true;
+    }
   }
 
   /** The latest pass's view of every live session, so the roster and pulse show what the tick acted on. */
@@ -539,9 +603,9 @@ export class Dispatcher {
    * seconds, like every other clock in the tick; only the verdict itself uses milliseconds.
    */
   private async recordVerdict(task: SupervisedTask, phase: DispatchPhase, home: string,
-    entries: EvaluatedEntry[] | undefined, now: number, globalBlocks: GlobalBlock[] = []): Promise<{ verdict: DispatchVerdict; since: number }> {
+    entries: EvaluatedEntry[] | undefined, now: number, globalBlocks: GlobalBlock[] = [], otherRepo = 0): Promise<{ verdict: DispatchVerdict; since: number }> {
     const since = task.dispatchBlockedPhase === phase && task.dispatchBlockedSince ? task.dispatchBlockedSince : now;
-    const verdict = evaluateDispatch({ taskId: task.id, goalId: task.goalId, title: task.title, phase, home, entries, globalBlocks,
+    const verdict = evaluateDispatch({ taskId: task.id, goalId: task.goalId, title: task.title, phase, home, entries, globalBlocks, otherRepo,
       workflowState: task.state === 'review' ? 'review' : task.state === 'doing' ? 'doing' : 'ready',
       role: phase === 'execute' ? task.executorRole : task.reviewerRole, since: since * 1000, checkedAt: now * 1000 });
     this.verdicts.set(`${task.id}:${phase}`, verdict);
@@ -557,8 +621,8 @@ export class Dispatcher {
    * undefined) is material at once, because nobody can tell whether the work is merely busy.
    */
   private async settleBlocked(task: SupervisedTask, phase: DispatchPhase, home: string,
-    entries: EvaluatedEntry[] | undefined, now: number, report: TickReport): Promise<void> {
-    const { verdict, since } = await this.recordVerdict(task, phase, home, entries, now);
+    entries: EvaluatedEntry[] | undefined, now: number, report: TickReport, globalBlocks: GlobalBlock[] = [], otherRepo = 0): Promise<void> {
+    const { verdict, since } = await this.recordVerdict(task, phase, home, entries, now, globalBlocks, otherRepo);
     if (!verdict.feasible || now - since >= BLOCK_NOTICE_MS / 1000) {
       await this.notice(verdict.noticeKey, dispatchNoticeText(verdict), report);
     }
@@ -1045,6 +1109,15 @@ export class Dispatcher {
       }
       const last = await wf.lastDispatch(item.task.id, item.task.version, item.purpose);
       if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      // SYS-DISP R1: a same-lane or overlapping write scope held by another writer is a reason of its own. The claim would be
+      // refused, so nothing is spawned or claimed; the verdict names the holders and clears once they finish.
+      if (item.purpose === 'execute') {
+        const scope = await this.writeScopeBlock(item.task);
+        if (scope) {
+          await this.settleBlocked(item.task, 'execute', home, undefined, now, report, [scope]);
+          continue;
+        }
+      }
       // SYS-DISP AC05 (R1): an engineering execute claim must leave the review that follows a legal path: a legal reuse
       // reviewer who is not the implementer, or a compliant spare seat. Otherwise nothing is claimed and the block goes to the
       // manager. The reserved reviewer is logical only: no review lease, and this task's execute pool may not pick it.
@@ -1065,7 +1138,8 @@ export class Dispatcher {
             ? { ...entry, eligible: false, code: 'review_capacity' as const }
             : entry);
           await this.settleBlocked(item.task, 'execute', home,
-            [...blocked, { key: '*', eligible: false, code: 'review_capacity' as const }], now, report);
+            [...blocked, { key: '*', eligible: false, code: 'review_capacity' as const }], now, report, [],
+            otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
           continue;
         }
         // An execute spawn takes a new seat of its def. That seat is not spare: the review must still have a reviewer
@@ -1095,10 +1169,17 @@ export class Dispatcher {
         pickRecusal?: ReviewRecusal, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickRecusal, anchorHome, reserved);
       const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
         spawnable(role, home, task, forReview, reserved);
+      this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
           { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
       if (!result) {
+        if (this.scopeDenied.delete(item.task.id)) {
+          // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
+          const scope = (await this.writeScopeBlock(item.task)) ?? { code: 'write_scope' as const, text: BLOCK_TEXT.write_scope };
+          await this.settleBlocked(item.task, item.purpose, home, undefined, now, report, [scope]);
+          continue;
+        }
         if (prefer) {
           // Jev's pick just failed in assign; stop re-picking the same candidate
           // while the rest of the pool stays eligible.
@@ -1114,7 +1195,8 @@ export class Dispatcher {
         const entries = poolFor(item.role, home, item.task, item.purpose === 'review', recusal, reserved).map(entry => entry.eligible
           ? { ...entry, eligible: false, code: 'wake_failed' as const, reason: '唤醒或创建失败，下一轮重试' }
           : entry);
-        await this.settleBlocked(item.task, item.purpose, home, entries, now, report);
+        await this.settleBlocked(item.task, item.purpose, home, entries, now, report, [],
+          otherRepoCount(insts, item.role, home, this.deps.env.opsRepo));
         continue;
       }
       await this.clearBlocked(item.task, item.purpose);
@@ -1442,9 +1524,13 @@ export class Dispatcher {
       try {
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(existing, anchor?.task?.id, anchor?.project);
         if (sidecar && task) {
+          // The candidate's own write-scope check first: a refused scope is no claim and no wake failure.
+          if (await this.scopeBlocked(task, existing.id)) { this.scopeDenied.add(task.id); return undefined; }
           claim = await sidecar.claim(existing, task);
           if (!claim) {
-            this.markDenied(task);
+            // A scope lost at claim time is task-wide, so it earns no cooldown: the next pass re-reads the holders.
+            if (sidecar.claimDenial(existing.id) === 'worktree_busy') this.scopeDenied.add(task.id);
+            else this.markDenied(task);
             this.log(`claim ${task.id} as ${existing.id} lost; skipping`);
             return undefined;
           }
@@ -1488,6 +1574,8 @@ export class Dispatcher {
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());
       if (!model) continue;
+      // No seat is created for a task whose write scope is held: the preflight comes before the spawn.
+      if (sidecar && task && await this.scopeBlocked(task)) { this.scopeDenied.add(task.id); return undefined; }
       const inst = await wf.spawnInst(def);
       const spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
       let claim: ClaimResult | undefined;
@@ -1504,8 +1592,10 @@ export class Dispatcher {
         return undefined;
       }
       if (sidecar && task && !claim) {
-        this.markDenied(task);
-        await wf.retire(inst.id, 'claim denied', 'failure');
+        // A scope lost at claim time is task-wide: no other def is tried, and the unbound seat is released.
+        const scopeLost = sidecar.claimDenial(inst.id) === 'worktree_busy';
+        if (scopeLost) this.scopeDenied.add(task.id); else this.markDenied(task);
+        await wf.retire(inst.id, scopeLost ? 'write scope held' : 'claim denied', 'failure');
         report.retired.push(inst.id);
         return undefined;
       }

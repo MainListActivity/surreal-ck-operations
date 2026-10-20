@@ -99,12 +99,28 @@ test('quota alone stays feasible: the subscription recovers by itself, so the ta
   expect(v.reasons[0]).toMatchObject({ code: 'quota', candidates: ['codex-inst'], owner: 'owner' });
 });
 
+test('a quota reason states the earliest proven recovery time, and says it is unknown when any candidate has none', () => {
+  const known = verdict([
+    { key: 'a', eligible: false, code: 'quota', until: '2026-10-15T06:00:00.000Z' },
+    { key: 'b', eligible: false, code: 'quota', until: '2026-10-15T05:00:00.000Z' },
+  ]);
+  expect(known.reasons[0]).toMatchObject({ code: 'quota', until: '2026-10-15T05:00:00.000Z', text: `${BLOCK_TEXT.quota}，恢复时间 2026-10-15T05:00:00.000Z` });
+  const mixed = verdict([
+    { key: 'a', eligible: false, code: 'quota', until: '2026-10-15T05:00:00.000Z' },
+    { key: 'b', eligible: false, code: 'quota' },
+  ]);
+  expect(mixed.reasons[0]!.text).toBe(`${BLOCK_TEXT.quota}，恢复时间未知`);
+  expect(mixed.reasons[0]!.until).toBeUndefined();
+});
+
 test('every code has owner-facing text, a recovery path and a next trigger', () => {
   const codes = Object.keys(BLOCK_TEXT) as BlockCode[];
   expect(codes.length).toBeGreaterThan(15);
   for (const code of codes) {
     const v = verdict([{ key: 'x', eligible: false, code }]);
-    expect(v.reasons[0]).toMatchObject({ code, text: BLOCK_TEXT[code] });
+    // Seat and quota reasons add the repository or the recovery time to the base text, so the base text is a prefix.
+    expect(v.reasons[0]).toMatchObject({ code });
+    expect(v.reasons[0]!.text.startsWith(BLOCK_TEXT[code])).toBe(true);
     expect(v.reasons[0]!.recovery.length).toBeGreaterThan(0);
     expect(v.reasons[0]!.nextTrigger.length).toBeGreaterThan(0);
   }

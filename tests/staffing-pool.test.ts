@@ -73,7 +73,7 @@ test('pool: legacy instance does not consume a maxInstances seat in sidecar mode
   expect(spawn.eligible).toBe(true);   // seat free despite the live legacy inst
   // Non-sidecar mode: the same inst would consume the seat.
   const pool2 = staffingPool(base({ defs: [d], insts: [legacy], states: new Map([['i1', 'idle']]), sidecar: false }));
-  expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('实例数 1/1 已满');
+  expect(pool2.find(e => e.kind === 'spawn')!.reason).toBe('编制席位已满（1/1 个实例，仓库 repo）');
 });
 
 test('pool: model drift and unresolved slots are ineligible', () => {

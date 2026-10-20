@@ -12,7 +12,7 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment } from "./vendor/src/contracts.ts";
+import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 
 const HEARTBEAT_MS = 60_000;
@@ -99,6 +99,8 @@ export class SidecarPool {
   private readonly processing = new Set<string>();
   private sweeper?: ReturnType<typeof setInterval>;
 
+  /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
+  private readonly denials = new Map<string, string>();
   constructor(private readonly deps: SidecarDeps) {}
   private log(message: string) { this.deps.log?.(message); }
 
@@ -225,6 +227,16 @@ export class SidecarPool {
     }
   }
 
+  /** Why the last claim of this instance was denied (for example worktree_busy), until its next claim. */
+  claimDenial(instId: string): string | undefined {
+    return this.denials.get(instId);
+  }
+
+  /** Write-scope preflight through the core: read-only, under the same rules as the claim it precedes. */
+  writeScope(task: SupervisedTask, employeeId?: string): Promise<WriteScopeHolder[]> {
+    return this.deps.core.writeScopeOf(task.id, employeeId);
+  }
+
   /** Claims the task as the instance and stages claim.json in its comm dir. */
   async claim(inst: EmployeeInst, task: SupervisedTask): Promise<ClaimResult | undefined> {
     // Legacy instances still carry a credential file their agent reads directly;
@@ -246,12 +258,14 @@ export class SidecarPool {
     }
     const cred = await this.credentialFor(inst.id);
     let result: ClaimResult;
+    this.denials.delete(inst.id);
     try {
       result = await this.deps.core.claim(cred, task.id);
     } catch (error) {
       const code = (error as { code?: string }).code ?? "";
       if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) {
         this.log(`claim ${task.id} denied for ${inst.id}: ${code} (${(error as Error).message?.slice(0, 160)})`);
+        this.denials.set(inst.id, code);
         return undefined;
       }
       throw error;

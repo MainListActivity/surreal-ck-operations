@@ -34,6 +34,14 @@ export interface WorktreeView extends Omit<WorktreeAssignment, 'intent' | 'disci
   deletable: boolean; reasons: string[];
 }
 
+/** A writer or reader that holds a worktree, or an overlapping asset path, a new code claim must wait for. */
+export interface WriteScopeHolder {
+  /** The holder's task. Absent for a read session, which holds no task. */
+  taskId?: string;
+  employee: string;
+  intent: WorkIntent['kind'];
+}
+
 export interface Principal {
   employeeId: EmployeeId;
   role: Role;
@@ -367,6 +375,8 @@ export interface ContributorDryRunView {
 }
 
 export interface CompanyCore {
+  /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
+  writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;

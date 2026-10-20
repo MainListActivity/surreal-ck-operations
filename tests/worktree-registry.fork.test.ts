@@ -660,6 +660,23 @@ run('LANE: a task waits instead of sharing the lane tree with another active wri
   expect(lonely.worktree!.mode).toBe('shared'); expect(lonely.worktree!.lane).toBeUndefined();
   await submit(core, a, first); await submit(core, qa, lonely);
 }, 30000);
+run('LANE: the write-scope preflight names the writer that refuses the claim, changes nothing, and clears once that writer submits', async () => {
+  const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering');
+  const goal = await laneGoal(core, 'preflight');
+  const t1 = await laneTask(core, goal, 'engineering', 'ledger', 'code'), t2 = await laneTask(core, goal, 'engineering', 'ledger', 'code');
+  const first = await core.claim(a, t1.id);
+  const writerId = (await core.authenticate(b)).employeeId;
+  const holders = await core.writeScopeOf(t2.id, writerId);
+  expect(holders).toEqual([{ taskId: t1.id, employee: (await core.authenticate(a)).employeeId, intent: 'code' }]);
+  expect(await core.writeScopeOf(t2.id, writerId)).toEqual(holders);
+  await expect(core.claim(b, t2.id)).rejects.toMatchObject({ code: 'worktree_busy' });
+  expect((await core.getTask(gm, t2.id)).state).toBe('ready');
+  await submit(core, a, first);
+  expect(await core.writeScopeOf(t2.id, writerId)).toEqual([]);
+  const second = await core.claim(b, t2.id);
+  expect(second.worktree!.worktreePath).toBe(first.worktree!.worktreePath);
+  await submit(core, b, second);
+}, 30000);
 run('LANE: a blocked task keeps its scene but does not lock the lane — a rework claim enters the parked tree, and an active writer still serializes', async () => {
   const path = repo(), core = coreFor(path), a = await employee('engineering'), b = await employee('engineering'), c = await employee('engineering');
   const goal = await laneGoal(core, 'returned');

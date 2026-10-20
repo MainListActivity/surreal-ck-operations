@@ -28,7 +28,8 @@ import type { ClaimResult, LeaseProof, ProviderQuota } from '../src/contracts.ts
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
 
 const EVIDENCE = process.env.SCK_B5_EVIDENCE_DIR ?? '/Users/y/Library/Application Support/SurrealCKCompany/evidence/f2f16a69-9472-47c1-8cf1-3df7c653defc';
-const OUT = join(EVIDENCE, 'impl-7ef5c9-v45', 'b5');
+// Replay output goes to a temp dir unless SCK_B5_OUT_DIR says otherwise: a plain run never overwrites the saved review evidence.
+const OUT = process.env.SCK_B5_OUT_DIR ?? join(tmpdir(), 'sck-b5-replay');
 const HISTORY_04195C93 = join(EVIDENCE, 'ac01', 'page1.json');
 const ROOT_PASSWORD = 'isolated-b5-test-only';
 

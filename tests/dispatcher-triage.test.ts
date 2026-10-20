@@ -116,6 +116,8 @@ function fixture(goals: Array<{ id: string; project?: string }>) {
     canReuse: () => true,
     detachAgent: () => {},
     claim: async () => undefined,
+    writeScope: async () => [],
+    claimDenial: () => undefined,
     bindAgent: () => {},
     commDirFor: () => '/tmp/comm',
     releaseClaim: async () => {},
