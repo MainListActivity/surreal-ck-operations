@@ -94,6 +94,17 @@ async function expectRefused(promise: Promise<unknown>, code: CompanyError['code
   expect((error as CompanyError).message).toMatch(pattern);
 }
 
+test('a manage holder with no lease on the project gets the project identity back from project_disciplines_update, never its environments', async () => {
+  const product = await new LocalEnrollmentAdmin(database).enroll(`ev-product-${suffix}`, 'product', ['execute', 'review', 'manage']);
+  const answer = await core.updateProjectDisciplines(product, { project: PROJECT, disciplines: [{ name: 'fixture-track' }] });
+  expect(answer.id).toBe(PROJECT);
+  expect(answer.envs).toEqual([]);
+  expect(answer.envsWithheld).toBe(true);
+  expect(JSON.stringify(answer)).not.toContain(SECRET);
+  const full = await core.updateProjectDisciplines(gm, { project: PROJECT, disciplines: [{ name: 'fixture-track' }] });
+  expect(full.envs).toEqual([expect.objectContaining({ name: ENV })]);
+});
+
 test('the owner console keeps the full environment view, with its credential aliases and roles', async () => {
   const project = (await owner.brief()).projects.find(item => item.id === PROJECT);
   expect(project?.envs).toEqual([expect.objectContaining({ name: ENV, secrets: [{ name: SECRET, roles: ['engineering'] }] })]);

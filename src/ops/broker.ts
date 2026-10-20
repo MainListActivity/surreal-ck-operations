@@ -617,7 +617,8 @@ export class OpsBroker {
         id: minted.id, label, scopes: minted.scopes, status: minted.status, createdAt: minted.createdAt,
         ...(sealedAlias ? { sealed: sealedAlias } : { token }),
       },
-      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}${sealedAlias ? `（密封 ${sealedAlias}）` : ''}` },
+      // The audit line is readable by the task's participants, so it names the sealed secret only as sealed: the alias is credential metadata.
+      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}${sealedAlias ? '（已密封）' : ''}` },
     };
   }
 

@@ -10,6 +10,8 @@ resolve_bun() {
     rb_pinned=$(/usr/bin/sed -n 's/^SCK_BUN=//p' "$rb_home/private/service.env" | /usr/bin/tail -n 1 | /usr/bin/tr -d "\"'")
   fi
   BUN="${rb_pinned:-$rb_home/runtime-bun/bin/bun}"
-  [ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
+  # An explicit pin is the runtime even when it is missing: it is never replaced by another Bun, so the gate cannot record one
+  # runtime while the services would run another. Only the default location falls back to ~/.bun.
+  [ -n "$rb_pinned" ] || [ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
   export BUN
 }

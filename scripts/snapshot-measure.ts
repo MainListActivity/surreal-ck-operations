@@ -370,8 +370,12 @@ async function main() {
       };
       const baseline = await runControl(controlTasks.slice(0, SAMPLES), false);
       const disturbed = await runControl(controlTasks.slice(SAMPLES, 2 * SAMPLES), true);
+      // What is left for the sweep after this phase, and the build connections in use (SYS01 M1: pending work and counts are observable).
+      const store = (core as unknown as { snapshots: { backlog(): Promise<{ due: number; listings: number }> } }).snapshots;
+      const pendingSweep = await store.backlog();
       return {
         rateBytesPerSecond: rate,
+        pendingSweep, buildConnections: database.buildConnectionStats(),
         channel: rate > 0 ? 'simulated constraint: the proxy shares the rate across all connections in each direction (not a measurement of the production WSS channel)' : 'loopback, unconstrained',
         firstPage, control: { baseline, disturbed },
       };

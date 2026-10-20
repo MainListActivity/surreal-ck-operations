@@ -68,3 +68,16 @@ test('a listing whose query matches exactly one task answers with that task', as
   expect(answer.tasks?.map(task => task.title)).toEqual(['reply ceiling fixture']);
   expect(answer.page?.hasMore).toBe(false);
 });
+
+test('a first page refused after its listing was stored releases that listing rather than keeping its quota until it expires', async () => {
+  const before = await store.census();
+  const realRead = store.read;
+  store.read = () => Promise.reject(new CompanyError('invalid', 'synthetic refusal after the listing was stored'));
+  const error = await core.contextView(reader, { pageSize: 25 }).then(() => undefined, (reason: unknown) => reason);
+  store.read = realRead;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('invalid');
+  const until = Date.now() + 3_000;
+  while (Date.now() < until && (await store.census()).listings !== before.listings) await Bun.sleep(20);
+  expect(await store.census()).toEqual(before);
+});

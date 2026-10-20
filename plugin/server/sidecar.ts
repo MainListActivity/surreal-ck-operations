@@ -16,6 +16,7 @@ import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, Worktree
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
+import { arriving, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -579,7 +580,7 @@ export class SidecarPool {
       return gateway.call(cred, live().taskId, tool, rest);
     }
     switch (tool) {
-      case "list_worktrees": {
+      case "list_worktrees": return withinReplyCeiling(async () => {
         // R8：不带 taskId 即全局库存，只有 gm 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
         // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId。
         const scope = parseWorktreeInput(args).taskId;
@@ -589,7 +590,7 @@ export class SidecarPool {
         // Cores that predate SYS01 keep the old unpaged array.
         if (!core.listWorktrees) return [];
         return core.listWorktrees(cred, scope);
-      }
+      });
       case "reclaim_worktrees": {
         // Strict, as on MCP and in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are
         // refused before any tree is touched. A non-list repos used to widen silently into a reclaim of every repository.
@@ -604,7 +605,7 @@ export class SidecarPool {
       // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the task keys; the company block is in an answer only
       // when includeCompany is true (AC-A, the same default as core). A core without contextView answers the same keys, and ignores
       // scope and paging (SYS01 AC-A note): scope "company" is answered only by a core with contextView.
-      case "get_context": {
+      case "get_context": return withinReplyCeiling(async () => {
         if (core.contextView) return core.contextView(cred, args);
         const withCompany = args.includeCompany === true;
         return {
@@ -614,13 +615,13 @@ export class SidecarPool {
           ...(withCompany ? { company: await core.companyBrief(cred) } : {}),
           tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, (args.state ?? undefined) as never),
         };
-      }
-      case "get_task_history": {
+      });
+      case "get_task_history": return withinReplyCeiling(async () => {
         // C2 default: without pageSize or cursor (null counts as absent) the complete history, or response_too_large, in the pre-SYS01 { history } shape of this channel.
         const taskId = taskIdOf(args.taskId);
         if (isPaged(args) && core.historyView) return core.historyView(cred, taskId, args);
         return { history: await core.history(cred, taskId) };
-      }
+      });
       case "get_admin_summary": return core.adminSummary
         ? core.adminSummary(cred, args)
         : Promise.reject(Object.assign(new Error("core does not expose get_admin_summary"), { code: "temporarily_unavailable" }));
@@ -723,6 +724,7 @@ export class SidecarPool {
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
     const request = { lease: this.claims.get(instId) };
+    const arrival = Date.now();
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
       ? { ok: false, error: "malformed request" }
@@ -731,10 +733,11 @@ export class SidecarPool {
         // SYS01, D3: a null argument object is absent for reads, but for reclaim it is refused: a null never starts a real reclaim.
         : req.tool === "reclaim_worktrees" && req.args === null
           ? { ok: false, error: "invalid: reclaim arguments must be one object" }
-          : await this.dispatch(instId, req.tool, req.args ?? {}, false, request)
+          // The request's arrival (stamped above) is kept for the retry too: a listing answer counts its reply ceiling from it (SYS01 M1).
+          : await arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, false, request), arrival)
             .catch((error: unknown) => SidecarPool.isAuthError(error)
               // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
-              ? this.dispatch(instId, req.tool, req.args ?? {}, true, request)
+              ? arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, true, request), arrival)
               : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));

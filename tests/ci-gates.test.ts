@@ -56,7 +56,8 @@ const deploySha = '0123456789abcdef0123456789abcdef01234567';
 // SYS01 AC-B (manager ruling v31, M2): the remote Bun check is run, not only ordered. The real deploy script runs against a sandbox:
 // ssh, scp, sudo and the account tools are stubs; the remote home, the deploy key and the product env are sandbox paths (the key is
 // never read); the ssh stub ends a run at its first payload step, so nothing reaches the switch.
-function runDeploy(sandbox: string, remoteBun: string) {
+// `record` overrides fields of the passing gate record that is written for this SHA; null writes no record at all.
+function runDeploy(sandbox: string, remoteBun: string, record: Record<string, string> | null = {}) {
   const bin = join(sandbox, 'bin');
   const home = join(sandbox, 'home');
   const remote = join(sandbox, 'remote');
@@ -68,7 +69,9 @@ function runDeploy(sandbox: string, remoteBun: string) {
   };
   mkdirSync(bin);
   mkdirSync(join(home, 'gates/comm-slow-pipe'), { recursive: true });
-  writeFileSync(join(home, 'gates/comm-slow-pipe', `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
+  if (record !== null) {
+    writeFileSync(join(home, 'gates/comm-slow-pipe', `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.4.2', platform: 'darwin', result: 'pass', ...record }));
+  }
   writeFileSync(join(sandbox, 'product.env'), 'SURREAL_ROOT_USER=stub\nSURREAL_ROOT_PASS=stub\n');
   writeFileSync(join(sandbox, 'deploy.key'), '');
   const remoteBunPath = join(remote, 'runtime-bun/bin/bun');
@@ -125,6 +128,30 @@ test('a remote runtime of the gated version passes the check and reaches the pay
     rmSync(sandbox, { recursive: true, force: true });
   }
 }, 20_000);
+
+// SYS01 AC-B (manager ruling v31, M2): a local gate refusal reaches no host at all. Each case runs the real script with a gate record
+// that is missing or does not match this SHA and the Bun version the deploy expects.
+test('without a passing gate record for this SHA and Bun, the deploy refuses before any ssh, scp or switch', () => {
+  const cases: Array<[string, Record<string, string> | null]> = [
+    ['no record', null],
+    ['a failed run', { result: 'fail' }],
+    ['a record that names another SHA', { sha: '1'.repeat(40) }],
+    ['a record for another Bun', { bun: '1.3.11' }],
+    ['a record from another platform', { platform: 'linux' }],
+  ];
+  for (const [name, record] of cases) {
+    const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-gate-'));
+    try {
+      const run = runDeploy(sandbox, '1.4.2', record);
+      expect(run.status, `${name}: refused`).not.toBe(0);
+      expect(run.stderr, `${name}: reason`).toContain('refused: no passing comm-slow-pipe gate');
+      expect(run.log, `${name}: no remote step reached`).toBe('');
+      expect(existsSync(join(run.remote, 'current')), `${name}: no switch`).toBe(false);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
 
 test('the deploy script checks the release gate before any remote step', () => {
   const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));

@@ -203,9 +203,13 @@ export class CompanyDatabase {
       }
       const socket = new Surreal();
       this.buildSockets.add(socket);
+      const opening = this.openSocket(socket);
       try {
-        await CompanyDatabase.withTimeout(this.openSocket(socket), 15_000, 'build connect');
+        await CompanyDatabase.withTimeout(opening, 15_000, 'build connect');
       } catch (error) {
+        // The timeout does not cancel the connect. A socket that opens after its slot was freed is closed at once, so it cannot
+        // outlive the build cap.
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
         await this.closeBuildSocket(socket);
         throw error;
       }
@@ -224,9 +228,11 @@ export class CompanyDatabase {
       if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
       const socket = new Surreal();
       this.releaseSockets.add(socket);
+      const opening = this.openSocket(socket);
       try {
-        await CompanyDatabase.withTimeout(this.openSocket(socket), 15_000, 'release connect');
+        await CompanyDatabase.withTimeout(opening, 15_000, 'release connect');
       } catch (error) {
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
         await this.closeReleaseSocket(socket);
         throw error;
       }
@@ -286,6 +292,11 @@ export class CompanyDatabase {
   private async closeReleaseSocket(socket: Surreal): Promise<void> {
     if (!this.releaseSockets.delete(socket)) return;
     await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'release close').catch(() => {});
+  }
+
+  /** Closes a socket whose connect finished after its owner had given up on it. Best effort, and bounded like the other closes. */
+  private async closeLateSocket(socket: Surreal): Promise<void> {
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'late close').catch(() => {});
   }
 
   async close(): Promise<void> {

@@ -5,7 +5,9 @@ import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '..
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
 import { isPaged, parseReclaimInput } from '../query-input';
+import { arrivedAt, arriving, currentTool, noteTool, SNAPSHOT_TOOLS, withinReplyCeiling } from '../reply-clock';
 import { answerBytes, answerResult, echoClaim, MAX_REQUEST_ID_BYTES, oversizeRequestId, RESPONSE_BUDGET_BYTES } from '../response-budget';
+import { REPLY_CEILING_MS, untilAt } from '../snapshot-store';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -91,7 +93,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const run = async (credential: Credential, action: () => Promise<unknown>) => {
     if (!credential) return toolError({ code: 'unauthorized' });
     try {
-      return toolResult(await action());
+      // A snapshot-backed listing is answered within the reply ceiling of its request (SYS01 M1); other tools keep their own time.
+      const answer = SNAPSHOT_TOOLS.has(currentTool() ?? '') ? await withinReplyCeiling(async () => action()) : await action();
+      return toolResult(answer);
     } catch (error) {
       return toolError(error);
     }
@@ -479,7 +483,8 @@ export function createMcpHttpService(options: McpServiceOptions) {
           resolve(new Response('Service unavailable', { status: 503 }));
         }, 55_000);
       });
-      const work = respond(request, credential);
+      // The request's arrival is stamped here, before heal: a listing answer counts its reply ceiling from it (SYS01 M1).
+      const work = arriving(() => respond(request, credential));
       work.catch(() => {}); // a rejection after the budget wins must not become an unhandled rejection
       try {
         return await Promise.race([work, budget]);
@@ -490,8 +495,21 @@ export function createMcpHttpService(options: McpServiceOptions) {
       async function respond(req: Request, cred: Credential): Promise<Response> {
         const t0 = Date.now();
         const mark = (stage: string) => console.log(`req ${req.method} ${stage} +${Date.now() - t0}ms`);
+        // The tool a tools/call names is read from a copy of the body, so that its reply ceiling applies from the arrival on.
+        noteTool(await req.clone().json().then(
+          (body: { method?: unknown; params?: { name?: unknown } }) => body.method === 'tools/call' && typeof body.params?.name === 'string' ? body.params.name : undefined,
+          () => undefined));
         try {
-          await options.heal?.();
+          if (SNAPSHOT_TOOLS.has(currentTool() ?? '')) {
+            // A listing answer is not kept waiting past its reply ceiling for a reconnect: the heal goes on in the background.
+            const healed = await untilAt(Promise.resolve(options.heal?.()).then(() => 'healed' as const), arrivedAt() + REPLY_CEILING_MS);
+            if (healed !== 'healed') {
+              mark('heal not done within the reply ceiling');
+              return new Response('Service unavailable', { status: 503 });
+            }
+          } else {
+            await options.heal?.();
+          }
           mark('heal');
         } catch {
           mark('heal failed');

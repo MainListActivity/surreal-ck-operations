@@ -213,14 +213,15 @@ test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned ru
     writeRecord(home, SHA, {});
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
 
-    // SCK_BUN in the environment wins over the pinned runtime, for both.
+    // SCK_BUN in the environment wins for the launcher, which runs in the caller's environment. The install's check does not read it:
+    // launchd does not pass the caller's environment to the services, so the gate checks the runtime they resolve (the pinned one).
     const override = join(home, 'override', 'bun');
     fakeBun(override, '9.9.9', 'override');
     expect(sh(LAUNCHER, ['mcp'], home, { SCK_BUN: override }).out).toContain('ran:override');
-    writeRecord(home, SHA, { bun: '9.9.9' });
-    expect(sh(SERVICE, ['check-gate', SHA], home, { SCK_BUN: override }).out).toContain('on bun 9.9.9');
+    expect(sh(SERVICE, ['check-gate', SHA], home, { SCK_BUN: override }).out).toContain('on bun 1.4.2');
 
     // SCK_BUN in private/service.env: the launcher sources that line and the gate reads it, so both pick the same override.
+    writeRecord(home, SHA, { bun: '9.9.9' });
     writeFileSync(join(home, 'private', 'service.env'), `SCK_BUN=${override}\n`);
     expect(sh(LAUNCHER, ['mcp'], home).out).toContain('ran:override');
     expect(sh(SERVICE, ['check-gate', SHA], home).out).toContain('on bun 9.9.9');
@@ -232,6 +233,21 @@ test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned ru
     expect(sh(LAUNCHER, ['mcp'], home).out).toContain('ran:home');
     writeRecord(home, SHA, { bun: '1.3.11' });
     expect(sh(SERVICE, ['check-gate', SHA], home).out).toContain('on bun 1.3.11');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an explicit pin that is missing is never replaced by another Bun: the launcher does not run ~/.bun and the gate refuses', () => {
+  const home = serviceHome();
+  try {
+    fakeBun(join(home, 'user-home', '.bun', 'bin', 'bun'), '1.3.11', 'home');
+    writeFileSync(join(home, 'private', 'service.env'), `SCK_BUN=${join(home, 'missing', 'bun')}\n`);
+    writeRecord(home, SHA, { bun: '1.3.11' });
+    expect(sh(LAUNCHER, ['mcp'], home).out).not.toContain('ran:home');
+    const check = sh(SERVICE, ['check-gate', SHA], home);
+    expect(check.code).not.toBe(0);
+    expect(check.out).not.toContain('gate ok');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

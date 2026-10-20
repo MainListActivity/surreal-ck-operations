@@ -195,6 +195,22 @@ test('failed connection heal answers 503 instead of authenticating on a broken s
   } finally { await broken.close(); }
 });
 
+test('a listing call whose reconnect is still pending at its reply ceiling is answered 503 at the ceiling, not after the reconnect (SYS01 M1)', async () => {
+  const stalled = createMcpHttpService({ core, port: 0, heal: () => new Promise<void>(() => undefined) });
+  try {
+    const started = Date.now();
+    const response = await fetch(new URL(`http://127.0.0.1:${stalled.port}/mcp`), {
+      method: 'POST',
+      headers: { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json', Authorization: 'Bearer sck_valid' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_context', arguments: {} } }),
+    });
+    const elapsed = Date.now() - started;
+    expect(response.status).toBe(503);
+    expect(elapsed).toBeGreaterThan(12_000);
+    expect(elapsed).toBeLessThan(14_000);
+  } finally { await stalled.close(); }
+}, 30_000);
+
 test('gate token guards the public endpoint before bearer auth', async () => {
   active = true;
   unavailable = false;

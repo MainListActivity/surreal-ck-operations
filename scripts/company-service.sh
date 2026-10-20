@@ -24,11 +24,13 @@ plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 # Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs a passing comm-slow-pipe record, made on darwin with
 # the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the switch; nothing is read from a hosted runner.
 gate_record() { echo "$service_home/gates/comm-slow-pipe/$1.json"; }
-# The version of the runtime the services run with (scripts/bun-runtime.sh), or "unknown" when it cannot report one.
-runtime_version() {
+# The version of the runtime the services run with (scripts/bun-runtime.sh), or "unknown" when it cannot report one. The services run
+# under launchd, which does not inherit this shell's environment, so SCK_BUN is ignored here: the gate checks the runtime they resolve.
+runtime_version() (
+  unset SCK_BUN
   resolve_bun "$service_home"
   rv=$("$BUN" --version 2>/dev/null) && [ -n "$rv" ] && echo "$rv" || echo unknown
-}
+)
 check_gate() {
   record=$(gate_record "$1")
   [ -f "$record" ] || return 1

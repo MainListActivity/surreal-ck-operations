@@ -177,4 +177,4 @@ fi
 REMOTE_CADDY
 
 echo "deployed $commit -> $host (public: https://$public_host/sck-mcp/mcp)"
-echo "next: $remote_home/bin/bun src/mcp/sync-gate.ts  (writes private/mcp-remote.env)"
+echo "next: $remote_home/runtime-bun/bin/bun src/mcp/sync-gate.ts  (writes private/mcp-remote.env)"

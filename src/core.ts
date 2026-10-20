@@ -15,6 +15,7 @@ import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, p
 import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
+import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
@@ -1236,35 +1237,40 @@ export class SurrealCompanyCore implements CompanyCore {
       sid = body.sid;
       after = body.seq;
     }
-    const read = await untilAt(this.snapshots.read({
-      id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
-    }), replyAt);
-    if (read === undefined) {
-      // The caller has no time left to wait for a release, so a listing this call stored is released in the background. A release
-      // that fails is left for the sweep, and the caller is told to retry.
-      if (stored !== undefined) void this.snapshots.release(stored).catch(() => undefined);
-      throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
-    }
-    const { header, rows } = read;
-    const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
-    const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
-      const last = kept.at(-1)?.seq ?? after;
-      const hasMore = last < header.rows;
-      const page: PageInfo = {
-        pageSize, returned: kept.length, hasMore, total: header.rows, snapshotAt: header.takenAt, budgetBytes: RESPONSE_BUDGET_BYTES,
-        ...(hasMore ? { nextCursor: sealCursor({ v: 1, k: kind, c: actor.employeeId, q: digest, sid, seq: last, exp: header.expiresMs }, key) } : {}),
+    // A listing this call stored is released in the background whenever the call does not return its page: the caller has no time
+    // left to wait for the release, and a release that fails is left for the sweep. Nothing stored stays reserved for its TTL.
+    const releaseStored = (): void => { if (stored !== undefined) void this.snapshots.release(stored).catch(() => undefined); };
+    try {
+      const read = await untilAt(this.snapshots.read({
+        id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
+      }), replyAt);
+      if (read === undefined) {
+        throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
+      }
+      const { header, rows } = read;
+      const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
+      const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
+        const last = kept.at(-1)?.seq ?? after;
+        const hasMore = last < header.rows;
+        const page: PageInfo = {
+          pageSize, returned: kept.length, hasMore, total: header.rows, snapshotAt: header.takenAt, budgetBytes: RESPONSE_BUDGET_BYTES,
+          ...(hasMore ? { nextCursor: sealCursor({ v: 1, k: kind, c: actor.employeeId, q: digest, sid, seq: last, exp: header.expiresMs }, key) } : {}),
+        };
+        return args.respond(kept.map(item => item.value), page);
       };
-      return args.respond(kept.map(item => item.value), page);
-    };
-    const bare = answerBytes(build([]));
-    if (bare > RESPONSE_BUDGET_BYTES) {
-      throw tooLarge(`the page envelope alone is ${bare} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${args.envelopeGuidance}`);
+      const bare = answerBytes(build([]));
+      if (bare > RESPONSE_BUDGET_BYTES) {
+        throw tooLarge(`the page envelope alone is ${bare} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${args.envelopeGuidance}`);
+      }
+      const kept = fitCount(items, subset => answerBytes(build(subset as ReadonlyArray<{ seq: number; value: T }>)), RESPONSE_BUDGET_BYTES);
+      if (kept === 0 && items.length > 0) {
+        throw tooLarge('one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
+      }
+      return completeOrRefuse(build(items.slice(0, kept)), 'this page', args.envelopeGuidance);
+    } catch (error) {
+      releaseStored();
+      throw error;
     }
-    const kept = fitCount(items, subset => answerBytes(build(subset as ReadonlyArray<{ seq: number; value: T }>)), RESPONSE_BUDGET_BYTES);
-    if (kept === 0 && items.length > 0) {
-      throw tooLarge('one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
-    }
-    return completeOrRefuse(build(items.slice(0, kept)), 'this page', args.envelopeGuidance);
   }
 
   /**
@@ -1273,7 +1279,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * page of a stored listing; a task read by id is never paged and takes no cursor.
    */
   async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
-    const startedAt = Date.now();
+    const startedAt = arrivedAt();
     const actor = await this.authenticate(credential);
     const params = parseContextInput(input);
     if (params.scope === 'company') return this.companyContextView(credential, actor, params, startedAt);
@@ -1356,7 +1362,7 @@ export class SurrealCompanyCore implements CompanyCore {
    * read_task_text gives the rest.
    */
   async historyView(credential: Credential, taskId: TaskId, input: Record<string, unknown> = {}): Promise<HistoryPageView> {
-    const startedAt = Date.now();
+    const startedAt = arrivedAt();
     const actor = await this.authenticate(credential);
     await this.getTask(credential, taskId);
     const params = parseHistoryInput(input);
@@ -1392,7 +1398,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseWorktreeInput(input);
     await this.worktreeScope(credential, actor, params.taskId);
     const digest = queryDigest('worktrees', { taskId: params.taskId ?? null, includeReleased: params.includeReleased });
-    const startedAt = Date.now();
+    const startedAt = arrivedAt();
     return this.listingPage<Record<string, unknown>, WorktreePageView>({
       actor, kind: 'worktrees', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
       create: async started => {
@@ -1732,7 +1738,9 @@ export class SurrealCompanyCore implements CompanyCore {
     const view = await this.projects.setDisciplines(input.project, input.disciplines);
     await this.auditManage(actor, 'project_disciplines_update',
       { project: input.project, disciplines: (input.disciplines ?? []).map(d => d?.name) });
-    return view;
+    // The answer is the project as this caller may read it (SYS01 M3): a manage holder without a lease on it gets no environments.
+    const visible = await this.envView(actor);
+    return visible.visible(view.id) ? view : withheldEnvs(view);
   }
 
   async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {

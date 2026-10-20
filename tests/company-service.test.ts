@@ -117,9 +117,11 @@ exit 0
 }
 
 function runInstall(f: Fixture, extraEnv: Record<string, string> = {}) {
+  // A developer's SCK_BUN must not decide the gate of these fixtures: the runtime is the one the fixture pins (see writeGateRecord).
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'SCK_BUN'));
   return Bun.spawnSync(['sh', SCRIPT, 'install', f.release], {
     env: {
-      ...process.env,
+      ...inherited,
       HOME: f.home,
       PATH: `${f.fakeBin}:/usr/bin:/bin`,
       PASEO: f.fakePaseo,
@@ -207,6 +209,21 @@ for (const [mode, label] of [
     }
   });
 }
+
+test('install gates the runtime the launchd service resolves, not the SCK_BUN of the calling shell', () => {
+  const f = fixture();
+  try {
+    // The caller's SCK_BUN reports another version with no gate record. launchd does not pass it on, so the services run the pinned
+    // runtime (1.4.2), which has a passing record: the install must go ahead.
+    const callerPin = join(f.home, 'caller-bun');
+    executable(callerPin, '#!/bin/sh\necho 1.3.11\n');
+    const result = runInstall(f, { SCK_BUN: callerPin });
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(true);
+  } finally {
+    cleanup(f);
+  }
+});
 
 test('install refuses a release without a passing comm-slow-pipe gate and leaves active unchanged', () => {
   const f = fixture();

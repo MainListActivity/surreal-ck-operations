@@ -670,8 +670,29 @@ export class SnapshotStore {
       return await this.dropOn(link.db, id, '', {}, until, markUntil);
     } catch (error) {
       console.error(`snapshot listing ${id} was not released (${(error as Error).message}); it is left for the sweep`);
-      await this.markForSweep(link.db, id, markUntil);
+      // The mark goes on a connection of its own: the one that just failed may be the stuck part, and a listing left unmarked
+      // keeps its quota until it expires.
+      await this.markOnOwnLink(id, markUntil);
       return 'pending';
+    } finally {
+      void link.close().catch(() => undefined);
+    }
+  }
+
+  /** Marks one listing for the sweep on a release-channel connection of its own, by `until`. */
+  private async markOnOwnLink(id: string, until: number): Promise<void> {
+    const opening = this.releaseChannel.open();
+    const link = await untilAt(opening.catch(() => undefined), until);
+    if (!link) {
+      void opening.then(async late => {
+        await this.markForSweep(late.db, id, Date.now() + MARK_WAIT_MS);
+        await late.close().catch(() => undefined);
+      }, () => undefined);
+      console.error(`snapshot listing ${id} could not be marked for the sweep: no connection opened in time`);
+      return;
+    }
+    try {
+      await this.markForSweep(link.db, id, until);
     } finally {
       void link.close().catch(() => undefined);
     }
