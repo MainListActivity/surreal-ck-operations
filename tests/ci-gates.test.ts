@@ -61,6 +61,16 @@ test('the deploy script checks the release gate before any remote step', () => {
   expect(remote, 'a remote step exists after the gate').toBeGreaterThan(gate);
 });
 
+test('the deploy script checks the remote Bun version before any payload upload or switch', () => {
+  const lines = readFileSync(deploy, 'utf8').split('\n').filter(line => !line.trimStart().startsWith('#'));
+  const compare = lines.findIndex(line => line.includes('actual" = "$bun_version"'));
+  const payload = lines.findIndex(line => line.includes('releases/$commit'));
+  const switchLink = lines.findIndex(line => line.includes('ln -sfn'));
+  expect(compare, 'the remote version comparison exists').toBeGreaterThan(-1);
+  expect(compare, 'the comparison precedes the first payload step').toBeLessThan(payload);
+  expect(compare, 'the comparison precedes the switch').toBeLessThan(switchLink);
+});
+
 test('without a passing record for the SHA and Bun version, the deploy script never reaches ssh or scp', () => {
   const sandbox = mkdtempSync(join(tmpdir(), 'sck-deploy-gate-'));
   try {

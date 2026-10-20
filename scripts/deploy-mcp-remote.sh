@@ -88,6 +88,10 @@ chmod 750 $remote_home $remote_home/private
 if [ ! -x $remote_home/runtime-bun/bin/bun ]; then
   sudo -u sckcompany bash -c 'curl -fsSL https://bun.sh/install | BUN_INSTALL=$remote_home/runtime-bun bash -s "bun-v$bun_version"'
 fi
+# The release gate is for bun $bun_version. A runtime installed earlier must report that version, or the deploy stops here,
+# before any release payload is uploaded: an old binary is never reused on trust.
+actual=\$(sudo -u sckcompany $remote_home/runtime-bun/bin/bun --version 2>/dev/null || true)
+[ "\$actual" = "$bun_version" ] || { echo "refused: remote bun is '\$actual', the release gate is for bun $bun_version; reinstall the pinned runtime, then deploy again" >&2; exit 1; }
 REMOTE_SETUP
 
 # --- remote: release payload -------------------------------------------------
