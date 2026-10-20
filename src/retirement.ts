@@ -4,7 +4,7 @@ import { CONTRIBUTION_ACTIONS, readContributionView, type ContributionFacts } fr
 
 /**
  * The retirement gate (SYS-DISP R1). Retiring an employee revokes its credential, so the refusal rules sit at the one boundary
- * every credential change passes (`gateCredentialChange`): `Workforce.retire` (admin CLI, dispatcher rotation and failure paths,
+ * every retirement and credential revocation passes (`gateCredentialChange`): `Workforce.retire` (admin CLI, dispatcher rotation and failure paths,
  * scene archive, MCP and plugin) and the admin revocation (`LocalEnrollmentAdmin.revoke`), not in the callers. An employee is
  * refused while:
  *  - it holds a task lease, in any phase (`active_lease`);

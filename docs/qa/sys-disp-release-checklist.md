@@ -1,6 +1,6 @@
 # SYS-DISP 发布清单与运行手册（退役硬门禁）
 
-适用范围：PR #1469 分支上的 SYS-DISP 派工改动，包括退役硬门禁（`src/retirement.ts`、`Workforce.retire`、`admin retire`、调度器各退役点与场景回收）。本文件是部署腿的执行依据，本身不授权合入或部署。合入、部署与上线申请仍按 [company-service-operations.md](../company-service-operations.md) 的双面流程与既有审批执行。
+适用范围：PR #1469 分支上的 SYS-DISP 派工改动，包括退役与撤凭证硬门禁（`src/retirement.ts`、`Workforce.retire`、`LocalEnrollmentAdmin.revoke`、`admin retire`、`admin revoke`、调度器各退役点与场景回收）。本文件是部署腿的执行依据，本身不授权合入或部署。合入、部署与上线申请仍按 [company-service-operations.md](../company-service-operations.md) 的双面流程与既有审批执行。
 
 ## 0. 本次交付的边界
 
@@ -12,11 +12,18 @@
 
 ## 1. 角色
 
-- 发布负责人：原部署 QA 腿（3381c477）的实际工程领取人。员工编号以该腿任务历史的 claim 记录为准。发布前由经理在任务历史中核对并记录，本文件不替代这一步。
+- 发布负责人：原部署 QA 腿（3381c477）的实际工程领取人。以该腿任务历史中的 claim 记录为准，本文件不预先指定人员。2026-10-20 核对时，该腿的任务历史只有 v1 创建记录，尚无领取人。
 - 独立 QA：该腿的独立 QA 领取人，负责验收。不得是发布负责人，也不得是本单任何作者。
-- 独立工程复核：非作者的工程员工。按 §2 的治理事实，候选为 engineering-factory-droid-f3bd7d，前提是其未写过 PR #1469 或本单代码。否则另选无实际贡献冲突的工程员工。
+- 独立工程复核：非作者的工程员工，由正常调度选择。不得是 §2 列出的任何作者，包括 engineering-factory-droid-9aeb10。
 - 运营：决定是否上线（上线申请 589b3a2e）。本单 done 后，上线申请才重新送运营。
 - 经理：协调维护窗口、暂停与恢复编制、接手。
+
+开工时由经理填写下表。未填写的项目不得视为已核对：
+
+| 角色 | 员工号 | 核对时间（UTC） | 核对结果 |
+| --- | --- | --- | --- |
+| 发布负责人（3381c477 腿的实际工程领取人） | 待填 | 待填 | 待填 |
+| 独立 QA（3381c477 腿的独立 QA 领取人） | 待填 | 待填 | 待填 |
 
 ## 2. 治理事实（经理已核，写入交接）
 
@@ -24,7 +31,12 @@
 - v60 return 后，v61 由 engineering-factory-droid-88ca95 领取，v63 提交 3099bc8；v64、v66 由独立的 engineering-claude-7129c1 复核并 accept。
 - 旧运行版 bdf9732 没有运行中实现者的硬绑定，正式历史中没有 `implementer_takeover`。
 - 本次管理决定不倒签 v61 的授权，也不抹历史。
-- 已知实际作者至少为 factory-droid-b954f0、claude-e3d236、factory-droid-7ef5c9、claude-b5ccb5、factory-droid-88ca95（均带 engineering- 前缀）。所有写过本 PR 及本补修的人，永久排除于本 PR 与本单的独立复核，不能只排最终提交者。
+- 本补修的接手（经理 gm-codex-488999 v23 决定，受控的一次性人工责任交接）：
+  - 原实现人 engineering-factory-droid-88ca95 当时持有另一任务的代码租约。经理不允许其同时改两棵树，因此批准一次受控交接，不做归档或座位调整。
+  - v22 的代码领取给了 engineering-factory-droid-f3bd7d。它在写码前被阻塞（v23），未提交代码，不计为作者。
+  - 恢复后，由正常调度首次合法领取本单代码写权的工程员工承接返修：engineering-factory-droid-9aeb10，领取于 v25（2026-10-20T16:46:45Z）。它承接 ca5c11e，提交 299967a（R1 代码与测试）及一个仅含文档的提交（见 PR #1469 正文）。提交的 Git 作者字段为本机配置身份，员工身份以提交说明与任务历史为准。
+- 已知实际作者至少为 factory-droid-b954f0、claude-e3d236、factory-droid-7ef5c9、claude-b5ccb5、factory-droid-88ca95、factory-droid-9aeb10（均带 engineering- 前缀）。所有写过本 PR 及本补修的人，永久排除于本 PR 与本单的独立复核，不能只排最终提交者。
+- 经手但未写码，不是作者：engineering-claude-7129c1（v2 代码领取，37 秒后释放，无写码记录，经理 v13 保留其主动回避）。
 - f4978d、f3bd7d 按正式记录为复核经手人，不因 review 记录而列为作者。
 - 经理批准：若正常调度首次选择原复核人 engineering-claude-7129c1 担任本补修作者，允许从本次决定之后转任实现，但必须新增其作者事实。此时独立复核改为 f3bd7d（前提同上）或另一名无实际贡献冲突的独立工程员工。任何已写代码者不得复核本单。
 - 旧运行服务尚不提供 `contributor_dryrun`、`implementer_takeover` 的全部保障。不得裸连生产补字段、换身份或手工 claim。若返修再次派给另一名写手，写代码前先报告归属冲突，不续写以扩大作者集合。
@@ -34,11 +46,13 @@
 1. 合入：PR 经正常流程合入 `origin/main`。部署只用 main，release 必须可达自 `origin/main`（见 company-service-operations.md §1）。
 2. 固定最终 main 集成 SHA：`git fetch origin` 后取 `origin/main` 的完整 SHA，写入部署记录。CI 对该 SHA 必须为绿。若 PR 头与 main SHA 不同，记录差异。
 3. 生成固定 release：沿用 company-service-operations.md §2 的步骤（归档、解引用依赖、`plugin/scripts/vendor.sh`、frozen-lockfile 安装、根与插件类型检查）。逐步检查退出码，任何一步失败即停止，保留当前生产版本。
-4. vendor 核对：去掉 vendor 文件首行 `// @ts-nocheck` 后，`plugin/server/vendor/src/retirement.ts` 必须与 `src/retirement.ts` 无差异，`plugin/server/vendor/src/workforce.ts` 必须与 `src/workforce.ts` 无差异。
+4. vendor 核对：去掉 vendor 文件首行 `// @ts-nocheck` 后，`plugin/server/vendor/src/retirement.ts` 必须与 `src/retirement.ts` 无差异，`plugin/server/vendor/src/workforce.ts` 必须与 `src/workforce.ts` 无差异；`plugin/server/vendor/src/enrollment.ts` 与 `plugin/server/vendor/src/dispatcher/paseo.ts` 同样必须与对应的 `src` 文件无差异。
 5. 受影响测试，在公司 fork 隔离库上运行。不得用裸 `bun test` 直连生产库：
    - 根：`bun run typecheck`；插件：`cd plugin && bun run typecheck`。
    - `bun run test:service`、`bun run test:channel`、`bun run test:bridge`，以及全量 `bun run test`，与 §5 基线逐项对照。
    - `bun scripts/test-worktrees.ts tests/retire-gate.fork.test.ts`，应为 18 项全部通过。
+   - `bun scripts/test-worktrees.ts tests/retire-gate-revoke.fork.test.ts`，应为 10 项全部通过（撤凭证门禁、场景回收的非拒绝失败、复核阶段合法动作）。
+   - 受影响文件集：`bun scripts/test-worktrees.ts` 加下列 14 个文件（共 157 项），应为 134 通过、23 跳过、0 失败：`contributor-cas.integration`、`mcp-run-reclaim.fork`、`worktree-scene`、`worktree-lock`、`implementer-binding.integration`、`dispatcher-sidecar.fork`、`retire-gate.fork`、`v3.integration`、`db.integration`、`retire-gate-revoke.fork`、`dispatch-episode.fork`、`internal-ai-proof.fork`、`paseo-dead-paths`、`worktree-registry.fork`（均为 `tests/` 下的 `.test.ts`）。
 6. 记录两面 SHA、`pnpm-lock.yaml` 哈希、vendor 生成物哈希与全部测试数字。
 
 ## 4. 切换前采样（回滚候选）
@@ -53,17 +67,19 @@
 
 ## 5. 基线对照（发布前复跑，逐项填写）
 
-| 项 | 基线 3099bc8（PR 原记录） | 本分支结果 |
+| 项 | 基线 3099bc8（PR 原记录） | 本分支结果（代码 SHA 299967a，证据目录 after-299967a/） |
 | --- | --- | --- |
-| 根 typecheck | 退出 0 | 以发布前复跑为准 |
-| 插件 typecheck | 退出 0 | 以发布前复跑为准 |
-| `test:service` | 12 通过，0 失败 | 以发布前复跑为准 |
-| `test:channel` | 132 通过，13 跳过，0 失败 | 以发布前复跑为准 |
-| `test:bridge` | 372 通过，23 跳过，0 失败 | 以发布前复跑为准 |
-| 全量 | 982 个：938 通过，33 跳过，11 失败（gm-attention 5，triage 5，GitHub 重试 1） | 以发布前复跑为准 |
+| 根 typecheck | 退出 0 | 退出 0 |
+| 插件 typecheck | 退出 0 | 退出 0 |
+| `test:service` | 12 通过，0 失败 | 12 通过，0 失败（1 个文件，退出 0） |
+| `test:channel` | 132 通过，13 跳过，0 失败 | 132 通过，13 跳过，0 失败（13 个文件，145 项） |
+| `test:bridge` | 372 通过，23 跳过，0 失败 | 372 通过，23 跳过，0 失败（24 个文件，395 项） |
+| 全量 | 982 个：938 通过，33 跳过，11 失败（gm-attention 5，triage 5，GitHub 重试 1） | 1011 个：967 通过，33 跳过，11 失败（失败名单与基线逐名相同） |
 | `retire-gate.fork.test.ts` | 基线不存在 | 18 项，全部通过 |
+| `retire-gate-revoke.fork.test.ts` | 基线不存在 | 10 项，全部通过（修复前 ca5c11e 上 9 项失败、1 项通过） |
+| 受影响 14 个文件 | 基线不存在 | 157 项：134 通过，23 跳过，0 失败 |
 
-失败名单与基线逐项相同，才算通过。新增失败须先查清，不能以“已知失败”忽略。
+失败名单与基线逐项相同，才算通过。新增失败须先查清，不能以“已知失败”忽略。名单对照见证据目录 `after-299967a/name-diff-vs-baseline.txt`：基线中 981 项的状态不变；1 项旧名称（`employee pre-retire failures do not block scene cleanup; already-retired rows count as handled`，`tests/worktree-scene.test.ts`）被改写为两项新名称；另新增 28 项门禁测试（18 与 10）。因此全量通过数比基线多 29 项，跳过与失败数不变。
 
 ## 6. 维护窗口与暂停（由经理协调）
 
@@ -73,7 +89,7 @@
    - 若现有只读入口无法证明无采样，视为未证明，继续等待。不得把任务 blocked 当作无外部运行证据。
    - 不写死日历时间。常规窗口不需要老板决定。
 3. 暂停新派工：经理使用现有受权管理通道（manage 能力工具，见 [agent-operations.md](../agent-operations.md) 的「管理工具（manage）」）。
-   - 先用 `def_list` 记录受影响编制的原 `enabled` 值。
+   - 先用 `def_list` 记录受影响编制的原 `enabled` 值，逐个写入发布记录（编制名、原值、记录时间）。恢复时以此为准，不凭记忆。
    - 再以 `def_list` 读出的完整定义为基础，只把 `enabled` 改为 false，用 `def_ensure` 写入。
    - 保留活租约与 comm 目录。不退役、不归档作者、不减少 `max_instances`、不启用原来就停用的渠道。
 4. 不做：不裸调 owner 配置（如 `admin config`），不重启整个 Paseo 守护进程，不另建 dispatcher 或定时器，不读取 `private/`、env 或凭证。
@@ -86,22 +102,24 @@
 - 层 1，存活与就绪：`/health` 与 `/ready` 均返回 200。
 - 层 2，真实 sck：用已登记员工通道执行 `sck call get_context '{}'`，核对返回。
 - 层 3，调度与活租约 adopt：插件重注册后，已有活租约的会话由 sidecar 的 adopt 恢复，不被误退役、不被重派。经理安排一次真实派工，核对 spawn、claim 与任务记录。
-- 退役门禁：生产上不执行退役测试，不制造退役或租约故障。门禁以 release 与 vendor 哈希、§3 的 18 项隔离测试，以及 §8 的只读核对共同证明。
+- 退役门禁：生产上不执行退役测试，不制造退役或租约故障。门禁以 release 与 vendor 哈希、§3 的隔离测试（18 项与 10 项）及受影响文件集共同证明。
 - UI：Paseo Company 页面按 §10 的路径只读核对，不在生产造数。
+- 恢复编制（F-C，成功路径）：层 1 至层 3 全部通过，且 §6 的前置条件仍然成立之后，经理按 §6 第 3 步记录的原值逐个用 `def_ensure` 恢复 `enabled`（以 `def_list` 读出的完整定义为基础，只改 `enabled`）。原本即为 false 的编制保持 false。不归档作者，不减少席位，不启用原停用渠道。任一层未通过，不恢复，报经理。
 
 未完成的层次必须标注为未验证，不能宣布部署完成。
 
 ## 8. 回滚
 
-1. 先由经理用 `def_ensure` 暂停受影响编制（做法同 §6）。
+1. 先由经理用 `def_ensure` 暂停受影响编制（做法同 §6），并先记录原 `enabled` 值。
 2. 旧代码失去新绑定防护时，先冻结相关新派工，保留全部新作者、绑定、审计与租约。完成兼容验证后才恢复派工。
 3. 回滚同时恢复 MCP `active` 与插件固定来源：`install <previous-release>` 加 `plugin install <previous-release>/plugin`，命令形式与顺序以 company-service-operations.md「双面回滚」为准，然后重做 §7 的验证。不能只切 `active`，不能删除新字段。
 4. 旧版忽略 `implementer_bound_at`，保留该字段不影响回滚。
-5. 回滚失败时保留现场并报阻塞。不回退到 v3 历史树作为生产来源。
+5. 回滚后的编制恢复（F-C，回滚路径）：回滚后的 §7 层 1 至层 3 验证全部通过，再按 §6 记录的原 `enabled` 值逐个恢复；原本即为 false 的保持 false。不归档作者，不减少席位，不启用原停用渠道。
+6. 回滚失败时保留现场并报阻塞。不回退到 v3 历史树作为生产来源。
 
 ## 9. 证据与交付
 
-- 证据目录：`evidenceDir`，即 `/Users/y/Library/Application Support/SurrealCKCompany/evidence/f517e2e4-49a4-4150-84f1-229710cbde99/`。内含基线、红绿、并发、全量与发布前对照的日志。
+- 证据目录：`evidenceDir`，即 `/Users/y/Library/Application Support/SurrealCKCompany/evidence/f517e2e4-49a4-4150-84f1-229710cbde99/`。内含基线（`baseline-3099bc8/`）、旧代码红测（`red-ca5c11e/`）、新代码绿测、并发与全量对照（`after-299967a/`）及发布前对照的日志。
 - 证据中的预览链接只使用 `sck call deliverable_publish` 返回的 URL。本地路径与 `file://` 不算交付。
 - 生产证据记录两面路径、SHA、进程状态、探针结果与真实派工时间。未验证的项明确写“未验证”。
 
