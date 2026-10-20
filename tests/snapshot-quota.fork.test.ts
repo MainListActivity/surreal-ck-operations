@@ -408,14 +408,19 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   const statements: string[] = [];
   const observed: Array<{ outcome: string }> = [];
   let slow = true;
-  let aborts = 0;
+  // One entry per connection the build closed: true when a statement was still in flight at that time.
+  const closes: boolean[] = [];
+  let holding = 0;
   const { db, store } = await fresh({ buildDeadlineMs: 2_000, batchBytes: 4 * KB }, {
     channel: {
-      connection: async () => throughChannel(holder.db!, async sql => {
-        statements.push(sql);
-        if (slow) await Bun.sleep(250);
+      open: async () => ({
+        db: throughChannel(holder.db!, async sql => {
+          statements.push(sql);
+          holding++;
+          try { if (slow) await Bun.sleep(250); } finally { holding--; }
+        }),
+        close: async () => { closes.push(holding > 0); },
       }),
-      abort: async () => { aborts++; },
     },
     observe: stats => observed.push(stats),
   });
@@ -437,11 +442,12 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   expect(writes).toBeGreaterThan(0);
   expect(writes).toBeLessThan(20);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
-  // Nothing starts once the build has given up. The statement in flight finished within the cleanup wait, so the channel was kept.
+  // Nothing starts once the build has given up. The statement in flight finished within the cleanup wait, so its connection was kept.
   const atGiveUp = statements.length;
   await Bun.sleep(600);
   expect(statements.length).toBe(atGiveUp);
-  expect(aborts).toBe(0);
+  // The one connection was closed when the build ended, with nothing in flight.
+  expect(closes).toEqual([false]);
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
   expect(await quotaOf(store)).toEqual(baseline);
 
@@ -452,18 +458,25 @@ test('(j) a build past its deadline is cancelled: no statement starts after it, 
   expect(await quotaOf(store)).toEqual(baseline);
 });
 
-test('(k) a statement still in flight after the cleanup wait drops the channel; the build ends as temporarily_unavailable and releases its room', async () => {
+test('(k) a statement still in flight after the cleanup wait closes its connection; the build ends as temporarily_unavailable and releases its room', async () => {
   const holder: { db?: Surreal } = {};
   const observed: Array<{ outcome: string }> = [];
   let hold = true;
-  let aborts = 0;
+  // One entry per connection the build closed: true when a statement was still in flight at that time.
+  const closes: boolean[] = [];
+  let holding = 0;
   const { db, store } = await fresh({ buildDeadlineMs: 2_000 }, {
     channel: {
-      connection: async () => throughChannel(holder.db!, async sql => {
-        // The row write never answers while `hold` is set, so the build is stuck inside its one batch.
-        if (hold && sql.includes('INSERT INTO query_snapshot_row')) await new Promise<never>(() => undefined);
+      open: async () => ({
+        db: throughChannel(holder.db!, async sql => {
+          // The row write never answers while `hold` is set, so the build is stuck inside its one batch.
+          if (hold && sql.includes('INSERT INTO query_snapshot_row')) {
+            holding++;
+            await new Promise<never>(() => undefined);
+          }
+        }),
+        close: async () => { closes.push(holding > 0); },
       }),
-      abort: async () => { aborts++; },
     },
     observe: stats => observed.push(stats),
   });
@@ -476,10 +489,10 @@ test('(k) a statement still in flight after the cleanup wait drops the channel; 
   expect(error).toBeInstanceOf(CompanyError);
   expect((error as CompanyError).code).toBe('temporarily_unavailable');
   expect((error as CompanyError).retryable).toBe(true);
-  // The 2-second deadline passes first, then the 2-second cleanup wait, and only then is the channel dropped.
+  // The 2-second deadline passes first, then the 2-second cleanup wait, and only then is the connection closed, still busy.
   expect(elapsed).toBeGreaterThanOrEqual(3_900);
   expect(elapsed).toBeLessThan(6_000);
-  expect(aborts).toBe(1);
+  expect(closes).toEqual([true]);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out' });
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });
   expect(await quotaOf(store)).toEqual(baseline);
@@ -488,4 +501,95 @@ test('(k) a statement still in flight after the cleanup wait drops the channel; 
   const header = await store.create({ owner: 'k-owner', kind: 'context', digest: 'dig-k-again', role: 'gm', takenAt: TAKEN_AT, bodies: ['again'] });
   expect(await store.release(header.id)).toBe('released');
   expect(await quotaOf(store)).toEqual(baseline);
+});
+
+test('(l) a read still unanswered after loadHedgeMs is abandoned, its connection closed, and the listing stored from the read that answers', async () => {
+  const holder: { db?: Surreal } = {};
+  const observed: Array<{ outcome: string; loadAttempts: number }> = [];
+  let opens = 0;
+  let closes = 0;
+  let reads = 0;
+  const { db, store } = await fresh({ loadHedgeMs: 300, buildDeadlineMs: 5_000 }, {
+    channel: { open: async () => { opens++; return { db: holder.db!, close: async () => { closes++; } }; } },
+    observe: stats => observed.push(stats),
+  });
+  holder.db = db.db;
+  const header = await store.build({
+    owner: 'l-owner', kind: 'context', digest: 'dig-l', role: 'gm', guidance: 'narrow the query',
+    load: async () => {
+      reads++;
+      // The first read never answers; the second one does.
+      if (reads === 1) return new Promise<never>(() => undefined);
+      return { takenAt: TAKEN_AT, bodies: ['answer'] };
+    },
+  });
+  expect(header.rows).toBe(1);
+  expect(reads).toBe(2);
+  // One connection per read attempt: the abandoned one closed at the hedge, the one that answered closed when the build ended.
+  expect(opens).toBe(2);
+  expect(closes).toBe(2);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'stored', loadAttempts: 2 });
+  expect(await store.release(header.id)).toBe('released');
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+});
+
+test('(m) a read that stalls again after the hedge ends the build as temporarily_unavailable: one retry only, nothing kept', async () => {
+  const holder: { db?: Surreal } = {};
+  const observed: Array<{ outcome: string; loadAttempts: number }> = [];
+  let opens = 0;
+  let closes = 0;
+  let reads = 0;
+  const { db, store } = await fresh({ loadHedgeMs: 300, buildDeadlineMs: 2_000 }, {
+    channel: { open: async () => { opens++; return { db: holder.db!, close: async () => { closes++; } }; } },
+    observe: stats => observed.push(stats),
+  });
+  holder.db = db.db;
+  const started = performance.now();
+  const error = await store.build({
+    owner: 'm-owner', kind: 'context', digest: 'dig-m', role: 'gm', guidance: 'narrow the query',
+    load: async () => { reads++; return new Promise<never>(() => undefined); },
+  }).then(() => undefined, (reason: unknown) => reason);
+  const elapsed = performance.now() - started;
+  expect(error).toBeInstanceOf(CompanyError);
+  expect((error as CompanyError).code).toBe('temporarily_unavailable');
+  expect((error as CompanyError).retryable).toBe(true);
+  expect(reads).toBe(2);
+  expect(opens).toBe(2);
+  expect(closes).toBe(2);
+  expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', loadAttempts: 2 });
+  expect(elapsed).toBeLessThan(6_000);
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
+});
+
+test('(n) a build whose read is abandoned closes only its own connection: a concurrent build on its own connection still stores', async () => {
+  const { db } = await fresh();
+  // Real connections: each build opens its own socket through the database's build channel.
+  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000, loadHedgeMs: 300, buildDeadlineMs: 5_000 }, { channel: db.buildChannel });
+  let attempts = 0;
+  // The first build's first read never answers, so it is abandoned at the hedge and read once more on a new connection.
+  const stalled = store.build({
+    owner: 'n-stalled', kind: 'context', digest: 'dig-n-stalled', role: 'gm', guidance: 'narrow the query',
+    load: async () => {
+      attempts++;
+      if (attempts === 1) return new Promise<never>(() => undefined);
+      return { takenAt: TAKEN_AT, bodies: ['stalled'] };
+    },
+  });
+  // The other build reads on its own connection while the first is abandoned, and must still store.
+  const other = store.build({
+    owner: 'n-other', kind: 'context', digest: 'dig-n-other', role: 'gm', guidance: 'narrow the query',
+    load: async conn => {
+      await Bun.sleep(600);
+      await conn.query('RETURN 1;');
+      return { takenAt: TAKEN_AT, bodies: ['other'] };
+    },
+  });
+  const [headerStalled, headerOther] = await Promise.all([stalled, other]);
+  expect(attempts).toBe(2);
+  expect(headerStalled.rows).toBe(1);
+  expect(headerOther.rows).toBe(1);
+  expect(await store.census()).toEqual({ listings: 2, rows: 2 });
+  expect(await store.release(headerStalled.id)).toBe('released');
+  expect(await store.release(headerOther.id)).toBe('released');
+  expect(await store.census()).toEqual({ listings: 0, rows: 0 });
 });

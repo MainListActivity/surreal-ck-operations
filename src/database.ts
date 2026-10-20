@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
+import type { SnapshotChannel, SnapshotLink } from './snapshot-store.ts';
 
 const OWNER = 'surreal-ck-operations/issue-23/v1';
 
@@ -176,39 +177,26 @@ export class CompanyDatabase {
     return this.reconnecting;
   }
 
-  private buildSocket: Surreal | undefined;
-  private buildOpening: Promise<Surreal> | undefined;
+  private readonly buildSockets = new Set<Surreal>();
 
   /**
-   * The channel snapshot builds run on (SYS01 AC-D): a second socket to the same namespace and database. A large build then
-   * never queues ahead of control requests on the main socket. The socket is probed before each build and reopened when the
-   * probe fails; abort drops it with whatever it is still waiting for.
+   * The connections snapshot builds run on (SYS01 AC-D): a socket of their own for each read attempt, to the same namespace and
+   * database. A large build then never queues ahead of control requests on the main socket, and an attempt that is abandoned or
+   * cancelled closes only its own socket.
    */
-  readonly buildChannel = {
-    connection: (): Promise<Surreal> => this.openBuildConnection(),
-    abort: (): Promise<void> => this.dropBuildConnection(),
-  };
-
-  private openBuildConnection(): Promise<Surreal> {
-    this.buildOpening ??= this.connectBuildSocket().finally(() => { this.buildOpening = undefined; });
-    return this.buildOpening;
-  }
-
-  private async connectBuildSocket(): Promise<Surreal> {
-    const current = this.buildSocket;
-    if (current) {
+  readonly buildChannel: SnapshotChannel = {
+    open: async (): Promise<SnapshotLink> => {
+      const socket = new Surreal();
+      this.buildSockets.add(socket);
       try {
-        await CompanyDatabase.withTimeout(current.query('INFO FOR DB;'), 5_000, 'build probe');
-        return current;
-      } catch {
-        await this.dropBuildConnection();
+        await CompanyDatabase.withTimeout(this.openSocket(socket), 15_000, 'build connect');
+      } catch (error) {
+        await this.closeBuildSocket(socket);
+        throw error;
       }
-    }
-    const socket = new Surreal();
-    await CompanyDatabase.withTimeout(this.openSocket(socket), 15_000, 'build connect');
-    this.buildSocket = socket;
-    return socket;
-  }
+      return { db: socket, close: () => this.closeBuildSocket(socket) };
+    },
+  };
 
   private async openSocket(socket: Surreal): Promise<void> {
     await socket.connect(this.config.url, {
@@ -217,16 +205,15 @@ export class CompanyDatabase {
     await socket.use({ namespace: this.config.namespace, database: this.config.database });
   }
 
-  private async dropBuildConnection(): Promise<void> {
-    const socket = this.buildSocket;
-    this.buildSocket = undefined;
-    if (socket) await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'build close').catch(() => {});
+  private async closeBuildSocket(socket: Surreal): Promise<void> {
+    this.buildSockets.delete(socket);
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'build close').catch(() => {});
   }
 
   async close(): Promise<void> {
     clearInterval(this.keepalive);
     this.keepalive = undefined;
-    await this.dropBuildConnection();
+    await Promise.all([...this.buildSockets].map(socket => this.closeBuildSocket(socket)));
     // engine.close() awaits a 'disconnected' event that never arrives when the peer
     // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
     await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});

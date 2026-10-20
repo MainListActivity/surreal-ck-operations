@@ -15,7 +15,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
-import type { SnapshotBuildStats } from '../src/snapshot-store.ts';
+import { DEFAULT_SNAPSHOT_LIMITS, type SnapshotBuildStats } from '../src/snapshot-store.ts';
 
 const args = process.argv.slice(2);
 const label = args[0] ?? 'run';
@@ -28,6 +28,9 @@ const CONTEXT_BYTES = flag('context-bytes', 2800);
 const SAMPLES = flag('samples', 12);
 const RATE = flag('rate', 0);
 const BATCH_KIB = flag('batch-kib', 0);
+// --direct connects to the fork without the proxy; --no-hedge leaves the first read of a listing unabandoned (diagnosis only).
+const DIRECT = args.includes('--direct');
+const NO_HEDGE = args.includes('--no-hedge');
 const outAt = args.indexOf('--out');
 const OUT = outAt >= 0 ? args[outAt + 1]!
   : join(homedir(), 'Library/Application Support/SurrealCKCompany/evidence/e1becaaa-4ff9-48a3-abfc-95ed04ade911/review-measure', `${label}.json`);
@@ -166,11 +169,12 @@ async function main() {
   const password = `measure-${randomUUID()}`;
   const fork = await startFork(dir, password);
   const proxy = startProxy(fork.port, RATE);
-  const database = new CompanyDatabase({ url: `ws://127.0.0.1:${proxy.port}/rpc`, rootUser: 'root', rootPassword: password, namespace: NS, database: 'control_plane' });
+  const database = new CompanyDatabase({ url: `ws://127.0.0.1:${DIRECT ? fork.port : proxy.port}/rpc`, rootUser: 'root', rootPassword: password, namespace: NS, database: 'control_plane' });
   const result: Record<string, unknown> = {
-    label, tasks: TASKS, contextBytes: CONTEXT_BYTES, samples: SAMPLES, rateBytesPerSecond: RATE,
+    label, runtime: `bun ${Bun.version}`, tasks: TASKS, contextBytes: CONTEXT_BYTES, samples: SAMPLES, rateBytesPerSecond: RATE,
     channel: RATE > 0 ? 'simulated constraint: the proxy shares the rate across all connections in each direction (not a measurement of the production WSS channel)' : 'loopback, unconstrained',
     batchKiB: BATCH_KIB > 0 ? BATCH_KIB : 'default', startedAt: new Date().toISOString(),
+    route: DIRECT ? 'direct to the fork, no proxy' : 'through the counting proxy', loadHedgeMs: NO_HEDGE ? 'disabled (diagnosis only)' : DEFAULT_SNAPSHOT_LIMITS.loadHedgeMs,
   };
   try {
     await database.connect();
@@ -181,7 +185,7 @@ async function main() {
     // Every listing build reports its phases and the server time of its statements (SnapshotBuildStats).
     const buildLog: SnapshotBuildStats[] = [];
     const core = new SurrealCompanyCore(database, {
-      ...(BATCH_KIB > 0 ? { snapshots: { batchBytes: BATCH_KIB * 1024 } } : {}),
+      snapshots: { ...(BATCH_KIB > 0 ? { batchBytes: BATCH_KIB * 1024 } : {}), ...(NO_HEDGE ? { loadHedgeMs: 2 * 60 * 60 * 1000 } : {}) },
       snapshotObserve: stats => { buildLog.push(stats); },
     });
     const enrollment = new LocalEnrollmentAdmin(database);
@@ -239,7 +243,7 @@ async function main() {
       outcome, seconds: round((performance.now() - firstStart) / 1000), pageRows: rows, answerBytes: answer, budgetBytes: RESPONSE_BUDGET_BYTES,
       wireDownBytes: counters.down - before.down, wireUpBytes: counters.up - before.up, clientRssPeakMb: round(rssPeak / 1048576),
       builds: buildLog.slice(firstFrom).map(stat => ({
-        outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, loadMs: round(stat.loadMs),
+        outcome: stat.outcome, rows: stat.rows, bytes: stat.bytes, batches: stat.batches, attempts: stat.loadAttempts, loadMs: round(stat.loadMs),
         reserveMs: round(stat.reserveMs), writeMs: round(stat.writeMs), commitMs: round(stat.commitMs), totalMs: round(stat.totalMs),
         serverMs: round(stat.serverMs),
       })),

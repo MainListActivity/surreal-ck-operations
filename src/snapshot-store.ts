@@ -11,10 +11,11 @@
 // written holds its room. A release deletes a listing and subtracts it in one transaction, and subtracts only when that
 // delete found the listing, so every listing is released exactly once.
 //
-// A build (SYS01 AC-D) runs on a channel: a connection of its own, so a large build never queues ahead of control requests
-// on the main connection. Reads, pages, releases and sweeps stay on the main connection. A build has a deadline
-// (buildDeadlineMs). Past it no further statement is started, the statement in flight gets a short wait to finish, the
-// channel is dropped if it is still running, what was reserved is released, and the caller gets temporarily_unavailable.
+// A build (SYS01 AC-D) runs on connections of its own, so a large build never queues ahead of control requests on the main
+// connection. Each read attempt opens one, and a build closes only its own. Reads, pages, releases and sweeps stay on the
+// main connection. A build has a deadline (buildDeadlineMs). Past it no further statement is started, the statement in
+// flight gets a short wait to finish, its connection is closed if it is still running, what was reserved is released, and
+// the caller gets temporarily_unavailable.
 import { randomUUID } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
@@ -43,6 +44,8 @@ export interface SnapshotLimits {
   batchBytes: number;
   /** Wall-clock time one listing build may take, from its first read to its commit. Past it the build is cancelled (see build). */
   buildDeadlineMs: number;
+  /** A listing's read still unanswered after this long is abandoned, its connection closed, and the read run once more on a new one (see build). */
+  loadHedgeMs: number;
 }
 
 export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
@@ -56,17 +59,23 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   reserveWaitMs: 5 * 1000,
   batchBytes: 64 * 1024,
   buildDeadlineMs: 10 * 1000,
+  loadHedgeMs: 5 * 1000,
 };
 
-/** The connection a build runs on. The store asks for it at the start of each build, and drops it when a build is cancelled. */
+/** A connection a read attempt of a build runs on. It is closed when the attempt is abandoned, when a cancelled build's statement does not finish, or when the build ends. */
+export interface SnapshotLink {
+  readonly db: Surreal;
+  /** Drops the connection with whatever it is still waiting for. Closing it again is harmless. */
+  close(): Promise<void>;
+}
+
+/** Opens the connections builds run on: one for each read attempt, so an attempt that is abandoned takes no other build's connection with it. */
 export interface SnapshotChannel {
-  connection(): Promise<Surreal>;
-  /** Drops the connection with whatever it is still waiting for; the next build opens a new one. */
-  abort(): Promise<void>;
+  open(): Promise<SnapshotLink>;
 }
 
 export interface SnapshotStoreOptions {
-  /** Where builds run. The default is the store's own connection. */
+  /** Where builds run. The default is the store's own connection, which a build never closes. */
   channel?: SnapshotChannel;
   /** Told what every build cost, stored or not. Used by the measurements; a listing's contents are never passed on. */
   observe?: (stats: SnapshotBuildStats) => void;
@@ -86,6 +95,8 @@ export interface SnapshotBuildStats {
   totalMs: number;
   /** Sum of the server's own durations for the statements of this build (query statistics), in milliseconds. */
   serverMs: number;
+  /** Reads of the rows: 2 when the first read was abandoned for a new connection after loadHedgeMs. */
+  loadAttempts: number;
 }
 
 export interface SnapshotHeader {
@@ -153,7 +164,7 @@ const QUOTA = new RecordId('query_snapshot_quota', 'global');
 const RESERVE_ATTEMPTS = 50;
 /** How long one transaction keeps retrying after a concurrent write conflicts with it. */
 const TRANSACTION_WAIT_MS = 10 * 1000;
-/** A cancelled build gives the statement it has in flight this long to finish before the channel is dropped. */
+/** A cancelled build gives the statement it has in flight this long to finish before that connection is closed. */
 const CLEANUP_WAIT_MS = 2 * 1000;
 
 const headerOf = (row: HeaderRow): SnapshotHeader => ({
@@ -176,7 +187,7 @@ export class SnapshotStore {
 
   constructor(private readonly db: Surreal, limits: Partial<SnapshotLimits> = {}, private readonly options: SnapshotStoreOptions = {}) {
     this.limits = { ...DEFAULT_SNAPSHOT_LIMITS, ...limits };
-    this.channel = options.channel ?? { connection: async () => db, abort: async () => undefined };
+    this.channel = options.channel ?? { open: async () => ({ db, close: async () => undefined }) };
   }
 
   /**
@@ -193,11 +204,13 @@ export class SnapshotStore {
   }
 
   /**
-   * Builds a listing. `load` reads its rows on the channel and returns them with the time they were read at. The whole build
-   * (the read, the reservation, every batch and the commit) must finish within buildDeadlineMs. Past that deadline no further
-   * statement is started; the one in flight gets CLEANUP_WAIT_MS to finish, and the channel is dropped if it has not; what was
-   * reserved is released; and the caller gets temporarily_unavailable, with `guidance` on how to narrow the query. Errors
-   * from `load` (for example response_too_large) pass through unchanged.
+   * Builds a listing. `load` reads its rows on a connection the build opens and returns them with the time they were read at.
+   * The whole build (the connection, the read, the reservation, every batch and the commit) must finish within buildDeadlineMs.
+   * Past that deadline no further statement is started; the one in flight gets CLEANUP_WAIT_MS to finish, and its connection is
+   * closed if it has not; what was reserved is released; and the caller gets temporarily_unavailable, with `guidance` on how to
+   * narrow the query. Errors from `load` (for example response_too_large) pass through unchanged. A read still unanswered after
+   * loadHedgeMs is abandoned, its connection closed, and the read run once more on a new connection; only the read that answers
+   * is used, so the listing is still one consistent read. A second stall is not retried.
    */
   async build(input: {
     owner: string; kind: SnapshotKind; digest: string; role: string; guidance: string;
@@ -208,11 +221,16 @@ export class SnapshotStore {
     const account: BuildAccount = { serverMs: 0, batches: 0 };
     const stats: SnapshotBuildStats = {
       outcome: 'failed', kind: input.kind, rows: 0, bytes: 0, batches: 0, loadMs: 0, reserveMs: 0, writeMs: 0, commitMs: 0, totalMs: 0, serverMs: 0,
+      loadAttempts: 1,
     };
     const signal: BuildSignal = { cancelled: false };
-    const state = { expired: false, reserved: false };
-    // The step in flight: `done` turns true when it settles, whatever its outcome.
-    const flight = { done: true, settled: Promise.resolve() };
+    const state = { expired: false, reserved: false, ended: false };
+    // The step in flight: `done` turns true when it settles, whatever its outcome. Steps are numbered, so a step abandoned by
+    // a hedge may still settle later without changing the state of the step that is in flight.
+    const flight = { done: true, settled: Promise.resolve(), current: 0 };
+    // The connections this build has open. A read attempt adds its connection once it is open. A connection is closed when its
+    // attempt is abandoned, when a cancelled build's statement does not finish, or when the build ends.
+    const links = new Set<SnapshotLink>();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -223,19 +241,53 @@ export class SnapshotStore {
     });
     expired.catch(() => undefined);
     const within = <T>(work: Promise<T>): Promise<T> => {
+      const step = ++flight.current;
       flight.done = false;
-      flight.settled = work.then(() => undefined, () => undefined).then(() => { flight.done = true; });
+      flight.settled = work.then(() => undefined, () => undefined).then(() => { if (flight.current === step) flight.done = true; });
       return Promise.race([work, expired]);
     };
     // No new step starts once the deadline has passed, even when the deadline passed between two awaits.
     const live = () => {
       if (signal.cancelled) throw timedOut(this.limits.buildDeadlineMs, input.guidance);
     };
+    const closeLinks = (): Promise<void> => Promise.all([...links].map(link => {
+      links.delete(link);
+      return link.close().catch(() => undefined);
+    })).then(() => undefined);
     try {
-      const db = await within(this.channel.connection());
-      live();
+      // Each read attempt runs on a connection of its own. An attempt still unanswered after loadHedgeMs is abandoned without
+      // waiting for it: its connection is closed, and the read runs once more on a new one. Only the read that answers is
+      // used, so the listing is still one consistent read.
       const loadStarted = performance.now();
-      const loaded = await within(input.load(db));
+      const attempt = async (token: { now: boolean }): Promise<{ db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } }> => {
+        // A connection is registered as soon as it opens, even when the deadline has already passed, so that it is always closed.
+        const link = await within(this.channel.open().then(opened => {
+          if (token.now || state.ended) {
+            void opened.close().catch(() => undefined);
+            throw new Error('read abandoned');
+          }
+          links.add(opened);
+          return opened;
+        }));
+        live();
+        return { db: link.db, loaded: await within(input.load(link.db)) };
+      };
+      let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
+      const hedge = new Promise<'hedge'>(resolve => { hedgeTimer = setTimeout(() => resolve('hedge'), this.limits.loadHedgeMs); });
+      const abandon = { now: false };
+      const first = attempt(abandon);
+      const answered = await Promise.race([first, hedge]).finally(() => clearTimeout(hedgeTimer));
+      let read: { db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } };
+      if (answered === 'hedge') {
+        first.catch(() => undefined);
+        abandon.now = true;
+        stats.loadAttempts = 2;
+        void closeLinks();
+        read = await attempt({ now: false });
+      } else {
+        read = answered;
+      }
+      const { db, loaded } = read;
       stats.loadMs = performance.now() - loadStarted;
       stats.rows = loaded.bodies.length;
       stats.bytes = loaded.bodies.reduce((sum, body) => sum + utf8Bytes(body), 0);
@@ -266,13 +318,15 @@ export class SnapshotStore {
         let patience: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([flight.settled, new Promise<void>(resolve => { patience = setTimeout(resolve, CLEANUP_WAIT_MS); })]);
         clearTimeout(patience);
-        if (!flight.done) await this.channel.abort().catch(() => undefined);
+        if (!flight.done) await closeLinks();
       }
       if (state.reserved) await this.release(id).catch(() => undefined);
       stats.outcome = state.expired ? 'timed_out' : error instanceof CompanyError ? 'refused' : 'failed';
       throw error instanceof CompanyError ? error : unavailable('the listing could not be stored; retry the read');
     } finally {
+      state.ended = true;
       clearTimeout(timer);
+      await closeLinks();
       stats.batches = account.batches;
       stats.serverMs = account.serverMs;
       stats.totalMs = performance.now() - started;
