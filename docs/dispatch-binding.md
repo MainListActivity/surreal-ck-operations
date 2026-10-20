@@ -22,7 +22,7 @@
   拒绝返回稳定错误码 `retire_refused`，附涉及的任务、阶段、状态、原因与合法动作（多条动作以 `1）…；2）…` 分隔）。`admin retire` 与 `admin revoke` 输出 JSON 并以退出码 1 结束。门禁拒绝时不写入：凭证、退役标记、安全撤销标记、租约、围栏与任务版本均保持不变（调度器在工作区变化分支中先于门禁释放租约，见 §六）。没有 `force` 或其他旁路。
 
   接受的退役或撤凭证在同一事务内重算在办关系，并与决定时的候选集合及版本逐一比对；并发移动或提交冲突按决定重试，重试耗尽返回可重试的 `temporarily_unavailable`。认领与接手同事务写员工记录，因此与退役或撤凭证冲突，不会同时成功。撤凭证保留 `security_revoked`，不写退役标记，因此不会被当作可自动复活的普通退役。
-- **自动轮换**同样经门禁：持有人与绑定实现人被拒绝时，本轮不轮换（`src/dispatcher/dispatcher.ts` 轮换段）。历史不可读时整轮不轮换。
+- **自动会话轮换**（调度器替换旧会话）同样经门禁：持有人与绑定实现人被拒绝时，本轮不轮换（`src/dispatcher/dispatcher.ts` 轮换段）。历史不可读时整轮不轮换。凭证轮换（`Workforce.rotate`）不在此门禁内，见 §六。
 
 ## 二、经理接手（`implementer_takeover`）
 
@@ -46,7 +46,7 @@
 3. 旧任务缺实现人字段时，先用 `contributor_dryrun` 核对贡献记录与时间线，再用 `implementer_takeover` 记录唯一实现人（执行阶段）。
 4. 处理后重试退役或撤凭证。每次拒绝都会列出仍需处理的任务、阶段与合法动作。
 
-拒绝时调度器不归档、不解绑、不重派：tick 报告的 `refused` 列出该实例。场景回收遇到任何未完成的员工退役（拒绝或其它失败）都保留整棵工作树：不解绑、不归档员工会话、不拆工作区与项目，抛出可重试的 `temporarily_unavailable`，登记的 `cleanup_todo` 记为 `scene-cleanup-failed:scene kept: …`（含原因），后续扫描会重试。
+拒绝时调度器不归档、不解绑、不重派：tick 报告的 `refused` 列出该实例。场景回收（`createSceneCleaner`）逐个退役工作树内的员工。遇到任何未完成的员工退役（拒绝或其它失败），该员工的会话保留：不解绑、不归档；同一工作树内已完成退役的员工照常解绑并归档。随后本树的工作区与项目一律不拆除，抛出可重试的 `temporarily_unavailable`（`scene kept: employee retirement not completed for …`），登记的 `cleanup_todo` 记为 `scene-cleanup-failed:scene kept: …`（含原因），后续扫描会重试。
 
 ## 三、只读核对（`contributor_dryrun`）
 
@@ -91,7 +91,7 @@
 9. 同线写者：同一任务线已有在办写者 → 等待任务的原因为 `write_scope`，候选写明持有者；持有者提交后该任务可派工，全程不出现 `wake_failed`。
 10. 退役门禁：在公司 fork 隔离库中，对持有活租约的测试员工执行 `admin retire` → 应见 `retire_refused` JSON、退出码 1；员工凭证仍有效，租约、围栏与任务版本不变。任务结束或完成交接后重试 → 应见 `ok: true`。生产只读核对不得执行退役。
 11. 撤凭证门禁：在公司 fork 隔离库中，对持有活租约的测试员工执行 `admin revoke` → 应见 `retire_refused` JSON、退出码 1；凭证摘要、`revoked` 与 `security_revoked` 不变。无在办关系的员工执行 `admin revoke` → 成功，写入 `security_revoked`，不写退役标记。
-12. 场景回收：员工退役遇非拒绝失败 → 应见 `scene kept` 可重试错误；员工会话未解绑、未归档，工作区与项目未拆除。
+12. 场景回收：员工退役遇非拒绝失败 → 应见 `scene kept` 可重试错误；该失败员工的会话未解绑、未归档，工作区与项目未拆除（同树中已完成退役的员工会解绑归档）。
 
 ## 六、测试分层与未覆盖
 
@@ -116,9 +116,10 @@
   - `probe_busy` 与仓库过滤的结论在纯函数层（`staffingPool`、`evaluateDispatch`）覆盖，完整 tick 层未单独覆盖。
   - AC07 发布腿：不在本 PR 内。
   - F-A 撤凭证（`admin revoke`）：已纳入同一门禁，不做应急旁路。有在办任务时不能直接撤凭证：须等任务结束；执行阶段的实现人可先由经理交接，复核阶段须等复核完成。撤凭证的真实子进程与并发用例见 `tests/retire-gate-revoke.fork.test.ts`。修复前（ca5c11e）该文件 10 项中 9 项失败、1 项通过（无在办关系的撤凭证，原本即允许），红测记录见证据目录 `red-ca5c11e/`。
-  - F-B 场景回收：非拒绝失败与拒绝一样保留现场。修复前，非拒绝错误后仍会解绑、归档与拆除工作区；现由 `tests/retire-gate-revoke.fork.test.ts` 的 scene 用例覆盖（真实 `Workforce.retire` 注入不可读故障，断言无解绑、无归档、无拆除、错误可重试；修复前失败）。`tests/worktree-scene.test.ts` 的同名语义用例以替身 `retire` 覆盖清理器（替身层，不作为真实证明）。
+  - F-B 场景回收：非拒绝失败与拒绝一样，失败员工的会话保留，本树的工作区与项目不拆除。修复前，非拒绝错误后仍会解绑、归档与拆除工作区；现由 `tests/retire-gate-revoke.fork.test.ts` 的 scene 用例覆盖（真实 `Workforce.retire` 注入不可读故障，断言无解绑、无归档、无拆除、错误可重试；修复前失败）。`tests/worktree-scene.test.ts` 的同语义用例（单员工）以替身 `retire` 覆盖清理器（替身层，不作为真实证明）。
+  - 场景回收的混合结果（同一工作树内一人退役成功、另一人被拒绝或失败）尚无用例覆盖。行为按 `createSceneCleaner` 代码路径：成功者解绑归档，失败者保留，整树不拆。
   - F-D 复核阶段合法动作：不再推荐 `implementer_takeover`（仅限执行阶段）；复核租约没有受权的提前释放入口，拒绝说明写“等待复核完成”。相关三项用例（复核租约、复核绑定、分隔）修复前失败，修复后通过（见 `tests/retire-gate-revoke.fork.test.ts`）。
-  - **凭证轮换不在门禁内**：`Workforce.rotate` 由插件通道（`plugin/server/sidecar.ts`）在没有该员工内存凭证时调用（插件重启或 adopt 之后的首次使用），也在调用返回认证错误后的重试中调用。它换发凭证摘要，旧凭证随之失效；不设撤销或退役标记，不改租约与任务关系；已退役或已撤销的员工调用时失败。它不属于 R1 所指的退役或撤凭证，未纳入门禁，待经理裁定。
+  - **凭证轮换不在门禁内**：`Workforce.rotate` 由插件通道（`plugin/server/sidecar.ts`）在没有该员工内存凭证时调用（插件重启或 adopt 之后的首次使用），也在调用返回认证错误后的重试中调用。它换发凭证摘要，旧凭证随之失效；不设撤销或退役标记，不改租约与任务关系；已退役或已撤销的员工调用时失败。当前未纳入门禁，是否纳入待经理裁定。
 - “影响 N 项后续”是未完成、且直接或经其它任务间接等待该根阻点的任务数（依赖链计数，见 `src/dispatcher/dispatch-blocked.ts`）。
 - 历史行缺阶段时，无法判定的行按作者处理，任务进入 `manager_decision`，需经理接手。这是 fail-closed 的设计，不是缺陷。
 - 扩编（如临时增加一个工程席位）与额度决定属于经理与老板，不由本规则自动完成。

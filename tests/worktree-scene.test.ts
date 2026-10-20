@@ -164,7 +164,7 @@ test('employee instances inside the doomed tree retire with an honest reason bef
   expect(result).toEqual({ workspacesArchived: 1, projectsDeleted: 0, employeesRetired: 2 });
 });
 
-test('an employee retirement that fails for any reason keeps the whole scene: nothing detached, archived or torn down', async () => {
+test('an employee retirement that fails for any reason keeps its session and holds back the tree teardown: no detach, no archive, no workspace teardown', async () => {
   const paseo = fakePaseo([ws('w-scene', tree)], []);
   const detached: string[] = [];
   const clean = createSceneCleaner(paseo, {

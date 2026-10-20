@@ -13,7 +13,7 @@ import { createSceneCleaner, type PaseoGateway } from '../src/dispatcher/paseo.t
 import type { ClaimResult, TaskView } from '../src/contracts.ts';
 
 // SYS-DISP f517e2e4 (R1, F-A, F-B, F-D). The credential revocation passes the same retirement gate as the retirement itself, the
-// scene cleaner keeps the scene on every failure, and review-phase refusals never recommend a takeover. Real core, real Workforce,
+// scene cleaner holds back the tree teardown on every failed employee retirement, and review-phase refusals never recommend a takeover. Real core, real Workforce,
 // real LocalEnrollmentAdmin and the real admin entry point, on the company fork. Own namespace.
 const NS = 'sck_agent_company_test_retire_revoke';
 const repoRoot = join(import.meta.dir, '..');

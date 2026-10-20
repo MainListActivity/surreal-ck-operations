@@ -231,7 +231,9 @@ const failureLabel = (error: unknown): string =>
  * Both steps are idempotent — a missing object counts as done. Every object is attempted so
  * one failure does not mask the others; the collected failures throw so the caller can keep
  * the scene and retry at the next event point. An employee whose retirement does not complete,
- * for any reason, keeps the whole scene: nothing is detached, archived or torn down (SYS-DISP R1).
+ * for any reason, keeps its own session (no detach, no archive) and holds back the teardown of the
+ * whole tree: no workspace or project is torn down while it remains (SYS-DISP R1). Employees already
+ * retired in the same tree are detached and archived as usual.
  */
 export function createSceneCleaner(
   paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject' | 'archive'>,

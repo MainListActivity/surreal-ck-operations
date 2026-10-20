@@ -34,7 +34,7 @@
 - 本补修的接手（经理 gm-codex-488999 v23 决定，受控的一次性人工责任交接）：
   - 原实现人 engineering-factory-droid-88ca95 当时持有另一任务的代码租约。经理不允许其同时改两棵树，因此批准一次受控交接，不做归档或座位调整。
   - v22 的代码领取给了 engineering-factory-droid-f3bd7d。它在写码前被阻塞（v23），未提交代码，不计为作者。
-  - 恢复后，由正常调度首次合法领取本单代码写权的工程员工承接返修：engineering-factory-droid-9aeb10，领取于 v25（2026-10-20T16:46:45Z）。它承接 ca5c11e，提交 299967a（R1 代码与测试）及一个仅含文档的提交（见 PR #1469 正文）。提交的 Git 作者字段为本机配置身份，员工身份以提交说明与任务历史为准。
+  - 恢复后，由正常调度首次合法领取本单代码写权的工程员工承接返修：engineering-factory-droid-9aeb10，领取于 v25（2026-10-20T16:46:45Z）。它承接 ca5c11e，提交 299967a（R1 代码与测试）及两个文档与注释提交（见 PR #1469 正文）。提交的 Git 作者字段为本机配置身份，员工身份以提交说明与任务历史为准。
 - 已知实际作者至少为 factory-droid-b954f0、claude-e3d236、factory-droid-7ef5c9、claude-b5ccb5、factory-droid-88ca95、factory-droid-9aeb10（均带 engineering- 前缀）。所有写过本 PR 及本补修的人，永久排除于本 PR 与本单的独立复核，不能只排最终提交者。
 - 经手但未写码，不是作者：engineering-claude-7129c1（v2 代码领取，37 秒后释放，无写码记录，经理 v13 保留其主动回避）。
 - f4978d、f3bd7d 按正式记录为复核经手人，不因 review 记录而列为作者。
@@ -67,7 +67,7 @@
 
 ## 5. 基线对照（发布前复跑，逐项填写）
 
-| 项 | 基线 3099bc8（PR 原记录） | 本分支结果（代码 SHA 299967a，证据目录 after-299967a/） |
+| 项 | 基线 3099bc8（PR 原记录） | 本分支结果（代码头与证据目录见 PR #1469 正文） |
 | --- | --- | --- |
 | 根 typecheck | 退出 0 | 退出 0 |
 | 插件 typecheck | 退出 0 | 退出 0 |
@@ -79,7 +79,7 @@
 | `retire-gate-revoke.fork.test.ts` | 基线不存在 | 10 项，全部通过（修复前 ca5c11e 上 9 项失败、1 项通过） |
 | 受影响 14 个文件 | 基线不存在 | 157 项：134 通过，23 跳过，0 失败 |
 
-失败名单与基线逐项相同，才算通过。新增失败须先查清，不能以“已知失败”忽略。名单对照见证据目录 `after-299967a/name-diff-vs-baseline.txt`：基线中 981 项的状态不变；1 项旧名称（`employee pre-retire failures do not block scene cleanup; already-retired rows count as handled`，`tests/worktree-scene.test.ts`）被改写为两项新名称；另新增 28 项门禁测试（18 与 10）。因此全量通过数比基线多 29 项，跳过与失败数不变。
+失败名单与基线逐项相同，才算通过。新增失败须先查清，不能以“已知失败”忽略。名单对照见最终头的证据目录（见 PR #1469 正文）中的 `name-diff-vs-baseline.txt`：基线中 981 项的状态不变；1 项旧名称（`employee pre-retire failures do not block scene cleanup; already-retired rows count as handled`，`tests/worktree-scene.test.ts`）被改写为两项新名称；另新增 28 项门禁测试（18 与 10）。因此全量通过数比基线多 29 项，跳过与失败数不变。
 
 ## 6. 维护窗口与暂停（由经理协调）
 
@@ -119,7 +119,7 @@
 
 ## 9. 证据与交付
 
-- 证据目录：`evidenceDir`，即 `/Users/y/Library/Application Support/SurrealCKCompany/evidence/f517e2e4-49a4-4150-84f1-229710cbde99/`。内含基线（`baseline-3099bc8/`）、旧代码红测（`red-ca5c11e/`）、新代码绿测、并发与全量对照（`after-299967a/`）及发布前对照的日志。
+- 证据目录：`evidenceDir`，即 `/Users/y/Library/Application Support/SurrealCKCompany/evidence/f517e2e4-49a4-4150-84f1-229710cbde99/`。内含基线（`baseline-3099bc8/`）、旧代码红测（`red-ca5c11e/`）、新代码绿测、并发与全量对照（最终头的证据目录，见 PR #1469 正文）及发布前对照的日志。
 - 证据中的预览链接只使用 `sck call deliverable_publish` 返回的 URL。本地路径与 `file://` 不算交付。
 - 生产证据记录两面路径、SHA、进程状态、探针结果与真实派工时间。未验证的项明确写“未验证”。
 
