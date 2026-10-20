@@ -5,8 +5,10 @@ import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
-import { LocalEnrollmentAdmin } from './enrollment.ts';
+import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
+import { readContributors, type ContributionFacts } from './contributors.ts';
+import { gateCredentialChange } from './retirement.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -164,6 +166,11 @@ export interface SupervisedTask {
   currentEmployee?: string;
   submittedBy?: string;
   previousEmployee?: string;
+  /** Explicit code implementer; derived implementers come from contributors (see contributors.ts). */
+  implementer?: string;
+  /** Open dispatch-blocked episode: the phase it blocks and when it began (unix seconds). */
+  dispatchBlockedPhase?: string;
+  dispatchBlockedSince?: number;
   leaseExpiresAt?: number;
   progressAt?: number;
   blockedTo?: 'gm' | 'owner';
@@ -171,6 +178,8 @@ export interface SupervisedTask {
   quotaResetsAt?: number;
   kind: string;
   title: string;
+  /** Goal this task belongs to; dispatch-blocked conclusions carry it so goal cards can show the root blocker. */
+  goalId?: string;
   evalAttempts: number;
   jevReleaseVersion?: number;
   jevRouteVersion?: number;
@@ -202,9 +211,11 @@ const supervised = (row: TaskRow): SupervisedTask => {
   return { row, id: v.id, state: v.state, version: v.version, executorRole: v.executorRole, reviewerRole: v.reviewerRole,
     discipline: v.discipline,
     currentEmployee: row.current_employee ?? undefined, submittedBy: row.submitted_by ?? undefined,
-    previousEmployee: row.previous_employee ?? undefined, leaseExpiresAt: row.lease_expires_at ?? undefined,
+    previousEmployee: row.previous_employee ?? undefined, implementer: row.implementer ?? undefined,
+    dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
+    leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
-    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title,
+    quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
     codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };
@@ -217,7 +228,12 @@ export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
 
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
-  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string) {
+  /**
+   * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
+   * write, so a test can land a claim or takeover in exactly that window.
+   */
+  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string,
+    private readonly retirementHook?: (employeeId: string) => Promise<void>) {
     this.enrollment = new LocalEnrollmentAdmin(database);
   }
   private get db() { return this.database.db; }
@@ -367,13 +383,23 @@ export class Workforce {
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
 
-  /** Retires an instance and revokes its credential, so a crashed session cannot act again. The kind is
-   * recorded by the first retirement only: a later one cannot turn a non-normal retirement into a normal one. */
+  /**
+   * Retires an instance and revokes its credential, so a crashed session cannot act again. The retirement gate is the one boundary
+   * every retirement and credential revocation passes (see gateCredentialChange in retirement.ts): admin CLI, dispatcher and scene
+   * cleaner. An employee who still holds a lease or is bound to unfinished work is refused with RETIRE_REFUSED before any write. An
+   * accepted retirement is one transaction that re-derives the employee's unfinished relations and writes only if they are the ones
+   * the decision saw. The kind is recorded by the first retirement only: a later one cannot turn a non-normal retirement into a
+   * normal one.
+   */
   async retire(employeeId: string, reason: string, kind: RetirementKind): Promise<void> {
-    await this.db.query(`UPDATE $e SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
-      retired = true, retired_reason = $reason, retired_at = time::now();`,
-      { e: id('employee', employeeId), reason, kind });
-    await this.enrollment.revoke(employeeId, 'retirement');
+    const [exists] = await this.db.query<[unknown]>('SELECT VALUE id FROM ONLY $e;', { e: id('employee', employeeId) });
+    if (!exists) throw new CompanyError('not_found', 'Employee not found');
+    await gateCredentialChange(this.db, employeeId, {
+      operation: 'retire',
+      statement: `UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
+        retired = true, retired_reason = $reason, retired_at = time::now(), revoked = true, credential_digest = $digest;`,
+      vars: { kind, reason, digest: revokedCredentialDigest() },
+    }, this.retirementHook);
   }
 
   async touchWake(employeeId: string): Promise<void> {
@@ -416,6 +442,32 @@ export class Workforce {
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
   async evalState(taskId: TaskId): Promise<EvalState> {
     return collectEvalState(this.db, taskId);
+  }
+
+  /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */
+  async contributors(taskId: TaskId): Promise<ContributionFacts> {
+    return readContributors(this.db, taskId);
+  }
+
+  /** Persists or clears a task's open dispatch-blocked episode (phase and start, unix seconds). */
+  async setDispatchBlock(taskId: TaskId, phase: string | undefined, since?: number): Promise<void> {
+    await this.db.query('UPDATE $task SET dispatch_blocked_phase = $phase, dispatch_blocked_since = $since;',
+      { task: id('task', taskId), phase: phase ?? null, since: since ?? null });
+  }
+
+  /** When each ready task last became ready (unix milliseconds), read in one query. Tasks with no such audit row are absent. */
+  async readySince(taskIds: readonly string[]): Promise<Map<string, number>> {
+    const since = new Map<string, number>();
+    if (taskIds.length === 0) return since;
+    const [rows] = await this.db.query<[Array<{ task: unknown; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $ids
+       AND action IN ['create', 'dependency_unlocked', 'return', 'release', 'revoke', 'resume'] ORDER BY at DESC;`,
+      { ids: taskIds.map(taskId => id('task', taskId)) });
+    for (const row of rows ?? []) {
+      const key = asId(row.task);
+      if (!since.has(key) && row.at !== undefined && row.at !== null) since.set(key, Date.parse(String(row.at)));
+    }
+    return since;
   }
 
   /** Record a Jev-produced evaluation: scorecards + evaluated_at + audit/outbox + rolling averages. */

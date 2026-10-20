@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type SupervisedTask, type Workforce } from '../src/workforce.ts';
-import type { CompanyCore, TaskView, LeaseProof } from '../src/contracts.ts';
+import type { CompanyCore, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
+import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
 import type { SidecarDeps } from '../plugin/server/sidecar.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
@@ -19,10 +20,19 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
-  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Set<string>();
-  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 1, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
+  const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
+  // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
+  const held = new Set<string>(), scopeUnreadable = new Set<string>();
+  // Authorised asset directories per task, and live assets holds of other writers: the registry's own overlap rule decides (B1).
+  const assetPaths = new Map<string, string[]>(), assetHolds: Array<{ paths: string[]; holder: WriteScopeHolder }> = [];
+  const authorsOf = new Map<string, string[]>();
+  // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
+  const unreadable = new Set<string>();
+  // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
+  const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
-  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string } = {}) => {
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
+    if (opts.assets) assetPaths.set(id, opts.assets);
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
       kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
@@ -45,14 +55,30 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     revokeLease: async (id: string, employee: string) => { const r = rows.find(t => t.id === id)!; if (r.currentEmployee !== employee) return false;
       events.push(`revoke:${id}`); Object.assign(r, { currentEmployee: undefined, state: 'ready', version: r.version + 1 }); Object.assign(views.get(id)!, r); return true; }, extendLease: async () => true,
     evalState: async () => ({ participants: [], metrics: {} }),
+    // Authors are set per task by the test (authorsOf); no implementer is bound, so no execute gate applies.
+    contributors: async (taskId: string) => {
+      if (unreadable.has(taskId)) throw new Error('audit history unreadable');
+      return { authors: [], reviewers: [], unknown: [], ambiguous: false, excluded: authorsOf.get(taskId) ?? [] };
+    },
+    setDispatchBlock: async (id: string, phase?: string, since?: number) => {
+      Object.assign(rows.find(t => t.id === id)!, { dispatchBlockedPhase: phase, dispatchBlockedSince: since });
+    },
   };
   const notices = new Map<string, string>();
   const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); }, openNotices: async () => [], triagePending: async () => [],
     raiseNotice: async (key: string, text: string) => { notices.set(key, text); return true; } };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
+    writeScopeOf: async (id: string) => {
+      if (scopeUnreadable.has(id)) throw new Error('write scope unreadable');
+      const need = assetPaths.get(id) ?? [];
+      const overlapping = assetHolds.filter(h => h.paths.some(a => need.some(b => overlap(a, b))));
+      if (overlapping.length) return overlapping.map(h => h.holder);
+      return held.has(id) ? [{ taskId: 'writer-1', employee: 'employee-7', intent: 'code' }] : [];
+    },
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
-      if (denied.has(id)) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error('scene is busy'), { code: 'worktree_busy' }); }
+      const refusal = denied.get(id);
+      if (refusal) { events.push(`claim-denied:${i.id}:${id}`); throw Object.assign(new Error(`refused: ${refusal}`), { code: refusal }); }
       events.push(`claim:${i.id}:${id}`); const v = views.get(id)!; Object.assign(v, { state: v.state === 'review' ? 'review' : 'doing', currentEmployee: i.id, version: v.version + 1, fence: v.fence + 1 }); v.deliveryId = `d-${id}-${v.fence}`;
       Object.assign(rows.find(t => t.id === id)!, v, { leaseExpiresAt: 2000 }); i.activeTask = id;
       return { task: { ...v }, deliveryId: v.deliveryId, fence: v.fence, leaseExpiresAt: new Date().toISOString(), history: [], worktree: v.worktree }; },
@@ -98,7 +124,9 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable,
+    holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
+    authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
@@ -236,8 +264,8 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(w.events).toContain('return:t3');
     expect(w.views.get('t3')!.state).toBe('ready');
   });
-  test('a task-side claim denial cools the task instead of churning disposable instances', async () => {
-    const w = world(); w.addTask('jammed'); w.denied.add('jammed');
+  test('a generic claim refusal cools the task instead of churning disposable instances (write scope is no cooldown, see R1)', async () => {
+    const w = world(); w.addTask('jammed'); w.denied.set('jammed', 'forbidden');
     const d = w.dispatcher();
     const r1 = await d.tick();
     // First attempt spawned one instance, was refused, retired it.
@@ -303,13 +331,13 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(w.events.some(e => e.startsWith('claim:'))).toBe(true);
   });
-  test('staff notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
+  test('dispatch-blocked notice names a track-mismatched def as 岗位轨不匹配, not a spawn failure', async () => {
     const w = world();
     w.def.tracks = ['角色设计'];
     w.addTask('synth', { discipline: '合成' });
     const r = await w.dispatcher().tick();
-    expect(r.notices).toContain('staff:engineering');
-    const text = w.notices.get('staff:engineering')!;
+    expect(r.notices).toContain('dispatch-blocked:synth:execute');
+    const text = w.notices.get('dispatch-blocked:synth:execute')!;
     expect(text).toContain('岗位轨不匹配');
     expect(text).not.toContain('可新开但唤醒/创建失败');
     // A task whose discipline the def covers still dispatches — the gate is the track only.
@@ -389,5 +417,266 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.skipped).toBe('resources');
     expect(w.notices.get('resources')).toContain('SCK_ARTIFACT_RECLAIM=0');
     expect(w.notices.get('resources-reclaim-blocked')).toContain('SCK_ARTIFACT_RECLAIM=0');
+  });
+});
+
+describe('R1: review capacity before an engineering execute claim', () => {
+  // Two idle engineers fill both seats of the fixture def.
+  const twoEngineers = (w: ReturnType<typeof world>) => {
+    for (const [id, agent] of [['employee-8', 'agent-8'], ['employee-9', 'agent-9']] as const) {
+      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}` } as EmployeeInst;
+      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
+      w.agents.set(agent, { id: agent, status: 'idle' });
+    }
+  };
+  test('a single engineering seat holds the claim: no independent reviewer exists after it', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('solo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(r.notices).toContain('dispatch-blocked:solo:execute');
+    expect(w.notices.get('dispatch-blocked:solo:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('a spare seat keeps the claim: the implementer takes one seat and a second stays free for review', async () => {
+    const w = world(); w.addTask('spare');
+    await w.dispatcher().tick();
+    expect(w.events).toContain('claim:employee-1:spare');
+    expect(w.views.get('spare')!.currentEmployee).toBe('employee-1');
+  });
+  test('a reserved reviewer is never picked to implement the task', async () => {
+    const w = world(); twoEngineers(w); w.addTask('held');
+    const r = await w.dispatcher().tick();
+    const reserved = r.decisions.find(d => d.startsWith('reserve:held='))?.split('=')[1];
+    const claimed = w.events.find(e => e.startsWith('claim:') && e.endsWith(':held'))?.split(':')[1];
+    expect(reserved).toBeDefined();
+    expect(claimed).toBeDefined();
+    expect(claimed).not.toBe(reserved);
+    expect(w.views.get('held')!.currentEmployee).toBe(claimed);
+  });
+  test('an author may implement a rework, and the reserved reviewer is the other engineer', async () => {
+    const w = world(); twoEngineers(w); w.addTask('rework'); w.authorsOf.set('rework', ['employee-8']);
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('claim:employee-8:rework');
+    expect(r.decisions).toContain('reserve:rework=employee-9');
+  });
+});
+
+describe('R1: a write scope held by another writer is a verdict, never a spawn churn or a wake failure', () => {
+  test('a scope held by another writer waits as write_scope: no spawn, no claim, the holder is named, and the claim follows once it ends', async () => {
+    const w = world(); w.addTask('scoped'); w.held.add('scoped');
+    const d = w.dispatcher();
+    const held = await d.tick();
+    expect(held.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:') || e.startsWith('send:'))).toBe(false);
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'scoped')!;
+    expect(verdict.dispatchable).toBe(false);
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 writer-1 · employee-7'] })]);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:scoped:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).toContain('任务 writer-1 · employee-7');
+    expect(text).not.toContain('派工未能唤醒');
+    w.held.delete('scoped'); w.setNow(1_360);
+    const freed = await d.tick();
+    expect(freed.woke.map(x => x.task)).toContain('scoped');
+    expect(w.notices.has('dispatch-blocked:scoped:execute')).toBe(false);
+  });
+  test('a claim refused for the write scope at claim time is write_scope, not wake_failed, and earns no cooldown', async () => {
+    const w = world(); w.addTask('raced'); w.denied.set('raced', 'worktree_busy');
+    const d = w.dispatcher();
+    const lost = await d.tick();
+    expect(lost.woke).toHaveLength(0);
+    expect(w.events).toContain('claim-denied:employee-1:raced');
+    // The seat spawned for the refused claim is released as write scope held, not as a claim denial.
+    expect(lost.retired).toEqual(['employee-1']);
+    expect(w.events).toContain('retire:employee-1:failure');
+    expect(w.notices.has('dispatch-blocked:raced:execute')).toBe(false);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:raced:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).not.toContain('派工未能唤醒');
+    // No cooldown: once the refusal clears, the next pass claims without waiting for a version bump.
+    w.denied.delete('raced'); w.setNow(1_360);
+    const resumed = await d.tick();
+    expect(resumed.woke.map(x => x.task)).toContain('raced');
+  });
+  test('a refused claim on a reused seat keeps the seat: nothing is spawned or retired', async () => {
+    const w = world(); w.addTask('reused'); w.denied.set('reused', 'worktree_busy');
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('claim-denied:employee-9:reused');
+    expect(w.events.some(e => e.startsWith('spawn:'))).toBe(false);
+    expect(r.retired).toEqual([]);
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(1);
+  });
+  test('an unreadable write scope is unknown: never free, never a claim, and the owner reads that the state is undecided', async () => {
+    const w = world(); w.addTask('blind'); w.scopeUnreadable.add('blind');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:blind:execute')).toContain('不能判定');
+  });
+  test('an assets scope overlapping another writer waits as write_scope: the holder is named to gm, no spawn, no claim, never a wake failure', async () => {
+    const w = world(); w.addTask('assets-overlap', { assets: ['docs/brand/logo'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const blocked = await d.tick();
+    expect(blocked.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'assets-overlap')!;
+    expect(verdict).toMatchObject({ dispatchable: false, workflowState: 'ready' });
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 asset-w1 · employee-7'] })]);
+    expect(verdict.reasons.some(reason => reason.code === 'wake_failed')).toBe(false);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:assets-overlap:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).toContain('任务 asset-w1 · employee-7');
+    expect(text).not.toContain('派工未能唤醒');
+    w.freeAssets(); w.setNow(1_360);
+    const freed = await d.tick();
+    expect(freed.woke.map(x => x.task)).toContain('assets-overlap');
+    expect(w.notices.has('dispatch-blocked:assets-overlap:execute')).toBe(false);
+  });
+  test('an assets scope on a disjoint directory of the same writer is not blocked: the claim proceeds', async () => {
+    const w = world(); w.addTask('assets-disjoint', { assets: ['docs/press'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const r = await d.tick();
+    expect(r.woke.map(x => x.task)).toContain('assets-disjoint');
+    expect(w.events).toContain('claim:employee-1:assets-disjoint');
+    expect(d.dispatchVerdicts().some(v => v.taskId === 'assets-disjoint')).toBe(false);
+  });
+});
+
+describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
+  // Idle engineers in this fixture's home (or another repo's home), each with its own agent and fixed id.
+  const engineers = (w: ReturnType<typeof world>, ids: string[], repoHome?: string) => {
+    for (const id of ids) {
+      const agent = `agent-${id}`;
+      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, repoHome } as EmployeeInst;
+      w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
+      w.agents.set(agent, { id: agent, status: 'idle' });
+    }
+  };
+  test('ten repeated ticks, with a restart in the middle, keep one blocked episode: no claim, one notice, one persisted start', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('ten');
+    let d = w.dispatcher();
+    const notes = new Set<string>(), starts = new Set<number | undefined>(), texts = new Set<string>();
+    for (let n = 0; n < 10; n++) {
+      if (n === 5) d = w.dispatcher();
+      w.setNow(1_000_000 + n * 60);
+      const r = await d.tick();
+      expect(r.woke).toHaveLength(0);
+      for (const key of r.notices) notes.add(key);
+      starts.add(w.rows.find(t => t.id === 'ten')!.dispatchBlockedSince);
+      texts.add(w.notices.get('dispatch-blocked:ten:execute')!);
+    }
+    expect(w.events.filter(e => e.startsWith('claim:') || e.startsWith('spawn:') || e.startsWith('send:'))).toEqual([]);
+    expect(w.instances).toHaveLength(0);
+    expect([...notes]).toEqual(['dispatch-blocked:ten:execute']);
+    expect([...starts]).toEqual([1_000_000]);
+    expect(texts.size).toBe(1);
+    expect(w.notices.size).toBe(1);
+  });
+  test('an unreadable contributor history holds the claim as unknown, and the episode clears once the history reads again', async () => {
+    const w = world(); w.addTask('replay'); w.unreadable.add('replay');
+    const held = await w.dispatcher().tick();
+    expect(held.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:replay:execute')).toContain('状态或贡献者历史读取失败');
+    w.unreadable.delete('replay'); w.setNow(1_000_060);
+    const resumed = await w.dispatcher().tick();
+    expect(resumed.woke.map(x => x.task)).toContain('replay');
+    expect(w.events).toContain('claim:employee-1:replay');
+    expect(w.notices.has('dispatch-blocked:replay:execute')).toBe(false);
+  });
+  test('A, B and C all recused with the seats full: no claim, the review capacity root cause is named, and one more seat clears it', async () => {
+    const w = world(); w.def.maxInstances = 3; w.addTask('abc');
+    const ids = ['employee-8', 'employee-9', 'employee-10'];
+    engineers(w, ids);
+    w.authorsOf.set('abc', ids);
+    const blocked = await w.dispatcher().tick();
+    expect(blocked.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    // A full seat can still free up, so the block waits; the owner hears about it once the five-minute threshold passes.
+    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
+    w.setNow(1_300);
+    const waited = await w.dispatcher().tick();
+    expect(waited.notices).toContain('dispatch-blocked:abc:execute');
+    expect(w.notices.get('dispatch-blocked:abc:execute')).toContain('后续独立复核缺合格人选');
+    w.def.maxInstances = 4; w.setNow(1_360);
+    const resumed = await w.dispatcher().tick();
+    expect(resumed.woke.map(x => x.task)).toContain('abc');
+    expect(w.notices.has('dispatch-blocked:abc:execute')).toBe(false);
+  });
+  test('a task with no reviewer role cannot prove an independent review: it is blocked as review capacity and never claimed', async () => {
+    const w = world(); w.addTask('norole');
+    Object.assign(w.rows.find(t => t.id === 'norole')!, { reviewerRole: undefined });
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:norole:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('an engineer bound to another repo cannot review this task, so the only seat is not spent on its claim', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('bound');
+    engineers(w, ['employee-8'], '/other-repo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(1);
+    expect(w.events.some(e => e.startsWith('claim:') || e.startsWith('spawn:'))).toBe(false);
+    expect(w.notices.get('dispatch-blocked:bound:execute')).toContain('后续独立复核缺合格人选');
+  });
+  test('a failed Paseo spawn releases the claim and retires the seat as a failure, waits as wake_failed, and clears on the next good pass', async () => {
+    const w = world(); w.addTask('spawnfail');
+    const spawn = w.paseo.spawn;
+    w.paseo.spawn = async () => { throw new Error('paseo daemon unreachable'); };
+    const failed = await w.dispatcher().tick();
+    expect(failed.woke).toHaveLength(0);
+    expect(failed.retired).toContain('employee-1');
+    expect(w.events).toContain('retire:employee-1:failure');
+    expect(w.rows.find(t => t.id === 'spawnfail')!.currentEmployee).toBeUndefined();
+    // Spawn failures are not material at once: the owner hears about them after the five-minute threshold.
+    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
+    w.setNow(1_300);
+    const again = await w.dispatcher().tick();
+    expect(again.notices).toContain('dispatch-blocked:spawnfail:execute');
+    expect(w.notices.get('dispatch-blocked:spawnfail:execute')).toContain('派工未能唤醒或创建会话');
+    w.paseo.spawn = spawn; w.setNow(1_360);
+    const recovered = await w.dispatcher().tick();
+    expect(recovered.woke.map(x => x.task)).toContain('spawnfail');
+    expect(w.notices.has('dispatch-blocked:spawnfail:execute')).toBe(false);
+  });
+  test('a same-role engineer of another repo is never woken: the target repo takes its own legal seat (R3 hard filter)', async () => {
+    const w = world(); w.def.maxInstances = 2; w.addTask('local');
+    engineers(w, ['employee-8'], '/other-repo');
+    const r = await w.dispatcher().tick();
+    expect(r.woke.map(x => x.task)).toContain('local');
+    expect(w.events).toContain('claim:employee-1:local');
+    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
+  });
+  test('a zero-candidate verdict names the other-repo engineers it left out, while its reasons stay in this repo', async () => {
+    const w = world(); w.def.maxInstances = 1; w.addTask('home-busy');
+    Object.assign(w.rows.find(t => t.id === 'home-busy')!, { reviewerRole: 'owner' });
+    engineers(w, ['employee-9']);
+    w.agents.set('agent-employee-9', { id: 'agent-employee-9', status: 'running' });
+    engineers(w, ['employee-8'], '/other-repo');
+    const d = w.dispatcher();
+    await d.tick();
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'home-busy')!;
+    expect(verdict.dispatchable).toBe(false);
+    expect(verdict.reasons.map(r => r.code)).toEqual(['seat_full', 'session_busy']);
+    expect(verdict.reasons.find(r => r.code === 'seat_full')!.text).toContain('仓库 fixture');
+    expect(verdict.summary).toContain('另有 1 名同岗位员工属其他仓库，不参与本仓库派工');
+    expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
   });
 });

@@ -1,0 +1,18 @@
+[
+  {
+    "workspaceId": "00000000-0000-4000-8000-000000000021",
+    "project": "<project>",
+    "name": "<name>",
+    "isolation": "local",
+    "cwd": "/fixture/cwd",
+    "background": false
+  },
+  {
+    "workspaceId": "00000000-0000-4000-8000-000000000022",
+    "project": "<project>",
+    "name": "<name>",
+    "isolation": "worktree",
+    "cwd": "/fixture/cwd",
+    "background": false
+  }
+]

@@ -1,0 +1,30 @@
+{
+  "Id": "00000000-0000-4000-8000-000000000011",
+  "Name": "<Name>",
+  "Provider": "<Provider>",
+  "Model": "<Model>",
+  "Thinking": "<Thinking>",
+  "Status": "idle",
+  "Archived": false,
+  "ArchivedAt": null,
+  "Mode": "<Mode>",
+  "Cwd": "/fixture/cwd",
+  "CreatedAt": "<iso-8601-utc>",
+  "UpdatedAt": "<iso-8601-utc>",
+  "LastUsage": null,
+  "Capabilities": {
+    "Streaming": true,
+    "Persistence": true,
+    "DynamicModes": true,
+    "McpServers": false
+  },
+  "AvailableModes": [
+    {
+      "id": "<id>",
+      "label": "<label>"
+    }
+  ],
+  "PendingPermissions": [],
+  "Worktree": null,
+  "ParentAgentId": null
+}

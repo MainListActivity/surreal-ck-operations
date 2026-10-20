@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
-import type { Brief, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
+import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -316,14 +316,38 @@ function Collapsible({ title, count, ctx, children, defaultOpen }: {
 const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []) as T[];
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
+/** A goal root's people; an absent or malformed block reads as nobody bound, never as an invented name. */
+const goalPeople = (v: unknown): { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number } => {
+  const p = (v ?? {}) as Record<string, unknown>;
+  return { implementer: str(p.implementer) || undefined, authors: arr<unknown>(p.authors).map(str), reviewers: arr<unknown>(p.reviewers).map(str),
+    submitter: str(p.submitter) || undefined, submitCommit: str(p.submitCommit) || undefined, peopleOmitted: num(p.peopleOmitted) || undefined };
+};
+/** A bounded list's truncation marker; a missing marker reads as complete, with nothing left out. */
+const bound = (v: unknown): { total: number; shown: number; truncated: boolean } => {
+  const b = (v ?? {}) as Record<string, unknown>;
+  return { total: num(b.total), shown: num(b.shown), truncated: b.truncated === true };
+};
+/** A workflow state from the wire; anything but doing or review reads as ready, the state every execute item starts in. */
+const workflowOf = (v: unknown): "ready" | "doing" | "review" => (v === "doing" ? "doing" : v === "review" ? "review" : "ready");
+/** Reason rows as the owner reads them; a malformed row keeps safe defaults, and the page reads only typed fields. */
+const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unknown>>(v).map(r => ({
+  code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
+  candidatesOmitted: num(r.candidatesOmitted) || undefined,
+  owner: r.owner === "owner" ? "owner" : "gm", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+  actions: arr<Record<string, unknown>>(r.actions).map(a => ({
+    authority: a.authority === "owner" ? "owner" : "gm", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
+  })),
+}));
 
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
   const o = (raw ?? {}) as Record<string, unknown>;
   const l24 = (o.last24h ?? {}) as Record<string, unknown>;
   const ch = (o.churn ?? {}) as Record<string, unknown>;
+  const marks = (o.bounds ?? {}) as Record<string, unknown>;
   return {
     at: str(o.at),
+    dispatchAt: str(o.dispatchAt) || undefined,
     paused: o.paused === true,
     doing: arr<Record<string, unknown>>(o.doing).map(d => ({
       taskId: str(d.taskId), title: str(d.title), employee: str(d.employee) || undefined,
@@ -344,11 +368,36 @@ export function normalizePulse(raw: unknown): Pulse {
     })),
     last24h: { done: num(l24.done), returned: num(l24.returned), rolledBack: num(l24.rolledBack), rejected: num(l24.rejected), retired: num(l24.retired) },
     resources: arr<unknown>(o.resources).map(str),
-    staffingAlerts: num(o.staffingAlerts),
     churn: { created: num(ch.created), retired: num(ch.retired), claimLost: num(ch.claimLost) },
     goals: arr<Record<string, unknown>>(o.goals).map(g => ({ title: str(g.title), days: num(g.days) })),
+    goalBlockers: arr<Record<string, unknown>>(o.goalBlockers).map(b => ({
+      goalId: str(b.goalId), taskId: str(b.taskId), title: str(b.title), phase: b.phase === "review" ? "review" : "execute",
+      summary: str(b.summary), feasible: b.feasible === true, since: str(b.since) || undefined, waitingMinutes: num(b.waitingMinutes),
+      others: num(b.others), impact: num(b.impact), undispatchable: num(b.undispatchable),
+      workflowState: workflowOf(b.workflowState), eligibleCount: num(b.eligibleCount), checkedAt: str(b.checkedAt),
+      dependencyPath: arr<Record<string, unknown>>(b.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
+      people: goalPeople(b.people),
+      reasons: reasonRows(b.reasons),
+    })),
+    dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
+      taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
+      phase: v.phase === "review" ? "review" : "execute", workflowState: workflowOf(v.workflowState), summary: str(v.summary),
+      checkedAt: str(v.checkedAt), eligibleCount: num(v.eligibleCount),
+      feasible: v.feasible === true, since: str(v.since) || undefined, waitingMinutes: num(v.waitingMinutes),
+      reasons: reasonRows(v.reasons),
+    })),
+    bounds: {
+      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), ready: bound(marks.ready),
+      doing: bound(marks.doing), stuck: bound(marks.stuck), waiting: bound(marks.waiting), recentDone: bound(marks.recentDone),
+      goals: bound(marks.goals), resources: bound(marks.resources),
+    },
   };
 }
+
+/** The workflow state of a blocked item, in the owner's words. */
+const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
+/** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
+const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
 
 /** 动态页：一页回答「公司现在在干什么、什么卡住了、为什么」。 */
 function PulseTab({ ctx }: { ctx: Ctx }) {
@@ -357,15 +406,17 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
   const data = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
   const loaded = data.data != null;
   const p = useMemo(() => normalizePulse(data.data), [data.data]);
-  const attention = p.waiting.length + p.stuck.length + p.ready.filter(r => r.unclaimableReason).length + p.resources.length + p.staffingAlerts;
+  // Each blocked item is counted once: the dispatch list holds both phases, and the ready queue is not added on top.
+  const attention = p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
   return (
     <View style={{ gap: 12 }}>
       <View style={s.card}>
         <Text style={s.text}>
           {p.paused ? "派工已暂停" : "派工运行中"}
-          {loaded ? ` · 在办 ${p.doing.length} · 就绪 ${p.ready.length} · 卡住 ${p.stuck.length} · 待你处理 ${p.waiting.length}` : ""}
+          {loaded ? ` · 在办 ${p.doing.length} · 就绪 ${p.ready.length} · 无法派工 ${p.bounds.dispatchBlocked.total} · 卡住 ${p.stuck.length} · 待你处理 ${p.waiting.length}` : ""}
         </Text>
         {attention > 0 && <Text style={s.muted}>需要关注 {attention} 项（往下翻）</Text>}
+        {loaded && <Text style={s.muted}>派工结论检查于 {clockOf(p.dispatchAt ?? "")}；页面刷新于 {clockOf(p.at)}</Text>}
       </View>
       <Section title="正在办" count={p.doing.length} ctx={ctx}>
         {p.doing.length === 0 && <Text style={s.muted}>现在没有人在干活。</Text>}
@@ -409,10 +460,30 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
           </View>
         ))}
       </Section>
-      <Section title="资源异常" count={p.resources.length + p.staffingAlerts} ctx={ctx}>
-        {p.resources.length === 0 && p.staffingAlerts === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
+      <Section title="无法派工" count={p.bounds.dispatchBlocked.total} ctx={ctx}>
+        {p.dispatchBlocked.length === 0 && <Text style={s.muted}>没有无法派工的任务。</Text>}
+        {p.dispatchBlocked.map(v => (
+          <View key={`${v.taskId}:${v.phase}`} style={s.card}>
+            <Text style={s.text}>{v.title}</Text>
+            <Text style={s.muted}>
+              {v.phase === "review" ? "复核" : "执行"} · 工作流：{WORKFLOW_LABEL[v.workflowState]} · 派工：无法派工 · 可选人数 {v.eligibleCount} · 已等 {fmtAge(v.waitingMinutes)}
+            </Text>
+            <Text style={{ color: "#d97706", fontSize: 13 }}>{v.summary}</Text>
+            {v.reasons.map((r, i) => (
+              <Text key={i} style={s.muted}>
+                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "gm" ? "经理" : "老板"} · 恢复：{r.recovery}
+              </Text>
+            ))}
+            <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt)}</Text>
+          </View>
+        ))}
+        {p.bounds.dispatchBlocked.truncated && (
+          <Text style={s.muted}>只列出 {p.bounds.dispatchBlocked.shown} 项，共 {p.bounds.dispatchBlocked.total} 项。</Text>
+        )}
+      </Section>
+      <Section title="资源异常" count={p.resources.length} ctx={ctx}>
+        {p.resources.length === 0 && <Text style={s.muted}>订阅与编制都正常。</Text>}
         {p.resources.map((r, i) => <Text key={i} style={s.text}>{r}</Text>)}
-        {p.staffingAlerts > 0 && <Text style={s.text}>有 {p.staffingAlerts} 个岗位暂无可用员工（见收件箱提醒）</Text>}
       </Section>
       <Collapsible title="近 24 小时" ctx={ctx}>
         <View style={s.card}>
@@ -596,17 +667,25 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
-function TaskRow({ task, ctx, depth, onOpen }: { task: TaskView; ctx: Ctx; depth: number; onOpen: (id: string) => void }) {
+function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: Ctx; depth: number; onOpen: (id: string) => void; verdict?: DispatchBlockedView }) {
   const s = makeStyles(ctx);
   return (
-    <Pressable style={[s.row, { paddingLeft: depth * 14 }]} onPress={() => onOpen(task.id)}>
-      <View style={[s.badge, { backgroundColor: STATE_COLOR[task.state] ?? ctx.theme.colors.surface2 }]}>
-        <Text style={[s.badgeText, { color: "#fff" }]}>{STATE_LABEL[task.state] ?? task.state}</Text>
-      </View>
-      <View style={[s.badge]}><Text style={s.badgeText}>{KIND_LABEL[task.kind] ?? task.kind}</Text></View>
-      <Text style={[s.text, { flex: 1 }]} numberOfLines={2}>{task.title}</Text>
-      <Text style={s.muted}>{task.currentEmployee?.split("⟨").pop()?.replace("⟩", "") ?? task.executorRole}</Text>
-    </Pressable>
+    <View>
+      <Pressable style={[s.row, { paddingLeft: depth * 14 }]} onPress={() => onOpen(task.id)}>
+        <View style={[s.badge, { backgroundColor: STATE_COLOR[task.state] ?? ctx.theme.colors.surface2 }]}>
+          <Text style={[s.badgeText, { color: "#fff" }]}>{STATE_LABEL[task.state] ?? task.state}</Text>
+        </View>
+        <View style={[s.badge]}><Text style={s.badgeText}>{KIND_LABEL[task.kind] ?? task.kind}</Text></View>
+        <Text style={[s.text, { flex: 1 }]} numberOfLines={2}>{task.title}</Text>
+        <Text style={s.muted}>{task.currentEmployee?.split("⟨").pop()?.replace("⟩", "") ?? task.executorRole}</Text>
+      </Pressable>
+      {verdict && (
+        <View style={{ paddingLeft: depth * 14 + 8, gap: 2 }}>
+          <Text style={{ color: "#d97706", fontSize: 13 }}>无法派工（{WORKFLOW_LABEL[verdict.workflowState]}）：{verdict.summary}</Text>
+          <Text style={s.muted}>可选人数 {verdict.eligibleCount} · 结论检查于 {clockOf(verdict.checkedAt)}</Text>
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -731,9 +810,18 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const queryClient = useQueryClient();
   const refreshAll = () => { void tasksQuery.refetch(); void detailQuery.refetch(); void queryClient.invalidateQueries(); };
   const goals = (brief?.goals ?? []).filter((g: GoalView) => g.state !== "cancelled");
+  // Goal cards read the same pulse as the queue: the root blocker is the server's conclusion, not a second computation.
+  const pulseRpc = useRpc(rpc.pulse);
+  const pulseQuery = useQuery({ queryKey: ["pulse"], queryFn: () => pulseRpc({}), refetchInterval: 10_000 });
+  const pulse = useMemo(() => normalizePulse(pulseQuery.data), [pulseQuery.data]);
+  const blockers = pulse.goalBlockers;
+  const verdictOf = new Map(pulse.dispatchBlocked.map(v => [v.taskId, v] as const));
   return (
     <View style={{ gap: 12 }}>
       {goals.length === 0 && <Text style={s.muted}>没有进行中的目标。</Text>}
+      {pulse.bounds.goalBlockers.truncated && (
+        <Text style={s.muted}>根阻点只列出 {pulse.bounds.goalBlockers.shown} 个目标，共 {pulse.bounds.goalBlockers.total} 个；其余目标的根阻点未在此列出。</Text>
+      )}
       {goals.map(g => (
         <View key={g.id} style={s.card}>
           <Pressable style={s.row} onPress={() => setOpenGoal(openGoal === g.id ? undefined : g.id)}>
@@ -741,12 +829,44 @@ function GoalsTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
             <View style={s.badge}><Text style={s.badgeText}>{g.tier ?? "?"}</Text></View>
             <View style={s.badge}><Text style={s.badgeText}>{g.state}</Text></View>
           </Pressable>
+          {blockers.find(b => b.goalId === g.id) && (() => {
+            const root = blockers.find(b => b.goalId === g.id)!;
+            return (
+              <View style={{ gap: 2 }}>
+                <Text style={s.muted}>
+                  {root.feasible ? "等待派工" : "无法派工"}：{root.title}（{root.phase === "review" ? "复核" : "执行"}，工作流：{WORKFLOW_LABEL[root.workflowState]}）。{root.summary}。已等待 {root.waitingMinutes} 分钟{root.impact > 0 ? `；影响 ${root.impact} 项后续` : ""}
+                </Text>
+                <Text style={s.muted}>
+                  无法派工 {root.undispatchable} 项（含根）；正常等待（依赖）{root.impact} 项{root.others > 0 ? `；同目标另有 ${root.others} 项阻塞` : ""}；结论检查于 {clockOf(root.checkedAt)}
+                </Text>
+              </View>
+            );
+          })()}
           {openGoal === g.id && (
             <View style={{ gap: 4 }}>
               <ExpandableText text={g.brief} lines={6} style={s.muted} ctx={ctx} />
+              {(blockers.find(b => b.goalId === g.id)?.reasons ?? []).map((r, i) => (
+                <Text key={i} style={s.muted}>
+                  {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}{r.candidatesOmitted ? `；另有 ${r.candidatesOmitted} 个候选未列出` : ""}）· 恢复：{r.recovery} · 处理：{r.owner === "gm" ? "经理" : "老板"}
+                </Text>
+              ))}
+              {blockers.find(b => b.goalId === g.id) && (() => {
+                const root = blockers.find(b => b.goalId === g.id)!;
+                return (
+                  <View style={{ gap: 4 }}>
+                    {root.dependencyPath.length > 1 && (
+                      <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(p => p.title).join(" → ")}</Text>
+                    )}
+                    <Text style={s.muted}>
+                      实现者：{root.people.implementer ?? "未绑定"}；作者：{root.people.authors.join("、") || "无"}；复核者：{root.people.reviewers.join("、") || "无"}；最后提交：{root.people.submitter ?? "无"}{root.people.submitCommit ? `（提交 ${root.people.submitCommit}）` : ""}{root.people.peopleOmitted ? `；另有 ${root.people.peopleOmitted} 人未列出` : ""}
+                    </Text>
+                    <Text style={s.muted}>数据时点（结论检查时刻）：{clockOf(root.checkedAt)}</Text>
+                  </View>
+                );
+              })()}
               {(tasksQuery.data?.tasks ?? []).map(t => (
                 <View key={t.id}>
-                  <TaskRow task={t} ctx={ctx} depth={0} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />
+                  <TaskRow task={t} ctx={ctx} depth={0} verdict={verdictOf.get(t.id)} onOpen={id => setOpenTask(openTask === id ? undefined : id)} />
                   {openTask === t.id && detailQuery.data && (
                     <View style={[s.card, { marginLeft: 14, backgroundColor: ctx.theme.colors.surface2 }]}>
                       <ExpandableText text={detailQuery.data.task.context} lines={8} style={s.muted} ctx={ctx} />
@@ -991,11 +1111,13 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
           problems.push(`编制已停用：${d.id}`);
         for (const i of insts.filter(i => i.agentStatus && !["running", "idle", "initializing"].includes(i.agentStatus)))
           problems.push(`实例会话异常：${i.id.split("⟨").pop()?.replace("⟩", "")}（${i.agentStatus}）`);
+        // A list the answer cut short may hide a problem, so "一切正常" is only said when nothing was cut.
+        const cut = [r?.bounds?.usage, r?.bounds?.health, r?.bounds?.defs, r?.bounds?.instances].some(b => b?.truncated);
         return (
           <>
             <Section title="需要处理" count={problems.length} ctx={ctx}>
               <View style={s.card}>
-                {problems.length === 0 && <Text style={s.muted}>一切正常。</Text>}
+                {problems.length === 0 && <Text style={s.muted}>{cut ? "已列出的项正常；部分列表已截断，未列出的项未参与判断。" : "一切正常。"}</Text>}
                 {problems.map((p, i) => <Text key={i} style={[s.text, { color: "#d97706" }]}>{p}</Text>)}
               </View>
             </Section>
@@ -1019,6 +1141,8 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 {health.map(h => (
                   <Text key={h.provider} style={s.muted}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
                 ))}
+                {r?.bounds?.usage?.truncated && <Text style={s.muted}>额度只列出 {r.bounds.usage.shown} 项，共 {r.bounds.usage.total} 项。</Text>}
+                {r?.bounds?.health?.truncated && <Text style={s.muted}>健康只列出 {r.bounds.health.shown} 项，共 {r.bounds.health.total} 项。</Text>}
               </View>
             </Collapsible>
             <Section title="员工编制" count={defs.length} ctx={ctx}>
@@ -1063,6 +1187,8 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     </Collapsible>
                   );
                 })}
+              {r?.bounds?.defs?.truncated && <Text style={s.muted}>编制只列出 {r.bounds.defs.shown} 项，共 {r.bounds.defs.total} 项，未列出的编制不在上方。</Text>}
+              {r?.bounds?.instances?.truncated && <Text style={s.muted}>实例只列出 {r.bounds.instances.shown} 个，共 {r.bounds.instances.total} 个，未列出的实例不在上方。</Text>}
             </Section>
             <Section title={editDef ? `编辑 ${editDef.id}` : "注册员工"} ctx={ctx}>
               <RegisterDefCard key={editDef?.id ?? "new"} ctx={ctx} editing={editDef}
@@ -1079,6 +1205,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     {p.status === "history_unavailable" && (
                       <Text style={s.text}>贡献者历史读取失败：候选不可派，中选率 0%，等待安全候选。</Text>
                     )}
+                    {p.status === "blocked" && (
+                      <Text style={s.text}>无合格复核人选：没有候选可以复核，任务不会被派工，原因见下方。</Text>
+                    )}
                     {p.entries.length === 0 && <Text style={s.muted}>暂无候选，任务继续等待。</Text>}
                     {p.entries.map(e => (
                       <Text key={`${e.kind}:${e.ref}`} style={s.muted}>
@@ -1089,6 +1218,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     ))}
                   </View>
                 ))}
+                {r?.bounds?.reviewPools?.truncated && (
+                  <Text style={s.muted}>复核候选只列出 {r.bounds.reviewPools.shown} 项，共 {r.bounds.reviewPools.total} 项。</Text>
+                )}
                 {(r?.pools ?? []).filter(p => p.entries.length).map(p => (
                   <View key={`${p.role}@${p.home}`} style={{ gap: 2, marginTop: 8 }}>
                     <Text style={s.muted}>池 {ROLE_LABEL[p.role] ?? p.role}@{p.home === r?.opsRepo ? "运营仓库" : p.home.split("/").pop()}</Text>
@@ -1101,6 +1233,9 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                     ))}
                   </View>
                 ))}
+                {r?.bounds?.pools?.truncated && (
+                  <Text style={s.muted}>候选池只列出 {r.bounds.pools.shown} 个，共 {r.bounds.pools.total} 个。</Text>
+                )}
               </View>
             </Collapsible>
           </>

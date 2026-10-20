@@ -9,9 +9,21 @@ if (helpersStart < 0 || normStart < 0) throw new Error('normalizePulse helpers m
 const normEnd = page.indexOf('\n}\n', normStart);
 const helpersSrc = page.slice(helpersStart, normEnd + '\n}\n'.length).replace('export function', 'function');
 const normalizePulse = new Function(`${new Bun.Transpiler({ loader: 'tsx' }).transformSync(helpersSrc)}\nreturn normalizePulse;`)() as (raw: unknown) => Pulse;
+const labelsStart = page.indexOf('const WORKFLOW_LABEL');
+const labelsEnd = page.indexOf('/** 动态页：一页回答');
+if (labelsStart < 0 || labelsEnd < 0) throw new Error('WORKFLOW_LABEL or clockOf missing');
+const { WORKFLOW_LABEL, clockOf } = new Function(`${new Bun.Transpiler({ loader: 'tsx' }).transformSync(page.slice(labelsStart, labelsEnd))}\nreturn { WORKFLOW_LABEL, clockOf };`)() as {
+  WORKFLOW_LABEL: Record<string, string>; clockOf: (iso: string) => string;
+};
+
+const emptyBound = { total: 0, shown: 0, truncated: false };
+const allBounds = (over: Partial<Pulse['bounds']> = {}): Pulse['bounds'] => ({
+  dispatchBlocked: emptyBound, goalBlockers: emptyBound, ready: emptyBound, doing: emptyBound, stuck: emptyBound,
+  waiting: emptyBound, recentDone: emptyBound, goals: emptyBound, resources: emptyBound, ...over,
+});
 
 const full: Pulse = {
-  at: '2026-10-15T04:00:00Z', paused: false,
+  at: '2026-10-15T04:00:00Z', dispatchAt: '2026-10-15T03:59:30Z', paused: false,
   doing: [{ taskId: 't1', title: '在办任务', role: 'engineering', sinceMin: 42 }],
   ready: [{ taskId: 't2', title: '就绪任务', role: 'qa', waitingMin: 90, unclaimableReason: '无可用实例' }],
   stuck: [{ taskId: 't3', title: '卡住任务', reason: '依赖未满足' }],
@@ -19,16 +31,45 @@ const full: Pulse = {
   recentDone: [{ taskId: 't5', title: '已完成任务', at: '2026-10-15T03:00:00Z', actor: 'qa' }],
   last24h: { done: 3, returned: 1, rolledBack: 0, rejected: 0, retired: 2 },
   resources: ['grok 额度不足'],
-  staffingAlerts: 1,
   churn: { created: 2, retired: 2, claimLost: 5 },
   goals: [{ title: '梦痕纪元宣传片', days: 4 }],
+  goalBlockers: [],
+  dispatchBlocked: [{ taskId: 't2', title: '就绪任务', summary: '就绪任务：执行无法派工（会话占用中或异常）', phase: 'execute',
+    workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0,
+    feasible: true, since: '2026-10-15T03:30:00Z', waitingMinutes: 30,
+    reasons: [{ code: 'session_busy', text: '会话占用中或异常', candidates: ['inst-1'], owner: 'gm', basis: 'tick-snapshot',
+      recovery: '等待在办任务完成', nextTrigger: '候选会话空闲', actions: [{ authority: 'gm', label: '等待在办任务完成', executable: false }] }] }],
+  bounds: allBounds({ dispatchBlocked: { total: 1, shown: 1, truncated: false } }),
 };
 
 test('normalizePulse: 完整响应原样通过', () => {
   const p = normalizePulse(full);
   expect(p.doing[0]!.title).toBe('在办任务');
   expect(p.waiting[0]!.hours).toBe(19.2);
-  expect(p.staffingAlerts).toBe(1);
+  expect(p.dispatchBlocked[0]).toMatchObject({ taskId: 't2', phase: 'execute', feasible: true, waitingMinutes: 30 });
+  expect(p.dispatchBlocked[0]!.reasons[0]!.code).toBe('session_busy');
+  expect(p.dispatchAt).toBe('2026-10-15T03:59:30Z');
+  expect(p.dispatchBlocked[0]).toMatchObject({ workflowState: 'ready', checkedAt: '2026-10-15T03:59:30Z', eligibleCount: 0 });
+});
+
+test('normalizePulse: truncation markers, omitted counts and reason actions survive the wire', () => {
+  const p = normalizePulse({
+    ...full,
+    bounds: allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }),
+    goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'execute', summary: '等待', feasible: true, waitingMinutes: 30,
+      others: 0, impact: 2, dependencyPath: [], people: { authors: ['a'], reviewers: [], peopleOmitted: 788 },
+      reasons: [{ code: 'session_busy', text: '忙', candidates: ['x'], candidatesOmitted: 54, owner: 'gm', basis: 'tick-snapshot', recovery: '等待', nextTrigger: '空闲',
+        actions: [{ authority: 'owner', label: '老板充值', executable: false }] }] }],
+  });
+  expect(p.bounds).toEqual(allBounds({ dispatchBlocked: { total: 1500, shown: 40, truncated: true }, goalBlockers: { total: 300, shown: 40, truncated: true } }));
+  expect(p.goalBlockers[0]!.people).toMatchObject({ authors: ['a'], peopleOmitted: 788 });
+  expect(p.goalBlockers[0]!.reasons[0]).toMatchObject({ candidatesOmitted: 54, basis: 'tick-snapshot', owner: 'gm',
+    actions: [{ authority: 'owner', label: '老板充值', executable: false }] });
+  expect(p.dispatchBlocked[0]!.reasons[0]!.candidatesOmitted).toBeUndefined();
+});
+
+test('normalizePulse: a response without markers reads as complete, with nothing left out', () => {
+  expect(normalizePulse({}).bounds).toEqual(allBounds());
 });
 
 test('normalizePulse: 畸形/缺字段输入收敛为安全视图模型，不再抛错', () => {
@@ -57,7 +98,7 @@ const compiled = new Bun.Transpiler({ loader: 'tsx', tsconfig: {
 } }).transformSync(`return (${jsx});`);
 const render = new Function(
   'React', 's', 'ctx', 'p', 'loaded', 'data', 'attention',
-  'Section', 'Collapsible', 'View', 'Text', 'fmtAge', 'ROLE_LABEL',
+  'Section', 'Collapsible', 'View', 'Text', 'fmtAge', 'ROLE_LABEL', 'WORKFLOW_LABEL', 'clockOf',
   compiled,
 );
 
@@ -88,11 +129,11 @@ const collectText = (node: unknown): string => {
   return collectText(n.props?.children);
 };
 const attentionOf = (p: Pulse) =>
-  p.waiting.length + p.stuck.length + p.ready.filter(r => r.unclaimableReason).length + p.resources.length + p.staffingAlerts;
+  p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
 const renderPulse = (raw: unknown, q: { isLoading?: boolean; isError?: boolean; error?: Error } = {}) =>
   render(React, s, ctx, normalizePulse(raw), raw != null,
     { data: raw, isLoading: false, isError: false, error: undefined, ...q },
-    attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL);
+    attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL, WORKFLOW_LABEL, clockOf);
 
 test('动态页渲染：完整数据呈现全部区块', () => {
   const text = collectText(renderPulse(full));
@@ -117,4 +158,27 @@ test('动态页渲染：畸形/部分数据不抛错，仍给出可见兜底', (
 test('动态页渲染：加载中与失败态可见', () => {
   expect(collectText(renderPulse(undefined, { isLoading: true }))).toContain('加载中…');
   expect(collectText(renderPulse(undefined, { isError: true, error: new Error('rpc timeout') }))).toContain('加载失败');
+});
+
+test('normalizePulse: goal roots carry their own counts and conclusion time; an unknown workflow state reads as ready', () => {
+  const p = normalizePulse({
+    ...full,
+    goalBlockers: [{ goalId: 'goal-1', taskId: 't9', title: '根任务', phase: 'review', workflowState: 'review', summary: '等待复核',
+      feasible: false, waitingMinutes: 12, others: 2, undispatchable: 3, impact: 5, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z',
+      dependencyPath: [], people: {}, reasons: [] }],
+    dispatchBlocked: [{ taskId: 't8', title: '未知状态', phase: 'execute', workflowState: 'weird', summary: 's', feasible: true,
+      waitingMinutes: 1, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z', reasons: [] }],
+  });
+  expect(p.goalBlockers[0]).toMatchObject({ workflowState: 'review', undispatchable: 3, impact: 5, eligibleCount: 0, checkedAt: '2026-10-15T03:59:30Z' });
+  expect(p.dispatchBlocked[0]).toMatchObject({ workflowState: 'ready' });
+});
+
+test('动态页渲染：无法派工逐条写出工作流与派工状态、结论时点，且只计一次', () => {
+  const text = collectText(renderPulse(full));
+  expect(text).toContain('无法派工');
+  expect(text).toContain(`工作流：${WORKFLOW_LABEL.ready}`);
+  expect(text).toContain('派工：无法派工');
+  expect(text).toContain(`结论检查于 ${clockOf('2026-10-15T03:59:30Z')}`);
+  // waiting 1 + stuck 1 + resources 1 + dispatch 1 = 4: the ready queue's unclaimable reason is not counted again.
+  expect(text).toContain('需要关注 4 项');
 });

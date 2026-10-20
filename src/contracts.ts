@@ -34,6 +34,14 @@ export interface WorktreeView extends Omit<WorktreeAssignment, 'intent' | 'disci
   deletable: boolean; reasons: string[];
 }
 
+/** A writer or reader that holds a worktree, or an overlapping asset path, a new code claim must wait for. */
+export interface WriteScopeHolder {
+  /** The holder's task. Absent for a read session, which holds no task. */
+  taskId?: string;
+  employee: string;
+  intent: WorkIntent['kind'];
+}
+
 export interface Principal {
   employeeId: EmployeeId;
   role: Role;
@@ -72,6 +80,8 @@ export interface TaskView {
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
+  /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
+  implementer?: EmployeeId;
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -200,6 +210,20 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
+/** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
+export interface ImplementerTakeover {
+  taskId: TaskId;
+  /** Takes over code work; must hold the task's execute role and capability. */
+  toEmployee: EmployeeId;
+  /** Required when toEmployee is a current reviewer: a different, independent engineer that will review. */
+  replacementReviewer?: EmployeeId;
+  /** Compare-and-set: refuse when the task version has moved. */
+  expectedVersion: number;
+  /** Why the bound implementer is replaced; audited. */
+  reason: string;
+  idempotencyKey: string;
+}
+
 /** gm (manage): read-only dry-run of the acceptance reference repair for a quick/software goal. */
 export interface GoalAcceptancePreview {
   goalId: string;
@@ -285,7 +309,34 @@ export interface OutboxEvent {
   createdAt: string;
 }
 
+/**
+ * gm dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
+ * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
+ */
+export interface ContributorDryRunView {
+  readOnly: true;
+  checkedAt: string;
+  /** UTF-8 JSON bytes the whole answer is held to (SYS-DISP, SYS01 budget). */
+  budgetBytes: number;
+  /** True when at least one task's timeline was cut to fit `budgetBytes`; the cut is marked per task. */
+  truncated: boolean;
+  tasks: Array<{
+    taskId: string; found: boolean; title?: string; state?: TaskState; version?: number;
+    executorRole?: string; reviewerRole?: string; currentEmployee?: string; lastSubmitter?: string;
+    status?: 'bound' | 'proposal' | 'manager_decision' | 'fresh'; implementer?: string; suggestedImplementer?: string;
+    authors?: string[]; reviewers?: string[]; excluded?: string[];
+    unknown?: Array<{ actor: string; action: string; at?: string; reason: string }>; note?: string;
+    /** The newest rows that fit, oldest first. `timelineTotal` counts every row of the task; `timelineShown` is how many are here. */
+    timeline?: Array<{ at: string; version?: number; actor?: string; action: string; phase?: string; phaseSource?: string; role: string }>;
+    timelineTotal?: number;
+    timelineShown?: number;
+    timelineTruncated?: boolean;
+  }>;
+}
+
 export interface CompanyCore {
+  /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
+  writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;
@@ -323,6 +374,10 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
+  implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
+  contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
