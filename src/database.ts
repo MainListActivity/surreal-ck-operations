@@ -121,6 +121,12 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
     await this.db.query(loadSchema('024-snapshot-quota.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
+    await this.db.query(loadSchema('025-acceptance.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 25 WHERE schema_version < 25;');
+    // SYS02 gate record: additive and disabled on install. The release application enables the scope it lists (AC06).
+    await this.db.query(`IF (SELECT * FROM ONLY company_meta:acceptance_gate) = NONE {
+      CREATE ONLY company_meta:acceptance_gate CONTENT { version: 1, enabled: false, scope: 'code-deliveries', criteria_version: 1 };
+    };`);
   }
 
   private async ensureOutboxSequence(): Promise<void> {

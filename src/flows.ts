@@ -1,4 +1,5 @@
 import type { CreateTask, GoalTier, TaskKind } from './contracts.ts';
+import { defaultAcceptanceCriteria } from './acceptance.ts';
 
 export const GOAL_TIERS: readonly GoalTier[] = ['quick', 'standard', 'program'];
 
@@ -7,7 +8,7 @@ export const PIPELINES = ['software', 'video', 'story'] as const;
 export type PipelineId = typeof PIPELINES[number];
 export const isPipeline = (value: unknown): value is PipelineId => PIPELINES.includes(value as PipelineId);
 
-type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRole'> & { kind: Exclude<TaskKind, 'goal'> };
+type Spec = Pick<CreateTask, 'title' | 'context' | 'executorRole' | 'reviewerRole' | 'acceptanceCriteria'> & { kind: Exclude<TaskKind, 'goal'> };
 
 const AUTHORITY = '决策边界：能在公司内决定的事不找老板。技术方案与拆分由经理定，是否上线由运营定，运营定不了交经理；只有花钱/充值、签约、对外联系、公司方向和项目红线才 report_blocker to=owner，并写明已查过哪些来源。';
 
@@ -23,6 +24,7 @@ export function deliveryChain(title: string, spec: string): Spec[] {
   return [
     {
       title: `${title} · 实现`, kind: 'task', executorRole: 'engineering', reviewerRole: 'engineering',
+      acceptanceCriteria: defaultAcceptanceCriteria('implement'),
       context: `${head}
 你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：树和分支由调度按任务或所属线（worktree.lane）分配，同一线的任务共用一棵树和一个分支，接手时在现有提交上继续，不另开分支；已有未合入 PR 就追加提交。仅在 intent=code 的登记分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
 完成标准：测试通过，推送分支并创建 PR（不要合入）。
@@ -31,6 +33,7 @@ submit 证据：PR 链接、分支、提交 SHA、测试命令与结果、数据
     },
     {
       title: `${title} · 上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
+      acceptanceCriteria: defaultAcceptanceCriteria('release'),
       context: `${head}
 你是工程。前置任务的 PR 已通过代码复核。提交上线申请：PR 链接与提交、改动摘要、影响面、数据库迁移类型、新环境变量或主机准备、回滚方式、生产验证要点。
 验收者是运营，由运营决定是否上线（调度器用 Jev 判断，高置信安全时自动批准）。运营 accept = 同意上线；return = 暂不上线并写明需要补什么。
@@ -39,6 +42,7 @@ ${AUTHORITY}`,
     },
     {
       title: `${title} · 合入部署与生产实测`, kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa',
+      acceptanceCriteria: defaultAcceptanceCriteria('deploy'),
       context: `${head}
 你是工程。上线申请已批准。按 project.release 发布：合入 PR、等待 CI 发布完成、确认生产运行的就是该提交（health、版本或页面）。
 发布失败或自动回滚：先按 project.rollback 恢复生产，再修复后重新发布；修不好就 report_blocker to=gm。
@@ -58,6 +62,9 @@ export function quickChain(title: string, spec: string): Spec[] {
   return [
     {
       title: `${title} · 实现与上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
+      // Quick skips the independent engineering review, so the combined leg keeps only the machine CI AC; Jev/product stays
+      // the reviewer and Jev may auto-approve when the CI evidence is verified (no human AC to sign).
+      acceptanceCriteria: defaultAcceptanceCriteria('release'),
       context: `${head}
 你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：树和分支由调度按任务或所属线（worktree.lane）分配，同一线的任务共用一棵树和一个分支，接手时在现有提交上继续，不另开分支；已有未合入 PR 就追加提交。仅在 intent=code 的登记分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
 完成标准：测试通过，推送分支并创建 PR（不要合入）。

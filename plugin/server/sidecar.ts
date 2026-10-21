@@ -34,7 +34,7 @@ const BASE_TOOLS = [
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
-  "get_admin_summary", "read_task_text", "read_worktree_refs",
+  "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
@@ -721,6 +721,19 @@ export class SidecarPool {
       case "read_worktree_refs": return core.worktreeRefs
         ? core.worktreeRefs(cred, args)
         : Promise.reject(Object.assign(new Error("core does not expose read_worktree_refs"), { code: "temporarily_unavailable" }));
+      // SYS02: the acceptance gate tools ride the same channel; core owns authorization and the source adapter.
+      case "record_acceptance_evidence": return core.recordAcceptanceEvidence
+        ? core.recordAcceptanceEvidence(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose record_acceptance_evidence"), { code: "temporarily_unavailable" }));
+      case "acceptance_status": return core.acceptanceStatus
+        ? core.acceptanceStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_status"), { code: "temporarily_unavailable" }));
+      case "acceptance_gate": return core.acceptanceGate
+        ? core.acceptanceGate(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_gate"), { code: "temporarily_unavailable" }));
+      case "set_acceptance_gate": return core.setAcceptanceGate
+        ? core.setAcceptanceGate(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose set_acceptance_gate"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);

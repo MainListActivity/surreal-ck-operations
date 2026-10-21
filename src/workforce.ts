@@ -10,6 +10,7 @@ import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 import { readContributors, type ContributionFacts } from './contributors.ts';
 import { gateCredentialChange } from './retirement.ts';
+import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
@@ -633,6 +634,20 @@ export class Workforce {
 
   /** Jev approves a release request nobody is reviewing yet: done + dependency unlock, audited as jev. */
   async jevAccept(taskId: TaskId, version: number, evidence: string): Promise<boolean> {
+    // SYS02 AC03/AC05: Jev is a machine actor. It may approve a release only when the unified evaluator passes and no
+    // required human criterion exists; an unmet gate leaves the release to product and records exactly why.
+    const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', taskId));
+    if (!taskRow) return false;
+    const gate = await loadAcceptanceGate(this.db);
+    const verdict = evaluateAcceptance({
+      subject: acceptanceSubject(taskRow), evidence: await loadAcceptanceEvidence(this.db, taskId),
+      phase: 'release', actor: { employeeId: 'jev', role: 'product', human: false }, gate,
+    });
+    if (!verdict.ok) {
+      await this.db.query(`CREATE audit CONTENT { task: $task, actor: 'jev', action: 'jev_acceptance_blocked', evidence: $evidence, at: time::now() };`,
+        { task: id('task', taskId), evidence: JSON.stringify({ version, unmet: verdict.unmet }).slice(0, 30000) });
+      return false;
+    }
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE OR $t.state != 'review' OR $t.current_employee != NONE OR $t.version != $version { THROW 'task changed' };

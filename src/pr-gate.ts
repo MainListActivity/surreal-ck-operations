@@ -29,7 +29,7 @@ export function judgePr(pr: PrInfo, branch: string | undefined): string | undefi
   return undefined;
 }
 
-const ghCli: GhRunner = args => new Promise((resolve, reject) => {
+export const ghCli: GhRunner = args => new Promise((resolve, reject) => {
   const child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PATH: `${process.env.PATH ?? ''}:/opt/homebrew/bin:/usr/local/bin` } });
   let out = '', err = '';
   const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);

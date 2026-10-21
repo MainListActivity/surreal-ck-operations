@@ -18,6 +18,105 @@ export type TaskId = string;
 export type DeliveryId = string;
 export type Credential = string;
 
+// ---- SYS02: versioned structured acceptance and server-verified evidence. ----
+
+/** One acceptance criterion kind: a machine fact the server verifies, or a named human sign-off. */
+export type AcceptanceCriterionKind = 'machine' | 'human';
+/** Where the criterion is verified. */
+export type AcceptanceLayer = 'unit' | 'integration' | 'fork' | 'ci' | 'runtime' | 'manual';
+/** What kind of evidence satisfies a criterion. */
+export type AcceptanceEvidenceType = 'ci-run' | 'probe' | 'artifact' | 'review-signoff';
+/** The risk the criterion covers; runtime/permission/packaging are the external checks a text claim cannot prove. */
+export type AcceptanceRisk = 'code' | 'data' | 'external-timing' | 'permission' | 'packaging' | 'runtime';
+/** Delivery leg a criterion applies to; absent on the criterion means every leg. */
+export type AcceptanceLeg = 'implement' | 'release' | 'deploy' | 'goal' | 'owner';
+/** The gate phase that evaluates a task. */
+export type AcceptancePhase = 'submit' | 'accept' | 'release' | 'deploy' | 'owner' | 'goal';
+
+/** A versioned acceptance criterion (SYS02 AC01). */
+export interface AcceptanceCriterion {
+  /** Unique within the task/delivery, e.g. AC-1. */
+  id: string;
+  kind: AcceptanceCriterionKind;
+  required: boolean;
+  layer: AcceptanceLayer;
+  evidence: AcceptanceEvidenceType;
+  /** What is verified, e.g. `ci`, `independent-review`, `qa-production`, `probe:running-channel`. */
+  verify: string;
+  description?: string;
+  risk?: AcceptanceRisk;
+  /** Legs this criterion applies to; absent = every leg of the delivery. */
+  legs?: AcceptanceLeg[];
+}
+
+/** Why one required criterion is not satisfied. */
+export interface AcceptanceUnmet { acId: string; reason: string }
+
+/** A server-verified evidence row (SYS02 AC02). It is written only from a trusted source or an authorized sign-off. */
+export interface AcceptanceEvidenceRecord {
+  id: string;
+  taskId: TaskId;
+  acId: string;
+  kind: AcceptanceCriterionKind;
+  /** PR head or deployed SHA the evidence is bound to. */
+  sha: string;
+  environment?: string;
+  evidenceType: AcceptanceEvidenceType;
+  source: Record<string, unknown>;
+  verified: boolean;
+  verifier: string;
+  actor: string;
+  at: string;
+  criteriaVersion: number;
+  taskVersion: number;
+  digest: string;
+}
+
+/** The versioned gate record (company_meta:acceptance_gate). */
+export interface AcceptanceGateView {
+  version: number;
+  enabled: boolean;
+  enabledAt?: string;
+  scope: string;
+  criteriaVersion: number;
+}
+
+/** The unified evaluator's answer for one task and phase (SYS02 AC03). */
+export interface AcceptanceVerdict {
+  ok: boolean;
+  phase: AcceptancePhase;
+  gateEnabled: boolean;
+  legacy: boolean;
+  notApplicable: boolean;
+  criteriaVersion: number;
+  head?: string;
+  criteria: AcceptanceCriterion[];
+  evidence: AcceptanceEvidenceRecord[];
+  unmet: AcceptanceUnmet[];
+}
+
+/** Arguments of record_acceptance_evidence (SYS02 AC02/AC04). */
+export interface AcceptanceEvidenceInput {
+  taskId: TaskId;
+  acId: string;
+  /** PR head or deployed SHA the evidence must match. */
+  sha: string;
+  environment?: string;
+  source: {
+    provider: 'github-actions';
+    runUrl: string;
+    artifactId?: string;
+    probe?: { runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string };
+  };
+  idempotencyKey: string;
+}
+
+/** Read-only status for a reviewer: the gate, the criteria, the evidence and the current verdict. */
+export interface AcceptanceStatusView { taskId: TaskId; gate: AcceptanceGateView; verdict: AcceptanceVerdict }
+
+/** A versioned, reason-audited change of the gate (SYS02 AC06). Only gm may call it. */
+export interface AcceptanceGateInput { enabled: boolean; reason: string; expectedVersion: number; idempotencyKey: string }
+
 /** Managed authorization; supplied by task creation, never inferred from prose. */
 export interface WorkIntent { kind: 'read' | 'code' | 'assets'; paths?: string[]; lane?: string }
 export interface WorktreeAssignment {
@@ -69,6 +168,17 @@ export interface TaskView {
    * opsScope, broker quotas) — that stays with projectOverlay/goal.project.
    */
   codeRepoPath?: string;
+  /** SYS02: this task/delivery leg's versioned structured acceptance criteria. */
+  acceptanceCriteria?: AcceptanceCriterion[];
+  acceptanceVersion?: number;
+  /** True for tasks created before the gate was enabled: they keep the old path and cannot fake a satisfied gate. */
+  acceptanceLegacy?: boolean;
+  /** The current PR head or deployed SHA machine evidence must match. */
+  acceptanceHead?: string;
+  acceptanceEnvironment?: string;
+  acceptanceAttempt?: number;
+  /** Groups the legs of one create_delivery chain. */
+  acceptanceChain?: string;
   dependencies: TaskId[];
   version: number;
   submittedBy?: EmployeeId;
@@ -289,6 +399,8 @@ export interface CreateTask {
   /** Optional project override: registered project id only; takes precedence over goal.project for this task. */
   project?: string;
   dependencies?: TaskId[];
+  /** SYS02: required for new code deliveries when the acceptance gate is enabled. */
+  acceptanceCriteria?: AcceptanceCriterion[];
   idempotencyKey: string;
   workIntent?: WorkIntent;
   /**
@@ -381,6 +493,11 @@ export interface CreateDelivery {
   title: string;
   /** What to build and the acceptance criteria qa verifies in production. */
   spec: string;
+  /**
+   * SYS02: versioned structured acceptance criteria for the delivery. Each criterion may name the legs it applies to;
+   * a leg with no matching criterion gets that leg's default criteria. The gate is enforced only once enabled (AC06).
+   */
+  acceptanceCriteria?: AcceptanceCriterion[];
   /** Optional discipline track; carried by the implementation leg only, release/deploy legs stay untracked. */
   discipline?: string;
   /** Optional project override persisted on all three legs so the chain stays on one project. */
@@ -501,6 +618,8 @@ export interface LeaseProof {
 export interface Evidence {
   text: string;
   idempotencyKey: string;
+  /** SYS02: the head this submission is bound to; machine evidence must match it. */
+  acceptance?: { sha?: string; environment?: string };
 }
 
 export interface OutboxEvent {
@@ -612,6 +731,14 @@ export interface CompanyCore {
   triageGoal(credential: Credential, input: { goalId: string; tier: GoalTier; reason: string }): Promise<GoalView>;
   /** gm/product: one call creates 实现 → 上线申请 → 合入部署与生产实测 for a code change. */
   createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]>;
+  /** SYS02: record server-verified machine evidence for one acceptance criterion. */
+  recordAcceptanceEvidence?(credential: Credential, input: AcceptanceEvidenceInput): Promise<AcceptanceEvidenceRecord>;
+  /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or gm). */
+  acceptanceStatus?(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView>;
+  /** SYS02: gm read of the versioned gate record. */
+  acceptanceGate?(credential: Credential): Promise<AcceptanceGateView>;
+  /** SYS02: gm versioned change of the gate; the reason and before/after are audited. */
+  setAcceptanceGate?(credential: Credential, input: AcceptanceGateInput): Promise<AcceptanceGateView>;
   /**
    * gm only: rebind a blocked task to a registered project (task-level override over goal.project).
    * Version-guarded, idempotent, fully audited; releases the stale worktree assignment through the
