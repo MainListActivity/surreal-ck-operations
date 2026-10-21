@@ -1,10 +1,10 @@
 import type { OwnerDesk } from '../owner.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, gmTriage, wake, type GmTodo, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
@@ -17,7 +17,7 @@ import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { isRetireRefused } from '../retirement.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
@@ -29,6 +29,10 @@ const LOG_TAIL_ENTRIES = 60;
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
 /** A failed in-place reload is retried on this interval, not on every poll. */
 const RELOAD_RETRY_SECONDS = 300;
+/** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
+const PERSISTENT_QUOTA_FAILURES = 2;
+/** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
+const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -1191,6 +1195,25 @@ export class Dispatcher {
       await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
       return true;
     };
+    /**
+     * A bound implementer whose provider has failed quota repeatedly, or whose reset time is unknown, cannot be relied
+     * on to come back on its own. This is not a busy/capacity wait: the manager gets a takeover todo. A known short
+     * cooldown stays a wait; one failure is not persistent.
+     */
+    const persistentQuotaImplementer = (task: SupervisedTask): { employee: string; until?: string; failures: number } | undefined => {
+      const employee = task.implementer;
+      if (!employee) return undefined;
+      const inst = insts.find(i => i.id === employee);
+      if (!inst) return undefined; // the struck path owns a vanished employee
+      if (states.get(inst.id) !== 'exhausted') return undefined;
+      const h = health.get(inst.provider ?? '');
+      if (!h || h.state !== 'exhausted') return undefined;
+      const def = defs.find(d => d.id === inst.def);
+      if (def?.quotaLimited === false) return undefined;
+      const failures = h.failures ?? 0;
+      if (failures < PERSISTENT_QUOTA_FAILURES && h.until !== undefined) return undefined;
+      return { employee, failures, until: h.until === undefined ? undefined : new Date(h.until * 1000).toISOString() };
+    };
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -1285,7 +1308,16 @@ export class Dispatcher {
       if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
-      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && await replaceStruckImplementer(item.task, home)) continue;
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering') {
+        if (await replaceStruckImplementer(item.task, home)) continue;
+        const quota = persistentQuotaImplementer(item.task);
+        if (quota) {
+          await this.settleBlocked(item.task, 'execute', home,
+            [{ key: quota.employee, eligible: false, code: 'implementer_quota', until: quota.until,
+              reason: `已连续 ${quota.failures} 次额度失败` }], now, report);
+          continue;
+        }
+      }
       if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
         await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
         continue;
@@ -1391,7 +1423,92 @@ export class Dispatcher {
     }
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
 
-    const pendingGm: SupervisedTask[] = [];
+    // Manager actions: a ready/doing engineering task whose execute verdict needs a manager decision (unresolved
+    // implementer, no automatic successor, or a persistent implementer quota failure) becomes a durable todo. The
+    // same GmTodo feeds the gm prompt and the owner-facing verdict, so reason, action and time basis cannot drift.
+    const tasksById = new Map(tasks.map(task => [task.id, task]));
+    const workExecute = new Map(work.filter(item => item.purpose === 'execute').map(item => [item.task.id, item.task]));
+    const managerActionCode = (verdict: DispatchVerdict): BlockCode | undefined => {
+      const codes = verdict.reasons.map(reason => reason.code);
+      if (codes.includes('implementer_unresolved')) return 'implementer_unresolved';
+      if (codes.includes('implementer_quota')) return 'implementer_quota';
+      if (codes.includes('implementer_unavailable')) return 'implementer_unavailable';
+      return undefined;
+    };
+    type ManagerTodo = GmTodo & { purpose: string; key: string; episode: number };
+    const managerTodos: ManagerTodo[] = [];
+    for (const verdict of this.verdicts.values()) {
+      if (verdict.phase !== 'execute') continue;
+      const task = workExecute.get(verdict.taskId);
+      if (!task || task.executorRole !== 'engineering') continue;
+      const reasonCode = managerActionCode(verdict);
+      if (!reasonCode) continue;
+      const parsed = Date.parse(verdict.since ?? verdict.checkedAt);
+      const episode = Number.isFinite(parsed) ? parsed : now * 1000;
+      const key = managerActionKey(task.id, 'execute', episode, reasonCode);
+      const purpose = `gm-manager-action:${key}`;
+      let last: { at: number } | undefined;
+      try {
+        last = await wf.lastDispatch(task.id, 0, purpose);
+      } catch (error) {
+        // Unknown throttle state is not a licence to wake again: keep the existing action and retry next pass.
+        this.log(`manager action throttle read failed for ${task.id}: ${(error as Error).message}`);
+        continue;
+      }
+      if (last && now - last.at < cfg.redispatchMinutes * 60) continue;
+      managerTodos.push({ task, action: 'implementer_takeover', expectedVersion: task.version, reasonCode, verdict, episode, key, purpose });
+    }
+
+    // Close todos that no longer describe the task; keep them on read failures and pass-wide gates.
+    let openActions: ManagerActionRow[] | undefined;
+    if (typeof wf.openManagerActions === 'function') {
+      try { openActions = await wf.openManagerActions(); }
+      catch (error) { this.log(`manager action read failed: ${(error as Error).message}`); }
+      if (openActions === undefined) {
+        // Fail closed: without the persisted open set we cannot dedupe a new wake or prove an old todo is resolved.
+        managerTodos.length = 0;
+      }
+    }
+    if (openActions) {
+      const currentByKey = new Map(managerTodos.map(todo => [todo.key, todo]));
+      for (const action of openActions) {
+        const current = currentByKey.get(action.key);
+        if (current && current.task.implementer === action.implementer) continue;
+        const task = tasksById.get(action.taskId);
+        let resolution: string | undefined;
+        if (!task || task.currentEmployee || !['ready', 'doing'].includes(task.state)) {
+          resolution = 'task left the execute queue';
+        } else if (task.implementer !== action.implementer) {
+          resolution = 'implementer changed';
+        } else {
+          const verdict = this.verdicts.get(`${task.id}:execute`);
+          const codes = verdict?.reasons.map(reason => reason.code) ?? [];
+          // Unknown state and pass-wide gates are not evidence that the implementer problem is handled.
+          if (verdict && codes.length && !codes.some(code => GLOBAL_KEEP.has(code)) && !codes.includes(action.reason as BlockCode)) {
+            resolution = 'reason changed or cleared';
+          }
+        }
+        if (resolution) {
+          await wf.closeManagerAction(action, resolution).catch(error =>
+            this.log(`manager action close failed for ${action.taskId}: ${(error as Error).message}`));
+        }
+      }
+    }
+
+    // Persist current todos before waking: a wake without a durable todo cannot be deduped after a restart.
+    for (const todo of managerTodos) {
+      if (typeof wf.openManagerAction !== 'function') continue;
+      try {
+        await wf.openManagerAction({ taskId: todo.task.id, phase: 'execute', episode: todo.episode, reason: todo.reasonCode!,
+          action: 'implementer_takeover', version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
+          implementer: todo.task.implementer });
+      } catch (error) {
+        this.log(`manager action open failed for ${todo.task.id}: ${(error as Error).message}`);
+        todo.purpose = ''; // skip the wake below: it would have no durable todo
+      }
+    }
+
+    const pendingGm: Array<GmTodo & { purpose?: string }> = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
     // interactive RPCs queued past the daemon's 30s timeout.
@@ -1412,29 +1529,33 @@ export class Dispatcher {
       const afterReset = quotaUntil !== undefined && !gated && (!last || last.at < quotaUntil);
       if (!gated && last && now - last.at < cfg.redispatchMinutes * 60 && !afterReset) continue;
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
-      pendingGm.push(task);
+      pendingGm.push({ task, action: 'resume', expectedVersion: task.version });
     }
+    for (const todo of managerTodos) if (todo.purpose) pendingGm.push(todo);
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
     // per repo: the group's readTask anchors pick home, per-project spawn quota,
     // readWorkspace resolution and the cwd/repoHome fallback on the repo the blocked
     // tasks actually belong to — a single anchorless assign would pin every project's
     // gm batch onto the ops repo tree.
-    const gmGroups = new Map<string, SupervisedTask[]>();
-    for (const task of pendingGm) {
-      const home = task.repoPath ?? this.deps.env.opsRepo;
+    const gmGroups = new Map<string, Array<GmTodo & { purpose?: string }>>();
+    for (const todo of pendingGm) {
+      const home = todo.task.repoPath ?? this.deps.env.opsRepo;
       const group = gmGroups.get(home);
-      if (group) group.push(task); else gmGroups.set(home, [task]);
+      if (group) group.push(todo); else gmGroups.set(home, [todo]);
     }
     for (const group of gmGroups.values()) {
       if (running >= cfg.maxRunning) break;
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
+        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0]!.task });
       if (!result) continue;
-      for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
+      for (const todo of group) {
+        if (todo.action === 'resume') await wf.recordDispatch(todo.task.id, todo.task.version, 'gm-attention', result.id);
+        else if (todo.purpose) await wf.recordDispatch(todo.task.id, 0, todo.purpose, result.id);
+      }
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
       assigned.add(result.id);
-      report.woke.push(...group.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
+      report.woke.push(...group.map(todo => ({ task: todo.task.id, employee: result.id, spawned: result.spawned })));
     }
 
     const triage = await owner.triagePending();

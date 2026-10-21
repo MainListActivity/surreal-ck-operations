@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
+import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
@@ -239,6 +240,26 @@ const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
   role === 'eval' ? [] : role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+
+/** One manager todo to persist: task + phase + episode + reason identify it; the action is what the manager can do. */
+export interface ManagerActionInput {
+  taskId: string;
+  phase: 'execute' | 'review';
+  episode: number;
+  reason: string;
+  action: 'implementer_takeover';
+  version: number;
+  repo: string;
+  implementer?: string;
+}
+
+export interface ManagerActionRow extends ManagerActionInput {
+  key: string;
+  status: 'open' | 'closed';
+  createdAt?: string;
+  closedAt?: string;
+  resolution?: string;
+}
 
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
@@ -653,6 +674,55 @@ export class Workforce {
   async recordDispatch(taskId: string, version: number, purpose: string, employee: string): Promise<void> {
     await this.db.query('UPSERT $d CONTENT { task: $task, version: $version, purpose: $purpose, employee: $employee, at: time::unix(time::now()) };',
       { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee });
+  }
+
+  /** Durably records one manager todo. The deterministic id (task+phase+episode+reason) makes repeated ticks idempotent. */
+  async openManagerAction(input: ManagerActionInput): Promise<boolean> {
+    const key = managerActionKey(input.taskId, input.phase, input.episode, input.reason);
+    const record = id('dispatch', HASH(key).slice(0, 24));
+    const existing = await this.db.select<{ status?: string }>(record);
+    if (existing?.status === 'open') return false;
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ ...input, key });
+    await this.db.query(`BEGIN;
+      UPSERT $d CONTENT { key: $key, task: $task, version: $version, purpose: 'gm-manager-action', employee: '',
+        phase: $phase, episode: $episode, reason: $reason, action: $action, repo: $repo, implementer: $implementer,
+        status: 'open', created_at: time::now() };
+      CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action', evidence: $evidence, at: time::now() };
+      COMMIT;`, {
+      d: record, key, task: input.taskId, task_ref: id('task', input.taskId), version: input.version,
+      phase: input.phase, episode: input.episode, reason: input.reason, action: input.action,
+      repo: input.repo, implementer: input.implementer ?? null, audit, evidence,
+    });
+    return true;
+  }
+
+  /** Open manager todos, restored across dispatcher restarts from the dispatch bookkeeping table. */
+  async openManagerActions(): Promise<ManagerActionRow[]> {
+    type Row = { id: RecordId; key?: string; task?: string; version?: number; phase?: string; episode?: number; reason?: string;
+      action?: string; repo?: string; implementer?: string; status?: string; created_at?: unknown };
+    const [rows] = await this.db.query<[Row[]]>(`SELECT * FROM dispatch WHERE purpose = 'gm-manager-action' AND status = 'open' ORDER BY created_at;`);
+    return (rows ?? []).map(row => ({
+      key: row.key ?? String(row.id).replace(/^dispatch:/, ''), taskId: String(row.task ?? ''), version: row.version ?? 0,
+      phase: row.phase === 'review' ? 'review' : 'execute', episode: row.episode ?? 0, reason: row.reason ?? '',
+      action: 'implementer_takeover' as const, repo: row.repo ?? '', implementer: row.implementer ?? undefined,
+      status: 'open' as const, createdAt: row.created_at === undefined ? undefined : String(row.created_at),
+    }));
+  }
+
+  /** Closes one manager todo without deleting its dispatch row or the open/close audit history. */
+  async closeManagerAction(action: ManagerActionRow, resolution: string): Promise<void> {
+    const record = id('dispatch', HASH(action.key).slice(0, 24));
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ task: action.taskId, phase: action.phase, episode: action.episode,
+      reason: action.reason, action: action.action, resolution });
+    await this.db.query(`BEGIN;
+      LET $row = SELECT * FROM ONLY $d;
+      IF $row.status = 'open' {
+        UPDATE ONLY $d SET status = 'closed', closed_at = time::now(), resolution = $resolution;
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action_closed', evidence: $evidence, at: time::now() };
+      };
+      COMMIT;`, { d: record, task_ref: id('task', action.taskId), resolution, audit, evidence });
   }
 
   async serverNow(): Promise<number> { return this.now(); }
