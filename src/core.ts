@@ -1829,6 +1829,79 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
+   * Dispatcher-initiated implementer replacement. Called when the bound implementer's session is gone for good — the
+   * employee left the roster, or its session is archived, quarantined or parked in a failure that cannot be restarted —
+   * so the task can never be handed back, and the binding would keep every other engineer out forever. The write is the
+   * same compare-and-set transaction as the manager's takeover (version, target role/capability/track, a lease held by
+   * someone else is revoked, authorship is never removed); only the actor differs: the dispatcher acts on its own and
+   * the audit row records `system:dispatcher`. No credential is involved, so this is never exposed as an agent tool.
+   */
+  async systemImplementerTakeover(input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }): Promise<TaskView> {
+    requireText(input.taskId, 'taskId', 1, 200);
+    requireText(input.toEmployee, 'toEmployee', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const actor = 'system:dispatcher';
+    const idem = this.idemId(actor, 'implementer_takeover', `auto:${input.taskId}:${input.expectedVersion}:${input.toEmployee}`);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, toEmployee: input.toEmployee, expectedVersion: input.expectedVersion, reason: input.reason }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const current = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    if (current.executor_role !== 'engineering') {
+      throw new CompanyError('invalid', 'implementer takeover invalid: only engineering tasks have a code implementer');
+    }
+    const contrib = await readContributionView(this.db, input.taskId);
+    const facts = contrib.facts;
+    if (input.toEmployee === facts.implementer) throw new CompanyError('invalid', 'implementer takeover invalid: employee is already the implementer');
+    if (facts.excluded.includes(input.toEmployee)) throw new CompanyError('invalid', 'implementer takeover invalid: the successor is an author of this task');
+    if (facts.reviewers.includes(input.toEmployee)) {
+      throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer cannot become the implementer without a named replacement reviewer');
+    }
+    const evidence = `${input.reason}\n[implementer_takeover:auto] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
+      IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
+      IF $t.version != $seen { THROW 'implementer takeover moved: contribution history changed' };
+      IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
+      LET $to = SELECT * FROM ONLY $target;
+      IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
+      LET $to_tracks = $to.def.tracks ?? [];
+      IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
+      LET $holder = $t.current_employee;
+      LET $next = UPDATE ONLY $task SET
+        implementer = $target_key,
+        current_employee = NONE,
+        delivery_id = NONE,
+        lease_expires_at = NONE,
+        fence = IF $holder != NONE THEN $t.fence + 1 ELSE $t.fence END,
+        version = $t.version + 1
+        RETURN AFTER;
+      IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
+      UPDATE ONLY $target SET implementer_bound_at = time::now();
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key, automatic: true }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      task: id('task', input.taskId), expected: input.expectedVersion, target: id('employee', input.toEmployee),
+      target_key: input.toEmployee, seen: contrib.version ?? -1, evidence, digest, idem, actor,
+      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+    };
+    try {
+      return view(await this.txTask<TaskRow>(query, vars));
+    } catch (error) {
+      const replayedAfterFailure = await this.replay(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
    * Shared read path for the preview and the repair gate: loads the goal, its references, the unfinished
    * goal work and the candidate; evaluates every acceptance rule; and hashes the basis the repair compares
    * against. Reads only.

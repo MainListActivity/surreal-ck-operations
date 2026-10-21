@@ -211,12 +211,12 @@ export interface DispatchReasonView {
   text: string;
   candidates: string[];
   candidatesOmitted?: number;
-  owner: "gm" | "owner";
+  owner: "gm" | "owner" | "system";
   /** The source the code was read from, for example "contribution-audit". */
   basis: string;
   recovery: string;
   /** Structured recovery actions; `executable` is false when no operations tool performs the action. */
-  actions: Array<{ authority: "gm" | "owner"; label: string; tool?: string; executable: boolean }>;
+  actions: Array<{ authority: "gm" | "owner" | "system"; label: string; tool?: string; executable: boolean }>;
   nextTrigger: string;
 }
 

@@ -26,7 +26,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
-  | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'no_candidate'
+  | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'author_recusal' | 'no_candidate'
   | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
   | 'write_scope';
@@ -53,7 +53,7 @@ export interface GlobalBlock {
 }
 
 /** Who may take a recovery action: the manager (gm, with the manage capability) or the owner. */
-export type RecoveryAuthority = 'gm' | 'owner';
+export type RecoveryAuthority = 'gm' | 'owner' | 'system';
 
 /**
  * One way out of a block. `tool` names the operations tool that performs it (sck call <tool>). `executable` is false when no
@@ -70,7 +70,7 @@ export interface DispatchReason {
   code: BlockCode;
   text: string;
   candidates: string[];
-  owner: 'gm' | 'owner';
+  owner: RecoveryAuthority;
   recovery: string;
   nextTrigger: string;
   /** The source the code was read from, so a reader can tell which fact the conclusion rests on (for example "contribution-audit"). */
@@ -141,6 +141,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
   implementer_unresolved: '多个作者且无实现负责人，需经理指定',
+  implementer_unavailable: '实现人会话已失效，系统自动改派在岗工程员工',
   author_recusal: '本任务作者（写过或提交过）不能复核',
   no_candidate: '该岗位与仓库下没有任何编制或员工',
   session_busy: '会话占用中或异常',
@@ -160,9 +161,9 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
 };
 
-const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
+const OWNER: Record<BlockCode, RecoveryAuthority> = {
   paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
-  implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', no_candidate: 'gm',
+  implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', author_recusal: 'gm', no_candidate: 'gm',
   session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
@@ -176,6 +177,7 @@ const RECOVERY: Record<BlockCode, string> = {
   max_running: '等待在办会话结束，或经理调高 max_running',
   implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
   implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
+  implementer_unavailable: '系统自动改派，无需经理；暂无候选时等候选人空闲后自动重试',
   author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
   no_candidate: '经理为该岗位或仓库增加编制或员工',
   session_busy: '等待在办任务完成或租约到期',
@@ -202,6 +204,7 @@ const NEXT: Record<BlockCode, string> = {
   max_running: '在办会话数低于上限',
   implementer_mismatch: '绑定实现负责人可派工，或经理接手',
   implementer_unresolved: '经理记录实现负责人',
+  implementer_unavailable: '出现可派候选，系统自动改派',
   author_recusal: '出现独立候选人选',
   no_candidate: '新增编制或员工',
   session_busy: '候选会话空闲',
@@ -224,7 +227,7 @@ const NEXT: Record<BlockCode, string> = {
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
 const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
-  implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', author_recusal: 'contribution-audit',
+  implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', implementer_unavailable: 'tick:session-status', author_recusal: 'contribution-audit',
   no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
@@ -241,6 +244,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   max_running: [{ authority: 'gm', label: '等待在办会话结束，或经理调高 max_running', executable: false }],
   implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
   implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
+  implementer_unavailable: [{ authority: 'system', label: '系统自动改派在岗工程员工', executable: false }],
   author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
   no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
   session_busy: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
