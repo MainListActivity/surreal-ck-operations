@@ -26,6 +26,8 @@ export interface TaskView {
   resumeState?: TaskState;
   /** Blocked rows: the role recorded by the original block. */
   resumeRole?: string;
+  /** Blocked rows: why the task waits (see src/contracts.ts TaskWaiting). */
+  waiting?: { kind: "manager" | "owner" | "dependency"; resumeState: TaskState | "unknown"; role: string; dependencies: string[] };
   previousEmployee?: string;
 }
 

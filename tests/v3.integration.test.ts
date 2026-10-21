@@ -857,6 +857,59 @@ test('review-phase gm block becomes a formal dependency wait and restores review
 });
 
 
+test('RW06 cross-version: the pre-RW06 unlock misdispatches a review wait (old-red); the audited restore keeps review and the view names the wait (new-green)', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false };");
+  const goal = await owner.createGoal({ text: 'RW06 跨版本对照', source: 'owner:test', key: key(), tier: 'quick' });
+  const gate = await core.createTask(tokens.gm, { title: 'RW06 前置门', context: '前置完成前，下面两条复核等待保持 blocked。', executorRole: 'engineering', reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: key() });
+  const qaB = await enrollment.enroll('t-qa-c', 'qa', ['execute', 'review']);
+  const waitTask = (title: string) => core.createTask(tokens.gm, { title, context: '合成用例：复核阶段阻塞转为正式依赖等待，用于旧红/新绿对照。', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key() });
+  const oldRed = await waitTask('RW06 旧版对照');
+  const newGreen = await waitTask('RW06 新版对照');
+  for (const t of [oldRed, newGreen]) {
+    const submitted = await core.claim(tokens['eng-a'], t.id);
+    await core.submit(tokens['eng-a'], proofOf(submitted), { text: '工程提交复核：旧红与新绿对照用例的原始交付。', idempotencyKey: key() });
+    const blocked = await core.claim(qaB, t.id);
+    await core.block(qaB, proofOf(blocked), 'gm', { text: '前置未完成，先挂正式依赖等待，避免误派工程。', idempotencyKey: key() });
+    // C3: the manager-blocked view is distinguishable before the wait is formalised.
+    // A manager gate on a review-phase task is a manager wait that still names the review phase and reviewer role.
+    expect((await task(t.id)).waiting).toMatchObject({ kind: 'manager', resumeState: 'review', role: 'qa' });
+    await core.deferTaskUntil(tokens.gm, { taskId: t.id, dependencies: [gate.id], text: '转为正式依赖等待：前置完成前不派复核、不派实现。', idempotencyKey: key() });
+    // C3: the dependency wait names the review phase and the reviewing role, not the execute phase.
+    expect((await task(t.id)).waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependencies: [gate.id] });
+  }
+
+  // Old-red (the pre-RW06 unlock in 475b5c2): a hard-written ready instead of the phase restore. Keep it as a safety fixture: the
+  // product drill reproduced exactly this misdispatch, and the switch guard refuses releases that would do it again.
+  await database.db.query("UPDATE ONLY $task SET state = 'ready', resume_state = NONE, resume_role = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE, version += 1;", { task: new RecordId('task', oldRed.id) });
+  expect((await task(oldRed.id)).state).toBe('ready');
+  const misdispatched = await core.claim(tokens['eng-a'], oldRed.id);
+  expect(misdispatched.task.state).toBe('doing'); // the wrong execute dispatch the old unlock allows
+  // Fixture cleanup: end the misdispatch lease through the ordinary release, then park that row as void so it cannot affect later tests.
+  await core.release(tokens['eng-a'], proofOf(misdispatched), { text: '对照夹具：结束旧红误派产生的租约，释放实现人占用的活动任务。', idempotencyKey: key() });
+  await database.db.query("UPDATE ONLY $task SET state = 'void', version += 1;", { task: new RecordId('task', oldRed.id) });
+
+  // New-green: the prerequisite finishes through the audited path, and the review wait comes back as review.
+  await execute(tokens['eng-b'], gate.id, '前置完成：独立工程复核与运营批准均已落库，可以解锁下游。');
+  await review(tokens['eng-a'], gate.id);
+  const restored = await task(newGreen.id);
+  expect(restored).toMatchObject({ state: 'review', submittedBy: 't-eng-a', implementer: 't-eng-a' });
+  expect(restored.waiting).toBeUndefined();
+  expect(restored.resumeState).toBeUndefined();
+  // The restore did not leak an execute dispatch: another engineer cannot take the code, and the original implementer is the submitter.
+  await expect(core.claim(tokens['eng-b'], newGreen.id)).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(core.claim(tokens['eng-a'], newGreen.id)).rejects.toMatchObject({ code: 'self_review' });
+  const qaClaim = await core.claim(tokens.qa, newGreen.id);
+  expect(qaClaim.task.state).toBe('review');
+  // A downstream task waiting on the restored one stays blocked: the restore is not an isolation/unlock.
+  const downstream = await core.createTask(tokens.gm, { title: 'RW06 下游', context: '依赖复核任务完成，复核尚在进行时必须保持 blocked。', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, dependencies: [newGreen.id], idempotencyKey: key() });
+  expect((await task(downstream.id)).state).toBe('blocked');
+  expect((await task(downstream.id)).waiting).toMatchObject({ kind: 'dependency' });
+  await core.accept(tokens.qa, proofOf(qaClaim), { text: '独立复核通过：复核等待恢复后按原提交验收。', idempotencyKey: key() });
+  expect((await task(newGreen.id)).state).toBe('done');
+  expect((await task(downstream.id)).state).not.toBe('blocked'); // the ordinary unlock path still works once the dependency is done
+});
+
 test('review wait concurrency, void dependencies and cycle attempts stay fail closed', async () => {
   await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
   await database.db.query('DELETE provider_health;');

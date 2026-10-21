@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -229,6 +229,24 @@ interface TaskRow {
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export type { TaskRow };
 
+/**
+ * Why a blocked row waits, in terms every view can show (RW06 C3 / RW05). The facts are the row's own: `blocked_to` names a
+ * manager or owner gate; a dependency wait carries the phase to restore and, for a review wait, the reviewer role. A review-phase
+ * wait never falls back to the execute role when `resume_role` is empty — it names the reviewer role, and a row with no phase
+ * fact is `unknown` rather than an implied execute wait.
+ */
+export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_state' | 'resume_role' | 'reviewer_role' | 'executor_role' | 'dependencies'>): TaskWaiting | undefined {
+  if (row.state !== 'blocked') return undefined;
+  const resumeState = row.resume_state ?? 'unknown';
+  const role: TaskWaiting['role'] = row.blocked_to === 'owner' ? 'owner'
+    : row.resume_role ? (row.resume_role as Role)
+      : resumeState === 'review' ? row.reviewer_role
+        : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
+          : 'unknown';
+  const kind: TaskWaiting['kind'] = row.blocked_to === 'gm' ? 'manager' : row.blocked_to === 'owner' ? 'owner' : 'dependency';
+  return { kind, resumeState, role, dependencies: (row.dependencies ?? []).map(asId) };
+}
+
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
@@ -245,6 +263,7 @@ export function view(row: TaskRow): TaskView {
     blockedTo: row.blocked_to,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
+    waiting: waitingOf(row),
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,

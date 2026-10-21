@@ -50,6 +50,22 @@ export interface Principal {
   tracks?: string[];
 }
 
+/**
+ * Why a blocked task is waiting, derived from the row's authoritative facts (RW05/RW06). The owner and manager views read this
+ * instead of guessing from transient fields: a review-phase wait names the reviewing role, never the execute phase; a fact the
+ * row does not carry is `unknown`, not a default.
+ */
+export interface TaskWaiting {
+  /** manager: blocked for a GM decision; owner: a boss gate; dependency: waiting on other tasks (a review wait is one of these). */
+  kind: 'manager' | 'owner' | 'dependency';
+  /** The phase restored when the wait ends (`unknown` when the row carries none). */
+  resumeState: TaskState | 'unknown';
+  /** For dependency waits: the role whose phase is awaited (review wait -> the reviewer role); `unknown` when no fact names it. */
+  role: Role | 'owner' | 'unknown';
+  /** Unfinished prerequisites recorded on the row (ids only, no text). */
+  dependencies: TaskId[];
+}
+
 export interface TaskView {
   id: TaskId;
   title: string;
@@ -81,6 +97,8 @@ export interface TaskView {
   resumeState?: TaskState;
   /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
   resumeRole?: string;
+  /** Blocked rows: why the task waits, in the same authoritative terms for every view (RW06 C3). */
+  waiting?: TaskWaiting;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;

@@ -11,6 +11,7 @@ action=${1:-}
 components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/bun-runtime.sh"
 . "$(dirname "$0")/release-content.sh"
+. "$(dirname "$0")/review-wait-guard.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -95,6 +96,11 @@ case "$action" in
     # named after a real commit but holding other code is refused here, before anything is switched.
     release_matches_commit "$release" "$sha" "$ops_repo" || {
       echo "refused: $release does not match commit $sha — cut the release from 'git archive $sha' (dependencies and vendor are prepared after), then install again" >&2; exit 1; }
+    # RW06 C1: a target may be switched to only when its own (content-bound) code proves it understands the persistent
+    # review-wait state. Incompatible, unreadable or drifted targets are refused here — before the bin copies, the active
+    # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
+    # "nothing waits yet" as safe would race a defer that lands right after it.
+    review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
     check_gate "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"

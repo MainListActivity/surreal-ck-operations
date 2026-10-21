@@ -667,6 +667,17 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
+/** Why a blocked task waits, in the owner's words (RW06 C3): a review prerequisite names the reviewing role; the manager and
+ *  boss gates name the decision owner. Facts the task row does not carry show as unknown, never as an implied execute wait. */
+function waitingLabel(w: NonNullable<TaskView["waiting"]>): string {
+  const phase = w.resumeState === "review" ? "复核" : w.resumeState === "doing" ? "执行" : w.resumeState === "ready" ? "就绪" : "未知阶段";
+  const role = w.role === "owner" ? "老板" : w.role === "unknown" ? "未知岗位" : (ROLE_LABEL[w.role] ?? w.role);
+  const deps = `依赖 ${w.dependencies.length} 项`;
+  if (w.kind === "manager") return `等待经理决定（恢复${phase}）· ${deps}`;
+  if (w.kind === "owner") return `等待老板决定（恢复${phase}）· ${deps}`;
+  return `等待${role}的${phase}前置（恢复${phase}）· ${deps}`;
+}
+
 function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: Ctx; depth: number; onOpen: (id: string) => void; verdict?: DispatchBlockedView }) {
   const s = makeStyles(ctx);
   return (
@@ -679,6 +690,11 @@ function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: C
         <Text style={[s.text, { flex: 1 }]} numberOfLines={2}>{task.title}</Text>
         <Text style={s.muted}>{task.currentEmployee?.split("⟨").pop()?.replace("⟩", "") ?? task.executorRole}</Text>
       </Pressable>
+      {task.waiting && (
+        <View style={{ paddingLeft: depth * 14 + 8 }}>
+          <Text style={s.muted}>{waitingLabel(task.waiting)}</Text>
+        </View>
+      )}
       {verdict && (
         <View style={{ paddingLeft: depth * 14 + 8, gap: 2 }}>
           <Text style={{ color: "#d97706", fontSize: 13 }}>无法派工（{WORKFLOW_LABEL[verdict.workflowState]}）：{verdict.summary}</Text>

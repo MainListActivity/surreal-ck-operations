@@ -15,6 +15,7 @@ const SHAS = {
   incomplete: '1111111111111111111111111111111111111111',
   symlink: '2222222222222222222222222222222222222222',
   nondir: '3333333333333333333333333333333333333333',
+  incompatible: '4444444444444444444444444444444444444444',
 } as const;
 
 type Fixture = {
@@ -34,13 +35,29 @@ function executable(path: string, content: string) {
   chmodSync(path, 0o755);
 }
 
-function makeRelease(releases: string, sha: string, withGit = false) {
+// The review-wait contract RW06's switch guard requires (src/review-wait-capability.ts, the restoring unlock in core, and the
+// view fields in contracts). A fixture release without it is the "old target" case the guard must refuse.
+const REVIEW_WAIT_FILES = {
+  'src/review-wait-capability.ts': "export const REVIEW_WAIT_PROTOCOL = 'review-wait/1';\n",
+  'src/core.ts': "export const UNLOCK = \"LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END; resume_state\";\n",
+  'src/contracts.ts': 'export interface TaskView { resumeState?: string; resumeRole?: string }\n',
+};
+
+function makeRelease(releases: string, sha: string, withGit = false, capable = true) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
   mkdirSync(join(dir, 'src', 'dispatcher'), { recursive: true });
   mkdirSync(join(dir, 'plugin'), { recursive: true });
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
+  if (capable) {
+    for (const [path, body] of Object.entries(REVIEW_WAIT_FILES)) writeFileSync(join(dir, path), body);
+    // The plugin surface runs the same core; its generated vendor must carry the contract too.
+    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
+    for (const [path, body] of Object.entries(REVIEW_WAIT_FILES)) {
+      writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
+    }
+  }
   if (withGit) writeFileSync(join(dir, '.git'), 'gitdir: /tmp/company-service-test\n');
   return dir;
 }
@@ -127,10 +144,10 @@ exit 0
   return { root, home, serviceHome, releases, release, fakeBin, fakePaseo, paseoLog, opsRepo };
 }
 
-function runInstall(f: Fixture, extraEnv: Record<string, string> = {}) {
+function runInstall(f: Fixture, extraEnv: Record<string, string> = {}, target = f.release) {
   // A developer's SCK_BUN must not decide the gate of these fixtures: the runtime is the one the fixture pins (see writeGateRecord).
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'SCK_BUN'));
-  return Bun.spawnSync(['sh', SCRIPT, 'install', f.release], {
+  return Bun.spawnSync(['sh', SCRIPT, 'install', target], {
     env: {
       ...inherited,
       HOME: f.home,
@@ -247,6 +264,29 @@ test('install refuses a release without a passing comm-slow-pipe gate and leaves
     expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
     expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
     expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test('install refuses a target whose code lacks the review-wait contract, before any switch side effect', () => {
+  const f = fixture();
+  try {
+    // Everything else about this target is valid (sha named release, fake ancestry and content, a passing gate record); only the
+    // RW06 contract is missing, which is exactly the pre-RW06 target the product drill showed unlocks a review wait into ready.
+    const old = makeRelease(f.releases, SHAS.incompatible, false, false);
+    writeGateRecord(f.serviceHome, SHAS.incompatible);
+    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' }, old);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain('refused:');
+    expect(result.stderr.toString()).toContain('复核等待');
+    expect(result.stderr.toString()).toContain(`target=${old}`);
+    expect(result.stderr.toString()).toContain('waiting items=unknown');
+    // No side effect: active still points at the previous release, no plist was written, no release pruned, Paseo untouched.
+    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+    expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
+    expect(existsSync(f.paseoLog) ? readFileSync(f.paseoLog, 'utf8').trim() : '').toBe('');
   } finally {
     cleanup(f);
   }
