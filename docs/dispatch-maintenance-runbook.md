@@ -36,8 +36,23 @@ PASEO="/Applications/Paseo.app/Contents/Resources/bin/paseo"
 
 ### Q0（T-10 分钟，只读）
 
-1. `sh "$SCK" call get_context '{}'`：记录 company.paused（必须为 false）；记录 state 为 ready 的任务数（必须为 0）；记录 blocked 任务中待 GM 的数量（必须为 0，核对方式以返回字段为准）；列出全部 doing 与 review 任务的 id、state、version、fence、reviewerRole。
-2. 对每个 doing 与 review 任务：`sh "$SCK" call get_task_history '{"taskId":"<id>"}'`，记录当前持有人（最后一条有效 claim 的员工）、fence、version、最近一条事件的时间。
+**窗口准入的候选来源**（按旧 release 的真实 claim/唤醒路径，而不只是 ready 清单）：
+
+- `ready` 任务：任何一次 tick 都可能被 claim，包括异常地仍带 holder 的 ready 行。
+- `review` 任务：未领取的非 owner review 会被 claim；活 review 的 accept/return 会解锁依赖或把任务退回 ready；owner review 的 accept 会解锁依赖。
+- `doing` 但没有 holder：异常行，下一轮可能被 claim。
+- 失效、未知或临近到期的租约：监督会 revoke/expire，随后重新成为 claim 候选。
+- 活的 execute 租约：submit（转 review，产生复核候选）、release/放弃（转 ready）同样产生候选。
+- 不签发任务租约但会新建/唤醒会话的路径：triage 目标、待 eval 的终态任务、GM-attention（blockedTo=gm）。
+- 任何未知、截断、分页或汇总漂移：数据不完整，不开窗。
+
+**保守窗口**：除原 3381 本次部署的 execute 租约（具名 task/holder/fence/version/expiry，持续受权保活）外，doing 与 review 全部排空；ready、待 GM/owner、triage/eval/GM-attention、未知或临近到期一律不开窗。静默窗口是有条件最佳努力，不是硬事务屏障：外部 owner 动作、崩溃或状态变化立即使窗口失效，必须重新采样。
+
+1. GM 运行 `bun "$REL/scripts/maintenance-preflight.ts"`（能力检查，只读；不暂停、不安装）。记录 admin summary（cutoff、since、逐 state 计数、outboxSequence、integrity.complete）、分页快照与行数、verdict。`capability.complete` 必须为 true；分页逐 state 计数必须与 summary 一致。本人的 review 会被分页隐藏，review 计数不一致即拒绝，不得用过滤后的清单自称完整。
+2. GM 运行 `bun "$REL/scripts/maintenance-preflight.ts" --window --deployment '<json>' --extras '<json>'`，记录 `window.allowed` 与 `admittedLease`。
+   - `--deployment`：本次部署的具名租约 `{taskId,holder,fence,version,expiresAt}`。
+   - `--extras`：`{triageGoals,pendingEvals,gmAttention}`，未知写作 `null`（会拒绝开窗）。
+   - `window.allowed` 为 false 时按 reasons 逐条处理，不得跳过；工具不执行的读（如 triage/eval 计数）必须由 GM 用现有只读工具补采后如实传入，未知不得当作 0。
 3. 运行面：`readlink "$SVC/active"`；`"$PASEO" plugin ls sck-company --json`，记录 SOURCE 与 DIRECTORY；`launchctl print "gui/$(id -u)/org.surrealck.company-mcp"`，记录 state 与 pid；`sh "$SVC/active/scripts/company-service.sh" status`。
 4. 探针：`curl --fail http://127.0.0.1:<MCP 端口>/health` 与 `/ready`，都必须为 200。端口由运维登记在 Q0 证据中，可用 `lsof -nP -iTCP -sTCP:LISTEN -a -p <MCP pid>` 核对。不读取 private/ 目录。
 5. GM 执行 `sh "$SCK" call def_list '{}'`，记录每个 employee_def 的 enabled，作为原状态基线（只读）。
@@ -45,14 +60,11 @@ PASEO="/Applications/Paseo.app/Contents/Resources/bin/paseo"
 
 ### Q1（T-1 分钟，只读复采）
 
-1. 重做 Q0 的第 1 与第 2 步。
-2. 全部满足才进入 Q2：
-   - ready 为 0，待 GM 的任务为 0。
-   - 没有 review 持有人，即没有活的复核租约。
-   - doing 与 review 清单，以及各自的 version、fence、持有人，与 Q0 完全一致。
-   - Q0 之后，get_task_history 中没有新的 claim、lease、release、revoke 或 expire 事件。
-   - Q0 之后，GM 与 owner 没有创建、批准、解锁、作废或改派任务。
-3. 任一条件不满足：不开窗。5 分钟后重做 Q1。
+1. 重新运行 Q0 的第 1 与第 2 步（新的一次 summary、分页与窗口判定），与 Q0 记录逐项比较：
+   - 两次 `capability.complete` 均为 true，逐 state 计数、outboxSequence 与 paused=false 一致；
+   - 两次 `window.allowed` 均为 true，`admittedLease` 与部署租约完全一致且未临近到期；
+   - doing/review 清单（id/state/version/fence/holder）与 Q0 完全一致；Q0 之后没有新的 claim、lease、release、revoke 或 expire 事件。
+2. 全部满足才进入 Q2；任一漂移、未知或超时：不开窗，5 分钟后重做 Q1。
 
 ### Q2 开窗（需 GM 在任务记录中授权）
 
