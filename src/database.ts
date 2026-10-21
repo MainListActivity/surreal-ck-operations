@@ -15,6 +15,15 @@ const loadSchema = (file: string) =>
 /** Snapshot-build connections open at once across the process (SYS01 AC-D). A build that gets none within BUILD_QUEUE_MS is refused. */
 export const MAX_BUILD_CONNECTIONS = 4;
 const BUILD_QUEUE_MS = 2_000;
+/**
+ * How long a build connection may sit idle before it is closed instead of reused (SYS01 AC02, production return). A remote WSS
+ * handshake costs seconds on the production link; reusing a warm socket for the next build removes that cost from the default
+ * first-page path. The idle socket is probed with one cheap statement before reuse, so a socket the server closed in the meantime
+ * is replaced rather than failing the build.
+ */
+const BUILD_IDLE_TTL_MS = 30_000;
+/** Longest the reuse probe may take before the socket is treated as gone and a fresh one is opened. */
+const BUILD_REUSE_PROBE_MS = 2_000;
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -188,6 +197,8 @@ export class CompanyDatabase {
   }
 
   private readonly buildSockets = new Set<Surreal>();
+  /** Open build sockets that are not checked out, newest last. They count toward MAX_BUILD_CONNECTIONS with the active ones. */
+  private readonly idleBuildSockets: Array<{ socket: Surreal; since: number }> = [];
   private buildSlotsInUse = 0;
   private readonly buildSlotWaiters: Array<() => void> = [];
   private closing = false;
@@ -201,11 +212,18 @@ export class CompanyDatabase {
   readonly buildChannel: SnapshotChannel = {
     open: async (): Promise<SnapshotLink> => {
       if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      // Reuse a warm socket when one is idle: on the production WSS link a handshake costs seconds, and a build that pays it on
+      // every first page cannot answer within its deadline (SYS01 AC02 production return).
+      const warm = await this.takeIdleBuildSocket();
+      if (warm) return this.linkFor(warm);
       await this.takeBuildSlot();
       if (this.closing) {
         this.freeBuildSlot();
         throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
       }
+      // A socket may have gone idle while this build waited for a slot: take it rather than opening another.
+      const raced = await this.takeIdleBuildSocket(true);
+      if (raced) return this.linkFor(raced);
       const socket = new Surreal();
       this.buildSockets.add(socket);
       const opening = this.openSocket(socket);
@@ -218,9 +236,58 @@ export class CompanyDatabase {
         await this.closeBuildSocket(socket);
         throw error;
       }
-      return { db: socket, close: () => this.closeBuildSocket(socket) };
+      return this.linkFor(socket);
     },
   };
+
+  /** The link a build holds: `close` drops the socket, `release` returns it warm for the next build. */
+  private linkFor(socket: Surreal): SnapshotLink {
+    return {
+      db: socket,
+      close: () => this.closeBuildSocket(socket),
+      release: () => this.releaseBuildSocket(socket),
+    };
+  }
+
+  /**
+   * Pops one warm socket, closing the ones past BUILD_IDLE_TTL_MS. `holdsSlot` is true when the caller already owns an active slot
+   * (the slot is handed over to this socket); otherwise the idle socket becomes active here. Returns undefined when none is usable.
+   */
+  private async takeIdleBuildSocket(holdsSlot = false): Promise<Surreal | undefined> {
+    while (this.idleBuildSockets.length > 0) {
+      const entry = this.idleBuildSockets.pop()!;
+      if (this.closing || Date.now() - entry.since > BUILD_IDLE_TTL_MS) {
+        await this.closeIdleBuildSocket(entry.socket);
+        continue;
+      }
+      // One cheap statement proves the socket is still alive: a server that dropped the idle connection fails here, not in the build.
+      const alive = await CompanyDatabase.withTimeout(
+        entry.socket.query('RETURN true;').then(() => true, () => false), BUILD_REUSE_PROBE_MS, 'build reuse probe',
+      ).catch(() => false);
+      if (!alive) {
+        await this.closeIdleBuildSocket(entry.socket);
+        continue;
+      }
+      if (!holdsSlot) this.buildSlotsInUse++;
+      return entry.socket;
+    }
+    return undefined;
+  }
+
+  /** Returns a build socket to the idle set; its slot is freed for the next waiter. A closing pool or a full idle set drops it. */
+  private async releaseBuildSocket(socket: Surreal): Promise<void> {
+    if (this.closing || !this.buildSockets.has(socket)) {
+      await this.closeBuildSocket(socket);
+      return;
+    }
+    this.idleBuildSockets.push({ socket, since: Date.now() });
+    this.freeBuildSlot();
+  }
+
+  private async closeIdleBuildSocket(socket: Surreal): Promise<void> {
+    if (!this.buildSockets.delete(socket)) return;
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'idle build close').catch(() => undefined);
+  }
 
   private readonly releaseSockets = new Set<Surreal>();
 
@@ -245,14 +312,18 @@ export class CompanyDatabase {
     },
   };
 
-  /** Build connections open or being opened, and the builds waiting for a slot (for the tests and the measurements). */
-  buildConnectionStats(): { open: number; slotsInUse: number; queued: number } {
-    return { open: this.buildSockets.size, slotsInUse: this.buildSlotsInUse, queued: this.buildSlotWaiters.length };
+  /**
+   * Build connections open (active and idle), the slots checked out, the idle sockets kept warm, and the builds waiting for a slot
+   * (for the tests and the measurements). `open` stays within MAX_BUILD_CONNECTIONS; after a build its slot returns to 0 while its
+   * socket may stay warm until BUILD_IDLE_TTL_MS.
+   */
+  buildConnectionStats(): { open: number; slotsInUse: number; idle: number; queued: number } {
+    return { open: this.buildSockets.size, slotsInUse: this.buildSlotsInUse, idle: this.idleBuildSockets.length, queued: this.buildSlotWaiters.length };
   }
 
   /** Takes a build slot now, or waits for one that a closing socket frees; a slot passes straight to the first waiter. */
   private takeBuildSlot(): Promise<void> {
-    if (this.buildSlotsInUse < MAX_BUILD_CONNECTIONS) {
+    if (this.buildSlotsInUse + this.idleBuildSockets.length < MAX_BUILD_CONNECTIONS) {
       this.buildSlotsInUse++;
       return Promise.resolve();
     }
@@ -308,6 +379,7 @@ export class CompanyDatabase {
     this.closing = true;
     clearInterval(this.keepalive);
     this.keepalive = undefined;
+    this.idleBuildSockets.length = 0;
     await Promise.all([...this.buildSockets].map(socket => this.closeBuildSocket(socket)));
     await Promise.all([...this.releaseSockets].map(socket => this.closeReleaseSocket(socket)));
     // engine.close() awaits a 'disconnected' event that never arrives when the peer

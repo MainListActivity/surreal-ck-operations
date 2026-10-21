@@ -7,7 +7,7 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
-import { REPLY_CEILING_MS } from '../src/snapshot-store.ts';
+import { DEFAULT_SNAPSHOT_LIMITS, REPLY_CEILING_MS } from '../src/snapshot-store.ts';
 
 setDefaultTimeout(120_000);
 
@@ -43,23 +43,24 @@ const store = (core as unknown as {
   snapshots: { census(): Promise<{ listings: number; rows: number }>; read: (...args: never[]) => Promise<unknown> };
 }).snapshots;
 
-test('a first page that is never read is answered at the reply ceiling, and the listing stored for that call is released', async () => {
+test('a first page whose build never gets a connection is answered at the reply ceiling, and nothing is left stored', async () => {
   const before = await store.census();
-  const realRead = store.read;
-  store.read = () => new Promise<never>(() => undefined);
+  // The first page is answered from the rows its build read (SYS01 AC02), so the stall that the ceiling must bound is the build's
+  // connection, not a read-back. A channel that never opens holds the build until its own deadline.
+  const channel = database.buildChannel;
+  const realOpen = channel.open;
+  channel.open = () => new Promise<never>(() => undefined);
   const started = performance.now();
   const error = await core.contextView(reader, { pageSize: 1 }).then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
-  store.read = realRead;
+  channel.open = realOpen;
   expect(error).toBeInstanceOf(CompanyError);
   expect((error as CompanyError).code).toBe('temporarily_unavailable');
   expect((error as CompanyError).retryable).toBe(true);
-  // Answered at the reply ceiling: the build, the stalled read and the release all end within it.
-  expect(elapsed).toBeGreaterThanOrEqual(REPLY_CEILING_MS - 1_000);
+  // A stalled build ends at its own deadline, which lies before the reply ceiling; nothing was reserved, so no release follows
+  // and the answer lands at the deadline rather than at the ceiling. The ceiling is the upper bound over build plus cleanup.
+  expect(elapsed).toBeGreaterThanOrEqual(DEFAULT_SNAPSHOT_LIMITS.buildDeadlineMs - 1_000);
   expect(elapsed).toBeLessThan(REPLY_CEILING_MS + 600);
-  // The listing the call stored is released in the background; the count returns to where it was.
-  const until = Date.now() + 3_000;
-  while (Date.now() < until && (await store.census()).listings !== before.listings) await Bun.sleep(20);
   expect(await store.census()).toEqual(before);
 });
 
@@ -71,13 +72,18 @@ test('a listing whose query matches exactly one task answers with that task', as
 
 test('a first page refused after its listing was stored releases that listing rather than keeping its quota until it expires', async () => {
   const before = await store.census();
-  const realRead = store.read;
-  store.read = () => Promise.reject(new CompanyError('invalid', 'synthetic refusal after the listing was stored'));
-  const error = await core.contextView(reader, { pageSize: 25 }).then(() => undefined, (reason: unknown) => reason);
-  store.read = realRead;
-  expect(error).toBeInstanceOf(CompanyError);
-  expect((error as CompanyError).code).toBe('invalid');
-  const until = Date.now() + 3_000;
-  while (Date.now() < until && (await store.census()).listings !== before.listings) await Bun.sleep(20);
-  expect(await store.census()).toEqual(before);
+  // A company block too large for the page envelope is refused after the task listing was stored: the refusal path must release
+  // that listing, not leave its room held until the TTL.
+  await database.db.query('CREATE direction CONTENT { text: $text, source: "reply-ceiling-test", at: time::now() };',
+    { text: 'x'.repeat(70_000) });
+  try {
+    const error = await core.contextView(reader, { pageSize: 25, includeCompany: true }).then(() => undefined, (reason: unknown) => reason);
+    expect(error).toBeInstanceOf(CompanyError);
+    expect((error as CompanyError).code).toBe('response_too_large');
+    const until = Date.now() + 3_000;
+    while (Date.now() < until && (await store.census()).listings !== before.listings) await Bun.sleep(20);
+    expect(await store.census()).toEqual(before);
+  } finally {
+    await database.db.query('DELETE direction WHERE source = "reply-ceiling-test";');
+  }
 });
