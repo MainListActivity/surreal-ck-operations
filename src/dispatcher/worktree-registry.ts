@@ -9,6 +9,7 @@ import { CompanyError } from '../core-errors.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
 } from './worktree-reclaim.ts';
+import { meaningfulChanges } from './lifecycle-gc.ts';
 
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
@@ -431,7 +432,7 @@ export class WorktreeRegistry {
         taskId: r.task ? String(r.task.id) : `session:${r.employee}`, employee: r.employee,
         deliveryId: r.delivery, fence: r.fence, intent: r.intent, state: refState(r), at: String(r.at),
       }));
-      const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+      const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
       const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
       const decision = decideReclaim({
         path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
@@ -499,7 +500,7 @@ export class WorktreeRegistry {
                 result.audited++;
               }
             }
-            const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+            const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
             const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
             // Re-read refs inside the lock immediately before any delete decision.
             const freshRefs = (await this.refs(repo)).filter(r => String(r.tree.id) === String(row.id.id));

@@ -120,6 +120,11 @@ export class SidecarPool {
     return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key };
   }
 
+  /** Instance ids this pool is currently answering for; everything else in comm/ is a dead channel. */
+  liveInstanceIds(): Set<string> {
+    return new Set([...this.active, ...this.quarantined, ...this.keys.keys()]);
+  }
+
   /** Absolute comm dir path for prompts — agents must never need to resolve env vars. */
   commDirFor(instId: string): string {
     return commDir(this.deps.runDir, instId);

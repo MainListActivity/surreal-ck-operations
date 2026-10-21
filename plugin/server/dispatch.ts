@@ -4,6 +4,9 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import { company, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
+import { join } from "node:path";
+import { serviceHome } from "./env";
+import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
 
 type ProviderUsageEntry = {
   providerId: string;
@@ -62,6 +65,9 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
 }
 
 let quotaRefreshedAt = 0;
+/** Lifecycle GC (dead comm channels + cold archive) runs on its own slow clock. */
+let gcRefreshedAt = 0;
+const GC_MS = 30 * 60_000;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -238,6 +244,29 @@ export function startDispatch(server: PluginServerContext): () => void {
     wake = () => { wake = undefined; clearTimeout(timer); resolve(); };
   });
 
+/** Removes leftovers the task-scoped artifact reclaim never sees; never touches task evidence. */
+async function runLifecycleGc(ctx: Company): Promise<void> {
+  const cfg = await ctx.workforce.config();
+  const now = new Date();
+  if (cfg.commDirGraceHours > 0) {
+    const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
+    const comm = await sweepInstanceDirs({
+      root: commRoot, now, graceMs: cfg.commDirGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
+    });
+    if (comm.removed.length) {
+      console.log(`lifecycle gc comm: removed ${comm.removed.length} dead channels (${(comm.bytes / 1048576).toFixed(1)} MB)`);
+    }
+  }
+  if (cfg.archiveRetentionDays > 0) {
+    const arch = await sweepArchiveBatches({
+      root: join(serviceHome(), "archive"), now, retentionMs: cfg.archiveRetentionDays * 86_400_000,
+    });
+    if (arch.removed.length) {
+      console.log(`lifecycle gc archive: removed ${arch.removed.length} batches (${(arch.bytes / 1048576).toFixed(1)} MB): ${arch.removed.join(", ")}`);
+    }
+  }
+}
+
   const loop = async () => {
     let failures = 0;
     while (!stopped) {
@@ -253,6 +282,10 @@ export function startDispatch(server: PluginServerContext): () => void {
         }
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
           await refreshModels(paseoHandle, ctx).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
+        }
+        if (Date.now() - gcRefreshedAt > GC_MS) {
+          gcRefreshedAt = Date.now();
+          await runLifecycleGc(ctx).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
         const report = await ctx.dispatcher.tick();
         failures = 0;
