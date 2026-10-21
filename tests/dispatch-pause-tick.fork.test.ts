@@ -70,7 +70,8 @@ async function startFork(name: string) {
     const makeTask = (title: string, extra: Record<string, unknown> = {}) => core.createTask(gm, {
       title, context: 'Synthetic dispatch-pause regression fixture; no real work.', executorRole: 'engineering', reviewerRole: 'qa',
       idempotencyKey: `tick-${title}-${crypto.randomUUID()}`, ...extra } as never);
-    return { core, owner, wf, db, gm, engineer, reviewer, pool: pool!, paseo, spawns, newDispatcher, passes, instRow, makeTask, close };
+    return { core, owner, wf, db, gm, engineer, reviewer, pool: pool!, paseo, spawns, newDispatcher, passes, instRow, makeTask, close,
+      url: `ws://127.0.0.1:${port}/rpc`, namespace: `pause_tick_${name.replaceAll('-', '_')}`, dir };
   } catch (error) {
     await close();
     throw error;
@@ -278,5 +279,44 @@ run('R-A regression: admin config can no longer set paused without the epoch, ga
       evidence: JSON.stringify({ source: 'admin config paused', value: false }) });
     expect(restored).toMatchObject({ operation: 'dispatch_restore', paused: false, epoch: 2 });
     expect((await w.core.claim(w.engineer, task.id)).task.state).toBe('doing');
+  } finally { await w.close(); }
+});
+
+run('R-A end to end: the admin CLI writes the pause through the transaction, refuses pause_epoch, and restores', async () => {
+  const w = await startFork('admin-cli');
+  try {
+    const cli = async (...args: string[]) => {
+      const child = Bun.spawn(['bun', join(import.meta.dir, '..', 'src', 'admin.ts'), ...args], {
+        cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
+        env: { ...process.env, SCK_PRODUCT_ENV: '/dev/null', SCK_CREDENTIAL_DIR: join(w.dir, 'cli-credentials'),
+          SURREAL_URL: w.url, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: ROOT_PASSWORD,
+          SCK_COMPANY_NS: w.namespace, SCK_COMPANY_DB: 'control_plane' },
+      });
+      const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { code: await child.exited, out, err };
+    };
+
+    const paused = await cli('config', 'paused', 'true');
+    expect(paused.code).toBe(0);
+    expect(paused.out).toContain('"operation": "dispatch_pause"');
+    expect(await readPauseState(w.db.db)).toMatchObject({ paused: true, epoch: 1 });
+    const [gate] = await w.db.db.query<[unknown]>('SELECT paused, epoch FROM ONLY company_meta:dispatch_gate;');
+    expect(gate).toMatchObject({ paused: true, epoch: 1 });
+    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
+      "SELECT action, actor, sequence FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] ORDER BY sequence;");
+    expect(audits).toMatchObject([{ action: 'dispatch_pause', actor: 'admin' }]);
+    // The epoch is not an operator-settable key: the CLI refuses it and points at the pause itself.
+    const epoch = await cli('config', 'pause_epoch', '7');
+    expect(epoch.code).not.toBe(0);
+    expect(epoch.err).toContain('dispatch_pause');
+    expect(await readPauseState(w.db.db)).toMatchObject({ paused: true, epoch: 1 });
+    // Other config keys still work unchanged.
+    const maxRunning = await cli('config', 'max_running', '3');
+    expect(maxRunning.code).toBe(0);
+    // And the same CLI restores it, moving the epoch again.
+    const restored = await cli('config', 'paused', 'false');
+    expect(restored.code).toBe(0);
+    expect(restored.out).toContain('"operation": "dispatch_restore"');
+    expect(await readPauseState(w.db.db)).toMatchObject({ paused: false, epoch: 2 });
   } finally { await w.close(); }
 });

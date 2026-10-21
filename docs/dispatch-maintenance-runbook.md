@@ -12,7 +12,7 @@
 2. 新版上线并通过 Q3 之后，维护停派只使用 dispatch_pause、dispatch_status、dispatch_restore（第 4 节）。
 3. 以下路径禁止用于维护停派：
    - 旧版布尔暂停：老板 UI 的暂停按钮、owner_command 的 pause 与 resume、宿主 RPC company.pause.set。
-   - `admin config paused`（见第 7 节第 4 条）。
+   - `admin config paused`：它现在经暂停事务写入纪元、闸门与审计（见第 7 节第 4 条），不再是绕过屏障的旁路；但没有比较并交换，也不等待排空，因此仍不作为维护停派手段。
    - `def_ensure` 写 enabled=false：它不拦截复用（见第 7 节第 6 条）。
 4. 禁止以 owner 身份、owner CLI、SQL、环境变量、token 或守护进程凭证绕过本手册的任何一步。
 5. 本手册描述的是 PR 合入 origin/main 之后的 release 切换。PR 未合入前，install 会拒绝该 release。
@@ -234,7 +234,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 1. ★ 陈旧 running 行。进程被强制结束时，pass 的 finally 不执行，行保持 running。OLD_RUNNING_PASSES（src/dispatch-pause.ts:114）不判断进程是否存活，清理只删除非 running 行（src/dispatch-pause.ts:177）。现有 fork 测试 `drain`（tests/dispatch-pause.fork.test.ts:134 起）已断言：只要旧 pass 未结束，drained 为 false，oldRunning 为 1。后果：每次插件重载或崩溃中断一个 pass 之后，之后所有 dispatch_pause 的 drained 都无法为 true。这是失败关闭，不会误报排空，但维护无法完成。建议：派工器启动时，把同一主机上 pid 已不存在的 running 行标记为 abandoned；无法判断的行保持 running。
 2. 无任务派工不经过租约闸门。GM 与 eval 的唤醒与 spawn 走 assign（src/dispatcher/dispatcher.ts:1504，调用点 :1251、:1280、:1336），没有 task，不调用 claimLease。它们只受 pass 级 gate（:934）与排空约束。drained 为 false 时，仍在运行的旧 pass 可能完成一次无任务唤醒或生成。
 3. 持有租约的员工继续续租、提交与复核，静默收尾提醒照常发出。暂停不停止在办任务。
-4. ★ admin config 可写 paused。src/admin.ts:189 的 `config <key> <json>` 接受任意小写键（校验见 :188），包括 paused，并直接 UPSERT company_meta:config。它不推进 pause_epoch，不写审计，不写 dispatch_gate，因此不参与 claimLease 的写冲突检测。禁止用于维护。建议：拒绝 paused 与 pause_epoch 两个键。
+4. admin config 的 paused 经暂停事务写入（本补修修复）。src/admin.ts 的 `config paused true|false` 现在调用 writePause，与经理暂停同一事务：暂停值、pause_epoch、company_meta:dispatch_gate 与审计行一起提交（actor 记为 admin，actor_role 为 operator）。因此它不再绕过屏障，也不与 claimLease 的写冲突检测脱节；`config pause_epoch` 被直接拒绝，并指向 dispatch_pause 或 owner 暂停入口。该路径仍没有比较并交换，也不等待排空，所以维护停派只使用 dispatch_pause、dispatch_status、dispatch_restore。回归：tests/dispatch-pause-tick.fork.test.ts 的 R-A 用例（写入推进纪元并留下闸门与审计行，暂停期间新租约被拒）。
 5. 老板路径（UI 按钮、owner_command 的 pause 与 resume）调用 owner.setPaused（src/owner.ts:319）。它同样经过 PAUSE_TXN（纪元、审计、gate），但不做比较并交换，也不排空。老板的恢复可以解除 GM 的暂停，这是设计。
 6. ★ 复用不检查 def.enabled。staffingPool 的复用分支（src/dispatcher/dispatcher.ts:233 至 :253）没有 def.enabled 检查，只有新建分支检查（:261）。因此 def_ensure 写 enabled=false 不是停派手段。本分支未改此行为，按决定保留披露。
 7. drainTimeoutSeconds 默认 120 秒是设计默认值，未在生产测量。
