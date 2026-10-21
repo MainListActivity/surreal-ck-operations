@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -210,6 +210,21 @@ interface TaskRow {
   superseded_by?: RecordId;
   lineage?: RecordId;
   revision_no?: number;
+}
+
+/** Compact row for the complete active-lease lookup; keeps task context text out of the recovery path. */
+interface ActiveLeaseRow {
+  id: RecordId;
+  state: TaskState;
+  executor_role: Role;
+  reviewer_role: ReviewerRole;
+  submitted_by?: string;
+  implementer?: string;
+  current_employee?: string;
+  delivery_id?: string;
+  lease_expires_at?: number;
+  fence: number;
+  version: number;
 }
 
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
@@ -457,6 +472,41 @@ export class SurrealCompanyCore implements CompanyCore {
        ORDER BY created_at DESC, id LIMIT $limit;`,
       { state, scoped, role: actor.role ?? '', ctx: LIST_CONTEXT_CHARS, limit: LIST_TASKS_LIMIT });
     return rows.filter(row => !(row.state === 'review' && row.submitted_by === actor.employeeId)).map(view);
+  }
+
+  /**
+   * Complete server-side truth for the current employee's live leases, doing and review.
+   * Deliberately not listTasks: that view is capped, previews task text, and hides rows the
+   * employee submitted, so a review lease at the back of the list would be lost on reload.
+   */
+  async activeLeases(credential: Credential): Promise<ActiveLease[]> {
+    const actor = await this.authorized(credential);
+    const [rows] = await this.db.query<[ActiveLeaseRow[]]>(
+      `SELECT id, state, executor_role, reviewer_role, submitted_by, implementer,
+              current_employee, delivery_id, lease_expires_at, fence, version
+         FROM task
+        WHERE current_employee = $employee
+          AND state IN ['doing', 'review']
+          AND delivery_id != NONE
+          AND lease_expires_at != NONE
+          AND lease_expires_at > time::unix(time::now());`,
+      { employee: actor.employeeId });
+    return (rows ?? []).flatMap(row => {
+      if (row.state !== 'doing' && row.state !== 'review') return [];
+      const role = row.state === 'review' ? row.reviewer_role : row.executor_role;
+      // A role change after the claim, or a review lease held by the submitter/implementer,
+      // is contradictory state: never rebuild it as a usable local claim.
+      if (role !== actor.role) return [];
+      if (row.state === 'review' && (row.submitted_by === actor.employeeId || row.implementer === actor.employeeId)) return [];
+      if (!row.delivery_id || !row.lease_expires_at || !Number.isSafeInteger(row.fence) || row.fence < 1 ||
+          !Number.isSafeInteger(row.version)) return [];
+      return [{
+        taskId: asId(row.id), state: row.state, deliveryId: row.delivery_id,
+        fence: row.fence, version: row.version,
+        leaseExpiresAt: new Date(row.lease_expires_at * 1000).toISOString(),
+        role: role as Role, currentEmployee: actor.employeeId,
+      }];
+    });
   }
 
   async getTask(credential: Credential, taskId: TaskId): Promise<TaskView> {

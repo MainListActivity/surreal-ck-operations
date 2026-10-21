@@ -277,6 +277,23 @@ export interface CreateTask {
   revises?: TaskId;
 }
 
+/**
+ * A complete, credential-scoped lease still active on the server for the authenticated employee.
+ * The sidecar uses this after a plugin reload instead of a list preview: lists are bounded and
+ * hide the employee's own review rows, so a trailing review lease would otherwise vanish.
+ */
+export interface ActiveLease {
+  taskId: TaskId;
+  state: 'doing' | 'review';
+  deliveryId: DeliveryId;
+  fence: number;
+  version: number;
+  leaseExpiresAt: string;
+  /** The role the holder acts under in this phase (executor for doing, reviewer for review). */
+  role: Role;
+  currentEmployee: EmployeeId;
+}
+
 export interface ClaimResult {
   task: TaskView;
   deliveryId: DeliveryId;
@@ -500,6 +517,12 @@ export interface CompanyCore {
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
+  /**
+   * Complete active leases (doing/review) held by the authenticated employee, with no list
+   * preview, pagination, output budget or self-review row filter. Optional for old adapters;
+   * a sidecar that needs to rebuild a lease after reload must fail closed without it.
+   */
+  activeLeases?(credential: Credential): Promise<ActiveLease[]>;
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;
   createTask(credential: Credential, input: CreateTask): Promise<TaskView>;
   claim(credential: Credential, taskId: TaskId): Promise<ClaimResult>;
