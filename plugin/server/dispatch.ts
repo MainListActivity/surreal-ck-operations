@@ -7,6 +7,7 @@ import { isCompanyAgent } from "./company-agent";
 import { dirname, join } from "node:path";
 import { serviceHome } from "./env";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
+import { missingFrom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
 
 type ProviderUsageEntry = {
   providerId: string;
@@ -159,6 +160,24 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   quotaRefreshedAt = Date.now();
   const usage = await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; });
   const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
+  // Paseo reports only the providers it drives (claude/codex/grok on this machine). Magpie holds
+  // every subscription the owner configured, so a provider whose allowance ran out is visible here
+  // even when Paseo never mentions it — that is how Factory's spent month stayed invisible until
+  // its sessions started failing. Paseo's numbers win wherever both report.
+  const magpie = await readMagpieQuotas().catch(() => undefined);
+  if (magpie?.length) {
+    const extra = missingFrom(providers, magpie);
+    if (extra.length) {
+      providers.push(...extra.map(entry => ({
+        providerId: entry.providerId,
+        displayName: entry.displayName,
+        planLabel: entry.planLabel,
+        status: entry.status,
+        windows: entry.windows.map(w => ({ id: w.id, label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt })),
+      })));
+      console.log(`quota refresh: +${extra.length} provider(s) from magpie (${extra.map(e => e.providerId).join(',')})`);
+    }
+  }
   if (!providers.length) {
     if (Date.now() - quotaEmptyLoggedAt > 300_000) {
       quotaEmptyLoggedAt = Date.now();
