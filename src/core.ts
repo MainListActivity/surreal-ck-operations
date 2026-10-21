@@ -14,7 +14,7 @@ import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoT
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
   ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createGithubActionsAdapter, criteriaForLeg,
-  defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs, isCodeDeliverable, loadAcceptanceEvidence,
+  acceptanceLegForSubject, defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs, isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
 } from './acceptance.ts';
@@ -696,11 +696,13 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.workIntent?.kind === 'code' && input.executorRole !== 'engineering') throw new CompanyError('invalid', 'Code writes require engineering');
     // SYS02 AC01: new code deliveries need structured criteria while the gate is enabled. Old rows stay valid because the
     // gate record is versioned and the evaluator marks pre-enablement rows legacy (AC06).
-    const acceptanceCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
+    let acceptanceCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
     const acceptanceGate = await loadAcceptanceGate(this.db);
-    if (acceptanceGate.enabled && acceptanceCriteria.length === 0 &&
-      isCodeDeliverable({ kind: input.kind ?? 'task', workIntent: input.workIntent })) {
-      throw new CompanyError('invalid', 'structured acceptanceCriteria are required for a new code delivery while the acceptance gate is enabled (SYS02 AC01)');
+    const trustedCode = isTrustedCodeDeliverable({ kind: input.kind ?? 'task', workIntent: input.workIntent });
+    if (acceptanceGate.enabled && trustedCode) {
+      // The server baseline is unremovable: custom criteria only supplement it (SYS02 C1).
+      acceptanceCriteria = mergeAcceptanceCriteria(
+        acceptanceLegForSubject({ kind: input.kind ?? 'task', workIntent: input.workIntent }), acceptanceCriteria);
     }
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
     const requiredTrack = REQUIRED_TRACKS[input.executorRole];
@@ -1888,6 +1890,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const specs = deliveryChain(input.title, input.spec);
     // SYS02: the delivery carries one versioned criteria set; each leg gets the criteria that name it, or its defaults.
     const explicitCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
+    const acceptanceGate = await loadAcceptanceGate(this.db);
     const acceptanceChain = HASH(`delivery\0${input.idempotencyKey}`).slice(0, 16);
     const legNames: AcceptanceLeg[] = ['implement', 'release', 'deploy'];
     // The legs are returned together: each echo gets an equal share of the item budget, so the whole answer fits (SYS01).
@@ -1899,7 +1902,11 @@ export class SurrealCompanyCore implements CompanyCore {
       // The leg is echoed once, below, at its share of the budget: an echo here too would cut its lists twice (SYS01 R3).
       const legName = legNames[index] ?? 'implement';
       const matching = explicitCriteria.length > 0 ? criteriaForLeg(explicitCriteria, legName) : [];
-      const acceptanceCriteria = matching.length > 0 ? matching : defaultAcceptanceCriteria(legName);
+      // Gate on: pass only the caller's matching criteria; createTaskRecord merges the unremovable baseline for this leg.
+      // Gate off: preserve the old default-criteria behaviour.
+      const acceptanceCriteria = acceptanceGate.enabled
+        ? matching
+        : (matching.length > 0 ? matching : defaultAcceptanceCriteria(legName));
       const task = await this.createTaskRecord(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
@@ -1986,6 +1993,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const verified = await this.acceptanceAdapter.verify({
       provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
       sha: input.sha, environment: input.environment, probe: input.source.probe,
+      verify: criterion.verify, risk: criterion.risk,
     });
     if (!verified.ok) {
       await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence_rejected', evidence: $evidence, at: time::now() };`,

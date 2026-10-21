@@ -136,17 +136,18 @@ fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveri
   expect(enabled).toMatchObject({ enabled: true, version: before.version + 1 });
   await expect(core.setAcceptanceGate(tokens.gm, { enabled: false, reason: 'stale', expectedVersion: before.version, idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'conflict' });
-  await expect(core.createTask(tokens.gm, { title: '缺 criteria', context: '启用后创建的新代码任务', executorRole: 'engineering',
-    reviewerRole: 'engineering', workIntent: { kind: 'code' }, idempotencyKey: key() }))
-    .rejects.toMatchObject({ code: 'invalid' });
+  // C1: a new code task without caller criteria gets the server baseline; it is not silently exempt.
+  const baselineTask = await core.createTask(tokens.gm, { title: '缺 criteria', context: '启用后创建的新代码任务', executorRole: 'engineering',
+    reviewerRole: 'engineering', workIntent: { kind: 'code' }, idempotencyKey: key() });
+  expect(baselineTask.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
   await expect(core.createDelivery(tokens.gm, { goalId: goal.id, title: '重复 id', spec: '重复 AC 必须被拒绝，不能静默去重。',
     acceptanceCriteria: [machine({ id: 'AC-1' }), machine({ id: 'AC-1' })], idempotencyKey: key() }))
     .rejects.toMatchObject({ code: 'invalid' });
   const [impl, release, deploy] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'SYS02 链', spec: '三腿共享版本化 criteria，按 legs 分配。',
     acceptanceCriteria: [machine({ id: 'AC-1' }), human({ id: 'AC-2', legs: ['implement'] })], idempotencyKey: key() });
   expect(impl.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-2']);
-  expect(release.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1']);
-  expect(deploy.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1']);
+  expect(release.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-BASE-RELEASE-2']);
+  expect(deploy.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-1', 'AC-BASE-DEPLOY-1', 'AC-BASE-DEPLOY-2']);
   expect(impl.acceptanceChain).toBe(release.acceptanceChain);
   // The legacy row keeps the old path: submit and accept without criteria after the gate is enabled.
   const claim = await core.claim(tokens['eng-a'], legacy.id);
@@ -154,6 +155,29 @@ fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveri
   const review = await core.claim(tokens['eng-b'], legacy.id);
   await core.accept(tokens['eng-b'], proofOf(review), { text: '独立复核旧任务，legacy 不伪造满足。', idempotencyKey: key() });
   expect((await core.getTask(tokens.gm, legacy.id)).state).toBe('done');
+});
+
+fork('SYS02 C1: custom optional or human-only criteria cannot remove the server baseline; zero evidence cannot reach review', async () => {
+  await ensureGate();
+  const goal = await goalFor();
+  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'C1 基线', spec: '自定义可选机器 AC 不得移除必需基线；零证据不得进入 review。',
+    acceptanceCriteria: [{ id: 'AC-OPTIONAL', kind: 'machine', required: false, layer: 'ci', evidence: 'ci-run', verify: 'ci' }], idempotencyKey: key() });
+  expect(impl.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-OPTIONAL', 'AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
+  const claim = await core.claim(tokens['eng-a'], impl.id);
+  await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '零可信机器证据的提交必须被服务端基线拒绝，不能进入复核。', idempotencyKey: key(), acceptance: { sha: 'optional-head' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  expect((await core.getTask(tokens.gm, impl.id)).state).toBe('doing');
+  await expect(core.createDelivery(tokens.gm, { goalId: goal.id, title: 'C1 降级', spec: '同 ID 的 required:false 不得覆盖服务端基线。',
+    acceptanceCriteria: [{ id: 'AC-BASE-IMPL-1', kind: 'machine', required: false, layer: 'ci', evidence: 'ci-run', verify: 'ci' }], idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  const [humanOnly] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'C1 仅人工', spec: '仅人工 AC 的集合仍必须补上必需机器 AC。',
+    acceptanceCriteria: [human({ id: 'AC-H' })], idempotencyKey: key() });
+  expect(humanOnly.acceptanceCriteria?.map(c => c.id)).toContain('AC-BASE-IMPL-1');
+  fake.setRun('12', 'optional-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'optional-head', '12');
+  await core.submit(tokens['eng-a'], proofOf(claim), { text: '补上可信 CI 证据后重新提交，等待独立复核签署人工基线。', idempotencyKey: key(), acceptance: { sha: 'optional-head' } });
+  const review = await core.claim(tokens['eng-b'], impl.id);
+  expect((await core.accept(tokens['eng-b'], proofOf(review), { text: '独立复核签署人工基线，确认机器证据绑定当前 head。', idempotencyKey: key() })).state).toBe('done');
 });
 
 fork('SYS02 AC02/AC03: evidence is server-verified and head-bound; submit and independent accept call the same evaluator', async () => {
@@ -204,7 +228,7 @@ fork('SYS02 AC05: report.md auto-submit and a missing head cannot bypass the sub
   await core.release(tokens['eng-a'], proofOf(claim), { text: '测试清理：被拒后释放租约，后续用例从干净状态开始。', idempotencyKey: key() });
 });
 
-fork('SYS02 AC03/AC05: Jev cannot sign a human AC; a machine-only release with verified evidence is auto-approved', async () => {
+fork('SYS02 AC03/AC05: the release baseline requires a human sign-off, so Jev cannot auto-approve a machine-only release', async () => {
   await ensureGate();
   // A standalone release task is ready. A create_delivery release leg waits for its implementation leg, which is not this test.
   const release = await core.createTask(tokens.gm, { title: 'Jev 机器链', context: 'release 只有机器 AC 时 Jev 可自动批准。',
@@ -214,8 +238,10 @@ fork('SYS02 AC03/AC05: Jev cannot sign a human AC; a machine-only release with v
   await recordEvidence(tokens['eng-a'], release.id, 'AC-1', 'rel-head', '2');
   await core.submit(tokens['eng-a'], proofOf(claim), { text: '上线申请：本 release 只有机器 AC，CI 已通过，无人工签署要求。', idempotencyKey: key(), acceptance: { sha: 'rel-head' } });
   const before = await core.getTask(tokens.gm, release.id);
-  expect(await workforce.jevAccept(release.id, before.version, 'Jev 测试：机器证据已核验。')).toBe(true);
-  expect((await core.getTask(tokens.gm, release.id)).state).toBe('done');
+  // The server release baseline adds AC-BASE-RELEASE-2 (human independent sign-off): Jev is a machine actor and is blocked.
+  expect(await workforce.jevAccept(release.id, before.version, 'Jev 测试：release 基线含人工签署。')).toBe(false);
+  expect((await core.getTask(tokens.gm, release.id)).state).toBe('review');
+  expect((await core.history(tokens.gm, release.id)).some(h => h.action === 'jev_acceptance_blocked')).toBe(true);
   const humanRelease = await core.createTask(tokens.gm, { title: 'Jev 人工链', context: 'release 带人工 AC，Jev 必须交运营。',
     kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
     acceptanceCriteria: [machine({ id: 'AC-1' }), human({ id: 'AC-9' })], idempotencyKey: key() });
@@ -260,6 +286,7 @@ fork('SYS02 AC04: a real in-progress probe satisfies a runtime AC; a post-job or
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('channel-ok') });
   try {
     fake.setRun('5', 'probe-head');
+    await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'probe-head', '5');
     const record = await runProbe({ kind: 'url', target: `http://127.0.0.1:${server.port}/` }, { GITHUB_RUN_ID: '5', GITHUB_JOB: 'probe' });
     expect(record).toMatchObject({ runId: '5', inProgress: true });
     fake.artifacts.set('probe-artifact', { expired: false, head: 'probe-head', runId: '5', record });
@@ -313,6 +340,7 @@ fork('SYS02 AC05: an expired artifact is refused; a live artifact of the same he
     idempotencyKey: key() });
   const claim = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('7', 'artifact-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'artifact-head', '7');
   fake.artifacts.set('a1', { expired: true, head: 'artifact-head' });
   await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
     taskId: impl.id, acId: 'AC-1', sha: 'artifact-head',

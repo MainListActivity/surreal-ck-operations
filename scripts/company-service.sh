@@ -104,6 +104,9 @@ case "$action" in
     # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
     # "nothing waits yet" as safe would race a defer that lands right after it.
     review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
+    # SYS02 C2: the same content-bound guard for the acceptance baseline, before the bin copies, the active symlink,
+    # the plugin repoint, the MCP restart or release pruning (and before the release gates, which are read-only).
+    acceptance_target_supported "$release" || { acceptance_refuse "$release"; exit 1; }
     check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     check_gate sidecar-review "$sha" || {

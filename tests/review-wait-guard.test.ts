@@ -129,3 +129,75 @@ test('the guard is a plain read-only script: no line writes, installs or restart
     expect(line, `side effect in guard: ${line}`).not.toMatch(/^(mkdir|rm|ln|cp|mv|launchctl|ssh|scp|sudo)\b/);
   }
 });
+
+// SYS02 C2: the acceptance baseline target guard. The fixture carries both the RW06 contract and the SYS02 baseline markers
+// because a real target must pass both guards; the old tree has neither acceptance file nor baseline declarations.
+const ACCEPTANCE = "export const ACCEPTANCE_BASELINE_VERSION = 1;\n"
+  + "export const BASELINE_IDS = { implement: { machine: 'AC-BASE-IMPL-1', human: 'AC-BASE-IMPL-2' } };\n"
+  + "export function mergeAcceptanceCriteria(leg: string, custom: unknown[]) { return custom; }\n"
+  + "export function isTrustedCodeDeliverable(subject: object) { return true; }\n"
+  + "if (trusted) criteria = mergeAcceptanceCriteria(leg, criteria);\n";
+const ACCEPTANCE_CORE = "const criteria = mergeAcceptanceCriteria(leg, custom);\nconst trusted = isTrustedCodeDeliverable(subject);\n";
+const ACCEPTANCE_DB = "await this.db.query(loadSchema('026-acceptance.surql'));\n// company_meta:acceptance_gate\n";
+const ACCEPTANCE_SCHEMA = "DEFINE FIELD IF NOT EXISTS acceptance_criteria ON task TYPE option<array<object>>;\nDEFINE TABLE IF NOT EXISTS acceptance_evidence SCHEMAFULL;\n";
+
+function acceptanceFiles(overrides: Record<string, string> = {}): Record<string, string> {
+  return {
+    'src/review-wait-capability.ts': CAPABILITY, 'src/core.ts': CORE + ACCEPTANCE_CORE, 'src/contracts.ts': CONTRACTS,
+    'src/acceptance.ts': ACCEPTANCE, 'src/database.ts': ACCEPTANCE_DB, 'schema/026-acceptance.surql': ACCEPTANCE_SCHEMA,
+    ...overrides,
+  };
+}
+function acceptanceTarget(overrides: Record<string, string> = {}, plugin: 'none' | 'vendor' | 'empty' = 'none'): string {
+  const dir = tree(acceptanceFiles(overrides));
+  if (plugin !== 'none') {
+    mkdirSync(join(dir, 'plugin', 'server'), { recursive: true });
+    if (plugin === 'vendor') {
+      for (const [path, body] of Object.entries(acceptanceFiles())) {
+        mkdirSync(join(dir, 'plugin', 'server', 'vendor', dirname(path)), { recursive: true });
+        writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
+      }
+    }
+  }
+  return dir;
+}
+
+test('the SYS02 target guard accepts a content-bound baseline target and refuses old or incomplete ones', () => {
+  const full = acceptanceTarget();
+  const withVendor = acceptanceTarget({}, 'vendor');
+  const emptyPlugin = acceptanceTarget({}, 'empty');
+  const old = tree({ 'src/mcp/run.ts': 'export {};\n' });
+  const noBaseline = acceptanceTarget({ 'src/acceptance.ts': 'export const OTHER = 1;\n' });
+  const commentOnly = acceptanceTarget({
+    'src/acceptance.ts': "// export const ACCEPTANCE_BASELINE_VERSION = 1;\n// export function mergeAcceptanceCriteria(leg, custom) {}\n// if (trusted) criteria = mergeAcceptanceCriteria(leg, criteria);\n",
+  });
+  const vendorOld = acceptanceTarget({});
+  mkdirSync(join(vendorOld, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
+  writeFileSync(join(vendorOld, 'plugin', 'server', 'vendor', 'src', 'acceptance.ts'), 'export const OTHER = 1;\n');
+  try {
+    expect(guard('acceptance_target_supported', full).code).toBe(0);
+    expect(guard('acceptance_target_supported', withVendor).code).toBe(0);
+    expect(guard('acceptance_target_supported', emptyPlugin, 'core').code).toBe(0);
+    expect(guard('acceptance_target_supported', emptyPlugin).code).not.toBe(0);
+    for (const dir of [old, noBaseline, commentOnly, vendorOld]) {
+      expect(guard('acceptance_target_supported', dir).code, dir).not.toBe(0);
+    }
+    const message = guard('acceptance_refuse', old).out;
+    expect(message).toContain('refused:');
+    expect(message).toContain('SYS02');
+    expect(message).toContain('row counts are not a safety proof');
+  } finally {
+    for (const dir of [full, withVendor, emptyPlugin, old, noBaseline, commentOnly, vendorOld]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('both switch entry points ask the SYS02 target guard before their first side effect', () => {
+  const service = readFileSync(SERVICE, 'utf8');
+  expect(service.indexOf('acceptance_target_supported "$release"')).toBeGreaterThan(0);
+  expect(service.indexOf('acceptance_target_supported "$release"')).toBeGreaterThan(service.indexOf('release_matches_commit "$release" "$sha" "$ops_repo"'));
+  expect(service.indexOf('acceptance_target_supported "$release"')).toBeLessThan(service.indexOf('mkdir -p "$service_home/bin"'));
+  expect(service.indexOf('acceptance_target_supported "$release"')).toBeLessThan(service.indexOf('ln -s "$release" "$service_home/active.next"'));
+  const deploy = readFileSync(DEPLOY, 'utf8');
+  expect(deploy.indexOf('acceptance_target_supported "$staging/probe" core')).toBeGreaterThan(0);
+  expect(deploy.indexOf('acceptance_target_supported "$staging/probe" core')).toBeLessThan(deploy.indexOf('ssh $ssh_opts'));
+});

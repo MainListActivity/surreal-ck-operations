@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'bun:test';
@@ -43,6 +43,14 @@ const REVIEW_WAIT_FILES = {
   'src/contracts.ts': 'export interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\n',
 };
 
+// SYS02 C2: the acceptance baseline contract the target guard requires (baseline declarations, the evaluator merge,
+// the schema/bootstrap link). A fixture target without it is refused before any install side effect.
+const ACCEPTANCE_FILES = {
+  'src/acceptance.ts': "export const ACCEPTANCE_BASELINE_VERSION = 1;\nexport const BASELINE_IDS = { implement: { machine: 'AC-BASE-IMPL-1', human: 'AC-BASE-IMPL-2' } };\nexport function mergeAcceptanceCriteria(leg, custom) { return custom; }\nexport function isTrustedCodeDeliverable(subject) { return true; }\nif (trusted) criteria = mergeAcceptanceCriteria(leg, criteria);\n",
+  'src/database.ts': "await this.db.query(loadSchema('026-acceptance.surql'));\n// company_meta:acceptance_gate\n",
+  'schema/026-acceptance.surql': "DEFINE FIELD IF NOT EXISTS acceptance_criteria ON task TYPE option<array<object>>;\nDEFINE TABLE IF NOT EXISTS acceptance_evidence SCHEMAFULL;\n",
+};
+
 function makeRelease(releases: string, sha: string, withGit = false, capable = true) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
@@ -51,12 +59,17 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-    for (const [path, body] of Object.entries(REVIEW_WAIT_FILES)) writeFileSync(join(dir, path), body);
+    const files = { ...REVIEW_WAIT_FILES, ...ACCEPTANCE_FILES };
+    mkdirSync(join(dir, 'schema'), { recursive: true });
+    for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
+    appendFileSync(join(dir, 'src', 'core.ts'), "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n");
     // The plugin surface runs the same core; its generated vendor must carry the contract too.
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
-    for (const [path, body] of Object.entries(REVIEW_WAIT_FILES)) {
+    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
+    for (const [path, body] of Object.entries(files)) {
       writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
     }
+    appendFileSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'core.ts'), "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n");
   }
   if (withGit) writeFileSync(join(dir, '.git'), 'gitdir: /tmp/company-service-test\n');
   return dir;

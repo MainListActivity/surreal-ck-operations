@@ -1,8 +1,9 @@
+import { createHash } from 'node:crypto';
 // SYS02 unit tests for the pure acceptance model: validation, defaults and the unified evaluator. No database.
 import { describe, expect, test } from 'bun:test';
 import {
   acceptanceError, createGithubActionsAdapter, criteriaForLeg, defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs,
-  validateAcceptanceCriteria, type AcceptanceActor, type AcceptanceSubject,
+  mergeAcceptanceCriteria, validateAcceptanceCriteria, type AcceptanceActor, type AcceptanceSubject,
 } from '../src/acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceRecord, AcceptanceGateView } from '../src/contracts.ts';
 import { CompanyError } from '../src/core-errors.ts';
@@ -40,6 +41,20 @@ describe('SYS02 acceptance criteria (AC01)', () => {
     expect(() => validateAcceptanceCriteria(Array.from({ length: 21 }, (_, i) => machine({ id: `AC-${i}` })))).toThrow(/20/);
   });
 
+  test('the server baseline cannot be removed or downgraded; a caller-set only supplements it', () => {
+    const optional = machine({ id: 'AC-OPTIONAL', required: false });
+    const merged = mergeAcceptanceCriteria('implement', [optional]);
+    expect(merged.map(criterion => criterion.id)).toEqual(['AC-OPTIONAL', 'AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
+    expect(() => mergeAcceptanceCriteria('implement', [machine({ id: 'AC-BASE-IMPL-1', required: false })])).toThrow(/baseline/);
+    expect(() => mergeAcceptanceCriteria('deploy', [human({ id: 'AC-BASE-RELEASE-2' })])).toThrow(/baseline ids/);
+    // A human-only or all-optional set still gets the required machine check.
+    expect(mergeAcceptanceCriteria('implement', [human()]).map(criterion => criterion.id)).toContain('AC-BASE-IMPL-1');
+    // The evaluator merges it too, so a row written before the fix cannot reach review without the machine evidence.
+    const verdict = verdictOf({ subject: subject({ acceptanceCriteria: [optional] }), evidence: [], phase: 'submit', actor: actor(), gate: gate() });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.unmet.some(item => item.acId === 'AC-BASE-IMPL-1')).toBe(true);
+  });
+
   test('defaults cover each delivery leg, and a leg filter keeps only criteria that name it or name no leg', () => {
     for (const leg of ['implement', 'release', 'deploy'] as const) {
       const defaults = defaultAcceptanceCriteria(leg);
@@ -57,8 +72,10 @@ describe('SYS02 unified evaluator (AC02/AC03/AC05)', () => {
   test('gate off allows old work as legacy; an enabled gate refuses a new code delivery with no criteria', () => {
     expect(verdictOf({ subject: subject({ acceptanceCriteria: undefined }), evidence: [], phase: 'submit', actor: actor(), gate: gate({ enabled: false }) }))
       .toMatchObject({ ok: true, legacy: true });
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: undefined }), evidence: [], phase: 'submit', actor: actor(), gate: gate() }))
-      .toMatchObject({ ok: false, unmet: [{ acId: '*', reason: 'structured-acceptance-criteria-required' }] });
+    const baselineOnly = verdictOf({ subject: subject({ acceptanceCriteria: undefined }), evidence: [], phase: 'submit', actor: actor(), gate: gate() });
+    expect(baselineOnly.ok).toBe(false);
+    expect(baselineOnly.criteria.map(criterion => criterion.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
+    expect(baselineOnly.unmet).toEqual([{ acId: 'AC-BASE-IMPL-1', reason: 'machine-evidence-missing-or-untrusted' }]);
     expect(verdictOf({ subject: subject({ kind: 'gate', workIntent: undefined, acceptanceCriteria: undefined }), evidence: [], phase: 'owner', actor: actor({ role: 'owner', owner: true }), gate: gate() }))
       .toMatchObject({ ok: true, notApplicable: true });
     expect(verdictOf({ subject: subject({ acceptanceCriteria: undefined, createdAt: '2026-10-20T00:00:00.000Z' }), evidence: [], phase: 'submit', actor: actor(), gate: gate() }))
@@ -80,16 +97,17 @@ describe('SYS02 unified evaluator (AC02/AC03/AC05)', () => {
 
   test('a human AC is pending at submit and must be signed by the authorized reviewer, never the submitter or a machine', () => {
     const criteria = [human()];
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [], phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(true);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [], phase: 'accept', actor: actor(), gate: gate() }).ok).toBe(true);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [], phase: 'accept', actor: actor({ employeeId: 'eng' }), gate: gate() }).unmet)
+    const machineEvidence = [row({ acId: 'AC-BASE-IMPL-1' })];
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: machineEvidence, phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(true);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: machineEvidence, phase: 'accept', actor: actor(), gate: gate() }).ok).toBe(true);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: machineEvidence, phase: 'accept', actor: actor({ employeeId: 'eng' }), gate: gate() }).unmet)
       .toEqual([{ acId: 'AC-2', reason: 'self-review' }]);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'qa' }), evidence: [], phase: 'accept', actor: actor(), gate: gate() }).unmet)
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'qa' }), evidence: machineEvidence, phase: 'accept', actor: actor(), gate: gate() }).unmet)
       .toEqual([{ acId: 'AC-2', reason: 'reviewer-role-mismatch' }]);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [], phase: 'release', actor: actor({ employeeId: 'jev', role: 'product', human: false }), gate: gate() }).unmet)
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: machineEvidence, phase: 'release', actor: actor({ employeeId: 'jev', role: 'product', human: false }), gate: gate() }).unmet)
       .toEqual([{ acId: 'AC-2', reason: 'human-signoff-required' }]);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'owner' }), evidence: [], phase: 'owner', actor: actor({ employeeId: 'owner', role: 'owner', owner: true }), gate: gate() }).ok).toBe(true);
-    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'owner' }), evidence: [], phase: 'owner', actor: actor({ role: 'product' }), gate: gate() }).unmet)
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'owner' }), evidence: machineEvidence, phase: 'owner', actor: actor({ employeeId: 'owner', role: 'owner', owner: true }), gate: gate() }).ok).toBe(true);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, reviewerRole: 'owner' }), evidence: machineEvidence, phase: 'owner', actor: actor({ role: 'product' }), gate: gate() }).unmet)
       .toEqual([{ acId: 'AC-2', reason: 'owner-signoff-required' }]);
   });
 
@@ -123,44 +141,66 @@ describe('SYS02 human sign-offs', () => {
 
 
 describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
+  const annotation = { title: 'acceptance-barrier', message: 'target-ready' };
+  const annotationHash = createHash('sha256').update(JSON.stringify(annotation)).digest('hex');
   const record = {
     probe: 'acceptance', runId: '42', jobId: 'probe', readAt: '2026-10-21T00:00:30.000Z', inProgress: true,
-    observationHash: 'a'.repeat(64), target: 'http://probe', kind: 'url', result: 'ok',
+    observationHash: annotationHash, target: 'o/r/Acceptance target/target', kind: 'running-channel', result: 'ok',
+    probeVersion: 'acceptance-probe/2', producerRunId: '42', targetRunId: '99', targetJobId: '77',
+    targetWorkflow: 'Acceptance target', targetStatus: 'in_progress', annotationHash,
   };
   const runLog: string[][] = [];
   const run = async (args: string[]): Promise<string> => {
     runLog.push(args);
     if (args[0] === 'run' && args[1] === 'view') {
-      return JSON.stringify({ headSha: 'head-1', status: 'completed', conclusion: 'success', workflowName: 'probe',
+      return JSON.stringify({ headSha: 'head-1', status: 'completed', conclusion: 'success', workflowName: 'Acceptance probe',
         createdAt: '2026-10-21T00:00:00.000Z', updatedAt: '2026-10-21T00:01:00.000Z' });
     }
     if (args[0] === 'api' && String(args[1]).includes('/actions/artifacts/7')) {
-      return JSON.stringify({ id: 7, name: 'acceptance-probe', expired: false, workflow_run: { id: 42, head_sha: 'head-1' } });
+      return JSON.stringify({ id: 7, name: 'acceptance-running', expired: false, workflow_run: { id: 42, head_sha: 'head-1' } });
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/actions/runs/99')) {
+      return JSON.stringify({ head_sha: 'head-1', run_started_at: '2026-10-21T00:00:05.000Z', updated_at: '2026-10-21T00:00:50.000Z', name: 'Acceptance target', path: '.github/workflows/acceptance-target.yml' });
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/77')) {
+      return JSON.stringify({ run_id: 99, head_sha: 'head-1', started_at: '2026-10-21T00:00:10.000Z', completed_at: '2026-10-21T00:00:40.000Z', check_run_url: 'https://api.github.com/repos/o/r/check-runs/77' });
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/check-runs/77/annotations')) {
+      return JSON.stringify({ annotations: [annotation] });
     }
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const readArtifact = async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(record) });
-  const base = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', artifactId: '7', sha: 'head-1' };
-  const probe = { runId: '42', jobId: 'probe', readAt: record.readAt, inProgress: true, observationHash: record.observationHash };
+  const base = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', artifactId: '7', sha: 'head-1', verify: 'probe:running-channel' };
+  const probe = { runId: '42', jobId: 'probe', readAt: record.readAt, inProgress: true, observationHash: annotationHash,
+    probeVersion: 'acceptance-probe/2', producerRunId: '42', targetRunId: '99', targetJobId: '77', kind: 'running-channel', annotationHash };
 
-  test('a probe is verified from its CI artifact, not from the caller record', async () => {
+  test('a probe is verified from its artifact and the target run/job window, not from the caller record', async () => {
     const adapter = createGithubActionsAdapter(run, readArtifact);
     expect(await adapter.verify({ ...base, probe })).toMatchObject({ ok: true });
-    // No artifact: a window-shaped caller record alone is refused.
     expect((await adapter.verify({ ...base, artifactId: undefined, probe })).ok).toBe(false);
-    // The caller's attested hash is not the artifact's record.
     expect((await adapter.verify({ ...base, probe: { ...probe, observationHash: 'b'.repeat(64) } })).ok).toBe(false);
-    // The artifact cannot be read or is of another run.
     expect((await adapter.verify({ ...base, artifactId: '8', probe })).ok).toBe(false);
-    // The artifact record read outside the run window.
     const late = { ...record, readAt: '2026-10-21T00:02:00.000Z' };
     const lateAdapter = createGithubActionsAdapter(run, async () => ({ name: 'late.json', content: JSON.stringify(late) }));
     expect((await lateAdapter.verify({ ...base, probe: { ...probe, readAt: late.readAt } })).ok).toBe(false);
-    // The artifact belongs to another run.
-    const otherRun = async (args: string[]) => args[0] === 'api'
-      ? JSON.stringify({ id: 8, name: 'acceptance-probe', expired: false, workflow_run: { id: 43, head_sha: 'head-1' } })
+    const otherRun = async (args: string[]) => args[0] === 'api' && String(args[1]).includes('/actions/artifacts/8')
+      ? JSON.stringify({ id: 8, name: 'acceptance-running', expired: false, workflow_run: { id: 43, head_sha: 'head-1' } })
       : run(args);
-    expect((await createGithubActionsAdapter(otherRun, readArtifact).verify({ ...base, probe })).ok).toBe(false);
+    expect((await createGithubActionsAdapter(otherRun, readArtifact).verify({ ...base, artifactId: '8', probe })).ok).toBe(false);
+    expect((await adapter.verify({ ...base, verify: 'probe:node-packed', probe })).ok).toBe(false);
     expect(runLog.some(args => args[0] === 'run' && args[1] === 'view')).toBe(true);
+  });
+
+  test('a Node packed probe is verified from its artifact and the Node/bundle fields', async () => {
+    const node = { ...record, kind: 'node-packed', nodeVersion: 'v22.14.0', bundleHash: 'c'.repeat(64), targetRunId: undefined, targetJobId: undefined, targetStatus: undefined, annotationHash: undefined };
+    const adapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(node) }));
+    const nodeBase = { ...base, verify: 'probe:node-packed', risk: 'packaging' };
+    const nodeProbe = { ...probe, kind: 'node-packed', targetRunId: undefined, targetJobId: undefined, annotationHash: undefined };
+    expect(await adapter.verify({ ...nodeBase, probe: nodeProbe })).toMatchObject({ ok: true });
+    expect((await adapter.verify({ ...nodeBase, risk: 'runtime', probe: nodeProbe })).ok).toBe(true);
+    const noVersion = { ...node, nodeVersion: undefined };
+    const noVersionAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(noVersion) }));
+    expect((await noVersionAdapter.verify({ ...nodeBase, probe: nodeProbe })).ok).toBe(false);
   });
 });

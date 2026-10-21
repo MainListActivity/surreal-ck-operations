@@ -97,11 +97,66 @@ export function defaultAcceptanceCriteria(leg: AcceptanceLeg): AcceptanceCriteri
   ];
 }
 
-/** Whether a task is a new code deliverable in the gate's scope. Release/deploy legs always are; a plain task is when it writes code. */
-export function isCodeDeliverable(subject: { kind?: TaskKind; workIntent?: WorkIntent; acceptanceCriteria?: AcceptanceCriterion[] }): boolean {
+/**
+ * The server-owned minimum for a new code delivery and each of its legs: one required machine CI check and one required
+ * real independent sign-off. Callers may only add criteria; a supplied set that omits, downgrades or leg-filters the
+ * minimum gets the missing baseline entries merged in (a baseline id with changed fields is refused). The baseline is
+ * derived from the trusted task kind/work intent, never from the caller's criteria, so an all-optional or human-only set
+ * cannot reclassify a code delivery.
+ */
+export const ACCEPTANCE_BASELINE_VERSION = 1;
+export const BASELINE_IDS: Record<AcceptanceLeg, { machine: string; human: string }> = {
+  implement: { machine: 'AC-BASE-IMPL-1', human: 'AC-BASE-IMPL-2' },
+  release: { machine: 'AC-BASE-RELEASE-1', human: 'AC-BASE-RELEASE-2' },
+  deploy: { machine: 'AC-BASE-DEPLOY-1', human: 'AC-BASE-DEPLOY-2' },
+  goal: { machine: 'AC-BASE-GOAL-1', human: 'AC-BASE-GOAL-2' },
+  owner: { machine: 'AC-BASE-OWNER-1', human: 'AC-BASE-OWNER-2' },
+};
+export function acceptanceLegForSubject(subject: { kind?: TaskKind; workIntent?: WorkIntent }): AcceptanceLeg {
+  if (subject.kind === 'release') return 'release';
+  if (subject.kind === 'deploy') return 'deploy';
+  return 'implement';
+}
+/** Trusted classification: kind and work intent only. Criteria cannot make a code delivery look like a non-code task. */
+export function isTrustedCodeDeliverable(subject: { kind?: TaskKind; workIntent?: WorkIntent }): boolean {
   if (subject.kind === 'release' || subject.kind === 'deploy') return true;
-  if (subject.kind === 'task' && subject.workIntent?.kind === 'code') return true;
-  return (subject.acceptanceCriteria ?? []).some(criterion => criterion.kind === 'machine');
+  return subject.kind === 'task' && subject.workIntent?.kind === 'code';
+}
+function baselineField(leg: AcceptanceLeg): { machineVerify: string; humanVerify: string; humanRisk: AcceptanceRisk } {
+  if (leg === 'deploy') return { machineVerify: 'deploy-run', humanVerify: 'qa-production', humanRisk: 'runtime' };
+  if (leg === 'release') return { machineVerify: 'ci', humanVerify: 'independent-release', humanRisk: 'code' };
+  if (leg === 'implement') return { machineVerify: 'ci', humanVerify: 'independent-review', humanRisk: 'code' };
+  return { machineVerify: 'ci', humanVerify: 'owner-acceptance', humanRisk: 'runtime' };
+}
+export function baselineAcceptanceCriteria(leg: AcceptanceLeg): AcceptanceCriterion[] {
+  const ids = BASELINE_IDS[leg];
+  const field = baselineField(leg);
+  return [
+    { id: ids.machine, kind: 'machine', required: true, layer: 'ci', evidence: 'ci-run', verify: field.machineVerify, risk: 'code',
+      description: `${leg} baseline: required machine CI evidence (server-owned)` },
+    { id: ids.human, kind: 'human', required: true, layer: 'manual', evidence: 'review-signoff', verify: field.humanVerify, risk: field.humanRisk,
+      description: `${leg} baseline: required real independent sign-off (server-owned)` },
+  ];
+}
+const baselineCovered = (criterion: AcceptanceCriterion, baseline: AcceptanceCriterion, leg: AcceptanceLeg): boolean =>
+  criterion.required && criterion.kind === baseline.kind && criterion.layer === baseline.layer &&
+  criterion.evidence === baseline.evidence && criterion.verify === baseline.verify &&
+  (!criterion.legs || criterion.legs.includes(leg));
+/** Merge the server baseline into a caller's set. A baseline id with different fields is a downgrade and is refused. */
+export function mergeAcceptanceCriteria(leg: AcceptanceLeg, custom: readonly AcceptanceCriterion[]): AcceptanceCriterion[] {
+  if (leg !== 'implement' && leg !== 'release' && leg !== 'deploy') return [...custom];
+  const baseline = baselineAcceptanceCriteria(leg);
+  const ids = new Set(baseline.map(item => item.id));
+  for (const criterion of custom) {
+    if (criterion.id.startsWith('AC-BASE-') && !ids.has(criterion.id)) {
+      throw invalid(`${criterion.id}: baseline ids are leg-scoped; use a normal AC id for a supplementary criterion`);
+    }
+    if (ids.has(criterion.id) && !baseline.some(item => item.id === criterion.id && baselineCovered(criterion, item, leg))) {
+      throw invalid(`${criterion.id}: the server-owned ${leg} baseline criterion cannot be replaced or downgraded`);
+    }
+  }
+  const missing = baseline.filter(item => !custom.some(criterion => baselineCovered(criterion, item, leg)));
+  return [...custom, ...missing];
 }
 
 /** The facts the evaluator reads. core builds this from a TaskRow; it is not a database object. */
@@ -170,22 +225,28 @@ export function acceptanceSubject(row: AcceptanceTaskRow, head?: string): Accept
  */
 export function evaluateAcceptance(input: AcceptanceInput): AcceptanceVerdict {
   const all = validateAcceptanceCriteria(input.subject.acceptanceCriteria);
-  const criteria = input.leg ? criteriaForLeg(all, input.leg) : all;
-  const base: Omit<AcceptanceVerdict, 'ok'> = {
+  const trusted = isTrustedCodeDeliverable(input.subject);
+  const leg = input.leg ?? acceptanceLegForSubject(input.subject);
+  let criteria = input.leg !== undefined || trusted ? criteriaForLeg(all, leg) : all;
+  const baseOf = (final: AcceptanceCriterion[]): Omit<AcceptanceVerdict, 'ok'> => ({
     phase: input.phase, gateEnabled: input.gate.enabled, legacy: false, notApplicable: false,
     criteriaVersion: input.gate.criteriaVersion, head: input.subject.acceptanceHead,
-    criteria, evidence: [...input.evidence], unmet: [],
-  };
-  if (!input.gate.enabled) return { ...base, ok: true, legacy: true };
-  const scope = isCodeDeliverable(input.subject);
+    criteria: final, evidence: [...input.evidence], unmet: [],
+  });
+  if (!input.gate.enabled) return { ...baseOf(criteria), ok: true, legacy: true };
+  const scope = trusted || all.some(criterion => criterion.kind === 'machine');
   if (criteria.length === 0) {
-    if (input.subject.acceptanceLegacy === true) return { ...base, ok: true, legacy: true };
-    if (!scope) return { ...base, ok: true, notApplicable: true };
+    if (input.subject.acceptanceLegacy === true) return { ...baseOf(criteria), ok: true, legacy: true };
+    if (!scope) return { ...baseOf(criteria), ok: true, notApplicable: true };
     const created = input.subject.createdAt ? Date.parse(input.subject.createdAt) : Number.NaN;
     const enabled = input.gate.enabledAt ? Date.parse(input.gate.enabledAt) : Number.NaN;
-    if (Number.isFinite(created) && Number.isFinite(enabled) && created < enabled) return { ...base, ok: true, legacy: true };
-    return { ...base, ok: false, unmet: [{ acId: '*', reason: 'structured-acceptance-criteria-required' }] };
+    if (Number.isFinite(created) && Number.isFinite(enabled) && created < enabled) return { ...baseOf(criteria), ok: true, legacy: true };
+    if (!trusted) return { ...baseOf(criteria), ok: false, unmet: [{ acId: '*', reason: 'structured-acceptance-criteria-required' }] };
   }
+  // The trusted minimum is merged at evaluation too, so a row written before this fix (for example a caller-supplied
+  // all-optional set) cannot reach review or done without the required machine evidence and independent sign-off.
+  if (trusted) criteria = mergeAcceptanceCriteria(leg, criteria);
+  const base = baseOf(criteria);
   const head = input.subject.acceptanceHead;
   const unmet: AcceptanceUnmet[] = [];
   for (const criterion of criteria) {
@@ -313,7 +374,15 @@ export async function recordAcceptanceEvidenceRow(db: Surreal, input: {
 
 // ---- The source adapter. The default reads GitHub Actions read-only through gh; tests inject a deterministic run registry. ----
 
-export interface ProbeRecord { runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string }
+export const ACCEPTANCE_PROBE_VERSION = 'acceptance-probe/2';
+export interface ProbeRecord {
+  runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string;
+  /** Trusted producer version; the real adapter refuses a record without it. */
+  probeVersion?: string;
+  /** The producer run and the target run/job it read while the target was in progress. */
+  producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string;
+  kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string;
+}
 export interface AcceptanceSourceInput {
   provider: 'github-actions';
   runUrl: string;
@@ -321,6 +390,9 @@ export interface AcceptanceSourceInput {
   sha: string;
   environment?: string;
   probe?: ProbeRecord;
+  /** The criterion's own verify/risk, so the adapter binds the probe kind/target to the AC it satisfies. */
+  verify?: string;
+  risk?: string;
 }
 export type AcceptanceVerifyResult =
   | { ok: true; sha: string; at: string; source: Record<string, unknown> }
@@ -412,6 +484,66 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
         if (input.probe.runId !== String(record.runId) || input.probe.inProgress !== record.inProgress ||
             input.probe.observationHash !== record.observationHash || Date.parse(input.probe.readAt) !== read) {
           return { ok: false, reason: 'the probe record does not match the CI artifact record' };
+        }
+        // A trusted probe is bound to its producer version, its criterion kind/risk, and (for a running channel) the actual
+        // target run/job whose in-progress window contains readAt. A local server, a fake adapter or a self-passed RUN_ID has
+        // no target run/job and is refused here.
+        if (record.probeVersion !== ACCEPTANCE_PROBE_VERSION) return { ok: false, reason: 'the probe record is not from the trusted probe version' };
+        const expectedKind = input.verify?.startsWith('probe:') ? input.verify.slice('probe:'.length) : undefined;
+        if (expectedKind !== undefined && record.kind !== expectedKind) {
+          return { ok: false, reason: `the probe kind ${record.kind ?? '?'} does not match the criterion verify ${input.verify}` };
+        }
+        if (input.risk === 'packaging' && record.kind !== 'node-packed') return { ok: false, reason: 'a packaging criterion needs the node-packed probe' };
+        if (record.kind === 'node-packed') {
+          if (typeof record.nodeVersion !== 'string' || !/^v\d+\./.test(record.nodeVersion)) return { ok: false, reason: 'the node-packed probe does not name the Node version' };
+          if (typeof record.bundleHash !== 'string' || !/^[0-9a-f]{64}$/.test(record.bundleHash)) return { ok: false, reason: 'the node-packed probe has no bundle hash' };
+        } else if (record.kind === 'running-channel') {
+          if (!record.targetRunId || !record.targetJobId || record.producerRunId !== runId) {
+            return { ok: false, reason: 'the running-channel probe is not bound to a producer and target run' };
+          }
+          if (record.targetStatus !== 'in_progress') return { ok: false, reason: 'the target was not in progress when read' };
+          let targetRun: { head_sha?: string; run_started_at?: string; updated_at?: string; name?: string; path?: string };
+          try {
+            targetRun = JSON.parse(await run(['api', `repos/${owner}/${repo}/actions/runs/${record.targetRunId}`]));
+          } catch (error) {
+            return { ok: false, reason: `the target run could not be read: ${(error as Error).message.slice(0, 160)}` };
+          }
+          if (targetRun.head_sha !== input.sha) return { ok: false, reason: 'the target run head is not the submitted sha' };
+          if (record.targetWorkflow && targetRun.name !== record.targetWorkflow && targetRun.path !== record.targetWorkflow) {
+            return { ok: false, reason: 'the target run is not the named target workflow' };
+          }
+          const targetStart = Date.parse(targetRun.run_started_at ?? '');
+          const targetEnd = Date.parse(targetRun.updated_at ?? '');
+          if (!Number.isFinite(targetStart) || !Number.isFinite(targetEnd) || read < targetStart || read > targetEnd) {
+            return { ok: false, reason: 'the probe read time is outside the target run window' };
+          }
+          let targetJob: { run_id?: number; head_sha?: string; started_at?: string; completed_at?: string | null; check_run_url?: string };
+          try {
+            targetJob = JSON.parse(await run(['api', `repos/${owner}/${repo}/actions/jobs/${record.targetJobId}`]));
+          } catch (error) {
+            return { ok: false, reason: `the target job could not be read: ${(error as Error).message.slice(0, 160)}` };
+          }
+          if (String(targetJob.run_id ?? '') !== record.targetRunId || targetJob.head_sha !== input.sha) {
+            return { ok: false, reason: 'the target job is not from the target run and head' };
+          }
+          const jobStart = Date.parse(targetJob.started_at ?? '');
+          const jobEnd = targetJob.completed_at ? Date.parse(targetJob.completed_at) : Number.POSITIVE_INFINITY;
+          if (!Number.isFinite(jobStart) || !(jobStart <= read && read <= jobEnd)) {
+            return { ok: false, reason: 'the probe read time is outside the target job in-progress window' };
+          }
+          const checkRun = /\/check-runs\/(\d+)/.exec(targetJob.check_run_url ?? '')?.[1] ?? record.targetJobId;
+          let annotations: { annotations?: Array<{ title?: string; message?: string }> };
+          try {
+            annotations = JSON.parse(await run(['api', `repos/${owner}/${repo}/check-runs/${checkRun}/annotations`]));
+          } catch (error) {
+            return { ok: false, reason: `the target annotations could not be read: ${(error as Error).message.slice(0, 160)}` };
+          }
+          const marker = (annotations.annotations ?? []).find(item => /acceptance-barrier/.test(item.title ?? '') || /target-ready/.test(item.message ?? ''));
+          if (!marker) return { ok: false, reason: 'the target annotation channel has no barrier marker' };
+          const annotationHash = createHash('sha256').update(JSON.stringify({ title: marker.title ?? '', message: marker.message ?? '' })).digest('hex');
+          if (annotationHash !== record.annotationHash) return { ok: false, reason: 'the target annotation hash does not match the record' };
+        } else {
+          return { ok: false, reason: 'the probe kind is unknown' };
         }
         at = record.readAt;
         verifiedProbe = record as unknown as Record<string, unknown>;
