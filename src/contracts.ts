@@ -376,6 +376,12 @@ export interface CompanyCore {
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /**
+   * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
+   * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
+   * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
+   */
+  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;
   /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
@@ -467,6 +473,7 @@ export interface DefView {
   maxInstances: number;
   priority: number;
   weight: number;
+  quotaLimited?: boolean;
 }
 
 /**
@@ -485,6 +492,8 @@ export interface EnsureDef {
   priority?: number;
   weight?: number;
   enabled?: boolean;
+  /** false = dispatched even when the subscription's remaining allowance is 0. Absent keeps the stored value. */
+  quotaLimited?: boolean;
 }
 
 export interface EmployeeScore {

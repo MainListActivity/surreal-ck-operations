@@ -33,6 +33,11 @@ export interface EmployeeDef {
   priority: number;
   /** 派工权重：同岗位候选中按 weight × 绩效系数 加权随机选取；0 = 永不主动选中。 */
   weight: number;
+  /**
+   * false = this def ignores quota-based dispatch gating: it is dispatched even when the
+   * subscription's remaining allowance is 0. Absent/true = limited (the default).
+   */
+  quotaLimited?: boolean;
   scored: number;
   avgScore?: number;
   errorStreak: number;
@@ -297,7 +302,7 @@ export class Workforce {
   }
 
   // ---- employee definitions ----
-  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean; quotaLimited?: boolean }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
@@ -316,16 +321,22 @@ export class Workforce {
     if (input.tracks !== undefined) {
       await this.db.query('UPDATE $def SET tracks = $tracks;', { def: id('employee_def', defId), tracks: input.tracks });
     }
+    // Written separately like tracks: an upsert that does not mention the flag keeps the stored
+    // value, so editing other fields can never silently re-apply the quota limit.
+    if (input.quotaLimited !== undefined) {
+      await this.db.query('UPDATE $def SET quota_limited = $q;', { def: id('employee_def', defId), q: input.quotaLimited });
+    }
   }
 
   async defs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
-      max_instances: number; priority: number; weight?: number; scored?: number; avg_score?: number; error_streak?: number };
+      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; scored?: number; avg_score?: number; error_streak?: number };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
       tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
-      weight: r.weight ?? 10, scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
+      weight: r.weight ?? 10, quotaLimited: r.quota_limited === false ? false : undefined,
+      scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
   }
 
   async defFailure(defId: string): Promise<number> {

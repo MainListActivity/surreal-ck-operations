@@ -165,6 +165,7 @@ export const registerDef = defineRpc({
     maxInstances: z.number().int().min(1).optional(),
     weight: z.number().int().min(0).optional(),
     enabled: z.boolean().optional(),
+    quotaLimited: z.boolean().optional(),
   }),
   output: z.object({ id: z.string() }),
 });

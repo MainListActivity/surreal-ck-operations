@@ -275,3 +275,33 @@ test('pool: screenwriter requires 编剧 on task and covering def for reuse and 
     states: new Map([['i1', 'idle']]), task: {} as StaffingInput['task'] }));
   expect(pool.every(e => e.eligible)).toBe(true);
 });
+
+test('pool: a def exempt from quota gating stays eligible at 0% and in provider cooldown', () => {
+  const exempt = def('d1', { quotaLimited: false });
+  const limited = def('d2');
+  const entries = staffingPool(base({
+    defs: [exempt, limited],
+    insts: [inst('i1', { def: 'd1' }), inst('i2', { def: 'd2' })],
+    states: new Map([['i1', 'idle'], ['i2', 'idle']]),
+    quotaBlocked: new Map([['codex', '额度不足（周/月额度 0%<2%）']]),
+    health: new Map([['codex', { provider: 'codex', state: 'exhausted', until: 2_000_000, failures: 1, lastError: 'model_usage_exhausted' }]]),
+  }));
+  const by = new Map(entries.map(e => [e.ref, e]));
+  expect(by.get('i1')!.eligible).toBe(true);
+  expect(by.get('d1')!.eligible).toBe(true);
+  expect(by.get('i2')!.eligible).toBe(false);
+  expect(by.get('d2')!.eligible).toBe(false);
+  expect(by.get('d2')!.code).toBe('quota');
+});
+
+test('pool: the seat cap still bounds an exempt def', () => {
+  const exempt = def('d1', { quotaLimited: false });
+  const entries = staffingPool(base({
+    defs: [exempt],
+    insts: [inst('i1', { def: 'd1' })],
+    states: new Map([['i1', 'idle']]),
+    health: new Map([['codex', { provider: 'codex', state: 'exhausted', until: 2_000_000, failures: 1 }]]),
+    busyBy: new Map([['codex', 3]]),
+  }));
+  expect(entries.every(e => !e.eligible && e.code === 'provider_capacity')).toBe(true);
+});

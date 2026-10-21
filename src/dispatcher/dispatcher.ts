@@ -56,13 +56,15 @@ export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyCo
 }
 
 /** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
-export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
+export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled' | 'quotaLimited'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
   const roles = new Map<string, RoleCapacity>();
   for (const def of defs.filter(d => d.enabled)) {
     const entry = roles.get(def.role) ?? { role: def.role, total: 0, usable: 0, down: [] };
     roles.set(def.role, entry); entry.total++;
     const h = health.get(def.provider);
-    const why = quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
+    // A def exempt from quota gating keeps its seat usable even while the subscription is out.
+    const why = def.quotaLimited === false ? undefined
+      : quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
     if (!why) entry.usable++;
     else if (!entry.down.some(d => d.startsWith(def.provider))) entry.down.push(`${def.provider} ${why}`);
   }
@@ -70,11 +72,14 @@ export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'pro
 }
 
 /** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
-export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>): boolean {
+export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>, quotaExempt = false): boolean {
+  const busy = busyBy.get(provider) ?? 0;
+  // An exempt def opts out of the quota/health gates but never out of the seat cap: seats are
+  // physical, and unbounded concurrency would starve every other def on the same provider.
+  if (quotaExempt) return busy < (providerMax[provider] ?? 1);
   if (quotaBlocked?.has(provider)) return false;
   const availability = availabilityOf(health.get(provider), now);
   if (availability === 'down') return false;
-  const busy = busyBy.get(provider) ?? 0;
   return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
 }
 
@@ -191,7 +196,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * A provider in quota or health cooldown: the percent floor (no provable recovery time), or the health cooldown, which
    * ends at its recorded `until` (server seconds). Quota, never concurrency-full.
    */
-  const quotaOf = (provider: string): Block | undefined => {
+  const quotaOf = (provider: string, exempt = false): Block | undefined => {
+    if (exempt) return undefined;
     const floor = p.quotaBlocked.get(provider);
     if (floor) return ['quota', floor];
     const health = p.health.get(provider);
@@ -214,18 +220,20 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const served = p.runtimeModels?.get(inst.id) ?? inst.model;
     return !target || !served || served === target;
   };
-  const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  const cap = (provider: string, exempt = false) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked, exempt);
   /**
    * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
-  const capHit = (provider: string): Block | undefined => {
-    const quota = quotaOf(provider);
-    if (quota) return quota;
-    if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
-      return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+  const capHit = (provider: string, exempt = false): Block | undefined => {
+    if (!exempt) {
+      const quota = quotaOf(provider);
+      if (quota) return quota;
+      if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
+        return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+      }
     }
-    return cap(provider) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
+    return cap(provider, exempt) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
   /**
    * Execute gate (engineering code work): only the bound implementer may take the task. An unreadable history and an
@@ -258,7 +266,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      capHit(inst.provider ?? '');
+      capHit(inst.provider ?? '', def?.quotaLimited === false);
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -274,7 +282,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
-      capHit(def.provider);
+      capHit(def.provider, def.quotaLimited === false);
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -396,6 +404,13 @@ export interface DispatcherDeps {
    * alone rather than turned into a retirement.
    */
   realignAgent?: (agentId: string, model: string) => Promise<boolean>;
+  /**
+   * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
+   * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
+   * failure that cannot be restarted). Returns true when the binding moved. Undefined disables the automatic successor:
+   * the block then names the manager's takeover instead.
+   */
+  autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
   /**
    * Terminal-task artifact reclaim (evidence/deliverables lifecycle). Bare call = periodic
    * normal-mode sweep; `{ targetFreeMb }` = pressure mode, oldest terminal work first until
@@ -789,9 +804,16 @@ export class Dispatcher {
     // Early warning: a subscription that is nearly spent still dispatches, but the owner hears
     // about it while there is time to top it up, instead of discovering it when the company stops.
     if (cfg.quotaWarnPct > 0) {
+      // A snapshot older than the breaker's own freshness window is no answer: the breaker fails
+      // open on it, and a warning built on it would state a number nobody verified. Stale rows
+      // raise no warning (an existing one clears as usual once the provider stops being listed).
+      const fresh = (q: ProviderQuota) => {
+        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
+        return age < 15 * 60_000;
+      };
       const low = new Set<string>();
       for (const q of quotaRows) {
-        if (quotaBlocked.has(q.provider)) continue;
+        if (quotaBlocked.has(q.provider) || !fresh(q)) continue;
         const pct = q.weeklyPct ?? q.lowestPct;
         if (pct === undefined || pct > cfg.quotaWarnPct) continue;
         low.add(q.provider);
@@ -854,6 +876,9 @@ export class Dispatcher {
           // still sitting in the old error state must not keep doubling it, or the provider is never probed.
           const known = health.get(inst.provider)?.state === 'exhausted';
           const fresh = previous === undefined ? !known : previous !== 'error';
+          // An exempt def keeps running through a spent subscription: its parked session is
+          // restarted on the normal retry interval instead of waiting out the provider cooldown.
+          const exempt = defs.find(d => d.id === inst.def)?.quotaLimited === false;
           if (fresh && !report.exhausted.includes(inst.provider)) {
             // A quota row that knows when the window resets beats the exponential backoff: the
             // provider is unusable until then, and probing earlier only burns another session.
@@ -861,14 +886,14 @@ export class Dispatcher {
             const resetsAtSec = resetsAt ? Math.floor(Date.parse(resetsAt) / 1000) : undefined;
             await wf.markExhausted(inst.provider, error, Number.isFinite(resetsAtSec) ? resetsAtSec : undefined);
             report.exhausted.push(inst.provider);
-            continue;
+            if (!exempt) continue;
           }
           // Not a fresh failure: the session has been parked in this error since an earlier turn,
           // and Paseo keeps it there until the underlying process restarts. Once the provider's
           // cooldown has passed, restart it in place — the agent, its conversation and its channel
           // survive, so the seat comes back without a retirement, a respawn or a new employee id.
-          const cooldownOver = !report.exhausted.includes(inst.provider) &&
-            availabilityOf(health.get(inst.provider), now) !== 'down';
+          const cooldownOver = exempt || (!report.exhausted.includes(inst.provider) &&
+            availabilityOf(health.get(inst.provider), now) !== 'down');
           if (cooldownOver && now - (this.reloadAt.get(inst.paseoAgentId) ?? 0) >= RELOAD_RETRY_SECONDS) {
             this.reloadAt.set(inst.paseoAgentId, now);
             try {
@@ -1036,8 +1061,9 @@ export class Dispatcher {
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
-    const usable = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))]
-      .filter(p => this.available(health.get(p), now) !== 'down' && !quotaBlocked.has(p));
+    const usable = [...new Set(defs.filter(d => d.enabled).filter(d =>
+      d.quotaLimited === false || (this.available(health.get(d.provider), now) !== 'down' && !quotaBlocked.has(d.provider)),
+    ).map(d => d.provider))];
     if ((work.length || gmBlocked.length) && usable.length === 0) {
       const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
         .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
@@ -1132,6 +1158,55 @@ export class Dispatcher {
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask, forReview = false,
       reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, forReview, undefined, reserved).flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    /**
+     * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
+     * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
+     * idle, exhausted and unknown are not struck: those recover on their own.
+     */
+    const struckImplementer = (employeeId: string): boolean => {
+      const inst = insts.find(i => i.id === employeeId);
+      return !inst || states.get(inst.id) === 'down';
+    };
+    /**
+     * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
+     * every other engineer out, so the work would wait forever on someone who is gone. The system hands the code to a
+     * live engineer of the same repository on its own — no manager, no owner decision — and the next pass dispatches to
+     * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
+     * here, so the caller leaves it to the next pass.
+     */
+    const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
+      const implementer = task.implementer;
+      if (!implementer || !struckImplementer(implementer)) return false;
+      const takeover = this.deps.autoTakeover;
+      if (takeover) {
+        let facts;
+        try {
+          facts = await wf.contributors(task.id);
+        } catch (error) {
+          this.log(`contributors read failed for ${task.id}: ${(error as Error).message}`);
+          await this.settleBlocked(task, 'execute', home, undefined, now, report);
+          return true;
+        }
+        // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
+        const excluded = new Set<string>([...facts.excluded, implementer]);
+        const successor = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+          .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
+          .map(entry => entry.key).sort()[0];
+        if (successor) {
+          const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
+            reason: `自动接替：原实现人 ${implementer} 的会话已失效（归档或不可恢复），系统把代码交给在岗工程员工` })
+            .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
+          if (moved) {
+            report.decisions.push(`auto-takeover:${task.id}=${successor}`);
+            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (session gone)`);
+            await this.clearBlocked(task, 'execute');
+            return true;
+          }
+        }
+      }
+      await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
+      return true;
+    };
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -1225,6 +1300,8 @@ export class Dispatcher {
     for (const item of work) {
       if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
+      // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && await replaceStruckImplementer(item.task, home)) continue;
       if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
         await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
         continue;

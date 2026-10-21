@@ -178,6 +178,23 @@ test('roster RPC: an instance the tick never observed is unknown, never reported
   } finally { sessions = idleSessions(); }
 });
 
+test('roster RPC: instance rows carry only the name, its def and the tick status', async () => {
+  const response = await callRoster();
+  for (const row of response.instances) expect(Object.keys(row).sort()).toEqual(['agentStatus', 'def', 'id']);
+});
+
+test('roster RPC: defs enabled with a live instance sort first, so truncation keeps actionable rows', async () => {
+  const idleDef: StaffingInput['defs'][number] = { id: 'no-instance', role: 'engineering', provider: 'grok', model: 'm',
+    enabled: true, maxInstances: 1, priority: 100, weight: 10, scored: 0, errorStreak: 0 };
+  const offDef: StaffingInput['defs'][number] = { ...idleDef, id: 'off', enabled: false };
+  // Input order: enabled-without-instance, disabled, then the fixture's enabled-with-instance def.
+  defs.splice(0, 0, idleDef, offDef);
+  try {
+    const response = await callRoster();
+    expect(response.defs.map(d => d.id)).toEqual(['d1', 'no-instance', 'off']);
+  } finally { defs.splice(0, 2); }
+});
+
 test('roster RPC: dispatch-blocked rows are the tick verdicts, with the notice summary', async () => {
   const verdict = evaluateDispatch({ taskId: task.id, title: task.title, phase: 'review', role: 'engineering', home: '/ops',
     entries: [{ key: 'author', eligible: false, code: 'author_recusal' }, { key: 'rework-submitter', eligible: false, code: 'author_recusal' }],
