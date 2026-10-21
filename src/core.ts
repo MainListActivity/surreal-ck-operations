@@ -1060,9 +1060,10 @@ export class SurrealCompanyCore implements CompanyCore {
   // ---- 受控编制管理工具（manage = gm/product） ----
   // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
 
-  private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight'>): DefView {
+  private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight' | 'quotaLimited'>): DefView {
     return { id: d.id, role: d.role, provider: d.provider, model: d.model, thinking: d.thinking,
-      tracks: d.tracks, enabled: d.enabled, maxInstances: d.maxInstances, priority: d.priority, weight: d.weight };
+      tracks: d.tracks, enabled: d.enabled, maxInstances: d.maxInstances, priority: d.priority, weight: d.weight,
+      quotaLimited: d.quotaLimited };
   }
 
   private async auditManage(actor: Principal, action: 'def_ensure' | 'project_disciplines_update', summary: Record<string, unknown>): Promise<void> {
@@ -1074,11 +1075,12 @@ export class SurrealCompanyCore implements CompanyCore {
   async listDefs(credential: Credential): Promise<DefView[]> {
     await this.authorized(credential, 'manage');
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[];
-      enabled?: boolean; max_instances?: number; priority?: number; weight?: number };
+      enabled?: boolean; max_instances?: number; priority?: number; weight?: number; quota_limited?: boolean };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY id;');
     return (rows ?? []).map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model,
       thinking: r.thinking ?? undefined, tracks: r.tracks ?? undefined, enabled: r.enabled !== false,
-      maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, weight: r.weight ?? 10 }));
+      maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, weight: r.weight ?? 10,
+      quotaLimited: r.quota_limited === false ? false : undefined }));
   }
 
   async ensureDef(credential: Credential, input: EnsureDef): Promise<DefView> {
@@ -1090,7 +1092,7 @@ export class SurrealCompanyCore implements CompanyCore {
     await this.workforce.upsertDef(input.id, input);
     await this.auditManage(actor, 'def_ensure', { def: input.id, role: input.role, provider: input.provider,
       model: input.model, thinking: input.thinking, tracks: input.tracks, maxInstances: input.maxInstances,
-      priority: input.priority, weight: input.weight, enabled: input.enabled });
+      priority: input.priority, weight: input.weight, enabled: input.enabled, quotaLimited: input.quotaLimited });
     const def = (await this.workforce.defs()).find(d => d.id === input.id);
     if (!def) throw new CompanyError('conflict', 'Definition write did not land');
     return SurrealCompanyCore.defView(def);

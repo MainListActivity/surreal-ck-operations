@@ -55,13 +55,15 @@ export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyCo
 }
 
 /** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
-export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
+export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled' | 'quotaLimited'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
   const roles = new Map<string, RoleCapacity>();
   for (const def of defs.filter(d => d.enabled)) {
     const entry = roles.get(def.role) ?? { role: def.role, total: 0, usable: 0, down: [] };
     roles.set(def.role, entry); entry.total++;
     const h = health.get(def.provider);
-    const why = quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
+    // A def exempt from quota gating keeps its seat usable even while the subscription is out.
+    const why = def.quotaLimited === false ? undefined
+      : quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
     if (!why) entry.usable++;
     else if (!entry.down.some(d => d.startsWith(def.provider))) entry.down.push(`${def.provider} ${why}`);
   }
@@ -69,11 +71,14 @@ export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'pro
 }
 
 /** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
-export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>): boolean {
+export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>, quotaExempt = false): boolean {
+  const busy = busyBy.get(provider) ?? 0;
+  // An exempt def opts out of the quota/health gates but never out of the seat cap: seats are
+  // physical, and unbounded concurrency would starve every other def on the same provider.
+  if (quotaExempt) return busy < (providerMax[provider] ?? 1);
   if (quotaBlocked?.has(provider)) return false;
   const availability = availabilityOf(health.get(provider), now);
   if (availability === 'down') return false;
-  const busy = busyBy.get(provider) ?? 0;
   return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
 }
 
@@ -190,7 +195,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * A provider in quota or health cooldown: the percent floor (no provable recovery time), or the health cooldown, which
    * ends at its recorded `until` (server seconds). Quota, never concurrency-full.
    */
-  const quotaOf = (provider: string): Block | undefined => {
+  const quotaOf = (provider: string, exempt = false): Block | undefined => {
+    if (exempt) return undefined;
     const floor = p.quotaBlocked.get(provider);
     if (floor) return ['quota', floor];
     const health = p.health.get(provider);
@@ -213,18 +219,20 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const served = p.runtimeModels?.get(inst.id) ?? inst.model;
     return !target || !served || served === target;
   };
-  const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  const cap = (provider: string, exempt = false) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked, exempt);
   /**
    * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
-  const capHit = (provider: string): Block | undefined => {
-    const quota = quotaOf(provider);
-    if (quota) return quota;
-    if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
-      return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+  const capHit = (provider: string, exempt = false): Block | undefined => {
+    if (!exempt) {
+      const quota = quotaOf(provider);
+      if (quota) return quota;
+      if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
+        return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+      }
     }
-    return cap(provider) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
+    return cap(provider, exempt) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
   /**
    * Execute gate (engineering code work): only the bound implementer may take the task. An unreadable history and an
@@ -257,7 +265,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      capHit(inst.provider ?? '');
+      capHit(inst.provider ?? '', def?.quotaLimited === false);
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -273,7 +281,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
-      capHit(def.provider);
+      capHit(def.provider, def.quotaLimited === false);
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -845,6 +853,9 @@ export class Dispatcher {
           // still sitting in the old error state must not keep doubling it, or the provider is never probed.
           const known = health.get(inst.provider)?.state === 'exhausted';
           const fresh = previous === undefined ? !known : previous !== 'error';
+          // An exempt def keeps running through a spent subscription: its parked session is
+          // restarted on the normal retry interval instead of waiting out the provider cooldown.
+          const exempt = defs.find(d => d.id === inst.def)?.quotaLimited === false;
           if (fresh && !report.exhausted.includes(inst.provider)) {
             // A quota row that knows when the window resets beats the exponential backoff: the
             // provider is unusable until then, and probing earlier only burns another session.
@@ -852,14 +863,14 @@ export class Dispatcher {
             const resetsAtSec = resetsAt ? Math.floor(Date.parse(resetsAt) / 1000) : undefined;
             await wf.markExhausted(inst.provider, error, Number.isFinite(resetsAtSec) ? resetsAtSec : undefined);
             report.exhausted.push(inst.provider);
-            continue;
+            if (!exempt) continue;
           }
           // Not a fresh failure: the session has been parked in this error since an earlier turn,
           // and Paseo keeps it there until the underlying process restarts. Once the provider's
           // cooldown has passed, restart it in place — the agent, its conversation and its channel
           // survive, so the seat comes back without a retirement, a respawn or a new employee id.
-          const cooldownOver = !report.exhausted.includes(inst.provider) &&
-            availabilityOf(health.get(inst.provider), now) !== 'down';
+          const cooldownOver = exempt || (!report.exhausted.includes(inst.provider) &&
+            availabilityOf(health.get(inst.provider), now) !== 'down');
           if (cooldownOver && now - (this.reloadAt.get(inst.paseoAgentId) ?? 0) >= RELOAD_RETRY_SECONDS) {
             this.reloadAt.set(inst.paseoAgentId, now);
             try {
@@ -1027,8 +1038,9 @@ export class Dispatcher {
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
-    const usable = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))]
-      .filter(p => this.available(health.get(p), now) !== 'down' && !quotaBlocked.has(p));
+    const usable = [...new Set(defs.filter(d => d.enabled).filter(d =>
+      d.quotaLimited === false || (this.available(health.get(d.provider), now) !== 'down' && !quotaBlocked.has(d.provider)),
+    ).map(d => d.provider))];
     if ((work.length || gmBlocked.length) && usable.length === 0) {
       const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
         .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
