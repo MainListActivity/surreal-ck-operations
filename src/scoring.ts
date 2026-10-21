@@ -155,6 +155,22 @@ export async function writeScorecards(
   return { recorded: written.size, participants: input.state.participants };
 }
 
+/**
+ * Recomputes every aggregate the scoring path writes, from the scorecards alone. writeScorecards records the cards and
+ * marks the task evaluated before it rolls the averages; a failure in that last step (a row the schema refuses, a
+ * timeout) leaves `scored`/`avg_score` one run behind, and recordScore's early return on `evaluated_at` means no retry
+ * repairs them. This is the repeatable repair entry: idempotent, reads scorecards, writes only the two aggregate columns.
+ */
+export async function rescoreAggregates(db: Surreal): Promise<{ employees: number; defs: number }> {
+  const [empRows] = await db.query<[Array<{ employee: string }>]>('SELECT employee FROM scorecard GROUP BY employee;');
+  const [defRows] = await db.query<[Array<{ def: string }>]>('SELECT def FROM scorecard WHERE def IS NOT NONE GROUP BY def;');
+  const employees = [...new Set((empRows ?? []).map(r => String(r.employee ?? '')).filter(Boolean))];
+  const defs = [...new Set((defRows ?? []).map(r => String(r.def ?? '')).filter(Boolean))];
+  for (const key of employees) await rescore(db, 'employee', key, 'employee');
+  for (const key of defs) await rescore(db, 'employee_def', key, 'def');
+  return { employees: employees.length, defs: defs.length };
+}
+
 export async function rescore(db: Surreal, table: 'employee' | 'employee_def', key: string, scoreField: 'employee' | 'def'): Promise<void> {
   const [[agg]] = await db.query<[[{ avg?: number; n?: number }]]>(
     `SELECT math::mean(overall) AS avg, count() AS n FROM scorecard WHERE ${scoreField} = $key GROUP ALL;`, { key });

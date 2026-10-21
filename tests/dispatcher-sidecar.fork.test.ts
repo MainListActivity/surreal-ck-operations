@@ -225,7 +225,9 @@ async function startCompanyFork(name: string) {
     core, owner, wf, db, gm, agentRows, errors, envs, relay,
     /** One real tick on a fresh dispatcher, as the existing fork tests run it. */
     tick: async () => {
-      last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0, env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
+      last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
+        autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
+        env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
       return last.tick();
     },
     verdicts: () => last?.dispatchVerdicts() ?? [],
@@ -442,6 +444,134 @@ run('company fork: legacy authors without a recorded implementer fail closed, th
     await expect(w.core.claim(fresh.credential!, task.id)).rejects.toMatchObject({ code: 'forbidden' });
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
     expect((await w.tick()).woke.find(x => x.task === task.id)).toBeUndefined();
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R7 (AC07): the bound implementer's session ends for good (archived). No manager is involved: the tick hands the
+// code to a live engineer of the same repository on its own, the audit row records the system actor, and the successor
+// delivers without a manager takeover. With nobody available the same block waits instead of assigning.
+run('company fork: an archived implementer is replaced by the system on its own, and the successor delivers', async () => {
+  const w = await startCompanyFork('auto-successor');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-eng-grok', { role: 'engineering', provider: 'grok', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'the struck implementer is replaced by the system', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).filter(i => i.role === 'engineering').find(i => i.provider === 'codex')!;
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id, implementer: A.id });
+    // A second engineer appears and finishes its own work first, so it is live, idle and free for handover.
+    const warm = await w.core.createTask(w.gm, { title: 'the second engineer finishes its own work first', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto-warm' });
+    expect((await w.tick()).woke.find(x => x.task === warm.id)?.spawned).toBe(true);
+    const C = (await w.wf.insts()).filter(i => i.role === 'engineering').find(i => i.provider === 'grok')!;
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery by the second engineer', idempotencyKey: 'auto-warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up task', idempotencyKey: 'auto-warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // A's session ends normally: Paseo reports it archived, the employee record stays while its task is open, and the
+    // retirement gate refuses to drop the session (the task is bound to it).
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    const replaced = await w.tick();
+    expect(replaced.refused).toContain(A.id);
+    expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: C.id });
+    // The system acted, and the record says so: no manager credential was involved.
+    const audit = await w.db.db.query<[Array<{ actor: string; action: string; evidence: string; at: string }>]>(
+      `SELECT actor, action, evidence, at FROM audit WHERE task = $task AND action = 'implementer_takeover';`,
+      { task: new RecordId('task', task.id) });
+    const lastTakeover = [...(audit[0] ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))).at(-1);
+    expect(lastTakeover).toMatchObject({ actor: 'system:dispatcher' });
+    expect(lastTakeover?.evidence).toContain('[implementer_takeover:auto]');
+    // The next pass wakes the successor, which delivers and is reviewed by the same independent reviewer.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery by the automatic successor', idempotencyKey: 'auto-successor-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    expect((await w.tick()).woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: B.id })]);
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review after the automatic successor', idempotencyKey: 'auto-successor-accept' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'done', implementer: C.id });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts.implementer).toBe(C.id);
+    expect(facts.authors).toContain(A.id);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R7: with no live candidate the same conclusion waits by itself — nothing is assigned and the copy names the
+// system, never the manager.
+run('company fork: a struck implementer with no live candidate waits on a system block, and the manager is never asked', async () => {
+  const w = await startCompanyFork('auto-successor-none');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'no successor is available yet', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto-none' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    const stuck = await w.tick();
+    expect(stuck.woke.filter(x => x.task === task.id)).toHaveLength(0);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: A.id });
+    const verdict = w.verdicts().find(v => v.taskId === task.id && v.phase === 'execute')!;
+    expect(verdict.dispatchable).toBe(false);
+    const reason = verdict.reasons.find(r => r.code === 'implementer_unavailable')!;
+    expect(reason).toMatchObject({ owner: 'system' });
+    expect(reason.text).toContain('系统自动改派');
+    expect(reason.actions[0]).toMatchObject({ authority: 'system', executable: false });
+    expect(reason.recovery).toContain('无需经理');
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R7(c): a task that never recorded an explicit implementer derives one from its contribution history. When that
+// sole author is gone from the roster (a retirement that predates the rotation guard), the system hands the code to a live
+// engineer on its own — the same automatic successor, now resolved through the execute gate instead of the task field.
+run('company fork: a derived implementer who is gone is replaced by the system on its own', async () => {
+  const w = await startCompanyFork('auto-derived');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    // A live engineer finishes a warm-up task first, so it is idle and free for the handover.
+    const warm = await w.core.createTask(w.gm, { title: 'warm-up for the successor', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived-warm' });
+    expect((await w.tick()).woke.find(x => x.task === warm.id)?.spawned).toBe(true);
+    const C = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery', idempotencyKey: 'derived-warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up', idempotencyKey: 'derived-warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // The task never recorded an explicit implementer: the only contributor is an employee gone from the roster.
+    const task = await w.core.createTask(w.gm, { title: 'derived implementer is gone', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived' });
+    const gone = new RecordId('employee', 'engineering-gone-000');
+    await w.db.db.query(`CREATE audit CONTENT { task: $task, actor: $gone, action: 'claim', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $gone, action: 'checkpoint', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };`,
+      { task: new RecordId('task', task.id), gone });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts).toMatchObject({ implementer: 'engineering-gone-000', ambiguous: false });
+    expect(facts.authors).toEqual(['engineering-gone-000']);
+    // The tick replaces the gone implementer by the system and reports the decision; nobody needed to be asked.
+    const replaced = await w.tick();
+    expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: C.id });
+    const audit = await w.db.db.query<[Array<{ actor: string; evidence: string; at: string }>]>(
+      `SELECT actor, evidence, at FROM audit WHERE task = $task AND action = 'implementer_takeover';`,
+      { task: new RecordId('task', task.id) });
+    const last = [...(audit[0] ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))).at(-1);
+    expect(last).toMatchObject({ actor: 'system:dispatcher' });
+    expect(last?.evidence).toContain('[implementer_takeover:auto]');
+    // The next pass hands the work to the successor.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
   } finally {
     await w.close();
   }

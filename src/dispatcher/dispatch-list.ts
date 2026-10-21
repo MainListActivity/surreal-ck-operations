@@ -33,7 +33,7 @@ export interface ReasonRow {
   text: string;
   candidates: string[];
   candidatesOmitted?: number;
-  owner: 'gm' | 'owner';
+  owner: 'gm' | 'owner' | 'system';
   basis: string;
   recovery: string;
   actions: RecoveryAction[];
