@@ -680,7 +680,7 @@ test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a buil
   const make = (owner: string) => store.create({ owner, kind: 'context', digest: `dig-${owner}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] });
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) => make(`q-${index}`));
   await Bun.sleep(300);
-  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
   const started = performance.now();
   const refused = await make('q-extra').then(() => undefined, (reason: unknown) => reason);
   const elapsed = performance.now() - started;
@@ -693,9 +693,10 @@ test('(q) at most MAX_BUILD_CONNECTIONS builds hold a connection at once: a buil
   expect(elapsed).toBeLessThan(3_500);
   const headers = await Promise.all(holding);
   expect(headers.map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
-  // A build frees its slot once its connection has closed, in the background: the caller never waits for that close.
+  // This test's channel wraps each socket and exposes no release, so the sockets close when the builds end (as before); the slot is
+  // freed either way. Warm-socket reuse through the real channel is covered by (y).
   await settled(() => db.buildConnectionStats().slotsInUse === 0, 6_000);
-  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, queued: 0 });
+  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, idle: 0, queued: 0 });
   expect(await store.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
 });
 
@@ -717,7 +718,7 @@ test('(r) a release is not held back by saturated build slots: with every slot t
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
     store.create({ owner: `r-${index}`, kind: 'context', digest: `dig-r-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
   await Bun.sleep(300);
-  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
   const started = performance.now();
   expect(await plain.release(kept.id)).toBe('released');
   expect(performance.now() - started).toBeLessThan(2_000);
@@ -743,15 +744,35 @@ test('(s) a release whose connection opens only after its deadline still marks t
   expect(await plain.census()).toEqual({ listings: 0, rows: 0 });
 });
 
-test('(t) the default limits are the reviewed ones: 5000 rows, 8 MiB per listing, 4 per identity, 64 listings, 64 MiB, 64 KiB batches, a 10 second build deadline, a 5 second hedge, 4 build connections, a 3 second cleanup budget and a 13 second reply ceiling', () => {
+test('(t) the default limits are the reviewed ones: 5000 rows, 8 MiB per listing, 4 per identity, 64 listings, 64 MiB, 256 KiB batches, a 10 second build deadline, a 5 second hedge, 4 build connections, a 3 second cleanup budget and a 13 second reply ceiling', () => {
   expect(DEFAULT_SNAPSHOT_LIMITS).toMatchObject({
     maxRows: 5000, maxBytes: 8 * KB * KB, maxPerOwner: 4, maxListings: 64, maxTotalBytes: 64 * KB * KB,
-    batchBytes: 64 * KB, buildDeadlineMs: 10_000, loadHedgeMs: 5_000,
+    // 256 KiB: a high-latency WSS link is dominated by round trips, so fewer, larger batches answer sooner (SYS01 AC02).
+    batchBytes: 256 * KB, buildDeadlineMs: 10_000, loadHedgeMs: 5_000,
   });
   expect(MAX_BUILD_CONNECTIONS).toBe(4);
   // Everything a listing caller waits for after its build deadline ends within the cleanup budget, so the reply is bounded.
   expect(CLEANUP_BUDGET_MS).toBe(3_000);
   expect(REPLY_CEILING_MS).toBe(13_000);
+});
+
+test('(y) a finished build keeps its socket warm and the next build reuses it, so the second first page skips the handshake', async () => {
+  // The real channel: `fresh()`'s default channel has no release, so a build there closes its socket as before.
+  const { db } = await fresh();
+  const store = new SnapshotStore(db.db, { reserveWaitMs: 10_000 }, { channel: db.buildChannel, releaseChannel: db.releaseChannel });
+  const baseline = await quotaOf(store);
+  const first = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y1', role: 'gm', takenAt: TAKEN_AT, bodies: ['one'] });
+  // The build returned its socket to the pool instead of closing it; its slot is already free for the next build.
+  await settled(() => db.buildConnectionStats().idle === 1, 3_000);
+  expect(db.buildConnectionStats()).toEqual({ open: 1, slotsInUse: 0, idle: 1, queued: 0 });
+  const second = await store.create({ owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'gm', takenAt: TAKEN_AT, bodies: ['two'] });
+  // A reused socket leaves the open count at one; a fresh connection would have made it two.
+  expect(db.buildConnectionStats()).toEqual({ open: 1, slotsInUse: 0, idle: 1, queued: 0 });
+  expect(await store.read({ id: second.id, owner: 'y-owner', kind: 'context', digest: 'dig-y2', role: 'gm', after: 0, limit: 10 }))
+    .toMatchObject({ header: { rows: 1 }, rows: [{ seq: 1, body: 'two' }] });
+  expect(await store.release(first.id)).toBe('released');
+  expect(await store.release(second.id)).toBe('released');
+  expect(await quotaOf(store)).toEqual(baseline);
 });
 
 test('(u) a reserved listing whose commit stalls is cut at the deadline: its room is released, nothing is kept, and the caller is answered at the deadline', async () => {
@@ -895,7 +916,7 @@ test('(x) a build queued behind saturated build slots is cut at its own deadline
   const holding = Array.from({ length: MAX_BUILD_CONNECTIONS }, (_, index) =>
     holdingStore.create({ owner: `x-${index}`, kind: 'context', digest: `dig-x-${index}`, role: 'gm', takenAt: TAKEN_AT, bodies: ['x'] }));
   await Bun.sleep(300);
-  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, queued: 0 });
+  expect(db.buildConnectionStats()).toEqual({ open: MAX_BUILD_CONNECTIONS, slotsInUse: MAX_BUILD_CONNECTIONS, idle: 0, queued: 0 });
   // A build with a 1-second deadline waits in the queue for a slot, which the queue would grant only after 2 seconds.
   const queued = new SnapshotStore(db.db, { reserveWaitMs: 10_000, buildDeadlineMs: 1_000 }, { channel: db.buildChannel });
   const started = performance.now();
@@ -908,8 +929,9 @@ test('(x) a build queued behind saturated build slots is cut at its own deadline
   expect(elapsed).toBeGreaterThanOrEqual(1_300);
   expect(elapsed).toBeLessThan(1_900);
   expect((await Promise.all(holding)).map(header => header.rows)).toEqual(Array(MAX_BUILD_CONNECTIONS).fill(1));
-  // The queued build's wait ends with the queue (2 seconds) and its entry leaves the queue; no connection is left behind.
+  // The queued build's wait ends with the queue (2 seconds) and its entry leaves the queue; this test's channel exposes no
+  // release, so the holding sockets closed and nothing is left behind.
   await Bun.sleep(2_200);
-  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, queued: 0 });
+  expect(db.buildConnectionStats()).toEqual({ open: 0, slotsInUse: 0, idle: 0, queued: 0 });
   expect(await holdingStore.census()).toEqual({ listings: MAX_BUILD_CONNECTIONS, rows: MAX_BUILD_CONNECTIONS });
 });

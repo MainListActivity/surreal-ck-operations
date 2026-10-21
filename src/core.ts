@@ -1084,19 +1084,23 @@ export class SurrealCompanyCore implements CompanyCore {
       'retry with {"pageSize":10} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false; read the evidence of one large entry with read_task_text {"taskId","field":"evidence","auditId","offset":0}, then offset = nextOffset with the expectSha256 of the first segment');
   }
 
+  /** The cursor secret read once per process: the row never changes, and one round trip per page was pure fixed cost. */
+  private cursorKeyCache?: Buffer;
+
   /** Per-key cursor secret: one row in company_meta, created on first use and never returned to callers. */
   private async cursorKey(): Promise<Buffer> {
+    if (this.cursorKeyCache) return this.cursorKeyCache;
     const record = id('company_meta', 'cursor_key');
     const existing = await this.db.select<{ key?: string }>(record);
-    if (existing?.key) return Buffer.from(existing.key, 'base64url');
+    if (existing?.key) return (this.cursorKeyCache = Buffer.from(existing.key, 'base64url'));
     const key = randomBytes(32);
     try {
       await this.db.query('CREATE ONLY $record CONTENT { key: $key, created_at: time::now() };', { record, key: key.toString('base64url') });
-      return key;
+      return (this.cursorKeyCache = key);
     } catch {
       const again = await this.db.select<{ key?: string }>(record);
       if (!again?.key) throw new CompanyError('temporarily_unavailable', 'cursor key unavailable; retry the read', true);
-      return Buffer.from(again.key, 'base64url');
+      return (this.cursorKeyCache = Buffer.from(again.key, 'base64url'));
     }
   }
 
@@ -1186,9 +1190,9 @@ export class SurrealCompanyCore implements CompanyCore {
    * Stores the working set as a context listing. Its membership and its projection are fixed by one read, which runs on the
    * build channel inside the build deadline (SYS01 AC-D): the main connection stays free for control requests meanwhile.
    */
-  private async contextListing(actor: Principal, params: ContextParams, digest: string, startedAt: number): Promise<SnapshotHeader> {
+  private async contextListing(actor: Principal, params: ContextParams, digest: string, startedAt: number): Promise<{ header: SnapshotHeader; bodies: readonly string[] } | { empty: true }> {
     const { limits } = this.snapshots;
-    return this.snapshots.build({
+    const header = await this.snapshots.build({
       owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', startedAt,
       guidance: 'narrow with state, goalId, role or since, or leave fields out',
       load: async db => {
@@ -1199,7 +1203,10 @@ export class SurrealCompanyCore implements CompanyCore {
         }
         return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
       },
+      emptyWhenNoRows: true, returnRows: true,
     });
+    if ('empty' in header) return header;
+    return { header, bodies: header.bodies };
   }
 
   /**
@@ -1213,7 +1220,11 @@ export class SurrealCompanyCore implements CompanyCore {
     startedAt: number;
     /** The refusal for a cursor that no longer matches the caller's access (for example a project-environment view that changed). */
     mismatch?: string;
-    create: (startedAt: number) => Promise<SnapshotHeader>;
+    /**
+     * `{ empty: true }` when the read matched nothing: the page is answered without storing a listing (SYS01 AC02). A listing that
+     * already holds its rows in memory returns them too, so its first page needs no read-back round trip.
+     */
+    create: (startedAt: number) => Promise<SnapshotHeader | { empty: true } | { header: SnapshotHeader; bodies: readonly string[] }>;
     parse: (body: string) => T;
     respond: (items: readonly T[], page: PageInfo) => R;
     /** What the caller can change when the page envelope alone is over the budget (for example includeCompany). */
@@ -1225,8 +1236,19 @@ export class SurrealCompanyCore implements CompanyCore {
     let sid: string;
     let after: number;
     let stored: string | undefined;
+    let built: { header: SnapshotHeader; bodies: readonly string[] } | undefined;
     if (args.cursor === undefined) {
-      stored = (await args.create(args.startedAt)).id;
+      const created = await args.create(args.startedAt);
+      if ('empty' in created) {
+        // Nothing matched: answer the empty page without a stored listing (SYS01 AC02 production return).
+        const page: PageInfo = {
+          pageSize, returned: 0, hasMore: false, total: 0, snapshotAt: new Date().toISOString(), budgetBytes: RESPONSE_BUDGET_BYTES,
+        };
+        return completeOrRefuse(args.respond([], page), 'this page', args.envelopeGuidance);
+      }
+      const header = 'header' in created ? created.header : created;
+      if ('bodies' in created) built = { header, bodies: created.bodies };
+      stored = header.id;
       sid = stored;
       after = 0;
     } else {
@@ -1241,13 +1263,22 @@ export class SurrealCompanyCore implements CompanyCore {
     // left to wait for the release, and a release that fails is left for the sweep. Nothing stored stays reserved for its TTL.
     const releaseStored = (): void => { if (stored !== undefined) void this.snapshots.release(stored).catch(() => undefined); };
     try {
-      const read = await untilAt(this.snapshots.read({
-        id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
-      }), replyAt);
-      if (read === undefined) {
-        throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
+      // A first page is answered from the rows the build just read: reading them back would cost another round trip and carry the
+      // same page over the link twice (SYS01 AC02 production return). Every later page reads the stored listing.
+      let header: SnapshotHeader;
+      let rows: Array<{ seq: number; body: string }>;
+      if (built) {
+        header = built.header;
+        rows = built.bodies.slice(0, pageSize).map((body, index) => ({ seq: index + 1, body }));
+      } else {
+        const read = await untilAt(this.snapshots.read({
+          id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
+        }), replyAt);
+        if (read === undefined) {
+          throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
+        }
+        ({ header, rows } = read);
       }
-      const { header, rows } = read;
       const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
       const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
         const last = kept.at(-1)?.seq ?? after;
@@ -1375,7 +1406,7 @@ export class SurrealCompanyCore implements CompanyCore {
         const { limits } = this.snapshots;
         return this.snapshots.build({
           owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '', startedAt: started,
-          guidance: 'read the evidence of large entries with read_task_text',
+          guidance: 'read the evidence of large entries with read_task_text', emptyWhenNoRows: true,
           load: async db => {
             const { at, rows } = await this.historyRowsAt(taskId, limits.maxRows + 1, db);
             if (rows.length > limits.maxRows) {
@@ -1412,7 +1443,7 @@ export class SurrealCompanyCore implements CompanyCore {
         }
         return this.snapshots.create({
           owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt, startedAt: started,
-          bodies: inventory.map(item => JSON.stringify(item)), guidance: 'narrow with taskId',
+          bodies: inventory.map(item => JSON.stringify(item)), guidance: 'narrow with taskId', emptyWhenNoRows: true,
         });
       },
       parse: body => JSON.parse(body) as Record<string, unknown>,
