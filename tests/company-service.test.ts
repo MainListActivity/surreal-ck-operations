@@ -85,7 +85,18 @@ function fixture(): Fixture {
   utimesSync(join(releases, SHAS.old), now, now - 20);
   utimesSync(join(releases, SHAS.worktree), now, now - 30);
 
-  executable(join(fakeBin, 'git'), '#!/bin/sh\nexit 0\n');
+  // Test stand-in for git. install verifies that a release directory holds the commit it is named after (SYS01 B2,
+  // scripts/release-content.sh), so archive/cat-file answer from the fixture release directory for that commit; the ancestry
+  // and fetch calls install also makes stay trivial. The mismatch case is covered with a real repository in release-gate.test.ts.
+  executable(join(fakeBin, 'git'), [
+    '#!/bin/sh',
+    'mode=""; sha=""',
+    'for arg in "$@"; do case "$arg" in archive|cat-file) mode="$arg";; esac; sha="$arg"; done',
+    'sha="${sha%\\^*}"',
+    'if [ "$mode" = archive ]; then exec tar -c -C "$FAKE_RELEASES_DIR/$sha" .; fi',
+    'if [ "$mode" = cat-file ]; then [ -d "$FAKE_RELEASES_DIR/$sha" ] && exit 0; exit 1; fi',
+    'exit 0',
+  ].join('\n') + '\n');
   executable(join(fakeBin, 'launchctl'), '#!/bin/sh\ncase "$1" in print) exit 1;; *) exit 0;; esac\n');
   executable(join(fakeBin, 'lsof'), '#!/bin/sh\n[ "${FAKE_LSOF_ERROR:-0}" = 1 ] && exit 2\n[ "${FAKE_LSOF_OPEN:-0}" = 1 ] && { printf \'open\n\'; exit 0; }\nexit 1\n');
   // The pinned runtime the services run with; the Bun on PATH (1.3.11) is a decoy that install must not consult.
@@ -127,6 +138,7 @@ function runInstall(f: Fixture, extraEnv: Record<string, string> = {}) {
       PASEO: f.fakePaseo,
       SCK_SERVICE_HOME: f.serviceHome,
       SCK_OPS_REPO: f.opsRepo,
+      FAKE_RELEASES_DIR: f.releases,
       FAKE_PASEO_LOG: f.paseoLog,
       FAKE_PASEO_MODE: 'normal',
       FAKE_PLUGIN_JSON: JSON.stringify([{ installation: { identity: { path: join(f.releases, SHAS.plugin, 'plugin') } } }]),

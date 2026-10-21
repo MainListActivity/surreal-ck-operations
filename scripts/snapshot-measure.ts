@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
@@ -281,6 +282,9 @@ async function main() {
     const runControl = async (slice: string[], withBuild: boolean) => {
       const timings = { claim: [] as number[], read: [] as number[], heartbeat: [] as number[], release: [] as number[] };
       const errors: Record<string, number> = {};
+      // Every write op's client-side window in wall-clock milliseconds, so the server's own audit stamps (also wall clock on this
+      // same host) can be put beside it afterwards (review B5).
+      const ops: Array<{ task: string; kind: 'claim' | 'heartbeat' | 'release'; start: number; end: number }> = [];
       const fail = (phase: string, error: unknown) => {
         const key = `${phase}:${codeOf(error)}`;
         errors[key] = (errors[key] ?? 0) + 1;
@@ -293,16 +297,19 @@ async function main() {
           let claimed: Awaited<ReturnType<SurrealCompanyCore['claim']>>;
           try { claimed = await core.claim(eng, taskId); } catch (error) { fail('claim', error); continue; }
           timings.claim.push(performance.now() - t0);
+          ops.push({ task: taskId, kind: 'claim', start: Date.now() - (performance.now() - t0), end: Date.now() });
           const t1 = performance.now();
           try { await core.getTask(gm, taskId); timings.read.push(performance.now() - t1); } catch (error) { fail('read', error); }
           const proof = { taskId, deliveryId: claimed.deliveryId, fence: claimed.fence, expectedVersion: claimed.task.version };
           const t2 = performance.now();
           try { await core.heartbeat(eng, proof); timings.heartbeat.push(performance.now() - t2); } catch (error) { fail('heartbeat', error); }
+          ops.push({ task: taskId, kind: 'heartbeat', start: Date.now() - (performance.now() - t2), end: Date.now() });
           const t3 = performance.now();
           try {
             await core.release(eng, proof, { text: '测量释放：合成样例，无真实内容，仅用于快照测量的控制请求。', idempotencyKey: `release-${label}-${taskId}-${randomUUID()}` });
             timings.release.push(performance.now() - t3);
           } catch (error) { fail('release', error); }
+          ops.push({ task: taskId, kind: 'release', start: Date.now() - (performance.now() - t3), end: Date.now() });
         }
       };
       const buildOutcomes: Record<string, number> = {};
@@ -318,9 +325,47 @@ async function main() {
       })() : Promise.resolve();
       try { await workers; } finally { finished = true; }
       await builds;
+      // ---- the server's own view (review B5): what the server recorded, and the state the leases were left in ----
+      // The client total says what the caller waited for; these two add the server side. Each control write leaves an audit row
+      // whose `at` is written by the server on this same host, so the client's window and that stamp share one clock: the gap from
+      // the call's start to the stamp is the way out, and from the stamp to the client's completion the way back.
+      const taskIds = [...new Set(ops.map(op => op.task))];
+      const ids = taskIds.map(id => new RecordId('task', id));
+      // Claim and release each leave an audit row ('claim', 'released'); a pure heartbeat leaves none, so it has no server stamp.
+      const actionFor: Record<string, string> = { claim: 'claim', release: 'released' };
+      const auditRows = taskIds.length
+        ? (await database.db.query<[Array<{ task: RecordId; action: string; at: string }>]>(
+            "SELECT task, action, at FROM audit WHERE task IN $ids AND action IN ['claim', 'released'] ORDER BY at;", { ids }))[0]
+        : [];
+      const toServer: number[] = [];
+      const fromServer: number[] = [];
+      let matched = 0;
+      for (const op of ops) {
+        const action = actionFor[op.kind];
+        if (!action) continue;
+        // Matched by action and the op's own window rather than by task id: the id comes back from the driver in its own
+        // rendering, and a claim/release row inside this op's window is this op's row (ops are spaced by their round trips).
+        const row = auditRows.find(candidate => candidate.action === action
+          && Date.parse(String(candidate.at)) >= op.start - 50 && Date.parse(String(candidate.at)) <= op.end + 2_000);
+        if (!row) continue;
+        matched++;
+        toServer.push(Math.max(0, Date.parse(row.at) - op.start));
+        fromServer.push(Math.max(0, op.end - Date.parse(row.at)));
+      }
+      const leases = taskIds.length
+        ? (await database.db.query<[Array<{ id: RecordId; state: string; current_employee?: string | null }>]>(
+            'SELECT id, state, current_employee FROM task WHERE id IN $ids;', { ids }))[0]
+        : [];
+      const leasesHeld = leases.filter(row => row.current_employee).length;
+      const notReleased = leases.filter(row => row.state !== 'ready').length;
       return {
         claim: summary(timings.claim), read: summary(timings.read), heartbeat: summary(timings.heartbeat), release: summary(timings.release),
-        errors, ...(withBuild ? { builds: buildOutcomes, buildStats: buildSummary(buildLog.slice(from)) } : {}),
+        errors,
+        // Server-side spans of the same operations: p50/p95 of the way out and the way back, in milliseconds.
+        serverSide: { ops: ops.length, matched, toServerMs: summary(toServer), fromServerMs: summary(fromServer) },
+        // Leases after the phase: every control task released, so none holds a lease and none is left out of ready.
+        leasesAfter: { tasks: leases.length, leasesHeld, notReleased },
+        ...(withBuild ? { builds: buildOutcomes, buildStats: buildSummary(buildLog.slice(from)) } : {}),
       };
     };
 
