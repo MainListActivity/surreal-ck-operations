@@ -256,6 +256,51 @@ run('R-B (5) while paused, an existing lease still delivers: checkpoint, submit 
   } finally { await w.close(); }
 });
 
+run('R-B (6) a review lease held before the pause can accept or return while paused, and the decision opens no new lease', async () => {
+  const w = await startFork('review-decide');
+  try {
+    await w.wf.upsertDef('tick-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('tick-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    // Both tasks reach review and are claimed by their reviewer before the pause, so each review lease exists when the pause starts.
+    // Each task has its own executor: an engineer that submitted one task stays active on it until that review ends.
+    const otherEngineer = await new LocalEnrollmentAdmin(w.db).enroll(`pause-tick-eng-return-${crypto.randomUUID().slice(0, 8)}`, 'engineering', ['execute', 'review']);
+    const held: Array<{ action: 'accept' | 'return'; executor: string; reviewer: string; taskId: string; proof: { taskId: string; deliveryId: string; fence: number; expectedVersion: number } }> = [];
+    // A reviewer that holds one review lease cannot claim a second one, so the return case has its own reviewer.
+    const otherReviewer = await new LocalEnrollmentAdmin(w.db).enroll(`pause-tick-qa-return-${crypto.randomUUID().slice(0, 8)}`, 'qa', ['execute', 'review']);
+    for (const [action, executor, reviewer] of [['accept', w.engineer, w.reviewer], ['return', otherEngineer, otherReviewer]] as const) {
+      const task = await w.makeTask(`review decided while paused: ${action}`);
+      const lease = await w.core.claim(executor, task.id);
+      const submitted = await w.core.submit(executor, { taskId: task.id, deliveryId: lease.deliveryId, fence: lease.fence, expectedVersion: lease.task.version },
+        { text: '暂停前提交交付：实现与测试均已完成，等待独立复核。', idempotencyKey: `review-decide-submit-${action}` });
+      expect(submitted.state).toBe('review');
+      const review = await w.core.claim(reviewer, task.id);
+      held.push({ action, executor, reviewer, taskId: task.id, proof: { taskId: task.id, deliveryId: review.deliveryId, fence: review.fence, expectedVersion: review.task.version } });
+    }
+    const claimCount = async (taskId: string) => ((await w.db.db.query<[Array<{ action: string }>]>(
+      "SELECT action FROM audit WHERE task = $t AND action = 'claim';", { t: new RecordId('task', taskId) }))[0] ?? []).length;
+    const claimsBefore = new Map<string, number>();
+    for (const h of held) claimsBefore.set(h.taskId, await claimCount(h.taskId));
+    const paused = await w.core.setDispatchPause(w.gm, { paused: true, expectedEpoch: 0, reason: '维护停派：复核中途暂停', idempotencyKey: 'tick-pause-review-decide', drainTimeoutSeconds: 10 });
+    expect(paused).toMatchObject({ paused: true, epoch: 1 });
+    for (const h of held) {
+      if (h.action === 'accept') {
+        // The accept carries the review lease's own proof: same delivery, fence and version as when the review began.
+        const accepted = await w.core.accept(h.reviewer, h.proof, { text: '暂停期间独立复核通过：逐项核对，结论一致。', idempotencyKey: `review-decide-accept-${h.taskId}` });
+        expect(accepted.state).toBe('done');
+      } else {
+        const returned = await w.core.returnTask(h.reviewer, h.proof, { text: '暂停期间退回：需补齐验证记录后再提交，原因如下。', idempotencyKey: `review-decide-return-${h.taskId}` });
+        expect(returned.state).toBe('ready');
+        // The returned task is ready again, but a new lease is refused while the pause holds.
+        await expect(w.core.claim(h.executor, h.taskId)).rejects.toMatchObject({ code: 'dispatch_paused' });
+      }
+      // The decision itself opens no lease: no claim row is written, and the task holds no employee.
+      expect(await claimCount(h.taskId)).toBe(claimsBefore.get(h.taskId));
+      const row = (await w.db.db.query<[{ state: string; current_employee?: unknown }]>('SELECT state, current_employee FROM ONLY $t;', { t: new RecordId('task', h.taskId) }))[0]!;
+      expect(row.current_employee ?? null).toBeNull();
+    }
+  } finally { await w.close(); }
+});
+
 run('R-A regression: admin config can no longer set paused without the epoch, gate and audit, and refuses pause_epoch', async () => {
   const w = await startFork('admin-config');
   try {
