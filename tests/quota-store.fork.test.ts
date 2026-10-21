@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { readProviderQuotas, readQuotaEntries } from '../src/dispatcher/quota-store.ts';
+import { rescoreAggregates } from '../src/scoring.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
 
@@ -53,6 +54,49 @@ run('quota rows are read by record name, including hyphenated provider ids', asy
 
     const entries = await readQuotaEntries<{ providerId: string }>(db.db);
     expect(entries.map(e => e.providerId).sort()).toEqual(['claude', 'factory-droid']);
+  } finally {
+    await db.close().catch(() => undefined);
+    server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Migration 022 first defined `quota_limited` as a non-optional bool. SurrealDB validates the whole record on UPDATE,
+ * so every def row that predated the field became unwritable — scoring aggregates, error counters and def edits failed
+ * with "Expected `bool` but found `NONE`". The field is optional now; this pins both halves: an old row stays writable,
+ * and the aggregate repair entry recomputes from scorecards alone.
+ */
+run('a def row without quota_limited stays writable, and aggregates recompute from scorecards', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quota-store-def-'));
+  const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  const port = reservation.port!; reservation.stop(true);
+  const password = 'isolated-quota-store-def-test-only';
+  const server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root',
+    '--pass', password, '--log', 'error', `rocksdb:${dir}/database`], { stdout: 'ignore', stderr: 'ignore' });
+  const db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: password,
+    namespace: 'quota_store_def_fixture', database: 'control_plane' });
+  try {
+    let ready = false;
+    for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
+    expect(ready).toBe(true);
+    await db.connect(); await db.bootstrap();
+    // An old def row: the field is cleared, exactly as migration 022 left the rows created before it.
+    await db.db.query(`CREATE employee_def:⟨fixture-legacy⟩ CONTENT { role: 'engineering', provider: 'codex', model: 'fixture' };`);
+    await db.db.query(`UPDATE employee_def:⟨fixture-legacy⟩ UNSET quota_limited;`);
+    // The write that failed in production: an UPDATE validates the whole record.
+    await db.db.query(`UPDATE employee_def:⟨fixture-legacy⟩ SET avg_score = 4.5, scored = 1;`);
+    await db.db.query(`CREATE employee:⟨fixture-worker⟩ CONTENT { role: 'engineering' };`);
+    for (const [card, overall] of [['fixture-card-one', 4], ['fixture-card-two', 5]] as const) {
+      await db.db.query(`CREATE scorecard:⟨${card}⟩ CONTENT { task: task:⟨fixture-task⟩, employee: 'fixture-worker', role: 'engineering',
+        def: 'fixture-legacy', quality: ${overall}, evidence: ${overall}, discipline: ${overall}, timeliness: ${overall}, overall: ${overall},
+        eval_by: 'fixture-judge' };`);
+    }
+    const out = await rescoreAggregates(db.db);
+    expect(out).toMatchObject({ employees: 1, defs: 1 });
+    const [defRows] = await db.db.query<[Array<{ scored: number; avg_score: number }>]>(`SELECT scored, avg_score FROM employee_def:⟨fixture-legacy⟩;`);
+    expect(defRows?.[0]).toMatchObject({ scored: 2, avg_score: 4.5 });
+    const [empRows] = await db.db.query<[Array<{ scored: number; avg_score: number }>]>(`SELECT scored, avg_score FROM employee:⟨fixture-worker⟩;`);
+    expect(empRows?.[0]).toMatchObject({ scored: 2, avg_score: 4.5 });
   } finally {
     await db.close().catch(() => undefined);
     server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true });
