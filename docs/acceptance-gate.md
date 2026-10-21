@@ -4,16 +4,18 @@
 
 ## 1. 数据契约（AC01）
 
-- `task.acceptance_criteria` 是版本化数组，每项 `{ id, kind, required, layer, evidence, verify, description?, risk?, legs? }`。`id` 唯一（`AC-…`），`kind` 为 `machine`/`human`；`machine` 不能用 `review-signoff`，`human` 只能用 `review-signoff`。
-- `create_delivery` 按 `legs` 把同一组 criteria 分到实现/上线申请/部署三腿；没有匹配项的腿使用该腿默认 criteria（实现：CI + 独立复核；上线申请：CI；部署：CI + QA 生产签署）。`create_task` 也可显式携带 criteria。
+- `task.acceptance_criteria` 是版本化数组，每项 `{ id, kind, required, layer, evidence, verify, description?, risk?, legs?, environment? }`。`id` 唯一（`AC-…`），`kind` 为 `machine`/`human`；`machine` 不能用 `review-signoff`，`human` 只能用 `review-signoff`。`environment` 是受控 AC 声明的目标环境（如 `production`），只能由建单/AC 写入，执行者不能在 submit 时引入或改写。
+- `create_delivery` 按 `legs` 把同一组 criteria 分到实现/上线申请/部署三腿；没有匹配项的腿使用该腿默认 criteria（实现：CI + 独立复核；上线申请：CI；部署：CI + QA 生产签署）。`create_task` 也可显式携带 criteria。`create_task`/`create_delivery` 还可携带受控的 `acceptanceEnvironment`；它与 criteria 的 `environment` 必须一致，冲突在建单时拒绝。
 - **legacy 先于 criteria 判定**：`acceptance_legacy === true` 或 `createdAt < enabledAt` 的行无论 criteria 是否为空都保留旧路径，且 legacy 不写 SYS02 证据；停用期间创建的交付三腿在启用后可继续 submit→独立 accept，启用后新建交付仍必须补机器证据。
 - 启用门禁后，每个新代码交付及其三腿由服务端合并**不可移除基线**（如 `AC-BASE-IMPL-1` required 机器 CI、`AC-BASE-IMPL-2` 真实独立签署；release/deploy 各有对应腿基线）；自定义 criteria 只能补充，同 ID、`required:false`、仅 human、全 optional 或 legs 过滤都不能移除/降级基线。`create_task`、`create_delivery` 与统一评估器同源合并，缺基线/降级/非法变更在创建或放行拒绝；门禁关闭期间创建的任务在创建时标 legacy，启用后保留旧路径，只读保留，不能伪造已满足。
 - `acceptance_version`、`acceptance_legacy`、`acceptance_head`、`acceptance_environment`、`acceptance_attempt`、`acceptance_chain` 均新增可选字段；旧行不需要迁移。
 
 ## 2. 证据（AC02）
 
-- `acceptance_evidence` 表保存 `task/ac_id/kind/sha/environment/evidence_type/source/verified/verifier/actor/at/criteria_version/task_version/digest`，`digest` 唯一，重复来源幂等。
-- 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view`、`gh api .../artifacts/<id>` 与 target run/job/status API，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。probe 必须是受信版本 `acceptance-probe/2` 的 CI artifact 记录：运行中通道由 target 作业开始即创建的 commit status 承载，适配器核验 producer run、target run/job 的 in-progress 窗口（`started_at <= readAt <= completed_at`）与 status 创建时刻/哈希；Node 打包模板由 Node 实际执行构建 bundle 的 default 请求路径并记录 Node 版本/bundle hash；`criterion.verify`（如 `probe:running-channel`/`probe:node-packed`）与 `risk` 绑定 probe kind/target。任意 2xx URL、Fake adapter、自传 `RUN_ID`、作业完成后读取或记录不符一律拒绝；artifact 类证据要求未过期且属于同一 head。模型文本或自写 `passed` 不会进入 `verified=true`。
+- `acceptance_evidence` 表保存 `task/ac_id/kind/sha/environment/attempt/evidence_type/source/verified/verifier/actor/at/criteria_version/task_version/digest`，`digest` 唯一。digest 包含目标 attempt、环境与 criteria 版本，因此同一来源为新 attempt 重新记录会产生新的行，不会被幂等回放成旧 attempt 的证据。
+- **环境绑定（N1）**：所需环境只来自建单/AC 的受控声明。submit 使用本次提交的目标环境（不是旧任务行）与受控声明严格比较，accept 使用持久化的同一值；缺失、未知、错误环境一律拒绝。机器证据的 `environment` 必须与目标环境精确相等，`undefined` 只表示「通用 CI」，不能通配 `production`。适配器必须返回核验过的环境：声明了环境时，服务端通过 GitHub Deployments API 读取该 run/head 的 deployment 记录并核验环境名与时间窗；probe 记录若带环境还必须与声明一致；没有 deployment、环境不符或环境在 run 窗口外都拒绝。通用 acceptance probe 不声明环境，因此不能作为 production 证据。
+- **attempt 绑定（N2）**：机器证据在记录时绑定目标 attempt（`doing` 时为当前 attempt+1，`review` 时为当前 attempt）和当时的 gate criteria 版本。submit/accept 只接受 attempt 与 criteria 版本都匹配的证据；退回后的新 attempt 必须重新记录，旧 attempt 记录被拒绝并返回对应 AC。heartbeat/checkpoint 只推进任务版本、不推进 attempt，因此不会让已有证据失效；`task_version` 仅作审计。
+- 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view`、`gh api .../artifacts/<id>`、`gh api .../deployments` 与 target run/job/status API，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。probe 必须是受信版本 `acceptance-probe/2` 的 CI artifact 记录：运行中通道由 target 作业开始即创建的 commit status 承载，适配器核验 producer run、target run/job 的 in-progress 窗口（`started_at <= readAt <= completed_at`）与 status 创建时刻/哈希；Node 打包模板由 Node 实际执行构建 bundle 的 default 请求路径并记录 Node 版本/bundle hash；`criterion.verify`（如 `probe:running-channel`/`probe:node-packed`）与 `risk` 绑定 probe kind/target。任意 2xx URL、Fake adapter、自传 `RUN_ID`、作业完成后读取或记录不符一律拒绝；artifact 类证据要求未过期且属于同一 head。模型文本或自写 `passed` 不会进入 `verified=true`。
 - 人工证据由获授权的独立签署写入：实现腿由另一位工程师在 `accept` 时签署，上线申请由运营，部署由 QA，老板关口由 `owner.decide`。Jev 是机器 actor，永远不能签署人工 AC。
 
 ## 3. 统一评估器（AC03）
@@ -30,7 +32,7 @@
 | 老板关口 | `owner.decide`（approve） | `owner`：机器证据 + 老板签署；老板关口不自动批准 |
 | 目标完成 | 验收锚点任务的 accept/owner approve | 上述门禁通过后目标才关闭；部署与目标完成都经 accept/owner approve 传递，不设独立旁路 |
 
-拒绝返回 `invalid`/`conflict`，消息与 `details.unmet` 列出每个未满足 AC 及原因（`machine-evidence-missing-or-untrusted`、`submission-head-missing`、`self-review`、`reviewer-role-mismatch`、`human-signoff-required`、`structured-acceptance-criteria-required` 等）。旧 head 的证据、旧 attempt、失效 artifact、越权作者和自验都会被拒；新 head 必须重新验证。
+拒绝返回 `invalid`/`conflict`，消息与 `details.unmet` 列出每个未满足 AC 及原因（`machine-evidence-missing-or-untrusted`、`machine-evidence-wrong-attempt`、`machine-evidence-wrong-environment`、`machine-evidence-stale-criteria-version`、`environment-mismatch`、`submission-head-missing`、`self-review`、`reviewer-role-mismatch`、`human-signoff-required`、`structured-acceptance-criteria-required` 等）。旧 head 的证据、旧 attempt、失效 criteria 版本、错误环境、失效 artifact、越权作者和自验都会被拒；新 head 必须重新验证。
 
 ## 4. 运行探针（AC04）
 
@@ -52,12 +54,12 @@
 
 | 工具 | 参数 | 作用 |
 | --- | --- | --- |
-| `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`、`source{provider,runUrl,artifactId,probe?}`、`idempotencyKey` | probe 必须带 artifactId，服务端下载并核验记录后写机器证据 |
+| `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`（只用于与受控声明比对，不能新增要求）、`source{provider,runUrl,artifactId,probe?}`、`idempotencyKey` | probe 必须带 artifactId；声明的环境由 Deployments API 核验；服务端写入本次 attempt 与 criteria 版本 |
 | `acceptance_status` | `taskId` | 读 gate、criteria、证据与当前未满足清单 |
 | `acceptance_gate` | — | gm 读 gate 记录 |
 | `set_acceptance_gate` | `enabled`、`reason`、`expectedVersion`、`idempotencyKey` | gm 版本化启停，审计理由 |
 
-`create_task`/`create_delivery`/`submit`/`review` 的 MCP schema 同时携带 `acceptanceCriteria` 与 `acceptance{sha,environment}`；`submit` 的声明 head 必须等于 PR 门禁实际 head；sidecar 与 core 同源校验。
+`create_task`/`create_delivery` 的 MCP schema 携带 `acceptanceCriteria`、`acceptanceEnvironment`；`submit`/`review` 携带 `acceptance{sha,environment}`。`submit` 的声明 head 必须等于 PR 门禁实际 head，声明的环境必须等于受控声明；`accept` 使用提交时持久化的环境与 attempt。sidecar 与 core 同源校验。
 
 ## 8. 回归
 
@@ -65,4 +67,5 @@
 - `tests/acceptance-gate.fork.test.ts`：隔离 fork 上的建单/提交/复核/owner/Jev/证据适配器/真实 sck 拒绝→补证据→独立 accept。
 - `tests/acceptance.test.ts` 的 adapter 负例：不受信 probeVersion、target workflow 不符、缺 `commit-status` 通道均拒绝；`Node` 执行失败时 `acceptance-node-probe` 不写记录。服务端核验 artifact 与 producer/target run/job/status 的绑定；`nodeVersion`/`bundleHash` 是受信探针自报，Node 执行保证来自 CI 作业退出码，信任锚是受信 `acceptance-probe/2` 与 run/artifact provenance。
 - `tests/acceptance-gate.fork.test.ts`：RB01 旧版读取与回滚边界，以及 probe artifact 伪造与 PR head 绑定的负例。
+- `tests/acceptance-gate.fork.test.ts` 的 N1/N2 用例：声明 production 的任务只有在适配器核验环境后才能 submit/accept；通用任务不能由提交方引入 production；退回后的新 attempt 不补证据会被拒，补录本 attempt 证据后非作者 accept；checkpoint 只改版本不使证据失效。
 - 根与 plugin typecheck；相关既有套件。

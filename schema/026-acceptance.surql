@@ -14,6 +14,7 @@ DEFINE FIELD IF NOT EXISTS ac_id ON acceptance_evidence TYPE string ASSERT strin
 DEFINE FIELD IF NOT EXISTS kind ON acceptance_evidence TYPE string ASSERT $value IN ['machine', 'human'];
 DEFINE FIELD IF NOT EXISTS sha ON acceptance_evidence TYPE string ASSERT string::len($value) > 0;
 DEFINE FIELD IF NOT EXISTS environment ON acceptance_evidence TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS attempt ON acceptance_evidence TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS evidence_type ON acceptance_evidence TYPE string ASSERT $value IN ['ci-run', 'probe', 'artifact', 'review-signoff'];
 DEFINE FIELD IF NOT EXISTS source ON acceptance_evidence TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS verified ON acceptance_evidence TYPE bool;

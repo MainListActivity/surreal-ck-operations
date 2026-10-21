@@ -47,6 +47,11 @@ export interface AcceptanceCriterion {
   risk?: AcceptanceRisk;
   /** Legs this criterion applies to; absent = every leg of the delivery. */
   legs?: AcceptanceLeg[];
+  /**
+   * Required environment for this criterion's machine evidence, from the controlled task/AC declaration.
+   * When present, evidence must carry exactly this environment; undefined is never a wildcard.
+   */
+  environment?: string;
 }
 
 /** Why one required criterion is not satisfied. */
@@ -61,6 +66,8 @@ export interface AcceptanceEvidenceRecord {
   /** PR head or deployed SHA the evidence is bound to. */
   sha: string;
   environment?: string;
+  /** The submission attempt this evidence was collected for; a later attempt cannot reuse it. */
+  attempt?: number;
   evidenceType: AcceptanceEvidenceType;
   source: Record<string, unknown>;
   verified: boolean;
@@ -90,6 +97,9 @@ export interface AcceptanceVerdict {
   notApplicable: boolean;
   criteriaVersion: number;
   head?: string;
+  /** The controlled environment and target attempt this verdict judged. */
+  environment?: string;
+  attempt?: number;
   criteria: AcceptanceCriterion[];
   evidence: AcceptanceEvidenceRecord[];
   unmet: AcceptanceUnmet[];
@@ -424,6 +434,8 @@ export interface CreateTask {
   dependencies?: TaskId[];
   /** SYS02: required for new code deliveries when the acceptance gate is enabled. */
   acceptanceCriteria?: AcceptanceCriterion[];
+  /** SYS02: controlled environment declaration for this task (e.g. production); evidence must match it exactly. */
+  acceptanceEnvironment?: string;
   idempotencyKey: string;
   workIntent?: WorkIntent;
   /**
@@ -521,6 +533,8 @@ export interface CreateDelivery {
    * a leg with no matching criterion gets that leg's default criteria. The gate is enforced only once enabled (AC06).
    */
   acceptanceCriteria?: AcceptanceCriterion[];
+  /** SYS02: controlled environment declaration applied to every leg; evidence must match it exactly. */
+  acceptanceEnvironment?: string;
   /** Optional discipline track; carried by the implementation leg only, release/deploy legs stay untracked. */
   discipline?: string;
   /** Optional project override persisted on all three legs so the chain stays on one project. */

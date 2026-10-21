@@ -36,6 +36,7 @@ const acceptanceCriterionShape = z.object({
   description: z.string().max(500).optional(),
   risk: z.enum(['code', 'data', 'external-timing', 'permission', 'packaging', 'runtime']).optional(),
   legs: z.array(z.enum(['implement', 'release', 'deploy', 'goal', 'owner'])).min(1).max(5).optional(),
+  environment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
 });
 const acceptanceCriteriaShape = z.array(acceptanceCriterionShape).min(1).max(20);
 
@@ -294,6 +295,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
+      acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
       revises: z.string().min(1).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
@@ -355,6 +357,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // reaches. Keeping it out of this schema preserves the structured `invalid` result.
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
+      acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
   server.registerTool('record_acceptance_evidence', {
@@ -376,6 +379,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
           kind: z.string().min(1).max(40).optional(), nodeVersion: z.string().min(1).max(40).optional(),
           bundleHash: z.string().regex(/^[0-9a-f]{64}$/).optional(), annotationHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
           channel: z.string().min(1).max(40).optional(), statusCreatedAt: z.string().min(1).max(40).optional(),
+          environment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
         }).optional(),
       }),
       idempotencyKey: z.string().min(1),

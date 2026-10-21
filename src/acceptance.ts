@@ -18,6 +18,8 @@ export const ACCEPTANCE_CRITERIA_VERSION = 1;
 export const ACCEPTANCE_MAX_CRITERIA = 20;
 /** Stable AC ids; the id is what evidence rows and unmet lists name. */
 export const ACCEPTANCE_CRITERIA_ID = /^AC-[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/;
+/** A controlled environment name (for example production); undefined is a distinct, generic value, never a wildcard. */
+export const ACCEPTANCE_ENVIRONMENT = /^[a-z][a-z0-9._-]{0,49}$/;
 
 const KINDS: readonly AcceptanceCriterionKind[] = ['machine', 'human'];
 const LAYERS: readonly AcceptanceLayer[] = ['unit', 'integration', 'fork', 'ci', 'runtime', 'manual'];
@@ -26,6 +28,10 @@ const RISKS: readonly AcceptanceRisk[] = ['code', 'data', 'external-timing', 'pe
 const LEGS: readonly AcceptanceLeg[] = ['implement', 'release', 'deploy', 'goal', 'owner'];
 
 const invalid = (message: string) => new CompanyError('invalid', message);
+const environmentValue = (value: string): string => {
+  if (!ACCEPTANCE_ENVIRONMENT.test(value)) throw invalid(`environment must match ${ACCEPTANCE_ENVIRONMENT}`);
+  return value;
+};
 
 /** Validate and normalize a criteria array. Unknown fields are not copied; duplicate ids and machine/human mismatches fail closed. */
 export function validateAcceptanceCriteria(input: unknown): AcceptanceCriterion[] {
@@ -48,6 +54,9 @@ export function validateAcceptanceCriteria(input: unknown): AcceptanceCriterion[
     if (criterion.kind === 'machine' && criterion.evidence === 'review-signoff') throw invalid(`${id}: machine criteria need a machine evidence type`);
     if (criterion.kind === 'human' && criterion.evidence !== 'review-signoff') throw invalid(`${id}: human criteria need review-signoff evidence`);
     if (typeof criterion.verify !== 'string' || criterion.verify.trim().length === 0 || criterion.verify.length > 120) throw invalid(`${id}: verify must be a non-empty string up to 120 characters`);
+    if (criterion.environment !== undefined && (typeof criterion.environment !== 'string' || !ACCEPTANCE_ENVIRONMENT.test(criterion.environment))) {
+      throw invalid(`${id}: environment must match ${ACCEPTANCE_ENVIRONMENT}`);
+    }
     if (criterion.description !== undefined && (typeof criterion.description !== 'string' || criterion.description.length > 500)) throw invalid(`${id}: description must be up to 500 characters`);
     if (criterion.risk !== undefined && (typeof criterion.risk !== 'string' || !RISKS.includes(criterion.risk as AcceptanceRisk))) throw invalid(`${id}: risk must be one of ${RISKS.join(', ')}`);
     let legs: AcceptanceLeg[] | undefined;
@@ -65,12 +74,28 @@ export function validateAcceptanceCriteria(input: unknown): AcceptanceCriterion[
       ...(criterion.description !== undefined ? { description: criterion.description } : {}),
       ...(criterion.risk !== undefined ? { risk: criterion.risk as AcceptanceRisk } : {}),
       ...(legs !== undefined ? { legs } : {}),
+      ...(criterion.environment !== undefined ? { environment: environmentValue(criterion.environment as string) } : {}),
     } as AcceptanceCriterion;
   });
 }
 
 export function criteriaForLeg(criteria: readonly AcceptanceCriterion[], leg: AcceptanceLeg): AcceptanceCriterion[] {
   return criteria.filter(criterion => !criterion.legs || criterion.legs.includes(leg));
+}
+
+/**
+ * The controlled environment declaration for one task/leg: the explicit task value, or the single environment named by
+ * its criteria. Conflicting declarations are refused, so an executor cannot relabel a generic CI run as production.
+ */
+export function effectiveEnvironment(criteria: readonly AcceptanceCriterion[], declared?: string): string | undefined {
+  const taskEnvironment = declared !== undefined && declared !== '' ? environmentValue(declared) : undefined;
+  const names = [...new Set(criteria.map(criterion => criterion.environment).filter((value): value is string => value !== undefined))];
+  if (names.length > 1) throw invalid(`acceptance criteria declare conflicting environments: ${names.join(', ')}`);
+  const criterionEnvironment = names[0];
+  if (taskEnvironment !== undefined && criterionEnvironment !== undefined && taskEnvironment !== criterionEnvironment) {
+    throw invalid(`acceptance environment ${taskEnvironment} conflicts with criterion environment ${criterionEnvironment}`);
+  }
+  return taskEnvironment ?? criterionEnvironment;
 }
 
 export const criteriaDigest = (criteria: readonly AcceptanceCriterion[]): string =>
@@ -205,14 +230,28 @@ export interface AcceptanceTaskRow {
 const rowId = (value: unknown): string =>
   typeof value === 'string' ? value : String((value as { id?: unknown } | null)?.id ?? value);
 /** Build the evaluator subject from a task row, optionally overriding the head (submit binds the new head). */
-export function acceptanceSubject(row: AcceptanceTaskRow, head?: string): AcceptanceSubject {
+export function acceptanceSubject(row: AcceptanceTaskRow, head?: string,
+  overrides: { environment?: string; attempt?: number } = {}): AcceptanceSubject {
+  let environment = row.acceptance_environment;
+  try { environment = effectiveEnvironment(row.acceptance_criteria ?? [], row.acceptance_environment); }
+  catch { /* a legacy/conflicting row keeps its stored value; the evaluator refuses it when a requirement exists */ }
   return {
     id: rowId(row.id), kind: row.kind, workIntent: row.work_intent, acceptanceCriteria: row.acceptance_criteria,
     acceptanceLegacy: row.acceptance_legacy, acceptanceHead: head ?? row.acceptance_head,
-    acceptanceEnvironment: row.acceptance_environment, acceptanceAttempt: row.acceptance_attempt,
+    acceptanceEnvironment: overrides.environment ?? environment,
+    acceptanceAttempt: overrides.attempt ?? row.acceptance_attempt ?? 0,
     taskVersion: row.version, submittedBy: row.submitted_by, reviewerRole: row.reviewer_role,
     createdAt: row.created_at ? String(row.created_at) : undefined,
   };
+}
+
+/** The AC06 legacy decision, shared by the evaluator and the submit environment check. */
+export function isLegacyAcceptance(subject: AcceptanceSubject, gate: AcceptanceGateView): boolean {
+  if (!gate.enabled) return true;
+  if (subject.acceptanceLegacy === true) return true;
+  const created = subject.createdAt ? Date.parse(subject.createdAt) : Number.NaN;
+  const enabled = gate.enabledAt ? Date.parse(gate.enabledAt) : Number.NaN;
+  return Number.isFinite(created) && Number.isFinite(enabled) && created < enabled;
 }
 
 /**
@@ -231,16 +270,13 @@ export function evaluateAcceptance(input: AcceptanceInput): AcceptanceVerdict {
   const baseOf = (final: AcceptanceCriterion[]): Omit<AcceptanceVerdict, 'ok'> => ({
     phase: input.phase, gateEnabled: input.gate.enabled, legacy: false, notApplicable: false,
     criteriaVersion: input.gate.criteriaVersion, head: input.subject.acceptanceHead,
+    environment: input.subject.acceptanceEnvironment, attempt: input.subject.acceptanceAttempt ?? 0,
     criteria: final, evidence: [...input.evidence], unmet: [],
   });
   if (!input.gate.enabled) return { ...baseOf(criteria), ok: true, legacy: true };
   // AC06/R1: a row created while the gate was off (or before enabledAt) keeps the old path even when it carries the
   // default criteria persisted by createDelivery. Enabling the gate must never retroactively require evidence from it.
-  const created = input.subject.createdAt ? Date.parse(input.subject.createdAt) : Number.NaN;
-  const enabled = input.gate.enabledAt ? Date.parse(input.gate.enabledAt) : Number.NaN;
-  if (input.subject.acceptanceLegacy === true || (Number.isFinite(created) && Number.isFinite(enabled) && created < enabled)) {
-    return { ...baseOf(criteria), ok: true, legacy: true };
-  }
+  if (isLegacyAcceptance(input.subject, input.gate)) return { ...baseOf(criteria), ok: true, legacy: true };
   const scope = trusted || all.some(criterion => criterion.kind === 'machine');
   if (criteria.length === 0) {
     if (!scope) return { ...baseOf(criteria), ok: true, notApplicable: true };
@@ -251,22 +287,37 @@ export function evaluateAcceptance(input: AcceptanceInput): AcceptanceVerdict {
   if (trusted) criteria = mergeAcceptanceCriteria(leg, criteria);
   const base = baseOf(criteria);
   const head = input.subject.acceptanceHead;
+  const targetEnvironment = input.subject.acceptanceEnvironment;
+  const targetAttempt = input.subject.acceptanceAttempt ?? 0;
+  const criteriaVersion = input.gate.criteriaVersion;
   const unmet: AcceptanceUnmet[] = [];
   for (const criterion of criteria) {
     if (!criterion.required) continue;
     if (criterion.kind === 'machine') {
-      const verified = head !== undefined && input.evidence.some(row =>
+      if (criterion.environment !== undefined && criterion.environment !== targetEnvironment) {
+        unmet.push({ acId: criterion.id, reason: 'environment-mismatch' });
+        continue;
+      }
+      const candidates = head === undefined ? [] : input.evidence.filter(row =>
         row.acId === criterion.id && row.kind === 'machine' && row.verified === true &&
-        row.evidenceType === criterion.evidence && row.sha === head &&
-        (input.subject.acceptanceEnvironment === undefined || row.environment === undefined || row.environment === input.subject.acceptanceEnvironment));
-      if (!verified) unmet.push({ acId: criterion.id, reason: head === undefined ? 'submission-head-missing' : 'machine-evidence-missing-or-untrusted' });
+        row.evidenceType === criterion.evidence && row.sha === head);
+      const verified = candidates.some(row => row.environment === targetEnvironment &&
+        (row.attempt ?? 0) === targetAttempt && row.criteriaVersion === criteriaVersion);
+      if (!verified) {
+        const reason = head === undefined ? 'submission-head-missing'
+          : candidates.some(row => (row.attempt ?? 0) !== targetAttempt) ? 'machine-evidence-wrong-attempt'
+          : candidates.some(row => row.environment !== targetEnvironment) ? 'machine-evidence-wrong-environment'
+          : candidates.some(row => row.criteriaVersion !== criteriaVersion) ? 'machine-evidence-stale-criteria-version'
+          : 'machine-evidence-missing-or-untrusted';
+        unmet.push({ acId: criterion.id, reason });
+      }
       continue;
     }
     // A human sign-off already written at this task version is reused (the status read, or a later goal gate);
     // a new attempt has a higher version, so an older sign-off never satisfies it.
     const signed = input.evidence.some(row =>
       row.acId === criterion.id && row.kind === 'human' && row.verified === true &&
-      row.taskVersion === input.subject.taskVersion &&
+      (row.attempt ?? 0) === targetAttempt && row.criteriaVersion === criteriaVersion &&
       (head === undefined ? row.sha === input.subject.id : row.sha === head));
     if (signed) continue;
     if (input.phase === 'submit') continue;
@@ -299,12 +350,12 @@ export function acceptanceError(verdict: AcceptanceVerdict): CompanyError {
 }
 
 /** The human sign-offs the gate writes at accept/owner approval. The digest is unique per task, AC, signer and attempt. */
-export interface HumanSignoff { acId: string; sha: string; criteriaVersion: number; digest: string }
+export interface HumanSignoff { acId: string; sha: string; criteriaVersion: number; attempt: number; digest: string }
 export function humanSignoffs(verdict: AcceptanceVerdict, taskId: string, actor: string, attempt: number): HumanSignoff[] {
   // The old path (gate off or a legacy row) must not write SYS02 evidence at all.
   if (!verdict.gateEnabled || verdict.legacy) return [];
   return verdict.criteria.filter(criterion => criterion.required && criterion.kind === 'human').map(criterion => ({
-    acId: criterion.id, sha: verdict.head ?? taskId, criteriaVersion: verdict.criteriaVersion,
+    acId: criterion.id, sha: verdict.head ?? taskId, criteriaVersion: verdict.criteriaVersion, attempt,
     digest: createHash('sha256').update(JSON.stringify({
       taskId, acId: criterion.id, actor, sha: verdict.head ?? '', attempt,
     })).digest('hex'),
@@ -328,13 +379,14 @@ export async function loadAcceptanceGate(db: Surreal): Promise<AcceptanceGateVie
 interface EvidenceRow {
   id: RecordId; task: RecordId; ac_id: string; kind: AcceptanceCriterionKind; sha: string; environment?: string;
   evidence_type: AcceptanceEvidenceType; source: Record<string, unknown>; verified: boolean; verifier: string;
-  actor: string; at: unknown; criteria_version: number; task_version: number; digest: string;
+  actor: string; at: unknown; criteria_version: number; task_version: number; attempt?: number; digest: string;
 }
 const evidenceView = (row: EvidenceRow): AcceptanceEvidenceRecord => ({
   id: String(row.id.id), taskId: String(row.task.id), acId: row.ac_id, kind: row.kind, sha: row.sha,
   ...(row.environment ? { environment: row.environment } : {}), evidenceType: row.evidence_type,
   source: row.source, verified: row.verified, verifier: row.verifier, actor: row.actor,
-  at: String(row.at), criteriaVersion: row.criteria_version, taskVersion: row.task_version, digest: row.digest,
+  at: String(row.at), criteriaVersion: row.criteria_version, taskVersion: row.task_version,
+  ...(row.attempt !== undefined ? { attempt: row.attempt } : {}), digest: row.digest,
 });
 
 export async function loadAcceptanceEvidence(db: Surreal, taskId: string): Promise<AcceptanceEvidenceRecord[]> {
@@ -346,23 +398,26 @@ export async function loadAcceptanceEvidence(db: Surreal, taskId: string): Promi
 export async function recordAcceptanceEvidenceRow(db: Surreal, input: {
   taskId: string; acId: string; kind: AcceptanceCriterionKind; sha: string; environment?: string;
   evidenceType: AcceptanceEvidenceType; source: Record<string, unknown>; verifier: string; actor: string;
-  at: string; criteriaVersion: number; taskVersion: number;
+  at: string; criteriaVersion: number; taskVersion: number; attempt?: number;
 }): Promise<AcceptanceEvidenceRecord> {
   const digest = createHash('sha256').update(JSON.stringify({
     taskId: input.taskId, acId: input.acId, sha: input.sha, evidenceType: input.evidenceType, source: input.source,
+    attempt: input.attempt, environment: input.environment, criteriaVersion: input.criteriaVersion,
   })).digest('hex');
   const record = new RecordId('acceptance_evidence', digest.slice(0, 32));
   try {
-    // The field is option<string>: omit it when absent, because a NULL is not NONE in a schemaless option field.
+    // Optional fields are omitted when absent: a NULL is not NONE in a schemaless option field.
     const environment = input.environment !== undefined ? 'environment: $environment,' : '';
+    const attempt = input.attempt !== undefined ? 'attempt: $attempt,' : '';
     const vars: Record<string, unknown> = {
       id: record, task: new RecordId('task', input.taskId), ac: input.acId, kind: input.kind, sha: input.sha,
       type: input.evidenceType, source: input.source, verifier: input.verifier, actor: input.actor, at: input.at,
       criteria: input.criteriaVersion, version: input.taskVersion, digest,
     };
     if (input.environment !== undefined) vars.environment = input.environment;
+    if (input.attempt !== undefined) vars.attempt = input.attempt;
     const [rows] = await db.query<[EvidenceRow[]]>(`CREATE $id CONTENT {
-      task: $task, ac_id: $ac, kind: $kind, sha: $sha, ${environment} evidence_type: $type,
+      task: $task, ac_id: $ac, kind: $kind, sha: $sha, ${environment} ${attempt} evidence_type: $type,
       source: $source, verified: true, verifier: $verifier, actor: $actor, at: <datetime>$at,
       criteria_version: $criteria, task_version: $version, digest: $digest
     };`, vars);
@@ -385,6 +440,8 @@ export interface ProbeRecord {
   /** The producer run and the target run/job it read while the target was in progress. */
   producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string;
   kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string; channel?: string; statusCreatedAt?: string;
+  /** The environment the trusted probe read from its CI context; the adapter corroborates it with the deployment record. */
+  environment?: string;
 }
 export interface AcceptanceSourceInput {
   provider: 'github-actions';
@@ -398,7 +455,7 @@ export interface AcceptanceSourceInput {
   risk?: string;
 }
 export type AcceptanceVerifyResult =
-  | { ok: true; sha: string; at: string; source: Record<string, unknown> }
+  | { ok: true; sha: string; at: string; environment?: string; source: Record<string, unknown> }
   | { ok: false; reason: string };
 export interface AcceptanceSourceAdapter { verify(input: AcceptanceSourceInput): Promise<AcceptanceVerifyResult> }
 
@@ -447,6 +504,7 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
       if (info.conclusion !== 'success') return { ok: false, reason: `the CI run is not successful (conclusion ${info.conclusion ?? 'unknown'})` };
       let at = info.updatedAt ?? new Date().toISOString();
       let verifiedProbe: Record<string, unknown> | undefined;
+      let probeEnvironment: string | undefined;
       if (input.probe) {
         // A probe record must be the CI artifact's content: the artifact has to belong to this run and head, and the
         // caller's attested fields must match what the artifact actually holds. A window-shaped caller record alone is refused.
@@ -472,6 +530,7 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
         } catch {
           return { ok: false, reason: 'the probe artifact does not hold a JSON record' };
         }
+        probeEnvironment = typeof record.environment === 'string' ? record.environment : undefined;
         if (record.probe !== 'acceptance' || String(record.runId) !== runId || record.inProgress !== true || record.result !== 'ok') {
           return { ok: false, reason: 'the probe artifact record is not an in-progress acceptance probe from this run' };
         }
@@ -485,7 +544,8 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
           return { ok: false, reason: 'the probe artifact read time is outside the CI run window' };
         }
         if (input.probe.runId !== String(record.runId) || input.probe.inProgress !== record.inProgress ||
-            input.probe.observationHash !== record.observationHash || Date.parse(input.probe.readAt) !== read) {
+            input.probe.observationHash !== record.observationHash || Date.parse(input.probe.readAt) !== read ||
+            (input.probe.environment !== undefined && input.probe.environment !== record.environment)) {
           return { ok: false, reason: 'the probe record does not match the CI artifact record' };
         }
         // A trusted probe is bound to its producer version, its criterion kind/risk, and (for a running channel) the actual
@@ -569,11 +629,41 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
         if (artifact.expired === true) return { ok: false, reason: 'the artifact has expired' };
         if (artifact.workflow_run?.head_sha !== input.sha) return { ok: false, reason: 'the artifact belongs to another head' };
       }
+      // N1: an environment is never taken from the caller's label. When the criterion/task declares one, the GitHub
+      // deployment record for this run/head must corroborate it; an environment-labeled probe cannot satisfy a generic
+      // criterion. Undefined here means "generic CI", not "any environment".
+      if (input.environment === undefined && probeEnvironment !== undefined) {
+        return { ok: false, reason: `the probe record names environment ${probeEnvironment} but the criterion did not require one` };
+      }
+      if (input.environment !== undefined && probeEnvironment !== undefined && probeEnvironment !== input.environment) {
+        return { ok: false, reason: `the probe record environment ${probeEnvironment} is not the declared environment ${input.environment}` };
+      }
+      let verifiedEnvironment: string | undefined;
+      if (input.environment !== undefined) {
+        let deployments: Array<{ environment?: string; sha?: string; created_at?: string }>;
+        try {
+          const raw = JSON.parse(await run(['api',
+            `repos/${owner}/${repo}/deployments?sha=${encodeURIComponent(input.sha)}&environment=${encodeURIComponent(input.environment)}&per_page=100`]));
+          deployments = Array.isArray(raw) ? raw : [];
+        } catch (error) {
+          return { ok: false, reason: `the environment could not be verified: ${(error as Error).message.slice(0, 160)}` };
+        }
+        const windowStart = Date.parse(info.createdAt ?? '');
+        const windowEnd = Date.parse(info.updatedAt ?? '');
+        const deployment = deployments.find(item => item?.environment === input.environment &&
+          (item.sha === undefined || item.sha === input.sha) &&
+          Number.isFinite(Date.parse(item.created_at ?? '')) &&
+          Date.parse(item.created_at ?? '') >= windowStart && Date.parse(item.created_at ?? '') <= windowEnd);
+        if (!deployment) return { ok: false, reason: `the CI run has no deployment for environment ${input.environment}` };
+        verifiedEnvironment = input.environment;
+      }
       return {
         ok: true, sha: input.sha, at,
+        ...(verifiedEnvironment !== undefined ? { environment: verifiedEnvironment } : {}),
         source: {
           provider: 'github-actions', runUrl: input.runUrl, runId, workflowName: info.workflowName ?? null,
           conclusion: info.conclusion, ...(verifiedProbe ? { probe: verifiedProbe } : {}),
+          ...(verifiedEnvironment !== undefined ? { environment: verifiedEnvironment } : {}),
           ...(input.artifactId ? { artifactId: input.artifactId } : {}),
         },
       };

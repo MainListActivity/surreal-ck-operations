@@ -27,7 +27,7 @@ const actor = (over: Partial<AcceptanceActor> = {}): AcceptanceActor =>
 const row = (over: Partial<AcceptanceEvidenceRecord> = {}): AcceptanceEvidenceRecord => ({
   id: 'e1', taskId: 't1', acId: 'AC-1', kind: 'machine', sha: 'head-1', evidenceType: 'ci-run', source: {},
   verified: true, verifier: 'github-actions', actor: 'eng', at: '2026-10-21T00:00:02.000Z',
-  criteriaVersion: 1, taskVersion: 1, digest: 'd1', ...over,
+  criteriaVersion: 1, taskVersion: 1, attempt: 0, digest: 'd1', ...over,
 });
 const verdictOf = (over: Parameters<typeof evaluateAcceptance>[0]) => evaluateAcceptance(over);
 
@@ -41,6 +41,8 @@ describe('SYS02 acceptance criteria (AC01)', () => {
     expect(() => validateAcceptanceCriteria([{ ...machine(), layer: 'vibes' } as never])).toThrow(/layer/);
     expect(() => validateAcceptanceCriteria([{ ...machine(), risk: 'magic' } as never])).toThrow(/risk/);
     expect(() => validateAcceptanceCriteria([{ ...machine(), legs: ['nope'] } as never])).toThrow(/legs/);
+    expect(() => validateAcceptanceCriteria([{ ...machine(), environment: 'Production' } as never])).toThrow(/environment/);
+    expect(() => validateAcceptanceCriteria([{ ...machine(), environment: 'has space' } as never])).toThrow(/environment/);
     expect(() => validateAcceptanceCriteria([])).toThrow(/non-empty/);
     expect(() => validateAcceptanceCriteria(Array.from({ length: 21 }, (_, i) => machine({ id: `AC-${i}` })))).toThrow(/20/);
   });
@@ -97,6 +99,21 @@ describe('SYS02 unified evaluator (AC02/AC03/AC05)', () => {
     expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceEnvironment: 'production' }), evidence: [row({ environment: 'staging' })], phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(false);
     expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceHead: undefined }), evidence: [row()], phase: 'submit', actor: actor(), gate: gate() }).unmet)
       .toEqual([{ acId: 'AC-1', reason: 'submission-head-missing' }]);
+    // N1: undefined never wildcards a declared environment, and a generic criterion never accepts environment-labeled evidence.
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceEnvironment: 'production' }), evidence: [row({ environment: 'production' })], phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(true);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceEnvironment: 'production' }), evidence: [row()], phase: 'submit', actor: actor(), gate: gate() }).unmet)
+      .toEqual([{ acId: 'AC-1', reason: 'machine-evidence-wrong-environment' }]);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [row({ environment: 'production' })], phase: 'submit', actor: actor(), gate: gate() }).unmet)
+      .toEqual([{ acId: 'AC-1', reason: 'machine-evidence-wrong-environment' }]);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: [machine({ environment: 'production' })] }), evidence: [row({ environment: 'production' })], phase: 'submit', actor: actor(), gate: gate() }).unmet)
+      .toEqual([{ acId: 'AC-1', reason: 'environment-mismatch' }]);
+    // N2: the attempt and the criteria version are part of the machine match; checkpoint version changes are not.
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceAttempt: 2 }), evidence: [row({ attempt: 1 })], phase: 'submit', actor: actor(), gate: gate() }).unmet)
+      .toEqual([{ acId: 'AC-1', reason: 'machine-evidence-wrong-attempt' }]);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceAttempt: 2 }), evidence: [row({ attempt: 2 })], phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(true);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria }), evidence: [row({ criteriaVersion: 2 })], phase: 'submit', actor: actor(), gate: gate() }).unmet)
+      .toEqual([{ acId: 'AC-1', reason: 'machine-evidence-stale-criteria-version' }]);
+    expect(verdictOf({ subject: subject({ acceptanceCriteria: criteria, acceptanceAttempt: 1, taskVersion: 7 }), evidence: [row({ attempt: 1, taskVersion: 1 })], phase: 'submit', actor: actor(), gate: gate() }).ok).toBe(true);
   });
 
   test('a human AC is pending at submit and must be signed by the authorized reviewer, never the submitter or a machine', () => {
@@ -135,7 +152,7 @@ describe('SYS02 human sign-offs', () => {
     });
     const first = humanSignoffs(verdict, 't1', 'rev', 1);
     expect(first).toHaveLength(1);
-    expect(first[0]).toMatchObject({ acId: 'AC-2', sha: 'head-1', criteriaVersion: 1 });
+    expect(first[0]).toMatchObject({ acId: 'AC-2', sha: 'head-1', criteriaVersion: 1, attempt: 1 });
     expect(humanSignoffs(verdict, 't1', 'rev', 1)[0]!.digest).toBe(first[0]!.digest);
     expect(humanSignoffs(verdict, 't1', 'rev', 2)[0]!.digest).not.toBe(first[0]!.digest);
     expect(humanSignoffs(verdict, 't1', 'other', 1)[0]!.digest).not.toBe(first[0]!.digest);
@@ -217,6 +234,30 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     const noVersion = { ...node, nodeVersion: undefined };
     const noVersionAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(noVersion) }));
     expect((await noVersionAdapter.verify({ ...nodeBase, probe: nodeProbe })).ok).toBe(false);
+  });
+
+  test('N1: an environment-bound probe is only accepted with a deployment record for this run and head', async () => {
+    const withDeployments = (list: unknown[]) => async (args: string[]) => {
+      if (args[0] === 'api' && String(args[1]).includes('/deployments?')) return JSON.stringify(list);
+      return run(args);
+    };
+    const envRecord = { ...record, environment: 'production' };
+    const reader = async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(envRecord) });
+    const envProbe = { ...probe, environment: 'production' };
+    const envBase = { ...base, probe: envProbe, environment: 'production' };
+    const deployment = { environment: 'production', sha: 'head-1', created_at: '2026-10-21T00:00:20.000Z' };
+    expect(await createGithubActionsAdapter(withDeployments([deployment]), reader).verify(envBase)).toMatchObject({ ok: true, environment: 'production' });
+    expect((await createGithubActionsAdapter(withDeployments([]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, environment: 'staging' }]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, created_at: '2026-10-21T00:02:00.000Z' }]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, sha: 'other-head' }]), reader).verify(envBase)).ok).toBe(false);
+    // A generic criterion refuses an environment-labeled probe, and a differing probe label is refused.
+    expect((await createGithubActionsAdapter(withDeployments([deployment]), reader).verify({ ...base, probe: envProbe })).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeployments([deployment]), reader).verify({ ...envBase, probe: { ...envProbe, environment: 'staging' } })).ok).toBe(false);
+    // A plain ci-run with the same deployment is accepted; without it, refused.
+    const ciBase = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', sha: 'head-1', environment: 'production' };
+    expect(await createGithubActionsAdapter(withDeployments([deployment])).verify(ciBase)).toMatchObject({ ok: true, environment: 'production' });
+    expect((await createGithubActionsAdapter(withDeployments([])).verify(ciBase)).ok).toBe(false);
   });
 
   test('R2: the Node packed probe writes no record when the Node execution fails', () => {

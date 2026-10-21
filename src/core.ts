@@ -14,7 +14,8 @@ import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoT
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
   ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createGithubActionsAdapter, criteriaForLeg,
-  acceptanceLegForSubject, defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs, isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
+  acceptanceLegForSubject, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
+  isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
 } from './acceptance.ts';
@@ -704,6 +705,9 @@ export class SurrealCompanyCore implements CompanyCore {
       acceptanceCriteria = mergeAcceptanceCriteria(
         acceptanceLegForSubject({ kind: input.kind ?? 'task', workIntent: input.workIntent }), acceptanceCriteria);
     }
+    // N1: the environment requirement is a controlled creation-time declaration, either the task value or the single
+    // environment named by its criteria. An executor cannot introduce or relabel it at submit time.
+    const acceptanceEnvironment = effectiveEnvironment(acceptanceCriteria, input.acceptanceEnvironment);
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
     const requiredTrack = REQUIRED_TRACKS[input.executorRole];
     if (requiredTrack !== undefined && input.discipline !== requiredTrack) {
@@ -731,6 +735,7 @@ export class SurrealCompanyCore implements CompanyCore {
       acceptance_criteria: acceptanceCriteria,
       acceptance_version: acceptanceCriteria.length > 0 ? ACCEPTANCE_CRITERIA_VERSION : undefined,
       acceptance_chain: options.acceptanceChain,
+      acceptance_environment: acceptanceEnvironment,
       // A task created while the gate is off is legacy: enabling later never retroactively gates it (SYS02 AC06).
       acceptance_legacy: !acceptanceGate.enabled,
     };
@@ -752,7 +757,7 @@ export class SurrealCompanyCore implements CompanyCore {
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
           kind: $kind, goal: $goal, created_at: time::now(),
           ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
-          acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: NONE,
+          acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
           acceptance_attempt: 0${options.acceptanceChain !== undefined ? ', acceptance_chain: $acceptance_chain' : ''}
         };
         ${GOAL_ANCHOR_SQL}
@@ -1916,6 +1921,7 @@ export class SurrealCompanyCore implements CompanyCore {
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
         discipline: index === 0 ? input.discipline : undefined,
         acceptanceCriteria,
+        acceptanceEnvironment: input.acceptanceEnvironment,
       }, { acceptanceChain });
       created.push(task);
       dependencies = [task.id];
@@ -1931,8 +1937,10 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!row) throw new CompanyError('not_found', 'Task not found');
     const gate = await loadAcceptanceGate(this.db);
     const phase: AcceptancePhase = row.state === 'review' ? (row.reviewer_role === 'owner' ? 'owner' : 'accept') : 'submit';
+    // A task still being worked is preparing its next submission; review/done read the attempt that is already submitted.
+    const attempt = ['ready', 'doing', 'blocked'].includes(row.state) ? (row.acceptance_attempt ?? 0) + 1 : (row.acceptance_attempt ?? 0);
     const verdict = evaluateAcceptance({
-      subject: acceptanceSubject(row), evidence: await loadAcceptanceEvidence(this.db, input.taskId), phase,
+      subject: acceptanceSubject(row, undefined, { attempt }), evidence: await loadAcceptanceEvidence(this.db, input.taskId), phase,
       actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
     });
     return { taskId: input.taskId, gate, verdict };
@@ -1985,14 +1993,27 @@ export class SurrealCompanyCore implements CompanyCore {
     const holds = row.current_employee === actor.employeeId && ['doing', 'review'].includes(row.state) &&
       (row.lease_expires_at ?? 0) > Date.now() / 1000;
     if (actor.role !== 'gm' && !holds) throw new CompanyError('forbidden', 'Acceptance evidence is recorded by the task holder or gm');
-    const criterion = validateAcceptanceCriteria(row.acceptance_criteria).find(item => item.id === input.acId);
+    const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
+    const criterion = criteria.find(item => item.id === input.acId);
     if (!criterion) throw new CompanyError('not_found', `acceptance criterion ${input.acId} not found on this task`);
     if (criterion.kind !== 'machine') throw new CompanyError('invalid', `${input.acId} is a human criterion; it is signed at independent review`);
     if (criterion.evidence === 'probe' && (!input.source.probe || !input.source.artifactId)) throw new CompanyError('invalid', `${input.acId}: a probe requires the CI artifact that carries its record and the record itself`);
     if (criterion.evidence === 'artifact' && !input.source.artifactId) throw new CompanyError('invalid', `${input.acId} requires an artifactId`);
+    const gate = await loadAcceptanceGate(this.db);
+    // N1: the expected environment comes from the controlled task/AC declaration, never from the caller's label. The
+    // adapter must return that same verified environment (GitHub deployments for the run/head) or the row is refused.
+    const declaredEnvironment = effectiveEnvironment(criteria, row.acceptance_environment);
+    if (criterion.environment !== undefined && criterion.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `${input.acId}: criterion environment ${criterion.environment} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
+    if (input.environment !== undefined && input.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `acceptance evidence environment ${input.environment} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
+    // N2: evidence collected in `doing` targets the next submission attempt; in `review` it targets the submitted one.
+    const targetAttempt = row.state === 'review' ? (row.acceptance_attempt ?? 0) : (row.acceptance_attempt ?? 0) + 1;
     const verified = await this.acceptanceAdapter.verify({
       provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
-      sha: input.sha, environment: input.environment, probe: input.source.probe,
+      sha: input.sha, environment: declaredEnvironment, probe: input.source.probe,
       verify: criterion.verify, risk: criterion.risk,
     });
     if (!verified.ok) {
@@ -2001,14 +2022,17 @@ export class SurrealCompanyCore implements CompanyCore {
           evidence: JSON.stringify({ acId: input.acId, sha: input.sha, reason: verified.reason }).slice(0, 30000) });
       throw new CompanyError('invalid', `acceptance evidence rejected: ${verified.reason}`);
     }
+    if (verified.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `acceptance evidence environment ${verified.environment ?? 'unknown'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
     const evidence = await recordAcceptanceEvidenceRow(this.db, {
-      taskId: input.taskId, acId: input.acId, kind: 'machine', sha: input.sha, environment: input.environment,
+      taskId: input.taskId, acId: input.acId, kind: 'machine', sha: input.sha, environment: verified.environment,
       evidenceType: criterion.evidence, source: verified.source, verifier: 'github-actions', actor: actor.employeeId,
-      at: verified.at, criteriaVersion: row.acceptance_version ?? ACCEPTANCE_CRITERIA_VERSION, taskVersion: row.version,
+      at: verified.at, criteriaVersion: gate.criteriaVersion, taskVersion: row.version, attempt: targetAttempt,
     });
     await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence', evidence: $evidence, at: time::now() };`,
       { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ acId: input.acId, sha: input.sha, evidenceType: criterion.evidence, digest: evidence.digest }) });
+        evidence: JSON.stringify({ acId: input.acId, sha: input.sha, evidenceType: criterion.evidence, environment: verified.environment, attempt: targetAttempt, digest: evidence.digest }) });
     return evidence;
   }
 
@@ -2151,16 +2175,30 @@ export class SurrealCompanyCore implements CompanyCore {
         throw new CompanyError('conflict', `the submitted acceptance head ${declared ?? 'is missing'} is not the PR head ${prHead}; update the acceptance evidence to the current head`);
       }
       const head = action === 'submit' ? (prHead ?? declared) : row.acceptance_head;
+      const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
+      const declaredEnvironment = effectiveEnvironment(criteria, row.acceptance_environment);
+      const attempt = action === 'submit' ? (row.acceptance_attempt ?? 0) + 1 : (row.acceptance_attempt ?? 0);
+      const submittedEnvironment = action === 'submit' ? evidence?.acceptance?.environment : undefined;
+      const subject = acceptanceSubject(row, head, { environment: declaredEnvironment, attempt });
+      const legacy = isLegacyAcceptance(subject, gate);
+      // N1: submit uses this submission's target environment, checked against the controlled declaration. Accept uses the
+      // persisted value. Undefined only matches undefined: it is a generic CI fact, never a wildcard for production.
+      if (action === 'submit' && !legacy && submittedEnvironment !== declaredEnvironment) {
+        throw new CompanyError('invalid',
+          `the submitted acceptance environment ${submittedEnvironment ?? 'is missing'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+      }
       const verdict = evaluateAcceptance({
-        subject: acceptanceSubject(row, head), evidence: evidenceRows,
+        subject, evidence: evidenceRows,
         phase: action === 'submit' ? 'submit' : 'accept',
         actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
       });
       if (!verdict.ok) throw acceptanceError(verdict);
+      const persistedEnvironment = action === 'submit'
+        ? (legacy ? (submittedEnvironment ?? declaredEnvironment) : declaredEnvironment)
+        : (row.acceptance_environment ?? declaredEnvironment);
       acceptance = {
         ...(head !== undefined ? { head } : {}),
-        ...(action === 'submit' && evidence?.acceptance?.environment !== undefined ? { environment: evidence.acceptance.environment } : {}),
-        ...(action === 'accept' && row.acceptance_environment !== undefined ? { environment: row.acceptance_environment } : {}),
+        ...(persistedEnvironment !== undefined ? { environment: persistedEnvironment } : {}),
         human: action === 'accept' ? humanSignoffs(verdict, proof.taskId, actor.employeeId, row.acceptance_attempt ?? 0) : [],
       };
     }
@@ -2229,7 +2267,7 @@ export class SurrealCompanyCore implements CompanyCore {
         previous_employee = IF $heartbeat OR $checkpoint THEN $t.previous_employee ELSE NONE END,
         accepted_by = IF $accept THEN $employee ELSE $t.accepted_by END,
         acceptance_head = IF $submit AND $has_head THEN $acceptance_head ELSE $t.acceptance_head END,
-        acceptance_environment = IF $submit AND $has_environment THEN $acceptance_environment ELSE $t.acceptance_environment END,
+        acceptance_environment = IF $submit THEN (IF $has_environment THEN $acceptance_environment ELSE NONE END) ELSE $t.acceptance_environment END,
         acceptance_attempt = IF $submit THEN ($t.acceptance_attempt ?? 0) + 1 ELSE $t.acceptance_attempt END,
         version = IF $heartbeat THEN $t.version ELSE $t.version + 1 END
         RETURN AFTER;
@@ -2238,6 +2276,7 @@ export class SurrealCompanyCore implements CompanyCore {
         FOR $e IN $human_evidence {
           CREATE acceptance_evidence CONTENT {
             task: $task, ac_id: $e.acId, kind: 'human', sha: $e.sha, environment: $t.acceptance_environment,
+            attempt: $e.attempt,
             evidence_type: 'review-signoff', source: { provider: 'reviewer' }, verified: true, verifier: 'reviewer',
             actor: $employee, at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
           };

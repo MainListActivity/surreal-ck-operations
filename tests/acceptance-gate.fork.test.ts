@@ -31,6 +31,8 @@ type FakeArtifactRecord = { probe?: string; runId?: string | number; jobId?: str
 class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
   runs = new Map<string, { headSha: string; conclusion: string; createdAt: string; updatedAt: string; workflowName?: string }>();
   artifacts = new Map<string, { expired: boolean; head: string; runId?: string; record?: FakeArtifactRecord }>();
+  /** When false the adapter returns no verified environment, like a CI source with no deployment record. */
+  environmentVerified = true;
   setRun(id: string, headSha: string, over: Partial<{ conclusion: string; createdAt: string; updatedAt: string }> = {}) {
     this.runs.set(id, {
       headSha, conclusion: 'success',
@@ -75,9 +77,12 @@ class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
       if (artifact.expired) return { ok: false, reason: 'artifact expired' };
       if (artifact.head !== input.sha) return { ok: false, reason: 'artifact head mismatch' };
     }
+    const environment = this.environmentVerified ? input.environment : undefined;
     return {
       ok: true, sha: input.sha, at,
+      ...(environment !== undefined ? { environment } : {}),
       source: { provider: 'github-actions', runUrl: input.runUrl, runId,
+        ...(environment !== undefined ? { environment } : {}),
         ...(verifiedProbe ? { probe: verifiedProbe } : {}), ...(input.artifactId ? { artifactId: input.artifactId } : {}) },
     };
   }
@@ -181,6 +186,80 @@ fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate del
   const postClaim = await core.claim(tokens['eng-a'], post.id);
   await expect(core.submit(tokens['eng-a'], proofOf(postClaim), { text: '启用后新交付没有机器证据，提交必须被拒绝。', idempotencyKey: key(), acceptance: { sha: 'post-head' } }))
     .rejects.toMatchObject({ code: 'invalid' });
+});
+
+fork('SYS02 N1: the declared environment binds submit, accept and adapter-verified evidence', async () => {
+  await ensureGate();
+  const task = await core.createTask(tokens.gm, { title: 'N1 环境绑定', context: '受控任务声明 production，未知环境不得通配。',
+    executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' },
+    acceptanceEnvironment: 'production', idempotencyKey: key() });
+  expect(task.acceptanceEnvironment).toBe('production');
+  expect(task.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
+  const claim = await core.claim(tokens['eng-a'], task.id);
+  fake.setRun('9101', 'n1-head');
+  // An adapter with no verified environment cannot satisfy the declared production.
+  fake.environmentVerified = false;
+  await expect(recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101')).rejects.toMatchObject({ code: 'invalid' });
+  fake.environmentVerified = true;
+  const evidence = await recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101');
+  expect(evidence).toMatchObject({ environment: 'production', attempt: 1 });
+  // Missing or wrong submit environments are refused; the declared one is accepted.
+  await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '缺少环境声明的提交必须被拒绝，不能默认通关生产。', idempotencyKey: key(), acceptance: { sha: 'n1-head' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '错误环境的提交必须被拒绝，环境不能由执行者改标签。', idempotencyKey: key(), acceptance: { sha: 'n1-head', environment: 'staging' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  expect((await core.submit(tokens['eng-a'], proofOf(claim), { text: '正确环境与机器证据齐备，提交独立复核，确认门禁接受该声明的 production 环境。', idempotencyKey: key(), acceptance: { sha: 'n1-head', environment: 'production' } })).state).toBe('review');
+  // Accept strictness: a row whose environment was changed no longer matches the persisted target.
+  const review = await core.claim(tokens['eng-b'], task.id);
+  await database.db.query("UPDATE acceptance_evidence SET environment = 'staging' WHERE task = $task AND ac_id = 'AC-BASE-IMPL-1';", { task: new RecordId('task', task.id) });
+  await expect(core.accept(tokens['eng-b'], proofOf(review), { text: '环境不匹配的证据不得通过独立复核，机器证据的环境必须与持久化的目标一致。', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+});
+
+fork('SYS02 N1: an executor cannot introduce an environment on a generic task', async () => {
+  await ensureGate();
+  const goal = await goalFor();
+  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N1 通用 CI', spec: '通用 CI 任务不得由提交方自行声明 production。', idempotencyKey: key() });
+  expect(impl.acceptanceEnvironment).toBeUndefined();
+  const claim = await core.claim(tokens['eng-a'], impl.id);
+  fake.setRun('9103', 'n1-generic-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n1-generic-head', '9103');
+  await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '通用任务上由执行者声明 production 必须被拒绝。', idempotencyKey: key(), acceptance: { sha: 'n1-generic-head', environment: 'production' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+});
+
+fork('SYS02 N2: a returned attempt cannot reuse old machine evidence; re-recording binds the new attempt', async () => {
+  await ensureGate();
+  const goal = await goalFor();
+  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N2 attempt 链', spec: '退回后的新 attempt 不得静默复用旧机器证据。', idempotencyKey: key() });
+  const first = await core.claim(tokens['eng-a'], impl.id);
+  fake.setRun('9102', 'n2-head');
+  const recorded = await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n2-head', '9102');
+  expect(recorded).toMatchObject({ attempt: 1 });
+  expect(recorded.environment).toBeUndefined();
+  await core.submit(tokens['eng-a'], proofOf(first), { text: '第一次提交已有可信机器证据，进入独立复核。', idempotencyKey: key(), acceptance: { sha: 'n2-head' } });
+  const reviewer = await core.claim(tokens['eng-b'], impl.id);
+  await core.returnTask(tokens['eng-b'], proofOf(reviewer), { text: '退回首次交付，要求新 attempt 重新验证机器证据。', idempotencyKey: key() });
+  const second = await core.claim(tokens['eng-a'], impl.id);
+  await expect(core.submit(tokens['eng-a'], proofOf(second), { text: '第二 attempt 未补机器证据，旧 attempt 的记录不得静默复用。', idempotencyKey: key(), acceptance: { sha: 'n2-head' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  const renewed = await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n2-head', '9102');
+  expect(renewed).toMatchObject({ attempt: 2 });
+  expect((await core.submit(tokens['eng-a'], proofOf(second), { text: '为本 attempt 补录可信机器证据后重新提交独立复核。', idempotencyKey: key(), acceptance: { sha: 'n2-head' } })).state).toBe('review');
+  const review = await core.claim(tokens['eng-b'], impl.id);
+  expect((await core.accept(tokens['eng-b'], proofOf(review), { text: '本次 attempt 的机器与人工证据齐备，独立复核通过。', idempotencyKey: key() })).state).toBe('done');
+});
+
+fork('SYS02 N2: a checkpoint between evidence and submit does not invalidate the attempt', async () => {
+  await ensureGate();
+  const goal = await goalFor();
+  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N2 checkpoint', spec: 'heartbeat/checkpoint 的版本变化不等于重新提交。', idempotencyKey: key() });
+  const claim = await core.claim(tokens['eng-a'], impl.id);
+  fake.setRun('9104', 'n2-checkpoint-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'n2-checkpoint-head', '9104');
+  const checkpoint = await core.checkpoint(tokens['eng-a'], proofOf(claim), { text: '检查点：任务版本前进，但这不是一次新的提交 attempt。', idempotencyKey: key() });
+  expect(checkpoint.version).toBeGreaterThan(claim.task.version);
+  const proof = { taskId: claim.task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: checkpoint.version };
+  expect((await core.submit(tokens['eng-a'], proof, { text: '检查点后的提交仍使用同一 attempt，机器证据不应失效。', idempotencyKey: key(), acceptance: { sha: 'n2-checkpoint-head' } })).state).toBe('review');
 });
 
 fork('SYS02 C1: custom optional or human-only criteria cannot remove the server baseline; zero evidence cannot reach review', async () => {

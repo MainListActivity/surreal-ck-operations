@@ -201,6 +201,7 @@ export class OwnerDesk {
         FOR $e IN $human_evidence {
           CREATE acceptance_evidence CONTENT {
             task: $task, ac_id: $e.acId, kind: 'human', sha: $e.sha, environment: $t.acceptance_environment,
+            attempt: $e.attempt,
             evidence_type: 'review-signoff', source: { provider: 'owner' }, verified: true, verifier: 'owner',
             actor: 'owner', at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
           };
