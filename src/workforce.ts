@@ -122,6 +122,8 @@ export interface CompanyConfig {
   archiveRetentionDays: number;
   /** 已不在册的员工实例，其 comm/ 目录保留的小时数；0 = 不自动清理。 */
   commDirGraceHours: number;
+  /** 员工临时文件目录 scratch/<实例> 的保留小时数，按目录最后修改时间计时；0 = 不自动清理。 */
+  scratchGraceHours: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -132,7 +134,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
-  archiveRetentionDays: 7, commDirGraceHours: 48,
+  archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -283,6 +285,7 @@ export class Workforce {
       artifactHeadroomMb: typeof row?.artifact_headroom_mb === 'number' ? row.artifact_headroom_mb : DEFAULT_CONFIG.artifactHeadroomMb,
       archiveRetentionDays: typeof row?.archive_retention_days === 'number' ? row.archive_retention_days : DEFAULT_CONFIG.archiveRetentionDays,
       commDirGraceHours: typeof row?.comm_dir_grace_hours === 'number' ? row.comm_dir_grace_hours : DEFAULT_CONFIG.commDirGraceHours,
+      scratchGraceHours: typeof row?.scratch_grace_hours === 'number' ? row.scratch_grace_hours : DEFAULT_CONFIG.scratchGraceHours,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }

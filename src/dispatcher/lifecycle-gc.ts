@@ -34,6 +34,22 @@ export function meaningfulChanges(porcelain: string): boolean {
   });
 }
 
+/** Untracked paths that are pure dependency/build output, trimmed to the junk root. */
+const JUNK_ROOT = /^(?:node_modules|\.venv|venv|__pycache__|\.pnpm-store|\.cache|\.next|\.turbo|dist|build|target)$/;
+export function junkPathsFromPorcelain(porcelain: string): string[] {
+  const out: string[] = [];
+  for (const line of porcelain.split('\n')) {
+    if (!line.startsWith('??')) continue;
+    const raw = line.slice(3).trim().replace(/^"|"$/g, '').replace(/\/$/, '');
+    if (!raw || raw.startsWith('/') || raw.split('/').includes('..')) continue;
+    if (!JUNK_SEGMENT.test(raw)) continue;
+    const segments = raw.split('/');
+    const idx = segments.findIndex(seg => JUNK_ROOT.test(seg));
+    out.push(idx >= 0 ? segments.slice(0, idx + 1).join('/') : raw);
+  }
+  return [...new Set(out)];
+}
+
 /** Instance ids minted by the dispatcher: `<role>-<provider>-<hex6>`; anything else is foreign. */
 const INSTANCE_DIR = /^[a-z0-9][a-z0-9-]*-[0-9a-f]{6}$/;
 /** Cold-archive batches produced by the operator: `evidence-YYYY-MM-DD` or any `*.tar.gz`. */

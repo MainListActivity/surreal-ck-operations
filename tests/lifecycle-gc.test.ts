@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { meaningfulChanges, sweepArchiveBatches, sweepInstanceDirs } from '../src/dispatcher/lifecycle-gc.ts';
+import { junkPathsFromPorcelain, meaningfulChanges, sweepArchiveBatches, sweepInstanceDirs } from '../src/dispatcher/lifecycle-gc.ts';
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -102,5 +102,21 @@ describe('sweepArchiveBatches', () => {
     expect(result.removed).toEqual([]);
     expect(existsSync(join(home, 'manual-keep'))).toBe(true);
     expect(existsSync(join(home, 'notes.txt'))).toBe(true);
+  });
+});
+
+describe('junkPathsFromPorcelain', () => {
+  test('trims an untracked junk tree to its junk root', () => {
+    expect(junkPathsFromPorcelain('?? node_modules/')).toEqual(['node_modules']);
+    expect(junkPathsFromPorcelain('?? web/node_modules/.bin/x\n?? dist/')).toEqual(['web/node_modules', 'dist']);
+    expect(junkPathsFromPorcelain('?? plugin/node_modules/\n?? plugin/bun.lock')).toEqual(['plugin/node_modules']);
+  });
+
+  test('real files, tracked changes and unsafe paths are never returned', () => {
+    expect(junkPathsFromPorcelain('?? wip.txt')).toEqual([]);
+    expect(junkPathsFromPorcelain(' M package.json')).toEqual([]);
+    expect(junkPathsFromPorcelain('?? ../escape/node_modules')).toEqual([]);
+    expect(junkPathsFromPorcelain('?? /abs/node_modules')).toEqual([]);
+    expect(junkPathsFromPorcelain('')).toEqual([]);
   });
 });
