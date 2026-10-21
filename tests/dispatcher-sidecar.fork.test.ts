@@ -222,11 +222,12 @@ async function startCompanyFork(name: string) {
     const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
   };
   return {
-    core, owner, wf, db, gm, agentRows, errors, envs, relay,
+    core, owner, wf, db, gm, dir, pool: pool!, agentRows, errors, envs, relay,
     /** One real tick on a fresh dispatcher, as the existing fork tests run it. */
     tick: async () => {
       last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
         autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
+        log: process.env.SCK_TEST_DISPATCH_LOG === '1' ? message => console.log('DISPATCH', message) : undefined,
         env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
       return last.tick();
     },
@@ -413,12 +414,13 @@ run('company fork: the bound implementer loses its lease, the manager hands the 
 }, 90000);
 
 // SYS-DISP R6(b) (AC04/AC06): legacy authors with no recorded implementer fail closed through the real tick and the real core. The
-// conclusion is visible with its reason, nobody is woken, and the core refuses a claim by a fresh engineer.
-run('company fork: legacy authors without a recorded implementer fail closed, the conclusion is visible, nobody is woken, and the core refuses a claim', async () => {
+// conclusion is visible with its reason, the manager is woken with a takeover todo, and the core refuses a claim by a fresh engineer.
+run('company fork: legacy authors without a recorded implementer wake the manager for takeover and the core refuses a claim', async () => {
   const w = await startCompanyFork('legacy');
   try {
     await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
     await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await w.core.createTask(w.gm, { title: 'legacy authors and no recorded implementer', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-legacy' });
     // Two legacy authors. Their rows carry no phase, and the task never recorded an implementer. Actors are employee records,
     // as production audit rows are written: the derivation reads only employee actors, so plain strings would be dropped.
@@ -432,18 +434,39 @@ run('company fork: legacy authors without a recorded implementer fail closed, th
     expect(facts.ambiguous).toBe(true);
     expect(facts.implementer).toBeUndefined();
     expect(facts.authors).toEqual(['legacy-author-one', 'legacy-author-two']);
-    // Nobody is woken. The gate blocks every candidate, and the conclusion names the unresolved implementer with its notice.
+    // The manager is woken with a takeover todo; the verdict stays the single source of the reason.
     const tick = await w.tick();
-    expect(tick.woke.find(x => x.task === task.id)).toBeUndefined();
+    const wake = tick.woke.find(x => x.task === task.id);
+    expect(wake?.employee.startsWith('fixture-gm')).toBe(true);
+    expect(tick.woke.filter(x => x.task === task.id)).toHaveLength(1);
     const verdict = w.verdicts().find(v => v.taskId === task.id && v.phase === 'execute')!;
     expect(verdict).toMatchObject({ dispatchable: false, feasible: false, workflowState: 'ready' });
     expect(verdict.reasons.map(r => r.code)).toContain('implementer_unresolved');
     expect(tick.notices).toContain(`dispatch-blocked:${task.id}:execute`);
+    expect(await w.wf.openManagerActions()).toEqual([expect.objectContaining({ taskId: task.id, reason: 'implementer_unresolved' })]);
     // The core refuses a claim by a fresh engineer as well: the manager has to record the implementer first.
     const fresh = await w.wf.spawnInst((await w.wf.defs()).find(d => d.id === 'fixture-eng')!);
     await expect(w.core.claim(fresh.credential!, task.id)).rejects.toMatchObject({ code: 'forbidden' });
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
-    expect((await w.tick()).woke.find(x => x.task === task.id)).toBeUndefined();
+    // The same episode does not wake another gm on a repeated tick.
+    expect((await w.tick()).woke.filter(x => x.task === task.id)).toHaveLength(0);
+    // Real manager seam: dry-run first, then a compare-and-set takeover; a stale version is refused.
+    const dry = await w.core.contributorDryRun(w.gm, { taskIds: [task.id] });
+    expect(dry.tasks[0]).toMatchObject({ status: 'manager_decision' });
+    const C = await w.wf.spawnInst((await w.wf.defs()).find(d => d.id === 'fixture-eng')!);
+    // Launch the channel before binding the agent, then bind the agent in the pool: canReuse requires both.
+    w.pool.env(C);
+    await w.wf.bind(C.id, { agentId: `agent-${C.id}`, cwd: w.dir, repoHome: w.dir, model: 'fixture' });
+    w.pool.bindAgent(C.id, `agent-${C.id}`);
+    w.agentRows.set(`agent-${C.id}`, { id: `agent-${C.id}`, status: 'idle' });
+    const current = await w.core.getTask(w.gm, task.id);
+    await expect(w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: current.version + 1,
+      reason: 'stale takeover regression', idempotencyKey: 'legacy-stale-takeover' })).rejects.toMatchObject({ code: 'conflict' });
+    expect(await w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: current.version,
+      reason: 'manager takes over the unresolved legacy task', idempotencyKey: 'legacy-takeover' })).toMatchObject({ implementer: C.id, state: 'ready' });
+    const after = await w.tick();
+    expect(after.woke.find(x => x.task === task.id)?.employee).toBe(C.id);
+    expect(await w.wf.openManagerActions()).toHaveLength(0);
   } finally {
     await w.close();
   }

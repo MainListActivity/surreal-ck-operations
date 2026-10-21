@@ -1,10 +1,20 @@
 import type { ClaimResult, WorktreeAssignment } from '../contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
+import type { BlockCode, DispatchVerdict } from './dispatch-blocked.ts';
 
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
 /** comm = 插件 sidecar 已代领任务、凭证不进 agent；否则为旧的凭证文件模式。 */
 export interface PromptCtx { comm: boolean; claim?: ClaimResult; worktree?: WorktreeAssignment; commDir?: string; scratchDir?: string }
+
+/** One manager todo as the dispatcher hands it to the gm prompt: a real action, its reason and the current version. */
+export interface GmTodo {
+  task: SupervisedTask;
+  action: 'resume' | 'implementer_takeover';
+  expectedVersion: number;
+  reasonCode?: BlockCode;
+  verdict?: DispatchVerdict;
+}
 
 const ROLE_NAMES: Record<string, string> = {
   gm: '经理：目标分级与拆解、处理运营定不了的事、G3 汇总',
@@ -91,15 +101,31 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
   return firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
 }
 
-export function gmAttention(inst: EmployeeInst, tasks: SupervisedTask[], env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
-  const list = tasks.map(t => `- ${t.id}「${t.title}」（执行岗位 ${t.executorRole}${t.discipline ? `/${t.discipline}` : ''}）`).join('\n');
+export function gmAttention(inst: EmployeeInst, todos: GmTodo[], env: PromptEnv, firstContact: boolean, ctx?: PromptCtx): string {
+  const call = tool(inst, env, ctx?.comm ?? false);
+  const list = todos.map(todo => {
+    const task = todo.task;
+    const reason = todo.verdict?.reasons.find(reason => reason.code === todo.reasonCode) ?? todo.verdict?.reasons[0];
+    const detail = reason ? `原因：${reason.text}；依据：${reason.basis}；自 ${todo.verdict?.since ?? '未知'}；版本 v${todo.expectedVersion}。` : `版本 v${todo.expectedVersion}。`;
+    const head = `- ${task.id}「${task.title}」（执行岗位 ${task.executorRole}${task.discipline ? `/${task.discipline}` : ''}）`;
+    if (todo.action === 'implementer_takeover') {
+      const dry = call.replace('<工具名>', 'contributor_dryrun').replace('<JSON参数>', JSON.stringify({ taskIds: [task.id] }));
+      const take = call.replace('<工具名>', 'implementer_takeover').replace('<JSON参数>', JSON.stringify({ taskId: task.id, toEmployee: '<在岗工程员工>', expectedVersion: todo.expectedVersion, reason: '<接手原因>', idempotencyKey: '<唯一串>' }));
+      const note = todo.reasonCode === 'implementer_unavailable'
+        ? '系统会继续自动重试；你也可以提前核对并指定负责人。'
+        : todo.reasonCode === 'implementer_quota'
+          ? '额度恢复时间以任务卡或通知为准，未知时不得编造；不要换账号、换模型或降低额度门槛。可等待恢复，也可现在接手。'
+          : '这是 ready 任务，不要调用 resume_task。';
+      return `${head}\n  动作：先只读核对 ${dry}；再由你在在岗工程员工中选一名非作者、非复核人，调用 ${take}。${note}${detail}`;
+    }
+    return `${head}\n  动作：读 get_task_history，按阻塞原因协调（补充上下文、拆任务、调整依赖）后用 resume_task 恢复。${detail}`;
+  }).join('\n');
   const workspace = ctx?.worktree ? `只读登记工作区：${ctx.worktree.worktreePath}；${ctx.worktree.discipline}\n` : '';
-  const body = `${workspace}【经理待办】以下任务被员工阻塞并交给经理处理：
+  const body = `${workspace}【经理待办】以下任务需要经理动作。经理动作通知不等于经理实际派工；ready 或在办无人的工程任务用 implementer_takeover，状态 blocked 的任务才用 resume_task。
 ${list}
-逐个用 get_task_history 读取阻塞原因，协调解决（补充上下文、拆出新任务 create_task、调整依赖）后用 resume_task 恢复。
 你有决定权：技术方案、拆分、上线（运营定不了时）、查得到的事实都由你决定并写进恢复说明，不要转给老板。
 只有花钱、签约、对外联系、公司方向和项目红线才让原员工 report_blocker(to=owner)，并写明你已查过哪些来源。处理完结束本轮。
-调用方式：${tool(inst, env, ctx?.comm ?? false)}`;
+调用方式：${call}`;
   return firstContact ? `${onboarding(inst, env, ctx?.comm ?? false, ctx?.commDir)}\n\n${body}` : body;
 }
 
