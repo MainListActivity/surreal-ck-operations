@@ -382,8 +382,15 @@ function listItem(row: TaskRow, fields: readonly string[] | undefined, cutLong: 
   const body: Record<string, unknown> = {
     ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context), contextTruncated: false,
   };
-  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) return body;
-  return echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
+  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) {
+    // A whole item: say so explicitly, so a caller that projects the list flags can tell "not cut" from "not reported".
+    if (fields?.includes('listsTruncated')) body.listsTruncated = task.listsTruncated ?? {};
+    return body;
+  }
+  const echoed = echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
+  // The echo cuts the lists and flags them; a projected caller must still see the flag (SYS-DISP R4).
+  if (fields?.includes('listsTruncated')) echoed.listsTruncated = echoed.listsTruncated ?? task.listsTruncated ?? {};
+  return echoed;
 }
 
 /** A task read by id, whole: the full context, with its size and digest so that a reassembly can be verified. */

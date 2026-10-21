@@ -1,9 +1,11 @@
 // SYS-DISP first-switch maintenance window (843d4e75 R1/R2): the executable preflight over the SYS01 GM read-only views.
 //
 // It reads only what a gm can already read — get_admin_summary (full-company counts with integrity) and paged get_context
-// (task projection) — and decides two separate things:
-//   1. capability: the GM read path is complete and consistent with the summary. Paged task rows can hide the caller's own
-//      submitted reviews (core.ts: `state = 'review' AND submitted_by = $me`), so a review-count mismatch is a hard refusal.
+// (task projection over the working set) — and decides two separate things:
+//   1. capability: the GM read path is complete and consistent. The two views count different scopes: the summary counts
+//      every task state (done/void/triage included), while paged get_context lists only the working set (ready/doing/
+//      review/blocked) and hides the caller's own submitted reviews. The comparison is therefore per working state; the
+//      review difference is reported as hidden own reviews and never treated as a truncated read.
 //   2. window: with complete data, no new candidate may exist. The silent window is a conditional best-effort, not a
 //      transactional barrier: any external owner action, crash or state move invalidates it and the caller must re-sample.
 //
@@ -18,10 +20,10 @@ export interface AdminSummaryView {
   integrity: { complete: boolean };
 }
 
-/** The projection the preflight requests from paged get_context. */
+/** The projection the preflight requests from paged get_context. listsTruncated is echoed only when a row was cut. */
 export const PREFLIGHT_FIELDS = [
   'id', 'state', 'executorRole', 'reviewerRole', 'blockedTo', 'submittedBy', 'currentEmployee',
-  'fence', 'version', 'leaseExpiresAt', 'dependencies',
+  'fence', 'version', 'leaseExpiresAt', 'dependencies', 'listsTruncated',
 ] as const;
 
 export interface PreflightTask {
@@ -36,6 +38,8 @@ export interface PreflightTask {
   version?: number;
   leaseExpiresAt?: string;
   dependencies?: string[];
+  /** The echo's cut flags: a key is present when that list was cut to fit the item budget. */
+  listsTruncated?: Record<string, unknown>;
 }
 
 export interface PageView {
@@ -75,11 +79,13 @@ export interface PreflightInput {
 }
 
 export interface PreflightVerdict {
-  capability: { complete: boolean; reasons: string[]; tasks: Record<string, number>; outboxSequence: number | null };
+  capability: { complete: boolean; reasons: string[]; tasks: Record<string, number>; hiddenReviews: number; outboxSequence: number | null };
   window: { allowed: boolean; reasons: string[]; admittedLease?: DeploymentLease };
 }
 
-const STATES = new Set(['ready', 'doing', 'review', 'blocked', 'done', 'void', 'triage', 'archived']);
+/** The states paged get_context lists (it never lists done/void/triage rows). */
+const WORKING_STATES = ['ready', 'doing', 'review', 'blocked'] as const;
+const STATES = new Set([...WORKING_STATES, 'done', 'void', 'triage', 'archived']);
 const DEFAULT_NEAR_EXPIRY_SECONDS = 300;
 
 const missingProjection = (row: PreflightTask): string[] => {
@@ -101,20 +107,28 @@ const countByState = (rows: readonly PreflightTask[]): Record<string, number> =>
   return counts;
 };
 
-const sameCounts = (a: Record<string, number>, b: Record<string, number>): boolean => {
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  for (const key of keys) if ((a[key] ?? 0) !== (b[key] ?? 0)) return false;
-  return true;
+const workingCounts = (tasks: Record<string, number>): Record<string, number> => {
+  const counts: Record<string, number> = {};
+  for (const state of WORKING_STATES) counts[state] = Number(tasks[state] ?? 0);
+  return counts;
 };
 
-/** Capability: the paged rows are the complete company task set the summary counted. Any gap is a refusal. */
+/**
+ * Capability: the paged working set is consistent with the summary, on the same scope. The summary counts every state;
+ * only the working states are compared. Reviews the caller submitted are hidden from paged get_context, so a smaller
+ * paged review count is expected and reported (the summary count still forbids the window); a larger one is a mismatch.
+ */
 function capability(input: PreflightInput): PreflightVerdict['capability'] {
   const reasons: string[] = [];
   const { summary, pages } = input;
   if (!summary.integrity?.complete) reasons.push('admin summary integrity.complete is not true');
   if (!Number.isSafeInteger(summary.outboxSequence) || summary.outboxSequence < 0) reasons.push('outbox sequence is missing or invalid');
   if (pages.length === 0) reasons.push('no pages were read');
-  if (pages.some(page => page.hasMore)) reasons.push('pagination did not reach hasMore=false (truncated read)');
+  // A walk is complete when its LAST page reports hasMore=false; an earlier page with hasMore=true is the normal
+  // "another page follows" marker, not a truncated read.
+  if (pages.length > 0 && pages[pages.length - 1]!.hasMore) reasons.push('pagination did not reach hasMore=false (truncated read)');
+  // A page that claims another page must also carry a cursor, and pages must not repeat a snapshot.
+  if (pages.some((page, index) => page.hasMore && index === pages.length - 1)) reasons.push('the last page still reports more rows');
   // One walk must read one fixed snapshot; pages from different snapshots are a drift, not a complete read.
   const snapshots = [...new Set(pages.map(page => page.snapshotAt).filter((value): value is string => typeof value === 'string'))];
   if (snapshots.length > 1) reasons.push(`pagination crossed snapshots: ${snapshots.join(', ')}`);
@@ -125,25 +139,38 @@ function capability(input: PreflightInput): PreflightVerdict['capability'] {
     seen.add(row.id);
     const missing = missingProjection(row);
     if (missing.length) reasons.push(`task ${row.id} is missing projection fields: ${missing.join(',')}`);
+    // A cut row may carry only part of its dependency list; admission would then miss a blocked dependency.
+    const cut = row.listsTruncated && typeof row.listsTruncated === 'object' ? Object.keys(row.listsTruncated) : [];
+    if (cut.length) reasons.push(`task ${row.id} lists were truncated (${cut.join(', ')}); its dependencies cannot be read whole`);
   }
   const unknownStates = [...new Set(rows.map(row => row.state))].filter(state => !STATES.has(state));
   if (unknownStates.length) reasons.push(`unknown task states: ${unknownStates.join(',')}`);
-  const summaryStates = Object.keys(summary.tasks ?? {});
-  const unknownSummaryStates = summaryStates.filter(state => !STATES.has(state));
+  const nonWorking = [...new Set(rows.map(row => row.state))].filter(state => !(WORKING_STATES as readonly string[]).includes(state));
+  if (nonWorking.length) reasons.push(`paged rows include non-working states: ${nonWorking.join(',')}`);
+  const unknownSummaryStates = Object.keys(summary.tasks ?? {}).filter(state => !STATES.has(state));
   if (unknownSummaryStates.length) reasons.push(`summary has unknown task states: ${unknownSummaryStates.join(',')}`);
-  const summaryCounts: Record<string, number> = {};
-  for (const [state, n] of Object.entries(summary.tasks ?? {})) summaryCounts[state] = Number(n);
   const pageCounts = countByState(rows);
-  if (!sameCounts(pageCounts, summaryCounts)) {
-    reasons.push(`paged task counts do not match the summary (pages: ${JSON.stringify(pageCounts)}, summary: ${JSON.stringify(summaryCounts)})`);
+  const summaryWorking = workingCounts(summary.tasks ?? {});
+  for (const state of ['ready', 'doing', 'blocked'] as const) {
+    if ((pageCounts[state] ?? 0) !== summaryWorking[state]!) {
+      reasons.push(`paged ${state} count ${pageCounts[state] ?? 0} does not match the summary ${summaryWorking[state]}`);
+    }
   }
-  // The caller's own submitted reviews are hidden from paged get_context; the summary still counts them. The mismatch
-  // above catches it, but state it explicitly so an operator sees why a "clean" page list can still be refused.
-  if ((pageCounts.review ?? 0) !== (summaryCounts.review ?? 0)) reasons.push('review rows are hidden or the summary moved (own submitted reviews are not paged)');
-  for (const page of pages) {
-    if (page.total !== undefined && page.total !== rows.length && pages.length === 1) reasons.push(`page total ${page.total} does not match ${rows.length} rows`);
+  const hiddenReviews = Math.max(0, (summaryWorking.review ?? 0) - (pageCounts.review ?? 0));
+  if ((pageCounts.review ?? 0) > (summaryWorking.review ?? 0)) {
+    reasons.push(`paged review count ${pageCounts.review} exceeds the summary ${summaryWorking.review}`);
   }
-  return { complete: reasons.length === 0, reasons, tasks: summaryCounts, outboxSequence: Number.isSafeInteger(summary.outboxSequence) ? summary.outboxSequence : null };
+  const workingTotal = WORKING_STATES.reduce((sum, state) => sum + (summaryWorking[state] ?? 0), 0);
+  if (rows.length + hiddenReviews !== workingTotal) {
+    reasons.push(`working-set size ${workingTotal} is not the paged rows ${rows.length} plus hidden own reviews ${hiddenReviews}`);
+  }
+  const totals = [...new Set(pages.map(page => page.total).filter((value): value is number => typeof value === 'number'))];
+  if (totals.length > 1) reasons.push(`pages report different totals: ${totals.join(', ')}`);
+  if (totals.length === 1 && totals[0] !== rows.length) reasons.push(`page total ${totals[0]} does not match ${rows.length} paged rows`);
+  return {
+    complete: reasons.length === 0, reasons, tasks: { ...workingCounts(summary.tasks ?? {}), ...summary.tasks },
+    hiddenReviews, outboxSequence: Number.isSafeInteger(summary.outboxSequence) ? summary.outboxSequence : null,
+  };
 }
 
 /** Admission: with complete data, every source that could claim, wake or unlock during the switch must be empty. */
@@ -151,8 +178,15 @@ function admission(input: PreflightInput, capabilityVerdict: PreflightVerdict['c
   const reasons: string[] = [];
   if (!capabilityVerdict.complete) return { allowed: false, reasons: [...capabilityVerdict.reasons] };
   const rows = input.pages.flatMap(page => page.rows);
+  const pageCounts = countByState(rows);
+  const summaryWorking = workingCounts(input.summary.tasks ?? {});
   const now = input.now ?? Date.now();
   const margin = (input.nearExpirySeconds ?? DEFAULT_NEAR_EXPIRY_SECONDS) * 1000;
+  // The summary is the authority for "does any candidate exist"; hidden own reviews exist only here.
+  if ((summaryWorking.ready ?? 0) > 0) reasons.push(`the summary counts ${summaryWorking.ready} ready task(s); every ready task is a claim candidate`);
+  if ((summaryWorking.review ?? 0) > 0) reasons.push(`the summary counts ${summaryWorking.review} review task(s), including any the caller submitted (hidden from pages)`);
+  if ((summaryWorking.blocked ?? 0) !== (pageCounts.blocked ?? 0)) reasons.push(`blocked rows cannot be read whole (summary ${summaryWorking.blocked}, pages ${pageCounts.blocked ?? 0})`);
+  if ((summaryWorking.doing ?? 0) !== (pageCounts.doing ?? 0)) reasons.push(`doing rows cannot be read whole (summary ${summaryWorking.doing}, pages ${pageCounts.doing ?? 0})`);
   const leaseTime = (row: PreflightTask): number | undefined => {
     if (!row.leaseExpiresAt) return undefined;
     const parsed = Date.parse(row.leaseExpiresAt);
@@ -215,4 +249,36 @@ function admission(input: PreflightInput, capabilityVerdict: PreflightVerdict['c
 export function evaluatePreflight(input: PreflightInput): PreflightVerdict {
   const cap = capability(input);
   return { capability: cap, window: admission(input, cap) };
+}
+
+/** One read of the two GM views: `call` is backed by sck in production and by the real core in the fork tests. */
+export type PreflightCall = (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+export interface CollectOptions {
+  pageSize?: number;
+  maxPages?: number;
+}
+
+/** Reads the summary and walks the paged working set to hasMore=false. Throws when the read shape is not the paged one. */
+export async function collectPreflightInput(call: PreflightCall, options: CollectOptions = {}): Promise<{ summary: AdminSummaryView; pages: PageView[] }> {
+  const summary = await call('get_admin_summary', {}) as unknown as AdminSummaryView;
+  const pageSize = options.pageSize ?? 100;
+  const maxPages = options.maxPages ?? 500;
+  const pages: PageView[] = [];
+  let cursor: string | undefined;
+  for (let index = 0; index < maxPages; index++) {
+    const answer = await call('get_context', { pageSize, fields: [...PREFLIGHT_FIELDS], ...(cursor === undefined ? {} : { cursor }) });
+    const rows = Array.isArray(answer.tasks) ? answer.tasks as PreflightTask[] : undefined;
+    const page = answer.page as { hasMore?: unknown; nextCursor?: unknown; total?: unknown; snapshotAt?: unknown } | undefined;
+    if (!rows || !page || typeof page.hasMore !== 'boolean') throw new Error('get_context did not return the paged task shape');
+    pages.push({
+      rows, hasMore: page.hasMore,
+      total: typeof page.total === 'number' ? page.total : undefined,
+      snapshotAt: typeof page.snapshotAt === 'string' ? page.snapshotAt : undefined,
+    });
+    if (!page.hasMore) break;
+    if (typeof page.nextCursor !== 'string' || page.nextCursor.length === 0) throw new Error('page.hasMore is true but no nextCursor was issued');
+    cursor = page.nextCursor;
+  }
+  return { summary, pages };
 }

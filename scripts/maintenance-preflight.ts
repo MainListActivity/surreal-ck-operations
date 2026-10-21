@@ -6,12 +6,13 @@
 //
 // Reads only what a gm can already read:
 //   sck call get_admin_summary '{}'                       full-company counts + integrity, one transaction
-//   sck call get_context '{"pageSize":100,"fields":[…]}'  fixed-snapshot task pages until page.hasMore is false
-// It never pauses dispatch, installs, reloads or writes; a non-zero exit means "do not open the window".
-import { evaluatePreflight, PREFLIGHT_FIELDS, type AdminSummaryView, type DeploymentLease, type PageView, type WindowExtras } from '../src/maintenance-preflight.ts';
+//   sck call get_context '{"pageSize":100,"fields":[…]}'  fixed-snapshot working-set pages until page.hasMore is false
+// The summary and the pages count different scopes (all states vs the working set, and own submitted reviews are hidden);
+// the evaluator compares them on the working set and reports hidden reviews separately. It never pauses dispatch,
+// installs, reloads or writes; a non-zero exit means "do not open the window".
+import { collectPreflightInput, evaluatePreflight, type DeploymentLease, type WindowExtras } from '../src/maintenance-preflight.ts';
 
 const SCK = process.env.SCK_BIN ?? '/Users/y/Library/Application Support/SurrealCKCompany/bin/sck';
-const MAX_PAGES = 500;
 
 const argValue = (name: string): string | undefined => {
   const index = process.argv.indexOf(name);
@@ -22,7 +23,7 @@ const parseJson = <T>(label: string, value: string | undefined): T | undefined =
   try { return JSON.parse(value) as T; } catch (error) { throw new Error(`${label} is not valid JSON: ${(error as Error).message}`); }
 };
 
-async function sck(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function sckCall(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const child = Bun.spawn([SCK, 'call', tool, JSON.stringify(args)], { stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
   const code = await child.exited;
@@ -30,25 +31,7 @@ async function sck(tool: string, args: Record<string, unknown>): Promise<Record<
   try { return JSON.parse(stdout) as Record<string, unknown>; } catch { throw new Error(`${tool} returned non-JSON output`); }
 }
 
-const summary = await sck('get_admin_summary', {}) as unknown as AdminSummaryView;
-const pageSize = Number(argValue('--page-size') ?? 100);
-const pages: PageView[] = [];
-let cursor: string | undefined;
-for (let index = 0; index < MAX_PAGES; index++) {
-  const answer = await sck('get_context', { pageSize, fields: [...PREFLIGHT_FIELDS], ...(cursor === undefined ? {} : { cursor }) });
-  const rows = Array.isArray(answer.tasks) ? answer.tasks as PageView['rows'] : undefined;
-  const page = answer.page as { hasMore?: unknown; nextCursor?: unknown; total?: unknown; snapshotAt?: unknown } | undefined;
-  if (!rows || !page || typeof page.hasMore !== 'boolean') throw new Error('get_context did not return the paged task shape');
-  pages.push({
-    rows, hasMore: page.hasMore,
-    total: typeof page.total === 'number' ? page.total : undefined,
-    snapshotAt: typeof page.snapshotAt === 'string' ? page.snapshotAt : undefined,
-  });
-  if (!page.hasMore) break;
-  if (typeof page.nextCursor !== 'string' || page.nextCursor.length === 0) throw new Error('page.hasMore is true but no nextCursor was issued');
-  cursor = page.nextCursor;
-}
-
+const { summary, pages } = await collectPreflightInput(sckCall, { pageSize: Number(argValue('--page-size') ?? 100) });
 const deployment = parseJson<DeploymentLease>('--deployment', argValue('--deployment'));
 const extras = parseJson<WindowExtras>('--extras', argValue('--extras')) ?? { triageGoals: null, pendingEvals: null, gmAttention: null };
 const now = argValue('--now') === undefined ? Date.now() : Date.parse(argValue('--now')!);

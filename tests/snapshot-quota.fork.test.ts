@@ -173,12 +173,13 @@ afterAll(async () => {
   }
 });
 
-test('setup: bootstrap applies schema 022, creating the quota table and the installation at schema 22', async () => {
+test('setup: bootstrap applies the snapshot schemas, creating the quota table and the installation at schema 25', async () => {
   const { db, store } = await fresh();
   const [info] = await db.db.query<[Record<string, unknown>]>('INFO FOR DB;');
   expect(Object.keys((info.tables ?? {}) as Record<string, string>)).toContain('query_snapshot_quota');
   const marker = await db.db.select<{ schema_version: number }>(new RecordId('company_meta', 'installation'));
-  expect(marker?.schema_version).toBe(24);
+  // SYS-DISP afdb562c adds the dispatch-pause migration after the two snapshot ones (023/024), so the chain ends at 25.
+  expect(marker?.schema_version).toBe(25);
   expect(await store.accounting()).toMatchObject({ listings: 0, bytes: 0, rows: 0, quota: { listings: 0, bytes: 0 } });
 });
 

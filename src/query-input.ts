@@ -14,6 +14,8 @@ export const TASK_FIELDS: readonly string[] = [
   'id', 'title', 'context', 'state', 'executorRole', 'reviewerRole', 'discipline', 'kind', 'goalId', 'projectOverlay',
   'codeRepoPath', 'dependencies', 'version', 'submittedBy', 'currentEmployee', 'deliveryId', 'leaseExpiresAt', 'fence',
   'blockedTo', 'handover', 'previousEmployee', 'workIntent', 'worktree', 'revises', 'supersededBy', 'lineage', 'revisionNo',
+  // The truncation flags: a caller that projects a list needs to know whether it got the whole list (SYS-DISP R4).
+  'listsTruncated', 'contextTruncated',
 ];
 
 const invalid = (message: string) => new CompanyError('invalid', message);
