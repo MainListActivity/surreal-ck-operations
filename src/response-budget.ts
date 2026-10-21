@@ -2,7 +2,7 @@
 // JavaScript string length, because a consumer cut lands on bytes and splits multi-byte characters. Pure helpers only:
 // no database, no transport.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import type { ClaimResult, FieldCut, HistoryEntry, ListCut, ProjectView, TaskTextField, TaskTextSegment, TaskView } from './contracts.ts';
+import type { ClaimResult, FieldCut, HistoryEntry, ListCut, ProjectView, TaskTextField, TaskTextSegment, TaskView, WorktreeRefsSegment } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { MAX_CURSOR_CHARS } from './query-input.ts';
 
@@ -163,6 +163,29 @@ export function textSegmentAnswer(head: TaskTextHead, segment: Utf8Segment): Tas
  */
 export function textSegment(text: string, offset: number, limit: number, head: TaskTextHead): Utf8Segment {
   return utf8Segment(text, offset, limit, segment => answerBytes(textSegmentAnswer(head, segment)) <= RESPONSE_BUDGET_BYTES);
+}
+
+/** What names a read_worktree_refs answer: the worktree, the reference filter, and the digest of the whole references text. */
+export interface WorktreeRefsHead {
+  worktreePath: string;
+  includeReleased: boolean;
+  sha256: string;
+}
+
+/** The answer read_worktree_refs gives for one segment. core builds every answer this way, so the budget check measures the real shape. */
+export function worktreeRefsSegmentAnswer(head: WorktreeRefsHead, segment: Utf8Segment): WorktreeRefsSegment {
+  return {
+    worktreePath: head.worktreePath, includeReleased: head.includeReleased, totalBytes: segment.total, sha256: head.sha256,
+    offset: segment.offset, bytes: segment.bytes, nextOffset: segment.next, text: segment.text,
+  };
+}
+
+/**
+ * One read_worktree_refs segment, cut so that its whole answer fits the response budget as it is sent (answerBytes; SYS01 R1).
+ * The text is JSON, so quotes and escapes are counted twice, exactly as read_task_text counts them.
+ */
+export function worktreeRefsSegment(text: string, offset: number, limit: number, head: WorktreeRefsHead): Utf8Segment {
+  return utf8Segment(text, offset, limit, segment => answerBytes(worktreeRefsSegmentAnswer(head, segment)) <= RESPONSE_BUDGET_BYTES);
 }
 
 /**

@@ -208,6 +208,17 @@ export function parseTextInput(input: Record<string, unknown>): {
   if (typeof field !== 'string' || !(TEXT_FIELDS as readonly string[]).includes(field)) {
     throw invalid(`field must be one of ${TEXT_FIELDS.join(', ')}`);
   }
+  return {
+    taskId, field: field as (typeof TEXT_FIELDS)[number], auditId: optionalText(input.auditId, 'auditId', 200),
+    ...parseSegmentWindow(input),
+  };
+}
+
+/**
+ * The byte window a segment read takes: offset, limit and the digest a continuation pins. read_task_text and
+ * read_worktree_refs share it, so both refuse a continuation that does not pin the digest it started with (C3, SYS01 R1).
+ */
+function parseSegmentWindow(input: Record<string, unknown>): { offset: number; limit: number; expectSha256?: string } {
   const offset = input.offset === undefined || input.offset === null ? 0 : input.offset;
   if (typeof offset !== 'number' || !Number.isInteger(offset) || offset < 0 || offset > 1e9) throw invalid('offset must be a non-negative integer');
   const limit = input.limit === undefined || input.limit === null ? undefined : input.limit;
@@ -220,9 +231,26 @@ export function parseTextInput(input: Record<string, unknown>): {
   if (offset > 0 && expectSha256 === undefined) {
     throw invalid('expectSha256 is required past offset 0: pass the sha256 returned by the first segment of this text');
   }
+  return { offset, limit: limit ?? 16 * 1024, expectSha256 };
+}
+
+/**
+ * Arguments of read_worktree_refs (SYS01 R1): the worktree a paged listing item named, the same includeReleased the listing
+ * used, and the byte window a reader continues with. A global read (no taskId) is gm only, as on list_worktrees.
+ */
+export function parseWorktreeRefsInput(input: Record<string, unknown>): {
+  taskId?: string; worktreePath: string; includeReleased: boolean; offset: number; limit: number; expectSha256?: string;
+} {
+  const taskId = optionalText(input.taskId, 'taskId', 200);
+  const worktreePath = input.worktreePath;
+  if (typeof worktreePath !== 'string' || worktreePath.trim().length === 0 || worktreePath.length > 4096) {
+    throw invalid('worktreePath is required: the canonical path a worktree listing returned, up to 4096 characters');
+  }
   return {
-    taskId, field: field as (typeof TEXT_FIELDS)[number], auditId: optionalText(input.auditId, 'auditId', 200),
-    offset, limit: (limit as number | undefined) ?? 16 * 1024, expectSha256,
+    ...(taskId !== undefined ? { taskId } : {}),
+    worktreePath,
+    includeReleased: optionalBoolean(input.includeReleased, 'includeReleased') ?? false,
+    ...parseSegmentWindow(input),
   };
 }
 

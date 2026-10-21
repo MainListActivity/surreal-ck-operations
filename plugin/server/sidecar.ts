@@ -34,7 +34,7 @@ const BASE_TOOLS = [
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
-  "get_admin_summary", "read_task_text",
+  "get_admin_summary", "read_task_text", "read_worktree_refs",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
@@ -717,6 +717,10 @@ export class SidecarPool {
       case "read_task_text": return core.taskText
         ? core.taskText(cred, args)
         : Promise.reject(Object.assign(new Error("core does not expose read_task_text"), { code: "temporarily_unavailable" }));
+      // SYS01 R1: the recovery entry a paged list_worktrees item names when its references were cut. Same scope as the listing (core).
+      case "read_worktree_refs": return core.worktreeRefs
+        ? core.worktreeRefs(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose read_worktree_refs"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);

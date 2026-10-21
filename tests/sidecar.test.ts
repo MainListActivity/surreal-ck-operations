@@ -24,6 +24,7 @@ let authRole = 'engineering';
 let activeLeaseRows: ActiveLease[] = [];
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
 const pageCalls: Array<{ cred: string; taskId?: string; pageSize?: number }> = [];
+const refCalls: Array<{ cred: string; input: Record<string, unknown> }> = [];
 const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
 const auditCalls: Array<{ cred: string; limit?: number }> = [];
 const snap = (proof: LeaseProof): LeaseProof => ({ ...proof }); // record a copy; the pool mutates its proof between calls
@@ -52,6 +53,11 @@ const core = {
   worktreePage: async (c: string, input: { taskId?: string; pageSize?: number }) => {
     pageCalls.push({ cred: c, taskId: input.taskId, pageSize: input.pageSize });
     return { worktrees: [], page: { returned: 0, hasMore: false } } as never;
+  },
+  worktreeRefs: async (c: string, input: Record<string, unknown>) => {
+    refCalls.push({ cred: c, input });
+    return { worktreePath: String(input.worktreePath), includeReleased: input.includeReleased === true, totalBytes: 2,
+      sha256: 'a'.repeat(64), offset: 0, bytes: 2, nextOffset: null, text: '[]' } as never;
   },
   reclaimWorktrees: async (c: string, input?: { dryRun?: boolean; repos?: string[] }) => {
     reclaimCalls.push({ cred: c, input });
@@ -114,6 +120,7 @@ beforeEach(() => {
   mediaReleased.length = 0;
   wtCalls.length = 0;
   pageCalls.length = 0;
+  refCalls.length = 0;
   reclaimCalls.length = 0;
   auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
@@ -293,6 +300,12 @@ describe('sidecar', () => {
     expect(paged.data).toEqual({ worktrees: [], page: { returned: 0, hasMore: false } });
     expect(pageCalls).toEqual([{ cred: 'tok-e13', taskId: undefined, pageSize: 5 }]);
 
+    // SYS01 R1：截断条目的恢复入口经通道原样转发（taskId、路径、过滤与字节窗口都由 core 校验）。
+    const refs = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w10', 'read_worktree_refs',
+      { taskId: 'task-13', worktreePath: '/wt/shared', includeReleased: true, offset: 0 });
+    expect(refs.ok).toBe(true);
+    expect(refCalls[0]).toEqual({ cred: 'tok-e13', input: { taskId: 'task-13', worktreePath: '/wt/shared', includeReleased: true, offset: 0 } });
+
     // 回收（dry-run 透传）与审计查询；写全量回收同样透传，由 core 做 gm 门控
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w4', 'reclaim_worktrees', { dryRun: true, repos: ['/repo/a'] });
     expect(reclaimCalls[0]).toEqual({ cred: 'tok-e13', input: { dryRun: true, repos: ['/repo/a'] } });
@@ -304,7 +317,7 @@ describe('sidecar', () => {
     // 工具清单暴露新工具
     const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w7', '__list__', {});
     expect((listed.data as { tools: string[] }).tools)
-      .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
+      .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits', 'read_worktree_refs']));
   });
 
   test('reclaim_worktrees is strict on the sidecar relay as in core and MCP (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are refused before the registry runs', async () => {
