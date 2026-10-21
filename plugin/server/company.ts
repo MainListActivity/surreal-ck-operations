@@ -5,6 +5,7 @@ import { loadServiceEnv, serviceHome } from "./env";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { readProviderQuotas } from "./dispatch";
+import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 
 export interface Company {
   db: import("./vendor/src/database").CompanyDatabase;
@@ -150,6 +151,10 @@ export function company(): Promise<Company> {
       // Host resource admission: free-memory/disk floors pause dispatch on the owner's
       // machine; supervision still runs so stalled leases keep getting reclaimed.
       hostResources: () => hostResources(serviceHome()),
+      // Model drift is realignment, not retirement: a provider may switch the model under a live
+      // session (Factory falls back once its standard allowance is spent) and switch back later.
+      // The daemon's MCP endpoint applies the change to the running session in place.
+      realignAgent: (agentId, model) => setAgentModel(agentId, model),
       // Terminal-task artifact lifecycle: the free-disk gate reclaims evidence/deliverables
       // before it gives up, so a full disk stops halting dispatch instead of silently wedging it.
       reclaimArtifacts: (input) => reclaimer.reclaim({

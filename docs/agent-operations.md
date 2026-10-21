@@ -160,6 +160,9 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 | `jev_decisions` | true | Jev 是否参与目标分级、上线决定、老板升级路由（拿不准时交经理/运营） |
 | `jev_release_threshold` | 0.8 | 上线申请「可以上线」概率 ≥ 该值且「触碰红线」≤ 1 − 该值时自动批准 |
 | `jev_owner_threshold` | 0.3 | 升级给老板的问题「必须老板决定」概率低于该值时改派经理（每任务一次） |
+| `quota_floor_pct` | 8 | 订阅短窗口/余额剩余低于该百分比即停止复用与新开；0 = 不熔断 |
+| `quota_weekly_floor_pct` | 2 | 订阅周/月窗口剩余低于该百分比即停止复用与新开；0 = 不熔断 |
+| `quota_warn_pct` | 20 | 订阅剩余低于该百分比但未触底时，给老板发一次「即将用尽」提醒；0 = 不提醒 |
 
 ## 排障
 
@@ -171,6 +174,11 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - **Jev 接入**：在 `private/service.env` 加 `JEV_API_KEY`（也可用 `TYPESAFE_API_KEY`）即启用；可选 `JEV_BASE_URL`（默认官方 `https://api.typesafe.ai/v1/systemone`，托管计费网关为 `https://jevtypesafeai.com/api/v1/decide`）、`JEV_MODEL`（默认固定 `jev-1.13.0`，避免阈值漂移）。key 从 TypeSafe 早期访问 waitlist 或托管网关获取。验证连通性：`pnpm run admin jev-test`。Jev 不产生文本输出，scorecard 的 `notes` 为空，判据与置信度在 `probabilities`/`confidence` 字段。
 - devin 订阅不接受 `thinking=low`（`paseo run` 报 AGENT_CREATE_FAILED）；devin 定义请用 medium/high。定义连续 spawn 失败 3 次会自动停用，修正后 `pnpm run admin def enable <id>` 恢复。
 - 不想让某类员工再接任务但保留定义：`pnpm run admin def weight <id> 0`（软停用，全部候选为 0 时仍可能兜底）；彻底停用用 `def disable <id>`。
+- **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
+- **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及经理/老板手工退役。
+- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却到上游重置时间），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。
+- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。
+- 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET http://127.0.0.1:3425/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。
 
 ## v2 归档
 

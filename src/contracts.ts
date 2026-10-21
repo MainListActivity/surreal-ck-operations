@@ -482,6 +482,8 @@ export interface ProviderQuota {
   weeklyPct?: number;
   status?: string;
   fetchedAt?: string;
+  /** Upstream reset of the window that is closest to running out (ISO 8601), when the provider reports one. */
+  resetsAt?: string;
 }
 
 export type OwnerDecision = 'approve' | 'reject' | 'reply';

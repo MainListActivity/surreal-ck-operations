@@ -22,7 +22,7 @@ import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLa
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
+export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
@@ -152,6 +152,12 @@ export interface StaffingInput {
   busyBy: ReadonlyMap<string, number>;
   providerMax: Record<string, number>;
   slots: ReadonlyMap<string, string>;
+  /**
+   * instId → the model the session is actually serving (Paseo's `ls -g`). Absent for a session
+   * nobody observed: the pool then falls back to `inst.model`, which is only what the spawn asked
+   * for and cannot see a model the provider switched under us.
+   */
+  runtimeModels?: ReadonlyMap<string, string>;
   opsRepo: string;
   sidecar: boolean;
   now: number;
@@ -199,7 +205,11 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
     const target = def && resolveSlot(def);
-    return !target || !inst.model || inst.model === target;
+    // What the provider serves wins over what the spawn asked for: a subscription can switch the
+    // model under a live session, and dispatching into it would run work on a model nobody chose.
+    // Unknown is unknown — neither "fine" nor "drifted" without evidence.
+    const served = p.runtimeModels?.get(inst.id) ?? inst.model;
+    return !target || !served || served === target;
   };
   const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
   /**
@@ -371,6 +381,14 @@ export interface DispatcherDeps {
    */
   hostResources?: () => HostResources;
   /**
+   * Rewrites a live session's model to the one its definition asks for. A provider may switch the
+   * model under a running subscription (Factory falls back to a cheaper model once the standard
+   * allowance is spent); the session keeps its conversation and is never retired for that. Returns
+   * true when the session now serves `model`. Undefined disables realignment: drift is then left
+   * alone rather than turned into a retirement.
+   */
+  realignAgent?: (agentId: string, model: string) => Promise<boolean>;
+  /**
    * Terminal-task artifact reclaim (evidence/deliverables lifecycle). Bare call = periodic
    * normal-mode sweep; `{ targetFreeMb }` = pressure mode, oldest terminal work first until
    * the real free-disk probe reaches the target. Undefined disables artifact reclaim.
@@ -452,6 +470,8 @@ export interface PassInputs {
   quotaBlocked: Map<string, string>;
   tasks: SupervisedTask[];
   slots: Map<string, string>;
+  /** instId → served model, from the same `paseo.list()` read the pass used. */
+  runtimeModels?: Map<string, string>;
 }
 
 export interface TickReport {
@@ -469,6 +489,8 @@ export interface TickReport {
   decisions: string[];
   /** Terminal-task artifacts trimmed this tick (see report.skipped === 'resources'). */
   reclaimed?: { tasks: number; files: number; freedBytes: number; trigger: ArtifactTrigger; pressure: boolean };
+  /** Sessions put back on their definition's model this tick (provider drift, or the def moved on). */
+  realigned?: string[];
   skipped?: 'paused' | 'budget' | 'resources';
 }
 
@@ -486,7 +508,8 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
+    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels,
+    opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
   const pools = roles.flatMap(role => homes.map(home => ({ role, home, entries: staffingPool({ ...poolBase, role, home }) })))
@@ -703,7 +726,7 @@ export class Dispatcher {
 
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -715,6 +738,14 @@ export class Dispatcher {
     /** `auto:<family>` defs resolve via the plugin-maintained slot map; literals pin. */
     const resolveModel = (def: EmployeeDef): string | undefined => this.resolveModel(def, slotMap);
     let insts = await wf.insts();
+    /** instId → the model Paseo reports the session actually serves (not what the spawn asked for). */
+    const runtimeModelOf = (inst: EmployeeInst): string | undefined =>
+      inst.paseoAgentId ? agents.get(inst.paseoAgentId)?.model : undefined;
+    const runtimeModels = new Map<string, string>();
+    for (const inst of insts) {
+      const served = runtimeModelOf(inst);
+      if (served) runtimeModels.set(inst.id, served);
+    }
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();
     for (const q of quotaRows) quotaByProvider.set(q.provider, q);
@@ -723,6 +754,23 @@ export class Dispatcher {
     // keeping a provider blocked forever.
     const quotaBlocked = quotaBlockedProviders(quotaRows, cfg, Date.now());
     if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
+    // Early warning: a subscription that is nearly spent still dispatches, but the owner hears
+    // about it while there is time to top it up, instead of discovering it when the company stops.
+    if (cfg.quotaWarnPct > 0) {
+      const low = new Set<string>();
+      for (const q of quotaRows) {
+        if (quotaBlocked.has(q.provider)) continue;
+        const pct = q.weeklyPct ?? q.lowestPct;
+        if (pct === undefined || pct > cfg.quotaWarnPct) continue;
+        low.add(q.provider);
+        await this.notice(`quota-warn:${q.provider}`,
+          `订阅 ${q.provider} 剩余 ${Math.round(pct)}%（低于提醒线 ${cfg.quotaWarnPct}%），${q.summary || '请查看用量'}。额度用尽后该订阅的会话会失败，建议现在充值或调整编制。`, report);
+      }
+      for (const notice of await owner.openNotices()) {
+        if (!notice.key.startsWith('quota-warn:')) continue;
+        if (!low.has(notice.key.slice('quota-warn:'.length))) await owner.resolveNotice(notice.key);
+      }
+    }
 
     // 1. Session health.
     const states = new Map<string, InstState>();
@@ -775,7 +823,11 @@ export class Dispatcher {
           const known = health.get(inst.provider)?.state === 'exhausted';
           const fresh = previous === undefined ? !known : previous !== 'error';
           if (fresh && !report.exhausted.includes(inst.provider)) {
-            await wf.markExhausted(inst.provider, error);
+            // A quota row that knows when the window resets beats the exponential backoff: the
+            // provider is unusable until then, and probing earlier only burns another session.
+            const resetsAt = quotaByProvider.get(inst.provider)?.resetsAt;
+            const resetsAtSec = resetsAt ? Math.floor(Date.parse(resetsAt) / 1000) : undefined;
+            await wf.markExhausted(inst.provider, error, Number.isFinite(resetsAtSec) ? resetsAtSec : undefined);
             report.exhausted.push(inst.provider);
           }
           continue;
@@ -863,31 +915,43 @@ export class Dispatcher {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
-        // Model staleness: an idle instance still on the previous resolved model would keep
-        // serving new tasks with it, so rotate it out before dispatch. Insts whose model we
-        // cannot read (undefined) stay; so do those of defs whose model is unresolvable now.
+        // Model drift is not a reason to retire anyone. A provider can switch the model under a
+        // live subscription (Factory falls back to a cheaper model once the standard allowance is
+        // spent) and can switch back when it recovers; the session, its conversation and its seat
+        // all stay valid. Realign it in place, and when that is not possible leave it for the next
+        // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
         const target = def ? resolveModel(def) : undefined;
-        const staleModel = Boolean(target && inst.model && inst.model !== target);
-        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK) && !staleModel) continue;
+        const served = runtimeModels.get(inst.id) ?? inst.model;
+        const staleModel = Boolean(target && served && served !== target);
+        if (staleModel) {
+          const realigned = this.deps.realignAgent
+            ? await this.deps.realignAgent(inst.paseoAgentId!, target!).catch(() => false)
+            : false;
+          if (realigned) {
+            runtimeModels.set(inst.id, target!);
+            (report.realigned ??= []).push(inst.id);
+            this.log(`realigned ${inst.id}: ${served} → ${target}`);
+          } else {
+            this.log(`model drift on ${inst.id} (${served} vs ${target}) left in place: no realign path`);
+          }
+          continue;
+        }
+        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
         const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
-          : staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
         if (!await this.retireGated(inst, reason, 'rotation', report)) continue;
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
-        if (staleModel && def) {
-          await this.notice(`model-upgrade:${def.id}:${target}`,
-            `编制 ${def.id} 的模型已升级到 ${target}（实例 ${inst.id} 等空闲旧模型会话已轮换，新任务将用新模型起会话）。`, report);
-        }
         report.retired.push(inst.id);
         this.log(`retired ${inst.id}: ${reason}`);
       }
       insts = insts.filter(i => !report.retired.includes(i.id));
+      for (const id of report.retired) runtimeModels.delete(id);
     }
 
     // What this pass has read before it decides. The snapshot and the daily brief are taken from these at the end of the tick.
-    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap };
+    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
@@ -987,7 +1051,7 @@ export class Dispatcher {
     // The candidate pool is evaluated by staffingPool — the same function the owner
     // page previews — so dispatch gating and the roster can never drift apart.
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
-      providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
+      providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>

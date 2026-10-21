@@ -5,7 +5,12 @@ import { join, resolve, sep } from 'node:path';
 import type { RetirementKind } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 
-export interface AgentInfo { id: string; status: string }
+/**
+ * `model` is the model the session is actually serving (`ls -g` prints `provider/model`), which a
+ * provider may have switched under us when a subscription hit its allowance. Undefined when Paseo
+ * prints a bare provider id: unknown, never "unchanged".
+ */
+export interface AgentInfo { id: string; status: string; model?: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
 export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number; employeesRetired?: number }
@@ -131,8 +136,14 @@ export function createPaseoCli(
   };
   return {
     async list() {
-      const rows = await json<Array<{ id: string; status: string }>>(['ls', '-g']);
-      return new Map(rows.map(r => [r.id, { id: r.id, status: r.status }]));
+      const rows = await json<Array<{ id: string; status: string; provider?: string }>>(['ls', '-g']);
+      return new Map(rows.map(r => {
+        // `provider` is "<providerId>/<modelId>"; a model id may itself contain slashes
+        // (`pi/magpie/stepfun/…`), so only the first one separates.
+        const slash = typeof r.provider === 'string' ? r.provider.indexOf('/') : -1;
+        const model = slash > 0 ? r.provider!.slice(slash + 1) : undefined;
+        return [r.id, { id: r.id, status: r.status, model }];
+      }));
     },
     async status(agentId) {
       let text: string;
@@ -156,9 +167,15 @@ export function createPaseoCli(
       return { status: fields.Status, pendingPermissions };
     },
     async lastError(agentId) {
-      const text = await run(['logs', agentId, '--tail', '8', '--no-color']).catch(() => '');
-      const errors = text.split('\n').filter(line => line.startsWith('[System Error]'));
-      return errors.at(-1)?.replace('[System Error]', '').trim() ?? '';
+      const text = await run(['logs', agentId, '--tail', '12', '--no-color']).catch(() => '');
+      // Paseo reports the failure as a timeline entry, not as a bare marker. The real line reads
+      //   Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: …
+      // so matching only a *leading* "[System Error]" never matched a single real failure and
+      // every quota exhaustion was read as an empty error and retired as "session error: unknown".
+      const marked = text.split('\n')
+        .map(line => line.trim())
+        .filter(line => line && (/\[System Error\]/.test(line) || /^(?:Internal error:|Error:)/.test(line)));
+      return (marked.at(-1) ?? '').replace(/\[System Error\]/g, ' ').replace(/\s+/g, ' ').trim();
     },
     async logsTail(agentId, entries) {
       return run(['logs', agentId, '--tail', String(entries), '--no-color']).catch(error => `（无法读取会话日志：${error.message}）`);
