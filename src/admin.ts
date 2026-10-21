@@ -21,6 +21,7 @@ const usage = `Usage: pnpm run admin <command>
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def tracks <id> <轨,轨|->               限定编制的岗位轨（- 或空 = 全接；非空则只接 discipline 在列的任务）
   def enable|disable <id>
+  def quota <id> limited|unlimited     是否受订阅额度限制（unlimited = 剩余额度为 0 也继续派工）
   seed-defs                               写入默认员工定义（30 个：九岗位含 eval × codex/grok/devin 订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座），已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
@@ -82,6 +83,7 @@ try {
       if (sub === 'list') {
         print((await workforce.defs()).map(d => ({ id: d.id, role: d.role, provider: d.provider, model: d.model,
           thinking: d.thinking, tracks: d.tracks ?? [], enabled: d.enabled, max: d.maxInstances, weight: d.weight,
+          quotaLimited: d.quotaLimited !== false,
           effectiveWeight: Number(effectiveWeight(d).toFixed(2)),
           avgScore: d.avgScore ? Number(d.avgScore.toFixed(2)) : undefined, scored: d.scored,
           errorStreak: d.errorStreak })));
@@ -102,6 +104,10 @@ try {
         const tracks = rest[0] === '-' ? [] : rest.join(' ').split(/[,，、]/).map(t => t.trim()).filter(Boolean);
         await database.db.query('UPDATE $def SET tracks = $tracks;',
           { def: new RecordId('employee_def', defId), tracks });
+      } else if (sub === 'quota') {
+        if (!defId || !['limited', 'unlimited'].includes(rest[0] ?? '')) throw new Error(usage);
+        await database.db.query('UPDATE $def SET quota_limited = $q;',
+          { def: new RecordId('employee_def', defId), q: rest[0] === 'limited' });
       } else if (sub === 'enable' || sub === 'disable') {
         await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0, disabled_reason = NONE, disabled_at = NONE;',
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });

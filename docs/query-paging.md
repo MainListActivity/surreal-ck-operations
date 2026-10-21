@@ -2,7 +2,7 @@
 
 本文说明员工与经理（gm）通过 sck（comm 通道）和 MCP 读取任务、历史、工作树与公司汇总时的契约。依据为经理裁决 v15（2026-10-19，C1 至 C6，见第 6 节）、经理裁决 v25（SYS01 P0，任务 04195c93）：快照 R4、工作树范围 R8、拆分项 R6 与 R7，以及经理裁决 v44（SYS01 终版）：MCP 结果采用方案 (b)（文本副本与 `structuredContent` 两份都计入预算）、预算 R3 按整条序列化应答（含信封）计、回收参数严格且三层一致。复核返工 v47 的 D1 至 D3 见第 9.9 节。第 2 节、第 3 节、第 6 节与第 9.8 节以 v44 为准，更早的记述保留作历史。
 
-实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储与库内配额）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/022-query-snapshot.surql`（快照行）与 `schema/023-snapshot-quota.surql`（全库计数）。
+实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储与库内配额）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/023-query-snapshot.surql`（快照行）与 `schema/024-snapshot-quota.surql`（全库计数）。
 
 ## 1. 截断层定位（AC01）
 
@@ -81,7 +81,7 @@ null 语义（MCP、sidecar 与核心一致）：
 
 ## 4. 快照与游标（C4）
 
-分页读取的第一页时，服务端把匹配的行与返回字段一次性物化为一个快照（表 `query_snapshot` 与 `query_snapshot_row`，由 schema 021 新增；容量计数见第 4 节末段的 schema 022）。此后每一页只读取已存储的行，不重新执行查询。
+分页读取的第一页时，服务端把匹配的行与返回字段一次性物化为一个快照（表 `query_snapshot` 与 `query_snapshot_row`，由 schema 023 新增；容量计数见第 4 节末段的 schema 024）。此后每一页只读取已存储的行，不重新执行查询。
 
 - 成员与字段固定。快照的成员、排序与返回字段在首页时刻确定。遍历中新增、状态变化、标题或其它字段变化、离开过滤集合、工作树登记增删，都不改变本次遍历的成员与字段。状态过滤的成员同样在首页时刻确定。
 - 每个任务在一次遍历中恰好出现一次，遍历中的写入不造成重复或遗漏。
@@ -133,7 +133,7 @@ null 语义（MCP、sidecar 与核心一致）：
 - 释放与清扫在构建之外各有 3 秒上限（`RELEASE_DEADLINE_MS`），超时即标记待清扫。
 - 受限链路（例如 50 KiB/s）上，超过 10 秒可传输量的大工作集会以 `temporarily_unavailable` 明确拒绝。这是可恢复的拒绝，不是数据损坏。请按答复指引收窄 `state`、`goalId`、`role`、`since`，或用 `fields` 减少每行字节后重试。
 
-准入上限在数据库内强制执行，由单一记录 `query_snapshot_quota:global`（schema 022）计数。每次预留、淘汰与释放都在同一事务中改动计数并递增 `version`，写入前校验版本；提交只把快照状态改为 `ready`，不改计数。因此 MCP 服务与插件 sidecar 两个进程共用同一上限，上限是硬限制，不是软限制。全库已满时，被拒绝的请求不淘汰任何快照。
+准入上限在数据库内强制执行，由单一记录 `query_snapshot_quota:global`（schema 024）计数。每次预留、淘汰与释放都在同一事务中改动计数并递增 `version`，写入前校验版本；提交只把快照状态改为 `ready`，不改计数。因此 MCP 服务与插件 sidecar 两个进程共用同一上限，上限是硬限制，不是软限制。全库已满时，被拒绝的请求不淘汰任何快照。
 
 ## 5. 汇总（C5，AC04）
 
@@ -195,8 +195,8 @@ null 语义（MCP、sidecar 与核心一致）：
 | 新增状态 | 写入方 | 旧版表现 |
 |---|---|---|
 | `company_meta:cursor_key`（一条随机密钥） | 新版首次分页时创建 | 旧版不读取，忽略 |
-| `query_snapshot`、`query_snapshot_row`（schema 021，只新增表） | 新版分页读取时创建，6 小时后由新版清扫删除 | 旧版不读取，忽略 |
-| `query_snapshot_quota:global`（schema 022，新增计数表，并为 `query_snapshot` 新增三个可缺省字段） | 新版快照存储首次使用时创建，之后随预留、提交、淘汰与释放更新 | 旧版不读取，忽略；既有快照行没有新字段时按 0 处理 |
+| `query_snapshot`、`query_snapshot_row`（schema 023，只新增表） | 新版分页读取时创建，6 小时后由新版清扫删除 | 旧版不读取，忽略 |
+| `query_snapshot_quota:global`（schema 024，新增计数表，并为 `query_snapshot` 新增三个可缺省字段） | 新版快照存储首次使用时创建，之后随预留、提交、淘汰与释放更新 | 旧版不读取，忽略；既有快照行没有新字段时按 0 处理 |
 | 游标（只在响应中，不持久化） | 新版 | 旧版忽略 `pageSize` 与 `cursor`，返回旧的全量形态（可能超预算，但不误派工） |
 | 无新的任务状态，无新的 audit 或 outbox 动作 | 无 | 任务与历史按旧语义读取，调度与认领不受影响 |
 | 工具 `get_admin_summary`、`read_task_text` | 无 | 旧版返回 `unknown_tool` |

@@ -21,3 +21,14 @@ test('capacity counts only enabled seats whose provider has quota and is not coo
 test('a provider whose cooldown has passed is usable again for a probe', () => {
   expect(roleCapacity([...defs], new Map(), health, 3000).find(r => r.role === 'engineering')!.usable).toBe(3);
 });
+
+test('an exempt def keeps its seat usable while its subscription is blocked', () => {
+  const rows = roleCapacity([
+    { role: 'engineering', provider: 'codex', enabled: true },
+    { role: 'engineering', provider: 'claude', enabled: true, quotaLimited: false },
+  ], new Map([['codex', '额度不足（周/月额度 0%<2%）'], ['claude', '额度不足（短窗口/余额 2%<8%）']]), new Map(), 1000);
+  const eng = rows.find(r => r.role === 'engineering')!;
+  expect(eng.total).toBe(2);
+  expect(eng.usable).toBe(1);
+  expect(eng.down).toEqual(['codex 额度不足（周/月额度 0%<2%）']);
+});

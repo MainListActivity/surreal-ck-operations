@@ -268,17 +268,18 @@ function registerTools(server: McpServer, core: CompanyCore) {
 
   // Workforce administration tools: manage capability only (gm/product), every write audited.
   server.registerTool('def_list', {
-    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight).',
+    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight/quota_limited).',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.listDefs(token(ctx))));
 
   server.registerTool('def_ensure', {
-    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables. Basic fields are required on every call.',
+    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables; quotaLimited=false keeps the def dispatchable even at 0% quota (omitted keeps the stored value). Basic fields are required on every call.',
     inputSchema: z.object({
       id: z.string().min(1).max(60), role: z.enum(defRoles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
       thinking: z.string().min(1).max(40).optional(), tracks: z.array(z.string().min(1).max(60)).max(50).optional(),
       maxInstances: z.number().int().min(0).max(8).optional(), priority: z.number().int().optional(),
       weight: z.number().int().min(0).max(1000).optional(), enabled: z.boolean().optional(),
+      quotaLimited: z.boolean().optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.ensureDef(token(ctx), input)));
 

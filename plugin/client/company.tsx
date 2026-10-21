@@ -906,6 +906,9 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   const [enabled, setEnabled] = useState(editing?.enabled ?? true);
   const [maxInstances, setMaxInstances] = useState(String(editing?.maxInstances ?? 1));
   const [weight, setWeight] = useState(String(editing?.weight ?? 10));
+  // undefined = "leave the stored value alone". A roster payload from an older plugin, or a page
+  // opened before a reload, must not silently re-apply the quota limit when the form is saved.
+  const [quotaLimited, setQuotaLimited] = useState<boolean | undefined>(editing ? editing.quotaLimited : true);
   const [showAllModels, setShowAllModels] = useState(false);
   const [result, setResult] = useState<string>();
 
@@ -933,6 +936,7 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
       role: role!, provider: provider!, model: model!, thinking, enabled,
       maxInstances: Number.parseInt(maxInstances, 10) || undefined,
       weight: Number.parseInt(weight, 10) || undefined,
+      quotaLimited,
     }),
     onSuccess: r => { setResult(editing ? `已更新 ${r.id}` : `已注册 ${r.id}`); if (!editing) { setModel(undefined); setThinking(undefined); } onDone(); },
     onError: e => setResult(`失败：${e instanceof Error ? e.message : String(e)}`),
@@ -1017,6 +1021,13 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
             <TextInput style={[s.input, { width: 56, paddingVertical: 6 }]} value={maxInstances} onChangeText={setMaxInstances} keyboardType="number-pad" />
             <Text style={s.muted}>派工权重</Text>
             <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
+            <Text style={s.muted}>额度限制</Text>
+            <Pressable accessibilityRole="button" style={[s.chip, quotaLimited !== false && s.chipActive]} onPress={() => setQuotaLimited(true)}>
+              <Text style={[s.chipText, quotaLimited !== false && s.chipTextActive]}>受限</Text>
+            </Pressable>
+            <Pressable accessibilityRole="button" style={[s.chip, !quotaLimited && s.chipActive]} onPress={() => setQuotaLimited(false)}>
+              <Text style={[s.chipText, !quotaLimited && s.chipTextActive]}>不受限</Text>
+            </Pressable>
             {editing && (
               <>
                 <Text style={s.muted}>状态</Text>
@@ -1165,7 +1176,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                             <View key={d.id} style={{ gap: 2 }}>
                               <View style={s.row}>
                                 <Text style={[s.text, { flex: 1 }]}>
-                                  {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.avgScore ? ` · 绩效 ${d.avgScore.toFixed(1)}` : ""}{d.enabled ? "" : " · 已停用"}
+                                  {d.provider}/{d.resolved ?? d.model} · 上限 {d.maxInstances}{d.avgScore ? ` · 绩效 ${d.avgScore.toFixed(1)}` : ""}{d.quotaLimited === false ? " · 不受额度限制" : ""}{d.enabled ? "" : " · 已停用"}
                                 </Text>
                                 <Pressable accessibilityRole="button" style={s.chip} onPress={() => setEditDef(d)}>
                                   <Text style={s.chipText}>编辑</Text>

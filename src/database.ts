@@ -103,13 +103,15 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('019-story-author-role.surql'));
     await this.db.query(loadSchema('020-cinematography-role.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
-    // main took 021 for worktree audit events; the SYS01 snapshot schemas are renumbered after it.
+    // The SYS01 snapshot schemas follow main's 021 (worktree audit events) and 022 (def quota limits).
     await this.db.query(loadSchema('021-worktree-audit-events.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
-    await this.db.query(loadSchema('022-query-snapshot.surql'));
+    await this.db.query(loadSchema('022-def-quota-limited.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
-    await this.db.query(loadSchema('023-snapshot-quota.surql'));
+    await this.db.query(loadSchema('023-query-snapshot.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
+    await this.db.query(loadSchema('024-snapshot-quota.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
