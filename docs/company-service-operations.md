@@ -241,6 +241,21 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 
 2026-10-20 事故：`artifact_reclaim_enabled` 被人工置为 false（无审计记录），磁盘降到 8.8 GB 后闸门连续阻塞全部派工十余小时，两个 ready 任务无人接手。修复后紧急回收绕过配置开关，闸门不会再被软开关死锁；此后该开关只影响例行清理频率。
 
+**工作树、员工通道与冷归档的保留期**
+
+四类回收器看不到的残留，由同一轮 GC（30 分钟）按保留期清理：
+
+| 对象 | 判定 | 默认保留 | 配置键 |
+|---|---|---|---|
+| 工作树 | `git status --porcelain` 里纯依赖/构建产物（未跟踪的 `node_modules`、`.venv`、`dist`、`build`、`target` 等）不算脏；**已跟踪文件的任何修改仍然算脏**，绝不自动删除 | 沿用 WT02 的孤儿宽限期 | `worktree_orphan_grace_days` |
+| `comm/<实例>` | 实例不在插件应答集合（`liveInstanceIds()`）里，且目录 mtime 超期 | 48 小时 | `comm_dir_grace_hours`（0 = 关闭） |
+| `scratch/<实例>` | 员工临时目录（克隆、构建、转码、抽帧、下载）；员工拿到的 `SCK_SCRATCH_DIR` 与 `TMPDIR` 都指向它，实例不在应答集合且 mtime 超期即清 | 24 小时 | `scratch_grace_hours`（0 = 关闭） |
+| `archive/<批次>` | 只认 `evidence-YYYY-MM-DD`、`deliverables-YYYY-MM-DD`、`*.tar.gz` 三类命名；其他内容留给人 | 7 天 | `archive_retention_days`（0 = 关闭） |
+
+GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪内容；结果打印在插件 stdout（`artifact reclaim` 台账只记 evidence/deliverables 的裁剪）。GC 与资源闸门无关，水位正常时也照常运行。
+
+删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。审计事件名是 `worktree_audit.event` 的 ASSERT 白名单：新增事件必须同时在 `schema/021-worktree-audit-events.surql` 放行，否则审计写入被拒、仓库级 catch 会中断整轮扫描（2026-10-21 事故）；`tests/audit-event-whitelist.test.ts` 在 `test:channel` 里校验两边一致。
+
 ## 老板作废、解锁与取消目标
 
 ```sh

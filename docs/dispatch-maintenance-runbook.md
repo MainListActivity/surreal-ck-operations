@@ -219,8 +219,8 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 
 ## 6. 迁移与环境需求
 
-- 迁移：schema/021-dispatch-pause.surql。定义 `dispatch_pass` 表（SCHEMALESS，PERMISSIONS NONE）与 state 索引，均为 IF NOT EXISTS。加法迁移，不改写存量行，不需要冻结写入。由 MCP bootstrap 执行（src/database.ts:99 至 :100）。
-- schema_version：新版由 20 改为 21（条件 WHERE schema_version < 21）。旧版的条件为 < 20，不会把 21 降回去（ddc8402 的 src/database.ts:99）。
+- 迁移：schema/022-dispatch-pause.surql。定义 `dispatch_pass` 表（SCHEMALESS，PERMISSIONS NONE）与 state 索引，均为 IF NOT EXISTS。加法迁移，不改写存量行，不需要冻结写入。由 MCP bootstrap 执行（src/database.ts:103 至 :104）。原编号 021 已被 main 的 worktree 审计事件迁移占用，故顺延为 022；两条迁移都是加法，先后只决定执行顺序。
+- schema_version：新版由 20 改为 22（条件 WHERE schema_version < 22）；中间经过 main 的 21（worktree 审计事件）。旧版的条件为 < 20，不会把 21 或 22 降回去（ddc8402 的 src/database.ts:99）。
 - 新增的数据字段与记录：company_meta:config.pause_epoch（缺省为 0）；company_meta:dispatch_gate；audit 中的 dispatch_pause 与 dispatch_restore 行；dispatch_pass 行。每个 pass 一行，已结束且超过 1 天的行在新 pass 开始时删除，running 行不删除。
 - 环境变量：分支没有新增 process.env 读取。RUN_SCK_DISPATCH_PAUSE_TESTS 只用于 fork 测试。install 沿用 SCK_RELEASE_KEEP 与 SCK_COMPONENTS。
 - 主机准备：无。

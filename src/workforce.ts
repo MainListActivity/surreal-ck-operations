@@ -98,6 +98,8 @@ export interface CompanyConfig {
   /** 订阅剩余额度（任一额度窗口或余额）低于该百分比时视为不可用，停止复用与新开；0 = 不熔断。 */
   quotaFloorPct: number;
   quotaWeeklyFloorPct: number;
+  /** 订阅剩余额度低于该百分比但尚未触及下限时，给老板发一次“即将用尽”提醒；0 = 不提醒。 */
+  quotaWarnPct: number;
   /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
   sessionMaxWakes: number;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
@@ -120,6 +122,12 @@ export interface CompanyConfig {
   artifactDeliverableGraceDays: number;
   /** 空闲磁盘低于「下限 + 该值」MB 时提前按压力回收，免得撞上暂停派工的下限；0 = 只在撞下限时回收。 */
   artifactHeadroomMb: number;
+  /** archive/ 冷归档批次的保留天数（按批次目录的最后修改时间计时）；0 = 不自动清理归档。 */
+  archiveRetentionDays: number;
+  /** 已不在册的员工实例，其 comm/ 目录保留的小时数；0 = 不自动清理。 */
+  commDirGraceHours: number;
+  /** 员工临时文件目录 scratch/<实例> 的保留小时数，按目录最后修改时间计时；0 = 不自动清理。 */
+  scratchGraceHours: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -127,9 +135,10 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
+  archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -269,6 +278,7 @@ export class Workforce {
       jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : 2,
+      quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
       evalQuickLlm: row?.eval_quick_llm === true,
@@ -279,6 +289,9 @@ export class Workforce {
       artifactEvidenceGraceDays: typeof row?.artifact_evidence_grace_days === 'number' ? row.artifact_evidence_grace_days : DEFAULT_CONFIG.artifactEvidenceGraceDays,
       artifactDeliverableGraceDays: typeof row?.artifact_deliverable_grace_days === 'number' ? row.artifact_deliverable_grace_days : DEFAULT_CONFIG.artifactDeliverableGraceDays,
       artifactHeadroomMb: typeof row?.artifact_headroom_mb === 'number' ? row.artifact_headroom_mb : DEFAULT_CONFIG.artifactHeadroomMb,
+      archiveRetentionDays: typeof row?.archive_retention_days === 'number' ? row.archive_retention_days : DEFAULT_CONFIG.archiveRetentionDays,
+      commDirGraceHours: typeof row?.comm_dir_grace_hours === 'number' ? row.comm_dir_grace_hours : DEFAULT_CONFIG.commDirGraceHours,
+      scratchGraceHours: typeof row?.scratch_grace_hours === 'number' ? row.scratch_grace_hours : DEFAULT_CONFIG.scratchGraceHours,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }
@@ -418,10 +431,16 @@ export class Workforce {
       failures: r.failures ?? 0, lastError: r.last_error }]));
   }
 
-  async markExhausted(provider: string, error: string): Promise<ProviderHealth> {
+  /**
+   * Cools a provider down after a quota failure. `resetsAt` (unix seconds) is the upstream reset
+   * time when something actually knows it (magpie reports it per window); the exponential backoff
+   * still applies as a floor so a stale or wrong upstream time cannot shorten the cooldown.
+   */
+  async markExhausted(provider: string, error: string, resetsAt?: number): Promise<ProviderHealth> {
     const current = (await this.providerHealth()).get(provider);
     const failures = (current?.failures ?? 0) + 1;
-    const until = (await this.now()) + Math.min(COOLDOWN_BASE * 2 ** (failures - 1), COOLDOWN_MAX);
+    const backoff = (await this.now()) + Math.min(COOLDOWN_BASE * 2 ** (failures - 1), COOLDOWN_MAX);
+    const until = resetsAt !== undefined && resetsAt > backoff ? resetsAt : backoff;
     await this.db.query(`UPSERT $p CONTENT { state: 'exhausted', until: $until, failures: $failures,
       last_error: $error, changed_at: time::now() };`, { p: id('provider_health', provider), until, failures, error: error.slice(0, 500) });
     return { provider, state: 'exhausted', until, failures, lastError: error };

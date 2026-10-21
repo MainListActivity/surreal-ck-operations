@@ -17,6 +17,7 @@ try {
   const targets = explicit.length ? explicit : process.argv.includes('--all') ? [] : [
     'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
+    'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
     'tests/mcp-run-reclaim.fork.test.ts', 'tests/paseo-dead-paths.test.ts',
     'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
     'tests/implementer-binding.integration.test.ts', 'tests/contributor-cas.integration.test.ts',

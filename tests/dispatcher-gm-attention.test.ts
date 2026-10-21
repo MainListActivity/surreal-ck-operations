@@ -104,7 +104,7 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
       return id;
     },
     send: async id => { agents.get(id)!.status = 'running'; },
-    stop: async () => {},
+    stop: async () => {}, reload: async () => {},
     archive: async () => {},
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
@@ -118,6 +118,7 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     claimDenial: () => undefined,
     bindAgent: () => {},
     commDirFor: () => '/tmp/comm',
+    scratchDirFor: instId => `/tmp/${instId}-scratch`,
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
     readWorkspace: async (inst, taskId) => {
