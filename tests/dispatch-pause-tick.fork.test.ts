@@ -59,6 +59,7 @@ async function startFork(name: string) {
       lastError: async () => '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
       spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); spawns.push(id); return id; },
       send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
+      reload: async id => { agentRows.get(id)!.status = 'idle'; },
       archive: async id => { agentRows.get(id)!.status = 'archived'; pool?.detachAgent(id); },
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     // Every dispatcher gets its own pass ledger instance, like a restarted plugin process.
