@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { RecordId } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
@@ -216,6 +216,42 @@ test('ProjectStore rejects new over-size public text before any project or env w
   expect(checked.ok).toBe(true);
   expect(checked.lengths.notes.over).toBe(true);
   expect(JSON.stringify(checked)).not.toContain('nnnnnnnnnnnnnnnnnnnn');
+});
+
+function recordingSurreal(real: Surreal): { db: Surreal; calls: string[] } {
+  const calls: string[] = [];
+  const wrapped = {
+    select: (thing: Parameters<Surreal['select']>[0]) => { calls.push(`select ${String(thing)}`); return real.select(thing); },
+    query: (sql: string, vars?: Record<string, unknown>) => { calls.push(`query ${sql}`); return real.query(sql, vars); },
+  } as unknown as Surreal;
+  return { db: wrapped, calls };
+}
+
+test('project diagnostics read only the public project row, never project_env or env_secret', async () => {
+  const { db, calls } = recordingSurreal(database.db);
+  const store = new ProjectStore(db);
+  const projectId = `ib-scope-${suffix}`;
+  const base = { id: projectId, name: 'Input scope', repoPath: '/fixture/input-scope', release: 'ok', envs: [{ name: 'production' }] };
+  await store.upsert(base);
+  const privateReads = () => calls.filter(call => /project_env|env_secret/.test(call));
+
+  calls.length = 0;
+  expect((await store.textLengths(projectId))!.release.over).toBe(false);
+  expect(privateReads()).toEqual([]);
+
+  calls.length = 0;
+  expect((await store.checkInput({ ...base, release: 'legal' })).ok).toBe(true);
+  expect(privateReads()).toEqual([]);
+
+  // The public-row basis still preserves an unchanged old over-limit value and refuses a changed one.
+  const longRelease = 'a'.repeat(PROJECT_TEXT_LIMITS.releaseBytes + 1);
+  await database.db.query('UPDATE $project SET release = $release;', { project: new RecordId('project', projectId), release: longRelease });
+  calls.length = 0;
+  expect((await store.checkInput({ ...base, release: longRelease })).ok).toBe(true);
+  expect(privateReads()).toEqual([]);
+  await expect(store.checkInput({ ...base, release: 'b'.repeat(PROJECT_TEXT_LIMITS.releaseBytes + 1) }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  expect(privateReads()).toEqual([]);
 });
 
 test('external create_delivery caps the raw dependency list before de-duplication, with zero task/audit/outbox/idempotency writes', async () => {

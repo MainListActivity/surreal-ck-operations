@@ -6,7 +6,7 @@ import { CompanyError } from './core-errors.ts';
 import { isPipeline } from './flows.ts';
 
 import { parseBrokerConfig } from './ops/config.ts';
-import { projectTextLengths, validateProjectTexts, type ProjectTextLengths } from './input-bounds.ts';
+import { projectTextLengths, validateProjectTexts, type ProjectTextExisting, type ProjectTextLengths } from './input-bounds.ts';
 
 const KEYCHAIN_SERVICE = 'surreal-ck-company';
 const KEYCHAIN_ACCOUNT = 'env-secret-key';
@@ -97,8 +97,8 @@ export class ProjectStore {
     if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
     // Read-only compatibility basis: an unchanged pre-limit over-size field may be preserved, but
     // any field this write changes must satisfy the new limits. Validate before the project row or
-    // any environment row is touched.
-    const existing = await this.get(input.id);
+    // any environment row is touched, and read only the public text fields (AC03).
+    const existing = await this.storedTexts(input.id);
     validateProjectTexts(input, existing ?? undefined);
     assertDisciplines(input.disciplines);
     if (input.pipeline !== undefined && !isPipeline(input.pipeline)) throw new CompanyError('invalid', 'pipeline must be software, video or story');
@@ -165,10 +165,20 @@ export class ProjectStore {
     });
   }
 
-  /** Dry-run `project check`: run the same pure validation as upsert, without any write. */
+  /**
+   * The public text fields of a stored project, used as the compatibility basis for validation.
+   * Deliberately not `get()`/`view()`: `project check`/`project lengths` and pre-write validation
+   * must not read project_env or env_secret (AC03).
+   */
+  private async storedTexts(projectId: string): Promise<ProjectTextExisting | undefined> {
+    const row = await this.db.select<ProjectRow>(new RecordId('project', projectId));
+    return row ? { release: row.release, rollback: row.rollback, notes: row.notes, runbooks: row.runbooks ?? [] } : undefined;
+  }
+
+  /** Dry-run `project check`: run the same pure validation as upsert, without any write or private-env read. */
   async checkInput(input: ProjectInput): Promise<{ ok: true; lengths: ProjectTextLengths }> {
     if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
-    const existing = await this.get(input.id);
+    const existing = await this.storedTexts(input.id);
     validateProjectTexts(input, existing ?? undefined);
     return { ok: true, lengths: projectTextLengths(input) };
   }
