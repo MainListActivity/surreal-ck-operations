@@ -294,7 +294,7 @@ run('R-B (6) a review lease held before the pause can accept or return while pau
         await expect(w.core.claim(h.executor, h.taskId)).rejects.toMatchObject({ code: 'dispatch_paused' });
       }
       // The decision itself opens no lease: no claim row is written, and the task holds no employee.
-      expect(await claimCount(h.taskId)).toBe(claimsBefore.get(h.taskId));
+      expect(await claimCount(h.taskId)).toBe(claimsBefore.get(h.taskId)!);
       const row = (await w.db.db.query<[{ state: string; current_employee?: unknown }]>('SELECT state, current_employee FROM ONLY $t;', { t: new RecordId('task', h.taskId) }))[0]!;
       expect(row.current_employee ?? null).toBeNull();
     }
