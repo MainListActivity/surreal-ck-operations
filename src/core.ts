@@ -21,6 +21,7 @@ import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplemente
 import type { ContributorDryRunView } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
@@ -646,12 +647,16 @@ export class SurrealCompanyCore implements CompanyCore {
 
   /** A created task answers with its context bounded to the item budget (SYS01); the create itself is not affected. */
   async createTask(credential: Credential, input: CreateTask): Promise<TaskView> {
-    return echoTask(await this.createTaskRecord(credential, input));
+    return echoTask(await this.createTaskRecord(credential, input, { external: true }));
   }
 
-  private async createTaskRecord(credential: Credential, input: CreateTask): Promise<TaskView> {
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
+    // External create_task only: the raw list is bounded before de-duplication. Internal delivery
+    // legs and automatic goal-anchor dependencies are deliberately not capped here; they must
+    // retain the complete dependency set.
+    if (options.external) validateExternalDependencies(input.dependencies);
     requireText(input.title, 'title', 3, 200);
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
@@ -1841,6 +1846,10 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]> {
+    // The caller's own dependency list is external input: bound the raw list before de-duplication,
+    // exactly like create_task (51 duplicates must not collapse into one legal edge). The legs' internal
+    // chain dependencies (leg N waits for leg N-1) are added below and stay complete.
+    validateExternalDependencies(input.dependencies);
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 3, 160);
     requireText(input.spec, 'spec', 20, 20000);

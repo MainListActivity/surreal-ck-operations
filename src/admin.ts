@@ -32,6 +32,8 @@ const usage = `Usage: pnpm run admin <command>
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
   project list                            列出项目环境与凭证名（不含值）
+  project lengths <项目>                   只读展示项目公开文本的 UTF-8 字节/计数与上限（不含正文）
+  project check <file.json>               只读校验候选项目输入，不写库
   project broker <项目> <环境> <file.json>
                                           写入该环境的运维代理（ops broker）配置；只放非敏感项，校验不过不入库
   secret set <项目> <环境> <名称> <角色,角色|-> [用途]
@@ -181,7 +183,14 @@ try {
       const store = new ProjectStore(database.db);
       if (sub === 'list') print(await store.list());
       else if (sub === 'set' && first) print(await store.upsert(JSON.parse(readFileSync(first, 'utf8')) as ProjectInput));
-      else if (sub === 'broker' && first && second && third) {
+      else if (sub === 'lengths' && first) {
+        const lengths = await store.textLengths(first);
+        if (!lengths) throw new CompanyError('not_found', `project ${first} not found`);
+        print({ action: 'project lengths', project: first, ...lengths });
+      } else if (sub === 'check' && first) {
+        const input = JSON.parse(readFileSync(first, 'utf8')) as ProjectInput;
+        print({ action: 'project check', ...(await store.checkInput(input)) });
+      } else if (sub === 'broker' && first && second && third) {
         await store.setBroker(first, second, JSON.parse(readFileSync(third, 'utf8')));
         print({ action: 'project broker', project: first, env: second, ok: true });
       } else throw new Error(usage);

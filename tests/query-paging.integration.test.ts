@@ -1458,9 +1458,10 @@ test('a delivery answers with all three legs inside one budget: each leg is cut 
 
 test('a delivery whose first leg holds a long dependency list echoes the whole count and digest, cut once (SYS01 R3)', async () => {
   const deliveryGoal = await owner.createGoal({ text: `依赖回显目标 ${suffix}`, source: 'owner:test', key: key('goal-dep-echo'), tier: 'standard' });
-  // 120 ids are over the share of the create answer, so that answer cuts the list; the leg answer then cuts the cut list again.
+  // The external dependency list is bounded (R67): at most 50 raw entries. 50 task ids of 36 characters are still
+  // over the share of the create answer, so that answer cuts the list; the leg answer then cuts the cut list again.
   const dependencies: string[] = [];
-  for (let index = 0; index < 120; index += 1) {
+  for (let index = 0; index < 50; index += 1) {
     const dependency = await core.createTask(gm, {
       title: `依赖回显 ${suffix} ${index}`, context: '依赖正文', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key(`dep-echo-${index}`),
     });
