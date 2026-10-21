@@ -20,6 +20,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string; model?: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
+  const logs: string[] = [];
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
   // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
   const held = new Set<string>(), scopeUnreadable = new Set<string>();
@@ -132,6 +133,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   let quotaRows: ProviderQuota[] = [];
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
+    log: (message: string) => { logs.push(message); },
     ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}),
     ...(realign ? { realignAgent: (agentId: string, model: string) => realign!(agentId, model) } : {}),
     quota: async () => quotaRows });
@@ -142,7 +144,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable,
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable,
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
@@ -755,6 +757,17 @@ describe('R4: provider model drift is realigned in place, never a retirement', (
     expect(r.realigned).toEqual([]);
     expect(r.retired).not.toContain('employee-9');
     expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('the waiting line is written once per drift episode, not on every pass', async () => {
+    const w = world();
+    driftedSession(w);
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    w.setRealign(async () => true);
+    const d = w.dispatcher();
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.includes('waits for codex to recover'))).toHaveLength(1);
   });
 
   test('a session already on its definition model is left alone', async () => {

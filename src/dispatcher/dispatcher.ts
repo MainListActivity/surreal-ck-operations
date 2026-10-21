@@ -538,6 +538,8 @@ export class Dispatcher {
   private readonly lastStatus = new Map<string, string>();
   /** agentId → when the last in-place reload was attempted; a failing restart is retried, not hammered. */
   private readonly reloadAt = new Map<string, number>();
+  /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
+  private readonly driftWaitLogged = new Map<string, string>();
   private readonly onboarded = new Set<string>();
   // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
   // identical answers, so re-asking every tick only burns tokens. Re-ask only
@@ -956,11 +958,13 @@ export class Dispatcher {
         const providerReady = !inst.provider ||
           (availabilityOf(health.get(inst.provider), now) !== 'down' && !quotaBlocked.has(inst.provider));
         const staleModel = Boolean(target && served && served !== target);
+        if (!staleModel) this.driftWaitLogged.delete(inst.paseoAgentId);
         if (staleModel && providerReady) {
           const realigned = this.deps.realignAgent
             ? await this.deps.realignAgent(inst.paseoAgentId!, target!).catch(() => false)
             : false;
           if (realigned) {
+            this.driftWaitLogged.delete(inst.paseoAgentId);
             runtimeModels.set(inst.id, target!);
             (report.realigned ??= []).push(inst.id);
             this.log(`realigned ${inst.id}: ${served} → ${target}`);
@@ -970,7 +974,11 @@ export class Dispatcher {
           continue;
         }
         if (staleModel) {
-          this.log(`model drift on ${inst.id} (${served} vs ${target}) waits for ${inst.provider} to recover`);
+          // Waiting out a spent subscription can last days; one line per episode keeps the plugin log readable.
+          if (this.driftWaitLogged.get(inst.paseoAgentId) !== served) {
+            this.driftWaitLogged.set(inst.paseoAgentId, served!);
+            this.log(`model drift on ${inst.id} (${served} vs ${target}) waits for ${inst.provider} to recover`);
+          }
           continue;
         }
         if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
