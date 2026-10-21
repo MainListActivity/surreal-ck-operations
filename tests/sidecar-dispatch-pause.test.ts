@@ -47,6 +47,13 @@ const core = {
     return view(proof.taskId, { version: proof.expectedVersion + 1 });
   },
   listTasks: async (_credential: string, state?: string) => (state === 'doing' ? doing : []),
+  // The restart path reads the complete credential-scoped lease view (main's review-lease fix), not the bounded list.
+  activeLeases: async (_credential: string) => doing
+    .filter(t => t.state === 'doing' || t.state === 'review')
+    .map(t => ({
+      taskId: t.id, state: t.state as 'doing' | 'review', deliveryId: String(t.deliveryId ?? ''), fence: t.fence,
+      version: t.version, leaseExpiresAt: t.leaseExpiresAt, role: t.executorRole, currentEmployee: t.currentEmployee,
+    })),
   getTask: async (_credential: string, taskId: string) => doing.find(t => t.id === taskId) ?? view(taskId, { state: 'ready' }),
   setDispatchPause: async (_credential: string, input: Record<string, unknown> & { paused: boolean }) => {
     dispatchCalls.push({ tool: input.paused ? 'dispatch_pause' : 'dispatch_restore', input });

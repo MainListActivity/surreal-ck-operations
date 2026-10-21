@@ -1,6 +1,6 @@
 # 派工维护运行手册：静默窗口切换、回滚与 dispatch_pause
 
-适用：SYS-DISP afdb562c（PR #1494）上线后的派工维护，以及从 bdf9732 首次切换到新版。
+适用：SYS-DISP afdb562c（PR #1494）上线后的派工维护，以及从旧版首次切换到新版。旧版 SHA 不写死：PREV 一律取切换当刻 Q0 记录的 active 与插件 SOURCE/DIRECTORY 双面核准值（bdf9732、021、633bdf2、2bacac1 以及旧版旁路修复均为历史，不再是生产现状）。
 
 状态：草案，待独立工程复核。本文件不授权合入、部署、开窗、暂停或恢复。每次执行都须由 GM 在任务记录中授权，并按本文留证据。
 
@@ -69,7 +69,8 @@ PASEO="/Applications/Paseo.app/Contents/Resources/bin/paseo"
 ### Q2 开窗（需 GM 在任务记录中授权）
 
 ```sh
-SCK_RELEASE_KEEP=<N> SCK_COMPONENTS=mcp sh "$REL/scripts/company-service.sh" install "$REL"
+# KEEP 取安装时有效的 40 位十六进制 release 目录数（含 $REL），动态计算，不用固定值
+SCK_RELEASE_KEEP=$(ls "$SVC/releases" | grep -E '^[0-9a-f]{40}$' | wc -l | tr -d ' ') SCK_COMPONENTS=mcp sh "$REL/scripts/company-service.sh" install "$REL"
 ```
 
 - $REL 为 `$SVC/releases/<40 位 SHA>`。SHA 为 origin/main 上的合并提交。脚本会拒绝不在 origin/main 上的提交。
@@ -78,7 +79,7 @@ SCK_RELEASE_KEEP=<N> SCK_COMPONENTS=mcp sh "$REL/scripts/company-service.sh" ins
   1. 校验 $REL 完整（src/mcp/run.ts 与 src/dispatcher/run.ts 存在）、SHA 为 40 位、可达 origin/main，并查询插件当前 SOURCE。查询失败则拒绝，active 不变。
   2. 替换 bin/run.sh 与 bin/sck；原子切换 active 指向 $REL。
   3. 若插件 SOURCE 位于服务目录内：`plugin remove sck-company`，再 `plugin install $REL/plugin --id sck-company`。此时旧插件进程退出，旧派工器停止；新插件启动，新派工器开始 tick。
-  4. 重写 MCP plist，bootout 后 bootstrap。MCP 重启并执行 bootstrap（含 schema 021）。MCP 在 bootstrap 完成后才开始监听（src/mcp/run.ts），因此 /health 与 /ready 返回 200 即表示 bootstrap 已完成。
+  4. 重写 MCP plist，bootout 后 bootstrap。MCP 重启并执行 bootstrap（迁移链当前至 schema/025；以 release 内 src/database.ts 为准）。MCP 在 bootstrap 完成后才开始监听（src/mcp/run.ts），因此 /health 与 /ready 返回 200 即表示 bootstrap 已完成。
   5. 按 SCK_RELEASE_KEEP 修剪快照。
 - 不做：不重启整个 Paseo 守护进程；不另建 dispatcher、launchd 或定时器；不修改 enabled；不写 company_meta:config。
 - 输出含 `warning: plugin repoint failed`：立即进入 R1，不进入 Q3。
@@ -132,7 +133,7 @@ SCK_RELEASE_KEEP=<N> SCK_COMPONENTS=mcp sh "$REL/scripts/company-service.sh" ins
 SCK_RELEASE_KEEP=<N> SCK_COMPONENTS=mcp sh "$PREV/scripts/company-service.sh" install "$PREV"
 ```
 
-- PREV 为已核实完整的上一版 release。生产当前为 bdf9732，以 Q0 记录为准。
+- PREV 为已核实完整的上一版 release，取切换当刻 Q0 记录的 active 与插件 SOURCE/DIRECTORY 双面核准值；部署记录必须写实际 PREV SHA 与回滚能力核对结果，不得沿用申请时的旧值（bdf9732 为历史）。
 - 完整性检查：src/mcp/run.ts 与 src/dispatcher/run.ts 存在；plugin/ 与 plugin/node_modules 存在；plugin/server/vendor/schema 与 schema 一致；目录内没有 .git（不是 Git worktree）。缺任一项则不回滚，报 GM。
 - 插件 SOURCE 位于服务目录内时，install 会自动把插件重指到 $PREV/plugin。
 
@@ -221,7 +222,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 
 | 组合 | 新租约闸门（claimLease） | dispatch_* 工具 | 可否用于维护停派 |
 |---|---|---|---|
-| bdf9732 两面（生产现状） | 无，只有派工 pass 级布尔 gate | 无 | 否 |
+| 旧版（bdf9732 等历史版本） | 无，只有派工 pass 级布尔 gate | 无 | 否（历史对照，非生产现状） |
 | 新版 MCP 与新版插件（同一 release） | 有，在事务内 | 有 | 是（第 4 节） |
 | 新版 MCP 与旧版插件 | 旧插件的派工与侧车 claim 无闸门 | 插件侧无 | 否，Q3 失败 |
 | 旧版 MCP 与新版插件 | 插件侧有；MCP 的 claim_next 无闸门 | 插件侧有，MCP 无 | 否，Q3 失败 |
@@ -252,7 +253,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 7. drainTimeoutSeconds 默认 120 秒是设计默认值，未在生产测量。
 8. 本分支未经生产验证。第 4 节的生产验证由 3381c477 执行。
 9. ★ 审计行没有员工侧读取工具（见第 4 节）。
-10. 切换顺序不一致：install 先重指插件，再重启 MCP（scripts/company-service.sh）；docs/company-service-operations.md 第 3 节写的是 MCP ready 后再切插件。本次迁移为加法，可以接受。非加法迁移前需统一顺序（待 GM 决定）。
+10. 安装顺序与恢复风险：`company-service.sh install` 先重指插件（remove+install），再重启 MCP；`docs/company-service-operations.md` 第 3 节写的是 MCP ready 后再切插件。实际顺序意味着插件先指向新 release，若随后 MCP 重启或 bootstrap 失败，两面会短暂不一致。恢复：立即用 PREV 重新 install（双面回滚），或在 MCP 就绪后用 PREV/REL 的 plugin 重新 install+reload；不得只改 active。本迁移为加法，可以接受；非加法迁移前需统一顺序（待 GM 决定）。
 
 ## 8. 本手册编写期间的执行情况
 
