@@ -897,3 +897,54 @@ describe('R4: a persistent quota floor writes one line, not one per tick', () =>
     expect(w.logs.filter(m => m.startsWith('quota recovered'))).toHaveLength(1);
   });
 });
+
+// A def can opt out of quota gating: even at 0% remaining the owner wants it dispatched and
+// retried, accepting that some turns will fail until the allowance returns.
+describe('R6: a def exempt from quota gating keeps dispatching through a spent subscription', () => {
+  test('a spawn is admitted while the provider is quota-blocked and cooling down', async () => {
+    const w = world();
+    w.def.quotaLimited = false;
+    try {
+      w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+      w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+      w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+      w.addTask('exempt-task');
+      const r = await w.dispatcher().tick();
+      expect(r.skipped).toBeUndefined();
+      expect(r.woke).toHaveLength(1);
+      expect(r.woke[0]!.spawned).toBe(true);
+    } finally { w.def.quotaLimited = undefined; }
+  });
+
+  test('a limited def in the same state still waits', async () => {
+    const w = world();
+    w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    w.addTask('limited-task');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(r.skipped).toBe('budget');
+  });
+
+  test('a session parked by a quota error is reloaded without waiting out the cooldown', async () => {
+    const w = world();
+    w.def.quotaLimited = false;
+    try {
+      const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+        credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+      w.instances.push(inst);
+      w.pool.env(inst);
+      w.pool.bindAgent(inst.id, 'agent-9');
+      inst.paseoAgentId = 'agent-9';
+      w.agents.set('agent-9', { id: 'agent-9', status: 'error' });
+      w.setLastError('Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: Agent turn ended: model_usage_exhausted');
+      // Still cooling down: a limited def waits, an exempt def restarts on the retry interval.
+      w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+      const r = await w.dispatcher().tick();
+      expect(w.events).toContain('reload:agent-9');
+      expect(r.recovered).toEqual(['employee-9']);
+      expect(w.agents.get('agent-9')!.status).toBe('idle');
+    } finally { w.def.quotaLimited = undefined; }
+  });
+});

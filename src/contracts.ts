@@ -432,6 +432,7 @@ export interface DefView {
   maxInstances: number;
   priority: number;
   weight: number;
+  quotaLimited?: boolean;
 }
 
 /**
@@ -450,6 +451,8 @@ export interface EnsureDef {
   priority?: number;
   weight?: number;
   enabled?: boolean;
+  /** false = dispatched even when the subscription's remaining allowance is 0. Absent keeps the stored value. */
+  quotaLimited?: boolean;
 }
 
 export interface EmployeeScore {

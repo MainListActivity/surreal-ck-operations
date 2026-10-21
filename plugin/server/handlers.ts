@@ -212,6 +212,7 @@ export function registerHandlers(server: PluginServerContext): void {
       defs: orderedDefs.map(d => ({
         id: d.id, role: d.role, provider: d.provider, model: d.model, resolved: resolveDisplay(d),
         thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight, avgScore: d.avgScore,
+        quotaLimited: d.quotaLimited,
       })),
       // Only what the roster renders: the instance name, its def and the tick's status.
       // cwd/agentId/role/provider had no reader and consumed most of the 6KB instance budget.
@@ -386,7 +387,7 @@ export function registerHandlers(server: PluginServerContext): void {
     await workforce.upsertDef(defId, {
       role: input.role as any, provider: input.provider, model: input.model,
       thinking: input.thinking, maxInstances: input.maxInstances, weight: input.weight,
-      enabled: input.enabled,
+      enabled: input.enabled, quotaLimited: input.quotaLimited,
     });
     return { id: defId };
   });
