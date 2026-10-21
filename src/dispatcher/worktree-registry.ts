@@ -7,6 +7,7 @@ import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, TaskView, WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
 } from './worktree-reclaim.ts';
@@ -96,10 +97,10 @@ export function validateIntent(intent: WorkIntent | undefined): void {
   if (!intent || typeof intent !== 'object' || Array.isArray(intent) || Object.keys(intent).some(k => !['kind', 'paths', 'lane'].includes(k)) ||
       (intent.paths !== undefined && !Array.isArray(intent.paths)) || (intent.lane !== undefined && typeof intent.lane !== 'string')) throw new CompanyError('invalid', 'Invalid work intent fields');
   if (!['read', 'code', 'assets'].includes(intent.kind) || (intent.lane !== undefined && !/^[a-zA-Z0-9_-]{1,60}$/.test(intent.lane))) throw new CompanyError('invalid', 'Invalid work intent');
-  if (intent.kind === 'assets' && (!intent.paths?.length || intent.paths.length > 50)) throw new CompanyError('invalid', 'Asset writes require authorized relative directories');
+  if (intent.kind === 'assets' && (!intent.paths?.length || intent.paths.length > MAX_ASSET_PATHS)) throw new CompanyError('invalid', 'Asset writes require authorized relative directories');
   if (intent.kind !== 'assets' && intent.paths?.length) throw new CompanyError('invalid', 'Only assets use directory write scopes');
   for (const p of intent.paths ?? []) {
-    if (typeof p !== 'string' || isAbsolute(p) || p.length > 300 || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
+    if (typeof p !== 'string' || isAbsolute(p) || p.length > MAX_ASSET_PATH_CHARS || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
   }
 }
 export const overlap = (a: string, b: string) => {

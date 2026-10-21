@@ -118,12 +118,12 @@ test('task answers leave the company block out by default, and say whether they 
 });
 
 test('the 31 KiB sample: the block pages back whole, and task answers keep it whole while it fits', async () => {
-  // The operations sample is a 30683-byte company block: long directions, goals and a project with a long runbook.
+  // The operations sample is a 30683-byte company block: long directions, goals and a project with two 2 KiB runbooks.
   await owner.addDirection({ text: textOf(9000, '方向一 '), source: 'owner:test', key: key('dir-a') });
   await owner.addDirection({ text: textOf(6000, '方向二 🙂 '), source: 'owner:test', key: key('dir-b') });
   await owner.createGoal({ text: textOf(7000, '目标简报 '), source: 'owner:test', key: key('goal-a'), tier: 'standard' });
   await owner.createGoal({ text: textOf(3000, '第二目标 '), source: 'owner:test', key: key('goal-b'), tier: 'standard' });
-  await new ProjectStore(database.db).upsert({ id: `cs-proj-a-${suffix}`, name: '样本项目', repoPath: '/fixture/cs-a', release: 'local', envs: [], runbooks: [textOf(4000, '运行手册 "引号" ')] });
+  await new ProjectStore(database.db).upsert({ id: `cs-proj-a-${suffix}`, name: '样本项目', repoPath: '/fixture/cs-a', release: 'local', envs: [], runbooks: [textOf(2000, '运行手册甲 '), textOf(2000, '运行手册乙 ')] });
   const brief = await live();
   // About 30 KiB of block is about 60 KiB of answer, so neither the task answer nor the complete company answer can carry it whole.
   await expectRefused(core.contextView(gm, { includeCompany: true, state: 'done' }), 'response_too_large', /pageSize/);

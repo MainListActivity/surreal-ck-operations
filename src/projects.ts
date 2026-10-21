@@ -6,6 +6,7 @@ import { CompanyError } from './core-errors.ts';
 import { isPipeline } from './flows.ts';
 
 import { parseBrokerConfig } from './ops/config.ts';
+import { projectTextLengths, validateProjectTexts, type ProjectTextLengths } from './input-bounds.ts';
 
 const KEYCHAIN_SERVICE = 'surreal-ck-company';
 const KEYCHAIN_ACCOUNT = 'env-secret-key';
@@ -94,6 +95,11 @@ export class ProjectStore {
 
   async upsert(input: ProjectInput): Promise<ProjectView> {
     if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
+    // Read-only compatibility basis: an unchanged pre-limit over-size field may be preserved, but
+    // any field this write changes must satisfy the new limits. Validate before the project row or
+    // any environment row is touched.
+    const existing = await this.get(input.id);
+    validateProjectTexts(input, existing ?? undefined);
     assertDisciplines(input.disciplines);
     if (input.pipeline !== undefined && !isPipeline(input.pipeline)) throw new CompanyError('invalid', 'pipeline must be software, video or story');
     const project = new RecordId('project', input.id);
@@ -147,6 +153,24 @@ export class ProjectStore {
   async get(projectId: string): Promise<ProjectView | undefined> {
     const row = await this.db.select<ProjectRow>(new RecordId('project', projectId));
     return row ? this.view(row) : undefined;
+  }
+
+  /** Read-only length diagnostic: field names, counts and UTF-8 bytes; never the text or credentials. */
+  async textLengths(projectId: string): Promise<ProjectTextLengths | undefined> {
+    if (!PROJECT_ID.test(projectId)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
+    const row = await this.db.select<ProjectRow>(new RecordId('project', projectId));
+    if (!row) return undefined;
+    return projectTextLengths({
+      release: row.release, rollback: row.rollback, notes: row.notes, runbooks: row.runbooks ?? [],
+    });
+  }
+
+  /** Dry-run `project check`: run the same pure validation as upsert, without any write. */
+  async checkInput(input: ProjectInput): Promise<{ ok: true; lengths: ProjectTextLengths }> {
+    if (!PROJECT_ID.test(input.id)) throw new CompanyError('invalid', 'project id must match [a-z][a-z0-9_-]*');
+    const existing = await this.get(input.id);
+    validateProjectTexts(input, existing ?? undefined);
+    return { ok: true, lengths: projectTextLengths(input) };
   }
 
   private async view(row: ProjectRow): Promise<ProjectView> {

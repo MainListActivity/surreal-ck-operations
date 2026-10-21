@@ -272,6 +272,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      // The 50-dependency and asset-path limits are enforced by core.createTask, the same
+      // validator the sidecar reaches. Keeping them out of this schema preserves the structured
+      // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
@@ -326,12 +329,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others.',
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
       lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
+      // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
+      // reaches. Keeping it out of this schema preserves the structured `invalid` result.
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
