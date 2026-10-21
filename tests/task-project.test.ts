@@ -264,10 +264,13 @@ run('rebind releases the stale registered reference but never deletes the physic
   expect(existsSync(treePath)).toBe(true); // 物理树未被删除，交给既有 reclaim 生命周期
   // 改绑后经理 resume，再在新项目仓重新领取：分配 maplayer-content 的任务分支，而不是复用旧仓现场。
   await C.resume(gm, t.id, { text: 'fixture resume after rebind away from the wrong repo', idempotencyKey: key() });
-  const next = await C.claim(eng2, t.id);
+  // The original implementer keeps the task: a different engineering employee is still refused by the implementer guard.
+  const crossClaim = await C.claim(eng2, t.id).catch((error: Error & { code?: string }) => error);
+  expect(crossClaim).toMatchObject({ code: 'forbidden', message: 'Task claim denied: bound to another implementer' });
+  const next = await C.claim(eng, t.id);
   expect(next.worktree!.repo).toBe(repoMlc);
   expect(next.worktree!.worktreePath).not.toBe(treePath);
-  await C.submit(eng2, proof(next), { text: 'fixture delivery proves rebinding rerouted the workspace', idempotencyKey: key() });
+  await C.submit(eng, proof(next), { text: 'fixture delivery proves rebinding rerouted the workspace', idempotencyKey: key() });
 });
 
 run('ops project resolution follows the override for broker scope and audit quota counting', async () => {
@@ -312,12 +315,15 @@ run('bind routes the workspace to the ops repo while the business project stays 
   expect(existsSync(treePath)).toBe(true);
 
   await C.resume(gm, t.id, { text: 'fixture resume after code-repo bind', idempotencyKey: key() });
-  const next = await C.claim(eng2, t.id);
+  // Binding the code repo does not hand the task to another employee: the original implementer still claims it.
+  const crossClaim = await C.claim(eng2, t.id).catch((error: Error & { code?: string }) => error);
+  expect(crossClaim).toMatchObject({ code: 'forbidden', message: 'Task claim denied: bound to another implementer' });
+  const next = await C.claim(eng4, t.id);
   expect(next.worktree!.repo).toBe(realpathSync(repoOps)); // 新 claim 在绑定仓分配任务分支
   expect(next.worktree!.branch).toBe(`task/${t.id.slice(0, 8)}`);
   expect(next.worktree!.worktreePath).not.toBe(treePath);
   expect(next.project?.id).toBe('maplayer-content'); // claim.json.project 仍是业务项目
-  const scope = await C.opsScope(eng2, t.id);
+  const scope = await C.opsScope(eng4, t.id);
   expect(scope.project).toBe('maplayer-content'); // ops 环境/凭证范围不受代码绑定影响
 
   const supervised = (await wf.tasks()).find(x => x.id === t.id)!;
@@ -333,7 +339,7 @@ run('bind routes the workspace to the ops repo while the business project stays 
   expect(events[0]!.payload.new_repo).toBe(realpathSync(repoOps));
   const hist = await C.history(gm, t.id);
   expect(hist.some(h => h.action === 'bind_task_code_repo' && h.actor === 'tp-gm')).toBe(true);
-  await C.submit(eng2, proof(next), { text: 'fixture delivery after binding code repo to operations', idempotencyKey: key() });
+  await C.submit(eng4, proof(next), { text: 'fixture delivery after binding code repo to operations', idempotencyKey: key() });
 });
 
 run('dependency waits and defer_task_until waits stay bindable, then claim in the bound repo', async () => {
