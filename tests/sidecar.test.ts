@@ -22,6 +22,7 @@ const calls: Call[] = [];
 let employeeForGetTask = 'eng-x';
 let authRole = 'engineering';
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
+const pageCalls: Array<{ cred: string; taskId?: string; pageSize?: number }> = [];
 const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
 const auditCalls: Array<{ cred: string; limit?: number }> = [];
 const snap = (proof: LeaseProof): LeaseProof => ({ ...proof }); // record a copy; the pool mutates its proof between calls
@@ -40,6 +41,11 @@ const core = {
   getTask: async (_c: string, taskId: string) => ({ ...taskView(taskId), currentEmployee: employeeForGetTask }),
   history: async () => [],
   listWorktrees: async (c: string, taskId?: string) => { wtCalls.push({ cred: c, taskId }); return [] as never; },
+  worktreeList: async (c: string, input: { taskId?: string }) => { wtCalls.push({ cred: c, taskId: input.taskId }); return [] as never; },
+  worktreePage: async (c: string, input: { taskId?: string; pageSize?: number }) => {
+    pageCalls.push({ cred: c, taskId: input.taskId, pageSize: input.pageSize });
+    return { worktrees: [], page: { returned: 0, hasMore: false } } as never;
+  },
   reclaimWorktrees: async (c: string, input?: { dryRun?: boolean; repos?: string[] }) => {
     reclaimCalls.push({ cred: c, input });
     return { scanId: 's', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
@@ -85,7 +91,7 @@ const media = {
   release: (employeeId: string) => { mediaReleased.push(employeeId); },
 };
 
-const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown>) => {
+const relay = async (envDir: string, key: string, name: string, tool: string, args: Record<string, unknown> | null) => {
   writeFileSync(join(reqDir(envDir), `${name}.json`), JSON.stringify({ key, tool, args }));
   await until(() => existsSync(join(resDir(envDir), `${name}.json`)));
   return readJsonFile<{ ok: boolean; data?: unknown; error?: string }>(join(resDir(envDir), `${name}.json`))!;
@@ -100,6 +106,7 @@ beforeEach(() => {
   mediaCalls.length = 0;
   mediaReleased.length = 0;
   wtCalls.length = 0;
+  pageCalls.length = 0;
   reclaimCalls.length = 0;
   auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
@@ -257,10 +264,12 @@ describe('sidecar', () => {
     const env = pool.env(i);
     await pool.claim(i, task('task-13'));
 
-    // 员工缺省：当前租约任务；显式 taskId 原样透传
-    const scoped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w1', 'list_worktrees', {});
-    expect(scoped.ok).toBe(true);
-    expect(wtCalls[0]).toEqual({ cred: 'tok-e13', taskId: 'task-13' });
+    // R8（GM 裁定 v25）：员工缺省不再回退到当前租约任务。改动原因：旧断言要求缺省回退到 task-13，与 core 的
+    // 「非 gm 且无 taskId 即 forbidden」相反。通道只把缺省 taskId 以 undefined 交给 core，由 core 判定拒绝；
+    // 本桩 core 不拒绝，所以这里只断言通道没有注入租约任务。显式 taskId 原样透传。
+    const unscoped = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w1', 'list_worktrees', {});
+    expect(unscoped.ok).toBe(true);
+    expect(wtCalls[0]).toEqual({ cred: 'tok-e13', taskId: undefined });
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w2', 'list_worktrees', { taskId: 'task-other' });
     expect(wtCalls[1]).toEqual({ cred: 'tok-e13', taskId: 'task-other' });
 
@@ -268,6 +277,13 @@ describe('sidecar', () => {
     authRole = 'gm';
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w3', 'list_worktrees', {});
     expect(wtCalls[2]).toEqual({ cred: 'tok-e13', taskId: undefined });
+
+    // C1：不带 pageSize/cursor 仍返回数组；带分页参数才走 worktreePage，返回 { worktrees, page }
+    const legacy = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w8', 'list_worktrees', {});
+    expect(Array.isArray(legacy.data)).toBe(true);
+    const paged = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w9', 'list_worktrees', { pageSize: 5 });
+    expect(paged.data).toEqual({ worktrees: [], page: { returned: 0, hasMore: false } });
+    expect(pageCalls).toEqual([{ cred: 'tok-e13', taskId: undefined, pageSize: 5 }]);
 
     // 回收（dry-run 透传）与审计查询；写全量回收同样透传，由 core 做 gm 门控
     await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w4', 'reclaim_worktrees', { dryRun: true, repos: ['/repo/a'] });
@@ -281,6 +297,63 @@ describe('sidecar', () => {
     const listed = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'w7', '__list__', {});
     expect((listed.data as { tools: string[] }).tools)
       .toEqual(expect.arrayContaining(['reclaim_worktrees', 'list_worktree_audits']));
+  });
+
+  test('reclaim_worktrees is strict on the sidecar relay as in core and MCP (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are refused before the registry runs', async () => {
+    const i = inst('e15');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-15'));
+    const before = reclaimCalls.length;
+    const refused: Array<[string, Record<string, unknown>]> = [
+      ['dry-null', { dryRun: null }], ['dry-string', { dryRun: 'true' }], ['dry-one', { dryRun: 1 }], ['dry-zero', { dryRun: 0 }],
+      ['dry-empty', { dryRun: '' }], ['repos-string', { repos: '/repo/a' }], ['repos-null', { repos: null }],
+      ['repos-number', { repos: 5 }], ['repos-blank', { repos: [' '] }], ['repos-element', { repos: [7] }],
+    ];
+    for (const [name, args] of refused) {
+      const res = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `bad-${name}`, 'reclaim_worktrees', args);
+      expect({ name, ok: res.ok }).toEqual({ name, ok: false });
+    }
+    // A null argument object is refused too: the relay does not read it as absent and reclaim.
+    const nullArgs = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'bad-args-null', 'reclaim_worktrees', null);
+    expect({ name: 'args-null', ok: nullArgs.ok, error: nullArgs.error?.slice(0, 7) }).toEqual({ name: 'args-null', ok: false, error: 'invalid' });
+    expect(reclaimCalls.length).toBe(before);
+    // An omitted dryRun is a reclaim and dryRun true a dry run, under the same rule as core and MCP.
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-reclaim', 'reclaim_worktrees', {});
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ok-dry', 'reclaim_worktrees', { dryRun: true });
+    expect(reclaimCalls.slice(before)).toEqual([
+      { cred: 'tok-e15', input: { dryRun: false } },
+      { cred: 'tok-e15', input: { dryRun: true } },
+    ]);
+  });
+
+  test('null is absent on the sidecar relay as in core and MCP (SYS01, defect 2): paging and filters are absent, a null task id is refused for get_task_history and resume_task', async () => {
+    const i = inst('e14');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-14'));
+    // list_worktrees (R8): null pageSize, cursor and taskId are absent, so the call is unscoped (core refuses a non-gm).
+    // It never falls back to the lease task, and the null never reaches core as the string "null".
+    const legacy = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n1', 'list_worktrees', { pageSize: null, cursor: null, taskId: null });
+    expect(legacy.ok).toBe(true);
+    expect(Array.isArray(legacy.data)).toBe(true);
+    expect(wtCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: undefined });
+    expect(pageCalls).toHaveLength(0);
+    // A null task id with a real page size is paged and still unscoped: null taskId is absent, pageSize 5 is the paged branch.
+    await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n6', 'list_worktrees', { taskId: null, pageSize: 5 });
+    expect(pageCalls.at(-1)).toEqual({ cred: 'tok-e14', taskId: undefined, pageSize: 5 });
+    // get_task_history: a null page size keeps the { history } shape; a null task id is refused, never read as "null".
+    const history = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n2', 'get_task_history', { taskId: 'task-14', pageSize: null, cursor: null });
+    expect(history).toMatchObject({ ok: true, data: { history: [] } });
+    const nullTask = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n3', 'get_task_history', { taskId: null });
+    expect(nullTask.ok).toBe(false);
+    expect(nullTask.error).toContain('taskId');
+    // get_context: null filters and a null task id are absent (legacy keys: this stub core has no contextView).
+    const context = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n4', 'get_context', { taskId: null, state: null, pageSize: null, cursor: null });
+    expect(context.ok).toBe(true);
+    expect(Object.keys(context.data as object).sort()).toEqual(['companyIncluded', 'companyRead', 'principal', 'tasks']);
+    // resume_task: a null task id is refused, and core never sees the string "null".
+    const resume = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'n5', 'resume_task', { taskId: null });
+    expect(resume.ok).toBe(false);
+    expect(resume.error).toContain('taskId');
   });
 
   test('ops sessions are dropped when the lease ends and when the agent is archived', async () => {
@@ -408,4 +481,26 @@ describe('deliverable_publish 工具', () => {
       expect(existsSync(join(home, 'deliverables', 'task-resend', 'x.txt'))).toBe(true);
     });
   });
+
+  test('a listing whose credential re-issue is still pending at its reply ceiling is refused recoverably at the ceiling (SYS01 M1)', async () => {
+    // No held credential and a stalled rotate: the credential phase of a snapshot-backed read is inside the one deadline.
+    const stalling = new SidecarPool({
+      core: core as never, workforce: { rotate: () => new Promise<never>(() => undefined) } as never,
+      ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+    });
+    try {
+      const i = inst('e-stall', { credential: undefined });
+      const env = stalling.env(i);
+      const started = Date.now();
+      // The answer is due at the ceiling, so wait past relay()'s short default.
+      writeFileSync(join(reqDir(env.SCK_COMM_DIR), 's1.json'), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'get_context', args: {} }));
+      await until(() => existsSync(join(resDir(env.SCK_COMM_DIR), 's1.json')), 20_000);
+      const res = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR), 's1.json'))!;
+      const elapsed = Date.now() - started;
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain('temporarily_unavailable');
+      expect(elapsed).toBeGreaterThan(12_000);
+      expect(elapsed).toBeLessThan(15_000);
+    } finally { stalling.close(); }
+  }, 30_000);
 });

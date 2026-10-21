@@ -24,5 +24,8 @@ jobs:
         working-directory: plugin
       - run: pnpm test:bridge
       - run: pnpm test:service
+      - run: pnpm test:comm
       # Fork integration is independently run on the company's installed fork.
       # No upstream database or private production credentials in hosted CI.
+      # The macOS slow-pipe regression is not hosted (no paid macOS runner): it runs at release
+      # time through scripts/release-gate.sh, and company-service.sh install refuses a release without it.

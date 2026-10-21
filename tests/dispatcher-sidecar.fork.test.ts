@@ -101,7 +101,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const history = await core.history(gm, task.id); expect(history.some(h => h.action === 'accept' && h.actor !== old.id)).toBe(true);
   } finally {
     for (const id of agentRows.keys()) pool?.detachAgent(id);
-    await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
+    pool?.close(); await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
   }
 }, 30000);
 

@@ -16,9 +16,9 @@ export PATH
 # Service-pinned runtime: ~/.bun/bin/bun (1.3.11) segfaults intermittently in the
 # http_server/WebSocket stack, taking MCP down in a launchd crash loop. Prefer the
 # isolated install under service home; fall back to the global bun when absent.
-BUN="${SCK_BUN:-$service_home/runtime-bun/bin/bun}"
-[ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
-export BUN
+# bun-runtime.sh is installed beside this script and shared with the release gate, which records the runtime resolved here.
+. "$(dirname "$0")/bun-runtime.sh"
+resolve_bun "$service_home"
 cd "$service_home/active"
 case "$component" in
   mcp)
