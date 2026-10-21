@@ -10,6 +10,8 @@
 
 CLI 客户端使用 `SCK_MCP_URL=http://127.0.0.1:<port>/mcp` 和 `SCK_EMPLOYEE_CREDENTIAL_FILE`（仅文件 owner 可读），执行 `pnpm run mcp:client -- list` 或 `pnpm run mcp:client -- call get_context '{}'`。受控环境也可传 `SCK_EMPLOYEE_CREDENTIAL`；若同时提供，文件优先。直连 `call` 只向 stdout 打印一份答案（与通道模式相同）：成功时为返回数据，失败时为一行 `{"ok":false,"code",…}` 并以退出码 1 结束（SYS01 AC03，F1）。客户端通过官方 `Client.connect` 初始化并使用 `listTools`/`callTool`；可用于已有员工真实领取、提交与独立验收。运行命令时不要在命令行参数或 shell 历史中直接写凭证。
 
+任务视图（`get_context`/`get_task` 等）的 blocked 行带 `waiting`：`kind`（`manager`/`owner`/`dependency`）、`resumeState`（恢复阶段，缺失为 `unknown`）、`role`（复核等待为原复核岗位；`resumeRole` 为空时取任务 `reviewerRole`）与 `dependencies`（依赖 id）。它是任务行权威事实的推导，MCP 与 sidecar 返回同一份（RW06 C3）。
+
 工具结果形态（SYS01 终版，经理裁定方案 b）：成功时 `content[0].text` 为答案的 JSON 文本（与 SYS01 之前发送的文本相同），`structuredContent` 为 `{ok: true, data}`，两者承载同一份数据。预算按整条结果计：两份副本各自计入字节，另加 256 字节的 JSON-RPC 帧预留（`answerBytes`），整条不超过 49 152 字节（`RESPONSE_BUDGET_BYTES`）。因此一份答案的数据最多占约一半预算，分页条目的上限为 46 769 双份字节（`ITEM_BUDGET_BYTES`，约 45.7 KiB）。超出时结果为 `isError`，`content[0].text` 与 `structuredContent` 都是同一个 `{ok: false, code: "response_too_large", retryable: false, error}` 的 JSON（复核 v47 的 D1：失败文本也是 JSON）。请求 id 的序列化长度超过 128 字节时，HTTP 入口在调用任何工具之前返回 HTTP 400、JSON-RPC 错误 `-32600`、id 为 null（D2）。`sck` 直连、通道与本仓库测试读取 `structuredContent`；只读 `content` 的第三方客户端读到的是与之相同的 JSON 文本。MCP 规范建议同时返回文本副本，本仓库即采用这一形态；方案比较与经理裁定见 `query-paging.md` 第 9.8 节。
 
 启动入口：设置 `SCK_MCP_PORT`（1–65535）并执行 `pnpm run mcp:serve`。进程读取 #24 的 `SCK_PRODUCT_ENV`/数据库配置，连接并 bootstrap 公司库，然后监听本机端口。若同时设置 `SCK_PROJECTOR_CREDENTIAL_FILE`（GM 凭证私有文件）和 `SCK_GITHUB_REPOSITORY=owner/repo`，同进程启动 GitHub outbox worker；投影状态默认 `.runtime/gh-projection.json`，可用 `SCK_PROJECTION_STATE_FILE` 指定。缺少配对配置会拒绝启动。SIGINT/SIGTERM 会停止 worker、HTTP 服务并关闭数据库连接。常驻与进程监管属于 #27。
