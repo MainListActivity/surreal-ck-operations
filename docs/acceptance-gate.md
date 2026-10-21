@@ -6,13 +6,13 @@
 
 - `task.acceptance_criteria` 是版本化数组，每项 `{ id, kind, required, layer, evidence, verify, description?, risk?, legs? }`。`id` 唯一（`AC-…`），`kind` 为 `machine`/`human`；`machine` 不能用 `review-signoff`，`human` 只能用 `review-signoff`。
 - `create_delivery` 按 `legs` 把同一组 criteria 分到实现/上线申请/部署三腿；没有匹配项的腿使用该腿默认 criteria（实现：CI + 独立复核；上线申请：CI；部署：CI + QA 生产签署）。`create_task` 也可显式携带 criteria。
-- 启用门禁后，新代码交付缺 criteria、重复 id 或机器/人工证据类型混用在创建或提交时被拒；门禁关闭期间创建的任务在创建时标 legacy，启用后保留旧路径，只读保留，不能伪造已满足。
+- 启用门禁后，每个新代码交付及其三腿由服务端合并**不可移除基线**（如 `AC-BASE-IMPL-1` required 机器 CI、`AC-BASE-IMPL-2` 真实独立签署；release/deploy 各有对应腿基线）；自定义 criteria 只能补充，同 ID、`required:false`、仅 human、全 optional 或 legs 过滤都不能移除/降级基线。`create_task`、`create_delivery` 与统一评估器同源合并，缺基线/降级/非法变更在创建或放行拒绝；门禁关闭期间创建的任务在创建时标 legacy，启用后保留旧路径，只读保留，不能伪造已满足。
 - `acceptance_version`、`acceptance_legacy`、`acceptance_head`、`acceptance_environment`、`acceptance_attempt`、`acceptance_chain` 均新增可选字段；旧行不需要迁移。
 
 ## 2. 证据（AC02）
 
 - `acceptance_evidence` 表保存 `task/ac_id/kind/sha/environment/evidence_type/source/verified/verifier/actor/at/criteria_version/task_version/digest`，`digest` 唯一，重复来源幂等。
-- 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view` 与 `gh api .../artifacts/<id>`，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。probe 必须提供承载记录的 CI artifact：artifact 必须属于同一 run 与 head，适配器下载其 JSON 记录并核验 `probe/runId/readAt/inProgress/observationHash` 与调用方记录一致；只有窗口内自报记录、没有 artifact 的一律拒绝。artifact 类证据要求未过期且属于同一 head。模型文本、任意 URL 或自写 `passed` 不会进入 `verified=true`。
+- 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view`、`gh api .../artifacts/<id>` 与 target run/job/status API，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。probe 必须是受信版本 `acceptance-probe/2` 的 CI artifact 记录：运行中通道由 target 作业开始即创建的 commit status 承载，适配器核验 producer run、target run/job 的 in-progress 窗口（`started_at <= readAt <= completed_at`）与 status 创建时刻/哈希；Node 打包模板由 Node 实际执行构建 bundle 的 default 请求路径并记录 Node 版本/bundle hash；`criterion.verify`（如 `probe:running-channel`/`probe:node-packed`）与 `risk` 绑定 probe kind/target。任意 2xx URL、Fake adapter、自传 `RUN_ID`、作业完成后读取或记录不符一律拒绝；artifact 类证据要求未过期且属于同一 head。模型文本或自写 `passed` 不会进入 `verified=true`。
 - 人工证据由获授权的独立签署写入：实现腿由另一位工程师在 `accept` 时签署，上线申请由运营，部署由 QA，老板关口由 `owner.decide`。Jev 是机器 actor，永远不能签署人工 AC。
 
 ## 3. 统一评估器（AC03）
@@ -33,7 +33,7 @@
 
 ## 4. 运行探针（AC04）
 
-`scripts/acceptance-probe.ts` 在 CI 作业内读取目标（URL 或打包后的模块），记录 `GITHUB_RUN_ID`、`GITHUB_JOB`、读取时刻、`inProgress=true` 与观测 sha256；`.github/workflows/acceptance-probe.yml` 上传该记录。调用方必须把该 artifact 的 id 传给 `record_acceptance_evidence`；服务端下载 artifact 并核验其 JSON 记录属于同一 run/head、读取时刻在 run 窗口内且与调用方记录一致。作业完成后下载或手写记录没有 artifact 记录依据，不能满足 AC。
+`.github/workflows/acceptance-target.yml` 在真实 CI target 作业开始时创建 commit status `acceptance-barrier=target-ready` 并保持作业 in progress；`scripts/acceptance-target-probe.ts` 由 producer 作业在 target 仍 in_progress 时读取该 status，记录 producer/target run 与 job、读取时刻、当时状态、status 创建时刻与哈希；`.github/workflows/acceptance-probe.yml` 的 Node 作业用 Bun 构建 `scripts/acceptance-pack-fixture.ts`，再用 Node 实际执行 bundle 的 default 请求路径并断言响应，记录 Node 版本与 bundle hash。调用方必须把承载记录的 artifact id 传给 `record_acceptance_evidence`；服务端下载 artifact 并核验其 JSON 记录属于同一 run/head、读取时刻在 target run/job 窗口内且与调用方记录一致。作业完成后下载、手写记录、只有 Bun 通过而 Node 失败、或 target/kind 不符均不能满足 AC。
 
 ## 5. 存量与治理（AC06）
 
@@ -45,7 +45,7 @@
 
 - 旧版按 schemaless 行读取，忽略 `acceptance_*` 字段与新表；它不会崩溃，也不会把任务认领到不存在的新状态（任务仍只在 ready/doing/review/blocked 中）。
 - 旧版没有评估器，会绕过新门禁直接 accept。因此**在存在已启用 criteria 的在办任务时不得回滚**；上线申请必须列出该边界，部署腿的回滚演练要覆盖「新版写入 → 回滚旧版 → 调度若干轮」并证明没有误认领/误拉起，且回滚计划包含排空或保留新 release。
-- `tests/acceptance-gate.fork.test.ts` 的 RB01 用例用隔离 fork 记录旧阅读器忽略新字段、任务状态不变、旧门禁关闭时可通过（即回滚边界）。
+- `tests/acceptance-gate.fork.test.ts` 的 RB01 用例用隔离 fork 记录旧阅读器忽略新字段、任务状态不变、旧门禁关闭时可通过（即回滚边界）。SYS02 还把目标能力守卫并入 `scripts/review-wait-guard.sh`：本地 install/回滚与远程 deploy 在任何 active/插件/MCP/ssh 副作用前读取目标自身（内容绑定提交）的基线声明、评估器合并、schema/bootstrap 与 plugin vendor；旧 a925222、缺失、注释冒充或不可读目标一律拒绝，没有“当前 gated 任务为 0/先关 gate”的宽松例外。公司 fork 演练固定 a925222 的旧 dispatcher/core：旧 tick 认领 gated review（`tickClaims=1`）且旧 core 无证据 accept 到 done，新守卫拒绝该目标（`code=1`）。
 
 ## 7. 工具与字段
 
