@@ -41,8 +41,10 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
     }
     views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
+  /** Per-test config overrides; the breaker floors stay 0 unless a test asks for them. */
+  let cfgOverride: Partial<typeof DEFAULT_CONFIG> = {};
   const wf = {
-    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false, ...cfgOverride }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
     providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
@@ -152,6 +154,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
     setRealign: (fn: typeof realign) => { realign = fn; },
     setQuota: (rows: ProviderQuota[]) => { quotaRows = rows; },
+    setConfig: (v: Partial<typeof DEFAULT_CONFIG>) => { cfgOverride = v; },
     setHealth: (rows: Map<string, ProviderHealth>) => { health = rows; },
     setLastError: (text: string) => { lastError = text; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
@@ -859,5 +862,25 @@ describe('R5: a session parked by a quota failure comes back when the window reo
     expect(w.events).toContain('exhausted:codex');
     expect(w.events.some(e => e.startsWith('reload:'))).toBe(false);
     expect(r.recovered).toEqual([]);
+  });
+});
+
+// A spent monthly allowance can keep a provider under the floor for days. One line per change
+// keeps the plugin log — which only holds the last ~130 lines — readable through the outage.
+describe('R4: a persistent quota floor writes one line, not one per tick', () => {
+  test('the floor line repeats only when the blocked set changes', async () => {
+    const w = world();
+    w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+    const d = w.dispatcher();
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.startsWith('quota below floor'))).toHaveLength(1);
+
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, sessionPct: 90, fetchedAt: new Date().toISOString() }]);
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.startsWith('quota below floor'))).toHaveLength(1);
+    expect(w.logs.filter(m => m.startsWith('quota recovered'))).toHaveLength(1);
   });
 });
