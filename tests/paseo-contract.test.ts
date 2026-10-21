@@ -32,7 +32,7 @@ let seq = 0;
  * A fake `paseo`. `ls` answers with `lsBody`; `inspect <id>` runs the shell body registered for that id. Any other id gets the
  * CLI's real not-found answer (exit 1, AGENT_NOT_FOUND on stderr).
  */
-function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('ls-global.sample.json')}'`, logsBody = `echo ''`): string {
+function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('ls-global.sample.json')}'`, logsBody = `echo ''`, agentBody = `echo '{"agentId":"${AGENT}","status":"reloaded","timelineSize":1}'`): string {
   const bin = join(dir, `paseo-${++seq}`);
   const arms = Object.entries(inspect).map(([id, body]) => `      ${id}) ${body} ;;`).join('\n');
   writeFileSync(bin, [
@@ -40,6 +40,7 @@ function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('
     'case "$1" in',
     `  ls) ${lsBody} ;;`,
     `  logs) ${logsBody} ;;`,
+    `  agent) ${agentBody} ;;`,
     '  inspect)',
     '    case "$2" in',
     arms,
@@ -211,4 +212,18 @@ test('the agent list carries the model the session actually serves', async () =>
   // The fixture keeps the real key set but redacts the value; a bare placeholder has no slash,
   // so the model is unknown rather than guessed.
   for (const row of rows.values()) expect(row.model).toBeUndefined();
+});
+
+// The dispatcher restarts a quota-parked session in place; the adapter must call the CLI's
+// `agent reload <id>` verb (there is no top-level `reload <id>`: that one reloads the daemon config).
+test('reload runs the per-agent verb with the agent id', async () => {
+  const argsFile = join(dir, 'reload-args.txt');
+  const bin = fakeCli({}, undefined, undefined, `printf '%s ' "$@" > '${argsFile}'`);
+  await createPaseoCli(bin).reload(AGENT);
+  expect(readFileSync(argsFile, 'utf8').trim()).toBe(`agent reload ${AGENT}`);
+});
+
+test('a failed reload surfaces instead of passing for a restart', async () => {
+  const bin = fakeCli({}, undefined, undefined, `echo '{"error":{"code":"RELOAD_FAILED"}}' >&2; exit 1`);
+  await expect(createPaseoCli(bin).reload(AGENT)).rejects.toThrow();
 });

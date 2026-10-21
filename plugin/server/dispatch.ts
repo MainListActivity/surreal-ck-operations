@@ -8,6 +8,8 @@ import { dirname, join } from "node:path";
 import { serviceHome } from "./env";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
 import { missingFrom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
+import { readProviderQuotas, readQuotaEntries } from "./vendor/src/dispatcher/quota-store.ts";
+export { readProviderQuotas };
 
 type ProviderUsageEntry = {
   providerId: string;
@@ -152,13 +154,21 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 // remember the latest one so the tick loop can also refresh quota during quiet periods.
 let paseoHandle: PaseoApi | undefined;
 
-/** Hooks carry the only paseo handle: persist latest quota to company_meta so the dispatcher can read it. */
+/**
+ * Persists the latest quota snapshot to company_meta for the dispatcher. Hooks carry a Paseo
+ * handle; the tick loop may not have one yet (it only arrives with the first session event), so
+ * the handle is optional: Paseo's list is skipped without it, and magpie — the source for the
+ * providers Paseo never lists — is read either way. On a quiet company that is the only thing
+ * keeping a spent subscription visible.
+ */
 let quotaEmptyLoggedAt = 0;
-export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<ProviderUsageEntry[]> {
-  paseoHandle = paseo;
-  if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries(ctx);
+export async function refreshQuota(paseo: PaseoApi | undefined, ctx: Company): Promise<ProviderUsageEntry[]> {
+  if (paseo) paseoHandle = paseo;
+  if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries<ProviderUsageEntry>(ctx.db.db);
   quotaRefreshedAt = Date.now();
-  const usage = await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; });
+  const usage = paseo
+    ? await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; })
+    : undefined;
   const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
   // Paseo reports only the providers it drives (claude/codex/grok on this machine). Magpie holds
   // every subscription the owner configured, so a provider whose allowance ran out is visible here
@@ -198,26 +208,9 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   return providers;
 }
 
-/** ProviderQuota rows the dispatcher's circuit breaker consumes; shared with the roster preview. */
-export async function readProviderQuotas(ctx: Pick<Company, "db">): Promise<import("./vendor/src/contracts").ProviderQuota[]> {
-  const [rows] = await ctx.db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
-    `SELECT provider, summary, lowest_pct, session_pct, weekly_pct, status, fetched_at, at FROM company_meta
-     WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
-  return (rows ?? []).map(r => ({
-    provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
-    sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
-    // Freshness = when WE last verified the row, not the upstream snapshot time:
-    // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
-    // the circuit breaker would fail open on dead data.
-    fetchedAt: String(r.at ?? "") || r.fetched_at,
-  }));
-}
-
-async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
-  const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
-    `SELECT payload FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
-  return (rows ?? []).map(r => r.payload).filter((p): p is ProviderUsageEntry => !!p);
-}
+// The quota readers moved to src/dispatcher/quota-store.ts (re-exported above): they select rows
+// by record name, because a hyphenated provider id prints as `company_meta:⟨quota_factory-droid⟩`
+// and an id-string prefix test skipped exactly those providers.
 
 /** When an employee's turn ends right after submit, stamp the provider's remaining quota into the task audit. */
 async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: string; provider?: string }): Promise<void> {
@@ -231,7 +224,7 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
     { e: new RecordId("employee", employeeId) });
   if (!tasks?.length) return;
   const providers = await refreshQuota(paseo, ctx);
-  const fresh = providers.length ? providers : await readQuotaEntries(ctx);
+  const fresh = providers.length ? providers : await readQuotaEntries<ProviderUsageEntry>(ctx.db.db);
   const entry = fresh.find(p => p.providerId === agent.provider);
   if (!entry) {
     console.log(`usage snapshot skipped: no ${agent.provider} usage entry`);
@@ -303,8 +296,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         wait = (await ctx.workforce.config()).pollSeconds * 1000;
         // Refresh quota and model slots BEFORE the tick so a newly published model is
         // resolved, stale idle sessions are retired, and new work spawns on it in the
-        // same dispatch pass instead of lagging one poll behind.
-        if (paseoHandle && Date.now() - quotaRefreshedAt > 300_000) {
+        // same dispatch pass instead of lagging one poll behind. Quota runs without a
+        // Paseo handle too: magpie is the source for the providers Paseo never lists.
+        if (Date.now() - quotaRefreshedAt > 300_000) {
           await refreshQuota(paseoHandle, ctx).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
         }
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
@@ -317,7 +311,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         const report = await ctx.dispatcher.tick();
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-          report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
+          report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
           report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
         await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();");

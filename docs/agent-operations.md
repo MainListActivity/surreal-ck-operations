@@ -177,7 +177,8 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
 - **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及经理/老板手工退役。
 - **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却到上游重置时间），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。
-- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。
+- **额度恢复后会话自动重启**：额度失败会把会话停在 Paseo 的 `error` 状态，而 Paseo 不会自己把它放出来；调度器只往 `idle` 会话派工，所以冷却结束后调度器用 `paseo agent reload` 就地重启该会话（agent、对话与通道绑定都保留），不退役、不重开新员工。重载失败按 5 分钟间隔重试。
+- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。订阅还在冷却或低于额度下限时不做改回——那期间的改回不可能生效，调度器等订阅恢复后的第一轮再改。
 - 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET http://127.0.0.1:3425/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。
 
 ## v2 归档
