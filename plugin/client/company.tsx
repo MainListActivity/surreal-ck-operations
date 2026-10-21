@@ -906,7 +906,9 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   const [enabled, setEnabled] = useState(editing?.enabled ?? true);
   const [maxInstances, setMaxInstances] = useState(String(editing?.maxInstances ?? 1));
   const [weight, setWeight] = useState(String(editing?.weight ?? 10));
-  const [quotaLimited, setQuotaLimited] = useState(editing?.quotaLimited ?? true);
+  // undefined = "leave the stored value alone". A roster payload from an older plugin, or a page
+  // opened before a reload, must not silently re-apply the quota limit when the form is saved.
+  const [quotaLimited, setQuotaLimited] = useState<boolean | undefined>(editing ? editing.quotaLimited : true);
   const [showAllModels, setShowAllModels] = useState(false);
   const [result, setResult] = useState<string>();
 
@@ -1020,8 +1022,8 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
             <Text style={s.muted}>派工权重</Text>
             <TextInput style={[s.input, { width: 64, paddingVertical: 6 }]} value={weight} onChangeText={setWeight} keyboardType="number-pad" />
             <Text style={s.muted}>额度限制</Text>
-            <Pressable accessibilityRole="button" style={[s.chip, quotaLimited && s.chipActive]} onPress={() => setQuotaLimited(true)}>
-              <Text style={[s.chipText, quotaLimited && s.chipTextActive]}>受限</Text>
+            <Pressable accessibilityRole="button" style={[s.chip, quotaLimited !== false && s.chipActive]} onPress={() => setQuotaLimited(true)}>
+              <Text style={[s.chipText, quotaLimited !== false && s.chipTextActive]}>受限</Text>
             </Pressable>
             <Pressable accessibilityRole="button" style={[s.chip, !quotaLimited && s.chipActive]} onPress={() => setQuotaLimited(false)}>
               <Text style={[s.chipText, !quotaLimited && s.chipTextActive]}>不受限</Text>
