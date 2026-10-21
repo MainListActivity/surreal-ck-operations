@@ -34,6 +34,13 @@ test('the comm gate runs the client and slow pipe regressions, and CI runs the c
 
 // SYS01 AC-B: the macOS slow-pipe regression is no longer a hosted paid job. It runs at release time through the local gate, and
 // install refuses a release that has no passing record for it. No workflow may name a hosted macOS runner again.
+test('the rollback runbook uses the guarded installer of the current release, never the old release installer', () => {
+  const docs = readFileSync(join(ROOT, 'docs/company-service-operations.md'), 'utf8');
+  expect(docs).not.toMatch(/SCK_PREVIOUS_RELEASE\/scripts\/company-service\.sh/);
+  expect(docs).toContain('sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"');
+  expect(readFileSync(join(ROOT, 'scripts/company-service.sh'), 'utf8')).toContain('review_wait_target_supported "$release"');
+});
+
 test('no workflow runs on a hosted macOS runner, and the release gate for the slow pipe exists', () => {
   // Every workflow file, not a fixed list: a new file must not name a macOS runner either. Comment lines are skipped, so a note
   // that says "macOS" does not count as a runner label.

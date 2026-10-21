@@ -50,6 +50,23 @@ export interface Principal {
   tracks?: string[];
 }
 
+/**
+ * Why a blocked task is waiting, derived from the row's authoritative facts (RW05/RW06). The owner and manager views read this
+ * instead of guessing from transient fields: a review-phase wait names the reviewing role, never the execute phase; a fact the
+ * row does not carry is `unknown`, not a default.
+ */
+export interface TaskWaiting {
+  /** manager: blocked for a GM decision; owner: a boss gate; dependency: waiting on other tasks (a review wait is one of these). */
+  kind: 'manager' | 'owner' | 'dependency';
+  /** The phase restored when the wait ends (`unknown` when the row carries none). */
+  resumeState: TaskState | 'unknown';
+  /** For dependency waits: the role whose phase is awaited (review wait -> the reviewer role); `unknown` when no fact names it. */
+  role: Role | 'owner' | 'unknown';
+  /** How many prerequisites the row records. The ids themselves stay in the task's own `dependencies` field, which SYS01's
+   *  per-item budget already truncates with an explicit flag; repeating them here would push a wide row past a page. */
+  dependenciesCount: number;
+}
+
 export interface TaskView {
   id: TaskId;
   title: string;
@@ -77,6 +94,12 @@ export interface TaskView {
   leaseExpiresAt?: string;
   fence: number;
   blockedTo?: 'gm' | 'owner';
+  /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
+  resumeState?: TaskState;
+  /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
+  resumeRole?: string;
+  /** Blocked rows: why the task waits, in the same authoritative terms for every view (RW06 C3). */
+  waiting?: TaskWaiting;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
@@ -391,12 +414,12 @@ export interface CreateDelivery {
   idempotencyKey: string;
 }
 
-/** gm only: re-point an execute-phase gm block at unmet dependencies instead of the manager. */
+/** gm only: re-point a gm block — execute, or a provable normal non-owner review block — at unmet dependencies instead of the manager. */
 export interface DeferTaskUntil {
   taskId: TaskId;
-  /** Dependencies to merge into the task's existing set (union, same goal, acyclic). */
+  /** Dependencies to merge into the task's existing set (union, same goal, acyclic after resolution). */
   dependencies: TaskId[];
-  /** Business reason for the wait; audited together with the before/after dependency snapshot. */
+  /** Business reason for the wait; audited together with the before/after dependency snapshot and the restore phase. */
   text: string;
   idempotencyKey: string;
   /** Optimistic concurrency: refuse when the task version has moved. */
@@ -575,7 +598,7 @@ export interface CompanyCore {
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
-  /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
+  /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
   /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;

@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
+import { waitingLabel } from "../shared/waiting-label";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -679,6 +680,11 @@ function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: C
         <Text style={[s.text, { flex: 1 }]} numberOfLines={2}>{task.title}</Text>
         <Text style={s.muted}>{task.currentEmployee?.split("⟨").pop()?.replace("⟩", "") ?? task.executorRole}</Text>
       </Pressable>
+      {task.waiting && (
+        <View style={{ paddingLeft: depth * 14 + 8 }}>
+          <Text style={s.muted}>{waitingLabel(task.waiting)}</Text>
+        </View>
+      )}
       {verdict && (
         <View style={{ paddingLeft: depth * 14 + 8, gap: 2 }}>
           <Text style={{ color: "#d97706", fontSize: 13 }}>无法派工（{WORKFLOW_LABEL[verdict.workflowState]}）：{verdict.summary}</Text>
