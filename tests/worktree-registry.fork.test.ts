@@ -756,4 +756,19 @@ run('WT02: a tree holding only dependency output is reclaimed, and a row for a v
   const swept = await core.reclaimWorktrees(gm, { repos: [path] });
   expect((swept.dropped ?? []).includes(gonePath) || !(await core.listWorktrees(gm)).some(w => w.worktreePath === gonePath)).toBe(true);
   expect((await core.listWorktrees(gm)).some(w => w.worktreePath === gonePath)).toBe(false);
+  // Legacy rows from older reclaim versions: tree gone, task ended, no reference left.
+  // The sweep must drop the row AND land the audit. A schema whitelist that rejects
+  // `drop_stale_row` aborts the whole repo scan after the row is already gone
+  // (2026-10-21 production incident), so the audit is asserted on both sides.
+  const ghostPath = join(path, 'sck-legacy-ghost');
+  await db.db.query(`CREATE worktree CONTENT { repo: $repo, path: $path, branch: 'task/legacy-ghost',
+    mode: 'exclusive', created_at: time::now(), last_used_at: time::now() };`, { repo: path, path: ghostPath });
+  const ghostSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(ghostSweep.dropped ?? []).toContain(ghostPath);
+  const [ghostAudits] = await db.db.query<[Array<{ path: string }>]>(
+    "SELECT path FROM worktree_audit WHERE event = 'drop_stale_row';");
+  expect((ghostAudits ?? []).some(row => row.path === ghostPath)).toBe(true);
+  const [ghostFails] = await db.db.query<[Array<{ reason: string }>]>(
+    "SELECT reason FROM worktree_audit WHERE event = 'fail' AND repo = $repo;", { repo: path });
+  expect(ghostFails ?? []).toEqual([]);
 }, 60000);
