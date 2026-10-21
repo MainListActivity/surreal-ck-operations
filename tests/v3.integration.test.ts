@@ -1511,6 +1511,10 @@ test('quota gate: bad reset times are refused; a valid one keeps gm quiet until 
 
   // Inside the gate the 15-minute redispatch does not re-announce the same version.
   await database.db.query('UPDATE dispatch SET at = at - 7200 WHERE task = $task;', { task: t.id });
+  // The GM turn is idle; simulate the same elapsed interval for the durable wake attempt so
+  // the conservative turn-end grace sees a provable end rather than a just-started session.
+  await database.db.query("UPDATE dispatch SET started_at = $past, external_started_at = $past WHERE task = $task AND purpose = 'gm-manager-wake';",
+    { task: t.id, past: Math.floor(Date.now() / 1000) - 7200 });
   idleAll();
   report = await dispatcher.tick();
   expect(report.woke.map(w => w.task)).not.toContain(t.id);
@@ -1524,4 +1528,43 @@ test('quota gate: bad reset times are refused; a valid one keeps gm quiet until 
   idleAll();
   report = await dispatcher.tick();
   expect(report.woke.map(w => w.task)).not.toContain(t.id);
+});
+
+test('MR02 real fork: two dispatchers can obtain only one in-flight manager wake and one external action', async () => {
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  await database.db.query('DELETE provider_health;');
+  await database.db.query('UPDATE employee_def SET enabled = false, error_streak = 0;');
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
+  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8 }, minFreeMemMb: 0, minFreeDiskMb: 0, artifactReclaimEnabled: false, blockLoopLimit: 0 };");
+  const taskId = crypto.randomUUID();
+  const taskRef = new RecordId('task', taskId);
+  await database.db.query(`CREATE ONLY $task CONTENT {
+      title: 'MR02 real fork', context: 'synthetic ambiguous implementer', state: 'ready',
+      executor_role: 'engineering', reviewer_role: 'engineering', dependencies: [], version: 1, fence: 0,
+      submitted_by: NONE, current_employee: NONE, delivery_id: NONE, lease_expires_at: NONE,
+      resume_role: NONE, resume_state: 'ready', blocked_to: NONE, kind: 'task', created_at: time::now() };
+    CREATE audit CONTENT { task: $task, actor: $a, action: 'claim', phase: 'execute', version: 1, at: time::now() };
+    CREATE audit CONTENT { task: $task, actor: $b, action: 'claim', phase: 'execute', version: 1, at: time::now() };`,
+    { task: taskRef, a: new RecordId('employee', 't-eng-a'), b: new RecordId('employee', 't-eng-b') });
+  await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 1 });
+  await workforce.upsertDef('gm-codex', { role: 'gm', provider: 'codex', model: 'gpt-6.1-sol', thinking: 'medium', maxInstances: 2 });
+  const paseo = new FakePaseo();
+  const makeDispatcher = () => new Dispatcher({ workforce, owner, paseo,
+    env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, notify: async () => {} });
+  const [first, second] = await Promise.all([makeDispatcher().tick(), makeDispatcher().tick()]);
+  const woke = [...first.woke, ...second.woke].filter(w => w.task === taskId);
+  expect(woke).toHaveLength(1);
+  expect((await workforce.openManagerActions()).filter(a => a.taskId === taskId)).toHaveLength(1);
+  const wakes = (await workforce.openManagerWakes()).filter(w => w.taskId === taskId);
+  expect(wakes).toHaveLength(1);
+  expect(['pending', 'running']).toContain(wakes[0]!.state);
+  const externalActions = () => [...paseo.agents.values()].filter(a => a.spawn?.prompt.includes(taskId)).length
+    + paseo.sent.filter(s => s.prompt.includes(taskId)).length;
+  expect(externalActions()).toBe(1);
+  // Restart a fresh dispatcher after the throttle window: the running owner still holds the episode.
+  await database.db.query("UPDATE dispatch SET at = $past WHERE task = $task AND string::starts_with(purpose, 'gm-manager-action:');", { task: taskId, past: Math.floor(Date.now() / 1000) - 7200 });
+  const restarted = await makeDispatcher().tick();
+  expect(restarted.woke.filter(w => w.task === taskId)).toHaveLength(0);
+  expect((await workforce.openManagerWakes()).filter(w => w.taskId === taskId)).toHaveLength(1);
+  expect(externalActions()).toBe(1);
 });
