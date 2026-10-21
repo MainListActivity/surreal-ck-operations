@@ -399,6 +399,13 @@ export interface DispatcherDeps {
    */
   realignAgent?: (agentId: string, model: string) => Promise<boolean>;
   /**
+   * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
+   * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
+   * failure that cannot be restarted). Returns true when the binding moved. Undefined disables the automatic successor:
+   * the block then names the manager's takeover instead.
+   */
+  autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
+  /**
    * Terminal-task artifact reclaim (evidence/deliverables lifecycle). Bare call = periodic
    * normal-mode sweep; `{ targetFreeMb }` = pressure mode, oldest terminal work first until
    * the real free-disk probe reaches the target. Undefined disables artifact reclaim.
@@ -1135,6 +1142,55 @@ export class Dispatcher {
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask, forReview = false,
       reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, forReview, undefined, reserved).flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    /**
+     * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
+     * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
+     * idle, exhausted and unknown are not struck: those recover on their own.
+     */
+    const struckImplementer = (employeeId: string): boolean => {
+      const inst = insts.find(i => i.id === employeeId);
+      return !inst || states.get(inst.id) === 'down';
+    };
+    /**
+     * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
+     * every other engineer out, so the work would wait forever on someone who is gone. The system hands the code to a
+     * live engineer of the same repository on its own — no manager, no owner decision — and the next pass dispatches to
+     * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
+     * here, so the caller leaves it to the next pass.
+     */
+    const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
+      const implementer = task.implementer;
+      if (!implementer || !struckImplementer(implementer)) return false;
+      const takeover = this.deps.autoTakeover;
+      if (takeover) {
+        let facts;
+        try {
+          facts = await wf.contributors(task.id);
+        } catch (error) {
+          this.log(`contributors read failed for ${task.id}: ${(error as Error).message}`);
+          await this.settleBlocked(task, 'execute', home, undefined, now, report);
+          return true;
+        }
+        // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
+        const excluded = new Set<string>([...facts.excluded, implementer]);
+        const successor = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+          .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
+          .map(entry => entry.key).sort()[0];
+        if (successor) {
+          const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
+            reason: `自动接替：原实现人 ${implementer} 的会话已失效（归档或不可恢复），系统把代码交给在岗工程员工` })
+            .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
+          if (moved) {
+            report.decisions.push(`auto-takeover:${task.id}=${successor}`);
+            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (session gone)`);
+            await this.clearBlocked(task, 'execute');
+            return true;
+          }
+        }
+      }
+      await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
+      return true;
+    };
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -1228,6 +1284,8 @@ export class Dispatcher {
     for (const item of work) {
       if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
+      // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && await replaceStruckImplementer(item.task, home)) continue;
       if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
         await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
         continue;

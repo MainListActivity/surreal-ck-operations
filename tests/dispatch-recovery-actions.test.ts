@@ -49,3 +49,13 @@ test('an unknown state is never shown as busy: its basis is the read that failed
   expect(verdict.reasons[0]).toMatchObject({ basis: 'read:state-or-audit' });
   expect(verdict.feasible).toBe(false);
 });
+
+test('an unavailable implementer is replaced by the system itself, not by the manager', () => {
+  const verdict = verdictOf([{ key: '*', eligible: false, code: 'implementer_unavailable' }]);
+  const [reason] = verdict.reasons;
+  expect(reason).toMatchObject({ code: 'implementer_unavailable', owner: 'system', basis: 'tick:session-status' });
+  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'system', executable: false })]);
+  expect(reason!.actions[0]!.tool).toBeUndefined();
+  expect(reason!.recovery).toContain('系统自动改派');
+  expect(reason!.nextTrigger).toContain('系统自动改派');
+});

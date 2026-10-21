@@ -333,9 +333,9 @@ const workflowOf = (v: unknown): "ready" | "doing" | "review" => (v === "doing" 
 const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unknown>>(v).map(r => ({
   code: str(r.code), text: str(r.text), candidates: arr<unknown>(r.candidates).map(str),
   candidatesOmitted: num(r.candidatesOmitted) || undefined,
-  owner: r.owner === "owner" ? "owner" : "gm", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
+  owner: r.owner === "owner" ? "owner" : r.owner === "system" ? "system" : "gm", basis: str(r.basis), recovery: str(r.recovery), nextTrigger: str(r.nextTrigger),
   actions: arr<Record<string, unknown>>(r.actions).map(a => ({
-    authority: a.authority === "owner" ? "owner" : "gm", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
+    authority: a.authority === "owner" ? "owner" : a.authority === "system" ? "system" : "gm", label: str(a.label), tool: str(a.tool) || undefined, executable: a.executable === true,
   })),
 }));
 
@@ -471,7 +471,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
             <Text style={{ color: "#d97706", fontSize: 13 }}>{v.summary}</Text>
             {v.reasons.map((r, i) => (
               <Text key={i} style={s.muted}>
-                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "gm" ? "经理" : "老板"} · 恢复：{r.recovery}
+                {r.text}（{r.candidates.filter(c => c !== "*").join("、") || "全局"}）· 负责：{r.owner === "gm" ? "经理" : r.owner === "system" ? "系统" : "老板"} · 恢复：{r.recovery}
               </Text>
             ))}
             <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt)}</Text>
