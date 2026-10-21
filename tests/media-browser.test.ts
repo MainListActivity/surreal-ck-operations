@@ -68,15 +68,27 @@ describe('media_image', () => {
     expect(audits[0].evidence).toContain('media_image chatgpt hero.png');
   });
 
-  test('provider=auto fails over on limit_reached and reports attempts', async () => {
+  test('provider=auto fails over from chatgpt to higgsfield on limit_reached', async () => {
     results = [
       { ok: false, code: 'limit_reached', message: 'weekly limit' },
       { ok: true },
     ];
     const value = await call(studio(), 'media_image', { prompt: 'a hallway scene, 16:9, painterly', file: 'hall.png' }) as any;
-    expect(value.provider).toBe('gemini');
+    expect(value.provider).toBe('higgsfield');
     expect(value.attempts).toEqual(['chatgpt: limit_reached']);
-    expect(ran.map(r => r.provider)).toEqual(['chatgpt', 'gemini']);
+    expect(ran.map(r => r.provider)).toEqual(['chatgpt', 'higgsfield']);
+  });
+
+  test('falls through higgsfield to gemini when both web image lanes fail', async () => {
+    results = [
+      { ok: false, code: 'limit_reached', message: 'chatgpt cap' },
+      { ok: false, code: 'login_required', message: 'higgsfield logged out' },
+      { ok: true },
+    ];
+    const value = await call(studio(), 'media_image', { prompt: 'a hallway scene, 16:9, painterly', file: 'hall.png' }) as any;
+    expect(value.provider).toBe('gemini');
+    expect(value.attempts).toEqual(['chatgpt: limit_reached', 'higgsfield: login_required']);
+    expect(ran.map(r => r.provider)).toEqual(['chatgpt', 'higgsfield', 'gemini']);
   });
 
   test('last provider failure maps code: login_required → not_configured, limit_reached → limit_reached', async () => {
@@ -130,6 +142,10 @@ describe('media_video', () => {
 
   test('chatgpt is not a video provider', async () => {
     expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.mp4', provider: 'chatgpt' }))).code).toBe('invalid');
+  });
+
+  test('higgsfield is not a video provider', async () => {
+    expect((await fail(call(studio(), 'media_video', { prompt: 'slow push-in on the balcony scene', file: 'clip.mp4', provider: 'higgsfield' }))).code).toBe('invalid');
   });
 });
 
@@ -268,7 +284,7 @@ describe('media_browser_info and serialisation', () => {
     results = [{ ok: false, code: 'login_required', message: 'expired' }];
     await fail(call(s, 'media_image', { prompt: 'a portrait of the character', file: 'x.png', provider: 'grok' }));
     const info = await call(s, 'media_browser_info') as any;
-    expect(info.providers.image).toEqual(['chatgpt', 'gemini', 'grok']);
+    expect(info.providers.image).toEqual(['chatgpt', 'higgsfield', 'gemini', 'grok']);
     expect(info.quotas.image.used).toBe(3);
     expect(info.providerStatus.grok).toContain('login_required');
   });

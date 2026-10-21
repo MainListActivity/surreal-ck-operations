@@ -13,6 +13,7 @@ import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
 import { writePause } from './dispatch-pause.ts';
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
+import { rescoreAggregates } from './scoring.ts';
 
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
@@ -38,6 +39,7 @@ const usage = `Usage: pnpm run admin <command>
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
   config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）；
                                           paused 走暂停事务（纪元、闸门、审计同写），pause_epoch 只能由暂停本身写
+  rescore                                 从评分卡重算员工与编制的 scored/avg_score（幂等；修复评分汇总失败留下的落后）
   reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
                                           回收终态任务的大文件（evidence/deliverables）；
                                           缺省只演练不删，加 --execute 才真正动手，带目标 MB 则按压力模式回收`;
@@ -115,6 +117,10 @@ try {
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });
       } else throw new Error(usage);
       print(await workforce.defs());
+      break;
+    }
+    case 'rescore': {
+      print(await rescoreAggregates(database.db));
       break;
     }
     case 'jev-test': {

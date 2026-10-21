@@ -50,12 +50,23 @@ test('an unknown state is never shown as busy: its basis is the read that failed
   expect(verdict.feasible).toBe(false);
 });
 
-test('an unavailable implementer is replaced by the system itself, not by the manager', () => {
+test('an unavailable implementer keeps the system retry and also offers the manager a takeover', () => {
   const verdict = verdictOf([{ key: '*', eligible: false, code: 'implementer_unavailable' }]);
   const [reason] = verdict.reasons;
   expect(reason).toMatchObject({ code: 'implementer_unavailable', owner: 'system', basis: 'tick:session-status' });
-  expect(reason!.actions).toEqual([expect.objectContaining({ authority: 'system', executable: false })]);
+  expect(reason!.actions).toHaveLength(2);
+  expect(reason!.actions[0]).toMatchObject({ authority: 'system', executable: false });
   expect(reason!.actions[0]!.tool).toBeUndefined();
+  expect(reason!.actions[1]).toMatchObject({ authority: 'gm', tool: 'implementer_takeover', executable: true });
   expect(reason!.recovery).toContain('系统自动改派');
   expect(reason!.nextTrigger).toContain('系统自动改派');
+});
+
+test('a persistent implementer quota failure is a manager takeover with its real reset basis', () => {
+  const until = '2026-10-21T10:00:00.000Z';
+  const verdict = verdictOf([{ key: 'eng-1', eligible: false, code: 'implementer_quota', until }]);
+  const [reason] = verdict.reasons;
+  expect(reason).toMatchObject({ code: 'implementer_quota', owner: 'gm', basis: 'tick:provider-health', until });
+  expect(reason!.text).toContain(`恢复时间 ${until}`);
+  expect(reason!.actions[0]).toMatchObject({ authority: 'gm', tool: 'implementer_takeover', executable: true });
 });

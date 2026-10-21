@@ -41,7 +41,10 @@ rtk proxy pnpm run test:worktrees
 ## 生产查询与 dry-run
 
 ```sh
-# 全局库存（GM）
+# 全局库存（仅 GM）：不带分页参数时返回完整数组；超出 48 KiB 预算会报 response_too_large，
+# 此时改用 '{"pageSize":100}'，按返回的 page.nextCursor 逐页读完（带分页参数时返回 {worktrees, page}）。
+# 统计时累加每页 worktrees 的数量，page.total 为快照内总数，用于核对。
+# 非 gm 角色必须带 taskId，例如 '{"taskId":"<任务ID>"}'，缺省或 null 返回 forbidden。
 sck call list_worktrees '{}'
 
 # dry-run：只写 audit，不删
@@ -66,7 +69,7 @@ sck call list_worktree_audits '{"limit":100}'
 
 ## 生产演练（上线后 QA 腿）
 
-1. 经理取 `list_worktrees {}` 与四仓 git list 作 before；记录 MCP/插件提交与 schema 012 哈希
+1. 由 gm 取 `list_worktrees {}`（超出预算报 `response_too_large` 时改用 `{"pageSize":25}` 并按 `page.nextCursor` 逐页读完，累加每页 `worktrees` 数量后再统计）与四仓 git list 作 before。非 gm 角色调用时必须带 `taskId`；记录 MCP/插件提交与 schema 012 哈希
 2. 串行/并行工程任务：done 后 exclusive 不在 `git worktree list`，shared 仍在；两写手未提交改动互不覆盖
 3. fixture：dirty exclusive 保留；租约过期交接、submit→review、return→ready 窗口 recovery 保留；把 fixture `last_released_at` 拨到 N 前，经真实 sweep 删除；N 内与保护树仍在；`list_worktree_audits` 可见 release/delete/skip/fail
 4. 至少 10 个同仓串行任务后 shared 数不增加（代码任务不进 shared）；同一线的多个任务始终落在同一路径同一分支，线结束后树消失；并行峰值与写手数相关；结束后收敛到共享/受保护基线加明确保留例外

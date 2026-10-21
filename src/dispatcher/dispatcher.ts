@@ -1,11 +1,11 @@
 import type { OwnerDesk } from '../owner.ts';
 import type { PassHandle, PassLedger } from '../dispatch-pause.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
-import { effectiveWeight, weightedOrder } from '../workforce.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, gmTriage, wake, type GmTodo, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
@@ -18,7 +18,7 @@ import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { isRetireRefused } from '../retirement.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
@@ -30,6 +30,10 @@ const LOG_TAIL_ENTRIES = 60;
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
 /** A failed in-place reload is retried on this interval, not on every poll. */
 const RELOAD_RETRY_SECONDS = 300;
+/** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
+const PERSISTENT_QUOTA_FAILURES = 2;
+/** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
+const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -459,6 +463,11 @@ interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolea
  * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
  */
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
+/** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
+interface AssignHooks {
+  beforeExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn') => Promise<void> | void;
+  afterExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn', agentId: string) => Promise<void> | void;
+}
 
 /** One live session as the latest pass saw it: the raw Paseo status and the state the tick acted on. */
 export interface ObservedSession { agentId?: string; status: string; state: InstState }
@@ -856,7 +865,7 @@ export class Dispatcher {
       const previous = this.lastStatus.get(inst.paseoAgentId);
       this.lastStatus.set(inst.paseoAgentId, status);
       observedStatus.set(inst.id, status);
-      if (status === 'running' || status === 'initializing') { states.set(inst.id, 'busy'); continue; }
+      if (status === 'running' || status === 'initializing' || status === 'busy') { states.set(inst.id, 'busy'); continue; }
       if (status === 'idle') {
         states.set(inst.id, 'idle');
         if ((previous === 'running' || previous === 'error') && inst.provider) {
@@ -1174,8 +1183,18 @@ export class Dispatcher {
      * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
      * here, so the caller leaves it to the next pass.
      */
+    /**
+     * The implementer the execute gate binds this task to, when it can be named: the explicit field first, then the derived one
+     * (the sole author of a task that never recorded an explicit implementer). An unresolved or unreadable history names
+     * nobody — the task waits there as unknown, never as struck.
+     */
+    const boundImplementer = (task: SupervisedTask): string | undefined => {
+      if (task.implementer) return task.implementer;
+      const gate = executeGates.get(task.id);
+      return gate && !gate.unresolved && gate.implementer ? gate.implementer : undefined;
+    };
     const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
-      const implementer = task.implementer;
+      const implementer = boundImplementer(task);
       if (!implementer || !struckImplementer(implementer)) return false;
       const takeover = this.deps.autoTakeover;
       if (takeover) {
@@ -1194,11 +1213,11 @@ export class Dispatcher {
           .map(entry => entry.key).sort()[0];
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
-            reason: `自动接替：原实现人 ${implementer} 的会话已失效（归档或不可恢复），系统把代码交给在岗工程员工` })
+            reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
             .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
           if (moved) {
             report.decisions.push(`auto-takeover:${task.id}=${successor}`);
-            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (session gone)`);
+            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (implementer unavailable)`);
             await this.clearBlocked(task, 'execute');
             return true;
           }
@@ -1206,6 +1225,25 @@ export class Dispatcher {
       }
       await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
       return true;
+    };
+    /**
+     * A bound implementer whose provider has failed quota repeatedly, or whose reset time is unknown, cannot be relied
+     * on to come back on its own. This is not a busy/capacity wait: the manager gets a takeover todo. A known short
+     * cooldown stays a wait; one failure is not persistent.
+     */
+    const persistentQuotaImplementer = (task: SupervisedTask): { employee: string; until?: string; failures: number } | undefined => {
+      const employee = task.implementer;
+      if (!employee) return undefined;
+      const inst = insts.find(i => i.id === employee);
+      if (!inst) return undefined; // the struck path owns a vanished employee
+      if (states.get(inst.id) !== 'exhausted') return undefined;
+      const h = health.get(inst.provider ?? '');
+      if (!h || h.state !== 'exhausted') return undefined;
+      const def = defs.find(d => d.id === inst.def);
+      if (def?.quotaLimited === false) return undefined;
+      const failures = h.failures ?? 0;
+      if (failures < PERSISTENT_QUOTA_FAILURES && h.until !== undefined) return undefined;
+      return { employee, failures, until: h.until === undefined ? undefined : new Date(h.until * 1000).toISOString() };
     };
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
@@ -1301,7 +1339,16 @@ export class Dispatcher {
       if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
-      if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && await replaceStruckImplementer(item.task, home)) continue;
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering') {
+        if (await replaceStruckImplementer(item.task, home)) continue;
+        const quota = persistentQuotaImplementer(item.task);
+        if (quota) {
+          await this.settleBlocked(item.task, 'execute', home,
+            [{ key: quota.employee, eligible: false, code: 'implementer_quota', until: quota.until,
+              reason: `已连续 ${quota.failures} 次额度失败` }], now, report);
+          continue;
+        }
+      }
       if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
         await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
         continue;
@@ -1407,7 +1454,100 @@ export class Dispatcher {
     }
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
 
-    const pendingGm: SupervisedTask[] = [];
+    // Manager actions: a ready/doing engineering task whose execute verdict needs a manager decision (unresolved
+    // implementer, no automatic successor, or a persistent implementer quota failure) becomes a durable todo. The
+    // same GmTodo feeds the gm prompt and the owner-facing verdict, so reason, action and time basis cannot drift.
+    const tasksById = new Map(tasks.map(task => [task.id, task]));
+    const workExecute = new Map(work.filter(item => item.purpose === 'execute').map(item => [item.task.id, item.task]));
+    const managerActionCode = (verdict: DispatchVerdict): BlockCode | undefined => {
+      const codes = verdict.reasons.map(reason => reason.code);
+      if (codes.includes('implementer_unresolved')) return 'implementer_unresolved';
+      if (codes.includes('implementer_quota')) return 'implementer_quota';
+      if (codes.includes('implementer_unavailable')) return 'implementer_unavailable';
+      return undefined;
+    };
+    type ManagerTodo = GmTodo & { purpose: string; key: string; episode: number; wakeEpisode: number; wakeReason: string; wakeDue: boolean };
+    const managerTodos: ManagerTodo[] = [];
+    for (const verdict of this.verdicts.values()) {
+      if (verdict.phase !== 'execute') continue;
+      const task = workExecute.get(verdict.taskId);
+      if (!task || task.executorRole !== 'engineering') continue;
+      const reasonCode = managerActionCode(verdict);
+      if (!reasonCode) continue;
+      const parsed = Date.parse(verdict.since ?? verdict.checkedAt);
+      const episode = Number.isFinite(parsed) ? parsed : now * 1000;
+      const key = managerActionKey(task.id, 'execute', episode, reasonCode);
+      const purpose = `gm-manager-action:${key}`;
+      let last: { at: number } | undefined;
+      let wakeDue = false;
+      try {
+        last = await wf.lastDispatch(task.id, 0, purpose);
+        wakeDue = !last || now - last.at >= cfg.redispatchMinutes * 60;
+      } catch (error) {
+        // Unknown throttle state is not a licence to wake again: keep the action and retry next pass.
+        this.log(`manager action throttle read failed for ${task.id}: ${(error as Error).message}`);
+      }
+      managerTodos.push({ task, action: 'implementer_takeover', expectedVersion: task.version, reasonCode, verdict, episode, key, purpose,
+        wakeEpisode: episode, wakeReason: reasonCode, wakeDue });
+    }
+
+    // Close todos that no longer describe the task; keep them on read failures and pass-wide gates.
+    let openActions: ManagerActionRow[] | undefined;
+    let managerReadFailed = false;
+    if (typeof wf.openManagerActions === 'function') {
+      try { openActions = await wf.openManagerActions(); }
+      catch (error) { this.log(`manager action read failed: ${(error as Error).message}`); managerReadFailed = true; }
+      if (openActions === undefined) {
+        // Fail closed: without the persisted open set we cannot dedupe a new wake or prove an old todo is resolved.
+        managerTodos.length = 0;
+        managerReadFailed = true;
+      }
+    }
+    if (openActions) {
+      const currentByKey = new Map(managerTodos.map(todo => [todo.key, todo]));
+      for (const action of openActions) {
+        const current = currentByKey.get(action.key);
+        if (current && current.task.implementer === action.implementer) continue;
+        const task = tasksById.get(action.taskId);
+        let resolution: string | undefined;
+        if (!task || task.currentEmployee || !['ready', 'doing'].includes(task.state)) {
+          resolution = 'task left the execute queue';
+        } else if (task.implementer !== action.implementer) {
+          resolution = 'implementer changed';
+        } else {
+          const verdict = this.verdicts.get(`${task.id}:execute`);
+          const codes = verdict?.reasons.map(reason => reason.code) ?? [];
+          // Unknown state and pass-wide gates are not evidence that the implementer problem is handled.
+          if (verdict && codes.length && !codes.some(code => GLOBAL_KEEP.has(code)) && !codes.includes(action.reason as BlockCode)) {
+            resolution = 'reason changed or cleared';
+          }
+        }
+        if (resolution) {
+          await wf.closeManagerAction(action, resolution).catch(error =>
+            this.log(`manager action close failed for ${action.taskId}: ${(error as Error).message}`));
+          if ((resolution === 'task left the execute queue' || resolution === 'implementer changed') && typeof wf.finishManagerWakesForTask === 'function') {
+            await wf.finishManagerWakesForTask(action.taskId, resolution).catch(error =>
+              this.log(`manager wake close failed for ${action.taskId}: ${(error as Error).message}`));
+          }
+        }
+      }
+    }
+
+    // Persist current todos before waking: a wake without a durable todo cannot be deduped after a restart.
+    for (const todo of managerTodos) {
+      if (typeof wf.openManagerAction !== 'function') continue;
+      try {
+        await wf.openManagerAction({ taskId: todo.task.id, phase: 'execute', episode: todo.episode, reason: todo.reasonCode!,
+          action: 'implementer_takeover', version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
+          implementer: todo.task.implementer });
+      } catch (error) {
+        this.log(`manager action open failed for ${todo.task.id}: ${(error as Error).message}`);
+        todo.purpose = ''; // skip the wake below: it would have no durable todo
+      }
+    }
+
+    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string };
+    const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
     // interactive RPCs queued past the daemon's 30s timeout.
@@ -1428,29 +1568,131 @@ export class Dispatcher {
       const afterReset = quotaUntil !== undefined && !gated && (!last || last.at < quotaUntil);
       if (!gated && last && now - last.at < cfg.redispatchMinutes * 60 && !afterReset) continue;
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
-      pendingGm.push(task);
+      pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
+        wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
+        wakeReason: 'blocked_to_gm' });
     }
+    for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
+
+    // Every current episode, not only the ones whose throttle expired, keeps its in-flight
+    // owner alive. Throttle controls a new wake; it must never release an old one.
+    const activeWakeKeys = new Set<string>();
+    for (const todo of managerTodos) activeWakeKeys.add(managerWakeKey(todo.task.id, 'execute', todo.wakeEpisode));
+    for (const task of gmBlocked) activeWakeKeys.add(managerWakeKey(task.id, 'execute',
+      task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version));
+    for (const action of openActions ?? []) activeWakeKeys.add(managerWakeKey(action.taskId, 'execute', action.episode));
+
+    // Restore the durable in-flight owner before any new external action. An unreadable
+    // ownership set is not evidence that the previous GM is gone: fail closed for this pass.
+    let wakeReadFailed = typeof wf.openManagerWakes !== 'function' || typeof wf.acquireManagerWake !== 'function';
+    if (!wakeReadFailed) {
+      let openWakes: ManagerWakeRow[] | undefined;
+      try { openWakes = await wf.openManagerWakes!(); }
+      catch (error) {
+        this.log(`manager wake read failed: ${(error as Error).message}`);
+      }
+      if (openWakes === undefined) wakeReadFailed = true;
+      else if (!managerReadFailed) {
+        await this.reconcileManagerWakes(openWakes, activeWakeKeys, now, report);
+      }
+    }
+    if (wakeReadFailed) {
+      this.log('manager wake ownership unavailable; suppressing all gm wake this pass');
+      pendingGm.length = 0;
+    }
+
+    const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
+    for (const todo of pendingGm) {
+      let claim: ManagerWakeClaim | undefined;
+      try {
+        claim = await wf.acquireManagerWake!({
+          taskId: todo.task.id, phase: 'execute', episode: todo.wakeEpisode, reason: todo.wakeReason,
+          version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
+        }, wf.newKey());
+      } catch (error) {
+        this.log(`manager wake acquire failed for ${todo.task.id}: ${(error as Error).message}`);
+        continue;
+      }
+      if (!claim) {
+        report.decisions.push(`gm-wake-held:${todo.task.id}`);
+        continue;
+      }
+      granted.push({ todo, claim });
+    }
+
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
     // per repo: the group's readTask anchors pick home, per-project spawn quota,
     // readWorkspace resolution and the cwd/repoHome fallback on the repo the blocked
     // tasks actually belong to — a single anchorless assign would pin every project's
-    // gm batch onto the ops repo tree.
-    const gmGroups = new Map<string, SupervisedTask[]>();
-    for (const task of pendingGm) {
-      const home = task.repoPath ?? this.deps.env.opsRepo;
+    // gm batch onto the ops repo tree. Only episodes that won the durable wake CAS are
+    // in a group; an in-flight episode is never carried along in another GM's prompt.
+    const gmGroups = new Map<string, Array<{ todo: PendingGm; claim: ManagerWakeClaim }>>();
+    for (const item of granted) {
+      const home = item.todo.task.repoPath ?? this.deps.env.opsRepo;
       const group = gmGroups.get(home);
-      if (group) group.push(task); else gmGroups.set(home, [task]);
+      if (group) group.push(item); else gmGroups.set(home, [item]);
     }
     for (const group of gmGroups.values()) {
-      if (running >= cfg.maxRunning) break;
-      const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
-      if (!result) continue;
-      for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
+      if (running >= cfg.maxRunning) {
+        for (const item of group) {
+          await wf.finishManagerWake(item.claim, 'finished', 'max_running gate held the wake').catch(error =>
+            this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
+        }
+        continue;
+      }
+      let externalTouched = false;
+      let externalStarted = false;
+      const beforeExternal = async (inst: EmployeeInst, kind: 'send' | 'spawn') => {
+        externalTouched = true;
+        for (const item of group) {
+          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, kind === 'send' ? inst.paseoAgentId : undefined);
+          if (!marked) throw new Error(`manager wake claim lost for ${item.todo.task.id}`);
+        }
+        externalStarted = true;
+      };
+      const afterExternal = async (inst: EmployeeInst, _kind: 'send' | 'spawn', agentId: string) => {
+        for (const item of group) {
+          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, agentId);
+          if (!marked) throw new Error(`manager wake binding lost for ${item.todo.task.id}`);
+        }
+      };
+      let result: (EmployeeInst & { spawned: boolean }) | undefined;
+      try {
+        result = await this.assign('gm', undefined, undefined, pick, spawnable,
+          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0]!.todo.task }, { beforeExternal, afterExternal });
+      } catch (error) {
+        this.log(`manager wake assign failed: ${(error as Error).message}`);
+      }
+      if (!result) {
+        for (const item of group) {
+          if (externalTouched) {
+            const reason = externalStarted ? 'external action result was not observed' : 'wake start write was uncertain';
+            await wf.finishManagerWake(item.claim, 'unknown', reason, 'unknown').catch(error =>
+              this.log(`manager wake unknown write failed for ${item.todo.task.id}: ${(error as Error).message}`));
+            await this.notice(`manager-wake-unknown:${item.todo.task.id}`,
+              `经理待办 ${item.todo.task.id} 的唤醒尝试已开始但结果未确认（${reason}）。待办与审计保留，本轮不会再次唤醒或 spawn 第二位 GM；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
+          } else {
+            await wf.finishManagerWake(item.claim, 'finished', 'no external action was started').catch(error =>
+              this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
+          }
+        }
+        continue;
+      }
+      for (const item of group) {
+        const marked = await wf.markManagerWakeRunning(item.claim, result.id, result.paseoAgentId).catch(error => {
+          this.log(`manager wake bind failed for ${item.todo.task.id}: ${(error as Error).message}`);
+          return false;
+        });
+        if (!marked) {
+          await wf.finishManagerWake(item.claim, 'unknown', 'wake binding update failed', 'unknown').catch(() => false);
+        }
+        if (item.todo.action === 'resume') await wf.recordDispatch(item.todo.task.id, item.todo.task.version, 'gm-attention', result.id);
+        else if (item.todo.purpose) await wf.recordDispatch(item.todo.task.id, 0, item.todo.purpose, result.id);
+      }
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
       assigned.add(result.id);
-      report.woke.push(...group.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
+      report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
     }
 
     const triage = await owner.triagePending();
@@ -1696,6 +1938,84 @@ export class Dispatcher {
     this.taskDeny.set(task.id, { at: now, version: task.version });
   }
 
+  /**
+   * Reconcile persisted wake ownership against the external session state before a new
+   * wake can be considered. running/initializing keeps ownership; idle after the turn
+   * grace, archived, missing or error releases it for a controlled retry; unknown,
+   * unreadable or mismatched evidence stays unknown and is never treated as idle.
+   */
+  private async reconcileManagerWakes(openWakes: ManagerWakeRow[], activeKeys: ReadonlySet<string>, now: number, report: TickReport): Promise<void> {
+    const { workforce: wf, paseo, owner } = this.deps;
+    for (const row of openWakes) {
+      const claim = wf.wakeClaim(row);
+      const noticeKey = `manager-wake-unknown:${row.taskId}`;
+      if (!activeKeys.has(row.key)) {
+        await wf.finishManagerWake(claim, 'finished', 'episode left the execute queue', row.lastStatus).catch(error =>
+          this.log(`manager wake close failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      // Pending with no external-start marker is only a crashed pre-assign attempt after a
+      // conservative grace. A live concurrent dispatcher is inside that grace.
+      if (row.state === 'pending' && !row.externalStartedAt) {
+        if (now - (row.startedAt ?? 0) >= MANAGER_WAKE_PENDING_GRACE_SECONDS) {
+          await wf.finishManagerWake(claim, 'finished', 'pending attempt expired before external action', row.lastStatus).catch(error =>
+            this.log(`manager wake pending release failed for ${row.taskId}: ${(error as Error).message}`));
+        }
+        continue;
+      }
+      if (!row.agent) {
+        const reason = row.externalStartedAt ? 'external action started without a bound agent' : 'agent not recorded';
+        await wf.finishManagerWake(claim, 'unknown', reason, 'unknown').catch(error =>
+          this.log(`manager wake unknown write failed for ${row.taskId}: ${(error as Error).message}`));
+        await this.notice(noticeKey,
+          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试无法核定 Paseo 会话（${reason}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待会话绑定恢复，或人工确认后清理该 episode。`, report);
+        continue;
+      }
+      let observed: { status: string; pendingPermissions: number } | undefined;
+      try {
+        observed = await paseo.status(row.agent);
+      } catch (error) {
+        await wf.finishManagerWake(claim, 'unknown', `status read failed: ${(error as Error).message.slice(0, 120)}`, 'unknown').catch(() => false);
+        await this.notice(noticeKey,
+          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试状态读取失败。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 可读或人工确认。`, report);
+        continue;
+      }
+      const status = observed?.status;
+      if (status === 'running' || status === 'initializing') {
+        await wf.markManagerWakeRunning(claim, row.employee ?? 'unknown', row.agent).catch(error =>
+          this.log(`manager wake running write failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      if (status === 'idle') {
+        const since = row.externalStartedAt ?? row.startedAt ?? 0;
+        if (since && now - since >= MANAGER_WAKE_TURN_GRACE_SECONDS) {
+          await wf.finishManagerWake(claim, 'finished', 'session turn ended without resolving the manager todo', 'idle').catch(error =>
+            this.log(`manager wake idle release failed for ${row.taskId}: ${(error as Error).message}`));
+          await owner.resolveNotice(noticeKey).catch(() => undefined);
+        }
+        continue;
+      }
+      if (status === 'archived' || status === undefined) {
+        await wf.finishManagerWake(claim, 'finished', status === 'archived' ? 'session archived' : 'session not found', status ?? 'missing').catch(error =>
+          this.log(`manager wake invalid release failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      if (status === 'error') {
+        await wf.finishManagerWake(claim, 'finished', 'session error before resolving the manager todo', 'error').catch(error =>
+          this.log(`manager wake error release failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      await wf.finishManagerWake(claim, 'unknown', `unrecognized session state: ${status}`, 'unknown').catch(error =>
+        this.log(`manager wake unknown state write failed for ${row.taskId}: ${(error as Error).message}`));
+      await this.notice(noticeKey,
+        `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试处于未知状态（${status}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
+    }
+  }
+
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal, anchorHome?: string) => EmployeeInst | undefined,
@@ -1703,6 +2023,7 @@ export class Dispatcher {
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
+    hooks?: AssignHooks,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     if (task && sidecar) {
@@ -1755,7 +2076,9 @@ export class Dispatcher {
           // instance's claim re-resolves the same registered worktree, so its
           // spawn cwd matches by construction.
         } else {
+          await hooks?.beforeExternal?.(existing, 'send');
           await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
+          await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
           await wf.touchWake(existing.id);
@@ -1811,6 +2134,7 @@ export class Dispatcher {
         // tree-bound cwd it always had.
         const instHome = sidecar?.commDirFor(inst.id);
         const spawnCwd = instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
+        await hooks?.beforeExternal?.(inst, 'spawn');
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd, workspaceTitle: instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
@@ -1818,6 +2142,7 @@ export class Dispatcher {
           env: spawnEnv,
           prompt: prompt(inst, true, claim, workspace),
         });
+        await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
         const repoHome = task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });

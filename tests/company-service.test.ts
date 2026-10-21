@@ -45,6 +45,17 @@ function makeRelease(releases: string, sha: string, withGit = false) {
   return dir;
 }
 
+// The install requires both release records for the SHA on the runtime the services run with (scripts/bun-runtime.sh: the
+// pinned runtime-bun under the service home). The fixture pins that runtime and its version, so it does not depend on the host Bun;
+// the gate runner itself is covered by tests/release-gate.test.ts.
+function writeGateRecord(serviceHome: string, sha: string) {
+  for (const gate of ['comm-slow-pipe', 'sidecar-review']) {
+    const dir = join(serviceHome, 'gates', gate);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ gate, sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
+  }
+}
+
 function fixture(): Fixture {
   const root = mkdtempSync(join(tmpdir(), 'sck-company-service-'));
   const home = join(root, 'home with spaces');
@@ -76,9 +87,25 @@ function fixture(): Fixture {
   utimesSync(join(releases, SHAS.old), now, now - 20);
   utimesSync(join(releases, SHAS.worktree), now, now - 30);
 
-  executable(join(fakeBin, 'git'), '#!/bin/sh\nexit 0\n');
+  // Test stand-in for git. install verifies that a release directory holds the commit it is named after (SYS01 B2,
+  // scripts/release-content.sh), so archive/cat-file answer from the fixture release directory for that commit; the ancestry
+  // and fetch calls install also makes stay trivial. The mismatch case is covered with a real repository in release-gate.test.ts.
+  executable(join(fakeBin, 'git'), [
+    '#!/bin/sh',
+    'mode=""; sha=""',
+    'for arg in "$@"; do case "$arg" in archive|cat-file) mode="$arg";; esac; sha="$arg"; done',
+    'sha="${sha%\\^*}"',
+    'if [ "$mode" = archive ]; then exec tar -c -C "$FAKE_RELEASES_DIR/$sha" .; fi',
+    'if [ "$mode" = cat-file ]; then [ -d "$FAKE_RELEASES_DIR/$sha" ] && exit 0; exit 1; fi',
+    'exit 0',
+  ].join('\n') + '\n');
   executable(join(fakeBin, 'launchctl'), '#!/bin/sh\ncase "$1" in print) exit 1;; *) exit 0;; esac\n');
   executable(join(fakeBin, 'lsof'), '#!/bin/sh\n[ "${FAKE_LSOF_ERROR:-0}" = 1 ] && exit 2\n[ "${FAKE_LSOF_OPEN:-0}" = 1 ] && { printf \'open\n\'; exit 0; }\nexit 1\n');
+  // The pinned runtime the services run with; the Bun on PATH (1.3.11) is a decoy that install must not consult.
+  mkdirSync(join(serviceHome, 'runtime-bun', 'bin'), { recursive: true });
+  executable(join(serviceHome, 'runtime-bun', 'bin', 'bun'), '#!/bin/sh\necho 1.4.2\n');
+  executable(join(fakeBin, 'bun'), '#!/bin/sh\necho 1.3.11\n');
+  writeGateRecord(serviceHome, SHAS.current);
   const fakePaseo = join(root, 'fake paseo');
   executable(fakePaseo, `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_PASEO_LOG"
@@ -103,14 +130,17 @@ exit 0
 }
 
 function runInstall(f: Fixture, extraEnv: Record<string, string> = {}) {
+  // A developer's SCK_BUN must not decide the gate of these fixtures: the runtime is the one the fixture pins (see writeGateRecord).
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'SCK_BUN'));
   return Bun.spawnSync(['sh', SCRIPT, 'install', f.release], {
     env: {
-      ...process.env,
+      ...inherited,
       HOME: f.home,
       PATH: `${f.fakeBin}:/usr/bin:/bin`,
       PASEO: f.fakePaseo,
       SCK_SERVICE_HOME: f.serviceHome,
       SCK_OPS_REPO: f.opsRepo,
+      FAKE_RELEASES_DIR: f.releases,
       FAKE_PASEO_LOG: f.paseoLog,
       FAKE_PASEO_MODE: 'normal',
       FAKE_PLUGIN_JSON: JSON.stringify([{ installation: { identity: { path: join(f.releases, SHAS.plugin, 'plugin') } } }]),
@@ -193,6 +223,36 @@ for (const [mode, label] of [
     }
   });
 }
+
+test('install gates the runtime the launchd service resolves, not the SCK_BUN of the calling shell', () => {
+  const f = fixture();
+  try {
+    // The caller's SCK_BUN reports another version with no gate record. launchd does not pass it on, so the services run the pinned
+    // runtime (1.4.2), which has a passing record: the install must go ahead.
+    const callerPin = join(f.home, 'caller-bun');
+    executable(callerPin, '#!/bin/sh\necho 1.3.11\n');
+    const result = runInstall(f, { SCK_BUN: callerPin });
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(true);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test('install refuses a release without a passing comm-slow-pipe gate and leaves active unchanged', () => {
+  const f = fixture();
+  try {
+    rmSync(join(f.serviceHome, 'gates'), { recursive: true, force: true });
+    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain('no passing comm-slow-pipe gate');
+    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
+    expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+  } finally {
+    cleanup(f);
+  }
+});
 
 test('an open file handle protects a candidate release from pruning', () => {
   const f = fixture();

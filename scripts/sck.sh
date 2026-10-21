@@ -1,10 +1,12 @@
 #!/bin/sh
 # Employee tool entry: SCK_EMPLOYEE_CREDENTIAL_FILE=<path> sck call <tool> '<json>' | sck list
 set -eu
+# The Bun runtime is resolved exactly as the services resolve it (scripts/bun-runtime.sh, installed beside this file as
+# bin/bun-runtime.sh): SCK_BUN, then the SCK_BUN line of private/service.env, then runtime-bun, then ~/.bun. PATH is never searched.
+. "$(dirname "$0")/bun-runtime.sh"
 service_home=${SCK_SERVICE_HOME:-"$HOME/Library/Application Support/SurrealCKCompany"}
 if [ "${1:-}" = "sync-gate" ]; then
-  BUN="${SCK_BUN:-$service_home/runtime-bun/bin/bun}"
-  [ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
+  resolve_bun "$service_home"
   cd "$service_home/active"
   exec "$BUN" src/mcp/sync-gate.ts
 fi
@@ -20,8 +22,7 @@ fi
 # Comm mode: the plugin sidecar owns the credential; the agent relays through
 # $SCK_COMM_DIR and carries no auth material at all.
 if [ -n "${SCK_COMM_DIR:-}" ]; then
-  BUN="${SCK_BUN:-$service_home/runtime-bun/bin/bun}"
-  [ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
+  resolve_bun "$service_home"
   cd "$service_home/active"
   exec "$BUN" src/mcp/client-cli.ts "$@"
 fi
@@ -38,6 +39,5 @@ export SCK_MCP_URL SCK_MCP_TOKEN SCK_EMPLOYEE_CREDENTIAL_FILE
 cd "$service_home/active"
 # Global ~/.bun (1.3.11) has a broken stream/SSE client that leaves calls hanging;
 # the service-pinned runtime is the same build the server runs on.
-BUN="${SCK_BUN:-$service_home/runtime-bun/bin/bun}"
-[ -x "$BUN" ] || BUN="$HOME/.bun/bin/bun"
+resolve_bun "$service_home"
 exec "$BUN" src/mcp/client-cli.ts "$@"

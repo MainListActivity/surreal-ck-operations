@@ -22,14 +22,16 @@ try {
     'tests/db.integration.test.ts', 'tests/v3.integration.test.ts',
     'tests/implementer-binding.integration.test.ts', 'tests/contributor-cas.integration.test.ts',
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/review-capacity-replay.fork.test.ts',
-    'tests/dispatcher-sidecar.test.ts', 'tests/sidecar.test.ts',
+    'tests/dispatcher-sidecar.test.ts', 'tests/dispatcher-manager-routing.test.ts', 'tests/sidecar.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/sidecar-dispatch-pause.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/pipelines.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/loop-breaker.fork.test.ts', 'tests/owner-commands.fork.test.ts',
-    'tests/dispatch-pause.fork.test.ts', 'tests/dispatch-pause-tick.fork.test.ts', 'tests/goal-acceptance-repair.integration.test.ts',
+    'tests/dispatch-pause.fork.test.ts', 'tests/dispatch-pause-tick.fork.test.ts', 'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/null-absent.fork.test.ts',
+    'tests/snapshot-quota.fork.test.ts',
   ];
   const test = Bun.spawn(['bun', 'test', ...targets], { stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_DISPATCH_PAUSE_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_DISPATCH_PAUSE_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1',
   } });
   exit = await test.exited;
 } finally { server.kill(); await server.exited; rmSync(dir, { recursive: true, force: true }); }

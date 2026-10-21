@@ -113,7 +113,7 @@ const VIDEO_PLAN = `把目标拆成可独立交付的任务，全部带 goalId�
 - 原型/概念设计（P 段，老板 demo 验收）：executorRole=concept-design、reviewerRole=owner。新角色、视觉风格、场景基调先交 demo，老板批准后才解锁依赖它的量产任务。
 - 量产制作（M 段，GM/QA 验收）：executorRole=asset-production、reviewerRole=gm 或 qa，并把对应原型任务写进 dependencies。
 - 音频腿（配音/对白/音效/配乐/主题曲）：一律用 sck call media_* 生成（先 media_info 看配置、当日额度与输出目录），产物在证据目录 media/ 下，自行拷进交付位；台词/对白/声线挂 配音 轨，背景音乐/音效/主题曲挂 配乐 轨（词表无该轨时挂 配音）；声线设计可作为 P 段 demo 由 concept-design 承接（owner 验收）。media_* 报错（额度用尽、key 未配置、上游故障）就如实写进证据并 report_blocker，不要绕过。
-- 浏览器会话生成腿（图片/视频）：media_image / media_video 走老板已登录的 ChatGPT/Gemini/Grok 网页账号（先 media_browser_info 看 provider 与当日额度），provider=auto 自动 failover；login_required=网页会话过期，limit_reached=账号配额（Grok 按周），均如实报 blocker 不绕过。产物同样落在证据目录 media/ 下。
+- 浏览器会话生成腿：media_image 走老板已登录的 ChatGPT/Higgsfield/Gemini/Grok 网页账号（Higgsfield 只用套餐内标记“无限”的图像模型，不花 credits；其余 provider 的账号配额与登录态同样受控）；media_video 走 Gemini/Grok。先 media_browser_info 看 provider 与当日额度，provider=auto 自动 failover；login_required=网页会话过期，limit_reached=账号配额，均如实报 blocker 不绕过。产物同样落在证据目录 media/ 下。
 - 每个任务必须传 discipline=<轨名>（词表内的轨名，不是 slug），单任务只挂一轨；产线岗不挂轨的任务会被拒绝。
 **编剧轨例外**：所有编剧轨任务（剧本初稿、二次创作修订、多轮打磨）用 executorRole=screenwriter 且 discipline=编剧；P 段由 owner 验收，M 段 reviewerRole=gm。剧本被老板真实驳回后，用 create_task 传 revises=<上一版任务id> 开下一版（标题带 v(N+1)，context 写逐条修订要点）。
 **摄影轨**：运镜设计、摄影机调度、镜头运动语言类任务用 executorRole=cinematography 且必须 discipline=摄影（建单与 claim 双端强制）；P 段运镜 demo 由 owner 验收，M 段量产运镜 reviewerRole=gm 或 qa。摄影岗只做镜头语言，不画分镜（concept-design）、不做合成渲染（asset-production）。

@@ -35,7 +35,11 @@ try {
   }
   // Workforce powers the manage-only def_* tools; its credential dir is unused by def writes.
   const workforce = new Workforce(db, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '..', '.runtime', 'credentials')));
-  const core = new SurrealCompanyCore(db, { workforce, submitCheck: process.env.SCK_PR_GATE === '0' ? undefined : createSubmitCheck(), worktrees: {
+  // Snapshot build costs go to the service log, so a slow first page names its phase (load, reserve, write, commit) instead of
+  // only its deadline (SYS01 AC02 production return). One line per build; no task text is included.
+  const snapshotObserve = (stats: { outcome: string; kind: string; rows: number; bytes: number; batches: number; loadMs: number; reserveMs: number; writeMs: number; commitMs: number; totalMs: number; serverMs: number; loadAttempts: number; release: string; releaseMs: number }) =>
+    console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
+  const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, submitCheck: process.env.SCK_PR_GATE === '0' ? undefined : createSubmitCheck(), worktrees: {
       opsRepo: process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations',
       // Same wiring as the plugin process (plugin/server/company.ts): a GM manual reclaim_worktrees
       // through this MCP process must tear the Paseo side down together with the git tree instead
