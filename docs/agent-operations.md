@@ -142,6 +142,10 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
 
+## 任务输入上限
+
+`create_task` 与 `create_delivery` 的显式 `dependencies` 至多 50 条，按去重前原始条数先验（51 条重复 ID 同样拒绝），每项为 1–200 字符的 task id；asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成，MCP、sidecar 与直接调用是同一结论：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。链内自动依赖（交付链腿间、goal anchor）不受此上限，保持完整。
+
 ## 运行参数
 
 `company_meta:config`（`pnpm run admin config <key> <json>` 或直接写库）：

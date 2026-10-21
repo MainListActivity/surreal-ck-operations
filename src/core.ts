@@ -1793,6 +1793,10 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]> {
+    // The caller's own dependency list is external input: bound the raw list before de-duplication,
+    // exactly like create_task (51 duplicates must not collapse into one legal edge). The legs' internal
+    // chain dependencies (leg N waits for leg N-1) are added below and stay complete.
+    validateExternalDependencies(input.dependencies);
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 3, 160);
     requireText(input.spec, 'spec', 20, 20000);
