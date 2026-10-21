@@ -807,6 +807,19 @@ describe('R4: a nearly spent subscription warns before it stops the company', ()
     expect(w.notices.has('quota-warn:codex')).toBe(false);
   });
 
+  test('a stale snapshot raises no warning, and clears one built on older data', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(true);
+    // Twenty minutes later the row says the same thing, but nobody verified it since: the breaker
+    // already fails open on stale snapshots, and the owner must not be warned from one either.
+    const stale = new Date(Date.now() - 20 * 60_000).toISOString();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: stale }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(false);
+  });
+
   test('a healthy subscription raises nothing', async () => {
     const w = world();
     w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);

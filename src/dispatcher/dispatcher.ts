@@ -773,9 +773,16 @@ export class Dispatcher {
     // Early warning: a subscription that is nearly spent still dispatches, but the owner hears
     // about it while there is time to top it up, instead of discovering it when the company stops.
     if (cfg.quotaWarnPct > 0) {
+      // A snapshot older than the breaker's own freshness window is no answer: the breaker fails
+      // open on it, and a warning built on it would state a number nobody verified. Stale rows
+      // raise no warning (an existing one clears as usual once the provider stops being listed).
+      const fresh = (q: ProviderQuota) => {
+        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
+        return age < 15 * 60_000;
+      };
       const low = new Set<string>();
       for (const q of quotaRows) {
-        if (quotaBlocked.has(q.provider)) continue;
+        if (quotaBlocked.has(q.provider) || !fresh(q)) continue;
         const pct = q.weeklyPct ?? q.lowestPct;
         if (pct === undefined || pct > cfg.quotaWarnPct) continue;
         low.add(q.provider);
