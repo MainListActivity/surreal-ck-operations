@@ -14,7 +14,7 @@ import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoT
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
   ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createGithubActionsAdapter, criteriaForLeg,
-  acceptanceLegForSubject, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
+  acceptanceLegForSubject, acceptanceTargetAttempt, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
   isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
@@ -700,13 +700,21 @@ export class SurrealCompanyCore implements CompanyCore {
     let acceptanceCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
     const acceptanceGate = await loadAcceptanceGate(this.db);
     const trustedCode = isTrustedCodeDeliverable({ kind: input.kind ?? 'task', workIntent: input.workIntent });
+    const leg = acceptanceLegForSubject({ kind: input.kind ?? 'task', workIntent: input.workIntent });
     if (acceptanceGate.enabled && trustedCode) {
       // The server baseline is unremovable: custom criteria only supplement it (SYS02 C1).
-      acceptanceCriteria = mergeAcceptanceCriteria(
-        acceptanceLegForSubject({ kind: input.kind ?? 'task', workIntent: input.workIntent }), acceptanceCriteria);
+      acceptanceCriteria = mergeAcceptanceCriteria(leg, acceptanceCriteria);
     }
     // N1: the environment requirement is a controlled creation-time declaration, either the task value or the single
     // environment named by its criteria. An executor cannot introduce or relabel it at submit time.
+    const declaresEnvironment = input.acceptanceEnvironment !== undefined ||
+      acceptanceCriteria.some(criterion => criterion.environment !== undefined);
+    if (declaresEnvironment && leg !== 'deploy') {
+      // Before the merge there is no deployment to verify, so an implement or release leg cannot carry an environment
+      // requirement: the deploy leg is the one that runs against a real environment.
+      throw new CompanyError('invalid',
+        `acceptance environment requirements apply to the deploy leg only; this task is the ${leg} leg`);
+    }
     const acceptanceEnvironment = effectiveEnvironment(acceptanceCriteria, input.acceptanceEnvironment);
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
     const requiredTrack = REQUIRED_TRACKS[input.executorRole];
@@ -1921,7 +1929,9 @@ export class SurrealCompanyCore implements CompanyCore {
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
         discipline: index === 0 ? input.discipline : undefined,
         acceptanceCriteria,
-        acceptanceEnvironment: input.acceptanceEnvironment,
+        // N1: the environment requirement is a deploy-leg fact. The implement and release legs run against the PR head,
+        // where no deployment exists yet, so they stay generic CI.
+        acceptanceEnvironment: spec.kind === 'deploy' ? input.acceptanceEnvironment : undefined,
       }, { acceptanceChain });
       created.push(task);
       dependencies = [task.id];
@@ -1938,7 +1948,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const gate = await loadAcceptanceGate(this.db);
     const phase: AcceptancePhase = row.state === 'review' ? (row.reviewer_role === 'owner' ? 'owner' : 'accept') : 'submit';
     // A task still being worked is preparing its next submission; review/done read the attempt that is already submitted.
-    const attempt = ['ready', 'doing', 'blocked'].includes(row.state) ? (row.acceptance_attempt ?? 0) + 1 : (row.acceptance_attempt ?? 0);
+    const attempt = acceptanceTargetAttempt(row);
     const verdict = evaluateAcceptance({
       subject: acceptanceSubject(row, undefined, { attempt }), evidence: await loadAcceptanceEvidence(this.db, input.taskId), phase,
       actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
@@ -2009,8 +2019,9 @@ export class SurrealCompanyCore implements CompanyCore {
     if (input.environment !== undefined && input.environment !== declaredEnvironment) {
       throw new CompanyError('invalid', `acceptance evidence environment ${input.environment} is not the declared environment ${declaredEnvironment ?? 'none'}`);
     }
-    // N2: evidence collected in `doing` targets the next submission attempt; in `review` it targets the submitted one.
-    const targetAttempt = row.state === 'review' ? (row.acceptance_attempt ?? 0) : (row.acceptance_attempt ?? 0) + 1;
+    // N2: evidence targets the attempt the task is heading for: the next submission while the work is in progress, the
+    // submitted one afterwards. The status read and the evaluator use the same rule.
+    const targetAttempt = acceptanceTargetAttempt(row);
     const verified = await this.acceptanceAdapter.verify({
       provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
       sha: input.sha, environment: declaredEnvironment, probe: input.source.probe,
@@ -2170,17 +2181,26 @@ export class SurrealCompanyCore implements CompanyCore {
       if (!row) throw new CompanyError('not_found', 'Task not found');
       const gate = await loadAcceptanceGate(this.db);
       const evidenceRows = await loadAcceptanceEvidence(this.db, proof.taskId);
-      const declared = action === 'submit' ? evidence?.acceptance?.sha : undefined;
-      if (action === 'submit' && prHead !== undefined && declared !== prHead) {
-        throw new CompanyError('conflict', `the submitted acceptance head ${declared ?? 'is missing'} is not the PR head ${prHead}; update the acceptance evidence to the current head`);
-      }
-      const head = action === 'submit' ? (prHead ?? declared) : row.acceptance_head;
       const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
       const declaredEnvironment = effectiveEnvironment(criteria, row.acceptance_environment);
       const attempt = action === 'submit' ? (row.acceptance_attempt ?? 0) + 1 : (row.acceptance_attempt ?? 0);
+      const gateSubject = acceptanceSubject(row, undefined, { environment: declaredEnvironment, attempt });
+      const legacy = isLegacyAcceptance(gateSubject, gate);
+      const declared = action === 'submit' ? evidence?.acceptance?.sha : undefined;
+      if (action === 'submit' && prHead !== undefined) {
+        // The PR gate's actual head is authoritative. A declared head that contradicts it is always refused; a missing
+        // declared head is refused only while the gate is on for a non-legacy row. With the gate off, or on a legacy row,
+        // the old path is kept: a submit that merely names its PR must not be turned away for a head it never declared.
+        if (declared !== undefined && declared !== prHead) {
+          throw new CompanyError('conflict', `the submitted acceptance head ${declared} is not the PR head ${prHead}; update the acceptance evidence to the current head`);
+        }
+        if (declared === undefined && gate.enabled && !legacy) {
+          throw new CompanyError('conflict', `the submitted acceptance head is missing; the PR head is ${prHead}; update the acceptance evidence to the current head`);
+        }
+      }
+      const head = action === 'submit' ? (prHead ?? declared) : row.acceptance_head;
       const submittedEnvironment = action === 'submit' ? evidence?.acceptance?.environment : undefined;
       const subject = acceptanceSubject(row, head, { environment: declaredEnvironment, attempt });
-      const legacy = isLegacyAcceptance(subject, gate);
       // N1: submit uses this submission's target environment, checked against the controlled declaration. Accept uses the
       // persisted value. Undefined only matches undefined: it is a generic CI fact, never a wildcard for production.
       if (action === 'submit' && !legacy && submittedEnvironment !== declaredEnvironment) {

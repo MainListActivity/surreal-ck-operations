@@ -644,9 +644,35 @@ export class SidecarPool {
     // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
     const resolveCred = () => (forceRotate ? this.rotateCredential(instId) : this.credentialFor(instId));
     const cred = SNAPSHOT_TOOLS.has(tool) ? await withinReplyCeiling(resolveCred) : await resolveCred();
+    // SYS02: the relay forwards the structured acceptance fields the caller declared. A malformed one is refused here
+    // instead of being dropped: a silently dropped head would reach the gate as a missing declaration.
+    const acceptance = (): { sha?: string; environment?: string } | undefined => {
+      const raw = args.acceptance;
+      if (raw === undefined || raw === null) return undefined;
+      if (typeof raw !== "object" || Array.isArray(raw)) {
+        throw Object.assign(new Error("acceptance must be an object with sha and/or environment"), { code: "invalid" });
+      }
+      const value = raw as Record<string, unknown>;
+      const out: { sha?: string; environment?: string } = {};
+      if (value.sha !== undefined) {
+        if (typeof value.sha !== "string" || value.sha.length === 0 || value.sha.length > 200) {
+          throw Object.assign(new Error("acceptance.sha must be a non-empty string up to 200 characters"), { code: "invalid" });
+        }
+        out.sha = value.sha;
+      }
+      if (value.environment !== undefined) {
+        if (typeof value.environment !== "string" || !/^[a-z][a-z0-9._-]{0,49}$/.test(value.environment)) {
+          throw Object.assign(new Error("acceptance.environment must be a controlled environment name"), { code: "invalid" });
+        }
+        out.environment = value.environment;
+      }
+      return Object.keys(out).length > 0 ? out : undefined;
+    };
+    const declared = acceptance();
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
+      ...(declared ? { acceptance: declared } : {}),
     });
     const live = () => {
       const claim = this.claims.get(instId);

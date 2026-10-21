@@ -16,7 +16,7 @@ const claimResult = (taskId: string): ClaimResult => ({
   task: taskView(taskId), deliveryId: `d-${taskId}`, fence: 7, leaseExpiresAt: new Date().toISOString(), history: [],
 });
 
-interface Call { tool: string; proof?: LeaseProof; text?: string; to?: string }
+interface Call { tool: string; proof?: LeaseProof; text?: string; to?: string; acceptance?: { sha?: string; environment?: string } }
 const calls: Call[] = [];
 
 let employeeForGetTask = 'eng-x';
@@ -33,7 +33,10 @@ const core = {
   claim: async (_cred: string, taskId: string) => claimResult(taskId),
   heartbeat: async (_c: string, proof: LeaseProof) => { calls.push({ tool: 'heartbeat', proof: snap(proof) }); return claimResult(proof.taskId); },
   checkpoint: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'checkpoint', proof: snap(proof), text: ev.text }); return { ...taskView(proof.taskId), version: proof.expectedVersion + 1 }; },
-  submit: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'submit', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
+  submit: async (_c: string, proof: LeaseProof, ev: { text: string; acceptance?: { sha?: string; environment?: string } }) => {
+    calls.push({ tool: 'submit', proof: snap(proof), text: ev.text, acceptance: ev.acceptance });
+    return taskView(proof.taskId);
+  },
   block: async (_c: string, proof: LeaseProof, to: string, ev: { text: string }) => { calls.push({ tool: 'block', proof: snap(proof), to, text: ev.text }); return taskView(proof.taskId); },
   accept: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'accept', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
   returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
@@ -169,6 +172,20 @@ describe('sidecar', () => {
     const call = calls.find(c => c.tool === 'checkpoint')!;
     expect(call.proof).toEqual({ taskId: 'task-3', deliveryId: 'd-task-3', fence: 7, expectedVersion: 1 });
     expect(call.text).toBe('half done');
+  });
+
+  test('relay forwards the declared acceptance fields and refuses a malformed one', async () => {
+    const i = inst('e-acceptance');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-acceptance'));
+    const ok = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'acc1', 'submit',
+      { text: '交付完成，PR 链接在此。', acceptance: { sha: 'head-1', environment: 'production' } });
+    expect(ok.ok).toBe(true);
+    const submit = calls.find(c => c.tool === 'submit')!;
+    expect(submit.acceptance).toEqual({ sha: 'head-1', environment: 'production' });
+    const bad = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'acc2', 'submit', { text: '交付完成。', acceptance: 'head-1' });
+    expect(bad.ok).toBe(false);
+    expect(bad.error).toContain('acceptance must be an object');
   });
 
   test('relay rejects a wrong comm key and claim_next', async () => {

@@ -12,6 +12,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { Workforce } from '../src/workforce.ts';
 import { runProbe } from '../scripts/acceptance-probe.ts';
+import { createSubmitCheck } from '../src/pr-gate.ts';
 import type { AcceptanceSourceAdapter, AcceptanceSourceInput, AcceptanceVerifyResult } from '../src/acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, ClaimResult, TaskView } from '../src/contracts.ts';
 
@@ -90,6 +91,20 @@ class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
 
 const fake = new FakeAcceptanceAdapter();
 const core = new SurrealCompanyCore(database, { acceptance: { adapter: fake } });
+// A relay-shaped submit reaches core through the sidecar: the PR gate stub answers with the task branch's own PR.
+let prBranch = '';
+const ghStub = async (args: string[]) => {
+  if (args[0] === 'pr' && args[1] === 'view') {
+    return JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefName: prBranch, headRefOid: 'pr-head-1', statusCheckRollup: [] });
+  }
+  throw new Error(`unexpected gh call ${args.join(' ')}`);
+};
+const relayCore = new SurrealCompanyCore(database, { acceptance: { adapter: fake }, submitCheck: createSubmitCheck(ghStub) });
+const PR_URL = 'https://github.com/MainListActivity/surreal-ck-operations/pull/1547';
+const attemptSubmit = async (fn: () => Promise<{ state?: string }>) => {
+  try { return { ok: true, state: (await fn()).state, error: undefined, code: undefined }; }
+  catch (error) { return { ok: false, state: undefined, error: String((error as Error).message), code: (error as { code?: string }).code }; }
+};
 
 const machine = (over: Partial<AcceptanceCriterion> = {}): AcceptanceCriterion =>
   ({ id: 'AC-1', kind: 'machine', required: true, layer: 'ci', evidence: 'ci-run', verify: 'ci', risk: 'code', ...over });
@@ -190,18 +205,19 @@ fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate del
 
 fork('SYS02 N1: the declared environment binds submit, accept and adapter-verified evidence', async () => {
   await ensureGate();
-  const task = await core.createTask(tokens.gm, { title: 'N1 环境绑定', context: '受控任务声明 production，未知环境不得通配。',
-    executorRole: 'engineering', reviewerRole: 'engineering', workIntent: { kind: 'code' },
+  // The environment requirement belongs to the deploy leg: that is the leg that runs against a real environment.
+  const task = await core.createTask(tokens.gm, { title: 'N1 环境绑定', context: '受控部署腿声明 production，未知环境不得通配。',
+    kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa',
     acceptanceEnvironment: 'production', idempotencyKey: key() });
   expect(task.acceptanceEnvironment).toBe('production');
-  expect(task.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
+  expect(task.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-DEPLOY-1', 'AC-BASE-DEPLOY-2']);
   const claim = await core.claim(tokens['eng-a'], task.id);
   fake.setRun('9101', 'n1-head');
   // An adapter with no verified environment cannot satisfy the declared production.
   fake.environmentVerified = false;
-  await expect(recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101')).rejects.toMatchObject({ code: 'invalid' });
+  await expect(recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-DEPLOY-1', 'n1-head', '9101')).rejects.toMatchObject({ code: 'invalid' });
   fake.environmentVerified = true;
-  const evidence = await recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-IMPL-1', 'n1-head', '9101');
+  const evidence = await recordEvidence(tokens['eng-a'], task.id, 'AC-BASE-DEPLOY-1', 'n1-head', '9101');
   expect(evidence).toMatchObject({ environment: 'production', attempt: 1 });
   // Missing or wrong submit environments are refused; the declared one is accepted.
   await expect(core.submit(tokens['eng-a'], proofOf(claim), { text: '缺少环境声明的提交必须被拒绝，不能默认通关生产。', idempotencyKey: key(), acceptance: { sha: 'n1-head' } }))
@@ -210,15 +226,32 @@ fork('SYS02 N1: the declared environment binds submit, accept and adapter-verifi
     .rejects.toMatchObject({ code: 'invalid' });
   expect((await core.submit(tokens['eng-a'], proofOf(claim), { text: '正确环境与机器证据齐备，提交独立复核，确认门禁接受该声明的 production 环境。', idempotencyKey: key(), acceptance: { sha: 'n1-head', environment: 'production' } })).state).toBe('review');
   // Accept strictness: a row whose environment was changed no longer matches the persisted target.
-  const review = await core.claim(tokens['eng-b'], task.id);
-  await database.db.query("UPDATE acceptance_evidence SET environment = 'staging' WHERE task = $task AND ac_id = 'AC-BASE-IMPL-1';", { task: new RecordId('task', task.id) });
-  await expect(core.accept(tokens['eng-b'], proofOf(review), { text: '环境不匹配的证据不得通过独立复核，机器证据的环境必须与持久化的目标一致。', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
+  const review = await core.claim(tokens.qa, task.id);
+  await database.db.query("UPDATE acceptance_evidence SET environment = 'staging' WHERE task = $task AND ac_id = 'AC-BASE-DEPLOY-1';", { task: new RecordId('task', task.id) });
+  await expect(core.accept(tokens.qa, proofOf(review), { text: '环境不匹配的证据不得通过独立复核，机器证据的环境必须与持久化的目标一致。', idempotencyKey: key() })).rejects.toMatchObject({ code: 'invalid' });
 });
 
-fork('SYS02 N1: an executor cannot introduce an environment on a generic task', async () => {
+fork('SYS02 N1: an environment requirement belongs to the deploy leg only', async () => {
   await ensureGate();
   const goal = await goalFor();
-  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N1 通用 CI', spec: '通用 CI 任务不得由提交方自行声明 production。', idempotencyKey: key() });
+  const [impl, release, deploy] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N1 腿环境', spec: '环境要求只落在部署腿：实现腿与上线申请腿不得携带环境要求。', acceptanceEnvironment: 'production', idempotencyKey: key() });
+  expect(impl.acceptanceEnvironment).toBeUndefined();
+  expect(release.acceptanceEnvironment).toBeUndefined();
+  expect(deploy.acceptanceEnvironment).toBe('production');
+  // A standalone task that is not the deploy leg refuses the requirement.
+  await expect(core.createTask(tokens.gm, { title: 'N1 任务环境', context: '实现腿不能带环境要求。', executorRole: 'engineering',
+    reviewerRole: 'engineering', workIntent: { kind: 'code' }, acceptanceEnvironment: 'production', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  // The deploy leg accepts it.
+  const deployTask = await core.createTask(tokens.gm, { title: 'N1 部署任务', context: '部署腿可以声明环境。', kind: 'deploy',
+    executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key() });
+  expect(deployTask.acceptanceEnvironment).toBe('production');
+});
+
+fork('SYS02 relay: an executor cannot introduce an environment on a generic task', async () => {
+  await ensureGate();
+  const goal = await goalFor();
+  const [impl] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'N1 通用 CI', spec: '通用 CI 任务不得由提交方自行声明 production 环境要求。', idempotencyKey: key() });
   expect(impl.acceptanceEnvironment).toBeUndefined();
   const claim = await core.claim(tokens['eng-a'], impl.id);
   fake.setRun('9103', 'n1-generic-head');
@@ -247,6 +280,8 @@ fork('SYS02 N2: a returned attempt cannot reuse old machine evidence; re-recordi
   expect((await core.submit(tokens['eng-a'], proofOf(second), { text: '为本 attempt 补录可信机器证据后重新提交独立复核。', idempotencyKey: key(), acceptance: { sha: 'n2-head' } })).state).toBe('review');
   const review = await core.claim(tokens['eng-b'], impl.id);
   expect((await core.accept(tokens['eng-b'], proofOf(review), { text: '本次 attempt 的机器与人工证据齐备，独立复核通过。', idempotencyKey: key() })).state).toBe('done');
+  // A done task reads the attempt it was submitted with, the same one its evidence rows carry.
+  expect((await core.acceptanceStatus(tokens.gm, { taskId: impl.id })).verdict).toMatchObject({ ok: true, attempt: 2 });
 });
 
 fork('SYS02 N2: a checkpoint between evidence and submit does not invalidate the attempt', async () => {

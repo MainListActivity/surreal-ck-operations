@@ -245,6 +245,16 @@ export function acceptanceSubject(row: AcceptanceTaskRow, head?: string,
   };
 }
 
+/**
+ * The attempt a piece of machine evidence or a status read belongs to: while the work is still in progress it is the
+ * next submission attempt, and once a submission exists it is the attempt that was submitted. One rule for the evidence
+ * writer, the evaluator and the status read, so a row is never judged against a different attempt than it was written for.
+ */
+export function acceptanceTargetAttempt(row: { state?: string; acceptance_attempt?: number }): number {
+  const attempt = row.acceptance_attempt ?? 0;
+  return ['ready', 'doing', 'blocked'].includes(row.state ?? '') ? attempt + 1 : attempt;
+}
+
 /** The AC06 legacy decision, shared by the evaluator and the submit environment check. */
 export function isLegacyAcceptance(subject: AcceptanceSubject, gate: AcceptanceGateView): boolean {
   if (!gate.enabled) return true;
