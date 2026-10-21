@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type SupervisedTask, type Workforce } from '../src/workforce.ts';
+import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
 import type { CompanyCore, ProviderQuota, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
 import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
@@ -43,7 +43,12 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const wf = {
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
-    providerHealth: async () => new Map(), lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
+    providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
+    markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
+      events.push(`exhausted:${provider}`);
+      health = new Map(health).set(provider, { provider, state: 'exhausted', until: resetsAt ?? now + 1800, failures: 1 });
+      return health.get(provider)!; },
+    markHealthy: async (provider: string) => { events.push(`healthy:${provider}`); health = new Map(health).set(provider, { provider, state: 'healthy', failures: 0 }); },
     defFailure: async () => { events.push('performance-failure'); return 1; },
     spawnInst: async () => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}` }; instances.push(i); return i; },
     bind: async (id: string, b: { agentId: string; cwd: string; repoHome?: string }) => {
@@ -104,13 +109,18 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   let pool = makePool();
   const paseo: PaseoGateway = {
     list: async () => agents, status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
-    lastError: async () => '', logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
+    lastError: async () => lastError, logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
     spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); events.push(`spawn:${id}`); return id; },
     send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
+    reload: async id => { events.push(`reload:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
   let host = { freeMemMb: 8192, freeDiskMb: 65536 };
+  /** Provider health the dispatcher reads; a test sets it to put a provider in (or past) cooldown. */
+  let health = new Map<string, ProviderHealth>();
+  /** What Paseo reports as the session's last error; empty unless a test sets it. */
+  let lastError = '';
   // Artifact reclaim seam for the resource-gate tests; absent by default so the
   // existing gate test keeps exercising the "no reclaim wired" path.
   type ReclaimInput = { trigger?: ArtifactTrigger; targetFreeMb?: number; dryRun?: boolean; taskId?: string; emergency?: boolean };
@@ -140,6 +150,8 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
     setRealign: (fn: typeof realign) => { realign = fn; },
     setQuota: (rows: ProviderQuota[]) => { quotaRows = rows; },
+    setHealth: (rows: Map<string, ProviderHealth>) => { health = rows; },
+    setLastError: (text: string) => { lastError = text; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -731,6 +743,20 @@ describe('R4: provider model drift is realigned in place, never a retirement', (
     expect(w.agents.get('agent-9')!.status).toBe('idle');
   });
 
+  test('while the subscription is still out, the drift is left alone instead of retried every pass', async () => {
+    const w = world();
+    driftedSession(w);
+    // Factory keeps serving its fallback model until the allowance resets: realigning now cannot take effect.
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    const calls: string[] = [];
+    w.setRealign(async agentId => { calls.push(agentId); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([]);
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
   test('a session already on its definition model is left alone', async () => {
     const w = world();
     driftedSession(w);
@@ -770,5 +796,55 @@ describe('R4: a nearly spent subscription warns before it stops the company', ()
     w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);
     const r = await w.dispatcher().tick();
     expect(r.notices.filter(n => n.startsWith('quota-warn:'))).toEqual([]);
+  });
+});
+
+// A quota failure parks the session in Paseo's `error` state, and nothing in Paseo leaves that
+// state on its own. The dispatcher only dispatches into idle sessions, so without a restart the
+// seat stays lost after the subscription recovers — the employee is never retired, but never works
+// again either. The session is restarted in place once the cooldown has passed.
+describe('R5: a session parked by a quota failure comes back when the window reopens', () => {
+  const parkedSession = (w: ReturnType<typeof world>, until: number) => {
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+    w.instances.push(inst);
+    w.pool.env(inst);
+    w.pool.bindAgent(inst.id, 'agent-9');
+    inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'error' });
+    w.setLastError('Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: Agent turn ended: model_usage_exhausted');
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until, failures: 1 }]]));
+    return inst;
+  };
+
+  test('once the cooldown has passed the session is reloaded in place and keeps its seat', async () => {
+    const w = world();
+    parkedSession(w, 500); // server time is 1000: the window has reopened
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('reload:agent-9');
+    expect(r.recovered).toEqual(['employee-9']);
+    expect(r.retired).not.toContain('employee-9');
+    expect(r.exhausted).toEqual([]);
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('while the cooldown still runs the session is left alone', async () => {
+    const w = world();
+    parkedSession(w, 5000);
+    const r = await w.dispatcher().tick();
+    expect(w.events.some(e => e.startsWith('reload:'))).toBe(false);
+    expect(r.recovered).toEqual([]);
+    expect(w.agents.get('agent-9')!.status).toBe('error');
+  });
+
+  test('a fresh quota failure still records the cooldown and does not reload', async () => {
+    const w = world();
+    parkedSession(w, 500);
+    w.setHealth(new Map()); // no prior cooldown: this failure is the one that starts it
+    const r = await w.dispatcher().tick();
+    expect(r.exhausted).toEqual(['codex']);
+    expect(w.events).toContain('exhausted:codex');
+    expect(w.events.some(e => e.startsWith('reload:'))).toBe(false);
+    expect(r.recovered).toEqual([]);
   });
 });

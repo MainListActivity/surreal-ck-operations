@@ -58,7 +58,7 @@ async function startFork(name: string) {
       status: async id => !agentRows.has(id) ? undefined : hidden.has(id) ? { status: 'unknown', pendingPermissions: 0 } : { status: agentRows.get(id)!.status, pendingPermissions: 0 },
       lastError: async () => '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
       spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
-      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
+      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; }, reload: async id => { agentRows.get(id)!.status = 'idle'; },
       archive: async id => { agentRows.get(id)!.status = 'archived'; pool?.detachAgent(id); },
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     // Every dispatcher is built on the same database; a new one is a process restart with no memory kept.

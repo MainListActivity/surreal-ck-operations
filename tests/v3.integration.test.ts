@@ -291,6 +291,7 @@ class FakePaseo implements PaseoGateway {
   agents = new Map<string, { status: string; error: string; spawn?: SpawnInput; inputTokens?: number }>();
   sent: Array<{ agentId: string; prompt: string }> = [];
   archived: string[] = [];
+  reloaded: string[] = [];
   async list() { return new Map([...this.agents].map(([id, a]) => [id, { id, status: a.status }])); }
   async status(id: string) { const a = this.agents.get(id); return a ? { status: a.status, pendingPermissions: 0 } : undefined; }
   async lastError(id: string) { return this.agents.get(id)?.error ?? ''; }
@@ -311,6 +312,7 @@ class FakePaseo implements PaseoGateway {
     this.sent.push({ agentId, prompt });
   }
   async stop(agentId: string) { this.agents.get(agentId)!.status = 'idle'; }
+  async reload(agentId: string) { this.agents.get(agentId)!.status = 'idle'; this.reloaded.push(agentId); }
   set(id: string, status: string, error = '') { const a = this.agents.get(id)!; a.status = status; a.error = error; }
 }
 
@@ -1213,6 +1215,9 @@ test('checkpoint limit rejects chatter and heartbeat still renews the lease', as
 
 test('model slots: auto defs resolve to newest family model; stale idle instances rotate out before dispatch', async () => {
   await database.db.query("UPDATE task SET state = 'done' WHERE state != 'done';");
+  // Retire leftover employees from earlier tests: their agent ids belong to a previous FakePaseo,
+  // so this pass would read them as missing sessions and archive ids that collide with fresh spawns.
+  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
   await database.db.query('UPDATE employee_def SET enabled = false;');
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 4, session_max_wakes: 0, session_max_input_k: 0 };");
   await workforce.upsertDef('engineering-codex', { role: 'engineering', provider: 'codex', model: 'auto:sol', thinking: 'medium', maxInstances: 2, priority: 10 });
@@ -1220,7 +1225,8 @@ test('model slots: auto defs resolve to newest family model; stale idle instance
   const notices: string[] = [];
   const slots: Record<string, string> = { 'codex:sol': 'gpt-6.1-sol' };
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
-    rand: () => 0, notify: async (_t, text) => { notices.push(text); }, models: async () => ({ ...slots }) });
+    rand: () => 0, notify: async (_t, text) => { notices.push(text); }, models: async () => ({ ...slots }),
+    realignAgent: async (agentId, model) => { paseo.reloaded.push(`${agentId}:${model}`); return true; } });
   const mkTask = (title: string) => core.createTask(tokens.gm, { title, context: 'synthetic', executorRole: 'engineering',
     reviewerRole: 'engineering', idempotencyKey: key() });
 
@@ -1246,17 +1252,18 @@ test('model slots: auto defs resolve to newest family model; stale idle instance
   expect(inst2).not.toBe(inst1);
   expect(paseo.agents.get([...paseo.agents][1][0])!.spawn).toMatchObject({ model: 'gpt-6.2-sol' });
 
-  // Phase 3: inst1 goes idle → next tick retires it BEFORE dispatch; task3 reuses inst2
-  // (already on the current model) rather than spawning again.
+  // Phase 3: inst1 goes idle → the pass realigns it to the current model in place (model drift is
+  // never a retirement), and task3 is woken on a session already serving that model — no spawn.
   paseo.set(agent1, 'idle');
   paseo.set([...paseo.agents][1][0], 'idle');
   await mkTask('slot 任务三');
   report = await dispatcher.tick();
-  expect(report.retired).toContain(inst1);
-  expect(paseo.archived).toContain(agent1);
+  expect(report.realigned).toContain(inst1);
+  expect(report.retired).not.toContain(inst1);
+  expect(paseo.archived).not.toContain(agent1);
+  expect(paseo.reloaded).toContain(`${agent1}:gpt-6.2-sol`);
   expect(report.woke).toHaveLength(1);
-  expect(report.woke[0]).toMatchObject({ employee: inst2, spawned: false });
-  expect(notices.some(n => n.includes('gpt-6.2-sol'))).toBe(true);
+  expect(report.woke[0].spawned).toBe(false);
 
   // Phase 4: slot resolution disappears (provider listModels failing) → defs cannot spawn
   // and the owner is told; the existing current-model instance still serves work.

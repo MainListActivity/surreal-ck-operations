@@ -27,6 +27,8 @@ const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
+/** A failed in-place reload is retried on this interval, not on every poll. */
+const RELOAD_RETRY_SECONDS = 300;
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -491,6 +493,8 @@ export interface TickReport {
   reclaimed?: { tasks: number; files: number; freedBytes: number; trigger: ArtifactTrigger; pressure: boolean };
   /** Sessions put back on their definition's model this tick (provider drift, or the def moved on). */
   realigned?: string[];
+  /** Sessions restarted in place after their provider's quota window reopened (see PaseoGateway.reload). */
+  recovered?: string[];
   skipped?: 'paused' | 'budget' | 'resources';
 }
 
@@ -532,6 +536,8 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
 export class Dispatcher {
   /** Last observed Paseo status per agent; a busy→idle transition is the recovery signal for a provider. */
   private readonly lastStatus = new Map<string, string>();
+  /** agentId → when the last in-place reload was attempted; a failing restart is retried, not hammered. */
+  private readonly reloadAt = new Map<string, number>();
   private readonly onboarded = new Set<string>();
   // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
   // identical answers, so re-asking every tick only burns tokens. Re-ask only
@@ -726,7 +732,7 @@ export class Dispatcher {
 
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [], recovered: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -829,6 +835,26 @@ export class Dispatcher {
             const resetsAtSec = resetsAt ? Math.floor(Date.parse(resetsAt) / 1000) : undefined;
             await wf.markExhausted(inst.provider, error, Number.isFinite(resetsAtSec) ? resetsAtSec : undefined);
             report.exhausted.push(inst.provider);
+            continue;
+          }
+          // Not a fresh failure: the session has been parked in this error since an earlier turn,
+          // and Paseo keeps it there until the underlying process restarts. Once the provider's
+          // cooldown has passed, restart it in place — the agent, its conversation and its channel
+          // survive, so the seat comes back without a retirement, a respawn or a new employee id.
+          const cooldownOver = !report.exhausted.includes(inst.provider) &&
+            availabilityOf(health.get(inst.provider), now) !== 'down';
+          if (cooldownOver && now - (this.reloadAt.get(inst.paseoAgentId) ?? 0) >= RELOAD_RETRY_SECONDS) {
+            this.reloadAt.set(inst.paseoAgentId, now);
+            try {
+              await paseo.reload(inst.paseoAgentId);
+              states.set(inst.id, 'idle');
+              observedStatus.set(inst.id, 'idle');
+              this.lastStatus.set(inst.paseoAgentId, 'idle');
+              (report.recovered ??= []).push(inst.id);
+              this.log(`recovered ${inst.id}: reloaded after ${inst.provider} quota reset`);
+            } catch (reloadError) {
+              this.log(`reload ${inst.id} failed: ${(reloadError as Error).message}`);
+            }
           }
           continue;
         }
@@ -923,8 +949,14 @@ export class Dispatcher {
         const def = defs.find(d => d.id === inst.def);
         const target = def ? resolveModel(def) : undefined;
         const served = runtimeModels.get(inst.id) ?? inst.model;
+        // Realign only once the subscription has recovered. A provider that switched models because
+        // its standard allowance ran out switches back on its own at reset; asking every pass during
+        // the fallback is a call that cannot take effect, and Factory keeps serving its fallback model
+        // until then. While the provider is out, the drifted session is left alone — never retired.
+        const providerReady = !inst.provider ||
+          (availabilityOf(health.get(inst.provider), now) !== 'down' && !quotaBlocked.has(inst.provider));
         const staleModel = Boolean(target && served && served !== target);
-        if (staleModel) {
+        if (staleModel && providerReady) {
           const realigned = this.deps.realignAgent
             ? await this.deps.realignAgent(inst.paseoAgentId!, target!).catch(() => false)
             : false;
@@ -935,6 +967,10 @@ export class Dispatcher {
           } else {
             this.log(`model drift on ${inst.id} (${served} vs ${target}) left in place: no realign path`);
           }
+          continue;
+        }
+        if (staleModel) {
+          this.log(`model drift on ${inst.id} (${served} vs ${target}) waits for ${inst.provider} to recover`);
           continue;
         }
         if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;

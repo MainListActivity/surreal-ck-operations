@@ -241,7 +241,7 @@ export function registerHandlers(server: PluginServerContext): void {
     const defs = await workforce.defs();
     const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
     const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
-    const quotaBlocked = quotaBlockedProviders(await readProviderQuotas({ db }), cfg, now);
+    const quotaBlocked = quotaBlockedProviders(await readProviderQuotas(db.db), cfg, now);
     const executeBlock = new Map(verdicts.filter(v => v.phase === "execute").map(v => [v.taskId, v]));
 
     const brief = await owner.briefData(now, localDate(new Date(now)),

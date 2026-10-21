@@ -210,7 +210,7 @@ run('actual dispatcher and sidecar stage one registry source in claim.json, prom
   const pool = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], runDir: join(dir, 'comm') });
   let seen: { cwd: string; prompt: string; env: Record<string, string> } | undefined;
   const paseo: PaseoGateway = { list: async () => new Map(), status: async () => undefined, lastError: async () => '', logsTail: async () => '', lastInputTokens: async () => 0,
-    spawn: async input => { seen = input; return 'fixture-agent'; }, send: async () => {}, stop: async () => {}, archive: async () => {},
+    spawn: async input => { seen = input; return 'fixture-agent'; }, send: async () => {}, stop: async () => {}, reload: async () => {}, archive: async () => {},
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
   try {
     const dispatcher = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool, env: { opsRepo: path, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });

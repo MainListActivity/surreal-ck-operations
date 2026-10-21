@@ -54,6 +54,13 @@ export interface PaseoGateway {
   spawn(input: SpawnInput): Promise<string>;
   send(agentId: string, prompt: string): Promise<void>;
   stop(agentId: string): Promise<void>;
+  /**
+   * Restart the session's underlying process in place, keeping the agent, its conversation and
+   * its channel binding. A session parked in `error` never leaves that state on its own — the
+   * dispatcher only dispatches into idle sessions — so this is how a seat comes back after the
+   * subscription that failed it recovers.
+   */
+  reload(agentId: string): Promise<void>;
   /** Soft-delete the agent's session (its transcript stays in Paseo history). */
   archive(agentId: string): Promise<void>;
   /** Active workspaces; archived ones no longer appear. */
@@ -223,6 +230,9 @@ export function createPaseoCli(
     },
     async stop(agentId) {
       await run(['stop', agentId]);
+    },
+    async reload(agentId) {
+      await run(['agent', 'reload', agentId]);
     },
   };
 }

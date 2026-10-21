@@ -167,7 +167,7 @@ export function company(): Promise<Company> {
         repos: input?.repo ? [input.repo] : undefined }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
-      quota: () => readProviderQuotas({ db }),
+      quota: () => readProviderQuotas(db.db),
       // `auto:<family>` model slots resolved by hooks/tick-loop via providers.listModels.
       models: async () => {
         const [rows] = await db.db.query<[Array<{ slots?: Record<string, string> }>]>(
