@@ -19,3 +19,7 @@ jobs:
         run: gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=pending -f context=acceptance-barrier -f description=target-ready
       - name: Keep the target in progress while the producer reads the status
         run: sleep 60
+      - name: Mark the barrier status successful after the read window
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/statuses/${{ github.sha }}" -f state=success -f context=acceptance-barrier -f description=target-read
