@@ -16,6 +16,25 @@ import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
+const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
+
+/** Exercise the same comm path a real `sck call` uses: a separate client-cli process writes req and reads res. */
+async function relayViaClient(env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) {
+  // Spawn asynchronously: the sidecar sweeper lives in this same Bun process, so a blocking
+  // spawnSync would prevent it from answering the child client.
+  const child = Bun.spawn([process.execPath, CLIENT_CLI, 'call', tool, JSON.stringify(args)], {
+    env: { ...process.env, SCK_COMM_DIR: env.SCK_COMM_DIR!, SCK_COMM_KEY: env.SCK_COMM_KEY! },
+    stdout: 'pipe', stderr: 'pipe',
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  let answer: { data?: unknown; error?: string } | undefined;
+  try { answer = stdout.trim() ? JSON.parse(stdout.trim()) : undefined; } catch { answer = undefined; }
+  if (code === 0) return { ok: true, data: answer };
+  const error = (typeof answer?.error === 'string' && answer.error) || stderr.trim() || 'real sck client failed';
+  return { ok: false, error };
+}
 run('company fork: restart quarantine, actual lease fencing, fresh dispatch and independent review', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'channel-fork-'));
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
@@ -54,12 +73,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     const makeDispatcher = () => new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
       env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
-    let counter = 0;
-    const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
-      const file = `${++counter}.json`; writeFileSync(join(reqDir(env.SCK_COMM_DIR!), file), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
-      for (let n = 0; n < 200 && !existsSync(join(resDir(env.SCK_COMM_DIR!), file)); n++) await Bun.sleep(5);
-      const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
-    };
+    const relay = (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => relayViaClient(env, tool, args);
     // The engineering claim needs a legal independent review after it (R1): a qa seat stays spare for that review.
     await wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await core.createTask(gm, { title: 'isolated channel recovery', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create' });
@@ -215,12 +229,7 @@ async function startCompanyFork(name: string) {
     archive: async id => { agentRows.get(id)!.status = 'archived'; pool?.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
   let last: Dispatcher | undefined;
-  let counter = 0;
-  const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
-    const file = `${++counter}.json`; writeFileSync(join(reqDir(env.SCK_COMM_DIR!), file), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
-    for (let n = 0; n < 200 && !existsSync(join(resDir(env.SCK_COMM_DIR!), file)); n++) await Bun.sleep(5);
-    const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
-  };
+  const relay = (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => relayViaClient(env, tool, args);
   return {
     core, owner, wf, db, gm, dir, pool: pool!, agentRows, errors, envs, relay,
     /** One real tick on a fresh dispatcher, as the existing fork tests run it. */
@@ -642,6 +651,12 @@ run('company fork: plugin reload recovers a live review lease for checkpoint and
     expect(final).toMatchObject({ state: 'done', implementer: A.id });
     const history = await w.core.history(w.gm, task.id);
     expect(history.some(h => h.action === 'accept' && h.actor === Q.id)).toBe(true);
+    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
+      "SELECT action, actor FROM audit WHERE task = $task AND action IN ['checkpoint','accept'];",
+      { task: new RecordId('task', task.id) });
+    expect(audits.filter(a => a.action === 'checkpoint')).toHaveLength(2);
+    expect(audits.filter(a => a.action === 'accept')).toHaveLength(1);
+    expect(String(audits.find(a => a.action === 'accept')?.actor)).toContain(Q.id);
   } finally {
     await w.close();
   }
@@ -668,6 +683,11 @@ run('company fork: plugin reload recovers a live review lease for report_blocker
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm', implementer: A.id });
     const history = await w.core.history(w.gm, task.id);
     expect(history.some(h => h.action === 'block' && h.actor === Q.id)).toBe(true);
+    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
+      "SELECT action, actor FROM audit WHERE task = $task AND action = 'block';",
+      { task: new RecordId('task', task.id) });
+    expect(audits).toHaveLength(1);
+    expect(String(audits[0]!.actor)).toContain(Q.id);
   } finally {
     await w.close();
   }
