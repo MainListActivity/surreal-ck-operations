@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { Dispatcher, type SidecarBridge } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { DEFAULT_CONFIG, type EmployeeDef, type EmployeeInst, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
+import { DEFAULT_CONFIG, managerWakeKey, type EmployeeDef, type EmployeeInst, type ManagerWakeClaim, type ManagerWakeInput, type ManagerWakeRow, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
 import type { OwnerDesk } from '../src/owner.ts';
 import type { ClaimResult, TaskView, WorktreeAssignment } from '../src/contracts.ts';
 import { managerActionKey } from '../src/dispatcher/dispatch-blocked.ts';
@@ -51,10 +51,17 @@ export function fixture(specs: TaskSpec[]) {
   const noticeCalls: unknown[][] = [];
   const dispatches = new Map<string, { employee: string; at: number }>();
   const actions = new Map<string, ActionRow>();
+  const wakes = new Map<string, ManagerWakeRow>();
   const now = 1_000_000;
   let next = 0;
+  let keySeq = 0;
   let failReload = false;
   let contributorsFail = false;
+  let statusFails = false;
+  let failSpawnAfterStart = false;
+  let failSendAfterStart = false;
+  let failWakeRead = false;
+  let failActionRead = false;
 
   const rows: SupervisedTask[] = specs.map(spec => {
     const state = spec.state ?? 'blocked';
@@ -70,6 +77,22 @@ export function fixture(specs: TaskSpec[]) {
       : { authors: ['author-a', 'author-b'], reviewers: [], excluded: ['author-a', 'author-b'], unknown: [], ambiguous: true }));
     return task;
   });
+
+  const addTask = (spec: TaskSpec): SupervisedTask => {
+    const state = spec.state ?? 'blocked';
+    const task = {
+      id: spec.id, title: spec.id, state, blockedTo: spec.blockedTo, executorRole: 'engineering', reviewerRole: 'qa',
+      kind: 'task', version: spec.version ?? 1, implementer: spec.implementer, repoPath: spec.repoPath,
+      evalAttempts: 0, ownerRerouted: false,
+      row: { id: spec.id, title: spec.id, state, blocked_to: spec.blockedTo, version: spec.version ?? 1,
+        implementer: spec.implementer, repo_path: spec.repoPath } as never,
+    } as unknown as SupervisedTask;
+    facts.set(spec.id, spec.facts ?? (spec.implementer
+      ? { authors: [spec.implementer], reviewers: [], excluded: [spec.implementer], unknown: [], ambiguous: false, implementer: spec.implementer }
+      : { authors: ['author-a', 'author-b'], reviewers: [], excluded: ['author-a', 'author-b'], unknown: [], ambiguous: true }));
+    rows.push(task);
+    return task;
+  };
 
   const addInstance = (def: EmployeeDef, id: string, status = 'idle') => {
     const inst: EmployeeInst = { id, role: def.role, def: def.id, provider: def.provider, model: def.model,
@@ -126,10 +149,60 @@ export function fixture(specs: TaskSpec[]) {
       actions.set(key, { ...input, key, status: 'open' });
       return true;
     },
-    openManagerActions: async () => [...actions.values()].filter(action => action.status === 'open'),
+    openManagerActions: async () => {
+      if (failActionRead) throw new Error('manager action read failed');
+      return [...actions.values()].filter(action => action.status === 'open');
+    },
     closeManagerAction: async (action: ActionRow, resolution: string) => {
       const row = actions.get(action.key);
       if (row && row.status === 'open') { row.status = 'closed'; row.resolution = resolution; }
+    },
+    newKey: () => `tok-${++keySeq}`,
+    wakeClaim: (row: ManagerWakeRow): ManagerWakeClaim => ({ key: row.key, token: row.token, attempt: row.attempt,
+      input: { taskId: row.taskId, phase: row.phase, episode: row.episode, reason: row.reason, version: row.version, repo: row.repo } }),
+    acquireManagerWake: async (input: ManagerWakeInput, token: string) => {
+      const key = managerWakeKey(input.taskId, input.phase, input.episode);
+      const existing = wakes.get(key);
+      if (existing && ['pending', 'running', 'unknown'].includes(existing.state)) return undefined;
+      const attempt = (existing?.attempt ?? 0) + 1;
+      const row: ManagerWakeRow = { ...input, key, purpose: 'gm-manager-wake', state: 'pending', attempt, token,
+        startedAt: now, updatedAt: now };
+      wakes.set(key, row);
+      return { key, token, attempt, input };
+    },
+    markManagerWakeRunning: async (claim: ManagerWakeClaim, employee: string, agent?: string) => {
+      const row = wakes.get(claim.key);
+      if (!row || row.token !== claim.token || row.attempt !== claim.attempt ||
+          !['pending', 'running', 'unknown'].includes(row.state)) return false;
+      row.state = 'running'; row.employee = employee;
+      if (agent !== undefined) row.agent = agent;
+      row.externalStartedAt ??= now;
+      row.lastCheckedAt = now; row.updatedAt = now;
+      return true;
+    },
+    finishManagerWake: async (claim: ManagerWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string) => {
+      const row = wakes.get(claim.key);
+      if (!row || row.token !== claim.token || row.attempt !== claim.attempt ||
+          !['pending', 'running', 'unknown'].includes(row.state)) return false;
+      if (state === 'unknown' && row.state === 'unknown' && row.lastStatus === lastStatus) return false;
+      row.state = state; row.resolution = resolution; row.lastStatus = lastStatus;
+      row.lastCheckedAt = now; row.updatedAt = now;
+      return true;
+    },
+    openManagerWakes: async () => {
+      if (failWakeRead) throw new Error('manager wake read failed');
+      return [...wakes.values()].filter(row => ['pending', 'running', 'unknown'].includes(row.state)).map(row => ({ ...row }));
+    },
+    finishManagerWakesForTask: async (taskId: string, resolution: string) => {
+      let closed = 0;
+      for (const row of wakes.values()) {
+        if (row.taskId !== taskId || !['pending', 'running', 'unknown'].includes(row.state)) continue;
+        if (await (wf as unknown as { finishManagerWake: (claim: ManagerWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string) => Promise<boolean> }).finishManagerWake(
+          { key: row.key, token: row.token, attempt: row.attempt,
+            input: { taskId: row.taskId, phase: row.phase, episode: row.episode, reason: row.reason, version: row.version, repo: row.repo } },
+          'finished', resolution, row.lastStatus)) closed++;
+      }
+      return closed;
     },
     touchWake: async () => {},
     defHealthy: async () => {},
@@ -182,7 +255,10 @@ export function fixture(specs: TaskSpec[]) {
 
   const paseo: PaseoGateway = {
     list: async () => agents,
-    status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
+    status: async id => {
+      if (statusFails) throw new Error('status read failed');
+      return agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined;
+    },
     lastError: async id => errors.get(id) ?? '',
     logsTail: async () => '',
     lastInputTokens: async () => 0,
@@ -191,11 +267,13 @@ export function fixture(specs: TaskSpec[]) {
       agents.set(id, { id, status: 'running' });
       prompts.push({ employee: input.labels.employee_id!, prompt: input.prompt, cwd: input.cwd });
       spawnCwds.push(input.cwd);
+      if (failSpawnAfterStart) throw new Error('spawn result lost');
       return id;
     },
     send: async (id, prompt) => {
       agents.get(id)!.status = 'running';
       sends.push({ agentId: id, prompt });
+      if (failSendAfterStart) throw new Error('send result lost');
     },
     stop: async id => { agents.get(id)!.status = 'idle'; },
     reload: async id => { if (failReload) throw new Error('reload failed'); agents.get(id)!.status = 'idle'; },
@@ -244,6 +322,20 @@ export function fixture(specs: TaskSpec[]) {
     setError(agentId: string, error: string) { errors.set(agentId, error); },
     failReload(value: boolean) { failReload = value; },
     failContributors(value: boolean) { contributorsFail = value; },
+    failStatus(value: boolean) { statusFails = value; },
+    failWakeRead(value: boolean) { failWakeRead = value; },
+    failActionRead(value: boolean) { failActionRead = value; },
+    failSpawnAfterStart(value: boolean) { failSpawnAfterStart = value; },
+    failSendAfterStart(value: boolean) { failSendAfterStart = value; },
+    wakes, addTask,
+    wakeFor(key: string) { return wakes.get(key); },
+    ageWake(key: string, seconds: number) {
+      const row = wakes.get(key); if (!row) return;
+      if (row.startedAt !== undefined) row.startedAt -= seconds;
+      if (row.externalStartedAt !== undefined) row.externalStartedAt -= seconds;
+    },
+    wf: wf as unknown as Workforce,
+    defs,
     setImplementer(taskId: string, employee: string) {
       const row = rows.find(r => r.id === taskId)!;
       row.implementer = employee;
@@ -297,6 +389,7 @@ test('a recorded implementer closes the old todo and resumes engineering dispatc
   const result = await f.tick();
   expect(result.woke.find(w => w.task === 'takeover-task')?.employee).toBe('eng-1');
   expect(f.openActions()).toHaveLength(0);
+  expect([...f.wakes.values()][0]?.state).toBe('finished');
   expect(f.last!.dispatchVerdicts().filter(v => v.taskId === 'takeover-task')).toHaveLength(0);
 });
 
@@ -378,4 +471,201 @@ test('manager todos group by the task repository', async () => {
   // Sidecar sessions run in their private comm dir; repo grouping is proven by readWorkspace's anchors.
   expect(f.prompts).toHaveLength(2);
   expect(f.openActions()).toHaveLength(2);
+});
+
+test('MR02: same open episode does not wake a second GM after throttle expiry, version change or restart', async () => {
+  const f = fixture([{ id: 'mr02-one-episode', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  const one = first.woke.find(w => w.task === 'mr02-one-episode')!;
+  expect(one).toBeDefined();
+  expect(f.agents.get(`agent-${one.employee}`)?.status).toBe('running');
+  // The task/open episode and first GM stay unchanged; only time and an ordinary version bump move.
+  f.rows[0]!.version += 1;
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-one-episode')).toHaveLength(0);
+  expect(f.openActions()).toHaveLength(1);
+  expect([...f.wakes.values()].filter(w => w.state === 'running')).toHaveLength(1);
+  expect([...f.wakes.values()][0]!.attempt).toBe(1);
+});
+
+test('MR02: a definite ended turn retries once after the throttle, then running suppresses again', async () => {
+  const f = fixture([{ id: 'mr02-retry', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  const firstWake = first.woke.find(w => w.task === 'mr02-retry')!;
+  const key = [...f.wakes.keys()][0]!;
+  f.setStatus(`agent-${firstWake.employee}`, 'idle');
+  f.ageWake(key, 120);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-retry')).toHaveLength(1);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 2 });
+  expect(f.openActions()).toHaveLength(1);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const third = await f.tick();
+  expect(third.woke.filter(w => w.task === 'mr02-retry')).toHaveLength(0);
+});
+
+test('MR02: unknown or unreadable session state keeps ownership and never wakes a second GM', async () => {
+  const f = fixture([{ id: 'mr02-unknown', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  const firstWake = first.woke.find(w => w.task === 'mr02-unknown')!;
+  const key = [...f.wakes.keys()][0]!;
+  f.setStatus(`agent-${firstWake.employee}`, 'unknown');
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-unknown')).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'unknown', attempt: 1 });
+  expect(f.openActions()).toHaveLength(1);
+  expect(f.notices.has('manager-wake-unknown:mr02-unknown')).toBe(true);
+  // A failed status read is also unknown, not idle.
+  f.failStatus(true);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const third = await f.tick();
+  expect(third.woke.filter(w => w.task === 'mr02-unknown')).toHaveLength(0);
+  // Once the turn is provably ended, the existing throttle allows exactly one controlled retry.
+  f.failStatus(false);
+  f.setStatus(`agent-${firstWake.employee}`, 'idle');
+  f.ageWake(key, 120);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const fourth = await f.tick();
+  expect(fourth.woke.filter(w => w.task === 'mr02-unknown')).toHaveLength(1);
+});
+
+test('MR02: an in-flight episode is excluded from a mixed repo group while a new episode wakes', async () => {
+  const f = fixture([{ id: 'mr02-a', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  expect(first.woke.find(w => w.task === 'mr02-a')).toBeDefined();
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  f.addTask({ id: 'mr02-b', state: 'ready', repoPath: OPS });
+  const second = await f.tick();
+  expect(second.woke.map(w => w.task)).toContain('mr02-b');
+  expect(second.woke.map(w => w.task)).not.toContain('mr02-a');
+  const prompt = f.prompts.at(-1)?.prompt ?? '';
+  expect(prompt).toContain('mr02-b');
+  expect(prompt).not.toContain('mr02-a');
+  expect(f.openActions()).toHaveLength(2);
+});
+
+test('MR02: explicit blockedTo=gm uses the same in-flight ownership', async () => {
+  const f = fixture([{ id: 'mr02-explicit', state: 'blocked', blockedTo: 'gm', repoPath: OPS }]);
+  const first = await f.tick();
+  expect(first.woke.find(w => w.task === 'mr02-explicit')).toBeDefined();
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-explicit')).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 1 });
+});
+
+test('MR02: a candidate-free assign releases only its own pending attempt and retries later', async () => {
+  const f = fixture([{ id: 'mr02-prefail', state: 'ready', repoPath: OPS }]);
+  f.defs[0]!.enabled = false;
+  const first = await f.tick();
+  expect(first.woke.filter(w => w.task === 'mr02-prefail')).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'finished' });
+  f.defs[0]!.enabled = true;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-prefail')).toHaveLength(1);
+});
+
+test('MR02: a spawn that starts and loses its result stays unknown, not a second wake', async () => {
+  const f = fixture([{ id: 'mr02-spawn-lost', state: 'ready', repoPath: OPS }]);
+  f.failSpawnAfterStart(true);
+  const first = await f.tick();
+  expect(first.woke.filter(w => w.task === 'mr02-spawn-lost')).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'unknown' });
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-spawn-lost')).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'unknown' });
+});
+
+test('MR02: an old attempt cannot finish a newer attempt', async () => {
+  const f = fixture([{ id: 'mr02-stale-event', state: 'ready', repoPath: OPS }]);
+  await f.tick();
+  const oldRow = [...f.wakes.values()][0]!;
+  const oldClaim = f.wf.wakeClaim(oldRow);
+  expect(await f.wf.finishManagerWake(oldClaim, 'finished', 'turn ended')).toBe(true);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-stale-event')).toHaveLength(1);
+  const newRow = [...f.wakes.values()][0]!;
+  expect(newRow.attempt).toBe(2);
+  expect(await f.wf.finishManagerWake(oldClaim, 'finished', 'late old event')).toBe(false);
+  expect([...f.wakes.values()][0]!.state).not.toBe('finished');
+});
+
+
+test('MR02: ticks inside the throttle never release a running owner for a later second wake', async () => {
+  const f = fixture([{ id: 'mr02-throttle-owner', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  expect(first.woke.find(w => w.task === 'mr02-throttle-owner')).toBeDefined();
+  const key = [...f.wakes.keys()][0]!;
+  const inThrottle = await f.tick();
+  expect(inThrottle.woke.filter(w => w.task === 'mr02-throttle-owner')).toHaveLength(0);
+  expect(f.wakeFor(key)).toMatchObject({ state: 'running', attempt: 1 });
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const afterExpiry = await f.tick();
+  expect(afterExpiry.woke.filter(w => w.task === 'mr02-throttle-owner')).toHaveLength(0);
+  expect(f.wakeFor(key)).toMatchObject({ state: 'running', attempt: 1 });
+});
+
+test('MR02: an archived session releases ownership for exactly one controlled retry', async () => {
+  const f = fixture([{ id: 'mr02-archived', state: 'ready', repoPath: OPS }]);
+  const first = await f.tick();
+  const firstWake = first.woke.find(w => w.task === 'mr02-archived')!;
+  f.setStatus(`agent-${firstWake.employee}`, 'archived');
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-archived')).toHaveLength(1);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 2 });
+});
+
+
+test('MR02: unreadable wake ownership keeps the todo and never wakes a second GM', async () => {
+  const f = fixture([{ id: 'mr02-wake-read-fail', state: 'ready', repoPath: OPS }]);
+  await f.tick();
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 1 });
+  f.failWakeRead(true);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-wake-read-fail')).toHaveLength(0);
+  expect(f.openActions()).toHaveLength(1);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 1 });
+});
+
+test('MR02: unreadable manager-action set keeps wake ownership and the durable action', async () => {
+  const f = fixture([{ id: 'mr02-action-read-fail', state: 'ready', repoPath: OPS }]);
+  await f.tick();
+  f.failActionRead(true);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-action-read-fail')).toHaveLength(0);
+  expect(f.actions.get([...f.actions.keys()][0]!)?.status).toBe('open');
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 1 });
+});
+
+test('MR02: task leaving the execute queue closes the open action and wake ownership', async () => {
+  const f = fixture([{ id: 'mr02-leaves-queue', state: 'ready', repoPath: OPS }]);
+  await f.tick();
+  f.rows[0]!.state = 'done';
+  f.setStatus('agent-gm-codex-1', 'idle');
+  const result = await f.tick();
+  expect(result.woke.filter(w => w.task === 'mr02-leaves-queue')).toHaveLength(0);
+  expect(f.openActions()).toHaveLength(0);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'finished' });
+});
+
+test('MR02: a pending attempt without external start is released after the conservative grace', async () => {
+  const f = fixture([{ id: 'mr02-pending-crash', state: 'ready', repoPath: OPS }]);
+  await f.tick();
+  const row = [...f.wakes.values()][0]!;
+  row.state = 'pending';
+  row.externalStartedAt = undefined;
+  row.agent = undefined;
+  f.ageWake(row.key, 121);
+  for (const entry of f.dispatches.values()) entry.at -= DEFAULT_CONFIG.redispatchMinutes * 60 + 1;
+  const second = await f.tick();
+  expect(second.woke.filter(w => w.task === 'mr02-pending-crash')).toHaveLength(1);
+  expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 2 });
 });
