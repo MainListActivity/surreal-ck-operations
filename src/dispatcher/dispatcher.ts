@@ -399,6 +399,8 @@ export interface SidecarBridge {
   bindAgent(instId: string, agentId: string): void;
   /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
   commDirFor(instId: string): string;
+  /** Absolute path of the instance's scratch dir (temp clones/builds); spawn env alone is lost on resume. */
+  scratchDirFor(instId: string): string;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
   /** Server-side lease was revoked: drop the local claim remnant so the instance can pick again. */
@@ -1158,7 +1160,7 @@ export class Dispatcher {
       this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
       if (!result) {
         if (this.scopeDenied.delete(item.task.id)) {
           // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
@@ -1233,7 +1235,7 @@ export class Dispatcher {
     for (const group of gmGroups.values()) {
       if (running >= cfg.maxRunning) break;
       const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
+        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
       if (!result) continue;
       for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
       running++;
@@ -1262,7 +1264,7 @@ export class Dispatcher {
       for (const [home, group] of triageGroups) {
         if (running >= cfg.maxRunning) break;
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
+          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
         if (!result) continue;
         for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
         running++;
@@ -1318,7 +1320,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;

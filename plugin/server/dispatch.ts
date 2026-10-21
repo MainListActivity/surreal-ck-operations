@@ -4,7 +4,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import { company, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { serviceHome } from "./env";
 import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
 
@@ -248,13 +248,21 @@ export function startDispatch(server: PluginServerContext): () => void {
 async function runLifecycleGc(ctx: Company): Promise<void> {
   const cfg = await ctx.workforce.config();
   const now = new Date();
+  const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
   if (cfg.commDirGraceHours > 0) {
-    const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
     const comm = await sweepInstanceDirs({
       root: commRoot, now, graceMs: cfg.commDirGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
     });
     if (comm.removed.length) {
       console.log(`lifecycle gc comm: removed ${comm.removed.length} dead channels (${(comm.bytes / 1048576).toFixed(1)} MB)`);
+    }
+  }
+  if (cfg.scratchGraceHours > 0) {
+    const scratch = await sweepInstanceDirs({
+      root: join(dirname(commRoot), "scratch"), now, graceMs: cfg.scratchGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
+    });
+    if (scratch.removed.length) {
+      console.log(`lifecycle gc scratch: removed ${scratch.removed.length} dirs (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
     }
   }
   if (cfg.archiveRetentionDays > 0) {
