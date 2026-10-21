@@ -265,7 +265,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('defer_task_until', {
-    description: 'gm only: turn a gm-blocked execute-phase task into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it auto-resumes when every dependency is done; with all dependencies already done it resumes immediately.',
+    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with all dependencies already done it restores immediately. Owner gates and unprovable review history are refused.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       dependencies: z.array(z.string().min(1)).min(1).max(20),

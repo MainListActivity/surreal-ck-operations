@@ -77,6 +77,10 @@ export interface TaskView {
   leaseExpiresAt?: string;
   fence: number;
   blockedTo?: 'gm' | 'owner';
+  /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
+  resumeState?: TaskState;
+  /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
+  resumeRole?: string;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
@@ -188,12 +192,12 @@ export interface CreateDelivery {
   idempotencyKey: string;
 }
 
-/** gm only: re-point an execute-phase gm block at unmet dependencies instead of the manager. */
+/** gm only: re-point a gm block — execute, or a provable normal non-owner review block — at unmet dependencies instead of the manager. */
 export interface DeferTaskUntil {
   taskId: TaskId;
-  /** Dependencies to merge into the task's existing set (union, same goal, acyclic). */
+  /** Dependencies to merge into the task's existing set (union, same goal, acyclic after resolution). */
   dependencies: TaskId[];
-  /** Business reason for the wait; audited together with the before/after dependency snapshot. */
+  /** Business reason for the wait; audited together with the before/after dependency snapshot and the restore phase. */
   text: string;
   idempotencyKey: string;
   /** Optimistic concurrency: refuse when the task version has moved. */
@@ -366,7 +370,7 @@ export interface CompanyCore {
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
-  /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
+  /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
   /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;

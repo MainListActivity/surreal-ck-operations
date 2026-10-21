@@ -7,7 +7,7 @@
 | ready | 依赖完成，可执行 | 调度器派给执行岗位的空闲员工 |
 | doing | 已被领取，持有租约 | 持有租约的员工；会话中断时调度器收回并改派 |
 | review | 已提交，等待独立验收 | 验收岗位中非提交者的员工；`reviewerRole=owner` 的关口由老板决定 |
-| blocked | 等依赖、经理或老板 | 依赖完成自动解锁；`blocked_to=gm` 派给经理；`blocked_to=owner` 进老板待办 |
+| blocked | 等依赖、经理或老板 | 正式依赖等待（`blocked_to` 为空）完成后按原阶段恢复：执行回 ready，复核回 review；`blocked_to=gm` 派给经理；`blocked_to=owner` 进老板待办 |
 | done | 验收通过（或老板批准） | 自动解锁后续任务 |
 
 ## 目标流程

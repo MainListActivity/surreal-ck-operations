@@ -22,6 +22,10 @@ export interface TaskView {
   deliveryId?: string;
   leaseExpiresAt?: string;
   blockedTo?: "gm" | "owner";
+  /** Blocked rows: the phase restored when the dependency wait ends. */
+  resumeState?: TaskState;
+  /** Blocked rows: the role recorded by the original block. */
+  resumeRole?: string;
   previousEmployee?: string;
 }
 
