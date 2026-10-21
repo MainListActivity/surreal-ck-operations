@@ -120,6 +120,7 @@ function fixture(goals: Array<{ id: string; project?: string }>) {
     claimDenial: () => undefined,
     bindAgent: () => {},
     commDirFor: () => '/tmp/comm',
+    scratchDirFor: instId => `/tmp/${instId}-scratch`,
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
     readWorkspace: async (inst, taskId, project) => {

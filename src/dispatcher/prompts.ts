@@ -4,7 +4,7 @@ import type { EmployeeInst, SupervisedTask } from '../workforce.ts';
 export interface PromptEnv { opsRepo: string; sckBin: string; paseoBin: string }
 
 /** comm = 插件 sidecar 已代领任务、凭证不进 agent；否则为旧的凭证文件模式。 */
-export interface PromptCtx { comm: boolean; claim?: ClaimResult; worktree?: WorktreeAssignment; commDir?: string }
+export interface PromptCtx { comm: boolean; claim?: ClaimResult; worktree?: WorktreeAssignment; commDir?: string; scratchDir?: string }
 
 const ROLE_NAMES: Record<string, string> = {
   gm: '经理：目标分级与拆解、处理运营定不了的事、G3 汇总',
@@ -51,10 +51,13 @@ export function wake(inst: EmployeeInst, task: SupervisedTask, env: PromptEnv, f
   const mode = task.state === 'review' ? '独立验收' : task.row.handover ? '接手续做（前任会话已中断）' : '执行';
   if (ctx?.comm) {
     const commDir = ctx.commDir ?? '$SCK_COMM_DIR';
+    // Absolute path, not $SCK_SCRATCH_DIR: Paseo drops spawn env on resume, so the variable
+    // is absent for every follow-up turn while the directory itself still exists.
+    const scratchDir = ctx.scratchDir ?? '$SCK_SCRATCH_DIR';
     const allocation = ctx.claim?.worktree;
     const usage = allocation ? `\n登记工作区：${allocation.worktreePath}；mode=${allocation.mode}；branch=${allocation.branch ?? 'detached'}；授权=${JSON.stringify(allocation.intent)}。${allocation.discipline}旧任务 context 若仍要求手动新建独立树，以本次登记路径与写权为准。` : '';
     const body = `【派工】任务 ${task.id}「${task.title}」已领取给你，本轮${mode}。${usage}
-先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）；它也是你的会话宿主目录，不是任务现场——文件操作一律用登记工作区/comm 目录的绝对路径，不要在宿主目录写任务产物。临时文件（克隆、构建、转码、抽帧、下载）一律放 $SCK_SCRATCH_DIR，不要写到 /tmp 或宿主目录；该目录按保留期自动清理。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
+先读 ${commDir}/claim.json —— 里面是本任务的完整上下文：任务详情、交接历史、前任会话（可用 '${env.paseoBin}' logs <agentId> 看完整时间线）、项目环境（project）。你的交付目录是 ${commDir}（report.md、blocker.md、sck 的 req/res 都在那里）；它也是你的会话宿主目录，不是任务现场——文件操作一律用登记工作区/comm 目录的绝对路径，不要在宿主目录写任务产物。临时文件（克隆、构建、转码、抽帧、下载）一律放 ${scratchDir}，不要写到 /tmp 或宿主目录；该目录按保留期自动清理。你不持有任何凭证；要账号、workspace、成员或生产登录，用运维工具 ops_*：先 sck call ops_info '{}' 看当前项目能做什么。
 完成后：把交付说明写入 ${commDir}/report.md（内容即评审证据，写清楚做了什么、怎么验证、遗留什么）；验收任务用 sck call review 报 accept/return。
 中途保活不需要你管（通道自动续租约）；每完成一个有意义阶段用 sck call checkpoint '{"text":"...","idempotencyKey":"..."}' 存进度；自己定不了就 sck call report_blocker '{"to":"gm","text":"...","idempotencyKey":"..."}'（只有花钱、签约、对外、方向、红线才 to=owner）。订阅额度用尽或限流导致的阻塞，另加 "quotaResetsAt"：平台给出的恢复时间，ISO 8601 且带时区偏移（如 "2026-10-18T10:12:00-04:00"），系统到点后才会重新派工。
 本轮只做这一项；写完 report.md 或报阻塞后结束本轮，不空转、不建 agent/定时器。`;
