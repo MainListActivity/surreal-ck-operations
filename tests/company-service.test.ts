@@ -62,13 +62,15 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   return dir;
 }
 
-// The install refuses a release without a passing comm-slow-pipe record for its SHA on the runtime the services run with
-// (scripts/bun-runtime.sh: the pinned runtime-bun under the service home). The fixture pins that runtime and its version, so it
-// does not depend on the host Bun; the gate runner itself is covered by tests/release-gate.test.ts.
+// The install requires both release records for the SHA on the runtime the services run with (scripts/bun-runtime.sh: the
+// pinned runtime-bun under the service home). The fixture pins that runtime and its version, so it does not depend on the host Bun;
+// the gate runner itself is covered by tests/release-gate.test.ts.
 function writeGateRecord(serviceHome: string, sha: string) {
-  const dir = join(serviceHome, 'gates', 'comm-slow-pipe');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ gate: 'comm-slow-pipe', sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
+  for (const gate of ['comm-slow-pipe', 'sidecar-review']) {
+    const dir = join(serviceHome, 'gates', gate);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ gate, sha, bun: '1.4.2', platform: 'darwin', result: 'pass' }));
+  }
 }
 
 function fixture(): Fixture {

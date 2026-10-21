@@ -23,9 +23,10 @@ unload() {
 }
 plist() { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
 
-# Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs a passing comm-slow-pipe record, made on darwin with
-# the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the switch; nothing is read from a hosted runner.
-gate_record() { echo "$service_home/gates/comm-slow-pipe/$1.json"; }
+# Local release gate (SYS01 AC-B, scripts/release-gate.sh): this release SHA needs passing comm-slow-pipe and sidecar-review
+# records, made on darwin with the Bun version installed now. A missing, failed, other-SHA or other-Bun record refuses the
+# switch; nothing is read from a hosted runner.
+gate_record() { echo "$service_home/gates/$1/$2.json"; }
 # The version of the runtime the services run with (scripts/bun-runtime.sh), or "unknown" when it cannot report one. The services run
 # under launchd, which does not inherit this shell's environment, so SCK_BUN is ignored here: the gate checks the runtime they resolve.
 runtime_version() (
@@ -34,19 +35,21 @@ runtime_version() (
   rv=$("$BUN" --version 2>/dev/null) && [ -n "$rv" ] && echo "$rv" || echo unknown
 )
 check_gate() {
-  record=$(gate_record "$1")
+  gate=$1
+  sha=$2
+  record=$(gate_record "$gate" "$sha")
   [ -f "$record" ] || return 1
   bun_now=$(runtime_version)
   [ "$bun_now" != unknown ] || return 1
-  /usr/bin/python3 - "$record" "$1" "$bun_now" <<'PY'
+  /usr/bin/python3 - "$record" "$gate" "$sha" "$bun_now" <<'PY'
 import json, sys
-record, sha, bun = sys.argv[1], sys.argv[2], sys.argv[3]
+record, gate, sha, bun = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
     with open(record, encoding='utf-8') as handle:
         data = json.load(handle)
 except (OSError, ValueError):
     sys.exit(1)
-ok = (data.get('gate') == 'comm-slow-pipe' and data.get('sha') == sha and data.get('bun') == bun
+ok = (data.get('gate') == gate and data.get('sha') == sha and data.get('bun') == bun
       and data.get('platform') == 'darwin' and data.get('result') == 'pass')
 sys.exit(0 if ok else 1)
 PY
@@ -101,8 +104,10 @@ case "$action" in
     # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
     # "nothing waits yet" as safe would race a defer that lands right after it.
     review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
-    check_gate "$sha" || {
+    check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
+    check_gate sidecar-review "$sha" || {
+      echo "refused: no passing sidecar-review gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh sidecar-review $release' on this Mac, then install again" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"
     chmod 700 "$service_home" "$service_home/bin" "$service_home/logs" "$service_home/private"
     cp "$(dirname "$0")/run-service.sh" "$service_home/bin/run.sh"
@@ -286,7 +291,8 @@ PY
     ;;
   check-gate)
     sha=${2:?usage: company-service.sh check-gate <40-character release sha>}
-    check_gate "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version)" >&2; exit 1; }
+    check_gate comm-slow-pipe "$sha" || { echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version)" >&2; exit 1; }
+    check_gate sidecar-review "$sha" || { echo "refused: no passing sidecar-review gate for $sha on bun $(runtime_version)" >&2; exit 1; }
     echo "gate ok: $sha on bun $(runtime_version)"
     ;;
   *)

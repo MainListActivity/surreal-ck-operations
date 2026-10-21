@@ -60,11 +60,17 @@ function sh(script: string, args: string[], home: string, extra: Record<string, 
   return { code: child.exitCode, out: child.stdout.toString(), err: child.stderr.toString() };
 }
 
-function writeRecord(home: string, sha: string, fields: Record<string, unknown>) {
-  const dir = join(home, 'gates', 'comm-slow-pipe');
+function writeRecord(home: string, sha: string, fields: Record<string, unknown>, gate = 'comm-slow-pipe') {
+  const dir = join(home, 'gates', gate);
   mkdirSync(dir, { recursive: true });
-  const record = { gate: 'comm-slow-pipe', sha, bun: PINNED, platform: 'darwin', result: 'pass', ...fields };
+  const record = { gate, sha, bun: PINNED, platform: 'darwin', result: 'pass', ...fields };
   writeFileSync(join(dir, `${sha}.json`), JSON.stringify(record));
+}
+
+/** Both release gates are required: a release is not installable with only one passing record. */
+function writeBoth(home: string, sha: string, fields: Record<string, unknown> = {}) {
+  writeRecord(home, sha, fields, 'comm-slow-pipe');
+  writeRecord(home, sha, fields, 'sidecar-review');
 }
 
 test('a release with no gate record is refused by check-gate, which install runs before it switches', () => {
@@ -78,10 +84,22 @@ test('a release with no gate record is refused by check-gate, which install runs
   }
 });
 
+test('check-gate refuses a release with only one of the two required gate records', () => {
+  const home = serviceHome();
+  try {
+    writeRecord(home, SHA, {}, 'comm-slow-pipe');
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
+    writeRecord(home, SHA, {}, 'sidecar-review');
+    expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a passing darwin record for this commit and the pinned runtime opens the gate', () => {
   const home = serviceHome();
   try {
-    writeRecord(home, SHA, {});
+    writeBoth(home, SHA);
     const run = sh(SERVICE, ['check-gate', SHA], home);
     expect(run.code).toBe(0);
     expect(run.out).toContain(`gate ok: ${SHA} on bun ${PINNED}`);
@@ -93,7 +111,7 @@ test('a passing darwin record for this commit and the pinned runtime opens the g
 test('a record made with the Bun on PATH does not open the gate, because the services never run that runtime', () => {
   const home = serviceHome();
   try {
-    writeRecord(home, SHA, { bun: PATH_BUN });
+    writeBoth(home, SHA, { bun: PATH_BUN });
     const run = sh(SERVICE, ['check-gate', SHA], home);
     expect(run.code).toBe(1);
     expect(run.err).toContain(`on bun ${PINNED}`);
@@ -105,22 +123,22 @@ test('a record made with the Bun on PATH does not open the gate, because the ser
 test('a failed run, another commit, another Bun version or a non-darwin host does not open the gate', () => {
   const home = serviceHome();
   try {
-    writeRecord(home, SHA, { result: 'fail' });
+    writeBoth(home, SHA, { result: 'fail' });
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
     rmSync(join(home, 'gates'), { recursive: true, force: true });
 
     // A record copied from another commit does not open this one: the sha inside must be the one the file is named for.
-    writeRecord(home, SHA, {});
+    writeBoth(home, SHA);
     const file = join(home, 'gates', 'comm-slow-pipe', `${SHA}.json`);
     writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), sha: 'b'.repeat(40) }));
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
     rmSync(join(home, 'gates'), { recursive: true, force: true });
 
-    writeRecord(home, SHA, { bun: '0.0.0-other' });
+    writeBoth(home, SHA, { bun: '0.0.0-other' });
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
     rmSync(join(home, 'gates'), { recursive: true, force: true });
 
-    writeRecord(home, SHA, { platform: 'linux' });
+    writeBoth(home, SHA, { platform: 'linux' });
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(1);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -186,6 +204,8 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a gate run writes the record check
     expect(pass.out).toContain(`comm-slow-pipe pass for ${SHA} on bun ${PINNED}`);
     expect(readFileSync(join(home, 'gates', 'comm-slow-pipe', `${SHA}.log`), 'utf8')).toContain('control=1');
     expect(JSON.parse(readFileSync(recordFile, 'utf8'))).toMatchObject({ gate: 'comm-slow-pipe', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
+    // Both gates are required for install; this test exercises the slow-pipe record itself.
+    writeRecord(home, SHA, {}, 'sidecar-review');
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
 
     const red = sh(GATE, ['slow-pipe', release], home, { FAKE_TEST_RC: '1' });
@@ -197,12 +217,33 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a gate run writes the record check
   }
 });
 
+test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records the fork mode, not the slow-pipe mode', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    writeFileSync(join(release, 'tests', 'dispatcher-sidecar.fork.test.ts'), '');
+    const pinned = join(home, 'runtime-bun', 'bin', 'bun');
+    writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
+    chmodSync(pinned, 0o755);
+    const run = sh(GATE, ['sidecar-review', release], home);
+    expect(run.code).toBe(0);
+    const record = JSON.parse(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.json`), 'utf8'));
+    expect(record).toMatchObject({ gate: 'sidecar-review', sha: SHA, bun: PINNED, platform: 'darwin', result: 'pass', exitCode: 0 });
+    expect(readFileSync(join(home, 'gates', 'sidecar-review', `${SHA}.log`), 'utf8')).toContain('fork=1');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('install checks the gate before it points the active release at the new one', () => {
   const script = readFileSync(SERVICE, 'utf8');
-  const check = script.indexOf('check_gate "$sha" ||');
+  const slow = script.indexOf('check_gate comm-slow-pipe "$sha"');
+  const review = script.indexOf('check_gate sidecar-review "$sha"');
   const switchPoint = script.indexOf('ln -s "$release" "$service_home/active.next"');
-  expect(check).toBeGreaterThan(0);
-  expect(switchPoint).toBeGreaterThan(check);
+  expect(slow).toBeGreaterThan(0);
+  expect(review).toBeGreaterThan(slow);
+  expect(switchPoint).toBeGreaterThan(review);
 });
 
 test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned runtime-bun, then ~/.bun, never PATH', () => {
@@ -210,7 +251,7 @@ test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned ru
   try {
     // The pinned runtime (1.4.2) is the default: the launcher executes it and the gate records its version.
     expect(sh(LAUNCHER, ['mcp'], home).out).toContain('ran:pinned');
-    writeRecord(home, SHA, {});
+    writeBoth(home, SHA);
     expect(sh(SERVICE, ['check-gate', SHA], home).code).toBe(0);
 
     // SCK_BUN in the environment wins for the launcher, which runs in the caller's environment. The install's check does not read it:
@@ -221,8 +262,8 @@ test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned ru
     expect(sh(SERVICE, ['check-gate', SHA], home, { SCK_BUN: override }).out).toContain('on bun 1.4.2');
 
     // SCK_BUN in private/service.env: the launcher sources that line and the gate reads it, so both pick the same override.
-    writeRecord(home, SHA, { bun: '9.9.9' });
-    writeFileSync(join(home, 'private', 'service.env'), `SCK_BUN=${override}\n`);
+    writeBoth(home, SHA, { bun: '9.9.9' });
+    writeFileSync(join(home, 'private', 'service.env'), `SCK_BUN="${override}"\n`);
     expect(sh(LAUNCHER, ['mcp'], home).out).toContain('ran:override');
     expect(sh(SERVICE, ['check-gate', SHA], home).out).toContain('on bun 9.9.9');
     writeFileSync(join(home, 'private', 'service.env'), '');
@@ -231,7 +272,7 @@ test('the launcher and the gate resolve one runtime: SCK_BUN, then the pinned ru
     rmSync(join(home, 'runtime-bun'), { recursive: true, force: true });
     fakeBun(join(home, 'user-home', '.bun', 'bin', 'bun'), '1.3.11', 'home');
     expect(sh(LAUNCHER, ['mcp'], home).out).toContain('ran:home');
-    writeRecord(home, SHA, { bun: '1.3.11' });
+    writeBoth(home, SHA, { bun: '1.3.11' });
     expect(sh(SERVICE, ['check-gate', SHA], home).out).toContain('on bun 1.3.11');
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -243,7 +284,7 @@ test('an explicit pin that is missing is never replaced by another Bun: the laun
   try {
     fakeBun(join(home, 'user-home', '.bun', 'bin', 'bun'), '1.3.11', 'home');
     writeFileSync(join(home, 'private', 'service.env'), `SCK_BUN=${join(home, 'missing', 'bun')}\n`);
-    writeRecord(home, SHA, { bun: '1.3.11' });
+    writeBoth(home, SHA, { bun: '1.3.11' });
     expect(sh(LAUNCHER, ['mcp'], home).out).not.toContain('ran:home');
     const check = sh(SERVICE, ['check-gate', SHA], home);
     expect(check.code).not.toBe(0);

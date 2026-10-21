@@ -12,7 +12,7 @@ import {
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
+import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
@@ -76,6 +76,8 @@ export interface SidecarDeps {
 interface LiveClaim {
   instId: string;
   taskId: string;
+  /** The server phase this lease was claimed for; review leases never submit a report.md. */
+  phase: "doing" | "review";
   proof: LeaseProof;
   /** Hash of artifact content already consumed, so a stale file never submits twice. */
   reportHash?: string;
@@ -236,7 +238,8 @@ export class SidecarPool {
     try {
       const cred = await this.credentialFor(held.instId);
       const task = await this.deps.core.getTask(cred, held.taskId);
-      return task.currentEmployee !== held.instId
+      return (task.state !== "doing" && task.state !== "review")
+          || task.currentEmployee !== held.instId
           || task.deliveryId !== held.proof.deliveryId
           || (task.leaseExpiresAt !== undefined && Date.parse(task.leaseExpiresAt) <= Date.now());
     } catch {
@@ -309,7 +312,7 @@ export class SidecarPool {
     this.archive(reportPath(dir), "stale");
     this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
-      instId: inst.id, taskId: task.id,
+      instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
     this.startBeat(inst.id);
@@ -350,11 +353,18 @@ export class SidecarPool {
       }
       return { status: "no_claim" };
     }
+    // A review turn closes through `review` or report_blocker, never through a report.md
+    // submit. Keep the lease and archive the non-closeout artifact instead of trying to
+    // submit a review task (which would fail and then end a still-valid lease).
+    if (live.phase === "review" && report !== undefined && hash(report) !== live.reportHash) {
+      this.log(`review report.md is not a closeout for ${instId} on ${live.taskId}; archiving`);
+      this.archive(reportPath(dir), "stale");
+    }
     if (blocker !== undefined && hash(blocker) !== live.blockerHash) {
       await this.finish(instId, live, "gm", blocker, blockerPath(dir));
       return { status: "ingested" };
     }
-    if (report !== undefined && hash(report) !== live.reportHash) {
+    if (live.phase !== "review" && report !== undefined && hash(report) !== live.reportHash) {
       await this.finish(instId, live, undefined, report, reportPath(dir));
       return { status: "ingested" };
     }
@@ -482,32 +492,94 @@ export class SidecarPool {
   }
 
   /**
-   * Re-establish the local claim for a lease that survived the restart, then run
-   * the turn-end ingest for artifacts the agent may have written while we were
-   * down. Only ingest when claim.json still names this delivery — older files
-   * belong to a dead lease and are archived as stale.
+   * Re-establish the local claim for a lease that survived the restart, then run the
+   * turn-end ingest for artifacts the agent may have written while we were down.
+   *
+   * The server lookup is a complete credential-scoped query (`activeLeases`), not a task
+   * list: listTasks is bounded and hides the employee's own review rows, which made a
+   * review holder lose its lease after a plugin reload. The server remains the authority:
+   * a local claim.json is only trusted for artifact delivery matching, never for deciding
+   * that a lease exists. Ambiguous, expired, foreign or unreadable leases fail closed.
    */
   private async rebuildClaim(inst: EmployeeInst): Promise<void> {
     const cred = await this.credentialFor(inst.id);
-    const doing = await this.deps.core.listTasks(cred, "doing");
-    const live = doing.find(t => t.currentEmployee === inst.id && !!t.deliveryId &&
-      (!t.leaseExpiresAt || Date.parse(t.leaseExpiresAt) > Date.now()));
-    if (!live) return;
+    if (!this.deps.core.activeLeases) {
+      throw new Error("core does not expose activeLeases; refusing to rebuild a lease from a bounded list");
+    }
+    const leases: ActiveLease[] = await this.deps.core.activeLeases(cred);
+    const now = Date.now();
+    const mine = leases.filter(lease => lease.currentEmployee === inst.id
+      && (lease.state === "doing" || lease.state === "review")
+      && !!lease.deliveryId
+      && Number.isSafeInteger(lease.fence) && lease.fence >= 1
+      && Number.isSafeInteger(lease.version)
+      && typeof lease.leaseExpiresAt === "string"
+      && Date.parse(lease.leaseExpiresAt) > now);
     const dir = commDir(this.deps.runDir, inst.id);
+    if (mine.length > 1) {
+      this.log(`sidecar adoption ambiguous for ${inst.id}: ${mine.length} active leases (${mine.map(l => l.taskId).join(", ")})`);
+      return;
+    }
+    if (!mine.length) {
+      // No server lease: the channel may still be live, but claim.json and artifacts are dead.
+      this.endLease(inst.id);
+      this.archive(reportPath(dir), "stale");
+      this.archive(blockerPath(dir), "stale");
+      return;
+    }
+    const lease = mine[0]!;
+    const task = await this.deps.core.getTask(cred, lease.taskId);
+    if (task.state !== lease.state || task.currentEmployee !== inst.id || task.deliveryId !== lease.deliveryId
+        || !task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) <= Date.now()
+        || !Number.isSafeInteger(task.fence) || task.fence < 1 || !Number.isSafeInteger(task.version)) {
+      this.log(`sidecar adoption lease ${lease.taskId} for ${inst.id} changed during recovery; not restoring`);
+      return;
+    }
+    const claimPath = join(dir, "claim.json");
+    const prior = readJsonFile<Partial<ClaimResult>>(claimPath);
+    const trustedArtifacts = prior?.task?.id === task.id && prior.deliveryId === lease.deliveryId;
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    const snapshot = {
+      ...(trustedArtifacts && prior ? prior : {}),
+      task,
+      deliveryId: lease.deliveryId,
+      fence: task.fence,
+      leaseExpiresAt: task.leaseExpiresAt,
+      history: trustedArtifacts && Array.isArray(prior?.history) ? prior.history : [],
+      worktree: task.worktree,
+      evidenceDir,
+    } as ClaimResult & { evidenceDir: string };
     this.claims.set(inst.id, {
-      instId: inst.id, taskId: live.id,
-      proof: { taskId: live.id, deliveryId: live.deliveryId!, fence: live.fence, expectedVersion: live.version },
+      instId: inst.id, taskId: task.id, phase: lease.state,
+      proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });
     this.startBeat(inst.id);
-    this.log(`sidecar adopted lease ${live.id} for ${inst.id}`);
-    const claimMeta = readJsonFile<{ deliveryId?: string }>(join(dir, "claim.json"));
-    if (claimMeta?.deliveryId !== live.deliveryId) {
+    this.log(`sidecar adopted ${lease.state} lease ${task.id} for ${inst.id}`);
+    try {
+      writeFileAtomic(claimPath, JSON.stringify(snapshot));
+    } catch (error) {
+      // The in-memory proof is enough for sck writes; a failed snapshot refresh must not
+      // turn a valid recovered lease into no_lease.
+      this.log(`adopted claim.json refresh ${inst.id} failed: ${(error as Error).message}`);
+    }
+    if (!trustedArtifacts) {
       this.archive(reportPath(dir), "stale");
       this.archive(blockerPath(dir), "stale");
       return;
     }
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
+    if (lease.state === "review") {
+      // report.md is execute-phase closeout; archive it without ending a valid review lease.
+      if (report !== undefined) {
+        this.log(`adopted review lease ${task.id} for ${inst.id} has report.md; archiving it`);
+        this.archive(reportPath(dir), "stale");
+      }
+      const claim = this.claims.get(inst.id);
+      if (blocker !== undefined && claim) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
+      return;
+    }
     const claim = this.claims.get(inst.id);
     if (!claim) return;
     if (blocker !== undefined) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));

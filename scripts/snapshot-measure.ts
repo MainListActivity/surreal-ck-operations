@@ -11,7 +11,9 @@
 // one phase of this sequence, run in order on the same seeded store, so a fixture is seeded once for all of its phases.
 //
 // Usage: bun scripts/snapshot-measure.ts <label> [--tasks N] [--context-bytes B] [--samples K] [--attempts A]
-//          [--rates BPS[,BPS...] | --rate BPS] [--batch-kib K] [--direct] [--no-hedge] [--out FILE]
+//          [--rates BPS[,BPS...] | --rate BPS] [--batch-kib K] [--latency-ms N] [--direct] [--no-hedge] [--out FILE]
+// --latency-ms adds that delay (milliseconds) to every forwarded chunk in each direction, so the measured requests pay a round
+// trip like the production WSS link's (~0.6 s per statement); it is a simulated constraint, labelled as such in the output.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -40,6 +42,8 @@ const RATES: number[] = args.includes('--rates')
   : [flag('rate', 0)];
 if (RATES.some(rate => !Number.isFinite(rate) || rate < 0)) throw new Error('--rates takes non-negative numbers, for example 0,51200');
 const BATCH_KIB = flag('batch-kib', 0);
+/** Added to every forwarded chunk in each direction: one statement's round trip pays it once per direction. */
+const LATENCY_MS = flag('latency-ms', 0);
 // --direct connects to the fork without the proxy; --no-hedge leaves the first read of a listing unabandoned (diagnosis only).
 const DIRECT = args.includes('--direct');
 const NO_HEDGE = args.includes('--no-hedge');
@@ -62,7 +66,9 @@ const PIECE_BYTES = 1024;
 type Dir = 'down' | 'up';
 const counters: Record<Dir, number> = { down: 0, up: 0 };
 interface Side { write(data: Uint8Array): number; end(): void }
-interface Link { client?: Side; upstream?: Side; down: Uint8Array[]; up: Uint8Array[]; closed: boolean }
+interface Link { client?: Side; upstream?: Side; down: Uint8Array[]; up: Uint8Array[]; closed: boolean;
+  /** Earliest release time of the next chunk in each direction: latency delays are queued, never reordered. */
+  nextAt: Record<Dir, number> }
 
 /**
  * A TCP proxy in front of the fork. Bytes are counted as they are written to each side. At rate 0 bytes pass straight through.
@@ -78,6 +84,23 @@ function startProxy(targetPort: number, initialRate: number) {
   const allowance: Record<Dir, number> = { down: 0, up: 0 };
   let rate = initialRate;
   let turn = 0;
+  /**
+   * Queues one chunk with the simulated latency. The delay models one-way propagation: it is paid when a direction goes from idle
+   * to busy, and the chunks that follow the first one in the same burst leave in order behind it. Charging every chunk would make a
+   * large answer cost hundreds of round trips, which no link does, and would overstate the very cost being measured.
+   */
+  const deliver = (link: Link, dir: Dir, bytes: Uint8Array) => {
+    const queue = dir === 'down' ? link.down : link.up;
+    if (LATENCY_MS <= 0) { queue.push(bytes); if (rate <= 0) send(dir, true); return; }
+    const now = Date.now();
+    // A burst starts when nothing is queued and the previous burst has already been released.
+    const idle = queue.length === 0 && now >= link.nextAt[dir];
+    if (idle) link.nextAt[dir] = now + LATENCY_MS;
+    const at = link.nextAt[dir];
+    if (idle) setTimeout(() => { if (rate <= 0) send(dir, true); }, Math.max(0, at - now));
+    queue.push(bytes);
+    if (rate <= 0 && !idle) send(dir, true);
+  };
   const closeLink = (link: Link) => {
     if (link.closed) return;
     link.closed = true;
@@ -133,7 +156,7 @@ function startProxy(targetPort: number, initialRate: number) {
     hostname: '127.0.0.1', port: 0,
     socket: {
       open(client) {
-        const link: Link = { client, down: [], up: [], closed: false };
+        const link: Link = { client, down: [], up: [], closed: false, nextAt: { down: 0, up: 0 } };
         client.data = link;
         links.add(link);
         connections.opened++;
@@ -143,7 +166,7 @@ function startProxy(targetPort: number, initialRate: number) {
           hostname: '127.0.0.1', port: targetPort,
           socket: {
             open(upstream) { link.upstream = upstream; if (rate <= 0) send('up', true); },
-            data(_upstream, chunk) { link.down.push(new Uint8Array(chunk)); if (rate <= 0) send('down', true); },
+            data(_upstream, chunk) { deliver(link, 'down', new Uint8Array(chunk)); },
             // A partial write stopped a direction; the socket is writable again, so carry the queue on without waiting for a tick.
             drain() { send('up', rate <= 0); },
             close() { closeLink(link); },
@@ -151,11 +174,7 @@ function startProxy(targetPort: number, initialRate: number) {
           },
         }).catch(() => closeLink(link));
       },
-      data(client, chunk) {
-        const link = client.data;
-        link.up.push(new Uint8Array(chunk));
-        if (rate <= 0) send('up', true);
-      },
+      data(client, chunk) { deliver(client.data, 'up', new Uint8Array(chunk)); },
       drain(client) { send('down', rate <= 0); },
       close(client) { closeLink(client.data); },
       error(client) { closeLink(client.data); },
@@ -220,7 +239,7 @@ async function main() {
   const database = new CompanyDatabase({ url: `ws://127.0.0.1:${DIRECT ? fork.port : proxy.port}/rpc`, rootUser: 'root', rootPassword: password, namespace: NS, database: 'control_plane' });
   const result: Record<string, unknown> = {
     label, runtime: `bun ${Bun.version}`, commit: process.env.SCK_MEASURE_COMMIT ?? 'not recorded', tasks: TASKS, contextBytes: CONTEXT_BYTES,
-    samples: SAMPLES, attempts: ATTEMPTS, pageSize: 25, rates: RATES,
+    samples: SAMPLES, attempts: ATTEMPTS, pageSize: 25, rates: RATES, latencyMs: LATENCY_MS,
     batchKiB: BATCH_KIB > 0 ? BATCH_KIB : 'default', startedAt: new Date().toISOString(),
     route: DIRECT ? 'direct to the fork, no proxy' : 'through the counting proxy',
     loadHedgeMs: NO_HEDGE ? 'disabled (diagnosis only)' : DEFAULT_SNAPSHOT_LIMITS.loadHedgeMs,

@@ -742,13 +742,16 @@ test('reads add no task, audit or outbox state; the only new rows are stored lis
   await core.contextView(gm, { goalId, pageSize: 10 });
   await core.historyView(gm, expectedWorking[0]!, { pageSize: 5 });
   await core.adminSummary(gm, { goalId });
-  await core.worktreePage(gm, { pageSize: 5 });
+  const emptyWorktrees = await core.worktreePage(gm, { pageSize: 5 });
   const after = { task: await countRows('task'), audit: await countRows('audit'), outbox: await countRows('outbox') };
   expect(after).toEqual(before);
-  // Each paged first page stored exactly one listing. The per-identity cap may evict older listings of the same caller,
-  // so the check is on the new listings, not on the total.
+  // Each non-empty paged first page stored exactly one listing; the worktree registry is empty in this fixture, and an empty
+  // first page stores nothing at all (SYS01 AC02 production return). The per-identity cap may evict older listings of the same
+  // caller, so the check is on the new listings, not on the total.
+  expect(emptyWorktrees.worktrees).toEqual([]);
+  expect(emptyWorktrees.page).toMatchObject({ returned: 0, hasMore: false, total: 0 });
   const created = (await listingIds()).filter(listing => !listingsBefore.includes(listing));
-  expect(created.length).toBe(3);
+  expect(created.length).toBe(2);
   const keyRow = await database.db.select<{ key?: string }>(id('company_meta', 'cursor_key'));
   expect(keyRow?.key).toBeString();
 });

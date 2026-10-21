@@ -44,7 +44,10 @@ export interface SnapshotLimits {
   buildTimeoutMs: number;
   /** A reservation whose owner holds only listings still being written waits this long for one to commit. */
   reserveWaitMs: number;
-  /** UTF-8 bytes written per transaction while a listing is stored. A smaller batch holds the channel for less time per statement. */
+  /**
+   * UTF-8 bytes written per transaction while a listing is stored. A smaller batch holds the channel for less time per statement;
+   * a larger one needs fewer round trips. On a high-latency WSS link the round trips dominate, so the default is set for that path.
+   */
   batchBytes: number;
   /** Wall-clock time one listing build may take, from its first read to its commit. Past it the build is cancelled (see build). */
   buildDeadlineMs: number;
@@ -61,7 +64,7 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   maxTotalBytes: 64 * 1024 * 1024,
   buildTimeoutMs: 5 * 60 * 1000,
   reserveWaitMs: 5 * 1000,
-  batchBytes: 64 * 1024,
+  batchBytes: 256 * 1024,
   buildDeadlineMs: 10 * 1000,
   loadHedgeMs: 5 * 1000,
 };
@@ -71,6 +74,11 @@ export interface SnapshotLink {
   readonly db: Surreal;
   /** Drops the connection with whatever it is still waiting for. Closing it again is harmless. */
   close(): Promise<void>;
+  /**
+   * Returns the connection to its channel after a build that ended cleanly, so the next build can reuse it instead of paying a new
+   * handshake (SYS01 AC02, production return). A channel that keeps no warm connections omits it, and `close` is used instead.
+   */
+  release?(): Promise<void>;
 }
 
 /** Opens the connections builds run on: one for each read attempt, so an attempt that is abandoned takes no other build's connection with it. */
@@ -125,6 +133,31 @@ export interface SnapshotHeader {
 }
 
 export interface SnapshotRow { seq: number; body: string }
+
+/** The input of create(): a build whose rows are already in hand. */
+export interface SnapshotCreateInput {
+  owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; bodies: readonly string[];
+  guidance?: string; startedAt?: number; emptyWhenNoRows?: boolean;
+}
+
+/** One build's input. `emptyWhenNoRows` opts the caller into the `{ empty: true }` answer (see build). */
+export interface SnapshotBuildInput {
+  owner: string; kind: SnapshotKind; digest: string; role: string; guidance: string;
+  load: (db: Surreal) => Promise<{ takenAt: string; bodies: readonly string[] }>;
+  /** Epoch milliseconds the caller's call started at (default: now). The build deadline counts from it, so time the call spent before the build is not added on top. */
+  startedAt?: number;
+  /**
+   * When the read matches nothing, answer `{ empty: true }` without reserving, writing or committing: a zero-row listing is a
+   * property of the read, not something worth storing, and on the production link those steps cost more round trips than the
+   * answer itself (SYS01 AC02 production return).
+   */
+  emptyWhenNoRows?: boolean;
+  /**
+   * Hand the rows the build already read back to the caller. The first page is answered from them instead of reading the listing
+   * again: on a slow link that read-back is a full round trip carrying the page a second time (SYS01 AC02 production return).
+   */
+  returnRows?: boolean;
+}
 
 /** A listing that has room reserved and is being written. The room is held until commit, release or the build timeout. */
 export interface SnapshotReservation {
@@ -208,7 +241,8 @@ const serverMsOf = (stats: { duration?: { nanoseconds?: bigint } } | undefined):
 export class SnapshotStore {
   readonly limits: SnapshotLimits;
   private quotaReady?: Promise<void>;
-  private readonly channel: SnapshotChannel;
+  /** The channel builds (and the empty-page probe) run on. */
+  readonly channel: SnapshotChannel;
   private readonly releaseChannel: SnapshotChannel;
 
   constructor(private readonly db: Surreal, limits: Partial<SnapshotLimits> = {}, private readonly options: SnapshotStoreOptions = {}) {
@@ -221,12 +255,13 @@ export class SnapshotStore {
    * Stores `bodies` as a new listing for `owner`. A listing over the row or byte limit is refused whole
    * (response_too_large) rather than stored partly. A write that fails part-way releases what it reserved.
    */
-  async create(input: {
-    owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; bodies: readonly string[]; guidance?: string; startedAt?: number;
-  }, now = Date.now()): Promise<SnapshotHeader> {
+  async create(input: SnapshotCreateInput & { emptyWhenNoRows: true }, now?: number): Promise<SnapshotHeader | { empty: true }>;
+  async create(input: SnapshotCreateInput, now?: number): Promise<SnapshotHeader>;
+  async create(input: SnapshotCreateInput, now = Date.now()): Promise<SnapshotHeader | { empty: true }> {
     return this.build({
       owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, guidance: input.guidance ?? 'narrow the query',
       load: async () => ({ takenAt: input.takenAt, bodies: input.bodies }), startedAt: input.startedAt,
+      emptyWhenNoRows: input.emptyWhenNoRows,
     }, now);
   }
 
@@ -240,12 +275,11 @@ export class SnapshotStore {
    * loadHedgeMs is abandoned, its connection closed, and the read run once more on a new connection; only the read that answers
    * is used, so the listing is still one consistent read. A second stall is not retried.
    */
-  async build(input: {
-    owner: string; kind: SnapshotKind; digest: string; role: string; guidance: string;
-    load: (db: Surreal) => Promise<{ takenAt: string; bodies: readonly string[] }>;
-    /** Epoch milliseconds the caller's call started at (default: now). The build deadline counts from it, so time the call spent before the build is not added on top. */
-    startedAt?: number;
-  }, now = Date.now()): Promise<SnapshotHeader> {
+  async build(input: SnapshotBuildInput & { emptyWhenNoRows: true; returnRows: true }, now?: number): Promise<(SnapshotHeader & { bodies: readonly string[] }) | { empty: true }>;
+  async build(input: SnapshotBuildInput & { emptyWhenNoRows: true }, now?: number): Promise<SnapshotHeader | { empty: true }>;
+  async build(input: SnapshotBuildInput & { returnRows: true }, now?: number): Promise<SnapshotHeader & { bodies: readonly string[] }>;
+  async build(input: SnapshotBuildInput, now?: number): Promise<SnapshotHeader>;
+  async build(input: SnapshotBuildInput, now = Date.now()): Promise<SnapshotHeader | { empty: true } | (SnapshotHeader & { bodies: readonly string[] })> {
     const started = performance.now();
     const deadlineAt = (input.startedAt ?? Date.now()) + this.limits.buildDeadlineMs;
     const id = randomUUID();
@@ -259,6 +293,8 @@ export class SnapshotStore {
     // The step in flight: `done` turns true when it settles, whatever its outcome. Steps are numbered, so a step abandoned by
     // a hedge may still settle later without changing the state of the step that is in flight.
     const flight = { done: true, settled: Promise.resolve(), current: 0 };
+    /** The link the build read its rows on: a build that ends cleanly hands it back for reuse. */
+    let readLink: SnapshotLink | undefined;
     // The connections this build has open. A read attempt adds its connection once it is open. A connection is closed when its
     // attempt is abandoned, when a cancelled build's statement does not finish, or when the build ends.
     const links = new Set<SnapshotLink>();
@@ -290,7 +326,7 @@ export class SnapshotStore {
       // waiting for it: its connection is closed, and the read runs once more on a new one. Only the read that answers is
       // used, so the listing is still one consistent read.
       const loadStarted = performance.now();
-      const attempt = async (token: { now: boolean }): Promise<{ db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } }> => {
+      const attempt = async (token: { now: boolean }): Promise<{ link: SnapshotLink; db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } }> => {
         // A connection is registered as soon as it opens, even when the deadline has already passed, so that it is always closed.
         const link = await within(this.channel.open().then(opened => {
           if (token.now || state.ended) {
@@ -301,14 +337,15 @@ export class SnapshotStore {
           return opened;
         }));
         live();
-        return { db: link.db, loaded: await within(input.load(link.db)) };
+        return { link, db: link.db, loaded: await within(input.load(link.db)) };
       };
       let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
       const hedge = new Promise<'hedge'>(resolve => { hedgeTimer = setTimeout(() => resolve('hedge'), this.limits.loadHedgeMs); });
       const abandon = { now: false };
       const first = attempt(abandon);
       const answered = await Promise.race([first, hedge]).finally(() => clearTimeout(hedgeTimer));
-      let read: { db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } };
+      type Attempt = { link: SnapshotLink; db: Surreal; loaded: { takenAt: string; bodies: readonly string[] } };
+      let read: Attempt;
       if (answered === 'hedge') {
         first.catch(() => undefined);
         abandon.now = true;
@@ -316,13 +353,18 @@ export class SnapshotStore {
         void closeLinks();
         read = await attempt({ now: false });
       } else {
-        read = answered;
+        read = answered as Attempt;
       }
       const { db, loaded } = read;
+      readLink = read.link;
       stats.loadMs = performance.now() - loadStarted;
       stats.rows = loaded.bodies.length;
       stats.bytes = loaded.bodies.reduce((sum, body) => sum + utf8Bytes(body), 0);
       live();
+      if (input.emptyWhenNoRows && loaded.bodies.length === 0) {
+        stats.outcome = 'stored';
+        return { empty: true };
+      }
       // From here a reservation may exist even if its statement is cut short, so the release below always runs.
       state.reserved = true;
       const reserveStarted = performance.now();
@@ -332,17 +374,20 @@ export class SnapshotStore {
       }, now, account));
       stats.reserveMs = performance.now() - reserveStarted;
       const writeStarted = performance.now();
-      await within(this.writeRowsOn(db, reservation, loaded.bodies, account, signal));
+      await within(this.writeRowsOn(db, reservation, loaded.bodies, account, signal, true));
       stats.writeMs = performance.now() - writeStarted;
       live();
       const commitStarted = performance.now();
       await within(this.commitOn(db, reservation, account));
       stats.commitMs = performance.now() - commitStarted;
       stats.outcome = 'stored';
-      return {
+      // A clean build returns its socket to the channel; a channel that keeps no warm sockets closes it like any other.
+      if (readLink?.release) links.delete(readLink);
+      const header = {
         id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, rows: reservation.rows,
         bytes: reservation.bytes, takenAt: reservation.takenAt, expiresMs: reservation.expiresMs,
       };
+      return input.returnRows ? { ...header, bodies: loaded.bodies } : header;
     } catch (caught) {
       // From here a connection that opens late is closed at once: the caller has stopped waiting for it.
       state.ended = true;
@@ -369,6 +414,9 @@ export class SnapshotStore {
     } finally {
       state.ended = true;
       clearTimeout(timer);
+      if (stats.outcome === 'stored' && readLink?.release) {
+        void readLink.release().catch(() => undefined);
+      }
       void closeLinks();
       stats.batches = account.batches;
       stats.serverMs = account.serverMs;
@@ -505,12 +553,14 @@ export class SnapshotStore {
     const deadline = Math.min(Date.now() + limits.reserveWaitMs, account?.deadline ?? Number.POSITIVE_INFINITY);
     while (Date.now() < deadline) {
       await this.ensureQuotaOn(db);
-      // The quota is read before the owner's listings. Any change after this read moves the version, and the swap below then fails.
-      const quota = await db.select<QuotaRow>(QUOTA);
+      // The quota and the owner's listings are read in one round trip: a build on a high-latency link pays for each statement, and
+      // the two reads must describe the same state anyway. Any change after this read moves the version, and the swap below fails.
+      // `FROM ONLY` yields the record itself (or NONE), not a list; the owner query yields its rows.
+      const [quota, mineRows] = await db.query<[QuotaRow | undefined, Array<{ id: RecordId; state: string; byte_count: number; created_seq?: number }>]>(
+        'SELECT * FROM ONLY $quota; SELECT id, state, byte_count, created_seq FROM query_snapshot WHERE owner = $owner ORDER BY created_seq ASC;',
+        { quota: QUOTA, owner: input.owner });
       if (!quota) throw unavailable('listing capacity is unavailable; retry shortly');
-      const [mine] = await db.query<[Array<{ id: RecordId; state: string; byte_count: number; created_seq?: number }>]>(
-        'SELECT id, state, byte_count, created_seq FROM query_snapshot WHERE owner = $owner ORDER BY created_seq ASC;', { owner: input.owner });
-      const held = mine ?? [];
+      const held = mineRows ?? [];
       // Only committed listings are evicted, oldest first. A listing still being written belongs to a request that is
       // waiting for it, so it keeps its room; when every listing the owner holds is still being written, this
       // reservation waits for one of them to commit.
@@ -555,9 +605,10 @@ export class SnapshotStore {
   }
 
   private async writeRowsOn(db: Surreal, reservation: SnapshotReservation, bodies: readonly string[], account: BuildAccount,
-    signal?: BuildSignal): Promise<void> {
+    signal?: BuildSignal, fresh = false): Promise<void> {
     const record = new RecordId('query_snapshot', reservation.id);
-    const written = await db.select<{ written_rows?: number; written_bytes?: number }>(record);
+    // A fresh build wrote nothing yet, so the read that would only confirm zeros is skipped: one fewer round trip on the hot path.
+    const written = fresh ? undefined : await db.select<{ written_rows?: number; written_bytes?: number }>(record);
     let doneRows = written?.written_rows ?? 0;
     let doneBytes = written?.written_bytes ?? 0;
     let batch: Array<{ snapshot: string; seq: number; body: string }> = [];
