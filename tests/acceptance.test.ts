@@ -141,13 +141,13 @@ describe('SYS02 human sign-offs', () => {
 
 
 describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
-  const annotation = { title: 'acceptance-barrier', message: 'target-ready' };
+  const annotation = { context: 'acceptance-barrier', description: 'target-ready' };
   const annotationHash = createHash('sha256').update(JSON.stringify(annotation)).digest('hex');
   const record = {
     probe: 'acceptance', runId: '42', jobId: 'probe', readAt: '2026-10-21T00:00:30.000Z', inProgress: true,
     observationHash: annotationHash, target: 'o/r/Acceptance target/target', kind: 'running-channel', result: 'ok',
     probeVersion: 'acceptance-probe/2', producerRunId: '42', targetRunId: '99', targetJobId: '77',
-    targetWorkflow: 'Acceptance target', targetStatus: 'in_progress', annotationHash,
+    targetWorkflow: 'Acceptance target', targetStatus: 'in_progress', channel: 'commit-status', statusCreatedAt: '2026-10-21T00:00:20.000Z', annotationHash,
   };
   const runLog: string[][] = [];
   const run = async (args: string[]): Promise<string> => {
@@ -165,15 +165,15 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/77')) {
       return JSON.stringify({ run_id: 99, head_sha: 'head-1', started_at: '2026-10-21T00:00:10.000Z', completed_at: '2026-10-21T00:00:40.000Z', check_run_url: 'https://api.github.com/repos/o/r/check-runs/77' });
     }
-    if (args[0] === 'api' && String(args[1]).includes('/check-runs/77/annotations')) {
-      return JSON.stringify({ annotations: [annotation] });
+    if (args[0] === 'api' && String(args[1]).includes('/commits/head-1/statuses')) {
+      return JSON.stringify([{ context: 'acceptance-barrier', description: 'target-ready', state: 'pending', created_at: '2026-10-21T00:00:20.000Z' }]);
     }
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const readArtifact = async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(record) });
   const base = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', artifactId: '7', sha: 'head-1', verify: 'probe:running-channel' };
   const probe = { runId: '42', jobId: 'probe', readAt: record.readAt, inProgress: true, observationHash: annotationHash,
-    probeVersion: 'acceptance-probe/2', producerRunId: '42', targetRunId: '99', targetJobId: '77', kind: 'running-channel', annotationHash };
+    probeVersion: 'acceptance-probe/2', producerRunId: '42', targetRunId: '99', targetJobId: '77', kind: 'running-channel', channel: 'commit-status', statusCreatedAt: '2026-10-21T00:00:20.000Z', annotationHash };
 
   test('a probe is verified from its artifact and the target run/job window, not from the caller record', async () => {
     const adapter = createGithubActionsAdapter(run, readArtifact);

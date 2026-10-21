@@ -101,8 +101,8 @@ acceptance_probe_root() {
     [ -f "$candidate" ] && schema=$candidate && break
   done
   [ -n "$schema" ] || return 1
-  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+ACCEPTANCE_BASELINE_VERSION[[:space:]]*=' "$acceptance" 2>/dev/null || return 1
-  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+BASELINE_IDS[[:space:]]*=' "$acceptance" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+ACCEPTANCE_BASELINE_VERSION[^=]*=' "$acceptance" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+BASELINE_IDS[^=]*=' "$acceptance" 2>/dev/null || return 1
   grep -Eq '^[[:space:]]*(export[[:space:]]+)?function[[:space:]]+mergeAcceptanceCriteria[[:space:]]*\(' "$acceptance" 2>/dev/null || return 1
   grep -Eq '^[[:space:]]*(export[[:space:]]+)?function[[:space:]]+isTrustedCodeDeliverable[[:space:]]*\(' "$acceptance" 2>/dev/null || return 1
   grep -qF 'mergeAcceptanceCriteria(leg, criteria)' "$acceptance" 2>/dev/null || return 1

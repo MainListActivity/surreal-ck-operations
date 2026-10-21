@@ -106,7 +106,7 @@ export interface AcceptanceEvidenceInput {
     provider: 'github-actions';
     runUrl: string;
     artifactId?: string;
-    probe?: { runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string; probeVersion?: string; producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string; kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string };
+    probe?: { runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string; probeVersion?: string; producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string; kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string; channel?: string; statusCreatedAt?: string };
   };
   idempotencyKey: string;
 }

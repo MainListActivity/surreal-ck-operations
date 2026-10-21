@@ -375,6 +375,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
           targetWorkflow: z.string().min(1).max(200).optional(), targetStatus: z.string().min(1).max(40).optional(),
           kind: z.string().min(1).max(40).optional(), nodeVersion: z.string().min(1).max(40).optional(),
           bundleHash: z.string().regex(/^[0-9a-f]{64}$/).optional(), annotationHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+          channel: z.string().min(1).max(40).optional(), statusCreatedAt: z.string().min(1).max(40).optional(),
         }).optional(),
       }),
       idempotencyKey: z.string().min(1),

@@ -27,26 +27,23 @@ const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 for (let round = 0; round < 120; round++) {
-  const runs = gh(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`).workflow_runs ?? [];
-  const targetRun = runs.find((run: any) => run.name === workflowName && String(run.id) !== producerRunId);
+  const runs = gh(`repos/${repo}/actions/runs?per_page=100`).workflow_runs ?? [];
+  const targetRun = runs.find((run: any) => run.name === workflowName && run.head_sha === sha && String(run.id) !== producerRunId);
   if (targetRun) {
     const jobs = gh(`repos/${repo}/actions/runs/${targetRun.id}/jobs`).jobs ?? [];
     const targetJob = jobs.find((job: any) => job.name === jobName);
     if (targetJob && targetJob.status === 'in_progress') {
-      const checkRun = /\/check-runs\/(\d+)/.exec(targetJob.check_run_url ?? '')?.[1] ?? String(targetJob.id);
-      let annotations: Array<{ title?: string; message?: string }> = [];
-      try {
-        annotations = gh(`repos/${repo}/check-runs/${checkRun}/annotations`).annotations ?? [];
-      } catch { annotations = []; }
-      const marker = annotations.find(item => /acceptance-barrier/.test(item.title ?? '') || /target-ready/.test(item.message ?? ''));
+      const statuses = gh(`repos/${repo}/commits/${sha}/statuses`);
+      const marker = (Array.isArray(statuses) ? statuses : []).find((item: any) => item.context === 'acceptance-barrier' && item.description === 'target-ready');
       if (marker) {
         const readAt = new Date().toISOString();
-        const annotationHash = hash(JSON.stringify({ title: marker.title ?? '', message: marker.message ?? '' }));
+        const annotationHash = hash(JSON.stringify({ context: marker.context ?? '', description: marker.description ?? '' }));
         const record = {
           probe: 'acceptance', runId: producerRunId, jobId: process.env.GITHUB_JOB, readAt, inProgress: true,
           observationHash: annotationHash, probeVersion: 'acceptance-probe/2', producerRunId,
           targetRunId: String(targetRun.id), targetJobId: String(targetJob.id), targetWorkflow: workflowName,
-          targetStatus: 'in_progress', kind: 'running-channel', annotationHash,
+          targetStatus: 'in_progress', kind: 'running-channel', channel: 'commit-status',
+          statusCreatedAt: marker.created_at, annotationHash,
           target: `${repo}/${workflowName}/${jobName}`, result: 'ok',
         };
         if (out) writeFileSync(out, `${JSON.stringify(record, null, 2)}\n`);

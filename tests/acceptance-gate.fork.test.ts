@@ -173,6 +173,8 @@ fork('SYS02 C1: custom optional or human-only criteria cannot remove the server 
   const [humanOnly] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'C1 仅人工', spec: '仅人工 AC 的集合仍必须补上必需机器 AC。',
     acceptanceCriteria: [human({ id: 'AC-H' })], idempotencyKey: key() });
   expect(humanOnly.acceptanceCriteria?.map(c => c.id)).toContain('AC-BASE-IMPL-1');
+  const [emptyCriteria] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'C1 空 criteria', spec: '无自定义 criteria 的新代码交付必须得到服务端基线，不能是空集。', idempotencyKey: key() });
+  expect(emptyCriteria.acceptanceCriteria?.map(c => c.id)).toEqual(['AC-BASE-IMPL-1', 'AC-BASE-IMPL-2']);
   fake.setRun('12', 'optional-head');
   await recordEvidence(tokens['eng-a'], impl.id, 'AC-BASE-IMPL-1', 'optional-head', '12');
   await core.submit(tokens['eng-a'], proofOf(claim), { text: '补上可信 CI 证据后重新提交，等待独立复核签署人工基线。', idempotencyKey: key(), acceptance: { sha: 'optional-head' } });

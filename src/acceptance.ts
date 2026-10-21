@@ -381,7 +381,7 @@ export interface ProbeRecord {
   probeVersion?: string;
   /** The producer run and the target run/job it read while the target was in progress. */
   producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string;
-  kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string;
+  kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string; channel?: string; statusCreatedAt?: string;
 }
 export interface AcceptanceSourceInput {
   provider: 'github-actions';
@@ -531,17 +531,26 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
           if (!Number.isFinite(jobStart) || !(jobStart <= read && read <= jobEnd)) {
             return { ok: false, reason: 'the probe read time is outside the target job in-progress window' };
           }
-          const checkRun = /\/check-runs\/(\d+)/.exec(targetJob.check_run_url ?? '')?.[1] ?? record.targetJobId;
-          let annotations: { annotations?: Array<{ title?: string; message?: string }> };
+          // The check-run annotation API does not expose a running job's notice (the real run showed it only after
+          // completion), so the trusted in-progress channel is a commit status the target job creates at start.
+          if (record.channel !== 'commit-status') return { ok: false, reason: 'the running-channel probe did not read the commit-status channel' };
+          let statuses: Array<{ context?: string; description?: string; state?: string; created_at?: string }>;
           try {
-            annotations = JSON.parse(await run(['api', `repos/${owner}/${repo}/check-runs/${checkRun}/annotations`]));
+            statuses = JSON.parse(await run(['api', `repos/${owner}/${repo}/commits/${input.sha}/statuses`]));
           } catch (error) {
-            return { ok: false, reason: `the target annotations could not be read: ${(error as Error).message.slice(0, 160)}` };
+            return { ok: false, reason: `the target status channel could not be read: ${(error as Error).message.slice(0, 160)}` };
           }
-          const marker = (annotations.annotations ?? []).find(item => /acceptance-barrier/.test(item.title ?? '') || /target-ready/.test(item.message ?? ''));
-          if (!marker) return { ok: false, reason: 'the target annotation channel has no barrier marker' };
-          const annotationHash = createHash('sha256').update(JSON.stringify({ title: marker.title ?? '', message: marker.message ?? '' })).digest('hex');
-          if (annotationHash !== record.annotationHash) return { ok: false, reason: 'the target annotation hash does not match the record' };
+          const marker = (Array.isArray(statuses) ? statuses : []).find(item => item.context === 'acceptance-barrier' && item.description === 'target-ready');
+          if (!marker) return { ok: false, reason: 'the target commit-status channel has no barrier marker' };
+          const statusAt = Date.parse(marker.created_at ?? '');
+          if (!Number.isFinite(statusAt) || statusAt < jobStart || statusAt > read) {
+            return { ok: false, reason: 'the barrier status was not created inside the target in-progress window' };
+          }
+          const statusHash = createHash('sha256').update(JSON.stringify({ context: marker.context ?? '', description: marker.description ?? '' })).digest('hex');
+          if (statusHash !== record.annotationHash) return { ok: false, reason: 'the target status hash does not match the record' };
+          if (record.statusCreatedAt !== undefined && Date.parse(record.statusCreatedAt) !== statusAt) {
+            return { ok: false, reason: 'the record status time does not match the target status' };
+          }
         } else {
           return { ok: false, reason: 'the probe kind is unknown' };
         }

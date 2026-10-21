@@ -1905,7 +1905,7 @@ export class SurrealCompanyCore implements CompanyCore {
       // Gate on: pass only the caller's matching criteria; createTaskRecord merges the unremovable baseline for this leg.
       // Gate off: preserve the old default-criteria behaviour.
       const acceptanceCriteria = acceptanceGate.enabled
-        ? matching
+        ? (matching.length > 0 ? matching : undefined)
         : (matching.length > 0 ? matching : defaultAcceptanceCriteria(legName));
       const task = await this.createTaskRecord(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
