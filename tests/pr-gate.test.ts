@@ -26,14 +26,23 @@ test('only the PR that carries the task branch is judged; other linked PRs are c
   expect(judgePr(pr({ mergeable: 'CONFLICTING' }), undefined)).toBeUndefined();
 });
 
-const payload = (over: Record<string, unknown> = {}) => JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', statusCheckRollup: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
+const payload = (over: Record<string, unknown> = {}) => JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', headRefOid: 'head-1', statusCheckRollup: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
 
 test('the submit check reads linked PRs through gh and names the first problem', async () => {
   const seen: string[][] = [];
   const check = createSubmitCheck(async args => { seen.push(args); return args[2]!.endsWith('/9') ? payload({ statusCheckRollup: [{ context: 'ci/legacy', state: 'FAILURE' }] }) : payload(); });
-  expect(await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7 以及 https://github.com/o/r/pull/9' })).toContain('ci/legacy');
+  expect((await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7 以及 https://github.com/o/r/pull/9' }))?.reason).toContain('ci/legacy');
   expect(seen.map(a => a[2])).toEqual(['https://github.com/o/r/pull/7', 'https://github.com/o/r/pull/9']);
-  expect(await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7' })).toBeUndefined();
+  expect(await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7' })).toEqual({ head: 'head-1' });
+});
+
+test('the submit check returns the own PR head and ignores another branch head', async () => {
+  const own = createSubmitCheck(async () => payload());
+  expect(await own({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' })).toEqual({ head: 'head-1' });
+  const other = createSubmitCheck(async () => payload({ headRefName: 'task/other', headRefOid: 'other-head' }));
+  expect(await other({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' })).toBeUndefined();
+  const noHead = createSubmitCheck(async () => payload({ headRefOid: undefined }));
+  expect(await noHead({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' })).toBeUndefined();
 });
 
 test('no branch, no link, or any gh trouble lets the submission through', async () => {

@@ -22,7 +22,7 @@ beforeAll(async () => {
   for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch {} await Bun.sleep(25); }
   db = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword: 'fixture-only', namespace: 'pr_gate_fixture', database: 'control_plane' });
   await db.connect(); await db.bootstrap();
-  core = new SurrealCompanyCore(db, { submitCheck: async input => { asked.push(input); return input.text.includes('CONFLICT') ? 'PR 与主干有冲突：先解决冲突再提交。' : undefined; } });
+  core = new SurrealCompanyCore(db, { submitCheck: async input => { asked.push(input); return input.text.includes('CONFLICT') ? { reason: 'PR 与主干有冲突：先解决冲突再提交。' } : undefined; } });
   const admin = new LocalEnrollmentAdmin(db);
   gm = await admin.enroll('gate-gm', 'gm', ['execute', 'review', 'manage']);
   eng = await admin.enroll('gate-eng', 'engineering', ['execute', 'review']);

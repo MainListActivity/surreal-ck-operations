@@ -3,6 +3,9 @@
 // the same facts the same way. Self-written text or an arbitrary URL never becomes a machine pass fact: only the source
 // adapter can set verified=true.
 import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type {
   AcceptanceCriterion, AcceptanceCriterionKind, AcceptanceEvidenceRecord, AcceptanceEvidenceType, AcceptanceGateView,
@@ -326,12 +329,33 @@ export interface AcceptanceSourceAdapter { verify(input: AcceptanceSourceInput):
 
 const RUN_URL = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/actions\/runs\/(\d+)\/?$/;
 
+/** One artifact's record as downloaded from a run; tests inject a deterministic reader. */
+export interface ArtifactRecord { name: string; content: string }
+export type ArtifactReader = (input: { owner: string; repo: string; runId: string; artifactId: string; name: string }) => Promise<ArtifactRecord>;
+
+/** Read-only artifact download through gh; the file is read from a private temporary directory and removed. */
+const ghArtifactReader = (run: GhRunner): ArtifactReader => async ({ owner, repo, runId, name }) => {
+  const dir = mkdtempSync(join(tmpdir(), 'sck-acceptance-artifact-'));
+  try {
+    await run(['run', 'download', runId, '--repo', `${owner}/${repo}`, '--name', name, '--dir', dir]);
+    const files = readdirSync(dir, { recursive: true }) as string[];
+    const file = files.find(entry => entry.endsWith('acceptance-probe.json')) ?? files.find(entry => entry.endsWith('.json'));
+    if (!file) throw new Error('the artifact has no acceptance probe JSON record');
+    return { name: file, content: readFileSync(join(dir, file), 'utf8') };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+interface ProbeArtifactRecord extends ProbeRecord { probe?: string; target?: string; kind?: string; result?: string }
+
 /**
  * Read-only GitHub Actions adapter (SYS02 AC02/AC04). It reads the run through gh and requires the run's head to equal the
- * submitted sha, the conclusion to be success, and, for a time-conditional probe, an in-progress read inside the run window.
- * An expired artifact or one from another head is refused. The adapter never reads product credentials.
+ * submitted sha and the conclusion to be success. A probe is the artifact's record, not a caller claim: the artifact must
+ * come from the same run and head, and its JSON record must match the caller's attested fields. An artifact-only criterion
+ * still requires an unexpired artifact of the same head. The adapter never reads product credentials.
  */
-export function createGithubActionsAdapter(run: GhRunner = ghCli): AcceptanceSourceAdapter {
+export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: ArtifactReader = ghArtifactReader(run)): AcceptanceSourceAdapter {
   return {
     async verify(input) {
       const match = RUN_URL.exec(input.runUrl);
@@ -347,19 +371,51 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli): AcceptanceSou
       if (info.headSha !== input.sha) return { ok: false, reason: `the CI run head ${info.headSha ?? '?'} is not the submitted sha ${input.sha}` };
       if (info.conclusion !== 'success') return { ok: false, reason: `the CI run is not successful (conclusion ${info.conclusion ?? 'unknown'})` };
       let at = info.updatedAt ?? new Date().toISOString();
+      let verifiedProbe: Record<string, unknown> | undefined;
       if (input.probe) {
-        if (input.probe.runId !== runId) return { ok: false, reason: 'the probe record belongs to another run' };
-        if (input.probe.inProgress !== true) return { ok: false, reason: 'the probe did not record an in-progress read' };
-        if (!/^[0-9a-f]{64}$/.test(input.probe.observationHash)) return { ok: false, reason: 'the probe observation hash is not a sha256' };
+        // A probe record must be the CI artifact's content: the artifact has to belong to this run and head, and the
+        // caller's attested fields must match what the artifact actually holds. A window-shaped caller record alone is refused.
+        if (input.artifactId === undefined) return { ok: false, reason: 'a probe requires the CI artifact that carries its record' };
+        let artifact: { name?: string; expired?: boolean; workflow_run?: { id?: number | string; head_sha?: string } };
+        try {
+          artifact = JSON.parse(await run(['api', `repos/${owner}/${repo}/actions/artifacts/${input.artifactId}`]));
+        } catch (error) {
+          return { ok: false, reason: `the probe artifact could not be read: ${(error as Error).message.slice(0, 160)}` };
+        }
+        if (artifact.expired === true) return { ok: false, reason: 'the probe artifact has expired' };
+        if (String(artifact.workflow_run?.id ?? '') !== runId) return { ok: false, reason: 'the probe artifact belongs to another run' };
+        if (artifact.workflow_run?.head_sha !== input.sha) return { ok: false, reason: 'the probe artifact belongs to another head' };
+        let pulled: ArtifactRecord;
+        try {
+          pulled = await readArtifact({ owner, repo, runId, artifactId: input.artifactId, name: artifact.name ?? 'acceptance-probe' });
+        } catch (error) {
+          return { ok: false, reason: `the probe record could not be read from its artifact: ${(error as Error).message.slice(0, 160)}` };
+        }
+        let record: ProbeArtifactRecord;
+        try {
+          record = JSON.parse(pulled.content) as ProbeArtifactRecord;
+        } catch {
+          return { ok: false, reason: 'the probe artifact does not hold a JSON record' };
+        }
+        if (record.probe !== 'acceptance' || String(record.runId) !== runId || record.inProgress !== true || record.result !== 'ok') {
+          return { ok: false, reason: 'the probe artifact record is not an in-progress acceptance probe from this run' };
+        }
+        if (typeof record.observationHash !== 'string' || !/^[0-9a-f]{64}$/.test(record.observationHash)) {
+          return { ok: false, reason: 'the probe artifact observation hash is not a sha256' };
+        }
         const started = Date.parse(info.createdAt ?? '');
-        const read = Date.parse(input.probe.readAt);
+        const read = Date.parse(record.readAt);
         const ended = Date.parse(info.updatedAt ?? '');
         if (!Number.isFinite(started) || !Number.isFinite(read) || !Number.isFinite(ended) || read < started || read > ended) {
-          return { ok: false, reason: 'the probe read time is outside the CI run window' };
+          return { ok: false, reason: 'the probe artifact read time is outside the CI run window' };
         }
-        at = input.probe.readAt;
-      }
-      if (input.artifactId) {
+        if (input.probe.runId !== String(record.runId) || input.probe.inProgress !== record.inProgress ||
+            input.probe.observationHash !== record.observationHash || Date.parse(input.probe.readAt) !== read) {
+          return { ok: false, reason: 'the probe record does not match the CI artifact record' };
+        }
+        at = record.readAt;
+        verifiedProbe = record as unknown as Record<string, unknown>;
+      } else if (input.artifactId) {
         let artifact: { expired?: boolean; workflow_run?: { head_sha?: string } };
         try {
           artifact = JSON.parse(await run(['api', `repos/${owner}/${repo}/actions/artifacts/${input.artifactId}`]));
@@ -373,7 +429,7 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli): AcceptanceSou
         ok: true, sha: input.sha, at,
         source: {
           provider: 'github-actions', runUrl: input.runUrl, runId, workflowName: info.workflowName ?? null,
-          conclusion: info.conclusion, ...(input.probe ? { probe: input.probe } : {}),
+          conclusion: info.conclusion, ...(verifiedProbe ? { probe: verifiedProbe } : {}),
           ...(input.artifactId ? { artifactId: input.artifactId } : {}),
         },
       };

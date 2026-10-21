@@ -26,9 +26,11 @@ const enrollment = new LocalEnrollmentAdmin(database);
 const tokens: Record<string, string> = {};
 const key = () => crypto.randomUUID();
 
+type FakeArtifactRecord = { probe?: string; runId?: string | number; jobId?: string; readAt?: string; inProgress?: boolean; observationHash?: string; result?: string; target?: string; kind?: string };
+
 class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
   runs = new Map<string, { headSha: string; conclusion: string; createdAt: string; updatedAt: string; workflowName?: string }>();
-  artifacts = new Map<string, { expired: boolean; head: string }>();
+  artifacts = new Map<string, { expired: boolean; head: string; runId?: string; record?: FakeArtifactRecord }>();
   setRun(id: string, headSha: string, over: Partial<{ conclusion: string; createdAt: string; updatedAt: string }> = {}) {
     this.runs.set(id, {
       headSha, conclusion: 'success',
@@ -42,15 +44,32 @@ class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
     if (run.headSha !== input.sha) return { ok: false, reason: 'head mismatch' };
     if (run.conclusion !== 'success') return { ok: false, reason: 'run not successful' };
     let at = run.updatedAt;
+    let verifiedProbe: Record<string, unknown> | undefined;
     if (input.probe) {
-      if (input.probe.runId !== runId) return { ok: false, reason: 'probe run mismatch' };
-      if (input.probe.inProgress !== true) return { ok: false, reason: 'probe not in progress' };
-      if (!/^[0-9a-f]{64}$/.test(input.probe.observationHash)) return { ok: false, reason: 'probe hash invalid' };
-      const read = Date.parse(input.probe.readAt);
-      if (!(Date.parse(run.createdAt) <= read && read <= Date.parse(run.updatedAt))) return { ok: false, reason: 'probe outside the run window' };
-      at = input.probe.readAt;
-    }
-    if (input.artifactId) {
+      // A probe is verified from its CI artifact record, not from the caller's window-shaped claim.
+      if (!input.artifactId) return { ok: false, reason: 'probe artifact missing' };
+      const artifact = this.artifacts.get(input.artifactId);
+      if (!artifact) return { ok: false, reason: 'artifact not found' };
+      if (artifact.expired) return { ok: false, reason: 'artifact expired' };
+      if (artifact.head !== input.sha) return { ok: false, reason: 'artifact head mismatch' };
+      if (artifact.runId !== undefined && artifact.runId !== runId) return { ok: false, reason: 'artifact run mismatch' };
+      const record = artifact.record;
+      if (!record) return { ok: false, reason: 'artifact record missing' };
+      if (record.probe !== 'acceptance' || String(record.runId) !== runId || record.inProgress !== true || record.result !== 'ok') {
+        return { ok: false, reason: 'artifact record not from this run' };
+      }
+      if (typeof record.observationHash !== 'string' || !/^[0-9a-f]{64}$/.test(record.observationHash)) {
+        return { ok: false, reason: 'artifact record hash invalid' };
+      }
+      const read = Date.parse(String(record.readAt));
+      if (!(Date.parse(run.createdAt) <= read && read <= Date.parse(run.updatedAt))) return { ok: false, reason: 'artifact record outside the run window' };
+      if (input.probe.runId !== String(record.runId) || input.probe.inProgress !== record.inProgress ||
+          input.probe.observationHash !== record.observationHash || Date.parse(input.probe.readAt) !== read) {
+        return { ok: false, reason: 'probe record does not match the artifact' };
+      }
+      at = String(record.readAt);
+      verifiedProbe = record;
+    } else if (input.artifactId) {
       const artifact = this.artifacts.get(input.artifactId);
       if (!artifact) return { ok: false, reason: 'artifact not found' };
       if (artifact.expired) return { ok: false, reason: 'artifact expired' };
@@ -59,7 +78,7 @@ class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
     return {
       ok: true, sha: input.sha, at,
       source: { provider: 'github-actions', runUrl: input.runUrl, runId,
-        ...(input.probe ? { probe: input.probe } : {}), ...(input.artifactId ? { artifactId: input.artifactId } : {}) },
+        ...(verifiedProbe ? { probe: verifiedProbe } : {}), ...(input.artifactId ? { artifactId: input.artifactId } : {}) },
     };
   }
 }
@@ -243,26 +262,44 @@ fork('SYS02 AC04: a real in-progress probe satisfies a runtime AC; a post-job or
     fake.setRun('5', 'probe-head');
     const record = await runProbe({ kind: 'url', target: `http://127.0.0.1:${server.port}/` }, { GITHUB_RUN_ID: '5', GITHUB_JOB: 'probe' });
     expect(record).toMatchObject({ runId: '5', inProgress: true });
+    fake.artifacts.set('probe-artifact', { expired: false, head: 'probe-head', runId: '5', record });
     const evidence = await core.recordAcceptanceEvidence(tokens['eng-a'], {
       taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
-      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', probe: record }, idempotencyKey: key(),
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', artifactId: 'probe-artifact', probe: record }, idempotencyKey: key(),
     });
     expect(evidence).toMatchObject({ verified: true, evidenceType: 'probe' });
+    // A caller cannot forge a window-shaped record without the CI artifact that carries it.
+    const forged = { ...record, observationHash: 'd'.repeat(64) };
+    await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
+      taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', probe: forged }, idempotencyKey: key(),
+    })).rejects.toMatchObject({ code: 'invalid' });
+    // The artifact record must agree with the caller record.
+    fake.artifacts.set('probe-mismatch', { expired: false, head: 'probe-head', runId: '5', record: { ...record, observationHash: 'e'.repeat(64) } });
+    await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
+      taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', artifactId: 'probe-mismatch', probe: record }, idempotencyKey: key(),
+    })).rejects.toMatchObject({ code: 'invalid' });
+    // The artifact must belong to the same run.
+    fake.artifacts.set('probe-other-run', { expired: false, head: 'probe-head', runId: '6', record });
+    await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
+      taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', artifactId: 'probe-other-run', probe: record }, idempotencyKey: key(),
+    })).rejects.toMatchObject({ code: 'invalid' });
     const late = { ...record, readAt: new Date(Date.now() + 120_000).toISOString() };
     await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
       taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
-      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', probe: late }, idempotencyKey: key(),
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', artifactId: 'probe-artifact', probe: late }, idempotencyKey: key(),
     })).rejects.toMatchObject({ code: 'invalid' });
     const mock = { ...record, runId: '999' };
     await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
       taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
-      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/999', probe: mock }, idempotencyKey: key(),
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/999', artifactId: 'probe-artifact', probe: mock }, idempotencyKey: key(),
     })).rejects.toMatchObject({ code: 'invalid' });
-    // A tampered observation hash is not a sha256 and is refused before the evidence row is written.
     const tampered = { ...record, observationHash: 'not-a-sha256' };
     await expect(core.recordAcceptanceEvidence(tokens['eng-a'], {
       taskId: impl.id, acId: 'AC-1', sha: 'probe-head',
-      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', probe: tampered }, idempotencyKey: key(),
+      source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/5', artifactId: 'probe-artifact', probe: tampered }, idempotencyKey: key(),
     })).rejects.toMatchObject({ code: 'invalid' });
     expect((await core.submit(tokens['eng-a'], proofOf(claim), { text: '运行中通道探针已由真实 CI 作业取回并绑定提交 head，提交独立复核。', idempotencyKey: key(), acceptance: { sha: 'probe-head' } })).state).toBe('review');
   } finally { server.stop(true); }
@@ -287,6 +324,23 @@ fork('SYS02 AC05: an expired artifact is refused; a live artifact of the same he
     source: { provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/7', artifactId: 'a1' }, idempotencyKey: key(),
   })).verified).toBe(true);
   expect((await core.submit(tokens['eng-a'], proofOf(claim), { text: 'artifact 证据已核验，提交独立复核。', idempotencyKey: key(), acceptance: { sha: 'artifact-head' } })).state).toBe('review');
+});
+
+fork('SYS02 AC02/AC03: the PR gate head is authoritative; an old declared head with old evidence is refused', async () => {
+  await ensureGate();
+  const gated = new SurrealCompanyCore(database, { acceptance: { adapter: fake }, submitCheck: async () => ({ head: 'pr-head' }) });
+  const goal = await goalFor();
+  const [impl] = await gated.createDelivery(tokens.gm, { goalId: goal.id, title: 'B2 head 链', spec: '提交的 acceptance head 必须等于 PR 门禁核验的实际 head。',
+    acceptanceCriteria: [machine()], idempotencyKey: key() });
+  const claim = await gated.claim(tokens['eng-a'], impl.id);
+  fake.setRun('8', 'old-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-1', 'old-head', '8');
+  await expect(gated.submit(tokens['eng-a'], proofOf(claim), { text: '旧 head 与旧证据必须被拒绝，不能复用旧 CI。', idempotencyKey: key(), acceptance: { sha: 'old-head' } }))
+    .rejects.toMatchObject({ code: 'conflict' });
+  fake.setRun('9', 'pr-head');
+  await recordEvidence(tokens['eng-a'], impl.id, 'AC-1', 'pr-head', '9');
+  const submitted = await gated.submit(tokens['eng-a'], proofOf(claim), { text: 'PR 门禁 head 与证据一致，提交独立复核。', idempotencyKey: key(), acceptance: { sha: 'pr-head' } });
+  expect(submitted).toMatchObject({ state: 'review', acceptanceHead: 'pr-head' });
 });
 
 fork('RB01: the new state is additive; an old reader sees the old states, and the rollback boundary is explicit', async () => {

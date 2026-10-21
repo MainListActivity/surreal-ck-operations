@@ -1,7 +1,7 @@
 // SYS02 unit tests for the pure acceptance model: validation, defaults and the unified evaluator. No database.
 import { describe, expect, test } from 'bun:test';
 import {
-  acceptanceError, criteriaForLeg, defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs,
+  acceptanceError, createGithubActionsAdapter, criteriaForLeg, defaultAcceptanceCriteria, evaluateAcceptance, humanSignoffs,
   validateAcceptanceCriteria, type AcceptanceActor, type AcceptanceSubject,
 } from '../src/acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceRecord, AcceptanceGateView } from '../src/contracts.ts';
@@ -118,5 +118,49 @@ describe('SYS02 human sign-offs', () => {
     expect(humanSignoffs(verdict, 't1', 'rev', 2)[0]!.digest).not.toBe(first[0]!.digest);
     expect(humanSignoffs(verdict, 't1', 'other', 1)[0]!.digest).not.toBe(first[0]!.digest);
     expect(humanSignoffs(verdict, 't2', 'rev', 1)[0]!.digest).not.toBe(first[0]!.digest);
+  });
+});
+
+
+describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
+  const record = {
+    probe: 'acceptance', runId: '42', jobId: 'probe', readAt: '2026-10-21T00:00:30.000Z', inProgress: true,
+    observationHash: 'a'.repeat(64), target: 'http://probe', kind: 'url', result: 'ok',
+  };
+  const runLog: string[][] = [];
+  const run = async (args: string[]): Promise<string> => {
+    runLog.push(args);
+    if (args[0] === 'run' && args[1] === 'view') {
+      return JSON.stringify({ headSha: 'head-1', status: 'completed', conclusion: 'success', workflowName: 'probe',
+        createdAt: '2026-10-21T00:00:00.000Z', updatedAt: '2026-10-21T00:01:00.000Z' });
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/actions/artifacts/7')) {
+      return JSON.stringify({ id: 7, name: 'acceptance-probe', expired: false, workflow_run: { id: 42, head_sha: 'head-1' } });
+    }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const readArtifact = async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(record) });
+  const base = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', artifactId: '7', sha: 'head-1' };
+  const probe = { runId: '42', jobId: 'probe', readAt: record.readAt, inProgress: true, observationHash: record.observationHash };
+
+  test('a probe is verified from its CI artifact, not from the caller record', async () => {
+    const adapter = createGithubActionsAdapter(run, readArtifact);
+    expect(await adapter.verify({ ...base, probe })).toMatchObject({ ok: true });
+    // No artifact: a window-shaped caller record alone is refused.
+    expect((await adapter.verify({ ...base, artifactId: undefined, probe })).ok).toBe(false);
+    // The caller's attested hash is not the artifact's record.
+    expect((await adapter.verify({ ...base, probe: { ...probe, observationHash: 'b'.repeat(64) } })).ok).toBe(false);
+    // The artifact cannot be read or is of another run.
+    expect((await adapter.verify({ ...base, artifactId: '8', probe })).ok).toBe(false);
+    // The artifact record read outside the run window.
+    const late = { ...record, readAt: '2026-10-21T00:02:00.000Z' };
+    const lateAdapter = createGithubActionsAdapter(run, async () => ({ name: 'late.json', content: JSON.stringify(late) }));
+    expect((await lateAdapter.verify({ ...base, probe: { ...probe, readAt: late.readAt } })).ok).toBe(false);
+    // The artifact belongs to another run.
+    const otherRun = async (args: string[]) => args[0] === 'api'
+      ? JSON.stringify({ id: 8, name: 'acceptance-probe', expired: false, workflow_run: { id: 43, head_sha: 'head-1' } })
+      : run(args);
+    expect((await createGithubActionsAdapter(otherRun, readArtifact).verify({ ...base, probe })).ok).toBe(false);
+    expect(runLog.some(args => args[0] === 'run' && args[1] === 'view')).toBe(true);
   });
 });

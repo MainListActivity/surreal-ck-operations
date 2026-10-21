@@ -5,11 +5,15 @@ export interface PrInfo {
   state: string;
   mergeable?: string;
   headRefName: string;
+  /** The PR's actual head commit, when gh reported it; the acceptance gate binds to this. */
+  headRefOid?: string;
   checks: Array<{ name: string; conclusion?: string; state?: string }>;
 }
 
 export type GhRunner = (args: string[]) => Promise<string>;
-export type SubmitCheck = (input: { branch?: string; text: string }) => Promise<string | undefined>;
+/** The PR gate's verdict: a refusal reason, and the actual head of the task branch's own PR (B2). */
+export interface SubmitVerdict { reason?: string; head?: string }
+export type SubmitCheck = (input: { branch?: string; text: string }) => Promise<SubmitVerdict | undefined>;
 
 const PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
 const FAILED = new Set(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'STARTUP_FAILURE']);
@@ -43,17 +47,20 @@ export const ghCli: GhRunner = args => new Promise((resolve, reject) => {
 export function createSubmitCheck(run: GhRunner = ghCli): SubmitCheck {
   return async ({ branch, text }) => {
     if (!branch) return undefined;
+    let own: SubmitVerdict | undefined;
     for (const url of extractPrUrls(text)) {
       let pr: PrInfo;
       try {
-        const raw = JSON.parse(await run(['pr', 'view', url, '--json', 'state,mergeable,headRefName,statusCheckRollup'])) as
-          { state: string; mergeable?: string; headRefName: string; statusCheckRollup?: Array<{ name?: string; context?: string; conclusion?: string; state?: string }> };
-        pr = { url, state: raw.state, mergeable: raw.mergeable, headRefName: raw.headRefName,
+        const raw = JSON.parse(await run(['pr', 'view', url, '--json', 'state,mergeable,headRefName,headRefOid,statusCheckRollup'])) as
+          { state: string; mergeable?: string; headRefName: string; headRefOid?: string; statusCheckRollup?: Array<{ name?: string; context?: string; conclusion?: string; state?: string }> };
+        pr = { url, state: raw.state, mergeable: raw.mergeable, headRefName: raw.headRefName, headRefOid: raw.headRefOid,
           checks: (raw.statusCheckRollup ?? []).map(c => ({ name: c.name ?? c.context ?? '?', conclusion: c.conclusion, state: c.state })) };
       } catch { continue; }
       const reason = judgePr(pr, branch);
-      if (reason) return reason;
+      if (reason) return { reason };
+      // Only the task branch's own PR names the head the acceptance gate is bound to; other linked PRs are context.
+      if (!own && pr.headRefName === branch && pr.headRefOid) own = { head: pr.headRefOid };
     }
-    return undefined;
+    return own;
   };
 }

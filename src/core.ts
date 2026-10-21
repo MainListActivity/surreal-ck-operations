@@ -208,7 +208,7 @@ interface TaskRow {
   jev_release_version?: number;
   jev_route_version?: number;
   owner_rerouted?: boolean;
-  /** SYS02 acceptance fields (schema 025); every one is optional, so rows written before SYS02 stay valid. */
+  /** SYS02 acceptance fields (schema 026); every one is optional, so rows written before SYS02 stay valid. */
   acceptance_criteria?: AcceptanceCriterion[];
   acceptance_version?: number;
   acceptance_legacy?: boolean;
@@ -1937,7 +1937,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const criterion = validateAcceptanceCriteria(row.acceptance_criteria).find(item => item.id === input.acId);
     if (!criterion) throw new CompanyError('not_found', `acceptance criterion ${input.acId} not found on this task`);
     if (criterion.kind !== 'machine') throw new CompanyError('invalid', `${input.acId} is a human criterion; it is signed at independent review`);
-    if (criterion.evidence === 'probe' && !input.source.probe) throw new CompanyError('invalid', `${input.acId} requires a probe record`);
+    if (criterion.evidence === 'probe' && (!input.source.probe || !input.source.artifactId)) throw new CompanyError('invalid', `${input.acId}: a probe requires the CI artifact that carries its record and the record itself`);
     if (criterion.evidence === 'artifact' && !input.source.artifactId) throw new CompanyError('invalid', `${input.acId} requires an artifactId`);
     const verified = await this.acceptanceAdapter.verify({
       provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
@@ -2076,11 +2076,14 @@ export class SurrealCompanyCore implements CompanyCore {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
     }
+    let prHead: string | undefined;
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
-        const reason = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
-        if (reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${reason}`);
+        const checked = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
+        if (checked?.reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+        // The PR gate's actual head is authoritative: a declared acceptance head cannot outlive a moved PR head (B2).
+        prHead = checked?.head;
       }
     }
     // SYS02 AC03: submit and independent accept call the same evaluator. submit binds the new head; accept signs the human
@@ -2091,7 +2094,11 @@ export class SurrealCompanyCore implements CompanyCore {
       if (!row) throw new CompanyError('not_found', 'Task not found');
       const gate = await loadAcceptanceGate(this.db);
       const evidenceRows = await loadAcceptanceEvidence(this.db, proof.taskId);
-      const head = action === 'submit' ? evidence?.acceptance?.sha : row.acceptance_head;
+      const declared = action === 'submit' ? evidence?.acceptance?.sha : undefined;
+      if (action === 'submit' && prHead !== undefined && declared !== prHead) {
+        throw new CompanyError('conflict', `the submitted acceptance head ${declared ?? 'is missing'} is not the PR head ${prHead}; update the acceptance evidence to the current head`);
+      }
+      const head = action === 'submit' ? (prHead ?? declared) : row.acceptance_head;
       const verdict = evaluateAcceptance({
         subject: acceptanceSubject(row, head), evidence: evidenceRows,
         phase: action === 'submit' ? 'submit' : 'accept',

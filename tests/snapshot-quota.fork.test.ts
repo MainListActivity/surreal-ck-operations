@@ -178,7 +178,7 @@ test('setup: bootstrap applies schema 022, creating the quota table and the inst
   const [info] = await db.db.query<[Record<string, unknown>]>('INFO FOR DB;');
   expect(Object.keys((info.tables ?? {}) as Record<string, string>)).toContain('query_snapshot_quota');
   const marker = await db.db.select<{ schema_version: number }>(new RecordId('company_meta', 'installation'));
-  expect(marker?.schema_version).toBe(24);
+  expect(marker?.schema_version).toBe(26);
   expect(await store.accounting()).toMatchObject({ listings: 0, bytes: 0, rows: 0, quota: { listings: 0, bytes: 0 } });
 });
 
