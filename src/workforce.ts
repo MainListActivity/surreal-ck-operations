@@ -191,6 +191,10 @@ export interface SupervisedTask {
   leaseExpiresAt?: number;
   progressAt?: number;
   blockedTo?: 'gm' | 'owner';
+  /** Blocked rows: phase restored when the dependency wait ends (review stays review; execute returns ready). */
+  resumeState?: TaskRow['state'];
+  /** Blocked rows: role recorded by the original block. */
+  resumeRole?: string;
   /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
   quotaResetsAt?: number;
   kind: string;
@@ -232,6 +236,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
     dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
+    resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,

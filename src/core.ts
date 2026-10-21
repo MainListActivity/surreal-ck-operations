@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -67,6 +67,11 @@ export function parseQuotaResetsAt(text: string, nowMs: number): number {
   return Math.floor(ms / 1000);
 }
 export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
+/** Query results may carry record ids as `task:⟨uuid⟩` (the fork's escaped rendering): strip the quoting so client-side uuids compare equal against server-side ids. */
+const normalizedId = (value: unknown): string => {
+  const raw = value instanceof RecordId ? String(value.id) : asId(value);
+  return raw.startsWith('⟨') && raw.endsWith('⟩') ? raw.slice(1, -1) : raw;
+};
 
 /**
  * A dependency counts as satisfied when it is 'done', or when it is 'void' and not an
@@ -115,10 +120,19 @@ export const UNLOCK_CHILDREN_SQL = `
     ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
     LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
     IF array::len($remaining) = 0 {
-      LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
-      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
+      LET $source_phase = $child.resume_state ?? 'ready';
+      LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
+      LET $unlocked = UPDATE ONLY $child.id SET
+        state = $restore_phase, version += 1, resume_state = NONE, resume_role = NONE,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE;
+      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked',
+        evidence: '依赖全部完成，按原阻塞阶段恢复', version: $unlocked.version, at: time::now(),
+        source_phase: $source_phase, restore_phase: $restore_phase,
+        dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value, payload: { state: 'ready' }, at: time::now() };
+      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
+        payload: { state: $restore_phase, source_phase: $source_phase, restore_phase: $restore_phase,
+          dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
     };
   };
 `;
@@ -232,6 +246,24 @@ interface ActiveLeaseRow {
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export type { TaskRow };
 
+/**
+ * Why a blocked row waits, in terms every view can show (RW06 C3 / RW05). The facts are the row's own: `blocked_to` names a
+ * manager or owner gate; a dependency wait carries the phase to restore and, for a review wait, the reviewer role. A review-phase
+ * wait never falls back to the execute role when `resume_role` is empty — it names the reviewer role, and a row with no phase
+ * fact is `unknown` rather than an implied execute wait.
+ */
+export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_state' | 'resume_role' | 'reviewer_role' | 'executor_role' | 'dependencies'>): TaskWaiting | undefined {
+  if (row.state !== 'blocked') return undefined;
+  const resumeState = row.resume_state ?? 'unknown';
+  const role: TaskWaiting['role'] = row.blocked_to === 'owner' ? 'owner'
+    : row.resume_role ? (row.resume_role as Role)
+      : resumeState === 'review' ? row.reviewer_role
+        : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
+          : 'unknown';
+  const kind: TaskWaiting['kind'] = row.blocked_to === 'gm' ? 'manager' : row.blocked_to === 'owner' ? 'owner' : 'dependency';
+  return { kind, resumeState, role, dependenciesCount: (row.dependencies ?? []).length };
+}
+
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
@@ -246,6 +278,9 @@ export function view(row: TaskRow): TaskView {
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
+    resumeState: row.state === 'blocked' ? row.resume_state : undefined,
+    resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
+    waiting: waitingOf(row),
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
@@ -2278,6 +2313,15 @@ export class SurrealCompanyCore implements CompanyCore {
     const digest = HASH(JSON.stringify({ taskId, evidence }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
+    const before = await this.db.select<TaskRow>(id('task', taskId));
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state === 'blocked') {
+      const target = before.resume_state ?? 'ready';
+      if (!['ready', 'doing', 'review'].includes(target)) {
+        throw new CompanyError('invalid', `Unknown resume phase: ${target}`);
+      }
+      if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
+    }
     try {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
@@ -2285,12 +2329,19 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
         LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
+        LET $source_phase = $t.resume_state ?? 'ready';
+        LET $restore_phase = IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END;
         LET $next = UPDATE ONLY $task SET
-          state = IF array::len($remaining) = 0 THEN (IF $t.resume_state = 'doing' THEN 'ready' ELSE $t.resume_state END) ELSE 'blocked' END,
-          resume_role = NONE, resume_state = NONE, blocked_to = NONE, version = $t.version + 1 RETURN AFTER;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now() };
+          state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
+          resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
+          resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
+          blocked_to = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+          version = $t.version + 1 RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
+          source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value, payload: { state: $next.state }, at: time::now() };
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
+          payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
         CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
@@ -2306,12 +2357,95 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * gm only: re-point an execute-phase gm block at the dependency graph. The task keeps
-   * state 'blocked' — it never re-enters the dispatcher's gm-attention loop or the work
-   * queues — but `blocked_to` clears, which is exactly what UNLOCK_SQL needs to flip it
-   * 'ready' the moment the last dependency finishes. Owner gates, review blocks, live
-   * leases and closed goals are refused, not guessed; with every dependency already done
-   * the task resumes immediately under the same safe execute semantics as resume.
+   * A review-phase wait is legal only when the row carries a real submitted review:
+   * the submitter matches the latest submit audit, the submit snapshot is not newer than
+   * the task, and the latest block is a review-phase block by the reviewer role. A
+   * non-owner reviewer is required; owner gates, cross-role rows and unreadable/missing
+   * history fail closed. Read-only.
+   */
+  private async requireProvableReviewWait(taskRef: RecordId, row: {
+    reviewer_role: ReviewerRole; submitted_by?: string; resume_role?: string; version: number;
+  }): Promise<void> {
+    if (row.reviewer_role === 'owner') throw new CompanyError('invalid', 'review wait does not apply to owner review gates');
+    if (!row.submitted_by) throw new CompanyError('invalid', 'review wait has no original submission');
+    if (row.resume_role && row.resume_role !== row.reviewer_role) {
+      throw new CompanyError('invalid', 'review wait role does not match the reviewer role');
+    }
+    const [subRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown }>]>(
+      "SELECT id, actor, version, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;", { task: taskRef });
+    const submission = subRows?.[0];
+    if (!submission || normalizedId(submission.actor) !== row.submitted_by) {
+      throw new CompanyError('invalid', 'review wait lacks a matching original submission');
+    }
+    if (submission.version === undefined || submission.version > row.version) {
+      throw new CompanyError('invalid', 'review submission snapshot is newer than the task');
+    }
+    const [blockRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown; phase?: string }>]>(
+      "SELECT id, actor, version, at, phase FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;", { task: taskRef });
+    const latestBlock = blockRows?.[0];
+    if (!latestBlock || latestBlock.phase !== 'review') {
+      throw new CompanyError('invalid', 'review block history is not provable');
+    }
+    const submittedAt = Date.parse(String(submission.at));
+    const blockedAt = Date.parse(String(latestBlock.at));
+    if (!Number.isFinite(submittedAt) || !Number.isFinite(blockedAt) || blockedAt <= submittedAt) {
+      throw new CompanyError('invalid', 'review block history predates the original submission');
+    }
+    const blockActor = latestBlock.actor instanceof RecordId ? await this.db.select<EmployeeRow>(latestBlock.actor) : undefined;
+    if (!blockActor || blockActor.role !== row.reviewer_role) {
+      throw new CompanyError('invalid', 'review block actor does not match the reviewer role');
+    }
+  }
+
+  /**
+   * The dependency graph used by defer's cycle guard. Each raw dependency is
+   * resolved through its superseded_by lineage tip before its dependencies are
+   * considered, so a chain that only becomes cyclic after revision resolution is
+   * still refused. Corrupt/missing lineage stays on the raw row (conservative).
+   */
+  private async dependencyGraph(ids: string[]): Promise<Map<string, string[]>> {
+    const graph = new Map<string, string[]>();
+    if (!ids.length) return graph;
+    type Row = { id: RecordId; dependencies?: RecordId[]; superseded_by?: RecordId; lineage?: RecordId };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+      { ids: ids.map(d => id('task', d)) });
+    const all: Row[] = [...(rows ?? [])];
+    const lineages = [...new Set(all.filter(row => row.superseded_by && row.lineage).map(row => normalizedId(row.lineage)))];
+    const tips = new Map<string, string>();
+    if (lineages.length) {
+      const [tipRows] = await this.db.query<[Array<{ id: RecordId; lineage: RecordId }>]>(
+        'SELECT id, lineage FROM task WHERE lineage IN $lineages AND superseded_by = NONE;',
+        { lineages: lineages.map(lineage => id('task', lineage)) });
+      for (const tip of tipRows ?? []) tips.set(normalizedId(tip.lineage), normalizedId(tip.id));
+    }
+    const present = new Set(all.map(row => normalizedId(row.id)));
+    const missingTips = [...new Set([...tips.values()].filter(tip => !present.has(tip)))];
+    if (missingTips.length) {
+      const [tipRows] = await this.db.query<[Row[]]>(
+        'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+        { ids: missingTips.map(tip => id('task', tip)) });
+      all.push(...(tipRows ?? []));
+    }
+    const byId = new Map(all.map(row => [normalizedId(row.id), row]));
+    for (const row of all) {
+      const rawId = normalizedId(row.id);
+      const lineage = row.lineage ? normalizedId(row.lineage) : '';
+      const tip = row.superseded_by && lineage ? tips.get(lineage) : undefined;
+      const source = tip ? byId.get(tip) ?? row : row;
+      graph.set(tip ?? rawId, (source.dependencies ?? []).map(normalizedId));
+    }
+    return graph;
+  }
+
+  /**
+   * gm only: re-point a gm block at the dependency graph. Execute blocks keep their old
+   * behaviour (wait blocked, restore ready). A normal non-owner review block — one backed
+   * by a real submit and a reviewer block in the audit stream — may also be deferred: the
+   * original submission, submitter, implementer and contributor facts stay untouched, and
+   * the task returns to 'review' under a fresh claim when the last dependency finishes.
+   * Owner gates, unprovable review history, live leases and closed goals are refused, not
+   * guessed; with every dependency already done the target phase is restored immediately.
    */
   async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
     return echoTask(await this.deferTaskUntilRecord(credential, input));
@@ -2336,57 +2470,62 @@ export class SurrealCompanyCore implements CompanyCore {
     const replayed = await this.replay(idem, digest);
     if (replayed) return replayed;
 
-    // Query results may carry record ids as `task:⟨uuid⟩` (the fork's escaped rendering):
-    // strip the quoting so client-side uuids compare equal against server-side ids.
-    const norm = (value: unknown): string => {
-      const raw = value instanceof RecordId ? String(value.id) : asId(value);
-      return raw.startsWith('⟨') && raw.endsWith('⟩') ? raw.slice(1, -1) : raw;
-    };
     const depIds = dependencies.map(dep => id('task', dep));
     const taskRef = id('task', input.taskId);
+    // Every defer mutates the dependency graph. A durable epoch, checked and advanced
+    // inside the write transaction, serialises those mutations: a request built from an
+    // older graph cannot commit a cycle after a concurrent defer has landed.
+    const [epochRow] = await this.db.query<[{ value?: number } | undefined]>(
+      'SELECT * FROM ONLY company_meta:defer_epoch;');
+    const epochSeen = epochRow?.value ?? 0;
 
     // Fast-fail with a readable reason plus the audit snapshot; the transaction re-checks
     // every guard atomically, so a stale pre-read can never turn into a wrong write.
     type DeferredRow = {
-      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; current_employee?: string;
+      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; resume_role?: string;
+      submitted_by?: string; reviewer_role: ReviewerRole; current_employee?: string;
       lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string;
     };
     // `FROM ONLY` yields the record itself (or NONE), not a list.
-    const [before] = await this.db.query<[DeferredRow | undefined]>('SELECT state, blocked_to, resume_state, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
+    const [before] = await this.db.query<[DeferredRow | undefined]>(
+      'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
       { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready'].includes(before.resume_state ?? '')) {
-      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute-phase tasks');
+    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
+      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute or normal review-phase tasks');
     }
+    const phase = before.resume_state ?? 'ready';
+    if (phase === 'review') await this.requireProvableReviewWait(taskRef, before);
     if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
     if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
       throw new CompanyError('conflict', 'Task version moved');
     }
-    const beforeDeps = (before.dependencies ?? []).map(norm);
+    const beforeDeps = (before.dependencies ?? []).map(normalizedId);
     const after = [...new Set([...beforeDeps, ...dependencies])];
-    const phase = before.resume_state ?? 'ready';
-    const evidence = `${input.text}\n[defer] 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
+    const evidence = `${input.text}\n[defer] 操作者=${actor.employeeId} 来源phase=${phase} 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
 
     const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
       'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
-    const depById = new Map((depRows ?? []).map(row => [norm(row.id), row]));
+    const depById = new Map((depRows ?? []).map(row => [normalizedId(row.id), row]));
     for (const dep of dependencies) {
       const row = depById.get(dep);
       if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
-      // norm maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
-      if (norm(row.goal) !== norm(before.goal)) {
+      // normalizedId maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
+      if (normalizedId(row.goal) !== normalizedId(before.goal)) {
         throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
       }
     }
     // The deferred task must not be reachable from its own new dependencies: walk the
-    // dependency closure of the proposed deps and refuse a path back to the task.
+    // resolved dependency closure of the proposed deps (superseded_by -> lineage tip)
+    // and refuse a path back to the task.
     const seen = new Set(dependencies);
     let frontier = [...dependencies];
     for (let depth = 0; frontier.length && depth < 32; depth++) {
-      const [closure] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
-        'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(d => id('task', d)) });
-      const next = [...new Set((closure ?? []).flatMap(row => (row.dependencies ?? []).map(norm)))].filter(d => !seen.has(d));
+      const graph = await this.dependencyGraph(frontier);
+      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
+      const next = [...new Set([...graph.values()].flat())].filter(d => !seen.has(d));
       if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
+      for (const key of graph.keys()) seen.add(key);
       for (const n of next) seen.add(n);
       frontier = next;
     }
@@ -2395,8 +2534,21 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $who.role != 'gm' OR $t = NONE { THROW 'defer denied' };
-      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready'] { THROW 'defer denied: only execute-phase gm blocks can wait on dependencies' };
+      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready', 'review'] { THROW 'defer denied: only gm-blocked execute or normal review-phase tasks can wait on dependencies' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'defer denied: the task still holds an active lease' };
+      IF $t.resume_state = 'review' {
+        IF $t.reviewer_role = 'owner' OR $t.submitted_by = NONE { THROW 'defer denied: review block is not an ordinary submitted review' };
+        IF $t.resume_role != NONE AND $t.resume_role != $t.reviewer_role { THROW 'defer denied: review block role mismatch' };
+        LET $sub = SELECT * FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
+        IF array::len($sub) = 0 { THROW 'defer denied: original submission missing' };
+        IF $sub[0].actor != $submitted_ref OR $t.submitted_by != $submitted_by { THROW 'defer denied: original submission snapshot mismatch' };
+        IF $sub[0].version = NONE OR $sub[0].version > $t.version { THROW 'defer denied: original submission snapshot is newer than the task' };
+        LET $blk = SELECT * FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;
+        IF array::len($blk) = 0 OR $blk[0].phase != 'review' { THROW 'defer denied: original review block is not provable' };
+        IF $blk[0].at <= $sub[0].at { THROW 'defer denied: original review block predates the submission' };
+        LET $blk_actor = SELECT * FROM ONLY $blk[0].actor;
+        IF $blk_actor = NONE OR $blk_actor.role != $t.reviewer_role { THROW 'defer denied: review block actor role mismatch' };
+      };
       LET $g = SELECT * FROM ONLY $t.goal;
       IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
@@ -2407,20 +2559,40 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
       ${RESOLVE_DEP_SQL('$merged', '$m_dep')}
       LET $remaining = SELECT VALUE id FROM task WHERE id IN $m_dep_resolved AND ${depUnsatisfiedFor('$t')};
+      LET $epoch = SELECT * FROM ONLY company_meta:defer_epoch;
+      LET $epoch_value = $epoch.value ?? 0;
+      IF $epoch_value != $epoch_seen { THROW 'defer graph moved: retry' };
+      IF $epoch = NONE {
+        CREATE ONLY company_meta:defer_epoch CONTENT { value: 1 };
+      } ELSE {
+        UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
+      };
+      LET $m_phase = $t.resume_state ?? 'ready';
+      LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
+      LET $next_resume_state = IF array::len($remaining) > 0 AND $m_phase = 'review' THEN 'review' ELSE NONE END;
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
-        state = IF array::len($remaining) = 0 THEN 'ready' ELSE 'blocked' END,
-        blocked_to = NONE, resume_role = NONE, resume_state = NONE,
+        state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
+        blocked_to = NONE,
+        resume_state = $next_resume_state,
+        resume_role = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         version = $t.version + 1 RETURN AFTER;
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now(),
+        source_phase: $m_phase, restore_phase: $restore_phase, dependencies_before: $before_refs,
+        dependencies_after: $merged, result: $next.state, operator: $employee };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value, payload: { state: $next.state, added: $added }, at: time::now() };
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value,
+        payload: { state: $next.state, source_phase: $m_phase, restore_phase: $restore_phase,
+          dependencies_before: $before_refs, dependencies_after: $merged, operator: $employee, added: $added }, at: time::now() };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
-      actor: id('employee', actor.employeeId), task: taskRef, expected: input.expectedVersion,
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
       dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
+      before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
+      submitted_ref: before.submitted_by ? id('employee', before.submitted_by) : undefined,
+      submitted_by: before.submitted_by, epoch_seen: epochSeen,
       idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     });
     return view(row);
