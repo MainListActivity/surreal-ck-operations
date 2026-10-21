@@ -1,6 +1,6 @@
 // Provider drivers for the browser media lane. Each builder returns a standalone
 // ego-browser script (`ego-browser nodejs -e <script>`): it drives the logged-in
-// consumer session (ChatGPT / Gemini / Grok), writes generated media into the
+// consumer session (ChatGPT / Higgsfield / Gemini / Grok), writes generated media into the
 // task's output dir, and prints a single protocol line `__RESULT__{json}`.
 // The script never returns page secrets — only file paths and sizes come back.
 //
@@ -247,7 +247,7 @@ const replyLooksFake = (text, prompt) => {
 // The runtime script: ARGS is interpolated by browser.ts as a JSON literal.
 export function buildScript(provider: string, a: ScriptArgs): string {
   const prelude = `const ARGS = ${JSON.stringify(a)};\n${HELPERS}\nconst providerSpace = 'sck-media-${provider}';\nconst task = await taskSpace(providerSpace);\nconst existing = await task.pages();\nconst p = existing[0] ?? await task.newPage();\n`;
-  const body = provider === 'notebook' ? notebook() : provider === 'gemini' ? gemini() : provider === 'chatgpt' ? chatgpt() : grok();
+  const body = provider === 'notebook' ? notebook() : provider === 'gemini' ? gemini() : provider === 'chatgpt' ? chatgpt() : provider === 'higgsfield' ? higgsfield() : grok();
   return prelude + body + `\n`;
 }
 
@@ -357,6 +357,181 @@ const saved = await saveImg(p, outPath);
 if (!saved) { fail('failed', '结果提取失败'); }
 const st = fs.statSync(saved);
 emit({ ok: true, file: saved, bytes: st.size, via: 'canvas' });
+`;
+}
+
+function higgsfield(): string {
+  return /* js */ `
+if (ARGS.kind !== 'image') { fail('failed', 'higgsfield 仅支持图片生成'); }
+const FREE_MODELS = ['Seedream 4.5', 'FLUX.2 Pro', 'Seedream 5.0 lite', 'GPT Image', 'Nano Banana', 'Kling O1'];
+const modelButton = async () => p.evaluate(() => {
+  const form = document.querySelector('form.image-form');
+  if (!form) return null;
+  const btn = [...form.querySelectorAll('button')].find(b => /^(Seedream|FLUX|Nano Banana|GPT Image|Kling|Grok|Recraft|Ideogram|Z-Image|WAN)/i.test((b.innerText || '').trim()));
+  return btn ? (btn.innerText || '').trim().split('\\n')[0].trim() : null;
+});
+await p.goto('https://higgsfield.ai/zh/ai/image');
+await p.waitForTimeout(4500);
+let body = await bodyText(p);
+if (loginWall(body)) { fail('login_required', 'higgsfield.ai 需要重新登录'); }
+const loggedIn = await p.evaluate(() => !!document.querySelector('button[aria-label="账户菜单"]'));
+if (!loggedIn) { fail('login_required', 'higgsfield.ai 需要重新登录（找不到账户菜单）'); }
+let current = await modelButton();
+if (!current || !FREE_MODELS.includes(current)) {
+  const opened = await p.evaluate(() => {
+    const form = document.querySelector('form.image-form');
+    if (!form) return false;
+    const btn = [...form.querySelectorAll('button')].find(b => /^(Seedream|FLUX|Nano Banana|GPT Image|Kling|Grok|Recraft|Ideogram|Z-Image|WAN)/i.test((b.innerText || '').trim()));
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (!opened) { fail('failed', '找不到 Higgsfield 模型选择器'); }
+  await p.waitForTimeout(1600);
+  const picked = await p.evaluate((free) => {
+    const buttons = [...document.querySelectorAll('button,[role=button]')];
+    for (const name of free) {
+      const hit = buttons.find(b => {
+        const lines = (b.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+        return lines[0] === name && lines.includes('无限');
+      });
+      if (hit) { hit.click(); return name; }
+    }
+    return null;
+  }, FREE_MODELS);
+  if (!picked) { fail('limit_reached', 'Higgsfield 当前没有可用的无限图像模型（套餐或页面可能已变化）'); }
+  await p.waitForTimeout(2400);
+  current = await modelButton();
+  if (current !== picked) { fail('limit_reached', 'Higgsfield 未能选中无限模型，当前=' + String(current)); }
+}
+const formText = await p.evaluate(() => {
+  const form = document.querySelector('form.image-form');
+  return form ? (form.innerText || '') : '';
+});
+if (!/无限/.test(formText)) { fail('limit_reached', 'Higgsfield 未显示无限模式，拒绝生成以免扣 credits'); }
+const switchOn = await p.evaluate(() => {
+  const form = document.querySelector('form.image-form');
+  if (!form) return { ok: false, reason: 'no form' };
+  const sw = form.querySelector('button[role="switch"]');
+  if (!sw) return { ok: false, reason: 'no unlimited switch' };
+  if (sw.disabled) return { ok: false, reason: 'switch disabled' };
+  const before = sw.getAttribute('aria-checked');
+  if (before !== 'true') sw.click();
+  return { ok: true, before };
+});
+if (!switchOn.ok) { fail('limit_reached', 'Higgsfield 无限模式不可用：' + switchOn.reason); }
+await p.waitForTimeout(900);
+const switchState = await p.evaluate(() => {
+  const form = document.querySelector('form.image-form');
+  const sw = form ? form.querySelector('button[role="switch"]') : null;
+  return sw ? { checked: sw.getAttribute('aria-checked'), state: sw.getAttribute('data-state') } : null;
+});
+if (!switchState || switchState.checked !== 'true') { fail('limit_reached', 'Higgsfield 无限模式未开启，拒绝生成以免扣 credits'); }
+if (ARGS.refs.length) {
+  const refClicked = await p.evaluate(() => {
+    const btn = document.querySelector('form.image-form button[aria-label="全能参考"]');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (!refClicked) { fail('failed', '找不到 Higgsfield 参考图入口'); }
+  await p.waitForTimeout(900);
+  try {
+    await p.setInputFiles('input[type=file][accept*="image"] >> nth=-1', ARGS.refs);
+  } catch (e) {
+    fail('failed', '参考图上传失败：' + String(e).slice(0, 160));
+  }
+  await p.waitForTimeout(3200);
+}
+const promptSelector = 'form.image-form [data-tour-anchor="tour-image-prompt"]';
+let filled = false;
+try {
+  await p.click(promptSelector, { label: 'focus higgsfield prompt' });
+  await p.keyboard.press('ControlOrMeta+A');
+  await p.keyboard.paste(ARGS.prompt);
+  await p.waitForTimeout(700);
+  filled = await p.evaluate((prompt) => {
+    const el = document.querySelector('form.image-form [data-tour-anchor="tour-image-prompt"]');
+    return !!el && (el.innerText || '').includes(prompt.slice(0, 20));
+  }, ARGS.prompt);
+} catch {}
+if (!filled) {
+  filled = await p.evaluate((prompt) => {
+    const el = document.querySelector('form.image-form [data-tour-anchor="tour-image-prompt"]');
+    if (!el) return false;
+    el.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, prompt);
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+    return (el.innerText || '').includes(prompt.slice(0, 20));
+  }, ARGS.prompt);
+}
+if (!filled) { fail('failed', '找不到 Higgsfield 提示词输入框或写入失败'); }
+await p.waitForTimeout(700);
+const before = await p.evaluate(() => [...document.querySelectorAll('img')].map(i => i.src).filter(Boolean));
+const clicked = await p.evaluate(() => {
+  const form = document.querySelector('form.image-form');
+  if (!form) return false;
+  const btn = form.querySelector('button[type="submit"]');
+  if (btn && !btn.disabled) { btn.click(); return true; }
+  return false;
+});
+if (!clicked) { fail('failed', '找不到 Higgsfield 图片生成按钮（或按钮不可用）'); }
+const t0 = Date.now();
+let resultSrc = null;
+while (Date.now() - t0 < ARGS.timeoutMs) {
+  const probe = await p.evaluate((prev) => {
+    const imgs = [...document.querySelectorAll('img')]
+      .filter(i => i.src && !prev.includes(i.src) && (/_min\.webp/i.test(i.src) || (i.alt || '').toLowerCase() === 'image generation'))
+      .sort((a, b) => b.naturalWidth - a.naturalWidth);
+    return { src: imgs[0] ? imgs[0].src : null, tail: (document.body.innerText || '').slice(-900) };
+  }, before);
+  if (hitLimit(probe.tail) || /积分不足|余额不足|额度|insufficient|credit/i.test(probe.tail)) { fail('limit_reached', 'Higgsfield 额度不足：' + probe.tail.slice(-200)); }
+  if (/生成失败|生成错误|failed/i.test(probe.tail)) { fail('failed', 'Higgsfield 生成失败：' + probe.tail.slice(-200)); }
+  if (probe.src) { resultSrc = probe.src; break; }
+  await p.waitForTimeout(3000);
+}
+if (!resultSrc) { fail('failed', '等待 Higgsfield 生成结果超时'); }
+let fullSrc = resultSrc;
+try {
+  const u = new URL(resultSrc);
+  const inner = u.searchParams.get('url');
+  if (inner) {
+    const decoded = decodeURIComponent(inner);
+    fullSrc = decoded.replace(/_min\.webp$/i, '.png');
+  } else if (/_min\.webp$/i.test(resultSrc)) {
+    fullSrc = resultSrc.replace(/_min\.webp$/i, '.png');
+  }
+} catch {}
+let downloaded = false;
+let via = 'fetch';
+const snap = await p.snapshot();
+const dlRef = refOf(snap, 'button "(?:Download|下载)"') || refOf(snap, 'link "(?:Download|下载)"');
+if (dlRef) {
+  try {
+    const wait = p.waitForEvent('download', { timeout: 45000 });
+    await p.click('@' + dlRef, { label: 'download higgsfield image' });
+    const dl = await wait;
+    await dl.saveAs(outPath);
+    downloaded = true;
+    via = 'download';
+  } catch {}
+}
+if (!downloaded) {
+  try {
+    if (fullSrc.startsWith('data:')) {
+      fs.writeFileSync(outPath, Buffer.from(fullSrc.split(',')[1], 'base64'));
+      via = 'data';
+    } else {
+      const res = await p.fetch(fullSrc, { saveAs: outPath });
+      if (!res.ok) throw new Error('fetch ' + res.status);
+    }
+  } catch (e) {
+    const saved = await saveImg(p, outPath);
+    if (!saved) { fail('failed', '结果下载失败：' + String(e).slice(0, 160)); }
+    via = 'canvas';
+  }
+}
+const st = fs.statSync(outPath);
+emit({ ok: true, file: outPath, bytes: st.size, via });
 `;
 }
 

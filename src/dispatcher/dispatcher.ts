@@ -1167,8 +1167,18 @@ export class Dispatcher {
      * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
      * here, so the caller leaves it to the next pass.
      */
+    /**
+     * The implementer the execute gate binds this task to, when it can be named: the explicit field first, then the derived one
+     * (the sole author of a task that never recorded an explicit implementer). An unresolved or unreadable history names
+     * nobody — the task waits there as unknown, never as struck.
+     */
+    const boundImplementer = (task: SupervisedTask): string | undefined => {
+      if (task.implementer) return task.implementer;
+      const gate = executeGates.get(task.id);
+      return gate && !gate.unresolved && gate.implementer ? gate.implementer : undefined;
+    };
     const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
-      const implementer = task.implementer;
+      const implementer = boundImplementer(task);
       if (!implementer || !struckImplementer(implementer)) return false;
       const takeover = this.deps.autoTakeover;
       if (takeover) {
@@ -1187,11 +1197,11 @@ export class Dispatcher {
           .map(entry => entry.key).sort()[0];
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
-            reason: `自动接替：原实现人 ${implementer} 的会话已失效（归档或不可恢复），系统把代码交给在岗工程员工` })
+            reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
             .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
           if (moved) {
             report.decisions.push(`auto-takeover:${task.id}=${successor}`);
-            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (session gone)`);
+            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (implementer unavailable)`);
             await this.clearBlocked(task, 'execute');
             return true;
           }

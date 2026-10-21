@@ -552,3 +552,50 @@ run('company fork: a struck implementer with no live candidate waits on a system
     await w.close();
   }
 }, 90000);
+
+// SYS-DISP R7(c): a task that never recorded an explicit implementer derives one from its contribution history. When that
+// sole author is gone from the roster (a retirement that predates the rotation guard), the system hands the code to a live
+// engineer on its own — the same automatic successor, now resolved through the execute gate instead of the task field.
+run('company fork: a derived implementer who is gone is replaced by the system on its own', async () => {
+  const w = await startCompanyFork('auto-derived');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    // A live engineer finishes a warm-up task first, so it is idle and free for the handover.
+    const warm = await w.core.createTask(w.gm, { title: 'warm-up for the successor', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived-warm' });
+    expect((await w.tick()).woke.find(x => x.task === warm.id)?.spawned).toBe(true);
+    const C = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery', idempotencyKey: 'derived-warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up', idempotencyKey: 'derived-warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // The task never recorded an explicit implementer: the only contributor is an employee gone from the roster.
+    const task = await w.core.createTask(w.gm, { title: 'derived implementer is gone', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived' });
+    const gone = new RecordId('employee', 'engineering-gone-000');
+    await w.db.db.query(`CREATE audit CONTENT { task: $task, actor: $gone, action: 'claim', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $gone, action: 'checkpoint', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };`,
+      { task: new RecordId('task', task.id), gone });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts).toMatchObject({ implementer: 'engineering-gone-000', ambiguous: false });
+    expect(facts.authors).toEqual(['engineering-gone-000']);
+    // The tick replaces the gone implementer by the system and reports the decision; nobody needed to be asked.
+    const replaced = await w.tick();
+    expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: C.id });
+    const audit = await w.db.db.query<[Array<{ actor: string; evidence: string; at: string }>]>(
+      `SELECT actor, evidence, at FROM audit WHERE task = $task AND action = 'implementer_takeover';`,
+      { task: new RecordId('task', task.id) });
+    const last = [...(audit[0] ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))).at(-1);
+    expect(last).toMatchObject({ actor: 'system:dispatcher' });
+    expect(last?.evidence).toContain('[implementer_takeover:auto]');
+    // The next pass hands the work to the successor.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+  } finally {
+    await w.close();
+  }
+}, 90000);
