@@ -252,7 +252,7 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 
 GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪内容；结果打印在插件 stdout（`artifact reclaim` 台账只记 evidence/deliverables 的裁剪）。GC 与资源闸门无关，水位正常时也照常运行。
 
-删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。
+删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。审计事件名是 `worktree_audit.event` 的 ASSERT 白名单：新增事件必须同时在 `schema/021-worktree-audit-events.surql` 放行，否则审计写入被拒、仓库级 catch 会中断整轮扫描（2026-10-21 事故）；`tests/audit-event-whitelist.test.ts` 在 `test:channel` 里校验两边一致。
 
 ## 老板作废、解锁与取消目标
 
