@@ -481,4 +481,26 @@ describe('deliverable_publish 工具', () => {
       expect(existsSync(join(home, 'deliverables', 'task-resend', 'x.txt'))).toBe(true);
     });
   });
+
+  test('a listing whose credential re-issue is still pending at its reply ceiling is refused recoverably at the ceiling (SYS01 M1)', async () => {
+    // No held credential and a stalled rotate: the credential phase of a snapshot-backed read is inside the one deadline.
+    const stalling = new SidecarPool({
+      core: core as never, workforce: { rotate: () => new Promise<never>(() => undefined) } as never,
+      ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+    });
+    try {
+      const i = inst('e-stall', { credential: undefined });
+      const env = stalling.env(i);
+      const started = Date.now();
+      // The answer is due at the ceiling, so wait past relay()'s short default.
+      writeFileSync(join(reqDir(env.SCK_COMM_DIR), 's1.json'), JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'get_context', args: {} }));
+      await until(() => existsSync(join(resDir(env.SCK_COMM_DIR), 's1.json')), 20_000);
+      const res = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR), 's1.json'))!;
+      const elapsed = Date.now() - started;
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toContain('temporarily_unavailable');
+      expect(elapsed).toBeGreaterThan(12_000);
+      expect(elapsed).toBeLessThan(15_000);
+    } finally { stalling.close(); }
+  }, 30_000);
 });

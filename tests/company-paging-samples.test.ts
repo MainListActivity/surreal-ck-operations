@@ -207,6 +207,15 @@ test('AC-A 30683-byte sample (core): task answers leave the block out, the compl
   // A task answer with the block cannot carry it whole, and a complete company answer cannot either.
   await expectRefused(fx.core.contextView(fx.gm, { includeCompany: true, state: 'done' }), 'response_too_large', /pageSize/);
   await expectRefused(fx.core.contextView(fx.gm, { scope: 'company' }), 'response_too_large', /pageSize/);
+  // A pinned task detail is answered by default whatever the block weighs: the block is read only when includeCompany asks for it.
+  const pinned = await fx.core.createTask(fx.gm, {
+    title: `定点详情 ${suffix}`, context: textOf(600, '任务上下文 '), executorRole: 'engineering', reviewerRole: 'qa',
+    idempotencyKey: `pinned-ops-${suffix}`,
+  });
+  const detail = await fx.core.contextView(fx.gm, { taskId: pinned.id });
+  expect(detail.companyIncluded).toBe(false);
+  expect(detail.tasks).toHaveLength(1);
+  expect(answerBytes(detail)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   const parts = await walkCore(fx, 4);
   expectPartsWellFormed(parts);
   expectBlock(reassembleCompany(parts), brief);
@@ -215,6 +224,15 @@ test('AC-A 30683-byte sample (core): task answers leave the block out, the compl
 test('AC-A 131 KiB sample (core): over-long CJK and emoji items are cut into parts and page back whole, and a project added mid-walk is not in that walk', async () => {
   const fx = await fresh();
   const brief = await growthSample(fx);
+  // The same pinned-detail default on the 131 KiB sample: the growing block never stands between a reader and one task.
+  const pinned = await fx.core.createTask(fx.gm, {
+    title: `定点详情 131 ${suffix}`, context: textOf(600, '任务上下文 '), executorRole: 'engineering', reviewerRole: 'qa',
+    idempotencyKey: `pinned-grow-${suffix}`,
+  });
+  const detail = await fx.core.contextView(fx.gm, { taskId: pinned.id });
+  expect(detail.companyIncluded).toBe(false);
+  expect(detail.tasks).toHaveLength(1);
+  expect(answerBytes(detail)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   const parts = await walkCore(fx, 3);
   expectPartsWellFormed(parts);
   // The 50 KiB direction alone needs at least four parts of at most 16 KiB.

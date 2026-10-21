@@ -10,7 +10,7 @@ import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase, MAX_BUILD_CONNECTIONS } from '../src/database.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import {
-  CLEANUP_BUDGET_MS, DEFAULT_SNAPSHOT_LIMITS, REPLY_CEILING_MS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation,
+  CLEANUP_BUDGET_MS, DEFAULT_SNAPSHOT_LIMITS, IN_FLIGHT_WAIT_MS, REPLY_CEILING_MS, SnapshotStore, type SnapshotLimits, type SnapshotHeader, type SnapshotReservation,
   type SnapshotStoreOptions,
 } from '../src/snapshot-store.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
@@ -784,10 +784,11 @@ test('(u) a reserved listing whose commit stalls is cut at the deadline: its roo
   const elapsed = performance.now() - started;
   expect(error).toBeInstanceOf(CompanyError);
   expect((error as CompanyError).code).toBe('temporarily_unavailable');
-  // Answered at the deadline plus the in-flight wait (500 ms) and the release on its own connection, well inside the 3 s cleanup budget.
-  // The upper bound allows for the release's own time under a loaded run; the caller never waits for the stuck commit.
+  // The caller waits for the build deadline (2 s) plus the in-flight wait (500 ms) and nothing else: the release runs on its own
+  // connection and is never waited for. The bound is that sum plus 500 ms of scheduling slack on a loaded run, still inside the
+  // 3 s cleanup budget; waiting for the stuck commit or for the release would land far above it.
   expect(elapsed).toBeGreaterThanOrEqual(1_900);
-  expect(elapsed).toBeLessThan(3_000);
+  expect(elapsed).toBeLessThan(2_000 + IN_FLIGHT_WAIT_MS + 500);
   expect(closes[0]).toBe(true);
   expect(observed.at(-1)).toMatchObject({ outcome: 'timed_out', release: 'released' });
   expect(await store.census()).toEqual({ listings: 0, rows: 0 });

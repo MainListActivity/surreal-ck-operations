@@ -18,6 +18,14 @@ sha=${release##*/}
 case "$sha" in *[!0-9a-f]*) echo "refused: release dir '$sha' is not a commit sha" >&2; exit 2;; esac
 [ ${#sha} -eq 40 ] || { echo "refused: release dir '$sha' is not a 40-character commit sha" >&2; exit 2; }
 [ -f "$release/tests/comm-slow-pipe.test.ts" ] || { echo 'refused: the release has no tests/comm-slow-pipe.test.ts' >&2; exit 2; }
+# The recorded pass is for a commit, so the content has to be that commit's (SYS01 AC-B, review B2). The ops checkout is used when
+# one can be resolved; install re-checks the content against the commit in any case, so this is the earlier, clearer refusal.
+. "$(dirname "$0")/release-content.sh"
+gate_ops_repo=${SCK_OPS_REPO:-$(/usr/bin/sed -n 's/^SCK_AGENT_CWD=//p' "$service_home/private/service.env" 2>/dev/null | /usr/bin/tr -d "\"'")}
+if [ -n "$gate_ops_repo" ] && [ -d "$gate_ops_repo/.git" ] \
+  && ! release_matches_commit "$release" "$sha" "$gate_ops_repo"; then
+  echo "refused: $release does not match commit $sha — the gate records a pass for a commit only for that commit's content" >&2; exit 2
+fi
 resolve_bun "$service_home"
 [ -x "$BUN" ] || { echo "refused: the service Bun runtime is not executable: $BUN" >&2; exit 2; }
 bun_version=$("$BUN" --version) || { echo "refused: $BUN did not report a version" >&2; exit 2; }

@@ -102,9 +102,16 @@ function startProxy(targetPort: number, initialRate: number) {
         const take = Math.min(head.byteLength, room);
         const piece = take === head.byteLength ? head : head.subarray(0, take);
         if (take === head.byteLength) queue.shift(); else queue[0] = head.subarray(take);
-        target.write(piece);
-        counters[dir] += piece.byteLength;
-        if (!unlimited) allowance[dir] -= take;
+        // Bun's socket write returns the bytes the socket took; it does not queue the rest. Counting the piece as sent and dropping
+        // the remainder (the previous behaviour, review B3) both lost bytes on a busy socket and reported bytes that never left.
+        // Put the unsent remainder back at the head of the queue and stop this direction until the socket drains.
+        const written = target.write(piece);
+        counters[dir] += written;
+        if (!unlimited) allowance[dir] -= written;
+        if (written < piece.byteLength) {
+          queue.unshift(piece.subarray(written));
+          return;
+        }
         turn = (turn + offset + 1) % ordered.length;
         wrote = true;
         break;
@@ -136,6 +143,8 @@ function startProxy(targetPort: number, initialRate: number) {
           socket: {
             open(upstream) { link.upstream = upstream; if (rate <= 0) send('up', true); },
             data(_upstream, chunk) { link.down.push(new Uint8Array(chunk)); if (rate <= 0) send('down', true); },
+            // A partial write stopped a direction; the socket is writable again, so carry the queue on without waiting for a tick.
+            drain() { send('up', rate <= 0); },
             close() { closeLink(link); },
             error() { closeLink(link); },
           },
@@ -146,6 +155,7 @@ function startProxy(targetPort: number, initialRate: number) {
         link.up.push(new Uint8Array(chunk));
         if (rate <= 0) send('up', true);
       },
+      drain(client) { send('down', rate <= 0); },
       close(client) { closeLink(client.data); },
       error(client) { closeLink(client.data); },
     },

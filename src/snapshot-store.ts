@@ -174,7 +174,7 @@ const QUOTA = new RecordId('query_snapshot_quota', 'global');
 /** How long one transaction keeps retrying after a concurrent write conflicts with it. */
 const TRANSACTION_WAIT_MS = 10 * 1000;
 /** A cancelled build gives the statement it has in flight this long, counted from its deadline, to finish; then its connection closes. */
-const IN_FLIGHT_WAIT_MS = 500;
+export const IN_FLIGHT_WAIT_MS = 500;
 /** A build's release must have run by this long after its deadline (connection and delete); past it the listing is marked for the sweep. */
 const RELEASE_UNTIL_MS = 2 * 1000;
 /** All a build's caller may wait for after the deadline: the in-flight statement, the release and the mark. */
@@ -328,7 +328,7 @@ export class SnapshotStore {
       const reserveStarted = performance.now();
       const reservation = await within(this.beginOn(db, {
         id, owner: input.owner, kind: input.kind, digest: input.digest, role: input.role, takenAt: loaded.takenAt,
-        rows: stats.rows, bytes: stats.bytes,
+        rows: stats.rows, bytes: stats.bytes, hint: input.guidance,
       }, now, account));
       stats.reserveMs = performance.now() - reserveStarted;
       const writeStarted = performance.now();
@@ -489,10 +489,12 @@ export class SnapshotStore {
 
   private async beginOn(db: Surreal, input: {
     id?: string; owner: string; kind: SnapshotKind; digest: string; role: string; takenAt: string; rows: number; bytes: number;
+    /** How this query is narrowed, from the caller that knows its shape (a task listing and a company listing narrow differently). */
+    hint?: string;
   }, now: number, account?: BuildAccount): Promise<SnapshotReservation> {
     const { limits } = this;
     if (input.rows > limits.maxRows || input.bytes > limits.maxBytes) {
-      throw new CompanyError('response_too_large', `this listing has ${input.rows} rows (${input.bytes} bytes), above the ${limits.maxRows}-row or ${limits.maxBytes}-byte listing limit; narrow it with state, goalId, role or since`);
+      throw new CompanyError('response_too_large', `this listing has ${input.rows} rows (${input.bytes} bytes), above the ${limits.maxRows}-row or ${limits.maxBytes}-byte listing limit; ${input.hint ?? 'narrow the query'}`);
     }
     // Inside a build the sweep stops at the build's deadline, so it cannot hold the build past its own cap.
     await this.sweepOn(db, now, account?.deadline);

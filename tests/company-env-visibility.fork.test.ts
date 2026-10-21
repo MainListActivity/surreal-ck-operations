@@ -188,3 +188,37 @@ test('read_task_text of the project field: gm and the valid holder read it; an u
   // The expired holder's lease on taskExpiring has ended, so that holder is refused as well.
   await expectRefused(Promise.resolve().then(() => read(expiring, taskExpiring)), 'forbidden', /gm or the holder of a valid task lease/);
 });
+
+test('the holder of the review lease on a task of the project reads its environments too, and loses them when the review ends', async () => {
+  const enrollment = new LocalEnrollmentAdmin(database);
+  const implementer = await enrollment.enroll(`ev-impl-${suffix}`, 'engineering', ['execute', 'review']);
+  const reviewer = await enrollment.enroll(`ev-reviewer-${suffix}`, 'engineering', ['execute', 'review']);
+  const taskId = (await core.createTask(gm, {
+    title: `env review fixture ${++count}`, context: 'Synthetic fixture for the review-lease environment visibility test',
+    executorRole: 'engineering', reviewerRole: 'engineering', project: PROJECT, idempotencyKey: `env-review-${suffix}-${count}`,
+  })).id;
+  const execute = await core.claim(implementer, taskId);
+  await core.submit(implementer, proof(execute), { text: 'Synthetic delivery before the review lease', idempotencyKey: `ev-review-submit-${suffix}` });
+  const review = await core.claim(reviewer, taskId);
+  // A review lease is a valid lease on a task of the project, so the reviewer reads the environments while it holds.
+  expect(projectOf(await core.companyBrief(reviewer)).envs).toEqual([expect.objectContaining({ name: ENV })]);
+  await core.accept(reviewer, proof(review), { text: 'Synthetic acceptance that ends the review lease', idempotencyKey: `ev-review-accept-${suffix}` });
+  expect(projectOf(await core.companyBrief(reviewer)).envsWithheld).toBe(true);
+});
+
+test('a project read started under a valid lease cannot be continued by its hash once that lease ends', async () => {
+  const shortHolder = await new LocalEnrollmentAdmin(database).enroll(`ev-hash-${suffix}`, 'engineering', ['execute', 'review']);
+  const taskId = (await core.createTask(gm, {
+    title: `env hash fixture ${++count}`, context: 'Synthetic fixture for the hash continuation test',
+    executorRole: 'engineering', reviewerRole: 'engineering', project: PROJECT, idempotencyKey: `env-hash-${suffix}-${count}`,
+  })).id;
+  await shortCore.claim(shortHolder, taskId);
+  const first = await shortCore.taskText(shortHolder, { taskId, field: 'project', offset: 0, limit: 64 });
+  expect(first.sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(first.nextOffset).toBeGreaterThan(0);
+  await Bun.sleep(2_100); // the one-second lease is over
+  // The hash is not a capability: the continuation is refused exactly like a fresh read.
+  await expectRefused(
+    shortCore.taskText(shortHolder, { taskId, field: 'project', offset: first.nextOffset!, expectSha256: first.sha256 }),
+    'forbidden', /gm or the holder of a valid task lease/);
+});

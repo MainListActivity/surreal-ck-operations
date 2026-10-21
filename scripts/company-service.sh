@@ -10,6 +10,7 @@ domain="gui/$(id -u)"
 action=${1:-}
 components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/bun-runtime.sh"
+. "$(dirname "$0")/release-content.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -90,6 +91,10 @@ case "$action" in
     git -C "$ops_repo" fetch origin main --quiet 2>/dev/null || echo "warning: git fetch failed; checking against last-known origin/main" >&2
     git -C "$ops_repo" merge-base --is-ancestor "$sha" origin/main 2>/dev/null || {
       echo "refused: $sha is not on origin/main — merge the change into main first, then cut the release from main HEAD" >&2; exit 1; }
+    # The name only says which commit this claims to be: the content must be that commit's (SYS01 AC-B, review B2). A directory
+    # named after a real commit but holding other code is refused here, before anything is switched.
+    release_matches_commit "$release" "$sha" "$ops_repo" || {
+      echo "refused: $release does not match commit $sha — cut the release from 'git archive $sha' (dependencies and vendor are prepared after), then install again" >&2; exit 1; }
     check_gate "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     mkdir -p "$service_home/bin" "$service_home/logs" "$HOME/Library/LaunchAgents"

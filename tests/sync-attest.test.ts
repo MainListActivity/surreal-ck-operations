@@ -102,7 +102,9 @@ describe.skipIf(!swiftAvailable)('sck-sync-attest', () => {
     });
     server.listen(socket);
     await new Promise(resolve => server!.once('listening', resolve));
-  }, 120_000); // compiling the two test binaries with swiftc can exceed the default 5 s hook timeout on a loaded machine
+    // The hook compiles two Swift binaries with `swiftc -O` before it can listen. Measured on the review machine: about 3 s with a
+    // warm cache, and well over the default 5 s hook timeout on a loaded or cold one, so the hook gets its own generous budget.
+  }, 120_000);
 
   afterAll(async () => {
     if (server) await new Promise<void>(resolve => server!.close(() => resolve()));

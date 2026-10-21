@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 
 // Local release gate (SYS01 AC-B). The macOS slow-pipe regression has no hosted runner any more: company-service.sh install must
 // refuse a release unless scripts/release-gate.sh recorded a passing run for that commit on the Bun runtime the services run with
@@ -251,4 +251,85 @@ test('an explicit pin that is missing is never replaced by another Bun: the laun
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// SYS01 AC-B, review B2: the gate and the switch are keyed on the release commit, so the directory's *content* must be that
+// commit's. A directory merely named after a commit used to be installable; release-content.sh is what install and the gate call.
+describe('release content is bound to the commit, not to the directory name', () => {
+  const git = (args: string[], options: Parameters<typeof Bun.spawnSync>[1] = {}) =>
+    Bun.spawnSync(['git', ...args], { stdout: 'pipe', stderr: 'pipe', ...options });
+
+  /** A one-commit ops repo, its sha, and a release directory cut from that commit with `git archive`. */
+  function fixture(home: string) {
+    const repo = join(home, 'ops-repo');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    expect(git(['init', '-q', repo]).exitCode).toBe(0);
+    writeFileSync(join(repo, 'src', 'core.ts'), 'export const committed = true;\n');
+    writeFileSync(join(repo, 'README.md'), '# fixture\n');
+    git(['-C', repo, 'add', '-A']);
+    expect(git(['-C', repo, '-c', 'user.email=t@example.test', '-c', 'user.name=t', 'commit', '-qm', 'fixture']).exitCode).toBe(0);
+    const sha = git(['-C', repo, 'rev-parse', 'HEAD']).stdout!.toString().trim();
+    const release = join(home, 'releases', sha);
+    mkdirSync(release, { recursive: true });
+    const archive = git(['-C', repo, 'archive', '--format=tar', sha]).stdout! as Uint8Array;
+    const extracted = Bun.spawnSync(['tar', '-x', '-C', release], { stdin: archive, stdout: 'pipe', stderr: 'pipe' });
+    expect(extracted.exitCode).toBe(0);
+    return { repo, sha, release };
+  }
+
+  /** Runs release_matches_commit in a shell, exactly as the scripts do. */
+  function matches(release: string, sha: string, repo: string): number {
+    return Bun.spawnSync(['sh', '-c', '. "$1/scripts/release-content.sh"; release_matches_commit "$2" "$3" "$4"',
+      'release-content-test', ROOT, release, sha, repo], { stdout: 'pipe', stderr: 'pipe' }).exitCode;
+  }
+
+  test('a release cut from the commit matches; generated paths are not part of the comparison', () => {
+    const home = serviceHome();
+    try {
+      const { repo, sha, release } = fixture(home);
+      expect(matches(release, sha, repo)).toBe(0);
+      // Dependencies, generated vendor, build output and the service runtime dir are added after the archive and never come
+      // from the commit. `.runtime/` matters most: it is gitignored, so it exists only in the release copy.
+      mkdirSync(join(release, 'node_modules', 'left-pad'), { recursive: true });
+      mkdirSync(join(release, 'plugin', 'server', 'vendor'), { recursive: true });
+      mkdirSync(join(release, 'vault', 'build'), { recursive: true });
+      mkdirSync(join(release, '.runtime'), { recursive: true });
+      writeFileSync(join(release, 'plugin', 'server', 'vendor', 'core.ts'), 'generated\n');
+      writeFileSync(join(release, 'node_modules', 'left-pad', 'index.js'), 'module.exports = 1;\n');
+      writeFileSync(join(release, '.runtime', 'state.json'), '{}\n');
+      expect(matches(release, sha, repo)).toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('a directory named after the commit but holding other content is refused, as is an unknown commit', () => {
+    const home = serviceHome();
+    try {
+      const { repo, sha, release } = fixture(home);
+      // The stub case the review reproduced: right name, wrong content, and even an extra file the commit never had.
+      writeFileSync(join(release, 'src', 'core.ts'), 'export const committed = false;\n');
+      expect(matches(release, sha, repo)).not.toBe(0);
+      writeFileSync(join(release, 'src', 'core.ts'), 'export const committed = true;\n');
+      writeFileSync(join(release, 'src', 'planted.ts'), 'export const planted = true;\n');
+      expect(matches(release, sha, repo)).not.toBe(0);
+      rmSync(join(release, 'src', 'planted.ts'));
+      expect(matches(release, sha, repo)).toBe(0);
+      // A commit the ops repo does not have cannot be verified, so it does not match.
+      expect(matches(release, 'b'.repeat(40), repo)).not.toBe(0);
+      expect(matches(release, sha, join(home, 'no-such-repo'))).not.toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('install verifies the content against the commit before it switches the active release', () => {
+    const script = readFileSync(SERVICE, 'utf8');
+    const content = script.indexOf('release_matches_commit "$release" "$sha" "$ops_repo"');
+    const switchPoint = script.indexOf('ln -s "$release" "$service_home/active.next"');
+    expect(content).toBeGreaterThan(0);
+    expect(switchPoint).toBeGreaterThan(content);
+    // The gate itself refuses a release whose content is not the commit it would record a pass for.
+    expect(readFileSync(GATE, 'utf8')).toContain('release_matches_commit "$release" "$sha" "$gate_ops_repo"');
+  });
 });

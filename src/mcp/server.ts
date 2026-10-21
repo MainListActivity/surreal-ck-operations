@@ -540,7 +540,11 @@ export function createMcpHttpService(options: McpServiceOptions) {
         }
         let principal;
         try {
-          principal = await core.authenticate(cred);
+          // SYS01 M1: one deadline from arrival covers the whole request, authentication included. A stalled auth on a
+          // snapshot-backed listing is refused recoverably at the same moment as its answer, not left to the 55s budget.
+          principal = SNAPSHOT_TOOLS.has(currentTool() ?? '')
+            ? await withinReplyCeiling(async () => core.authenticate(cred))
+            : await core.authenticate(cred);
           mark('auth');
         } catch (error) {
           mark(`auth failed: ${(error as Error)?.message ?? String(error)}`.slice(0, 120));

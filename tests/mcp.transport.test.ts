@@ -211,6 +211,25 @@ test('a listing call whose reconnect is still pending at its reply ceiling is an
   } finally { await stalled.close(); }
 }, 30_000);
 
+test('a listing call whose authentication is still pending at its reply ceiling is answered 503 at the ceiling, not at the 55s budget (SYS01 M1)', async () => {
+  const stalledAuth = createMcpHttpService({
+    core: { ...core, authenticate: () => new Promise<never>(() => undefined) } as unknown as CompanyCore,
+    port: 0,
+  });
+  try {
+    const started = Date.now();
+    const response = await fetch(new URL(`http://127.0.0.1:${stalledAuth.port}/mcp`), {
+      method: 'POST',
+      headers: { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json', Authorization: 'Bearer sck_valid' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_context', arguments: {} } }),
+    });
+    const elapsed = Date.now() - started;
+    expect(response.status).toBe(503);
+    expect(elapsed).toBeGreaterThan(12_000);
+    expect(elapsed).toBeLessThan(14_000);
+  } finally { await stalledAuth.close(); }
+}, 30_000);
+
 test('gate token guards the public endpoint before bearer auth', async () => {
   active = true;
   unavailable = false;

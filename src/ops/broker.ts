@@ -612,13 +612,17 @@ export class OpsBroker {
       eventType: 'admin.service_principal.minted', targetType: 'service_principal', targetId: minted.id,
       payload: { label, scopes: minted.scopes, via: 'ops_broker' }, occurredAt: minted.createdAt,
     });
+    // The token never leaves the broker (manager ruling v41 on credential output): both branches answer with sealed
+    // references only, so omitting sealAs cannot echo the raw value. `sealed` is the name ops_idp_admin_request resolves
+    // from the principal id; `sealedAs` is the caller's extra alias when one was asked for.
     return {
       value: {
         id: minted.id, label, scopes: minted.scopes, status: minted.status, createdAt: minted.createdAt,
-        ...(sealedAlias ? { sealed: sealedAlias } : { token }),
+        sealed: principalTokenSecretName(id),
+        ...(sealedAlias ? { sealedAs: sealedAlias } : {}),
       },
       // The audit line is readable by the task's participants, so it names the sealed secret only as sealed: the alias is credential metadata.
-      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}${sealedAlias ? '（已密封）' : ''}` },
+      audit: { action: 'ops_idp_principal_mint', evidence: `ops_idp_principal_mint ${label} → ${minted.id}（已密封）` },
     };
   }
 

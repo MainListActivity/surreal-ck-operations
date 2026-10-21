@@ -1347,7 +1347,9 @@ export class SurrealCompanyCore implements CompanyCore {
         const takenAt = new Date().toISOString();
         return this.snapshots.create({
           owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt, startedAt: started,
-          bodies: companyParts(brief, section).map(part => JSON.stringify(part)), guidance: 'read one section with section',
+          bodies: companyParts(brief, section).map(part => JSON.stringify(part)),
+          // The company block narrows by section and pages, never by the task filters: the guidance a refusal hands back says so (SYS01 B9).
+          guidance: 'read it in pages: {"scope":"company","pageSize":25}, or one section with "section"',
         });
       },
       parse: body => JSON.parse(body) as CompanyPart,

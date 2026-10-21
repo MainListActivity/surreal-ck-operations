@@ -16,7 +16,7 @@ import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, Worktree
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
-import { arriving, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
+import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -568,7 +568,10 @@ export class SidecarPool {
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
-    const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
+    // SYS01 M1: for a snapshot-backed listing the reply ceiling covers the credential phase too, counted from the same
+    // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
+    const resolveCred = () => (forceRotate ? this.rotateCredential(instId) : this.credentialFor(instId));
+    const cred = SNAPSHOT_TOOLS.has(tool) ? await withinReplyCeiling(resolveCred) : await resolveCred();
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
