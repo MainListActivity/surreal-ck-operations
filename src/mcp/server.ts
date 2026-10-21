@@ -272,6 +272,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      // The 50-dependency and asset-path limits are enforced by core.createTask, the same
+      // validator the sidecar reaches. Keeping them out of this schema preserves the structured
+      // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),

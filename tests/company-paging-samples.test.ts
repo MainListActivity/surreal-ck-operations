@@ -100,7 +100,7 @@ function expectPartsWellFormed(parts: CompanyPart[]) {
   expect(parts.every(part => Buffer.byteLength(part.json, 'utf8') <= COMPANY_PART_BYTES)).toBe(true);
 }
 
-/** The operations sample: 9000 + 6000 bytes of directions, 7000 + 3000 bytes of goals, a project with a 4000-byte runbook, then a
+/** The operations sample: 9000 + 6000 bytes of directions, 7000 + 3000 bytes of goals, a project with two 2 KiB runbooks, then a
  *  final direction sized so the block is exactly OPERATIONS_BLOCK_BYTES. The final direction is written short and then lengthened in
  *  place. Its `at` is a nanosecond timestamp whose text drops trailing zeros, so the overhead of one direction is not that of another. */
 async function operationsSample(fx: Fixture): Promise<CompanyBrief> {
@@ -109,7 +109,7 @@ async function operationsSample(fx: Fixture): Promise<CompanyBrief> {
   await fx.owner.createGoal({ text: textOf(7000, '目标简报 '), source: 'owner:test', key: `ops-${suffix}-goal-a`, tier: 'standard' });
   await fx.owner.createGoal({ text: textOf(3000, '第二目标 '), source: 'owner:test', key: `ops-${suffix}-goal-b`, tier: 'standard' });
   await fx.projects.upsert({
-    id: `ops-proj-${suffix}`, name: '样本项目', repoPath: '/fixture/ops', release: 'local', envs: [], runbooks: [textOf(4000, '运行手册 "引号" ')],
+    id: `ops-proj-${suffix}`, name: '样本项目', repoPath: '/fixture/ops', release: 'local', envs: [], runbooks: [textOf(2000, '运行手册甲 '), textOf(2000, '运行手册乙 ')],
   });
   // The owner desk needs at least two characters, so the tuning direction starts as 'yy'. Each 'y' is one byte of JSON and is not
   // escaped, so lengthening the text by n characters grows the block by exactly n bytes, and the `at` written with it stays as it is.

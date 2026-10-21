@@ -57,11 +57,13 @@
 ```
 pnpm run admin project set project.json                           # 写入或更新
 pnpm run admin project list                                       # 查看（含凭证名，不含值）
+pnpm run admin project lengths <项目>                              # 只读长度诊断（字段/计数/UTF-8 字节，不含正文）
+pnpm run admin project check project.json                         # 只读校验候选输入，不写库
 pnpm run admin project broker surreal_ck production broker.json   # 配置该环境的运维代理（见下节）
 printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME - "用途"   # 角色写 - 表示无
 ```
 
-`project.json` 结构：`{ id, name, repoPath, defaultBranch, release, rollback, redLines[], runbooks[], notes, envs: [{ name, url, healthUrl, verify }] }`。
+`project.json` 结构：`{ id, name, repoPath, defaultBranch, release, rollback, redLines[], runbooks[], notes, envs: [{ name, url, healthUrl, verify }] }`。公开文本上限（按 UTF-8 字节，不是字符）：`release`/`rollback` 各 16 KiB，`notes` 32 KiB；`runbooks` 最多 50 条、每条最多 2 KiB、数组序列化总量最多 32 KiB。超限输入在项目/env 写入前拒绝；存量超限字段未改变时原样保留，显式改变必须满足上限。`project lengths`/`project check` 只返回字段名、计数和字节数，不输出正文或凭证。
 
 凭证存在 `env_secret` 表，值用 AES-256-GCM 加密；密钥只在本机登录钥匙串（服务 `surreal-ck-company`，账号 `env-secret-key`，首次写入凭证时自动生成）。**员工读不到任何凭证值**：`get_secret` / `put_secret` 已下线（调用得到 `unknown_tool` 和指向运维工具的提示），claim 不再下发 `secrets`，`project` 只列凭证名。值只由运维代理在插件进程内解密使用。测试账号的密码 `<别名>_PASSWORD` 由运维代理在 `ops_account_ensure` 时生成并直接密封，不需要手工登记；沿用旧的 `QA_PASSWORD`（对应别名 `QA`）也行。部署密钥不放这里：代码发布走各仓库的 CI（例如 surreal_ck 的 SSH 部署密钥只在 GitHub `production` Environment）。
 

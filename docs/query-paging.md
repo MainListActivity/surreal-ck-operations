@@ -188,10 +188,10 @@ null 语义（MCP、sidecar 与核心一致）：
 - D3（运行时）：证据覆盖 Bun 1.3.11 与部署运行时 Bun 1.4.2，见第 9 节。两种运行时的门禁与红灯结果一致（见第 9 节）。
 - D4（核心认领的字节数）：`claim()` 的返回值是完整认领（写入 `claim.json`，供调度器使用），字节数可以超过预算，它不是 RPC 应答。预算约束的是 RPC 回显：MCP `claim_next` 与 `heartbeat` 的应答（`echoClaim`）。复核断言针对 MCP 与通道的应答，不针对 `core.claim`。这一层次已由经理裁决 v25 确认。sidecar 没有 `claim_next` 与认领回显（见第 9.6 节）。
 
-拆分项与 v25 裁决（R6、R7 未在 SYS01 实现）：
+拆分项与 v25 裁决（R6、R7 由后续包实现）：
 
-- R6（有界性）：本轮未实现，拆分为三项链路。实现为工程 `d8069d8c-bebc-4df8-a7e5-bb608147825b`（工程到工程），发布申请为 `69e862fd-0acc-4f5d-9955-bdd7bd204ef8`（工程到产品），部署为 `9890243a-47c5-4b15-9505-cc03d4717c83`（工程到 QA）。部署依赖 SYS01 部署 `6b6cb5b9-dd3d-4a59-b611-c897a3ec67df`。裁定数值：`create_task` 的 `dependencies` 至多 50 条，按去重前的原始条数计。`workIntent.paths` 至多 50 条，每条至多 300 字符。当前代码中，`dependencies` 只去重（`src/core.ts` 第 543 行），无条数上限。`workIntent.paths` 的条数与长度只对 `kind: assets` 检查（`validateIntent`，`src/dispatcher/worktree-registry.ts` 第 95 至 98 行；核心在 `src/core.ts` 第 533 行调用），其它 `kind` 带 `paths` 即拒绝。以上裁定数值在拆分链交付前均未执行，写入时依赖条数不受限。标识符、角色、轨道名 `discipline`、工作树的仓库、分支与路径等固定字段仍无字节上限。
-- R7（项目自由文本）：裁定 `release` 与 `rollback` 各至多 16 KiB（UTF-8），`notes` 至多 32 KiB，`runbooks` 至多 50 条，每条 2 KiB，合计 32 KiB。现有超限数据不做追溯裁剪，变更的字段必须满足新上限，超限在写入前拒绝。当前 `ProjectStore.upsert`（`projects.ts` 约 95 至 111 行）未做长度检查。认领回显中，项目超过 8 KiB 时只回显身份与红线（第 2 节）。
+- R6（有界性）：由本包 `d8069d8c-bebc-4df8-a7e5-bb608147825b` 实现（待复核/上线）；发布申请 `69e862fd-0acc-4f5d-9955-bdd7bd204ef8`，部署 `9890243a-47c5-4b15-9505-cc03d4717c83`，依赖 SYS01 部署 `6b6cb5b9-dd3d-4a59-b611-c897a3ec67df`。`create_task` 的显式 `dependencies` 至多 50 条，按去重前原始条数先验，每项为 1–200 字符的 task id；`workIntent.paths` 仅 assets 可用，至多 50 条、每条至多 300 字符，沿用原有规范化/越界/凭证路径/symlink 拒绝。MCP、sidecar 与 core 同源：适配层调用 core，core 的 `validateExternalDependencies` 与 `validateIntent` 是唯一判定。系统自动维护的 goal anchor 依赖不在本上限内，保持完整。无 schema 迁移。
+- R7（项目自由文本）：由本包 `d8069d8c-bebc-4df8-a7e5-bb608147825b` 实现（待复核/上线）。`release`/`rollback` 各至多 16 KiB UTF-8，`notes` 32 KiB，`runbooks` 50 条、每条 2 KiB、序列化总量 32 KiB。`ProjectStore.upsert` 在项目/env 写入前共用纯校验；未改变的存量超限字段可保留，显式改变必须满足上限；`admin project lengths <id>` 与 `project check <file>` 只读展示字段/计数/字节，不含正文或凭证。现有超限数据不追溯裁剪；认领回显中项目超过 8 KiB 时只回显身份与红线（第 2 节）。
 - R1（工作树引用过长，2026-10-21 QA 生产退回）：分页的 `list_worktrees` 不再因单条工作树的 references 超限而无法前进；该条被截断并标注 `referencesTruncated`，`read_worktree_refs` 是真正的续读入口。旧游标指向部署前建立的快照时仍按旧行返回，遇到超限条目的拒绝会指向该入口；重新发起不带游标的 listing 即得到截断后的新行。48 KiB 整包预算、任务/身份范围与历史审计均不变。
 - R8（员工的工作树缺省范围，已在代码中落实）：sidecar 的 `list_worktrees` 不再回退到调用人的当前租约任务。核心 `listWorktrees`（`core.ts` 约 801 行）对非 gm 且未带 taskId（含 taskId 为 null）的调用一律 `forbidden`，MCP 与 sidecar 都经此判定。显式 taskId 走 `getTask` 授权与仓库范围。gm 保留全局读。员工与 QA 的指令须带 taskId。
 
