@@ -25,6 +25,8 @@
 - 分页条目的上限为 `ITEM_BUDGET_BYTES`，即 46 769 个双份字节（约 45.7 KiB）：数据可占的 `DATA_BUDGET_BYTES`（48 817）减去 2 KiB 的页信封余量（`PAGE_ENVELOPE_BYTES`）。它是按整条应答算出的内部上限，条目不超过它时保持完整。
 - 两道检查：sidecar 写回中继响应时（`guardRelayResponse`），以及 MCP 的 `toolResult`，两者都按 `answerBytes` 计。超过预算的成功响应替换为 JSON 错误 `response_too_large`（`retryable: false`，缩小查询后重试）；失败结果的文本与 `structuredContent` 是同一个 JSON 对象。comm 客户端退出码为 1，stdout 为一行 JSON。
 - 完整读取从不截断（见第 3 节）。分页读取只在单条超过 `ITEM_BUDGET_BYTES` 时截断该条：列表按下文截断，正文取剩余空间并标注 `contextTruncated` 与 `contextNextOffset`（证据为 `evidenceTruncated` 与 `evidenceNextOffset`），其余部分用 `read_task_text` 按段读取。
+- 工作树分页条目（`list_worktrees` 带 `pageSize`/`cursor`）：单个工作树连同全部 references 超过 `ITEM_BUDGET_BYTES` 时，references 只保留放得下的最长前缀，并标注 `referencesTruncated`（完整条数 `count`、完整 JSON 的 SHA-256 `sha256`、读取时使用的 `includeReleased`，以及恢复入口 `tool: "read_worktree_refs"`）。该条仍留在页里，分页继续前进；完整引用列表用 `read_worktree_refs` 按段读取。这是 SYS01 R1 的恢复入口：错误与标志都指向它，不靠缩小 `pageSize`、静默丢引用或关闭 `includeReleased`。
+- `read_worktree_refs` 的 `worktreePath` 用 listing 返回的规范路径，`includeReleased` 必须与当时 listing 一致，这样 `referencesTruncated.sha256` 覆盖的就是读回的全文。每段默认 16 KiB，最大 24 KiB，最小 4 字节；段边界不拆字符，`sha256` 覆盖全文，`offset` 大于 0 时必须带第一段的 `expectSha256`，列表在两次读取之间变化则返回 `conflict`。权限与 `list_worktrees` 相同：非 gm 必须带 `taskId`，gm 可全局读。
 - `read_task_text` 每段默认 16 KiB，最大 24 KiB（`SEGMENT_MAX_BYTES`），最小 4 字节，且不超过 `limit` 原始字节。段长同时按整条应答的 `answerBytes` 计：正文在两份副本中都计入，JSON 把控制字符写成 6 字节、引号写成 2 字节，文本副本还要再转义一次，所以控制字符或引号密集的正文，段会短于 `limit`，每条应答都不超过 49 152 字节（F2）。段边界落在字符边界上，各段拼接即为原文，不产生 UTF-8 断字符；`sha256` 为整段正文的摘要。
 
 写接口的回显（SYS01，`echoTask`）：检查点、提交、验收、退回、阻塞（`report_blocker`）、创建、释放、续做、延后、退役、项目换绑、仓库绑定与负责人决定返回的任务回显，同样受预算限制。回显中的依赖列表（`dependencies`）与任务、工作树的意图路径（`workIntent.paths`、`worktree.intent.paths`）各取不超过 `min(4 KiB, 本次回显的双份字节上限 / 8)` 的最长前缀，超出的列表在 `listsTruncated` 中给出完整条数（`count`）与完整 JSON 的 SHA-256（`sha256`），完整列表用 `read_task_text` 读取。之后 `context` 取剩余空间，超出时截断并标注（`contextTruncated`、`contextNextOffset`）。`contextBytes` 与 `contextSha256` 始终描述完整正文。`create_delivery` 把 `ITEM_BUDGET_BYTES` 按腿数均分，每条腿不超过 `floor(ITEM_BUDGET_BYTES / 腿数)`。写接口的回显不含项目环境正文。
@@ -51,6 +53,7 @@
 | `get_context` | `scope?`（`tasks` 缺省，或 `company`）、`section?`（仅 `scope: company`，`directions`、`goals`、`projects`）、`taskId?`、`state?`、`goalId?`、`role?`、`since?`、`includeCompany?`（缺省 `false`）、`fields?`、`pageSize?`（1–100，默认 25）、`cursor?` | 任务：`{ principal, companyIncluded, companyRead, tasks, company? }`，完整或拒绝；`scope: company`：`{ principal, scope, section?, company }`，完整或拒绝 | 任务：`{ principal, companyIncluded, companyRead, tasks, company?, page }`；`scope: company`：`{ principal, scope, section?, parts, page }` | 员工见自己可见的任务；gm 见全部；公司块对所有已认证身份可读，但项目环境（`envs`、凭证别名与角色）仅 gm 与持有该项目有效任务租约的员工可见，其它人得到空 `envs` 与 `envsWithheld: true` |
 | `get_task_history` | `taskId`、`pageSize?`、`cursor?` | 通道为 `{ history }`，MCP 为裸数组（与 `8d03d35` 相同）；均为完整（按时间正序）或拒绝 | `{ history, page }`，页序从新到旧，页内按时间正序 | 与 `get_task` 相同 |
 | `list_worktrees` | `taskId?`、`includeReleased?`、`pageSize?`、`cursor?` | 数组，完整或拒绝 | `{ worktrees, page }`，按路径排序 | 非 gm 须带 taskId（缺省或 null 一律 `forbidden`）；gm 可全局 |
+| `read_worktree_refs` | `taskId?`、`worktreePath`、`includeReleased?`、`offset?`、`limit?`、`expectSha256?` | 无 | `{ worktreePath, includeReleased, totalBytes, sha256, offset, bytes, nextOffset, text }` | 与 `list_worktrees` 相同：非 gm 须带 taskId；gm 可全局 |
 | `read_task_text` | `taskId`、`field`（`context`、`evidence`、`project`、`dependencies`、`workIntentPaths`、`worktreePaths`）、`auditId?`、`offset?`、`limit?`、`expectSha256?` | 无 | `{ taskId, field, auditId?, totalBytes, sha256, offset, bytes, nextOffset, text }` | 每段都检查权限 |
 | `get_admin_summary` | `since?`、`goalId?` | 无 | `{ cutoffAt, since, goalId?, scope, tasks, audit, outboxSequence, integrity }`（第 5 节） | 仅 gm |
 
@@ -106,7 +109,7 @@ null 语义（MCP、sidecar 与核心一致）：
 | `unauthorized` | 身份已撤销 | 停止读取 |
 | `snapshot_gone` | 快照过期、被淘汰或已删除；游标已过期 | 不带游标重新开始 |
 | `temporarily_unavailable` | 全库快照容量已满，或同一身份的快照都还在写入且等待超时，或快照构建超过 10 秒截止，或构建连接排队超过 2 秒，或快照未能写入 | 稍后重试（`retryable: true`）；答复最迟在 13 秒内返回（`REPLY_CEILING_MS`），收到后可换更窄的筛选再试 |
-| `response_too_large` | 快照超过 5000 行或 8 MiB；单页信封或单条超过预算 | 按查询形状收窄：任务/历史列表用 `state`、`goalId`、`role`、`since` 或 `pageSize`+`cursor`；公司块与某一节用 `{"scope":"company","pageSize":25}` 或 `section` 分页，不要用任务筛选参数。拒绝答复本身按被拒查询的形状给出对应指引 |
+| `response_too_large` | 快照超过 5000 行或 8 MiB；单页信封或单条超过预算 | 按查询形状收窄：任务/历史列表用 `state`、`goalId`、`role`、`since` 或 `pageSize`+`cursor`；公司块与某一节用 `{"scope":"company","pageSize":25}` 或 `section` 分页，不要用任务筛选参数；工作树引用用 `read_worktree_refs` 按段读取。拒绝答复本身按被拒查询的形状给出对应指引 |
 
 快照上限（`DEFAULT_SNAPSHOT_LIMITS`，v25 R4，代码中为固定值，没有运营配置项）：
 
@@ -189,6 +192,7 @@ null 语义（MCP、sidecar 与核心一致）：
 
 - R6（有界性）：本轮未实现，拆分为三项链路。实现为工程 `d8069d8c-bebc-4df8-a7e5-bb608147825b`（工程到工程），发布申请为 `69e862fd-0acc-4f5d-9955-bdd7bd204ef8`（工程到产品），部署为 `9890243a-47c5-4b15-9505-cc03d4717c83`（工程到 QA）。部署依赖 SYS01 部署 `6b6cb5b9-dd3d-4a59-b611-c897a3ec67df`。裁定数值：`create_task` 的 `dependencies` 至多 50 条，按去重前的原始条数计。`workIntent.paths` 至多 50 条，每条至多 300 字符。当前代码中，`dependencies` 只去重（`src/core.ts` 第 543 行），无条数上限。`workIntent.paths` 的条数与长度只对 `kind: assets` 检查（`validateIntent`，`src/dispatcher/worktree-registry.ts` 第 95 至 98 行；核心在 `src/core.ts` 第 533 行调用），其它 `kind` 带 `paths` 即拒绝。以上裁定数值在拆分链交付前均未执行，写入时依赖条数不受限。标识符、角色、轨道名 `discipline`、工作树的仓库、分支与路径等固定字段仍无字节上限。
 - R7（项目自由文本）：裁定 `release` 与 `rollback` 各至多 16 KiB（UTF-8），`notes` 至多 32 KiB，`runbooks` 至多 50 条，每条 2 KiB，合计 32 KiB。现有超限数据不做追溯裁剪，变更的字段必须满足新上限，超限在写入前拒绝。当前 `ProjectStore.upsert`（`projects.ts` 约 95 至 111 行）未做长度检查。认领回显中，项目超过 8 KiB 时只回显身份与红线（第 2 节）。
+- R1（工作树引用过长，2026-10-21 QA 生产退回）：分页的 `list_worktrees` 不再因单条工作树的 references 超限而无法前进；该条被截断并标注 `referencesTruncated`，`read_worktree_refs` 是真正的续读入口。旧游标指向部署前建立的快照时仍按旧行返回，遇到超限条目的拒绝会指向该入口；重新发起不带游标的 listing 即得到截断后的新行。48 KiB 整包预算、任务/身份范围与历史审计均不变。
 - R8（员工的工作树缺省范围，已在代码中落实）：sidecar 的 `list_worktrees` 不再回退到调用人的当前租约任务。核心 `listWorktrees`（`core.ts` 约 801 行）对非 gm 且未带 taskId（含 taskId 为 null）的调用一律 `forbidden`，MCP 与 sidecar 都经此判定。显式 taskId 走 `getTask` 授权与仓库范围。gm 保留全局读。员工与 QA 的指令须带 taskId。
 
 ## 7. 回滚隔离（RB01）

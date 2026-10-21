@@ -1063,6 +1063,199 @@ test('list_worktrees without pageSize or cursor keeps the array shape; an over-b
   }
 });
 
+/**
+ * The QA R1 production shape: 37 worktrees, the 18th a shared tree with one active and 128 released references. Long ids
+ * and nanosecond timestamps make the entry larger than a page item, as the production shared tree was.
+ */
+function longReferences(root: string) {
+  const at = '2026-10-21T17:01:51.123456789Z';
+  const reference = (index: number, state: 'active' | 'released') => ({
+    taskId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    employee: 'engineering-fixture-01',
+    deliveryId: `delivery-${String(index).padStart(8, '0')}-0000-4000-8000-000000000000`,
+    fence: 1, intent: { kind: 'code' as const, lane: 'ops-governance' }, state, at,
+  });
+  const views = Array.from({ length: 37 }, (_, index) => ({
+    id: `${root}-${index}`, repo: '/repo/ops', worktreePath: `/tmp/${root}-${String(index).padStart(3, '0')}`,
+    mode: index === 17 ? 'shared' as const : 'exclusive' as const, branch: `task/${root}${index}`,
+    createdAt: at, lastUsedAt: at, status: 'present' as const, deletable: false, reasons: [],
+    references: index === 17
+      ? [reference(0, 'active'), ...Array.from({ length: 128 }, (_, r) => reference(r + 1, 'released'))]
+      : [reference(index, 'active')],
+  }));
+  const shared = views[17]!;
+  return { views, shared, fullText: JSON.stringify(shared.references) };
+}
+
+test('a worktree whose references alone exceed a page is cut and flagged, pageSize 1 still traverses all 37 rows, and read_worktree_refs reassembles the whole list (SYS01 R1, AC03/AC05)', async () => {
+  const { views, shared, fullText } = longReferences('r1');
+  const original = core.listWorktrees;
+  core.listWorktrees = async () => views as never;
+  try {
+    // The QA repro: a page may no longer hold every row, because the cut row is large, but it must hold rows and carry a
+    // cursor, never fail. pageSize 1 is the variant that failed before.
+    const first = await core.worktreePage(gm, { pageSize: 100, includeReleased: true });
+    expect(first.page.total).toBe(37);
+    expect(first.page.returned).toBeGreaterThan(0);
+    expect(bytesOf(first)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const seen = await drain(async cursor => {
+      const page = await core.worktreePage(gm, { pageSize: 1, includeReleased: true, ...(cursor ? { cursor } : {}) });
+      expect(bytesOf(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      return { items: page.worktrees.map(worktree => String(worktree.worktreePath)), nextCursor: page.page.nextCursor };
+    });
+    expect(seen.length).toBe(37);
+    expect(new Set(seen).size).toBe(37);
+    expect([...seen].sort()).toEqual(views.map(view => view.worktreePath).sort());
+    // The cut row is delivered once, with the whole list's count, digest and filter.
+    const delivered = await drain(async cursor => {
+      const page = await core.worktreePage(gm, { pageSize: 100, includeReleased: true, ...(cursor ? { cursor } : {}) });
+      return { items: page.worktrees, nextCursor: page.page.nextCursor };
+    });
+    const cut = delivered.filter(worktree => worktree.worktreePath === shared.worktreePath);
+    expect(cut).toHaveLength(1);
+    expect(cut[0]!.referencesTruncated).toEqual({ count: 129, sha256: sha256(fullText), includeReleased: true, tool: 'read_worktree_refs' });
+    expect((cut[0]!.references as unknown[]).length).toBeLessThan(129);
+    // read_worktree_refs reads the whole list in segments; every answer fits, and the reassembly matches the flag.
+    const pieces: string[] = [];
+    let offset: number | null = 0;
+    let pinned: string | undefined;
+    while (offset !== null) {
+      const segment = await core.worktreeRefs(gm, {
+        worktreePath: shared.worktreePath, includeReleased: true, offset, limit: 16 * 1024,
+        ...(pinned ? { expectSha256: pinned } : {}),
+      });
+      expect(bytesOf(segment)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      expect(segment.worktreePath).toBe(shared.worktreePath);
+      expect(segment.includeReleased).toBe(true);
+      expect(segment.totalBytes).toBe(utf8(fullText));
+      expect(segment.sha256).toBe(sha256(fullText));
+      expect(segment.text).not.toContain('�');
+      pinned = segment.sha256;
+      pieces.push(segment.text);
+      offset = segment.nextOffset;
+    }
+    expect(pieces.join('')).toBe(fullText);
+    expect(sha256(pieces.join(''))).toBe(sha256(fullText));
+    const parsed = JSON.parse(pieces.join('')) as Array<{ taskId: string }>;
+    expect(parsed).toEqual(JSON.parse(fullText));
+    expect(new Set(parsed.map(reference => reference.taskId)).size).toBe(parsed.length);
+    // A continuation with a foreign digest is refused, never mixed with another version.
+    await expectRefused(core.worktreeRefs(gm, {
+      worktreePath: shared.worktreePath, includeReleased: true, offset: 4, expectSha256: '0'.repeat(64),
+    }), 'conflict', /references changed/);
+    // Without includeReleased nothing is cut: the old behavior of the listing is unchanged.
+    const without = await core.worktreePage(gm, { pageSize: 100 });
+    expect(without.worktrees.every(worktree => worktree.referencesTruncated === undefined)).toBe(true);
+    // Through the real comm client: a segment and the cut page are JSON, within the budget, and verifiable.
+    const relayed = await relay('read_worktree_refs',
+      { worktreePath: shared.worktreePath, includeReleased: true, offset: 0, limit: 16 * 1024 },
+      args => core.worktreeRefs(gm, args));
+    expect(relayed.exit).toBe(0);
+    expect(Buffer.byteLength(relayed.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const segment = JSON.parse(relayed.out) as { worktreePath: string; sha256: string; text: string };
+    expect(segment.worktreePath).toBe(shared.worktreePath);
+    expect(segment.sha256).toBe(sha256(fullText));
+    expect(fullText.startsWith(segment.text)).toBe(true);
+    const relayedList = await relay('list_worktrees', { pageSize: 1, includeReleased: true }, args => core.worktreePage(gm, args));
+    expect(relayedList.exit).toBe(0);
+    const row = JSON.parse(relayedList.out) as { worktrees: Array<{ worktreePath: string; referencesTruncated?: unknown }> };
+    expect(row.worktrees).toHaveLength(1);
+    expect(bytesOf(row)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  } finally {
+    core.listWorktrees = original;
+  }
+});
+
+test('read_worktree_refs keeps the list_worktrees scope: a global read is gm only, and a path outside the scope is not_found (SYS01 R1, R8)', async () => {
+  await expectRefused(core.worktreeRefs(eng, { worktreePath: '/tmp/wt-000' }), 'forbidden', /gm/);
+  await expectRefused(core.worktreeRefs(gm, { worktreePath: '/tmp/not-registered' }), 'not_found', /worktree not found/);
+});
+
+test('the cut worktree and its references read back through the real sidecar channel: every reply is whole, and the segments reassemble (SYS01 R1, AC05)', async () => {
+  const { views, shared, fullText } = longReferences('r1');
+  const original = core.listWorktrees;
+  core.listWorktrees = async () => views as never;
+  const runDir = mkdtempSync(join(tmpdir(), 'sys01-r1-sidecar-'));
+  try {
+    const pool = new SidecarPool({ core, workforce: { rotate: async () => gm } as unknown as SidecarDeps['workforce'], runDir, sweepMs: 5 });
+    const call = sckCall(pool, 'r1', gm);
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 60; page++) {
+      const reply = await call('list_worktrees', { pageSize: 1, includeReleased: true, ...(cursor ? { cursor } : {}) });
+      expect(reply.exit).toBe(0);
+      expect(Buffer.byteLength(reply.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      const body = JSON.parse(reply.out) as {
+        worktrees: Array<{ worktreePath: string; referencesTruncated?: unknown }>;
+        page: { nextCursor?: string };
+      };
+      for (const worktree of body.worktrees) {
+        seen.push(worktree.worktreePath);
+        if (worktree.worktreePath === shared.worktreePath) {
+          expect(worktree.referencesTruncated).toMatchObject({ count: 129, includeReleased: true });
+        }
+      }
+      if (!body.page.nextCursor) break;
+      cursor = body.page.nextCursor;
+    }
+    expect(seen.length).toBe(37);
+    expect(new Set(seen).size).toBe(37);
+    const pieces: string[] = [];
+    let offset: number | null = 0;
+    let pinned: string | undefined;
+    while (offset !== null) {
+      const reply = await call('read_worktree_refs', {
+        worktreePath: shared.worktreePath, includeReleased: true, offset, limit: 16 * 1024,
+        ...(pinned ? { expectSha256: pinned } : {}),
+      });
+      expect(reply.exit).toBe(0);
+      expect(Buffer.byteLength(reply.out, 'utf8')).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      const segment = JSON.parse(reply.out) as { sha256: string; text: string; nextOffset: number | null };
+      pinned = segment.sha256;
+      pieces.push(segment.text);
+      offset = segment.nextOffset;
+    }
+    expect(pieces.join('')).toBe(fullText);
+  } finally {
+    core.listWorktrees = original;
+    rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test('read_worktree_refs over MCP: a cut worktree reassembles in segments, and each whole MCP response stays within 48 KiB (SYS01 R1)', async () => {
+  const { views, shared, fullText } = longReferences('r1');
+  const original = core.listWorktrees;
+  core.listWorktrees = async () => views as never;
+  const session = await mcpSession(gm);
+  try {
+    const pieces: string[] = [];
+    let offset: number | null = 0;
+    let pinned: string | undefined;
+    while (offset !== null) {
+      const answer = await session.client.callTool({
+        name: 'read_worktree_refs',
+        arguments: { worktreePath: shared.worktreePath, includeReleased: true, offset, limit: 16 * 1024, ...(pinned ? { expectSha256: pinned } : {}) },
+      });
+      expect(answer.structuredContent).toMatchObject({ ok: true });
+      expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      const segment = (answer.structuredContent as { data: { sha256: string; text: string; nextOffset: number | null } }).data;
+      expect(segment.sha256).toBe(sha256(fullText));
+      pinned = segment.sha256;
+      pieces.push(segment.text);
+      offset = segment.nextOffset;
+    }
+    expect(pieces.join('')).toBe(fullText);
+    const listed = await session.client.callTool({ name: 'list_worktrees', arguments: { pageSize: 1, includeReleased: true } });
+    expect(listed.structuredContent).toMatchObject({ ok: true });
+    expect(lastBody(session)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const page = (listed.structuredContent as { data: { worktrees: Array<{ referencesTruncated?: unknown }> } }).data;
+    expect(page.worktrees).toHaveLength(1);
+  } finally {
+    core.listWorktrees = original;
+    await session.close();
+  }
+});
+
 test('concurrent traversals with writers: each listing is delivered exactly once, with no duplicate and no miss, and each row shows its state at the listing (C4)', async () => {
   const concurrent = await owner.createGoal({ text: `并发目标 ${suffix}`, source: 'owner:test', key: key('goal-conc'), tier: 'standard' });
   for (let i = 0; i < 120; i++) {

@@ -115,6 +115,12 @@ export interface TaskView {
 /** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
 export interface ListCut { count: number; sha256: string }
 
+/**
+ * References cut from one worktree of a paged listing (SYS01 R1): the whole list's count and SHA-256, the filter the list was
+ * read with, and the tool that reads the whole list. A reader never has to guess where the rest is.
+ */
+export interface ReferencesCut extends ListCut { includeReleased: boolean; tool: 'read_worktree_refs' }
+
 /** A text field of a task echo that was cut: the UTF-8 size of its whole value, and the SHA-256 of that value (SYS01 R3). */
 export interface FieldCut { bytes: number; sha256: string }
 
@@ -218,6 +224,25 @@ export interface TaskTextSegment {
   auditId?: string;
   totalBytes: number;
   /** SHA-256 of the whole text, so a reader can verify a reassembly. */
+  sha256: string;
+  offset: number;
+  bytes: number;
+  nextOffset: number | null;
+  text: string;
+}
+
+/**
+ * One byte segment of one worktree's references as JSON (SYS01 R1). It is the recovery entry a paged list_worktrees item names
+ * when its references were cut: the same task/gm scope as the listing, the whole list's size and SHA-256, and a byte window
+ * that reassembles exactly.
+ */
+export interface WorktreeRefsSegment {
+  /** The canonical path the listing returned. */
+  worktreePath: string;
+  /** The filter the whole list was read with: true lists released references too. */
+  includeReleased: boolean;
+  totalBytes: number;
+  /** SHA-256 of the whole references text, so a reader can verify a reassembly. */
   sha256: string;
   offset: number;
   bytes: number;
@@ -564,6 +589,8 @@ export interface CompanyCore {
   worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
   /** list_worktrees without pageSize or cursor: the pre-SYS01 array, in the same compact form as a page. */
   worktreeList?(credential: Credential, input: Record<string, unknown>): Promise<unknown[]>;
+  /** One byte segment of one worktree's references, as a cut listing item named it (SYS01 R1). Same scope as listWorktrees. */
+  worktreeRefs?(credential: Credential, input: Record<string, unknown>): Promise<WorktreeRefsSegment>;
   taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
   adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */

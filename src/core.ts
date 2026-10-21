@@ -10,10 +10,10 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes } from './response-budget.ts';
-import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, queryDigest, type ContextParams } from './query-input.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer } from './response-budget.ts';
+import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import { companyBlock, companyParts } from './company-context.ts';
-import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, TaskTextSegment, WorktreePageView } from './contracts.ts';
+import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
@@ -329,7 +329,7 @@ const HANDOVER_ROWS = 60;
 const HANDOVER_OPS_ROWS = 20;
 
 type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
-interface WorktreeCompact { worktreePath: string; releasedReferences: number; [key: string]: unknown }
+interface WorktreeCompact { worktreePath: string; releasedReferences: number; referencesTruncated?: ReferencesCut; [key: string]: unknown }
 
 const tooLarge = (message: string) => new CompanyError('response_too_large', message);
 /** The arguments that read the company block in pages, named in every task answer (SYS01 AC-A). */
@@ -343,15 +343,25 @@ function completeOrRefuse<T>(value: T, what: string, guidance: string): T {
   return value;
 }
 
-/** Compact references, sorted by path so that listings are stable. Released references are counted, and listed only when asked. */
-function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolean): WorktreeCompact[] {
+/**
+ * Compact references, sorted by path so that listings are stable. Released references are counted, and listed only when asked.
+ * A paged listing passes `itemBudget`: a worktree whose whole entry cannot fit a page keeps the longest prefix of its
+ * references that does, and is flagged with the whole list's count and SHA-256 (SYS01 R1). read_worktree_refs reads the rest
+ * in byte segments. A complete (legacy) list never passes a budget: it stays whole, or is refused.
+ */
+function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolean, itemBudget?: number): WorktreeCompact[] {
   return [...all]
     .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
-    .map(worktree => ({
-      ...worktree,
-      references: includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released'),
-      releasedReferences: worktree.references.filter(reference => reference.state === 'released').length,
-    }));
+    .map(worktree => {
+      const references = includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released');
+      const releasedReferences = worktree.references.filter(reference => reference.state === 'released').length;
+      const item: WorktreeCompact = { ...worktree, references, releasedReferences };
+      if (itemBudget === undefined || references.length === 0 || dualBytes(item) <= itemBudget) return item;
+      const cut: ReferencesCut = { count: references.length, sha256: HASH(JSON.stringify(references)), includeReleased: includeReleased === true, tool: 'read_worktree_refs' };
+      const bounded = (kept: readonly WorktreeView['references'][number][]): WorktreeCompact => ({ ...item, references: kept, referencesTruncated: cut });
+      const kept = fitCount(references, subset => dualBytes(bounded(subset)), itemBudget);
+      return bounded(references.slice(0, kept));
+    });
 }
 
 const pick = (value: Record<string, unknown>, fields?: readonly string[]): Record<string, unknown> =>
@@ -1279,6 +1289,8 @@ export class SurrealCompanyCore implements CompanyCore {
     respond: (items: readonly T[], page: PageInfo) => R;
     /** What the caller can change when the page envelope alone is over the budget (for example includeCompany). */
     envelopeGuidance: string;
+    /** Guidance when one row cannot fit a page even after its own cut: name a real entry that reads the rest. */
+    oversizeGuidance?: (item: T) => string;
   }): Promise<R> {
     const { actor, kind, digest, pageSize } = args;
     const replyAt = this.replyAt(args.startedAt);
@@ -1345,7 +1357,8 @@ export class SurrealCompanyCore implements CompanyCore {
       }
       const kept = fitCount(items, subset => answerBytes(build(subset as ReadonlyArray<{ seq: number; value: T }>)), RESPONSE_BUDGET_BYTES);
       if (kept === 0 && items.length > 0) {
-        throw tooLarge('one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
+        const first = items[0]!.value;
+        throw tooLarge(args.oversizeGuidance?.(first) ?? 'one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
       }
       return completeOrRefuse(build(items.slice(0, kept)), 'this page', args.envelopeGuidance);
     } catch (error) {
@@ -1397,6 +1410,7 @@ export class SurrealCompanyCore implements CompanyCore {
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
       envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
+      oversizeGuidance: item => `task ${String(item.id)} is larger than a page can hold; read its context with read_task_text ${JSON.stringify({ taskId: String(item.id), field: 'context', offset: 0 })}, or narrow the fields with fields`,
     });
   }
 
@@ -1436,6 +1450,7 @@ export class SurrealCompanyCore implements CompanyCore {
       parse: body => JSON.parse(body) as CompanyPart,
       respond: (parts, page) => ({ principal: actor, scope: 'company', ...named, parts: [...parts], page }),
       envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: () => 'one part of the company block is larger than a page can hold; use a smaller pageSize or one section with "section"',
     });
   }
 
@@ -1469,6 +1484,9 @@ export class SurrealCompanyCore implements CompanyCore {
       parse: body => JSON.parse(body) as HistoryEntry,
       respond: (history, page) => ({ history: [...history].reverse(), page }),
       envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: entry => entry.auditId
+        ? `history entry ${entry.auditId} is larger than a page can hold; read its evidence with read_task_text ${JSON.stringify({ taskId: String(taskId), field: 'evidence', auditId: entry.auditId, offset: 0 })}`
+        : 'a history entry is larger than a page can hold; use a smaller pageSize',
     });
   }
 
@@ -1487,7 +1505,7 @@ export class SurrealCompanyCore implements CompanyCore {
       create: async started => {
         const replyAt = this.replyAt(started);
         const takenAt = await this.bounded(this.dbNow(), replyAt);
-        const inventory = compactWorktrees(await this.bounded(this.listWorktrees(credential, params.taskId as TaskId | undefined), replyAt), params.includeReleased);
+        const inventory = compactWorktrees(await this.bounded(this.listWorktrees(credential, params.taskId as TaskId | undefined), replyAt), params.includeReleased, ITEM_BUDGET_BYTES);
         if (inventory.length > this.snapshots.limits.maxRows) {
           throw tooLarge(`${inventory.length} worktrees are registered, above the ${this.snapshots.limits.maxRows}-row listing limit`);
         }
@@ -1499,6 +1517,7 @@ export class SurrealCompanyCore implements CompanyCore {
       parse: body => JSON.parse(body) as Record<string, unknown>,
       respond: (worktrees, page) => ({ worktrees: [...worktrees], page }),
       envelopeGuidance: 'use a smaller pageSize, or narrow with taskId',
+      oversizeGuidance: item => `worktree ${String(item.worktreePath)} is larger than a page can hold even with its references cut; start the listing again without cursor, or read its references with read_worktree_refs ${JSON.stringify({ ...(params.taskId ? { taskId: params.taskId } : {}), worktreePath: String(item.worktreePath), includeReleased: params.includeReleased, offset: 0 })}`,
     });
   }
 
@@ -1511,7 +1530,34 @@ export class SurrealCompanyCore implements CompanyCore {
     const params = parseWorktreeInput(input);
     const list = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
     return completeOrRefuse(list, `the worktree inventory (${list.length} worktrees)`,
-      'read it with list_worktrees, pageSize and page.nextCursor, or pass taskId to narrow it');
+      'read it with list_worktrees, pageSize and page.nextCursor, or pass taskId to narrow it; a worktree whose references are cut in a page is read whole with read_worktree_refs');
+  }
+
+  /**
+   * read_worktree_refs (SYS01 R1): one byte segment of one worktree's references as JSON, the recovery entry a paged listing
+   * item names when its references were cut. The worktree is looked up under the same scope as list_worktrees (a task id
+   * scopes it to that task's repository; a global read is gm only), and includeReleased must be the filter the listing item
+   * reports, so the digest the item carries covers exactly this text. Segments never split a character and reassemble
+   * exactly; sha256 covers the whole text, and a segment past offset 0 pins the digest it started with.
+   */
+  async worktreeRefs(credential: Credential, input: Record<string, unknown>): Promise<WorktreeRefsSegment> {
+    const actor = await this.authenticate(credential);
+    const params = parseWorktreeRefsInput(input);
+    await this.worktreeScope(credential, actor, params.taskId);
+    const inventory = await this.listWorktrees(credential, params.taskId as TaskId | undefined);
+    const worktree = inventory.find(item => item.worktreePath === params.worktreePath);
+    if (!worktree) throw new CompanyError('not_found', 'worktree not found in the scope of this call');
+    const references = params.includeReleased
+      ? worktree.references
+      : worktree.references.filter(reference => reference.state !== 'released');
+    const text = JSON.stringify(references);
+    const sha256 = HASH(text);
+    // A reassembly pins the digest it started with. A list that changed since is refused, never mixed in.
+    if (params.expectSha256 !== undefined && params.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the references changed: they are now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read them again from offset 0, with the same includeReleased as the listing`);
+    }
+    const head = { worktreePath: worktree.worktreePath, includeReleased: params.includeReleased, sha256 };
+    return worktreeRefsSegmentAnswer(head, worktreeRefsSegment(text, params.offset, params.limit, head));
   }
 
   /** Re-checks, on every worktree read, what it needs: access to the task, or gm for the global inventory. */

@@ -7,11 +7,11 @@ import {
   ANSWER_WRAPPER_BYTES, CLAIM_HISTORY_FLOOR_BYTES, CLAIM_LIST_ECHO_BYTES, DATA_BUDGET_BYTES, ITEM_BUDGET_BYTES, MAX_REQUEST_ID_BYTES,
   PROJECT_ECHO_BYTES, RESPONSE_BUDGET_BYTES, RESPONSE_FRAME_BYTES, SSE_RPC_FRAME_BYTES, answerBytes, answerResult, dualBytes, echoClaim,
   echoTask, fitCount, guardRelayResponse, jsonBytes, longestFittingPrefix, oversizeRequestId, openCursor, sealCursor, textSegment,
-  textSegmentAnswer, utf8Prefix, utf8Segment,
+  textSegmentAnswer, utf8Prefix, utf8Segment, worktreeRefsSegment, worktreeRefsSegmentAnswer,
 } from '../src/response-budget.ts';
 import {
   cursorOf, isPaged, pageSizeOf, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput,
-  queryDigest, TASK_FIELDS, taskIdOf,
+  parseWorktreeRefsInput, queryDigest, TASK_FIELDS, taskIdOf,
 } from '../src/query-input.ts';
 
 describe('byte budget (SYS01)', () => {
@@ -287,6 +287,18 @@ describe('argument parsing (SYS01)', () => {
     expect(parseTextInput({ taskId: 't', field: 'context', offset: 4, expectSha256: digest })).toMatchObject({ offset: 4 });
     expect(() => parseTextInput({ taskId: 't', field: 'context', expectSha256: 'A'.repeat(64) })).toThrow(/expectSha256/);
     expect(() => parseTextInput({ taskId: 't', field: 'context', expectSha256: 'abc' })).toThrow(/expectSha256/);
+  });
+
+  test('worktree refs arguments: a canonical path, the same includeReleased, and a pinned digest past offset 0 (SYS01 R1)', () => {
+    expect(() => parseWorktreeRefsInput({})).toThrow(/worktreePath/);
+    expect(() => parseWorktreeRefsInput({ worktreePath: '   ' })).toThrow(/worktreePath/);
+    expect(() => parseWorktreeRefsInput({ worktreePath: 'x'.repeat(4097) })).toThrow(/worktreePath/);
+    expect(parseWorktreeRefsInput({ worktreePath: '/wt/shared' })).toMatchObject({ worktreePath: '/wt/shared', includeReleased: false, offset: 0, limit: 16 * 1024 });
+    expect(parseWorktreeRefsInput({ taskId: 't', worktreePath: '/wt/shared', includeReleased: true })).toMatchObject({ taskId: 't', includeReleased: true });
+    expect(() => parseWorktreeRefsInput({ worktreePath: '/wt/shared', includeReleased: 'yes' })).toThrow(/includeReleased/);
+    expect(() => parseWorktreeRefsInput({ worktreePath: '/wt/shared', offset: 4 })).toThrow(/expectSha256/);
+    const digest = 'b'.repeat(64);
+    expect(parseWorktreeRefsInput({ worktreePath: '/wt/shared', offset: 4, expectSha256: digest })).toMatchObject({ offset: 4, expectSha256: digest });
   });
 
   test('query digests ignore key order and change with every filter', () => {
@@ -722,5 +734,35 @@ describe('reclaim_worktrees arguments (SYS01, D3): one strict rule on every laye
     await expect(core.reclaimWorktrees('eng-token', { dryRun: null } as never)).rejects.toMatchObject({ code: 'invalid' });
     await expect(core.reclaimWorktrees('eng-token', { dryRun: true })).rejects.toMatchObject({ code: 'forbidden' });
     expect(runs.length).toBe(2);
+  });
+});
+
+
+describe('read_worktree_refs segments (SYS01 R1): one worktree references list, read whole in byte segments', () => {
+  const refs = Array.from({ length: 129 }, (_, i) => ({
+    taskId: `task-${String(i).padStart(4, '0')}`, employee: 'engineering-fixture-01', deliveryId: `delivery-${i}`,
+    fence: 1, intent: { kind: 'code' as const, lane: '运营治理🙂' }, state: i === 0 ? 'active' as const : 'released' as const,
+    at: '2026-10-21T17:01:51.123456789Z',
+  }));
+  const text = JSON.stringify(refs);
+  const head = { worktreePath: '/Users/y/IdeaProjects/shared-工作树🙂', includeReleased: true, sha256: createHash('sha256').update(text).digest('hex') };
+
+  test('segments reassemble the whole JSON, and every answer fits the budget as it is sent', () => {
+    const pieces: Buffer[] = [];
+    const sizes: number[] = [];
+    let offset: number | null = 0;
+    while (offset !== null) {
+      const segment = worktreeRefsSegment(text, offset, 16 * 1024, head);
+      expect(segment.bytes).toBeGreaterThan(0);
+      expect(segment.text).not.toContain('\uFFFD');
+      if (segment.next !== null) expect(segment.next).toBeGreaterThan(offset);
+      const answer = { ok: true as const, data: worktreeRefsSegmentAnswer(head, segment) };
+      expect(guardRelayResponse(answer)).toBe(answer);
+      pieces.push(Buffer.from(segment.text, 'utf8'));
+      sizes.push(answerBytes(answer.data));
+      offset = segment.next;
+    }
+    expect(Buffer.concat(pieces).toString('utf8')).toBe(text);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   });
 });

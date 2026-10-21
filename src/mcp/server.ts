@@ -162,7 +162,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.listWorktreeAudits(token(ctx), limit ?? undefined)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. Task-scoped reads, or gm global reads.',
+    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. A worktree whose whole entry cannot fit a page has its references cut and flagged (referencesTruncated: count, sha256, includeReleased, tool); read_worktree_refs returns the whole list in byte segments. Task-scoped reads, or gm global reads.',
     inputSchema: z.object({ taskId: z.string().min(1).max(200).nullish(), includeReleased: z.boolean().nullish(), ...pageArgs }),
   }, async (input, ctx) => run(token(ctx), () => {
     // C1 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 array shape.
@@ -170,6 +170,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
     if (core.worktreeList) return core.worktreeList(token(ctx), input);
     return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId ?? undefined) : Promise.resolve([]);
   }));
+  server.registerTool('read_worktree_refs', {
+    description: 'Read one byte segment of one worktree\'s references as JSON: the recovery entry a paged list_worktrees item names when its references were cut (referencesTruncated carries the whole count, SHA-256 and includeReleased). Pass the same taskId and includeReleased the listing used. Returns the total size and SHA-256 of the whole text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: a list that changed in between is refused with conflict instead of mixing two versions. Same access as list_worktrees: a task id scopes the read to that task repository, a global read is gm only.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200).nullish(),
+      worktreePath: z.string().min(1).max(4096),
+      includeReleased: z.boolean().nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(),
+      limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.worktreeRefs
+    ? core.worktreeRefs(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('get_admin_summary', {
     description: 'gm only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
     inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
