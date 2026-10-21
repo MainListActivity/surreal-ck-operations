@@ -188,6 +188,12 @@ export function registerHandlers(server: PluginServerContext): void {
         : undefined;
     const defs = await workforce.defs();
     const insts = await workforce.insts();
+    // A truncated list must keep the defs the owner can act on: enabled defs with a live instance
+    // first, then other enabled defs, then disabled ones. The sort is stable, so within a rank the
+    // query order (weight DESC, priority, id) still decides.
+    const liveDefIds = new Set(insts.map(i => i.def));
+    const defRank = (d: { id: string; enabled: boolean }) => d.enabled ? (liveDefIds.has(d.id) ? 0 : 1) : 2;
+    const orderedDefs = [...defs].sort((a, b) => defRank(a) - defRank(b));
     const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
     const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
       entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,
@@ -203,14 +209,13 @@ export function registerHandlers(server: PluginServerContext): void {
         windows: (u.windows ?? []).map((w: any) => ({ label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt, tone: w.tone })),
         balances: (u.balances ?? []).map((b: any) => ({ label: b.label, remaining: b.remaining, limit: b.limit, unit: b.unit, tone: b.tone })),
       })),
-      defs: defs.map(d => ({
+      defs: orderedDefs.map(d => ({
         id: d.id, role: d.role, provider: d.provider, model: d.model, resolved: resolveDisplay(d),
         thinking: d.thinking, enabled: d.enabled, maxInstances: d.maxInstances, weight: d.weight, avgScore: d.avgScore,
       })),
-      instances: insts.map(i => ({
-        id: i.id, def: i.def, role: i.role, provider: i.provider, cwd: i.cwd,
-        agentId: i.paseoAgentId, agentStatus: observed.sessions.get(i.id)?.status,
-      })),
+      // Only what the roster renders: the instance name, its def and the tick's status.
+      // cwd/agentId/role/provider had no reader and consumed most of the 6KB instance budget.
+      instances: insts.map(i => ({ id: i.id, def: i.def, agentStatus: observed.sessions.get(i.id)?.status })),
       health: healthView,
       pools,
       reviewPools,

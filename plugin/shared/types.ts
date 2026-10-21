@@ -226,7 +226,8 @@ export interface Roster {
   opsRepo: string;
   usage: ProviderUsageView[];
   defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; avgScore?: number }>;
-  instances: Array<{ id: string; def?: string; role: string; provider?: string; cwd?: string; agentId?: string; agentStatus?: string }>;
+  /** What the roster renders: the instance name, its def, and the tick's session status. */
+  instances: Array<{ id: string; def?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
   /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
   pools: StaffingPoolView[];
