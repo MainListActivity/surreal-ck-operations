@@ -540,6 +540,8 @@ export class Dispatcher {
   private readonly reloadAt = new Map<string, number>();
   /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
   private readonly driftWaitLogged = new Map<string, string>();
+  /** The last quota-floor line written. A subscription can stay below the floor for days; one line per change, not per tick. */
+  private lastQuotaFloor = '';
   private readonly onboarded = new Set<string>();
   // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
   // identical answers, so re-asking every tick only burns tokens. Re-ask only
@@ -761,7 +763,13 @@ export class Dispatcher {
     // and long windows (week/month). Stale snapshots (>15min) fail open rather than
     // keeping a provider blocked forever.
     const quotaBlocked = quotaBlockedProviders(quotaRows, cfg, Date.now());
-    if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
+    const quotaFloorLine = [...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ');
+    if (quotaFloorLine !== this.lastQuotaFloor) {
+      const clears = this.lastQuotaFloor !== '' && quotaFloorLine === '';
+      this.lastQuotaFloor = quotaFloorLine;
+      if (quotaFloorLine) this.log(`quota below floor: ${quotaFloorLine}`);
+      else if (clears) this.log('quota recovered: every provider is above its floor');
+    }
     // Early warning: a subscription that is nearly spent still dispatches, but the owner hears
     // about it while there is time to top it up, instead of discovering it when the company stops.
     if (cfg.quotaWarnPct > 0) {
