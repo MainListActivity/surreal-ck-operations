@@ -876,7 +876,7 @@ test('RW06 cross-version: the pre-RW06 unlock misdispatches a review wait (old-r
     expect((await task(t.id)).waiting).toMatchObject({ kind: 'manager', resumeState: 'review', role: 'qa' });
     await core.deferTaskUntil(tokens.gm, { taskId: t.id, dependencies: [gate.id], text: '转为正式依赖等待：前置完成前不派复核、不派实现。', idempotencyKey: key() });
     // C3: the dependency wait names the review phase and the reviewing role, not the execute phase.
-    expect((await task(t.id)).waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependencies: [gate.id] });
+    expect((await task(t.id)).waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependenciesCount: 1 });
   }
 
   // Old-red (the pre-RW06 unlock in 475b5c2): a hard-written ready instead of the phase restore. Keep it as a safety fixture: the

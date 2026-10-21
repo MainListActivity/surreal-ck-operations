@@ -672,7 +672,7 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 function waitingLabel(w: NonNullable<TaskView["waiting"]>): string {
   const phase = w.resumeState === "review" ? "复核" : w.resumeState === "doing" ? "执行" : w.resumeState === "ready" ? "就绪" : "未知阶段";
   const role = w.role === "owner" ? "老板" : w.role === "unknown" ? "未知岗位" : (ROLE_LABEL[w.role] ?? w.role);
-  const deps = `依赖 ${w.dependencies.length} 项`;
+  const deps = `依赖 ${w.dependenciesCount} 项`;
   if (w.kind === "manager") return `等待经理决定（恢复${phase}）· ${deps}`;
   if (w.kind === "owner") return `等待老板决定（恢复${phase}）· ${deps}`;
   return `等待${role}的${phase}前置（恢复${phase}）· ${deps}`;

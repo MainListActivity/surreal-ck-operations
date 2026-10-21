@@ -12,7 +12,7 @@ const base = {
 
 test('a review-phase dependency wait names the reviewer role and the review phase it restores', () => {
   const waiting = waitingOf({ ...base, resume_state: 'review', resume_role: 'qa', dependencies: ['task:dep'] as never });
-  expect(waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependencies: ['dep'] });
+  expect(waiting).toEqual({ kind: 'dependency', resumeState: 'review', role: 'qa', dependenciesCount: 1 });
 });
 
 test('an empty resume role on a review wait is not read as an execute wait: the reviewer role stands in', () => {

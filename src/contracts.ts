@@ -62,8 +62,9 @@ export interface TaskWaiting {
   resumeState: TaskState | 'unknown';
   /** For dependency waits: the role whose phase is awaited (review wait -> the reviewer role); `unknown` when no fact names it. */
   role: Role | 'owner' | 'unknown';
-  /** Unfinished prerequisites recorded on the row (ids only, no text). */
-  dependencies: TaskId[];
+  /** How many prerequisites the row records. The ids themselves stay in the task's own `dependencies` field, which SYS01's
+   *  per-item budget already truncates with an explicit flag; repeating them here would push a wide row past a page. */
+  dependenciesCount: number;
 }
 
 export interface TaskView {

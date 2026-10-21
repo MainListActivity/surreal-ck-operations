@@ -244,7 +244,7 @@ export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_st
         : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
           : 'unknown';
   const kind: TaskWaiting['kind'] = row.blocked_to === 'gm' ? 'manager' : row.blocked_to === 'owner' ? 'owner' : 'dependency';
-  return { kind, resumeState, role, dependencies: (row.dependencies ?? []).map(asId) };
+  return { kind, resumeState, role, dependenciesCount: (row.dependencies ?? []).length };
 }
 
 export function view(row: TaskRow): TaskView {
