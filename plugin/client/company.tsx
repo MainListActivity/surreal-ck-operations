@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View, type StyleProp, type TextStyle } from "react-native";
 import * as RN from "react-native";
 import * as rpc from "../shared/rpc";
+import { waitingLabel } from "../shared/waiting-label";
 import type { Brief, DispatchBlockedView, DispatchReasonView, GoalTier, GoalView, Inbox, PermissionRequest, Pulse, Roster, TaskAttachment, TaskView } from "../shared/types";
 
 const newKey = () => `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -665,17 +666,6 @@ function NewGoalTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
       </Section>
     </View>
   );
-}
-
-/** Why a blocked task waits, in the owner's words (RW06 C3): a review prerequisite names the reviewing role; the manager and
- *  boss gates name the decision owner. Facts the task row does not carry show as unknown, never as an implied execute wait. */
-function waitingLabel(w: NonNullable<TaskView["waiting"]>): string {
-  const phase = w.resumeState === "review" ? "复核" : w.resumeState === "doing" ? "执行" : w.resumeState === "ready" ? "就绪" : "未知阶段";
-  const role = w.role === "owner" ? "老板" : w.role === "unknown" ? "未知岗位" : (ROLE_LABEL[w.role] ?? w.role);
-  const deps = `依赖 ${w.dependenciesCount} 项`;
-  if (w.kind === "manager") return `等待经理决定（恢复${phase}）· ${deps}`;
-  if (w.kind === "owner") return `等待老板决定（恢复${phase}）· ${deps}`;
-  return `等待${role}的${phase}前置（恢复${phase}）· ${deps}`;
 }
 
 function TaskRow({ task, ctx, depth, onOpen, verdict }: { task: TaskView; ctx: Ctx; depth: number; onOpen: (id: string) => void; verdict?: DispatchBlockedView }) {

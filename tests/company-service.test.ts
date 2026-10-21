@@ -39,8 +39,8 @@ function executable(path: string, content: string) {
 // view fields in contracts). A fixture release without it is the "old target" case the guard must refuse.
 const REVIEW_WAIT_FILES = {
   'src/review-wait-capability.ts': "export const REVIEW_WAIT_PROTOCOL = 'review-wait/1';\n",
-  'src/core.ts': "export const UNLOCK = \"LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END; resume_state\";\n",
-  'src/contracts.ts': 'export interface TaskView { resumeState?: string; resumeRole?: string }\n',
+  'src/core.ts': "export const UNLOCK = `\n  LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\n  UPDATE $t SET resume_state = NONE;\n`;\n",
+  'src/contracts.ts': 'export interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\n',
 };
 
 function makeRelease(releases: string, sha: string, withGit = false, capable = true) {

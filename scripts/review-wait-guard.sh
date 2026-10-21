@@ -22,13 +22,14 @@ review_wait_probe_root() {
   core="$root/src/core.ts"
   contracts="$root/src/contracts.ts"
   [ -f "$cap" ] && [ -f "$core" ] && [ -f "$contracts" ] || return 1
-  grep -q 'REVIEW_WAIT_PROTOCOL' "$cap" 2>/dev/null || return 1
+  # Declarations, not comment text: a comment-only tree cannot pass (review B-non-blocking).
+  grep -Eq '^[[:space:]]*(export[[:space:]]+)?const[[:space:]]+REVIEW_WAIT_PROTOCOL[[:space:]]*=' "$cap" 2>/dev/null || return 1
   grep -q "$REVIEW_WAIT_PROTOCOL_EXPECTED" "$cap" 2>/dev/null || return 1
-  # The unlock restores the blocked phase; an old core hard-writes ready and fails this marker.
-  grep -qF "\$restore_phase = IF \$source_phase = 'review' THEN 'review' ELSE 'ready' END" "$core" 2>/dev/null || return 1
-  grep -q 'resume_state' "$core" 2>/dev/null || return 1
-  grep -q 'resumeState' "$contracts" 2>/dev/null || return 1
-  grep -q 'resumeRole' "$contracts" 2>/dev/null || return 1
+  # The unlock restores the blocked phase as a real LET statement; an old core hard-writes ready and fails this marker.
+  grep -qF "LET \$restore_phase = IF \$source_phase = 'review' THEN 'review' ELSE 'ready' END" "$core" 2>/dev/null || return 1
+  grep -Eq 'resume_state[[:space:]]*=' "$core" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*resumeState\?:' "$contracts" 2>/dev/null || return 1
+  grep -Eq '^[[:space:]]*resumeRole\?:' "$contracts" 2>/dev/null || return 1
   return 0
 }
 

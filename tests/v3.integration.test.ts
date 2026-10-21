@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
-import { SurrealCompanyCore } from '../src/core.ts';
+import { createHash } from 'node:crypto';
+import { depUnsatisfiedFor, RESOLVE_DEP_SQL, SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { SEED_DEFS } from '../src/seed.ts';
@@ -908,6 +909,57 @@ test('RW06 cross-version: the pre-RW06 unlock misdispatches a review wait (old-r
   await core.accept(tokens.qa, proofOf(qaClaim), { text: '独立复核通过：复核等待恢复后按原提交验收。', idempotencyKey: key() });
   expect((await task(newGreen.id)).state).toBe('done');
   expect((await task(downstream.id)).state).not.toBe('blocked'); // the ordinary unlock path still works once the dependency is done
+});
+
+// RW06 C2: the product drill reproduced the misdispatch with the pre-RW06 code at 475b5c2. This case runs that commit's own
+// unlock statement, extracted from the commit (its digest is pinned so the fixture is provably the old code, not a hand-written
+// equivalent), with its two SQL helpers expanded by the same builders a runtime would use. Skipped where the clone has no such
+// history (CI shallow checkouts); it runs on a full clone and in this review's local runs.
+const OLD_475 = '475b5c244f35922baf845325687c42ede82dcf10';
+const OLD_475_UNLOCK_SHA256 = '271b11a40af7735a9003fee5a4128afbf1ab50c31482834606c1e91adb050aaa';
+const old475Available = (() => {
+  try { return Bun.spawnSync(['git', 'cat-file', '-e', `${OLD_475}^{commit}`], { cwd: join(import.meta.dir, '..') }).exitCode === 0; } catch { return false; }
+})();
+
+test.skipIf(!old475Available)('RW06 real old code: the 475 unlock statement writes ready and lets an execute claim through', async () => {
+  const shown = Bun.spawnSync(['git', 'show', `${OLD_475}:src/core.ts`], { cwd: join(import.meta.dir, '..') });
+  const oldSource = shown.stdout.toString();
+  const match = /export const UNLOCK_CHILDREN_SQL = `([\s\S]*?)`;/.exec(oldSource);
+  expect(match).not.toBeNull();
+  const template = match![1];
+  expect(createHash('sha256').update(template).digest('hex')).toBe(OLD_475_UNLOCK_SHA256);
+  expect(template).not.toContain('$restore_phase'); // the old statement hard-writes ready
+  expect(template).toContain("state = 'ready'");
+  const oldSql = template
+    .replace("${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}", RESOLVE_DEP_SQL('$child.dependencies', '$c_dep'))
+    .replace("${depUnsatisfiedFor('$child')}", depUnsatisfiedFor('$child'));
+
+  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
+  const goal = await owner.createGoal({ text: 'RW06 真实旧代码对照', source: 'owner:test', key: key(), tier: 'quick' });
+  const gate = await core.createTask(tokens.gm, { title: '旧代码前置', context: '前置未完成，复核等待保持 blocked，用于真实旧代码对照。', executorRole: 'engineering', reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: key() });
+  const waiting = await core.createTask(tokens.gm, { title: '旧代码复核等待', context: '复核阶段阻塞转为依赖等待后，用旧提交自身的解锁语句完成前置。', executorRole: 'engineering', reviewerRole: 'qa', goalId: goal.id, idempotencyKey: key() });
+  const submitted = await core.claim(tokens['eng-a'], waiting.id);
+  await core.submit(tokens['eng-a'], proofOf(submitted), { text: '工程提交复核：真实旧代码对照的原始交付与证据。', idempotencyKey: key() });
+  const qaC = await enrollment.enroll('t-qa-oldcode', 'qa', ['execute', 'review']);
+  const blocked = await core.claim(qaC, waiting.id);
+  await core.block(qaC, proofOf(blocked), 'gm', { text: '前置未完成，先转正式依赖等待，再用旧代码完成前置。', idempotencyKey: key() });
+  await core.deferTaskUntil(tokens.gm, { taskId: waiting.id, dependencies: [gate.id], text: '转为正式依赖等待：前置完成前不派复核与实现。', idempotencyKey: key() });
+  // Finish the prerequisite out of band (a status flip, no core transition), so the only unlock statement that runs is the old
+  // one under test — the new code's unlock would restore review before the old statement could see the wait.
+  await database.db.query("UPDATE ONLY $gate SET state = 'done', version += 1;", { gate: new RecordId('task', gate.id) });
+  expect((await task(waiting.id)).state).toBe('blocked');
+  const gm = await core.authenticate(tokens.gm);
+  await database.db.query(`BEGIN; LET $task = $taskRef; LET $actor = $actorRef; ${oldSql} COMMIT;`, {
+    taskRef: new RecordId('task', gate.id), actorRef: new RecordId('employee', gm.employeeId),
+  });
+  // Old-red: the old unlock writes ready and an execute claim is accepted — the misdispatch the product reproduced.
+  expect((await task(waiting.id)).state).toBe('ready');
+  // The product drill saw the ORIGINAL implementer's execute claim go through on the wrongly-ready row; the implementer binding is
+  // what makes that the visible misdispatch.
+  const misdispatched = await core.claim(tokens['eng-a'], waiting.id);
+  expect(misdispatched.task.state).toBe('doing');
+  await core.release(tokens['eng-a'], proofOf(misdispatched), { text: '真实旧代码对照夹具：结束误派租约并释放活动任务。', idempotencyKey: key() });
+  await database.db.query("UPDATE ONLY $task SET state = 'void', version += 1;", { task: new RecordId('task', waiting.id) });
 });
 
 test('review wait concurrency, void dependencies and cycle attempts stay fail closed', async () => {

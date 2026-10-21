@@ -97,12 +97,14 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 **先停用受影响编制再回滚**：由经理通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
 
 ```sh
-rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_PREVIOUS_RELEASE/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
+# 用当前（受审、带守卫）release 的 installer 安装回滚目标：守卫与内容/门禁校验都在这一步完成。
+rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
 rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
-rtk proxy "$PASEO_CLI" plugin install "$SCK_PREVIOUS_RELEASE/plugin" --id sck-company
-rtk proxy "$PASEO_CLI" plugin reload sck-company
+# 插件面由上面的 install 自动重指（登记在服务目录内时）；这里只核对，不重复 install。
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
+
+**不得调用旧 release 自带的 installer**：旧版本的 `scripts/company-service.sh` 没有 RW06 守卫，实测对不兼容目标会直接 `rc=0` 切 `active` 并复制 bin（全新 installer 对同一目标则拒绝且零副作用）。回滚命令固定用 `$SCK_RELEASE_DIR/scripts/company-service.sh`（`$SCK_RELEASE_DIR` 为当前受审 release）。若 install 输出 `warning: plugin repoint failed`（插件登记在服务目录之外），按第 3 节 R3 手工 `remove` + `install` 指向**已被守卫放行的同一目标**，顺序不得颠倒。
 
 回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 

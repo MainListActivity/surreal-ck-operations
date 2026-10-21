@@ -12,8 +12,8 @@ const SERVICE = join(ROOT, 'scripts/company-service.sh');
 const DEPLOY = join(ROOT, 'scripts/deploy-mcp-remote.sh');
 
 const CAPABILITY = "export const REVIEW_WAIT_PROTOCOL = 'review-wait/1';\n";
-const CORE = "LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\nSELECT resume_state;\n";
-const CONTRACTS = 'interface TaskView { resumeState?: string; resumeRole?: string }\n';
+const CORE = "LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\nUPDATE $t SET resume_state = NONE;\n";
+const CONTRACTS = 'interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\n';
 
 function tree(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), 'sck-rw06-guard-'));
@@ -105,6 +105,20 @@ test('the guard rejects on capability alone: no task rows are read, so a zero-ro
   const deploy = readFileSync(DEPLOY, 'utf8');
   expect(deploy.indexOf('review_wait_target_supported "$staging/probe" core')).toBeGreaterThan(0);
   expect(deploy.indexOf('review_wait_target_supported "$staging/probe" core')).toBeLessThan(deploy.indexOf('ssh $ssh_opts'));
+});
+
+test('markers that exist only in comments do not make a target compatible', () => {
+  // The non-blocking review point: a tree that merely mentions the contract in comments must be refused.
+  const fake = release({
+    'src/review-wait-capability.ts': '// export const REVIEW_WAIT_PROTOCOL = \'review-wait/1\';\nexport const OTHER = 1;\n',
+    'src/core.ts': "// LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\nexport const X = 1;\n",
+    'src/contracts.ts': '// resumeState?: string; // resumeRole?: string\nexport interface T { a: string }\n',
+  });
+  try {
+    expect(guard('review_wait_target_supported', fake).code).not.toBe(0);
+  } finally {
+    rmSync(fake, { recursive: true, force: true });
+  }
 });
 
 test('the guard is a plain read-only script: no line writes, installs or restarts anything', () => {
