@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
 import { commDir, reqDir, resDir, reportPath, blockerPath, readJsonFile } from '../src/comm.ts';
-import type { ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
+import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 
 const taskView = (id: string, version = 1): TaskView => ({
@@ -21,6 +21,7 @@ const calls: Call[] = [];
 
 let employeeForGetTask = 'eng-x';
 let authRole = 'engineering';
+let activeLeaseRows: ActiveLease[] = [];
 const wtCalls: Array<{ cred: string; taskId?: string }> = [];
 const pageCalls: Array<{ cred: string; taskId?: string; pageSize?: number }> = [];
 const reclaimCalls: Array<{ cred: string; input?: { dryRun?: boolean; repos?: string[] } }> = [];
@@ -38,7 +39,13 @@ const core = {
   authenticate: async () => ({ employeeId: 'eng-x', role: authRole, capabilities: ['execute'] as const }),
   companyBrief: async () => ({ ok: true }),
   listTasks: async () => [],
-  getTask: async (_c: string, taskId: string) => ({ ...taskView(taskId), currentEmployee: employeeForGetTask }),
+  activeLeases: async () => activeLeaseRows,
+  getTask: async (_c: string, taskId: string) => {
+    const lease = activeLeaseRows.find(row => row.taskId === taskId);
+    return { ...taskView(taskId, lease?.version ?? 1), state: lease?.state ?? 'doing',
+      currentEmployee: employeeForGetTask, deliveryId: lease?.deliveryId ?? `d-${taskId}`,
+      fence: lease?.fence ?? 1, leaseExpiresAt: lease?.leaseExpiresAt };
+  },
   history: async () => [],
   listWorktrees: async (c: string, taskId?: string) => { wtCalls.push({ cred: c, taskId }); return [] as never; },
   worktreeList: async (c: string, input: { taskId?: string }) => { wtCalls.push({ cred: c, taskId: input.taskId }); return [] as never; },
@@ -111,6 +118,7 @@ beforeEach(() => {
   auditCalls.length = 0;
   employeeForGetTask = 'eng-x';
   authRole = 'engineering';
+  activeLeaseRows = [];
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
   pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20 });
 });
@@ -397,6 +405,110 @@ describe('sidecar', () => {
     expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
     await expect(fresh.claim(live, task('other'))).resolves.toBeTruthy();
     fresh.detachAgent('a-9');
+  });
+
+  test('adopt recovers a live review lease and keeps checkpoint/review usable without a new claim', async () => {
+    const i = inst('e-review', { paseoAgentId: 'agent-review', role: 'qa', credential: undefined });
+    const expires = new Date(Date.now() + 60_000).toISOString();
+    activeLeaseRows = [{ taskId: 'task-review', state: 'review', deliveryId: 'd-review', fence: 4, version: 9,
+      leaseExpiresAt: expires, role: 'qa', currentEmployee: 'e-review' }];
+    employeeForGetTask = 'e-review';
+    authRole = 'qa';
+    const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    await fresh.adopt([i]);
+    await fresh.adopt([i]); // two consecutive adopts must reuse the one recovered claim
+    expect(fresh.canReuse(i)).toBe(true);
+    const env = fresh.env(i);
+    const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rv1', 'checkpoint', { text: 'review checkpoint after reload' });
+    expect(checkpoint.ok).toBe(true);
+    expect(calls.find(c => c.tool === 'checkpoint')!.proof).toEqual({
+      taskId: 'task-review', deliveryId: 'd-review', fence: 4, expectedVersion: 9,
+    });
+    // A report.md is execute-phase closeout; on a review lease it is archived, not submitted,
+    // and the recovered lease stays usable.
+    writeFileSync(reportPath(env.SCK_COMM_DIR), 'review report should not submit');
+    await fresh.settle('agent-review');
+    expect(calls.filter(c => c.tool === 'submit')).toHaveLength(0);
+    expect(readdirSync(env.SCK_COMM_DIR).some(f => f.startsWith('report.md.stale-'))).toBe(true);
+    const review = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rv2', 'review', { decision: 'return', text: 'formal review after reload' });
+    expect(review.ok).toBe(true);
+    expect(calls.find(c => c.tool === 'return')!.proof).toEqual({
+      taskId: 'task-review', deliveryId: 'd-review', fence: 4, expectedVersion: 10,
+    });
+    fresh.close();
+  });
+
+  test('adopt recovers a review lease for report_blocker', async () => {
+    const i = inst('e-review-block', { paseoAgentId: 'agent-review-block', role: 'qa', credential: undefined });
+    activeLeaseRows = [{ taskId: 'task-review-block', state: 'review', deliveryId: 'd-review-block', fence: 2, version: 3,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(), role: 'qa', currentEmployee: 'e-review-block' }];
+    employeeForGetTask = 'e-review-block';
+    authRole = 'qa';
+    const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    await fresh.adopt([i]);
+    const env = fresh.env(i);
+    const blocked = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'rb1', 'report_blocker', { text: 'review blocker after reload', to: 'gm' });
+    expect(blocked.ok).toBe(true);
+    expect(calls.find(c => c.tool === 'block')!.proof).toEqual({
+      taskId: 'task-review-block', deliveryId: 'd-review-block', fence: 2, expectedVersion: 3,
+    });
+    expect(calls.find(c => c.tool === 'block')!.to).toBe('gm');
+    fresh.close();
+  });
+
+  test('adopt fails closed on an expired review lease; no local no_lease resurrection', async () => {
+    const i = inst('e-expired', { paseoAgentId: 'agent-expired', role: 'qa', credential: undefined });
+    activeLeaseRows = [{ taskId: 'task-expired', state: 'review', deliveryId: 'd-expired', fence: 1, version: 1,
+      leaseExpiresAt: new Date(Date.now() - 1_000).toISOString(), role: 'qa', currentEmployee: 'e-expired' }];
+    employeeForGetTask = 'e-expired';
+    authRole = 'qa';
+    const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    await fresh.adopt([i]);
+    const env = fresh.env(i);
+    const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'ex1', 'checkpoint', { text: 'expired lease must not revive' });
+    expect(checkpoint.ok).toBe(false);
+    expect(checkpoint.error).toContain('no_lease');
+    fresh.close();
+  });
+
+  test('adopt does not apply a stale claim.json artifact to a different delivery', async () => {
+    const i = inst('e-stale-artifact', { credential: undefined });
+    const env = pool.env(i);
+    await pool.claim(i, task('task-old'));
+    writeFileSync(reportPath(env.SCK_COMM_DIR), 'old delivery report');
+    writeFileSync(blockerPath(env.SCK_COMM_DIR), 'old delivery blocker');
+    pool.close();
+    i.paseoAgentId = 'agent-stale-artifact';
+    activeLeaseRows = [{ taskId: 'task-new', state: 'doing', deliveryId: 'd-task-new', fence: 2, version: 2,
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(), role: 'engineering', currentEmployee: 'e-stale-artifact' }];
+    employeeForGetTask = 'e-stale-artifact';
+    const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    await fresh.adopt([i]);
+    expect(calls.filter(c => c.tool === 'submit' || c.tool === 'block')).toHaveLength(0);
+    expect(readdirSync(env.SCK_COMM_DIR).some(f => f.startsWith('report.md.stale-'))).toBe(true);
+    expect(readdirSync(env.SCK_COMM_DIR).some(f => f.startsWith('blocker.md.stale-'))).toBe(true);
+    const staged = readJsonFile<ClaimResult>(join(env.SCK_COMM_DIR, 'claim.json'))!;
+    expect(staged.task.id).toBe('task-new');
+    expect(staged.deliveryId).toBe('d-task-new');
+    fresh.close();
+  });
+
+  test('adopt fails closed when the complete lease lookup is ambiguous', async () => {
+    const i = inst('e-ambiguous', { paseoAgentId: 'agent-ambiguous', role: 'qa', credential: undefined });
+    const expires = new Date(Date.now() + 60_000).toISOString();
+    activeLeaseRows = [
+      { taskId: 'task-one', state: 'review', deliveryId: 'd-one', fence: 1, version: 1, leaseExpiresAt: expires, role: 'qa', currentEmployee: 'e-ambiguous' },
+      { taskId: 'task-two', state: 'review', deliveryId: 'd-two', fence: 1, version: 1, leaseExpiresAt: expires, role: 'qa', currentEmployee: 'e-ambiguous' },
+    ];
+    employeeForGetTask = 'e-ambiguous';
+    authRole = 'qa';
+    const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    await fresh.adopt([i]);
+    const env = fresh.env(i);
+    const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'amb1', 'checkpoint', { text: 'ambiguous lease must not revive' });
+    expect(checkpoint.ok).toBe(false);
+    expect(checkpoint.error).toContain('no_lease');
+    fresh.close();
   });
 
   test('claim drops a stale local claim when the server lease is already dead', async () => {

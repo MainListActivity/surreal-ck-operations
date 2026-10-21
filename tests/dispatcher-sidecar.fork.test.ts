@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -12,7 +12,7 @@ import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
-import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
+import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
@@ -230,6 +230,14 @@ async function startCompanyFork(name: string) {
         log: process.env.SCK_TEST_DISPATCH_LOG === '1' ? message => console.log('DISPATCH', message) : undefined,
         env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
       return last.tick();
+    },
+    /** Process restart: the old pool loses its channel/claim memory, then a fresh pool adopts the roster.
+     *  The comm directory (including claim.json and any artifact written before the crash) persists. */
+    reload: async () => {
+      pool?.close();
+      const next = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], ops, runDir: join(dir, 'comm'), sweepMs: 5 });
+      pool = next;
+      await next.adopt(await wf.insts());
     },
     verdicts: () => last?.dispatchVerdicts() ?? [],
     close: async () => {
@@ -595,6 +603,71 @@ run('company fork: a derived implementer who is gone is replaced by the system o
     const handover = await w.tick();
     expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+run('company fork: plugin reload recovers a live review lease for checkpoint and formal review', async () => {
+  const w = await startCompanyFork('review-recovery');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'review lease survives plugin reload', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-review-recovery' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(A.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery for reload review', idempotencyKey: 'review-recovery-submit' })).ok).toBe(true);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    const reviewTick = await w.tick();
+    const Q = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(reviewTick.woke.find(x => x.task === task.id)).toMatchObject({ employee: Q.id, spawned: true });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id, implementer: A.id });
+    const qaEnv = w.envs.get(Q.paseoAgentId!)!;
+    expect((await w.relay(qaEnv, 'checkpoint', { text: 'review checkpoint before plugin reload', idempotencyKey: 'review-checkpoint-before' })).ok).toBe(true);
+    const before = await w.core.getTask(w.gm, task.id);
+    expect(before.state).toBe('review');
+    expect(before.deliveryId).toBeTruthy();
+    // A report.md written before the process died is not a review closeout: the recovered
+    // pool must archive it, never submit it or end the review lease.
+    writeFileSync(reportPath(qaEnv.SCK_COMM_DIR!), 'review report written during plugin reload');
+    await w.reload();
+    expect(readdirSync(qaEnv.SCK_COMM_DIR!).some(f => f.startsWith('report.md.stale-'))).toBe(true);
+    // The old session key is fenced out; the agent re-enters through the adopter's binding pointer.
+    expect((await w.relay(qaEnv, 'checkpoint', { text: 'old key must be fenced after reload', idempotencyKey: 'review-old-key' })).ok).toBe(false);
+    const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
+    const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
+    expect((await w.relay(rebound, 'checkpoint', { text: 'review checkpoint after plugin reload', idempotencyKey: 'review-checkpoint-after' })).ok).toBe(true);
+    expect((await w.relay(rebound, 'review', { decision: 'accept', text: 'Independent review after plugin reload', idempotencyKey: 'review-accept-after' })).ok).toBe(true);
+    const final = await w.core.getTask(w.gm, task.id);
+    expect(final).toMatchObject({ state: 'done', implementer: A.id });
+    const history = await w.core.history(w.gm, task.id);
+    expect(history.some(h => h.action === 'accept' && h.actor === Q.id)).toBe(true);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+run('company fork: plugin reload recovers a live review lease for report_blocker', async () => {
+  const w = await startCompanyFork('review-blocker-recovery');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'review blocker survives plugin reload', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-review-blocker' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(A.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery for reload blocker', idempotencyKey: 'review-blocker-submit' })).ok).toBe(true);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    const reviewTick = await w.tick();
+    const Q = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(reviewTick.woke.find(x => x.task === task.id)).toMatchObject({ employee: Q.id, spawned: true });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id });
+    await w.reload();
+    const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
+    const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
+    expect((await w.relay(rebound, 'report_blocker', { to: 'gm', text: 'Review blocker after plugin reload', idempotencyKey: 'review-blocker-after' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm', implementer: A.id });
+    const history = await w.core.history(w.gm, task.id);
+    expect(history.some(h => h.action === 'block' && h.actor === Q.id)).toBe(true);
   } finally {
     await w.close();
   }

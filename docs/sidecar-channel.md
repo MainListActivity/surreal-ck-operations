@@ -21,6 +21,7 @@
 - **代领**：任务在叫醒员工之前已由调度器调 `sidecar.claim` 以实例凭证领取，`claim.json` 写进 comm 目录作为任务上下文；`claim_next` 在员工侧直接返回 `forbidden`。
 - **续租**：sidecar 每 60s 用持有的凭证调 `core.heartbeat`（`HEARTBEAT_MS`）；员工调 `heartbeat` 是 no-op。
 - **轮换**：插件重启或 `adopt` 重建时内存凭证丢失，`credentialFor` 经 `workforce.rotate` 重签——库中 digest 被换掉，旧 token 立即作废（`retired`/`revoked` 实例在此处失败）。
+- **重载恢复**：`adopt` 重签通道后，用 `core.activeLeases` 的完整凭证域查询（不是 `listTasks` 的受限预览/分页）按服务端当前 `taskId`/`deliveryId`/`fence`/`version`/持有人/到期时间重建当前员工的 `doing` 与 `review` 租约，并刷新 `claim.json`；过期、撤销、他人、角色不符、租约歧义或不可读一律 fail closed（不新建 claim、不改作者/实现者、不伪造评审结论）。review 租约的 `report.md` 不是收尾，归档而不 submit；review 仍通过 `review` 或 `report_blocker` 收尾。
 - **撤销**：实例退役或凭证撤销后所有调用 401；`credential_file` 非空的旧凭证文件实例不再被 sidecar 代领新任务，自然淘汰。
 - **环境清场**：员工进程是 Paseo 守护进程的子进程，会继承其环境。`agent.session_open` 钩子（`plugin/server/scrub.ts`）把继承来的基础设施凭证变量清空（`CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV` 等，`SCK_SCRUB_ENV` 可加名），并把公司员工会话的 `ZDOTDIR` 指向垫片目录，使交互式 zsh 重读启动文件后再 `unset` 同名变量。provider 登录变量（`OPENAI_API_KEY` 等）、`SSH_AUTH_SOCK`、`gh` 登录不动。
 - **边界**：这套机制去掉的是「交到员工手里的凭证」和「继承进员工环境的变量」，不是沙箱——员工与插件、老板命令行跑在同一系统用户下，仍能读同用户可读的文件；越界读取靠协议约束与会话日志留痕。要硬隔离需独立系统用户或容器。详见 [运行手册](agent-operations.md#项目环境与凭证) 的安全边界段。
@@ -84,5 +85,6 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 - 员工侧 `sck call` 报 `comm request timed out`：插件未运行或 sidecar 未接管；确认 Paseo 插件已加载（`plugin reload sck-company`）。
 - `stale comm key`：会话环境里的 key 与当前 spawn 不符，一般是插件重启后旧会话仍在写 req；该会话的租约状态以服务端为准。
 - `no_lease`：租约已被收回/消耗（提交后、被改派后），先重读 `claim.json` 与任务状态。
+- 插件重载后 `no_lease`：确认服务端 `activeLeases` 能查到该员工仍有效的 `doing`/`review` 租约；若查询为空、过期、被撤销或与本地 `claim.json` 的 delivery 不一致，sidecar 会按 fail closed 处理并归档陈旧 report/blocker。
 - comm 目录残留 `.failed-`/`.orphaned-` 文件：分别是提交失败与无租约残留的交付物归档，看审计与插件日志定因。
 - 插件日志（Paseo 插件进程 stdout）有 `sidecar claimed|submitted|blocked|adopted|releaseClaim`、`scrub <agentId>`、`heartbeat failed` 等行；任务侧看 `audit` 表。
