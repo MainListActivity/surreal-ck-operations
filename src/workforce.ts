@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { Principal, RetirementKind, Role, TaskId } from './contracts.ts';
+import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
@@ -244,6 +245,72 @@ const COOLDOWN_BASE = 30 * 60;
 const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
   role === 'eval' ? [] : role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
+
+/** One manager todo to persist: task + phase + episode + reason identify it; the action is what the manager can do. */
+export interface ManagerActionInput {
+  taskId: string;
+  phase: 'execute' | 'review';
+  episode: number;
+  reason: string;
+  action: 'implementer_takeover';
+  version: number;
+  repo: string;
+  implementer?: string;
+}
+
+export interface ManagerActionRow extends ManagerActionInput {
+  key: string;
+  status: 'open' | 'closed';
+  createdAt?: string;
+  closedAt?: string;
+  resolution?: string;
+}
+
+/** One manager-wake attempt. It lives in the same schemaless dispatch table, keyed by task+phase+episode. */
+export type ManagerWakeState = 'pending' | 'running' | 'finished' | 'unknown';
+
+export interface ManagerWakeInput {
+  taskId: string;
+  phase: 'execute' | 'review';
+  /** Episode start in milliseconds (the same value managerActionKey carries). */
+  episode: number;
+  reason: string;
+  version: number;
+  repo: string;
+}
+
+export interface ManagerWakeRow extends ManagerWakeInput {
+  key: string;
+  purpose: 'gm-manager-wake';
+  state: ManagerWakeState;
+  attempt: number;
+  token: string;
+  employee?: string;
+  agent?: string;
+  /** Unix seconds. */
+  startedAt?: number;
+  externalStartedAt?: number;
+  lastCheckedAt?: number;
+  lastStatus?: string;
+  resolution?: string;
+  updatedAt?: number;
+}
+
+/** The CAS token a dispatcher must present for every later write to this attempt. */
+export interface ManagerWakeClaim {
+  key: string;
+  token: string;
+  attempt: number;
+  input: ManagerWakeInput;
+}
+
+/** Logical in-flight unit: task + phase + episode. Reason/version are fields, not part of the key. */
+export const managerWakeKey = (taskId: string, phase: string, episode: number) => `${taskId}:${phase}:${episode}`;
+
+/** A pending attempt with no external-start evidence is safe to release only after this conservative grace. */
+export const MANAGER_WAKE_PENDING_GRACE_SECONDS = 120;
+/** An observed idle turn is a definite end only after the external action has had this long to start. */
+export const MANAGER_WAKE_TURN_GRACE_SECONDS = 60;
 
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
@@ -660,6 +727,211 @@ export class Workforce {
       { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee });
   }
 
+  /** Durably records one manager todo. The deterministic id (task+phase+episode+reason) makes repeated ticks idempotent. */
+  async openManagerAction(input: ManagerActionInput): Promise<boolean> {
+    const key = managerActionKey(input.taskId, input.phase, input.episode, input.reason);
+    const record = id('dispatch', HASH(key).slice(0, 24));
+    const existing = await this.db.select<{ status?: string }>(record);
+    if (existing?.status === 'open') return false;
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ ...input, key });
+    await this.db.query(`BEGIN;
+      UPSERT $d CONTENT { key: $key, task: $task, version: $version, purpose: 'gm-manager-action', employee: '',
+        phase: $phase, episode: $episode, reason: $reason, action: $action, repo: $repo, implementer: $implementer,
+        status: 'open', created_at: time::now() };
+      CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action', evidence: $evidence, at: time::now() };
+      COMMIT;`, {
+      d: record, key, task: input.taskId, task_ref: id('task', input.taskId), version: input.version,
+      phase: input.phase, episode: input.episode, reason: input.reason, action: input.action,
+      repo: input.repo, implementer: input.implementer ?? null, audit, evidence,
+    });
+    return true;
+  }
+
+  /** Open manager todos, restored across dispatcher restarts from the dispatch bookkeeping table. */
+  async openManagerActions(): Promise<ManagerActionRow[]> {
+    type Row = { id: RecordId; key?: string; task?: string; version?: number; phase?: string; episode?: number; reason?: string;
+      action?: string; repo?: string; implementer?: string; status?: string; created_at?: unknown };
+    const [rows] = await this.db.query<[Row[]]>(`SELECT * FROM dispatch WHERE purpose = 'gm-manager-action' AND status = 'open' ORDER BY created_at;`);
+    return (rows ?? []).map(row => ({
+      key: row.key ?? String(row.id).replace(/^dispatch:/, ''), taskId: String(row.task ?? ''), version: row.version ?? 0,
+      phase: row.phase === 'review' ? 'review' : 'execute', episode: row.episode ?? 0, reason: row.reason ?? '',
+      action: 'implementer_takeover' as const, repo: row.repo ?? '', implementer: row.implementer ?? undefined,
+      status: 'open' as const, createdAt: row.created_at === undefined ? undefined : String(row.created_at),
+    }));
+  }
+
+  /** Closes one manager todo without deleting its dispatch row or the open/close audit history. */
+  async closeManagerAction(action: ManagerActionRow, resolution: string): Promise<void> {
+    const record = id('dispatch', HASH(action.key).slice(0, 24));
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ task: action.taskId, phase: action.phase, episode: action.episode,
+      reason: action.reason, action: action.action, resolution });
+    await this.db.query(`BEGIN;
+      LET $row = SELECT * FROM ONLY $d;
+      IF $row.status = 'open' {
+        UPDATE ONLY $d SET status = 'closed', closed_at = time::now(), resolution = $resolution;
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action_closed', evidence: $evidence, at: time::now() };
+      };
+      COMMIT;`, { d: record, task_ref: id('task', action.taskId), resolution, audit, evidence });
+  }
+
+  // ---- manager wake ownership (MR02) ----
+  // The manager action row is the todo. A separate dispatch row is the in-flight attempt, keyed by
+  // task+phase+episode, so a reason/version change never starts a second wake while the first GM is
+  // still processing. Every transition is CAS'd by token+attempt; old callbacks cannot release a new claim.
+  private managerWakeId(taskId: string, phase: string, episode: number) {
+    return id('dispatch', HASH(`gm-manager-wake\0${taskId}\0${phase}\0${episode}`).slice(0, 24));
+  }
+
+  private wakeRow(row: WakeDbRow): ManagerWakeRow {
+    const phase = row.phase === 'review' ? 'review' : 'execute';
+    const episode = row.episode ?? 0;
+    return {
+      key: row.key ?? managerWakeKey(String(row.task ?? ''), phase, episode),
+      taskId: String(row.task ?? ''), phase, episode,
+      reason: row.reason ?? '', version: row.version ?? 0, repo: row.repo ?? '',
+      purpose: 'gm-manager-wake', state: row.state ?? 'finished', attempt: row.attempt ?? 0, token: row.token ?? '',
+      employee: row.employee ?? undefined, agent: row.agent ?? undefined,
+      startedAt: row.started_at ?? undefined, externalStartedAt: row.external_started_at ?? undefined,
+      lastCheckedAt: row.last_checked_at ?? undefined, lastStatus: row.last_status ?? undefined,
+      resolution: row.resolution ?? undefined, updatedAt: row.updated_at ?? undefined,
+    };
+  }
+
+  /** The CAS token for a row read from the database. */
+  wakeClaim(row: ManagerWakeRow): ManagerWakeClaim {
+    return { key: row.key, token: row.token, attempt: row.attempt, input: {
+      taskId: row.taskId, phase: row.phase, episode: row.episode, reason: row.reason, version: row.version, repo: row.repo,
+    } };
+  }
+
+  /**
+   * Acquire the only in-flight permission for task+phase+episode. Missing rows are created; a finished
+   * row starts the next attempt; pending/running/unknown rows refuse. The write is a single CAS
+   * transaction, so concurrent dispatchers and restarts can only produce one winner.
+   */
+  async acquireManagerWake(input: ManagerWakeInput, token: string = randomUUID()): Promise<ManagerWakeClaim | undefined> {
+    const key = managerWakeKey(input.taskId, input.phase, input.episode);
+    const d = this.managerWakeId(input.taskId, input.phase, input.episode);
+    const evidence = JSON.stringify({ ...input, key, token, attempt: 1 });
+    try {
+      const created = await this.runTxResult<WakeDbRow>(`BEGIN;
+        LET $created = CREATE ONLY $d CONTENT { key: $key, task: $task, phase: $phase, episode: $episode,
+          purpose: 'gm-manager-wake', state: 'pending', attempt: 1, token: $wake_token, version: $version,
+          reason: $reason, repo: $repo, employee: NONE, agent: NONE,
+          started_at: time::unix(time::now()), external_started_at: NONE, last_checked_at: NONE,
+          last_status: NONE, resolution: NONE, updated_at: time::unix(time::now()), at: time::unix(time::now()) };
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_acquired',
+          evidence: $evidence, at: time::now() };
+        RETURN $created;
+        COMMIT;`, { d, key, task: input.taskId, task_ref: id('task', input.taskId), phase: input.phase,
+        episode: input.episode, wake_token: token, version: input.version, reason: input.reason, repo: input.repo,
+        audit: id('audit', randomUUID()), evidence });
+      if (created) return { key, token, attempt: 1, input };
+    } catch (error) {
+      // A concurrent creator won the unique record id; read its row below.
+      if (!/already exists|duplicate/i.test(String((error as Error).message))) throw error;
+    }
+    const row = await this.db.select<WakeDbRow>(d);
+    if (!row || (row.state ?? 'finished') !== 'finished') return undefined;
+    const attempt = (row.attempt ?? 0) + 1;
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $updated = UPDATE ONLY $d SET state = 'pending', attempt = $attempt, token = $wake_token,
+        version = $version, reason = $reason, repo = $repo, employee = NONE, agent = NONE,
+        started_at = time::unix(time::now()), external_started_at = NONE, last_checked_at = NONE,
+        last_status = NONE, resolution = NONE, updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE state = 'finished' RETURN AFTER;
+      IF $updated != NONE {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_acquired',
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, key, task: input.taskId, task_ref: id('task', input.taskId), phase: input.phase,
+      episode: input.episode, wake_token: token, attempt, version: input.version, reason: input.reason, repo: input.repo,
+      audit: id('audit', randomUUID()), evidence: JSON.stringify({ ...input, key, token, attempt }) });
+    if (!updated) return undefined;
+    return { key, token, attempt, input };
+  }
+
+  /** Mark the attempt as externally started / running and bind the GM employee and (when known) Paseo agent. */
+  async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
+    const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $old = SELECT * FROM ONLY $d;
+      LET $updated = UPDATE ONLY $d SET state = 'running', employee = $employee, agent = $agent,
+        external_started_at = IF external_started_at = NONE THEN time::unix(time::now()) ELSE external_started_at END,
+        last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
+      IF $updated != NONE AND ($old.state ?? '') != 'running' {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_started',
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, task_ref: id('task', claim.input.taskId), wake_token: claim.token, attempt: claim.attempt,
+      employee, agent: agent ?? null, audit: id('audit', randomUUID()),
+      evidence: JSON.stringify({ key: claim.key, token: claim.token, attempt: claim.attempt, employee, agent }) });
+    return Boolean(updated);
+  }
+
+  /** CAS the attempt to finished (retryable) or unknown (fail closed, never re-woken as if idle). */
+  async finishManagerWake(claim: ManagerWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string): Promise<boolean> {
+    const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
+    const action = state === 'unknown' ? 'manager_wake_unknown' : 'manager_wake_finished';
+    const repeatGuard = state === 'unknown' ? " AND (state != 'unknown' OR last_status != $last_status)" : '';
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $updated = UPDATE ONLY $d SET state = $state, resolution = $resolution, last_status = $last_status,
+        last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown']${repeatGuard} RETURN AFTER;
+      IF $updated != NONE {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: $action,
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, task_ref: id('task', claim.input.taskId), wake_token: claim.token, attempt: claim.attempt,
+      state, resolution, last_status: lastStatus ?? null, action, audit: id('audit', randomUUID()),
+      evidence: JSON.stringify({ key: claim.key, token: claim.token, attempt: claim.attempt, state, resolution, lastStatus }) });
+    return Boolean(updated);
+  }
+
+  /** Active attempts restored after a restart. */
+  async openManagerWakes(): Promise<ManagerWakeRow[]> {
+    const [rows] = await this.db.query<[WakeDbRow[]]>(
+      `SELECT * FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] ORDER BY started_at;`);
+    return (rows ?? []).map(row => this.wakeRow(row));
+  }
+
+  /** Close all active attempts for a task whose work left the execute queue. Reason changes do not call this. */
+  async finishManagerWakesForTask(taskId: string, resolution: string): Promise<number> {
+    const [rows] = await this.db.query<[WakeDbRow[]]>(
+      `SELECT * FROM dispatch WHERE purpose = 'gm-manager-wake' AND task = $task AND state IN ['pending', 'running', 'unknown'];`,
+      { task: taskId });
+    let closed = 0;
+    for (const raw of rows ?? []) {
+      const row = this.wakeRow(raw);
+      if (await this.finishManagerWake(this.wakeClaim(row), 'finished', resolution, row.lastStatus)) closed++;
+    }
+    return closed;
+  }
+
+  private async runTxResult<T>(query: string, vars: Record<string, unknown>): Promise<T | undefined> {
+    const responses = await this.db.query<unknown[]>(query, vars).responses();
+    const failures = responses.filter(response => !response.success);
+    if (failures.length) {
+      const cause = failures.map(response => response.error.message).find(message =>
+        !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'manager wake transaction failed';
+      throw new Error(cause);
+    }
+    return responses.map(response => response.success ? response.result : undefined).at(-2) as T | undefined;
+  }
+
   async serverNow(): Promise<number> { return this.now(); }
   newKey(): string { return randomUUID(); }
+}
+
+interface WakeDbRow {
+  id?: RecordId; key?: string; task?: string; phase?: string; episode?: number; purpose?: string;
+  state?: ManagerWakeState; attempt?: number; token?: string; version?: number; reason?: string; repo?: string;
+  employee?: string; agent?: string; started_at?: number; external_started_at?: number; last_checked_at?: number;
+  last_status?: string; resolution?: string; updated_at?: number; at?: number;
 }

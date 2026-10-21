@@ -3,12 +3,18 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
+import { CompanyError } from './core-errors.ts';
+import type { SnapshotChannel, SnapshotLink } from './snapshot-store.ts';
 
 const OWNER = 'surreal-ck-operations/issue-23/v1';
 
 // Lazy: runtimes that only query (e.g. the Paseo plugin subprocess) may not have schema/ beside the bundle.
 const loadSchema = (file: string) =>
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'schema', file), 'utf8');
+
+/** Snapshot-build connections open at once across the process (SYS01 AC-D). A build that gets none within BUILD_QUEUE_MS is refused. */
+export const MAX_BUILD_CONNECTIONS = 4;
+const BUILD_QUEUE_MS = 2_000;
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -96,9 +102,16 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('018-pipeline.surql'));
     await this.db.query(loadSchema('019-story-author-role.surql'));
     await this.db.query(loadSchema('020-cinematography-role.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
+    // The SYS01 snapshot schemas follow main's 021 (worktree audit events) and 022 (def quota limits).
     await this.db.query(loadSchema('021-worktree-audit-events.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
     await this.db.query(loadSchema('022-def-quota-limited.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
+    await this.db.query(loadSchema('023-query-snapshot.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
+    await this.db.query(loadSchema('024-snapshot-quota.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
@@ -174,9 +187,129 @@ export class CompanyDatabase {
     return this.reconnecting;
   }
 
+  private readonly buildSockets = new Set<Surreal>();
+  private buildSlotsInUse = 0;
+  private readonly buildSlotWaiters: Array<() => void> = [];
+  private closing = false;
+
+  /**
+   * The connections snapshot builds run on (SYS01 AC-D): a socket of their own for each read attempt, to the same namespace and
+   * database. A large build then never queues ahead of control requests on the main socket, and an attempt that is abandoned or
+   * cancelled closes only its own socket. At most MAX_BUILD_CONNECTIONS are open at once across the process: a socket keeps its
+   * slot until it is closed, and a build that gets no slot within BUILD_QUEUE_MS is refused as temporarily_unavailable.
+   */
+  readonly buildChannel: SnapshotChannel = {
+    open: async (): Promise<SnapshotLink> => {
+      if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      await this.takeBuildSlot();
+      if (this.closing) {
+        this.freeBuildSlot();
+        throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      }
+      const socket = new Surreal();
+      this.buildSockets.add(socket);
+      const opening = this.openSocket(socket);
+      try {
+        await CompanyDatabase.withTimeout(opening, 15_000, 'build connect');
+      } catch (error) {
+        // The timeout does not cancel the connect. A socket that opens after its slot was freed is closed at once, so it cannot
+        // outlive the build cap.
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
+        await this.closeBuildSocket(socket);
+        throw error;
+      }
+      return { db: socket, close: () => this.closeBuildSocket(socket) };
+    },
+  };
+
+  private readonly releaseSockets = new Set<Surreal>();
+
+  /**
+   * The connections releases and sweeps of listings run on, one for each, outside the build cap. A saturated build pool must not
+   * hold back a release: a listing that is not released holds its quota until it expires.
+   */
+  readonly releaseChannel: SnapshotChannel = {
+    open: async (): Promise<SnapshotLink> => {
+      if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      const socket = new Surreal();
+      this.releaseSockets.add(socket);
+      const opening = this.openSocket(socket);
+      try {
+        await CompanyDatabase.withTimeout(opening, 15_000, 'release connect');
+      } catch (error) {
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
+        await this.closeReleaseSocket(socket);
+        throw error;
+      }
+      return { db: socket, close: () => this.closeReleaseSocket(socket) };
+    },
+  };
+
+  /** Build connections open or being opened, and the builds waiting for a slot (for the tests and the measurements). */
+  buildConnectionStats(): { open: number; slotsInUse: number; queued: number } {
+    return { open: this.buildSockets.size, slotsInUse: this.buildSlotsInUse, queued: this.buildSlotWaiters.length };
+  }
+
+  /** Takes a build slot now, or waits for one that a closing socket frees; a slot passes straight to the first waiter. */
+  private takeBuildSlot(): Promise<void> {
+    if (this.buildSlotsInUse < MAX_BUILD_CONNECTIONS) {
+      this.buildSlotsInUse++;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        const index = this.buildSlotWaiters.indexOf(waiter);
+        if (index >= 0) this.buildSlotWaiters.splice(index, 1);
+        reject(new CompanyError('temporarily_unavailable',
+          `snapshot builds are busy: ${MAX_BUILD_CONNECTIONS} are running and none finished within ${BUILD_QUEUE_MS / 1000} seconds; narrow the query with state, goalId, role or since, then retry`, true));
+      }, BUILD_QUEUE_MS);
+      this.buildSlotWaiters.push(waiter);
+    });
+  }
+
+  private freeBuildSlot(): void {
+    const next = this.buildSlotWaiters.shift();
+    if (next) next();
+    else this.buildSlotsInUse--;
+  }
+
+  private async openSocket(socket: Surreal): Promise<void> {
+    await socket.connect(this.config.url, {
+      authentication: { username: this.config.rootUser, password: this.config.rootPassword },
+    });
+    await socket.use({ namespace: this.config.namespace, database: this.config.database });
+  }
+
+  private async closeBuildSocket(socket: Surreal): Promise<void> {
+    // Only the call that finds the socket still open closes it and frees its slot, so a link closed twice frees its slot once.
+    if (!this.buildSockets.delete(socket)) return;
+    try {
+      await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'build close').catch(() => {});
+    } finally {
+      this.freeBuildSlot();
+    }
+  }
+
+  private async closeReleaseSocket(socket: Surreal): Promise<void> {
+    if (!this.releaseSockets.delete(socket)) return;
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'release close').catch(() => {});
+  }
+
+  /** Closes a socket whose connect finished after its owner had given up on it. Best effort, and bounded like the other closes. */
+  private async closeLateSocket(socket: Surreal): Promise<void> {
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'late close').catch(() => {});
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
     clearInterval(this.keepalive);
     this.keepalive = undefined;
+    await Promise.all([...this.buildSockets].map(socket => this.closeBuildSocket(socket)));
+    await Promise.all([...this.releaseSockets].map(socket => this.closeReleaseSocket(socket)));
     // engine.close() awaits a 'disconnected' event that never arrives when the peer
     // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
     await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});

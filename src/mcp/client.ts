@@ -4,6 +4,8 @@ const loopbackHosts = new Set(['127.0.0.1', 'localhost', '::1']);
 
 export async function connectCompanyClient(input: {
   url: URL; credential: string; clientName: string; gateToken?: string;
+  // Test seam: lets a test count the bytes of every HTTP response it receives.
+  fetch?: (url: string | URL, init?: RequestInit) => Promise<Response>;
 }) {
   const loopback = loopbackHosts.has(input.url.hostname);
   if (!loopback && input.url.protocol !== 'https:') {
@@ -14,6 +16,7 @@ export async function connectCompanyClient(input: {
   const transport = new StreamableHTTPClientTransport(input.url, {
     authProvider: { token: async () => input.credential },
     ...(input.gateToken ? { requestInit: { headers: { 'X-SCK-Token': input.gateToken } } } : {}),
+    ...(input.fetch ? { fetch: input.fetch } : {}),
   });
   await client.connect(transport);
   return {

@@ -96,14 +96,164 @@ export interface TaskView {
   lineage?: TaskId;
   /** 1-based version number inside the lineage (v1 has none until superseded). */
   revisionNo?: number;
+  /**
+   * Set on a write's echo (SYS01): the size and digest of the whole context, and whether `context` holds only its leading part.
+   * A cut context continues at contextNextOffset in read_task_text, which verifies the text against contextSha256.
+   */
+  contextBytes?: number;
+  contextSha256?: string;
+  contextTruncated?: boolean;
+  contextNextOffset?: number;
+  /**
+   * Set on a write's echo (SYS01 R3) and on a claim's task: each list that was cut to its leading part, with the whole count and
+   * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
+   */
+  listsTruncated?: Partial<Record<'dependencies' | 'workIntentPaths' | 'worktreePaths', ListCut>>;
+  /**
+   * Set on a task echo (SYS01 R3): each text field other than the context that was cut to its leading part, with the size and the
+   * SHA-256 of its whole value. The whole value is not readable through read_task_text.
+   */
+  fieldsTruncated?: Record<string, FieldCut>;
 }
+
+/** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
+export interface ListCut { count: number; sha256: string }
+
+/** A text field of a task echo that was cut: the UTF-8 size of its whole value, and the SHA-256 of that value (SYS01 R3). */
+export interface FieldCut { bytes: number; sha256: string }
 
 export interface HistoryEntry {
   action: string;
   actor: string;
+  /**
+   * Evidence text. A complete answer carries it whole. A paged answer carries it whole too, unless the entry alone
+   * cannot fit a page: then evidenceTruncated is true, and read_task_text continues at evidenceNextOffset (C3).
+   */
   evidence?: string;
   version?: number;
   at: string;
+  /** Audit row id, the handle read_task_text takes for the full evidence (SYS01). */
+  auditId?: string;
+  /** Size and digest of the full evidence, whether or not the text above is cut. */
+  evidenceBytes?: number;
+  evidenceSha256?: string;
+  evidenceTruncated?: boolean;
+  /** Byte offset where read_task_text continues the evidence; present only when evidenceTruncated is true. */
+  evidenceNextOffset?: number;
+}
+
+/**
+ * Paging metadata of a paged answer (SYS01). A complete (legacy) answer carries no page: it is the whole set or it is
+ * refused as response_too_large. total is the stored listing's row count; snapshotAt is the database time it was read at.
+ */
+export interface PageInfo {
+  pageSize: number;
+  returned: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  total?: number;
+  /** Database time the listing was read at. The listing reflects the database as it stood then. */
+  snapshotAt?: string;
+  budgetBytes: number;
+}
+
+/**
+ * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction, goal
+ * and project is one item: its JSON text is cut into parts of a page's size, in order. A reader joins the `json` of the parts of one
+ * (section, key) item, checks the joined UTF-8 length against `totalBytes` and its SHA-256 against `sha256`, then parses it.
+ */
+export interface CompanyPart {
+  section: 'meta' | 'directions' | 'goals' | 'projects';
+  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a goal or project. */
+  key: string;
+  /** 0-based position of this part among the parts of its item. */
+  part: number;
+  /** How many parts the item has. */
+  parts: number;
+  /** Byte offset of this part in the item's JSON text. */
+  offset: number;
+  /** Byte length and SHA-256 (hex) of the whole item JSON text. */
+  totalBytes: number;
+  sha256: string;
+  /** This part of the item's JSON text, cut on UTF-8 character boundaries. */
+  json: string;
+}
+
+/**
+ * get_context answer (SYS01). A task answer carries `tasks`, `companyIncluded` and `companyRead` (the arguments that read the company
+ * block in pages). A company answer carries `scope: 'company'` and either `company` (complete) or `parts` with `page` (paged).
+ */
+export interface ContextView {
+  principal: Principal;
+  /** The company block: with includeCompany true on a task answer, or a complete scope-company answer. */
+  company?: unknown;
+  /** Whether a task answer carries the company block (AC-A: false unless includeCompany is true). */
+  companyIncluded?: boolean;
+  /** How to read the company block in pages: the get_context arguments that return it, one page at a time. */
+  companyRead?: { scope: 'company'; pageSize: number };
+  scope?: 'tasks' | 'company';
+  section?: 'directions' | 'goals' | 'projects';
+  parts?: CompanyPart[];
+  tasks?: Array<Record<string, unknown>>;
+  page?: PageInfo;
+}
+
+export interface HistoryPageView {
+  history: HistoryEntry[];
+  page: PageInfo;
+}
+
+export interface WorktreePageView {
+  worktrees: Array<Record<string, unknown>>;
+  page: PageInfo;
+}
+
+/**
+ * What read_task_text reads. context and evidence are text. project is the project environment as JSON (holder or gm only),
+ * and dependencies, workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
+ * read back whole (SYS01 R3).
+ */
+export type TaskTextField = 'context' | 'evidence' | 'project' | 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+
+/** One byte segment of a text read by read_task_text (SYS01). */
+export interface TaskTextSegment {
+  taskId: string;
+  field: TaskTextField;
+  auditId?: string;
+  totalBytes: number;
+  /** SHA-256 of the whole text, so a reader can verify a reassembly. */
+  sha256: string;
+  offset: number;
+  bytes: number;
+  nextOffset: number | null;
+  text: string;
+}
+
+/** gm-only read-only summary (SYS01): counts at a cutoff, never task text. */
+export interface AdminSummary {
+  /** Database time of the read. Every count reflects the database as it stood then. */
+  cutoffAt: string;
+  /** Start of the audit window, [since, cutoffAt]. Declared even when the task counts ignore it. */
+  since: string;
+  goalId?: string;
+  /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
+  scope: { tasks: string; audit: string };
+  tasks: Record<string, number>;
+  audit: Record<string, number>;
+  outboxSequence: number;
+  integrity: {
+    /**
+     * True only when the read was consistent (its two in-transaction reads agree), every row is grouped under a
+     * known state, and each count matches the rows it covers. Otherwise false: retry the summary.
+     */
+    complete: boolean;
+    method: string;
+    taskRows: number;
+    auditRows: number;
+    checks: { taskCountsMatchRows: boolean; auditCountsMatchRows: boolean; statesKnown: boolean; repeatableRead: boolean };
+    /** Present only when a task row carries a state outside the known set. */
+    unknownStates?: string[];
+  };
 }
 
 export interface CreateTask {
@@ -136,8 +286,14 @@ export interface ClaimResult {
   deliveryId: DeliveryId;
   fence: number;
   leaseExpiresAt: string;
-  /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
+  /**
+   * Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task, oldest first: the newest entries
+   * that core read. historyCount is the number of entries the task holds in all; historyComplete is true only when history holds
+   * every one of them. get_task_history pages the whole history (SYS01 R3).
+   */
   history: HistoryEntry[];
+  historyCount?: number;
+  historyComplete?: boolean;
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
@@ -175,6 +331,11 @@ export interface ProjectView {
   runbooks: string[];
   notes?: string;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
+  /**
+   * Set on a company block read by someone who may not see the environments (SYS01 M3): `envs` is then empty, not the project's
+   * list. The owner's console never sets it.
+   */
+  envsWithheld?: true;
 }
 
 export interface CreateDelivery {
@@ -378,6 +539,14 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
+  contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
+  historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
+  worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
+  /** list_worktrees without pageSize or cursor: the pre-SYS01 array, in the same compact form as a page. */
+  worktreeList?(credential: Credential, input: Record<string, unknown>): Promise<unknown[]>;
+  taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
+  adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
   /**
