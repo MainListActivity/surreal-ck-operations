@@ -20,10 +20,15 @@ export interface AdminSummaryView {
   integrity: { complete: boolean };
 }
 
-/** The projection the preflight requests from paged get_context. listsTruncated is echoed only when a row was cut. */
+/**
+ * The projection the preflight requests from paged get_context. It only names fields an older release also accepts:
+ * the preflight runs against the release that is about to be switched to, and a release that refuses the projection
+ * would make the check unusable exactly where it matters. Truncation is therefore detected from the row itself (a cut
+ * dependency list) and from the page totals, not from a flag the old projection vocabulary does not have.
+ */
 export const PREFLIGHT_FIELDS = [
   'id', 'state', 'executorRole', 'reviewerRole', 'blockedTo', 'submittedBy', 'currentEmployee',
-  'fence', 'version', 'leaseExpiresAt', 'dependencies', 'listsTruncated',
+  'fence', 'version', 'leaseExpiresAt', 'dependencies',
 ] as const;
 
 export interface PreflightTask {
@@ -76,6 +81,11 @@ export interface PreflightInput {
   now?: number;
   /** A named deployment lease must have at least this much life left. */
   nearExpirySeconds?: number;
+  /**
+   * Reads one task's dependency list whole. The preflight calls it for every paged row that carries dependencies: a cut
+   * dependency list would hide a blocked dependency, so a row whose whole list differs from the paged one fails closed.
+   */
+  readDependencies?: (taskId: string) => Promise<string[] | undefined>;
 }
 
 export interface PreflightVerdict {
@@ -139,7 +149,8 @@ function capability(input: PreflightInput): PreflightVerdict['capability'] {
     seen.add(row.id);
     const missing = missingProjection(row);
     if (missing.length) reasons.push(`task ${row.id} is missing projection fields: ${missing.join(',')}`);
-    // A cut row may carry only part of its dependency list; admission would then miss a blocked dependency.
+    // A cut row may carry only part of its dependency list; admission would then miss a blocked dependency. The cut
+    // flags are not in the projection vocabulary an older release accepts, so the whole list is re-read and compared.
     const cut = row.listsTruncated && typeof row.listsTruncated === 'object' ? Object.keys(row.listsTruncated) : [];
     if (cut.length) reasons.push(`task ${row.id} lists were truncated (${cut.join(', ')}); its dependencies cannot be read whole`);
   }
@@ -251,6 +262,35 @@ export function evaluatePreflight(input: PreflightInput): PreflightVerdict {
   return { capability: cap, window: admission(input, cap) };
 }
 
+/**
+ * The same verdict, with the dependency lists re-read whole. A paged row whose dependency list was cut is compared with
+ * the whole list; a difference is a truncated read and fails closed. The read is optional: without it, a row that carries
+ * no dependencies cannot be cut, and rows with dependencies are refused as unreadable.
+ */
+export async function evaluatePreflightWithDependencyCheck(input: PreflightInput): Promise<PreflightVerdict> {
+  const rows = input.pages.flatMap(page => page.rows);
+  const problems: string[] = [];
+  for (const row of rows) {
+    const paged = row.dependencies ?? [];
+    if (paged.length === 0 && !input.readDependencies) continue;
+    if (!input.readDependencies) { problems.push(`task ${row.id} has dependencies but no whole-list read was available`); continue; }
+    let whole: string[] | undefined;
+    try { whole = await input.readDependencies(row.id); } catch (error) { whole = undefined; }
+    if (!whole) { problems.push(`task ${row.id}: its dependency list could not be read whole`); continue; }
+    const shown = [...paged].sort();
+    const full = [...whole].sort();
+    if (shown.length !== full.length || shown.some((value, index) => value !== full[index])) {
+      problems.push(`task ${row.id}: its dependency list was cut (${shown.length} of ${full.length} shown)`);
+    }
+  }
+  const verdict = evaluatePreflight(input);
+  if (problems.length === 0) return verdict;
+  return {
+    capability: { ...verdict.capability, complete: false, reasons: [...verdict.capability.reasons, ...problems] },
+    window: { allowed: false, reasons: [...verdict.window.reasons, ...problems] },
+  };
+}
+
 /** One read of the two GM views: `call` is backed by sck in production and by the real core in the fork tests. */
 export type PreflightCall = (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -260,7 +300,7 @@ export interface CollectOptions {
 }
 
 /** Reads the summary and walks the paged working set to hasMore=false. Throws when the read shape is not the paged one. */
-export async function collectPreflightInput(call: PreflightCall, options: CollectOptions = {}): Promise<{ summary: AdminSummaryView; pages: PageView[] }> {
+export async function collectPreflightInput(call: PreflightCall, options: CollectOptions = {}): Promise<{ summary: AdminSummaryView; pages: PageView[]; readDependencies: (taskId: string) => Promise<string[] | undefined> }> {
   const summary = await call('get_admin_summary', {}) as unknown as AdminSummaryView;
   const pageSize = options.pageSize ?? 100;
   const maxPages = options.maxPages ?? 500;
@@ -280,5 +320,15 @@ export async function collectPreflightInput(call: PreflightCall, options: Collec
     if (typeof page.nextCursor !== 'string' || page.nextCursor.length === 0) throw new Error('page.hasMore is true but no nextCursor was issued');
     cursor = page.nextCursor;
   }
-  return { summary, pages };
+  // The whole dependency list of one task, read through the detail path: a paged list may be cut, and a cut dependency
+  // list would hide a blocked dependency from the admission check.
+  const readDependencies = async (taskId: string): Promise<string[] | undefined> => {
+    const segment = await call('read_task_text', { taskId, field: 'dependencies' }) as { text?: string };
+    if (typeof segment?.text !== 'string') return undefined;
+    try {
+      const parsed = JSON.parse(segment.text) as unknown;
+      return Array.isArray(parsed) ? parsed.map(value => String(value)) : undefined;
+    } catch { return undefined; }
+  };
+  return { summary, pages, readDependencies };
 }

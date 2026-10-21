@@ -10,7 +10,7 @@
 // The summary and the pages count different scopes (all states vs the working set, and own submitted reviews are hidden);
 // the evaluator compares them on the working set and reports hidden reviews separately. It never pauses dispatch,
 // installs, reloads or writes; a non-zero exit means "do not open the window".
-import { collectPreflightInput, evaluatePreflight, type DeploymentLease, type WindowExtras } from '../src/maintenance-preflight.ts';
+import { collectPreflightInput, evaluatePreflightWithDependencyCheck, type DeploymentLease, type WindowExtras } from '../src/maintenance-preflight.ts';
 
 const SCK = process.env.SCK_BIN ?? '/Users/y/Library/Application Support/SurrealCKCompany/bin/sck';
 
@@ -31,12 +31,13 @@ async function sckCall(tool: string, args: Record<string, unknown>): Promise<Rec
   try { return JSON.parse(stdout) as Record<string, unknown>; } catch { throw new Error(`${tool} returned non-JSON output`); }
 }
 
-const { summary, pages } = await collectPreflightInput(sckCall, { pageSize: Number(argValue('--page-size') ?? 100) });
+const { summary, pages, readDependencies } = await collectPreflightInput(sckCall, { pageSize: Number(argValue('--page-size') ?? 100) });
 const deployment = parseJson<DeploymentLease>('--deployment', argValue('--deployment'));
 const extras = parseJson<WindowExtras>('--extras', argValue('--extras')) ?? { triageGoals: null, pendingEvals: null, gmAttention: null };
 const now = argValue('--now') === undefined ? Date.now() : Date.parse(argValue('--now')!);
 const nearExpirySeconds = argValue('--near-expiry') === undefined ? undefined : Number(argValue('--near-expiry'));
-const verdict = evaluatePreflight({ summary, pages, extras, deployment, now, nearExpirySeconds });
+// The dependency lists are re-read whole: a paged list may be cut, and a cut dependency list hides a blocked dependency.
+const verdict = await evaluatePreflightWithDependencyCheck({ summary, pages, extras, deployment, now, nearExpirySeconds, readDependencies });
 const wantWindow = process.argv.includes('--window');
 console.log(JSON.stringify({ mode: wantWindow ? 'window' : 'capability', verdict, pages: pages.length, rows: pages.reduce((sum, page) => sum + page.rows.length, 0) }, null, 2));
 process.exit(verdict.capability.complete && (!wantWindow || verdict.window.allowed) ? 0 : 1);

@@ -48,7 +48,7 @@ PASEO="/Applications/Paseo.app/Contents/Resources/bin/paseo"
 
 **保守窗口**：除原 3381 本次部署的 execute 租约（具名 task/holder/fence/version/expiry，持续受权保活）外，doing 与 review 全部排空；ready、待 GM/owner、triage/eval/GM-attention、未知或临近到期一律不开窗。静默窗口是有条件最佳努力，不是硬事务屏障：外部 owner 动作、崩溃或状态变化立即使窗口失效，必须重新采样。
 
-1. GM 运行 `bun "$REL/scripts/maintenance-preflight.ts"`（能力检查，只读；不暂停、不安装）。记录 admin summary（cutoff、since、逐 state 计数、outboxSequence、integrity.complete）、分页快照与行数、verdict。`capability.complete` 必须为 true；分页逐 state 计数必须与 summary 一致。本人的 review 会被分页隐藏，review 计数不一致即拒绝，不得用过滤后的清单自称完整。
+1. GM 运行 `bun "$REL/scripts/maintenance-preflight.ts"`（能力检查，只读；不暂停、不安装）。记录 admin summary（cutoff、since、逐 state 计数、outboxSequence、integrity.complete）、分页快照与行数、verdict。`capability.complete` 必须为 true。口径说明：summary 统计全部任务状态，get_context 只列工作态（ready/doing/review/blocked）且隐藏本人提交的 review，因此工具按工作态比对 ready/doing/blocked，并把 review 的差额记为 `hiddenReviews`；工作态总数必须等于分页行数加隐藏 review，任一行列表被截断（`listsTruncated`）即失败关闭——依赖读不全就不放行。隐藏的本人 review 仍会挡住窗口（它可以被 accept/return 解锁依赖）。
 2. GM 运行 `bun "$REL/scripts/maintenance-preflight.ts" --window --deployment '<json>' --extras '<json>'`，记录 `window.allowed` 与 `admittedLease`。
    - `--deployment`：本次部署的具名租约 `{taskId,holder,fence,version,expiresAt}`。
    - `--extras`：`{triageGoals,pendingEvals,gmAttention}`，未知写作 `null`（会拒绝开窗）。

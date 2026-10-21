@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { evaluatePreflight, type AdminSummaryView, type DeploymentLease, type PreflightTask } from '../src/maintenance-preflight.ts';
+import { evaluatePreflight, evaluatePreflightWithDependencyCheck, type AdminSummaryView, type DeploymentLease, type PreflightTask } from '../src/maintenance-preflight.ts';
 
 // SYS-DISP 843d4e75 R1/R2: the executable preflight over the gm read-only views. Pure inputs, no database.
 const NOW = Date.parse('2026-10-21T18:00:00.000Z');
@@ -123,4 +123,28 @@ test('window: session-creating paths without a task lease must be known and zero
     expect(verdict.window.allowed, key).toBe(false);
     expect(verdict.window.reasons.join(' ')).toContain(key);
   }
+});
+
+test('a dependency list the page cut is refused: the whole list is re-read and compared', async () => {
+  const row = task({ id: 't-deps', state: 'blocked', dependencies: [] });
+  const cut = await evaluatePreflightWithDependencyCheck({
+    summary: summary({ blocked: 1 }), pages: [page([row])], extras,
+    readDependencies: async () => ['t-a', 't-b'],
+  });
+  expect(cut.capability.complete).toBe(false);
+  expect(cut.capability.reasons.join(' ')).toMatch(/dependency list/);
+  expect(cut.window.allowed).toBe(false);
+
+  // The same list read whole passes the dependency check.
+  const whole = await evaluatePreflightWithDependencyCheck({
+    summary: summary({ blocked: 1 }), pages: [page([task({ id: 't-deps', state: 'blocked', dependencies: ['t-a', 't-b'] })])], extras,
+    readDependencies: async () => ['t-a', 't-b'],
+  });
+  expect(whole.capability.complete).toBe(true);
+  // A dependency list that cannot be read whole is unknown, not assumed complete.
+  const unreadable = await evaluatePreflightWithDependencyCheck({
+    summary: summary({ blocked: 1 }), pages: [page([row])], extras, readDependencies: async () => undefined,
+  });
+  expect(unreadable.capability.complete).toBe(false);
+  expect(unreadable.capability.reasons.join(' ')).toMatch(/could not be read whole/);
 });

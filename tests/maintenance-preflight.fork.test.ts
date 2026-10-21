@@ -7,7 +7,7 @@ import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
-import { collectPreflightInput, evaluatePreflight, type PreflightCall } from '../src/maintenance-preflight.ts';
+import { collectPreflightInput, evaluatePreflightWithDependencyCheck, type AdminSummaryView, type PreflightCall } from '../src/maintenance-preflight.ts';
 
 // SYS-DISP 843d4e75 R5: the preflight over the real GM read paths — get_admin_summary and paged get_context on a
 // company fork — in the production shape: hundreds of finished tasks, void rows and a review the caller submitted
@@ -66,9 +66,9 @@ test('the preflight reads the real GM views on a fork and stays usable with done
       if (tool === 'get_context') return await core.contextView(gm, args) as unknown as Record<string, unknown>;
       throw new Error(`unexpected tool ${tool}`);
     };
-    const { summary, pages } = await collectPreflightInput(call, { pageSize: 100 });
+    const { summary, pages, readDependencies } = await collectPreflightInput(call, { pageSize: 100 });
     const rows = pages.flatMap(page => page.rows);
-    const verdict = evaluatePreflight({ summary, pages, extras: { triageGoals: 0, pendingEvals: 0, gmAttention: 0 } });
+    const verdict = await evaluatePreflightWithDependencyCheck({ summary, pages, extras: { triageGoals: 0, pendingEvals: 0, gmAttention: 0 }, readDependencies });
 
     // The summary counts every state; the pages list only the working set; the difference is the hidden own review.
     expect(summary.tasks.done).toBeGreaterThanOrEqual(bulk);
@@ -82,6 +82,21 @@ test('the preflight reads the real GM views on a fork and stays usable with done
     expect(verdict.window.reasons.join(' ')).toMatch(/review/);
     // A read that is not the paged shape is refused by the collector itself.
     await expect(collectPreflightInput(async () => ({ tasks: [] }))).rejects.toThrow(/paged task shape/);
+
+    // A dependency list that the page cut is refused: the whole list is re-read and compared.
+    const withDeps = await core.createTask(gm, { title: '带依赖的等待行', context: '合成夹具：带依赖的 blocked 任务。', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() } as never);
+    const depsLease = await core.claim(engineer, withDeps.id);
+    await core.block(engineer, { taskId: withDeps.id, deliveryId: depsLease.deliveryId, fence: depsLease.fence, expectedVersion: depsLease.task.version }, 'gm', { text: '合成阻塞记录：带依赖的等待行，用于验证依赖截断会被拒绝。', idempotencyKey: key() });
+    await db.db.query('UPDATE $t SET dependencies = $deps;', { t: new RecordId('task', withDeps.id), deps: [new RecordId('task', done.id)] });
+    const cut = await evaluatePreflightWithDependencyCheck({
+      summary: await core.adminSummary(gm, {}) as unknown as AdminSummaryView,
+      pages: [{ rows: [{ id: withDeps.id, state: 'blocked', executorRole: 'engineering', reviewerRole: 'qa', fence: 1, version: 1, dependencies: [] }], hasMore: false, total: 1, snapshotAt: 'cut' }],
+      extras: { triageGoals: 0, pendingEvals: 0, gmAttention: 0 },
+      readDependencies: async () => [done.id],
+    });
+    expect(cut.capability.complete).toBe(false);
+    expect(cut.capability.reasons.join(' ')).toMatch(/dependency list/);
+    expect(cut.window.allowed).toBe(false);
   } finally {
     await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
   }
