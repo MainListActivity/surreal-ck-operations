@@ -176,8 +176,9 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - 不想让某类员工再接任务但保留定义：`pnpm run admin def weight <id> 0`（软停用，全部候选为 0 时仍可能兜底）；彻底停用用 `def disable <id>`。
 - **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
 - **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及经理/老板手工退役。
-- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却到上游重置时间），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。
-- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。
+- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（magpie 补上 Paseo 不报的订阅），不靠冷却时长兜底。
+- **额度恢复后会话自动重启**：额度失败会把会话停在 Paseo 的 `error` 状态，而 Paseo 不会自己把它放出来；调度器只往 `idle` 会话派工，所以冷却结束后调度器用 `paseo agent reload` 就地重启该会话（agent、对话与通道绑定都保留），不退役、不重开新员工。重载失败按 5 分钟间隔重试。
+- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。订阅还在冷却或低于额度下限时不做改回——那期间的改回不可能生效，调度器等订阅恢复后的第一轮再改。
 - 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET http://127.0.0.1:3425/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。
 
 ## v2 归档
@@ -186,6 +187,7 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 ## 上线记录
 
+- 2026-10-21：额度耗尽误判修复上线（老板批准范围：修复顺序 2、3、4——magpie 额度接入、额度预警、事故收尾；另含模型漂移改回与退役标准梳理）。来源 PR #1503 → main `6b6a0be`，发布 `releases/6b6a0be…`；随后发现额度行读取的前缀谓词漏掉带连字符的 provider（`factory-droid` 恰好不可见），来源 PR #1507 → main `2ac720d`，发布 `releases/2ac720d…`；再以 PR #1508 → main `6003e2c` 发布 `releases/6003e2c…`（漂移等待日志按周期节流并补前两条记录；active 与插件来源同为该 SHA）。同日再以 PR #1510 → main `3d19cb7` 发布 `releases/3d19cb7…`（额度下限日志按变化节流；active 与插件来源同为该 SHA，双面一致；CI 两个工作流均 success）。随后以 PR #1512 → main `4f01a1d` 发布 `releases/4f01a1d…`（过期额度快照不再触发预警，防止 15 分钟前的旧数字上收件箱；active 与插件来源同为该 SHA，CI 两个工作流均 success）。上线后 `quota-warn:grok` 旧提醒已清除，`quota below floor` 每轮只写一次。`2ac720d` 验收：根/插件 typecheck 退出 0；test:service 12 通过；test:channel 153 通过/14 跳过/0 失败；test:bridge 403 通过/23 跳过/0 失败；fork 套件 46 通过/0 失败；全量 `--all` 1019 通过/33 跳过/12 失败，与基线 `6b6a0be` 的 14 个具名失败逐名比对为真子集（无新增）。pnpm-lock `94ec54e8…`，plugin/pnpm-lock `1e9c48f5…`，vendor 摘要 `fefa7b35…`（106 个文件）。上线后插件日志出现 `quota below floor: … factory-droid 额度不足（周/月额度 0%<2%）`，为额度行读取修复的直接证据。
 - 2026-09-28：v3 上线，发布 `af63565`（`releases/<sha>`，`active` 指向当前版本）。写入 18 个默认员工定义；gm-01、product-01、eng-01、eng-02、ai-01、qa-01、cs-01 挂到各自的 `*-codex` 定义上，身份与历史保留。旧 Paseo 定时巡检 `d747edb8` 已到期，额度巡检 `cc85bb8f` 已暂停，由调度器取代。启动任务 #3—#16 已按老板决定取消（not planned）。
 - 演练 A（GitHub #34）：调度器派 qa-01 执行 → checkpoint → submit → 自动派 eng-01 独立验收 → done。
 - 演练 B（GitHub #35）：codex 并发临时设为 0，调度器按定义新开 `cs-grok-9d59da`；它存下 ALPHA 进度后会话被强制归档。约 25 秒内调度器退役该实例并撤销凭证、收回租约并附交接包、新开 `cs-grok-580043` 接手；接手者读到 ALPHA 与交接包，跳过已完成步骤存下 BETA 并提交；`qa-grok-5dfd5a` 独立验收通过。旧凭证调用返回 401。
