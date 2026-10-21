@@ -917,6 +917,15 @@ test('review wait concurrency, void dependencies and cycle attempts stay fail cl
     .rejects.toMatchObject({ code: 'invalid' });
   expect(await task(cycleB.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
 
+  // A raw dependency that resolves to a superseded lineage tip must still be checked for a back-edge.
+  const resolvedCycle = await mkReview('解析后环任务');
+  const rawDep = await core.createTask(tokens.gm, { title: '解析前旧稿', context: 'superseded lineage fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId: goal.id, idempotencyKey: key() });
+  const tipDep = await core.createTask(tokens.gm, { title: '解析后新稿', context: 'superseded lineage tip fixture', executorRole: 'engineering', reviewerRole: 'engineering', goalId: goal.id, dependencies: [resolvedCycle.id], idempotencyKey: key() });
+  await database.db.query("UPDATE $raw SET superseded_by = $tip, lineage = $raw; UPDATE $tip SET lineage = $raw;", { raw: new RecordId('task', rawDep.id), tip: new RecordId('task', tipDep.id) });
+  await expect(core.deferTaskUntil(tokens.gm, { taskId: resolvedCycle.id, dependencies: [rawDep.id], text: '原始依赖解析到新 tip 后若回指本任务，必须按解析后环拒绝。', idempotencyKey: key() }))
+    .rejects.toMatchObject({ code: 'invalid' });
+  expect(await task(resolvedCycle.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm' });
+
   // Concurrent reverse defers must not create a cycle even when both pre-reads see a clean graph.
   const concurrentA = await mkReview('并发环A');
   const concurrentB = await mkReview('并发环B');

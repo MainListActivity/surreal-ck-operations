@@ -1503,6 +1503,47 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
+   * The dependency graph used by defer's cycle guard. Each raw dependency is
+   * resolved through its superseded_by lineage tip before its dependencies are
+   * considered, so a chain that only becomes cyclic after revision resolution is
+   * still refused. Corrupt/missing lineage stays on the raw row (conservative).
+   */
+  private async dependencyGraph(ids: string[]): Promise<Map<string, string[]>> {
+    const graph = new Map<string, string[]>();
+    if (!ids.length) return graph;
+    type Row = { id: RecordId; dependencies?: RecordId[]; superseded_by?: RecordId; lineage?: RecordId };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+      { ids: ids.map(d => id('task', d)) });
+    const all: Row[] = [...(rows ?? [])];
+    const lineages = [...new Set(all.filter(row => row.superseded_by && row.lineage).map(row => normalizedId(row.lineage)))];
+    const tips = new Map<string, string>();
+    if (lineages.length) {
+      const [tipRows] = await this.db.query<[Array<{ id: RecordId; lineage: RecordId }>]>(
+        'SELECT id, lineage FROM task WHERE lineage IN $lineages AND superseded_by = NONE;',
+        { lineages: lineages.map(lineage => id('task', lineage)) });
+      for (const tip of tipRows ?? []) tips.set(normalizedId(tip.lineage), normalizedId(tip.id));
+    }
+    const present = new Set(all.map(row => normalizedId(row.id)));
+    const missingTips = [...new Set([...tips.values()].filter(tip => !present.has(tip)))];
+    if (missingTips.length) {
+      const [tipRows] = await this.db.query<[Row[]]>(
+        'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+        { ids: missingTips.map(tip => id('task', tip)) });
+      all.push(...(tipRows ?? []));
+    }
+    const byId = new Map(all.map(row => [normalizedId(row.id), row]));
+    for (const row of all) {
+      const rawId = normalizedId(row.id);
+      const lineage = row.lineage ? normalizedId(row.lineage) : '';
+      const tip = row.superseded_by && lineage ? tips.get(lineage) : undefined;
+      const source = tip ? byId.get(tip) ?? row : row;
+      graph.set(tip ?? rawId, (source.dependencies ?? []).map(normalizedId));
+    }
+    return graph;
+  }
+
+  /**
    * gm only: re-point a gm block at the dependency graph. Execute blocks keep their old
    * behaviour (wait blocked, restore ready). A normal non-owner review block — one backed
    * by a real submit and a reviewer block in the audit stream — may also be deferred: the
@@ -1576,14 +1617,16 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     // The deferred task must not be reachable from its own new dependencies: walk the
-    // dependency closure of the proposed deps and refuse a path back to the task.
+    // resolved dependency closure of the proposed deps (superseded_by -> lineage tip)
+    // and refuse a path back to the task.
     const seen = new Set(dependencies);
     let frontier = [...dependencies];
     for (let depth = 0; frontier.length && depth < 32; depth++) {
-      const [closure] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
-        'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(d => id('task', d)) });
-      const next = [...new Set((closure ?? []).flatMap(row => (row.dependencies ?? []).map(normalizedId)))].filter(d => !seen.has(d));
+      const graph = await this.dependencyGraph(frontier);
+      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
+      const next = [...new Set([...graph.values()].flat())].filter(d => !seen.has(d));
       if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
+      for (const key of graph.keys()) seen.add(key);
       for (const n of next) seen.add(n);
       frontier = next;
     }
