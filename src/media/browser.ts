@@ -12,7 +12,7 @@ import { buildScript } from './browser-scripts.ts';
 
 export const BROWSER_TOOLS = ['media_browser_info', 'media_image', 'media_video', 'notebook_list', 'notebook_create', 'notebook_query', 'notebook_add_source', 'notebook_remove_source', 'notebook_write', 'notebook_recover'] as const;
 export type BrowserTool = typeof BROWSER_TOOLS[number];
-export const BROWSER_PROVIDERS = ['chatgpt', 'gemini', 'grok', 'notebook'] as const;
+export const BROWSER_PROVIDERS = ['chatgpt', 'higgsfield', 'gemini', 'grok', 'notebook'] as const;
 export type Provider = typeof BROWSER_PROVIDERS[number];
 
 const KINDS = ['image', 'video', 'notebook'] as const;
@@ -26,7 +26,8 @@ const TIMEOUT: Record<Kind, number> = { image: 300_000, video: 420_000, notebook
 // Which providers can serve each kind, in failover order. Sora is discontinued (no ChatGPT video);
 // grok works but carries a shared weekly cap, so it stays last.
 // 'notebook' is the NotebookLM lane — a pseudo-provider covering notebook_* tools only.
-const ROUTES = { image: ['chatgpt', 'gemini', 'grok'], video: ['gemini', 'grok'], notebook: ['notebook'] } as const;
+// 'higgsfield' is the free image lane: only the plan's unlimited image models are used, web UI only.
+const ROUTES = { image: ['chatgpt', 'higgsfield', 'gemini', 'grok'], video: ['gemini', 'grok'], notebook: ['notebook'] } as const;
 
 const IMG_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.png$/;
 const VID_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(mp4|webm)$/;
@@ -267,13 +268,14 @@ export class BrowserStudio {
       outputDir: this.outputDir(scope),
       notes: [
         '网页会话生成：provider=auto 按 ' + ROUTES.image.join(' → ') + ' 顺序 failover',
+        'higgsfield 仅使用套餐内标记为“无限”的图像模型（Seedream 4.5 / FLUX.2 Pro / Seedream 5.0 lite / GPT Image / Nano Banana / Kling O1），不花 credits；未登录返回 login_required',
         '图片产物为 PNG（透明底能力以会话实际支持为准）；视频产物 mp4 优先、提取失败回落 webm',
         'notebook_* 为笔记本通道：一部作品一本（如《作品名》），源按一卷一个（卷正文汇编）；write 在 Gemini 壳内基于笔记本源写作，query 查证/读取，add_source/remove_source 维护卷源',
         'login_required 错误 = 对应平台网页会话过期，需要老板在 ego 浏览器里重新登录该站',
         'limit_reached 为账号级配额（Grok 按周），等重置或换 provider',
       ],
       tools: {
-        media_image: '{"prompt","file":"x.png","refs?"[:至多4张参考图绝对路径],"provider?"[:auto/chatgpt/gemini/grok]}',
+        media_image: '{"prompt","file":"x.png","refs?"[:至多4张参考图绝对路径],"provider?"[:auto/chatgpt/higgsfield/gemini/grok]}',
         media_video: '{"prompt","file":"x.mp4","seconds?"(4-10),"provider?"[:auto/gemini/grok]}',
         notebook_list: '{}',
         notebook_create: '{"title":"作品名"}',
