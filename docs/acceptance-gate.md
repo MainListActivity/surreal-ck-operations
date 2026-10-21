@@ -6,6 +6,7 @@
 
 - `task.acceptance_criteria` 是版本化数组，每项 `{ id, kind, required, layer, evidence, verify, description?, risk?, legs? }`。`id` 唯一（`AC-…`），`kind` 为 `machine`/`human`；`machine` 不能用 `review-signoff`，`human` 只能用 `review-signoff`。
 - `create_delivery` 按 `legs` 把同一组 criteria 分到实现/上线申请/部署三腿；没有匹配项的腿使用该腿默认 criteria（实现：CI + 独立复核；上线申请：CI；部署：CI + QA 生产签署）。`create_task` 也可显式携带 criteria。
+- **legacy 先于 criteria 判定**：`acceptance_legacy === true` 或 `createdAt < enabledAt` 的行无论 criteria 是否为空都保留旧路径，且 legacy 不写 SYS02 证据；停用期间创建的交付三腿在启用后可继续 submit→独立 accept，启用后新建交付仍必须补机器证据。
 - 启用门禁后，每个新代码交付及其三腿由服务端合并**不可移除基线**（如 `AC-BASE-IMPL-1` required 机器 CI、`AC-BASE-IMPL-2` 真实独立签署；release/deploy 各有对应腿基线）；自定义 criteria 只能补充，同 ID、`required:false`、仅 human、全 optional 或 legs 过滤都不能移除/降级基线。`create_task`、`create_delivery` 与统一评估器同源合并，缺基线/降级/非法变更在创建或放行拒绝；门禁关闭期间创建的任务在创建时标 legacy，启用后保留旧路径，只读保留，不能伪造已满足。
 - `acceptance_version`、`acceptance_legacy`、`acceptance_head`、`acceptance_environment`、`acceptance_attempt`、`acceptance_chain` 均新增可选字段；旧行不需要迁移。
 
@@ -62,5 +63,6 @@
 
 - `tests/acceptance.test.ts`：criteria 校验、三腿默认、机器/人工判定、Jev 不能签人工、拒绝清单、签署摘要唯一性；GitHub adapter 的 artifact 记录核验。
 - `tests/acceptance-gate.fork.test.ts`：隔离 fork 上的建单/提交/复核/owner/Jev/证据适配器/真实 sck 拒绝→补证据→独立 accept。
+- `tests/acceptance.test.ts` 的 adapter 负例：不受信 probeVersion、target workflow 不符、缺 `commit-status` 通道均拒绝；`Node` 执行失败时 `acceptance-node-probe` 不写记录。服务端核验 artifact 与 producer/target run/job/status 的绑定；`nodeVersion`/`bundleHash` 是受信探针自报，Node 执行保证来自 CI 作业退出码，信任锚是受信 `acceptance-probe/2` 与 run/artifact provenance。
 - `tests/acceptance-gate.fork.test.ts`：RB01 旧版读取与回滚边界，以及 probe artifact 伪造与 PR head 绑定的负例。
 - 根与 plugin typecheck；相关既有套件。

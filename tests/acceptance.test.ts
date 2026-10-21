@@ -1,4 +1,8 @@
 import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const ROOT = join(import.meta.dir, '..');
 // SYS02 unit tests for the pure acceptance model: validation, defaults and the unified evaluator. No database.
 import { describe, expect, test } from 'bun:test';
 import {
@@ -190,6 +194,17 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     expect((await createGithubActionsAdapter(otherRun, readArtifact).verify({ ...base, artifactId: '8', probe })).ok).toBe(false);
     expect((await adapter.verify({ ...base, verify: 'probe:node-packed', probe })).ok).toBe(false);
     expect(runLog.some(args => args[0] === 'run' && args[1] === 'view')).toBe(true);
+
+    // R2: untrusted probe version, a target workflow mismatch and a missing commit-status channel are all refused.
+    const versionMismatch = { ...record, probeVersion: 'acceptance-probe/1' };
+    const versionAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(versionMismatch) }));
+    expect((await versionAdapter.verify({ ...base, probe: { ...probe, probeVersion: 'acceptance-probe/1' } })).ok).toBe(false);
+    const otherWorkflow = { ...record, targetWorkflow: 'Other target' };
+    const otherWorkflowAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(otherWorkflow) }));
+    expect((await otherWorkflowAdapter.verify({ ...base, probe })).ok).toBe(false);
+    const noChannel = { ...record, channel: undefined };
+    const noChannelAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(noChannel) }));
+    expect((await noChannelAdapter.verify({ ...base, probe })).ok).toBe(false);
   });
 
   test('a Node packed probe is verified from its artifact and the Node/bundle fields', async () => {
@@ -202,5 +217,23 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     const noVersion = { ...node, nodeVersion: undefined };
     const noVersionAdapter = createGithubActionsAdapter(run, async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(noVersion) }));
     expect((await noVersionAdapter.verify({ ...nodeBase, probe: nodeProbe })).ok).toBe(false);
+  });
+
+  test('R2: the Node packed probe writes no record when the Node execution fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sck-node-fail-'));
+    try {
+      const bin = join(dir, 'bin'); mkdirSync(bin);
+      const stub = join(bin, 'node');
+      writeFileSync(stub, '#!/bin/sh\ncase "$1" in --version) echo v22.14.0 ;; *) echo node-failed >&2; exit 1 ;; esac\n');
+      chmodSync(stub, 0o755);
+      const out = join(dir, 'acceptance-probe.json');
+      const child = Bun.spawnSync([process.execPath, join(ROOT, 'scripts', 'acceptance-node-probe.ts'), '--out', out], {
+        cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+        env: { ...process.env, GITHUB_RUN_ID: '1', PATH: `${bin}:${process.env.PATH ?? ''}` },
+      });
+      expect(child.exitCode).not.toBe(0);
+      expect(existsSync(out)).toBe(false);
+      expect(child.stderr.toString()).toContain('node failed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

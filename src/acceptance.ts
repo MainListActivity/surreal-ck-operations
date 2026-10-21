@@ -234,13 +234,16 @@ export function evaluateAcceptance(input: AcceptanceInput): AcceptanceVerdict {
     criteria: final, evidence: [...input.evidence], unmet: [],
   });
   if (!input.gate.enabled) return { ...baseOf(criteria), ok: true, legacy: true };
+  // AC06/R1: a row created while the gate was off (or before enabledAt) keeps the old path even when it carries the
+  // default criteria persisted by createDelivery. Enabling the gate must never retroactively require evidence from it.
+  const created = input.subject.createdAt ? Date.parse(input.subject.createdAt) : Number.NaN;
+  const enabled = input.gate.enabledAt ? Date.parse(input.gate.enabledAt) : Number.NaN;
+  if (input.subject.acceptanceLegacy === true || (Number.isFinite(created) && Number.isFinite(enabled) && created < enabled)) {
+    return { ...baseOf(criteria), ok: true, legacy: true };
+  }
   const scope = trusted || all.some(criterion => criterion.kind === 'machine');
   if (criteria.length === 0) {
-    if (input.subject.acceptanceLegacy === true) return { ...baseOf(criteria), ok: true, legacy: true };
     if (!scope) return { ...baseOf(criteria), ok: true, notApplicable: true };
-    const created = input.subject.createdAt ? Date.parse(input.subject.createdAt) : Number.NaN;
-    const enabled = input.gate.enabledAt ? Date.parse(input.gate.enabledAt) : Number.NaN;
-    if (Number.isFinite(created) && Number.isFinite(enabled) && created < enabled) return { ...baseOf(criteria), ok: true, legacy: true };
     if (!trusted) return { ...baseOf(criteria), ok: false, unmet: [{ acId: '*', reason: 'structured-acceptance-criteria-required' }] };
   }
   // The trusted minimum is merged at evaluation too, so a row written before this fix (for example a caller-supplied
@@ -298,8 +301,8 @@ export function acceptanceError(verdict: AcceptanceVerdict): CompanyError {
 /** The human sign-offs the gate writes at accept/owner approval. The digest is unique per task, AC, signer and attempt. */
 export interface HumanSignoff { acId: string; sha: string; criteriaVersion: number; digest: string }
 export function humanSignoffs(verdict: AcceptanceVerdict, taskId: string, actor: string, attempt: number): HumanSignoff[] {
-  // The gate is off: the old path must not write SYS02 evidence at all.
-  if (!verdict.gateEnabled) return [];
+  // The old path (gate off or a legacy row) must not write SYS02 evidence at all.
+  if (!verdict.gateEnabled || verdict.legacy) return [];
   return verdict.criteria.filter(criterion => criterion.required && criterion.kind === 'human').map(criterion => ({
     acId: criterion.id, sha: verdict.head ?? taskId, criteriaVersion: verdict.criteriaVersion,
     digest: createHash('sha256').update(JSON.stringify({

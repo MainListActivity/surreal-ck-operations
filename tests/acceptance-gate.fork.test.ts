@@ -157,6 +157,32 @@ fork('SYS02 AC01/AC06: criteria are versioned and required for new code deliveri
   expect((await core.getTask(tokens.gm, legacy.id)).state).toBe('done');
 });
 
+fork('SYS02 R1: pre-gate delivery legs stay legacy after enabling; post-gate deliveries still need evidence', async () => {
+  await ensureGate(false);
+  const goal = await goalFor();
+  const [impl, release, deploy] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'R1 legacy 链', spec: '门禁关闭期间创建的交付三腿在启用后保留旧路径。', idempotencyKey: key() });
+  expect(impl.acceptanceLegacy).toBe(true);
+  expect(release.acceptanceLegacy).toBe(true);
+  expect(deploy.acceptanceLegacy).toBe(true);
+  expect(impl.acceptanceCriteria?.length ?? 0).toBeGreaterThan(0);
+  await ensureGate(true);
+  const runLeg = async (task: TaskView, submitter: string, reviewer: string) => {
+    const claim = await core.claim(submitter, task.id);
+    await core.submit(submitter, proofOf(claim), { text: 'R1 legacy：启用前创建的交付腿在启用后提交，保留旧路径。', idempotencyKey: key() });
+    const review = await core.claim(reviewer, task.id);
+    await core.accept(reviewer, proofOf(review), { text: 'R1 legacy：独立复核放行，legacy 不伪造 SYS02 机器满足。', idempotencyKey: key() });
+    expect((await core.getTask(tokens.gm, task.id)).state).toBe('done');
+  };
+  await runLeg(impl, tokens['eng-a'], tokens['eng-b']);
+  await runLeg(release, tokens['eng-a'], tokens.product);
+  await runLeg(deploy, tokens['eng-a'], tokens.qa);
+  // A delivery created after enabling still needs machine evidence and is refused without it.
+  const [post] = await core.createDelivery(tokens.gm, { goalId: goal.id, title: 'R1 post-gate', spec: '启用后创建的新交付仍必须补机器证据才能提交。', idempotencyKey: key() });
+  const postClaim = await core.claim(tokens['eng-a'], post.id);
+  await expect(core.submit(tokens['eng-a'], proofOf(postClaim), { text: '启用后新交付没有机器证据，提交必须被拒绝。', idempotencyKey: key(), acceptance: { sha: 'post-head' } }))
+    .rejects.toMatchObject({ code: 'invalid' });
+});
+
 fork('SYS02 C1: custom optional or human-only criteria cannot remove the server baseline; zero evidence cannot reach review', async () => {
   await ensureGate();
   const goal = await goalFor();
