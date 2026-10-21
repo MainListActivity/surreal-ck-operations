@@ -124,7 +124,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     cursor: z.string().min(1).max(2048).nullish(),
   };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to gm and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to gm and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
       scope: z.enum(['tasks', 'company']).nullish(),
       section: z.enum(['directions', 'goals', 'projects']).nullish(),
@@ -287,6 +287,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      // The 50-dependency and asset-path limits are enforced by core.createTask, the same
+      // validator the sidecar reaches. Keeping them out of this schema preserves the structured
+      // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
@@ -342,12 +345,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others.',
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
       lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
+      // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
+      // reaches. Keeping it out of this schema preserves the structured `invalid` result.
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
       acceptanceCriteria: acceptanceCriteriaShape.optional(),
     }),
@@ -410,7 +415,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('defer_task_until', {
-    description: 'gm only: turn a gm-blocked execute-phase task into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it auto-resumes when every dependency is done; with all dependencies already done it resumes immediately.',
+    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with all dependencies already done it restores immediately. Owner gates and unprovable review history are refused.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       dependencies: z.array(z.string().min(1)).min(1).max(20),
