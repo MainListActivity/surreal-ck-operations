@@ -114,15 +114,29 @@ export class SidecarPool {
     }
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
+    const scratch = this.scratchDirFor(inst.id);
     const held = this.keys.get(inst.id);
-    if (held) return { SCK_COMM_DIR: dir, SCK_COMM_KEY: held };
+    if (held) return { SCK_COMM_DIR: dir, SCK_COMM_KEY: held, SCK_SCRATCH_DIR: scratch, TMPDIR: scratch };
     this.launched.add(inst.id);
     const key = randomBytes(16).toString("hex");
     this.keys.set(inst.id, key);
     this.active.add(inst.id);
     if (inst.credential) this.creds.set(inst.id, inst.credential);
     this.ensureSweeper();
-    return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key };
+    return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key, SCK_SCRATCH_DIR: scratch, TMPDIR: scratch };
+  }
+
+  /** Per-instance scratch root: agents put clones/builds/temp media here, never in /tmp or the host dir.
+   *  Derived from the comm root so an overridden SCK_COMM_ROOT (tests, alternate homes) keeps it in one place. */
+  scratchDirFor(instId: string): string {
+    const dir = join(dirname(this.deps.runDir), "scratch", instId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
+  /** Instance ids this pool is currently answering for; everything else in comm/ is a dead channel. */
+  liveInstanceIds(): Set<string> {
+    return new Set([...this.active, ...this.quarantined, ...this.keys.keys()]);
   }
 
   /** Absolute comm dir path for prompts — agents must never need to resolve env vars. */

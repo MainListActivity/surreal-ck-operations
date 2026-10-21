@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -731,3 +731,44 @@ run('LANE: a shared tree is not moved off its branch while any task lease (legac
   expect(git(shared.worktreePath, 'branch', '--show-current')).toMatch(/^sck\/shared-/);
   await submit(core, qa, after);
 }, 30000);
+
+run('WT02: a tree holding only dependency output is reclaimed, and a row for a vanished tree is dropped', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng = await employee('engineering');
+  const claim = await core.claim(eng, (await task(core, 'engineering')).id);
+  expect(claim.worktree!.mode).toBe('exclusive');
+  const treePath = claim.worktree!.worktreePath, treeId = claim.worktree!.id;
+  // Untracked dependency output is not work: plain `git worktree remove` refuses on it alone.
+  mkdirSync(join(treePath, 'node_modules', 'pkg'), { recursive: true });
+  writeFileSync(join(treePath, 'node_modules', 'pkg', 'index.js'), 'dep');
+  await acceptDone(core, eng, claim);
+  expect(existsSync(treePath)).toBe(false);
+  expect((await core.listWorktrees(gm)).find(w => w.id === treeId)).toBeUndefined();
+
+  // A vanished tree whose task ended is litter, not a permanent "missing" alert: the scan
+  // drops the registry row instead of reporting it forever.
+  const eng2 = await employee('engineering');
+  const gone = await core.claim(eng2, (await task(core, 'engineering')).id);
+  const gonePath = gone.worktree!.worktreePath;
+  rmSync(gonePath, { recursive: true, force: true });
+  git(path, 'worktree', 'prune');
+  await acceptDone(core, eng2, gone);
+  const swept = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect((swept.dropped ?? []).includes(gonePath) || !(await core.listWorktrees(gm)).some(w => w.worktreePath === gonePath)).toBe(true);
+  expect((await core.listWorktrees(gm)).some(w => w.worktreePath === gonePath)).toBe(false);
+  // Legacy rows from older reclaim versions: tree gone, task ended, no reference left.
+  // The sweep must drop the row AND land the audit. A schema whitelist that rejects
+  // `drop_stale_row` aborts the whole repo scan after the row is already gone
+  // (2026-10-21 production incident), so the audit is asserted on both sides.
+  const ghostPath = join(path, 'sck-legacy-ghost');
+  await db.db.query(`CREATE worktree CONTENT { repo: $repo, path: $path, branch: 'task/legacy-ghost',
+    mode: 'exclusive', created_at: time::now(), last_used_at: time::now() };`, { repo: path, path: ghostPath });
+  const ghostSweep = await core.reclaimWorktrees(gm, { repos: [path] });
+  expect(ghostSweep.dropped ?? []).toContain(ghostPath);
+  const [ghostAudits] = await db.db.query<[Array<{ path: string }>]>(
+    "SELECT path FROM worktree_audit WHERE event = 'drop_stale_row';");
+  expect((ghostAudits ?? []).some(row => row.path === ghostPath)).toBe(true);
+  const [ghostFails] = await db.db.query<[Array<{ reason: string }>]>(
+    "SELECT reason FROM worktree_audit WHERE event = 'fail' AND repo = $repo;", { repo: path });
+  expect(ghostFails ?? []).toEqual([]);
+}, 60000);

@@ -4,6 +4,10 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import { company, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
+import { dirname, join } from "node:path";
+import { serviceHome } from "./env";
+import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
+import { missingFrom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
 
 type ProviderUsageEntry = {
   providerId: string;
@@ -62,6 +66,9 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
 }
 
 let quotaRefreshedAt = 0;
+/** Lifecycle GC (dead comm channels + cold archive) runs on its own slow clock. */
+let gcRefreshedAt = 0;
+const GC_MS = 30 * 60_000;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -153,6 +160,24 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   quotaRefreshedAt = Date.now();
   const usage = await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; });
   const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
+  // Paseo reports only the providers it drives (claude/codex/grok on this machine). Magpie holds
+  // every subscription the owner configured, so a provider whose allowance ran out is visible here
+  // even when Paseo never mentions it — that is how Factory's spent month stayed invisible until
+  // its sessions started failing. Paseo's numbers win wherever both report.
+  const magpie = await readMagpieQuotas().catch(() => undefined);
+  if (magpie?.length) {
+    const extra = missingFrom(providers, magpie);
+    if (extra.length) {
+      providers.push(...extra.map(entry => ({
+        providerId: entry.providerId,
+        displayName: entry.displayName,
+        planLabel: entry.planLabel,
+        status: entry.status,
+        windows: entry.windows.map(w => ({ id: w.id, label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt })),
+      })));
+      console.log(`quota refresh: +${extra.length} provider(s) from magpie (${extra.map(e => e.providerId).join(',')})`);
+    }
+  }
   if (!providers.length) {
     if (Date.now() - quotaEmptyLoggedAt > 300_000) {
       quotaEmptyLoggedAt = Date.now();
@@ -238,6 +263,37 @@ export function startDispatch(server: PluginServerContext): () => void {
     wake = () => { wake = undefined; clearTimeout(timer); resolve(); };
   });
 
+/** Removes leftovers the task-scoped artifact reclaim never sees; never touches task evidence. */
+async function runLifecycleGc(ctx: Company): Promise<void> {
+  const cfg = await ctx.workforce.config();
+  const now = new Date();
+  const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
+  if (cfg.commDirGraceHours > 0) {
+    const comm = await sweepInstanceDirs({
+      root: commRoot, now, graceMs: cfg.commDirGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
+    });
+    if (comm.removed.length) {
+      console.log(`lifecycle gc comm: removed ${comm.removed.length} dead channels (${(comm.bytes / 1048576).toFixed(1)} MB)`);
+    }
+  }
+  if (cfg.scratchGraceHours > 0) {
+    const scratch = await sweepInstanceDirs({
+      root: join(dirname(commRoot), "scratch"), now, graceMs: cfg.scratchGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
+    });
+    if (scratch.removed.length) {
+      console.log(`lifecycle gc scratch: removed ${scratch.removed.length} dirs (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
+    }
+  }
+  if (cfg.archiveRetentionDays > 0) {
+    const arch = await sweepArchiveBatches({
+      root: join(serviceHome(), "archive"), now, retentionMs: cfg.archiveRetentionDays * 86_400_000,
+    });
+    if (arch.removed.length) {
+      console.log(`lifecycle gc archive: removed ${arch.removed.length} batches (${(arch.bytes / 1048576).toFixed(1)} MB): ${arch.removed.join(", ")}`);
+    }
+  }
+}
+
   const loop = async () => {
     let failures = 0;
     while (!stopped) {
@@ -253,6 +309,10 @@ export function startDispatch(server: PluginServerContext): () => void {
         }
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
           await refreshModels(paseoHandle, ctx).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
+        }
+        if (Date.now() - gcRefreshedAt > GC_MS) {
+          gcRefreshedAt = Date.now();
+          await runLifecycleGc(ctx).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
         const report = await ctx.dispatcher.tick();
         failures = 0;

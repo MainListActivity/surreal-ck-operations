@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type SupervisedTask, type Workforce } from '../src/workforce.ts';
-import type { CompanyCore, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
+import type { CompanyCore, ProviderQuota, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
 import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
 import type { SidecarDeps } from '../plugin/server/sidecar.ts';
@@ -18,7 +18,7 @@ afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 function world(role: EmployeeDef['role'] = 'engineering') {
   const root = mkdtempSync(join(tmpdir(), 'dispatch-comm-'));
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
-  const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
+  const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string; model?: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
   // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
@@ -65,7 +65,8 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     },
   };
   const notices = new Map<string, string>();
-  const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); }, openNotices: async () => [], triagePending: async () => [],
+  const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); },
+    openNotices: async () => [...notices].map(([key, text]) => ({ key, text, at: '' })), triagePending: async () => [],
     raiseNotice: async (key: string, text: string) => { notices.set(key, text); return true; } };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
@@ -114,9 +115,16 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   // existing gate test keeps exercising the "no reclaim wired" path.
   type ReclaimInput = { trigger?: ArtifactTrigger; targetFreeMb?: number; dryRun?: boolean; taskId?: string; emergency?: boolean };
   let reclaim: ((input?: ReclaimInput) => Promise<ArtifactReclaimResult>) | undefined;
+  /** Realign seam: absent by default, so the "no realign path" behaviour is the default too. */
+  type RealignFn = (agentId: string, model: string) => Promise<boolean>;
+  let realign: RealignFn | undefined;
+  /** Quota snapshot the breaker and the pre-warning read; empty unless a test sets one. */
+  let quotaRows: ProviderQuota[] = [];
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
-    ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}) });
+    ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}),
+    ...(realign ? { realignAgent: (agentId: string, model: string) => realign!(agentId, model) } : {}),
+    quota: async () => quotaRows });
   const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
     const name = `${++request}.json`, dir = env.SCK_COMM_DIR!;
     writeFileSync(join(reqDir(dir), name), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
@@ -130,6 +138,8 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     setNow: (v: number) => { now = v; },
     setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
+    setRealign: (fn: typeof realign) => { realign = fn; },
+    setQuota: (rows: ProviderQuota[]) => { quotaRows = rows; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -678,5 +688,87 @@ describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
     expect(verdict.reasons.find(r => r.code === 'seat_full')!.text).toContain('仓库 fixture');
     expect(verdict.summary).toContain('另有 1 名同岗位员工属其他仓库，不参与本仓库派工');
     expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
+  });
+});
+
+// A provider may switch the model under a running subscription on its own: Factory serves a
+// cheaper model once its standard allowance is spent and switches back when it recovers. The
+// session, its conversation and its seat all stay valid, so the pass realigns the model in place
+// instead of retiring the employee and losing its context.
+describe('R4: provider model drift is realigned in place, never a retirement', () => {
+  const driftedSession = (w: ReturnType<typeof world>) => {
+    const drifted = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+    w.instances.push(drifted);
+    w.pool.env(drifted);
+    w.pool.bindAgent(drifted.id, 'agent-9');
+    drifted.paseoAgentId = 'agent-9';
+    // Paseo reports what the session actually serves, which is no longer what the def asks for.
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle', model: 'cheap-model' });
+    return drifted;
+  };
+
+  test('the session is put back on its definition model and keeps its seat', async () => {
+    const w = world();
+    driftedSession(w);
+    const calls: Array<[string, string]> = [];
+    w.setRealign(async (agentId, model) => { calls.push([agentId, model]); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([['agent-9', 'fixture']]);
+    expect(r.realigned).toContain('employee-9');
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.events.some(e => e.startsWith('retire:employee-9'))).toBe(false);
+    expect(w.agents.get('agent-9')!.status).not.toBe('archived');
+  });
+
+  test('with no realign path the session is left for the next pass, not retired', async () => {
+    const w = world();
+    driftedSession(w);
+    const r = await w.dispatcher().tick();
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.events.some(e => e.startsWith('retire:employee-9'))).toBe(false);
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('a session already on its definition model is left alone', async () => {
+    const w = world();
+    driftedSession(w);
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle', model: 'fixture' });
+    const calls: string[] = [];
+    w.setRealign(async agentId => { calls.push(agentId); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([]);
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+  });
+});
+
+// The breaker stops dispatch only at the floor; the owner should hear about a subscription that
+// is nearly spent while there is still time to top it up.
+describe('R4: a nearly spent subscription warns before it stops the company', () => {
+  test('a subscription under the warning line raises one notice', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, sessionPct: 50, fetchedAt: new Date().toISOString() }]);
+    const r = await w.dispatcher().tick();
+    expect(r.notices).toContain('quota-warn:codex');
+    expect(w.notices.get('quota-warn:codex')).toContain('10%');
+  });
+
+  test('the warning clears once the subscription recovers', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(true);
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(false);
+  });
+
+  test('a healthy subscription raises nothing', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);
+    const r = await w.dispatcher().tick();
+    expect(r.notices.filter(n => n.startsWith('quota-warn:'))).toEqual([]);
   });
 });

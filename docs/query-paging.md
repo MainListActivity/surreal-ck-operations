@@ -2,7 +2,7 @@
 
 本文说明员工与经理（gm）通过 sck（comm 通道）和 MCP 读取任务、历史、工作树与公司汇总时的契约。依据为经理裁决 v15（2026-10-19，C1 至 C6，见第 6 节）、经理裁决 v25（SYS01 P0，任务 04195c93）：快照 R4、工作树范围 R8、拆分项 R6 与 R7，以及经理裁决 v44（SYS01 终版）：MCP 结果采用方案 (b)（文本副本与 `structuredContent` 两份都计入预算）、预算 R3 按整条序列化应答（含信封）计、回收参数严格且三层一致。复核返工 v47 的 D1 至 D3 见第 9.9 节。第 2 节、第 3 节、第 6 节与第 9.8 节以 v44 为准，更早的记述保留作历史。
 
-实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储与库内配额）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/021-query-snapshot.surql`（快照行）与 `schema/022-snapshot-quota.surql`（全库计数）。
+实现位置：`src/response-budget.ts`（字节预算、UTF-8 切分、写回显、游标封装）、`src/query-input.ts`（参数校验与查询摘要）、`src/snapshot-store.ts`（快照存储与库内配额）、`src/core.ts`（读取与汇总）、`plugin/server/sidecar.ts`（通道分发与响应检查）、`src/mcp/server.ts`（MCP 工具）、`src/mcp/client-cli.ts`（comm 客户端）。新增 schema 为 `schema/022-query-snapshot.surql`（快照行）与 `schema/023-snapshot-quota.surql`（全库计数）。
 
 ## 1. 截断层定位（AC01）
 
