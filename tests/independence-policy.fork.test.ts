@@ -9,6 +9,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { independenceHit, readIndependenceSnapshot, type IndependenceScope } from '../src/independence.ts';
+import { readContributionView } from '../src/contributors.ts';
 import { Workforce, type EmployeeDef, type EmployeeInst, type SupervisedTask } from '../src/workforce.ts';
 import { staffingPool, type InstState } from '../src/dispatcher/dispatcher.ts';
 import { dispatchNoticeText, evaluateDispatch } from '../src/dispatcher/dispatch-blocked.ts';
@@ -46,10 +47,15 @@ beforeAll(async () => {
     ['alias', 'engineering', ['execute', 'review']], ['explicit', 'engineering', ['execute', 'review']],
     ['exec', 'engineering', ['execute', 'review']],
   ] as const) tokens[name] = await enrollment.enroll(`t-${name}`, role, caps);
-  // `src` and `alias` are instances of one registered definition (the same source); `indep`, `explicit` and `exec` are not.
+  // `src` and `alias` are instances of one registered definition (a capacity template, NOT an identity: SYS-DISP Q3) and are
+  // linked into one person by a registered principal. `indep`, `explicit` and `exec` share the def but have no principal link.
   for (const [name, def] of [['src', 'eng-factory'], ['alias', 'eng-factory'], ['indep', 'eng-claude'], ['explicit', 'eng-qa'], ['exec', 'eng-exec']] as const) {
     await database.db.query('UPDATE ONLY $e SET def = $d;', { e: new RecordId('employee', `t-${name}`), d: new RecordId('employee_def', def) });
   }
+  await database.db.query('CREATE ONLY $p CONTENT { reason: $reason, version: 1, created_at: time::now() };',
+    { p: new RecordId('principal', 'ppl-factory'), reason: '同一人的两个工程会话（IR05 夹具）' });
+  await database.db.query('UPDATE $e SET principal = $p;', { e: [new RecordId('employee', 't-src'), new RecordId('employee', 't-alias')],
+    p: new RecordId('principal', 'ppl-factory') });
 });
 
 afterAll(async () => {
@@ -87,11 +93,16 @@ const authorParent = async (author: 'src' | 'alias', parentId: string) => {
 };
 
 // R1 (v18 return): migration 023 must be loaded by the bootstrap of an empty database, not only exist as a file.
-test('a fresh bootstrap loads the independence migration: task has both fields and the schema marker reads 28', async () => {
+test('a fresh bootstrap loads the independence migrations: task has both policy fields and the schema marker reads 29', async () => {
   const [info] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(info?.fields ?? {})).toEqual(expect.arrayContaining(['independence', 'independence_guard']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(28);
+  expect(marker?.[0]?.schema_version).toBe(29);
+  // The identity link is additive: the field exists on employee, and no employee carries a principal until a manager registers one.
+  const [table] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE employee;');
+  expect(Object.keys(table?.fields ?? {})).toContain('principal');
+  const probe = await engineering('bootstrap probe');
+  expect((await core.getTask(tokens.gm, probe.id)).independence).toBeUndefined();
 });
 
 test('G5 replay: a source authored after the policy is a conflict at claim; the independent engineer still claims', async () => {
@@ -122,19 +133,45 @@ test('explicit exclusion: a manager-named employee is refused, the rest of the p
   expect((await core.claim(tokens.indep, dependent.id)).task.currentEmployee).toBe('t-indep');
 });
 
-test('same source by registered definition: an alias is refused, and a new session of the same employee is still the same identity', async () => {
-  const parent = await engineering('parent with a contributor of the factory definition');
+// SYS-DISP Q3: a definition is a capacity template, not an identity. Only a registered principal links two employeeIds.
+test('a registered principal links an alias of a contributor: it is refused, and a new session of the same employee is the same identity', async () => {
+  const parent = await engineering('parent whose contributor has a registered identity link');
   await authorParent('src', parent.id);
-  const dependent = await engineering('alias of the source definition must not review it');
+  const dependent = await engineering('dependent whose registered alias must not take it');
   await setPolicy(dependent.id, [parent.id]);
 
   const alias = await failureOf(core.claim(tokens.alias, dependent.id));
   expect(alias.message).toContain('independence conflict');
-  expect(alias.details).toMatchObject({ conflicts: [{ employee: 't-alias', matched: 't-src', via: 'same_def', def: 'eng-factory' }] });
+  expect(alias.details).toMatchObject({ conflicts: [{ employee: 't-alias', matched: 't-src', via: 'same_principal', principal: expect.any(String) }] });
 
   // A new paseo session under the same employee id changes nothing: identity is the registered employee, not the session.
   await database.db.query('UPDATE ONLY $e SET paseo_agent_id = $agent;', { e: new RecordId('employee', 't-src'), agent: 'ag-new-session' });
   expect((await failureOf(core.claim(tokens.src, dependent.id))).message).toContain('independence conflict');
+});
+
+test('the same definition is not the same identity: an independent employee of the contributor def may claim', async () => {
+  // The link is unregistered, so the two factory-droid employees are different people.
+  await database.db.query('UPDATE ONLY $e SET principal = NONE;', { e: new RecordId('employee', 't-alias') });
+  const parent = await engineering('parent with a factory contributor and no identity link');
+  await authorParent('src', parent.id);
+  const dependent = await engineering('dependent a same-def independent employee may take');
+  await setPolicy(dependent.id, [parent.id]);
+  const scope = await workforce.independenceScope((await core.getTask(tokens.gm, dependent.id)).independence, 'execute');
+  if (scope?.kind !== 'index') throw new Error('expected an index scope');
+  expect(independenceHit(scope.index, 't-src', undefined)).toMatchObject({ via: 'contributor', source: parent.id });
+  expect(independenceHit(scope.index, 't-alias', 'eng-factory')).toBeUndefined();
+  expect((await core.claim(tokens.alias, dependent.id)).task.currentEmployee).toBe('t-alias');
+});
+
+test('a different definition with the same principal is the same identity: it is refused', async () => {
+  // t-explicit uses another def (eng-qa) but shares the contributor's registered principal.
+  await database.db.query('UPDATE ONLY $e SET principal = (SELECT VALUE principal FROM ONLY $src);',
+    { e: new RecordId('employee', 't-explicit'), src: new RecordId('employee', 't-src') });
+  const parent = await engineering('parent whose contributor is linked across definitions');
+  await authorParent('src', parent.id);
+  const dependent = await engineering('dependent whose cross-def alias must not take it');
+  await setPolicy(dependent.id, [parent.id]);
+  expect((await failureOf(core.claim(tokens.explicit, dependent.id))).message).toContain('independence conflict');
 });
 
 test('an unreadable source history refuses the claim fail-closed, leaves no lease, and clears when the history reads again', async () => {
@@ -253,11 +290,88 @@ test('policy writes are manager-only and every bad input is refused before anyth
   expect((await core.getTask(tokens.gm, dependent.id)).version).toBe(version);
 });
 
+// SYS-DISP Q3 negatives: an identity link is a manage-controlled, audited write. Nobody may self-declare a link, and a live lease
+// is never re-identified under a running task.
+test('principal writes are manager-only, audited, idempotent, and refuse a live lease', async () => {
+  const parent = await engineering('parent for principal negatives');
+  const held = await core.claim(tokens.indep, parent.id);
+  const principalInput = (over: Partial<Parameters<typeof core.setIdentityPrincipal>[1]> = {}) => ({
+    employees: ['t-src', 't-alias'], reason: 'IR05 principal 夹具：同一人的两个会话', idempotencyKey: key(), ...over,
+  });
+  // Restore the fixture identity state whatever happens: later tests read the registered ppl-factory link from a clean principal
+  // table, and a half-run test must never leave a second link behind for them.
+  const restoreFixtureIdentity = async () => {
+    await database.db.query('DELETE principal;');
+    await database.db.query('UPDATE employee SET principal = NONE;');
+    await database.db.query('CREATE ONLY $p CONTENT { reason: $reason, version: 1, created_at: time::now() };',
+      { p: new RecordId('principal', 'ppl-factory'), reason: '同一人的两个工程会话（IR05 夹具）' });
+    await database.db.query('UPDATE $e SET principal = $p;', { e: [new RecordId('employee', 't-src'), new RecordId('employee', 't-alias')],
+      p: new RecordId('principal', 'ppl-factory') });
+  };
+  try {
+    // Only manage may register an identity link.
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.src, principalInput()))).code).toBe('forbidden');
+    // A short reason and an unknown employee are refused before anything is written.
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ reason: '短' })))).code).toBe('invalid');
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ employees: ['t-ghost'] })))).code).toBe('not_found');
+    // A live lease refuses the write: an identity is never changed under a running task.
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, principalInput({ employees: ['t-indep', 't-alias'] })))).code).toBe('conflict');
+    // Nothing was written: only the fixture's own principal row exists, and no employee gained a second link.
+    const [rows] = await database.db.query<[{ count: number }[]]>('SELECT count() AS count FROM principal GROUP ALL;');
+    expect(rows?.[0]?.count ?? 0).toBe(1);
+    const [linked] = await database.db.query<[{ count: number }[]]>('SELECT count() AS count FROM employee WHERE principal != NONE GROUP ALL;');
+    expect(linked?.[0]?.count ?? 0).toBe(2);
+    // The same key and payload replays the original result; a different payload under that key conflicts.
+    const input = principalInput();
+    const first = await core.setIdentityPrincipal!(tokens.gm, input);
+    expect(first).toMatchObject({ employees: ['t-src', 't-alias'], setBy: 't-gm', reason: input.reason });
+    expect(await core.setIdentityPrincipal!(tokens.gm, input)).toEqual(first);
+    expect((await failureOf(core.setIdentityPrincipal!(tokens.gm, { ...input, reason: '另一个理由，同一把幂等键' }))).code).toBe('conflict');
+    const [audit] = await database.db.query<[{ count: number }[]]>("SELECT count() AS count FROM audit WHERE action = 'identity_principal_set' GROUP ALL;");
+    expect(audit?.[0]?.count ?? 0).toBeGreaterThan(0);
+  } finally {
+    await core.submit(tokens.indep, proofOf(held), { text: EVIDENCE, idempotencyKey: key() });
+    await restoreFixtureIdentity();
+  }
+});
+
 test('a task without a policy is unchanged: a source contributor of another task may still claim it', async () => {
   const parent = await engineering('parent with a contributor');
   await authorParent('src', parent.id);
   const legacy = await engineering('legacy task with no policy');
   expect((await core.claim(tokens.src, legacy.id)).task.currentEmployee).toBe('t-src');
+});
+
+// SYS-DISP IR01 (Q1/B): an ordinary task's plain review rule is unchanged. A holder who only claimed execute and never wrote
+// code is demoted, not excluded, so they may still take and decide the review — exactly the pre-SYS-DISP running baseline.
+test('an ordinary task keeps the claim-only review rule: the prior hand may claim and decide the review, while a real author may not', async () => {
+  // The implementer is bound first and writes the code, so a later execute holder can only be a claim-only hand: the
+  // binding (not the lease) is what makes someone the author.
+  const parent = await engineering('parent where a hand claimed the review and released it');
+  const written = await core.claim(tokens.exec, parent.id);
+  await core.submit(tokens.exec, proofOf(written), { text: EVIDENCE, idempotencyKey: key() });
+  expect((await core.getTask(tokens.gm, parent.id)).state).toBe('review');
+  // A second holder claims the review lease and releases it without deciding: they held the task but wrote nothing.
+  const claimed = await core.claim(tokens.alias, parent.id);
+  await core.release(tokens.alias, proofOf(claimed), { text: '本轮暂停，未裁决（claim-only 经手人，Q1 回归夹具）', idempotencyKey: key() });
+
+  // The prior hand (held a lease, never wrote code) is demoted, not excluded: the review claim is allowed again.
+  const facts = await readContributionView(database.db, parent.id);
+  expect(facts.facts).toMatchObject({ authors: ['t-exec'], excluded: ['t-exec'], hands: ['t-alias'], implementer: 't-exec', ambiguous: false });
+  const reviewing = await core.claim(tokens.alias, parent.id);
+  expect(reviewing.task.currentEmployee).toBe('t-alias');
+  // The actual author never reviews their own delivery, policy or not.
+  expect((await failureOf(core.claim(tokens.exec, parent.id))).code).toBe('self_review');
+  await core.release(tokens.alias, proofOf(reviewing), { text: '释放复核租约（Q1 回归夹具收尾，避免占用租约影响后续断言）', idempotencyKey: key() });
+
+  // A strict source excludes every execute handler of the source, including one who claimed execute and never wrote
+  // code. The execute hand is the source's first implementer whose binding a takeover moved on: they held the code.
+  const source = await engineering('source whose execute hand is hard-excluded');
+  const first = await core.claim(tokens.alias, source.id);
+  await core.release(tokens.alias, proofOf(first), { text: '本轮暂停，未写码（claim-only 执行经手人，Q1 回归夹具）', idempotencyKey: key() });
+  const dependent = await engineering('dependent whose strict source hard-excludes the prior hand');
+  await setPolicy(dependent.id, [source.id]);
+  expect((await failureOf(core.claim(tokens.alias, dependent.id))).message).toContain('independence conflict');
 });
 
 test('the dispatcher reads the same exclusion from the audit stream: the contributor and its alias are out, the independent engineer stays in', async () => {
@@ -268,10 +382,10 @@ test('the dispatcher reads the same exclusion from the audit stream: the contrib
   const policy = (await core.getTask(tokens.gm, dependent.id)).independence!;
   const scope = await readIndependenceSnapshot(database.db, policy);
   expect(scope.sources).toEqual([expect.objectContaining({ taskId: parent.id, version: expect.any(Number) })]);
-  expect(independenceHit(scope.index, 't-src', 'eng-factory')).toMatchObject({ via: 'contributor', source: parent.id });
-  // The alias is not a contributor: it is excluded through the registered definition its contributor carries.
-  expect(independenceHit(scope.index, 't-alias', 'eng-factory')).toMatchObject({ via: 'same_def', matched: 't-src', def: 'eng-factory' });
-  expect(independenceHit(scope.index, 't-indep', 'eng-claude')).toBeUndefined();
+  expect(independenceHit(scope.index, 't-src', undefined)).toMatchObject({ via: 'contributor', source: parent.id });
+  // The alias is not a contributor: it is excluded through the registered principal its contributor carries.
+  expect(independenceHit(scope.index, 't-alias', 'ppl-factory')).toMatchObject({ via: 'same_principal', matched: 't-src', principal: 'ppl-factory' });
+  expect(independenceHit(scope.index, 't-indep', undefined)).toBeUndefined();
 });
 
 test('review stage: a source contributor may not review the dependent, the independent reviewer may', async () => {
@@ -314,10 +428,11 @@ test('review decisions are gated too: a reviewer who became a source contributor
 /** Candidate pool of an engineering dispatch over the policy fixtures: the registered definitions and their instances. */
 const poolDef = (id: string): EmployeeDef => ({ id, role: 'engineering', provider: 'codex', model: 'm1', enabled: true,
   maxInstances: 4, priority: 100, weight: 10, scored: 0, errorStreak: 0 });
-const poolInst = (id: string, def: string): EmployeeInst => ({ id, role: 'engineering', def, provider: 'codex', model: 'm1',
-  paseoAgentId: `ag-${id}` });
-const POOL_INSTS = [poolInst('t-src', 'eng-factory'), poolInst('t-alias', 'eng-factory'), poolInst('t-indep', 'eng-claude'),
-  poolInst('t-explicit', 'eng-qa'), poolInst('t-exec', 'eng-exec')];
+const poolInst = (id: string, def: string, principal?: string): EmployeeInst => ({ id, role: 'engineering', def, provider: 'codex',
+  model: 'm1', paseoAgentId: `ag-${id}`, ...(principal ? { principal } : {}) });
+// The registered principal (identity link) the fixture registers in beforeAll, not the definition.
+const POOL_INSTS = [poolInst('t-src', 'eng-factory', 'ppl-factory'), poolInst('t-alias', 'eng-factory', 'ppl-factory'),
+  poolInst('t-indep', 'eng-claude'), poolInst('t-explicit', 'eng-qa'), poolInst('t-exec', 'eng-exec')];
 const POOL_DEFS = ['eng-factory', 'eng-claude', 'eng-qa', 'eng-exec'].map(id => poolDef(id));
 const POOL_STATES = new Map<string, InstState>(POOL_INSTS.map((inst): [string, InstState] => [inst.id, 'idle']));
 const pool = (task: SupervisedTask, independence: IndependenceScope | undefined) => staffingPool({
@@ -341,8 +456,9 @@ test('the candidate pool built from the stored policy drops a contributor that a
   await authorParent('src', parent.id);
   const entries = await dispatchPass();
   expect(entryOf(entries, 't-src')).toMatchObject({ eligible: false, code: 'independence_conflict' });
+  // The registered alias is out; a spawn of the same def is a new employee id with no principal, so it stays eligible.
   expect(entryOf(entries, 't-alias')).toMatchObject({ eligible: false, code: 'independence_conflict' });
-  expect(entryOf(entries, 'spawn:eng-factory')).toMatchObject({ eligible: false, code: 'independence_conflict' });
+  expect(entryOf(entries, 'spawn:eng-factory')).toMatchObject({ eligible: true });
   expect(entryOf(entries, 't-indep')).toMatchObject({ eligible: true });
   expect(entryOf(entries, 'spawn:eng-claude')).toMatchObject({ eligible: true });
 });

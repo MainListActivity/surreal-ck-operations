@@ -148,13 +148,24 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 ## 独立性策略（independence_set）
 
-经理（manage 能力）可为任务写入独立性策略（SYS-DISP IR01–IR03）：来源任务的经手人，以及点名的员工（及其同一登记编制的员工），不能接手（`execute`）或裁决（`review`）该任务。策略与任务版本一起存放，无策略的旧任务行为不变。
+经理（manage 能力）可为任务写入独立性策略（SYS-DISP IR01–IR03）：来源任务的经手人，以及点名的员工（及其同一登记身份 principal 的员工），不能接手（`execute`）或裁决（`review`）该任务。策略与任务版本一起存放，无策略的旧任务行为不变。
 
 - 字段：`stages`（`execute` / `review`，非空）；`sources`（来源任务 ID，原始条数至多 20）；`mode`（`execute_handlers`：来源的全部执行阶段经手人，含只领取未提交者与实现负责人；`all_handlers`：再加上来源的复核人）；`excluded`（点名回避的员工 ID，原始条数至多 100）；`reason`（非空，至多 2048 UTF-8 字节）。序列化后整个策略不超过 8 KiB。
 - 写入：`expectedVersion` 比较并交换；任务有未到期租约时拒绝，不静默改策略；同一 `idempotencyKey` 且载荷相同则回放原结果，载荷不同则冲突。自引用、来源不存在、未知员工、非法参数均拒绝。非 manage 能力的调用返回 `forbidden`。
-- 同源判定只用已登记的员工 ID 与员工定义（`employee.def`）。不从 agent、会话或工作区推断身份，也不识别未登记的身份关联。
-- 执行：调度每轮按来源的最新贡献历史过滤候选，包括 `previousEmployee`、Jev 选择与补位，因此被排除者不会因为连续性或优先级重新入选。领取、提交与裁决在事务内带来源版本守卫：来源在读取后有变动即拒绝并重读。来源不可读时失败关闭：不授租约，候选标记为 `unknown`，恢复后自动重判。
-- 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_def`）、角色与审计引用（不含凭证）。
+- 同源判定只用已登记的员工 ID 与登记的 principal 身份关联（`employee.principal`，见「身份关联 identity_principal_set」）。同一个 employeeId 跨 agent/会话/工作区始终同源；不同 employeeId 只有显式登记同一 principal 才算同源。编制（`employee.def`）、provider、模型、名字、目录都不构成身份，两个同一编制的员工默认相互独立；未登记的关联一律不识别，也不声称能识别。
+- 执行：调度每轮按来源的最新贡献历史过滤候选，包括 `previousEmployee`、Jev 选择与补位，因此被排除者不会因为连续性或优先级重新入选。新 spawn 的实例是全新 employeeId、无 principal 关联，因此同编制的新实例默认独立、可被派工。领取、提交与裁决在事务内带来源版本守卫：来源在读取后有变动即拒绝并重读。来源不可读时失败关闭：不授租约，候选标记为 `unknown`，恢复后自动重判。
+- 与普通 review 的分界（IR01/Q1）：普通任务的复核回避保持原规则——提交过（写过码）的人硬回避；只持有过租约、未写码的经手人 `hands` 降权（`PRIOR_HAND_WEIGHT_FACTOR`）仍可领取与裁决复核。该规则与阶段无关：执行或复核阶段只领取未提交者都是 `hands`。被经理或系统指定为实现负责人（`implementer_takeover`）或首次执行领取绑定为实现负责人的人，写码事实以 `implementer_bound` 审计行留痕，是真实作者，绑定后来转移也不改写该事实。只有策略指定的来源任务，才按 `mode` 硬排除其全部执行经手人（含 claimed-but-never-submitted）。历史行缺阶段且之后无可判定动作的，仍按作者 fail-closed。
+- 多名经手人都未提交且没有记录的实现负责人时，任务视为归属不明（`ambiguous`）：无人可执行，等经理 `implementer_takeover` 指定；这与「只领取未写码」的降权不同，不因修复而丢失。
+- 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_principal`）、角色与审计引用（不含凭证）。
+## 身份关联（identity_principal_set）
+
+经理（manage 能力）可登记 principal：把多个 employeeId 显式绑定为同一个人，用于独立性策略的同源判定（SYS-DISP IR02/Q3）。
+
+- 这是唯一的跨员工身份键。编制（`employee.def`）是容量模板（可有多个独立员工），provider、模型、名字、目录都不是身份；两个同一编制的员工默认相互独立，`maxInstances` 不构成连坐。
+- 字段：`principalId`（省略则新建）；`employees`（写入后该 principal 的完整员工集合，1–20 个，原始条数受检）；`reason`（必填，8–2000 字符，写审计）；`expectedVersion`（compare-and-set，新建时省略）；`idempotencyKey`。
+- 写入：单事务完成，审计 + 幂等行同时落库；同一 `idempotencyKey` 同载荷回放原结果，异载荷冲突。任一被登记员工持有未到期租约时拒绝——不在任务运行中静默改身份。员工不存在、已注销、参数非法均拒绝。非 manage 能力返回 `forbidden`。
+- 默认身份是 employeeId 本身：不登记任何 principal 时，同 def 不同 employee 允许，同 employee 换会话/agent/工作区仍拒绝。历史审计事实不因身份变更重写。
+
 ## 运行参数
 
 `company_meta:config`（`pnpm run admin config <key> <json>` 或直接写库）：

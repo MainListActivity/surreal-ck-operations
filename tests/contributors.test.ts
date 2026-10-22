@@ -29,12 +29,27 @@ describe('deriveContributors', () => {
     expect(facts.excluded).toEqual([]);
   });
 
-  test('an execute claim that was revoked before any submit still makes its holder the permanent author', () => {
+  // SYS-DISP IR01 (Q1, manager decision B): the ordinary review rule is the running baseline's — an actor who never SUBMITTED is a
+  // prior hand (demoted, still eligible), not a permanent author. Only code-writing evidence authors permanently.
+  test('an execute claim that was revoked before any submit is a prior hand, not an author', () => {
     const facts = deriveContributors([ev('claim', 'X', 'execute'), ev('released', 'X', 'execute'), ev('claim', 'Y', 'review')]);
+    expect(facts.authors).toEqual([]);
+    // The running baseline's rule is phase-blind: every holder who never submitted is a prior hand, in either phase, so
+    // the pool demotes them instead of excluding them.
+    expect(facts.hands).toEqual(['X', 'Y']);
+    expect(facts.implementer).toBeUndefined();
+    expect(facts.reviewers).toEqual(['Y']);
+    expect(facts.excluded).toEqual([]);
+    // A strict source excludes the execute-phase handler only: the review-phase holder is not an execute handler.
+    expect(facts.strictExcluded).toEqual(['X']);
+  });
+
+  test('an execute holder who submits is a permanent author and the implementer of a single-author task', () => {
+    const facts = deriveContributors([ev('claim', 'X', 'execute'), ev('submit', 'X')]);
     expect(facts.authors).toEqual(['X']);
     expect(facts.implementer).toBe('X');
-    expect(facts.reviewers).toEqual(['Y']);
     expect(facts.excluded).toEqual(['X']);
+    expect(facts.hands).toEqual([]);
   });
 
   test('a review-phase block or checkpoint never authors', () => {

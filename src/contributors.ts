@@ -78,7 +78,9 @@ export interface ContributionFacts {
 }
 
 /** Audit actions that can carry authorship. Everything else (resume, defer, ops_call, takeover) is ignored. */
-export const CONTRIBUTION_ACTIONS = ['claim', 'checkpoint', 'released', 'block', 'submit', 'accept', 'return'] as const;
+// `implementer_bound` is written by implementerTakeover (manager and system): being bound as the implementer is the record
+// that this employee writes the task's code, so it authors and never reviews — even after the binding moves on (SYS-DISP IR01/Q1).
+export const CONTRIBUTION_ACTIONS = ['claim', 'checkpoint', 'released', 'block', 'submit', 'accept', 'return', 'implementer_bound'] as const;
 
 /** Phrase a transaction raises when the contribution facts it was built from are stale (see readContributionView). */
 export const CONTRIBUTION_MOVED = 'contribution history moved';
@@ -145,35 +147,60 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   const unknown: UnknownContribution[] = [];
   const hands = new Set<string>();
   const roles = rolesOf(rows, open);
+  // The pre-SYS-DISP recusal rule (SYS-DISP IR01/Q1, manager decision B): an actor who ever SUBMITTED is an author; an actor
+  // who only held an execute lease and never submitted is a prior hand (demoted, still eligible). Reviewers are review-phase
+  // holders who are neither. Unknown-phase rows stay fail-closed as authors.
+  const submitted = new Set(rows.filter(event => event.action === 'submit').map(event => event.actor!));
+  const bound = new Set(rows.filter(event => event.action === 'implementer_bound').map(event => event.actor!));
   rows.forEach((event, index) => {
     const actor = event.actor!;
     const role = roles[index]!;
     if (role === 'reviewer') {
       reviewers.add(actor);
+      // The pre-SYS-DISP rule is phase-blind: any holder who never submitted is a prior hand, in either phase. A
+      // reviewer who only claimed the review and never decided it is demoted too, so they stay eligible but never
+      // outrank a fresh reviewer.
+      if (!submitted.has(actor)) hands.add(actor);
       return;
     }
-    authors.add(actor);
     if (role === 'unknown') {
+      // No decisive evidence either way: fail closed as an author, and say so to the owner.
+      authors.add(actor);
       unknown.push({ actor, action: event.action, at: event.at, reason: '历史行缺少阶段且之后无可判定动作，按作者处理（fail-closed）' });
       return;
     }
-    // An execute-phase holder who never submitted is a prior hand: eligible for review at a demoted weight, and the
-    // first claimant of a fresh task becomes its implementer. Submits never reach here (they are authors above).
-    if (event.action !== 'submit') hands.add(actor);
+    // A recorded implementer (submit, or a takeover that bound them to write the code) is a real author. A claim-only
+    // holder is a prior hand: demoted, still eligible.
+    if (submitted.has(actor) || bound.has(actor)) {
+      authors.add(actor);
+      return;
+    }
+    hands.add(actor);
   });
   const sortedAuthors = [...authors].sort();
   const explicit = explicitImplementer || undefined;
+  // The implementer is the recorded one, else the single author. A prior hand is never inferred as the implementer: only
+  // recorded authorship (a submit) or an explicit gm takeover binds a task to one engineer.
   const implementer = explicit ?? (sortedAuthors.length === 1 ? sortedAuthors[0] : undefined);
-  const excluded = [...new Set([...sortedAuthors, ...(implementer ? [implementer] : [])])].sort();
-  const handsOnly = [...hands].filter(actor => !excluded.includes(actor)).sort();
+  const excluded = [...new Set([...sortedAuthors, ...(explicit ? [explicit] : [])])].sort();
+  // A reviewer who also wrote code is an author, not a demoted hand.
+  const handsOnly = [...hands].filter(actor => !excluded.includes(actor) && !reviewers.has(actor)).sort();
+  const demoted = [...hands].filter(actor => !excluded.includes(actor)).sort();
   return {
     authors: sortedAuthors,
     reviewers: [...reviewers].filter(actor => !excluded.includes(actor)).sort(),
     unknown,
     implementer,
-    ambiguous: !explicit && sortedAuthors.length > 1,
+    // Ambiguity is a real multi-author state: several people wrote code and nobody is recorded as the implementer, so
+    // nobody may execute until a manager records one. It is also the state of several prior hands with no recorded
+    // implementer: more than one person held the code and no submit names who wrote it, which is exactly the "who wrote
+    // this?" question a manager must answer. A single prior hand is not ambiguous — they are demoted, and the manager can
+    // bind them or the task waits.
+    ambiguous: !explicit && (sortedAuthors.length > 1 || handsOnly.length > 1),
     excluded,
-    hands: handsOnly,
+    // The prior hands a review pool demotes: every claim-only holder, in either phase.
+    hands: demoted,
+    // Every execute-phase handler: authors, implementer and the execute claim-only holders. What a strict source excludes.
     strictExcluded: [...new Set([...excluded, ...handsOnly])].sort(),
   };
 }

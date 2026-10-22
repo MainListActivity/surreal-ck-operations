@@ -7,4 +7,4 @@ DEFINE TABLE IF NOT EXISTS principal SCHEMALESS PERMISSIONS NONE;
 DEFINE FIELD IF NOT EXISTS reason ON principal TYPE string ASSERT string::len($value) > 0;
 DEFINE FIELD IF NOT EXISTS employees ON principal TYPE option<array<record<employee>>>;
 DEFINE FIELD IF NOT EXISTS created_at ON principal TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS employee_principal ON employee TYPE option<record<principal>>;
+DEFINE FIELD IF NOT EXISTS principal ON employee TYPE option<record<principal>>;

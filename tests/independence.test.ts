@@ -24,10 +24,12 @@ const reject = (run: () => unknown) => {
 };
 
 test('strict mode excludes every execute-phase handler of a source, including a claim that never submitted', () => {
+  // `t-src` held an execute lease and released it without submitting: a prior hand. Ordinary review would only demote them;
+  // a strict source excludes them outright, which is the whole point of the policy mode.
   const source = facts([claim('t-src'), { action: 'released', actor: 't-src', phase: 'execute' }, claim('t-sub'),
     { action: 'submit', actor: 't-sub' }]);
   const index = buildIndependenceIndex({ policy: policy(), sources: [{ taskId: 'P', facts: source }], principalOf });
-  expect(independenceHit(index, 't-src')).toMatchObject({ via: 'contributor', source: 'P', matched: 't-src', role: 'author' });
+  expect(independenceHit(index, 't-src')).toMatchObject({ via: 'contributor', source: 'P', matched: 't-src' });
   expect(independenceHit(index, 't-sub')).toMatchObject({ via: 'contributor', source: 'P', role: 'author' });
 });
 
