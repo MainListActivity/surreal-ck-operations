@@ -235,7 +235,7 @@ sh "$SCK" call dispatch_audit '{"operationId":"<dispatch_pause 或 dispatch_rest
 ## 6. 迁移与环境需求
 
 - 迁移：schema/025-dispatch-pause.surql。定义 `dispatch_pass` 表（SCHEMALESS，PERMISSIONS NONE）与 state 索引，均为 IF NOT EXISTS。加法迁移，不改写存量行，不需要冻结写入。由 MCP bootstrap 执行（src/database.ts:126 至 :127）。编号历史：本迁移最初为 021，main 依次占用 021（worktree 审计事件）、022（编制额度限制）、023（query snapshot）与 024（snapshot quota），故最终集成为 025。集成时 main 已到 027（QA 观察），执行顺序 024→025→027（026 保留给 SYS02），schema_version 依次 25、27。所有迁移都是加法，先后只决定执行顺序。
-- schema_version：新版由 20 改为 25（条件 WHERE schema_version < 25）；中间经过 main 的 21、22、23、24。旧版的条件为 < 20，不会把 21–25 降回去（ddc8402 的 src/database.ts:99）。
+- schema_version：本分支自身把 24 推进到 25（025，条件 WHERE schema_version < 25），main 的 027（QA 观察）随后推进到 27；集成后依次执行 024→025→027，最终停在 27。旧版的条件为 < 20，不会把 21–27 降回去（ddc8402 的 src/database.ts:99）。
 - 新增的数据字段与记录：company_meta:config.pause_epoch（缺省为 0）；company_meta:dispatch_gate；audit 中的 dispatch_pause 与 dispatch_restore 行；dispatch_pass 行。每个 pass 一行，已结束且超过 1 天的行在新 pass 开始时删除，running 行不删除。启动回收把确证死亡的同主机行改为 abandoned（不删行），abandoned 行由此进入同一条 1 天清理。
 - 环境变量：分支没有新增 process.env 读取。RUN_SCK_DISPATCH_PAUSE_TESTS 只用于 fork 测试。install 沿用 SCK_RELEASE_KEEP 与 SCK_COMPONENTS。
 - 主机准备：无。
