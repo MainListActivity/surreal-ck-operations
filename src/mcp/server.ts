@@ -309,6 +309,27 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.updateProjectDisciplines(token(ctx), input)));
 
+  // Dispatch maintenance: gm only in core. Pause and restore are compare-and-set on the epoch and audited in one transaction.
+  server.registerTool('dispatch_pause', {
+    description: 'gm only (manage): pause new dispatch. No new lease commits and no new pass work starts until restored. expectedEpoch is the epoch from dispatch_status (compare-and-set). The state, epoch, gate and audit commit in one transaction; the call then waits up to drainTimeoutSeconds (10-900, default 120) for passes that started under an older epoch and returns drained=false if they did not (paused stays true). The same idempotencyKey with the same payload replays the stored result.',
+    inputSchema: z.object({
+      expectedEpoch: z.number().int().min(0), reason: z.string().min(2).max(500), idempotencyKey: z.string().min(8).max(200),
+      drainTimeoutSeconds: z.number().int().min(10).max(900).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setDispatchPause(token(ctx), { ...input, paused: true })));
+
+  server.registerTool('dispatch_restore', {
+    description: 'gm only (manage): restore new dispatch. expectedEpoch must be the current epoch from dispatch_status; a change made by another manager since then is refused, not overwritten. Audited in the same transaction as the state change.',
+    inputSchema: z.object({
+      expectedEpoch: z.number().int().min(0), reason: z.string().min(2).max(500), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setDispatchPause(token(ctx), { ...input, paused: false })));
+
+  server.registerTool('dispatch_status', {
+    description: 'gm only (manage): read-only dispatch pause state, its epoch, and the dispatch passes still running (oldRunning counts those a pause still waits for).',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.dispatchStatus(token(ctx))));
+
   server.registerTool('get_task_history', {
     description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Without pageSize or cursor it returns the complete history, oldest first, or response_too_large with retry guidance when it does not fit the 48 KiB budget (retry with pageSize 10, then cursor set to page.nextCursor). With pageSize or cursor, newest entries come first in pages that fit the budget; each page is returned oldest first. Evidence too large for a page is cut and flagged (evidenceTruncated, evidenceNextOffset), with evidenceBytes and evidenceSha256; read the full text with read_task_text (field evidence, auditId).',
     inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),

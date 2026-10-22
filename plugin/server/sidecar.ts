@@ -38,6 +38,8 @@ const BASE_TOOLS = [
   "record_score", "heartbeat", "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
+  // gm only in core: dispatch maintenance pause/restore (compare-and-set on the epoch, audited) and the read-only status.
+  "dispatch_pause", "dispatch_restore", "dispatch_status",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
   // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
@@ -297,7 +299,8 @@ export class SidecarPool {
       result = await this.deps.core.claim(cred, task.id);
     } catch (error) {
       const code = (error as { code?: string }).code ?? "";
-      if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy"].includes(code)) {
+      // dispatch_paused: the manager's maintenance pause refused a new lease; the dispatcher reads it as a refusal, not a failure.
+      if (["already_claimed", "forbidden", "no_available_task", "not_found", "worktree_busy", "dispatch_paused"].includes(code)) {
         this.log(`claim ${task.id} denied for ${inst.id}: ${code} (${(error as Error).message?.slice(0, 160)})`);
         this.denials.set(inst.id, code);
         return undefined;
@@ -803,6 +806,9 @@ export class SidecarPool {
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);
+      case "dispatch_pause": return core.setDispatchPause(cred, { ...args, paused: true } as never);
+      case "dispatch_restore": return core.setDispatchPause(cred, { ...args, paused: false } as never);
+      case "dispatch_status": return core.dispatchStatus(cred);
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。

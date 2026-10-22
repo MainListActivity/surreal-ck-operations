@@ -178,6 +178,8 @@ test('setup: bootstrap includes snapshot quota schema and preserves newer migrat
   const [info] = await db.db.query<[Record<string, unknown>]>('INFO FOR DB;');
   expect(Object.keys((info.tables ?? {}) as Record<string, string>)).toContain('query_snapshot_quota');
   const marker = await db.db.select<{ schema_version: number }>(new RecordId('company_meta', 'installation'));
+  // The integrated chain ends at 027 (dispatch pause 025 + QA observation 027); this test pins only
+  // that its own quota schema applied, so it stays tolerant of later additions.
   expect(marker?.schema_version).toBeGreaterThanOrEqual(24);
   expect(await store.accounting()).toMatchObject({ listings: 0, bytes: 0, rows: 0, quota: { listings: 0, bytes: 0 } });
 });

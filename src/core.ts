@@ -29,6 +29,8 @@ import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRo
 import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
+import type { DispatchPauseInput, DispatchPauseView, DispatchStatusView } from './contracts.ts';
+import { DRAIN_DEFAULT_SECONDS, DRAIN_MAX_SECONDS, DRAIN_MIN_SECONDS, PAUSE_BLOCKS_LEASE, PAUSE_EPOCH_MOVED, oldRunningPasses, readPauseState, runningPasses, waitForDrain, writePause, type PauseResult } from './dispatch-pause.ts';
 export { CompanyError };
 
 export { ROLES };
@@ -420,8 +422,15 @@ function listItem(row: TaskRow, fields: readonly string[] | undefined, cutLong: 
   const body: Record<string, unknown> = {
     ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context), contextTruncated: false,
   };
-  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) return body;
-  return echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
+  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) {
+    // A whole item: say so explicitly, so a caller that projects the list flags can tell "not cut" from "not reported".
+    if (fields?.includes('listsTruncated')) body.listsTruncated = task.listsTruncated ?? {};
+    return body;
+  }
+  const echoed = echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
+  // The echo cuts the lists and flags them; a projected caller must still see the flag (SYS-DISP R4).
+  if (fields?.includes('listsTruncated')) echoed.listsTruncated = echoed.listsTruncated ?? task.listsTruncated ?? {};
+  return echoed;
 }
 
 /** A task read by id, whole: the full context, with its size and digest so that a reassembly can be verified. */
@@ -589,6 +598,8 @@ export class SurrealCompanyCore implements CompanyCore {
         if (failures.length) {
           const cause = failures.map(response => response.error.message).find(message =>
             !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? '';
+          // Maintenance barrier: a manager pause refuses every new lease until it is restored; the holder's renewals still pass.
+          if (cause.includes(PAUSE_BLOCKS_LEASE)) throw new CompanyError('dispatch_paused', 'Dispatch is paused by the manager: no new lease until it is restored');
           if (/conflict/i.test(cause) && attempt < 4) {
             await Bun.sleep(10 * (attempt + 1));
             continue;
@@ -1000,10 +1011,15 @@ export class SurrealCompanyCore implements CompanyCore {
 
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
+    // Maintenance barrier (the dispatch pause, dispatch-pause.ts): the config is read inside this transaction. While the pause
+    // holds, no new lease commits; a renewal of the holder's live lease (`$same`) is not new and passes. Every new lease also
+    // writes company_meta:dispatch_gate, which a pause writes too, so a pause that commits after this read makes this claim
+    // conflict and retry into the paused branch.
     const row = await this.withContributionRetry(taskId, contrib => this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
+      LET $cfg = SELECT paused, pause_epoch FROM ONLY company_meta:config;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
@@ -1030,6 +1046,7 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
       };
       LET $same = $t.current_employee = $employee AND $t.lease_expires_at > $now;
+      IF !$same AND ($cfg.paused ?? false) { THROW '${PAUSE_BLOCKS_LEASE}' };
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
         current_employee = $employee,
@@ -1048,6 +1065,7 @@ export class SurrealCompanyCore implements CompanyCore {
           delivery: $next.delivery_id, fence: $next.fence, intent: $assignment.intent, at: time::now() };
       };
       IF !$same {
+        UPSERT company_meta:dispatch_gate MERGE { last_lease_at: time::now() };
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END, evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
@@ -1885,6 +1903,75 @@ export class SurrealCompanyCore implements CompanyCore {
     await this.db.query(
       'CREATE audit CONTENT { actor: $actor, action: $action, evidence: $evidence, at: time::now() };',
       { actor: id('employee', actor.employeeId), action, evidence: JSON.stringify(summary).slice(0, OPS_EVIDENCE_CHARS) });
+  }
+
+  // ---- 派工维护：经理暂停屏障（gm only） ----
+
+  /**
+   * gm only: pause or restore new dispatch. The state, its epoch, the shared gate record and the audit row commit in one
+   * transaction, compare-and-set on expectedEpoch (read it from dispatch_status first). A pause then waits, bounded by
+   * drainTimeoutSeconds, for dispatch passes that started under an older epoch; drained=false means they did not finish.
+   * Paused stays true in that case: nothing here force-opens the window. The same key with the same payload replays the
+   * stored result; the same key with another payload is a conflict.
+   */
+  async setDispatchPause(credential: Credential, input: DispatchPauseInput): Promise<DispatchPauseView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Dispatch pause is gm only');
+    if (typeof input.paused !== 'boolean') throw new CompanyError('invalid', 'paused must be true or false');
+    if (!Number.isSafeInteger(input.expectedEpoch) || input.expectedEpoch < 0) {
+      throw new CompanyError('invalid', 'expectedEpoch must be the non-negative epoch from dispatch_status');
+    }
+    requireText(input.reason, 'reason', 2, 500);
+    const drainSeconds = input.drainTimeoutSeconds ?? DRAIN_DEFAULT_SECONDS;
+    if (!Number.isSafeInteger(drainSeconds) || drainSeconds < DRAIN_MIN_SECONDS || drainSeconds > DRAIN_MAX_SECONDS) {
+      throw new CompanyError('invalid', `drainTimeoutSeconds must be an integer from ${DRAIN_MIN_SECONDS} to ${DRAIN_MAX_SECONDS}`);
+    }
+    const operation = input.paused ? 'dispatch_pause' : 'dispatch_restore';
+    const ident = this.idemId(actor.employeeId, operation, input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ operation, expectedEpoch: input.expectedEpoch, reason: input.reason, drainSeconds }));
+    type Stored = { payload_digest: string; result: PauseResult };
+    const settle = (stored: Stored): PauseResult => {
+      if (stored.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+      return stored.result;
+    };
+    let result: PauseResult;
+    let replayed = false;
+    const prior = await this.db.select<Stored>(ident);
+    if (prior) {
+      result = settle(prior);
+      replayed = true;
+    } else {
+      try {
+        result = await writePause(this.db, {
+          paused: input.paused, actor: id('employee', actor.employeeId), actorRole: actor.role, expectedEpoch: input.expectedEpoch,
+          evidence: JSON.stringify({ reason: input.reason, expectedEpoch: input.expectedEpoch, drainSeconds }).slice(0, OPS_EVIDENCE_CHARS),
+          idem: ident, digest,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes(PAUSE_EPOCH_MOVED)) throw new CompanyError('conflict', 'Dispatch epoch moved: read dispatch_status and retry with the current epoch');
+        // An identical call that committed first owns the idempotency record: answer with its stored result.
+        const won = /already exists/i.test(message) ? await this.db.select<Stored>(ident) : undefined;
+        if (!won) {
+          if (/conflict/i.test(message)) throw new CompanyError('conflict', 'Dispatch pause changed under this request; retry', true);
+          throw error;
+        }
+        result = settle(won);
+        replayed = true;
+      }
+    }
+    const drain = result.paused ? await waitForDrain(this.db, result.epoch, drainSeconds * 1000) : undefined;
+    return { operationId: result.operationId, operation: result.operation, paused: result.paused, epoch: result.epoch,
+      before: result.before, drained: drain ? { drained: drain.drained, blocking: drain.blocking, waitedMs: drain.waitedMs } : null, replayed };
+  }
+
+  /** gm only: read-only pause state, its epoch, and the dispatch passes still running (oldRunning: those that started under an earlier epoch). */
+  async dispatchStatus(credential: Credential): Promise<DispatchStatusView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Dispatch status is gm only');
+    const state = await readPauseState(this.db);
+    return { paused: state.paused, epoch: state.epoch, changedAt: state.changedAt,
+      runningPasses: await runningPasses(this.db), oldRunning: await oldRunningPasses(this.db, state.epoch) };
   }
 
   async listDefs(credential: Credential): Promise<DefView[]> {

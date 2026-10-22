@@ -5,6 +5,7 @@ import { CompanyDatabase } from '../database.ts';
 import { OwnerDesk } from '../owner.ts';
 import { SurrealCompanyCore } from '../core.ts';
 import { Workforce } from '../workforce.ts';
+import { passLedger } from '../dispatch-pause.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
 import { createPaseoCli } from './paseo.ts';
@@ -38,6 +39,7 @@ try {
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),
+    passes: passLedger(db.db),
     // Same automatic successor as the plugin's dispatcher (see plugin/server/company.ts).
     autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
     // WT01: managed/legacy scenes must survive; no destructive sweeper.

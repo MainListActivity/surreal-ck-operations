@@ -792,6 +792,10 @@ export interface CompanyCore {
   listDefs(credential: Credential): Promise<DefView[]>;
   /** manage (gm/product): create or update an employee_def via the shared workforce writer; audited. */
   ensureDef(credential: Credential, input: EnsureDef): Promise<DefView>;
+  /** gm (manage): pause or restore new dispatch; compare-and-set on the epoch, state + gate + audit in one transaction (ops maintenance). */
+  setDispatchPause(credential: Credential, input: DispatchPauseInput): Promise<DispatchPauseView>;
+  /** gm (manage): read-only pause state, its epoch and the dispatch passes still running. */
+  dispatchStatus(credential: Credential): Promise<DispatchStatusView>;
   /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
   updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string; roles?: Role[] }> }): Promise<ProjectView>;
   /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
@@ -804,6 +808,37 @@ export interface CompanyCore {
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
+}
+
+/** gm dispatch maintenance (pause/restore). `expectedEpoch` is the epoch read from dispatch_status: a stale value is refused. */
+export interface DispatchPauseInput {
+  paused: boolean;
+  expectedEpoch: number;
+  reason: string;
+  idempotencyKey: string;
+  /** Pause only: how long to wait for passes that started under an older epoch (10–900 s, default 120). */
+  drainTimeoutSeconds?: number;
+}
+
+export interface DispatchPauseView {
+  operationId: string;
+  operation: 'dispatch_pause' | 'dispatch_restore';
+  paused: boolean;
+  epoch: number;
+  before: { paused: boolean; epoch: number };
+  /** Pause only: drained=true when no pass that started under an older epoch is still running; null for restore. */
+  drained: { drained: boolean; blocking: number | null; waitedMs: number } | null;
+  /** True when the same idempotency key with the same payload returned the stored result. */
+  replayed: boolean;
+}
+
+export interface DispatchStatusView {
+  paused: boolean;
+  epoch: number;
+  changedAt?: string;
+  runningPasses: Array<{ id: string; instance: string; epoch: number | null; startedAt?: string }>;
+  /** Running passes that started under an epoch older than `epoch` (or recorded none): the ones a pause still waits for. */
+  oldRunning: number;
 }
 
 /** Employee definition as returned by the manage tools (score internals stay server-side). */

@@ -10,6 +10,7 @@ import { capabilitiesFor, effectiveWeight, Workforce } from './workforce.ts';
 import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
+import { writePause } from './dispatch-pause.ts';
 import type { Role } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
 import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
@@ -39,7 +40,8 @@ const usage = `Usage: pnpm run admin <command>
                                           从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
   repair-infrastructure-scores [--execute]  排除有明确额度故障证据的纯空转评分；默认只演练，保留原始卡片
-  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）
+  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）；
+                                          paused 走暂停事务（纪元、闸门、审计同写），pause_epoch 只能由暂停本身写
   rescore                                 从评分卡重算员工与编制的 scored/avg_score（幂等；修复评分汇总失败留下的落后）
   reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
                                           回收终态任务的大文件（evidence/deliverables）；
@@ -212,7 +214,25 @@ try {
     case 'config': {
       const [key, value] = args;
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
-      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: JSON.parse(value) } });
+      // The pause is not a plain config value: claimLease only sees a pause that moved the epoch and the shared gate in one
+      // transaction, so writing `paused` here would hold the flag without any barrier (SYS-DISP review R-A). The epoch belongs
+      // to writePause; a hand-written one would desynchronise it from the gate and the audit rows.
+      if (key === 'pause_epoch') {
+        throw new Error('config pause_epoch is written only by the pause itself (dispatch_pause / dispatch_restore, or the owner pause); use `sck call dispatch_status` to read it');
+      }
+      const parsed = JSON.parse(value);
+      if (key === 'paused') {
+        if (typeof parsed !== 'boolean') throw new Error('config paused takes true or false; the epoch, gate and audit move with it');
+        // Same transaction as the manager pause (epoch, gate, audit row). The operator path has no compare-and-set, like the
+        // owner pause, and the audit row names the operator rather than an employee: no employee credential is borrowed here.
+        const result = await writePause(database.db, {
+          paused: parsed, actor: 'admin', actorRole: 'operator', expectedEpoch: null,
+          evidence: JSON.stringify({ source: 'admin config paused', value: parsed }),
+        });
+        print({ ...await workforce.config(), pause: { operation: result.operation, operationId: result.operationId, epoch: result.epoch, before: result.before } });
+        break;
+      }
+      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
       print(await workforce.config());
       break;
     }
