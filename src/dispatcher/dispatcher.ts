@@ -22,7 +22,7 @@ import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLa
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
+export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
@@ -1587,6 +1587,16 @@ export class Dispatcher {
 
     const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
     for (const todo of pendingGm) {
+      const home = todo.task.repoPath ?? this.deps.env.opsRepo;
+      const noticeKey = `gm-unavailable:${home}`;
+      // Use the exact same pools as assign, without acquiring a wake only to
+      // immediately release it. This remains quiet across dispatcher restarts.
+      if (!eligibleInsts('gm', home, undefined, false).length && !eligibleDefs('gm', home).length) {
+        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理；待办保留，检查经理编制、额度和容量。候选恢复后自动唤醒。`, report);
+        continue;
+      }
+      await owner.resolveNotice(noticeKey);
+      if (running >= cfg.maxRunning) continue;
       let claim: ManagerWakeClaim | undefined;
       try {
         claim = await wf.acquireManagerWake!({

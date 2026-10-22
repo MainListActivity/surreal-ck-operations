@@ -335,14 +335,17 @@ export class SidecarPool {
   /** Spawn/wake/workspace-handoff rollback after a pre-claim: hand the lease back without a
    * reviewer verdict — never routed through returnTask, which would fake a return and bounce
    * a review task back to doing. Cores without the release op let the lease expire on its own. */
-  async releaseClaim(instId: string, _taskId: string, reason: string): Promise<void> {
+  async releaseClaim(instId: string, _taskId: string, reason: string, options: { strict?: boolean } = {}): Promise<void> {
     const live = this.claims.get(instId);
-    this.endLease(instId);
+    if (!options.strict) this.endLease(instId);
     if (!live) return;
     try {
       const cred = await this.credentialFor(instId);
+      if (options.strict && !this.deps.core.release) throw new Error("core release unavailable");
       await this.deps.core.release?.(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
+      if (options.strict && this.claims.get(instId) === live) this.endLease(instId);
     } catch (error) {
+      if (options.strict) throw error;
       this.log(`releaseClaim ${instId} failed (lease will expire): ${(error as Error).message}`);
     }
   }
@@ -350,7 +353,7 @@ export class SidecarPool {
   /** Turn ended: ingest the agent's artifacts, then let the lease live or die.
    * The keepalive is NOT stopped here — the claim may outlive this turn (multi-turn
    * work), and a claim whose beat died becomes an orphan no heartbeat can expire. */
-  async settle(agentId: string): Promise<SettleResult> {
+  async settle(agentId: string, options: { infrastructureFailure?: boolean } = {}): Promise<SettleResult> {
     const instId = this.instByAgent.get(agentId);
     if (!instId) return { status: "no_claim" };
     const dir = commDir(this.deps.runDir, instId);
@@ -382,9 +385,9 @@ export class SidecarPool {
     }
     // Turn closed with the round still open: keep the lease while the caller decides
     // between a wake nudge and a server-side release; the count feeds that decision.
-    live.nudges = (live.nudges ?? 0) + 1;
+    if (!options.infrastructureFailure) live.nudges = (live.nudges ?? 0) + 1;
     this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
-    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges } };
+    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0 } };
   }
 
   private async finish(

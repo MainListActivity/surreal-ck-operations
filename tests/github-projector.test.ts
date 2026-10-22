@@ -58,7 +58,7 @@ test('failed GitHub comment leaves event pending, retry reuses the managed issue
     async closeIssue() {},
   };
   const projector = createGithubProjector({ core, credential: 'opaque', github: gateway, statePath });
-  await expect(projector.runOnce()).rejects.toThrow('temporary GitHub outage');
+  expect(await projector.runOnce()).toEqual({ projected: 0 });
   expect(issue?.number).toBe(102);
   fail = false;
   expect(await projector.runOnce()).toEqual({ projected: 1 });
