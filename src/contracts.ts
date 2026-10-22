@@ -579,6 +579,31 @@ export interface QaObservationAuth { credential?: Credential; token?: string; }
 export interface QaObservationDispatchReason {
   code: string; text: string; candidates: string[]; owner: string; recovery: string;
   nextTrigger: string; basis: string; until?: string;
+  /**
+   * Structured recovery actions with their authority and tool (F1). Observations written before this field existed do not
+   * carry it: the page shows the action as unknown rather than inventing one.
+   */
+  actions?: Array<{ authority: string; label: string; tool?: string; executable: boolean }>;
+}
+
+/**
+ * The goal-level root blocker for a QA goal summary (F2). Built by the same server-side evaluator the owner pulse uses
+ * (goalRootBlockers over the pass's verdicts); the QA channel never re-derives a parallel conclusion.
+ * `factsAvailable` is false when the waiting graph / people could not be read: impact, dependencyPath and people are then
+ * omitted (unknown), never reported as zero or empty-as-fact.
+ */
+export interface QaObservationGoalRoot {
+  taskId: string; title: string; phase: 'execute' | 'review'; workflowState: 'ready' | 'doing' | 'review';
+  summary: string; feasible: boolean; waitingMinutes: number; since?: string; checkedAt: string;
+  eligibleCount: number; undispatchable: number; others: number;
+  /** The notice key of the root verdict, so a QA can name the episode the owner was told about. */
+  noticeKey?: string;
+  factsAvailable: boolean;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  reasons: QaObservationDispatchReason[];
+  reasonsOmitted?: number;
 }
 export interface QaObservationDispatchVerdict {
   phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
@@ -613,7 +638,9 @@ export interface QaObservationReadView {
   dispatch?: QaObservationDispatch;
   goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
     dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
-    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean };
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    /** F2: the goal's root blocker from the same evaluator the owner page reads, with impact and dependency path. */
+    root?: QaObservationGoalRoot };
   contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
   contextRead?: { taskId: string; field: 'context'; offset: number };
 }
