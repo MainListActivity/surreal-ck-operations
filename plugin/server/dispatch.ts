@@ -1,3 +1,4 @@
+import { settleCompanyTurn } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -243,9 +244,6 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
   }
 }
 
-/** Wake nudges a silently-ended round may get before the claim is released server-side. */
-const MAX_SILENT_NUDGES = 2;
-
 export const QA_DISPATCH_OBSERVATION_MAX_BYTES = 4 * 1024 * 1024;
 export const QA_DISPATCH_ITEM_MAX_BYTES = 256 * 1024;
 let lastObservation = '';
@@ -395,32 +393,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         // The sidecar ingests report.md/blocker.md and lands submit/block before
         // the usage snapshot looks for freshly-reviewed tasks.
         try {
-          const res = await ctx.sidecar.settle(event.agent.id);
-          // A turn that closed without report.md/blocker.md leaves the lease alive
-          // but the agent idle — a completed turn gets a bounded wake nudge, a
-          // failed/canceled turn (or a nudge budget already spent) surrenders the
-          // claim server-side so the task goes back to ready instead of wedging.
-          if (res.status === "silent" && res.silent) {
-            const { instId, taskId, nudges } = res.silent;
-            const kind = event.outcome?.kind ?? "completed";
-            if (kind === "completed" && nudges <= MAX_SILENT_NUDGES) {
-              try {
-                await paseo.agents.ref(event.agent.id).send(
-                  `【系统】你上一轮结束时没有提交 report.md 或 blocker.md，任务仍挂在你名下。继续执行当前任务；收尾规则不变：完成写 report.md，受阻写 blocker.md。这是第 ${nudges}/${MAX_SILENT_NUDGES} 次提醒——再次无收尾退出，任务将被收回重派。`
-                );
-                console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
-              } catch (error) {
-                console.warn(`silent-turn nudge failed for ${instId} on ${taskId}: ${(error as Error).message}`);
-                await ctx.sidecar.releaseClaim(instId, taskId, `第 ${nudges} 轮无收尾退出且会话无法唤醒，收回任务重派`);
-              }
-            } else {
-              const reason = kind === "completed"
-                ? `连续 ${nudges} 轮无收尾退出，放弃本轮并回收任务重派`
-                : `turn 以 ${kind} 结束且未提交 report.md/blocker.md，回收任务重派`;
-              await ctx.sidecar.releaseClaim(instId, taskId, reason);
-              console.log(`silent-turn released ${taskId} from ${instId} (outcome=${kind}, silent turns=${nudges})`);
-            }
-          }
+          await settleCompanyTurn(ctx, paseo, event);
         } catch (error) {
           console.warn(`sidecar settle failed: ${(error as Error).message}`);
         }
