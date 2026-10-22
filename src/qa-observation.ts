@@ -2,7 +2,7 @@
 // 授权与读取逻辑在 core（同一评估器/同一 ACL 之外的单一路径），这里不接触数据库。
 import { createHash } from 'node:crypto';
 import { RecordId } from 'surrealdb';
-import type { QaObservationDispatch, QaObservationScopeView } from './contracts.ts';
+import type { QaObservationDispatch, QaObservationGoalWaitRoot, QaObservationGoalWaitSummary, QaObservationScopeView } from './contracts.ts';
 
 export const QA_OBSERVATION_MAX_SUBJECTS = 50;
 export const QA_OBSERVATION_MIN_TTL_MS = 60_000;
@@ -11,6 +11,10 @@ export const QA_OBSERVATION_CODE_TTL_MS = 5 * 60_000;
 export const QA_OBSERVATION_TOKEN_TTL_MS = 30 * 60_000;
 /** A task context up to this size is returned inline; longer ones are read in byte segments with qa_observation_text. */
 export const QA_OBSERVATION_CONTEXT_INLINE_BYTES = 8 * 1024;
+/** Workflow wait roots one QA goal read evaluates before the byte budget applies (the dispatcher's own root limit). */
+export const QA_OBSERVATION_WAIT_ROOTS_LIMIT = 20;
+/** Bytes kept free for the release stamp (runtimeRelease, added by MCP and the sidecar after the core returns). */
+export const QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES = 1024;
 
 /** The stored scope row. Kept structural so core can select it without another module's mapper. */
 export interface QaObservationScopeRow {
@@ -138,3 +142,41 @@ export const qaDispatchFor = (observation: unknown, taskId: string, attempt?: Qa
   }
   return { ...result, available: true, verdicts: verdicts as QaObservationDispatch['verdicts'] };
 };
+
+/**
+ * Shrinks a workflow wait summary until `fits` accepts the whole answer that carries it, and reports every cut. Roots are
+ * dropped from the tail first (the evaluator's order is stable, so the kept roots are the highest-priority ones); when not
+ * even the first root fits with its path, the path is shortened one step at a time, then dropped, then the root itself.
+ * `totalRoots` always stays the evaluator's full count; `shownRoots`/`truncated` describe what the answer carries, and
+ * `budgetLimited` marks a cut made for bytes rather than the root limit. Pure: the caller supplies the measurement.
+ */
+export function fitGoalWaitSummary(
+  summary: QaObservationGoalWaitSummary,
+  fits: (candidate: QaObservationGoalWaitSummary) => boolean,
+): QaObservationGoalWaitSummary {
+  if (!summary.available || fits(summary)) return summary;
+  const cut = (roots: QaObservationGoalWaitRoot[]): QaObservationGoalWaitSummary =>
+    ({ ...summary, shownRoots: roots.length, truncated: true, budgetLimited: true, roots });
+  // The answer only grows with more roots, so the largest fitting prefix is found by bisection.
+  let lo = 0;
+  let hi = summary.roots.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(cut(summary.roots.slice(0, mid)))) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo > 0) return cut(summary.roots.slice(0, lo));
+  const first = summary.roots[0];
+  if (first) {
+    const path = first.dependencyPath ?? [];
+    for (let length = path.length - 1; length >= 1; length--) {
+      const candidate = cut([{ ...first, dependencyPath: path.slice(0, length), dependencyPathTruncated: true }]);
+      if (fits(candidate)) return candidate;
+    }
+    if (path.length > 0) {
+      const candidate = cut([{ ...first, dependencyPath: undefined, dependencyPathTruncated: true }]);
+      if (fits(candidate)) return candidate;
+    }
+  }
+  return cut([]);
+}

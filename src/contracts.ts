@@ -633,6 +633,8 @@ export interface QaObservationGoalWaitSummary {
   totalRoots: number;
   shownRoots: number;
   truncated: boolean;
+  /** true when the cut was made for the response byte budget, not only by the root limit: roots or paths were shortened. */
+  budgetLimited?: boolean;
   reason?: string;
   roots: QaObservationGoalWaitRoot[];
 }

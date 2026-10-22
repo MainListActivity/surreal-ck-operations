@@ -11,9 +11,10 @@ export const PULSE_BUDGET_BYTES = 48 * 1024;
 
 /** Caps per list: at most `items` rows, and at most `bytes` serialized bytes. The byte shares sum below PULSE_BUDGET_BYTES. */
 export const PULSE_LIST_CAPS = {
-  dispatchBlocked: { items: 40, bytes: 16 * 1024 },
-  goalBlockers: { items: 40, bytes: 12 * 1024 },
-  workflowWaits: { items: 20, bytes: 2 * 1024 },
+  dispatchBlocked: { items: 40, bytes: 13 * 1024 },
+  goalBlockers: { items: 40, bytes: 9 * 1024 },
+  // One row can reach ~6.7 KB (a 200-character title plus an 8-step path), so the share holds at least one whole row.
+  workflowWaits: { items: 20, bytes: 8 * 1024 },
   ready: { items: 40, bytes: 4 * 1024 },
   doing: { items: 40, bytes: 3 * 1024 },
   stuck: { items: 30, bytes: 2 * 1024 },

@@ -24,3 +24,14 @@ test('owner pulse bounds workflow wait roots by serialized bytes without silent 
   expect(Buffer.byteLength(JSON.stringify(answer.workflowWaits), 'utf8')).toBeLessThanOrEqual(PULSE_LIST_CAPS.workflowWaits.bytes);
   expect(answer.bounds.workflowWaits).toMatchObject({ total: 25, shown: answer.workflowWaits.length, truncated: true });
 });
+
+test('one contract-max wait row fits the workflow-waits share, so a full list is never silently emptied', () => {
+  // The review measured 6669 bytes for a 200-character title plus an 8-step path; the share must hold at least one whole row.
+  const maxRow = { ...waitRoot(0, '长标题'.repeat(64)),
+    dependencyPath: Array.from({ length: 8 }, (_, step) => ({ taskId: `step-${step}`, title: '长标题'.repeat(64) })) };
+  expect(Buffer.byteLength(JSON.stringify(maxRow), 'utf8')).toBeLessThanOrEqual(PULSE_LIST_CAPS.workflowWaits.bytes);
+  const answer = pulseAnswer(parts([maxRow, maxRow, maxRow]));
+  expect(answer.workflowWaits.length).toBeGreaterThan(0);
+  expect(answer.bounds.workflowWaits).toMatchObject({ total: 3, shown: answer.workflowWaits.length, truncated: true });
+  expect(Buffer.byteLength(JSON.stringify(answer.workflowWaits), 'utf8')).toBeLessThanOrEqual(PULSE_LIST_CAPS.workflowWaits.bytes);
+});

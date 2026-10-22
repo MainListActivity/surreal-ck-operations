@@ -480,6 +480,8 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
       <Section title="目标工作流等待" count={p.workflowWaitSummary.totalRoots} ctx={ctx}>
         {!p.workflowWaitSummary.available ? (
           <Text style={s.muted}>等待图不可读：{p.workflowWaitSummary.reason ?? "未知"}</Text>
+        ) : p.workflowWaits.length === 0 && p.workflowWaitSummary.totalRoots > 0 ? (
+          <Text style={s.muted}>等待根 {p.workflowWaitSummary.totalRoots} 个，均未纳入本页字节预算；见下方截断说明。</Text>
         ) : p.workflowWaits.length === 0 ? (
           <Text style={s.muted}>当前没有已识别的目标等待根。</Text>
         ) : p.workflowWaits.map(root => (
@@ -495,7 +497,7 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
           </View>
         ))}
         {p.workflowWaitSummary.available && <Text style={s.muted}>来源 workflow-graph · 采集于 {clockOf(p.workflowWaitSummary.checkedAt ?? "")}{p.dispatchAt ? ` · dispatcher pass ${clockOf(p.dispatchAt)}` : " · dispatcher pass 未记录"}</Text>}
-        {p.workflowWaitSummary.truncated || p.bounds.workflowWaits.truncated ? <Text style={s.muted}>等待根列表已截断：显示 {p.bounds.workflowWaits.shown} / {p.workflowWaitSummary.totalRoots}。</Text> : null}
+        {p.workflowWaitSummary.truncated || p.bounds.workflowWaits.truncated ? <Text style={s.muted}>等待根列表已截断：显示 {p.bounds.workflowWaits.shown} / {p.workflowWaitSummary.totalRoots}{p.bounds.workflowWaits.shown === 0 ? "（单项超出本页字节份额，见下方说明）" : ""}。</Text> : null}
         {p.workflowWaits.some(root => root.kind === "active_lease") && <Text style={s.muted}>活租约中的复核任务来自独立工作流图，可能未纳入最近 dispatcher pass；这不表示不可派工。</Text>}
       </Section>
       <Section title="就绪待领" count={p.ready.length} ctx={ctx}>

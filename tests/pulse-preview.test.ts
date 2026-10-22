@@ -159,6 +159,21 @@ test('normalizePulse and owner view preserve workflow waits, provenance, impact 
   expect(text).toContain('列表已截断');
 });
 
+test('动态页渲染：等待根被字节份额清空时不再说“没有等待根”，真实空目标仍说', () => {
+  const cut = { ...full, workflowWaitSummary: { source: 'workflow-graph', available: true, checkedAt: '2026-10-15T03:58:00Z', totalRoots: 3, truncated: true },
+    workflowWaits: [], bounds: allBounds({ workflowWaits: { total: 3, shown: 0, truncated: true } }) };
+  const text = collectText(renderPulse(cut));
+  expect(text).toContain('均未纳入本页字节预算');
+  expect(text).toContain('显示 0 / 3');
+  expect(text).toContain('单项超出本页字节份额');
+  expect(text).not.toContain('当前没有已识别的目标等待根');
+  const empty = { ...full, workflowWaitSummary: { source: 'workflow-graph', available: true, checkedAt: '2026-10-15T03:58:00Z', totalRoots: 0, truncated: false },
+    workflowWaits: [], bounds: allBounds() };
+  const emptyText = collectText(renderPulse(empty));
+  expect(emptyText).toContain('当前没有已识别的目标等待根');
+  expect(emptyText).not.toContain('均未纳入本页字节预算');
+});
+
 test('动态页渲染：完整数据呈现全部区块', () => {
   const text = collectText(renderPulse(full));
   expect(text).toContain('派工运行中');

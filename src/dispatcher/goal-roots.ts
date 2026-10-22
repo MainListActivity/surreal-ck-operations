@@ -159,12 +159,6 @@ export async function readGoalWorkflowWaitSnapshot(db: Surreal, workforce?: Pick
   };
 }
 
-/** Shared workflow wait summary used by the owner pulse and scoped QA goal view. */
-export async function readGoalWorkflowWaitSummary(db: Surreal, workforce?: Pick<Workforce, 'contributors'>,
-  options: { goalId?: string; limit?: number; log?: (message: string) => void } = {}): Promise<GoalWorkflowWaitSummary> {
-  return (await readGoalWorkflowWaitSnapshot(db, workforce, options)).summary;
-}
-
 function withPeople(root: GoalWorkflowWaitRoot, facts: GoalRootPersonFacts | undefined): GoalWorkflowWaitRoot {
   if (!facts) return root;
   const base = facts.people;
@@ -179,15 +173,4 @@ function withPeople(root: GoalWorkflowWaitRoot, facts: GoalRootPersonFacts | und
     ...(facts.peopleCheckedAt ? { peopleCheckedAt: facts.peopleCheckedAt } : {}),
     ...(facts.submitCheckedAt ? { submitCheckedAt: facts.submitCheckedAt } : {}),
   };
-}
-
-/**
- * Facts used by the existing dispatch verdict card. Its graph is transactionally read and can be scoped to one goal. The legacy
- * unfinished-edge projection and people behavior remain compatible with goalRootBlockers.
- */
-export async function readGoalRootFacts(db: Surreal, workforce: Pick<Workforce, 'contributors'>, roots: readonly string[],
-  log: (message: string) => void = () => {}, goalIds?: readonly string[]): Promise<GoalRootFacts> {
-  const snapshot = await readGoalWorkflowWaitSnapshot(db, workforce, { goalId: goalIds?.length === 1 ? goalIds[0] : undefined,
-    roots, limit: 0, log });
-  return snapshot.facts;
 }

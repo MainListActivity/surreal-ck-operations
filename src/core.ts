@@ -20,12 +20,12 @@ import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
-import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
+import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
-import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople } from './dispatcher/dispatch-blocked.ts';
+import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
 import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
@@ -3425,6 +3425,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const baseMeta: QaObservationMeta = { checkedAt, dataSource: 'live', instanceAt, scope: scopeView, completeness: { complete: true } };
     if (input.goalId !== undefined) {
       if (input.goalId !== asId(scope.goal)) throw new CompanyError('forbidden', 'the goal is outside the QA observation scope');
+      const goalId = input.goalId;
       const [rows] = await this.db.query<[Array<{ state?: string | null; n: number }>]>(
         "SELECT state, count() AS n FROM task WHERE goal = $goal GROUP BY state;", { goal: scope.goal });
       const states: Record<string, number> = {};
@@ -3440,13 +3441,13 @@ export class SurrealCompanyCore implements CompanyCore {
       // Workflow waits are a separately sampled, goal-scoped graph. They remain available when a dispatch pass is absent,
       // partial or stale, and never inherit the pass timestamp.
       const passVerdicts = (observation as { verdicts?: DispatchVerdict[] } | undefined)?.verdicts ?? [];
-      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === input.goalId && goalIds.has(verdict.taskId));
+      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === goalId && goalIds.has(verdict.taskId));
       const verdictRoot = goalRootBlockers(goalVerdicts)[0];
       let workflowSnapshot: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>> | undefined;
-      let waits: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>>['summary'];
+      let waits: GoalWorkflowWaitSummary;
       try {
         workflowSnapshot = await readGoalWorkflowWaitSnapshot(this.db, this.workforce, {
-          goalId: input.goalId, roots: verdictRoot ? [verdictRoot.taskId] : [], limit: 20,
+          goalId, roots: verdictRoot ? [verdictRoot.taskId] : [], limit: QA_OBSERVATION_WAIT_ROOTS_LIMIT,
           log: message => console.warn(message),
         });
         waits = workflowSnapshot.summary;
@@ -3486,23 +3487,28 @@ export class SurrealCompanyCore implements CompanyCore {
         })),
         ...(reasons.length > 20 ? { reasonsOmitted: reasons.length - 20 } : {}),
       } : undefined;
-      return { meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
-        goal: { id: input.goalId, states, total,
+      // The waits ride on the one goal answer, and qa_observation_read has no paging input, so an over-budget answer would be
+      // replaced whole by response_too_large on the relay and refused on MCP. Shrink waits against the measured answer instead,
+      // leaving the release stamp its reserve, and say in the summary what was left out.
+      const view = (fitted: GoalWorkflowWaitSummary): QaObservationReadView => ({ meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
+        goal: { id: goalId, states, total,
           ...(undispatchable !== undefined ? { undispatchable } : {}),
           dispatchAvailable: state.available, dispatchComplete: state.complete, dispatchSource: 'dispatcher-pass',
           ...(state.reason ? { dispatchReason: state.reason } : {}),
           ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
           ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
           ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
-          waits: waits.available ? { ...waits, roots: waits.roots.map(wait => {
-            if (!wait.people) return wait;
-            const authors = wait.people.authors.slice(0, 6);
-            const reviewers = wait.people.reviewers.slice(0, 6);
-            const peopleOmitted = wait.people.authors.length - authors.length + wait.people.reviewers.length - reviewers.length;
-            return { ...wait, people: { ...wait.people, authors, reviewers, ...(peopleOmitted ? { peopleOmitted } : {}) } };
-          }) } : waits,
+          waits: fitted,
           ...(root ? { root } : {}),
-        } };
+        } });
+      const trimmed: GoalWorkflowWaitSummary = waits.available ? { ...waits, roots: waits.roots.map(wait => {
+        if (!wait.people) return wait;
+        const authors = wait.people.authors.slice(0, 6);
+        const reviewers = wait.people.reviewers.slice(0, 6);
+        const peopleOmitted = wait.people.authors.length - authors.length + wait.people.reviewers.length - reviewers.length;
+        return { ...wait, people: { ...wait.people, authors, reviewers, ...(peopleOmitted ? { peopleOmitted } : {}) } };
+      }) } : waits;
+      return view(fitGoalWaitSummary(trimmed, candidate => answerBytes(view(candidate)) <= RESPONSE_BUDGET_BYTES - QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES));
     }
     if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
     const taskId = input.taskId;

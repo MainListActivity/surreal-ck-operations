@@ -35,7 +35,7 @@ type QaRead = {
   goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string;
     dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
     dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
-    waits?: { source?: string; available?: boolean; checkedAt?: string; totalRoots?: number; shownRoots?: number; truncated?: boolean; reason?: string;
+    waits?: { source?: string; available?: boolean; checkedAt?: string; totalRoots?: number; shownRoots?: number; truncated?: boolean; budgetLimited?: boolean; reason?: string;
       roots?: Array<{ goalId?: string; taskId?: string; title?: string; workflowState?: string; kind?: string; basis?: string; waitingForRole?: string;
         nextTrigger?: string; goalRootCount?: number; impact?: number; dependencyPath?: Array<{ taskId?: string; title?: string }>; dependencyPathTruncated?: boolean; unknownReason?: string;
         people?: { implementer?: string; authors?: string[]; reviewers?: string[]; submitter?: string; submitCommit?: string };
@@ -268,8 +268,8 @@ ${reasons}${root.reasonsOmitted ? `<div class="meta">另有 ${esc(root.reasonsOm
           })() : `<div class="card"><div class="meta">派工结论：${g.dispatchComplete === true ? `完整 pass，本目标不可派工 ${undispatchable} 项` : `未知（${esc(g.dispatchReason ?? '派工快照不可用')}）`}</div></div>`;
           const waitsHtml = waits?.available === true
             ? `<div class="card"><h3>工作流等待 · ${esc(waits.totalRoots ?? 0)} 个根</h3>
-<div class="meta">来源 ${esc(waits.source ?? 'workflow-graph')} · 采集于 ${esc(waits.checkedAt ?? '未知')} · dispatcher pass ${esc(g.dispatchCheckedAt ?? '未知')} · 显示 ${esc(waits.shownRoots ?? waits.roots?.length ?? 0)} / ${esc(waits.totalRoots ?? 0)}${waits.truncated ? ' · 已截断' : ''}</div>
-${(waits.roots ?? []).length === 0 ? '<div class="meta">当前目标没有已识别的工作流等待根。</div>' : ''}
+<div class="meta">来源 ${esc(waits.source ?? 'workflow-graph')} · 采集于 ${esc(waits.checkedAt ?? '未知')} · dispatcher pass ${esc(g.dispatchCheckedAt ?? '未知')} · 显示 ${esc(waits.shownRoots ?? waits.roots?.length ?? 0)} / ${esc(waits.totalRoots ?? 0)}${waits.truncated ? ' · 已截断' : ''}${waits.budgetLimited ? ' · 为响应字节预算收缩' : ''}</div>
+${(waits.roots ?? []).length === 0 && (waits.totalRoots ?? 0) > 0 ? '<div class="meta">等待根存在，但本页字节预算未保留任何一条；见上方显示数与截断标记。</div>' : (waits.roots ?? []).length === 0 ? '<div class="meta">当前目标没有已识别的工作流等待根。</div>' : ''}
 ${(waits.roots ?? []).map(r => {
   const kind = r.kind === 'dependency' ? '正常依赖等待' : r.kind === 'manager' ? '经理关口' : r.kind === 'owner' ? '老板关口' : r.kind === 'active_lease' ? '活租约等待' : '等待未知';
   const impact = r.impact === undefined ? '未知' : `${esc(r.impact)} 项`;

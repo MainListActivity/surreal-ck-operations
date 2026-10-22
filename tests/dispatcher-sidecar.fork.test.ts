@@ -14,6 +14,7 @@ import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
+import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse } from '../src/response-budget.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
 const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
@@ -696,8 +697,7 @@ run('company fork: plugin reload recovers a live review lease for report_blocker
 
 
 run('company fork: zero dispatch verdicts still report the live review dependency root through QA goal API and console', async () => {
-  const scratch = '/Users/y/Library/Application Support/SurrealCKCompany/scratch/engineering-fable-12c5e9';
-  const w = await startCompanyFork('qa-wait-roots', scratch);
+  const w = await startCompanyFork('qa-wait-roots');
   try {
     const enrollment = new LocalEnrollmentAdmin(w.db);
     const engineer = await enrollment.enroll('wait-root-engineer', 'engineering', ['execute', 'review']);
@@ -747,6 +747,13 @@ run('company fork: zero dispatch verdicts still report the live review dependenc
     expect((read.goal as any)?.waits?.roots?.[0]?.peopleCheckedAt).toBeTruthy();
     expect((read.goal as any)?.waits?.roots?.[0]?.submitCheckedAt).toBeTruthy();
     expect(Date.parse((read.goal as any).waits.checkedAt)).toBeGreaterThanOrEqual(Date.parse(observation!.at!));
+    // The answer the real core returns is what the relay measures: it must pass the same budget check the sidecar applies,
+    // because qa_observation_read has no paging input to recover from response_too_large.
+    expect(answerBytes(read)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const relayed = guardRelayResponse({ ok: true as const, data: read });
+    expect(relayed).toMatchObject({ ok: true });
+    expect((relayed as { data?: unknown }).data).toBe(read);
+    expect((read.goal as any)?.waits?.budgetLimited).toBeUndefined();
 
     const session = await factsCore.qaObservationSession(qa2, { scopeId: scope.id });
     const { createQaConsoleFetch } = await import('../plugin/server/qa-console.ts');
