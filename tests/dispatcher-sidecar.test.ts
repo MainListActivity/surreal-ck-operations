@@ -12,6 +12,7 @@ import type { SidecarDeps } from '../plugin/server/sidecar.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath, blockerPath } from '../src/comm.ts';
 import type { ArtifactReclaimResult } from '../src/dispatcher/artifact-sweeper.ts';
+import type { HostResources } from '../src/dispatcher/host.ts';
 import type { ArtifactTrigger } from '../src/dispatcher/artifact-reclaim.ts';
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
@@ -46,7 +47,11 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   const wf = {
     config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false, ...cfgOverride }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
-    providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
+    providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
+      for (const o of observations) { const i = instances.find(i => i.id === o.id); if (i) i.idleSince = o.since; }
+    }, openManagerWakes: async () => [],
+    retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
+    touchWake: async () => {}, defHealthy: async () => {},
     markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
       events.push(`exhausted:${provider}`);
       health = new Map(health).set(provider, { provider, state: 'exhausted', until: resetsAt ?? now + 1800, failures: 1 });
@@ -119,7 +124,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
-  let host = { freeMemMb: 8192, freeDiskMb: 65536 };
+  let host: HostResources = { freeMemMb: 8192, freeDiskMb: 65536 };
   /** Provider health the dispatcher reads; a test sets it to put a provider in (or past) cooldown. */
   let health = new Map<string, ProviderHealth>();
   /** What Paseo reports as the session's last error; empty unless a test sets it. */
@@ -150,7 +155,7 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
     authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
-    setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
+    setHost: (v: HostResources) => { host = v; },
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
     setRealign: (fn: typeof realign) => { realign = fn; },
     setQuota: (rows: ProviderQuota[]) => { quotaRows = rows; },
@@ -947,4 +952,31 @@ describe('R6: a def exempt from quota gating keeps dispatching through a spent s
       expect(w.agents.get('agent-9')!.status).toBe('idle');
     } finally { w.def.quotaLimited = undefined; }
   });
+});
+
+
+test('kernel pressure gates the real dispatcher even when byte estimates disagree', async () => {
+  const w = world();
+  w.addTask('kernel-pressure');
+  w.setHost({ freeMemMb: 8192, freeDiskMb: 65536, memoryPressure: 2 });
+  expect((await w.dispatcher().tick()).skipped).toBe('resources');
+  expect(w.events.some(e => e.startsWith('spawn:'))).toBe(false);
+  w.setHost({ freeMemMb: 100, freeDiskMb: 65536, memoryPressure: 1 });
+  expect((await w.dispatcher().tick()).woke).toHaveLength(1);
+});
+
+
+test('idle retirement waits for two hours of actual observations, then archives without a performance failure', async () => {
+  const w = world();
+  const inst: EmployeeInst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'synthetic', lastWakeAt: 1 };
+  w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+  w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+  expect((await w.dispatcher().tick()).retired).toEqual([]);
+  expect(inst.idleSince).toBe(1000);
+  w.setNow(8199);
+  expect((await w.dispatcher().tick()).retired).toEqual([]);
+  w.setNow(8201);
+  expect((await w.dispatcher().tick()).retired).toEqual([inst.id]);
+  expect(w.events).toContain('archive:agent-9');
+  expect(w.events).not.toContain('performance-failure');
 });

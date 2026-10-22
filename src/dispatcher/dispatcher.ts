@@ -11,7 +11,8 @@ import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
-import type { HostResources } from './host.ts';
+import { reclaimIdleSessions } from './idle-sessions.ts';
+import { memoryBlocked, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
@@ -971,10 +972,17 @@ export class Dispatcher {
       // An unreadable gate hides which session is bound, so nothing is rotated in that pass (fail-closed).
       const bound = new Set([...gates.values()].flatMap(gate => gate?.implementer ? [gate.implementer] : []));
       const rotationSafe = ![...gates.values()].includes(null);
+      if (rotationSafe) {
+        const idleRetired = await reclaimIdleSessions({ instances: insts, states, held: holding, bound, now,
+          minutes: cfg.sessionIdleMinutes ?? 120, workforce: wf, paseo,
+          archiveScene: inst => this.archiveInstScene(inst), log: text => this.log(text),
+        }).catch(error => { this.log(`idle cleanup failed safely: ${(error as Error).message}`); return [] as string[]; });
+        report.retired.push(...idleRetired);
+      }
       let inspected = 0;
       for (const inst of insts) {
         if (!rotationSafe) break;
-        if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
+        if (report.retired.includes(inst.id) || states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
         // Sidecar mode: a credential-file instance can never take new work (the pool
         // refuses to claim for it), so an idle one only wastes a provider seat and
         // misleads Jev's staffing picks. Retire it on sight.
@@ -1079,7 +1087,7 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     const host = this.hostResources();
-    const underFloor = Boolean(host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb));
+    const underFloor = Boolean(host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb));
     const headroom = cfg.artifactHeadroomMb ?? 0;
     const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
     let reclaimAttempt: ArtifactReclaimResult | undefined;
@@ -1104,12 +1112,12 @@ export class Dispatcher {
         }
       }
     }
-    if (host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb)) {
+    if (host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb)) {
       const why = reclaimAttempt?.disabled
         ? `；终态产物回收被${reclaimAttempt.disabledReason === 'env' ? '环境硬停（SCK_ARTIFACT_RECLAIM=0）' : '配置关闭（artifact_reclaim_enabled=false）'}，无法自动腾出空间`
         : '';
       await this.notice('resources',
-        `宿主机资源不足，本轮暂停派工：空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
+        `宿主机资源不足，本轮暂停派工：内存压力 ${host.memoryPressure ?? '未知（按空闲内存判断）'}，空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
       if (reclaimAttempt?.disabled) {
         await this.notice('resources-reclaim-blocked',
           `资源闸门正在阻塞全部派工，但终态产物回收不可用（${reclaimAttempt.disabledReason === 'env' ? 'SCK_ARTIFACT_RECLAIM=0 环境硬停' : 'artifact_reclaim_enabled=false'}）。空闲磁盘 ${host.freeDiskMb} MB，低于下限 ${cfg.minFreeDiskMb} MB。请恢复回收配置，或用 admin reclaim-artifacts --execute 手工回收。`, report, { force: true });

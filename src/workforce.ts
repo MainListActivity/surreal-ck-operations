@@ -57,6 +57,7 @@ export interface EmployeeInst {
   /** Minted at spawnInst or re-issued by rotate(); held by the caller (plugin sidecar) only. */
   credential?: string;
   lastWakeAt?: number;
+  idleSince?: number;
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
@@ -108,6 +109,8 @@ export interface CompanyConfig {
   sessionMaxWakes: number;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
+  /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
+  sessionIdleMinutes: number;
   /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
   evalQuickLlm: boolean;
   /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
@@ -139,7 +142,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -354,6 +357,7 @@ export class Workforce {
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
       quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
+      sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
@@ -424,13 +428,13 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number;
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
-      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0 }));
   }
 
@@ -487,19 +491,42 @@ export class Workforce {
    * the decision saw. The kind is recorded by the first retirement only: a later one cannot turn a non-normal retirement into a
    * normal one.
    */
-  async retire(employeeId: string, reason: string, kind: RetirementKind): Promise<void> {
+  async retire(employeeId: string, reason: string, kind: RetirementKind, idle?: EmployeeInst): Promise<void> {
     const [exists] = await this.db.query<[unknown]>('SELECT VALUE id FROM ONLY $e;', { e: id('employee', employeeId) });
     if (!exists) throw new CompanyError('not_found', 'Employee not found');
     await gateCredentialChange(this.db, employeeId, {
       operation: 'retire',
-      statement: `UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
+      statement: `IF $idle_guard = true {
+        LET $observed = SELECT * FROM ONLY $employee;
+        IF ($observed.idle_since ?? NONE) != $idle_since OR ($observed.last_wake_at ?? NONE) != $last_wake OR $observed.paseo_agent_id != $agent { THROW 'idle retirement moved' };
+        LET $wakes = SELECT VALUE id FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] AND (employee = $key OR agent = $agent);
+        IF array::len($wakes) > 0 { THROW 'idle retirement protected by manager wake' };
+      };
+      UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
         retired = true, retired_reason = $reason, retired_at = time::now(), revoked = true, credential_digest = $digest;`,
-      vars: { kind, reason, digest: revokedCredentialDigest() },
+      vars: { kind, reason, digest: revokedCredentialDigest(), idle_guard: !!idle, idle_since: idle?.idleSince, last_wake: idle?.lastWakeAt, agent: idle?.paseoAgentId },
     }, this.retirementHook);
   }
 
+  /** A turn can start and finish between polls; its lifecycle event invalidates any old idle timer. */
+  async clearIdleForAgent(agentId: string): Promise<void> {
+    await this.db.query('UPDATE employee SET idle_since = NONE WHERE paseo_agent_id = $agent AND retired != true;', { agent: agentId });
+  }
+
+  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number }>): Promise<void> {
+    if (!observations.length) return;
+    await this.db.query(`FOR $o IN $observations {
+      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake;
+    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt })) });
+  }
+
+  async retireIdle(inst: EmployeeInst): Promise<void> {
+    if (inst.idleSince === undefined) throw new CompanyError('retire_refused', 'Missing idle observation');
+    await this.retire(inst.id, '连续观测空闲超过配置时长，正常回收会话', 'rotation', inst);
+  }
+
   async touchWake(employeeId: string): Promise<void> {
-    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
   }
 
@@ -875,13 +902,18 @@ export class Workforce {
         external_started_at = IF external_started_at = NONE THEN time::unix(time::now()) ELSE external_started_at END,
         last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
         WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
+      IF $updated != NONE {
+        LET $seat = SELECT * FROM ONLY $employee_record;
+        IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'manager employee retired' };
+        IF $seat != NONE { UPDATE $employee_record SET idle_since = NONE; };
+      };
       IF $updated != NONE AND ($old.state ?? '') != 'running' {
         CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_started',
           evidence: $evidence, at: time::now() };
       };
       RETURN $updated;
       COMMIT;`, { d, task_ref: id('task', claim.input.taskId), wake_token: claim.token, attempt: claim.attempt,
-      employee, agent: agent ?? null, audit: id('audit', randomUUID()),
+      employee, employee_record: id('employee', employee), agent: agent ?? null, audit: id('audit', randomUUID()),
       evidence: JSON.stringify({ key: claim.key, token: claim.token, attempt: claim.attempt, employee, agent }) });
     return Boolean(updated);
   }
