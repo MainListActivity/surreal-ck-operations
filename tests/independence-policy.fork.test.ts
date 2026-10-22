@@ -87,11 +87,11 @@ const authorParent = async (author: 'src' | 'alias', parentId: string) => {
 };
 
 // R1 (v18 return): migration 023 must be loaded by the bootstrap of an empty database, not only exist as a file.
-test('a fresh bootstrap loads the independence migration: task has both fields and the schema marker reads 23', async () => {
+test('a fresh bootstrap loads the independence migration: task has both fields and the schema marker reads 28', async () => {
   const [info] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(info?.fields ?? {})).toEqual(expect.arrayContaining(['independence', 'independence_guard']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(23);
+  expect(marker?.[0]?.schema_version).toBe(28);
 });
 
 test('G5 replay: a source authored after the policy is a conflict at claim; the independent engineer still claims', async () => {

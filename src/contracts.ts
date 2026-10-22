@@ -50,6 +50,23 @@ export interface Principal {
   tracks?: string[];
 }
 
+/**
+ * Why a blocked task is waiting, derived from the row's authoritative facts (RW05/RW06). The owner and manager views read this
+ * instead of guessing from transient fields: a review-phase wait names the reviewing role, never the execute phase; a fact the
+ * row does not carry is `unknown`, not a default.
+ */
+export interface TaskWaiting {
+  /** manager: blocked for a GM decision; owner: a boss gate; dependency: waiting on other tasks (a review wait is one of these). */
+  kind: 'manager' | 'owner' | 'dependency';
+  /** The phase restored when the wait ends (`unknown` when the row carries none). */
+  resumeState: TaskState | 'unknown';
+  /** For dependency waits: the role whose phase is awaited (review wait -> the reviewer role); `unknown` when no fact names it. */
+  role: Role | 'owner' | 'unknown';
+  /** How many prerequisites the row records. The ids themselves stay in the task's own `dependencies` field, which SYS01's
+   *  per-item budget already truncates with an explicit flag; repeating them here would push a wide row past a page. */
+  dependenciesCount: number;
+}
+
 export interface TaskView {
   id: TaskId;
   title: string;
@@ -77,6 +94,12 @@ export interface TaskView {
   leaseExpiresAt?: string;
   fence: number;
   blockedTo?: 'gm' | 'owner';
+  /** Blocked rows: the phase to restore when the wait ends (ready/doing -> ready, review -> review). */
+  resumeState?: TaskState;
+  /** Blocked rows: the role recorded by the original block, kept for cross-role display and validation. */
+  resumeRole?: string;
+  /** Blocked rows: why the task waits, in the same authoritative terms for every view (RW06 C3). */
+  waiting?: TaskWaiting;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
@@ -94,14 +117,189 @@ export interface TaskView {
   lineage?: TaskId;
   /** 1-based version number inside the lineage (v1 has none until superseded). */
   revisionNo?: number;
+  /**
+   * Set on a write's echo (SYS01): the size and digest of the whole context, and whether `context` holds only its leading part.
+   * A cut context continues at contextNextOffset in read_task_text, which verifies the text against contextSha256.
+   */
+  contextBytes?: number;
+  contextSha256?: string;
+  contextTruncated?: boolean;
+  contextNextOffset?: number;
+  /**
+   * Set on a write's echo (SYS01 R3) and on a claim's task: each list that was cut to its leading part, with the whole count and
+   * the SHA-256 of the whole JSON. read_task_text (field dependencies, workIntentPaths or worktreePaths) returns the whole list.
+   */
+  listsTruncated?: Partial<Record<'dependencies' | 'workIntentPaths' | 'worktreePaths', ListCut>>;
+  /**
+   * Set on a task echo (SYS01 R3): each text field other than the context that was cut to its leading part, with the size and the
+   * SHA-256 of its whole value. The whole value is not readable through read_task_text.
+   */
+  fieldsTruncated?: Record<string, FieldCut>;
 }
+
+/** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
+export interface ListCut { count: number; sha256: string }
+
+/**
+ * References cut from one worktree of a paged listing (SYS01 R1): the whole list's count and SHA-256, the filter the list was
+ * read with, and the tool that reads the whole list. A reader never has to guess where the rest is.
+ */
+export interface ReferencesCut extends ListCut { includeReleased: boolean; tool: 'read_worktree_refs' }
+
+/** A text field of a task echo that was cut: the UTF-8 size of its whole value, and the SHA-256 of that value (SYS01 R3). */
+export interface FieldCut { bytes: number; sha256: string }
 
 export interface HistoryEntry {
   action: string;
   actor: string;
+  /**
+   * Evidence text. A complete answer carries it whole. A paged answer carries it whole too, unless the entry alone
+   * cannot fit a page: then evidenceTruncated is true, and read_task_text continues at evidenceNextOffset (C3).
+   */
   evidence?: string;
   version?: number;
   at: string;
+  /** Audit row id, the handle read_task_text takes for the full evidence (SYS01). */
+  auditId?: string;
+  /** Size and digest of the full evidence, whether or not the text above is cut. */
+  evidenceBytes?: number;
+  evidenceSha256?: string;
+  evidenceTruncated?: boolean;
+  /** Byte offset where read_task_text continues the evidence; present only when evidenceTruncated is true. */
+  evidenceNextOffset?: number;
+}
+
+/**
+ * Paging metadata of a paged answer (SYS01). A complete (legacy) answer carries no page: it is the whole set or it is
+ * refused as response_too_large. total is the stored listing's row count; snapshotAt is the database time it was read at.
+ */
+export interface PageInfo {
+  pageSize: number;
+  returned: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  total?: number;
+  /** Database time the listing was read at. The listing reflects the database as it stood then. */
+  snapshotAt?: string;
+  budgetBytes: number;
+}
+
+/**
+ * One part of the company block (get_context with scope company, SYS01 AC-A). The meta part carries `paused`. Each direction, goal
+ * and project is one item: its JSON text is cut into parts of a page's size, in order. A reader joins the `json` of the parts of one
+ * (section, key) item, checks the joined UTF-8 length against `totalBytes` and its SHA-256 against `sha256`, then parses it.
+ */
+export interface CompanyPart {
+  section: 'meta' | 'directions' | 'goals' | 'projects';
+  /** Stable within the listing: `company` for the meta part, `direction-<position>` for a direction, the id for a goal or project. */
+  key: string;
+  /** 0-based position of this part among the parts of its item. */
+  part: number;
+  /** How many parts the item has. */
+  parts: number;
+  /** Byte offset of this part in the item's JSON text. */
+  offset: number;
+  /** Byte length and SHA-256 (hex) of the whole item JSON text. */
+  totalBytes: number;
+  sha256: string;
+  /** This part of the item's JSON text, cut on UTF-8 character boundaries. */
+  json: string;
+}
+
+/**
+ * get_context answer (SYS01). A task answer carries `tasks`, `companyIncluded` and `companyRead` (the arguments that read the company
+ * block in pages). A company answer carries `scope: 'company'` and either `company` (complete) or `parts` with `page` (paged).
+ */
+export interface ContextView {
+  principal: Principal;
+  /** The company block: with includeCompany true on a task answer, or a complete scope-company answer. */
+  company?: unknown;
+  /** Whether a task answer carries the company block (AC-A: false unless includeCompany is true). */
+  companyIncluded?: boolean;
+  /** How to read the company block in pages: the get_context arguments that return it, one page at a time. */
+  companyRead?: { scope: 'company'; pageSize: number };
+  scope?: 'tasks' | 'company';
+  section?: 'directions' | 'goals' | 'projects';
+  parts?: CompanyPart[];
+  tasks?: Array<Record<string, unknown>>;
+  page?: PageInfo;
+}
+
+export interface HistoryPageView {
+  history: HistoryEntry[];
+  page: PageInfo;
+}
+
+export interface WorktreePageView {
+  worktrees: Array<Record<string, unknown>>;
+  page: PageInfo;
+}
+
+/**
+ * What read_task_text reads. context and evidence are text. project is the project environment as JSON (holder or gm only),
+ * and dependencies, workIntentPaths and worktreePaths are the task's lists as JSON arrays, so a claim echo that cut them can be
+ * read back whole (SYS01 R3).
+ */
+export type TaskTextField = 'context' | 'evidence' | 'project' | 'dependencies' | 'workIntentPaths' | 'worktreePaths';
+
+/** One byte segment of a text read by read_task_text (SYS01). */
+export interface TaskTextSegment {
+  taskId: string;
+  field: TaskTextField;
+  auditId?: string;
+  totalBytes: number;
+  /** SHA-256 of the whole text, so a reader can verify a reassembly. */
+  sha256: string;
+  offset: number;
+  bytes: number;
+  nextOffset: number | null;
+  text: string;
+}
+
+/**
+ * One byte segment of one worktree's references as JSON (SYS01 R1). It is the recovery entry a paged list_worktrees item names
+ * when its references were cut: the same task/gm scope as the listing, the whole list's size and SHA-256, and a byte window
+ * that reassembles exactly.
+ */
+export interface WorktreeRefsSegment {
+  /** The canonical path the listing returned. */
+  worktreePath: string;
+  /** The filter the whole list was read with: true lists released references too. */
+  includeReleased: boolean;
+  totalBytes: number;
+  /** SHA-256 of the whole references text, so a reader can verify a reassembly. */
+  sha256: string;
+  offset: number;
+  bytes: number;
+  nextOffset: number | null;
+  text: string;
+}
+
+/** gm-only read-only summary (SYS01): counts at a cutoff, never task text. */
+export interface AdminSummary {
+  /** Database time of the read. Every count reflects the database as it stood then. */
+  cutoffAt: string;
+  /** Start of the audit window, [since, cutoffAt]. Declared even when the task counts ignore it. */
+  since: string;
+  goalId?: string;
+  /** What each count covers. `since` limits only the audit counts; task counts are the state at cutoffAt. */
+  scope: { tasks: string; audit: string };
+  tasks: Record<string, number>;
+  audit: Record<string, number>;
+  outboxSequence: number;
+  integrity: {
+    /**
+     * True only when the read was consistent (its two in-transaction reads agree), every row is grouped under a
+     * known state, and each count matches the rows it covers. Otherwise false: retry the summary.
+     */
+    complete: boolean;
+    method: string;
+    taskRows: number;
+    auditRows: number;
+    checks: { taskCountsMatchRows: boolean; auditCountsMatchRows: boolean; statesKnown: boolean; repeatableRead: boolean };
+    /** Present only when a task row carries a state outside the known set. */
+    unknownStates?: string[];
+  };
 }
 
 export interface CreateTask {
@@ -129,13 +327,36 @@ export interface CreateTask {
   revises?: TaskId;
 }
 
+/**
+ * A complete, credential-scoped lease still active on the server for the authenticated employee.
+ * The sidecar uses this after a plugin reload instead of a list preview: lists are bounded and
+ * hide the employee's own review rows, so a trailing review lease would otherwise vanish.
+ */
+export interface ActiveLease {
+  taskId: TaskId;
+  state: 'doing' | 'review';
+  deliveryId: DeliveryId;
+  fence: number;
+  version: number;
+  leaseExpiresAt: string;
+  /** The role the holder acts under in this phase (executor for doing, reviewer for review). */
+  role: Role;
+  currentEmployee: EmployeeId;
+}
+
 export interface ClaimResult {
   task: TaskView;
   deliveryId: DeliveryId;
   fence: number;
   leaseExpiresAt: string;
-  /** Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task. */
+  /**
+   * Prior claims, checkpoints, returns, owner decisions and revocation handovers for this task, oldest first: the newest entries
+   * that core read. historyCount is the number of entries the task holds in all; historyComplete is true only when history holds
+   * every one of them. get_task_history pages the whole history (SYS01 R3).
+   */
   history: HistoryEntry[];
+  historyCount?: number;
+  historyComplete?: boolean;
   /** Earlier holders of this task with their Paseo session IDs; the successor can pull full transcripts. */
   predecessors?: SessionRef[];
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
@@ -173,6 +394,11 @@ export interface ProjectView {
   runbooks: string[];
   notes?: string;
   envs: Array<{ name: string; url?: string; healthUrl?: string; verify?: string; secrets: Array<{ name: string; roles: Role[] }> }>;
+  /**
+   * Set on a company block read by someone who may not see the environments (SYS01 M3): `envs` is then empty, not the project's
+   * list. The owner's console never sets it.
+   */
+  envsWithheld?: true;
 }
 
 export interface CreateDelivery {
@@ -190,12 +416,12 @@ export interface CreateDelivery {
   idempotencyKey: string;
 }
 
-/** gm only: re-point an execute-phase gm block at unmet dependencies instead of the manager. */
+/** gm only: re-point a gm block — execute, or a provable normal non-owner review block — at unmet dependencies instead of the manager. */
 export interface DeferTaskUntil {
   taskId: TaskId;
-  /** Dependencies to merge into the task's existing set (union, same goal, acyclic). */
+  /** Dependencies to merge into the task's existing set (union, same goal, acyclic after resolution). */
   dependencies: TaskId[];
-  /** Business reason for the wait; audited together with the before/after dependency snapshot. */
+  /** Business reason for the wait; audited together with the before/after dependency snapshot and the restore phase. */
   text: string;
   idempotencyKey: string;
   /** Optimistic concurrency: refuse when the task version has moved. */
@@ -374,11 +600,145 @@ export interface ContributorDryRunView {
   }>;
 }
 
+
+/** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记的范围视图。不携带任何凭证。 */
+export interface QaObservationScopeView {
+  id: string; goalId: string; deploymentTaskId: string; qaEmployee: string;
+  leaseHolder: string; leaseFence: number; subjects: string[];
+  status: 'active' | 'revoked'; expiresAt: string; version: number;
+  reason: string; createdAt: string; revokedAt?: string; revokedReason?: string;
+}
+/** GM 登记 scope：绑定正在审的部署任务、同 goal、QA 实际复核租约 holder/fence、任务 allowlist、期限与理由。 */
+export interface QaObservationGrant {
+  goalId: string; deploymentTaskId: string; qaEmployee: string; leaseFence: number;
+  subjects: string[]; expiresAt: string; reason: string; idempotencyKey: string;
+}
+export interface QaObservationRevoke { scopeId: string; expectedVersion: number; reason: string; idempotencyKey: string; }
+/** 读接口的两种调用身份：员工本人的 sck 凭证，或浏览器受限会话令牌（都不是 owner token）。 */
+export interface QaObservationAuth { credential?: Credential; token?: string; }
+export interface QaObservationDispatchReason {
+  code: string; text: string; candidates: string[]; owner: string; recovery: string;
+  nextTrigger: string; basis: string; until?: string;
+  /**
+   * Structured recovery actions with their authority and tool (F1). Observations written before this field existed do not
+   * carry it: the page shows the action as unknown rather than inventing one.
+   */
+  actions?: Array<{ authority: string; label: string; tool?: string; executable: boolean }>;
+}
+
+/**
+ * The goal-level root blocker for a QA goal summary (F2). Built by the same server-side evaluator the owner pulse uses
+ * (goalRootBlockers over the pass's verdicts); the QA channel never re-derives a parallel conclusion.
+ * `factsAvailable` is false when the waiting graph / people could not be read: impact, dependencyPath and people are then
+ * omitted (unknown), never reported as zero or empty-as-fact.
+ */
+export interface QaObservationGoalRoot {
+  taskId: string; title: string; phase: 'execute' | 'review'; workflowState: 'ready' | 'doing' | 'review';
+  summary: string; feasible: boolean; waitingMinutes: number; since?: string; checkedAt: string;
+  eligibleCount: number; undispatchable: number; others: number;
+  /** The notice key of the root verdict, so a QA can name the episode the owner was told about. */
+  noticeKey?: string;
+  factsAvailable: boolean;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  reasons: QaObservationDispatchReason[];
+  reasonsOmitted?: number;
+}
+export interface QaObservationGoalWaitRoot {
+  goalId?: string;
+  taskId: string;
+  title: string;
+  workflowState: 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
+  kind: 'dependency' | 'manager' | 'owner' | 'active_lease' | 'unknown';
+  basis: string;
+  waitingForRole: string;
+  nextTrigger: string;
+  goalRootCount: number;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  dependencyPathTruncated?: boolean;
+  unknownReason?: string;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  peopleSource?: 'contributor-audit';
+  submitterSource?: 'submit-audit';
+  submitCommitSource?: 'submit-audit-evidence';
+  peopleCheckedAt?: string;
+  submitCheckedAt?: string;
+}
+export interface QaObservationGoalWaitSummary {
+  source: 'workflow-graph';
+  available: boolean;
+  checkedAt?: string;
+  totalRoots: number;
+  shownRoots: number;
+  truncated: boolean;
+  /** true when the cut was made for the response byte budget, not only by the root limit: roots or paths were shortened. */
+  budgetLimited?: boolean;
+  reason?: string;
+  roots: QaObservationGoalWaitRoot[];
+}
+
+export interface QaObservationDispatchVerdict {
+  phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
+  eligibleCount: number; feasible: boolean; summary: string;
+  reasons: QaObservationDispatchReason[]; checkedAt: string; since?: string; waitingMinutes: number;
+}
+export interface QaObservationDispatch {
+  available: boolean; source: string; checkedAt?: string; reason?: string;
+  /** true only when the stored pass is a complete observation; false means partial/unavailable, never a silent cut. */
+  complete?: boolean;
+  /** Counts of the pass before any storage decision; a reader can compare them with what it received. */
+  originalVerdicts?: number; originalReasons?: number;
+  /** The latest persistence attempt: the stored snapshot is stale when the last write failed. */
+  attemptAt?: string; attemptOk?: boolean;
+  verdicts?: QaObservationDispatchVerdict[];
+}
+export interface QaObservationMeta {
+  checkedAt: string; dataSource: 'live'; instanceAt: string; runtimeRelease?: string;
+  scope: QaObservationScopeView;
+  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean; dispatchComplete?: boolean };
+}
+export interface QaObservationReadInput { scopeId?: string; taskId?: string; goalId?: string; }
+export interface QaObservationContribution {
+  authors: string[]; reviewers: string[]; excluded: string[];
+  unknown: Array<{ actor: string; action: string; at?: string; reason: string }>;
+  implementer?: string; ambiguous: boolean;
+}
+export interface QaObservationReadView {
+  meta: QaObservationMeta;
+  task?: TaskView;
+  contribution?: QaObservationContribution;
+  dispatch?: QaObservationDispatch;
+  goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
+    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    /** Workflow waits are read from a separately timed, goal-scoped graph, not the dispatcher pass. */
+    waits?: QaObservationGoalWaitSummary;
+    /** F2: the goal's root blocker from the same evaluator the owner page reads, with impact and dependency path. */
+    root?: QaObservationGoalRoot };
+  contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
+  contextRead?: { taskId: string; field: 'context'; offset: number };
+}
+export interface QaObservationTimelineView { meta: QaObservationMeta; history: HistoryEntry[]; page: PageInfo }
+export interface QaObservationTextSegment {
+  meta: QaObservationMeta; taskId: string; field: 'context' | 'evidence'; auditId?: string;
+  totalBytes: number; sha256: string; offset: number; bytes: number; nextOffset: number | null; text: string;
+}
+export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
+export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
+
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
   authenticate(credential: Credential): Promise<Principal>;
   listTasks(credential: Credential, state?: TaskState): Promise<TaskView[]>;
+  /**
+   * Complete active leases (doing/review) held by the authenticated employee, with no list
+   * preview, pagination, output budget or self-review row filter. Optional for old adapters;
+   * a sidecar that needs to rebuild a lease after reload must fail closed without it.
+   */
+  activeLeases?(credential: Credential): Promise<ActiveLease[]>;
   getTask(credential: Credential, taskId: TaskId): Promise<TaskView>;
   createTask(credential: Credential, input: CreateTask): Promise<TaskView>;
   claim(credential: Credential, taskId: TaskId): Promise<ClaimResult>;
@@ -406,7 +766,7 @@ export interface CompanyCore {
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
-  /** gm only: an execute-phase gm block becomes a dependency wait — stays blocked for the dispatcher, auto-resumes on the last dependency finishing. */
+  /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;
   /** gm/product: mark a task 'void' (terminal), release any lease on it, and unlock dependents that were waiting only on it. */
   retireTask(credential: Credential, input: RetireTask): Promise<TaskView>;
@@ -414,12 +774,37 @@ export interface CompanyCore {
   goalAcceptancePreview?(credential: Credential, input: GoalAcceptancePreview): Promise<GoalAcceptanceView>;
   /** gm (manage): compare-and-set repair of a quick/software goal's acceptance reference; audited and idempotent. */
   goalAcceptanceRepair?(credential: Credential, input: GoalAcceptanceRepair): Promise<GoalAcceptanceResult>;
+  /** SYS01 bounded reads: optional so older adapters still compile; the sidecar and MCP layers check for them. */
+  contextView?(credential: Credential, input: Record<string, unknown>): Promise<ContextView>;
+  historyView?(credential: Credential, taskId: TaskId, input: Record<string, unknown>): Promise<HistoryPageView>;
+  worktreePage?(credential: Credential, input: Record<string, unknown>): Promise<WorktreePageView>;
+  /** list_worktrees without pageSize or cursor: the pre-SYS01 array, in the same compact form as a page. */
+  worktreeList?(credential: Credential, input: Record<string, unknown>): Promise<unknown[]>;
+  /** One byte segment of one worktree's references, as a cut listing item named it (SYS01 R1). Same scope as listWorktrees. */
+  worktreeRefs?(credential: Credential, input: Record<string, unknown>): Promise<WorktreeRefsSegment>;
+  taskText?(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment>;
+  adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
   /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
   setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
-  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
+  /**
+   * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
+   * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
+   * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
+   */
+  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
+  /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
+  qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
+  qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;
+  qaObservationStatus?(credential: Credential): Promise<QaObservationScopeView[]>;
+  qaObservationSession?(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView>;
+  qaObservationLogin?(code: string): Promise<QaObservationLoginView>;
+  qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
+  qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
+  qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
+
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
@@ -474,6 +859,7 @@ export interface DefView {
   maxInstances: number;
   priority: number;
   weight: number;
+  quotaLimited?: boolean;
 }
 
 /**
@@ -492,6 +878,8 @@ export interface EnsureDef {
   priority?: number;
   weight?: number;
   enabled?: boolean;
+  /** false = dispatched even when the subscription's remaining allowance is 0. Absent keeps the stored value. */
+  quotaLimited?: boolean;
 }
 
 export interface EmployeeScore {
@@ -524,6 +912,8 @@ export interface ProviderQuota {
   weeklyPct?: number;
   status?: string;
   fetchedAt?: string;
+  /** Upstream reset of the window that is closest to running out (ISO 8601), when the provider reports one. */
+  resetsAt?: string;
 }
 
 export type OwnerDecision = 'approve' | 'reject' | 'reply';

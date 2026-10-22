@@ -3,6 +3,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { installBunShim } from "./server/bun-shim";
 import { company } from "./server/company";
 import { createConsoleFetch } from "./server/console";
+import { createQaConsoleFetch } from "./server/qa-console";
 import { registerHandlers } from "./server/handlers";
 import { startDispatch } from "./server/dispatch";
 import { loadServiceEnv, serviceHome } from "./server/env";
@@ -27,7 +28,8 @@ export default function contribute(server: PluginServerContext) {
   const stopDispatch = startDispatch(server);
   let preview!: PreviewHandle;
   const consoleFetch = createConsoleFetch({ home: serviceHome(), company, lanBase: () => preview.lanUrl });
-  preview = startPreview({ consoleFetch });
+  const qaConsoleFetch = createQaConsoleFetch({ home: serviceHome(), company });
+  preview = startPreview({ consoleFetch, qaFetch: qaConsoleFetch });
   return () => {
     stopDispatch();
     void preview.stop();

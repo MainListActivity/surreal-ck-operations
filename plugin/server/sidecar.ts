@@ -4,16 +4,30 @@
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
+import { OpsCircuit } from "./ops-circuit";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
   writeFileAtomic, type CommRequest, type CommResponse,
 } from "./vendor/src/comm.ts";
 import { serviceHome } from "./env";
-import type { ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
+import type { ActiveLease, ClaimResult, CompanyCore, Evidence, LeaseProof, TaskView, WorktreeAssignment, WriteScopeHolder } from "./vendor/src/contracts.ts";
 import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workforce.ts";
+import { guardRelayResponse } from "./vendor/src/response-budget.ts";
+import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
+import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
+
+/** The release the service is running (the `active` symlink); undefined when it cannot be read. */
+const qaRuntimeRelease = (): string | undefined => {
+  try { return basename(realpathSync(join(serviceHome(), "active"))); } catch { return undefined; }
+};
+/** Stamp the actual running release onto a QA read answer; never a guessed value. */
+const withQaRelease = <T extends { meta: object }>(value: T): T => {
+  const release = qaRuntimeRelease();
+  return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+};
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -30,11 +44,14 @@ const BASE_TOOLS = [
   "bind_task_code_repo",
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
+  // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
+  "get_admin_summary", "read_task_text", "read_worktree_refs",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
+  "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
+  "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
   // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
-  "independence_set",
-  // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
+  "independence_set",  // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
 ];
 
@@ -73,6 +90,8 @@ export interface SidecarDeps {
 interface LiveClaim {
   instId: string;
   taskId: string;
+  /** The server phase this lease was claimed for; review leases never submit a report.md. */
+  phase: "doing" | "review";
   proof: LeaseProof;
   /** Hash of artifact content already consumed, so a stale file never submits twice. */
   reportHash?: string;
@@ -101,7 +120,8 @@ export class SidecarPool {
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
   private readonly denials = new Map<string, string>();
-  constructor(private readonly deps: SidecarDeps) {}
+  private readonly opsCircuit: OpsCircuit;
+  constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
@@ -111,15 +131,29 @@ export class SidecarPool {
     }
     const dir = commDir(this.deps.runDir, inst.id);
     ensureCommDirs(dir);
+    const scratch = this.scratchDirFor(inst.id);
     const held = this.keys.get(inst.id);
-    if (held) return { SCK_COMM_DIR: dir, SCK_COMM_KEY: held };
+    if (held) return { SCK_COMM_DIR: dir, SCK_COMM_KEY: held, SCK_SCRATCH_DIR: scratch, TMPDIR: scratch };
     this.launched.add(inst.id);
     const key = randomBytes(16).toString("hex");
     this.keys.set(inst.id, key);
     this.active.add(inst.id);
     if (inst.credential) this.creds.set(inst.id, inst.credential);
     this.ensureSweeper();
-    return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key };
+    return { SCK_COMM_DIR: dir, SCK_COMM_KEY: key, SCK_SCRATCH_DIR: scratch, TMPDIR: scratch };
+  }
+
+  /** Per-instance scratch root: agents put clones/builds/temp media here, never in /tmp or the host dir.
+   *  Derived from the comm root so an overridden SCK_COMM_ROOT (tests, alternate homes) keeps it in one place. */
+  scratchDirFor(instId: string): string {
+    const dir = join(dirname(this.deps.runDir), "scratch", instId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
+  /** Instance ids this pool is currently answering for; everything else in comm/ is a dead channel. */
+  liveInstanceIds(): Set<string> {
+    return new Set([...this.active, ...this.quarantined, ...this.keys.keys()]);
   }
 
   /** Absolute comm dir path for prompts — agents must never need to resolve env vars. */
@@ -219,7 +253,8 @@ export class SidecarPool {
     try {
       const cred = await this.credentialFor(held.instId);
       const task = await this.deps.core.getTask(cred, held.taskId);
-      return task.currentEmployee !== held.instId
+      return (task.state !== "doing" && task.state !== "review")
+          || task.currentEmployee !== held.instId
           || task.deliveryId !== held.proof.deliveryId
           || (task.leaseExpiresAt !== undefined && Date.parse(task.leaseExpiresAt) <= Date.now());
     } catch {
@@ -292,7 +327,7 @@ export class SidecarPool {
     this.archive(reportPath(dir), "stale");
     this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
-      instId: inst.id, taskId: task.id,
+      instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
     this.startBeat(inst.id);
@@ -303,14 +338,17 @@ export class SidecarPool {
   /** Spawn/wake/workspace-handoff rollback after a pre-claim: hand the lease back without a
    * reviewer verdict — never routed through returnTask, which would fake a return and bounce
    * a review task back to doing. Cores without the release op let the lease expire on its own. */
-  async releaseClaim(instId: string, _taskId: string, reason: string): Promise<void> {
+  async releaseClaim(instId: string, _taskId: string, reason: string, options: { strict?: boolean } = {}): Promise<void> {
     const live = this.claims.get(instId);
-    this.endLease(instId);
+    if (!options.strict) this.endLease(instId);
     if (!live) return;
     try {
       const cred = await this.credentialFor(instId);
+      if (options.strict && !this.deps.core.release) throw new Error("core release unavailable");
       await this.deps.core.release?.(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
+      if (options.strict && this.claims.get(instId) === live) this.endLease(instId);
     } catch (error) {
+      if (options.strict) throw error;
       this.log(`releaseClaim ${instId} failed (lease will expire): ${(error as Error).message}`);
     }
   }
@@ -318,7 +356,7 @@ export class SidecarPool {
   /** Turn ended: ingest the agent's artifacts, then let the lease live or die.
    * The keepalive is NOT stopped here — the claim may outlive this turn (multi-turn
    * work), and a claim whose beat died becomes an orphan no heartbeat can expire. */
-  async settle(agentId: string): Promise<SettleResult> {
+  async settle(agentId: string, options: { infrastructureFailure?: boolean } = {}): Promise<SettleResult> {
     const instId = this.instByAgent.get(agentId);
     if (!instId) return { status: "no_claim" };
     const dir = commDir(this.deps.runDir, instId);
@@ -333,19 +371,26 @@ export class SidecarPool {
       }
       return { status: "no_claim" };
     }
+    // A review turn closes through `review` or report_blocker, never through a report.md
+    // submit. Keep the lease and archive the non-closeout artifact instead of trying to
+    // submit a review task (which would fail and then end a still-valid lease).
+    if (live.phase === "review" && report !== undefined && hash(report) !== live.reportHash) {
+      this.log(`review report.md is not a closeout for ${instId} on ${live.taskId}; archiving`);
+      this.archive(reportPath(dir), "stale");
+    }
     if (blocker !== undefined && hash(blocker) !== live.blockerHash) {
       await this.finish(instId, live, "gm", blocker, blockerPath(dir));
       return { status: "ingested" };
     }
-    if (report !== undefined && hash(report) !== live.reportHash) {
+    if (live.phase !== "review" && report !== undefined && hash(report) !== live.reportHash) {
       await this.finish(instId, live, undefined, report, reportPath(dir));
       return { status: "ingested" };
     }
     // Turn closed with the round still open: keep the lease while the caller decides
     // between a wake nudge and a server-side release; the count feeds that decision.
-    live.nudges = (live.nudges ?? 0) + 1;
+    if (!options.infrastructureFailure) live.nudges = (live.nudges ?? 0) + 1;
     this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
-    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges } };
+    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0 } };
   }
 
   private async finish(
@@ -465,32 +510,94 @@ export class SidecarPool {
   }
 
   /**
-   * Re-establish the local claim for a lease that survived the restart, then run
-   * the turn-end ingest for artifacts the agent may have written while we were
-   * down. Only ingest when claim.json still names this delivery — older files
-   * belong to a dead lease and are archived as stale.
+   * Re-establish the local claim for a lease that survived the restart, then run the
+   * turn-end ingest for artifacts the agent may have written while we were down.
+   *
+   * The server lookup is a complete credential-scoped query (`activeLeases`), not a task
+   * list: listTasks is bounded and hides the employee's own review rows, which made a
+   * review holder lose its lease after a plugin reload. The server remains the authority:
+   * a local claim.json is only trusted for artifact delivery matching, never for deciding
+   * that a lease exists. Ambiguous, expired, foreign or unreadable leases fail closed.
    */
   private async rebuildClaim(inst: EmployeeInst): Promise<void> {
     const cred = await this.credentialFor(inst.id);
-    const doing = await this.deps.core.listTasks(cred, "doing");
-    const live = doing.find(t => t.currentEmployee === inst.id && !!t.deliveryId &&
-      (!t.leaseExpiresAt || Date.parse(t.leaseExpiresAt) > Date.now()));
-    if (!live) return;
+    if (!this.deps.core.activeLeases) {
+      throw new Error("core does not expose activeLeases; refusing to rebuild a lease from a bounded list");
+    }
+    const leases: ActiveLease[] = await this.deps.core.activeLeases(cred);
+    const now = Date.now();
+    const mine = leases.filter(lease => lease.currentEmployee === inst.id
+      && (lease.state === "doing" || lease.state === "review")
+      && !!lease.deliveryId
+      && Number.isSafeInteger(lease.fence) && lease.fence >= 1
+      && Number.isSafeInteger(lease.version)
+      && typeof lease.leaseExpiresAt === "string"
+      && Date.parse(lease.leaseExpiresAt) > now);
     const dir = commDir(this.deps.runDir, inst.id);
+    if (mine.length > 1) {
+      this.log(`sidecar adoption ambiguous for ${inst.id}: ${mine.length} active leases (${mine.map(l => l.taskId).join(", ")})`);
+      return;
+    }
+    if (!mine.length) {
+      // No server lease: the channel may still be live, but claim.json and artifacts are dead.
+      this.endLease(inst.id);
+      this.archive(reportPath(dir), "stale");
+      this.archive(blockerPath(dir), "stale");
+      return;
+    }
+    const lease = mine[0]!;
+    const task = await this.deps.core.getTask(cred, lease.taskId);
+    if (task.state !== lease.state || task.currentEmployee !== inst.id || task.deliveryId !== lease.deliveryId
+        || !task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) <= Date.now()
+        || !Number.isSafeInteger(task.fence) || task.fence < 1 || !Number.isSafeInteger(task.version)) {
+      this.log(`sidecar adoption lease ${lease.taskId} for ${inst.id} changed during recovery; not restoring`);
+      return;
+    }
+    const claimPath = join(dir, "claim.json");
+    const prior = readJsonFile<Partial<ClaimResult>>(claimPath);
+    const trustedArtifacts = prior?.task?.id === task.id && prior.deliveryId === lease.deliveryId;
+    const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    const snapshot = {
+      ...(trustedArtifacts && prior ? prior : {}),
+      task,
+      deliveryId: lease.deliveryId,
+      fence: task.fence,
+      leaseExpiresAt: task.leaseExpiresAt,
+      history: trustedArtifacts && Array.isArray(prior?.history) ? prior.history : [],
+      worktree: task.worktree,
+      evidenceDir,
+    } as ClaimResult & { evidenceDir: string };
     this.claims.set(inst.id, {
-      instId: inst.id, taskId: live.id,
-      proof: { taskId: live.id, deliveryId: live.deliveryId!, fence: live.fence, expectedVersion: live.version },
+      instId: inst.id, taskId: task.id, phase: lease.state,
+      proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });
     this.startBeat(inst.id);
-    this.log(`sidecar adopted lease ${live.id} for ${inst.id}`);
-    const claimMeta = readJsonFile<{ deliveryId?: string }>(join(dir, "claim.json"));
-    if (claimMeta?.deliveryId !== live.deliveryId) {
+    this.log(`sidecar adopted ${lease.state} lease ${task.id} for ${inst.id}`);
+    try {
+      writeFileAtomic(claimPath, JSON.stringify(snapshot));
+    } catch (error) {
+      // The in-memory proof is enough for sck writes; a failed snapshot refresh must not
+      // turn a valid recovered lease into no_lease.
+      this.log(`adopted claim.json refresh ${inst.id} failed: ${(error as Error).message}`);
+    }
+    if (!trustedArtifacts) {
       this.archive(reportPath(dir), "stale");
       this.archive(blockerPath(dir), "stale");
       return;
     }
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
+    if (lease.state === "review") {
+      // report.md is execute-phase closeout; archive it without ending a valid review lease.
+      if (report !== undefined) {
+        this.log(`adopted review lease ${task.id} for ${inst.id} has report.md; archiving it`);
+        this.archive(reportPath(dir), "stale");
+      }
+      const claim = this.claims.get(inst.id);
+      if (blocker !== undefined && claim) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
+      return;
+    }
     const claim = this.claims.get(inst.id);
     if (!claim) return;
     if (blocker !== undefined) await this.finish(inst.id, claim, "gm", blocker, blockerPath(dir));
@@ -551,7 +658,10 @@ export class SidecarPool {
     if (tool === "__list__") return { tools: [...BASE_TOOLS, ...(ops?.tools ?? []), ...(media?.tools ?? []), ...(browser?.tools ?? []), ...(sync?.tools ?? [])] };
     if (tool === "heartbeat") return { ok: true }; // the sidecar owns keepalive
     if (tool === "claim_next") throw Object.assign(new Error("任务由调度通道代领，无需手动 claim"), { code: "forbidden" });
-    const cred = forceRotate ? await this.rotateCredential(instId) : await this.credentialFor(instId);
+    // SYS01 M1: for a snapshot-backed listing the reply ceiling covers the credential phase too, counted from the same
+    // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
+    const resolveCred = () => (forceRotate ? this.rotateCredential(instId) : this.credentialFor(instId));
+    const cred = SNAPSHOT_TOOLS.has(tool) ? await withinReplyCeiling(resolveCred) : await resolveCred();
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
@@ -574,32 +684,68 @@ export class SidecarPool {
     if (gateway) {
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;
-      return gateway.call(cred, live().taskId, tool, rest);
+      const claim = live();
+      if (gateway !== ops) return gateway.call(cred, claim.taskId, tool, rest);
+      return this.opsCircuit.run({ employee: instId, task: claim.taskId, delivery: claim.proof.deliveryId, tool,
+        check: () => { live(); }, invoke: () => gateway.call(cred, claim.taskId, tool, rest),
+        block: text => writeOp(proof => core.block(cred, proof, "gm", {
+          text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${tool}`,
+        }), true),
+      });
     }
     switch (tool) {
-      case "list_worktrees": {
+      case "list_worktrees": return withinReplyCeiling(async () => {
+        // R8：不带 taskId 即全局库存，只有 gm 可读，由 core 判定并拒绝员工；租约任务不再作为回退范围。
+        // 显式 taskId 走 core 的 getTask 授权。null 与缺省相同（与 MCP、core 同源）：parseWorktreeInput 只接受字符串 taskId。
+        const scope = parseWorktreeInput(args).taskId;
+        // C1 default: a call that names neither pageSize nor cursor keeps the pre-SYS01 array; a paged call returns { worktrees, page }.
+        if (isPaged(args) && core.worktreePage) return core.worktreePage(cred, { ...args, taskId: scope });
+        if (core.worktreeList) return core.worktreeList(cred, { ...args, taskId: scope });
+        // Cores that predate SYS01 keep the old unpaged array.
         if (!core.listWorktrees) return [];
-        if (args.taskId !== undefined) return core.listWorktrees(cred, String(args.taskId));
-        // GM 缺省取全局库存（runbook：list_worktrees {}）；员工缺省仍按当前租约任务取数。
-        const actor = await core.authenticate(cred);
-        return core.listWorktrees(cred, actor.role === "gm" ? undefined : live().taskId);
+        return core.listWorktrees(cred, scope);
+      });
+      case "reclaim_worktrees": {
+        // Strict, as on MCP and in core (SYS01, D3): a null or non-boolean dryRun, and a repos that is not a list of paths, are
+        // refused before any tree is touched. A non-list repos used to widen silently into a reclaim of every repository.
+        const params = parseReclaimInput(args);
+        return core.reclaimWorktrees
+          ? core.reclaimWorktrees(cred, params)
+          : { scanId: "", removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
       }
-      case "reclaim_worktrees": return core.reclaimWorktrees
-        ? core.reclaimWorktrees(cred, {
-            dryRun: args.dryRun === true,
-            repos: Array.isArray(args.repos) ? args.repos.map(String) : undefined,
-          })
-        : { scanId: "", removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
       case "list_worktree_audits": return core.listWorktreeAudits
         ? core.listWorktreeAudits(cred, typeof args.limit === "number" ? args.limit : undefined)
         : [];
-      case "get_context":
+      // SYS01: bounded pages. A call that names neither pageSize nor cursor keeps the task keys; the company block is in an answer only
+      // when includeCompany is true (AC-A, the same default as core). A core without contextView answers the same keys, and ignores
+      // scope and paging (SYS01 AC-A note): scope "company" is answered only by a core with contextView.
+      case "get_context": return withinReplyCeiling(async () => {
+        if (core.contextView) return core.contextView(cred, args);
+        const withCompany = args.includeCompany === true;
         return {
           principal: await core.authenticate(cred),
-          company: await core.companyBrief(cred),
-          tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, args.state as never),
+          companyIncluded: withCompany,
+          companyRead: { scope: "company", pageSize: 25 },
+          ...(withCompany ? { company: await core.companyBrief(cred) } : {}),
+          tasks: args.taskId ? [await core.getTask(cred, String(args.taskId))] : await core.listTasks(cred, (args.state ?? undefined) as never),
         };
-      case "get_task_history": return { history: await core.history(cred, String(args.taskId)) };
+      });
+      case "get_task_history": return withinReplyCeiling(async () => {
+        // C2 default: without pageSize or cursor (null counts as absent) the complete history, or response_too_large, in the pre-SYS01 { history } shape of this channel.
+        const taskId = taskIdOf(args.taskId);
+        if (isPaged(args) && core.historyView) return core.historyView(cred, taskId, args);
+        return { history: await core.history(cred, taskId) };
+      });
+      case "get_admin_summary": return core.adminSummary
+        ? core.adminSummary(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose get_admin_summary"), { code: "temporarily_unavailable" }));
+      case "read_task_text": return core.taskText
+        ? core.taskText(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose read_task_text"), { code: "temporarily_unavailable" }));
+      // SYS01 R1: the recovery entry a paged list_worktrees item names when its references were cut. Same scope as the listing (core).
+      case "read_worktree_refs": return core.worktreeRefs
+        ? core.worktreeRefs(cred, args)
+        : Promise.reject(Object.assign(new Error("core does not expose read_worktree_refs"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
@@ -610,7 +756,7 @@ export class SidecarPool {
       case "create_delivery": return core.createDelivery(cred, args as never);
       case "record_owner_decision": return core.relayOwnerDecision(cred, args as never);
       case "set_direction": await core.relayDirection(cred, args as never); return { recorded: true };
-      case "resume_task": return core.resume(cred, String(args.taskId), evidence());
+      case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
       case "retire_task": return core.retireTask(cred, args as never);
       case "task_project_update": return core.taskProjectUpdate
@@ -628,6 +774,30 @@ export class SidecarPool {
       case "contributor_dryrun": return core.contributorDryRun
         ? core.contributorDryRun(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
+      case "qa_observation_grant": return core.qaObservationGrant
+        ? core.qaObservationGrant(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_grant"), { code: "temporarily_unavailable" }));
+      case "qa_observation_revoke": return core.qaObservationRevoke
+        ? core.qaObservationRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_revoke"), { code: "temporarily_unavailable" }));
+      case "qa_observation_status": return core.qaObservationStatus
+        ? core.qaObservationStatus(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_status"), { code: "temporarily_unavailable" }));
+      case "qa_observation_session": return core.qaObservationSession
+        ? core.qaObservationSession(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_session"), { code: "temporarily_unavailable" }));
+      case "qa_observation_read": return withinReplyCeiling(async () => {
+        if (!core.qaObservationRead) throw Object.assign(new Error("core does not expose qa_observation_read"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationRead({ credential: cred }, args as never));
+      });
+      case "qa_observation_timeline": return withinReplyCeiling(async () => {
+        if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationTimeline({ credential: cred }, args as never));
+      });
+      case "qa_observation_text": return withinReplyCeiling(async () => {
+        if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationText({ credential: cred }, args as never));
+      });
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
@@ -640,7 +810,7 @@ export class SidecarPool {
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。
-        const taskId = args.taskId !== undefined ? String(args.taskId) : live().taskId;
+        const taskId = args.taskId !== undefined && args.taskId !== null ? String(args.taskId) : live().taskId;
         const { publishDeliverables } = await import("./vendor/src/deliverables.ts");
         return publishDeliverables({
           home: serviceHome(), taskId,
@@ -653,19 +823,19 @@ export class SidecarPool {
     }
   }
 
+  /** Stops this pool's sweeper and keepalives, as a process exit would. A replacement pool over the same run
+   *  directory must be the only one answering it, so a restarted pool closes its predecessor first. */
+  close(): void {
+    for (const instId of [...this.beats.keys()]) this.stopBeat(instId);
+    if (this.sweeper) clearInterval(this.sweeper);
+    this.sweeper = undefined;
+  }
+
   private ensureSweeper(): void {
     if (this.sweeper) return;
     const sweep = setInterval(() => this.sweep(), this.deps.sweepMs ?? SWEEP_MS);
     if (typeof sweep === "object" && "unref" in sweep) sweep.unref();
     this.sweeper = sweep;
-  }
-
-  /** Stops this pool's sweeper and keepalives. A replaced pool is closed like an exited process, so it stops answering directories the new pool owns. */
-  close(): void {
-    if (this.sweeper) clearInterval(this.sweeper);
-    this.sweeper = undefined;
-    for (const beat of this.beats.values()) clearInterval(beat);
-    this.beats.clear();
   }
 
   private sweep(): void {
@@ -699,18 +869,24 @@ export class SidecarPool {
     const reqPath = join(reqDir(dir), file);
     const req = readJsonFile<CommRequest>(reqPath);
     const request = { lease: this.claims.get(instId) };
+    const arrival = Date.now();
     try { unlinkSync(reqPath); } catch { /* already consumed */ }
     const res: CommResponse = !req
       ? { ok: false, error: "malformed request" }
       : this.quarantined.has(instId) || !this.keys.has(instId) || req.key !== this.keys.get(instId)
         ? { ok: false, error: "stale comm key; this session predates a plugin restart" }
-        : await this.dispatch(instId, req.tool, req.args ?? {}, false, request)
+        // SYS01, D3: a null argument object is absent for reads, but for reclaim it is refused: a null never starts a real reclaim.
+        : req.tool === "reclaim_worktrees" && req.args === null
+          ? { ok: false, error: "invalid: reclaim arguments must be one object" }
+          // The request's arrival (stamped above) is kept for the retry too: a listing answer counts its reply ceiling from it (SYS01 M1).
+          : await arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, false, request), arrival)
             .catch((error: unknown) => SidecarPool.isAuthError(error)
               // A concurrent adopter may have rotated the credential out from under us; retry once on a fresh one.
-              ? this.dispatch(instId, req.tool, req.args ?? {}, true, request)
+              ? arriving(() => this.dispatch(instId, req.tool, req.args ?? {}, true, request), arrival)
               : Promise.reject(error))
             .then(data => ({ ok: true as const, data }))
             .catch((error: Error & { code?: string }) => ({ ok: false as const, error: `${error.code ?? "error"}: ${error.message}` }));
-    writeFileAtomic(join(resDir(dir), file), JSON.stringify(res));
+    // Last-line budget check: an over-budget success becomes a recoverable, JSON-legal error (SYS01).
+    writeFileAtomic(join(resDir(dir), file), JSON.stringify(guardRelayResponse(res)));
   }
 }

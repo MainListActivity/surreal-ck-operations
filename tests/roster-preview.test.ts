@@ -50,8 +50,13 @@ let doingOverride: Array<Record<string, unknown>> = [];
 let recentOverride: Array<Record<string, unknown>> = [];
 const queryRows = (sql: string): unknown[][] =>
   sql.includes("state = 'doing'") ? [doingOverride] : sql.includes("action IN ['accept'") ? [recentOverride] : [[]];
+const dbQuery = (sql: string) => sql.includes('BEGIN TRANSACTION;')
+  ? { responses: async () => [{ success: true, result: sql.includes('LET $rows = SELECT')
+    ? { read: { at: new Date().toISOString(), rows: [] } }
+    : { read: { at: new Date().toISOString(), submits: [] } } }] }
+  : Promise.resolve(queryRows(sql));
 mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
-  opsRepo: '/ops', db: { db: { query: async (sql: string) => queryRows(sql) } },
+  opsRepo: '/ops', db: { db: { query: dbQuery } },
   owner: { briefData: async () => briefOverride ?? ({ stuck: [], waiting: [], resources: [], goals: [],
     last24h: { done: 0, returned: 0, rolledBack: 0, rejected: 0, retired: 0 }, churn: { created: 0, retired: 0, claimLost: 0 } }) },
   workforce: {
@@ -64,7 +69,9 @@ mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
     dispatchSnapshot: () => snapshot,
   },
 }) }));
+const realDispatch = await import('../plugin/server/dispatch.ts');
 mock.module('../plugin/server/dispatch.ts', () => ({
+  ...realDispatch,
   refreshModels: async () => ({}), refreshQuota: async () => [], readProviderQuotas: async () => [],
 }));
 const handlersPath = '../plugin/server/handlers.ts';
@@ -176,6 +183,23 @@ test('roster RPC: an instance the tick never observed is unknown, never reported
     expect(response.pools[0]!.entries.find(e => e.ref === 'fresh'))
       .toMatchObject({ eligible: false, code: 'unknown', reason: BLOCK_TEXT.unknown });
   } finally { sessions = idleSessions(); }
+});
+
+test('roster RPC: instance rows carry only the name, its def and the tick status', async () => {
+  const response = await callRoster();
+  for (const row of response.instances) expect(Object.keys(row).sort()).toEqual(['agentStatus', 'def', 'id']);
+});
+
+test('roster RPC: defs enabled with a live instance sort first, so truncation keeps actionable rows', async () => {
+  const idleDef: StaffingInput['defs'][number] = { id: 'no-instance', role: 'engineering', provider: 'grok', model: 'm',
+    enabled: true, maxInstances: 1, priority: 100, weight: 10, scored: 0, errorStreak: 0 };
+  const offDef: StaffingInput['defs'][number] = { ...idleDef, id: 'off', enabled: false };
+  // Input order: enabled-without-instance, disabled, then the fixture's enabled-with-instance def.
+  defs.splice(0, 0, idleDef, offDef);
+  try {
+    const response = await callRoster();
+    expect(response.defs.map(d => d.id)).toEqual(['d1', 'no-instance', 'off']);
+  } finally { defs.splice(0, 2); }
 });
 
 test('roster RPC: dispatch-blocked rows are the tick verdicts, with the notice summary', async () => {
@@ -312,14 +336,14 @@ test('pulse RPC: with every list full, the whole answer stays within the 48 KiB 
     last24h: { done: 1, returned: 0, rolledBack: 0, rejected: 0, retired: 0 },
     churn: { created: 0, retired: 0, claimLost: 0 },
   };
-  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, ready: 300, doing: 300, stuck: 200,
+  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, workflowWaits: 0, ready: 300, doing: 300, stuck: 200,
     waiting: 200, recentDone: 50, goals: 100, resources: 100 };
   try {
     const response = await callPulse();
     for (const name of Object.keys(totals) as PulseListName[]) {
       const list = response[name];
-      expect(response.bounds[name]).toEqual({ total: totals[name], shown: list.length, truncated: true });
-      expect(list.length).toBeGreaterThan(0);
+      expect(response.bounds[name]).toEqual({ total: totals[name], shown: list.length, truncated: totals[name] > 0 });
+      if (totals[name] > 0) expect(list.length).toBeGreaterThan(0);
       expect(list.length).toBeLessThanOrEqual(PULSE_LIST_CAPS[name].items);
       expect(bytesOf(list)).toBeLessThanOrEqual(PULSE_LIST_CAPS[name].bytes);
     }

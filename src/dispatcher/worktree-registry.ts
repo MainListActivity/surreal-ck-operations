@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
 import type { Principal, ProjectView, TaskView, WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
 } from './worktree-reclaim.ts';
+import { junkPathsFromPorcelain, meaningfulChanges } from './lifecycle-gc.ts';
 
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const record = (table: string, key: string) => new RecordId(table, key);
@@ -34,6 +37,8 @@ export interface ReclaimResult {
   kept: Array<{ path: string; reason: string }>;
   branchesDeleted: string[];
   branchesRetained: Array<{ branch: string; reason: string }>;
+  /** Registry rows dropped because the tree was already gone and nothing referenced it. */
+  dropped?: string[];
   audited: number;
 }
 interface Tree { path: string; branch?: string; main: boolean }
@@ -92,13 +97,13 @@ export function validateIntent(intent: WorkIntent | undefined): void {
   if (!intent || typeof intent !== 'object' || Array.isArray(intent) || Object.keys(intent).some(k => !['kind', 'paths', 'lane'].includes(k)) ||
       (intent.paths !== undefined && !Array.isArray(intent.paths)) || (intent.lane !== undefined && typeof intent.lane !== 'string')) throw new CompanyError('invalid', 'Invalid work intent fields');
   if (!['read', 'code', 'assets'].includes(intent.kind) || (intent.lane !== undefined && !/^[a-zA-Z0-9_-]{1,60}$/.test(intent.lane))) throw new CompanyError('invalid', 'Invalid work intent');
-  if (intent.kind === 'assets' && (!intent.paths?.length || intent.paths.length > 50)) throw new CompanyError('invalid', 'Asset writes require authorized relative directories');
+  if (intent.kind === 'assets' && (!intent.paths?.length || intent.paths.length > MAX_ASSET_PATHS)) throw new CompanyError('invalid', 'Asset writes require authorized relative directories');
   if (intent.kind !== 'assets' && intent.paths?.length) throw new CompanyError('invalid', 'Only assets use directory write scopes');
   for (const p of intent.paths ?? []) {
-    if (typeof p !== 'string' || isAbsolute(p) || p.length > 300 || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
+    if (typeof p !== 'string' || isAbsolute(p) || p.length > MAX_ASSET_PATH_CHARS || p.split('/').some(s => !s || s === '.' || s === '..' || /^(\.git|\.env.*|\.runtime|credentials|private)$/i.test(s)) || /[\\\x00-\x1f]/.test(p)) throw new CompanyError('invalid', 'Unsafe asset write directory');
   }
 }
-const overlap = (a: string, b: string) => {
+export const overlap = (a: string, b: string) => {
   a = a.toLocaleLowerCase('en-US'); b = b.toLocaleLowerCase('en-US');
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 };
@@ -385,9 +390,15 @@ export class WorktreeRegistry {
     return (rows?.length ?? 0) > 0;
   }
 
-  /** Safe remove without --force; keep dirty / unavailable scenes with an explicit reason. */
+  /**
+   * Safe remove without --force. Untracked dependency/build trees are cleared first: git
+   * refuses on any untracked entry, and `node_modules` is not work. Tracked changes never
+   * reach here (decideReclaim keeps a tree whose porcelain shows real changes).
+   */
   private async removeTree(repo: string, path: string): Promise<{ ok: boolean; reason?: string }> {
     try {
+      const junk = junkPathsFromPorcelain(await git(path, ['status', '--porcelain']).catch(() => ''));
+      for (const rel of junk) await rm(join(path, rel), { recursive: true, force: true }).catch(() => undefined);
       await git(repo, ['worktree', 'remove', path]);
       return { ok: true };
     } catch (error) {
@@ -431,7 +442,7 @@ export class WorktreeRegistry {
         taskId: r.task ? String(r.task.id) : `session:${r.employee}`, employee: r.employee,
         deliveryId: r.delivery, fence: r.fence, intent: r.intent, state: refState(r), at: String(r.at),
       }));
-      const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+      const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
       const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
       const decision = decideReclaim({
         path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
@@ -499,10 +510,39 @@ export class WorktreeRegistry {
                 result.audited++;
               }
             }
-            const dirty = !!(tree && await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable'));
+            const dirty = !!(tree && meaningfulChanges(await git(row.path, ['status', '--porcelain']).catch(() => 'unavailable')));
             const status: WorktreeView['status'] = !tree ? 'missing' : tree.branch !== row.branch ? 'drift' : 'present';
             // Re-read refs inside the lock immediately before any delete decision.
             const freshRefs = (await this.refs(repo)).filter(r => String(r.tree.id) === String(row.id.id));
+            // A row whose tree is gone, whose task ended (refs released) and whose branch no open
+            // task needs is pure litter: drop it instead of keeping a permanent "missing" alert.
+            // Exclusive task trees only — shared/protected rows stay so a human can explain them.
+            const anyLiveRef = freshRefs.some(r => refState(r) !== 'released');
+            if (status === 'missing' && row.mode === 'exclusive' && !anyLiveRef && !(await this.branchStillNeeded(row.branch))) {
+              if (input.dryRun || !policy.enabled) {
+                result.kept.push({ path: row.path, reason: input.dryRun ? 'dry-run:stale-row' : 'reclaim-disabled' });
+                await this.audit({
+                  scanId, repo, path: row.path, tree: row.id, event: input.dryRun ? 'dry_run' : 'skip',
+                  trigger: input.trigger, ownership: { mode: row.mode }, decision: 'skip', result: 'skipped',
+                  reason: 'stale-row',
+                });
+                result.audited++;
+                continue;
+              }
+              await this.db.query(`BEGIN;
+                DELETE worktree_ref WHERE tree = $tree;
+                DELETE worktree_session_ref WHERE tree = $tree;
+                DELETE ONLY $tree;
+                COMMIT;`, { tree: row.id });
+              (result.dropped ??= []).push(row.path);
+              await this.audit({
+                scanId, repo, path: row.path, tree: row.id, event: 'drop_stale_row', trigger: input.trigger,
+                ownership: { mode: row.mode }, decision: 'delete', result: 'success',
+                reason: 'tree-missing-released-refs',
+              });
+              result.audited++;
+              continue;
+            }
             const decision = decideReclaim({
               path: row.path, branch: row.branch, mode: row.mode, protection: row.protection, main: tree?.main,
               status, dirty,

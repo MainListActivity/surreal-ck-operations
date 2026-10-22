@@ -32,13 +32,15 @@ let seq = 0;
  * A fake `paseo`. `ls` answers with `lsBody`; `inspect <id>` runs the shell body registered for that id. Any other id gets the
  * CLI's real not-found answer (exit 1, AGENT_NOT_FOUND on stderr).
  */
-function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('ls-global.sample.json')}'`): string {
+function fakeCli(inspect: Record<string, string>, lsBody = `cat '${fixturePath('ls-global.sample.json')}'`, logsBody = `echo ''`, agentBody = `echo '{"agentId":"${AGENT}","status":"reloaded","timelineSize":1}'`): string {
   const bin = join(dir, `paseo-${++seq}`);
   const arms = Object.entries(inspect).map(([id, body]) => `      ${id}) ${body} ;;`).join('\n');
   writeFileSync(bin, [
     '#!/bin/sh',
     'case "$1" in',
     `  ls) ${lsBody} ;;`,
+    `  logs) ${logsBody} ;;`,
+    `  agent) ${agentBody} ;;`,
     '  inspect)',
     '    case "$2" in',
     arms,
@@ -180,3 +182,48 @@ test('B4 dispatcher control: idle, running and archived keep their states', asyn
   expect(archived.state).toBe('down');
   expect(archived.events).toContain('retire:employee-1:archive');
 }, DISPATCHER_TEST_MS);
+
+// The failure entry Paseo really writes does not start with the marker: it is a timeline line
+// like `Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: …`.
+// Reading only lines that *begin* with "[System Error]" matched nothing, every quota exhaustion
+// arrived as an empty string, and the dispatcher retired the session as "session error: unknown".
+const LOGS_QUOTA = `printf '%s\\n%s\\n' '[Shell] date -u' 'Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: Agent turn ended: model_usage_exhausted'`;
+const LOGS_CLEAN = `printf '%s\\n%s\\n' '[Shell] date -u' '[Thought] nothing failed here'`;
+
+test('lastError reads the real failure entry, which does not start with the marker', async () => {
+  const paseo = createPaseoCli(fakeCli({}, undefined, LOGS_QUOTA));
+  const error = await paseo.lastError(AGENT);
+  expect(error).toContain('model_usage_exhausted');
+  expect(error.startsWith('[')).toBe(false);
+});
+
+test('lastError keeps a healthy transcript empty instead of inventing a failure', async () => {
+  const paseo = createPaseoCli(fakeCli({}, undefined, LOGS_CLEAN));
+  expect(await paseo.lastError(AGENT)).toBe('');
+});
+
+test('lastError survives an unreadable transcript', async () => {
+  const paseo = createPaseoCli(fakeCli({}, undefined, `exit 1`));
+  expect(await paseo.lastError(AGENT)).toBe('');
+});
+
+test('the agent list carries the model the session actually serves', async () => {
+  const rows = await createPaseoCli(fakeCli({})).list();
+  // The fixture keeps the real key set but redacts the value; a bare placeholder has no slash,
+  // so the model is unknown rather than guessed.
+  for (const row of rows.values()) expect(row.model).toBeUndefined();
+});
+
+// The dispatcher restarts a quota-parked session in place; the adapter must call the CLI's
+// `agent reload <id>` verb (there is no top-level `reload <id>`: that one reloads the daemon config).
+test('reload runs the per-agent verb with the agent id', async () => {
+  const argsFile = join(dir, 'reload-args.txt');
+  const bin = fakeCli({}, undefined, undefined, `printf '%s ' "$@" > '${argsFile}'`);
+  await createPaseoCli(bin).reload(AGENT);
+  expect(readFileSync(argsFile, 'utf8').trim()).toBe(`agent reload ${AGENT}`);
+});
+
+test('a failed reload surfaces instead of passing for a restart', async () => {
+  const bin = fakeCli({}, undefined, undefined, `echo '{"error":{"code":"RELOAD_FAILED"}}' >&2; exit 1`);
+  await expect(createPaseoCli(bin).reload(AGENT)).rejects.toThrow();
+});

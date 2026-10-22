@@ -1,9 +1,17 @@
+import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
+import { settleCompanyTurn } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { PaseoApi } from "@getpaseo/client";
 import { company, type Company } from "./company";
 import { isCompanyAgent } from "./company-agent";
+import { dirname, join } from "node:path";
+import { serviceHome } from "./env";
+import { sweepArchiveBatches, sweepInstanceDirs } from "./vendor/src/dispatcher/lifecycle-gc.ts";
+import { missingFrom, readMagpieQuotas, type MagpieUsageEntry } from "./vendor/src/dispatcher/magpie-quota.ts";
+import { readProviderQuotas, readQuotaEntries } from "./vendor/src/dispatcher/quota-store.ts";
+export { readProviderQuotas };
 
 type ProviderUsageEntry = {
   providerId: string;
@@ -62,6 +70,9 @@ function formatProviderUsage(entry: ProviderUsageEntry): string {
 }
 
 let quotaRefreshedAt = 0;
+/** Lifecycle GC (dead comm channels + cold archive) runs on its own slow clock. */
+let gcRefreshedAt = 0;
+const GC_MS = 30 * 60_000;
 // Model family matchers: an `auto:<family>` def resolves to the newest id of that family
 // among the provider's selectable models. Families are deliberately narrow so a provider
 // publishing an unrelated line (e.g. gpt-7, or a renamed workhorse) never silently switches.
@@ -145,14 +156,40 @@ export async function readModelSlots(ctx: Company): Promise<Record<string, strin
 // remember the latest one so the tick loop can also refresh quota during quiet periods.
 let paseoHandle: PaseoApi | undefined;
 
-/** Hooks carry the only paseo handle: persist latest quota to company_meta so the dispatcher can read it. */
+/**
+ * Persists the latest quota snapshot to company_meta for the dispatcher. Hooks carry a Paseo
+ * handle; the tick loop may not have one yet (it only arrives with the first session event), so
+ * the handle is optional: Paseo's list is skipped without it, and magpie — the source for the
+ * providers Paseo never lists — is read either way. On a quiet company that is the only thing
+ * keeping a spent subscription visible.
+ */
 let quotaEmptyLoggedAt = 0;
-export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<ProviderUsageEntry[]> {
-  paseoHandle = paseo;
-  if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries(ctx);
+export async function refreshQuota(paseo: PaseoApi | undefined, ctx: Company): Promise<ProviderUsageEntry[]> {
+  if (paseo) paseoHandle = paseo;
+  if (Date.now() - quotaRefreshedAt < 45_000) return readQuotaEntries<ProviderUsageEntry>(ctx.db.db);
   quotaRefreshedAt = Date.now();
-  const usage = await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; });
+  const usage = paseo
+    ? await paseo.providers.listUsage().catch((error) => { console.warn(`quota listUsage failed: ${(error as Error).message}`); return undefined; })
+    : undefined;
   const providers = (usage as { fetchedAt?: string; providers?: ProviderUsageEntry[] } | undefined)?.providers ?? [];
+  // Paseo reports only the providers it drives (claude/codex/grok on this machine). Magpie holds
+  // every subscription the owner configured, so a provider whose allowance ran out is visible here
+  // even when Paseo never mentions it — that is how Factory's spent month stayed invisible until
+  // its sessions started failing. Paseo's numbers win wherever both report.
+  const magpie = await readMagpieQuotas().catch(() => undefined);
+  if (magpie?.length) {
+    const extra = missingFrom(providers, magpie);
+    if (extra.length) {
+      providers.push(...extra.map(entry => ({
+        providerId: entry.providerId,
+        displayName: entry.displayName,
+        planLabel: entry.planLabel,
+        status: entry.status,
+        windows: entry.windows.map(w => ({ id: w.id, label: w.label, remainingPct: w.remainingPct, resetsAt: w.resetsAt })),
+      })));
+      console.log(`quota refresh: +${extra.length} provider(s) from magpie (${extra.map(e => e.providerId).join(',')})`);
+    }
+  }
   if (!providers.length) {
     if (Date.now() - quotaEmptyLoggedAt > 300_000) {
       quotaEmptyLoggedAt = Date.now();
@@ -173,26 +210,9 @@ export async function refreshQuota(paseo: PaseoApi, ctx: Company): Promise<Provi
   return providers;
 }
 
-/** ProviderQuota rows the dispatcher's circuit breaker consumes; shared with the roster preview. */
-export async function readProviderQuotas(ctx: Pick<Company, "db">): Promise<import("./vendor/src/contracts").ProviderQuota[]> {
-  const [rows] = await ctx.db.db.query<[Array<{ provider?: string; summary?: string; lowest_pct?: number; session_pct?: number; weekly_pct?: number; status?: string; fetched_at?: string; at?: unknown }>]>(
-    `SELECT provider, summary, lowest_pct, session_pct, weekly_pct, status, fetched_at, at FROM company_meta
-     WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
-  return (rows ?? []).map(r => ({
-    provider: r.provider ?? "", summary: r.summary ?? "", lowestPct: r.lowest_pct,
-    sessionPct: r.session_pct, weeklyPct: r.weekly_pct, status: r.status,
-    // Freshness = when WE last verified the row, not the upstream snapshot time:
-    // a frozen Paseo usage cache would otherwise keep fetched_at old forever and
-    // the circuit breaker would fail open on dead data.
-    fetchedAt: String(r.at ?? "") || r.fetched_at,
-  }));
-}
-
-async function readQuotaEntries(ctx: Company): Promise<ProviderUsageEntry[]> {
-  const [rows] = await ctx.db.db.query<[Array<{ payload?: ProviderUsageEntry }>]>(
-    `SELECT payload FROM company_meta WHERE string::starts_with(<string>id, 'company_meta:quota_');`);
-  return (rows ?? []).map(r => r.payload).filter((p): p is ProviderUsageEntry => !!p);
-}
+// The quota readers moved to src/dispatcher/quota-store.ts (re-exported above): they select rows
+// by record name, because a hyphenated provider id prints as `company_meta:⟨quota_factory-droid⟩`
+// and an id-string prefix test skipped exactly those providers.
 
 /** When an employee's turn ends right after submit, stamp the provider's remaining quota into the task audit. */
 async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: string; provider?: string }): Promise<void> {
@@ -206,7 +226,7 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
     { e: new RecordId("employee", employeeId) });
   if (!tasks?.length) return;
   const providers = await refreshQuota(paseo, ctx);
-  const fresh = providers.length ? providers : await readQuotaEntries(ctx);
+  const fresh = providers.length ? providers : await readQuotaEntries<ProviderUsageEntry>(ctx.db.db);
   const entry = fresh.find(p => p.providerId === agent.provider);
   if (!entry) {
     console.log(`usage snapshot skipped: no ${agent.provider} usage entry`);
@@ -225,8 +245,59 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
   }
 }
 
-/** Wake nudges a silently-ended round may get before the claim is released server-side. */
-const MAX_SILENT_NUDGES = 2;
+export const QA_DISPATCH_OBSERVATION_MAX_BYTES = 4 * 1024 * 1024;
+export const QA_DISPATCH_ITEM_MAX_BYTES = 256 * 1024;
+let lastObservation = '';
+async function markDispatchAttempt(ctx: Company, at: string, ok: boolean, error = ''): Promise<void> {
+  await ctx.db.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: $ok, error: $error };",
+    { at, ok, error: error.slice(0, 500) });
+}
+/**
+ * Persist the last dispatch pass for the QA observation channel (SYS-DISP 7454fc89 / B3).
+ * Every verdict and every reason is kept: the reader filters one subject and never receives a silently cut list.
+ * A pass over the safe size, or one item over the per-item cap, is stored as complete=false with no partial data;
+ * the reader then reports partial/unavailable with the original counts and the pass time. A failed write leaves the
+ * previous snapshot in place and records the attempt as failed, so the reader can mark it stale instead of current.
+ */
+export async function persistDispatchObservation(ctx: Company): Promise<void> {
+  const snapshot = ctx.dispatcher.dispatchSnapshot();
+  if (!snapshot.at) return;
+  const at = new Date(snapshot.at).toISOString();
+  const attemptAt = new Date().toISOString();
+  const originalVerdicts = snapshot.verdicts.length;
+  const originalReasons = snapshot.verdicts.reduce((sum, verdict) => sum + verdict.reasons.length, 0);
+  const itemTooLarge = snapshot.verdicts.some(verdict =>
+    Buffer.byteLength(JSON.stringify(verdict)) > QA_DISPATCH_ITEM_MAX_BYTES ||
+    verdict.reasons.some(reason => Buffer.byteLength(JSON.stringify(reason)) > QA_DISPATCH_ITEM_MAX_BYTES));
+  let complete = true;
+  let reason = '';
+  if (itemTooLarge) {
+    complete = false;
+    reason = `a single dispatch verdict or reason exceeds the ${QA_DISPATCH_ITEM_MAX_BYTES}-byte safe item size; no partial snapshot was stored`;
+  } else {
+    const bytes = Buffer.byteLength(JSON.stringify({ at, verdicts: snapshot.verdicts, complete: true, originalVerdicts, originalReasons }));
+    if (bytes > QA_DISPATCH_OBSERVATION_MAX_BYTES) {
+      complete = false;
+      reason = `the dispatch observation is ${bytes} bytes, over the ${QA_DISPATCH_OBSERVATION_MAX_BYTES}-byte safe size; no partial snapshot was stored`;
+    }
+  }
+  const record = complete
+    ? { at, verdicts: snapshot.verdicts, complete: true, originalVerdicts, originalReasons }
+    : { at, verdicts: [], complete: false, originalVerdicts, originalReasons, reason };
+  const json = JSON.stringify(record);
+  try {
+    if (json !== lastObservation) {
+      await ctx.db.db.query(
+        "UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts, complete: $complete, originalVerdicts: $ov, originalReasons: $or, reason: $reason };",
+        { at, verdicts: record.verdicts, complete: record.complete, ov: originalVerdicts, or: originalReasons, reason });
+      lastObservation = json;
+    }
+    await markDispatchAttempt(ctx, attemptAt, true);
+  } catch (error) {
+    await markDispatchAttempt(ctx, attemptAt, false, (error as Error).message).catch(() => undefined);
+    throw error;
+  }
+}
 
 export function startDispatch(server: PluginServerContext): () => void {
   let stopped = false;
@@ -238,6 +309,43 @@ export function startDispatch(server: PluginServerContext): () => void {
     wake = () => { wake = undefined; clearTimeout(timer); resolve(); };
   });
 
+
+async function runLifecycleGc(ctx: Company): Promise<void> {
+  const cfg = await ctx.workforce.config();
+  const now = new Date();
+  const commRoot = process.env.SCK_COMM_ROOT ?? join(serviceHome(), "comm");
+  if (cfg.commDirGraceHours > 0) {
+    const comm = await sweepInstanceDirs({
+      root: commRoot, now, graceMs: cfg.commDirGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
+    });
+    if (comm.removed.length) {
+      console.log(`lifecycle gc comm: removed ${comm.removed.length} dead channels (${(comm.bytes / 1048576).toFixed(1)} MB)`);
+    }
+  }
+  if (cfg.scratchGraceHours > 0) {
+    // Failure to read either source retains scratch for this pass. A stale root
+    // mtime alone is never authority to remove a still-open or registered tree.
+    try {
+      const [paths] = await ctx.db.db.query<[Array<{ path: string; repo?: string }>]>("SELECT path, repo FROM worktree;");
+      const open = await openUserPaths();
+      const scratch = await sweepInstanceDirs({
+        root: join(dirname(commRoot), "scratch"), now, graceMs: cfg.scratchGraceHours * 3_600_000,
+        keep: ctx.sidecar.liveInstanceIds(), protect: path => scratchKeepReason(path, { registered: paths.map(p => p.path).filter(Boolean), open, mergedRepos: [...new Set(paths.map(p => p.repo).filter((p): p is string => !!p))], activeAfterMs: now.getTime() - cfg.scratchGraceHours * 3_600_000 }),
+      });
+      if (scratch.removed.length || scratch.failed?.length) console.log(`lifecycle gc scratch: removed ${scratch.removed.length}, failed ${scratch.failed?.length ?? 0}, kept ${scratch.skipped} (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
+    } catch { console.warn("lifecycle gc scratch retained: reference/process inspection unavailable"); }
+  }
+
+  if (cfg.archiveRetentionDays > 0) {
+    const arch = await sweepArchiveBatches({
+      root: join(serviceHome(), "archive"), now, retentionMs: cfg.archiveRetentionDays * 86_400_000,
+    });
+    if (arch.removed.length) {
+      console.log(`lifecycle gc archive: removed ${arch.removed.length} batches (${(arch.bytes / 1048576).toFixed(1)} MB): ${arch.removed.join(", ")}`);
+    }
+  }
+}
+
   const loop = async () => {
     let failures = 0;
     while (!stopped) {
@@ -247,17 +355,23 @@ export function startDispatch(server: PluginServerContext): () => void {
         wait = (await ctx.workforce.config()).pollSeconds * 1000;
         // Refresh quota and model slots BEFORE the tick so a newly published model is
         // resolved, stale idle sessions are retired, and new work spawns on it in the
-        // same dispatch pass instead of lagging one poll behind.
-        if (paseoHandle && Date.now() - quotaRefreshedAt > 300_000) {
+        // same dispatch pass instead of lagging one poll behind. Quota runs without a
+        // Paseo handle too: magpie is the source for the providers Paseo never lists.
+        if (Date.now() - quotaRefreshedAt > 300_000) {
           await refreshQuota(paseoHandle, ctx).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
         }
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
           await refreshModels(paseoHandle, ctx).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
         }
+        if (Date.now() - gcRefreshedAt > GC_MS) {
+          gcRefreshedAt = Date.now();
+          await runLifecycleGc(ctx).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
+        }
         const report = await ctx.dispatcher.tick();
+        await persistDispatchObservation(ctx).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-          report.exhausted.length || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
+          report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
           report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
         await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();");
@@ -277,6 +391,11 @@ export function startDispatch(server: PluginServerContext): () => void {
   // instead of waiting out the poll interval.
   const kick = () => { if (!stopped && running) wake?.(); };
   const removers = [
+    server.on("agent.turn_started", (event, { paseo }) => {
+      void isCompanyAgent(paseo, event.agent).then(async ok => {
+        if (ok) await (await company()).workforce.clearIdleForAgent(event.agent.id);
+      }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
+    }),
     server.on("agent.turn_ended", (event, { paseo }) => {
       paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
@@ -286,32 +405,7 @@ export function startDispatch(server: PluginServerContext): () => void {
         // The sidecar ingests report.md/blocker.md and lands submit/block before
         // the usage snapshot looks for freshly-reviewed tasks.
         try {
-          const res = await ctx.sidecar.settle(event.agent.id);
-          // A turn that closed without report.md/blocker.md leaves the lease alive
-          // but the agent idle — a completed turn gets a bounded wake nudge, a
-          // failed/canceled turn (or a nudge budget already spent) surrenders the
-          // claim server-side so the task goes back to ready instead of wedging.
-          if (res.status === "silent" && res.silent) {
-            const { instId, taskId, nudges } = res.silent;
-            const kind = event.outcome?.kind ?? "completed";
-            if (kind === "completed" && nudges <= MAX_SILENT_NUDGES) {
-              try {
-                await paseo.agents.ref(event.agent.id).send(
-                  `【系统】你上一轮结束时没有提交 report.md 或 blocker.md，任务仍挂在你名下。继续执行当前任务；收尾规则不变：完成写 report.md，受阻写 blocker.md。这是第 ${nudges}/${MAX_SILENT_NUDGES} 次提醒——再次无收尾退出，任务将被收回重派。`
-                );
-                console.log(`silent-turn nudge ${nudges}/${MAX_SILENT_NUDGES} sent to ${instId} on ${taskId}`);
-              } catch (error) {
-                console.warn(`silent-turn nudge failed for ${instId} on ${taskId}: ${(error as Error).message}`);
-                await ctx.sidecar.releaseClaim(instId, taskId, `第 ${nudges} 轮无收尾退出且会话无法唤醒，收回任务重派`);
-              }
-            } else {
-              const reason = kind === "completed"
-                ? `连续 ${nudges} 轮无收尾退出，放弃本轮并回收任务重派`
-                : `turn 以 ${kind} 结束且未提交 report.md/blocker.md，回收任务重派`;
-              await ctx.sidecar.releaseClaim(instId, taskId, reason);
-              console.log(`silent-turn released ${taskId} from ${instId} (outcome=${kind}, silent turns=${nudges})`);
-            }
-          }
+          await settleCompanyTurn(ctx, paseo, event);
         } catch (error) {
           console.warn(`sidecar settle failed: ${(error as Error).message}`);
         }

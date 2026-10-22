@@ -26,8 +26,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
-  | 'implementer_mismatch' | 'implementer_unresolved' | 'author_recusal' | 'independence_conflict' | 'no_candidate'
-  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
+  | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'independence_conflict' | 'no_candidate'  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
   | 'write_scope';
 
@@ -53,7 +52,7 @@ export interface GlobalBlock {
 }
 
 /** Who may take a recovery action: the manager (gm, with the manage capability) or the owner. */
-export type RecoveryAuthority = 'gm' | 'owner';
+export type RecoveryAuthority = 'gm' | 'owner' | 'system';
 
 /**
  * One way out of a block. `tool` names the operations tool that performs it (sck call <tool>). `executable` is false when no
@@ -70,7 +69,7 @@ export interface DispatchReason {
   code: BlockCode;
   text: string;
   candidates: string[];
-  owner: 'gm' | 'owner';
+  owner: RecoveryAuthority;
   recovery: string;
   nextTrigger: string;
   /** The source the code was read from, so a reader can tell which fact the conclusion rests on (for example "contribution-audit"). */
@@ -129,8 +128,7 @@ export interface EvaluateInput {
 
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
-  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'track_mismatch',
-  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
+  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
 ]);
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
@@ -141,6 +139,8 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
   implementer_unresolved: '多个作者且无实现负责人，需经理指定',
+  implementer_unavailable: '实现人会话已失效，系统自动改派在岗工程员工',
+  implementer_quota: '实现人订阅额度持续不可用，需等待恢复或经理接手',
   author_recusal: '本任务作者（写过或提交过）不能复核',
   independence_conflict: '来源任务的经手人或经理指定回避的员工不能接手或复核，且暂无其它合格候选',
   no_candidate: '该岗位与仓库下没有任何编制或员工',
@@ -161,10 +161,9 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
 };
 
-const OWNER: Record<BlockCode, 'gm' | 'owner'> = {
+const OWNER: Record<BlockCode, RecoveryAuthority> = {
   paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
-  implementer_mismatch: 'gm', implementer_unresolved: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',
-  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
+  implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
   write_scope: 'gm', probe_busy: 'gm',
@@ -177,6 +176,8 @@ const RECOVERY: Record<BlockCode, string> = {
   max_running: '等待在办会话结束，或经理调高 max_running',
   implementer_mismatch: '等待绑定的实现负责人可用，或经理用 implementer_takeover 显式接手',
   implementer_unresolved: '经理用 implementer_takeover 记录实现负责人',
+  implementer_unavailable: '系统自动改派，无需经理；暂无候选时等候选人空闲后自动重试',
+  implementer_quota: '等待额度恢复，或经理用 implementer_takeover 接手',
   author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
   independence_conflict: '经理增补独立候选人选（编制扩容或新员工），来源经手人不能接手或复核',
   no_candidate: '经理为该岗位或仓库增加编制或员工',
@@ -204,6 +205,8 @@ const NEXT: Record<BlockCode, string> = {
   max_running: '在办会话数低于上限',
   implementer_mismatch: '绑定实现负责人可派工，或经理接手',
   implementer_unresolved: '经理记录实现负责人',
+  implementer_unavailable: '出现可派候选，系统自动改派',
+  implementer_quota: '额度恢复或经理接手',
   author_recusal: '出现独立候选人选',
   independence_conflict: '出现独立于来源任务的合格候选人选',
   no_candidate: '新增编制或员工',
@@ -227,9 +230,8 @@ const NEXT: Record<BlockCode, string> = {
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
 const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
-  implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', author_recusal: 'contribution-audit',
-  independence_conflict: 'contribution-audit',
-  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
+  implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', implementer_unavailable: 'tick:session-status', implementer_quota: 'tick:provider-health', author_recusal: 'contribution-audit',
+  independence_conflict: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
@@ -245,6 +247,11 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   max_running: [{ authority: 'gm', label: '等待在办会话结束，或经理调高 max_running', executable: false }],
   implementer_mismatch: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true }],
   implementer_unresolved: [{ authority: 'gm', label: '经理用 implementer_takeover 记录实现负责人', tool: 'implementer_takeover', executable: true }],
+  implementer_unavailable: [
+    { authority: 'system', label: '系统自动改派在岗工程员工', executable: false },
+    { authority: 'gm', label: '经理也可先核对贡献者再指定负责人（系统同步重试）', tool: 'implementer_takeover', executable: true },
+  ],
+  implementer_quota: [{ authority: 'gm', label: '经理用 implementer_takeover 接手，或等待额度恢复', tool: 'implementer_takeover', executable: true }],
   author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
   independence_conflict: [{ authority: 'gm', label: '经理用 def_ensure 增补独立编制，或新增员工（来源经手人不能接手）', tool: 'def_ensure', executable: true }],
   no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
@@ -326,6 +333,11 @@ function quotaUntil(list: readonly EvaluatedEntry[]): string | undefined {
 /** The repository a verdict is about, by its name: the last segment of its home path. */
 export const repoName = (home: string) => home.split('/').filter(Boolean).pop() ?? home;
 
+/** Stable key for one manager-action episode: task, phase, episode start (ms) and reason. */
+export function managerActionKey(taskId: string, phase: string, since: number, reason: string): string {
+  return `${taskId}:${phase}:${since}:${reason}`;
+}
+
 /** The distinct owner-facing reasons of a group's candidates, sorted, so a repeated tick reads the same. */
 const detailsOf = (list: readonly EvaluatedEntry[]): string =>
   [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；');
@@ -336,9 +348,9 @@ const detailsOf = (list: readonly EvaluatedEntry[]): string =>
  */
 function reasonText(code: BlockCode, list: readonly EvaluatedEntry[], until: string | undefined, home: string): string {
   if (code === 'quota') return `${BLOCK_TEXT.quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
+  if (code === 'implementer_quota') return `${BLOCK_TEXT.implementer_quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
   if (code === 'seat_full') return detailsOf(list) || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
-  if (code === 'independence_conflict' || code === 'unknown') return detailsOf(list) || BLOCK_TEXT[code];
-  return BLOCK_TEXT[code];
+  if (code === 'independence_conflict' || code === 'unknown') return detailsOf(list) || BLOCK_TEXT[code];  return BLOCK_TEXT[code];
 }
 
 /** Evaluates one task phase. Pure: the same inputs always produce the same verdict and summary text. */
@@ -367,7 +379,7 @@ export function evaluateDispatch(input: EvaluateInput): DispatchVerdict {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([code, candidates]) => {
       const list = pool.filter(entry => !entry.eligible && (entry.code ?? 'unknown') === code);
-      const until = code === 'quota' ? quotaUntil(list) : undefined;
+      const until = code === 'quota' || code === 'implementer_quota' ? quotaUntil(list) : undefined;
       return {
         code,
         text: reasonText(code, list, until, input.home),
@@ -410,7 +422,7 @@ export function dispatchNoticeText(verdict: DispatchVerdict): string {
   const reasons = verdict.reasons.map(reason =>
     `${reason.text}（${reason.candidates.filter(c => c !== '*').join('、') || '全局'}）`).join('；');
   const next = verdict.reasons.map(reason => reason.nextTrigger).filter((v, i, all) => all.indexOf(v) === i).join('；');
-  const recovery = verdict.reasons.map(reason => `${reason.owner === 'gm' ? 'gm' : '老板'}：${reason.recovery}`).join('；');
+  const recovery = verdict.reasons.map(reason => `${reason.owner === 'gm' ? 'gm' : reason.owner === 'system' ? '系统' : '老板'}：${reason.recovery}`).join('；');
   return `${verdict.summary}。自 ${verdict.since ?? verdict.checkedAt} 起等待。原因：${reasons}。下一触发：${next || '待定'}。处理：${recovery}。`;
 }
 
@@ -425,11 +437,65 @@ export interface GoalRootPeople {
 }
 
 /** Facts a goal card names beyond the verdicts: the waiting graph of unfinished goal work, titles, and each root's people. */
+export interface GoalWorkflowTaskFact {
+  taskId: string;
+  goalId?: string;
+  title: string;
+  state: string;
+  dependencies: readonly string[];
+  blockedTo?: string;
+  resumeState?: string;
+  executorRole?: string;
+  reviewerRole?: string;
+  currentEmployee?: string;
+  leaseExpiresAt?: number;
+  hiddenDependencies?: number;
+  goalAnchor?: boolean;
+}
+
 export interface GoalRootFacts {
-  /** Unfinished goal tasks and the task ids each one depends on. */
+  /** Goal task ids and their dependency edges. Completed rows are retained to prove an edge is satisfied. */
   dependencies: ReadonlyMap<string, readonly string[]>;
   titles: ReadonlyMap<string, string>;
   people: ReadonlyMap<string, GoalRootPeople>;
+  /** Authoritative workflow state used to distinguish normal waits, gates and live leases. */
+  tasks?: ReadonlyMap<string, GoalWorkflowTaskFact>;
+  /** Database time sampled with the workflow graph, separate from any dispatcher pass time. */
+  collectedAt?: string;
+}
+
+export type GoalWorkflowWaitKind = 'dependency' | 'manager' | 'owner' | 'active_lease' | 'unknown';
+export type GoalWorkflowState = 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
+export interface GoalWorkflowWaitRoot {
+  goalId?: string;
+  taskId: string;
+  title: string;
+  workflowState: GoalWorkflowState;
+  kind: GoalWorkflowWaitKind;
+  basis: string;
+  waitingForRole: string;
+  nextTrigger: string;
+  goalRootCount: number;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  dependencyPathTruncated?: boolean;
+  unknownReason?: string;
+  people?: GoalRootPeople & { peopleOmitted?: number };
+  peopleSource?: 'contributor-audit';
+  submitterSource?: 'submit-audit';
+  submitCommitSource?: 'submit-audit-evidence';
+  peopleCheckedAt?: string;
+  submitCheckedAt?: string;
+}
+export interface GoalWorkflowWaitSummary {
+  source: 'workflow-graph';
+  available: boolean;
+  checkedAt?: string;
+  totalRoots: number;
+  shownRoots: number;
+  truncated: boolean;
+  reason?: string;
+  roots: GoalWorkflowWaitRoot[];
 }
 
 /** A goal card's root blocker: the verdict the card names first, and how much work waits behind it. */
@@ -493,6 +559,161 @@ function waitingBehind(root: string, facts?: GoalRootFacts): { count: number; pa
   const path = [deepest];
   while (path[0] !== root && parent.has(path[0]!)) path.unshift(parent.get(path[0]!)!);
   return { count: queue.length - 1, path: path.slice(0, PATH_LIMIT) };
+}
+
+
+const KNOWN_WORKFLOW_STATES = new Set(['ready', 'doing', 'review', 'blocked', 'done', 'void']);
+const TERMINAL_STATES = new Set(['done', 'void']);
+const rootWaitRank: Record<GoalWorkflowWaitKind, number> = { manager: 0, owner: 1, active_lease: 2, dependency: 3, unknown: 4 };
+
+/**
+ * Derives normal workflow waits from one goal graph. Dependency edges are followed only inside `facts.tasks`; absent targets,
+ * inconsistent blocked rows, unknown states and cycles produce an explicit unknown root with no invented impact or path.
+ */
+export function goalWorkflowWaitRoots(facts: GoalRootFacts, limit = 20): GoalWorkflowWaitSummary {
+  const tasks = facts.tasks;
+  if (!tasks || !facts.collectedAt) return { source: 'workflow-graph', available: false, totalRoots: 0, shownRoots: 0, truncated: false,
+    reason: 'workflow graph or its collection time is unavailable', roots: [] };
+  const nodes = new Map(tasks);
+  const cycles = new Set<string>();
+  const cycleRoot = new Map<string, string>();
+  const active = new Map<string, number>();
+  const visited = new Set<string>();
+  const visit = (taskId: string) => {
+    if (visited.has(taskId)) return;
+    visited.add(taskId);
+    active.set(taskId, active.size);
+    const task = nodes.get(taskId)!;
+    for (const dependency of [...task.dependencies].sort()) {
+      const dep = nodes.get(dependency);
+      if (!dep || dep.goalId !== task.goalId) continue;
+      if (active.has(dependency)) {
+        const cycleStart = active.get(dependency)!;
+        const members = [...active].filter(([, index]) => index >= cycleStart).map(([id]) => id);
+        const representative = [...members].sort()[0]!;
+        for (const id of members) { cycles.add(id); cycleRoot.set(id, representative); }
+      } else visit(dependency);
+    }
+    active.delete(taskId);
+  };
+  for (const taskId of [...nodes.keys()].sort()) visit(taskId);
+
+  type Candidate = { id: string; kind: GoalWorkflowWaitKind; reason?: string };
+  const candidates = new Map<string, Candidate>();
+  const add = (candidate: Candidate) => {
+    const prior = candidates.get(candidate.id);
+    if (!prior || rootWaitRank[candidate.kind] < rootWaitRank[prior.kind] ||
+        (rootWaitRank[candidate.kind] === rootWaitRank[prior.kind] && (candidate.reason ?? '').localeCompare(prior.reason ?? '') < 0)) {
+      candidates.set(candidate.id, candidate);
+    }
+  };
+  const unknown = (taskId: string, reason: string): Candidate => ({ id: taskId, kind: 'unknown', reason });
+  const resolveWait = (taskId: string, waiterId?: string): Candidate[] => {
+    const task = nodes.get(taskId);
+    const waiter = waiterId ? nodes.get(waiterId) : undefined;
+    if (!task) return [unknown(waiterId ?? taskId, '依赖记录缺失或不在当前目标可见范围')];
+    if (waiter && task.goalId !== waiter.goalId) return [unknown(waiter.taskId, '依赖不在当前目标范围')];
+    if (!KNOWN_WORKFLOW_STATES.has(task.state)) return [unknown(taskId, '工作流状态未知')];
+    if (cycles.has(taskId)) return [unknown(cycleRoot.get(taskId) ?? taskId, '依赖关系存在循环')];
+    if (task.state === 'blocked') {
+      if (task.blockedTo === 'gm') return [{ id: taskId, kind: 'manager' }];
+      if (task.blockedTo === 'owner') return [{ id: taskId, kind: 'owner' }];
+      if (task.blockedTo !== undefined && task.blockedTo !== '') return [unknown(taskId, '阻塞处理岗位未知')];
+      if ((task.hiddenDependencies ?? 0) > 0) return [unknown(taskId, '存在当前目标不可见范围的依赖')];
+      if (task.dependencies.length === 0) return [unknown(taskId, 'blocked 任务没有可核实的阻塞依赖')];
+      const roots: Candidate[] = [];
+      for (const dependency of [...task.dependencies].sort()) {
+        const dep = nodes.get(dependency);
+        if (!dep) { roots.push(unknown(taskId, '依赖记录缺失或不在当前目标可见范围')); continue; }
+        if (dep.goalId !== task.goalId) { roots.push(unknown(taskId, '依赖不在当前目标范围')); continue; }
+        if (!KNOWN_WORKFLOW_STATES.has(dep.state)) { roots.push(unknown(taskId, '依赖任务状态未知')); continue; }
+        // Core dependency semantics: a void owner gate is satisfied only for a goal-anchor waiter.
+        if (dep.state === 'done' || (dep.state === 'void' && (dep.reviewerRole !== 'owner' || task.goalAnchor))) continue;
+        if (dep.state === 'void' && dep.reviewerRole === 'owner') {
+          roots.push(unknown(taskId, '非目标锚点仍依赖已作废的老板关口'));
+          continue;
+        }
+        roots.push(...resolveWait(dependency, taskId));
+      }
+      return roots.length ? roots : [unknown(taskId, 'blocked 任务的依赖均已完成，工作流状态不一致')];
+    }
+    if (task.blockedTo !== undefined && task.blockedTo !== '') return [unknown(taskId, '非 blocked 任务带有阻塞处理岗位')];
+    if (TERMINAL_STATES.has(task.state)) return [];
+    if (task.state === 'review' && task.reviewerRole === 'owner') return [{ id: taskId, kind: 'owner' }];
+    if (task.currentEmployee) {
+      const collected = Date.parse(facts.collectedAt!);
+      const leaseUntil = (task.leaseExpiresAt ?? 0) * 1000;
+      if (Number.isFinite(collected) && leaseUntil > collected) return [{ id: taskId, kind: 'active_lease' }];
+      return [unknown(taskId, '存在持有人记录，但租约已过期或租约时点不可核实')];
+    }
+    return [{ id: taskId, kind: 'dependency' }];
+  };
+
+  for (const task of [...nodes.values()].sort((a, b) => a.taskId.localeCompare(b.taskId))) {
+    if (!KNOWN_WORKFLOW_STATES.has(task.state)) add(unknown(task.taskId, '工作流状态未知'));
+    else if (task.state === 'blocked') for (const candidate of resolveWait(task.taskId)) add(candidate);
+  }
+
+  const waiters = new Map<string, string[]>();
+  for (const task of nodes.values()) {
+    for (const dependency of [...task.dependencies].sort()) {
+      const dep = nodes.get(dependency);
+      if (dep?.goalId === task.goalId) waiters.set(dependency, [...(waiters.get(dependency) ?? []), task.taskId]);
+    }
+  }
+  const roots = [...candidates.values()].map(candidate => {
+    const task = nodes.get(candidate.id);
+    const base: GoalWorkflowWaitRoot = {
+      ...(task?.goalId ? { goalId: task.goalId } : {}), taskId: candidate.id,
+      title: task?.title ?? candidate.id,
+      workflowState: task && KNOWN_WORKFLOW_STATES.has(task.state) ? task.state as GoalWorkflowState : 'unknown',
+      kind: candidate.kind,
+      basis: candidate.kind === 'manager' ? 'task.blocked_to=gm' : candidate.kind === 'owner' ? 'task.blocked_to=owner or reviewer_role=owner'
+        : candidate.kind === 'active_lease' ? 'task.current_employee + task.lease_expires_at'
+          : candidate.kind === 'dependency' ? 'task.dependencies' : 'workflow-graph',
+      waitingForRole: candidate.kind === 'manager' ? 'gm' : candidate.kind === 'owner' ? 'owner'
+        : candidate.kind === 'unknown' ? 'unknown'
+          : (task?.state === 'review' || (task?.state === 'blocked' && task.resumeState === 'review')
+            ? task.reviewerRole ?? 'unknown' : task?.executorRole ?? 'unknown'),
+      nextTrigger: candidate.kind === 'manager' ? '经理解除阻塞后恢复'
+        : candidate.kind === 'owner' ? '老板处理关口后恢复'
+          : candidate.kind === 'active_lease' ? '持有人完成当前任务或租约到期后重新判定'
+            : candidate.kind === 'dependency' ? '依赖任务完成、撤销或恢复后重新判定'
+              : '工作流依赖图恢复一致后重新判定',
+      goalRootCount: 0,
+      ...(candidate.reason ? { unknownReason: candidate.reason } : {}),
+    };
+    if (candidate.kind === 'unknown') return base;
+    const depth = new Map<string, number>([[candidate.id, 0]]);
+    const parent = new Map<string, string>();
+    const queue = [candidate.id];
+    let deepest = candidate.id;
+    let incomplete = false;
+    for (let i = 0; i < queue.length; i++) {
+      const current = queue[i]!;
+      for (const next of [...(waiters.get(current) ?? [])].sort()) {
+        const child = nodes.get(next)!;
+        if (depth.has(next)) continue;
+        if (!KNOWN_WORKFLOW_STATES.has(child.state) || child.hiddenDependencies || cycles.has(next)) { incomplete = true; continue; }
+        if (child.state !== 'blocked') continue;
+        depth.set(next, depth.get(current)! + 1); parent.set(next, current); queue.push(next);
+        if (depth.get(next)! > depth.get(deepest)! || (depth.get(next) === depth.get(deepest) && next < deepest)) deepest = next;
+      }
+    }
+    if (incomplete) return { ...base, unknownReason: '影响路径包含未知状态、不可见依赖或循环，无法核实影响数与路径' };
+    const path = [deepest];
+    while (path[0] !== candidate.id && parent.has(path[0]!)) path.unshift(parent.get(path[0]!)!);
+    return { ...base, impact: queue.length - 1, dependencyPath: path.slice(0, PATH_LIMIT).map(id => ({ taskId: id, title: nodes.get(id)?.title ?? id })),
+      ...(path.length > PATH_LIMIT ? { dependencyPathTruncated: true } : {}) };
+  });
+  roots.sort((a, b) => (a.goalId ?? '').localeCompare(b.goalId ?? '') || rootWaitRank[a.kind] - rootWaitRank[b.kind]
+    || (b.impact ?? -1) - (a.impact ?? -1) || a.taskId.localeCompare(b.taskId));
+  const perGoal = new Map<string, number>();
+  for (const root of roots) { const key = root.goalId ?? ''; perGoal.set(key, (perGoal.get(key) ?? 0) + 1); }
+  for (const root of roots) root.goalRootCount = perGoal.get(root.goalId ?? '') ?? roots.length;
+  const shown = roots.slice(0, Math.max(0, limit));
+  return { source: 'workflow-graph', available: true, checkedAt: facts.collectedAt, totalRoots: roots.length, shownRoots: shown.length,
+    truncated: shown.length < roots.length, roots: shown };
 }
 
 /**

@@ -85,21 +85,26 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 - `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
 - `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
 - 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。预览健康与监听进程按下节检查。
+- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按下节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
 
 ### 5. 双面回滚
 
+**兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
+只有证明兼容的目标才能切换；旧版本（如 9854fe0、475b5c2 及其后的旧快照）不是固定可回退版本。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复，不得把破坏复核阶段的旧版当成可用性恢复，也不得以伪 accept 或改库换取回滚条件。窗口内切换前仍须按第 4 节采样并证明没有活复核租约（或使用已独立部署验收、支持复核 adopt 的版本）。
+
 **先停用受影响编制再回滚**：由经理通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
 
 ```sh
-rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_PREVIOUS_RELEASE/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
+# 用当前（受审、带守卫）release 的 installer 安装回滚目标：守卫与内容/门禁校验都在这一步完成。
+rtk proxy env SCK_COMPONENTS=mcp sh "$SCK_RELEASE_DIR/scripts/company-service.sh" install "$SCK_PREVIOUS_RELEASE"
 rtk proxy curl --fail 'http://127.0.0.1:<mcp-port>/ready'
-rtk proxy "$PASEO_CLI" plugin install "$SCK_PREVIOUS_RELEASE/plugin" --id sck-company
-rtk proxy "$PASEO_CLI" plugin reload sck-company
+# 插件面由上面的 install 自动重指（登记在服务目录内时）；这里只核对，不重复 install。
 rtk proxy "$PASEO_CLI" plugin ls sck-company
 ```
+
+**不得调用旧 release 自带的 installer**：旧版本的 `scripts/company-service.sh` 没有 RW06 守卫，实测对不兼容目标会直接 `rc=0` 切 `active` 并复制 bin（全新 installer 对同一目标则拒绝且零副作用）。回滚命令固定用 `$SCK_RELEASE_DIR/scripts/company-service.sh`（`$SCK_RELEASE_DIR` 为当前受审 release）。若 install 输出 `warning: plugin repoint failed`（插件登记在服务目录之外），按第 3 节 R3 手工 `remove` + `install` 指向**已被守卫放行的同一目标**，顺序不得颠倒。
 
 回滚恢复的是上一版完整固定 release（含集成过的在途功能、依赖与 vendor），不能只改 `active` 或只 reload。重做第 4 节的双面验证；仅恢复与回滚版本兼容的编制，其余保持停用并报经理。旧 release 不完整/不兼容或回滚失败时保留现场并报阻塞，不回退到 v3 历史树作为生产源。
 
@@ -161,7 +166,20 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依据；租约过期/交接只释放员工 fence，非终态保留 recovery；done 后 exclusive 干净树可事件触发删除，shared 与保护树保留；脏树与未合并分支不强制删除。孤儿宽限默认 7 天（`SCK_WORKTREE_ORPHAN_GRACE_DAYS` / `company_meta:config.worktree_orphan_grace_days`），时钟用 last_released_at → last_used_at → created_at。调度器沿用既有 10 分钟 sweep，不新建定时器。紧急关闭：`SCK_WORKTREE_RECLAIM=0`。审计表 schema 012 `worktree_audit` 可查。细节与演练见 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。
 
-查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；GM 可不传 taskId 查询全局。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。
+查询入口：员工 `sck call list_worktrees '{"taskId":"当前任务ID"}'`，权限沿用 get_task；GM 可不传 taskId 查询全局。非 gm 不带 taskId 一律 `forbidden`，通道不回退到当前租约任务。released 引用默认只计数，加 `"includeReleased":true` 才列出。返回规范路径、稳定 ID、project/repo、mode、实际/登记 branch 状态、创建/最后使用时间、各引用持有人/任务/时间、`deletable` 与 reasons；不含凭证。不带 `pageSize`、`cursor` 时返回完整数组，超出 48 KiB 预算则报 `response_too_large`，不截尾；带分页参数时返回 `{worktrees, page}`，按 `page.nextCursor` 逐页读完再统计（见 [query-paging.md](./query-paging.md) 第 3、4 节）。GM 另可 `reclaim_worktrees`（支持 dryRun）与 `list_worktree_audits`。branch 漂移或丢失只报告，不自动修复。
+
+管理查询分页与预算（SYS01，v25）：运营需要知道以下行为。
+
+- `get_context`、`get_task_history`、`list_worktrees` 的每个响应不超过 48 KiB，即 49152 字节（UTF-8）。计量为 MCP 结果的 JSON 字节加 256 字节帧预留（`answerBytes`），答案的文本副本与 `structuredContent` 两份都计入。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出则报 `response_too_large`，不截尾。
+- 需要统计或遍历全部条目时，带 `pageSize`（1 至 100，缺省 25）逐页读取，直到 `page.hasMore` 为 false，并累加每页的 `returned`。`page.total` 为快照内的总数，可用于核对。每页条数由预算决定，可能少于 `pageSize`。
+- 分页快照由数据库统一计数，MCP 与插件 sidecar 共用上限：每身份 4 个，全库 64 个，合计 64 MiB；单个快照最多 5000 行或 8 MiB，有效期 6 小时。上限在代码中固定，没有运营配置项。
+- 全库快照已满时返回 `temporarily_unavailable`，可重试。同一身份的快照全部仍在写入时，请求最多等待 5 秒，且不超过本次构建的 10 秒截止。构建超过 10 秒截止，或排队超过 2 秒仍拿不到构建连接，都返回可恢复的 `temporarily_unavailable`；答复最迟在 13 秒内返回。已预留的配额在截止后 2 秒内释放，来不及释放的标记为待清扫，下一次清扫释放一次。50 KiB/s 等受限链路上，超过 10 秒可传输量的大工作集会以该错误返回，这是可恢复的拒绝而不是数据损坏，应按答复指引收窄 `state`、`goalId`、`role`、`since` 或投影字段后重试。超过 5 分钟仍未完成的快照视为遗弃并删除。持续出现容量错误时，核对 `query_snapshot` 表的行数与 `query_snapshot_quota:global` 的 `listings`、`bytes` 计数是否一致。
+- 长文本用 `read_task_text` 按字节段读取，每段默认 16 KiB、最大 24 KiB。第二段起必须带首段返回的 `expectSha256`，若原文已变，返回 `conflict`，须从 `offset: 0` 重读。
+- 写入先于回显提交。回显先裁切超长列表（依赖、意图路径，标注 `listsTruncated`，完整列表用 `read_task_text` 读取），再裁切正文（标注 `contextTruncated`）；其余顶层文本字段超过 2 KiB 时同样裁切并标注。只有整条应答仍超过 49 152 字节时，调用方才会收到 `response_too_large`。此时写入已经提交，用 `get_context`（带 `taskId`）核对状态，不得重复提交。
+- 全局库存只有 gm 可读，即不带 `taskId` 的 `list_worktrees`。非 gm 角色必须带 `taskId`，缺省或 null 一律返回 `forbidden`。
+- `reclaim_worktrees` 参数严格（经理裁定 v44）：`dryRun` 只接受 true、false 或省略（省略即回收）；整包 null、`dryRun` 为 null 或字符串、`repos` 不是路径列表，一律返回 `invalid`，不触碰任何工作树。
+
+QA 步骤对应如下。统计工作树数量时，先以 gm 身份执行 `list_worktrees` 分页读取，或对具体任务带 `taskId` 读取。遇到 `response_too_large` 时改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读完。`get_admin_summary` 为 gm 专用的只读汇总，口径与完整性标志见 [query-paging.md](./query-paging.md) 第 5 节。发布后的真实员工 sck 最终验收由 QA 任务 `6b6cb5b9` 执行。
 
 本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)：
 
@@ -239,6 +257,21 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 
 2026-10-20 事故：`artifact_reclaim_enabled` 被人工置为 false（无审计记录），磁盘降到 8.8 GB 后闸门连续阻塞全部派工十余小时，两个 ready 任务无人接手。修复后紧急回收绕过配置开关，闸门不会再被软开关死锁；此后该开关只影响例行清理频率。
 
+**工作树、员工通道与冷归档的保留期**
+
+四类回收器看不到的残留，由同一轮 GC（30 分钟）按保留期清理：
+
+| 对象 | 判定 | 默认保留 | 配置键 |
+|---|---|---|---|
+| 工作树 | `git status --porcelain` 里纯依赖/构建产物（未跟踪的 `node_modules`、`.venv`、`dist`、`build`、`target` 等）不算脏；**已跟踪文件的任何修改仍然算脏**，绝不自动删除 | 沿用 WT02 的孤儿宽限期 | `worktree_orphan_grace_days` |
+| `comm/<实例>` | 实例不在插件应答集合（`liveInstanceIds()`）里，且目录 mtime 超期 | 48 小时 | `comm_dir_grace_hours`（0 = 关闭） |
+| `scratch/<实例>` | 员工临时目录（克隆、构建、转码、抽帧、下载）；员工拿到的 `SCK_SCRATCH_DIR` 与 `TMPDIR` 都指向它，实例不在应答集合且 mtime 超期即清 | 24 小时 | `scratch_grace_hours`（0 = 关闭） |
+| `archive/<批次>` | 只认 `evidence-YYYY-MM-DD`、`deliverables-YYYY-MM-DD`、`*.tar.gz` 三类命名；其他内容留给人 | 7 天 | `archive_retention_days`（0 = 关闭） |
+
+GC 只删目录本身，不碰 `evidence/`、`deliverables/` 与任何已跟踪内容；结果打印在插件 stdout（`artifact reclaim` 台账只记 evidence/deliverables 的裁剪）。GC 与资源闸门无关，水位正常时也照常运行。
+
+删除工作树前，GC 先清掉未跟踪的依赖/构建目录（`junkPathsFromPorcelain`），再执行**不带 `--force`** 的 `git worktree remove`；已跟踪文件的任何修改仍会让删除被拒并记 `git-remove-failed`。登记行指向的目录已消失、任务已终态（引用全部 released）且该分支没有未终态任务时，扫描直接摘除这一行（审计 `drop_stale_row`），只对 `exclusive` 生效，`shared`/`protected` 行留给人工判断。审计事件名是 `worktree_audit.event` 的 ASSERT 白名单：新增事件必须同时在 `schema/021-worktree-audit-events.surql` 放行，否则审计写入被拒、仓库级 catch 会中断整轮扫描（2026-10-21 事故）；`tests/audit-event-whitelist.test.ts` 在 `test:channel` 里校验两边一致。
+
 ## 老板作废、解锁与取消目标
 
 ```sh
@@ -300,3 +333,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 ## 远程部署（VPS MCP 服务）
 
 `sh scripts/deploy-mcp-remote.sh <main 提交 SHA>` 把指定提交部署到 VPS 的 `sckcompany` 服务，并校验 `/ready`。部署认证只用专用密钥 `~/.ssh/sck-deploy-ed25519`：密码短语保护、不进 ssh-agent、不存钥匙串，`SCK_DEPLOY_KEY` 可换路径。`IdentitiesOnly` 固定身份，全部连接复用一条控制通道，每次部署只需输一次密码短语。VPS 的 `authorized_keys` 只保留这把部署密钥；日常使用或已加载到 agent 的钥匙一律不得授权，否则任何同用户进程都能登录 VPS。
+
+发布门禁（SYS01 AC-B）：慢管道回归与 sidecar review 回归只在本机 macOS 上执行，不用托管 macOS 作业，也不新增付费资源。发布某个提交前，把该提交导出到以 40 位提交 SHA 命名的目录，分别运行 `SCK_SERVICE_HOME=<服务目录> sh scripts/release-gate.sh slow-pipe <该目录的绝对路径>` 和 `SCK_SERVICE_HOME=<服务目录> sh scripts/release-gate.sh sidecar-review <该目录的绝对路径>`。脚本按 `SCK_BUN`、`private/service.env` 中的 `SCK_BUN`、服务目录的 `runtime-bun`、`~/.bun/bin/bun` 的顺序选定 Bun，不查 PATH；慢管道运行包含红色对照，sidecar-review 运行真实 client-cli -> 临时 sidecar -> 公司 fork 的整组用例。两项 `result` 都为 `pass` 时分别写入 `<服务目录>/gates/comm-slow-pipe/<SHA>.json` 与 `<服务目录>/gates/sidecar-review/<SHA>.json`，记录 `sha`、`bun`、`platform` 与 `result`。`company-service.sh install` 与 `company-service.sh check-gate <SHA>` 在切换前核对两项记录；任一缺失、失败、SHA 不符或 Bun 版本不符都拒绝。这两项不读调用方 shell 中的 `SCK_BUN`：launchd 启动的服务不继承它，门禁只核对服务实际会运行的运行时（`private/service.env` 中的 `SCK_BUN`、`runtime-bun`、`~/.bun/bin/bun`）。显式指定的 pin 缺失时拒绝，不回落到其它 Bun。
+
+已披露的残留（SYS01 复核）：`deploy-mcp-remote.sh` 安装远端 Bun 时直接执行 bun.sh 的安装脚本，未做 sha256 校验；`scripts/release-content.sh` 的清单比较只看文件内容，不看权限位。前者列为后续跟进。`release-gate.sh` 按目录名取 SHA 一项已关闭：`release-gate.sh` 与 `company-service.sh install` 都调用 `scripts/release-content.sh`，把目录内容与提交归档逐文件比较（依赖、生成的 `plugin/server/vendor`、`vault/build` 与 `.runtime/` 不计入），内容不符即拒绝。
+
+`deploy-mcp-remote.sh` 在任何远端步骤前核对同一记录（Bun 版本取 `SCK_BUN_VERSION`，缺省 1.4.2）。随后在远端执行 `runtime-bun/bin/bun --version`，实际版本与门禁不符时在上传载荷前拒绝，不复用旧二进制。两项都通过后才上传 release、写入 `service.env`、切换 `current` 并重启。`SCK_REMOTE_HOME` 只供测试覆盖：`tests/ci-gates.test.ts` 以桩化的 ssh 与 scp 运行脚本，不触及真实主机；生产路径不设置。最终集成提交若与审查过的提交不同，必须对该集成 SHA 重新生成门禁记录，不能复制旧记录或改写 JSON。

@@ -1,32 +1,39 @@
 import type { OwnerDesk } from '../owner.ts';
-import type { CompanyConfig, EmployeeDef, EmployeeInst, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
-import { effectiveWeight, weightedOrder } from '../workforce.ts';
+import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
+import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
 import { REQUIRED_TRACKS } from '../core.ts';
 import { UNATTENDED_MODE, type PaseoGateway, type PaseoWorkspaceInfo } from './paseo.ts';
-import { evalPrompt, gmAttention, gmTriage, wake, type PromptEnv } from './prompts.ts';
+import { evalPrompt, gmAttention, gmTriage, wake, type GmTodo, type PromptEnv } from './prompts.ts';
 import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
-import type { HostResources } from './host.ts';
+import { reclaimIdleSessions } from './idle-sessions.ts';
+import { memoryBlocked, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
+import { isRetireRefused } from '../retirement.ts';
 import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
-import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
-
+import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)/i;
+export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
+/** A failed in-place reload is retried on this interval, not on every poll. */
+const RELOAD_RETRY_SECONDS = 300;
+/** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
+const PERSISTENT_QUOTA_FAILURES = 2;
+/** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
+const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -53,13 +60,15 @@ export function quotaBlockedProviders(rows: ProviderQuota[], cfg: Pick<CompanyCo
 }
 
 /** Per role: how many enabled seats can take work right now (provider quota and health), and why the rest cannot. */
-export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
+export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'provider' | 'enabled' | 'quotaLimited'>>, quotaBlocked: ReadonlyMap<string, string>, health: ReadonlyMap<string, ProviderHealth>, now: number): RoleCapacity[] {
   const roles = new Map<string, RoleCapacity>();
   for (const def of defs.filter(d => d.enabled)) {
     const entry = roles.get(def.role) ?? { role: def.role, total: 0, usable: 0, down: [] };
     roles.set(def.role, entry); entry.total++;
     const h = health.get(def.provider);
-    const why = quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
+    // A def exempt from quota gating keeps its seat usable even while the subscription is out.
+    const why = def.quotaLimited === false ? undefined
+      : quotaBlocked.get(def.provider) ?? (availabilityOf(h, now) === 'down' ? `额度耗尽或异常${h?.lastError ? `：${h.lastError.slice(0, 40)}` : ''}` : undefined);
     if (!why) entry.usable++;
     else if (!entry.down.some(d => d.startsWith(def.provider))) entry.down.push(`${def.provider} ${why}`);
   }
@@ -67,11 +76,14 @@ export function roleCapacity(defs: ReadonlyArray<Pick<EmployeeDef, 'role' | 'pro
 }
 
 /** Provider seat check: quota floor, health window, and the per-provider concurrency cap. */
-export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>): boolean {
+export function providerCapacity(provider: string, providerMax: Record<string, number>, health: ReadonlyMap<string, ProviderHealth>, busyBy: ReadonlyMap<string, number>, now: number, quotaBlocked?: ReadonlyMap<string, string>, quotaExempt = false): boolean {
+  const busy = busyBy.get(provider) ?? 0;
+  // An exempt def opts out of the quota/health gates but never out of the seat cap: seats are
+  // physical, and unbounded concurrency would starve every other def on the same provider.
+  if (quotaExempt) return busy < (providerMax[provider] ?? 1);
   if (quotaBlocked?.has(provider)) return false;
   const availability = availabilityOf(health.get(provider), now);
   if (availability === 'down') return false;
-  const busy = busyBy.get(provider) ?? 0;
   return availability === 'probe' ? busy === 0 : busy < (providerMax[provider] ?? 1);
 }
 
@@ -157,6 +169,12 @@ export interface StaffingInput {
   busyBy: ReadonlyMap<string, number>;
   providerMax: Record<string, number>;
   slots: ReadonlyMap<string, string>;
+  /**
+   * instId → the model the session is actually serving (Paseo's `ls -g`). Absent for a session
+   * nobody observed: the pool then falls back to `inst.model`, which is only what the spawn asked
+   * for and cannot see a model the provider switched under us.
+   */
+  runtimeModels?: ReadonlyMap<string, string>;
   opsRepo: string;
   sidecar: boolean;
   now: number;
@@ -187,7 +205,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * A provider in quota or health cooldown: the percent floor (no provable recovery time), or the health cooldown, which
    * ends at its recorded `until` (server seconds). Quota, never concurrency-full.
    */
-  const quotaOf = (provider: string): Block | undefined => {
+  const quotaOf = (provider: string, exempt = false): Block | undefined => {
+    if (exempt) return undefined;
     const floor = p.quotaBlocked.get(provider);
     if (floor) return ['quota', floor];
     const health = p.health.get(provider);
@@ -204,20 +223,26 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
     const target = def && resolveSlot(def);
-    return !target || !inst.model || inst.model === target;
+    // What the provider serves wins over what the spawn asked for: a subscription can switch the
+    // model under a live session, and dispatching into it would run work on a model nobody chose.
+    // Unknown is unknown — neither "fine" nor "drifted" without evidence.
+    const served = p.runtimeModels?.get(inst.id) ?? inst.model;
+    return !target || !served || served === target;
   };
-  const cap = (provider: string) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked);
+  const cap = (provider: string, exempt = false) => providerCapacity(provider, p.providerMax, p.health, p.busyBy, p.now, p.quotaBlocked, exempt);
   /**
    * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
-  const capHit = (provider: string): Block | undefined => {
-    const quota = quotaOf(provider);
-    if (quota) return quota;
-    if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
-      return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+  const capHit = (provider: string, exempt = false): Block | undefined => {
+    if (!exempt) {
+      const quota = quotaOf(provider);
+      if (quota) return quota;
+      if (availabilityOf(p.health.get(provider), p.now) === 'probe') {
+        return (p.busyBy.get(provider) ?? 0) === 0 ? undefined : ['probe_busy', BLOCK_TEXT.probe_busy];
+      }
     }
-    return cap(provider) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
+    return cap(provider, exempt) ? undefined : ['provider_capacity', BLOCK_TEXT.provider_capacity];
   };
   /**
    * Execute gate (engineering code work): only the bound implementer may take the task. An unreadable history and an
@@ -264,7 +289,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      capHit(inst.provider ?? '');
+      capHit(inst.provider ?? '', def?.quotaLimited === false);
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -281,7 +306,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
-      capHit(def.provider);
+      capHit(def.provider, def.quotaLimited === false);
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
       weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
@@ -393,6 +418,21 @@ export interface DispatcherDeps {
    */
   hostResources?: () => HostResources;
   /**
+   * Rewrites a live session's model to the one its definition asks for. A provider may switch the
+   * model under a running subscription (Factory falls back to a cheaper model once the standard
+   * allowance is spent); the session keeps its conversation and is never retired for that. Returns
+   * true when the session now serves `model`. Undefined disables realignment: drift is then left
+   * alone rather than turned into a retirement.
+   */
+  realignAgent?: (agentId: string, model: string) => Promise<boolean>;
+  /**
+   * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
+   * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
+   * failure that cannot be restarted). Returns true when the binding moved. Undefined disables the automatic successor:
+   * the block then names the manager's takeover instead.
+   */
+  autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
+  /**
    * Terminal-task artifact reclaim (evidence/deliverables lifecycle). Bare call = periodic
    * normal-mode sweep; `{ targetFreeMb }` = pressure mode, oldest terminal work first until
    * the real free-disk probe reaches the target. Undefined disables artifact reclaim.
@@ -421,6 +461,8 @@ export interface SidecarBridge {
   bindAgent(instId: string, agentId: string): void;
   /** Absolute path of the instance's comm dir, for prompts (agents must not resolve env vars). */
   commDirFor(instId: string): string;
+  /** Absolute path of the instance's scratch dir (temp clones/builds); spawn env alone is lost on resume. */
+  scratchDirFor(instId: string): string;
   /** A spawn that succeeded but whose pre-claim is now orphaned. */
   releaseClaim(instId: string, taskId: string, reason: string): Promise<void>;
   /** Server-side lease was revoked: drop the local claim remnant so the instance can pick again. */
@@ -438,6 +480,11 @@ interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolea
  * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
  */
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
+/** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
+interface AssignHooks {
+  beforeExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn') => Promise<void> | void;
+  afterExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn', agentId: string) => Promise<void> | void;
+}
 
 /** One live session as the latest pass saw it: the raw Paseo status and the state the tick acted on. */
 export interface ObservedSession { agentId?: string; status: string; state: InstState }
@@ -472,6 +519,8 @@ export interface PassInputs {
   quotaBlocked: Map<string, string>;
   tasks: SupervisedTask[];
   slots: Map<string, string>;
+  /** instId → served model, from the same `paseo.list()` read the pass used. */
+  runtimeModels?: Map<string, string>;
 }
 
 export interface TickReport {
@@ -480,6 +529,8 @@ export interface TickReport {
   extended: string[];
   woke: Array<{ task: string; employee: string; spawned: boolean }>;
   retired: string[];
+  /** Instances whose retirement the shared gate refused this tick (SYS-DISP R1): nothing was written for them; see the log. */
+  refused?: string[];
   exhausted: string[];
   notices: string[];
   evals: string[];
@@ -487,6 +538,10 @@ export interface TickReport {
   decisions: string[];
   /** Terminal-task artifacts trimmed this tick (see report.skipped === 'resources'). */
   reclaimed?: { tasks: number; files: number; freedBytes: number; trigger: ArtifactTrigger; pressure: boolean };
+  /** Sessions put back on their definition's model this tick (provider drift, or the def moved on). */
+  realigned?: string[];
+  /** Sessions restarted in place after their provider's quota window reopened (see PaseoGateway.reload). */
+  recovered?: string[];
   skipped?: 'paused' | 'budget' | 'resources';
 }
 
@@ -504,7 +559,8 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
+    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels,
+    opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
   const pools = roles.flatMap(role => homes.map(home => ({ role, home, entries: staffingPool({ ...poolBase, role, home }) })))
@@ -527,6 +583,12 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
 export class Dispatcher {
   /** Last observed Paseo status per agent; a busy→idle transition is the recovery signal for a provider. */
   private readonly lastStatus = new Map<string, string>();
+  /** agentId → when the last in-place reload was attempted; a failing restart is retried, not hammered. */
+  private readonly reloadAt = new Map<string, number>();
+  /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
+  private readonly driftWaitLogged = new Map<string, string>();
+  /** The last quota-floor line written. A subscription can stay below the floor for days; one line per change, not per tick. */
+  private lastQuotaFloor = '';
   private readonly onboarded = new Set<string>();
   // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
   // identical answers, so re-asking every tick only burns tokens. Re-ask only
@@ -721,7 +783,7 @@ export class Dispatcher {
 
   private async pass(): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
-    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], exhausted: [], notices: [], evals: [], decisions: [] };
+    const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [], recovered: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
@@ -733,6 +795,14 @@ export class Dispatcher {
     /** `auto:<family>` defs resolve via the plugin-maintained slot map; literals pin. */
     const resolveModel = (def: EmployeeDef): string | undefined => this.resolveModel(def, slotMap);
     let insts = await wf.insts();
+    /** instId → the model Paseo reports the session actually serves (not what the spawn asked for). */
+    const runtimeModelOf = (inst: EmployeeInst): string | undefined =>
+      inst.paseoAgentId ? agents.get(inst.paseoAgentId)?.model : undefined;
+    const runtimeModels = new Map<string, string>();
+    for (const inst of insts) {
+      const served = runtimeModelOf(inst);
+      if (served) runtimeModels.set(inst.id, served);
+    }
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();
     for (const q of quotaRows) quotaByProvider.set(q.provider, q);
@@ -740,15 +810,44 @@ export class Dispatcher {
     // and long windows (week/month). Stale snapshots (>15min) fail open rather than
     // keeping a provider blocked forever.
     const quotaBlocked = quotaBlockedProviders(quotaRows, cfg, Date.now());
-    if (quotaBlocked.size) this.log(`quota below floor: ${[...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ')}`);
+    const quotaFloorLine = [...quotaBlocked].map(([p, r]) => `${p} ${r}`).join('; ');
+    if (quotaFloorLine !== this.lastQuotaFloor) {
+      const clears = this.lastQuotaFloor !== '' && quotaFloorLine === '';
+      this.lastQuotaFloor = quotaFloorLine;
+      if (quotaFloorLine) this.log(`quota below floor: ${quotaFloorLine}`);
+      else if (clears) this.log('quota recovered: every provider is above its floor');
+    }
+    // Early warning: a subscription that is nearly spent still dispatches, but the owner hears
+    // about it while there is time to top it up, instead of discovering it when the company stops.
+    if (cfg.quotaWarnPct > 0) {
+      // A snapshot older than the breaker's own freshness window is no answer: the breaker fails
+      // open on it, and a warning built on it would state a number nobody verified. Stale rows
+      // raise no warning (an existing one clears as usual once the provider stops being listed).
+      const fresh = (q: ProviderQuota) => {
+        const age = q.fetchedAt ? Date.now() - Date.parse(q.fetchedAt) : 0;
+        return age < 15 * 60_000;
+      };
+      const low = new Set<string>();
+      for (const q of quotaRows) {
+        if (quotaBlocked.has(q.provider) || !fresh(q)) continue;
+        const pct = q.weeklyPct ?? q.lowestPct;
+        if (pct === undefined || pct > cfg.quotaWarnPct) continue;
+        low.add(q.provider);
+        await this.notice(`quota-warn:${q.provider}`,
+          `订阅 ${q.provider} 剩余 ${Math.round(pct)}%（低于提醒线 ${cfg.quotaWarnPct}%），${q.summary || '请查看用量'}。额度用尽后该订阅的会话会失败，建议现在充值或调整编制。`, report);
+      }
+      for (const notice of await owner.openNotices()) {
+        if (!notice.key.startsWith('quota-warn:')) continue;
+        if (!low.has(notice.key.slice('quota-warn:'.length))) await owner.resolveNotice(notice.key);
+      }
+    }
 
     // 1. Session health.
     const states = new Map<string, InstState>();
     const observedStatus = new Map<string, string>();
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
-        await wf.retire(inst.id, 'spawn did not bind a Paseo agent', 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
       }
       if (this.deps.sidecar && !inst.credentialFile && !this.deps.sidecar.canReuse(inst)) {
@@ -758,7 +857,7 @@ export class Dispatcher {
         // session whose binding is gone is real channel isolation.
         states.set(inst.id, 'down');
         const archived = (await paseo.status(inst.paseoAgentId).catch(() => undefined))?.status === 'archived';
-        await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure');
+        if (!await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure')) continue;
         await paseo.stop(inst.paseoAgentId).catch(() => undefined);
         await paseo.archive(inst.paseoAgentId).catch(() => undefined);
         continue;
@@ -773,7 +872,7 @@ export class Dispatcher {
       const previous = this.lastStatus.get(inst.paseoAgentId);
       this.lastStatus.set(inst.paseoAgentId, status);
       observedStatus.set(inst.id, status);
-      if (status === 'running' || status === 'initializing') { states.set(inst.id, 'busy'); continue; }
+      if (status === 'running' || status === 'initializing' || status === 'busy') { states.set(inst.id, 'busy'); continue; }
       if (status === 'idle') {
         states.set(inst.id, 'idle');
         if ((previous === 'running' || previous === 'error') && inst.provider) {
@@ -793,9 +892,36 @@ export class Dispatcher {
           // still sitting in the old error state must not keep doubling it, or the provider is never probed.
           const known = health.get(inst.provider)?.state === 'exhausted';
           const fresh = previous === undefined ? !known : previous !== 'error';
+          // An exempt def keeps running through a spent subscription: its parked session is
+          // restarted on the normal retry interval instead of waiting out the provider cooldown.
+          const exempt = defs.find(d => d.id === inst.def)?.quotaLimited === false;
           if (fresh && !report.exhausted.includes(inst.provider)) {
-            await wf.markExhausted(inst.provider, error);
+            // A quota row that knows when the window resets beats the exponential backoff: the
+            // provider is unusable until then, and probing earlier only burns another session.
+            const resetsAt = quotaByProvider.get(inst.provider)?.resetsAt;
+            const resetsAtSec = resetsAt ? Math.floor(Date.parse(resetsAt) / 1000) : undefined;
+            await wf.markExhausted(inst.provider, error, Number.isFinite(resetsAtSec) ? resetsAtSec : undefined);
             report.exhausted.push(inst.provider);
+            if (!exempt) continue;
+          }
+          // Not a fresh failure: the session has been parked in this error since an earlier turn,
+          // and Paseo keeps it there until the underlying process restarts. Once the provider's
+          // cooldown has passed, restart it in place — the agent, its conversation and its channel
+          // survive, so the seat comes back without a retirement, a respawn or a new employee id.
+          const cooldownOver = exempt || (!report.exhausted.includes(inst.provider) &&
+            availabilityOf(health.get(inst.provider), now) !== 'down');
+          if (cooldownOver && now - (this.reloadAt.get(inst.paseoAgentId) ?? 0) >= RELOAD_RETRY_SECONDS) {
+            this.reloadAt.set(inst.paseoAgentId, now);
+            try {
+              await paseo.reload(inst.paseoAgentId);
+              states.set(inst.id, 'idle');
+              observedStatus.set(inst.id, 'idle');
+              this.lastStatus.set(inst.paseoAgentId, 'idle');
+              (report.recovered ??= []).push(inst.id);
+              this.log(`recovered ${inst.id}: reloaded after ${inst.provider} quota reset`);
+            } catch (reloadError) {
+              this.log(`reload ${inst.id} failed: ${(reloadError as Error).message}`);
+            }
           }
           continue;
         }
@@ -868,10 +994,17 @@ export class Dispatcher {
       // An unreadable gate hides which session is bound, so nothing is rotated in that pass (fail-closed).
       const bound = new Set([...gates.values()].flatMap(gate => gate?.implementer ? [gate.implementer] : []));
       const rotationSafe = ![...gates.values()].includes(null);
+      if (rotationSafe) {
+        const idleRetired = await reclaimIdleSessions({ instances: insts, states, held: holding, bound, now,
+          minutes: cfg.sessionIdleMinutes ?? 120, workforce: wf, paseo,
+          archiveScene: inst => this.archiveInstScene(inst), log: text => this.log(text),
+        }).catch(error => { this.log(`idle cleanup failed safely: ${(error as Error).message}`); return [] as string[]; });
+        report.retired.push(...idleRetired);
+      }
       let inspected = 0;
       for (const inst of insts) {
         if (!rotationSafe) break;
-        if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
+        if (report.retired.includes(inst.id) || states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
         // Sidecar mode: a credential-file instance can never take new work (the pool
         // refuses to claim for it), so an idle one only wastes a provider seat and
         // misleads Jev's staffing picks. Retire it on sight.
@@ -882,31 +1015,59 @@ export class Dispatcher {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
-        // Model staleness: an idle instance still on the previous resolved model would keep
-        // serving new tasks with it, so rotate it out before dispatch. Insts whose model we
-        // cannot read (undefined) stay; so do those of defs whose model is unresolvable now.
+        // Model drift is not a reason to retire anyone. A provider can switch the model under a
+        // live subscription (Factory falls back to a cheaper model once the standard allowance is
+        // spent) and can switch back when it recovers; the session, its conversation and its seat
+        // all stay valid. Realign it in place, and when that is not possible leave it for the next
+        // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
         const target = def ? resolveModel(def) : undefined;
-        const staleModel = Boolean(target && inst.model && inst.model !== target);
-        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK) && !staleModel) continue;
+        const served = runtimeModels.get(inst.id) ?? inst.model;
+        // Realign only once the subscription has recovered. A provider that switched models because
+        // its standard allowance ran out switches back on its own at reset; asking every pass during
+        // the fallback is a call that cannot take effect, and Factory keeps serving its fallback model
+        // until then. While the provider is out, the drifted session is left alone — never retired.
+        const providerReady = !inst.provider ||
+          (availabilityOf(health.get(inst.provider), now) !== 'down' && !quotaBlocked.has(inst.provider));
+        const staleModel = Boolean(target && served && served !== target);
+        if (!staleModel) this.driftWaitLogged.delete(inst.paseoAgentId);
+        if (staleModel && providerReady) {
+          const realigned = this.deps.realignAgent
+            ? await this.deps.realignAgent(inst.paseoAgentId!, target!).catch(() => false)
+            : false;
+          if (realigned) {
+            this.driftWaitLogged.delete(inst.paseoAgentId);
+            runtimeModels.set(inst.id, target!);
+            (report.realigned ??= []).push(inst.id);
+            this.log(`realigned ${inst.id}: ${served} → ${target}`);
+          } else {
+            this.log(`model drift on ${inst.id} (${served} vs ${target}) left in place: no realign path`);
+          }
+          continue;
+        }
+        if (staleModel) {
+          // Waiting out a spent subscription can last days; one line per episode keeps the plugin log readable.
+          if (this.driftWaitLogged.get(inst.paseoAgentId) !== served) {
+            this.driftWaitLogged.set(inst.paseoAgentId, served!);
+            this.log(`model drift on ${inst.id} (${served} vs ${target}) waits for ${inst.provider} to recover`);
+          }
+          continue;
+        }
+        if (!legacyEol && !overWakes && !(cfg.sessionMaxInputK > 0 && inputK > cfg.sessionMaxInputK)) continue;
         const reason = legacyEol ? '通道轮换：凭证文件实例在 sidecar 模式下不可再接任务'
-          : staleModel ? `模型轮换：实例跑 ${inst.model}，编制已到 ${target}`
           : overWakes ? `会话轮换：已派工 ${inst.wakeCount} 轮` : `会话轮换：上一轮 input ${Math.round(inputK)}k tokens`;
-        await wf.retire(inst.id, reason, 'rotation');
+        if (!await this.retireGated(inst, reason, 'rotation', report)) continue;
         await paseo.archive(inst.paseoAgentId!).catch(() => undefined);
         await this.archiveInstScene(inst);
-        if (staleModel && def) {
-          await this.notice(`model-upgrade:${def.id}:${target}`,
-            `编制 ${def.id} 的模型已升级到 ${target}（实例 ${inst.id} 等空闲旧模型会话已轮换，新任务将用新模型起会话）。`, report);
-        }
         report.retired.push(inst.id);
         this.log(`retired ${inst.id}: ${reason}`);
       }
       insts = insts.filter(i => !report.retired.includes(i.id));
+      for (const id of report.retired) runtimeModels.delete(id);
     }
 
     // What this pass has read before it decides. The snapshot and the daily brief are taken from these at the end of the tick.
-    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap };
+    this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
     await this.ownerNotices(tasks, report);
@@ -930,8 +1091,9 @@ export class Dispatcher {
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
-    const usable = [...new Set(defs.filter(d => d.enabled).map(d => d.provider))]
-      .filter(p => this.available(health.get(p), now) !== 'down' && !quotaBlocked.has(p));
+    const usable = [...new Set(defs.filter(d => d.enabled).filter(d =>
+      d.quotaLimited === false || (this.available(health.get(d.provider), now) !== 'down' && !quotaBlocked.has(d.provider)),
+    ).map(d => d.provider))];
     if ((work.length || gmBlocked.length) && usable.length === 0) {
       const exhausted = [...health.values()].filter(h => h.state === 'exhausted')
         .map(h => `${h.provider}（预计 ${new Date((h.until ?? now) * 1000).toLocaleString('zh-CN')} 后重试）`);
@@ -954,7 +1116,7 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     const host = this.hostResources();
-    const underFloor = Boolean(host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb));
+    const underFloor = Boolean(host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb));
     const headroom = cfg.artifactHeadroomMb ?? 0;
     const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
     let reclaimAttempt: ArtifactReclaimResult | undefined;
@@ -979,12 +1141,12 @@ export class Dispatcher {
         }
       }
     }
-    if (host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb)) {
+    if (host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb)) {
       const why = reclaimAttempt?.disabled
         ? `；终态产物回收被${reclaimAttempt.disabledReason === 'env' ? '环境硬停（SCK_ARTIFACT_RECLAIM=0）' : '配置关闭（artifact_reclaim_enabled=false）'}，无法自动腾出空间`
         : '';
       await this.notice('resources',
-        `宿主机资源不足，本轮暂停派工：空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
+        `宿主机资源不足，本轮暂停派工：内存压力 ${host.memoryPressure ?? '未知（按空闲内存判断）'}，空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
       if (reclaimAttempt?.disabled) {
         await this.notice('resources-reclaim-blocked',
           `资源闸门正在阻塞全部派工，但终态产物回收不可用（${reclaimAttempt.disabledReason === 'env' ? 'SCK_ARTIFACT_RECLAIM=0 环境硬停' : 'artifact_reclaim_enabled=false'}）。空闲磁盘 ${host.freeDiskMb} MB，低于下限 ${cfg.minFreeDiskMb} MB。请恢复回收配置，或用 admin reclaim-artifacts --execute 手工回收。`, report, { force: true });
@@ -1013,7 +1175,7 @@ export class Dispatcher {
     // The candidate pool is evaluated by staffingPool — the same function the owner
     // page previews — so dispatch gating and the roster can never drift apart.
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
-      providerMax: cfg.providerMax, slots: slotMap, opsRepo: this.deps.env.opsRepo,
+      providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
@@ -1027,6 +1189,84 @@ export class Dispatcher {
     const eligibleDefs = (role: string, home: string, task?: SupervisedTask, forReview = false,
       reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, forReview, undefined, reserved).flatMap(e => e.kind === 'spawn' && e.eligible ? [e.def!] : []);
+    /**
+     * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
+     * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
+     * idle, exhausted and unknown are not struck: those recover on their own.
+     */
+    const struckImplementer = (employeeId: string): boolean => {
+      const inst = insts.find(i => i.id === employeeId);
+      return !inst || states.get(inst.id) === 'down';
+    };
+    /**
+     * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
+     * every other engineer out, so the work would wait forever on someone who is gone. The system hands the code to a
+     * live engineer of the same repository on its own — no manager, no owner decision — and the next pass dispatches to
+     * it. With no candidate the verdict says so and the pass retries by itself. Returns true when the item was settled
+     * here, so the caller leaves it to the next pass.
+     */
+    /**
+     * The implementer the execute gate binds this task to, when it can be named: the explicit field first, then the derived one
+     * (the sole author of a task that never recorded an explicit implementer). An unresolved or unreadable history names
+     * nobody — the task waits there as unknown, never as struck.
+     */
+    const boundImplementer = (task: SupervisedTask): string | undefined => {
+      if (task.implementer) return task.implementer;
+      const gate = executeGates.get(task.id);
+      return gate && !gate.unresolved && gate.implementer ? gate.implementer : undefined;
+    };
+    const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
+      const implementer = boundImplementer(task);
+      if (!implementer || !struckImplementer(implementer)) return false;
+      const takeover = this.deps.autoTakeover;
+      if (takeover) {
+        let facts;
+        try {
+          facts = await wf.contributors(task.id);
+        } catch (error) {
+          this.log(`contributors read failed for ${task.id}: ${(error as Error).message}`);
+          await this.settleBlocked(task, 'execute', home, undefined, now, report);
+          return true;
+        }
+        // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
+        const excluded = new Set<string>([...facts.excluded, implementer]);
+        const successor = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+          .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
+          .map(entry => entry.key).sort()[0];
+        if (successor) {
+          const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
+            reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
+            .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
+          if (moved) {
+            report.decisions.push(`auto-takeover:${task.id}=${successor}`);
+            this.log(`auto takeover ${task.id}: ${implementer} → ${successor} (implementer unavailable)`);
+            await this.clearBlocked(task, 'execute');
+            return true;
+          }
+        }
+      }
+      await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
+      return true;
+    };
+    /**
+     * A bound implementer whose provider has failed quota repeatedly, or whose reset time is unknown, cannot be relied
+     * on to come back on its own. This is not a busy/capacity wait: the manager gets a takeover todo. A known short
+     * cooldown stays a wait; one failure is not persistent.
+     */
+    const persistentQuotaImplementer = (task: SupervisedTask): { employee: string; until?: string; failures: number } | undefined => {
+      const employee = task.implementer;
+      if (!employee) return undefined;
+      const inst = insts.find(i => i.id === employee);
+      if (!inst) return undefined; // the struck path owns a vanished employee
+      if (states.get(inst.id) !== 'exhausted') return undefined;
+      const h = health.get(inst.provider ?? '');
+      if (!h || h.state !== 'exhausted') return undefined;
+      const def = defs.find(d => d.id === inst.def);
+      if (def?.quotaLimited === false) return undefined;
+      const failures = h.failures ?? 0;
+      if (failures < PERSISTENT_QUOTA_FAILURES && h.until !== undefined) return undefined;
+      return { employee, failures, until: h.until === undefined ? undefined : new Date(h.until * 1000).toISOString() };
+    };
     const ready = (inst: EmployeeInst) => states.get(inst.id) === 'idle' ||
       (states.get(inst.id) === 'exhausted' && availabilityOf(health.get(inst.provider ?? ''), now) === 'probe');
     // Surfacing: enabled auto defs whose family cannot be resolved right now would silently
@@ -1120,6 +1360,17 @@ export class Dispatcher {
     for (const item of work) {
       if (running >= cfg.maxRunning) { unplaced.push(item); continue; }
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
+      // The binding outlives the employee: a struck implementer settles here, by automatic successor or by the block that says so.
+      if (item.purpose === 'execute' && item.task.executorRole === 'engineering') {
+        if (await replaceStruckImplementer(item.task, home)) continue;
+        const quota = persistentQuotaImplementer(item.task);
+        if (quota) {
+          await this.settleBlocked(item.task, 'execute', home,
+            [{ key: quota.employee, eligible: false, code: 'implementer_quota', until: quota.until,
+              reason: `已连续 ${quota.failures} 次额度失败` }], now, report);
+          continue;
+        }
+      }
       if (item.purpose === 'execute' && item.task.executorRole === 'engineering' && !executeGates.has(item.task.id)) {
         await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
         continue;
@@ -1189,7 +1440,7 @@ export class Dispatcher {
       this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
       if (!result) {
         if (this.scopeDenied.delete(item.task.id)) {
           // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
@@ -1227,7 +1478,100 @@ export class Dispatcher {
     }
     if (unplaced.length) await this.markGlobal(unplaced, globalBlock('max_running'), now, report, true);
 
-    const pendingGm: SupervisedTask[] = [];
+    // Manager actions: a ready/doing engineering task whose execute verdict needs a manager decision (unresolved
+    // implementer, no automatic successor, or a persistent implementer quota failure) becomes a durable todo. The
+    // same GmTodo feeds the gm prompt and the owner-facing verdict, so reason, action and time basis cannot drift.
+    const tasksById = new Map(tasks.map(task => [task.id, task]));
+    const workExecute = new Map(work.filter(item => item.purpose === 'execute').map(item => [item.task.id, item.task]));
+    const managerActionCode = (verdict: DispatchVerdict): BlockCode | undefined => {
+      const codes = verdict.reasons.map(reason => reason.code);
+      if (codes.includes('implementer_unresolved')) return 'implementer_unresolved';
+      if (codes.includes('implementer_quota')) return 'implementer_quota';
+      if (codes.includes('implementer_unavailable')) return 'implementer_unavailable';
+      return undefined;
+    };
+    type ManagerTodo = GmTodo & { purpose: string; key: string; episode: number; wakeEpisode: number; wakeReason: string; wakeDue: boolean };
+    const managerTodos: ManagerTodo[] = [];
+    for (const verdict of this.verdicts.values()) {
+      if (verdict.phase !== 'execute') continue;
+      const task = workExecute.get(verdict.taskId);
+      if (!task || task.executorRole !== 'engineering') continue;
+      const reasonCode = managerActionCode(verdict);
+      if (!reasonCode) continue;
+      const parsed = Date.parse(verdict.since ?? verdict.checkedAt);
+      const episode = Number.isFinite(parsed) ? parsed : now * 1000;
+      const key = managerActionKey(task.id, 'execute', episode, reasonCode);
+      const purpose = `gm-manager-action:${key}`;
+      let last: { at: number } | undefined;
+      let wakeDue = false;
+      try {
+        last = await wf.lastDispatch(task.id, 0, purpose);
+        wakeDue = !last || now - last.at >= cfg.redispatchMinutes * 60;
+      } catch (error) {
+        // Unknown throttle state is not a licence to wake again: keep the action and retry next pass.
+        this.log(`manager action throttle read failed for ${task.id}: ${(error as Error).message}`);
+      }
+      managerTodos.push({ task, action: 'implementer_takeover', expectedVersion: task.version, reasonCode, verdict, episode, key, purpose,
+        wakeEpisode: episode, wakeReason: reasonCode, wakeDue });
+    }
+
+    // Close todos that no longer describe the task; keep them on read failures and pass-wide gates.
+    let openActions: ManagerActionRow[] | undefined;
+    let managerReadFailed = false;
+    if (typeof wf.openManagerActions === 'function') {
+      try { openActions = await wf.openManagerActions(); }
+      catch (error) { this.log(`manager action read failed: ${(error as Error).message}`); managerReadFailed = true; }
+      if (openActions === undefined) {
+        // Fail closed: without the persisted open set we cannot dedupe a new wake or prove an old todo is resolved.
+        managerTodos.length = 0;
+        managerReadFailed = true;
+      }
+    }
+    if (openActions) {
+      const currentByKey = new Map(managerTodos.map(todo => [todo.key, todo]));
+      for (const action of openActions) {
+        const current = currentByKey.get(action.key);
+        if (current && current.task.implementer === action.implementer) continue;
+        const task = tasksById.get(action.taskId);
+        let resolution: string | undefined;
+        if (!task || task.currentEmployee || !['ready', 'doing'].includes(task.state)) {
+          resolution = 'task left the execute queue';
+        } else if (task.implementer !== action.implementer) {
+          resolution = 'implementer changed';
+        } else {
+          const verdict = this.verdicts.get(`${task.id}:execute`);
+          const codes = verdict?.reasons.map(reason => reason.code) ?? [];
+          // Unknown state and pass-wide gates are not evidence that the implementer problem is handled.
+          if (verdict && codes.length && !codes.some(code => GLOBAL_KEEP.has(code)) && !codes.includes(action.reason as BlockCode)) {
+            resolution = 'reason changed or cleared';
+          }
+        }
+        if (resolution) {
+          await wf.closeManagerAction(action, resolution).catch(error =>
+            this.log(`manager action close failed for ${action.taskId}: ${(error as Error).message}`));
+          if ((resolution === 'task left the execute queue' || resolution === 'implementer changed') && typeof wf.finishManagerWakesForTask === 'function') {
+            await wf.finishManagerWakesForTask(action.taskId, resolution).catch(error =>
+              this.log(`manager wake close failed for ${action.taskId}: ${(error as Error).message}`));
+          }
+        }
+      }
+    }
+
+    // Persist current todos before waking: a wake without a durable todo cannot be deduped after a restart.
+    for (const todo of managerTodos) {
+      if (typeof wf.openManagerAction !== 'function') continue;
+      try {
+        await wf.openManagerAction({ taskId: todo.task.id, phase: 'execute', episode: todo.episode, reason: todo.reasonCode!,
+          action: 'implementer_takeover', version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
+          implementer: todo.task.implementer });
+      } catch (error) {
+        this.log(`manager action open failed for ${todo.task.id}: ${(error as Error).message}`);
+        todo.purpose = ''; // skip the wake below: it would have no durable todo
+      }
+    }
+
+    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string };
+    const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
     // interactive RPCs queued past the daemon's 30s timeout.
@@ -1248,29 +1592,141 @@ export class Dispatcher {
       const afterReset = quotaUntil !== undefined && !gated && (!last || last.at < quotaUntil);
       if (!gated && last && now - last.at < cfg.redispatchMinutes * 60 && !afterReset) continue;
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
-      pendingGm.push(task);
+      pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
+        wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
+        wakeReason: 'blocked_to_gm' });
     }
+    for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
+
+    // Every current episode, not only the ones whose throttle expired, keeps its in-flight
+    // owner alive. Throttle controls a new wake; it must never release an old one.
+    const activeWakeKeys = new Set<string>();
+    for (const todo of managerTodos) activeWakeKeys.add(managerWakeKey(todo.task.id, 'execute', todo.wakeEpisode));
+    for (const task of gmBlocked) activeWakeKeys.add(managerWakeKey(task.id, 'execute',
+      task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version));
+    for (const action of openActions ?? []) activeWakeKeys.add(managerWakeKey(action.taskId, 'execute', action.episode));
+
+    // Restore the durable in-flight owner before any new external action. An unreadable
+    // ownership set is not evidence that the previous GM is gone: fail closed for this pass.
+    let wakeReadFailed = typeof wf.openManagerWakes !== 'function' || typeof wf.acquireManagerWake !== 'function';
+    if (!wakeReadFailed) {
+      let openWakes: ManagerWakeRow[] | undefined;
+      try { openWakes = await wf.openManagerWakes!(); }
+      catch (error) {
+        this.log(`manager wake read failed: ${(error as Error).message}`);
+      }
+      if (openWakes === undefined) wakeReadFailed = true;
+      else if (!managerReadFailed) {
+        await this.reconcileManagerWakes(openWakes, activeWakeKeys, now, report);
+      }
+    }
+    if (wakeReadFailed) {
+      this.log('manager wake ownership unavailable; suppressing all gm wake this pass');
+      pendingGm.length = 0;
+    }
+
+    const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
+    for (const todo of pendingGm) {
+      const home = todo.task.repoPath ?? this.deps.env.opsRepo;
+      const noticeKey = `gm-unavailable:${home}`;
+      // Use the exact same pools as assign, without acquiring a wake only to
+      // immediately release it. This remains quiet across dispatcher restarts.
+      if (!eligibleInsts('gm', home, undefined, false).length && !eligibleDefs('gm', home).length) {
+        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理；待办保留，检查经理编制、额度和容量。候选恢复后自动唤醒。`, report);
+        continue;
+      }
+      await owner.resolveNotice(noticeKey);
+      if (running >= cfg.maxRunning) continue;
+      let claim: ManagerWakeClaim | undefined;
+      try {
+        claim = await wf.acquireManagerWake!({
+          taskId: todo.task.id, phase: 'execute', episode: todo.wakeEpisode, reason: todo.wakeReason,
+          version: todo.task.version, repo: todo.task.repoPath ?? this.deps.env.opsRepo,
+        }, wf.newKey());
+      } catch (error) {
+        this.log(`manager wake acquire failed for ${todo.task.id}: ${(error as Error).message}`);
+        continue;
+      }
+      if (!claim) {
+        report.decisions.push(`gm-wake-held:${todo.task.id}`);
+        continue;
+      }
+      granted.push({ todo, claim });
+    }
+
     // An instance lives in one Paseo workspace (one project), so gm-attention dispatches
     // per repo: the group's readTask anchors pick home, per-project spawn quota,
     // readWorkspace resolution and the cwd/repoHome fallback on the repo the blocked
     // tasks actually belong to — a single anchorless assign would pin every project's
-    // gm batch onto the ops repo tree.
-    const gmGroups = new Map<string, SupervisedTask[]>();
-    for (const task of pendingGm) {
-      const home = task.repoPath ?? this.deps.env.opsRepo;
+    // gm batch onto the ops repo tree. Only episodes that won the durable wake CAS are
+    // in a group; an in-flight episode is never carried along in another GM's prompt.
+    const gmGroups = new Map<string, Array<{ todo: PendingGm; claim: ManagerWakeClaim }>>();
+    for (const item of granted) {
+      const home = item.todo.task.repoPath ?? this.deps.env.opsRepo;
       const group = gmGroups.get(home);
-      if (group) group.push(task); else gmGroups.set(home, [task]);
+      if (group) group.push(item); else gmGroups.set(home, [item]);
     }
     for (const group of gmGroups.values()) {
-      if (running >= cfg.maxRunning) break;
-      const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-        (inst, first, claim, worktree) => gmAttention(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0] });
-      if (!result) continue;
-      for (const task of group) await wf.recordDispatch(task.id, task.version, 'gm-attention', result.id);
+      if (running >= cfg.maxRunning) {
+        for (const item of group) {
+          await wf.finishManagerWake(item.claim, 'finished', 'max_running gate held the wake').catch(error =>
+            this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
+        }
+        continue;
+      }
+      let externalTouched = false;
+      let externalStarted = false;
+      const beforeExternal = async (inst: EmployeeInst, kind: 'send' | 'spawn') => {
+        externalTouched = true;
+        for (const item of group) {
+          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, kind === 'send' ? inst.paseoAgentId : undefined);
+          if (!marked) throw new Error(`manager wake claim lost for ${item.todo.task.id}`);
+        }
+        externalStarted = true;
+      };
+      const afterExternal = async (inst: EmployeeInst, _kind: 'send' | 'spawn', agentId: string) => {
+        for (const item of group) {
+          const marked = await wf.markManagerWakeRunning(item.claim, inst.id, agentId);
+          if (!marked) throw new Error(`manager wake binding lost for ${item.todo.task.id}`);
+        }
+      };
+      let result: (EmployeeInst & { spawned: boolean }) | undefined;
+      try {
+        result = await this.assign('gm', undefined, undefined, pick, spawnable,
+          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0]!.todo.task }, { beforeExternal, afterExternal });
+      } catch (error) {
+        this.log(`manager wake assign failed: ${(error as Error).message}`);
+      }
+      if (!result) {
+        for (const item of group) {
+          if (externalTouched) {
+            const reason = externalStarted ? 'external action result was not observed' : 'wake start write was uncertain';
+            await wf.finishManagerWake(item.claim, 'unknown', reason, 'unknown').catch(error =>
+              this.log(`manager wake unknown write failed for ${item.todo.task.id}: ${(error as Error).message}`));
+            await this.notice(`manager-wake-unknown:${item.todo.task.id}`,
+              `经理待办 ${item.todo.task.id} 的唤醒尝试已开始但结果未确认（${reason}）。待办与审计保留，本轮不会再次唤醒或 spawn 第二位 GM；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
+          } else {
+            await wf.finishManagerWake(item.claim, 'finished', 'no external action was started').catch(error =>
+              this.log(`manager wake release failed for ${item.todo.task.id}: ${(error as Error).message}`));
+          }
+        }
+        continue;
+      }
+      for (const item of group) {
+        const marked = await wf.markManagerWakeRunning(item.claim, result.id, result.paseoAgentId).catch(error => {
+          this.log(`manager wake bind failed for ${item.todo.task.id}: ${(error as Error).message}`);
+          return false;
+        });
+        if (!marked) {
+          await wf.finishManagerWake(item.claim, 'unknown', 'wake binding update failed', 'unknown').catch(() => false);
+        }
+        if (item.todo.action === 'resume') await wf.recordDispatch(item.todo.task.id, item.todo.task.version, 'gm-attention', result.id);
+        else if (item.todo.purpose) await wf.recordDispatch(item.todo.task.id, 0, item.todo.purpose, result.id);
+      }
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
       assigned.add(result.id);
-      report.woke.push(...group.map(t => ({ task: t.id, employee: result.id, spawned: result.spawned })));
+      report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
     }
 
     const triage = await owner.triagePending();
@@ -1293,7 +1749,7 @@ export class Dispatcher {
       for (const [home, group] of triageGroups) {
         if (running >= cfg.maxRunning) break;
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
+          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
         if (!result) continue;
         for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
         running++;
@@ -1349,7 +1805,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -1516,6 +1972,84 @@ export class Dispatcher {
     this.taskDeny.set(task.id, { at: now, version: task.version });
   }
 
+  /**
+   * Reconcile persisted wake ownership against the external session state before a new
+   * wake can be considered. running/initializing keeps ownership; idle after the turn
+   * grace, archived, missing or error releases it for a controlled retry; unknown,
+   * unreadable or mismatched evidence stays unknown and is never treated as idle.
+   */
+  private async reconcileManagerWakes(openWakes: ManagerWakeRow[], activeKeys: ReadonlySet<string>, now: number, report: TickReport): Promise<void> {
+    const { workforce: wf, paseo, owner } = this.deps;
+    for (const row of openWakes) {
+      const claim = wf.wakeClaim(row);
+      const noticeKey = `manager-wake-unknown:${row.taskId}`;
+      if (!activeKeys.has(row.key)) {
+        await wf.finishManagerWake(claim, 'finished', 'episode left the execute queue', row.lastStatus).catch(error =>
+          this.log(`manager wake close failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      // Pending with no external-start marker is only a crashed pre-assign attempt after a
+      // conservative grace. A live concurrent dispatcher is inside that grace.
+      if (row.state === 'pending' && !row.externalStartedAt) {
+        if (now - (row.startedAt ?? 0) >= MANAGER_WAKE_PENDING_GRACE_SECONDS) {
+          await wf.finishManagerWake(claim, 'finished', 'pending attempt expired before external action', row.lastStatus).catch(error =>
+            this.log(`manager wake pending release failed for ${row.taskId}: ${(error as Error).message}`));
+        }
+        continue;
+      }
+      if (!row.agent) {
+        const reason = row.externalStartedAt ? 'external action started without a bound agent' : 'agent not recorded';
+        await wf.finishManagerWake(claim, 'unknown', reason, 'unknown').catch(error =>
+          this.log(`manager wake unknown write failed for ${row.taskId}: ${(error as Error).message}`));
+        await this.notice(noticeKey,
+          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试无法核定 Paseo 会话（${reason}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待会话绑定恢复，或人工确认后清理该 episode。`, report);
+        continue;
+      }
+      let observed: { status: string; pendingPermissions: number } | undefined;
+      try {
+        observed = await paseo.status(row.agent);
+      } catch (error) {
+        await wf.finishManagerWake(claim, 'unknown', `status read failed: ${(error as Error).message.slice(0, 120)}`, 'unknown').catch(() => false);
+        await this.notice(noticeKey,
+          `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试状态读取失败。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 可读或人工确认。`, report);
+        continue;
+      }
+      const status = observed?.status;
+      if (status === 'running' || status === 'initializing') {
+        await wf.markManagerWakeRunning(claim, row.employee ?? 'unknown', row.agent).catch(error =>
+          this.log(`manager wake running write failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      if (status === 'idle') {
+        const since = row.externalStartedAt ?? row.startedAt ?? 0;
+        if (since && now - since >= MANAGER_WAKE_TURN_GRACE_SECONDS) {
+          await wf.finishManagerWake(claim, 'finished', 'session turn ended without resolving the manager todo', 'idle').catch(error =>
+            this.log(`manager wake idle release failed for ${row.taskId}: ${(error as Error).message}`));
+          await owner.resolveNotice(noticeKey).catch(() => undefined);
+        }
+        continue;
+      }
+      if (status === 'archived' || status === undefined) {
+        await wf.finishManagerWake(claim, 'finished', status === 'archived' ? 'session archived' : 'session not found', status ?? 'missing').catch(error =>
+          this.log(`manager wake invalid release failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      if (status === 'error') {
+        await wf.finishManagerWake(claim, 'finished', 'session error before resolving the manager todo', 'error').catch(error =>
+          this.log(`manager wake error release failed for ${row.taskId}: ${(error as Error).message}`));
+        await owner.resolveNotice(noticeKey).catch(() => undefined);
+        continue;
+      }
+      await wf.finishManagerWake(claim, 'unknown', `unrecognized session state: ${status}`, 'unknown').catch(error =>
+        this.log(`manager wake unknown state write failed for ${row.taskId}: ${(error as Error).message}`));
+      await this.notice(noticeKey,
+        `经理唤醒 ${row.taskId} 第 ${row.attempt} 次尝试处于未知状态（${status}）。待办与审计保留，本轮不会再次唤醒；恢复路径：等待 Paseo 状态明确，或人工确认会话后清理该 episode。`, report);
+    }
+  }
+
   private async assign(
     role: string, task: SupervisedTask | undefined, avoid: string | undefined,
     pick: (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter?: boolean, recusal?: ReviewRecusal, anchorHome?: string) => EmployeeInst | undefined,
@@ -1523,6 +2057,7 @@ export class Dispatcher {
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
     prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
+    hooks?: AssignHooks,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
     if (task && sidecar) {
@@ -1562,7 +2097,8 @@ export class Dispatcher {
           if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
           else await sidecar?.releaseWorkspace?.(existing);
           claim = undefined;
-          await wf.retire(existing.id, 'managed worktree workspace changed', 'rotation');
+          // A refused retirement keeps this session: no respawn over it and no wake into the stale tree this pass.
+          if (!await this.retireGated(existing, 'managed worktree workspace changed', 'rotation', report)) return undefined;
           await paseo.archive(existing.paseoAgentId!);
           sidecar!.detachAgent(existing.paseoAgentId!);
           report.retired.push(existing.id);
@@ -1572,7 +2108,9 @@ export class Dispatcher {
           // instance's claim re-resolves the same registered worktree, so its
           // spawn cwd matches by construction.
         } else {
+          await hooks?.beforeExternal?.(existing, 'send');
           await paseo.send(existing.paseoAgentId!, prompt(existing, first, claim, workspace));
+          await hooks?.afterExternal?.(existing, 'send', existing.paseoAgentId!);
           this.onboarded.add(existing.id);
           this.lastStatus.set(existing.paseoAgentId!, 'running');
           await wf.touchWake(existing.id);
@@ -1602,9 +2140,10 @@ export class Dispatcher {
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
       catch (error) {
-        await wf.retire(inst.id, 'allocation unavailable', 'failure');
-        sidecar?.detachAgent(inst.paseoAgentId ?? '');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, 'allocation unavailable', 'failure', report)) {
+          sidecar?.detachAgent(inst.paseoAgentId ?? '');
+          report.retired.push(inst.id);
+        }
         this.log(`allocation ${task?.id} waiting: ${(error as Error).message}`);
         return undefined;
       }
@@ -1612,8 +2151,7 @@ export class Dispatcher {
         // A scope lost at claim time is task-wide: no other def is tried, and the unbound seat is released.
         const scopeLost = sidecar.claimDenial(inst.id) === 'worktree_busy';
         if (scopeLost) this.scopeDenied.add(task.id); else this.markDenied(task);
-        await wf.retire(inst.id, scopeLost ? 'write scope held' : 'claim denied', 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, scopeLost ? 'write scope held' : 'claim denied', 'failure', report)) report.retired.push(inst.id);
         return undefined;
       }
       try {
@@ -1624,6 +2162,7 @@ export class Dispatcher {
         // tree-bound cwd it always had.
         const instHome = sidecar?.commDirFor(inst.id);
         const spawnCwd = instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
+        await hooks?.beforeExternal?.(inst, 'spawn');
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd, workspaceTitle: instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
@@ -1631,6 +2170,7 @@ export class Dispatcher {
           env: spawnEnv,
           prompt: prompt(inst, true, claim, workspace),
         });
+        await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
         const repoHome = task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });
@@ -1647,8 +2187,7 @@ export class Dispatcher {
         this.log(`spawn ${inst.id} failed: ${message}`);
         if (workspace) await sidecar?.releaseWorkspace?.(inst);
         if (claim) await sidecar!.releaseClaim(inst.id, task!.id, `spawn failed: ${message.slice(0, 120)}`);
-        await wf.retire(inst.id, `spawn failed: ${message.slice(0, 200)}`, 'failure');
-        report.retired.push(inst.id);
+        if (await this.retireGated(inst, `spawn failed: ${message.slice(0, 200)}`, 'failure', report)) report.retired.push(inst.id);
         // A quota-flavored spawn failure is the provider's problem, not the def's:
         // cool the provider down instead of eating a strike toward auto-disable.
         if (EXHAUSTED_PATTERN.test(message)) {
@@ -1692,8 +2231,25 @@ export class Dispatcher {
     }
   }
 
-  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure') {
-    await this.deps.workforce.retire(inst.id, reason, kind);
+  /**
+   * Retires through the shared gate (SYS-DISP R1). A refusal writes nothing: the instance keeps its session, credential and lease,
+   * so the caller must not archive, detach or respawn it, and the tick reports it as refused instead of retired. Returns false then.
+   */
+  private async retireGated(inst: EmployeeInst, reason: string, kind: RetirementKind, report: TickReport): Promise<boolean> {
+    try {
+      await this.deps.workforce.retire(inst.id, reason, kind);
+      return true;
+    } catch (error) {
+      if (!isRetireRefused(error)) throw error;
+      report.refused?.push(inst.id);
+      this.log(`retire ${inst.id} refused (${reason}): ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /** Returns false when the gate refused the retirement; the session is then left in place (see retireGated). */
+  private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure'): Promise<boolean> {
+    if (!await this.retireGated(inst, reason, kind, report)) return false;
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
     // The dead session is useless and its red "error" entry confuses the roster —
     // archive it (soft-delete, timeline kept) like session rotation already does.
@@ -1703,6 +2259,7 @@ export class Dispatcher {
     this.log(`retired ${inst.id}: ${reason}`);
     const def = defs.find(d => d.id === inst.def);
     if (def && countFailure) await this.countDefFailure(def, report);
+    return true;
   }
 
   /**

@@ -3,8 +3,14 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import type { RetirementKind } from '../contracts.ts';
+import { CompanyError } from '../core-errors.ts';
 
-export interface AgentInfo { id: string; status: string }
+/**
+ * `model` is the model the session is actually serving (`ls -g` prints `provider/model`), which a
+ * provider may have switched under us when a subscription hit its allowance. Undefined when Paseo
+ * prints a bare provider id: unknown, never "unchanged".
+ */
+export interface AgentInfo { id: string; status: string; model?: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
 export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number; employeesRetired?: number }
@@ -48,6 +54,13 @@ export interface PaseoGateway {
   spawn(input: SpawnInput): Promise<string>;
   send(agentId: string, prompt: string): Promise<void>;
   stop(agentId: string): Promise<void>;
+  /**
+   * Restart the session's underlying process in place, keeping the agent, its conversation and
+   * its channel binding. A session parked in `error` never leaves that state on its own — the
+   * dispatcher only dispatches into idle sessions — so this is how a seat comes back after the
+   * subscription that failed it recovers.
+   */
+  reload(agentId: string): Promise<void>;
   /** Soft-delete the agent's session (its transcript stays in Paseo history). */
   archive(agentId: string): Promise<void>;
   /** Active workspaces; archived ones no longer appear. */
@@ -130,8 +143,14 @@ export function createPaseoCli(
   };
   return {
     async list() {
-      const rows = await json<Array<{ id: string; status: string }>>(['ls', '-g']);
-      return new Map(rows.map(r => [r.id, { id: r.id, status: r.status }]));
+      const rows = await json<Array<{ id: string; status: string; provider?: string }>>(['ls', '-g']);
+      return new Map(rows.map(r => {
+        // `provider` is "<providerId>/<modelId>"; a model id may itself contain slashes
+        // (`pi/magpie/stepfun/…`), so only the first one separates.
+        const slash = typeof r.provider === 'string' ? r.provider.indexOf('/') : -1;
+        const model = slash > 0 ? r.provider!.slice(slash + 1) : undefined;
+        return [r.id, { id: r.id, status: r.status, model }];
+      }));
     },
     async status(agentId) {
       let text: string;
@@ -155,9 +174,15 @@ export function createPaseoCli(
       return { status: fields.Status, pendingPermissions };
     },
     async lastError(agentId) {
-      const text = await run(['logs', agentId, '--tail', '8', '--no-color']).catch(() => '');
-      const errors = text.split('\n').filter(line => line.startsWith('[System Error]'));
-      return errors.at(-1)?.replace('[System Error]', '').trim() ?? '';
+      const text = await run(['logs', agentId, '--tail', '12', '--no-color']).catch(() => '');
+      // Paseo reports the failure as a timeline entry, not as a bare marker. The real line reads
+      //   Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: …
+      // so matching only a *leading* "[System Error]" never matched a single real failure and
+      // every quota exhaustion was read as an empty error and retired as "session error: unknown".
+      const marked = text.split('\n')
+        .map(line => line.trim())
+        .filter(line => line && (/\[System Error\]/.test(line) || /^(?:Internal error:|Error:)/.test(line)));
+      return (marked.at(-1) ?? '').replace(/\[System Error\]/g, ' ').replace(/\s+/g, ' ').trim();
     },
     async logsTail(agentId, entries) {
       return run(['logs', agentId, '--tail', String(entries), '--no-color']).catch(error => `（无法读取会话日志：${error.message}）`);
@@ -206,6 +231,9 @@ export function createPaseoCli(
     async stop(agentId) {
       await run(['stop', agentId]);
     },
+    async reload(agentId) {
+      await run(['agent', 'reload', agentId]);
+    },
   };
 }
 
@@ -220,12 +248,19 @@ const withinTree = (candidate: string, root: string) => candidate === root || ca
 const goneSceneError = (error: unknown) =>
   /not.?found|no such|already|archived/i.test(error instanceof Error ? error.message : String(error));
 
+/** The stable code of a failed employee retirement, or a short message for an unknown failure. It is kept on the scene for the retry. */
+const failureLabel = (error: unknown): string =>
+  error instanceof CompanyError ? error.code : (error instanceof Error ? error.message : String(error)).slice(0, 80);
+
 /**
  * Release the Paseo side of a task scene: archive every workspace whose cwd points at the
  * tree, then delete each project rooted at the tree that no longer hosts a live workspace.
  * Both steps are idempotent — a missing object counts as done. Every object is attempted so
  * one failure does not mask the others; the collected failures throw so the caller can keep
- * the scene and retry at the next event point.
+ * the scene and retry at the next event point. An employee whose retirement does not complete,
+ * for any reason, keeps its own session (no detach, no archive) and holds back the teardown of the
+ * whole tree: no workspace or project is torn down while it remains (SYS-DISP R1). Employees already
+ * retired in the same tree are detached and archived as usual.
  */
 export function createSceneCleaner(
   paseo: Pick<PaseoGateway, 'listWorkspaces' | 'listProjects' | 'archiveWorkspace' | 'deleteProject' | 'archive'>,
@@ -240,14 +275,24 @@ export function createSceneCleaner(
     // Otherwise the archived agent fires agent.archived, the sidecar quarantines the
     // instance, and the next tick blames a dead binding as 通道隔离.
     let employeesRetired = 0;
+    const kept: string[] = [];
     if (employees) {
       for (const inst of await employees.insts()) {
         if (!inst.cwd || !withinTree(canonicalPath(inst.cwd), target)) continue;
+        try {
+          await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive');
+        } catch (error) {
+          // Refused (in-flight work is still here) or failed for another reason (the facts are unconfirmed). Either way the session
+          // stays: no detach, no archive, and the teardown below does not run for this tree.
+          kept.push(`${inst.id}（${failureLabel(error)}）`);
+          continue;
+        }
         employeesRetired++;
-        await employees.retire(inst.id, '场景回收：会话随任务现场销毁', 'archive').catch(() => undefined);
         employees.detach?.(inst);
         if (inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
       }
+      // The workspace teardown below ends every session in the tree, so a tree with an employee not retired waits for a retry, with its cause.
+      if (kept.length) throw new CompanyError('temporarily_unavailable', `scene kept: employee retirement not completed for ${kept.join('、')}`, true);
     }
     const workspaces = await paseo.listWorkspaces();
     const doomed = workspaces.filter(w => withinTree(canonicalPath(w.cwd), target));

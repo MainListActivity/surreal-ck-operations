@@ -22,6 +22,12 @@ export interface TaskView {
   deliveryId?: string;
   leaseExpiresAt?: string;
   blockedTo?: "gm" | "owner";
+  /** Blocked rows: the phase restored when the dependency wait ends. */
+  resumeState?: TaskState;
+  /** Blocked rows: the role recorded by the original block. */
+  resumeRole?: string;
+  /** Blocked rows: why the task waits (see src/contracts.ts TaskWaiting). */
+  waiting?: { kind: "manager" | "owner" | "dependency"; resumeState: TaskState | "unknown"; role: string; dependenciesCount: number };
   previousEmployee?: string;
 }
 
@@ -68,7 +74,7 @@ export interface Inbox {
  * 最近做完了什么、资源有没有异常。全部来自任务服务与调度器同一套判定。
  */
 /** The lists of the pulse answer that carry a truncation marker (see the bounds field). */
-export type PulseListName = "dispatchBlocked" | "goalBlockers" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "goals" | "resources";
+export type PulseListName = "dispatchBlocked" | "goalBlockers" | "workflowWaits" | "ready" | "doing" | "stuck" | "waiting" | "recentDone" | "goals" | "resources";
 
 export interface Pulse {
   /** When this answer was built (request time). Live lists (doing, stuck, waiting, ...) read as of this instant. */
@@ -82,8 +88,15 @@ export interface Pulse {
   ready: Array<{ taskId: string; title: string; role: string; discipline?: string; waitingMin: number; unclaimableReason?: string }>;
   /** 本轮 tick 判定派不出去的工作（execute 与 review 两阶段），与公司通知同源 */
   dispatchBlocked: DispatchBlockedView[];
-  /** 每个目标的根阻点（同一服务端评估器），目标卡直接显示 */
+  /** 每个目标的派工不可派结论根，沿用既有 dispatcher pass。 */
   goalBlockers: GoalRootBlockerView[];
+  /** 独立采集的目标工作流等待根；不代表派工失败，时间与 dispatcherAt 分开。 */
+  workflowWaits: Array<{ goalId?: string; taskId: string; title: string; workflowState: "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown";
+    kind: "dependency" | "manager" | "owner" | "active_lease" | "unknown"; basis: string;
+    waitingForRole: string; nextTrigger: string; goalRootCount: number; impact?: number; dependencyPath?: Array<{ taskId: string; title: string }>;
+    unknownReason?: string; dependencyPathTruncated?: boolean; people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+    peopleSource?: string; submitterSource?: string; submitCommitSource?: string; peopleCheckedAt?: string; submitCheckedAt?: string }>;
+  workflowWaitSummary: { source: 'workflow-graph'; available: boolean; checkedAt?: string; totalRoots: number; truncated: boolean; reason?: string };
   /** 依赖全部完成却仍 blocked（需解锁）等异常卡滞 */
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   /** 等老板拍板/回答（带已等时长与下游受阻数） */
@@ -211,12 +224,12 @@ export interface DispatchReasonView {
   text: string;
   candidates: string[];
   candidatesOmitted?: number;
-  owner: "gm" | "owner";
+  owner: "gm" | "owner" | "system";
   /** The source the code was read from, for example "contribution-audit". */
   basis: string;
   recovery: string;
   /** Structured recovery actions; `executable` is false when no operations tool performs the action. */
-  actions: Array<{ authority: "gm" | "owner"; label: string; tool?: string; executable: boolean }>;
+  actions: Array<{ authority: "gm" | "owner" | "system"; label: string; tool?: string; executable: boolean }>;
   nextTrigger: string;
 }
 
@@ -225,8 +238,9 @@ export interface Roster {
   /** The operations repo; pools whose home equals this render as the default project. */
   opsRepo: string;
   usage: ProviderUsageView[];
-  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; avgScore?: number }>;
-  instances: Array<{ id: string; def?: string; role: string; provider?: string; cwd?: string; agentId?: string; agentStatus?: string }>;
+  defs: Array<{ id: string; role: string; provider: string; model: string; resolved?: string; thinking?: string; enabled: boolean; maxInstances: number; weight?: number; avgScore?: number; quotaLimited?: boolean }>;
+  /** What the roster renders: the instance name, its def, and the tick's session status. */
+  instances: Array<{ id: string; def?: string; agentStatus?: string }>;
   health: Array<{ provider: string; state: string; lastError?: string; until?: number }>;
   /** Live staffing preview per role+project — same function, same inputs as the dispatcher tick. */
   pools: StaffingPoolView[];

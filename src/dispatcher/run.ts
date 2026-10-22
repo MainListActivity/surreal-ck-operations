@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { loadDatabaseConfig } from '../config.ts';
 import { CompanyDatabase } from '../database.ts';
 import { OwnerDesk } from '../owner.ts';
+import { SurrealCompanyCore } from '../core.ts';
 import { Workforce } from '../workforce.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
@@ -29,6 +30,7 @@ process.once('SIGTERM', () => stop.abort());
 try {
   await db.bootstrap();
   const workforce = new Workforce(db, resolve(required('SCK_CREDENTIAL_DIR')));
+  const core = new SurrealCompanyCore(db);
   const dispatcher = new Dispatcher({
     workforce, owner: new OwnerDesk(db), paseo: createPaseoCli(),
     env: { opsRepo: required('SCK_AGENT_CWD'), sckBin: required('SCK_TOOL_BIN'),
@@ -36,6 +38,8 @@ try {
     notify: process.env.SCK_NOTIFY === '0' ? undefined : notify,
     log: message => console.log(`${new Date().toISOString()} ${message}`),
     jev: jevFromEnv(),
+    // Same automatic successor as the plugin's dispatcher (see plugin/server/company.ts).
+    autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
     // WT01: managed/legacy scenes must survive; no destructive sweeper.
     // `auto:<family>` defs resolve through the slot map the Paseo plugin maintains;
     // without it this fallback dispatcher cannot spawn auto defs at all.
@@ -53,7 +57,7 @@ try {
       const report = await dispatcher.tick();
       failures = 0;
       const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
-        report.exhausted.length || report.notices.length || report.evals.length || report.decisions.length ||
+        report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || report.decisions.length ||
         report.reclaimed;
       if (changed) console.log(`${new Date().toISOString()} tick ${JSON.stringify(report)}`);
     } catch (error) {

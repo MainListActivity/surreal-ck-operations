@@ -3,12 +3,27 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RecordId, Surreal } from 'surrealdb';
 import type { DatabaseConfig } from './config.ts';
+import { CompanyError } from './core-errors.ts';
+import type { SnapshotChannel, SnapshotLink } from './snapshot-store.ts';
 
 const OWNER = 'surreal-ck-operations/issue-23/v1';
 
 // Lazy: runtimes that only query (e.g. the Paseo plugin subprocess) may not have schema/ beside the bundle.
 const loadSchema = (file: string) =>
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'schema', file), 'utf8');
+
+/** Snapshot-build connections open at once across the process (SYS01 AC-D). A build that gets none within BUILD_QUEUE_MS is refused. */
+export const MAX_BUILD_CONNECTIONS = 4;
+const BUILD_QUEUE_MS = 2_000;
+/**
+ * How long a build connection may sit idle before it is closed instead of reused (SYS01 AC02, production return). A remote WSS
+ * handshake costs seconds on the production link; reusing a warm socket for the next build removes that cost from the default
+ * first-page path. The idle socket is probed with one cheap statement before reuse, so a socket the server closed in the meantime
+ * is replaced rather than failing the build.
+ */
+const BUILD_IDLE_TTL_MS = 30_000;
+/** Longest the reuse probe may take before the socket is treated as gone and a fresh one is opened. */
+const BUILD_REUSE_PROBE_MS = 2_000;
 
 export class CompanyDatabase {
   readonly db = new Surreal();
@@ -97,9 +112,20 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('019-story-author-role.surql'));
     await this.db.query(loadSchema('020-cinematography-role.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
-    await this.db.query(loadSchema('023-independence-policy.surql'));
+    // The SYS01 snapshot schemas follow main's 021 (worktree audit events) and 022 (def quota limits).
+    await this.db.query(loadSchema('021-worktree-audit-events.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
+    await this.db.query(loadSchema('022-def-quota-limited.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
+    await this.db.query(loadSchema('023-query-snapshot.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
-  }
+    await this.db.query(loadSchema('024-snapshot-quota.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
+    // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
+    await this.db.query(loadSchema('027-qa-observation.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');    // 独立性策略（SYS-DISP 8c732ae6 IR01）：028 由本线取用（025/026 为在办 lane 预占，027 已被 QA 取证占用）；只新增字段，旧行不动。
+    await this.db.query(loadSchema('028-independence-policy.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 28 WHERE schema_version < 28;');  }
 
   private async ensureOutboxSequence(): Promise<void> {
     const counter = new RecordId('company_meta', 'outbox_counter');
@@ -174,9 +200,192 @@ export class CompanyDatabase {
     return this.reconnecting;
   }
 
+  private readonly buildSockets = new Set<Surreal>();
+  /** Open build sockets that are not checked out, newest last. They count toward MAX_BUILD_CONNECTIONS with the active ones. */
+  private readonly idleBuildSockets: Array<{ socket: Surreal; since: number }> = [];
+  private buildSlotsInUse = 0;
+  private readonly buildSlotWaiters: Array<() => void> = [];
+  private closing = false;
+
+  /**
+   * The connections snapshot builds run on (SYS01 AC-D): a socket of their own for each read attempt, to the same namespace and
+   * database. A large build then never queues ahead of control requests on the main socket, and an attempt that is abandoned or
+   * cancelled closes only its own socket. At most MAX_BUILD_CONNECTIONS are open at once across the process: a socket keeps its
+   * slot until it is closed, and a build that gets no slot within BUILD_QUEUE_MS is refused as temporarily_unavailable.
+   */
+  readonly buildChannel: SnapshotChannel = {
+    open: async (): Promise<SnapshotLink> => {
+      if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      // Reuse a warm socket when one is idle: on the production WSS link a handshake costs seconds, and a build that pays it on
+      // every first page cannot answer within its deadline (SYS01 AC02 production return).
+      const warm = await this.takeIdleBuildSocket();
+      if (warm) return this.linkFor(warm);
+      await this.takeBuildSlot();
+      if (this.closing) {
+        this.freeBuildSlot();
+        throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      }
+      // A socket may have gone idle while this build waited for a slot: take it rather than opening another.
+      const raced = await this.takeIdleBuildSocket(true);
+      if (raced) return this.linkFor(raced);
+      const socket = new Surreal();
+      this.buildSockets.add(socket);
+      const opening = this.openSocket(socket);
+      try {
+        await CompanyDatabase.withTimeout(opening, 15_000, 'build connect');
+      } catch (error) {
+        // The timeout does not cancel the connect. A socket that opens after its slot was freed is closed at once, so it cannot
+        // outlive the build cap.
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
+        await this.closeBuildSocket(socket);
+        throw error;
+      }
+      return this.linkFor(socket);
+    },
+  };
+
+  /** The link a build holds: `close` drops the socket, `release` returns it warm for the next build. */
+  private linkFor(socket: Surreal): SnapshotLink {
+    return {
+      db: socket,
+      close: () => this.closeBuildSocket(socket),
+      release: () => this.releaseBuildSocket(socket),
+    };
+  }
+
+  /**
+   * Pops one warm socket, closing the ones past BUILD_IDLE_TTL_MS. `holdsSlot` is true when the caller already owns an active slot
+   * (the slot is handed over to this socket); otherwise the idle socket becomes active here. Returns undefined when none is usable.
+   */
+  private async takeIdleBuildSocket(holdsSlot = false): Promise<Surreal | undefined> {
+    while (this.idleBuildSockets.length > 0) {
+      const entry = this.idleBuildSockets.pop()!;
+      if (this.closing || Date.now() - entry.since > BUILD_IDLE_TTL_MS) {
+        await this.closeIdleBuildSocket(entry.socket);
+        continue;
+      }
+      // One cheap statement proves the socket is still alive: a server that dropped the idle connection fails here, not in the build.
+      const alive = await CompanyDatabase.withTimeout(
+        entry.socket.query('RETURN true;').then(() => true, () => false), BUILD_REUSE_PROBE_MS, 'build reuse probe',
+      ).catch(() => false);
+      if (!alive) {
+        await this.closeIdleBuildSocket(entry.socket);
+        continue;
+      }
+      if (!holdsSlot) this.buildSlotsInUse++;
+      return entry.socket;
+    }
+    return undefined;
+  }
+
+  /** Returns a build socket to the idle set; its slot is freed for the next waiter. A closing pool or a full idle set drops it. */
+  private async releaseBuildSocket(socket: Surreal): Promise<void> {
+    if (this.closing || !this.buildSockets.has(socket)) {
+      await this.closeBuildSocket(socket);
+      return;
+    }
+    this.idleBuildSockets.push({ socket, since: Date.now() });
+    this.freeBuildSlot();
+  }
+
+  private async closeIdleBuildSocket(socket: Surreal): Promise<void> {
+    if (!this.buildSockets.delete(socket)) return;
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'idle build close').catch(() => undefined);
+  }
+
+  private readonly releaseSockets = new Set<Surreal>();
+
+  /**
+   * The connections releases and sweeps of listings run on, one for each, outside the build cap. A saturated build pool must not
+   * hold back a release: a listing that is not released holds its quota until it expires.
+   */
+  readonly releaseChannel: SnapshotChannel = {
+    open: async (): Promise<SnapshotLink> => {
+      if (this.closing) throw new CompanyError('temporarily_unavailable', 'the database is closing; retry shortly', true);
+      const socket = new Surreal();
+      this.releaseSockets.add(socket);
+      const opening = this.openSocket(socket);
+      try {
+        await CompanyDatabase.withTimeout(opening, 15_000, 'release connect');
+      } catch (error) {
+        void opening.then(() => this.closeLateSocket(socket), () => undefined);
+        await this.closeReleaseSocket(socket);
+        throw error;
+      }
+      return { db: socket, close: () => this.closeReleaseSocket(socket) };
+    },
+  };
+
+  /**
+   * Build connections open (active and idle), the slots checked out, the idle sockets kept warm, and the builds waiting for a slot
+   * (for the tests and the measurements). `open` stays within MAX_BUILD_CONNECTIONS; after a build its slot returns to 0 while its
+   * socket may stay warm until BUILD_IDLE_TTL_MS.
+   */
+  buildConnectionStats(): { open: number; slotsInUse: number; idle: number; queued: number } {
+    return { open: this.buildSockets.size, slotsInUse: this.buildSlotsInUse, idle: this.idleBuildSockets.length, queued: this.buildSlotWaiters.length };
+  }
+
+  /** Takes a build slot now, or waits for one that a closing socket frees; a slot passes straight to the first waiter. */
+  private takeBuildSlot(): Promise<void> {
+    if (this.buildSlotsInUse + this.idleBuildSockets.length < MAX_BUILD_CONNECTIONS) {
+      this.buildSlotsInUse++;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        const index = this.buildSlotWaiters.indexOf(waiter);
+        if (index >= 0) this.buildSlotWaiters.splice(index, 1);
+        reject(new CompanyError('temporarily_unavailable',
+          `snapshot builds are busy: ${MAX_BUILD_CONNECTIONS} are running and none finished within ${BUILD_QUEUE_MS / 1000} seconds; narrow the query with state, goalId, role or since, then retry`, true));
+      }, BUILD_QUEUE_MS);
+      this.buildSlotWaiters.push(waiter);
+    });
+  }
+
+  private freeBuildSlot(): void {
+    const next = this.buildSlotWaiters.shift();
+    if (next) next();
+    else this.buildSlotsInUse--;
+  }
+
+  private async openSocket(socket: Surreal): Promise<void> {
+    await socket.connect(this.config.url, {
+      authentication: { username: this.config.rootUser, password: this.config.rootPassword },
+    });
+    await socket.use({ namespace: this.config.namespace, database: this.config.database });
+  }
+
+  private async closeBuildSocket(socket: Surreal): Promise<void> {
+    // Only the call that finds the socket still open closes it and frees its slot, so a link closed twice frees its slot once.
+    if (!this.buildSockets.delete(socket)) return;
+    try {
+      await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'build close').catch(() => {});
+    } finally {
+      this.freeBuildSlot();
+    }
+  }
+
+  private async closeReleaseSocket(socket: Surreal): Promise<void> {
+    if (!this.releaseSockets.delete(socket)) return;
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'release close').catch(() => {});
+  }
+
+  /** Closes a socket whose connect finished after its owner had given up on it. Best effort, and bounded like the other closes. */
+  private async closeLateSocket(socket: Surreal): Promise<void> {
+    await CompanyDatabase.withTimeout(socket.close().catch(() => {}), 5_000, 'late close').catch(() => {});
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
     clearInterval(this.keepalive);
     this.keepalive = undefined;
+    this.idleBuildSockets.length = 0;
+    await Promise.all([...this.buildSockets].map(socket => this.closeBuildSocket(socket)));
+    await Promise.all([...this.releaseSockets].map(socket => this.closeReleaseSocket(socket)));
     // engine.close() awaits a 'disconnected' event that never arrives when the peer
     // silently dropped (close frame sent, no reply) — bound it so shutdown can't wedge.
     await CompanyDatabase.withTimeout(this.db.close(), 5_000, 'db close').catch(() => {});

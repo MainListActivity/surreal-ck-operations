@@ -4,12 +4,13 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
 import type { IndependencePolicy, IndependenceStage, Principal, RetirementKind, Role, TaskId } from './contracts.ts';
+import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
-import { LocalEnrollmentAdmin } from './enrollment.ts';
+import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
-import { readContributors, type ContributionFacts } from './contributors.ts';
+import { readContributors, readContributionView, type ContributionFacts } from './contributors.ts';
 import { readIndependenceScope, type IndependenceScope } from './independence.ts';
-
+import { gateCredentialChange } from './retirement.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
  * Never hand this object to the MCP adapter.
@@ -33,6 +34,11 @@ export interface EmployeeDef {
   priority: number;
   /** 派工权重：同岗位候选中按 weight × 绩效系数 加权随机选取；0 = 永不主动选中。 */
   weight: number;
+  /**
+   * false = this def ignores quota-based dispatch gating: it is dispatched even when the
+   * subscription's remaining allowance is 0. Absent/true = limited (the default).
+   */
+  quotaLimited?: boolean;
   scored: number;
   avgScore?: number;
   errorStreak: number;
@@ -51,6 +57,7 @@ export interface EmployeeInst {
   /** Minted at spawnInst or re-issued by rotate(); held by the caller (plugin sidecar) only. */
   credential?: string;
   lastWakeAt?: number;
+  idleSince?: number;
   onboarded?: boolean;
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
@@ -96,10 +103,14 @@ export interface CompanyConfig {
   /** 订阅剩余额度（任一额度窗口或余额）低于该百分比时视为不可用，停止复用与新开；0 = 不熔断。 */
   quotaFloorPct: number;
   quotaWeeklyFloorPct: number;
+  /** 订阅剩余额度低于该百分比但尚未触及下限时，给老板发一次“即将用尽”提醒；0 = 不提醒。 */
+  quotaWarnPct: number;
   /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
   sessionMaxWakes: number;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
+  /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
+  sessionIdleMinutes: number;
   /** quick 目标的完成任务在 Jev 低置信度时是否升级 LLM 评审员；默认 false，直接记录 Jev 评分。 */
   evalQuickLlm: boolean;
   /** 每日简报的本地发送时刻（0-23 点，之后第一个周期发送）；-1 = 关闭。 */
@@ -118,6 +129,12 @@ export interface CompanyConfig {
   artifactDeliverableGraceDays: number;
   /** 空闲磁盘低于「下限 + 该值」MB 时提前按压力回收，免得撞上暂停派工的下限；0 = 只在撞下限时回收。 */
   artifactHeadroomMb: number;
+  /** archive/ 冷归档批次的保留天数（按批次目录的最后修改时间计时）；0 = 不自动清理归档。 */
+  archiveRetentionDays: number;
+  /** 已不在册的员工实例，其 comm/ 目录保留的小时数；0 = 不自动清理。 */
+  commDirGraceHours: number;
+  /** 员工临时文件目录 scratch/<实例> 的保留小时数，按目录最后修改时间计时；0 = 不自动清理。 */
+  scratchGraceHours: number;
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
@@ -125,9 +142,10 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
+  archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
 };
 
 /** 有效派工权重 = 配置的 weight × 绩效系数（无评分记录时系数为 1；5 分约 1.7 倍，1 分约 0.33 倍）。 */
@@ -176,6 +194,10 @@ export interface SupervisedTask {
   leaseExpiresAt?: number;
   progressAt?: number;
   blockedTo?: 'gm' | 'owner';
+  /** Blocked rows: phase restored when the dependency wait ends (review stays review; execute returns ready). */
+  resumeState?: TaskRow['state'];
+  /** Blocked rows: role recorded by the original block. */
+  resumeRole?: string;
   /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
   quotaResetsAt?: number;
   kind: string;
@@ -217,6 +239,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
     dispatchBlockedPhase: row.dispatch_blocked_phase ?? undefined, dispatchBlockedSince: row.dispatch_blocked_since ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
+    resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
@@ -228,9 +251,80 @@ const COOLDOWN_MAX = 6 * 60 * 60;
 export const capabilitiesFor = (role: Role): Principal['capabilities'] =>
   role === 'eval' ? [] : role === 'gm' || role === 'product' ? ['execute', 'review', 'manage'] : ['execute', 'review'];
 
+/** One manager todo to persist: task + phase + episode + reason identify it; the action is what the manager can do. */
+export interface ManagerActionInput {
+  taskId: string;
+  phase: 'execute' | 'review';
+  episode: number;
+  reason: string;
+  action: 'implementer_takeover';
+  version: number;
+  repo: string;
+  implementer?: string;
+}
+
+export interface ManagerActionRow extends ManagerActionInput {
+  key: string;
+  status: 'open' | 'closed';
+  createdAt?: string;
+  closedAt?: string;
+  resolution?: string;
+}
+
+/** One manager-wake attempt. It lives in the same schemaless dispatch table, keyed by task+phase+episode. */
+export type ManagerWakeState = 'pending' | 'running' | 'finished' | 'unknown';
+
+export interface ManagerWakeInput {
+  taskId: string;
+  phase: 'execute' | 'review';
+  /** Episode start in milliseconds (the same value managerActionKey carries). */
+  episode: number;
+  reason: string;
+  version: number;
+  repo: string;
+}
+
+export interface ManagerWakeRow extends ManagerWakeInput {
+  key: string;
+  purpose: 'gm-manager-wake';
+  state: ManagerWakeState;
+  attempt: number;
+  token: string;
+  employee?: string;
+  agent?: string;
+  /** Unix seconds. */
+  startedAt?: number;
+  externalStartedAt?: number;
+  lastCheckedAt?: number;
+  lastStatus?: string;
+  resolution?: string;
+  updatedAt?: number;
+}
+
+/** The CAS token a dispatcher must present for every later write to this attempt. */
+export interface ManagerWakeClaim {
+  key: string;
+  token: string;
+  attempt: number;
+  input: ManagerWakeInput;
+}
+
+/** Logical in-flight unit: task + phase + episode. Reason/version are fields, not part of the key. */
+export const managerWakeKey = (taskId: string, phase: string, episode: number) => `${taskId}:${phase}:${episode}`;
+
+/** A pending attempt with no external-start evidence is safe to release only after this conservative grace. */
+export const MANAGER_WAKE_PENDING_GRACE_SECONDS = 120;
+/** An observed idle turn is a definite end only after the external action has had this long to start. */
+export const MANAGER_WAKE_TURN_GRACE_SECONDS = 60;
+
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
-  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string) {
+  /**
+   * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
+   * write, so a test can land a claim or takeover in exactly that window.
+   */
+  constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string,
+    private readonly retirementHook?: (employeeId: string) => Promise<void>) {
     this.enrollment = new LocalEnrollmentAdmin(database);
   }
   private get db() { return this.database.db; }
@@ -262,9 +356,11 @@ export class Workforce {
       jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
       jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
-      quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : 2,
+      quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
+      quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
-      sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
+      sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
+      sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
@@ -273,12 +369,15 @@ export class Workforce {
       artifactEvidenceGraceDays: typeof row?.artifact_evidence_grace_days === 'number' ? row.artifact_evidence_grace_days : DEFAULT_CONFIG.artifactEvidenceGraceDays,
       artifactDeliverableGraceDays: typeof row?.artifact_deliverable_grace_days === 'number' ? row.artifact_deliverable_grace_days : DEFAULT_CONFIG.artifactDeliverableGraceDays,
       artifactHeadroomMb: typeof row?.artifact_headroom_mb === 'number' ? row.artifact_headroom_mb : DEFAULT_CONFIG.artifactHeadroomMb,
+      archiveRetentionDays: typeof row?.archive_retention_days === 'number' ? row.archive_retention_days : DEFAULT_CONFIG.archiveRetentionDays,
+      commDirGraceHours: typeof row?.comm_dir_grace_hours === 'number' ? row.comm_dir_grace_hours : DEFAULT_CONFIG.commDirGraceHours,
+      scratchGraceHours: typeof row?.scratch_grace_hours === 'number' ? row.scratch_grace_hours : DEFAULT_CONFIG.scratchGraceHours,
       blockLoopLimit: typeof row?.block_loop_limit === 'number' ? row.block_loop_limit : 5,
     };
   }
 
   // ---- employee definitions ----
-  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean }): Promise<void> {
+  async upsertDef(defId: string, input: { role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; maxInstances?: number; priority?: number; weight?: number; enabled?: boolean; quotaLimited?: boolean }): Promise<void> {
     if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(defId)) throw new CompanyError('invalid', 'Invalid def ID');
     if (!ROLES.includes(input.role)) throw new CompanyError('invalid', 'Invalid role');
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(input.provider)) throw new CompanyError('invalid', 'Invalid provider');
@@ -297,16 +396,22 @@ export class Workforce {
     if (input.tracks !== undefined) {
       await this.db.query('UPDATE $def SET tracks = $tracks;', { def: id('employee_def', defId), tracks: input.tracks });
     }
+    // Written separately like tracks: an upsert that does not mention the flag keeps the stored
+    // value, so editing other fields can never silently re-apply the quota limit.
+    if (input.quotaLimited !== undefined) {
+      await this.db.query('UPDATE $def SET quota_limited = $q;', { def: id('employee_def', defId), q: input.quotaLimited });
+    }
   }
 
   async defs(): Promise<EmployeeDef[]> {
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[]; enabled: boolean;
-      max_instances: number; priority: number; weight?: number; scored?: number; avg_score?: number; error_streak?: number };
+      max_instances: number; priority: number; weight?: number; quota_limited?: boolean; scored?: number; avg_score?: number; error_streak?: number };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY weight DESC, priority, id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model, thinking: r.thinking ?? undefined,
       tracks: r.tracks ?? undefined,
       enabled: r.enabled !== false, maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100,
-      weight: r.weight ?? 10, scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
+      weight: r.weight ?? 10, quotaLimited: r.quota_limited === false ? false : undefined,
+      scored: r.scored ?? 0, avgScore: r.avg_score ?? undefined, errorStreak: r.error_streak ?? 0 }));
   }
 
   async defFailure(defId: string): Promise<number> {
@@ -325,13 +430,13 @@ export class Workforce {
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
-      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number;
+      paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
-      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at,
+      activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
       onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0 }));
   }
 
@@ -380,18 +485,63 @@ export class Workforce {
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
 
-  /** Retires an instance and revokes its credential, so a crashed session cannot act again. The kind is
-   * recorded by the first retirement only: a later one cannot turn a non-normal retirement into a normal one. */
-  async retire(employeeId: string, reason: string, kind: RetirementKind): Promise<void> {
-    await this.db.query(`UPDATE $e SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
-      retired = true, retired_reason = $reason, retired_at = time::now();`,
-      { e: id('employee', employeeId), reason, kind });
-    await this.enrollment.revoke(employeeId, 'retirement');
+  /**
+   * Retires an instance and revokes its credential, so a crashed session cannot act again. The retirement gate is the one boundary
+   * every retirement and credential revocation passes (see gateCredentialChange in retirement.ts): admin CLI, dispatcher and scene
+   * cleaner. An employee who still holds a lease or is bound to unfinished work is refused with RETIRE_REFUSED before any write. An
+   * accepted retirement is one transaction that re-derives the employee's unfinished relations and writes only if they are the ones
+   * the decision saw. The kind is recorded by the first retirement only: a later one cannot turn a non-normal retirement into a
+   * normal one.
+   */
+  async retire(employeeId: string, reason: string, kind: RetirementKind, idle?: EmployeeInst): Promise<void> {
+    const [exists] = await this.db.query<[unknown]>('SELECT VALUE id FROM ONLY $e;', { e: id('employee', employeeId) });
+    if (!exists) throw new CompanyError('not_found', 'Employee not found');
+    await gateCredentialChange(this.db, employeeId, {
+      operation: 'retire',
+      statement: `IF $idle_guard = true {
+        LET $observed = SELECT * FROM ONLY $employee;
+        IF ($observed.idle_since ?? NONE) != $idle_since OR ($observed.last_wake_at ?? NONE) != $last_wake OR $observed.paseo_agent_id != $agent { THROW 'idle retirement moved' };
+        LET $wakes = SELECT VALUE id FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] AND (employee = $key OR agent = $agent);
+        IF array::len($wakes) > 0 { THROW 'idle retirement protected by manager wake' };
+      };
+      UPDATE $employee SET retired_kind = IF retired = true THEN retired_kind ELSE $kind END,
+        retired = true, retired_reason = $reason, retired_at = time::now(), revoked = true, credential_digest = $digest;`,
+      vars: { kind, reason, digest: revokedCredentialDigest(), idle_guard: !!idle, idle_since: idle?.idleSince, last_wake: idle?.lastWakeAt, agent: idle?.paseoAgentId },
+    }, this.retirementHook);
+  }
+
+  /** A turn can start and finish between polls; its lifecycle event invalidates any old idle timer. */
+  async clearIdleForAgent(agentId: string): Promise<void> {
+    await this.db.query('UPDATE employee SET idle_since = NONE WHERE paseo_agent_id = $agent AND retired != true;', { agent: agentId });
+  }
+
+  async observeSessionIdle(observations: Array<{ id: string; since?: number; lastWakeAt?: number }>): Promise<void> {
+    if (!observations.length) return;
+    await this.db.query(`FOR $o IN $observations {
+      UPDATE employee SET idle_since = $o.since WHERE id = $o.employee AND retired != true AND (last_wake_at ?? NONE) = $o.last_wake;
+    };`, { observations: observations.map(o => ({ employee: id('employee', o.id), since: o.since, last_wake: o.lastWakeAt })) });
+  }
+
+  async retireIdle(inst: EmployeeInst): Promise<void> {
+    if (inst.idleSince === undefined) throw new CompanyError('retire_refused', 'Missing idle observation');
+    await this.retire(inst.id, '连续观测空闲超过配置时长，正常回收会话', 'rotation', inst);
   }
 
   async touchWake(employeeId: string): Promise<void> {
-    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
+    await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), idle_since = NONE, v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
+  }
+
+  /** Refund only the rejected wake, once per stable Paseo turn id, including after a plugin restart. */
+  async refundQuotaWake(employeeId: string, turnId: string): Promise<void> {
+    const key = createHash('sha256').update(`${employeeId}\0${turnId}`).digest('hex');
+    await this.db.query(`BEGIN;
+      LET $prior = SELECT * FROM ONLY $marker;
+      IF $prior = NONE {
+        UPDATE $e SET wake_count = math::max([0, (wake_count ?? 0) - 1]);
+        CREATE ONLY $marker CONTENT { employee: $employee, at: time::now() };
+      };
+      COMMIT;`, { e: id('employee', employeeId), employee: employeeId, marker: id('company_meta', `infra_refund_${key}`) });
   }
 
   // ---- provider health ----
@@ -402,10 +552,16 @@ export class Workforce {
       failures: r.failures ?? 0, lastError: r.last_error }]));
   }
 
-  async markExhausted(provider: string, error: string): Promise<ProviderHealth> {
+  /**
+   * Cools a provider down after a quota failure. `resetsAt` (unix seconds) is the upstream reset
+   * time when something actually knows it (magpie reports it per window); the exponential backoff
+   * still applies as a floor so a stale or wrong upstream time cannot shorten the cooldown.
+   */
+  async markExhausted(provider: string, error: string, resetsAt?: number): Promise<ProviderHealth> {
     const current = (await this.providerHealth()).get(provider);
     const failures = (current?.failures ?? 0) + 1;
-    const until = (await this.now()) + Math.min(COOLDOWN_BASE * 2 ** (failures - 1), COOLDOWN_MAX);
+    const backoff = (await this.now()) + Math.min(COOLDOWN_BASE * 2 ** (failures - 1), COOLDOWN_MAX);
+    const until = resetsAt !== undefined && resetsAt > backoff ? resetsAt : backoff;
     await this.db.query(`UPSERT $p CONTENT { state: 'exhausted', until: $until, failures: $failures,
       last_error: $error, changed_at: time::now() };`, { p: id('provider_health', provider), until, failures, error: error.slice(0, 500) });
     return { provider, state: 'exhausted', until, failures, lastError: error };
@@ -440,8 +596,9 @@ export class Workforce {
   }
 
   /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */
-  async contributors(taskId: TaskId): Promise<ContributionFacts> {
-    return readContributors(this.db, taskId);
+  async contributors(taskId: TaskId): Promise<ContributionFacts & { checkedAt?: string }> {
+    const view = await readContributionView(this.db, taskId);
+    return { ...view.facts, checkedAt: view.checkedAt };
   }
 
   /** Persists or clears a task's open dispatch-blocked episode (phase and start, unix seconds). */
@@ -620,6 +777,216 @@ export class Workforce {
       { d: this.dispatchId(taskId, version, purpose), task: taskId, version, purpose, employee });
   }
 
+  /** Durably records one manager todo. The deterministic id (task+phase+episode+reason) makes repeated ticks idempotent. */
+  async openManagerAction(input: ManagerActionInput): Promise<boolean> {
+    const key = managerActionKey(input.taskId, input.phase, input.episode, input.reason);
+    const record = id('dispatch', HASH(key).slice(0, 24));
+    const existing = await this.db.select<{ status?: string }>(record);
+    if (existing?.status === 'open') return false;
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ ...input, key });
+    await this.db.query(`BEGIN;
+      UPSERT $d CONTENT { key: $key, task: $task, version: $version, purpose: 'gm-manager-action', employee: '',
+        phase: $phase, episode: $episode, reason: $reason, action: $action, repo: $repo, implementer: $implementer,
+        status: 'open', created_at: time::now() };
+      CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action', evidence: $evidence, at: time::now() };
+      COMMIT;`, {
+      d: record, key, task: input.taskId, task_ref: id('task', input.taskId), version: input.version,
+      phase: input.phase, episode: input.episode, reason: input.reason, action: input.action,
+      repo: input.repo, implementer: input.implementer ?? null, audit, evidence,
+    });
+    return true;
+  }
+
+  /** Open manager todos, restored across dispatcher restarts from the dispatch bookkeeping table. */
+  async openManagerActions(): Promise<ManagerActionRow[]> {
+    type Row = { id: RecordId; key?: string; task?: string; version?: number; phase?: string; episode?: number; reason?: string;
+      action?: string; repo?: string; implementer?: string; status?: string; created_at?: unknown };
+    const [rows] = await this.db.query<[Row[]]>(`SELECT * FROM dispatch WHERE purpose = 'gm-manager-action' AND status = 'open' ORDER BY created_at;`);
+    return (rows ?? []).map(row => ({
+      key: row.key ?? String(row.id).replace(/^dispatch:/, ''), taskId: String(row.task ?? ''), version: row.version ?? 0,
+      phase: row.phase === 'review' ? 'review' : 'execute', episode: row.episode ?? 0, reason: row.reason ?? '',
+      action: 'implementer_takeover' as const, repo: row.repo ?? '', implementer: row.implementer ?? undefined,
+      status: 'open' as const, createdAt: row.created_at === undefined ? undefined : String(row.created_at),
+    }));
+  }
+
+  /** Closes one manager todo without deleting its dispatch row or the open/close audit history. */
+  async closeManagerAction(action: ManagerActionRow, resolution: string): Promise<void> {
+    const record = id('dispatch', HASH(action.key).slice(0, 24));
+    const audit = id('audit', randomUUID());
+    const evidence = JSON.stringify({ task: action.taskId, phase: action.phase, episode: action.episode,
+      reason: action.reason, action: action.action, resolution });
+    await this.db.query(`BEGIN;
+      LET $row = SELECT * FROM ONLY $d;
+      IF $row.status = 'open' {
+        UPDATE ONLY $d SET status = 'closed', closed_at = time::now(), resolution = $resolution;
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action_closed', evidence: $evidence, at: time::now() };
+      };
+      COMMIT;`, { d: record, task_ref: id('task', action.taskId), resolution, audit, evidence });
+  }
+
+  // ---- manager wake ownership (MR02) ----
+  // The manager action row is the todo. A separate dispatch row is the in-flight attempt, keyed by
+  // task+phase+episode, so a reason/version change never starts a second wake while the first GM is
+  // still processing. Every transition is CAS'd by token+attempt; old callbacks cannot release a new claim.
+  private managerWakeId(taskId: string, phase: string, episode: number) {
+    return id('dispatch', HASH(`gm-manager-wake\0${taskId}\0${phase}\0${episode}`).slice(0, 24));
+  }
+
+  private wakeRow(row: WakeDbRow): ManagerWakeRow {
+    const phase = row.phase === 'review' ? 'review' : 'execute';
+    const episode = row.episode ?? 0;
+    return {
+      key: row.key ?? managerWakeKey(String(row.task ?? ''), phase, episode),
+      taskId: String(row.task ?? ''), phase, episode,
+      reason: row.reason ?? '', version: row.version ?? 0, repo: row.repo ?? '',
+      purpose: 'gm-manager-wake', state: row.state ?? 'finished', attempt: row.attempt ?? 0, token: row.token ?? '',
+      employee: row.employee ?? undefined, agent: row.agent ?? undefined,
+      startedAt: row.started_at ?? undefined, externalStartedAt: row.external_started_at ?? undefined,
+      lastCheckedAt: row.last_checked_at ?? undefined, lastStatus: row.last_status ?? undefined,
+      resolution: row.resolution ?? undefined, updatedAt: row.updated_at ?? undefined,
+    };
+  }
+
+  /** The CAS token for a row read from the database. */
+  wakeClaim(row: ManagerWakeRow): ManagerWakeClaim {
+    return { key: row.key, token: row.token, attempt: row.attempt, input: {
+      taskId: row.taskId, phase: row.phase, episode: row.episode, reason: row.reason, version: row.version, repo: row.repo,
+    } };
+  }
+
+  /**
+   * Acquire the only in-flight permission for task+phase+episode. Missing rows are created; a finished
+   * row starts the next attempt; pending/running/unknown rows refuse. The write is a single CAS
+   * transaction, so concurrent dispatchers and restarts can only produce one winner.
+   */
+  async acquireManagerWake(input: ManagerWakeInput, token: string = randomUUID()): Promise<ManagerWakeClaim | undefined> {
+    const key = managerWakeKey(input.taskId, input.phase, input.episode);
+    const d = this.managerWakeId(input.taskId, input.phase, input.episode);
+    const evidence = JSON.stringify({ ...input, key, token, attempt: 1 });
+    try {
+      const created = await this.runTxResult<WakeDbRow>(`BEGIN;
+        LET $created = CREATE ONLY $d CONTENT { key: $key, task: $task, phase: $phase, episode: $episode,
+          purpose: 'gm-manager-wake', state: 'pending', attempt: 1, token: $wake_token, version: $version,
+          reason: $reason, repo: $repo, employee: NONE, agent: NONE,
+          started_at: time::unix(time::now()), external_started_at: NONE, last_checked_at: NONE,
+          last_status: NONE, resolution: NONE, updated_at: time::unix(time::now()), at: time::unix(time::now()) };
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_acquired',
+          evidence: $evidence, at: time::now() };
+        RETURN $created;
+        COMMIT;`, { d, key, task: input.taskId, task_ref: id('task', input.taskId), phase: input.phase,
+        episode: input.episode, wake_token: token, version: input.version, reason: input.reason, repo: input.repo,
+        audit: id('audit', randomUUID()), evidence });
+      if (created) return { key, token, attempt: 1, input };
+    } catch (error) {
+      // A concurrent creator won the unique record id; read its row below.
+      if (!/already exists|duplicate/i.test(String((error as Error).message))) throw error;
+    }
+    const row = await this.db.select<WakeDbRow>(d);
+    if (!row || (row.state ?? 'finished') !== 'finished') return undefined;
+    const attempt = (row.attempt ?? 0) + 1;
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $updated = UPDATE ONLY $d SET state = 'pending', attempt = $attempt, token = $wake_token,
+        version = $version, reason = $reason, repo = $repo, employee = NONE, agent = NONE,
+        started_at = time::unix(time::now()), external_started_at = NONE, last_checked_at = NONE,
+        last_status = NONE, resolution = NONE, updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE state = 'finished' RETURN AFTER;
+      IF $updated != NONE {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_acquired',
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, key, task: input.taskId, task_ref: id('task', input.taskId), phase: input.phase,
+      episode: input.episode, wake_token: token, attempt, version: input.version, reason: input.reason, repo: input.repo,
+      audit: id('audit', randomUUID()), evidence: JSON.stringify({ ...input, key, token, attempt }) });
+    if (!updated) return undefined;
+    return { key, token, attempt, input };
+  }
+
+  /** Mark the attempt as externally started / running and bind the GM employee and (when known) Paseo agent. */
+  async markManagerWakeRunning(claim: ManagerWakeClaim, employee: string, agent?: string): Promise<boolean> {
+    const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $old = SELECT * FROM ONLY $d;
+      LET $updated = UPDATE ONLY $d SET state = 'running', employee = $employee, agent = $agent,
+        external_started_at = IF external_started_at = NONE THEN time::unix(time::now()) ELSE external_started_at END,
+        last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown'] RETURN AFTER;
+      IF $updated != NONE {
+        LET $seat = SELECT * FROM ONLY $employee_record;
+        IF $seat != NONE AND ($seat.revoked = true OR $seat.retired = true) { THROW 'manager employee retired' };
+        IF $seat != NONE { UPDATE $employee_record SET idle_since = NONE; };
+      };
+      IF $updated != NONE AND ($old.state ?? '') != 'running' {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_wake_started',
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, task_ref: id('task', claim.input.taskId), wake_token: claim.token, attempt: claim.attempt,
+      employee, employee_record: id('employee', employee), agent: agent ?? null, audit: id('audit', randomUUID()),
+      evidence: JSON.stringify({ key: claim.key, token: claim.token, attempt: claim.attempt, employee, agent }) });
+    return Boolean(updated);
+  }
+
+  /** CAS the attempt to finished (retryable) or unknown (fail closed, never re-woken as if idle). */
+  async finishManagerWake(claim: ManagerWakeClaim, state: 'finished' | 'unknown', resolution: string, lastStatus?: string): Promise<boolean> {
+    const d = this.managerWakeId(claim.input.taskId, claim.input.phase, claim.input.episode);
+    const action = state === 'unknown' ? 'manager_wake_unknown' : 'manager_wake_finished';
+    const repeatGuard = state === 'unknown' ? " AND (state != 'unknown' OR last_status != $last_status)" : '';
+    const updated = await this.runTxResult<WakeDbRow>(`BEGIN;
+      LET $updated = UPDATE ONLY $d SET state = $state, resolution = $resolution, last_status = $last_status,
+        last_checked_at = time::unix(time::now()), updated_at = time::unix(time::now()), at = time::unix(time::now())
+        WHERE token = $wake_token AND attempt = $attempt AND state IN ['pending', 'running', 'unknown']${repeatGuard} RETURN AFTER;
+      IF $updated != NONE {
+        CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: $action,
+          evidence: $evidence, at: time::now() };
+      };
+      RETURN $updated;
+      COMMIT;`, { d, task_ref: id('task', claim.input.taskId), wake_token: claim.token, attempt: claim.attempt,
+      state, resolution, last_status: lastStatus ?? null, action, audit: id('audit', randomUUID()),
+      evidence: JSON.stringify({ key: claim.key, token: claim.token, attempt: claim.attempt, state, resolution, lastStatus }) });
+    return Boolean(updated);
+  }
+
+  /** Active attempts restored after a restart. */
+  async openManagerWakes(): Promise<ManagerWakeRow[]> {
+    const [rows] = await this.db.query<[WakeDbRow[]]>(
+      `SELECT * FROM dispatch WHERE purpose = 'gm-manager-wake' AND state IN ['pending', 'running', 'unknown'] ORDER BY started_at;`);
+    return (rows ?? []).map(row => this.wakeRow(row));
+  }
+
+  /** Close all active attempts for a task whose work left the execute queue. Reason changes do not call this. */
+  async finishManagerWakesForTask(taskId: string, resolution: string): Promise<number> {
+    const [rows] = await this.db.query<[WakeDbRow[]]>(
+      `SELECT * FROM dispatch WHERE purpose = 'gm-manager-wake' AND task = $task AND state IN ['pending', 'running', 'unknown'];`,
+      { task: taskId });
+    let closed = 0;
+    for (const raw of rows ?? []) {
+      const row = this.wakeRow(raw);
+      if (await this.finishManagerWake(this.wakeClaim(row), 'finished', resolution, row.lastStatus)) closed++;
+    }
+    return closed;
+  }
+
+  private async runTxResult<T>(query: string, vars: Record<string, unknown>): Promise<T | undefined> {
+    const responses = await this.db.query<unknown[]>(query, vars).responses();
+    const failures = responses.filter(response => !response.success);
+    if (failures.length) {
+      const cause = failures.map(response => response.error.message).find(message =>
+        !message.includes('not executed due to') && !message.startsWith('Cannot COMMIT')) ?? 'manager wake transaction failed';
+      throw new Error(cause);
+    }
+    return responses.map(response => response.success ? response.result : undefined).at(-2) as T | undefined;
+  }
+
   async serverNow(): Promise<number> { return this.now(); }
   newKey(): string { return randomUUID(); }
+}
+
+interface WakeDbRow {
+  id?: RecordId; key?: string; task?: string; phase?: string; episode?: number; purpose?: string;
+  state?: ManagerWakeState; attempt?: number; token?: string; version?: number; reason?: string; repo?: string;
+  employee?: string; agent?: string; started_at?: number; external_started_at?: number; last_checked_at?: number;
+  last_status?: string; resolution?: string; updated_at?: number; at?: number;
 }

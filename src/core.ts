@@ -1,22 +1,32 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { RecordId } from 'surrealdb';
+import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence } from './contracts.ts';
-import { OwnerDesk } from './owner.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence } from './contracts.ts';import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
+import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
+import { companyBlock, companyParts } from './company-context.ts';
+import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
+import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
+import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
+import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import { normalizeIndependence, policyFault, readEmployeeDefs, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
+import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
+import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
+import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
 export { CompanyError };
@@ -31,9 +41,6 @@ export const REQUIRED_TRACKS: Partial<Record<Role, string>> = { screenwriter: '�
 const DEFAULT_LEASE_SECONDS = 600;
 /** Checkpoints cost a full model round trip each; past this many per holder per task the holder should heartbeat/submit instead. */
 const DEFAULT_CHECKPOINT_LIMIT = 6;
-const HISTORY_LIMIT = 40;
-const OPS_HISTORY_LIMIT = 15;
-const HISTORY_EVIDENCE_CHARS = 6000;
 const OPS_EVIDENCE_CHARS = 600;
 const LIST_CONTEXT_CHARS = 1200;
 const LIST_TASKS_LIMIT = 500;
@@ -63,6 +70,11 @@ export function parseQuotaResetsAt(text: string, nowMs: number): number {
   return Math.floor(ms / 1000);
 }
 export const asId = (value: unknown): string => value instanceof RecordId ? String(value.id) : String(value).split(':').slice(1).join(':');
+/** Query results may carry record ids as `task:⟨uuid⟩` (the fork's escaped rendering): strip the quoting so client-side uuids compare equal against server-side ids. */
+const normalizedId = (value: unknown): string => {
+  const raw = value instanceof RecordId ? String(value.id) : asId(value);
+  return raw.startsWith('⟨') && raw.endsWith('⟩') ? raw.slice(1, -1) : raw;
+};
 
 /**
  * A dependency counts as satisfied when it is 'done', or when it is 'void' and not an
@@ -111,10 +123,19 @@ export const UNLOCK_CHILDREN_SQL = `
     ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
     LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
     IF array::len($remaining) = 0 {
-      LET $unlocked = UPDATE ONLY $child.id SET state = 'ready', version += 1, resume_state = NONE;
-      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked', version: $unlocked.version, at: time::now() };
+      LET $source_phase = $child.resume_state ?? 'ready';
+      LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
+      LET $unlocked = UPDATE ONLY $child.id SET
+        state = $restore_phase, version += 1, resume_state = NONE, resume_role = NONE,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE;
+      CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked',
+        evidence: '依赖全部完成，按原阻塞阶段恢复', version: $unlocked.version, at: time::now(),
+        source_phase: $source_phase, restore_phase: $restore_phase,
+        dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value, payload: { state: 'ready' }, at: time::now() };
+      CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
+        payload: { state: $restore_phase, source_phase: $source_phase, restore_phase: $restore_phase,
+          dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
     };
   };
 `;
@@ -217,12 +238,44 @@ interface TaskRow {
 /** A stored policy: the API shape, with `setAt` as the driver returns it (a Date, or a string in tests). */
 type IndependenceRow = Omit<IndependencePolicy, 'setAt'> & { setAt: Date | string };
 
+/** Compact row for the complete active-lease lookup; keeps task context text out of the recovery path. */
+interface ActiveLeaseRow {
+  id: RecordId;
+  state: TaskState;
+  executor_role: Role;
+  reviewer_role: ReviewerRole;
+  submitted_by?: string;
+  implementer?: string;
+  current_employee?: string;
+  delivery_id?: string;
+  lease_expires_at?: number;
+  fence: number;
+  version: number;
+}
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export type { TaskRow };
 
 /** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
 function policyView(policy: IndependenceRow): IndependencePolicy {
   return { ...policy, setAt: policy.setAt instanceof Date ? policy.setAt.toISOString() : String(policy.setAt) };
+}
+
+/**
+ * Why a blocked row waits, in terms every view can show (RW06 C3 / RW05). The facts are the row's own: `blocked_to` names a
+ * manager or owner gate; a dependency wait carries the phase to restore and, for a review wait, the reviewer role. A review-phase
+ * wait never falls back to the execute role when `resume_role` is empty — it names the reviewer role, and a row with no phase
+ * fact is `unknown` rather than an implied execute wait.
+ */
+export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_state' | 'resume_role' | 'reviewer_role' | 'executor_role' | 'dependencies'>): TaskWaiting | undefined {
+  if (row.state !== 'blocked') return undefined;
+  const resumeState = row.resume_state ?? 'unknown';
+  const role: TaskWaiting['role'] = row.blocked_to === 'owner' ? 'owner'
+    : row.resume_role ? (row.resume_role as Role)
+      : resumeState === 'review' ? row.reviewer_role
+        : (resumeState === 'ready' || resumeState === 'doing') ? row.executor_role
+          : 'unknown';
+  const kind: TaskWaiting['kind'] = row.blocked_to === 'gm' ? 'manager' : row.blocked_to === 'owner' ? 'owner' : 'dependency';
+  return { kind, resumeState, role, dependenciesCount: (row.dependencies ?? []).length };
 }
 
 export function view(row: TaskRow): TaskView {
@@ -239,6 +292,9 @@ export function view(row: TaskRow): TaskView {
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
+    resumeState: row.state === 'blocked' ? row.resume_state : undefined,
+    resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
+    waiting: waitingOf(row),
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
@@ -295,6 +351,10 @@ interface GoalAcceptanceState {
 }
 const isLeased = (row: { current_employee?: string; lease_expires_at?: number }) =>
   Boolean(row.current_employee) && (row.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000);
+/** Which projects' environments one reader may see in a company block (SYS01 M3). `key` names that view, so a stored listing is read only under the same one. */
+interface EnvView { key: string; visible: (project: string) => boolean }
+/** A project as a reader without environment access sees it: the identity fields as they are, the environments withheld. */
+const withheldEnvs = (project: ProjectView): ProjectView => ({ ...project, envs: [], envsWithheld: true });
 const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   id: asId(row.id), title: row.title, state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
   kind: row.kind ?? 'task', version: row.version, blockedTo: row.blocked_to ?? undefined,
@@ -319,6 +379,106 @@ interface IndependenceGate {
   guards: Array<{ task: RecordId; version: number }>;
 }
 
+// ---- Bounded reads (SYS01). Every response, complete or paged, fits the 48 KiB budget measured as serialized
+// UTF-8. A complete answer is returned whole or refused (C2, C3); a paged answer reads a stored listing (C4). ----
+// Items of a page keep their whole text unless that item alone cannot fit a page (ITEM_BUDGET_BYTES); then it is cut and flagged.
+// A complete answer is never cut: it is returned whole or refused as response_too_large.
+/**
+ * A complete answer reads at most this many rows before it is refused. Each task or audit item serializes to well over
+ * 100 bytes, so one more row than this could not fit the budget anyway.
+ */
+const COMPLETE_TASK_ROWS = 500;
+const COMPLETE_HISTORY_ROWS = 1000;
+/**
+ * A claim reads at most this many of its task's newest protocol entries and newest ops entries for the handover (SYS01 R3).
+ * The whole history is counted, so a claim that read less says so: historyComplete is false and historyCount is the total.
+ * The echo of the claim fits as many of the entries it was given as the budget allows; get_task_history pages the rest.
+ */
+const HANDOVER_ROWS = 60;
+const HANDOVER_OPS_ROWS = 20;
+
+type AuditHistoryRow = { id: RecordId; action: string; actor: unknown; evidence?: string | null; version?: number; cat: string };
+interface WorktreeCompact { worktreePath: string; releasedReferences: number; referencesTruncated?: ReferencesCut; [key: string]: unknown }
+
+const tooLarge = (message: string) => new CompanyError('response_too_large', message);
+/** The arguments that read the company block in pages, named in every task answer (SYS01 AC-A). */
+const COMPANY_READ = { scope: 'company' as const, pageSize: DEFAULT_PAGE_SIZE };
+/** Guidance when a task answer that carries the company block is too large: leave the block out, and read it on its own. */
+const COMPANY_PAGED_HINT = 'pass includeCompany false, and read the company block in pages with {"scope":"company","pageSize":25}';
+/** A complete answer: returned whole when it fits the budget as it is sent (answerBytes), refused otherwise. Never cut. */
+function completeOrRefuse<T>(value: T, what: string, guidance: string): T {
+  const bytes = answerBytes(value);
+  if (bytes > RESPONSE_BUDGET_BYTES) throw tooLarge(`${what} is ${bytes} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
+  return value;
+}
+
+/**
+ * Compact references, sorted by path so that listings are stable. Released references are counted, and listed only when asked.
+ * A paged listing passes `itemBudget`: a worktree whose whole entry cannot fit a page keeps the longest prefix of its
+ * references that does, and is flagged with the whole list's count and SHA-256 (SYS01 R1). read_worktree_refs reads the rest
+ * in byte segments. A complete (legacy) list never passes a budget: it stays whole, or is refused.
+ */
+function compactWorktrees(all: readonly WorktreeView[], includeReleased?: boolean, itemBudget?: number): WorktreeCompact[] {
+  return [...all]
+    .sort((a, b) => (a.worktreePath < b.worktreePath ? -1 : a.worktreePath > b.worktreePath ? 1 : 0))
+    .map(worktree => {
+      const references = includeReleased ? worktree.references : worktree.references.filter(reference => reference.state !== 'released');
+      const releasedReferences = worktree.references.filter(reference => reference.state === 'released').length;
+      const item: WorktreeCompact = { ...worktree, references, releasedReferences };
+      if (itemBudget === undefined || references.length === 0 || dualBytes(item) <= itemBudget) return item;
+      const cut: ReferencesCut = { count: references.length, sha256: HASH(JSON.stringify(references)), includeReleased: includeReleased === true, tool: 'read_worktree_refs' };
+      const bounded = (kept: readonly WorktreeView['references'][number][]): WorktreeCompact => ({ ...item, references: kept, referencesTruncated: cut });
+      const kept = fitCount(references, subset => dualBytes(bounded(subset)), itemBudget);
+      return bounded(references.slice(0, kept));
+    });
+}
+
+const pick = (value: Record<string, unknown>, fields?: readonly string[]): Record<string, unknown> =>
+  fields ? Object.fromEntries(fields.filter(field => field in value).map(field => [field, value[field]])) : value;
+
+/**
+ * A list item: the task as the caller projects it, with the size and digest of its whole context. The item is whole unless
+ * `cutLong` is set and the item alone cannot fit a page (ITEM_BUDGET_BYTES, in dual bytes: the item is in the answer's text and in
+ * its JSON). Then it is echoed as a write echo is (echoTask): its lists are cut to their share and flagged (listsTruncated), and
+ * its context takes the room that is left, cut and flagged (contextTruncated, contextNextOffset). A goal's acceptance task depends
+ * on every task of the goal, so its dependency list alone can exceed a page; cutting only the context could never deliver it (SYS01).
+ * read_task_text returns any cut list or context whole. A complete answer never cuts.
+ */
+function listItem(row: TaskRow, fields: readonly string[] | undefined, cutLong: boolean): Record<string, unknown> {
+  const task = view(row);
+  const body: Record<string, unknown> = {
+    ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context), contextTruncated: false,
+  };
+  if (!cutLong || typeof body.context !== 'string' || dualBytes(body) <= ITEM_BUDGET_BYTES) return body;
+  return echoTask(body as unknown as TaskView, ITEM_BUDGET_BYTES) as unknown as Record<string, unknown>;
+}
+
+/** A task read by id, whole: the full context, with its size and digest so that a reassembly can be verified. */
+function detailTaskView(task: TaskView, fields?: readonly string[]): Record<string, unknown> {
+  return { ...pick({ ...task }, fields), contextBytes: utf8Bytes(task.context), contextSha256: HASH(task.context) };
+}
+
+/**
+ * One audit entry. The evidence is whole unless `limit` (the entry's own size in dual bytes, see dualBytes) would be exceeded;
+ * then the longest prefix that fits is kept and flagged, and evidenceNextOffset tells read_task_text where to continue. The size
+ * and digest always describe the full text, so the reassembly can be checked.
+ */
+function historyEntry(row: AuditHistoryRow, limit?: number): HistoryEntry {
+  const head = {
+    auditId: asId(row.id), action: row.action, actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
+    version: row.version, at: row.cat,
+  };
+  if (!row.evidence) return head;
+  const full = row.evidence;
+  const total = utf8Bytes(full);
+  const entry = (text: string, cut: boolean): HistoryEntry => ({
+    ...head, evidence: text, evidenceBytes: total, evidenceSha256: HASH(full), evidenceTruncated: cut,
+    ...(cut ? { evidenceNextOffset: utf8Bytes(text) } : {}),
+  });
+  if (limit === undefined || dualBytes(entry(full, false)) <= limit) return entry(full, false);
+  return entry(longestFittingPrefix(full, text => dualBytes(entry(text, true)) <= limit), true);
+}
+
 export class SurrealCompanyCore implements CompanyCore {
   readonly leaseSeconds: number;
   readonly checkpointLimit: number;
@@ -327,7 +487,7 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
   private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void> }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void> }) {
     this.submitCheck = options?.submitCheck;
     this.contributionReadHook = options?.contributionReadHook;
     this.independenceReadHook = options?.independenceReadHook;
@@ -341,10 +501,13 @@ export class SurrealCompanyCore implements CompanyCore {
     this.owner = new OwnerDesk(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
+    this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, releaseChannel: database.releaseChannel, observe: options?.snapshotObserve });
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
   private readonly projects: ProjectStore;
+  /** Stored listings behind the paged reads (C4). */
+  private readonly snapshots: SnapshotStore;
   /** Manage tools reuse the workforce writer; absent in processes that never wire one. */
   private readonly workforce?: Workforce;
   private get db() { return this.database.db; }
@@ -392,6 +555,41 @@ export class SurrealCompanyCore implements CompanyCore {
     return rows.filter(row => !(row.state === 'review' && row.submitted_by === actor.employeeId)).map(view);
   }
 
+  /**
+   * Complete server-side truth for the current employee's live leases, doing and review.
+   * Deliberately not listTasks: that view is capped, previews task text, and hides rows the
+   * employee submitted, so a review lease at the back of the list would be lost on reload.
+   */
+  async activeLeases(credential: Credential): Promise<ActiveLease[]> {
+    const actor = await this.authorized(credential);
+    const [rows] = await this.db.query<[ActiveLeaseRow[]]>(
+      `SELECT id, state, executor_role, reviewer_role, submitted_by, implementer,
+              current_employee, delivery_id, lease_expires_at, fence, version
+         FROM task
+        WHERE current_employee = $employee
+          AND state IN ['doing', 'review']
+          AND delivery_id != NONE
+          AND lease_expires_at != NONE
+          AND lease_expires_at > time::unix(time::now());`,
+      { employee: actor.employeeId });
+    return (rows ?? []).flatMap(row => {
+      if (row.state !== 'doing' && row.state !== 'review') return [];
+      const role = row.state === 'review' ? row.reviewer_role : row.executor_role;
+      // A role change after the claim, or a review lease held by the submitter/implementer,
+      // is contradictory state: never rebuild it as a usable local claim.
+      if (role !== actor.role) return [];
+      if (row.state === 'review' && (row.submitted_by === actor.employeeId || row.implementer === actor.employeeId)) return [];
+      if (!row.delivery_id || !row.lease_expires_at || !Number.isSafeInteger(row.fence) || row.fence < 1 ||
+          !Number.isSafeInteger(row.version)) return [];
+      return [{
+        taskId: asId(row.id), state: row.state, deliveryId: row.delivery_id,
+        fence: row.fence, version: row.version,
+        leaseExpiresAt: new Date(row.lease_expires_at * 1000).toISOString(),
+        role: role as Role, currentEmployee: actor.employeeId,
+      }];
+    });
+  }
+
   async getTask(credential: Credential, taskId: TaskId): Promise<TaskView> {
     const actor = await this.authorized(credential);
     const row = await this.db.select<TaskRow>(id('task', taskId));
@@ -433,6 +631,8 @@ export class SurrealCompanyCore implements CompanyCore {
           // Facts read before a lease transaction moved under it: the caller re-reads the contribution view and retries (SYS-DISP AC04).
           if (new RegExp(CONTRIBUTION_MOVED, 'i').test(cause)) throw new CompanyError('conflict', 'Task contribution history moved; retry the request');
           // Implementer takeover: 'moved' is a stale basis (CAS), 'invalid' is an ineligible target; both are checked before the generic denied/forbidden match.
+          const qaScope = /qa observation (invalid|moved): ([^'"\n]+)/i.exec(cause);
+          if (qaScope) throw new CompanyError(qaScope[1]!.toLowerCase() === 'moved' ? 'conflict' : 'invalid', `QA observation ${qaScope[1]!.toLowerCase()}: ${qaScope[2]!.trim()}`);
           const takeover = /implementer takeover (moved|invalid): ([^'"\n]+)/i.exec(cause);
           if (takeover) {
             const kind = takeover[1]!.toLowerCase();
@@ -477,9 +677,18 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
+  /** A created task answers with its context bounded to the item budget (SYS01); the create itself is not affected. */
   async createTask(credential: Credential, input: CreateTask): Promise<TaskView> {
+    return echoTask(await this.createTaskRecord(credential, input, { external: true }));
+  }
+
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
+    // External create_task only: the raw list is bounded before de-duplication. Internal delivery
+    // legs and automatic goal-anchor dependencies are deliberately not capped here; they must
+    // retain the complete dependency set.
+    if (options.external) validateExternalDependencies(input.dependencies);
     requireText(input.title, 'title', 3, 200);
     requireText(input.context, 'context', 1, 20000);
     requireRole(input.executorRole);
@@ -798,8 +1007,9 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async listWorktrees(credential: Credential, taskId?: TaskId): Promise<WorktreeView[]> {
     const actor = await this.authorized(credential);
-    if (!this.worktrees) return [];
+    // Checked before the registry is consulted: a caller without a task and without gm is refused even when no registry exists (R8).
     if (!taskId && actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+    if (!this.worktrees) return [];
     if (taskId) {
       const task = await this.getTask(credential, taskId);
       const project = await this.taskProject(taskId);
@@ -924,8 +1134,9 @@ export class SurrealCompanyCore implements CompanyCore {
     }));
     const taskView = view(row);
     const project = await this.taskProject(taskId);
+    const handover = await this.handoverHistory(taskId);
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
-      leaseExpiresAt: taskView.leaseExpiresAt!, history: await this.readHistory(taskId),
+      leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
       project, worktree: taskView.worktree };
   }
@@ -1001,27 +1212,599 @@ export class SurrealCompanyCore implements CompanyCore {
     return allowed;
   }
 
-  private async readHistory(taskId: TaskId): Promise<HistoryEntry[]> {
-    type Row = { action: string; actor: unknown; evidence?: string; version?: number; at: unknown };
-    // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the
-    // handover history; routine `ops_call` reads are never shown.
-    const [protocol, ops] = await this.db.query<[Row[], Row[]]>(
-      `SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC LIMIT $limit;
-       SELECT action, actor, string::slice(evidence ?? '', 0, $ev_chars) AS evidence, version, at FROM audit WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC LIMIT $ops_limit;`,
-      { task: id('task', taskId), limit: HISTORY_LIMIT, ops_limit: OPS_HISTORY_LIMIT, ev_chars: HISTORY_EVIDENCE_CHARS }
-    );
-    const rows = [...protocol, ...ops].sort((a, b) => (String(a.at) < String(b.at) ? 1 : String(a.at) > String(b.at) ? -1 : 0));
-    return rows.reverse().map(row => ({
-      action: row.action,
-      actor: row.actor instanceof RecordId ? asId(row.actor) : String(row.actor),
-      evidence: row.evidence ? String(row.evidence).slice(0, HISTORY_EVIDENCE_CHARS) : undefined,
-      version: row.version, at: String(row.at),
-    }));
+  /**
+   * Audit entries of one task, newest first, read in one consistent read with the database time. Routine ops_call
+   * reads are not audit history and are left out of every history answer.
+   */
+  private async historyRowsAt(taskId: TaskId, limit: number, db?: Surreal): Promise<{ at: string; rows: AuditHistoryRow[] }> {
+    return this.consistentRead<{ at: string; rows: AuditHistoryRow[] }>(`LET $at = <string>time::now();
+      LET $rows = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $limit);
+      RETURN { read: { at: $at, rows: $rows } };`, { task: id('task', taskId), limit }, db);
   }
 
+  /**
+   * The handover window of a claim (SYS01 R3): the newest HANDOVER_ROWS protocol entries and the newest HANDOVER_OPS_ROWS ops
+   * entries, oldest first, each whole. historyCount is the task's entry count in all, read in the same transaction as the
+   * window, and historyComplete is true only when every entry was read. A claim has committed when its answer is built, so the
+   * window is bounded, never refused: the echo (echoClaim) keeps the entries its response can hold, and get_task_history
+   * pages the rest.
+   */
+  private async handoverHistory(taskId: TaskId): Promise<{ history: HistoryEntry[]; historyComplete: boolean; historyCount: number }> {
+    // Ops rows get their own window so a chatty broker session cannot push claims and checkpoints out of the handover.
+    const read = await this.consistentRead<{ protocol: AuditHistoryRow[]; ops: AuditHistoryRow[]; count: number | null }>(`LET $protocol = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND !string::starts_with(action, 'ops_') ORDER BY at DESC, id DESC LIMIT $limit);
+      LET $ops = (SELECT id, action, actor, evidence, version, at, <string>at AS cat FROM audit
+        WHERE task = $task AND string::starts_with(action, 'ops_') AND action != 'ops_call' ORDER BY at DESC, id DESC LIMIT $ops_limit);
+      LET $counted = (SELECT count() AS n FROM audit WHERE task = $task AND action != 'ops_call' GROUP ALL);
+      RETURN { read: { protocol: $protocol, ops: $ops, count: $counted[0].n ?? 0 } };`,
+    { task: id('task', taskId), limit: HANDOVER_ROWS + 1, ops_limit: HANDOVER_OPS_ROWS + 1 });
+    const rows = [...read.protocol.slice(0, HANDOVER_ROWS), ...read.ops.slice(0, HANDOVER_OPS_ROWS)]
+      .sort((a, b) => (a.cat < b.cat ? 1 : a.cat > b.cat ? -1 : 0));
+    const historyCount = Number(read.count ?? 0);
+    const history = rows.map(row => historyEntry(row)).reverse();
+    const complete = read.protocol.length <= HANDOVER_ROWS && read.ops.length <= HANDOVER_OPS_ROWS && rows.length === historyCount;
+    return { history, historyComplete: complete, historyCount };
+  }
+
+  /** get_task_history without pageSize or cursor (C2): the complete history, oldest first, or a refusal when it does not fit. */
   async history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]> {
     await this.getTask(credential, taskId);
-    return this.readHistory(taskId);
+    const { rows } = await this.historyRowsAt(taskId, COMPLETE_HISTORY_ROWS + 1);
+    if (rows.length > COMPLETE_HISTORY_ROWS) {
+      throw tooLarge(`task ${taskId} has more than ${COMPLETE_HISTORY_ROWS} audit entries; read them with get_task_history, pageSize and page.nextCursor`);
+    }
+    const entries = rows.map(row => historyEntry(row)).reverse();
+    return completeOrRefuse(entries, `the history of task ${taskId} (${entries.length} entries)`,
+      'retry with {"pageSize":10} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false; read the evidence of one large entry with read_task_text {"taskId","field":"evidence","auditId","offset":0}, then offset = nextOffset with the expectSha256 of the first segment');
+  }
+
+  /** The cursor secret read once per process: the row never changes, and one round trip per page was pure fixed cost. */
+  private cursorKeyCache?: Buffer;
+
+  /** Per-key cursor secret: one row in company_meta, created on first use and never returned to callers. */
+  private async cursorKey(): Promise<Buffer> {
+    if (this.cursorKeyCache) return this.cursorKeyCache;
+    const record = id('company_meta', 'cursor_key');
+    const existing = await this.db.select<{ key?: string }>(record);
+    if (existing?.key) return (this.cursorKeyCache = Buffer.from(existing.key, 'base64url'));
+    const key = randomBytes(32);
+    try {
+      await this.db.query('CREATE ONLY $record CONTENT { key: $key, created_at: time::now() };', { record, key: key.toString('base64url') });
+      return (this.cursorKeyCache = key);
+    } catch {
+      const again = await this.db.select<{ key?: string }>(record);
+      if (!again?.key) throw new CompanyError('temporarily_unavailable', 'cursor key unavailable; retry the read', true);
+      return (this.cursorKeyCache = Buffer.from(again.key, 'base64url'));
+    }
+  }
+
+  /** Database clock now: the time a listing is stamped with. */
+  private async dbNow(): Promise<string> {
+    const [now] = await this.db.query<[string]>('RETURN <string>time::now();');
+    return now;
+  }
+
+  /**
+   * Runs `statements`, which end in RETURN { read: … }, inside one BEGIN…COMMIT and returns that value, so every row and
+   * time in it comes from one database state. A failed statement is retryable.
+   */
+  private async consistentRead<T>(statements: string, vars: Record<string, unknown>, db: Surreal = this.db): Promise<T> {
+    let responses;
+    try {
+      responses = await db.query<unknown[]>(`BEGIN TRANSACTION;\n${statements}\nCOMMIT TRANSACTION;`, vars).responses();
+    } catch {
+      throw new CompanyError('temporarily_unavailable', 'read did not complete; retry', true);
+    }
+    const found = responses.every(response => response.success)
+      ? responses.map(response => response.result).find((value): value is { read: T } => typeof value === 'object' && value !== null && 'read' in value)
+      : undefined;
+    if (!found) throw new CompanyError('temporarily_unavailable', 'read did not complete; retry', true);
+    return found.read;
+  }
+
+  /**
+   * Task rows for the context queries: the filters, the default states and the role scope, newest first, in one consistent
+   * read. The read counts the matches and the UTF-8 bytes of their context first (bytes::len, the size the listing stores), and
+   * the whole rows are read only when that total is within `cap`, so a read that will be refused never loads the text.
+   */
+  private async taskRowsAt(actor: Principal, params: ContextParams, limit: number, cap: number, db?: Surreal):
+    Promise<{ at: string; count: number; textBytes: number; rows: TaskRow[] }> {
+    const where: string[] = [
+      params.state ? 'state = $state' : "state IN ['ready', 'doing', 'review', 'blocked']",
+      "NOT (state = 'review' AND submitted_by = $me)",
+    ];
+    const vars: Record<string, unknown> = { cap, limit, me: actor.employeeId };
+    if (params.state) vars.state = params.state;
+    if (actor.role !== 'gm') {
+      where.push('(executor_role = $myrole OR reviewer_role = $myrole)');
+      vars.myrole = actor.role ?? '';
+    }
+    if (params.role) {
+      where.push('(executor_role = $qrole OR reviewer_role = $qrole)');
+      vars.qrole = params.role;
+    }
+    if (params.goalId) {
+      where.push('goal = $goal');
+      vars.goal = id('goal', params.goalId);
+    }
+    if (params.since) {
+      where.push('created_at >= <datetime>$since');
+      vars.since = params.since;
+    }
+    const read = await this.consistentRead<{ at: string; count: number; textBytes: number; rows?: TaskRow[] | null }>(`LET $at = <string>time::now();
+      LET $probe = (SELECT id, created_at, bytes::len(<bytes>(context ?? '')) AS textBytes FROM task WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $limit);
+      LET $n = array::len($probe);
+      LET $total = IF $n = 0 THEN 0 ELSE math::sum($probe.textBytes) END;
+      LET $full = IF $n = 0 OR $total > $cap THEN [] ELSE (SELECT * FROM task WHERE id IN $probe.id ORDER BY created_at DESC, id DESC) END;
+      RETURN { read: { at: $at, count: $n, textBytes: $total, rows: array::flatten([$full]) } };`, vars, db);
+    const count = Number(read.count ?? 0);
+    const textBytes = Number(read.textBytes ?? 0);
+    // The query wraps the rows in array::flatten: a lone match comes back as one object, not as a one-element array.
+    const rows = read.rows ?? [];
+    // Within the cap every match is loaded. A short load would drop tasks silently, so it is refused as retryable instead.
+    if (textBytes <= cap && rows.length !== count) {
+      throw new CompanyError('temporarily_unavailable', 'task listing read did not complete; retry', true);
+    }
+    return { at: read.at, count, textBytes, rows };
+  }
+
+  /** The instant (epoch milliseconds) by which a listing call must have answered: its build deadline and the cleanup budget, from its start. */
+  private replyAt(startedAt: number): number {
+    return startedAt + this.snapshots.limits.buildDeadlineMs + CLEANUP_BUDGET_MS;
+  }
+
+  /** `work` answers by `at`, or the caller gets a recoverable temporarily_unavailable. A stalled read is left to finish on its own. */
+  private async bounded<T>(work: Promise<T>, at: number): Promise<T> {
+    const value = await untilAt(work, at);
+    if (value === undefined) throw new CompanyError('temporarily_unavailable', 'the database did not answer in time; retry shortly', true);
+    return value as T;
+  }
+
+  /**
+   * Stores the working set as a context listing. Its membership and its projection are fixed by one read, which runs on the
+   * build channel inside the build deadline (SYS01 AC-D): the main connection stays free for control requests meanwhile.
+   */
+  private async contextListing(actor: Principal, params: ContextParams, digest: string, startedAt: number): Promise<{ header: SnapshotHeader; bodies: readonly string[] } | { empty: true }> {
+    const { limits } = this.snapshots;
+    const header = await this.snapshots.build({
+      owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', startedAt,
+      guidance: 'narrow with state, goalId, role or since, or leave fields out',
+      load: async db => {
+        const { at, count, textBytes, rows } = await this.taskRowsAt(actor, params, limits.maxRows + 1, limits.maxBytes, db);
+        if (count > limits.maxRows) throw tooLarge(`more than ${limits.maxRows} tasks match; narrow with state, goalId, role or since`);
+        if (textBytes > limits.maxBytes) {
+          throw tooLarge(`the matching tasks hold more than ${limits.maxBytes} bytes of text; narrow with state, goalId, role or since`);
+        }
+        return { takenAt: at, bodies: rows.map(row => JSON.stringify(listItem(row, params.fields, true))) };
+      },
+      emptyWhenNoRows: true, returnRows: true,
+    });
+    if ('empty' in header) return header;
+    return { header, bodies: header.bodies };
+  }
+
+  /**
+   * One page of a stored listing (C4). The first page (no cursor) stores the listing through `create`; a later page
+   * resumes after the cursor's position. Every page re-checks the caller, the kind, the query and the role. The page
+   * holds as many of the next rows as fit the budget, and its cursor continues after the last row it delivered.
+   */
+  private async listingPage<T, R>(args: {
+    actor: Principal; kind: SnapshotKind; digest: string; pageSize: number; cursor?: string;
+    /** When the tool call started: every wait of this page, the build and the reads included, ends by replyAt(startedAt). */
+    startedAt: number;
+    /** The refusal for a cursor that no longer matches the caller's access (for example a project-environment view that changed). */
+    mismatch?: string;
+    /**
+     * `{ empty: true }` when the read matched nothing: the page is answered without storing a listing (SYS01 AC02). A listing that
+     * already holds its rows in memory returns them too, so its first page needs no read-back round trip.
+     */
+    create: (startedAt: number) => Promise<SnapshotHeader | { empty: true } | { header: SnapshotHeader; bodies: readonly string[] }>;
+    parse: (body: string) => T;
+    respond: (items: readonly T[], page: PageInfo) => R;
+    /** What the caller can change when the page envelope alone is over the budget (for example includeCompany). */
+    envelopeGuidance: string;
+    /** Guidance when one row cannot fit a page even after its own cut: name a real entry that reads the rest. */
+    oversizeGuidance?: (item: T) => string;
+  }): Promise<R> {
+    const { actor, kind, digest, pageSize } = args;
+    const replyAt = this.replyAt(args.startedAt);
+    const key = await this.bounded(this.cursorKey(), replyAt);
+    let sid: string;
+    let after: number;
+    let stored: string | undefined;
+    let built: { header: SnapshotHeader; bodies: readonly string[] } | undefined;
+    if (args.cursor === undefined) {
+      const created = await args.create(args.startedAt);
+      if ('empty' in created) {
+        // Nothing matched: answer the empty page without a stored listing (SYS01 AC02 production return).
+        const page: PageInfo = {
+          pageSize, returned: 0, hasMore: false, total: 0, snapshotAt: new Date().toISOString(), budgetBytes: RESPONSE_BUDGET_BYTES,
+        };
+        return completeOrRefuse(args.respond([], page), 'this page', args.envelopeGuidance);
+      }
+      const header = 'header' in created ? created.header : created;
+      if ('bodies' in created) built = { header, bodies: created.bodies };
+      stored = header.id;
+      sid = stored;
+      after = 0;
+    } else {
+      const body = openCursor(args.cursor, key, Date.now());
+      if (body.k !== kind || body.c !== actor.employeeId || body.q !== digest) {
+        throw new CompanyError('forbidden', args.mismatch ?? 'cursor belongs to another caller or another query');
+      }
+      sid = body.sid;
+      after = body.seq;
+    }
+    // A listing this call stored is released in the background whenever the call does not return its page: the caller has no time
+    // left to wait for the release, and a release that fails is left for the sweep. Nothing stored stays reserved for its TTL.
+    const releaseStored = (): void => { if (stored !== undefined) void this.snapshots.release(stored).catch(() => undefined); };
+    try {
+      // A first page is answered from the rows the build just read: reading them back would cost another round trip and carry the
+      // same page over the link twice (SYS01 AC02 production return). Every later page reads the stored listing.
+      let header: SnapshotHeader;
+      let rows: Array<{ seq: number; body: string }>;
+      if (built) {
+        header = built.header;
+        rows = built.bodies.slice(0, pageSize).map((body, index) => ({ seq: index + 1, body }));
+      } else {
+        const read = await untilAt(this.snapshots.read({
+          id: sid, owner: actor.employeeId, kind, digest, role: actor.role ?? '', after, limit: pageSize,
+        }), replyAt);
+        if (read === undefined) {
+          throw new CompanyError('temporarily_unavailable', 'the listing page was not read in time; narrow the query or retry shortly', true);
+        }
+        ({ header, rows } = read);
+      }
+      const items = rows.map(row => ({ seq: row.seq, value: args.parse(row.body) }));
+      const build = (kept: ReadonlyArray<{ seq: number; value: T }>): R => {
+        const last = kept.at(-1)?.seq ?? after;
+        const hasMore = last < header.rows;
+        const page: PageInfo = {
+          pageSize, returned: kept.length, hasMore, total: header.rows, snapshotAt: header.takenAt, budgetBytes: RESPONSE_BUDGET_BYTES,
+          ...(hasMore ? { nextCursor: sealCursor({ v: 1, k: kind, c: actor.employeeId, q: digest, sid, seq: last, exp: header.expiresMs }, key) } : {}),
+        };
+        return args.respond(kept.map(item => item.value), page);
+      };
+      const bare = answerBytes(build([]));
+      if (bare > RESPONSE_BUDGET_BYTES) {
+        throw tooLarge(`the page envelope alone is ${bare} bytes, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${args.envelopeGuidance}`);
+      }
+      const kept = fitCount(items, subset => answerBytes(build(subset as ReadonlyArray<{ seq: number; value: T }>)), RESPONSE_BUDGET_BYTES);
+      if (kept === 0 && items.length > 0) {
+        const first = items[0]!.value;
+        throw tooLarge(args.oversizeGuidance?.(first) ?? 'one entry of this listing is larger than a page can hold; read it with read_task_text, or narrow the fields');
+      }
+      return completeOrRefuse(build(items.slice(0, kept)), 'this page', args.envelopeGuidance);
+    } catch (error) {
+      releaseStored();
+      throw error;
+    }
+  }
+
+  /**
+   * get_context (SYS01, C2 to C4). Without pageSize or cursor the answer is complete: the working set, or one task with its
+   * whole context. It is refused as response_too_large when it does not fit the budget. With pageSize or cursor it is one
+   * page of a stored listing; a task read by id is never paged and takes no cursor.
+   */
+  async contextView(credential: Credential, input: Record<string, unknown> = {}): Promise<ContextView> {
+    const startedAt = arrivedAt();
+    const actor = await this.authenticate(credential);
+    const params = parseContextInput(input);
+    if (params.scope === 'company') return this.companyContextView(credential, actor, params, startedAt);
+    // A task answer carries the company block only when includeCompany is true (AC-A). Every task answer says whether it does, and how
+    // the block is read in pages, so the directions are always one call away.
+    const company = params.includeCompany ? await this.bounded(this.companyBrief(credential), this.replyAt(startedAt)) : undefined;
+    const withCompany = { ...(company ? { company } : {}), companyIncluded: company !== undefined, companyRead: COMPANY_READ };
+    if (params.taskId !== undefined) {
+      if (params.cursor !== undefined) throw new CompanyError('invalid', 'a cursor pages a listing; one task is read without it');
+      const task = await this.getTask(credential, params.taskId as TaskId);
+      const view: ContextView = {
+        principal: actor, ...withCompany, tasks: [detailTaskView(task, params.fields)],
+        ...(params.paged ? { page: { pageSize: params.pageSize, returned: 1, hasMore: false, total: 1, budgetBytes: RESPONSE_BUDGET_BYTES } } : {}),
+      };
+      return completeOrRefuse(view, `task ${task.id}`,
+        `read a long part with read_task_text: the context {"taskId":"${task.id}","field":"context","offset":0}, then offset = nextOffset with the expectSha256 of the first segment, until nextOffset is null (the whole text has sha256 ${HASH(task.context)}); a long dependency list {"taskId":"${task.id}","field":"dependencies","offset":0}; or leave a part out with fields${company ? `; or ${COMPANY_PAGED_HINT}` : ''}`);
+    }
+    if (!params.paged) {
+      const guidance = 'retry with {"pageSize":25} and then {"cursor":"<page.nextCursor>"} until page.hasMore is false, or narrow with state, goalId, role or since';
+      const { count, textBytes, rows } = await this.taskRowsAt(actor, params, COMPLETE_TASK_ROWS + 1, RESPONSE_BUDGET_BYTES);
+      if (count > COMPLETE_TASK_ROWS) throw tooLarge(`more than ${COMPLETE_TASK_ROWS} tasks match; ${guidance}`);
+      if (textBytes > RESPONSE_BUDGET_BYTES) {
+        throw tooLarge(`the matching tasks hold ${textBytes} bytes of text, above the ${RESPONSE_BUDGET_BYTES}-byte budget; ${guidance}`);
+      }
+      const view: ContextView = { principal: actor, ...withCompany, tasks: rows.map(row => listItem(row, params.fields, false)) };
+      return completeOrRefuse(view, `the working set (${rows.length} tasks)`, company ? `${guidance}; or ${COMPANY_PAGED_HINT}` : guidance);
+    }
+    const digest = queryDigest('context', {
+      state: params.state ?? null, goalId: params.goalId ?? null, role: params.role ?? null, since: params.since ?? null, fields: params.fields ?? null, includeCompany: params.includeCompany,
+    });
+    return this.listingPage<Record<string, unknown>, ContextView>({
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: started => this.contextListing(actor, params, digest, started),
+      parse: body => JSON.parse(body) as Record<string, unknown>,
+      respond: (tasks, page) => ({ principal: actor, ...withCompany, tasks: [...tasks], page }),
+      envelopeGuidance: company ? `${COMPANY_PAGED_HINT}, which leaves the block out of every page` : 'narrow the query with state, goalId, role or since',
+      oversizeGuidance: item => `task ${String(item.id)} is larger than a page can hold; read its context with read_task_text ${JSON.stringify({ taskId: String(item.id), field: 'context', offset: 0 })}, or narrow the fields with fields`,
+    });
+  }
+
+  /**
+   * get_context with scope company (SYS01 AC-A): the company block, complete or in stored pages. Without paging the block, or the one
+   * section named, is returned whole or refused. With paging it is one page of parts (company-context.ts): every part of every item
+   * is listed exactly once, in a stable order, and a part carries its item's length and SHA-256 so the reader can check the join.
+   */
+  private async companyContextView(credential: Credential, actor: Principal, params: ContextParams, startedAt: number): Promise<ContextView> {
+    const section = params.section;
+    const named = section === undefined ? {} : { section };
+    const replyAt = this.replyAt(startedAt);
+    // The block and the listing digest are built from the same view of the project environments (SYS01 M3), so a stored listing
+    // is read only by the reader and under the access it was taken with.
+    const view = await this.bounded(this.envView(actor), replyAt);
+    if (!params.paged) {
+      const brief = await this.bounded(this.companyBriefAs(view), replyAt);
+      const answer: ContextView = { principal: actor, scope: 'company', ...named, company: companyBlock(brief, section) };
+      return completeOrRefuse(answer, 'the company block',
+        'read it in pages: {"scope":"company","pageSize":25}, then {"scope":"company","pageSize":25,"cursor":"<page.nextCursor>"} until page.hasMore is false; or one section with "section"');
+    }
+    const digest = queryDigest('company', { section: section ?? null, envs: view.key });
+    return this.listingPage<CompanyPart, ContextView>({
+      actor, kind: 'context', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      mismatch: 'cursor belongs to another caller or query, or was taken under other access to project environments; start the listing again without cursor',
+      // The block is read only when a listing is made: a cursor page reads the stored listing and never the block.
+      create: async started => {
+        const brief = await this.bounded(this.companyBriefAs(view), this.replyAt(started));
+        const takenAt = new Date().toISOString();
+        return this.snapshots.create({
+          owner: actor.employeeId, kind: 'context', digest, role: actor.role ?? '', takenAt, startedAt: started,
+          bodies: companyParts(brief, section).map(part => JSON.stringify(part)),
+          // The company block narrows by section and pages, never by the task filters: the guidance a refusal hands back says so (SYS01 B9).
+          guidance: 'read it in pages: {"scope":"company","pageSize":25}, or one section with "section"',
+        });
+      },
+      parse: body => JSON.parse(body) as CompanyPart,
+      respond: (parts, page) => ({ principal: actor, scope: 'company', ...named, parts: [...parts], page }),
+      envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: () => 'one part of the company block is larger than a page can hold; use a smaller pageSize or one section with "section"',
+    });
+  }
+
+  /**
+   * get_task_history with pageSize or cursor (SYS01, C4): one page of the task's stored history. Pages run newest first;
+   * the entries within a page are returned oldest first. Evidence that cannot fit a page is cut and flagged, and
+   * read_task_text gives the rest.
+   */
+  async historyView(credential: Credential, taskId: TaskId, input: Record<string, unknown> = {}): Promise<HistoryPageView> {
+    const startedAt = arrivedAt();
+    const actor = await this.authenticate(credential);
+    await this.getTask(credential, taskId);
+    const params = parseHistoryInput(input);
+    const digest = queryDigest('history', { taskId });
+    return this.listingPage<HistoryEntry, HistoryPageView>({
+      actor, kind: 'history', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: started => {
+        const { limits } = this.snapshots;
+        return this.snapshots.build({
+          owner: actor.employeeId, kind: 'history', digest, role: actor.role ?? '', startedAt: started,
+          guidance: 'read the evidence of large entries with read_task_text', emptyWhenNoRows: true,
+          load: async db => {
+            const { at, rows } = await this.historyRowsAt(taskId, limits.maxRows + 1, db);
+            if (rows.length > limits.maxRows) {
+              throw tooLarge(`task ${taskId} has more than ${limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
+            }
+            return { takenAt: at, bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))) };
+          },
+        });
+      },
+      parse: body => JSON.parse(body) as HistoryEntry,
+      respond: (history, page) => ({ history: [...history].reverse(), page }),
+      envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: entry => entry.auditId
+        ? `history entry ${entry.auditId} is larger than a page can hold; read its evidence with read_task_text ${JSON.stringify({ taskId: String(taskId), field: 'evidence', auditId: entry.auditId, offset: 0 })}`
+        : 'a history entry is larger than a page can hold; use a smaller pageSize',
+    });
+  }
+
+  /**
+   * list_worktrees with pageSize or cursor (SYS01, C1 and C4): one page of a stored inventory. References are compact:
+   * released ones are counted, and listed only with includeReleased. Rows are sorted by path. Every call re-checks access.
+   */
+  async worktreePage(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreePageView> {
+    const actor = await this.authenticate(credential);
+    const params = parseWorktreeInput(input);
+    await this.worktreeScope(credential, actor, params.taskId);
+    const digest = queryDigest('worktrees', { taskId: params.taskId ?? null, includeReleased: params.includeReleased });
+    const startedAt = arrivedAt();
+    return this.listingPage<Record<string, unknown>, WorktreePageView>({
+      actor, kind: 'worktrees', digest, pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: async started => {
+        const replyAt = this.replyAt(started);
+        const takenAt = await this.bounded(this.dbNow(), replyAt);
+        const inventory = compactWorktrees(await this.bounded(this.listWorktrees(credential, params.taskId as TaskId | undefined), replyAt), params.includeReleased, ITEM_BUDGET_BYTES);
+        if (inventory.length > this.snapshots.limits.maxRows) {
+          throw tooLarge(`${inventory.length} worktrees are registered, above the ${this.snapshots.limits.maxRows}-row listing limit`);
+        }
+        return this.snapshots.create({
+          owner: actor.employeeId, kind: 'worktrees', digest, role: actor.role ?? '', takenAt, startedAt: started,
+          bodies: inventory.map(item => JSON.stringify(item)), guidance: 'narrow with taskId', emptyWhenNoRows: true,
+        });
+      },
+      parse: body => JSON.parse(body) as Record<string, unknown>,
+      respond: (worktrees, page) => ({ worktrees: [...worktrees], page }),
+      envelopeGuidance: 'use a smaller pageSize, or narrow with taskId',
+      oversizeGuidance: item => `worktree ${String(item.worktreePath)} is larger than a page can hold even with its references cut; start the listing again without cursor, or read its references with read_worktree_refs ${JSON.stringify({ ...(params.taskId ? { taskId: params.taskId } : {}), worktreePath: String(item.worktreePath), includeReleased: params.includeReleased, offset: 0 })}`,
+    });
+  }
+
+  /**
+   * list_worktrees without pageSize or cursor (C1): the complete compact inventory as one array, in the same form as a
+   * page. It is refused as response_too_large when it does not fit the budget; it is never cut.
+   */
+  async worktreeList(credential: Credential, input: Record<string, unknown> = {}): Promise<WorktreeCompact[]> {
+    await this.authenticate(credential);
+    const params = parseWorktreeInput(input);
+    const list = compactWorktrees(await this.listWorktrees(credential, params.taskId as TaskId | undefined), params.includeReleased);
+    return completeOrRefuse(list, `the worktree inventory (${list.length} worktrees)`,
+      'read it with list_worktrees, pageSize and page.nextCursor, or pass taskId to narrow it; a worktree whose references are cut in a page is read whole with read_worktree_refs');
+  }
+
+  /**
+   * read_worktree_refs (SYS01 R1): one byte segment of one worktree's references as JSON, the recovery entry a paged listing
+   * item names when its references were cut. The worktree is looked up under the same scope as list_worktrees (a task id
+   * scopes it to that task's repository; a global read is gm only), and includeReleased must be the filter the listing item
+   * reports, so the digest the item carries covers exactly this text. Segments never split a character and reassemble
+   * exactly; sha256 covers the whole text, and a segment past offset 0 pins the digest it started with.
+   */
+  async worktreeRefs(credential: Credential, input: Record<string, unknown>): Promise<WorktreeRefsSegment> {
+    const actor = await this.authenticate(credential);
+    const params = parseWorktreeRefsInput(input);
+    await this.worktreeScope(credential, actor, params.taskId);
+    const inventory = await this.listWorktrees(credential, params.taskId as TaskId | undefined);
+    const worktree = inventory.find(item => item.worktreePath === params.worktreePath);
+    if (!worktree) throw new CompanyError('not_found', 'worktree not found in the scope of this call');
+    const references = params.includeReleased
+      ? worktree.references
+      : worktree.references.filter(reference => reference.state !== 'released');
+    const text = JSON.stringify(references);
+    const sha256 = HASH(text);
+    // A reassembly pins the digest it started with. A list that changed since is refused, never mixed in.
+    if (params.expectSha256 !== undefined && params.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the references changed: they are now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read them again from offset 0, with the same includeReleased as the listing`);
+    }
+    const head = { worktreePath: worktree.worktreePath, includeReleased: params.includeReleased, sha256 };
+    return worktreeRefsSegmentAnswer(head, worktreeRefsSegment(text, params.offset, params.limit, head));
+  }
+
+  /** Re-checks, on every worktree read, what it needs: access to the task, or gm for the global inventory. */
+  private async worktreeScope(credential: Credential, actor: Principal, taskId?: string): Promise<void> {
+    if (taskId !== undefined) await this.getTask(credential, taskId as TaskId);
+    else if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Global worktree inventory requires gm');
+  }
+
+  /**
+   * read_task_text (SYS01, R3): one byte segment of one text of a task. context and evidence are read as stored. project is the
+   * task's project environment as JSON, read by its holder and gm only. dependencies, workIntentPaths and worktreePaths are the
+   * task's lists as JSON arrays, the form a claim echo cuts them from. Segments never split a character and reassemble exactly;
+   * sha256 covers the whole text, so a reader can verify it.
+   */
+  async taskText(credential: Credential, input: Record<string, unknown>): Promise<TaskTextSegment> {
+    const params = parseTextInput(input);
+    const task = await this.getTask(credential, params.taskId as TaskId);
+    let text: string;
+    if (params.field === 'context') {
+      const row = await this.db.select<TaskRow>(id('task', params.taskId));
+      text = row?.context ?? '';
+    } else if (params.field === 'evidence') {
+      if (!params.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
+      // Routine ops_call rows are not audit history, so no history answer names them and they are not readable here either.
+      const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
+        "SELECT task, evidence FROM audit WHERE id = $aid AND action != 'ops_call';", { aid: id('audit', params.auditId) });
+      const row = rows?.[0];
+      if (!row || !row.task || asId(row.task) !== params.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
+      text = row.evidence ?? '';
+    } else if (params.field === 'project') {
+      const actor = await this.authenticate(credential);
+      // The holder reads it only while the lease is valid, the same rule as the company block (SYS01 M3).
+      const holds = task.currentEmployee === actor.employeeId && Date.parse(task.leaseExpiresAt ?? '') > Date.now();
+      if (actor.role !== 'gm' && !holds) {
+        throw new CompanyError('forbidden', 'the project environment is read by gm or the holder of a valid task lease');
+      }
+      const project = await this.taskProject(params.taskId as TaskId);
+      if (!project) throw new CompanyError('not_found', 'the task has no project environment');
+      text = JSON.stringify(project);
+    } else {
+      const lists = {
+        dependencies: task.dependencies,
+        workIntentPaths: task.workIntent?.paths ?? [],
+        worktreePaths: task.worktree?.intent?.paths ?? [],
+      };
+      text = JSON.stringify(lists[params.field]);
+    }
+    const sha256 = HASH(text);
+    // A reassembly pins the digest of the text it started with. A text that changed since is refused, never mixed in.
+    if (params.expectSha256 !== undefined && params.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the ${params.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
+    }
+    // Sized by the serialized answer, so escaped control characters and quotes cannot push it past the budget (F2).
+    const head = { taskId: params.taskId, field: params.field, ...(params.auditId ? { auditId: params.auditId } : {}), sha256 };
+    return textSegmentAnswer(head, textSegment(text, params.offset, params.limit, head));
+  }
+
+  /**
+   * get_admin_summary (SYS01, C5, gm only): counts by state and by audit action in a window, with the cutoff time and the
+   * outbox sequence. The counts are read twice inside one transaction. integrity.complete is true only when the two reads
+   * agree and each count matches the rows it grouped. Nothing here carries task text.
+   */
+  async adminSummary(credential: Credential, input: Record<string, unknown> = {}): Promise<AdminSummary> {
+    const actor = await this.authenticate(credential);
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may read the company summary');
+    const params = parseSummaryInput(input);
+    const since = params.since ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const goal = params.goalId ? id('goal', params.goalId) : undefined;
+    // One transaction. The cutoff is the database time at its start. Task counts are each task's state at that cutoff and
+    // ignore since. Audit counts cover [since, cutoff]; with a goal, only the audit entries of that goal's tasks.
+    const taskWhere = goal ? 'WHERE goal = $goal' : '';
+    const auditWhere = goal ? 'task IN $goalTasks AND at >= <datetime>$since AND at <= $cutoff' : 'at >= <datetime>$since AND at <= $cutoff';
+    const counts = (n: string) => `LET $states${n} = (SELECT state, count() AS n FROM task ${taskWhere} GROUP BY state);
+      LET $taskTotal${n} = (SELECT count() AS n FROM task ${taskWhere} GROUP ALL)[0].n;
+      LET $actions${n} = (SELECT action, count() AS n FROM audit WHERE ${auditWhere} GROUP BY action);
+      LET $auditTotal${n} = (SELECT count() AS n FROM audit WHERE ${auditWhere} GROUP ALL)[0].n;`;
+    type Counts = {
+      states?: Array<{ state?: string | null; n: number }>; taskTotal?: number | null;
+      actions?: Array<{ action?: string | null; n: number }>; auditTotal?: number | null;
+    };
+    type SummaryRead = Counts & { cutoff: string; outbox?: number | null; again?: Counts };
+    const read = await this.consistentRead<SummaryRead>(`LET $cutoff = time::now();
+      LET $outbox = (SELECT VALUE value FROM company_meta:outbox_counter)[0];
+      ${goal ? 'LET $goalTasks = (SELECT VALUE id FROM task WHERE goal = $goal);' : ''}
+      ${counts('')}
+      ${counts('_again')}
+      RETURN { read: {
+        cutoff: <string>$cutoff, outbox: $outbox,
+        states: $states, taskTotal: $taskTotal, actions: $actions, auditTotal: $auditTotal,
+        again: { states: $states_again, taskTotal: $taskTotal_again, actions: $actions_again, auditTotal: $auditTotal_again },
+      } };`, { since, ...(goal ? { goal } : {}) });
+    // Both reads are compared in one canonical order, so a difference in row order alone is not reported as a change.
+    const canonical = (c: Counts) => JSON.stringify([
+      [...(c.states ?? [])].map(row => [String(row.state ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      Number(c.taskTotal ?? 0),
+      [...(c.actions ?? [])].map(row => [String(row.action ?? null), Number(row.n)]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      Number(c.auditTotal ?? 0),
+    ]);
+    const repeatableRead = canonical(read) === canonical(read.again ?? {});
+    const tasks: Record<string, number> = {};
+    for (const row of read.states ?? []) {
+      const key = row.state == null ? 'unknown' : String(row.state);
+      tasks[key] = (tasks[key] ?? 0) + Number(row.n);
+    }
+    const audit: Record<string, number> = {};
+    for (const row of read.actions ?? []) {
+      const key = row.action == null ? 'unknown' : String(row.action);
+      audit[key] = (audit[key] ?? 0) + Number(row.n);
+    }
+    const taskRows = Object.values(tasks).reduce((sum, n) => sum + n, 0);
+    const auditRows = Object.values(audit).reduce((sum, n) => sum + n, 0);
+    const unknownStates = Object.keys(tasks).filter(state => !TASK_STATES.includes(state as TaskState));
+    const checks = {
+      taskCountsMatchRows: taskRows === Number(read.taskTotal ?? 0),
+      auditCountsMatchRows: auditRows === Number(read.auditTotal ?? 0),
+      statesKnown: unknownStates.length === 0,
+      repeatableRead,
+    };
+    return {
+      cutoffAt: read.cutoff, since, ...(params.goalId ? { goalId: params.goalId } : {}),
+      scope: {
+        tasks: goal ? 'tasks of this goal, each in the state it holds at cutoffAt; since does not apply to them'
+          : 'every task, each in the state it holds at cutoffAt; since does not apply to them',
+        audit: goal ? "audit entries of this goal's tasks with at from since up to cutoffAt" : 'audit entries with at from since up to cutoffAt',
+      },
+      tasks, audit, outboxSequence: Number(read.outbox ?? 0),
+      integrity: {
+        complete: Object.values(checks).every(Boolean),
+        method: 'one BEGIN…COMMIT transaction: cutoff, outbox sequence and counts read together; counts read twice must agree (repeatableRead), and each count must match the rows it grouped; task counts ignore since, audit counts cover [since, cutoffAt]',
+        taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
+      },
+    };
   }
 
   /**
@@ -1071,9 +1854,32 @@ export class SurrealCompanyCore implements CompanyCore {
     }
   }
 
+  /**
+   * The company block as the credential's holder may read it. Projects keep their identity fields for everyone; their environments
+   * (names, URLs and credential aliases with roles) are shown only to gm and to the holder of a valid lease on one of their tasks
+   * (SYS01 M3). The owner's console reads the full block through OwnerDesk.brief, which is unchanged.
+   */
   async companyBrief(credential: Credential): Promise<CompanyBrief> {
-    await this.authorized(credential);
-    return this.owner.brief();
+    const actor = await this.authorized(credential);
+    return this.companyBriefAs(await this.envView(actor));
+  }
+
+  private async companyBriefAs(view: EnvView): Promise<CompanyBrief> {
+    const brief = await this.owner.brief();
+    return { ...brief, projects: brief.projects.map(project => (view.visible(project.id) ? project : withheldEnvs(project))) };
+  }
+
+  /** Which project environments a reader may see: all for gm; otherwise those of the projects of tasks it holds under a valid lease. */
+  private async envView(actor: Principal): Promise<EnvView> {
+    if (actor.role === 'gm') return { key: 'all', visible: () => true };
+    const [rows] = await this.db.query<[Array<{ project?: RecordId; goal_project?: RecordId }>]>(
+      'SELECT project AS project, goal.project AS goal_project FROM task WHERE current_employee = $employee AND lease_expires_at > $now;',
+      { employee: actor.employeeId, now: Math.floor(Date.now() / 1000) });
+    const held = new Set((rows ?? []).flatMap(row => {
+      const project = row.project ?? row.goal_project;
+      return project ? [String(project.id)] : [];
+    }));
+    return { key: [...held].sort().join(','), visible: project => held.has(project) };
   }
 
   private async relayActor(credential: Credential, ownerQuote: string): Promise<string> {
@@ -1097,6 +1903,10 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async createDelivery(credential: Credential, input: CreateDelivery): Promise<TaskView[]> {
+    // The caller's own dependency list is external input: bound the raw list before de-duplication,
+    // exactly like create_task (51 duplicates must not collapse into one legal edge). The legs' internal
+    // chain dependencies (leg N waits for leg N-1) are added below and stay complete.
+    validateExternalDependencies(input.dependencies);
     requireText(input.goalId, 'goal', 1, 100);
     requireText(input.title, 'title', 3, 160);
     requireText(input.spec, 'spec', 20, 20000);
@@ -1109,11 +1919,14 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     const specs = deliveryChain(input.title, input.spec);
+    // The legs are returned together: each echo gets an equal share of the item budget, so the whole answer fits (SYS01).
+    const legLimit = Math.floor(ITEM_BUDGET_BYTES / specs.length);
     const lane = input.lane ?? `delivery-${HASH(input.idempotencyKey).slice(0, 8)}`;
     const created: TaskView[] = [];
     let dependencies = [...new Set(input.dependencies ?? [])];
     for (const [index, spec] of specs.entries()) {
-      const task = await this.createTask(credential, {
+      // The leg is echoed once, below, at its share of the budget: an echo here too would cut its lists twice (SYS01 R3).
+      const task = await this.createTaskRecord(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
         project: input.project,
@@ -1125,15 +1938,16 @@ export class SurrealCompanyCore implements CompanyCore {
       created.push(task);
       dependencies = [task.id];
     }
-    return created;
+    return created.map(task => echoTask(task, legLimit));
   }
 
   // ---- 受控编制管理工具（manage = gm/product） ----
   // 员工侧唯一写编制/词表的入口；owner console 与 admin CLI 继续可用。每次写落一条 audit。
 
-  private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight'>): DefView {
+  private static defView(d: Pick<EmployeeDef, 'id' | 'role' | 'provider' | 'model' | 'thinking' | 'tracks' | 'enabled' | 'maxInstances' | 'priority' | 'weight' | 'quotaLimited'>): DefView {
     return { id: d.id, role: d.role, provider: d.provider, model: d.model, thinking: d.thinking,
-      tracks: d.tracks, enabled: d.enabled, maxInstances: d.maxInstances, priority: d.priority, weight: d.weight };
+      tracks: d.tracks, enabled: d.enabled, maxInstances: d.maxInstances, priority: d.priority, weight: d.weight,
+      quotaLimited: d.quotaLimited };
   }
 
   private async auditManage(actor: Principal, action: 'def_ensure' | 'project_disciplines_update', summary: Record<string, unknown>): Promise<void> {
@@ -1145,11 +1959,12 @@ export class SurrealCompanyCore implements CompanyCore {
   async listDefs(credential: Credential): Promise<DefView[]> {
     await this.authorized(credential, 'manage');
     type Row = { id: RecordId; role: Role; provider: string; model: string; thinking?: string; tracks?: string[];
-      enabled?: boolean; max_instances?: number; priority?: number; weight?: number };
+      enabled?: boolean; max_instances?: number; priority?: number; weight?: number; quota_limited?: boolean };
     const [rows] = await this.db.query<[Row[]]>('SELECT * FROM employee_def ORDER BY id;');
     return (rows ?? []).map(r => ({ id: asId(r.id), role: r.role, provider: r.provider, model: r.model,
       thinking: r.thinking ?? undefined, tracks: r.tracks ?? undefined, enabled: r.enabled !== false,
-      maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, weight: r.weight ?? 10 }));
+      maxInstances: r.max_instances ?? 1, priority: r.priority ?? 100, weight: r.weight ?? 10,
+      quotaLimited: r.quota_limited === false ? false : undefined }));
   }
 
   async ensureDef(credential: Credential, input: EnsureDef): Promise<DefView> {
@@ -1161,7 +1976,7 @@ export class SurrealCompanyCore implements CompanyCore {
     await this.workforce.upsertDef(input.id, input);
     await this.auditManage(actor, 'def_ensure', { def: input.id, role: input.role, provider: input.provider,
       model: input.model, thinking: input.thinking, tracks: input.tracks, maxInstances: input.maxInstances,
-      priority: input.priority, weight: input.weight, enabled: input.enabled });
+      priority: input.priority, weight: input.weight, enabled: input.enabled, quotaLimited: input.quotaLimited });
     const def = (await this.workforce.defs()).find(d => d.id === input.id);
     if (!def) throw new CompanyError('conflict', 'Definition write did not land');
     return SurrealCompanyCore.defView(def);
@@ -1173,7 +1988,9 @@ export class SurrealCompanyCore implements CompanyCore {
     const view = await this.projects.setDisciplines(input.project, input.disciplines);
     await this.auditManage(actor, 'project_disciplines_update',
       { project: input.project, disciplines: (input.disciplines ?? []).map(d => d?.name) });
-    return view;
+    // The answer is the project as this caller may read it (SYS01 M3): a manage holder without a lease on it gets no environments.
+    const visible = await this.envView(actor);
+    return visible.visible(view.id) ? view : withheldEnvs(view);
   }
 
   async opsScope(credential: Credential, taskId: TaskId): Promise<OpsScope> {
@@ -1208,8 +2025,8 @@ export class SurrealCompanyCore implements CompanyCore {
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
     const source = await this.relayActor(credential, input.ownerQuote);
-    return this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
-      note: `${input.note}\n老板原话：${input.ownerQuote}` });
+    return echoTask(await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
+      note: `${input.note}\n老板原话：${input.ownerQuote}` }));
   }
 
   async relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void> {
@@ -1217,7 +2034,15 @@ export class SurrealCompanyCore implements CompanyCore {
     await this.owner.addDirection({ text: input.text, source, key: `${source}:${input.idempotencyKey}` });
   }
 
+  /** Lease writes answer with their task echoed within the budget (SYS01): the write is already committed, so its echo never fails it. */
   private async transition(
+    credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
+    evidence?: Evidence, to?: 'gm' | 'owner'
+  ): Promise<TaskView> {
+    return echoTask(await this.transitionRecord(credential, proof, action, evidence, to));
+  }
+
+  private async transitionRecord(
     credential: Credential, proof: LeaseProof, action: 'heartbeat' | 'checkpoint' | 'submit' | 'accept' | 'return' | 'block',
     evidence?: Evidence, to?: 'gm' | 'owner'
   ): Promise<TaskView> {
@@ -1371,6 +2196,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * reviewer return; handover markers from earlier holders are left untouched.
    */
   async release(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
+    return echoTask(await this.releaseRecord(credential, proof, evidence));
+  }
+
+  private async releaseRecord(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView> {
     const actor = await this.authorized(credential);
     if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
       throw new CompanyError('invalid', 'Invalid lease proof');
@@ -1453,12 +2282,18 @@ export class SurrealCompanyCore implements CompanyCore {
     });
   }
 
-  /** GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep. */
+  /**
+   * GM: run ownership reclaim (or dry-run) across registered repos. Uses the same lock and audit path as the dispatcher sweep.
+   * Order: the credential, then the arguments (parseReclaimInput, SYS01 D3), then the gm role. The arguments come before the role,
+   * as on MCP and the sidecar, so a malformed call gets the same invalid refusal from any caller. A bad argument never reaches
+   * reclaimAll, so no tree is touched.
+   */
   async reclaimWorktrees(credential: Credential, input?: { dryRun?: boolean; repos?: string[] }) {
     const actor = await this.authorized(credential);
+    const params = parseReclaimInput(input);
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Worktree reclaim requires gm');
     if (!this.worktrees) return { scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 };
-    return this.worktrees.reclaimAll({ trigger: input?.dryRun ? 'dry_run' : 'manual', dryRun: input?.dryRun, repos: input?.repos });
+    return this.worktrees.reclaimAll({ trigger: params.dryRun ? 'dry_run' : 'manual', dryRun: params.dryRun, repos: params.repos });
   }
 
   async listWorktreeAudits(credential: Credential, limit = 100) {
@@ -1468,6 +2303,10 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
+    return echoTask(await this.resumeRecord(credential, taskId, evidence));
+  }
+
+  private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
@@ -1475,6 +2314,15 @@ export class SurrealCompanyCore implements CompanyCore {
     const digest = HASH(JSON.stringify({ taskId, evidence }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
+    const before = await this.db.select<TaskRow>(id('task', taskId));
+    if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state === 'blocked') {
+      const target = before.resume_state ?? 'ready';
+      if (!['ready', 'doing', 'review'].includes(target)) {
+        throw new CompanyError('invalid', `Unknown resume phase: ${target}`);
+      }
+      if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
+    }
     try {
       const row = await this.txTask(`BEGIN;
         LET $who = SELECT * FROM ONLY $actor;
@@ -1482,12 +2330,19 @@ export class SurrealCompanyCore implements CompanyCore {
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
         LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
+        LET $source_phase = $t.resume_state ?? 'ready';
+        LET $restore_phase = IF $source_phase = 'doing' THEN 'ready' ELSE $source_phase END;
         LET $next = UPDATE ONLY $task SET
-          state = IF array::len($remaining) = 0 THEN (IF $t.resume_state = 'doing' THEN 'ready' ELSE $t.resume_state END) ELSE 'blocked' END,
-          resume_role = NONE, resume_state = NONE, blocked_to = NONE, version = $t.version + 1 RETURN AFTER;
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now() };
+          state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
+          resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
+          resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
+          blocked_to = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+          version = $t.version + 1 RETURN AFTER;
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
+          source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value, payload: { state: $next.state }, at: time::now() };
+        CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
+          payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
         CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
@@ -1503,15 +2358,101 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
+   * A review-phase wait is legal only when the row carries a real submitted review:
+   * the submitter matches the latest submit audit, the submit snapshot is not newer than
+   * the task, and the latest block is a review-phase block by the reviewer role. A
+   * non-owner reviewer is required; owner gates, cross-role rows and unreadable/missing
+   * history fail closed. Read-only.
+   */
+  private async requireProvableReviewWait(taskRef: RecordId, row: {
+    reviewer_role: ReviewerRole; submitted_by?: string; resume_role?: string; version: number;
+  }): Promise<void> {
+    if (row.reviewer_role === 'owner') throw new CompanyError('invalid', 'review wait does not apply to owner review gates');
+    if (!row.submitted_by) throw new CompanyError('invalid', 'review wait has no original submission');
+    if (row.resume_role && row.resume_role !== row.reviewer_role) {
+      throw new CompanyError('invalid', 'review wait role does not match the reviewer role');
+    }
+    const [subRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown }>]>(
+      "SELECT id, actor, version, at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;", { task: taskRef });
+    const submission = subRows?.[0];
+    if (!submission || normalizedId(submission.actor) !== row.submitted_by) {
+      throw new CompanyError('invalid', 'review wait lacks a matching original submission');
+    }
+    if (submission.version === undefined || submission.version > row.version) {
+      throw new CompanyError('invalid', 'review submission snapshot is newer than the task');
+    }
+    const [blockRows] = await this.db.query<[Array<{ id: RecordId; actor: unknown; version?: number; at: unknown; phase?: string }>]>(
+      "SELECT id, actor, version, at, phase FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;", { task: taskRef });
+    const latestBlock = blockRows?.[0];
+    if (!latestBlock || latestBlock.phase !== 'review') {
+      throw new CompanyError('invalid', 'review block history is not provable');
+    }
+    const submittedAt = Date.parse(String(submission.at));
+    const blockedAt = Date.parse(String(latestBlock.at));
+    if (!Number.isFinite(submittedAt) || !Number.isFinite(blockedAt) || blockedAt <= submittedAt) {
+      throw new CompanyError('invalid', 'review block history predates the original submission');
+    }
+    const blockActor = latestBlock.actor instanceof RecordId ? await this.db.select<EmployeeRow>(latestBlock.actor) : undefined;
+    if (!blockActor || blockActor.role !== row.reviewer_role) {
+      throw new CompanyError('invalid', 'review block actor does not match the reviewer role');
+    }
+  }
+
   /**
-   * gm only: re-point an execute-phase gm block at the dependency graph. The task keeps
-   * state 'blocked' — it never re-enters the dispatcher's gm-attention loop or the work
-   * queues — but `blocked_to` clears, which is exactly what UNLOCK_SQL needs to flip it
-   * 'ready' the moment the last dependency finishes. Owner gates, review blocks, live
-   * leases and closed goals are refused, not guessed; with every dependency already done
-   * the task resumes immediately under the same safe execute semantics as resume.
+   * The dependency graph used by defer's cycle guard. Each raw dependency is
+   * resolved through its superseded_by lineage tip before its dependencies are
+   * considered, so a chain that only becomes cyclic after revision resolution is
+   * still refused. Corrupt/missing lineage stays on the raw row (conservative).
+   */
+  private async dependencyGraph(ids: string[]): Promise<Map<string, string[]>> {
+    const graph = new Map<string, string[]>();
+    if (!ids.length) return graph;
+    type Row = { id: RecordId; dependencies?: RecordId[]; superseded_by?: RecordId; lineage?: RecordId };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+      { ids: ids.map(d => id('task', d)) });
+    const all: Row[] = [...(rows ?? [])];
+    const lineages = [...new Set(all.filter(row => row.superseded_by && row.lineage).map(row => normalizedId(row.lineage)))];
+    const tips = new Map<string, string>();
+    if (lineages.length) {
+      const [tipRows] = await this.db.query<[Array<{ id: RecordId; lineage: RecordId }>]>(
+        'SELECT id, lineage FROM task WHERE lineage IN $lineages AND superseded_by = NONE;',
+        { lineages: lineages.map(lineage => id('task', lineage)) });
+      for (const tip of tipRows ?? []) tips.set(normalizedId(tip.lineage), normalizedId(tip.id));
+    }
+    const present = new Set(all.map(row => normalizedId(row.id)));
+    const missingTips = [...new Set([...tips.values()].filter(tip => !present.has(tip)))];
+    if (missingTips.length) {
+      const [tipRows] = await this.db.query<[Row[]]>(
+        'SELECT id, dependencies, superseded_by, lineage FROM task WHERE id IN $ids;',
+        { ids: missingTips.map(tip => id('task', tip)) });
+      all.push(...(tipRows ?? []));
+    }
+    const byId = new Map(all.map(row => [normalizedId(row.id), row]));
+    for (const row of all) {
+      const rawId = normalizedId(row.id);
+      const lineage = row.lineage ? normalizedId(row.lineage) : '';
+      const tip = row.superseded_by && lineage ? tips.get(lineage) : undefined;
+      const source = tip ? byId.get(tip) ?? row : row;
+      graph.set(tip ?? rawId, (source.dependencies ?? []).map(normalizedId));
+    }
+    return graph;
+  }
+
+  /**
+   * gm only: re-point a gm block at the dependency graph. Execute blocks keep their old
+   * behaviour (wait blocked, restore ready). A normal non-owner review block — one backed
+   * by a real submit and a reviewer block in the audit stream — may also be deferred: the
+   * original submission, submitter, implementer and contributor facts stay untouched, and
+   * the task returns to 'review' under a fresh claim when the last dependency finishes.
+   * Owner gates, unprovable review history, live leases and closed goals are refused, not
+   * guessed; with every dependency already done the target phase is restored immediately.
    */
   async deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
+    return echoTask(await this.deferTaskUntilRecord(credential, input));
+  }
+
+  private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may defer blocked tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -1530,57 +2471,62 @@ export class SurrealCompanyCore implements CompanyCore {
     const replayed = await this.replay(idem, digest);
     if (replayed) return replayed;
 
-    // Query results may carry record ids as `task:⟨uuid⟩` (the fork's escaped rendering):
-    // strip the quoting so client-side uuids compare equal against server-side ids.
-    const norm = (value: unknown): string => {
-      const raw = value instanceof RecordId ? String(value.id) : asId(value);
-      return raw.startsWith('⟨') && raw.endsWith('⟩') ? raw.slice(1, -1) : raw;
-    };
     const depIds = dependencies.map(dep => id('task', dep));
     const taskRef = id('task', input.taskId);
+    // Every defer mutates the dependency graph. A durable epoch, checked and advanced
+    // inside the write transaction, serialises those mutations: a request built from an
+    // older graph cannot commit a cycle after a concurrent defer has landed.
+    const [epochRow] = await this.db.query<[{ value?: number } | undefined]>(
+      'SELECT * FROM ONLY company_meta:defer_epoch;');
+    const epochSeen = epochRow?.value ?? 0;
 
     // Fast-fail with a readable reason plus the audit snapshot; the transaction re-checks
     // every guard atomically, so a stale pre-read can never turn into a wrong write.
     type DeferredRow = {
-      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; current_employee?: string;
+      state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; resume_role?: string;
+      submitted_by?: string; reviewer_role: ReviewerRole; current_employee?: string;
       lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string;
     };
     // `FROM ONLY` yields the record itself (or NONE), not a list.
-    const [before] = await this.db.query<[DeferredRow | undefined]>('SELECT state, blocked_to, resume_state, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
+    const [before] = await this.db.query<[DeferredRow | undefined]>(
+      'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
       { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
-    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready'].includes(before.resume_state ?? '')) {
-      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute-phase tasks');
+    if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
+      throw new CompanyError('invalid', 'defer only applies to gm-blocked execute or normal review-phase tasks');
     }
+    const phase = before.resume_state ?? 'ready';
+    if (phase === 'review') await this.requireProvableReviewWait(taskRef, before);
     if (before.goal && before.goal_state !== 'active') throw new CompanyError('invalid', 'Task goal is not active');
     if (input.expectedVersion !== undefined && before.version !== input.expectedVersion) {
       throw new CompanyError('conflict', 'Task version moved');
     }
-    const beforeDeps = (before.dependencies ?? []).map(norm);
+    const beforeDeps = (before.dependencies ?? []).map(normalizedId);
     const after = [...new Set([...beforeDeps, ...dependencies])];
-    const phase = before.resume_state ?? 'ready';
-    const evidence = `${input.text}\n[defer] 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
+    const evidence = `${input.text}\n[defer] 操作者=${actor.employeeId} 来源phase=${phase} 依赖 before=[${beforeDeps.join(', ')}] after=[${after.join(', ')}] 恢复阶段=${phase}`;
 
     const [depRows] = await this.db.query<[Array<{ id: RecordId; goal?: RecordId }>]>(
       'SELECT id, goal FROM task WHERE id IN $ids;', { ids: depIds });
-    const depById = new Map((depRows ?? []).map(row => [norm(row.id), row]));
+    const depById = new Map((depRows ?? []).map(row => [normalizedId(row.id), row]));
     for (const dep of dependencies) {
       const row = depById.get(dep);
       if (!row) throw new CompanyError('not_found', `Dependency not found: ${dep}`);
-      // norm maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
-      if (norm(row.goal) !== norm(before.goal)) {
+      // normalizedId maps a missing goal to '' on both sides, so goal-less tasks pair with goal-less deps.
+      if (normalizedId(row.goal) !== normalizedId(before.goal)) {
         throw new CompanyError('invalid', 'Dependencies must live in the same goal as the task');
       }
     }
     // The deferred task must not be reachable from its own new dependencies: walk the
-    // dependency closure of the proposed deps and refuse a path back to the task.
+    // resolved dependency closure of the proposed deps (superseded_by -> lineage tip)
+    // and refuse a path back to the task.
     const seen = new Set(dependencies);
     let frontier = [...dependencies];
     for (let depth = 0; frontier.length && depth < 32; depth++) {
-      const [closure] = await this.db.query<[Array<{ dependencies?: RecordId[] }>]>(
-        'SELECT dependencies FROM task WHERE id IN $ids;', { ids: frontier.map(d => id('task', d)) });
-      const next = [...new Set((closure ?? []).flatMap(row => (row.dependencies ?? []).map(norm)))].filter(d => !seen.has(d));
+      const graph = await this.dependencyGraph(frontier);
+      if (graph.has(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle after revision resolution');
+      const next = [...new Set([...graph.values()].flat())].filter(d => !seen.has(d));
       if (next.includes(input.taskId)) throw new CompanyError('invalid', 'Dependencies would create a cycle');
+      for (const key of graph.keys()) seen.add(key);
       for (const n of next) seen.add(n);
       frontier = next;
     }
@@ -1589,8 +2535,21 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $who.role != 'gm' OR $t = NONE { THROW 'defer denied' };
-      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready'] { THROW 'defer denied: only execute-phase gm blocks can wait on dependencies' };
+      IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.resume_state NOT IN ['doing', 'ready', 'review'] { THROW 'defer denied: only gm-blocked execute or normal review-phase tasks can wait on dependencies' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'defer denied: the task still holds an active lease' };
+      IF $t.resume_state = 'review' {
+        IF $t.reviewer_role = 'owner' OR $t.submitted_by = NONE { THROW 'defer denied: review block is not an ordinary submitted review' };
+        IF $t.resume_role != NONE AND $t.resume_role != $t.reviewer_role { THROW 'defer denied: review block role mismatch' };
+        LET $sub = SELECT * FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;
+        IF array::len($sub) = 0 { THROW 'defer denied: original submission missing' };
+        IF $sub[0].actor != $submitted_ref OR $t.submitted_by != $submitted_by { THROW 'defer denied: original submission snapshot mismatch' };
+        IF $sub[0].version = NONE OR $sub[0].version > $t.version { THROW 'defer denied: original submission snapshot is newer than the task' };
+        LET $blk = SELECT * FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;
+        IF array::len($blk) = 0 OR $blk[0].phase != 'review' { THROW 'defer denied: original review block is not provable' };
+        IF $blk[0].at <= $sub[0].at { THROW 'defer denied: original review block predates the submission' };
+        LET $blk_actor = SELECT * FROM ONLY $blk[0].actor;
+        IF $blk_actor = NONE OR $blk_actor.role != $t.reviewer_role { THROW 'defer denied: review block actor role mismatch' };
+      };
       LET $g = SELECT * FROM ONLY $t.goal;
       IF $g != NONE AND $g.state != 'active' { THROW 'goal is closed' };
       IF $expected != NONE AND $t.version != $expected { THROW 'task version moved' };
@@ -1601,20 +2560,40 @@ export class SurrealCompanyCore implements CompanyCore {
       LET $merged = array::distinct(array::concat($t.dependencies ?? [], $dependencies));
       ${RESOLVE_DEP_SQL('$merged', '$m_dep')}
       LET $remaining = SELECT VALUE id FROM task WHERE id IN $m_dep_resolved AND ${depUnsatisfiedFor('$t')};
+      LET $epoch = SELECT * FROM ONLY company_meta:defer_epoch;
+      LET $epoch_value = $epoch.value ?? 0;
+      IF $epoch_value != $epoch_seen { THROW 'defer graph moved: retry' };
+      IF $epoch = NONE {
+        CREATE ONLY company_meta:defer_epoch CONTENT { value: 1 };
+      } ELSE {
+        UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
+      };
+      LET $m_phase = $t.resume_state ?? 'ready';
+      LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
+      LET $next_resume_state = IF array::len($remaining) > 0 AND $m_phase = 'review' THEN 'review' ELSE NONE END;
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
-        state = IF array::len($remaining) = 0 THEN 'ready' ELSE 'blocked' END,
-        blocked_to = NONE, resume_role = NONE, resume_state = NONE,
+        state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
+        blocked_to = NONE,
+        resume_state = $next_resume_state,
+        resume_role = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         version = $t.version + 1 RETURN AFTER;
-      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now(),
+        source_phase: $m_phase, restore_phase: $restore_phase, dependencies_before: $before_refs,
+        dependencies_after: $merged, result: $next.state, operator: $employee };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value, payload: { state: $next.state, added: $added }, at: time::now() };
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value,
+        payload: { state: $next.state, source_phase: $m_phase, restore_phase: $restore_phase,
+          dependencies_before: $before_refs, dependencies_after: $merged, operator: $employee, added: $added }, at: time::now() };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
-      actor: id('employee', actor.employeeId), task: taskRef, expected: input.expectedVersion,
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
       dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
+      before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
+      submitted_ref: before.submitted_by ? id('employee', before.submitted_by) : undefined,
+      submitted_by: before.submitted_by, epoch_seen: epochSeen,
       idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     });
     return view(row);
@@ -1629,6 +2608,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * returning the current view; 'done' tasks refuse (their audit trail stands).
    */
   async retireTask(credential: Credential, input: RetireTask): Promise<TaskView> {
+    return echoTask(await this.retireTaskRecord(credential, input));
+  }
+
+  private async retireTaskRecord(credential: Credential, input: RetireTask): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only gm or product may retire tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -1880,6 +2863,8 @@ export class SurrealCompanyCore implements CompanyCore {
    * and, when the new implementer is a current reviewer, a named replacement reviewer that is neither an author nor
    * the new implementer. A lease held by someone else is revoked in the same write (the fence moves, so the old
    * holder's proof is refused). Audit, outbox and the idempotency row land together. Authorship is never removed.
+   * The target's employee record is written in the same transaction, so a concurrent retirement of the target conflicts
+   * with this takeover instead of both succeeding (retirement.ts, Workforce.retire).
    */
   async implementerTakeover(credential: Credential, input: ImplementerTakeover): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
@@ -1937,6 +2922,7 @@ export class SurrealCompanyCore implements CompanyCore {
         version = $t.version + 1
         RETURN AFTER;
       IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
+      UPDATE ONLY $target SET implementer_bound_at = time::now();
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
@@ -1949,6 +2935,79 @@ export class SurrealCompanyCore implements CompanyCore {
       replacement: input.replacementReviewer ? id('employee', input.replacementReviewer) : undefined,
       excluded_ids: [...new Set([...facts.excluded, input.toEmployee])].map(employee => id('employee', employee)),
       seen: contrib.version ?? -1, evidence, digest, idem, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+    };
+    try {
+      return view(await this.txTask<TaskRow>(query, vars));
+    } catch (error) {
+      const replayedAfterFailure = await this.replay(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
+   * Dispatcher-initiated implementer replacement. Called when the bound implementer's session is gone for good — the
+   * employee left the roster, or its session is archived, quarantined or parked in a failure that cannot be restarted —
+   * so the task can never be handed back, and the binding would keep every other engineer out forever. The write is the
+   * same compare-and-set transaction as the manager's takeover (version, target role/capability/track, a lease held by
+   * someone else is revoked, authorship is never removed); only the actor differs: the dispatcher acts on its own and
+   * the audit row records `system:dispatcher`. No credential is involved, so this is never exposed as an agent tool.
+   */
+  async systemImplementerTakeover(input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }): Promise<TaskView> {
+    requireText(input.taskId, 'taskId', 1, 200);
+    requireText(input.toEmployee, 'toEmployee', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const actor = 'system:dispatcher';
+    const idem = this.idemId(actor, 'implementer_takeover', `auto:${input.taskId}:${input.expectedVersion}:${input.toEmployee}`);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, toEmployee: input.toEmployee, expectedVersion: input.expectedVersion, reason: input.reason }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const current = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    if (current.executor_role !== 'engineering') {
+      throw new CompanyError('invalid', 'implementer takeover invalid: only engineering tasks have a code implementer');
+    }
+    const contrib = await readContributionView(this.db, input.taskId);
+    const facts = contrib.facts;
+    if (input.toEmployee === facts.implementer) throw new CompanyError('invalid', 'implementer takeover invalid: employee is already the implementer');
+    if (facts.excluded.includes(input.toEmployee)) throw new CompanyError('invalid', 'implementer takeover invalid: the successor is an author of this task');
+    if (facts.reviewers.includes(input.toEmployee)) {
+      throw new CompanyError('invalid', 'implementer takeover invalid: a current reviewer cannot become the implementer without a named replacement reviewer');
+    }
+    const evidence = `${input.reason}\n[implementer_takeover:auto] task=${input.taskId} from=${facts.implementer ?? 'none'} to=${input.toEmployee} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'implementer takeover invalid: task not found' };
+      IF $t.version != $expected { THROW 'implementer takeover moved: task version changed' };
+      IF $t.version != $seen { THROW 'implementer takeover moved: contribution history changed' };
+      IF $t.state NOT IN ['ready', 'doing'] AND ($t.state != 'blocked' OR $t.resume_state NOT IN ['ready', 'doing']) { THROW 'implementer takeover moved: task is not in execute phase' };
+      LET $to = SELECT * FROM ONLY $target;
+      IF $to = NONE OR $to.revoked = true OR 'execute' NOT IN $to.capabilities OR $to.role != $t.executor_role { THROW 'implementer takeover invalid: target employee cannot execute this task' };
+      LET $to_tracks = $to.def.tracks ?? [];
+      IF $t.discipline != NONE AND array::len($to_tracks) > 0 AND $t.discipline NOT IN $to_tracks { THROW 'implementer takeover invalid: target employee track does not cover the task' };
+      LET $holder = $t.current_employee;
+      LET $next = UPDATE ONLY $task SET
+        implementer = $target_key,
+        current_employee = NONE,
+        delivery_id = NONE,
+        lease_expires_at = NONE,
+        fence = IF $holder != NONE THEN $t.fence + 1 ELSE $t.fence END,
+        version = $t.version + 1
+        RETURN AFTER;
+      IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
+      UPDATE ONLY $target SET implementer_bound_at = time::now();
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key, automatic: true }, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      task: id('task', input.taskId), expected: input.expectedVersion, target: id('employee', input.toEmployee),
+      target_key: input.toEmployee, seen: contrib.version ?? -1, evidence, digest, idem, actor,
+      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     };
     try {
       return view(await this.txTask<TaskRow>(query, vars));
@@ -2100,6 +3159,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * claim allocates a fresh task branch in the target repo.
    */
   async taskProjectUpdate(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    return echoTask(await this.taskProjectUpdateRecord(credential, input));
+  }
+
+  private async taskProjectUpdateRecord(credential: Credential, input: { taskId: TaskId; project: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may rebind task projects');
     requireText(input.taskId, 'task', 1, 200);
@@ -2159,6 +3222,10 @@ export class SurrealCompanyCore implements CompanyCore {
    * uncommitted work in the old tree is preserved, and the tree itself is never deleted here.
    */
   async bindTaskCodeRepo(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
+    return echoTask(await this.bindTaskCodeRepoRecord(credential, input));
+  }
+
+  private async bindTaskCodeRepoRecord(credential: Credential, input: { taskId: TaskId; codeRepoPath: string; expectedVersion: number; text: string; idempotencyKey: string }): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may bind a task code repo');
     requireText(input.taskId, 'task', 1, 200);
@@ -2262,4 +3329,420 @@ export class SurrealCompanyCore implements CompanyCore {
     return rows.map(row => ({ id: asId(row.id), sequence: row.sequence, kind: row.kind, taskId: asId(row.task),
       payload: row.payload, createdAt: String(row.at) }));
   }
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
+  // 一条独立的只读路径：GM 登记 scope，QA 用本人 sck 会话或浏览器受限会话读取 allowlist 内的任务；
+  // 现有 getTask 的 executor/reviewer/gm/eval ACL 不变，scope 的部署任务复核租约一变即失败关闭。
+
+  /** The named scope, or the QA employee's single active scope. Never another employee's scope. */
+  private async qaScopeFor(employeeId: string, scopeId?: string): Promise<QaObservationScopeRow> {
+    if (scopeId !== undefined) {
+      requireText(scopeId, 'scopeId', 1, 200);
+      const row = await this.db.select<QaObservationScopeRow>(id('qa_observation_scope', scopeId));
+      if (!row) throw new CompanyError('not_found', 'QA observation scope not found');
+      if (row.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
+      return row;
+    }
+    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
+      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me AND status = 'active' ORDER BY created_at DESC LIMIT 2;",
+      { me: employeeId });
+    const active = rows ?? [];
+    if (active.length === 0) throw new CompanyError('forbidden', 'no active QA observation scope for this employee');
+    if (active.length > 1) throw new CompanyError('invalid', 'more than one active QA observation scope; pass scopeId');
+    return active[0]!;
+  }
+
+  /** A scope is usable only while its deployment task still carries the exact QA review lease it was granted on. */
+  private async qaScopeUsable(scope: QaObservationScopeRow, employeeId: string): Promise<void> {
+    if (scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is revoked');
+    if (!(Date.parse(scope.expires_at) > Date.now())) throw new CompanyError('forbidden', 'QA observation scope expired');
+    if (scope.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
+    const task = await this.db.select<TaskRow>(scope.deployment_task);
+    if (!task) throw new CompanyError('forbidden', 'the deployment task of the QA observation scope no longer exists');
+    const now = Math.floor(Date.now() / 1000);
+    if (task.state !== 'review' || task.reviewer_role !== 'qa') throw new CompanyError('forbidden', 'the deployment task is no longer in QA review');
+    if (task.current_employee !== scope.lease_holder || task.fence !== scope.lease_fence ||
+        task.lease_expires_at === undefined || task.lease_expires_at <= now) {
+      throw new CompanyError('forbidden', 'the QA review lease changed; the observation scope fails closed');
+    }
+    if (!task.goal || asId(task.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the deployment task left the scope goal');
+  }
+
+  /** Authenticate a QA read: an employee credential (qa role) or a browser-only restricted session token. */
+  private async qaObservationAuth(auth: QaObservationAuth, scopeId?: string): Promise<{ scope: QaObservationScopeRow; employeeId: string }> {
+    let employeeId: string;
+    let sessionScope: string | undefined;
+    if (auth.token !== undefined) {
+      requireText(auth.token, 'token', 10, 500);
+      const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
+        "SELECT * FROM qa_observation_session WHERE token_hash = $hash AND state = 'active' LIMIT 1;",
+        { hash: qaHash(auth.token) });
+      const session = rows?.[0];
+      if (!session) throw new CompanyError('forbidden', 'QA observation session is invalid or expired');
+      if (!session.expires_at || !(Date.parse(session.expires_at) > Date.now())) {
+        throw new CompanyError('forbidden', 'QA observation session expired');
+      }
+      employeeId = session.qa_employee;
+      sessionScope = qaId(session.scope);
+    } else if (auth.credential !== undefined) {
+      const actor = await this.authenticate(auth.credential);
+      if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation reads require the qa role');
+      employeeId = actor.employeeId;
+    } else {
+      throw new CompanyError('unauthorized', 'QA observation read requires a credential or a session token');
+    }
+    const scope = await this.qaScopeFor(employeeId, scopeId ?? sessionScope);
+    if (sessionScope !== undefined && scopeId !== undefined && scopeId !== sessionScope) {
+      throw new CompanyError('forbidden', 'the session is bound to another QA observation scope');
+    }
+    await this.qaScopeUsable(scope, employeeId);
+    return { scope, employeeId };
+  }
+
+  /** GM (manage): register a time-bounded, task-allowlisted QA read scope on a live QA review lease. */
+  async qaObservationGrant(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may grant a QA observation scope');
+    requireText(input.goalId, 'goalId', 1, 100);
+    requireText(input.deploymentTaskId, 'deploymentTaskId', 1, 200);
+    requireText(input.qaEmployee, 'qaEmployee', 1, 200);
+    if (!Number.isSafeInteger(input.leaseFence) || input.leaseFence < 1) throw new CompanyError('invalid', 'Invalid leaseFence');
+    if (!Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > QA_OBSERVATION_MAX_SUBJECTS) {
+      throw new CompanyError('invalid', `subjects must be 1-${QA_OBSERVATION_MAX_SUBJECTS} task ids`);
+    }
+    for (const subject of input.subjects) requireText(subject, 'subject', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    const expiresMs = Date.parse(input.expiresAt);
+    if (!Number.isFinite(expiresMs) || expiresMs < Date.now() + QA_OBSERVATION_MIN_TTL_MS || expiresMs > Date.now() + QA_OBSERVATION_MAX_TTL_MS) {
+      throw new CompanyError('invalid', 'expiresAt must be within 1 minute and 24 hours from now');
+    }
+    const expiresAt = new Date(expiresMs).toISOString();
+    const subjects = [...new Set(input.subjects)];
+    const scopeId = randomUUID();
+    const scopeRecord = id('qa_observation_scope', scopeId);
+    const idem = this.idemId(actor.employeeId, 'qa_observation_grant', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, deploymentTaskId: input.deploymentTaskId, qaEmployee: input.qaEmployee,
+      leaseFence: input.leaseFence, subjects, expiresAt, reason: input.reason }));
+    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
+    if (prior) return qaScopeView(prior);
+    const evidence = `${input.reason}\n[qa_observation_grant] scope=${scopeId} goal=${input.goalId} deployment=${input.deploymentTaskId} qa=${input.qaEmployee} leaseFence=${input.leaseFence} subjects=${subjects.join(',')} expiresAt=${expiresAt}`;
+    const query = `BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      LET $d = SELECT * FROM ONLY $deploy;
+      IF $d = NONE { THROW 'qa observation invalid: deployment task not found' };
+      IF $d.state != 'review' OR $d.reviewer_role != 'qa' { THROW 'qa observation invalid: deployment task is not in QA review' };
+      IF $d.current_employee != $qa OR $d.fence != $fence { THROW 'qa observation invalid: QA review lease holder or fence does not match' };
+      IF $d.lease_expires_at = NONE OR $d.lease_expires_at <= time::unix(time::now()) { THROW 'qa observation invalid: QA review lease is not live' };
+      IF $d.goal != $goal { THROW 'qa observation invalid: deployment task is not in the scope goal' };
+      IF $d.submitted_by = $qa OR $d.implementer = $qa { THROW 'qa observation invalid: the qa employee authored the deployment task' };
+      LET $q = SELECT * FROM ONLY $qa_emp;
+      IF $q = NONE OR $q.revoked = true OR $q.role != 'qa' OR 'review' NOT IN $q.capabilities { THROW 'qa observation invalid: qa employee is not an active reviewer' };
+      FOR $s IN $subjects {
+        LET $t = SELECT * FROM ONLY type::record('task', $s);
+        IF $t = NONE { THROW 'qa observation invalid: subject task not found' };
+        IF $t.goal != $goal { THROW 'qa observation invalid: subject task is not in the scope goal' };
+        IF $t.submitted_by = $qa OR $t.implementer = $qa { THROW 'qa observation invalid: the qa employee authored a subject task' };
+      };
+      LET $scope = CREATE ONLY $scope_rec CONTENT { goal: $goal, deployment_task: $deploy, qa_employee: $qa, lease_holder: $qa,
+        lease_fence: $fence, subjects: $subjects, status: 'active', expires_at: $expires, version: 1, reason: $reason,
+        created_by: $actor, created_at: time::now() };
+      CREATE ONLY $audit CONTENT { task: $deploy, actor: $actor, action: 'qa_observation_grant', evidence: $evidence, version: 1, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $scope };
+      RETURN $scope;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), deploy: id('task', input.deploymentTaskId), qa: input.qaEmployee,
+      qa_emp: id('employee', input.qaEmployee), goal: id('goal', input.goalId), fence: input.leaseFence,
+      subjects, expires: expiresAt, reason: input.reason, scope_rec: scopeRecord, evidence, digest, idem,
+      audit: id('audit', randomUUID()),
+    };
+    try {
+      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
+    } catch (error) {
+      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
+      if (replayed) return qaScopeView(replayed);
+      throw error;
+    }
+  }
+
+  /** GM (manage): revoke a scope with compare-and-set on its version. */
+  async qaObservationRevoke(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may revoke a QA observation scope');
+    requireText(input.scopeId, 'scopeId', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const idem = this.idemId(actor.employeeId, 'qa_observation_revoke', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ scopeId: input.scopeId, expectedVersion: input.expectedVersion, reason: input.reason }));
+    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
+    if (prior) return qaScopeView(prior);
+    const evidence = `${input.reason}\n[qa_observation_revoke] scope=${input.scopeId} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      LET $s = SELECT * FROM ONLY $scope;
+      IF $s = NONE { THROW 'qa observation invalid: scope not found' };
+      IF $s.version != $expected { THROW 'qa observation moved: scope version changed' };
+      IF $s.status != 'active' { THROW 'qa observation moved: scope is not active' };
+      LET $next = UPDATE ONLY $scope SET status = 'revoked', revoked_at = time::now(), revoked_by = $actor,
+        revoked_reason = $reason, version = $s.version + 1 RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $s.deployment_task, actor: $actor, action: 'qa_observation_revoke', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = { actor: id('employee', actor.employeeId), scope: id('qa_observation_scope', input.scopeId),
+      expected: input.expectedVersion, reason: input.reason, evidence, digest, idem, audit: id('audit', randomUUID()) };
+    try {
+      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
+    } catch (error) {
+      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
+      if (replayed) return qaScopeView(replayed);
+      throw error;
+    }
+  }
+
+  /** GM sees every scope; a QA sees its own. No credentials or session hashes are returned. */
+  async qaObservationStatus(credential: Credential): Promise<QaObservationScopeView[]> {
+    const actor = await this.authorized(credential);
+    if (actor.role === 'gm') {
+      const [rows] = await this.db.query<[QaObservationScopeRow[]]>("SELECT * FROM qa_observation_scope ORDER BY created_at DESC LIMIT 50;");
+      return (rows ?? []).map(qaScopeView);
+    }
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation status is read by gm or qa');
+    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
+      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me ORDER BY created_at DESC LIMIT 20;", { me: actor.employeeId });
+    return (rows ?? []).map(qaScopeView);
+  }
+
+  /** QA (own credential): one-time login code for the company page. The code is stored as a hash and expires quickly. */
+  async qaObservationSession(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView> {
+    const actor = await this.authenticate(credential);
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation sessions require the qa role');
+    const scope = await this.qaScopeFor(actor.employeeId, input.scopeId);
+    await this.qaScopeUsable(scope, actor.employeeId);
+    const code = randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + QA_OBSERVATION_CODE_TTL_MS).toISOString();
+    await this.db.query("CREATE $sess CONTENT { scope: $scope, qa_employee: $qa, code_hash: $hash, state: 'code', code_expires_at: $expires, created_at: time::now() };",
+      { sess: id('qa_observation_session', randomUUID()), scope: scope.id, qa: actor.employeeId, hash: qaHash(code), expires: expiresAt });
+    return { scope: qaScopeView(scope), code, expiresAt, pagePath: '/q/' };
+  }
+
+  /** The company page exchanges the one-time code for a browser-only restricted token. The code is consumed. */
+  async qaObservationLogin(code: string): Promise<QaObservationLoginView> {
+    requireText(code, 'code', 10, 500);
+    const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
+      "SELECT * FROM qa_observation_session WHERE code_hash = $hash AND state = 'code' LIMIT 1;", { hash: qaHash(code) });
+    const session = rows?.[0];
+    if (!session) throw new CompanyError('forbidden', 'login code is invalid or already used');
+    if (!(Date.parse(session.code_expires_at) > Date.now())) throw new CompanyError('forbidden', 'login code expired');
+    const scope = await this.db.select<QaObservationScopeRow>(session.scope);
+    if (!scope || scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is not active');
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + QA_OBSERVATION_TOKEN_TTL_MS).toISOString();
+    await this.db.query("UPDATE ONLY $sess SET state = 'active', token_hash = $token_hash, expires_at = $expires, used_at = time::now();",
+      { sess: session.id, token_hash: qaHash(token), expires: expiresAt });
+    return { scope: qaScopeView(scope), token, expiresAt };
+  }
+
+  /** QA: full task state, contribution facts (unknown fail-closed), and the last dispatcher pass's verdicts. */
+  async qaObservationRead(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView> {
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    const [instanceAt, observation, attempt] = await Promise.all([
+      this.dbNow(),
+      this.db.select<Record<string, unknown>>(id('company_meta', 'dispatch_observation')),
+      this.db.select<{ at?: string; ok?: boolean; error?: string }>(id('company_meta', 'dispatch_observation_status')),
+    ]);
+    const checkedAt = new Date().toISOString();
+    const scopeView = qaScopeView(scope);
+    const baseMeta: QaObservationMeta = { checkedAt, dataSource: 'live', instanceAt, scope: scopeView, completeness: { complete: true } };
+    if (input.goalId !== undefined) {
+      if (input.goalId !== asId(scope.goal)) throw new CompanyError('forbidden', 'the goal is outside the QA observation scope');
+      const goalId = input.goalId;
+      const [rows] = await this.db.query<[Array<{ state?: string | null; n: number }>]>(
+        "SELECT state, count() AS n FROM task WHERE goal = $goal GROUP BY state;", { goal: scope.goal });
+      const states: Record<string, number> = {};
+      for (const row of rows ?? []) states[row.state == null ? 'unknown' : String(row.state)] = Number(row.n);
+      const total = Object.values(states).reduce((sum, n) => sum + n, 0);
+      const [goalTasks] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal;", { goal: scope.goal });
+      const goalIds = new Set((goalTasks ?? []).map(row => asId(row.id)));
+      const state = qaDispatchState(observation, attempt);
+      const verdicts = (observation as { verdicts?: Array<{ taskId?: string; dispatchable?: boolean }> } | undefined)?.verdicts ?? [];
+      const undispatchable = state.complete
+        ? new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size
+        : undefined;
+      // Workflow waits are a separately sampled, goal-scoped graph. They remain available when a dispatch pass is absent,
+      // partial or stale, and never inherit the pass timestamp.
+      const passVerdicts = (observation as { verdicts?: DispatchVerdict[] } | undefined)?.verdicts ?? [];
+      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === goalId && goalIds.has(verdict.taskId));
+      const verdictRoot = goalRootBlockers(goalVerdicts)[0];
+      let workflowSnapshot: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>> | undefined;
+      let waits: GoalWorkflowWaitSummary;
+      try {
+        workflowSnapshot = await readGoalWorkflowWaitSnapshot(this.db, this.workforce, {
+          goalId, roots: verdictRoot ? [verdictRoot.taskId] : [], limit: QA_OBSERVATION_WAIT_ROOTS_LIMIT,
+          log: message => console.warn(message),
+        });
+        waits = workflowSnapshot.summary;
+      } catch (error) {
+        console.warn(`qa goal workflow wait facts failed: ${(error as Error).message}`);
+        waits = { source: 'workflow-graph', available: false, totalRoots: 0, shownRoots: 0, truncated: false,
+          reason: 'workflow graph could not be read', roots: [] };
+      }
+      // The exact same goal-root evaluator and graph facts serve dispatch blockers and workflow waits. Without workforce
+      // contributor access, the legacy F1 root keeps its facts-unavailable semantics; the workflow wait graph remains readable.
+      const facts: GoalRootFacts | undefined = verdictRoot && this.workforce && workflowSnapshot
+        ? workflowSnapshot.facts : undefined;
+      const rootBlocker = goalRootBlockers(goalVerdicts, facts)[0];
+      const rootVerdict = verdictRoot
+        ? goalVerdicts.find(verdict => verdict.taskId === verdictRoot.taskId && verdict.phase === verdictRoot.phase)
+        : undefined;
+      const reasons = rootBlocker?.reasons ?? [];
+      // Revalidate after the graph and provenance reads so expiry, revocation or holder-fence changes during collection fail closed.
+      await this.qaObservationAuth(auth, input.scopeId);
+      const root = rootBlocker ? {
+        taskId: rootBlocker.taskId, title: rootBlocker.title, phase: rootBlocker.phase,
+        workflowState: rootBlocker.workflowState, summary: rootBlocker.summary, feasible: rootBlocker.feasible,
+        waitingMinutes: rootBlocker.waitingMinutes, ...(rootBlocker.since ? { since: rootBlocker.since } : {}),
+        checkedAt: rootBlocker.checkedAt, eligibleCount: rootBlocker.eligibleCount,
+        undispatchable: rootBlocker.undispatchable, others: rootBlocker.others,
+        ...(rootVerdict?.noticeKey ? { noticeKey: rootVerdict.noticeKey } : {}),
+        factsAvailable: facts !== undefined,
+        ...(facts !== undefined ? {
+          impact: rootBlocker.impact, dependencyPath: rootBlocker.dependencyPath,
+          people: { ...rootBlocker.people, authors: [...rootBlocker.people.authors], reviewers: [...rootBlocker.people.reviewers] },
+        } : {}),
+        reasons: reasons.slice(0, 20).map(reason => ({
+          code: reason.code, text: reason.text, candidates: [...reason.candidates], owner: reason.owner,
+          recovery: reason.recovery, nextTrigger: reason.nextTrigger, basis: reason.basis,
+          ...(reason.until ? { until: reason.until } : {}),
+          actions: reason.actions.map(action => ({ ...action })),
+        })),
+        ...(reasons.length > 20 ? { reasonsOmitted: reasons.length - 20 } : {}),
+      } : undefined;
+      // The waits ride on the one goal answer, and qa_observation_read has no paging input, so an over-budget answer would be
+      // replaced whole by response_too_large on the relay and refused on MCP. Shrink waits against the measured answer instead,
+      // leaving the release stamp its reserve, and say in the summary what was left out.
+      const view = (fitted: GoalWorkflowWaitSummary): QaObservationReadView => ({ meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
+        goal: { id: goalId, states, total,
+          ...(undispatchable !== undefined ? { undispatchable } : {}),
+          dispatchAvailable: state.available, dispatchComplete: state.complete, dispatchSource: 'dispatcher-pass',
+          ...(state.reason ? { dispatchReason: state.reason } : {}),
+          ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
+          ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
+          ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
+          waits: fitted,
+          ...(root ? { root } : {}),
+        } });
+      const trimmed: GoalWorkflowWaitSummary = waits.available ? { ...waits, roots: waits.roots.map(wait => {
+        if (!wait.people) return wait;
+        const authors = wait.people.authors.slice(0, 6);
+        const reviewers = wait.people.reviewers.slice(0, 6);
+        const peopleOmitted = wait.people.authors.length - authors.length + wait.people.reviewers.length - reviewers.length;
+        return { ...wait, people: { ...wait.people, authors, reviewers, ...(peopleOmitted ? { peopleOmitted } : {}) } };
+      }) } : waits;
+      return view(fitGoalWaitSummary(trimmed, candidate => answerBytes(view(candidate)) <= RESPONSE_BUDGET_BYTES - QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES));
+    }
+    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
+    const taskId = input.taskId;
+    if (!scope.subjects.includes(taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
+    const taskView = view(row);
+    const facts = (await readContributionView(this.db, taskId)).facts;
+    const dispatch = qaDispatchFor(observation, taskId, attempt);
+    const context = row.context ?? '';
+    const contextBytes = utf8Bytes(context);
+    const inline = contextBytes <= QA_OBSERVATION_CONTEXT_INLINE_BYTES;
+    const meta: QaObservationMeta = { ...baseMeta, completeness: { complete: true, taskRead: true, contextIncluded: inline,
+      dispatchComplete: dispatch.available && dispatch.complete !== false } };
+    return {
+      meta,
+      task: inline ? taskView : { ...taskView, context: '' },
+      contribution: {
+        authors: [...facts.authors], reviewers: [...facts.reviewers], excluded: [...facts.excluded],
+        unknown: facts.unknown.map(entry => ({ actor: entry.actor, action: entry.action, ...(entry.at ? { at: entry.at } : {}), reason: entry.reason })),
+        ...(facts.implementer ? { implementer: facts.implementer } : {}), ambiguous: facts.ambiguous,
+      },
+      dispatch,
+      ...(inline ? {} : { contextOmitted: true, contextBytes, contextSha256: HASH(context), contextRead: { taskId, field: 'context' as const, offset: 0 } }),
+    };
+  }
+
+  /** QA: one stored page of the allowlisted task's audit history (evidence cut per item, read whole with qa_observation_text). */
+  async qaObservationTimeline(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView> {
+    const startedAt = arrivedAt();
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId is required');
+    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    const params = parseHistoryInput({ ...input });
+    const digest = queryDigest('qa-history', { scope: asId(scope.id), taskId: input.taskId });
+    const scopeView = qaScopeView(scope);
+    const taskId = input.taskId;
+    return this.listingPage<HistoryEntry, QaObservationTimelineView>({
+      actor: { employeeId: scope.qa_employee, role: 'qa', capabilities: [] }, kind: 'history', digest,
+      pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: async started => {
+        const { limits } = this.snapshots;
+        return this.snapshots.build({
+          owner: scope.qa_employee, kind: 'history', digest, role: 'qa', startedAt: started,
+          guidance: 'read large evidence with qa_observation_text', emptyWhenNoRows: true,
+          load: async db => {
+            const { at, rows } = await this.historyRowsAt(taskId as TaskId, limits.maxRows + 1, db);
+            if (rows.length > limits.maxRows) throw tooLarge(`task ${taskId} has more than ${limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
+            return { takenAt: at, bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))) };
+          },
+        });
+      },
+      parse: body => JSON.parse(body) as HistoryEntry,
+      respond: (history, page) => ({
+        meta: { checkedAt: page.snapshotAt ?? new Date().toISOString(), dataSource: 'live',
+          instanceAt: page.snapshotAt ?? new Date().toISOString(), scope: scopeView,
+          completeness: { complete: !page.hasMore, timelinePaged: true } },
+        history: [...history].reverse(), page,
+      }),
+      envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: entry => entry.auditId
+        ? `history entry ${entry.auditId} is larger than a page can hold; read its evidence with qa_observation_text ${JSON.stringify({ taskId, field: 'evidence', auditId: entry.auditId, offset: 0 })}`
+        : 'a history entry is larger than a page can hold; use a smaller pageSize',
+    });
+  }
+
+  /** QA: one byte segment of the allowlisted task's context or audit evidence, with the digest for reassembly. */
+  async qaObservationText(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment> {
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    if (input.field !== 'context' && input.field !== 'evidence') throw new CompanyError('invalid', 'field must be context or evidence');
+    const offset = input.offset ?? 0;
+    const limit = input.limit ?? SEGMENT_DEFAULT_BYTES;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000_000) throw new CompanyError('invalid', 'Invalid offset');
+    if (!Number.isSafeInteger(limit) || limit < 4 || limit > SEGMENT_MAX_BYTES) throw new CompanyError('invalid', `limit must be 4-${SEGMENT_MAX_BYTES}`);
+    if (input.expectSha256 !== undefined && !/^[0-9a-f]{64}$/.test(input.expectSha256)) throw new CompanyError('invalid', 'Invalid expectSha256');
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
+    let text: string;
+    if (input.field === 'context') {
+      text = row.context ?? '';
+    } else {
+      if (!input.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
+      const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
+        "SELECT task, evidence FROM audit WHERE id = $aid AND action != 'ops_call';", { aid: id('audit', input.auditId) });
+      const audit = rows?.[0];
+      if (!audit || !audit.task || asId(audit.task) !== input.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
+      text = audit.evidence ?? '';
+    }
+    const sha256 = HASH(text);
+    if (input.expectSha256 !== undefined && input.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the ${input.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
+    }
+    const head: TaskTextHead = { taskId: input.taskId, field: input.field, ...(input.auditId ? { auditId: input.auditId } : {}), sha256 };
+    const segment = textSegment(text, offset, limit, head);
+    const meta: QaObservationMeta = { checkedAt: new Date().toISOString(), dataSource: 'live', instanceAt: await this.dbNow(),
+      scope: qaScopeView(scope), completeness: { complete: segment.next === null } };
+    return { meta, ...textSegmentAnswer(head, segment), field: input.field };
+  }
+
 }

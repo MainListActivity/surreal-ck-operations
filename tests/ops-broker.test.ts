@@ -1192,8 +1192,12 @@ describe('ops_idp_principal_mint', () => {
     const r = rig();
     const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify' });
     expect(res).toMatchObject({ label: 'qa-verify', scopes: ['tenant.read', 'user.read', 'user.provision'], status: 'active' });
-    const token = res.token as string;
+    // Without sealAs the answer still carries only the sealed reference: the raw token never leaves the broker.
+    expect(res.token).toBeUndefined();
+    expect(res.sealed).toBe(`IDP_SP_${String(res.id).toUpperCase().replaceAll('-', '_')}`);
+    const token = r.company.sealed.get(`demo/production/${res.sealed}`)!;
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(JSON.stringify(res)).not.toContain(token);
 
     // The D1 row mirrors the IdP's own mint: hash only, fixed scopes, ops caller attributed.
     const row = r.world.principal(res.id)!;
@@ -1221,7 +1225,8 @@ describe('ops_idp_principal_mint', () => {
   test('sealAs returns the alias seal name and never the token value', async () => {
     const r = rig();
     const res = await call(r, 'ops_idp_principal_mint', { label: 'qa-verify', sealAs: 'qa-verify' });
-    expect(res).toMatchObject({ label: 'qa-verify', sealed: 'IDP_SP_QA_VERIFY', status: 'active' });
+    expect(res).toMatchObject({ label: 'qa-verify', sealedAs: 'IDP_SP_QA_VERIFY', status: 'active' });
+    expect(res.sealed).toBe(`IDP_SP_${String(res.id).toUpperCase().replaceAll('-', '_')}`);
     expect(res.token).toBeUndefined();
     const token = r.company.sealed.get('demo/production/IDP_SP_QA_VERIFY')!;
     expect(token).toBeTruthy();

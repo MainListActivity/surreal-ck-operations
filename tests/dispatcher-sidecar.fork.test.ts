@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -12,10 +12,30 @@ import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
-import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
+import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
+import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse } from '../src/response-budget.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
+const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
+
+/** Exercise the same comm path a real `sck call` uses: a separate client-cli process writes req and reads res. */
+async function relayViaClient(env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) {
+  // Spawn asynchronously: the sidecar sweeper lives in this same Bun process, so a blocking
+  // spawnSync would prevent it from answering the child client.
+  const child = Bun.spawn([process.execPath, CLIENT_CLI, 'call', tool, JSON.stringify(args)], {
+    env: { ...process.env, SCK_COMM_DIR: env.SCK_COMM_DIR!, SCK_COMM_KEY: env.SCK_COMM_KEY! },
+    stdout: 'pipe', stderr: 'pipe',
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  let answer: { data?: unknown; error?: string } | undefined;
+  try { answer = stdout.trim() ? JSON.parse(stdout.trim()) : undefined; } catch { answer = undefined; }
+  if (code === 0) return { ok: true, data: answer };
+  const error = (typeof answer?.error === 'string' && answer.error) || stderr.trim() || 'real sck client failed';
+  return { ok: false, error };
+}
 run('company fork: restart quarantine, actual lease fencing, fresh dispatch and independent review', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'channel-fork-'));
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
@@ -49,17 +69,12 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const paseo: PaseoGateway = { list: async () => agentRows, status: async id => agentRows.get(id) ? { status: agentRows.get(id)!.status, pendingPermissions: 0 } : undefined,
       lastError: async () => '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
       spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
-      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
+      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; }, reload: async id => { agentRows.get(id)!.status = 'idle'; },
       archive: async id => { agentRows.get(id)!.status = 'archived'; pool!.detachAgent(id); },
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     const makeDispatcher = () => new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
       env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
-    let counter = 0;
-    const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
-      const file = `${++counter}.json`; writeFileSync(join(reqDir(env.SCK_COMM_DIR!), file), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
-      for (let n = 0; n < 200 && !existsSync(join(resDir(env.SCK_COMM_DIR!), file)); n++) await Bun.sleep(5);
-      const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
-    };
+    const relay = (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => relayViaClient(env, tool, args);
     // The engineering claim needs a legal independent review after it (R1): a qa seat stays spare for that review.
     await wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await core.createTask(gm, { title: 'isolated channel recovery', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create' });
@@ -101,7 +116,7 @@ run('company fork: restart quarantine, actual lease fencing, fresh dispatch and 
     const history = await core.history(gm, task.id); expect(history.some(h => h.action === 'accept' && h.actor !== old.id)).toBe(true);
   } finally {
     for (const id of agentRows.keys()) pool?.detachAgent(id);
-    await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
+    pool?.close(); await db.close(); child.kill(); await child.exited; rmSync(dir, { recursive: true, force: true });
   }
 }, 30000);
 
@@ -133,7 +148,7 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
     const paseo: PaseoGateway = { list: async () => agentRows, status: async id => agentRows.get(id) ? { status: agentRows.get(id)!.status, pendingPermissions: 0 } : undefined,
       lastError: async () => '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
       spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
-      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
+      send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; }, reload: async id => { agentRows.get(id)!.status = 'idle'; },
       archive: async id => { agentRows.get(id)!.status = 'archived'; pool!.detachAgent(id); },
       listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
     const makeDispatcher = () => new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
@@ -187,8 +202,8 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
  * A real company fork for the real-tick scenarios below: the actual core, dispatcher and sidecar pool over a fresh database.
  * Paseo is a fake: the test drives each session's status and last error, and agents get real comm directories to relay through.
  */
-async function startCompanyFork(name: string) {
-  const dir = mkdtempSync(join(tmpdir(), `channel-fork-${name}-`));
+async function startCompanyFork(name: string, tempRoot = tmpdir()) {
+  const dir = mkdtempSync(join(tempRoot, `channel-fork-${name}-`));
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = reservation.port!; reservation.stop(true);
   const rootPassword = 'isolated-channel-test-only';
@@ -211,24 +226,31 @@ async function startCompanyFork(name: string) {
   const paseo: PaseoGateway = { list: async () => agentRows, status: async id => agentRows.get(id) ? { status: agentRows.get(id)!.status, pendingPermissions: 0 } : undefined,
     lastError: async id => errors.get(id) ?? '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
     spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
-    send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; },
+    send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; }, reload: async id => { agentRows.get(id)!.status = 'idle'; },
     archive: async id => { agentRows.get(id)!.status = 'archived'; pool?.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
   let last: Dispatcher | undefined;
-  let counter = 0;
-  const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
-    const file = `${++counter}.json`; writeFileSync(join(reqDir(env.SCK_COMM_DIR!), file), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
-    for (let n = 0; n < 200 && !existsSync(join(resDir(env.SCK_COMM_DIR!), file)); n++) await Bun.sleep(5);
-    const result = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(env.SCK_COMM_DIR!), file)); expect(!!result).toBe(true); return result!;
-  };
+  const relay = (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => relayViaClient(env, tool, args);
   return {
-    core, owner, wf, db, gm, agentRows, errors, envs, relay,
+    core, owner, wf, db, gm, dir, pool: pool!, agentRows, errors, envs, relay,
     /** One real tick on a fresh dispatcher, as the existing fork tests run it. */
     tick: async () => {
-      last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0, env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
+      last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
+        autoTakeover: async input => { await core.systemImplementerTakeover(input); return true; },
+        log: process.env.SCK_TEST_DISPATCH_LOG === '1' ? message => console.log('DISPATCH', message) : undefined,
+        env: { opsRepo: dir, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
       return last.tick();
     },
+    /** Process restart: the old pool loses its channel/claim memory, then a fresh pool adopts the roster.
+     *  The comm directory (including claim.json and any artifact written before the crash) persists. */
+    reload: async () => {
+      pool?.close();
+      const next = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], ops, runDir: join(dir, 'comm'), sweepMs: 5 });
+      pool = next;
+      await next.adopt(await wf.insts());
+    },
     verdicts: () => last?.dispatchVerdicts() ?? [],
+    snapshot: () => last?.dispatchSnapshot(),
     close: async () => {
       for (const id of agentRows.keys()) pool?.detachAgent(id);
       pool?.close();
@@ -260,6 +282,12 @@ run('company fork: a bound implementer runs out of quota, the task waits without
     expect(verdict).toMatchObject({ dispatchable: false, feasible: true, eligibleCount: 0 });
     expect(verdict.reasons.map(r => r.code)).toEqual(['implementer_mismatch', 'quota']);
     expect(verdict.reasons.find(r => r.code === 'quota')?.candidates).toEqual([A.id]);
+    // The quota reason carries the recovery time the provider health record holds (ISO 8601), never the concurrency-full text (AC02).
+    const [healthRows] = await w.db.db.query<[Array<{ until: number }>]>('SELECT until FROM provider_health:codex;');
+    const quota = verdict.reasons.find(r => r.code === 'quota')!;
+    expect(quota.until).toBe(new Date(healthRows![0]!.until * 1000).toISOString());
+    expect(quota.text).toContain('恢复时间');
+    expect(quota.text).not.toContain('并发已满');
     expect((await w.wf.insts()).filter(i => i.role === 'engineering')).toHaveLength(1);
     // A fresh episode waits five minutes before it becomes an owner notice; repeated ticks keep one open item.
     expect((await w.tick()).notices).not.toContain(`dispatch-blocked:${task.id}:execute`);
@@ -405,12 +433,13 @@ run('company fork: the bound implementer loses its lease, the manager hands the 
 }, 90000);
 
 // SYS-DISP R6(b) (AC04/AC06): legacy authors with no recorded implementer fail closed through the real tick and the real core. The
-// conclusion is visible with its reason, nobody is woken, and the core refuses a claim by a fresh engineer.
-run('company fork: legacy authors without a recorded implementer fail closed, the conclusion is visible, nobody is woken, and the core refuses a claim', async () => {
+// conclusion is visible with its reason, the manager is woken with a takeover todo, and the core refuses a claim by a fresh engineer.
+run('company fork: legacy authors without a recorded implementer wake the manager for takeover and the core refuses a claim', async () => {
   const w = await startCompanyFork('legacy');
   try {
     await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 2 });
     await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-gm', { role: 'gm', provider: 'codex', model: 'fixture', maxInstances: 1 });
     const task = await w.core.createTask(w.gm, { title: 'legacy authors and no recorded implementer', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-legacy' });
     // Two legacy authors. Their rows carry no phase, and the task never recorded an implementer. Actors are employee records,
     // as production audit rows are written: the derivation reads only employee actors, so plain strings would be dropped.
@@ -424,19 +453,399 @@ run('company fork: legacy authors without a recorded implementer fail closed, th
     expect(facts.ambiguous).toBe(true);
     expect(facts.implementer).toBeUndefined();
     expect(facts.authors).toEqual(['legacy-author-one', 'legacy-author-two']);
-    // Nobody is woken. The gate blocks every candidate, and the conclusion names the unresolved implementer with its notice.
+    // The manager is woken with a takeover todo; the verdict stays the single source of the reason.
     const tick = await w.tick();
-    expect(tick.woke.find(x => x.task === task.id)).toBeUndefined();
+    const wake = tick.woke.find(x => x.task === task.id);
+    expect(wake?.employee.startsWith('fixture-gm')).toBe(true);
+    expect(tick.woke.filter(x => x.task === task.id)).toHaveLength(1);
     const verdict = w.verdicts().find(v => v.taskId === task.id && v.phase === 'execute')!;
     expect(verdict).toMatchObject({ dispatchable: false, feasible: false, workflowState: 'ready' });
     expect(verdict.reasons.map(r => r.code)).toContain('implementer_unresolved');
     expect(tick.notices).toContain(`dispatch-blocked:${task.id}:execute`);
+    expect(await w.wf.openManagerActions()).toEqual([expect.objectContaining({ taskId: task.id, reason: 'implementer_unresolved' })]);
     // The core refuses a claim by a fresh engineer as well: the manager has to record the implementer first.
     const fresh = await w.wf.spawnInst((await w.wf.defs()).find(d => d.id === 'fixture-eng')!);
     await expect(w.core.claim(fresh.credential!, task.id)).rejects.toMatchObject({ code: 'forbidden' });
     expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready' });
-    expect((await w.tick()).woke.find(x => x.task === task.id)).toBeUndefined();
+    // The same episode does not wake another gm on a repeated tick.
+    expect((await w.tick()).woke.filter(x => x.task === task.id)).toHaveLength(0);
+    // Real manager seam: dry-run first, then a compare-and-set takeover; a stale version is refused.
+    const dry = await w.core.contributorDryRun(w.gm, { taskIds: [task.id] });
+    expect(dry.tasks[0]).toMatchObject({ status: 'manager_decision' });
+    const C = await w.wf.spawnInst((await w.wf.defs()).find(d => d.id === 'fixture-eng')!);
+    // Launch the channel before binding the agent, then bind the agent in the pool: canReuse requires both.
+    w.pool.env(C);
+    await w.wf.bind(C.id, { agentId: `agent-${C.id}`, cwd: w.dir, repoHome: w.dir, model: 'fixture' });
+    w.pool.bindAgent(C.id, `agent-${C.id}`);
+    w.agentRows.set(`agent-${C.id}`, { id: `agent-${C.id}`, status: 'idle' });
+    const current = await w.core.getTask(w.gm, task.id);
+    await expect(w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: current.version + 1,
+      reason: 'stale takeover regression', idempotencyKey: 'legacy-stale-takeover' })).rejects.toMatchObject({ code: 'conflict' });
+    expect(await w.core.implementerTakeover(w.gm, { taskId: task.id, toEmployee: C.id, expectedVersion: current.version,
+      reason: 'manager takes over the unresolved legacy task', idempotencyKey: 'legacy-takeover' })).toMatchObject({ implementer: C.id, state: 'ready' });
+    const after = await w.tick();
+    expect(after.woke.find(x => x.task === task.id)?.employee).toBe(C.id);
+    expect(await w.wf.openManagerActions()).toHaveLength(0);
   } finally {
     await w.close();
   }
 }, 90000);
+
+// SYS-DISP R7 (AC07): the bound implementer's session ends for good (archived). No manager is involved: the tick hands the
+// code to a live engineer of the same repository on its own, the audit row records the system actor, and the successor
+// delivers without a manager takeover. With nobody available the same block waits instead of assigning.
+run('company fork: an archived implementer is replaced by the system on its own, and the successor delivers', async () => {
+  const w = await startCompanyFork('auto-successor');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-eng-grok', { role: 'engineering', provider: 'grok', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'the struck implementer is replaced by the system', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).filter(i => i.role === 'engineering').find(i => i.provider === 'codex')!;
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: A.id, implementer: A.id });
+    // A second engineer appears and finishes its own work first, so it is live, idle and free for handover.
+    const warm = await w.core.createTask(w.gm, { title: 'the second engineer finishes its own work first', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto-warm' });
+    expect((await w.tick()).woke.find(x => x.task === warm.id)?.spawned).toBe(true);
+    const C = (await w.wf.insts()).filter(i => i.role === 'engineering').find(i => i.provider === 'grok')!;
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery by the second engineer', idempotencyKey: 'auto-warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up task', idempotencyKey: 'auto-warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // A's session ends normally: Paseo reports it archived, the employee record stays while its task is open, and the
+    // retirement gate refuses to drop the session (the task is bound to it).
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    const replaced = await w.tick();
+    expect(replaced.refused).toContain(A.id);
+    expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: C.id });
+    // The system acted, and the record says so: no manager credential was involved.
+    const audit = await w.db.db.query<[Array<{ actor: string; action: string; evidence: string; at: string }>]>(
+      `SELECT actor, action, evidence, at FROM audit WHERE task = $task AND action = 'implementer_takeover';`,
+      { task: new RecordId('task', task.id) });
+    const lastTakeover = [...(audit[0] ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))).at(-1);
+    expect(lastTakeover).toMatchObject({ actor: 'system:dispatcher' });
+    expect(lastTakeover?.evidence).toContain('[implementer_takeover:auto]');
+    // The next pass wakes the successor, which delivers and is reviewed by the same independent reviewer.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery by the automatic successor', idempotencyKey: 'auto-successor-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    expect((await w.tick()).woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: B.id })]);
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review after the automatic successor', idempotencyKey: 'auto-successor-accept' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'done', implementer: C.id });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts.implementer).toBe(C.id);
+    expect(facts.authors).toContain(A.id);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R7: with no live candidate the same conclusion waits by itself — nothing is assigned and the copy names the
+// system, never the manager.
+run('company fork: a struck implementer with no live candidate waits on a system block, and the manager is never asked', async () => {
+  const w = await startCompanyFork('auto-successor-none');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'no successor is available yet', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-auto-none' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    const stuck = await w.tick();
+    expect(stuck.woke.filter(x => x.task === task.id)).toHaveLength(0);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: A.id });
+    const verdict = w.verdicts().find(v => v.taskId === task.id && v.phase === 'execute')!;
+    expect(verdict.dispatchable).toBe(false);
+    const reason = verdict.reasons.find(r => r.code === 'implementer_unavailable')!;
+    expect(reason).toMatchObject({ owner: 'system' });
+    expect(reason.text).toContain('系统自动改派');
+    expect(reason.actions[0]).toMatchObject({ authority: 'system', executable: false });
+    expect(reason.recovery).toContain('无需经理');
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+// SYS-DISP R7(c): a task that never recorded an explicit implementer derives one from its contribution history. When that
+// sole author is gone from the roster (a retirement that predates the rotation guard), the system hands the code to a live
+// engineer on its own — the same automatic successor, now resolved through the execute gate instead of the task field.
+run('company fork: a derived implementer who is gone is replaced by the system on its own', async () => {
+  const w = await startCompanyFork('auto-derived');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    // A live engineer finishes a warm-up task first, so it is idle and free for the handover.
+    const warm = await w.core.createTask(w.gm, { title: 'warm-up for the successor', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived-warm' });
+    expect((await w.tick()).woke.find(x => x.task === warm.id)?.spawned).toBe(true);
+    const C = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(C.paseoAgentId!)!, 'submit', { text: 'Synthetic warm-up delivery', idempotencyKey: 'derived-warm-submit' })).ok).toBe(true);
+    w.agentRows.get(C.paseoAgentId!)!.status = 'idle';
+    const warmReview = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(warmReview.woke.find(x => x.task === warm.id)).toMatchObject({ employee: B.id, spawned: true });
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent synthetic review of the warm-up', idempotencyKey: 'derived-warm-accept' })).ok).toBe(true);
+    w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
+    // The task never recorded an explicit implementer: the only contributor is an employee gone from the roster.
+    const task = await w.core.createTask(w.gm, { title: 'derived implementer is gone', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-derived' });
+    const gone = new RecordId('employee', 'engineering-gone-000');
+    await w.db.db.query(`CREATE audit CONTENT { task: $task, actor: $gone, action: 'claim', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };
+      CREATE audit CONTENT { task: $task, actor: $gone, action: 'checkpoint', evidence: 'legacy row without an explicit implementer', version: 2, at: time::now() };`,
+      { task: new RecordId('task', task.id), gone });
+    const facts = await w.wf.contributors(task.id);
+    expect(facts).toMatchObject({ implementer: 'engineering-gone-000', ambiguous: false });
+    expect(facts.authors).toEqual(['engineering-gone-000']);
+    // The tick replaces the gone implementer by the system and reports the decision; nobody needed to be asked.
+    const replaced = await w.tick();
+    expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'ready', implementer: C.id });
+    const audit = await w.db.db.query<[Array<{ actor: string; evidence: string; at: string }>]>(
+      `SELECT actor, evidence, at FROM audit WHERE task = $task AND action = 'implementer_takeover';`,
+      { task: new RecordId('task', task.id) });
+    const last = [...(audit[0] ?? [])].sort((a, b) => String(a.at).localeCompare(String(b.at))).at(-1);
+    expect(last).toMatchObject({ actor: 'system:dispatcher' });
+    expect(last?.evidence).toContain('[implementer_takeover:auto]');
+    // The next pass hands the work to the successor.
+    const handover = await w.tick();
+    expect(handover.woke.filter(x => x.task === task.id)).toEqual([expect.objectContaining({ employee: C.id, spawned: false })]);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', currentEmployee: C.id, implementer: C.id });
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+run('company fork: plugin reload recovers a live review lease for checkpoint and formal review', async () => {
+  const w = await startCompanyFork('review-recovery');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'review lease survives plugin reload', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-review-recovery' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(A.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery for reload review', idempotencyKey: 'review-recovery-submit' })).ok).toBe(true);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    const reviewTick = await w.tick();
+    const Q = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(reviewTick.woke.find(x => x.task === task.id)).toMatchObject({ employee: Q.id, spawned: true });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id, implementer: A.id });
+    const qaEnv = w.envs.get(Q.paseoAgentId!)!;
+    expect((await w.relay(qaEnv, 'checkpoint', { text: 'review checkpoint before plugin reload', idempotencyKey: 'review-checkpoint-before' })).ok).toBe(true);
+    const before = await w.core.getTask(w.gm, task.id);
+    expect(before.state).toBe('review');
+    expect(before.deliveryId).toBeTruthy();
+    // A report.md written before the process died is not a review closeout: the recovered
+    // pool must archive it, never submit it or end the review lease.
+    writeFileSync(reportPath(qaEnv.SCK_COMM_DIR!), 'review report written during plugin reload');
+    await w.reload();
+    expect(readdirSync(qaEnv.SCK_COMM_DIR!).some(f => f.startsWith('report.md.stale-'))).toBe(true);
+    // The old session key is fenced out; the agent re-enters through the adopter's binding pointer.
+    expect((await w.relay(qaEnv, 'checkpoint', { text: 'old key must be fenced after reload', idempotencyKey: 'review-old-key' })).ok).toBe(false);
+    const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
+    const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
+    expect((await w.relay(rebound, 'checkpoint', { text: 'review checkpoint after plugin reload', idempotencyKey: 'review-checkpoint-after' })).ok).toBe(true);
+    expect((await w.relay(rebound, 'review', { decision: 'accept', text: 'Independent review after plugin reload', idempotencyKey: 'review-accept-after' })).ok).toBe(true);
+    const final = await w.core.getTask(w.gm, task.id);
+    expect(final).toMatchObject({ state: 'done', implementer: A.id });
+    const history = await w.core.history(w.gm, task.id);
+    expect(history.some(h => h.action === 'accept' && h.actor === Q.id)).toBe(true);
+    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
+      "SELECT action, actor FROM audit WHERE task = $task AND action IN ['checkpoint','accept'];",
+      { task: new RecordId('task', task.id) });
+    expect(audits.filter(a => a.action === 'checkpoint')).toHaveLength(2);
+    expect(audits.filter(a => a.action === 'accept')).toHaveLength(1);
+    expect(String(audits.find(a => a.action === 'accept')?.actor)).toContain(Q.id);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+run('company fork: plugin reload recovers a live review lease for report_blocker', async () => {
+  const w = await startCompanyFork('review-blocker-recovery');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'review blocker survives plugin reload', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fixture-create-review-blocker' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    expect((await w.relay(w.envs.get(A.paseoAgentId!)!, 'submit', { text: 'Synthetic delivery for reload blocker', idempotencyKey: 'review-blocker-submit' })).ok).toBe(true);
+    w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    const reviewTick = await w.tick();
+    const Q = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(reviewTick.woke.find(x => x.task === task.id)).toMatchObject({ employee: Q.id, spawned: true });
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'review', currentEmployee: Q.id });
+    await w.reload();
+    const [boundDir, boundKey] = readFileSync(join(w.dir, 'comm-agents', Q.paseoAgentId!), 'utf8').trim().split('\n');
+    const rebound = { SCK_COMM_DIR: boundDir!, SCK_COMM_KEY: boundKey! };
+    expect((await w.relay(rebound, 'report_blocker', { to: 'gm', text: 'Review blocker after plugin reload', idempotencyKey: 'review-blocker-after' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'blocked', blockedTo: 'gm', implementer: A.id });
+    const history = await w.core.history(w.gm, task.id);
+    expect(history.some(h => h.action === 'block' && h.actor === Q.id)).toBe(true);
+    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
+      "SELECT action, actor FROM audit WHERE task = $task AND action = 'block';",
+      { task: new RecordId('task', task.id) });
+    expect(audits).toHaveLength(1);
+    expect(String(audits[0]!.actor)).toContain(Q.id);
+  } finally {
+    await w.close();
+  }
+}, 90000);
+
+
+run('company fork: zero dispatch verdicts still report the live review dependency root through QA goal API and console', async () => {
+  const w = await startCompanyFork('qa-wait-roots');
+  try {
+    const enrollment = new LocalEnrollmentAdmin(w.db);
+    const engineer = await enrollment.enroll('wait-root-engineer', 'engineering', ['execute', 'review']);
+    const qa2 = await enrollment.enroll('wait-root-qa-two', 'qa', ['execute', 'review']);
+    const goal = await w.owner.createGoal({ text: '依赖等待根真实 tick 回归', source: 'fork:test', key: 'qa-wait-root-goal' });
+    await w.db.db.query("UPDATE ONLY type::record('goal', $id) SET state = 'active', tier = 'quick', anchors = [];", { id: goal.id });
+    const root = await w.core.createTask(w.gm, { goalId: goal.id, title: '活租约复核根', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'wait-root-create' });
+    const rootClaim = await w.core.claim(engineer, root.id);
+    await w.core.submit(engineer, { taskId: rootClaim.task.id, deliveryId: rootClaim.deliveryId, fence: rootClaim.fence, expectedVersion: rootClaim.task.version },
+      { text: '隔离公司 fork 回归根任务已提交，用于只读目标等待摘要验证。', idempotencyKey: 'wait-root-submit' });
+    await w.core.claim(qa2, root.id);
+    const downstream = await w.core.createTask(w.gm, { goalId: goal.id, title: '直接依赖等待任务', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', dependencies: [root.id], idempotencyKey: 'wait-root-downstream' });
+    const leaf = await w.core.createTask(w.gm, { goalId: goal.id, title: '多级依赖等待任务', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', dependencies: [downstream.id], idempotencyKey: 'wait-root-leaf' });
+    expect((await w.core.getTask(w.gm, downstream.id)).state).toBe('blocked');
+    expect((await w.core.getTask(w.gm, leaf.id)).state).toBe('blocked');
+
+    const scope = await w.core.qaObservationGrant(w.gm, {
+      goalId: goal.id, deploymentTaskId: root.id, qaEmployee: 'wait-root-qa-two', leaseFence: (await w.core.getTask(w.gm, root.id)).fence, subjects: [root.id],
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '隔离 fork 目标等待根回归', idempotencyKey: 'wait-root-scope',
+    });
+    const factsCore = new SurrealCompanyCore(w.db, { workforce: w.wf });
+
+    await w.tick();
+    expect(w.snapshot()?.verdicts).toEqual([]);
+    const { persistDispatchObservation } = await import('../plugin/server/dispatch.ts');
+    await persistDispatchObservation({ dispatcher: { dispatchSnapshot: () => w.snapshot() }, db: w.db } as never);
+    const observation = await w.db.db.select<{ at?: string; complete?: boolean; originalVerdicts?: number; verdicts?: unknown[] }>(
+      new RecordId('company_meta', 'dispatch_observation'));
+    expect(observation?.complete).toBe(true);
+    expect(observation?.originalVerdicts).toBe(0);
+    expect(observation?.verdicts).toEqual([]);
+
+    const read = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(read.goal?.dispatchComplete).toBe(true);
+    expect(read.goal?.undispatchable).toBe(0);
+    expect((read.goal as any)?.waits).toBeDefined();
+    expect((read.goal as any)?.waits?.roots).toHaveLength(1);
+    expect((read.goal as any)?.waits?.roots?.[0]).toMatchObject({
+      taskId: root.id, title: '活租约复核根', workflowState: 'review', kind: 'active_lease', impact: 2,
+    });
+    expect(JSON.stringify((read.goal as any)?.waits)).toContain(downstream.id);
+    expect(JSON.stringify((read.goal as any)?.waits)).toContain(leaf.id);
+    expect((read.goal as any)?.waits?.source).toBe('workflow-graph');
+    expect((read.goal as any)?.waits?.checkedAt).toBeTruthy();
+    expect((read.goal as any)?.waits?.roots?.[0]?.peopleSource).toBe("contributor-audit");
+    expect((read.goal as any)?.waits?.roots?.[0]?.submitterSource).toBe("submit-audit");
+    expect((read.goal as any)?.waits?.roots?.[0]?.peopleCheckedAt).toBeTruthy();
+    expect((read.goal as any)?.waits?.roots?.[0]?.submitCheckedAt).toBeTruthy();
+    expect(Date.parse((read.goal as any).waits.checkedAt)).toBeGreaterThanOrEqual(Date.parse(observation!.at!));
+    // The answer the real core returns is what the relay measures: it must pass the same budget check the sidecar applies,
+    // because qa_observation_read has no paging input to recover from response_too_large.
+    expect(answerBytes(read)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const relayed = guardRelayResponse({ ok: true as const, data: read });
+    expect(relayed).toMatchObject({ ok: true });
+    expect((relayed as { data?: unknown }).data).toBe(read);
+    expect((read.goal as any)?.waits?.budgetLimited).toBeUndefined();
+
+    const session = await factsCore.qaObservationSession(qa2, { scopeId: scope.id });
+    const { createQaConsoleFetch } = await import('../plugin/server/qa-console.ts');
+    const app = createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: factsCore }) as never });
+    const login = await app(new Request('http://x/q/login', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `code=${encodeURIComponent(session.code)}`,
+    }));
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const page = await app(new Request('http://x/q/?goal=1', { headers: { cookie } }));
+    const body = await page.text();
+    expect(page.status).toBe(200);
+    expect(body).toContain('活租约复核根');
+    expect(body).toContain('直接依赖等待任务');
+    expect(body).toContain('多级依赖等待任务');
+    expect(body).toContain('活租约');
+    expect(body).toContain('人物时点');
+    expect(body).toContain('提交审计时点');
+    expect(body).not.toContain('本轮 pass 中该目标无可报的阻断结论');
+
+    const dispatchBlocked = await w.core.createTask(w.gm, { goalId: goal.id, title: '真实派工阻断并存任务', context: '隔离 fork 回归数据',
+      executorRole: 'product', reviewerRole: 'qa', idempotencyKey: 'wait-root-dispatch-blocked-coexists' });
+    await w.tick();
+    expect(w.snapshot()?.verdicts.some(verdict => verdict.taskId === dispatchBlocked.id && !verdict.dispatchable)).toBe(true);
+    await persistDispatchObservation({ dispatcher: { dispatchSnapshot: () => w.snapshot() }, db: w.db } as never);
+    const coexistRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(coexistRead.goal?.dispatchComplete).toBe(true);
+    expect(coexistRead.goal?.undispatchable).toBe(1);
+    expect(coexistRead.goal?.root?.taskId).toBe(dispatchBlocked.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]).not.toHaveProperty('noticeKey');
+
+    // Dispatch pass availability is independent from the freshly collected goal graph.
+    await w.db.db.query('DELETE company_meta:dispatch_observation; DELETE company_meta:dispatch_observation_status;');
+    const missingPassRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(missingPassRead.goal?.dispatchAvailable).toBe(false);
+    expect(missingPassRead.goal?.dispatchComplete).toBe(false);
+    expect(missingPassRead.goal?.undispatchable).toBeUndefined();
+    expect((missingPassRead.goal as any)?.waits?.available).toBe(true);
+    expect((missingPassRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect((missingPassRead.goal as any)?.waits?.checkedAt).toBeTruthy();
+    const missingPassPage = await app(new Request('http://x/q/?goal=1', { headers: { cookie } }));
+    const missingPassBody = await missingPassPage.text();
+    expect(missingPassBody).toContain('活租约复核根');
+    expect(missingPassBody).toContain('派工覆盖 不可用/未知');
+
+    const oldPassAt = '2020-01-01T00:00:00.000Z';
+    await w.db.db.query("UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: [], complete: false, originalVerdicts: 3, originalReasons: 0, reason: 'partial fork observation' };", { at: oldPassAt });
+    await w.db.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };", { at: oldPassAt });
+    const incompleteRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(incompleteRead.goal?.dispatchAvailable).toBe(false);
+    expect(incompleteRead.goal?.dispatchComplete).toBe(false);
+    expect(incompleteRead.goal?.dispatchCheckedAt).toBe(oldPassAt);
+    expect((incompleteRead.goal as any)?.waits?.available).toBe(true);
+    expect((incompleteRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect(Date.parse((incompleteRead.goal as any).waits.checkedAt)).toBeGreaterThan(Date.parse(oldPassAt));
+
+    await w.db.db.query("UPDATE company_meta:dispatch_observation SET complete = true, verdicts = []; UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: false, error: 'write failed' };", { at: oldPassAt });
+    const staleRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(staleRead.goal?.dispatchAvailable).toBe(false);
+    expect(staleRead.goal?.dispatchComplete).toBe(false);
+    expect(staleRead.goal?.dispatchReason).toMatch(/stale/);
+    expect(staleRead.goal?.dispatchCheckedAt).toBe(oldPassAt);
+    expect((staleRead.goal as any)?.waits?.available).toBe(true);
+    expect((staleRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect(Date.parse((staleRead.goal as any).waits.checkedAt)).toBeGreaterThan(Date.parse(oldPassAt));
+
+    const foreignGoal = await w.owner.createGoal({ text: '隔离外目标边界任务', source: 'fork:test', key: 'wait-root-foreign-goal', tier: 'quick' });
+    const foreign = await w.core.createTask(w.gm, { goalId: foreignGoal.id, title: '外目标不可见标题', context: '隔离 fork 外目标数据', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'wait-root-foreign-task' });
+    await w.db.db.query('UPDATE ONLY $task SET dependencies += $dependency;', { task: new RecordId('task', downstream.id), dependency: new RecordId('task', foreign.id) });
+    const isolated = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    const isolatedWaits = (isolated.goal as any)?.waits;
+    expect(JSON.stringify(isolatedWaits)).not.toContain(foreign.id);
+    expect(JSON.stringify(isolatedWaits)).not.toContain('外目标不可见标题');
+    expect(isolatedWaits.roots.some((row: any) => row.impact !== undefined || row.dependencyPath?.some((step: any) => step.taskId === foreign.id))).toBe(false);
+
+    const duringReadScope = await w.core.qaObservationGrant(w.gm, {
+      goalId: goal.id, deploymentTaskId: root.id, qaEmployee: 'wait-root-qa-two', leaseFence: (await w.core.getTask(w.gm, root.id)).fence,
+      subjects: [root.id], expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '隔离 fork 采集期间租约变更验证', idempotencyKey: 'wait-root-scope-during-read',
+    });
+    let fenceChangedDuringRead = false;
+    const fencingCore = new SurrealCompanyCore(w.db, { workforce: {
+      contributors: async () => {
+        if (!fenceChangedDuringRead) {
+          fenceChangedDuringRead = true;
+          await w.db.db.query('UPDATE ONLY $task SET fence += 1;', { task: new RecordId('task', root.id) });
+        }
+        return { authors: [], reviewers: [] };
+      },
+    } as never });
+    await expect(fencingCore.qaObservationRead({ credential: qa2 }, { scopeId: duringReadScope.id, goalId: goal.id }))
+      .rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/lease changed/) });
+  } finally {
+    await w.close();
+  }
+}, 60000);

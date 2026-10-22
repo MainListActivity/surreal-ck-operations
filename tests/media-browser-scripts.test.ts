@@ -706,3 +706,26 @@ describe('generated scripts parse (template-escape regression)', () => {
     }
   });
 });
+
+describe('higgsfield image script', () => {
+  const script = buildScript('higgsfield', {
+    kind: 'image', prompt: 'a painterly keyframe of the heroine', outDir: '/tmp/o', file: 'key.png',
+    refs: [], timeoutMs: 300000,
+  });
+
+  test('drives the free Higgsfield image lane and scopes generate to the image form', () => {
+    expect(script).toContain('higgsfield.ai/zh/ai/image');
+    expect(script).toContain('form.image-form');
+    expect(script).toContain('tour-image-prompt');
+    expect(script).toContain('Seedream 4.5');
+    expect(script).toContain('无限');
+    expect(script).toContain('全能参考');
+    expect(script).toContain('button[role="switch"]');
+    expect(script).toContain('aria-checked');
+    expect(script).toContain('_min.webp');
+    expect(script).toContain("replace(/_min.webp$/i, '.png')");
+    expect(script).toContain('button[type="submit"]');
+    expect(script).toContain('keyboard.paste');
+    expect(script).not.toContain("document.querySelector('button[aria-label=\"生成\"]')");
+  });
+});

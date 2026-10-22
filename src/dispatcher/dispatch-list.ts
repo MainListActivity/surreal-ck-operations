@@ -3,7 +3,7 @@
  * keeps at most LIST_ITEM_LIMIT items within LIST_BYTE_BUDGET serialized bytes, and every candidate or people list keeps a few
  * names. Nothing is cut silently: `bound` reports the count before the cap and whether the answer left items out.
  */
-import { goalRootBlockers, type DispatchPhase, type DispatchReason, type DispatchVerdict, type GoalRootFacts, type RecoveryAction, type WorkflowState } from './dispatch-blocked.ts';
+import { goalRootBlockers, type DispatchPhase, type DispatchReason, type DispatchVerdict, type GoalRootFacts, type GoalWorkflowWaitRoot, type GoalWorkflowWaitSummary, type RecoveryAction, type WorkflowState } from './dispatch-blocked.ts';
 
 /** Items per list. */
 export const LIST_ITEM_LIMIT = 40;
@@ -33,7 +33,7 @@ export interface ReasonRow {
   text: string;
   candidates: string[];
   candidatesOmitted?: number;
-  owner: 'gm' | 'owner';
+  owner: 'gm' | 'owner' | 'system';
   basis: string;
   recovery: string;
   actions: RecoveryAction[];
@@ -149,6 +149,22 @@ export function goalBlockerRows(verdicts: readonly DispatchVerdict[], facts?: Go
     };
   });
   return rows.sort(goalPriority);
+}
+
+/** Owner pulse projection for workflow waits. Root order and classification come from the shared evaluator. */
+export function goalWorkflowWaitRows(summary: GoalWorkflowWaitSummary): GoalWorkflowWaitRoot[] {
+  return summary.roots.map(root => {
+    if (!root.people) return { ...root, dependencyPath: root.dependencyPath?.map(item => ({ ...item })) };
+    const authors = capValues(root.people.authors, PEOPLE_LIMIT);
+    const reviewers = capValues(root.people.reviewers, PEOPLE_LIMIT);
+    const omitted = authors.omitted + reviewers.omitted;
+    return {
+      ...root,
+      dependencyPath: root.dependencyPath?.map(item => ({ ...item })),
+      people: { ...root.people, authors: authors.values, reviewers: reviewers.values,
+        ...(omitted ? { peopleOmitted: omitted } : {}) },
+    };
+  });
 }
 
 /** The bounded view of goalBlockerRows: at most `limit` rows and LIST_BYTE_BUDGET bytes, with the marker. */

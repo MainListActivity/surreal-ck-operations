@@ -55,7 +55,8 @@ const WORKFLOW_NAME = { ready: '就绪', doing: '在办无人持有', review: '�
 /** One blocked item as the brief names it: what, which phase and workflow state, every reason, the wait, who acts, what unblocks it. */
 export function dispatchLine(row: DispatchBlockedRow): string {
   const reasons = row.reasons.map(reason => reason.text).join('；') || row.summary;
-  const owner = row.reasons.some(reason => reason.owner === 'owner') ? '老板' : 'gm';
+  const owner = row.reasons.some(reason => reason.owner === 'owner') ? '老板'
+    : row.reasons.some(reason => reason.owner === 'system') ? '系统' : 'gm';
   const next = [...new Set(row.reasons.map(reason => reason.nextTrigger))].join('；');
   return `《${short(row.title, 40)}》（${PHASE_NAME[row.phase]}·${WORKFLOW_NAME[row.workflowState]}）：${reasons}；已等 ${row.waitingMinutes} 分钟；负责：${owner}；下一触发：${next || '待定'}`;
 }

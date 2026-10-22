@@ -1,9 +1,15 @@
+import { basename } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 import { REQUIRED_TRACKS } from '../core';
 import type { Role } from '../contracts';
+import { isPaged, parseReclaimInput } from '../query-input';
+import { arrivedAt, arriving, currentTool, noteTool, SNAPSHOT_TOOLS, withinReplyCeiling } from '../reply-clock';
+import { answerBytes, answerResult, echoClaim, MAX_REQUEST_ID_BYTES, oversizeRequestId, RESPONSE_BUDGET_BYTES } from '../response-budget';
+import { REPLY_CEILING_MS, untilAt } from '../snapshot-store';
 
 const roles = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs'] as const;
 const defRoles = [...roles, 'eval'] as const;
@@ -48,18 +54,30 @@ function toolError(error: unknown) {
   // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
   const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
     ? error.details : undefined;
+  // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
+  const message = code !== 'internal_error' && typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
+    ? error.message.slice(0, 500)
+    : '';
+  const structured = { ok: false as const, code, retryable, error: message || code, ...(details ? { details } : {}) };
+  // The text copy is the same JSON as structuredContent, for refusals as for answers, so every result parses the same way (SYS01, D1).
   return {
     isError: true,
-    content: [{ type: 'text' as const, text: code }],
-    structuredContent: { ok: false, code, retryable, ...(details ? { details } : {}) },
-  };
+    content: [{ type: 'text' as const, text: JSON.stringify(structured) }],
+    structuredContent: structured,  };
 }
 
 function toolResult(data: unknown) {
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data) }],
-    structuredContent: { ok: true, data },
-  };
+  // SYS01: a response over the byte budget becomes a recoverable, JSON-legal error, never a cut stream. The budget counts the
+  // whole tool result with its frame (answerBytes). The answer's JSON is the text, and the same data is in structuredContent,
+  // so both copies are counted (SYS01, D1).
+  const bytes = answerBytes(data);
+  if (bytes > RESPONSE_BUDGET_BYTES) {
+    return toolError({
+      code: 'response_too_large',
+      message: `response is ${bytes} bytes, over the ${RESPONSE_BUDGET_BYTES}-byte budget; narrow it with pageSize and cursor, a taskId, or read_task_text for one long text`,
+    });
+  }
+  return answerResult(data);
 }
 
 function evidence(input: { text: string; idempotencyKey: string }): Evidence {
@@ -79,52 +97,120 @@ function registerTools(server: McpServer, core: CompanyCore) {
   const run = async (credential: Credential, action: () => Promise<unknown>) => {
     if (!credential) return toolError({ code: 'unauthorized' });
     try {
-      return toolResult(await action());
+      // A snapshot-backed listing is answered within the reply ceiling of its request (SYS01 M1); other tools keep their own time.
+      const answer = SNAPSHOT_TOOLS.has(currentTool() ?? '') ? await withinReplyCeiling(async () => action()) : await action();
+      return toolResult(answer);
     } catch (error) {
       return toolError(error);
     }
   };
   const token = (ctx: { http?: { authInfo?: { token?: string } } }): Credential => ctx.http?.authInfo?.token ?? '';
 
+  // SYS01: every paged read takes the same pageSize/cursor pair; the cursor is sealed to the caller and the query.
+  // null means absent on every read argument, as in core and the sidecar (same-source rule, one predicate: isPaged).
+  const pageArgs = {
+    pageSize: z.number().int().min(1).max(100).nullish(),
+    cursor: z.string().min(1).max(2048).nullish(),
+  };
   server.registerTool('get_context', {
-    description: 'Show the authenticated employee and available company tasks.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional(), state: z.enum(states).optional() }),
-  }, async ({ taskId, state }, ctx) => {
+    description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to gm and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
+    inputSchema: z.object({
+      scope: z.enum(['tasks', 'company']).nullish(),
+      section: z.enum(['directions', 'goals', 'projects']).nullish(),
+      taskId: z.string().min(1).max(200).nullish(),
+      state: z.enum(states).nullish(),
+      goalId: z.string().min(1).max(100).nullish(),
+      role: z.enum(roles).nullish(),
+      since: z.string().min(1).max(40).nullish(),
+      includeCompany: z.boolean().nullish(),
+      fields: z.array(z.string().min(1).max(60)).min(1).max(40).nullish(),
+      ...pageArgs,
+    }),
+  }, async (input, ctx) => {
     const credential = token(ctx);
-    return run(credential, async () => ({
-      principal: await core.authenticate(credential),
-      company: await core.companyBrief(credential),
-      tasks: taskId ? [await core.getTask(credential, taskId)] : await core.listTasks(credential, state),
-    }));
+    if (!core.contextView) {
+      // Cores that predate SYS01 keep the single-shot listing, with the same defaults: the company block only when includeCompany is true.
+      // This branch ignores scope and paging (SYS01 AC-A note), so scope "company" is answered only by a core with contextView.
+      const withCompany = input.includeCompany === true;
+      return run(credential, async () => ({
+        principal: await core.authenticate(credential),
+        companyIncluded: withCompany,
+        companyRead: { scope: 'company', pageSize: 25 },
+        ...(withCompany ? { company: await core.companyBrief(credential) } : {}),
+        tasks: input.taskId ? [await core.getTask(credential, input.taskId)] : await core.listTasks(credential, input.state ?? undefined),
+      }));
+    }
+    return run(credential, () => core.contextView!(credential, input));
   });
 
   server.registerTool('reclaim_worktrees', {
-    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees.',
+    description: 'GM: ownership-based worktree reclaim or dry-run. Uses persistent refs and durable audit; never force-deletes dirty trees. A value other than the documented ones is refused as invalid before any tree is touched.',
     inputSchema: z.object({
-      dryRun: z.boolean().optional(),
-      repos: z.array(z.string()).optional(),
+      // The rule is parseReclaimInput, shared with core and the sidecar (SYS01, D3). The schema documents the shape only: a schema
+      // error would be a plain-text refusal, while parseReclaimInput gives the same structured `invalid` on every layer.
+      dryRun: z.unknown().optional().describe('true for a dry run; omit to reclaim. Any other value is refused as invalid.'),
+      repos: z.unknown().optional().describe('Optional list of repository paths, each a non-empty string. Any other value is refused as invalid.'),
     }),
-  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => core.reclaimWorktrees
-    ? core.reclaimWorktrees(token(ctx), { dryRun, repos })
-    : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 })));
+  }, async ({ dryRun, repos }, ctx) => run(token(ctx), () => {
+    // SYS01, D3: checked before any tree is touched.
+    const params = parseReclaimInput({ dryRun, repos });
+    return core.reclaimWorktrees
+      ? core.reclaimWorktrees(token(ctx), params)
+      : Promise.resolve({ scanId: '', removed: [], kept: [], branchesDeleted: [], branchesRetained: [], audited: 0 });
+  }));
   server.registerTool('list_worktree_audits', {
     description: 'GM: query durable worktree reclaim audit rows (delete/skip/fail/branch_retain/orphan_scan).',
-    inputSchema: z.object({ limit: z.number().int().min(1).max(500).optional() }),
+    // A null limit is absent, as on the sidecar (read-only audit list; reclaim_worktrees is left as it is).
+    inputSchema: z.object({ limit: z.number().int().min(1).max(500).nullish() }),
   }, async ({ limit }, ctx) => run(token(ctx), () => core.listWorktreeAudits
-    ? core.listWorktreeAudits(token(ctx), limit)
+    ? core.listWorktreeAudits(token(ctx), limit ?? undefined)
     : Promise.resolve([])));
   server.registerTool('list_worktrees', {
-    description: 'Authenticated persistent worktree inventory and git reconciliation; task-scoped reads or gm global reads.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional() }),
-  }, async ({ taskId }, ctx) => run(token(ctx), () => core.listWorktrees ? core.listWorktrees(token(ctx), taskId) : Promise.resolve([])));
+    description: 'Authenticated persistent worktree inventory with compact references (released ones are counted, and listed only with includeReleased). Without pageSize or cursor it returns the complete array, or response_too_large when over the 48 KiB budget (retry with pageSize 25, then cursor set to page.nextCursor, or narrow with taskId); with either it pages by path and returns { worktrees, page }. A worktree whose whole entry cannot fit a page has its references cut and flagged (referencesTruncated: count, sha256, includeReleased, tool); read_worktree_refs returns the whole list in byte segments. Task-scoped reads, or gm global reads.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200).nullish(), includeReleased: z.boolean().nullish(), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), () => {
+    // C1 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 array shape.
+    if (isPaged(input) && core.worktreePage) return core.worktreePage(token(ctx), input);
+    if (core.worktreeList) return core.worktreeList(token(ctx), input);
+    return core.listWorktrees ? core.listWorktrees(token(ctx), input.taskId ?? undefined) : Promise.resolve([]);
+  }));
+  server.registerTool('read_worktree_refs', {
+    description: 'Read one byte segment of one worktree\'s references as JSON: the recovery entry a paged list_worktrees item names when its references were cut (referencesTruncated carries the whole count, SHA-256 and includeReleased). Pass the same taskId and includeReleased the listing used. Returns the total size and SHA-256 of the whole text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: a list that changed in between is refused with conflict instead of mixing two versions. Same access as list_worktrees: a task id scopes the read to that task repository, a global read is gm only.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200).nullish(),
+      worktreePath: z.string().min(1).max(4096),
+      includeReleased: z.boolean().nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(),
+      limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.worktreeRefs
+    ? core.worktreeRefs(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('get_admin_summary', {
+    description: 'gm only: read-only company summary at one stated cutoffAt. tasks counts each task by the state it holds at cutoffAt (optionally for one goal; since does not apply to tasks). audit counts entries from since (default: the 24 hours before the cutoff) up to cutoffAt, limited to the tasks of the goal when goalId is given. Returns scope, outboxSequence and integrity; integrity.complete is true only for a proven consistent read, and false means retry. Never returns task text.',
+    inputSchema: z.object({ since: z.string().min(1).max(40).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+  }, async (input, ctx) => run(token(ctx), () => core.adminSummary ? core.adminSummary(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('read_task_text', {
+    description: 'Read one byte segment of a task text: context, evidence (one audit entry, auditId from get_task_history), project (the project environment as JSON; the task holder or gm only), or the lists dependencies, workIntentPaths and worktreePaths as JSON arrays. A claim or heartbeat echo that cut one of them names it and its size; this reads the rest. Returns the total size and SHA-256 of the full text, so a reader can reassemble and verify. Segments never split a character. expectSha256 (from the first segment) is required on every segment past offset 0: if the text changed in between, the read is refused with conflict instead of mixing two versions.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      field: z.enum(['context', 'evidence', 'project', 'dependencies', 'workIntentPaths', 'worktreePaths']),
+      auditId: z.string().min(1).max(200).nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(),
+      limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.taskText ? core.taskText(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('claim_next', {
-    description: 'Atomically claim a task from the authenticated employee queue.',
-    inputSchema: z.object({ taskId: z.string().min(1).optional() }),
+    description: 'Atomically claim a task from the authenticated employee queue. The answer echoes the claim within the 48 KiB budget: deliveryId, fence and leaseExpiresAt always come back; a long context is cut and flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest.',
+    inputSchema: z.object({ taskId: z.string().min(1).nullish() }),
   }, async ({ taskId }, ctx) => {
     const credential = token(ctx);
     return run(credential, async () => {
-      if (taskId) return core.claim(credential, taskId);
+      // SYS01 (return of 04195c93): the claim has committed by now, so its answer is an echo; core keeps the whole claim for claim.json.
+      if (taskId) return echoClaim(await core.claim(credential, taskId));
       const principal = await core.authenticate(credential);
       const tasks = await core.listTasks(credential);
       const now = Date.now();
@@ -145,7 +231,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // The core remains the sole authority for concurrent claims and dependencies.
       for (const candidate of candidates) {
         try {
-          return await core.claim(credential, candidate.id);
+          return echoClaim(await core.claim(credential, candidate.id));
         } catch (error) {
           if (typeof error !== 'object' || error === null || !('code' in error) ||
             !['conflict', 'already_claimed', 'worktree_busy'].includes(String(error.code))) throw error;
@@ -156,9 +242,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
   });
 
   server.registerTool('heartbeat', {
-    description: 'Extend the current delivery lease using the core server clock.',
+    description: 'Extend the current delivery lease using the core server clock. The answer echoes the task within the 48 KiB budget (deliveryId, fence and leaseExpiresAt always come back); a long context is cut and flagged (contextTruncated, contextNextOffset), and read_task_text returns the rest.',
     inputSchema: z.object(proofShape),
-  }, async (input, ctx) => run(token(ctx), () => core.heartbeat(token(ctx), proof(input))));
+  }, async (input, ctx) => run(token(ctx), async () => echoClaim(await core.heartbeat(token(ctx), proof(input)))));
 
   server.registerTool('checkpoint', {
     description: 'Record resumable progress for the current delivery. Limited to a few per task per holder (checkpoint_limit); use heartbeat for liveness and merge progress notes.',
@@ -190,6 +276,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
+      // The 50-dependency and asset-path limits are enforced by core.createTask, the same
+      // validator the sidecar reaches. Keeping them out of this schema preserves the structured
+      // `invalid` result; a schema failure here would be a plain protocol error instead.
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
@@ -199,17 +288,18 @@ function registerTools(server: McpServer, core: CompanyCore) {
 
   // Workforce administration tools: manage capability only (gm/product), every write audited.
   server.registerTool('def_list', {
-    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight).',
+    description: 'manage only (gm/product): list employee_def rows (id/role/provider/model/thinking/tracks/enabled/max_instances/priority/weight/quota_limited).',
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.listDefs(token(ctx))));
 
   server.registerTool('def_ensure', {
-    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables. Basic fields are required on every call.',
+    description: 'manage only (gm/product): create or update an employee_def (audited). tracks [] clears tracks, omitted keeps; enabled=false disables; quotaLimited=false keeps the def dispatchable even at 0% quota (omitted keeps the stored value). Basic fields are required on every call.',
     inputSchema: z.object({
       id: z.string().min(1).max(60), role: z.enum(defRoles), provider: z.string().min(1).max(60), model: z.string().min(1).max(120),
       thinking: z.string().min(1).max(40).optional(), tracks: z.array(z.string().min(1).max(60)).max(50).optional(),
       maxInstances: z.number().int().min(0).max(8).optional(), priority: z.number().int().optional(),
       weight: z.number().int().min(0).max(1000).optional(), enabled: z.boolean().optional(),
+      quotaLimited: z.boolean().optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.ensureDef(token(ctx), input)));
 
@@ -222,9 +312,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.updateProjectDisciplines(token(ctx), input)));
 
   server.registerTool('get_task_history', {
-    description: 'Read the audited history of a task: claims, checkpoints, submissions, returns, owner decisions and handover packets.',
-    inputSchema: z.object({ taskId: z.string().min(1) }),
-  }, async ({ taskId }, ctx) => run(token(ctx), () => core.history(token(ctx), taskId)));
+    description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Without pageSize or cursor it returns the complete history, oldest first, or response_too_large with retry guidance when it does not fit the 48 KiB budget (retry with pageSize 10, then cursor set to page.nextCursor). With pageSize or cursor, newest entries come first in pages that fit the budget; each page is returned oldest first. Evidence too large for a page is cut and flagged (evidenceTruncated, evidenceNextOffset), with evidenceBytes and evidenceSha256; read the full text with read_task_text (field evidence, auditId).',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), () => {
+    // C2 default: a call that names neither pageSize nor cursor (null counts as absent) keeps the pre-SYS01 bare array, complete or refused.
+    if (isPaged(input) && core.historyView) return core.historyView(token(ctx), input.taskId, input);
+    return core.history(token(ctx), input.taskId);
+  }));
 
   const relayShape = { ownerQuote: z.string().min(2), idempotencyKey: z.string().min(1) };
   const tiers = ['quick', 'standard', 'program'] as const;
@@ -239,12 +333,14 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.triageGoal(token(ctx), input)));
 
   server.registerTool('create_delivery', {
-    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others.',
+    description: 'gm/product: create the delivery chain for one code change under a goal: implement (engineering, peer review) -> release request (product or Jev decides go-live) -> merge, deploy and production verification (qa). project optionally binds all three legs to a registered project. The three legs form one worktree lane (one tree, one branch); pass lane to put related deliveries of the same goal into the same lane, otherwise every delivery gets its own lane and runs in parallel with the others. The explicit dependencies are external input: at most 50 raw entries, each a 1-200 character task id, checked before de-duplication by the same core validator create_task uses; a refusal writes no task, audit, outbox or idempotency row.',
     inputSchema: z.object({
       goalId: z.string().min(1), title: z.string().min(3), spec: z.string().min(20),
       discipline: z.string().min(1).max(60).optional(),
       project: z.string().min(1).max(60).optional(),
       lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional(),
+      // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
+      // reaches. Keeping it out of this schema preserves the structured `invalid` result.
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
@@ -267,7 +363,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('defer_task_until', {
-    description: 'gm only: turn a gm-blocked execute-phase task into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it auto-resumes when every dependency is done; with all dependencies already done it resumes immediately.',
+    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with all dependencies already done it restores immediately. Owner gates and unprovable review history are refused.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       dependencies: z.array(z.string().min(1)).min(1).max(20),
@@ -381,6 +477,78 @@ function registerTools(server: McpServer, core: CompanyCore) {
       })).max(50),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.recordScore(token(ctx), input)));
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
+  const qaRelease = (): string | undefined => {
+    try { return process.env.SCK_RELEASE ?? basename(realpathSync(process.cwd())); } catch { return undefined; }
+  };
+  const withRelease = <T extends { meta: object }>(value: T): T => {
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+  };
+  server.registerTool('qa_observation_grant', {
+    description: 'gm only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100), deploymentTaskId: z.string().min(1).max(200),
+      qaEmployee: z.string().min(1).max(200), leaseFence: z.number().int().positive(),
+      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
+      expiresAt: z.string().min(10).max(40), reason: z.string().min(8).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationGrant
+    ? core.qaObservationGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_revoke', {
+    description: 'gm only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
+    ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_status', {
+    description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
+    ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_session', {
+    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the dedicated read-only QA console (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the console at the preview LAN /q/ page (returned as pagePath) exchanges it for an HttpOnly 30-minute read-only session. The console has no owner RPC and no write route.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish() }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationSession
+    ? core.qaObservationSession(token(ctx), { ...(input.scopeId ? { scopeId: input.scopeId } : {}) }) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_read', {
+    description: 'qa only (the scope must still bind the live QA review lease holder and fence): read one allowlisted subject of the scope. A task subject returns its full state (a long context is omitted and flagged, read it with qa_observation_text), contribution facts with unknown rows fail-closed, the last dispatcher pass\'s verdicts and all reasons for the task, and checkedAt/dataSource/instanceAt/runtimeRelease/scope/completeness. A goal subject returns the controlled goal summary only. Read-only; no task text of unlisted tasks is ever returned.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationRead) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationRead({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.goalId ? { goalId: input.goalId } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_timeline', {
+    description: 'qa only: one stored page of an allowlisted task\'s audit history (newest-first pages, oldest-first within a page), within the 48 KiB budget. Evidence too large for a page is cut and flagged; read it whole with qa_observation_text. Continue with page.nextCursor until page.hasMore is false; a cursor is bound to the scope, task and caller.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationTimeline) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationTimeline({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId,
+      ...(input.pageSize !== undefined && input.pageSize !== null ? { pageSize: input.pageSize } : {}),
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_text', {
+    description: 'qa only: one byte segment of an allowlisted task\'s context or one audit entry\'s evidence. Returns the whole text\'s size and SHA-256; a segment past offset 0 requires expectSha256 from the first segment, so a changed text is refused instead of mixed. Segments never split a character.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200),
+      field: z.enum(['context', 'evidence']), auditId: z.string().min(1).max(200).nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(), limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationText) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationText({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId, field: input.field,
+      ...(input.auditId ? { auditId: input.auditId } : {}),
+      ...(input.offset !== undefined && input.offset !== null ? { offset: input.offset } : {}),
+      ...(input.limit !== undefined && input.limit !== null ? { limit: input.limit } : {}),
+      ...(input.expectSha256 ? { expectSha256: input.expectSha256 } : {}),
+    }));
+  }));
 }
 
 export function createMcpHttpService(options: McpServiceOptions) {
@@ -426,7 +594,8 @@ export function createMcpHttpService(options: McpServiceOptions) {
           resolve(new Response('Service unavailable', { status: 503 }));
         }, 55_000);
       });
-      const work = respond(request, credential);
+      // The request's arrival is stamped here, before heal: a listing answer counts its reply ceiling from it (SYS01 M1).
+      const work = arriving(() => respond(request, credential));
       work.catch(() => {}); // a rejection after the budget wins must not become an unhandled rejection
       try {
         return await Promise.race([work, budget]);
@@ -437,8 +606,21 @@ export function createMcpHttpService(options: McpServiceOptions) {
       async function respond(req: Request, cred: Credential): Promise<Response> {
         const t0 = Date.now();
         const mark = (stage: string) => console.log(`req ${req.method} ${stage} +${Date.now() - t0}ms`);
+        // The tool a tools/call names is read from a copy of the body, so that its reply ceiling applies from the arrival on.
+        noteTool(await req.clone().json().then(
+          (body: { method?: unknown; params?: { name?: unknown } }) => body.method === 'tools/call' && typeof body.params?.name === 'string' ? body.params.name : undefined,
+          () => undefined));
         try {
-          await options.heal?.();
+          if (SNAPSHOT_TOOLS.has(currentTool() ?? '')) {
+            // A listing answer is not kept waiting past its reply ceiling for a reconnect: the heal goes on in the background.
+            const healed = await untilAt(Promise.resolve(options.heal?.()).then(() => 'healed' as const), arrivedAt() + REPLY_CEILING_MS);
+            if (healed !== 'healed') {
+              mark('heal not done within the reply ceiling');
+              return new Response('Service unavailable', { status: 503 });
+            }
+          } else {
+            await options.heal?.();
+          }
           mark('heal');
         } catch {
           mark('heal failed');
@@ -447,7 +629,14 @@ export function createMcpHttpService(options: McpServiceOptions) {
         if (options.gateToken) {
           let expected: string | undefined;
           try {
-            expected = await options.gateToken();
+            // The gate lookup is part of a listing answer's wait too, so it is cut at the same reply ceiling (SYS01 M1).
+            const lookup = options.gateToken().then(value => ({ value }));
+            const found = SNAPSHOT_TOOLS.has(currentTool() ?? '') ? await untilAt(lookup, arrivedAt() + REPLY_CEILING_MS) : await lookup;
+            if (found === undefined) {
+              mark('gate lookup not done within the reply ceiling');
+              return new Response('Service unavailable', { status: 503 });
+            }
+            expected = found.value;
             mark('gate');
           } catch {
             mark('gate lookup failed');
@@ -462,7 +651,11 @@ export function createMcpHttpService(options: McpServiceOptions) {
         }
         let principal;
         try {
-          principal = await core.authenticate(cred);
+          // SYS01 M1: one deadline from arrival covers the whole request, authentication included. A stalled auth on a
+          // snapshot-backed listing is refused recoverably at the same moment as its answer, not left to the 55s budget.
+          principal = SNAPSHOT_TOOLS.has(currentTool() ?? '')
+            ? await withinReplyCeiling(async () => core.authenticate(cred))
+            : await core.authenticate(cred);
           mark('auth');
         } catch (error) {
           mark(`auth failed: ${(error as Error)?.message ?? String(error)}`.slice(0, 120));
@@ -473,6 +666,17 @@ export function createMcpHttpService(options: McpServiceOptions) {
           });
         }
         if (!principal) return new Response('Unauthorized', { status: 401 });
+        // SYS01, D2: a request id over MAX_REQUEST_ID_BYTES is refused before any tool runs, since the frame reserve of the budget
+        // assumes that bound. Nothing is written for the refused request, and its refusal carries a null id: no valid id is known.
+        if (req.method === 'POST') {
+          const oversize = oversizeRequestId(await req.clone().text());
+          if (oversize !== undefined) {
+            return new Response(JSON.stringify({
+              jsonrpc: '2.0', id: null,
+              error: { code: -32600, message: `request id is ${oversize} bytes; ids are limited to ${MAX_REQUEST_ID_BYTES} bytes` },
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
+        }
         const response = await handler.fetch(req, { authInfo: { token: cred, clientId: principal.employeeId, scopes: [] } });
         mark('handler');
         return response;
@@ -483,4 +687,6 @@ export function createMcpHttpService(options: McpServiceOptions) {
     port: server.port,
     async close() { await handler.close(); server.stop(); },
   };
+
+
 }

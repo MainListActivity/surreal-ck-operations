@@ -5,6 +5,7 @@ import { loadServiceEnv, serviceHome } from "./env";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { readProviderQuotas } from "./dispatch";
+import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 
 export interface Company {
   db: import("./vendor/src/database").CompanyDatabase;
@@ -81,7 +82,10 @@ export function company(): Promise<Company> {
           ? true : undefined,
     };
     const { createSubmitCheck } = await import("./vendor/src/pr-gate.ts");
-    const core = new SurrealCompanyCore(db, { workforce, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck() });
+    // Same build-cost line as the MCP process: the plugin's sidecar serves the same paged reads, so both surfaces must be diagnosable.
+    const snapshotObserve = (stats: { outcome: string; kind: string; rows: number; bytes: number; batches: number; loadMs: number; reserveMs: number; writeMs: number; commitMs: number; totalMs: number; serverMs: number; loadAttempts: number; release: string; releaseMs: number }) =>
+      console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
+    const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck() });
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
@@ -150,6 +154,14 @@ export function company(): Promise<Company> {
       // Host resource admission: free-memory/disk floors pause dispatch on the owner's
       // machine; supervision still runs so stalled leases keep getting reclaimed.
       hostResources: () => hostResources(serviceHome()),
+      // Model drift is realignment, not retirement: a provider may switch the model under a live
+      // session (Factory falls back once its standard allowance is spent) and switch back later.
+      // The daemon's MCP endpoint applies the change to the running session in place.
+      realignAgent: (agentId, model) => setAgentModel(agentId, model),
+      // The implementer binding outlives the employee: when a bound implementer's session is gone for good, the
+      // dispatcher hands the code to a live engineer on its own (audited as system:dispatcher) instead of waiting for
+      // the manager to reassign.
+      autoTakeover: async input => { await core.systemImplementerTakeover!(input); return true; },
       // Terminal-task artifact lifecycle: the free-disk gate reclaims evidence/deliverables
       // before it gives up, so a full disk stops halting dispatch instead of silently wedging it.
       reclaimArtifacts: (input) => reclaimer.reclaim({
@@ -162,7 +174,7 @@ export function company(): Promise<Company> {
         repos: input?.repo ? [input.repo] : undefined }),
       sidecar,
       // Quota snapshots written by lifecycle hooks (they hold the only paseo handle).
-      quota: () => readProviderQuotas({ db }),
+      quota: () => readProviderQuotas(db.db),
       // `auto:<family>` model slots resolved by hooks/tick-loop via providers.listModels.
       models: async () => {
         const [rows] = await db.db.query<[Array<{ slots?: Record<string, string> }>]>(

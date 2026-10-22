@@ -4,31 +4,37 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type SupervisedTask, type Workforce } from '../src/workforce.ts';
-import type { CompanyCore, TaskView, LeaseProof } from '../src/contracts.ts';
+import { DEFAULT_CONFIG, type EmployeeInst, type EmployeeDef, type ProviderHealth, type SupervisedTask, type Workforce } from '../src/workforce.ts';
+import type { CompanyCore, ProviderQuota, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
+import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
 import type { SidecarDeps } from '../plugin/server/sidecar.ts';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath, blockerPath } from '../src/comm.ts';
 import type { ArtifactReclaimResult } from '../src/dispatcher/artifact-sweeper.ts';
+import type { HostResources } from '../src/dispatcher/host.ts';
 import type { ArtifactTrigger } from '../src/dispatcher/artifact-reclaim.ts';
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 function world(role: EmployeeDef['role'] = 'engineering') {
   const root = mkdtempSync(join(tmpdir(), 'dispatch-comm-'));
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
-  const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string }>();
+  const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string; model?: string }>();
   const envs = new Map<string, Record<string, string>>(), events: string[] = [], retired = new Set<string>();
+  const logs: string[] = [];
   const cwds = new Map<string, string>(), wtPaths = new Map<string, string>(), denied = new Map<string, string>();
   // Write scopes another writer holds right now, and tasks whose scope cannot be read (SYS-DISP R1): the preflight sees both.
   const held = new Set<string>(), scopeUnreadable = new Set<string>();
+  // Authorised asset directories per task, and live assets holds of other writers: the registry's own overlap rule decides (B1).
+  const assetPaths = new Map<string, string[]>(), assetHolds: Array<{ paths: string[]; holder: WriteScopeHolder }> = [];
   const authorsOf = new Map<string, string[]>();
   // Tasks whose audit history cannot be read right now (R3 replay): the read throws until the test clears the entry.
   const unreadable = new Set<string>();
   // Two seats: an independent reviewer other than the implementer needs a second engineer, so the fixture keeps a spare seat (R1).
   const def: EmployeeDef = { id: 'test', role, provider: 'codex', model: 'fixture', enabled: true, maxInstances: 2, priority: 0, weight: 1, scored: 0, errorStreak: 0 };
   let next = 0, request = 0, now = 1000;
-  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string } = {}) => {
+  const addTask = (id: string, opts: { state?: TaskView['state']; submittedBy?: string; worktreePath?: string; discipline?: string; assets?: string[] } = {}) => {
+    if (opts.assets) assetPaths.set(id, opts.assets);
     const v: TaskView = { id, title: id, context: '', state: opts.state ?? 'ready', executorRole: 'engineering', reviewerRole: 'engineering',
       kind: 'task', dependencies: [], version: 1, fence: 0, submittedBy: opts.submittedBy, discipline: opts.discipline };
     if (opts.worktreePath) {
@@ -36,10 +42,21 @@ function world(role: EmployeeDef['role'] = 'engineering') {
       v.worktree = { id: `wt-${id}`, repo: '/repo', worktreePath: opts.worktreePath, mode: 'exclusive', intent: { kind: 'code' }, discipline: '' };
     }
     views.set(id, v); rows.push({ ...v, row: {}, evalAttempts: 0, repoPath: opts.worktreePath ? '/repo' : undefined } as unknown as SupervisedTask); };
+  /** Per-test config overrides; the breaker floors stay 0 unless a test asks for them. */
+  let cfgOverride: Partial<typeof DEFAULT_CONFIG> = {};
   const wf = {
-    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false }),
+    config: async () => ({ ...DEFAULT_CONFIG, quotaFloorPct: 0, quotaWeeklyFloorPct: 0, sessionMaxWakes: 0, sessionMaxInputK: 0, evalEnabled: false, jevDecisions: false, ...cfgOverride }),
     defs: async () => [def], serverNow: async () => now, insts: async () => instances.filter(i => !retired.has(i.id)), tasks: async () => rows,
-    providerHealth: async () => new Map(), lastDispatch: async () => undefined, recordDispatch: async () => {}, touchWake: async () => {}, defHealthy: async () => {},
+    providerHealth: async () => health, lastDispatch: async () => undefined, recordDispatch: async () => {}, observeSessionIdle: async (observations: Array<{ id: string; since?: number }>) => {
+      for (const o of observations) { const i = instances.find(i => i.id === o.id); if (i) i.idleSince = o.since; }
+    }, openManagerWakes: async () => [],
+    retireIdle: async (inst: EmployeeInst) => { events.push(`retire:${inst.id}:rotation`); retired.add(inst.id); },
+    touchWake: async () => {}, defHealthy: async () => {},
+    markExhausted: async (provider: string, _error: string, resetsAt?: number) => {
+      events.push(`exhausted:${provider}`);
+      health = new Map(health).set(provider, { provider, state: 'exhausted', until: resetsAt ?? now + 1800, failures: 1 });
+      return health.get(provider)!; },
+    markHealthy: async (provider: string) => { events.push(`healthy:${provider}`); health = new Map(health).set(provider, { provider, state: 'healthy', failures: 0 }); },
     defFailure: async () => { events.push('performance-failure'); return 1; },
     spawnInst: async () => { const i: EmployeeInst = { id: `employee-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `fixture-${next}` }; instances.push(i); return i; },
     bind: async (id: string, b: { agentId: string; cwd: string; repoHome?: string }) => {
@@ -61,12 +78,16 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     },
   };
   const notices = new Map<string, string>();
-  const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); }, openNotices: async () => [], triagePending: async () => [],
+  const owner = { applyPending: async () => [], resolveNotice: async (key: string) => { notices.delete(key); },
+    openNotices: async () => [...notices].map(([key, text]) => ({ key, text, at: '' })), triagePending: async () => [],
     raiseNotice: async (key: string, text: string) => { notices.set(key, text); return true; } };
   const check = (p: LeaseProof) => { const v = views.get(p.taskId)!; if (v.deliveryId !== p.deliveryId || v.fence !== p.fence || v.version !== p.expectedVersion) throw Object.assign(new Error('stale lease'), { code: 'stale_lease' }); return v; };
   const core = {
     writeScopeOf: async (id: string) => {
       if (scopeUnreadable.has(id)) throw new Error('write scope unreadable');
+      const need = assetPaths.get(id) ?? [];
+      const overlapping = assetHolds.filter(h => h.paths.some(a => need.some(b => overlap(a, b))));
+      if (overlapping.length) return overlapping.map(h => h.holder);
       return held.has(id) ? [{ taskId: 'writer-1', employee: 'employee-7', intent: 'code' }] : [];
     },
     claim: async (cred: string, id: string) => { const i = instances.find(i => i.credential === cred || cred === `rotated-${i.id}`)!;
@@ -96,20 +117,33 @@ function world(role: EmployeeDef['role'] = 'engineering') {
   let pool = makePool();
   const paseo: PaseoGateway = {
     list: async () => agents, status: async id => agents.get(id) ? { status: agents.get(id)!.status, pendingPermissions: 0 } : undefined,
-    lastError: async () => '', logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
+    lastError: async () => lastError, logsTail: async () => 'fixture transcript', lastInputTokens: async () => 0,
     spawn: async b => { const id = `agent-${b.labels.employee_id}`; agents.set(id, { id, status: 'running' }); envs.set(id, b.env); cwds.set(id, b.cwd); events.push(`spawn:${id}`); return id; },
     send: async id => { events.push(`send:${id}`); agents.get(id)!.status = 'running'; }, stop: async id => { events.push(`stop:${id}`); agents.get(id)!.status = 'idle'; },
+    reload: async id => { events.push(`reload:${id}`); agents.get(id)!.status = 'idle'; },
     archive: async id => { events.push(`archive:${id}`); agents.get(id)!.status = 'archived'; pool.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {},
   };
-  let host = { freeMemMb: 8192, freeDiskMb: 65536 };
+  let host: HostResources = { freeMemMb: 8192, freeDiskMb: 65536 };
+  /** Provider health the dispatcher reads; a test sets it to put a provider in (or past) cooldown. */
+  let health = new Map<string, ProviderHealth>();
+  /** What Paseo reports as the session's last error; empty unless a test sets it. */
+  let lastError = '';
   // Artifact reclaim seam for the resource-gate tests; absent by default so the
   // existing gate test keeps exercising the "no reclaim wired" path.
   type ReclaimInput = { trigger?: ArtifactTrigger; targetFreeMb?: number; dryRun?: boolean; taskId?: string; emergency?: boolean };
   let reclaim: ((input?: ReclaimInput) => Promise<ArtifactReclaimResult>) | undefined;
+  /** Realign seam: absent by default, so the "no realign path" behaviour is the default too. */
+  type RealignFn = (agentId: string, model: string) => Promise<boolean>;
+  let realign: RealignFn | undefined;
+  /** Quota snapshot the breaker and the pre-warning read; empty unless a test sets one. */
+  let quotaRows: ProviderQuota[] = [];
   const dispatcher = () => new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk, paseo, sidecar: pool,
     env: { opsRepo: '/fixture', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, hostResources: () => host,
-    ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}) });
+    log: (message: string) => { logs.push(message); },
+    ...(reclaim ? { reclaimArtifacts: (input?: ReclaimInput) => reclaim!(input) } : {}),
+    ...(realign ? { realignAgent: (agentId: string, model: string) => realign!(agentId, model) } : {}),
+    quota: async () => quotaRows });
   const relay = async (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => {
     const name = `${++request}.json`, dir = env.SCK_COMM_DIR!;
     writeFileSync(join(reqDir(dir), name), JSON.stringify({ key: env.SCK_COMM_KEY, tool, args }));
@@ -117,10 +151,17 @@ function world(role: EmployeeDef['role'] = 'engineering') {
     const r = readJsonFile<{ ok: boolean; error?: string }>(join(resDir(dir), name)); if (!r) throw new Error('relay timeout'); return r;
   };
   cleanup.push(() => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); rmSync(root, { recursive: true, force: true }); });
-  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, views, relay, denied, held, scopeUnreadable, authorsOf, unreadable, paseo, get pool() { return pool; },
+  return { addTask, dispatcher, def, notices, instances, rows, agents, envs, cwds, events, logs, views, relay, denied, held, scopeUnreadable,
+    holdAssets: (paths: string[], holder: WriteScopeHolder) => { assetHolds.push({ paths, holder }); }, freeAssets: () => { assetHolds.splice(0); },
+    authorsOf, unreadable, paseo, get pool() { return pool; },
     setNow: (v: number) => { now = v; },
-    setHost: (v: { freeMemMb: number; freeDiskMb: number }) => { host = v; },
+    setHost: (v: HostResources) => { host = v; },
     setReclaim: (fn: typeof reclaim) => { reclaim = fn; },
+    setRealign: (fn: typeof realign) => { realign = fn; },
+    setQuota: (rows: ProviderQuota[]) => { quotaRows = rows; },
+    setConfig: (v: Partial<typeof DEFAULT_CONFIG>) => { cfgOverride = v; },
+    setHealth: (rows: Map<string, ProviderHealth>) => { health = rows; },
+    setLastError: (text: string) => { lastError = text; },
     restart: async () => { for (const i of instances) if (i.paseoAgentId) pool.detachAgent(i.paseoAgentId); pool = makePool(); await pool.adopt(instances.map(i => ({ ...i, credential: undefined }))); } };
 }
 describe('dispatcher + sidecar launch/reuse/restart', () => {
@@ -515,6 +556,38 @@ describe('R1: a write scope held by another writer is a verdict, never a spawn c
     expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
     expect(w.notices.get('dispatch-blocked:blind:execute')).toContain('不能判定');
   });
+  test('an assets scope overlapping another writer waits as write_scope: the holder is named to gm, no spawn, no claim, never a wake failure', async () => {
+    const w = world(); w.addTask('assets-overlap', { assets: ['docs/brand/logo'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const blocked = await d.tick();
+    expect(blocked.woke).toHaveLength(0);
+    expect(w.instances).toHaveLength(0);
+    expect(w.events.some(e => e.startsWith('claim') || e.startsWith('spawn:'))).toBe(false);
+    const verdict = d.dispatchVerdicts().find(v => v.taskId === 'assets-overlap')!;
+    expect(verdict).toMatchObject({ dispatchable: false, workflowState: 'ready' });
+    expect(verdict.reasons).toEqual([expect.objectContaining({ code: 'write_scope', owner: 'gm', candidates: ['任务 asset-w1 · employee-7'] })]);
+    expect(verdict.reasons.some(reason => reason.code === 'wake_failed')).toBe(false);
+    w.setNow(1_300);
+    await d.tick();
+    const text = w.notices.get('dispatch-blocked:assets-overlap:execute')!;
+    expect(text).toContain('同线或重叠目录');
+    expect(text).toContain('任务 asset-w1 · employee-7');
+    expect(text).not.toContain('派工未能唤醒');
+    w.freeAssets(); w.setNow(1_360);
+    const freed = await d.tick();
+    expect(freed.woke.map(x => x.task)).toContain('assets-overlap');
+    expect(w.notices.has('dispatch-blocked:assets-overlap:execute')).toBe(false);
+  });
+  test('an assets scope on a disjoint directory of the same writer is not blocked: the claim proceeds', async () => {
+    const w = world(); w.addTask('assets-disjoint', { assets: ['docs/press'] });
+    w.holdAssets(['docs/brand'], { taskId: 'asset-w1', employee: 'employee-7', intent: 'assets' });
+    const d = w.dispatcher();
+    const r = await d.tick();
+    expect(r.woke.map(x => x.task)).toContain('assets-disjoint');
+    expect(w.events).toContain('claim:employee-1:assets-disjoint');
+    expect(d.dispatchVerdicts().some(v => v.taskId === 'assets-disjoint')).toBe(false);
+  });
 });
 
 describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
@@ -638,4 +711,272 @@ describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
     expect(verdict.summary).toContain('另有 1 名同岗位员工属其他仓库，不参与本仓库派工');
     expect(w.events.some(e => e.includes('employee-8'))).toBe(false);
   });
+});
+
+// A provider may switch the model under a running subscription on its own: Factory serves a
+// cheaper model once its standard allowance is spent and switches back when it recovers. The
+// session, its conversation and its seat all stay valid, so the pass realigns the model in place
+// instead of retiring the employee and losing its context.
+describe('R4: provider model drift is realigned in place, never a retirement', () => {
+  const driftedSession = (w: ReturnType<typeof world>) => {
+    const drifted = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+    w.instances.push(drifted);
+    w.pool.env(drifted);
+    w.pool.bindAgent(drifted.id, 'agent-9');
+    drifted.paseoAgentId = 'agent-9';
+    // Paseo reports what the session actually serves, which is no longer what the def asks for.
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle', model: 'cheap-model' });
+    return drifted;
+  };
+
+  test('the session is put back on its definition model and keeps its seat', async () => {
+    const w = world();
+    driftedSession(w);
+    const calls: Array<[string, string]> = [];
+    w.setRealign(async (agentId, model) => { calls.push([agentId, model]); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([['agent-9', 'fixture']]);
+    expect(r.realigned).toContain('employee-9');
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.events.some(e => e.startsWith('retire:employee-9'))).toBe(false);
+    expect(w.agents.get('agent-9')!.status).not.toBe('archived');
+  });
+
+  test('with no realign path the session is left for the next pass, not retired', async () => {
+    const w = world();
+    driftedSession(w);
+    const r = await w.dispatcher().tick();
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.events.some(e => e.startsWith('retire:employee-9'))).toBe(false);
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('while the subscription is still out, the drift is left alone instead of retried every pass', async () => {
+    const w = world();
+    driftedSession(w);
+    // Factory keeps serving its fallback model until the allowance resets: realigning now cannot take effect.
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    const calls: string[] = [];
+    w.setRealign(async agentId => { calls.push(agentId); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([]);
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('the waiting line is written once per drift episode, not on every pass', async () => {
+    const w = world();
+    driftedSession(w);
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    w.setRealign(async () => true);
+    const d = w.dispatcher();
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.includes('waits for codex to recover'))).toHaveLength(1);
+  });
+
+  test('a session already on its definition model is left alone', async () => {
+    const w = world();
+    driftedSession(w);
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle', model: 'fixture' });
+    const calls: string[] = [];
+    w.setRealign(async agentId => { calls.push(agentId); return true; });
+    const r = await w.dispatcher().tick();
+    expect(calls).toEqual([]);
+    expect(r.realigned).toEqual([]);
+    expect(r.retired).not.toContain('employee-9');
+  });
+});
+
+// The breaker stops dispatch only at the floor; the owner should hear about a subscription that
+// is nearly spent while there is still time to top it up.
+describe('R4: a nearly spent subscription warns before it stops the company', () => {
+  test('a subscription under the warning line raises one notice', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, sessionPct: 50, fetchedAt: new Date().toISOString() }]);
+    const r = await w.dispatcher().tick();
+    expect(r.notices).toContain('quota-warn:codex');
+    expect(w.notices.get('quota-warn:codex')).toContain('10%');
+  });
+
+  test('the warning clears once the subscription recovers', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(true);
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(false);
+  });
+
+  test('a stale snapshot raises no warning, and clears one built on older data', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: new Date().toISOString() }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(true);
+    // Twenty minutes later the row says the same thing, but nobody verified it since: the breaker
+    // already fails open on stale snapshots, and the owner must not be warned from one either.
+    const stale = new Date(Date.now() - 20 * 60_000).toISOString();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 10%', weeklyPct: 10, fetchedAt: stale }]);
+    await w.dispatcher().tick();
+    expect(w.notices.has('quota-warn:codex')).toBe(false);
+  });
+
+  test('a healthy subscription raises nothing', async () => {
+    const w = world();
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, fetchedAt: new Date().toISOString() }]);
+    const r = await w.dispatcher().tick();
+    expect(r.notices.filter(n => n.startsWith('quota-warn:'))).toEqual([]);
+  });
+});
+
+// A quota failure parks the session in Paseo's `error` state, and nothing in Paseo leaves that
+// state on its own. The dispatcher only dispatches into idle sessions, so without a restart the
+// seat stays lost after the subscription recovers — the employee is never retired, but never works
+// again either. The session is restarted in place once the cooldown has passed.
+describe('R5: a session parked by a quota failure comes back when the window reopens', () => {
+  const parkedSession = (w: ReturnType<typeof world>, until: number) => {
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+      credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+    w.instances.push(inst);
+    w.pool.env(inst);
+    w.pool.bindAgent(inst.id, 'agent-9');
+    inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'error' });
+    w.setLastError('Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: Agent turn ended: model_usage_exhausted');
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until, failures: 1 }]]));
+    return inst;
+  };
+
+  test('once the cooldown has passed the session is reloaded in place and keeps its seat', async () => {
+    const w = world();
+    parkedSession(w, 500); // server time is 1000: the window has reopened
+    const r = await w.dispatcher().tick();
+    expect(w.events).toContain('reload:agent-9');
+    expect(r.recovered).toEqual(['employee-9']);
+    expect(r.retired).not.toContain('employee-9');
+    expect(r.exhausted).toEqual([]);
+    expect(w.agents.get('agent-9')!.status).toBe('idle');
+  });
+
+  test('while the cooldown still runs the session is left alone', async () => {
+    const w = world();
+    parkedSession(w, 5000);
+    const r = await w.dispatcher().tick();
+    expect(w.events.some(e => e.startsWith('reload:'))).toBe(false);
+    expect(r.recovered).toEqual([]);
+    expect(w.agents.get('agent-9')!.status).toBe('error');
+  });
+
+  test('a fresh quota failure still records the cooldown and does not reload', async () => {
+    const w = world();
+    parkedSession(w, 500);
+    w.setHealth(new Map()); // no prior cooldown: this failure is the one that starts it
+    const r = await w.dispatcher().tick();
+    expect(r.exhausted).toEqual(['codex']);
+    expect(w.events).toContain('exhausted:codex');
+    expect(w.events.some(e => e.startsWith('reload:'))).toBe(false);
+    expect(r.recovered).toEqual([]);
+  });
+});
+
+// A spent monthly allowance can keep a provider under the floor for days. One line per change
+// keeps the plugin log — which only holds the last ~130 lines — readable through the outage.
+describe('R4: a persistent quota floor writes one line, not one per tick', () => {
+  test('the floor line repeats only when the blocked set changes', async () => {
+    const w = world();
+    w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+    const d = w.dispatcher();
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.startsWith('quota below floor'))).toHaveLength(1);
+
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 90%', weeklyPct: 90, sessionPct: 90, fetchedAt: new Date().toISOString() }]);
+    await d.tick();
+    await d.tick();
+    expect(w.logs.filter(m => m.startsWith('quota below floor'))).toHaveLength(1);
+    expect(w.logs.filter(m => m.startsWith('quota recovered'))).toHaveLength(1);
+  });
+});
+
+// A def can opt out of quota gating: even at 0% remaining the owner wants it dispatched and
+// retried, accepting that some turns will fail until the allowance returns.
+describe('R6: a def exempt from quota gating keeps dispatching through a spent subscription', () => {
+  test('a spawn is admitted while the provider is quota-blocked and cooling down', async () => {
+    const w = world();
+    w.def.quotaLimited = false;
+    try {
+      w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+      w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+      w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+      w.addTask('exempt-task');
+      const r = await w.dispatcher().tick();
+      expect(r.skipped).toBeUndefined();
+      expect(r.woke).toHaveLength(1);
+      expect(r.woke[0]!.spawned).toBe(true);
+    } finally { w.def.quotaLimited = undefined; }
+  });
+
+  test('a limited def in the same state still waits', async () => {
+    const w = world();
+    w.setConfig({ quotaFloorPct: 8, quotaWeeklyFloorPct: 2 });
+    w.setQuota([{ provider: 'codex', summary: 'Weekly 剩余 0%', weeklyPct: 0, sessionPct: 100, fetchedAt: new Date().toISOString() }]);
+    w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+    w.addTask('limited-task');
+    const r = await w.dispatcher().tick();
+    expect(r.woke).toHaveLength(0);
+    expect(r.skipped).toBe('budget');
+  });
+
+  test('a session parked by a quota error is reloaded without waiting out the cooldown', async () => {
+    const w = world();
+    w.def.quotaLimited = false;
+    try {
+      const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture',
+        credential: 'fixture-9', cwd: '/repo', repoHome: '/repo' } as EmployeeInst;
+      w.instances.push(inst);
+      w.pool.env(inst);
+      w.pool.bindAgent(inst.id, 'agent-9');
+      inst.paseoAgentId = 'agent-9';
+      w.agents.set('agent-9', { id: 'agent-9', status: 'error' });
+      w.setLastError('Error: Agent turn ended: model_usage_exhausted[System Error] Internal error: Agent turn ended: model_usage_exhausted');
+      // Still cooling down: a limited def waits, an exempt def restarts on the retry interval.
+      w.setHealth(new Map([['codex', { provider: 'codex', state: 'exhausted', until: 5000, failures: 1 }]]));
+      const r = await w.dispatcher().tick();
+      expect(w.events).toContain('reload:agent-9');
+      expect(r.recovered).toEqual(['employee-9']);
+      expect(w.agents.get('agent-9')!.status).toBe('idle');
+    } finally { w.def.quotaLimited = undefined; }
+  });
+});
+
+
+test('kernel pressure gates the real dispatcher even when byte estimates disagree', async () => {
+  const w = world();
+  w.addTask('kernel-pressure');
+  w.setHost({ freeMemMb: 8192, freeDiskMb: 65536, memoryPressure: 2 });
+  expect((await w.dispatcher().tick()).skipped).toBe('resources');
+  expect(w.events.some(e => e.startsWith('spawn:'))).toBe(false);
+  w.setHost({ freeMemMb: 100, freeDiskMb: 65536, memoryPressure: 1 });
+  expect((await w.dispatcher().tick()).woke).toHaveLength(1);
+});
+
+
+test('idle retirement waits for two hours of actual observations, then archives without a performance failure', async () => {
+  const w = world();
+  const inst: EmployeeInst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'synthetic', lastWakeAt: 1 };
+  w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+  w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+  expect((await w.dispatcher().tick()).retired).toEqual([]);
+  expect(inst.idleSince).toBe(1000);
+  w.setNow(8199);
+  expect((await w.dispatcher().tick()).retired).toEqual([]);
+  w.setNow(8201);
+  expect((await w.dispatcher().tick()).retired).toEqual([inst.id]);
+  expect(w.events).toContain('archive:agent-9');
+  expect(w.events).not.toContain('performance-failure');
 });

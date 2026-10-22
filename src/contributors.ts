@@ -170,18 +170,24 @@ export function openLeaseOf(holder: string | null | undefined, state: string | n
 }
 
 /**
- * The facts, the task version they were read at, the task state and its independence policy. All four are read in one transaction,
- * so a policy change (which bumps the version) is never seen without the version it moved to. `version` is undefined when the task
- * does not exist.
+ * The facts, the task version they were read at, the state, open holder and explicit implementer, and the independence policy.
+ * All read in one transaction, so a policy change (which bumps the version) is never seen without the version it moved to.
+ * `version` is undefined when the task does not exist.
  */
 export interface ContributionView {
   facts: ContributionFacts;
+  checkedAt?: string;
   version?: number;
+  /** The task's state, open holder and explicit implementer, read in the same transaction as the facts (retirement gate),
+   * plus the independence policy: one read, so a policy change is never seen without the version it moved to. */
   state?: string;
+  holder?: string;
+  explicitImplementer?: string;
   policy?: IndependencePolicy;
 }
 
 interface ContributionRead {
+  checkedAt?: string | null;
   implementer?: string | null;
   version?: number | null;
   state?: string | null;
@@ -197,10 +203,10 @@ interface ContributionRead {
  */
 export async function readContributionView(db: Surreal, taskId: string): Promise<ContributionView> {
   const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
+    LET $at = time::now();
     LET $row = SELECT implementer, version, state, current_employee AS holder, independence AS policy FROM ONLY $task;
     LET $rows = SELECT action, actor, phase, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at ASC;
-    RETURN { read: { implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, policy: $row.policy, rows: $rows } };
-    COMMIT TRANSACTION;`,
+    RETURN { read: { checkedAt: <string>$at, implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, policy: $row.policy, rows: $rows } };    COMMIT TRANSACTION;`,
   { task: new RecordId('task', taskId), actions: [...CONTRIBUTION_ACTIONS] }).responses();
   const found = responses.every(response => response.success)
     ? responses.map(response => response.success ? response.result : undefined)
@@ -217,10 +223,12 @@ export async function readContributionView(db: Surreal, taskId: string): Promise
   const open = openLeaseOf(read.holder, read.state);
   return {
     facts: deriveContributors(events, read.implementer ?? undefined, open),
+    checkedAt: read.checkedAt ?? undefined,
     version: typeof read.version === 'number' ? read.version : undefined,
     state: read.state ?? undefined,
-    policy: read.policy ?? undefined,
-  };
+    holder: read.holder ?? undefined,
+    explicitImplementer: read.implementer ?? undefined,
+    policy: read.policy ?? undefined,  };
 }
 
 /** The facts only, for callers that do not check the version (dispatcher reads, previews). */

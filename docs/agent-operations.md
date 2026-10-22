@@ -57,11 +57,13 @@
 ```
 pnpm run admin project set project.json                           # 写入或更新
 pnpm run admin project list                                       # 查看（含凭证名，不含值）
+pnpm run admin project lengths <项目>                              # 只读长度诊断（字段/计数/UTF-8 字节，不含正文）
+pnpm run admin project check project.json                         # 只读校验候选输入，不写库
 pnpm run admin project broker surreal_ck production broker.json   # 配置该环境的运维代理（见下节）
 printf '%s' "$VALUE" | pnpm run admin secret set surreal_ck production SOME_NAME - "用途"   # 角色写 - 表示无
 ```
 
-`project.json` 结构：`{ id, name, repoPath, defaultBranch, release, rollback, redLines[], runbooks[], notes, envs: [{ name, url, healthUrl, verify }] }`。
+`project.json` 结构：`{ id, name, repoPath, defaultBranch, release, rollback, redLines[], runbooks[], notes, envs: [{ name, url, healthUrl, verify }] }`。公开文本上限（按 UTF-8 字节，不是字符）：`release`/`rollback` 各 16 KiB，`notes` 32 KiB；`runbooks` 最多 50 条、每条最多 2 KiB、数组序列化总量最多 32 KiB。超限输入在项目/env 写入前拒绝；存量超限字段未改变时原样保留，显式改变必须满足上限。`project lengths`/`project check` 只返回字段名、计数和字节数，不输出正文或凭证。
 
 凭证存在 `env_secret` 表，值用 AES-256-GCM 加密；密钥只在本机登录钥匙串（服务 `surreal-ck-company`，账号 `env-secret-key`，首次写入凭证时自动生成）。**员工读不到任何凭证值**：`get_secret` / `put_secret` 已下线（调用得到 `unknown_tool` 和指向运维工具的提示），claim 不再下发 `secrets`，`project` 只列凭证名。值只由运维代理在插件进程内解密使用。测试账号的密码 `<别名>_PASSWORD` 由运维代理在 `ops_account_ensure` 时生成并直接密封，不需要手工登记；沿用旧的 `QA_PASSWORD`（对应别名 `QA`）也行。部署密钥不放这里：代码发布走各仓库的 CI（例如 surreal_ck 的 SSH 部署密钥只在 GitHub `production` Environment）。
 
@@ -140,6 +142,10 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 三次写入的审计条目可查：`SELECT * FROM audit WHERE action IN ('def_ensure','project_disciplines_update') ORDER BY at DESC`。owner console 与 admin CLI 继续可用，与 MCP 管理工具并存。
 
+## 任务输入上限
+
+`create_task` 与 `create_delivery` 的显式 `dependencies` 至多 50 条，按去重前原始条数先验（51 条重复 ID 同样拒绝），每项为 1–200 字符的 task id；asset 类 `workIntent.paths` 至多 50 条、每条至多 300 字符，非 assets 不接受 paths。判定在 core 统一完成，MCP、sidecar 与直接调用是同一结论：超限返回结构化 `invalid`，任务/审计/outbox/幂等零写入。链内自动依赖（交付链腿间、goal anchor）不受此上限，保持完整。
+
 ## 独立性策略（independence_set）
 
 经理（manage 能力）可为任务写入独立性策略（SYS-DISP IR01–IR03）：来源任务的经手人，以及点名的员工（及其同一登记编制的员工），不能接手（`execute`）或裁决（`review`）该任务。策略与任务版本一起存放，无策略的旧任务行为不变。
@@ -149,7 +155,6 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - 同源判定只用已登记的员工 ID 与员工定义（`employee.def`）。不从 agent、会话或工作区推断身份，也不识别未登记的身份关联。
 - 执行：调度每轮按来源的最新贡献历史过滤候选，包括 `previousEmployee`、Jev 选择与补位，因此被排除者不会因为连续性或优先级重新入选。领取、提交与裁决在事务内带来源版本守卫：来源在读取后有变动即拒绝并重读。来源不可读时失败关闭：不授租约，候选标记为 `unknown`，恢复后自动重判。
 - 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_def`）、角色与审计引用（不含凭证）。
-
 ## 运行参数
 
 `company_meta:config`（`pnpm run admin config <key> <json>` 或直接写库）：
@@ -170,6 +175,9 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 | `jev_decisions` | true | Jev 是否参与目标分级、上线决定、老板升级路由（拿不准时交经理/运营） |
 | `jev_release_threshold` | 0.8 | 上线申请「可以上线」概率 ≥ 该值且「触碰红线」≤ 1 − 该值时自动批准 |
 | `jev_owner_threshold` | 0.3 | 升级给老板的问题「必须老板决定」概率低于该值时改派经理（每任务一次） |
+| `quota_floor_pct` | 8 | 订阅短窗口/余额剩余低于该百分比即停止复用与新开；0 = 不熔断 |
+| `quota_weekly_floor_pct` | 2 | 订阅周/月窗口剩余低于该百分比即停止复用与新开；0 = 不熔断 |
+| `quota_warn_pct` | 20 | 订阅剩余低于该百分比但未触底时，给老板发一次「即将用尽」提醒；0 = 不提醒 |
 
 ## 排障
 
@@ -181,6 +189,15 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - **Jev 接入**：在 `private/service.env` 加 `JEV_API_KEY`（也可用 `TYPESAFE_API_KEY`）即启用；可选 `JEV_BASE_URL`（默认官方 `https://api.typesafe.ai/v1/systemone`，托管计费网关为 `https://jevtypesafeai.com/api/v1/decide`）、`JEV_MODEL`（默认固定 `jev-1.13.0`，避免阈值漂移）。key 从 TypeSafe 早期访问 waitlist 或托管网关获取。验证连通性：`pnpm run admin jev-test`。Jev 不产生文本输出，scorecard 的 `notes` 为空，判据与置信度在 `probabilities`/`confidence` 字段。
 - devin 订阅不接受 `thinking=low`（`paseo run` 报 AGENT_CREATE_FAILED）；devin 定义请用 medium/high。定义连续 spawn 失败 3 次会自动停用，修正后 `pnpm run admin def enable <id>` 恢复。
 - 不想让某类员工再接任务但保留定义：`pnpm run admin def weight <id> 0`（软停用，全部候选为 0 时仍可能兜底）；彻底停用用 `def disable <id>`。
+- **订阅额度从哪读**：Paseo 的用量列表只覆盖它自己驱动的订阅（本机是 claude/codex/grok）。magpie 网关（`GET /v1/magpie/quotas`，本机回环）覆盖老板配置的全部订阅，调度器只把 Paseo 没报的那几个补进来（`factory` → `factory-droid`），两边都报时以 Paseo 为准。magpie 未运行或超时按“没有答案”处理，绝不当成“额度为 0”。
+- **员工实例什么时候退役**：只有“这个会话不可能再接任何任务”才退役——凭证文件实例在 sidecar 模式下不可复用（通道轮换）、派工轮次或上下文超过 `session_max_wakes` / `session_max_input_k`（会话轮换）、Paseo 报会话已归档（正常结束）、启动绑定失效且会话还活着（通道隔离）、spawn 失败且不是额度类错误、claim 被拒或写权被占且未绑定实现人、任务现场销毁（场景回收），以及经理/老板手工退役。
+- **不因额度耗尽退役**：额度失败只把 provider 记进 `provider_health`（冷却按指数退避：30 分钟起、最长 6 小时），任务留在原实现人名下等待恢复，不再记员工定义的违规次数。长时间耗尽由额度下限熔断挡住派工（magpie 补上 Paseo 不报的订阅），不靠冷却时长兜底。
+- **经理待办路由**：ready/doing 无人的工程任务若 execute verdict 需要经理动作（`implementer_unresolved`、系统自动接替无候选的 `implementer_unavailable`、绑定实现人持续额度失败），调度器生成持久经理待办并按仓库复用 gm-attention 唤醒 GM；同一 task+阶段+episode+reason 去重，负责人已记录、任务开工、退役或理由变化时收口并保留审计。GM 对 ready 任务先 `contributor_dryrun` 再以最新 `expectedVersion` 调 `implementer_takeover`，不调用 `resume_task`；只有 blocked 任务用 `resume_task`。普通忙碌、在办租约、普通并发满、依赖等待不升级；读取失败保持待办，不当作已处理。
+- **实现人失效自动接替**：绑定的实现人（显式绑定，或由贡献记录派生的唯一作者）彻底不可用（员工退役/撤凭证、不在册，或会话归档、隔离、停在无法就地重启的失败里）时，调度器自动把执行权交给同仓库、非作者的在岗工程员工并发下一轮派工，不需要经理；审计 actor 为 `system:dispatcher`，事件标记 `[implementer_takeover:auto]`，写入与经理 `implementer_takeover` 同一笔事务。实现人只是忙、空闲、额度冷却或状态未知时不触发。没有可派候选时按 `implementer_unavailable` 记为无法派工（负责方「系统」），每轮自动重试。
+- **按编制豁免额度限制**：`employee_def.quota_limited`（默认 true）设为 false 时，该编制不受额度下限熔断与额度类健康冷却影响：剩余额度为 0 也继续派工；停在 error 的会话按 5 分钟重试间隔就地重载后继续尝试。并发席位上限（`provider_max`）仍然生效。设置方式：编制页编辑「额度限制：不受限」、经理 `def_ensure` 的 `quotaLimited` 字段，或 `pnpm run admin def quota <id> unlimited`。
+- **额度恢复后会话自动重启**：额度失败会把会话停在 Paseo 的 `error` 状态，而 Paseo 不会自己把它放出来；调度器只往 `idle` 会话派工，所以冷却结束后调度器用 `paseo agent reload` 就地重启该会话（agent、对话与通道绑定都保留），不退役、不重开新员工。重载失败按 5 分钟间隔重试。
+- **不因模型漂移退役**：供应商可能在会话中途换模型（Factory 标准额度用尽后会切到更便宜的模型，恢复后再切回）。调度器读到 Paseo 报的实际模型与编制不符时，通过 Paseo daemon 的 `update_agent` 就地改回；改不动就留到下一轮，会话、上下文与席位都不丢。订阅还在冷却或低于额度下限时不做改回——那期间的改回不可能生效，调度器等订阅恢复后的第一轮再改。
+- 订阅耗尽的排查顺序：`pnpm run company status` 看订阅状态 → `SELECT * FROM provider_health` 看冷却与 `last_error` → `GET http://127.0.0.1:3425/v1/magpie/quotas` 看真实剩余额度（含 Paseo 不报的订阅）。
 
 ## v2 归档
 
@@ -188,6 +205,7 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 
 ## 上线记录
 
+- 2026-10-21：额度耗尽误判修复上线（老板批准范围：修复顺序 2、3、4——magpie 额度接入、额度预警、事故收尾；另含模型漂移改回与退役标准梳理）。来源 PR #1503 → main `6b6a0be`，发布 `releases/6b6a0be…`；随后发现额度行读取的前缀谓词漏掉带连字符的 provider（`factory-droid` 恰好不可见），来源 PR #1507 → main `2ac720d`，发布 `releases/2ac720d…`；再以 PR #1508 → main `6003e2c` 发布 `releases/6003e2c…`（漂移等待日志按周期节流并补前两条记录；active 与插件来源同为该 SHA）。同日再以 PR #1510 → main `3d19cb7` 发布 `releases/3d19cb7…`（额度下限日志按变化节流；active 与插件来源同为该 SHA，双面一致；CI 两个工作流均 success）。随后以 PR #1512 → main `4f01a1d` 发布 `releases/4f01a1d…`（过期额度快照不再触发预警，防止 15 分钟前的旧数字上收件箱；active 与插件来源同为该 SHA，CI 两个工作流均 success）。上线后 `quota-warn:grok` 旧提醒已清除，`quota below floor` 每轮只写一次。再以 PR #1514 → main `2849dcf` 发布 `releases/2849dcf…`（花名册实例载荷只带 id/def/agentStatus，编制按「启用且有在线实例」优先排序后再截断；active 与插件来源同为该 SHA，CI 两个工作流均 success）。上线后 44 条编制显示 35 条（全部 35 条启用编制在内），34 个在线实例全部显示。再以 PR #1516 → main `cc5cab2` 发布 `releases/cc5cab2…`（员工定义新增 `quota_limited`，默认受额度限制；设为 false 的编制在剩余额度为 0 时仍可派工，schema 升到 22；active 与插件来源同为该 SHA，CI 两个工作流均 success）。上线后将工程 4 条启用编制设为不受限，工程派工恢复。`2ac720d` 验收：根/插件 typecheck 退出 0；test:service 12 通过；test:channel 153 通过/14 跳过/0 失败；test:bridge 403 通过/23 跳过/0 失败；fork 套件 46 通过/0 失败；全量 `--all` 1019 通过/33 跳过/12 失败，与基线 `6b6a0be` 的 14 个具名失败逐名比对为真子集（无新增）。pnpm-lock `94ec54e8…`，plugin/pnpm-lock `1e9c48f5…`，vendor 摘要 `fefa7b35…`（106 个文件）。上线后插件日志出现 `quota below floor: … factory-droid 额度不足（周/月额度 0%<2%）`，为额度行读取修复的直接证据。再以 PR #1518 → main `b0d8dc7` 发布 `releases/b0d8dc7…`（编制编辑表单不再把未知的额度开关写成「受限」：表单状态保留 undefined、提交时原样回传，界面判定改为 `quotaLimited !== false`；active 与插件来源同为该 SHA，CI 两个工作流均 success）。`b0d8dc7` 验收：根/插件 typecheck 退出 0；test:bridge 410 通过/23 跳过/0 失败；test:channel 159 通过/14 跳过/0 失败；fork 套件 46 通过/0 失败。再以 PR #1520 → main `d815ba8` 发布 `releases/d815ba8…`（实现人会话失效时系统自动接替：与经理 `implementer_takeover` 同一笔比较并交换事务，审计 actor 记为 `system:dispatcher`、事件标记 `[implementer_takeover:auto]`，不带凭证、不暴露为员工工具；新增原因码 `implementer_unavailable`，负责方写「系统」，文案不再指向经理；active 与插件来源同为该 SHA，CI 两个工作流均 success）。`d815ba8` 验收：根/插件 typecheck 退出 0；test:bridge 411 通过/23 跳过/0 失败；channel fork 定向 62 通过/0 失败；其余 channel fork 文件 51 通过/0 失败。上线后线上实测：07:24:46Z 系统自动接替 `58042591`（实现人 `engineering-grok-fecf2b` 会话已归档 → `engineering-fable-12c5e9`，审计 actor `system:dispatcher`）；07:26:02Z 死会话员工退役；07:26:21Z 接替者领取任务并唤醒，任务转 `doing`；「无法派工」通知随之消警。再以 PR #1523 → main `9854fe0` 发布 `releases/9854fe0…`（修复 schema 22 把 `quota_limited` 定义成非可选布尔、使 40 条旧员工定义一经写入即报 `Expected bool but found NONE` 的问题：原地改为 `DEFINE FIELD OVERWRITE … TYPE option<bool>`，不新增 schema 版本；新增 `scoring.rescoreAggregates` 与 `admin rescore` 可重复重算入口；active 与插件来源同为该 SHA，CI 两个工作流均 success）。`9854fe0` 验收：根/插件 typecheck 退出 0；channel fork 定向（quota-store + dispatcher-sidecar）11 通过/0 失败。生产处理：回填 44/44 条定义（缺失 0）；重算 915 名员工与 40 条编制，三条落后编制已与评分卡一致；线上字段已显示为 `none | bool`（option<bool>），`admin rescore` 从发布目录返回 `{employees:915, defs:40}`。事故回执：`eval-codex-6dd001` 对 `0565ac1b` 的 `record_score` 因该字段失败，但 5 张评分卡与 `evaluated_at` 已落库，本轮汇总已由重算补齐。再以 PR #1536 → main `b1a8968` 发布 `releases/b1a8968…`（自动接替覆盖派生实现人：无显式 `implementer` 的旧任务按执行门派生的唯一作者判定，员工退役/撤凭证、不在册或会话不可恢复时系统直接改派；忙、空闲、额度冷却不触发；接管事务照旧把新实现人显式写回。active 与插件来源同为该 SHA，CI 两个工作流均 success）。`b1a8968` 验收：根/插件 typecheck 退出 0；channel fork 定向 63 通过/0 失败。上线后线上实测：10:14:10Z 系统自动接替 `1c7544fa`（派生实现人 `engineering-factory-droid-7ef5c9` 已于 10-20 会话轮换退役 → `engineering-claude-2860a2`，审计 actor `system:dispatcher`）；10:16:02Z 接替者领取并唤醒，任务转 `doing`。
 - 2026-09-28：v3 上线，发布 `af63565`（`releases/<sha>`，`active` 指向当前版本）。写入 18 个默认员工定义；gm-01、product-01、eng-01、eng-02、ai-01、qa-01、cs-01 挂到各自的 `*-codex` 定义上，身份与历史保留。旧 Paseo 定时巡检 `d747edb8` 已到期，额度巡检 `cc85bb8f` 已暂停，由调度器取代。启动任务 #3—#16 已按老板决定取消（not planned）。
 - 演练 A（GitHub #34）：调度器派 qa-01 执行 → checkpoint → submit → 自动派 eng-01 独立验收 → done。
 - 演练 B（GitHub #35）：codex 并发临时设为 0，调度器按定义新开 `cs-grok-9d59da`；它存下 ALPHA 进度后会话被强制归档。约 25 秒内调度器退役该实例并撤销凭证、收回租约并附交接包、新开 `cs-grok-580043` 接手；接手者读到 ALPHA 与交接包，跳过已完成步骤存下 BETA 并提交；`qa-grok-5dfd5a` 独立验收通过。旧凭证调用返回 401。

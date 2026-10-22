@@ -11,6 +11,8 @@ import { jevFromEnv } from './dispatcher/jev.ts';
 import { parseReclaimCliArgs } from './dispatcher/artifact-reclaim.ts';
 import { loadSecretKey, ProjectStore, type ProjectInput } from './projects.ts';
 import type { Role } from './contracts.ts';
+import { CompanyError } from './core-errors.ts';
+import { repairInfrastructureScores, rescoreAggregates } from './scoring.ts';
 
 const usage = `Usage: pnpm run admin <command>
   enroll <employee-id> <role>             登记固定身份（写入本 checkout .runtime/credentials）
@@ -20,6 +22,7 @@ const usage = `Usage: pnpm run admin <command>
   def weight <id> <n>                     调整派工权重（0-1000，0=不主动派工；概率按权重占比）
   def tracks <id> <轨,轨|->               限定编制的岗位轨（- 或空 = 全接；非空则只接 discipline 在列的任务）
   def enable|disable <id>
+  def quota <id> limited|unlimited     是否受订阅额度限制（unlimited = 剩余额度为 0 也继续派工）
   seed-defs                               写入默认员工定义（30 个：九岗位含 eval × codex/grok/devin 订阅，另加 screenwriter-agy、story-author-agy（antigravity 单座）、cinematography-codex（codex 单座），已存在则不覆盖）
   inst list                               列出在职员工实例
   bind <employee-id> <paseo-agent-id> [def-id] [credential-file]
@@ -28,12 +31,16 @@ const usage = `Usage: pnpm run admin <command>
   jev-test                                测试 Jev 决策模型连通性（需 JEV_API_KEY）
   project set <file.json>                 写入/更新项目环境（结构见 docs/agent-operations.md）
   project list                            列出项目环境与凭证名（不含值）
+  project lengths <项目>                   只读展示项目公开文本的 UTF-8 字节/计数与上限（不含正文）
+  project check <file.json>               只读校验候选项目输入，不写库
   project broker <项目> <环境> <file.json>
                                           写入该环境的运维代理（ops broker）配置；只放非敏感项，校验不过不入库
   secret set <项目> <环境> <名称> <角色,角色|-> [用途]
                                           从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
+  repair-infrastructure-scores [--execute]  排除有明确额度故障证据的纯空转评分；默认只演练，保留原始卡片
   config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）
+  rescore                                 从评分卡重算员工与编制的 scored/avg_score（幂等；修复评分汇总失败留下的落后）
   reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
                                           回收终态任务的大文件（evidence/deliverables）；
                                           缺省只演练不删，加 --execute 才真正动手，带目标 MB 则按压力模式回收`;
@@ -49,7 +56,15 @@ try {
   const workforce = new Workforce(database, resolve(process.env.SCK_CREDENTIAL_DIR ?? join(import.meta.dir, '..', '.runtime', 'credentials')));
   switch (action) {
     case 'revoke': {
-      await admin.revoke(args[0]!);
+      // The same gate as retirement (LocalEnrollmentAdmin.revoke): a refusal writes nothing and exits non-zero with its stable code.
+      try {
+        await admin.revoke(args[0]!);
+      } catch (error) {
+        if (!(error instanceof CompanyError) || error.code !== 'retire_refused') throw error;
+        print({ action, employeeId: args[0], ok: false, code: error.code, message: error.message, details: error.details });
+        process.exitCode = 1;
+        break;
+      }
       print({ action, employeeId: args[0], ok: true });
       break;
     }
@@ -73,6 +88,7 @@ try {
       if (sub === 'list') {
         print((await workforce.defs()).map(d => ({ id: d.id, role: d.role, provider: d.provider, model: d.model,
           thinking: d.thinking, tracks: d.tracks ?? [], enabled: d.enabled, max: d.maxInstances, weight: d.weight,
+          quotaLimited: d.quotaLimited !== false,
           effectiveWeight: Number(effectiveWeight(d).toFixed(2)),
           avgScore: d.avgScore ? Number(d.avgScore.toFixed(2)) : undefined, scored: d.scored,
           errorStreak: d.errorStreak })));
@@ -93,11 +109,23 @@ try {
         const tracks = rest[0] === '-' ? [] : rest.join(' ').split(/[,，、]/).map(t => t.trim()).filter(Boolean);
         await database.db.query('UPDATE $def SET tracks = $tracks;',
           { def: new RecordId('employee_def', defId), tracks });
+      } else if (sub === 'quota') {
+        if (!defId || !['limited', 'unlimited'].includes(rest[0] ?? '')) throw new Error(usage);
+        await database.db.query('UPDATE $def SET quota_limited = $q;',
+          { def: new RecordId('employee_def', defId), q: rest[0] === 'limited' });
       } else if (sub === 'enable' || sub === 'disable') {
         await database.db.query('UPDATE $def SET enabled = $enabled, error_streak = 0, disabled_reason = NONE, disabled_at = NONE;',
           { def: new RecordId('employee_def', defId!), enabled: sub === 'enable' });
       } else throw new Error(usage);
       print(await workforce.defs());
+      break;
+    }
+    case 'repair-infrastructure-scores': {
+      print(await repairInfrastructureScores(database.db, args.includes('--execute')));
+      break;
+    }
+    case 'rescore': {
+      print(await rescoreAggregates(database.db));
       break;
     }
     case 'jev-test': {
@@ -141,7 +169,15 @@ try {
       break;
     }
     case 'retire': {
-      await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual', 'manual');
+      // The same gate as every other retirement (workforce.retire): a refusal writes nothing and exits non-zero with its stable code.
+      try {
+        await workforce.retire(args[0]!, args.slice(1).join(' ') || 'manual', 'manual');
+      } catch (error) {
+        if (!(error instanceof CompanyError) || error.code !== 'retire_refused') throw error;
+        print({ action, employeeId: args[0], ok: false, code: error.code, message: error.message, details: error.details });
+        process.exitCode = 1;
+        break;
+      }
       print({ action, employeeId: args[0], ok: true });
       break;
     }
@@ -150,7 +186,14 @@ try {
       const store = new ProjectStore(database.db);
       if (sub === 'list') print(await store.list());
       else if (sub === 'set' && first) print(await store.upsert(JSON.parse(readFileSync(first, 'utf8')) as ProjectInput));
-      else if (sub === 'broker' && first && second && third) {
+      else if (sub === 'lengths' && first) {
+        const lengths = await store.textLengths(first);
+        if (!lengths) throw new CompanyError('not_found', `project ${first} not found`);
+        print({ action: 'project lengths', project: first, ...lengths });
+      } else if (sub === 'check' && first) {
+        const input = JSON.parse(readFileSync(first, 'utf8')) as ProjectInput;
+        print({ action: 'project check', ...(await store.checkInput(input)) });
+      } else if (sub === 'broker' && first && second && third) {
         await store.setBroker(first, second, JSON.parse(readFileSync(third, 'utf8')));
         print({ action: 'project broker', project: first, env: second, ok: true });
       } else throw new Error(usage);
