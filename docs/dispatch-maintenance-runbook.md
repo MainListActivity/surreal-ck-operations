@@ -181,7 +181,7 @@ sh "$SCK" call dispatch_audit '{"operationId":"<dispatch_pause 或 dispatch_rest
 | dispatch_status | 无 | paused、epoch、changedAt、runningPasses（最多 50 条，含 instance、epoch、startedAt）、oldRunning |
 | dispatch_pause | expectedEpoch 为非负整数；reason 为 2 至 500 字；idempotencyKey 为 8 至 200 字符；drainTimeoutSeconds 为 10 至 900，默认 120 | operationId、operation、paused、epoch、before、drained（含 drained、blocking、waitedMs，或为 null）、replayed |
 | dispatch_restore | 同上，不含 drainTimeoutSeconds | 同上，drained 为 null，不排空 |
-| dispatch_audit | operationId 为 8 至 100 字符（dispatch_pause 或 dispatch_restore 返回值，形如 audit:<uuid>） | action、actor、paused 与 previous_paused、epoch 与 previous_epoch、sequence、at、evidence；仅限这两类 action 的审计行 |
+| dispatch_audit | operationId 为 8 至 100 字符，必须是 dispatch_pause 或 dispatch_restore 的返回值（`type::string($audit)`，形如 audit:`<uuid>，id 部分带回点，含 audit: 前缀；回读时按去掉 audit: 与回点后的 uuid 定位该行） | action、actor、paused 与 previous_paused、epoch 与 previous_epoch、sequence、at、evidence；仅限这两类 action 的审计行 |
 
 错误码：forbidden（不是 gm，或没有 manage）；invalid（参数越界）；conflict（expectedEpoch 已过期、同一 key 的载荷不同，或并发冲突，可重试）。
 

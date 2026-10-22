@@ -72,6 +72,16 @@ run('only a gm with manage reads or changes the dispatch pause, and bad input is
   expect(await status()).toMatchObject({ paused: false, epoch: before.epoch });
 });
 
+run('the operationId an operation returns is the audit row id dispatch_audit takes back', async () => {
+  await ensureOpen();
+  const s0 = await status();
+  const first = await pause(gmA, s0.epoch, '运维标识回归', 10);
+  // type::string($audit) of the row written in the same transaction; the id part is backtick-wrapped.
+  expect(first.operationId).toMatch(/^audit:`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`$/);
+  await expect(core.dispatchAudit(gmA, first.operationId)).resolves.toMatchObject({ operationId: first.operationId, action: 'dispatch_pause' });
+  await restore(gmA, first.epoch);
+});
+
 run('compare-and-set: a stale or future epoch conflicts and changes nothing; a second gm cannot overwrite the first', async () => {
   await ensureOpen();
   const s0 = await status();
@@ -391,7 +401,7 @@ run('H1 fail closed on the fork: live-pid row and cross-host row both stay runni
     const bad = await passLedger(db.db, malformed).begin();
     const summary = await reapStaleRunningPasses(db.db);
     expect(summary.reaped).toBe(0);
-    const rows = await db.db.query<Array<{ instance: string; state: string }>>(
+    const [rows] = await db.db.query<[Array<{ instance: string; state: string }>]>(
       'SELECT instance, state FROM dispatch_pass WHERE instance IN [$a, $b, $c] ORDER BY instance;',
       { a: liveInstance, b: foreignInstance, c: malformed });
     expect(rows.map(r => r.state)).toEqual(['running', 'running', 'running']);

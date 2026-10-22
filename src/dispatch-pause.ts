@@ -53,6 +53,8 @@ export interface PauseWrite {
 }
 
 export interface PauseResult {
+  /** The maintenance operation's audit id as `type::string($audit)` renders it, e.g. audit:`<uuid>` (id part backticked);
+   * dispatch_audit takes this exact string back. */
   operationId: string;
   operation: 'dispatch_pause' | 'dispatch_restore';
   paused: boolean;

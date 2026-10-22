@@ -1981,7 +1981,9 @@ export class SurrealCompanyCore implements CompanyCore {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Dispatch audit is gm only');
     requireText(operationId, 'operationId', 8, 100);
-    const idPart = operationId.startsWith('audit:') ? operationId.slice('audit:'.length) : operationId;
+    // type::string($audit) renders the id backticked (audit:`<uuid>`), so strip the prefix and the backticks:
+    // the string dispatch_pause returned must select the row PAUSE_TXN actually wrote.
+    const idPart = operationId.replace(/^audit:/, '').replaceAll('`', '');
     const row = await this.db.select<Record<string, unknown>>(id('audit', idPart));
     const action = row?.action;
     if (action !== 'dispatch_pause' && action !== 'dispatch_restore') {

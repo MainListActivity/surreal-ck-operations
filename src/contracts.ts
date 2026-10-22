@@ -796,7 +796,8 @@ export interface CompanyCore {
   setDispatchPause(credential: Credential, input: DispatchPauseInput): Promise<DispatchPauseView>;
   /** gm (manage): read-only pause state, its epoch and the dispatch passes still running. */
   dispatchStatus(credential: Credential): Promise<DispatchStatusView>;
-  /** gm (manage): read the audit row of one maintenance operation by the operationId its pause/restore returned. */
+  /** gm (manage): read the audit row of one maintenance operation by the operationId its pause/restore returned
+   * (`type::string($audit)`, e.g. audit:`<uuid>`); only dispatch_pause/dispatch_restore rows are reachable. */
   dispatchAudit(credential: Credential, operationId: string): Promise<DispatchAuditView>;
   /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
   updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string; roles?: Role[] }> }): Promise<ProjectView>;
