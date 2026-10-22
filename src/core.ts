@@ -25,7 +25,7 @@ import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBS
 import { CompanyError } from './core-errors.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
-import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts } from './dispatcher/dispatch-blocked.ts';
+import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople } from './dispatcher/dispatch-blocked.ts';
 import { readGoalRootFacts } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
@@ -3446,7 +3446,22 @@ export class SurrealCompanyCore implements CompanyCore {
       let facts: GoalRootFacts | undefined;
       if (verdictRoot && this.workforce) {
         try {
-          facts = await readGoalRootFacts(this.db, this.workforce, [verdictRoot.taskId], message => console.warn(message));
+          const readFacts = await readGoalRootFacts(this.db, this.workforce, [verdictRoot.taskId], message => console.warn(message));
+          // B1 isolation (QA review R1): readGoalRootFacts reads the whole company's unfinished-task graph, and the owner
+          // pulse may see all of it. The QA channel may see only the scope goal, so the graph is narrowed here — keys and
+          // dependency edges — before the shared evaluator walks it. goalRootBlockers/waitingBehind stay unchanged, so the
+          // owner-facing conclusion is untouched; a task of another goal that waits on this root neither appears in the
+          // payload nor inflates the impact count.
+          const dependencies = new Map<string, string[]>();
+          for (const [task, deps] of readFacts.dependencies) {
+            if (!goalIds.has(task)) continue;
+            dependencies.set(task, deps.filter(dep => goalIds.has(dep)));
+          }
+          const titles = new Map<string, string>();
+          for (const [task, title] of readFacts.titles) if (goalIds.has(task)) titles.set(task, title);
+          const people = new Map<string, GoalRootPeople>();
+          for (const [task, value] of readFacts.people) if (goalIds.has(task)) people.set(task, value);
+          facts = { dependencies, titles, people };
         } catch (error) {
           console.warn(`qa goal root facts failed: ${(error as Error).message}`);
           facts = undefined;

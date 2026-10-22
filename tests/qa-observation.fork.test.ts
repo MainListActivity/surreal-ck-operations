@@ -264,13 +264,32 @@ fork('F2: goal summary carries the root blocker, impact, dependency path and sub
   expect(root?.taskId).toBe(subjectId);
   expect(root?.factsAvailable).toBe(true);
   expect(root?.impact).toBeGreaterThanOrEqual(1);
-  expect(root?.dependencyPath?.some(step => step.taskId === subjectId)).toBe(true);
-  expect(root?.dependencyPath?.some(step => step.taskId === downstream.id)).toBe(true);
+  // waitingBehind returns one deepest chain (bounded at 8), and a goal's own anchor chain can be as deep as the hand-made
+  // downstream: assert the stable contract — the chain starts at the root and stays within the goal — instead of one branch.
+  expect(root?.dependencyPath?.[0]?.taskId).toBe(subjectId);
+  expect(root?.dependencyPath?.length ?? 0).toBeGreaterThanOrEqual(1);
+  expect(root?.dependencyPath?.length ?? 0).toBeLessThanOrEqual(8);
   expect(root?.noticeKey).toContain('no_candidate');
   expect(root?.checkedAt).toBe(at);
   expect(root?.reasons[0]?.nextTrigger).toBe('新增编制或员工');
   expect(root?.reasons[0]?.basis).toBe('tick:staffing-pool');
   expect(root?.reasons[0]?.actions?.[0]?.tool).toBe('def_ensure');
+  // B1 isolation (QA review R1): a task of another goal that depends on this goal's root must neither surface in the QA
+  // payload nor inflate the impact count.
+  const beforeImpact = root?.impact;
+  const foreignGoal = await owner.createGoal({ text: '外部目标（QA scope 之外）', source: 'owner:test', key: key(), tier: 'quick' });
+  const foreignTask = await core.createTask(tokens.gm, {
+    goalId: foreignGoal.id, title: 'SECRET_FOREIGN_GOAL_TASK', context: '外部目标任务，依赖本目标根，但不得出现在 QA payload。',
+    executorRole: 'engineering', reviewerRole: 'product', kind: 'task',
+    dependencies: [subjectId, downstream.id], idempotencyKey: key(),
+  });
+  const isolated = await factsCore.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });
+  const serializedGoal = JSON.stringify(isolated.goal);
+  expect(serializedGoal).not.toContain(foreignTask.id);
+  expect(serializedGoal).not.toContain('SECRET_FOREIGN_GOAL_TASK');
+  expect(serializedGoal).not.toContain(foreignGoal.id);
+  expect(isolated.goal?.root?.factsAvailable).toBe(true);
+  expect(isolated.goal?.root?.impact).toBe(beforeImpact);
   // The bare core has no workforce: facts are unavailable, and impact/path/people are omitted rather than reported as zero.
   const bare = await core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });
   expect(bare.goal?.root?.factsAvailable).toBe(false);
