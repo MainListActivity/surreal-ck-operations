@@ -171,6 +171,7 @@ export function openLeaseOf(holder: string | null | undefined, state: string | n
 /** The facts and the task version they were read at. `version` is undefined when the task does not exist. */
 export interface ContributionView {
   facts: ContributionFacts;
+  checkedAt?: string;
   version?: number;
   /** The task's state, open holder and explicit implementer, read in the same transaction as the facts (retirement gate). */
   state?: string;
@@ -179,6 +180,7 @@ export interface ContributionView {
 }
 
 interface ContributionRead {
+  checkedAt?: string | null;
   implementer?: string | null;
   version?: number | null;
   state?: string | null;
@@ -193,9 +195,10 @@ interface ContributionRead {
  */
 export async function readContributionView(db: Surreal, taskId: string): Promise<ContributionView> {
   const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
+    LET $at = time::now();
     LET $row = SELECT implementer, version, state, current_employee AS holder FROM ONLY $task;
     LET $rows = SELECT action, actor, phase, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at ASC;
-    RETURN { read: { implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, rows: $rows } };
+    RETURN { read: { checkedAt: <string>$at, implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, rows: $rows } };
     COMMIT TRANSACTION;`,
   { task: new RecordId('task', taskId), actions: [...CONTRIBUTION_ACTIONS] }).responses();
   const found = responses.every(response => response.success)
@@ -213,6 +216,7 @@ export async function readContributionView(db: Surreal, taskId: string): Promise
   const open = openLeaseOf(read.holder, read.state);
   return {
     facts: deriveContributors(events, read.implementer ?? undefined, open),
+    checkedAt: read.checkedAt ?? undefined,
     version: typeof read.version === 'number' ? read.version : undefined,
     state: read.state ?? undefined,
     holder: read.holder ?? undefined,

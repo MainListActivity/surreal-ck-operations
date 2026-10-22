@@ -13,7 +13,7 @@ import { Dispatcher, quotaBlockedProviders, roleCapacity, type DispatchSnapshot 
 import { dispatchBlockedRows, goalBlockerRows } from '../src/dispatcher/dispatch-list.ts';
 import { rosterAnswer } from '../src/dispatcher/roster-answer.ts';
 import { pulseAnswer } from '../src/dispatcher/pulse-answer.ts';
-import { readGoalRootFacts } from '../src/dispatcher/goal-roots.ts';
+import { readGoalWorkflowWaitSnapshot } from '../src/dispatcher/goal-roots.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { deriveContributors, contributionTimeline, openLeaseOf, proposeImplementer, type ContributionEvent } from '../src/contributors.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
@@ -174,9 +174,9 @@ const snapshotOfTask = async (w: Fork, taskId: string) => {
 /** The roster and pulse views of one pass, built the way the plugin builds them: the same snapshot and the same bounded answers. */
 async function ownerViews(w: Fork, snapshot: DispatchSnapshot, roots: string[]) {
   // The pulse reads the goal-root facts the way plugin/server/handlers.ts does: a failed read keeps the verdict-only card.
-  let facts: Awaited<ReturnType<typeof readGoalRootFacts>> | undefined;
+  let facts: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>>['facts'] | undefined;
   let factsError: string | undefined;
-  try { facts = await readGoalRootFacts(w.db.db, w.wf, roots); } catch (error) { factsError = (error as Error).message; }
+  try { facts = (await readGoalWorkflowWaitSnapshot(w.db.db, w.wf, { roots })).facts; } catch (error) { factsError = (error as Error).message; }
   const entryView = (e: DispatchSnapshot['reviewPools'][number]['entries'][number]) =>
     ({ key: e.key, kind: e.kind, eligible: e.eligible, code: e.code, reason: e.reason, provider: e.provider, role: e.role, weight: e.weight, share: e.share });
   const roster = rosterAnswer({ paused: false, opsRepo: w.dir, usage: [], defs: [], instances: [], health: [],
@@ -186,7 +186,9 @@ async function ownerViews(w: Fork, snapshot: DispatchSnapshot, roots: string[]) 
     dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined });
   const pulse = pulseAnswer({ at: new Date().toISOString(), dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined,
     paused: false, doing: [], ready: [], dispatchBlocked: dispatchBlockedRows(snapshot.verdicts),
-    goalBlockers: goalBlockerRows(snapshot.verdicts, facts), stuck: [], waiting: [], recentDone: [], goals: [], resources: [],
+    goalBlockers: goalBlockerRows(snapshot.verdicts, facts), workflowWaits: [],
+    workflowWaitSummary: { source: 'workflow-graph', available: false, totalRoots: 0, truncated: false, reason: 'test fixture' },
+    stuck: [], waiting: [], recentDone: [], goals: [], resources: [],
     last24h: {}, churn: {} });
   return { roster, pulse, facts, factsError };
 }

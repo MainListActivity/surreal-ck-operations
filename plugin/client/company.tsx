@@ -340,6 +340,11 @@ const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unkn
   })),
 }));
 
+const workflowWaitStateOf = (v: unknown): "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown" =>
+  v === "ready" || v === "doing" || v === "review" || v === "blocked" || v === "done" || v === "void" ? v : "unknown";
+const workflowWaitKindOf = (v: unknown): "dependency" | "manager" | "owner" | "active_lease" | "unknown" =>
+  v === "dependency" || v === "manager" || v === "owner" || v === "active_lease" ? v : "unknown";
+
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
   const o = (raw ?? {}) as Record<string, unknown>;
@@ -380,6 +385,29 @@ export function normalizePulse(raw: unknown): Pulse {
       people: goalPeople(b.people),
       reasons: reasonRows(b.reasons),
     })),
+    workflowWaits: arr<Record<string, unknown>>(o.workflowWaits).map(w => {
+      const people = w.people && typeof w.people === "object" ? w.people as Record<string, unknown> : undefined;
+      return {
+        goalId: str(w.goalId) || undefined, taskId: str(w.taskId), title: str(w.title),
+        workflowState: workflowWaitStateOf(w.workflowState), kind: workflowWaitKindOf(w.kind),
+        basis: str(w.basis), waitingForRole: str(w.waitingForRole), nextTrigger: str(w.nextTrigger), goalRootCount: num(w.goalRootCount),
+        impact: typeof w.impact === "number" && Number.isFinite(w.impact) ? w.impact : undefined,
+        dependencyPath: arr<Record<string, unknown>>(w.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
+        unknownReason: str(w.unknownReason) || undefined, dependencyPathTruncated: w.dependencyPathTruncated === true,
+        people: people ? { implementer: str(people.implementer) || undefined, authors: arr<unknown>(people.authors).map(str),
+          reviewers: arr<unknown>(people.reviewers).map(str), submitter: str(people.submitter) || undefined,
+          submitCommit: str(people.submitCommit) || undefined, peopleOmitted: num(people.peopleOmitted) || undefined } : undefined,
+        peopleSource: str(w.peopleSource) || undefined, submitterSource: str(w.submitterSource) || undefined,
+        submitCommitSource: str(w.submitCommitSource) || undefined, peopleCheckedAt: str(w.peopleCheckedAt) || undefined,
+        submitCheckedAt: str(w.submitCheckedAt) || undefined,
+      };
+    }),
+    workflowWaitSummary: (() => {
+      const summary = (o.workflowWaitSummary ?? {}) as Record<string, unknown>;
+      return { source: "workflow-graph" as const, available: summary.available === true,
+        checkedAt: str(summary.checkedAt) || undefined, totalRoots: num(summary.totalRoots), truncated: summary.truncated === true,
+        reason: str(summary.reason) || undefined };
+    })(),
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
       taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", workflowState: workflowOf(v.workflowState), summary: str(v.summary),
@@ -388,7 +416,7 @@ export function normalizePulse(raw: unknown): Pulse {
       reasons: reasonRows(v.reasons),
     })),
     bounds: {
-      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), ready: bound(marks.ready),
+      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), workflowWaits: bound(marks.workflowWaits), ready: bound(marks.ready),
       doing: bound(marks.doing), stuck: bound(marks.stuck), waiting: bound(marks.waiting), recentDone: bound(marks.recentDone),
       goals: bound(marks.goals), resources: bound(marks.resources),
     },
@@ -397,6 +425,8 @@ export function normalizePulse(raw: unknown): Pulse {
 
 /** The workflow state of a blocked item, in the owner's words. */
 const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
+const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "经理关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
+const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
 /** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
 const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
 
@@ -446,6 +476,29 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
             <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
           </View>
         ))}
+      </Section>
+      <Section title="目标工作流等待" count={p.workflowWaitSummary.totalRoots} ctx={ctx}>
+        {!p.workflowWaitSummary.available ? (
+          <Text style={s.muted}>等待图不可读：{p.workflowWaitSummary.reason ?? "未知"}</Text>
+        ) : p.workflowWaits.length === 0 && p.workflowWaitSummary.totalRoots > 0 ? (
+          <Text style={s.muted}>等待根 {p.workflowWaitSummary.totalRoots} 个，均未纳入本页字节预算；见下方截断说明。</Text>
+        ) : p.workflowWaits.length === 0 ? (
+          <Text style={s.muted}>当前没有已识别的目标等待根。</Text>
+        ) : p.workflowWaits.map(root => (
+          <View key={`${root.goalId ?? ""}:${root.taskId}`} style={s.card}>
+            <Text style={s.text}>{WAIT_KIND_LABEL[root.kind]} · {root.title}</Text>
+            <Text style={s.muted}>工作流 {WAIT_STATE_LABEL[root.workflowState]} · 处理岗位 {root.waitingForRole || "未知"} · 根数 {root.goalRootCount}{root.impact !== undefined ? ` · 影响 ${root.impact} 项` : " · 影响未知"}</Text>
+            <Text style={s.muted}>依据 {root.basis || "未知"} · 下一触发 {root.nextTrigger || "未知"}{root.unknownReason ? ` · ${root.unknownReason}` : ""}</Text>
+            {root.dependencyPath && root.dependencyPath.length > 0 && <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(item => item.title).join(" → ")}{root.dependencyPathTruncated ? " · 路径已截断" : ""}</Text>}
+            {root.people && <Text style={s.muted}>人物来源 {root.peopleSource ?? "未知"} · 实现者 {root.people.implementer ?? "未绑定"} · 作者 {root.people.authors.join("、") || "未记录"} · 复核者 {root.people.reviewers.join("、") || "未记录"}{root.people.peopleOmitted ? ` · 另有 ${root.people.peopleOmitted} 人未列出` : ""}</Text>}
+            {(root.people?.submitter || root.people?.submitCommit) && <Text style={s.muted}>提交人 {root.people.submitter ?? "未记录"}（{root.submitterSource ?? "来源未知"}） · 提交 SHA {root.people.submitCommit ?? "未记录"}（{root.submitCommitSource ?? "来源未知"}）</Text>}
+            {root.peopleCheckedAt && <Text style={s.muted}>人物来源采集于 {clockOf(root.peopleCheckedAt)}</Text>}
+            {root.submitCheckedAt && <Text style={s.muted}>提交审计采集于 {clockOf(root.submitCheckedAt)}</Text>}
+          </View>
+        ))}
+        {p.workflowWaitSummary.available && <Text style={s.muted}>来源 workflow-graph · 采集于 {clockOf(p.workflowWaitSummary.checkedAt ?? "")}{p.dispatchAt ? ` · dispatcher pass ${clockOf(p.dispatchAt)}` : " · dispatcher pass 未记录"}</Text>}
+        {p.workflowWaitSummary.truncated || p.bounds.workflowWaits.truncated ? <Text style={s.muted}>等待根列表已截断：显示 {p.bounds.workflowWaits.shown} / {p.workflowWaitSummary.totalRoots}{p.bounds.workflowWaits.shown === 0 ? "（单项超出本页字节份额，见下方说明）" : ""}。</Text> : null}
+        {p.workflowWaits.some(root => root.kind === "active_lease") && <Text style={s.muted}>活租约中的复核任务来自独立工作流图，可能未纳入最近 dispatcher pass；这不表示不可派工。</Text>}
       </Section>
       <Section title="就绪待领" count={p.ready.length} ctx={ctx}>
         {p.ready.length === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}

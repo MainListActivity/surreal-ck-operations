@@ -157,3 +157,21 @@ test('F2: the goal page renders root blocker, impact, dependency path, notice an
   expect(unknownPage).toContain('未知（事实不可读）');
   expect(unknownPage).not.toContain('影响 0 项');
 });
+
+test('F3: an empty waits list with roots present is a budget cut, not an empty goal; a real empty goal still says so', async () => {
+  const waitsPage = async (waits: unknown) => (await createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
+    qaObservationRead: async (_a: any, input: any) => ({ meta: { scope, completeness: { dispatchComplete: true } },
+      goal: { id: input.goalId, total: 5, states: { blocked: 3 }, dispatchComplete: true, undispatchable: 0,
+        dispatchCheckedAt: '2026-10-22T00:19:00Z', waits } }),
+  } }) as any })(new Request('http://x/q/?goal=1', { headers: { cookie } }))).text();
+  const cut = await waitsPage({ source: 'workflow-graph', available: true, checkedAt: '2026-10-22T00:20:00Z',
+    totalRoots: 3, shownRoots: 0, truncated: true, budgetLimited: true, roots: [] });
+  expect(cut).toContain('本页字节预算未保留任何一条');
+  expect(cut).toContain('为响应字节预算收缩');
+  expect(cut).toContain('显示 0 / 3');
+  expect(cut).not.toContain('当前目标没有已识别的工作流等待根');
+  const empty = await waitsPage({ source: 'workflow-graph', available: true, checkedAt: '2026-10-22T00:20:00Z',
+    totalRoots: 0, shownRoots: 0, truncated: false, roots: [] });
+  expect(empty).toContain('当前目标没有已识别的工作流等待根');
+  expect(empty).not.toContain('本页字节预算未保留任何一条');
+});

@@ -8,7 +8,7 @@ import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
-import { readContributors, type ContributionFacts } from './contributors.ts';
+import { readContributors, readContributionView, type ContributionFacts } from './contributors.ts';
 import { gateCredentialChange } from './retirement.ts';
 
 /**
@@ -586,8 +586,9 @@ export class Workforce {
   }
 
   /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */
-  async contributors(taskId: TaskId): Promise<ContributionFacts> {
-    return readContributors(this.db, taskId);
+  async contributors(taskId: TaskId): Promise<ContributionFacts & { checkedAt?: string }> {
+    const view = await readContributionView(this.db, taskId);
+    return { ...view.facts, checkedAt: view.checkedAt };
   }
 
   /** Persists or clears a task's open dispatch-blocked episode (phase and start, unix seconds). */
