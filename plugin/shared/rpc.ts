@@ -192,3 +192,47 @@ export const answerPermission = defineRpc({
   }),
   output: z.object({ ok: z.boolean() }),
 });
+
+export const qaLogin = defineRpc({
+  name: "company.qa.login",
+  input: z.object({ code: z.string().min(10).max(500) }),
+  output: record<Record<string, unknown>>(),
+});
+
+export const qaRead = defineRpc({
+  name: "company.qa.read",
+  input: z.object({
+    token: z.string().min(10).max(500),
+    scopeId: z.string().min(1).max(200).optional(),
+    taskId: z.string().min(1).max(200).optional(),
+    goalId: z.string().min(1).max(100).optional(),
+  }),
+  output: record<Record<string, unknown>>(),
+});
+
+export const qaTimeline = defineRpc({
+  name: "company.qa.timeline",
+  input: z.object({
+    token: z.string().min(10).max(500),
+    scopeId: z.string().min(1).max(200).optional(),
+    taskId: z.string().min(1).max(200),
+    pageSize: z.number().int().min(1).max(100).optional(),
+    cursor: z.string().min(1).max(2048).optional(),
+  }),
+  output: record<Record<string, unknown>>(),
+});
+
+export const qaText = defineRpc({
+  name: "company.qa.text",
+  input: z.object({
+    token: z.string().min(10).max(500),
+    scopeId: z.string().min(1).max(200).optional(),
+    taskId: z.string().min(1).max(200),
+    field: z.enum(["context", "evidence"]),
+    auditId: z.string().min(1).max(200).optional(),
+    offset: z.number().int().min(0).max(1_000_000_000).optional(),
+    limit: z.number().int().min(4).max(24576).optional(),
+    expectSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  }),
+  output: record<Record<string, unknown>>(),
+});

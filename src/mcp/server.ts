@@ -1,3 +1,5 @@
+import { basename } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
@@ -457,6 +459,78 @@ function registerTools(server: McpServer, core: CompanyCore) {
       })).max(50),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.recordScore(token(ctx), input)));
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
+  const qaRelease = (): string | undefined => {
+    try { return process.env.SCK_RELEASE ?? basename(realpathSync(process.cwd())); } catch { return undefined; }
+  };
+  const withRelease = <T extends { meta: object }>(value: T): T => {
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+  };
+  server.registerTool('qa_observation_grant', {
+    description: 'gm only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100), deploymentTaskId: z.string().min(1).max(200),
+      qaEmployee: z.string().min(1).max(200), leaseFence: z.number().int().positive(),
+      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
+      expiresAt: z.string().min(10).max(40), reason: z.string().min(8).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationGrant
+    ? core.qaObservationGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_revoke', {
+    description: 'gm only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
+    ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_status', {
+    description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
+    ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_session', {
+    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the company page (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the page exchanges it for a 30-minute read-only session.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish() }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationSession
+    ? core.qaObservationSession(token(ctx), { ...(input.scopeId ? { scopeId: input.scopeId } : {}) }) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_read', {
+    description: 'qa only (the scope must still bind the live QA review lease holder and fence): read one allowlisted subject of the scope. A task subject returns its full state (a long context is omitted and flagged, read it with qa_observation_text), contribution facts with unknown rows fail-closed, the last dispatcher pass\'s verdicts and all reasons for the task, and checkedAt/dataSource/instanceAt/runtimeRelease/scope/completeness. A goal subject returns the controlled goal summary only. Read-only; no task text of unlisted tasks is ever returned.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationRead) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationRead({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.goalId ? { goalId: input.goalId } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_timeline', {
+    description: 'qa only: one stored page of an allowlisted task\'s audit history (newest-first pages, oldest-first within a page), within the 48 KiB budget. Evidence too large for a page is cut and flagged; read it whole with qa_observation_text. Continue with page.nextCursor until page.hasMore is false; a cursor is bound to the scope, task and caller.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationTimeline) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationTimeline({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId,
+      ...(input.pageSize !== undefined && input.pageSize !== null ? { pageSize: input.pageSize } : {}),
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_text', {
+    description: 'qa only: one byte segment of an allowlisted task\'s context or one audit entry\'s evidence. Returns the whole text\'s size and SHA-256; a segment past offset 0 requires expectSha256 from the first segment, so a changed text is refused instead of mixed. Segments never split a character.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200),
+      field: z.enum(['context', 'evidence']), auditId: z.string().min(1).max(200).nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(), limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationText) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationText({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId, field: input.field,
+      ...(input.auditId ? { auditId: input.auditId } : {}),
+      ...(input.offset !== undefined && input.offset !== null ? { offset: input.offset } : {}),
+      ...(input.limit !== undefined && input.limit !== null ? { limit: input.limit } : {}),
+      ...(input.expectSha256 ? { expectSha256: input.expectSha256 } : {}),
+    }));
+  }));
 }
 
 export function createMcpHttpService(options: McpServiceOptions) {
@@ -595,4 +669,6 @@ export function createMcpHttpService(options: McpServiceOptions) {
     port: server.port,
     async close() { await handler.close(); server.stop(); },
   };
+
+
 }

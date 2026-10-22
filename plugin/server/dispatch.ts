@@ -257,6 +257,27 @@ export function startDispatch(server: PluginServerContext): () => void {
   });
 
 /** Removes leftovers the task-scoped artifact reclaim never sees; never touches task evidence. */
+let lastObservation = '';
+/**
+ * Persist the last dispatch pass's verdicts for the QA observation channel (SYS-DISP 7454fc89). The MCP service
+ * runs in another process and cannot see the dispatcher's memory, so this bounded copy is what makes the QA read
+ * and the company page report the same conclusion the tick acted on. A failed write never fails the tick: the QA
+ * read then reports the observation as unavailable, never a fabricated verdict.
+ */
+async function persistDispatchObservation(ctx: Company): Promise<void> {
+  const snapshot = ctx.dispatcher.dispatchSnapshot();
+  if (!snapshot.at) return;
+  const at = new Date(snapshot.at).toISOString();
+  let verdicts = snapshot.verdicts.slice(0, 120).map(v => ({ ...v, reasons: v.reasons.slice(0, 30) }));
+  while (verdicts.length > 0 && Buffer.byteLength(JSON.stringify({ at, verdicts })) > 40 * 1024) {
+    verdicts = verdicts.slice(0, Math.max(1, Math.floor(verdicts.length / 2)));
+  }
+  const json = JSON.stringify({ at, verdicts });
+  if (json === lastObservation) return;
+  lastObservation = json;
+  await ctx.db.db.query("UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts };", { at, verdicts });
+}
+
 async function runLifecycleGc(ctx: Company): Promise<void> {
   const cfg = await ctx.workforce.config();
   const now = new Date();
@@ -309,6 +330,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           await runLifecycleGc(ctx).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
         const report = await ctx.dispatcher.tick();
+        await persistDispatchObservation(ctx).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||

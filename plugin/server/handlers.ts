@@ -1,3 +1,5 @@
+import { basename, join } from "node:path";
+import { realpathSync } from "node:fs";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { RpcInput } from "@getpaseo/plugin";
 import { spawn } from "node:child_process";
@@ -433,4 +435,45 @@ export function registerHandlers(server: PluginServerContext): void {
     });
     return { ok: true };
   });
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89）：只读会话，不暴露 owner token/员工凭证 ----
+  const qaRelease = (): string | undefined => {
+    try { return basename(realpathSync(join(serviceHome(), "active"))); } catch { return undefined; }
+  };
+  server.handle(rpc.qaLogin, async (input: RpcInput<typeof rpc.qaLogin>) => {
+    const { core } = await company();
+    if (!core.qaObservationLogin) throw new Error("QA observation login is unavailable");
+    return await core.qaObservationLogin(input.code) as unknown as Record<string, unknown>;
+  });
+  server.handle(rpc.qaRead, async (input: RpcInput<typeof rpc.qaRead>) => {
+    const { core } = await company();
+    if (!core.qaObservationRead) throw new Error("QA observation read is unavailable");
+    const value = await core.qaObservationRead({ token: input.token }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.goalId ? { goalId: input.goalId } : {}),
+    });
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as unknown as Record<string, unknown>;
+  });
+  server.handle(rpc.qaTimeline, async (input: RpcInput<typeof rpc.qaTimeline>) => {
+    const { core } = await company();
+    if (!core.qaObservationTimeline) throw new Error("QA observation timeline is unavailable");
+    const value = await core.qaObservationTimeline({ token: input.token }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId,
+      ...(input.pageSize !== undefined ? { pageSize: input.pageSize } : {}), ...(input.cursor ? { cursor: input.cursor } : {}),
+    });
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as unknown as Record<string, unknown>;
+  });
+  server.handle(rpc.qaText, async (input: RpcInput<typeof rpc.qaText>) => {
+    const { core } = await company();
+    if (!core.qaObservationText) throw new Error("QA observation text is unavailable");
+    const value = await core.qaObservationText({ token: input.token }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId, field: input.field,
+      ...(input.auditId ? { auditId: input.auditId } : {}), ...(input.offset !== undefined ? { offset: input.offset } : {}),
+      ...(input.limit !== undefined ? { limit: input.limit } : {}), ...(input.expectSha256 ? { expectSha256: input.expectSha256 } : {}),
+    });
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as unknown as Record<string, unknown>;
+  });
+
 }
