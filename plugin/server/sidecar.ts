@@ -4,6 +4,7 @@
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
+import { OpsCircuit } from "./ops-circuit";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -118,7 +119,8 @@ export class SidecarPool {
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
   private readonly denials = new Map<string, string>();
-  constructor(private readonly deps: SidecarDeps) {}
+  private readonly opsCircuit: OpsCircuit;
+  constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
@@ -681,7 +683,14 @@ export class SidecarPool {
     if (gateway) {
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;
-      return gateway.call(cred, live().taskId, tool, rest);
+      const claim = live();
+      if (gateway !== ops) return gateway.call(cred, claim.taskId, tool, rest);
+      return this.opsCircuit.run({ employee: instId, task: claim.taskId, delivery: claim.proof.deliveryId, tool,
+        check: () => { live(); }, invoke: () => gateway.call(cred, claim.taskId, tool, rest),
+        block: text => writeOp(proof => core.block(cred, proof, "gm", {
+          text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${tool}`,
+        }), true),
+      });
     }
     switch (tool) {
       case "list_worktrees": return withinReplyCeiling(async () => {

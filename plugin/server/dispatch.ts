@@ -1,3 +1,4 @@
+import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { settleCompanyTurn } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
@@ -322,13 +323,19 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     }
   }
   if (cfg.scratchGraceHours > 0) {
-    const scratch = await sweepInstanceDirs({
-      root: join(dirname(commRoot), "scratch"), now, graceMs: cfg.scratchGraceHours * 3_600_000, keep: ctx.sidecar.liveInstanceIds(),
-    });
-    if (scratch.removed.length) {
-      console.log(`lifecycle gc scratch: removed ${scratch.removed.length} dirs (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
-    }
+    // Failure to read either source retains scratch for this pass. A stale root
+    // mtime alone is never authority to remove a still-open or registered tree.
+    try {
+      const [paths] = await ctx.db.db.query<[Array<{ path: string; repo?: string }>]>("SELECT path, repo FROM worktree;");
+      const open = await openUserPaths();
+      const scratch = await sweepInstanceDirs({
+        root: join(dirname(commRoot), "scratch"), now, graceMs: cfg.scratchGraceHours * 3_600_000,
+        keep: ctx.sidecar.liveInstanceIds(), protect: path => scratchKeepReason(path, { registered: paths.map(p => p.path).filter(Boolean), open, mergedRepos: [...new Set(paths.map(p => p.repo).filter((p): p is string => !!p))], activeAfterMs: now.getTime() - cfg.scratchGraceHours * 3_600_000 }),
+      });
+      if (scratch.removed.length || scratch.failed?.length) console.log(`lifecycle gc scratch: removed ${scratch.removed.length}, failed ${scratch.failed?.length ?? 0}, kept ${scratch.skipped} (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
+    } catch { console.warn("lifecycle gc scratch retained: reference/process inspection unavailable"); }
   }
+
   if (cfg.archiveRetentionDays > 0) {
     const arch = await sweepArchiveBatches({
       root: join(serviceHome(), "archive"), now, retentionMs: cfg.archiveRetentionDays * 86_400_000,
@@ -384,6 +391,11 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
   // instead of waiting out the poll interval.
   const kick = () => { if (!stopped && running) wake?.(); };
   const removers = [
+    server.on("agent.turn_started", (event, { paseo }) => {
+      void isCompanyAgent(paseo, event.agent).then(async ok => {
+        if (ok) await (await company()).workforce.clearIdleForAgent(event.agent.id);
+      }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
+    }),
     server.on("agent.turn_ended", (event, { paseo }) => {
       paseoHandle = paseo;
       void isCompanyAgent(paseo, event.agent).then(async ok => {
