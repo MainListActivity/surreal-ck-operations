@@ -441,6 +441,19 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.setIndependence(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('identity_principal_set', {
+    description: 'Manager (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      principalId: z.string().min(1).max(200).optional(),
+      employees: z.array(z.string().min(1).max(200)).min(1).max(20),
+      reason: z.string().min(8).max(2000),
+      expectedVersion: z.number().int().positive().optional(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIdentityPrincipal
+    ? core.setIdentityPrincipal(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('task_project_update', {
     description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({

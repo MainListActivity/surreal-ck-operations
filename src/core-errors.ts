@@ -7,7 +7,8 @@ export class CompanyError extends Error {
     readonly retryable = false,
     /** Structured facts a caller can act on: the retirement gate's reasons and legal actions, independence conflicts
      * (task, source, employee). Never credentials. */
-    readonly details?: unknown,  ) {
+    readonly details?: unknown,
+  ) {
     super(message);
     this.name = 'CompanyError';
   }

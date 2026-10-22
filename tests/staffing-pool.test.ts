@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
-import { executeGateFor, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
+import { executeGateFor, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
+import { buildIndependenceIndex } from '../src/independence.ts';
+import { deriveContributors } from '../src/contributors.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 import type { ProviderQuota } from '../src/contracts.ts';
 
@@ -163,7 +165,7 @@ test('pool: review hard-excludes every author; other candidates keep their full 
     defs: [d], insts: [author, reviewer, fresh],
     states: new Map([['eng-author', 'idle'], ['eng-reviewer', 'idle'], ['eng-fresh', 'idle']]),
     task, excludeSubmitter: true,
-    recusal: { authors: new Set(['eng-author', 'eng-rework']) },
+    recusal: { authors: new Set(['eng-author', 'eng-rework']), hands: new Set() },
   }));
   const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
   expect(by.get('eng-author')!.eligible).toBe(false);
@@ -172,6 +174,33 @@ test('pool: review hard-excludes every author; other candidates keep their full 
   expect(by.get('eng-reviewer')!.eligible).toBe(true);
   expect(by.get('eng-reviewer')!.weight).toBeCloseTo(by.get('eng-fresh')!.weight);
   expect(by.get('eng-fresh')!.eligible).toBe(true);
+});
+
+// SYS-DISP IR01 (Q1): an ordinary task's plain review rule is unchanged by an independence policy elsewhere. A prior hand —
+// claimed execute, never wrote code — is demoted, not excluded, so a task never starves behind them.
+test('pool: a prior hand (claimed, never wrote code) is demoted but eligible, and a strict source excludes it outright', () => {
+  const d = def('d1');
+  const hand = inst('eng-hand');
+  const fresh = inst('eng-fresh');
+  const task = {} as StaffingInput['task'];
+  const base0: Partial<StaffingInput> = { defs: [d], insts: [hand, fresh],
+    states: new Map([['eng-hand', 'idle'], ['eng-fresh', 'idle']]), task, excludeSubmitter: true };
+  // No policy: the claim-only holder is eligible at the demoted weight (the pre-SYS-DISP rule).
+  const demoted = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) } }));
+  const byDemoted = new Map(demoted.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(byDemoted.get('eng-hand')!.eligible).toBe(true);
+  expect(byDemoted.get('eng-hand')!.weight).toBeCloseTo(byDemoted.get('eng-fresh')!.weight * PRIOR_HAND_WEIGHT_FACTOR);
+  expect(byDemoted.get('eng-hand')!.note).toContain('降权兜底');
+  // A strict independence source that names this task: the same holder is excluded outright, demotion never applies.
+  const index = buildIndependenceIndex({ policy: { mode: 'execute_handlers', excluded: [] },
+    sources: [{ taskId: 'P', facts: deriveContributors([{ action: 'claim', actor: 'eng-hand', phase: 'execute' }]) }],
+    principalOf: () => undefined });
+  const strict = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) },
+    independence: { kind: 'index', index } }));
+  const byStrict = new Map(strict.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(byStrict.get('eng-hand')!.eligible).toBe(false);
+  expect(byStrict.get('eng-hand')!.code).toBe('independence_conflict');
+  expect(byStrict.get('eng-fresh')!.eligible).toBe(true);
 });
 
 test('pool: without a recusal set (execute path or read failure) recusal is unchanged', () => {
@@ -184,7 +213,7 @@ test('pool: without a recusal set (execute path or read failure) recusal is unch
   // review 且贡献者读取失败（空集）：提交者仍由 excludeSubmitter 兜底拦住。
   const review = staffingPool(base({
     defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]),
-    task, excludeSubmitter: true, recusal: { authors: new Set<string>() },
+    task, excludeSubmitter: true, recusal: { authors: new Set<string>(), hands: new Set() },
   }));
   expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
 });

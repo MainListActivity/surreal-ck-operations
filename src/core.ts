@@ -3,7 +3,8 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence } from './contracts.ts';import { OwnerDesk } from './owner.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
+import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import type { SubmitCheck } from './pr-gate.ts';
@@ -18,7 +19,7 @@ import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type Snapsho
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
-import { normalizeIndependence, policyFault, readEmployeeDefs, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
+import { normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -258,6 +259,13 @@ export type { TaskRow };
 /** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
 function policyView(policy: IndependenceRow): IndependencePolicy {
   return { ...policy, setAt: policy.setAt instanceof Date ? policy.setAt.toISOString() : String(policy.setAt) };
+}
+
+/** A principal as the API states it, whatever the driver returned for `setAt`. */
+function principalView(principalId: string, employees: readonly string[], reason: string, setBy: string,
+  setAt: Date | string | undefined): IdentityPrincipalView {
+  return { id: principalId, employees: [...employees], reason, setBy,
+    setAt: setAt instanceof Date ? setAt.toISOString() : String(setAt ?? '') };
 }
 
 /**
@@ -1037,8 +1045,8 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Refuses `employee` when the gate excludes them: `forbidden`, with the structured conflict in `details`. Writes nothing. */
   private async refuseIndependent(gate: IndependenceGate | undefined, employee: string): Promise<void> {
     if (!gate) return;
-    const def = (await readEmployeeDefs(this.db, [employee])).get(employee);
-    await refuseIfExcluded(this.db, gate.taskId, gate.index, employee, def);
+    const principal = (await readEmployeePrincipals(this.db, [employee])).get(employee);
+    await refuseIfExcluded(this.db, gate.taskId, gate.index, employee, principal);
   }
 
   /**
@@ -2853,6 +2861,84 @@ export class SurrealCompanyCore implements CompanyCore {
       if (replayedAfterFailure) return replayedAfterFailure;
       throw error;
     }
+  }
+
+  /**
+   * Manager write of an identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several
+   * employeeIds one person for independence purposes. This is the only cross-employee identity key — a definition, provider,
+   * model, name or directory never implies it — so registering one is a deliberate, audited act with a required reason.
+   * The write sets the principal's exact employee set under a compare-and-set on the principal row, is idempotent per
+   * (key, payload), and refuses while any named employee holds a live lease: an identity is never changed under a running
+   * task. Removing an employee leaves its history rows as they are (audit facts are never rewritten).
+   */
+  async setIdentityPrincipal(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView> {
+    const actor = await this.authorized(credential, 'manage');
+    const employees = [...new Set((input.employees ?? []).filter((employee): employee is string => typeof employee === 'string'))];
+    if (employees.length === 0) throw new CompanyError('invalid', 'Invalid principal: name at least one employee');
+    if (employees.length > 20) throw new CompanyError('invalid', 'Invalid principal: at most 20 employees');
+    for (const employee of employees) requireText(employee, 'employee', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    if (input.principalId !== undefined) requireText(input.principalId, 'principalId', 1, 200);
+    if (input.expectedVersion !== undefined && (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1)) {
+      throw new CompanyError('invalid', 'Invalid expectedVersion');
+    }
+    const idem = this.idemId(actor.employeeId, 'identity_principal_set', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ principalId: input.principalId ?? '', employees, reason: input.reason,
+      expectedVersion: input.expectedVersion ?? 0 }));
+    // A new principal gets its id before the transaction, so the idempotency row and the audit row name the same id.
+    const principalId = input.principalId ?? `p_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    const replayed = await this.replayPrincipal(idem, digest, principalId, employees);
+    if (replayed) return replayed;
+    const existing = input.principalId === undefined ? undefined : await this.db.select<{ version?: number }>(id('principal', input.principalId));
+    if (input.principalId !== undefined && !existing) throw new CompanyError('not_found', `Principal not found: ${input.principalId}`);
+    const version = (existing?.version ?? 0) + 1;
+    // An identity is never changed under a running task: the lease check runs in the transaction too (see SQL).
+    for (const employee of employees) {
+      const row = await this.db.select<EmployeeRow>(id('employee', employee));
+      if (!row) throw new CompanyError('not_found', `Employee not found: ${employee}`);
+    }
+    const evidence = `${input.reason}\n[identity_principal_set] principal=${input.principalId ?? '(new)'} employees=${employees.join(',')} expectedVersion=${input.expectedVersion ?? 0}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'principal denied: actor revoked or forbidden' };
+      LET $p = SELECT * FROM ONLY $principal;
+      IF $p = NONE AND $existing { THROW 'principal not found' };
+      IF $p != NONE AND $p.version != $expected { THROW 'principal moved: version changed' };
+      FOR $e IN $employees {
+        LET $row = SELECT * FROM ONLY $e;
+        IF $row = NONE OR $row.revoked = true { THROW 'principal invalid: employee missing or revoked' };
+        IF $row.current_employee != NONE AND $row.lease_expires_at > $now { THROW 'principal refused: employee is leased' };
+      };
+      LET $next = UPSERT ONLY $principal CONTENT { reason: $reason, employees: $employees, version: $version, created_at: time::now() } RETURN AFTER;
+      FOR $e IN $employees { UPDATE ONLY $e SET principal = $principal; };
+      CREATE ONLY $audit CONTENT { actor: $actor, action: 'identity_principal_set', evidence: $evidence, version: $version, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), principal: id('principal', principalId), employees: employees.map(employee => id('employee', employee)),
+      reason: input.reason, version, existing: input.principalId !== undefined, expected: input.expectedVersion ?? 0,
+      evidence, digest, idem, audit: id('audit', randomUUID()),
+    };
+    try {
+      const row = await this.txTask<{ version: number; reason: string; employees: EmployeeRow[]; created_at?: Date | string }>(query, vars);
+      return principalView(principalId, employees, input.reason, actor.employeeId, row.created_at);
+    } catch (error) {
+      const replayedAfterFailure = await this.replayPrincipal(idem, digest, principalId, employees);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /** Idempotent replay of a principal write: same key and payload returns the original result; a different payload conflicts. */
+  private async replayPrincipal(ident: RecordId, payloadDigest: string, principalId: string,
+    employees: readonly string[]): Promise<IdentityPrincipalView | undefined> {
+    const prior = await this.db.select<IdempotencyRow & { reason?: string; set_by?: string; set_at?: Date | string }>(ident);
+    if (!prior) return undefined;
+    if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+    const result = prior.result as unknown as { reason?: string; set_by?: string; created_at?: Date | string } | undefined;
+    return principalView(principalId, employees, result?.reason ?? '', result?.set_by ?? '', result?.created_at);
   }
 
   /**

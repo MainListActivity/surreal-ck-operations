@@ -463,6 +463,21 @@ export interface IndependencePolicy {
   setAt: string;
 }
 
+/**
+ * A registered identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several employeeIds one
+ * person for independence purposes. This is the ONLY cross-employee identity key: a definition, provider, model, name or
+ * directory never implies it, and an unregistered link is never recognized.
+ */
+export interface IdentityPrincipalView {
+  id: string;
+  /** Employees registered to this principal. */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
 /** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
 export interface SetIndependence {
   taskId: TaskId;
@@ -473,6 +488,19 @@ export interface SetIndependence {
   reason: string;
   /** Compare-and-set: refuse when the task version has moved. */
   expectedVersion: number;
+  idempotencyKey: string;
+}
+
+/** Manager write of an identity principal: register the link, or set its exact employee set, under a compare-and-set. */
+export interface SetIdentityPrincipal {
+  /** Existing principal to change; omit to register a new one. */
+  principalId?: string;
+  /** The complete employee set of the principal after the write (at least 1, at most 20). */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  /** Compare-and-set on the principal row: refuse when it has moved. Omit for a new principal. */
+  expectedVersion?: number;
   idempotencyKey: string;
 }
 
@@ -788,6 +816,8 @@ export interface CompanyCore {
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
   /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
   setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
+  /** Manager (manage capability): register an identity principal, or add/remove employees from it. Optional for old adapters. */
+  setIdentityPrincipal?(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView>;
   /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the

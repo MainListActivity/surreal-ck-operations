@@ -5,8 +5,11 @@ import type { EmployeeId, IndependenceMode, IndependencePolicy, IndependenceStag
 
 /**
  * Independence policy (SYS-DISP IR01-IR02): which contributors of other tasks may not take or decide a task. Contributors come from
- * the source tasks' audit stream (contributors.ts), and "same source" means the same registered employee or the same registered
- * definition. Nothing is inferred from agent, session or workspace, and nothing unregistered is recognized.
+ * the source tasks' audit stream (contributors.ts), and "same source" means the same registered identity: the same employeeId
+ * (across every agent, session and workspace it ever used) or a registered principal link between two employeeIds. A registered
+ * definition is NOT an identity (SYS-DISP Q3): it is a capacity template, so two independent employees of one definition are
+ * independent people. Nothing is inferred from def, provider, model, name or directory, and an unregistered link is never
+ * recognized — nor claimed to be.
  *
  * The rules are pure (validation, the exclusion index), so the core, the dispatcher and the unit tests read one definition.
  * The readers only read; a read that fails or a source that is missing is never reported as "no conflict".
@@ -83,21 +86,22 @@ export function normalizeIndependence(input: {
 export type ContributorRole = 'author' | 'implementer' | 'reviewer';
 
 /**
- * Why an employee is excluded: a contributor of a source, a named employee, or a sibling (same registered definition) of either.
- * `via: same_def` carries the matched employee and its definition; the source is set when the match came from a contributor.
+ * Why an employee is excluded: a contributor of a source, a named employee, or the same registered identity as either.
+ * `via: same_principal` carries the matched employee and the principal linking them (schema 029); `source` is set when
+ * the match came from a contributor.
  */
 export interface IndependenceHit {
-  via: 'contributor' | 'explicit' | 'same_def';
+  via: 'contributor' | 'explicit' | 'same_principal';
   source?: TaskId;
   matched?: EmployeeId;
   role?: ContributorRole;
-  def?: string;
+  principal?: string;
 }
 
-/** Exclusions by employee id and by registered definition. */
+/** Exclusions by employee id and by registered principal (an identity link, never a definition). */
 export interface IndependenceIndex {
   byEmployee: Map<EmployeeId, IndependenceHit>;
-  byDef: Map<string, IndependenceHit>;
+  byPrincipal: Map<string, IndependenceHit>;
 }
 
 /**
@@ -106,29 +110,39 @@ export interface IndependenceIndex {
  */
 export type IndependenceScope = { kind: 'index'; index: IndependenceIndex } | { kind: 'unverifiable'; reason: string; source?: TaskId };
 
-/** Contributors of a source for the policy mode. `execute_handlers` is every execute-phase handler; `all_handlers` adds the reviewers. */
+/**
+ * Contributors of a source for the policy mode (SYS-DISP IR01). `execute_handlers` is every execute-phase handler of the source —
+ * authors, implementer and claim-only holders (`hands`) — which is the strict set a source excludes; `all_handlers` adds the
+ * source's reviewers.
+ */
 function contributorsOf(facts: ContributionFacts, mode: IndependenceMode): Array<[EmployeeId, ContributorRole]> {
   const roles = new Map<EmployeeId, ContributorRole>();
   for (const employee of facts.excluded) roles.set(employee, facts.authors.includes(employee) ? 'author' : 'implementer');
+  for (const employee of facts.strictExcluded) {
+    if (!roles.has(employee)) roles.set(employee, facts.authors.includes(employee) ? 'author' : 'implementer');
+  }
   if (mode === 'all_handlers') for (const employee of facts.reviewers) roles.set(employee, 'reviewer');
   return [...roles];
 }
 
 /**
- * The exclusion index for a policy: each source contributor (per mode) and each named employee, by employee id and by registered
- * definition. The definition lets an alias of a contributor (another instance of the same definition) be excluded too.
+ * The exclusion index for a policy: each source contributor (per mode) and each named employee, by employee id and by the
+ * registered principal linking employees into one identity. A definition is never an index key: two employees of one
+ * definition are independent unless a registered principal link says otherwise (SYS-DISP Q3).
  */
 export function buildIndependenceIndex(input: {
   policy: Pick<IndependenceFields, 'mode' | 'excluded'>;
   sources: ReadonlyArray<{ taskId: TaskId; facts: ContributionFacts }>;
-  defOf: (employee: EmployeeId) => string | undefined;
+  principalOf: (employee: EmployeeId) => string | undefined;
 }): IndependenceIndex {
   const byEmployee = new Map<EmployeeId, IndependenceHit>();
-  const byDef = new Map<string, IndependenceHit>();
+  const byPrincipal = new Map<string, IndependenceHit>();
   const add = (employee: EmployeeId, hit: IndependenceHit) => {
     if (!byEmployee.has(employee)) byEmployee.set(employee, hit);
-    const def = input.defOf(employee);
-    if (def !== undefined && !byDef.has(def)) byDef.set(def, { ...hit, via: 'same_def', matched: employee, def });
+    const principal = input.principalOf(employee);
+    if (principal !== undefined && !byPrincipal.has(principal)) {
+      byPrincipal.set(principal, { ...hit, via: 'same_principal', matched: employee, principal });
+    }
   };
   for (const source of input.sources) {
     for (const [employee, role] of contributorsOf(source.facts, input.policy.mode)) {
@@ -136,45 +150,49 @@ export function buildIndependenceIndex(input: {
     }
   }
   for (const employee of input.policy.excluded) add(employee, { via: 'explicit', matched: employee });
-  return { byEmployee, byDef };
+  return { byEmployee, byPrincipal };
 }
 
-/** The hit that excludes an employee (registered as `def`), or undefined when nothing excludes them. */
-export function independenceHit(index: IndependenceIndex, employee: EmployeeId | undefined, def?: string): IndependenceHit | undefined {
-  return (employee === undefined ? undefined : index.byEmployee.get(employee)) ?? (def === undefined ? undefined : index.byDef.get(def));
+/**
+ * The hit that excludes an employee (registered as `principal`, when a principal link is registered), or undefined when nothing
+ * excludes them. An employee with no registered principal is judged by its own id alone.
+ */
+export function independenceHit(index: IndependenceIndex, employee: EmployeeId | undefined, principal?: string): IndependenceHit | undefined {
+  return (employee === undefined ? undefined : index.byEmployee.get(employee)) ?? (principal === undefined ? undefined : index.byPrincipal.get(principal));
 }
 
 /** Owner-facing text for a hit, for the dispatcher's candidate reasons. */
 export function independenceText(hit: IndependenceHit): string {
   if (hit.via === 'explicit') return '经理指定回避的员工，不能接手或复核本任务';
-  if (hit.via === 'same_def') {
+  if (hit.via === 'same_principal') {
     return hit.source === undefined
-      ? `与经理指定回避的员工 ${hit.matched} 同源（同一登记编制），不能接手或复核本任务`
-      : `与来源任务 ${hit.source} 的经手人 ${hit.matched} 同源（同一登记编制），不能接手或复核本任务`;
+      ? `与经理指定回避的员工 ${hit.matched} 同一登记身份（principal ${hit.principal}），不能接手或复核本任务`
+      : `与来源任务 ${hit.source} 的经手人 ${hit.matched} 同一登记身份（principal ${hit.principal}），不能接手或复核本任务`;
   }
   return `来源任务 ${hit.source} 的经手人 ${hit.matched}，不能接手或复核本任务`;
 }
 
 const employeeKey = (value: unknown): string | undefined =>
   value instanceof RecordId && value.table.name === 'employee' ? String(value.id) : undefined;
-const defKey = (value: unknown): string | undefined =>
-  value instanceof RecordId && value.table.name === 'employee_def' ? String(value.id) : undefined;
+const principalKey = (value: unknown): string | undefined =>
+  value instanceof RecordId && value.table.name === 'principal' ? String(value.id) : undefined;
 
 /**
- * Registered definition of each named employee. Rows survive retirement, so a retired contributor's siblings are still excluded
- * even though the retired contributor is no longer a candidate.
+ * The registered principal of each named employee (schema 029): the explicit, manage-controlled identity link that makes two
+ * employeeIds one person. Rows survive retirement, so a retired contributor's registered identity still links whoever shares it.
+ * An employee with no link returns nothing here and is judged by its own id alone. A definition is never read as an identity.
  */
-export async function readEmployeeDefs(db: Surreal, employees: readonly EmployeeId[]): Promise<Map<EmployeeId, string>> {
-  const defs = new Map<EmployeeId, string>();
-  if (employees.length === 0) return defs;
-  const [rows] = await db.query<[Array<{ id?: unknown; def?: unknown }>]>('SELECT id, def FROM employee WHERE id IN $ids;',
+export async function readEmployeePrincipals(db: Surreal, employees: readonly EmployeeId[]): Promise<Map<EmployeeId, string>> {
+  const principals = new Map<EmployeeId, string>();
+  if (employees.length === 0) return principals;
+  const [rows] = await db.query<[Array<{ id?: unknown; principal?: unknown }>]>('SELECT id, principal FROM employee WHERE id IN $ids;',
     { ids: employees.map(employee => new RecordId('employee', employee)) });
   for (const row of rows ?? []) {
     const employee = employeeKey(row.id);
-    const def = defKey(row.def);
-    if (employee !== undefined && def !== undefined) defs.set(employee, def);
+    const principal = principalKey(row.principal);
+    if (employee !== undefined && principal !== undefined) principals.set(employee, principal);
   }
-  return defs;
+  return principals;
 }
 
 /** Everything a policy reads at one moment: each source's contribution view with the version it was read at, and the index. */
@@ -223,14 +241,15 @@ export async function readIndependenceSnapshot(db: Surreal, policy: Independence
     if (view.version === undefined) throw new CompanyError('not_found', `Independence source not found: ${taskId}`, false, { source: taskId });
     sources.push({ taskId, version: view.version, facts: view.facts });
   }
-  const employees = unique([...policy.excluded, ...sources.flatMap(source => [...source.facts.excluded, ...source.facts.reviewers])]);
-  let defs: Map<EmployeeId, string>;
+  const employees = unique([...policy.excluded, ...sources.flatMap(source => [...source.facts.excluded, ...source.facts.reviewers, ...source.facts.strictExcluded])]);
+  let principals: Map<EmployeeId, string>;
   try {
-    defs = await readEmployeeDefs(db, employees);
+    principals = await readEmployeePrincipals(db, employees);
   } catch {
-    throw new CompanyError('temporarily_unavailable', 'Independence employee definitions unreadable; retry', true);
+    // Identity records unreadable is never "no conflict": the whole scope is unverifiable and fails closed.
+    throw new CompanyError('temporarily_unavailable', 'Independence identity links unreadable; retry', true);
   }
-  const index = buildIndependenceIndex({ policy, sources, defOf: employee => defs.get(employee) });
+  const index = buildIndependenceIndex({ policy, sources, principalOf: employee => principals.get(employee) });
   return { sources, index };
 }
 
@@ -248,7 +267,8 @@ export async function readIndependenceScope(db: Surreal, policy: IndependencePol
   try {
     return { kind: 'index', index: (await readIndependenceSnapshot(db, policy)).index };
   } catch (error) {
-    const source = error instanceof CompanyError ? error.details?.source : undefined;
+    const source = error instanceof CompanyError && typeof error.details === 'object' && error.details !== null
+      ? (error.details as { source?: unknown }).source : undefined;
     return { kind: 'unverifiable', reason: error instanceof Error ? error.message : String(error), ...(typeof source === 'string' ? { source } : {}) };
   }
 }
@@ -270,7 +290,7 @@ export interface IndependenceConflict {
   source?: TaskId;
   matched?: EmployeeId;
   role?: ContributorRole;
-  def?: string;
+  principal?: string;
   auditRef?: string;
 }
 
@@ -281,17 +301,18 @@ async function conflictOf(db: Surreal, task: TaskId, employee: EmployeeId, hit: 
     ...(hit.source !== undefined ? { source: hit.source } : {}),
     ...(hit.matched !== undefined ? { matched: hit.matched } : {}),
     ...(hit.role !== undefined ? { role: hit.role } : {}),
-    ...(hit.def !== undefined ? { def: hit.def } : {}),
+    ...(hit.principal !== undefined ? { principal: hit.principal } : {}),
     ...(auditRef !== undefined ? { auditRef } : {}),
   };
 }
 
 /**
- * Refuses `employee` (registered as `def`) for `task` when the index excludes them. The refusal is `forbidden` with the structured
- * conflict in `details`. Used by the claim and submit gates, which read the index from the same snapshot their write is guarded by.
+ * Refuses `employee` (registered as `principal`, when a link is registered) for `task` when the index excludes them. The refusal
+ * is `forbidden` with the structured conflict in `details`. Used by the claim and submit gates, which read the index from the same
+ * snapshot their write is guarded by.
  */
-export async function refuseIfExcluded(db: Surreal, task: TaskId, index: IndependenceIndex, employee: EmployeeId, def?: string): Promise<void> {
-  const hit = independenceHit(index, employee, def);
+export async function refuseIfExcluded(db: Surreal, task: TaskId, index: IndependenceIndex, employee: EmployeeId, principal?: string): Promise<void> {
+  const hit = independenceHit(index, employee, principal);
   if (!hit) return;
   const conflict = await conflictOf(db, task, employee, hit);
   const via = conflict.source === undefined ? conflict.via : `${conflict.via} of source ${conflict.source}`;

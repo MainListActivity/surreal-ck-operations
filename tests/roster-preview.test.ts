@@ -32,7 +32,7 @@ const contributors = async (): Promise<ContributionFacts> => {
   historyCalls++;
   if (historyFails) throw new Error('synthetic read failure');
   const authors = emptyHistory ? [] : ['author', 'rework-submitter'];
-  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors };
+  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors, hands: [], strictExcluded: authors };
 };
 // One dispatch pass as far as the owner-facing answers are concerned: the observed sessions and the snapshot of the inputs it reads.
 let observed = { at: 0, sessions: new Map<string, Session>() };

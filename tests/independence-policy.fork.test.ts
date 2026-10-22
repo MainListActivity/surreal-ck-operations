@@ -104,7 +104,7 @@ test('G5 replay: a source authored after the policy is a conflict at claim; the 
   expect(refusal.code).toBe('forbidden');
   expect(refusal.message).toContain('independence conflict');
   expect(refusal.details).toMatchObject({ conflicts: [{ task: dependent.id, source: parent.id, employee: 't-src', matched: 't-src', via: 'contributor', role: 'author' }] });
-  expect(refusal.details?.conflicts).toEqual([expect.objectContaining({ auditRef: expect.stringContaining('audit') })]);
+  expect((refusal.details as { conflicts?: unknown[] }).conflicts).toEqual([expect.objectContaining({ auditRef: expect.stringContaining('audit') })]);
 
   const granted = await core.claim(tokens.indep, dependent.id);
   expect(granted.task.currentEmployee).toBe('t-indep');

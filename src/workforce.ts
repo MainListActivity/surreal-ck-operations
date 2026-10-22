@@ -62,6 +62,8 @@ export interface EmployeeInst {
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
   repoHome?: string;
+  /** Registered identity principal (schema 029), when one is registered: the only cross-employee identity link (SYS-DISP Q3). */
+  principal?: string;
   /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
   wakeCount?: number;
 }
@@ -429,7 +431,7 @@ export class Workforce {
 
   // ---- employee instances ----
   async insts(): Promise<EmployeeInst[]> {
-    type Row = { id: RecordId; role: Role; def?: RecordId; provider?: string; model?: string; thinking?: string;
+    type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
       v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
@@ -437,7 +439,8 @@ export class Workforce {
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
-      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0 }));
+      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0,
+      principal: r.principal ? asId(r.principal) : undefined }));
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.

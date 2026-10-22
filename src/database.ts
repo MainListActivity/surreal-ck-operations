@@ -123,9 +123,14 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
     // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
     await this.db.query(loadSchema('027-qa-observation.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');    // 独立性策略（SYS-DISP 8c732ae6 IR01）：028 由本线取用（025/026 为在办 lane 预占，027 已被 QA 取证占用）；只新增字段，旧行不动。
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');
+    // 独立性策略（SYS-DISP 8c732ae6 IR01）：028 由本线取用（025/026 为在办 lane 预占，027 已被 QA 取证占用）；只新增字段，旧行不动。
     await this.db.query(loadSchema('028-independence-policy.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 28 WHERE schema_version < 28;');  }
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 28 WHERE schema_version < 28;');
+    // 登记身份（SYS-DISP IR02/Q3）：029 由本线取用；只新增表与字段，不改任何已有员工行。
+    await this.db.query(loadSchema('029-identity-principal.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
+  }
 
   private async ensureOutboxSequence(): Promise<void> {
     const counter = new RecordId('company_meta', 'outbox_counter');

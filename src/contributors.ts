@@ -61,8 +61,20 @@ export interface ContributionFacts {
   implementer?: string;
   /** Several authors and no explicit implementer: nobody may execute until a manager records one. */
   ambiguous: boolean;
-  /** Authors plus the implementer. Nobody in this set may review or accept the task. */
+  /**
+   * Ordinary recusal set: authors plus the implementer. A claim-only holder (took an execute lease, never wrote code
+   * with decisive evidence) is NOT here — they are `hands`, demoted but still eligible (SYS-DISP IR01: an ordinary
+   * task's plain review recusal rule is unchanged).
+   */
   excluded: string[];
+  /**
+   * Execute-phase holders with no code-writing evidence: they claimed (or checkpointed/released) but never submitted,
+   * and their rows are not unknown-phase. Demoted for review, never hard-excluded, unless a policy names this task as
+   * a source of another — see `strictExcluded`, which is what the independence gate uses.
+   */
+  hands: string[];
+  /** Every execute-phase handler: authors, implementer and `hands`. What a strict independence source excludes. */
+  strictExcluded: string[];
 }
 
 /** Audit actions that can carry authorship. Everything else (resume, defer, ops_call, takeover) is ignored. */
@@ -131,6 +143,7 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   const authors = new Set<string>();
   const reviewers = new Set<string>();
   const unknown: UnknownContribution[] = [];
+  const hands = new Set<string>();
   const roles = rolesOf(rows, open);
   rows.forEach((event, index) => {
     const actor = event.actor!;
@@ -142,12 +155,17 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
     authors.add(actor);
     if (role === 'unknown') {
       unknown.push({ actor, action: event.action, at: event.at, reason: '历史行缺少阶段且之后无可判定动作，按作者处理（fail-closed）' });
+      return;
     }
+    // An execute-phase holder who never submitted is a prior hand: eligible for review at a demoted weight, and the
+    // first claimant of a fresh task becomes its implementer. Submits never reach here (they are authors above).
+    if (event.action !== 'submit') hands.add(actor);
   });
   const sortedAuthors = [...authors].sort();
   const explicit = explicitImplementer || undefined;
   const implementer = explicit ?? (sortedAuthors.length === 1 ? sortedAuthors[0] : undefined);
   const excluded = [...new Set([...sortedAuthors, ...(implementer ? [implementer] : [])])].sort();
+  const handsOnly = [...hands].filter(actor => !excluded.includes(actor)).sort();
   return {
     authors: sortedAuthors,
     reviewers: [...reviewers].filter(actor => !excluded.includes(actor)).sort(),
@@ -155,6 +173,8 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
     implementer,
     ambiguous: !explicit && sortedAuthors.length > 1,
     excluded,
+    hands: handsOnly,
+    strictExcluded: [...new Set([...excluded, ...handsOnly])].sort(),
   };
 }
 
