@@ -206,3 +206,30 @@ fork('goal summary fails closed when dispatch observation/status is missing, par
   expect(read.meta.completeness.dispatchComplete).toBe(false);
   expect(read.goal?.dispatchReason).toMatch(/stale/);
 });
+
+fork('scope view uses bare record ids so the goal page and the core goal check agree', async () => {
+  const scope = await core.qaObservationGrant(tokens.gm, {
+    goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '目标页裸ID回归范围', idempotencyKey: key(),
+  });
+  // The view serialises the scope's RecordId goal to the bare id core compares against.
+  expect(scope.goalId).toBe(goalId);
+  expect(scope.deploymentTaskId).toBe(deployId);
+  const session = await core.qaObservationSession(tokens.qa, { scopeId: scope.id });
+  const { createQaConsoleFetch } = await import('../plugin/server/qa-console.ts');
+  const app = createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core }) as never });
+  const login = await app(new Request('http://x/q/login', {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: `code=${encodeURIComponent(session.code)}`,
+  }));
+  expect(login.status).toBe(303);
+  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
+  const goalPage = await app(new Request('http://x/q/?goal=1', { headers: { cookie } }));
+  const goalBody = await goalPage.text();
+  expect(goalPage.status).toBe(200);
+  expect(goalBody).toContain(goalId);
+  expect(goalBody).not.toContain('outside the QA observation scope');
+  // A different goal is still refused through the same session; the check did not widen.
+  const other = await owner.createGoal({ text: '另一个目标（负例）', source: 'owner:test', key: key(), tier: 'quick' });
+  await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId: other.id }), 'forbidden', /outside the QA observation scope/);
+});
