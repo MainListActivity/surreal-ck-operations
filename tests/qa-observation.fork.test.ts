@@ -69,6 +69,7 @@ beforeAll(async () => {
       reasons: [{ code: 'author_recusal', text: '本任务作者不能复核', candidates: ['eng-other'], owner: 'gm',
         recovery: '经理增补独立复核人选', nextTrigger: '出现独立候选人选', basis: 'contribution-audit' }] }],
   });
+  await database.db.query(`UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };`, { at: new Date().toISOString() });
 }, 120_000);
 afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true, force: true }); });
 beforeEach(async () => {
@@ -172,4 +173,36 @@ fork('session login, idempotency replay, timeline paging and text segments', asy
   expect(evidenceEntry.auditId).toBeDefined();
   const evidence = await core.qaObservationText({ credential: tokens.qa }, { scopeId: first.id, taskId: subjectId, field: 'evidence', auditId: evidenceEntry.auditId!, offset: 0, limit: 64 });
   expect(evidence.totalBytes).toBeGreaterThan(0);
+});
+
+fork('goal summary fails closed when dispatch observation/status is missing, partial or stale', async () => {
+  const scope = await core.qaObservationGrant(tokens.gm, {
+    goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '目标完整性负例范围', idempotencyKey: key(),
+  });
+  const readGoal = () => core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });
+  await database.db.query('DELETE company_meta:dispatch_observation; DELETE company_meta:dispatch_observation_status;');
+  let read = await readGoal();
+  expect(read.meta.completeness.dispatchComplete).toBe(false);
+  expect(read.goal?.dispatchComplete).toBe(false);
+  expect(read.goal?.undispatchable).toBeUndefined();
+  const at = new Date().toISOString();
+  await database.db.query('UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts, complete: true, originalVerdicts: 1, originalReasons: 1 };',
+    { at, verdicts: [{ taskId: subjectId, phase: 'execute', dispatchable: false, reasons: [] }] });
+  read = await readGoal();
+  expect(read.meta.completeness.dispatchComplete).toBe(false); // a complete observation with no trusted save status is unknown
+  await database.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };", { at });
+  read = await readGoal();
+  expect(read.meta.completeness.dispatchComplete).toBe(true);
+  expect(read.goal?.undispatchable).toBe(1);
+  await database.db.query("UPDATE company_meta:dispatch_observation SET complete = false, verdicts = [], reason = 'partial';");
+  read = await readGoal();
+  expect(read.meta.completeness.dispatchComplete).toBe(false);
+  expect(read.goal?.undispatchable).toBeUndefined();
+  await database.db.query('UPDATE company_meta:dispatch_observation SET complete = true, verdicts = $verdicts;',
+    { verdicts: [{ taskId: subjectId, phase: 'execute', dispatchable: false, reasons: [] }] });
+  await database.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: false, error: 'write failed' };", { at });
+  read = await readGoal();
+  expect(read.meta.completeness.dispatchComplete).toBe(false);
+  expect(read.goal?.dispatchReason).toMatch(/stale/);
 });

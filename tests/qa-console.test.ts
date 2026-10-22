@@ -81,3 +81,27 @@ test('context and evidence are reassembled in nextOffset+sha256 segments', async
   const evidence = await (await get('/q/text?taskId=t1&field=evidence&auditId=a2')).text();
   expect(evidence).toContain('证据原文');
 });
+
+test('short inline context is rendered, every task offers a context link, and goal coverage is explicit', async () => {
+  const marker = 'INLINE_CONTEXT_MUST_BE_VISIBLE_正体验收条件';
+  const inlineRead = { meta: { scope, completeness: { complete: true, contextIncluded: true }, dataSource: 'live' },
+    task: { id: 'short-task', title: '短正文主体', context: marker, state: 'review', version: 1 }, dispatch: { available: false, reason: 'local fixture' } };
+  const goalIncomplete = { meta: { scope, completeness: { dispatchComplete: false } },
+    goal: { id: 'goal-1', total: 5, states: { review: 1 }, dispatchComplete: false, dispatchReason: 'no dispatcher pass observation' } };
+  const app = createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
+    qaObservationRead: async (_a: any, input: any) => input.goalId ? goalIncomplete : inlineRead,
+  } }) as any });
+  const page = await (await app(new Request('http://x/q/?taskId=short-task', { headers: { cookie } }))).text();
+  expect(page).toContain(marker);
+  expect(page).toContain('field=context');
+  const goalPage = await (await app(new Request('http://x/q/?goal=1', { headers: { cookie } }))).text();
+  expect(goalPage).toContain('不可用/未知');
+  expect(goalPage).not.toContain('无法派工 0');
+  const completeApp = createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
+    qaObservationRead: async (_a: any, input: any) => ({ meta: { scope, completeness: { dispatchComplete: true } },
+      goal: { id: input.goalId, total: 5, states: { review: 1 }, dispatchComplete: true, undispatchable: 2, dispatchCheckedAt: '2026-10-22T00:19:00Z' } }),
+  } }) as any });
+  const completePage = await (await completeApp(new Request('http://x/q/?goal=1', { headers: { cookie } }))).text();
+  expect(completePage).toContain('无法派工 2');
+  expect(completePage).toContain('完整');
+});

@@ -20,7 +20,7 @@ import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
-import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, qaDispatchFor, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
+import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
@@ -3430,12 +3430,20 @@ export class SurrealCompanyCore implements CompanyCore {
       const total = Object.values(states).reduce((sum, n) => sum + n, 0);
       const [goalTasks] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal;", { goal: scope.goal });
       const goalIds = new Set((goalTasks ?? []).map(row => asId(row.id)));
+      const state = qaDispatchState(observation, attempt);
       const verdicts = (observation as { verdicts?: Array<{ taskId?: string; dispatchable?: boolean }> } | undefined)?.verdicts ?? [];
-      const undispatchable = new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size;
-      const dispatchComplete = (observation as { complete?: boolean } | undefined)?.complete !== false && attempt?.ok !== false;
-      return { meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete } },
-        goal: { id: input.goalId, states, total, undispatchable,
-          ...((observation as { at?: string } | undefined)?.at ? { checkedAt: (observation as { at?: string }).at } : {}) } };
+      const undispatchable = state.complete
+        ? new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size
+        : undefined;
+      return { meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
+        goal: { id: input.goalId, states, total,
+          ...(undispatchable !== undefined ? { undispatchable } : {}),
+          dispatchAvailable: state.available, dispatchComplete: state.complete, dispatchSource: 'dispatcher-pass',
+          ...(state.reason ? { dispatchReason: state.reason } : {}),
+          ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
+          ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
+          ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
+        } };
     }
     if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
     const taskId = input.taskId;

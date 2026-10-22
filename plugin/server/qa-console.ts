@@ -32,7 +32,9 @@ type QaRead = {
     verdicts?: Array<{ phase?: string; dispatchable?: boolean; workflowState?: string; eligibleCount?: number;
       waitingMinutes?: number; summary?: string; checkedAt?: string;
       reasons?: Array<{ code?: string; text?: string; candidates?: string[]; owner?: string; recovery?: string; nextTrigger?: string; basis?: string; until?: string }> }> };
-  goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string };
+  goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string;
+    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean };
   contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
 };
 type QaTimeline = { meta?: QaRead['meta']; history?: Array<{ auditId?: string; action?: string; actor?: string; at?: string; version?: number; evidence?: string; evidenceBytes?: number; evidenceSha256?: string; evidenceTruncated?: boolean }>; page?: { returned?: number; total?: number; hasMore?: boolean; nextCursor?: string; snapshotAt?: string } };
@@ -100,10 +102,14 @@ ${(v.reasons ?? []).map(r => `<div class="meta">${esc(r.code)} · ${esc(r.text)}
 const taskHtml = (read: QaRead, taskId: string | undefined): string => {
   const task = read.task;
   if (!task) return "";
+  const inlineContext = typeof task.context === "string" && task.context.length > 0 ? task.context : "";
+  const contextLink = `<a href="/q/text?taskId=${encodeURIComponent(taskId ?? "")}&field=context">读取正文${inlineContext ? "（分段/原文）" : ""}</a>`;
   return `<div class="card"><h3>${esc(task.title)}</h3>
 <div class="meta">编号 ${esc(task.id)} · 状态 ${esc(task.state)} · 版本 ${esc(task.version)} · 执行 ${esc(task.executorRole)} · 复核 ${esc(task.reviewerRole)} · 实现人 ${esc(task.implementer ?? "未知")} · 当前租约 ${esc(task.currentEmployee ?? "无")}</div>
 <div class="meta">goal ${esc(task.goalId)} · kind ${esc(task.kind)} · 依赖 ${esc((task.dependencies as unknown[] | undefined)?.length ?? 0)} 项 · 等待 ${esc(task.waiting ? JSON.stringify(task.waiting) : "无")}</div>
-${read.contextOmitted ? `<div class="meta">正文未内联（${esc(read.contextBytes)} 字节，sha256 ${esc(read.contextSha256)}）：<a href="/q/text?taskId=${encodeURIComponent(taskId ?? "")}&field=context">分段读取并重组正文</a></div>` : ""}
+${inlineContext ? `<details open><summary>正文（${esc(Buffer.byteLength(inlineContext, "utf8"))} 字节，页面已渲染）</summary><pre>${esc(inlineContext)}</pre></details>` : ""}
+<div class="meta">完整性：${inlineContext ? "core 返回正文，页面已渲染" : "正文未在页面内联"} · ${contextLink}</div>
+${read.contextOmitted ? `<div class="meta">正文未内联（${esc(read.contextBytes)} 字节，sha256 ${esc(read.contextSha256)}）：${contextLink}</div>` : ""}
 <div class="row"><a href="/q/timeline?taskId=${encodeURIComponent(taskId ?? "")}">审计时间线</a><a href="/q/?taskId=${encodeURIComponent(taskId ?? "")}">刷新本主体</a></div></div>`;
 };
 const contributionHtml = (read: QaRead): string => {
@@ -211,7 +217,13 @@ export function createQaConsoleFetch(opts: QaConsoleOptions): (req: Request) => 
         if (scope?.id) scopes.set(token, scope);
         if (goal) {
           const g = read.goal ?? {};
-          return html(layout("QA 目标汇总", `${scopeLinks(scope)}${metaHtml(read, runtimeRelease)}<div class="card"><h3>目标 ${esc(g.id)}</h3><div class="meta">总任务 ${esc(g.total)} · 无法派工 ${esc(g.undispatchable)} · 检查于 ${esc(g.checkedAt)}</div><pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>`));
+          const coverage = g.dispatchComplete === true
+            ? `完整${g.dispatchCheckedAt ? `（检查于 ${esc(g.dispatchCheckedAt)}）` : ""}`
+            : `不可用/未知${g.dispatchReason ? `（${esc(g.dispatchReason)}）` : ""}`;
+          const undispatchable = g.dispatchComplete === true ? esc(g.undispatchable ?? 0) : "未知（未核验）";
+          return html(layout("QA 目标汇总", `${scopeLinks(scope)}${metaHtml(read, runtimeRelease)}<div class="card"><h3>目标 ${esc(g.id)}</h3>
+<div class="meta">总任务 ${esc(g.total)} · 状态计数 ${esc(JSON.stringify(g.states ?? {}))} · 派工覆盖 ${coverage} · 无法派工 ${undispatchable} · 检查于 ${esc(g.checkedAt)}</div>
+<pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>`));
         }
         return html(layout("QA 只读验收", `${scopeLinks(scope, taskId)}${metaHtml(read, runtimeRelease)}${taskHtml(read, taskId)}${dispatchHtml(read.dispatch)}${contributionHtml(read)}`));
       }

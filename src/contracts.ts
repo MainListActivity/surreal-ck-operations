@@ -611,7 +611,9 @@ export interface QaObservationReadView {
   task?: TaskView;
   contribution?: QaObservationContribution;
   dispatch?: QaObservationDispatch;
-  goal?: { id: string; states: Record<string, number>; total: number; undispatchable: number; checkedAt?: string };
+  goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
+    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean };
   contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
   contextRead?: { taskId: string; field: 'context'; offset: number };
 }
