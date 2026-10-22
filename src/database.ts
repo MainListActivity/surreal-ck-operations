@@ -121,7 +121,11 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
     await this.db.query(loadSchema('024-snapshot-quota.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
-    // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
+    // SYS-DISP 876e36e2 integration: the dispatch-pause ledger (025, reviewed on PR #1494) applies before
+    // QA observation (027, main); 026 stays reserved for SYS02. Both migrations are additive, so the
+    // order only decides which runs first.
+    await this.db.query(loadSchema('025-dispatch-pause.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 25 WHERE schema_version < 25;');
     await this.db.query(loadSchema('027-qa-observation.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');
   }

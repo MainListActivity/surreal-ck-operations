@@ -39,7 +39,8 @@ const usage = `Usage: pnpm run admin <command>
                                           从标准输入读取凭证值，加密后入库（值不回显、不进参数）；
                                           凭证只有运维代理能解密，员工拿不到（角色仅作清单标签，- 表示无）
   repair-infrastructure-scores [--execute]  排除有明确额度故障证据的纯空转评分；默认只演练，保留原始卡片
-  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）
+  config <key> <json-value>               修改 company_meta:config（如 max_running 4、eval_enabled false）；
+                                          paused 与 pause_epoch 是维护键：此处一律拒绝，用 sck call dispatch_pause / dispatch_restore
   rescore                                 从评分卡重算员工与编制的 scored/avg_score（幂等；修复评分汇总失败留下的落后）
   reclaim-artifacts [--execute] [任务ID] [目标空闲MB]
                                           回收终态任务的大文件（evidence/deliverables）；
@@ -212,7 +213,19 @@ try {
     case 'config': {
       const [key, value] = args;
       if (!key || value === undefined || !/^[a-z_]+$/.test(key)) throw new Error(usage);
-      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: JSON.parse(value) } });
+      // Maintenance keys are refused outright (SYS-DISP 876e36e2 H2): the pause now has the authorized surfaces — gm
+      // dispatch_pause/dispatch_restore (compare-and-set, drain, audit) and the owner path — and this operator entry
+      // would be a side door with no compare-and-set and no drain. Refused BEFORE any write, stable code, other keys
+      // behave exactly as before.
+      if (key === 'paused' || key === 'pause_epoch') {
+        print({ action, key, ok: false, code: 'invalid',
+          message: `config ${key} 是维护键：只能随暂停事务移动（纪元、闸门、审计同提交）。停派请用 sck call dispatch_pause / dispatch_restore（gm manage），读取用 sck call dispatch_status；维护操作审计按 operationId 回读用 sck call dispatch_audit。老板工作台 pause 仍走暂停事务。`,
+          use: ['dispatch_pause', 'dispatch_restore', 'dispatch_status', 'dispatch_audit'] });
+        process.exitCode = 1;
+        break;
+      }
+      const parsed = JSON.parse(value);
+      await database.db.query('UPSERT company_meta:config MERGE $patch;', { patch: { [key]: parsed } });
       print(await workforce.config());
       break;
     }

@@ -1,4 +1,5 @@
 import type { OwnerDesk } from '../owner.ts';
+import type { PassHandle, PassLedger } from '../dispatch-pause.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
 import type { ClaimResult, WorktreeAssignment, ModelSlots, ProviderQuota, RetirementKind, Role, WriteScopeHolder } from '../contracts.ts';
@@ -372,6 +373,11 @@ export interface DispatcherDeps {
   rand?: () => number;
   /** Jev System One decision model; undefined disables the Jev evaluation path. */
   jev?: JevClient;
+  /**
+   * Dispatch pass ledger (dispatch-pause.ts): one row per tick, so a manager pause can wait until every pass that started under an
+   * older epoch has ended. Undefined disables the ledger (tests); production wiring always passes one.
+   */
+  passes?: PassLedger;
   /** Legacy regex sweeper (pre-WT01). Prefer reclaimWorktrees when the managed registry is enabled. */
   git?: GitGateway;
   /**
@@ -748,22 +754,32 @@ export class Dispatcher {
    */
   async tick(): Promise<TickReport> {
     this.passInputs = undefined;
-    const report = await this.pass();
-    // The pass set the inputs through `this`, which control-flow analysis cannot see across the await: the assertion is the contract.
-    const inputs = this.passInputs as PassInputs | undefined;
-    if (inputs) {
-      this.snapshot = await this.buildSnapshot(inputs);
-      await this.dailyBrief(inputs.now, inputs.cfg, report, this.snapshot.verdicts)
-        .catch(error => this.log(`daily brief failed: ${(error as Error).message}`));
+    // The ledger row opens before any work in this pass, so a pause that waits for drain counts the pass as old until it ends.
+    const handle = await this.deps.passes?.begin();
+    let state: 'done' | 'failed' = 'failed';
+    try {
+      const report = await this.pass(handle);
+      // The pass set the inputs through `this`, which control-flow analysis cannot see across the await: the assertion is the contract.
+      const inputs = this.passInputs as PassInputs | undefined;
+      if (inputs) {
+        this.snapshot = await this.buildSnapshot(inputs);
+        await this.dailyBrief(inputs.now, inputs.cfg, report, this.snapshot.verdicts)
+          .catch(error => this.log(`daily brief failed: ${(error as Error).message}`));
+      }
+      state = 'done';
+      return report;
+    } finally {
+      await handle?.end(state).catch(error => this.log(`dispatch pass ledger close failed: ${(error as Error).message}`));
     }
-    return report;
   }
 
-  private async pass(): Promise<TickReport> {
+  private async pass(handle?: PassHandle): Promise<TickReport> {
     const { workforce: wf, owner, paseo } = this.deps;
     const report: TickReport = { commands: 0, revoked: [], extended: [], woke: [], retired: [], refused: [], exhausted: [], notices: [], evals: [], decisions: [], realigned: [], recovered: [] };
     report.commands = (await owner.applyPending()).length;
     const cfg = await wf.config();
+    // The epoch this pass acted under: a pass that read the config before a pause keeps counting as old until it ends.
+    await handle?.setEpoch(cfg.pauseEpoch);
     const [agents, defs, now, quotaRows, slotRows] = await Promise.all([paseo.list(), wf.defs(), wf.serverNow(),
       this.deps.quota ? this.deps.quota().catch((error) => { this.log(`quota read failed: ${(error as Error).message}`); return [] as ProviderQuota[]; })
         : Promise.resolve([] as ProviderQuota[]),
@@ -2049,9 +2065,11 @@ export class Dispatcher {
           claim = await sidecar.claim(existing, task);
           if (!claim) {
             // A scope lost at claim time is task-wide, so it earns no cooldown: the next pass re-reads the holders.
-            if (sidecar.claimDenial(existing.id) === 'worktree_busy') this.scopeDenied.add(task.id);
-            else this.markDenied(task);
-            this.log(`claim ${task.id} as ${existing.id} lost; skipping`);
+            // A refusal by the maintenance pause says nothing about the task, so it earns no cooldown either.
+            const denial = sidecar.claimDenial(existing.id);
+            if (denial === 'worktree_busy') this.scopeDenied.add(task.id);
+            else if (denial !== 'dispatch_paused') this.markDenied(task);
+            this.log(`claim ${task.id} as ${existing.id} lost (${denial ?? 'unknown'}); skipping`);
             return undefined;
           }
         }
@@ -2117,9 +2135,13 @@ export class Dispatcher {
       }
       if (sidecar && task && !claim) {
         // A scope lost at claim time is task-wide: no other def is tried, and the unbound seat is released.
-        const scopeLost = sidecar.claimDenial(inst.id) === 'worktree_busy';
-        if (scopeLost) this.scopeDenied.add(task.id); else this.markDenied(task);
-        if (await this.retireGated(inst, scopeLost ? 'write scope held' : 'claim denied', 'failure', report)) report.retired.push(inst.id);
+        // A pause refusal is the orphan of a spawn that raced the pause: retired as a rotation, never counted as a seat failure.
+        const denial = sidecar.claimDenial(inst.id);
+        const scopeLost = denial === 'worktree_busy';
+        const paused = denial === 'dispatch_paused';
+        if (scopeLost) this.scopeDenied.add(task.id); else if (!paused) this.markDenied(task);
+        const reason = scopeLost ? 'write scope held' : paused ? 'dispatch paused before claim' : 'claim denied';
+        if (await this.retireGated(inst, reason, paused ? 'rotation' : 'failure', report)) report.retired.push(inst.id);
         return undefined;
       }
       try {

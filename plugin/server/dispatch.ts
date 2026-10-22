@@ -1,4 +1,5 @@
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
+import { reapStaleRunningPasses } from "./vendor/src/dispatch-pause.ts";
 import { settleCompanyTurn } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
@@ -348,10 +349,23 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
 
   const loop = async () => {
     let failures = 0;
+    let reaped = false;
     while (!stopped) {
       let wait = 20_000;
       try {
         const ctx: Company = await company();
+        if (!reaped) {
+          // Startup reap (SYS-DISP 876e36e2 H1), once per process, before this process's first pass: orphaned running
+          // rows of this host whose pid is provably dead become abandoned. Failures here never block the dispatcher;
+          // drain stays fail closed for anything not provably dead.
+          reaped = true;
+          try {
+            const s = await reapStaleRunningPasses(ctx.db.db);
+            console.log(`startup reap: scanned ${s.scanned}, abandoned ${s.reaped}, kept running ${s.keptUnknown}`);
+          } catch (error) {
+            console.error(`startup reap failed: ${(error as Error).message}`);
+          }
+        }
         wait = (await ctx.workforce.config()).pollSeconds * 1000;
         // Refresh quota and model slots BEFORE the tick so a newly published model is
         // resolved, stale idle sessions are retired, and new work spawns on it in the

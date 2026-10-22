@@ -9,6 +9,7 @@ import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requi
 import { assertRoleContract, loadContract } from './role-contract.ts';
 import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
+import { writePause } from './dispatch-pause.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -311,8 +312,13 @@ export class OwnerDesk {
       { record, text: input.text.trim(), source: input.source });
   }
 
-  async setPaused(paused: boolean): Promise<void> {
-    await this.db.query('UPSERT company_meta:config MERGE { paused: $paused };', { paused });
+  /**
+   * Owner-side pause (the Paseo RPC and owner_command). Same epoch, gate and audit write as the manager's pause, so it cannot
+   * bypass the barrier; the owner has no compare-and-set, so no expected epoch is checked.
+   */
+  async setPaused(paused: boolean, source = 'paseo_rpc'): Promise<void> {
+    await writePause(this.db, { paused, actor: 'owner', actorRole: 'owner', expectedEpoch: null,
+      evidence: JSON.stringify({ source }) });
   }
 
   async brief(): Promise<CompanyBrief> {
@@ -583,7 +589,7 @@ export class OwnerDesk {
             break;
           case 'direction': await this.addDirection({ text: row.text ?? '', source, key }); break;
           case 'instruct': result = `task=${(await this.instruct({ text: row.text ?? '', source, key })).taskId}`; break;
-          case 'pause': case 'resume': await this.setPaused(row.kind === 'pause'); break;
+          case 'pause': case 'resume': await this.setPaused(row.kind === 'pause', 'owner_command'); break;
           default: throw new CompanyError('invalid', 'unknown command kind');
         }
       } catch (error) {

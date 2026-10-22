@@ -76,6 +76,8 @@ export interface ProviderHealth {
 
 export interface CompanyConfig {
   paused: boolean;
+  /** Dispatch pause epoch (company_meta:config.pause_epoch): bumps on every paused-state change; the pass ledger records it. */
+  pauseEpoch: number;
   maxRunning: number;
   providerMax: Record<string, number>;
   pollSeconds: number;
@@ -138,7 +140,7 @@ export interface CompanyConfig {
 }
 
 export const DEFAULT_CONFIG: CompanyConfig = {
-  paused: false, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
+  paused: false, pauseEpoch: 0, maxRunning: 4, providerMax: { codex: 3, grok: 2, devin: 2 },
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
@@ -337,6 +339,7 @@ export class Workforce {
       (row?.[snake] ?? row?.[key] ?? DEFAULT_CONFIG[key]) as CompanyConfig[K];
     return {
       paused: Boolean(row?.paused),
+      pauseEpoch: typeof row?.pause_epoch === 'number' ? row.pause_epoch : 0,
       maxRunning: pick('maxRunning', 'max_running'),
       providerMax: { ...DEFAULT_CONFIG.providerMax, ...(pick('providerMax', 'provider_max') as Record<string, number>) },
       pollSeconds: pick('pollSeconds', 'poll_seconds'),
