@@ -10,15 +10,17 @@ import { assertRoleContract, loadContract, type DisciplineContract } from './rol
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
-import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer } from './response-budget.ts';
+import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
+import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import type { ContributorDryRunView } from './contracts.ts';
+import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
@@ -596,6 +598,8 @@ export class SurrealCompanyCore implements CompanyCore {
           // Facts read before a lease transaction moved under it: the caller re-reads the contribution view and retries (SYS-DISP AC04).
           if (new RegExp(CONTRIBUTION_MOVED, 'i').test(cause)) throw new CompanyError('conflict', 'Task contribution history moved; retry the request');
           // Implementer takeover: 'moved' is a stale basis (CAS), 'invalid' is an ineligible target; both are checked before the generic denied/forbidden match.
+          const qaScope = /qa observation (invalid|moved): ([^'"\n]+)/i.exec(cause);
+          if (qaScope) throw new CompanyError(qaScope[1]!.toLowerCase() === 'moved' ? 'conflict' : 'invalid', `QA observation ${qaScope[1]!.toLowerCase()}: ${qaScope[2]!.trim()}`);
           const takeover = /implementer takeover (moved|invalid): ([^'"\n]+)/i.exec(cause);
           if (takeover) {
             const kind = takeover[1]!.toLowerCase();
@@ -3189,4 +3193,357 @@ export class SurrealCompanyCore implements CompanyCore {
     return rows.map(row => ({ id: asId(row.id), sequence: row.sequence, kind: row.kind, taskId: asId(row.task),
       payload: row.payload, createdAt: String(row.at) }));
   }
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
+  // 一条独立的只读路径：GM 登记 scope，QA 用本人 sck 会话或浏览器受限会话读取 allowlist 内的任务；
+  // 现有 getTask 的 executor/reviewer/gm/eval ACL 不变，scope 的部署任务复核租约一变即失败关闭。
+
+  /** The named scope, or the QA employee's single active scope. Never another employee's scope. */
+  private async qaScopeFor(employeeId: string, scopeId?: string): Promise<QaObservationScopeRow> {
+    if (scopeId !== undefined) {
+      requireText(scopeId, 'scopeId', 1, 200);
+      const row = await this.db.select<QaObservationScopeRow>(id('qa_observation_scope', scopeId));
+      if (!row) throw new CompanyError('not_found', 'QA observation scope not found');
+      if (row.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
+      return row;
+    }
+    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
+      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me AND status = 'active' ORDER BY created_at DESC LIMIT 2;",
+      { me: employeeId });
+    const active = rows ?? [];
+    if (active.length === 0) throw new CompanyError('forbidden', 'no active QA observation scope for this employee');
+    if (active.length > 1) throw new CompanyError('invalid', 'more than one active QA observation scope; pass scopeId');
+    return active[0]!;
+  }
+
+  /** A scope is usable only while its deployment task still carries the exact QA review lease it was granted on. */
+  private async qaScopeUsable(scope: QaObservationScopeRow, employeeId: string): Promise<void> {
+    if (scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is revoked');
+    if (!(Date.parse(scope.expires_at) > Date.now())) throw new CompanyError('forbidden', 'QA observation scope expired');
+    if (scope.qa_employee !== employeeId) throw new CompanyError('forbidden', 'QA observation scope belongs to another employee');
+    const task = await this.db.select<TaskRow>(scope.deployment_task);
+    if (!task) throw new CompanyError('forbidden', 'the deployment task of the QA observation scope no longer exists');
+    const now = Math.floor(Date.now() / 1000);
+    if (task.state !== 'review' || task.reviewer_role !== 'qa') throw new CompanyError('forbidden', 'the deployment task is no longer in QA review');
+    if (task.current_employee !== scope.lease_holder || task.fence !== scope.lease_fence ||
+        task.lease_expires_at === undefined || task.lease_expires_at <= now) {
+      throw new CompanyError('forbidden', 'the QA review lease changed; the observation scope fails closed');
+    }
+    if (!task.goal || asId(task.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the deployment task left the scope goal');
+  }
+
+  /** Authenticate a QA read: an employee credential (qa role) or a browser-only restricted session token. */
+  private async qaObservationAuth(auth: QaObservationAuth, scopeId?: string): Promise<{ scope: QaObservationScopeRow; employeeId: string }> {
+    let employeeId: string;
+    let sessionScope: string | undefined;
+    if (auth.token !== undefined) {
+      requireText(auth.token, 'token', 10, 500);
+      const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
+        "SELECT * FROM qa_observation_session WHERE token_hash = $hash AND state = 'active' LIMIT 1;",
+        { hash: qaHash(auth.token) });
+      const session = rows?.[0];
+      if (!session) throw new CompanyError('forbidden', 'QA observation session is invalid or expired');
+      if (!session.expires_at || !(Date.parse(session.expires_at) > Date.now())) {
+        throw new CompanyError('forbidden', 'QA observation session expired');
+      }
+      employeeId = session.qa_employee;
+      sessionScope = qaId(session.scope);
+    } else if (auth.credential !== undefined) {
+      const actor = await this.authenticate(auth.credential);
+      if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation reads require the qa role');
+      employeeId = actor.employeeId;
+    } else {
+      throw new CompanyError('unauthorized', 'QA observation read requires a credential or a session token');
+    }
+    const scope = await this.qaScopeFor(employeeId, scopeId ?? sessionScope);
+    if (sessionScope !== undefined && scopeId !== undefined && scopeId !== sessionScope) {
+      throw new CompanyError('forbidden', 'the session is bound to another QA observation scope');
+    }
+    await this.qaScopeUsable(scope, employeeId);
+    return { scope, employeeId };
+  }
+
+  /** GM (manage): register a time-bounded, task-allowlisted QA read scope on a live QA review lease. */
+  async qaObservationGrant(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may grant a QA observation scope');
+    requireText(input.goalId, 'goalId', 1, 100);
+    requireText(input.deploymentTaskId, 'deploymentTaskId', 1, 200);
+    requireText(input.qaEmployee, 'qaEmployee', 1, 200);
+    if (!Number.isSafeInteger(input.leaseFence) || input.leaseFence < 1) throw new CompanyError('invalid', 'Invalid leaseFence');
+    if (!Array.isArray(input.subjects) || input.subjects.length === 0 || input.subjects.length > QA_OBSERVATION_MAX_SUBJECTS) {
+      throw new CompanyError('invalid', `subjects must be 1-${QA_OBSERVATION_MAX_SUBJECTS} task ids`);
+    }
+    for (const subject of input.subjects) requireText(subject, 'subject', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    const expiresMs = Date.parse(input.expiresAt);
+    if (!Number.isFinite(expiresMs) || expiresMs < Date.now() + QA_OBSERVATION_MIN_TTL_MS || expiresMs > Date.now() + QA_OBSERVATION_MAX_TTL_MS) {
+      throw new CompanyError('invalid', 'expiresAt must be within 1 minute and 24 hours from now');
+    }
+    const expiresAt = new Date(expiresMs).toISOString();
+    const subjects = [...new Set(input.subjects)];
+    const scopeId = randomUUID();
+    const scopeRecord = id('qa_observation_scope', scopeId);
+    const idem = this.idemId(actor.employeeId, 'qa_observation_grant', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ goalId: input.goalId, deploymentTaskId: input.deploymentTaskId, qaEmployee: input.qaEmployee,
+      leaseFence: input.leaseFence, subjects, expiresAt, reason: input.reason }));
+    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
+    if (prior) return qaScopeView(prior);
+    const evidence = `${input.reason}\n[qa_observation_grant] scope=${scopeId} goal=${input.goalId} deployment=${input.deploymentTaskId} qa=${input.qaEmployee} leaseFence=${input.leaseFence} subjects=${subjects.join(',')} expiresAt=${expiresAt}`;
+    const query = `BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      LET $d = SELECT * FROM ONLY $deploy;
+      IF $d = NONE { THROW 'qa observation invalid: deployment task not found' };
+      IF $d.state != 'review' OR $d.reviewer_role != 'qa' { THROW 'qa observation invalid: deployment task is not in QA review' };
+      IF $d.current_employee != $qa OR $d.fence != $fence { THROW 'qa observation invalid: QA review lease holder or fence does not match' };
+      IF $d.lease_expires_at = NONE OR $d.lease_expires_at <= time::unix(time::now()) { THROW 'qa observation invalid: QA review lease is not live' };
+      IF $d.goal != $goal { THROW 'qa observation invalid: deployment task is not in the scope goal' };
+      IF $d.submitted_by = $qa OR $d.implementer = $qa { THROW 'qa observation invalid: the qa employee authored the deployment task' };
+      LET $q = SELECT * FROM ONLY $qa_emp;
+      IF $q = NONE OR $q.revoked = true OR $q.role != 'qa' OR 'review' NOT IN $q.capabilities { THROW 'qa observation invalid: qa employee is not an active reviewer' };
+      FOR $s IN $subjects {
+        LET $t = SELECT * FROM ONLY type::record('task', $s);
+        IF $t = NONE { THROW 'qa observation invalid: subject task not found' };
+        IF $t.goal != $goal { THROW 'qa observation invalid: subject task is not in the scope goal' };
+        IF $t.submitted_by = $qa OR $t.implementer = $qa { THROW 'qa observation invalid: the qa employee authored a subject task' };
+      };
+      LET $scope = CREATE ONLY $scope_rec CONTENT { goal: $goal, deployment_task: $deploy, qa_employee: $qa, lease_holder: $qa,
+        lease_fence: $fence, subjects: $subjects, status: 'active', expires_at: $expires, version: 1, reason: $reason,
+        created_by: $actor, created_at: time::now() };
+      CREATE ONLY $audit CONTENT { task: $deploy, actor: $actor, action: 'qa_observation_grant', evidence: $evidence, version: 1, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $scope };
+      RETURN $scope;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), deploy: id('task', input.deploymentTaskId), qa: input.qaEmployee,
+      qa_emp: id('employee', input.qaEmployee), goal: id('goal', input.goalId), fence: input.leaseFence,
+      subjects, expires: expiresAt, reason: input.reason, scope_rec: scopeRecord, evidence, digest, idem,
+      audit: id('audit', randomUUID()),
+    };
+    try {
+      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
+    } catch (error) {
+      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
+      if (replayed) return qaScopeView(replayed);
+      throw error;
+    }
+  }
+
+  /** GM (manage): revoke a scope with compare-and-set on its version. */
+  async qaObservationRevoke(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may revoke a QA observation scope');
+    requireText(input.scopeId, 'scopeId', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const idem = this.idemId(actor.employeeId, 'qa_observation_revoke', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ scopeId: input.scopeId, expectedVersion: input.expectedVersion, reason: input.reason }));
+    const prior = await this.replayStored<QaObservationScopeRow>(idem, digest);
+    if (prior) return qaScopeView(prior);
+    const evidence = `${input.reason}\n[qa_observation_revoke] scope=${input.scopeId} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role != 'gm' { THROW 'actor revoked or forbidden' };
+      LET $s = SELECT * FROM ONLY $scope;
+      IF $s = NONE { THROW 'qa observation invalid: scope not found' };
+      IF $s.version != $expected { THROW 'qa observation moved: scope version changed' };
+      IF $s.status != 'active' { THROW 'qa observation moved: scope is not active' };
+      LET $next = UPDATE ONLY $scope SET status = 'revoked', revoked_at = time::now(), revoked_by = $actor,
+        revoked_reason = $reason, version = $s.version + 1 RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $s.deployment_task, actor: $actor, action: 'qa_observation_revoke', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = { actor: id('employee', actor.employeeId), scope: id('qa_observation_scope', input.scopeId),
+      expected: input.expectedVersion, reason: input.reason, evidence, digest, idem, audit: id('audit', randomUUID()) };
+    try {
+      return qaScopeView(await this.txTask<QaObservationScopeRow>(query, vars));
+    } catch (error) {
+      const replayed = await this.replayStored<QaObservationScopeRow>(idem, digest);
+      if (replayed) return qaScopeView(replayed);
+      throw error;
+    }
+  }
+
+  /** GM sees every scope; a QA sees its own. No credentials or session hashes are returned. */
+  async qaObservationStatus(credential: Credential): Promise<QaObservationScopeView[]> {
+    const actor = await this.authorized(credential);
+    if (actor.role === 'gm') {
+      const [rows] = await this.db.query<[QaObservationScopeRow[]]>("SELECT * FROM qa_observation_scope ORDER BY created_at DESC LIMIT 50;");
+      return (rows ?? []).map(qaScopeView);
+    }
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation status is read by gm or qa');
+    const [rows] = await this.db.query<[QaObservationScopeRow[]]>(
+      "SELECT * FROM qa_observation_scope WHERE qa_employee = $me ORDER BY created_at DESC LIMIT 20;", { me: actor.employeeId });
+    return (rows ?? []).map(qaScopeView);
+  }
+
+  /** QA (own credential): one-time login code for the company page. The code is stored as a hash and expires quickly. */
+  async qaObservationSession(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView> {
+    const actor = await this.authenticate(credential);
+    if (actor.role !== 'qa') throw new CompanyError('forbidden', 'QA observation sessions require the qa role');
+    const scope = await this.qaScopeFor(actor.employeeId, input.scopeId);
+    await this.qaScopeUsable(scope, actor.employeeId);
+    const code = randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + QA_OBSERVATION_CODE_TTL_MS).toISOString();
+    await this.db.query("CREATE $sess CONTENT { scope: $scope, qa_employee: $qa, code_hash: $hash, state: 'code', code_expires_at: $expires, created_at: time::now() };",
+      { sess: id('qa_observation_session', randomUUID()), scope: scope.id, qa: actor.employeeId, hash: qaHash(code), expires: expiresAt });
+    return { scope: qaScopeView(scope), code, expiresAt, pagePath: '/q/' };
+  }
+
+  /** The company page exchanges the one-time code for a browser-only restricted token. The code is consumed. */
+  async qaObservationLogin(code: string): Promise<QaObservationLoginView> {
+    requireText(code, 'code', 10, 500);
+    const [rows] = await this.db.query<[QaObservationSessionRow[]]>(
+      "SELECT * FROM qa_observation_session WHERE code_hash = $hash AND state = 'code' LIMIT 1;", { hash: qaHash(code) });
+    const session = rows?.[0];
+    if (!session) throw new CompanyError('forbidden', 'login code is invalid or already used');
+    if (!(Date.parse(session.code_expires_at) > Date.now())) throw new CompanyError('forbidden', 'login code expired');
+    const scope = await this.db.select<QaObservationScopeRow>(session.scope);
+    if (!scope || scope.status !== 'active') throw new CompanyError('forbidden', 'QA observation scope is not active');
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + QA_OBSERVATION_TOKEN_TTL_MS).toISOString();
+    await this.db.query("UPDATE ONLY $sess SET state = 'active', token_hash = $token_hash, expires_at = $expires, used_at = time::now();",
+      { sess: session.id, token_hash: qaHash(token), expires: expiresAt });
+    return { scope: qaScopeView(scope), token, expiresAt };
+  }
+
+  /** QA: full task state, contribution facts (unknown fail-closed), and the last dispatcher pass's verdicts. */
+  async qaObservationRead(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView> {
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    const [instanceAt, observation, attempt] = await Promise.all([
+      this.dbNow(),
+      this.db.select<Record<string, unknown>>(id('company_meta', 'dispatch_observation')),
+      this.db.select<{ at?: string; ok?: boolean; error?: string }>(id('company_meta', 'dispatch_observation_status')),
+    ]);
+    const checkedAt = new Date().toISOString();
+    const scopeView = qaScopeView(scope);
+    const baseMeta: QaObservationMeta = { checkedAt, dataSource: 'live', instanceAt, scope: scopeView, completeness: { complete: true } };
+    if (input.goalId !== undefined) {
+      if (input.goalId !== asId(scope.goal)) throw new CompanyError('forbidden', 'the goal is outside the QA observation scope');
+      const [rows] = await this.db.query<[Array<{ state?: string | null; n: number }>]>(
+        "SELECT state, count() AS n FROM task WHERE goal = $goal GROUP BY state;", { goal: scope.goal });
+      const states: Record<string, number> = {};
+      for (const row of rows ?? []) states[row.state == null ? 'unknown' : String(row.state)] = Number(row.n);
+      const total = Object.values(states).reduce((sum, n) => sum + n, 0);
+      const [goalTasks] = await this.db.query<[Array<{ id: RecordId }>]>("SELECT id FROM task WHERE goal = $goal;", { goal: scope.goal });
+      const goalIds = new Set((goalTasks ?? []).map(row => asId(row.id)));
+      const state = qaDispatchState(observation, attempt);
+      const verdicts = (observation as { verdicts?: Array<{ taskId?: string; dispatchable?: boolean }> } | undefined)?.verdicts ?? [];
+      const undispatchable = state.complete
+        ? new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size
+        : undefined;
+      return { meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete: state.complete } },
+        goal: { id: input.goalId, states, total,
+          ...(undispatchable !== undefined ? { undispatchable } : {}),
+          dispatchAvailable: state.available, dispatchComplete: state.complete, dispatchSource: 'dispatcher-pass',
+          ...(state.reason ? { dispatchReason: state.reason } : {}),
+          ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
+          ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
+          ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
+        } };
+    }
+    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
+    const taskId = input.taskId;
+    if (!scope.subjects.includes(taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
+    const taskView = view(row);
+    const facts = (await readContributionView(this.db, taskId)).facts;
+    const dispatch = qaDispatchFor(observation, taskId, attempt);
+    const context = row.context ?? '';
+    const contextBytes = utf8Bytes(context);
+    const inline = contextBytes <= QA_OBSERVATION_CONTEXT_INLINE_BYTES;
+    const meta: QaObservationMeta = { ...baseMeta, completeness: { complete: true, taskRead: true, contextIncluded: inline,
+      dispatchComplete: dispatch.available && dispatch.complete !== false } };
+    return {
+      meta,
+      task: inline ? taskView : { ...taskView, context: '' },
+      contribution: {
+        authors: [...facts.authors], reviewers: [...facts.reviewers], excluded: [...facts.excluded],
+        unknown: facts.unknown.map(entry => ({ actor: entry.actor, action: entry.action, ...(entry.at ? { at: entry.at } : {}), reason: entry.reason })),
+        ...(facts.implementer ? { implementer: facts.implementer } : {}), ambiguous: facts.ambiguous,
+      },
+      dispatch,
+      ...(inline ? {} : { contextOmitted: true, contextBytes, contextSha256: HASH(context), contextRead: { taskId, field: 'context' as const, offset: 0 } }),
+    };
+  }
+
+  /** QA: one stored page of the allowlisted task's audit history (evidence cut per item, read whole with qa_observation_text). */
+  async qaObservationTimeline(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView> {
+    const startedAt = arrivedAt();
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId is required');
+    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    const params = parseHistoryInput({ ...input });
+    const digest = queryDigest('qa-history', { scope: asId(scope.id), taskId: input.taskId });
+    const scopeView = qaScopeView(scope);
+    const taskId = input.taskId;
+    return this.listingPage<HistoryEntry, QaObservationTimelineView>({
+      actor: { employeeId: scope.qa_employee, role: 'qa', capabilities: [] }, kind: 'history', digest,
+      pageSize: params.pageSize, cursor: params.cursor, startedAt,
+      create: async started => {
+        const { limits } = this.snapshots;
+        return this.snapshots.build({
+          owner: scope.qa_employee, kind: 'history', digest, role: 'qa', startedAt: started,
+          guidance: 'read large evidence with qa_observation_text', emptyWhenNoRows: true,
+          load: async db => {
+            const { at, rows } = await this.historyRowsAt(taskId as TaskId, limits.maxRows + 1, db);
+            if (rows.length > limits.maxRows) throw tooLarge(`task ${taskId} has more than ${limits.maxRows} audit entries; its history cannot be listed in one stored listing`);
+            return { takenAt: at, bodies: rows.map(row => JSON.stringify(historyEntry(row, ITEM_BUDGET_BYTES))) };
+          },
+        });
+      },
+      parse: body => JSON.parse(body) as HistoryEntry,
+      respond: (history, page) => ({
+        meta: { checkedAt: page.snapshotAt ?? new Date().toISOString(), dataSource: 'live',
+          instanceAt: page.snapshotAt ?? new Date().toISOString(), scope: scopeView,
+          completeness: { complete: !page.hasMore, timelinePaged: true } },
+        history: [...history].reverse(), page,
+      }),
+      envelopeGuidance: 'use a smaller pageSize',
+      oversizeGuidance: entry => entry.auditId
+        ? `history entry ${entry.auditId} is larger than a page can hold; read its evidence with qa_observation_text ${JSON.stringify({ taskId, field: 'evidence', auditId: entry.auditId, offset: 0 })}`
+        : 'a history entry is larger than a page can hold; use a smaller pageSize',
+    });
+  }
+
+  /** QA: one byte segment of the allowlisted task's context or audit evidence, with the digest for reassembly. */
+  async qaObservationText(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment> {
+    const { scope } = await this.qaObservationAuth(auth, input.scopeId);
+    if (!scope.subjects.includes(input.taskId)) throw new CompanyError('forbidden', 'the task is outside the QA observation scope');
+    if (input.field !== 'context' && input.field !== 'evidence') throw new CompanyError('invalid', 'field must be context or evidence');
+    const offset = input.offset ?? 0;
+    const limit = input.limit ?? SEGMENT_DEFAULT_BYTES;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000_000) throw new CompanyError('invalid', 'Invalid offset');
+    if (!Number.isSafeInteger(limit) || limit < 4 || limit > SEGMENT_MAX_BYTES) throw new CompanyError('invalid', `limit must be 4-${SEGMENT_MAX_BYTES}`);
+    if (input.expectSha256 !== undefined && !/^[0-9a-f]{64}$/.test(input.expectSha256)) throw new CompanyError('invalid', 'Invalid expectSha256');
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
+    let text: string;
+    if (input.field === 'context') {
+      text = row.context ?? '';
+    } else {
+      if (!input.auditId) throw new CompanyError('invalid', 'auditId is required to read evidence');
+      const [rows] = await this.db.query<[Array<{ task?: RecordId; evidence?: string | null }>]>(
+        "SELECT task, evidence FROM audit WHERE id = $aid AND action != 'ops_call';", { aid: id('audit', input.auditId) });
+      const audit = rows?.[0];
+      if (!audit || !audit.task || asId(audit.task) !== input.taskId) throw new CompanyError('not_found', 'evidence entry not found for this task');
+      text = audit.evidence ?? '';
+    }
+    const sha256 = HASH(text);
+    if (input.expectSha256 !== undefined && input.expectSha256 !== sha256) {
+      throw new CompanyError('conflict', `the ${input.field} text changed: it is now ${utf8Bytes(text)} bytes with sha256 ${sha256}; read it again from offset 0`);
+    }
+    const head: TaskTextHead = { taskId: input.taskId, field: input.field, ...(input.auditId ? { auditId: input.auditId } : {}), sha256 };
+    const segment = textSegment(text, offset, limit, head);
+    const meta: QaObservationMeta = { checkedAt: new Date().toISOString(), dataSource: 'live', instanceAt: await this.dbNow(),
+      scope: qaScopeView(scope), completeness: { complete: segment.next === null } };
+    return { meta, ...textSegmentAnswer(head, segment), field: input.field };
+  }
+
 }

@@ -37,6 +37,8 @@ const BASE_TOOLS = [
   "get_admin_summary", "read_task_text", "read_worktree_refs",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
+  "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
+  "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
 ];
@@ -749,6 +751,30 @@ export class SidecarPool {
       case "contributor_dryrun": return core.contributorDryRun
         ? core.contributorDryRun(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
+      case "qa_observation_grant": return core.qaObservationGrant
+        ? core.qaObservationGrant(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_grant"), { code: "temporarily_unavailable" }));
+      case "qa_observation_revoke": return core.qaObservationRevoke
+        ? core.qaObservationRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_revoke"), { code: "temporarily_unavailable" }));
+      case "qa_observation_status": return core.qaObservationStatus
+        ? core.qaObservationStatus(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_status"), { code: "temporarily_unavailable" }));
+      case "qa_observation_session": return core.qaObservationSession
+        ? core.qaObservationSession(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_session"), { code: "temporarily_unavailable" }));
+      case "qa_observation_read": return withinReplyCeiling(async () => {
+        if (!core.qaObservationRead) throw Object.assign(new Error("core does not expose qa_observation_read"), { code: "temporarily_unavailable" });
+        return core.qaObservationRead({ credential: cred }, args as never);
+      });
+      case "qa_observation_timeline": return withinReplyCeiling(async () => {
+        if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
+        return core.qaObservationTimeline({ credential: cred }, args as never);
+      });
+      case "qa_observation_text": return withinReplyCeiling(async () => {
+        if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
+        return core.qaObservationText({ credential: cred }, args as never);
+      });
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));

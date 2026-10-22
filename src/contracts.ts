@@ -560,6 +560,71 @@ export interface ContributorDryRunView {
   }>;
 }
 
+
+/** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记的范围视图。不携带任何凭证。 */
+export interface QaObservationScopeView {
+  id: string; goalId: string; deploymentTaskId: string; qaEmployee: string;
+  leaseHolder: string; leaseFence: number; subjects: string[];
+  status: 'active' | 'revoked'; expiresAt: string; version: number;
+  reason: string; createdAt: string; revokedAt?: string; revokedReason?: string;
+}
+/** GM 登记 scope：绑定正在审的部署任务、同 goal、QA 实际复核租约 holder/fence、任务 allowlist、期限与理由。 */
+export interface QaObservationGrant {
+  goalId: string; deploymentTaskId: string; qaEmployee: string; leaseFence: number;
+  subjects: string[]; expiresAt: string; reason: string; idempotencyKey: string;
+}
+export interface QaObservationRevoke { scopeId: string; expectedVersion: number; reason: string; idempotencyKey: string; }
+/** 读接口的两种调用身份：员工本人的 sck 凭证，或浏览器受限会话令牌（都不是 owner token）。 */
+export interface QaObservationAuth { credential?: Credential; token?: string; }
+export interface QaObservationDispatchReason {
+  code: string; text: string; candidates: string[]; owner: string; recovery: string;
+  nextTrigger: string; basis: string; until?: string;
+}
+export interface QaObservationDispatchVerdict {
+  phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
+  eligibleCount: number; feasible: boolean; summary: string;
+  reasons: QaObservationDispatchReason[]; checkedAt: string; since?: string; waitingMinutes: number;
+}
+export interface QaObservationDispatch {
+  available: boolean; source: string; checkedAt?: string; reason?: string;
+  /** true only when the stored pass is a complete observation; false means partial/unavailable, never a silent cut. */
+  complete?: boolean;
+  /** Counts of the pass before any storage decision; a reader can compare them with what it received. */
+  originalVerdicts?: number; originalReasons?: number;
+  /** The latest persistence attempt: the stored snapshot is stale when the last write failed. */
+  attemptAt?: string; attemptOk?: boolean;
+  verdicts?: QaObservationDispatchVerdict[];
+}
+export interface QaObservationMeta {
+  checkedAt: string; dataSource: 'live'; instanceAt: string; runtimeRelease?: string;
+  scope: QaObservationScopeView;
+  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean; dispatchComplete?: boolean };
+}
+export interface QaObservationReadInput { scopeId?: string; taskId?: string; goalId?: string; }
+export interface QaObservationContribution {
+  authors: string[]; reviewers: string[]; excluded: string[];
+  unknown: Array<{ actor: string; action: string; at?: string; reason: string }>;
+  implementer?: string; ambiguous: boolean;
+}
+export interface QaObservationReadView {
+  meta: QaObservationMeta;
+  task?: TaskView;
+  contribution?: QaObservationContribution;
+  dispatch?: QaObservationDispatch;
+  goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
+    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean };
+  contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
+  contextRead?: { taskId: string; field: 'context'; offset: number };
+}
+export interface QaObservationTimelineView { meta: QaObservationMeta; history: HistoryEntry[]; page: PageInfo }
+export interface QaObservationTextSegment {
+  meta: QaObservationMeta; taskId: string; field: 'context' | 'evidence'; auditId?: string;
+  totalBytes: number; sha256: string; offset: number; bytes: number; nextOffset: number | null; text: string;
+}
+export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
+export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
+
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
@@ -626,6 +691,16 @@ export interface CompanyCore {
   systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;
   /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
+  /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
+  qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
+  qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;
+  qaObservationStatus?(credential: Credential): Promise<QaObservationScopeView[]>;
+  qaObservationSession?(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView>;
+  qaObservationLogin?(code: string): Promise<QaObservationLoginView>;
+  qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
+  qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
+  qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
+
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;

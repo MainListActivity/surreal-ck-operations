@@ -1262,6 +1262,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   );
 }
 
+
 export function CompanySurface(props: PluginSurfaceProps) {
   const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
   const s = makeStyles(ctx);
