@@ -186,7 +186,9 @@ async function ownerViews(w: Fork, snapshot: DispatchSnapshot, roots: string[]) 
     dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined });
   const pulse = pulseAnswer({ at: new Date().toISOString(), dispatchAt: snapshot.at ? new Date(snapshot.at).toISOString() : undefined,
     paused: false, doing: [], ready: [], dispatchBlocked: dispatchBlockedRows(snapshot.verdicts),
-    goalBlockers: goalBlockerRows(snapshot.verdicts, facts), stuck: [], waiting: [], recentDone: [], goals: [], resources: [],
+    goalBlockers: goalBlockerRows(snapshot.verdicts, facts), workflowWaits: [],
+    workflowWaitSummary: { source: 'workflow-graph', available: false, totalRoots: 0, truncated: false, reason: 'test fixture' },
+    stuck: [], waiting: [], recentDone: [], goals: [], resources: [],
     last24h: {}, churn: {} });
   return { roster, pulse, facts, factsError };
 }

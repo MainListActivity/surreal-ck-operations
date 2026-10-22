@@ -605,6 +605,38 @@ export interface QaObservationGoalRoot {
   reasons: QaObservationDispatchReason[];
   reasonsOmitted?: number;
 }
+export interface QaObservationGoalWaitRoot {
+  goalId?: string;
+  taskId: string;
+  title: string;
+  workflowState: 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
+  kind: 'dependency' | 'manager' | 'owner' | 'active_lease' | 'unknown';
+  basis: string;
+  waitingForRole: string;
+  nextTrigger: string;
+  goalRootCount: number;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  dependencyPathTruncated?: boolean;
+  unknownReason?: string;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  peopleSource?: 'contributor-audit';
+  submitterSource?: 'submit-audit';
+  submitCommitSource?: 'submit-audit-evidence';
+  peopleCheckedAt?: string;
+  submitCheckedAt?: string;
+}
+export interface QaObservationGoalWaitSummary {
+  source: 'workflow-graph';
+  available: boolean;
+  checkedAt?: string;
+  totalRoots: number;
+  shownRoots: number;
+  truncated: boolean;
+  reason?: string;
+  roots: QaObservationGoalWaitRoot[];
+}
+
 export interface QaObservationDispatchVerdict {
   phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
   eligibleCount: number; feasible: boolean; summary: string;
@@ -639,6 +671,8 @@ export interface QaObservationReadView {
   goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
     dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
     dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    /** Workflow waits are read from a separately timed, goal-scoped graph, not the dispatcher pass. */
+    waits?: QaObservationGoalWaitSummary;
     /** F2: the goal's root blocker from the same evaluator the owner page reads, with impact and dependency path. */
     root?: QaObservationGoalRoot };
   contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;

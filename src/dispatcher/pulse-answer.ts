@@ -13,6 +13,7 @@ export const PULSE_BUDGET_BYTES = 48 * 1024;
 export const PULSE_LIST_CAPS = {
   dispatchBlocked: { items: 40, bytes: 16 * 1024 },
   goalBlockers: { items: 40, bytes: 12 * 1024 },
+  workflowWaits: { items: 20, bytes: 2 * 1024 },
   ready: { items: 40, bytes: 4 * 1024 },
   doing: { items: 40, bytes: 3 * 1024 },
   stuck: { items: 30, bytes: 2 * 1024 },
@@ -35,6 +36,8 @@ export interface PulseParts {
   ready: readonly unknown[];
   dispatchBlocked: readonly unknown[];
   goalBlockers: readonly unknown[];
+  workflowWaits: readonly unknown[];
+  workflowWaitSummary: { source: 'workflow-graph'; available: boolean; checkedAt?: string; totalRoots: number; truncated: boolean; reason?: string };
   stuck: readonly unknown[];
   waiting: readonly unknown[];
   recentDone: readonly unknown[];

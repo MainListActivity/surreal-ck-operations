@@ -35,6 +35,11 @@ type QaRead = {
   goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string;
     dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
     dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    waits?: { source?: string; available?: boolean; checkedAt?: string; totalRoots?: number; shownRoots?: number; truncated?: boolean; reason?: string;
+      roots?: Array<{ goalId?: string; taskId?: string; title?: string; workflowState?: string; kind?: string; basis?: string; waitingForRole?: string;
+        nextTrigger?: string; goalRootCount?: number; impact?: number; dependencyPath?: Array<{ taskId?: string; title?: string }>; dependencyPathTruncated?: boolean; unknownReason?: string;
+        people?: { implementer?: string; authors?: string[]; reviewers?: string[]; submitter?: string; submitCommit?: string };
+        peopleSource?: string; submitterSource?: string; submitCommitSource?: string; peopleCheckedAt?: string; submitCheckedAt?: string }> };
     root?: { taskId?: string; title?: string; phase?: string; workflowState?: string; summary?: string; feasible?: boolean;
       waitingMinutes?: number; since?: string; checkedAt?: string; eligibleCount?: number; undispatchable?: number; others?: number;
       noticeKey?: string; factsAvailable?: boolean; impact?: number; dependencyPath?: Array<{ taskId?: string; title?: string }>;
@@ -237,6 +242,7 @@ export function createQaConsoleFetch(opts: QaConsoleOptions): (req: Request) => 
             : `不可用/未知${g.dispatchReason ? `（${esc(g.dispatchReason)}）` : ""}`;
           const undispatchable = g.dispatchComplete === true ? esc(g.undispatchable ?? 0) : "未知（未核验）";
           const root = g.root;
+          const waits = g.waits;
           const rootHtml = root ? (() => {
             const facts = root.factsAvailable === true;
             const impact = facts ? `${esc(root.impact ?? 0)} 项` : "未知（事实不可读）";
@@ -259,10 +265,22 @@ export function createQaConsoleFetch(opts: QaConsoleOptions): (req: Request) => 
 <div class="meta">依赖路径 ${path}</div>
 <div class="meta">${people}</div>
 ${reasons}${root.reasonsOmitted ? `<div class="meta">另有 ${esc(root.reasonsOmitted)} 条原因未列出</div>` : ""}</div>`;
-          })() : `<div class="card"><div class="meta">根阻点：本轮 pass 中该目标无可报的阻断结论（或派工快照不可用）</div></div>`;
+          })() : `<div class="card"><div class="meta">派工结论：${g.dispatchComplete === true ? `完整 pass，本目标不可派工 ${undispatchable} 项` : `未知（${esc(g.dispatchReason ?? '派工快照不可用')}）`}</div></div>`;
+          const waitsHtml = waits?.available === true
+            ? `<div class="card"><h3>工作流等待 · ${esc(waits.totalRoots ?? 0)} 个根</h3>
+<div class="meta">来源 ${esc(waits.source ?? 'workflow-graph')} · 采集于 ${esc(waits.checkedAt ?? '未知')} · dispatcher pass ${esc(g.dispatchCheckedAt ?? '未知')} · 显示 ${esc(waits.shownRoots ?? waits.roots?.length ?? 0)} / ${esc(waits.totalRoots ?? 0)}${waits.truncated ? ' · 已截断' : ''}</div>
+${(waits.roots ?? []).length === 0 ? '<div class="meta">当前目标没有已识别的工作流等待根。</div>' : ''}
+${(waits.roots ?? []).map(r => {
+  const kind = r.kind === 'dependency' ? '正常依赖等待' : r.kind === 'manager' ? '经理关口' : r.kind === 'owner' ? '老板关口' : r.kind === 'active_lease' ? '活租约等待' : '等待未知';
+  const impact = r.impact === undefined ? '未知' : `${esc(r.impact)} 项`;
+  const path = r.dependencyPath?.length ? r.dependencyPath.map(p => `${esc(p.title ?? p.taskId)}（${esc(p.taskId)}）`).join(' → ') : r.kind === 'unknown' ? '未知' : '无后续等待';
+  const people = r.people ? `人物 ${esc(r.peopleSource ?? '未知')} · 提交人 ${esc(r.people?.submitter ?? '未记录')}（${esc(r.submitterSource ?? '来源未知')}） · 提交 SHA ${esc(r.people?.submitCommit ?? '未记录')}（${esc(r.submitCommitSource ?? '来源未知')}） · 人物时点 ${esc(r.peopleCheckedAt ?? '未知')} · 提交审计时点 ${esc(r.submitCheckedAt ?? '未知')}` : '人物与提交依据未记录';
+  return `<div class="meta"><b>${esc(kind)} · ${esc(r.title)}（${esc(r.taskId)}）</b><br>工作流 ${esc(r.workflowState ?? 'unknown')} · 处理岗位 ${esc(r.waitingForRole ?? '未知')} · 根数 ${esc(r.goalRootCount ?? '未知')} · 影响 ${impact}<br>依据 ${esc(r.basis ?? '未知')} · 下一触发 ${esc(r.nextTrigger ?? '未知')}${r.unknownReason ? ` · ${esc(r.unknownReason)}` : ''}<br>依赖路径 ${path}${r.dependencyPathTruncated ? ' · 路径已截断' : ''}<br>${people}</div>`;
+}).join('')}</div>`
+            : `<div class="card"><h3>工作流等待：未知</h3><div class="meta">来源 ${esc(waits?.source ?? 'workflow-graph')} · ${esc(waits?.reason ?? '事实不可读')} · dispatcher pass ${esc(g.dispatchCheckedAt ?? '未知')}</div></div>`;
           return html(layout("QA 目标汇总", `${scopeLinks(scope)}${metaHtml(read, runtimeRelease)}<div class="card"><h3>目标 ${esc(g.id)}</h3>
 <div class="meta">总任务 ${esc(g.total)} · 状态计数 ${esc(JSON.stringify(g.states ?? {}))} · 派工覆盖 ${coverage} · 无法派工 ${undispatchable} · 检查于 ${esc(g.checkedAt)}</div>
-<pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>${rootHtml}`));
+<pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>${rootHtml}${waitsHtml}`));
         }
         return html(layout("QA 只读验收", `${scopeLinks(scope, taskId)}${metaHtml(read, runtimeRelease)}${taskHtml(read, taskId)}${dispatchHtml(read.dispatch)}${contributionHtml(read)}`));
       }

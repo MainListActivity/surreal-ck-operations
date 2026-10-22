@@ -329,7 +329,7 @@ test('pulse RPC: with every list full, the whole answer stays within the 48 KiB 
     last24h: { done: 1, returned: 0, rolledBack: 0, rejected: 0, retired: 0 },
     churn: { created: 0, retired: 0, claimLost: 0 },
   };
-  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, ready: 300, doing: 300, stuck: 200,
+  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, workflowWaits: 0, ready: 300, doing: 300, stuck: 200,
     waiting: 200, recentDone: 50, goals: 100, resources: 100 };
   try {
     const response = await callPulse();

@@ -235,9 +235,9 @@ export function registerHandlers(server: PluginServerContext): void {
   ownerHandle(rpc.pulse, async () => {
     const { db, owner, workforce, dispatcher } = await company();
     const { quotaBlockedProviders, roleCapacity } = await import("./vendor/src/dispatcher/dispatcher.ts");
-    const { dispatchBlockedRows, goalBlockerList, goalBlockerRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
+    const { dispatchBlockedRows, goalBlockerList, goalBlockerRows, goalWorkflowWaitRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
     const { pulseAnswer } = await import("./vendor/src/dispatcher/pulse-answer.ts");
-    const { readGoalRootFacts } = await import("./vendor/src/dispatcher/goal-roots.ts");
+    const { readGoalWorkflowWaitSnapshot } = await import("./vendor/src/dispatcher/goal-roots.ts");
     const { localDate } = await import("./vendor/src/owner-brief.ts");
     const { readProviderQuotas } = await import("./dispatch.ts");
     const { RecordId } = await import("surrealdb");
@@ -296,8 +296,18 @@ export function registerHandlers(server: PluginServerContext): void {
     // Goal cards name each root's people and waiting chain, read now for the roots the bounded list shows. A failed read keeps the
     // verdict-only card rather than failing the whole pulse.
     const roots = goalBlockerList(verdicts);
-    const goalFacts = await readGoalRootFacts(db.db, workforce, roots.items.map(root => root.taskId),
-      message => console.warn(message)).catch(error => { console.warn(`goal root facts failed: ${(error as Error).message}`); return undefined; });
+    const workflowSnapshot = await readGoalWorkflowWaitSnapshot(db.db, workforce, {
+      roots: roots.items.map(root => root.taskId), limit: 20,
+      log: message => console.warn(message),
+    }).catch(error => {
+      console.warn(`goal workflow wait facts failed: ${(error as Error).message}`);
+      return undefined;
+    });
+    const goalFacts = workflowSnapshot?.facts;
+    const workflowWaitSummary = workflowSnapshot?.summary ?? {
+      source: 'workflow-graph' as const, available: false, totalRoots: 0, shownRoots: 0, truncated: false,
+      reason: 'workflow graph could not be read', roots: [],
+    };
     // Every row goes to pulseAnswer, which caps the list and reports the whole count (SYS-DISP R6).
     return pulseAnswer({
       at: new Date(now).toISOString(),
@@ -307,6 +317,10 @@ export function registerHandlers(server: PluginServerContext): void {
       ready,
       dispatchBlocked: dispatchBlockedRows(verdicts),
       goalBlockers: goalBlockerRows(verdicts, goalFacts),
+      workflowWaits: goalWorkflowWaitRows(workflowWaitSummary),
+      workflowWaitSummary: { source: workflowWaitSummary.source, available: workflowWaitSummary.available,
+        checkedAt: workflowWaitSummary.checkedAt, totalRoots: workflowWaitSummary.totalRoots,
+        truncated: workflowWaitSummary.truncated, ...(workflowWaitSummary.reason ? { reason: workflowWaitSummary.reason } : {}) },
       stuck: (brief.stuck ?? []).filter(s => !readyIds.has(s.taskId)),
       waiting: brief.waiting ?? [],
       recentDone: (recentDone ?? []).map((r: any) => ({ taskId: asId(r.task), title: String(r.title ?? ""), at: String(r.at), actor: r.actor ? asId(r.actor) : undefined })),

@@ -26,7 +26,7 @@ import { CompanyError } from './core-errors.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople } from './dispatcher/dispatch-blocked.ts';
-import { readGoalRootFacts } from './dispatcher/goal-roots.ts';
+import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
 export { CompanyError };
@@ -3437,41 +3437,35 @@ export class SurrealCompanyCore implements CompanyCore {
       const undispatchable = state.complete
         ? new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size
         : undefined;
-      // F2: the goal's root blocker comes from the same server-side evaluator the owner pulse uses (goalRootBlockers over
-      // the pass's verdicts). Facts (waiting graph, people, last submit commit) are read only for the root the verdicts name;
-      // when they cannot be read the answer says factsAvailable=false and omits impact/path/people instead of reporting zero.
+      // Workflow waits are a separately sampled, goal-scoped graph. They remain available when a dispatch pass is absent,
+      // partial or stale, and never inherit the pass timestamp.
       const passVerdicts = (observation as { verdicts?: DispatchVerdict[] } | undefined)?.verdicts ?? [];
-      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === input.goalId);
+      const goalVerdicts = passVerdicts.filter(verdict => verdict.goalId === input.goalId && goalIds.has(verdict.taskId));
       const verdictRoot = goalRootBlockers(goalVerdicts)[0];
-      let facts: GoalRootFacts | undefined;
-      if (verdictRoot && this.workforce) {
-        try {
-          const readFacts = await readGoalRootFacts(this.db, this.workforce, [verdictRoot.taskId], message => console.warn(message));
-          // B1 isolation (QA review R1): readGoalRootFacts reads the whole company's unfinished-task graph, and the owner
-          // pulse may see all of it. The QA channel may see only the scope goal, so the graph is narrowed here — keys and
-          // dependency edges — before the shared evaluator walks it. goalRootBlockers/waitingBehind stay unchanged, so the
-          // owner-facing conclusion is untouched; a task of another goal that waits on this root neither appears in the
-          // payload nor inflates the impact count.
-          const dependencies = new Map<string, string[]>();
-          for (const [task, deps] of readFacts.dependencies) {
-            if (!goalIds.has(task)) continue;
-            dependencies.set(task, deps.filter(dep => goalIds.has(dep)));
-          }
-          const titles = new Map<string, string>();
-          for (const [task, title] of readFacts.titles) if (goalIds.has(task)) titles.set(task, title);
-          const people = new Map<string, GoalRootPeople>();
-          for (const [task, value] of readFacts.people) if (goalIds.has(task)) people.set(task, value);
-          facts = { dependencies, titles, people };
-        } catch (error) {
-          console.warn(`qa goal root facts failed: ${(error as Error).message}`);
-          facts = undefined;
-        }
+      let workflowSnapshot: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>> | undefined;
+      let waits: Awaited<ReturnType<typeof readGoalWorkflowWaitSnapshot>>['summary'];
+      try {
+        workflowSnapshot = await readGoalWorkflowWaitSnapshot(this.db, this.workforce, {
+          goalId: input.goalId, roots: verdictRoot ? [verdictRoot.taskId] : [], limit: 20,
+          log: message => console.warn(message),
+        });
+        waits = workflowSnapshot.summary;
+      } catch (error) {
+        console.warn(`qa goal workflow wait facts failed: ${(error as Error).message}`);
+        waits = { source: 'workflow-graph', available: false, totalRoots: 0, shownRoots: 0, truncated: false,
+          reason: 'workflow graph could not be read', roots: [] };
       }
+      // The exact same goal-root evaluator and graph facts serve dispatch blockers and workflow waits. Without workforce
+      // contributor access, the legacy F1 root keeps its facts-unavailable semantics; the workflow wait graph remains readable.
+      const facts: GoalRootFacts | undefined = verdictRoot && this.workforce && workflowSnapshot
+        ? workflowSnapshot.facts : undefined;
       const rootBlocker = goalRootBlockers(goalVerdicts, facts)[0];
       const rootVerdict = verdictRoot
         ? goalVerdicts.find(verdict => verdict.taskId === verdictRoot.taskId && verdict.phase === verdictRoot.phase)
         : undefined;
       const reasons = rootBlocker?.reasons ?? [];
+      // Revalidate after the graph and provenance reads so expiry, revocation or holder-fence changes during collection fail closed.
+      await this.qaObservationAuth(auth, input.scopeId);
       const root = rootBlocker ? {
         taskId: rootBlocker.taskId, title: rootBlocker.title, phase: rootBlocker.phase,
         workflowState: rootBlocker.workflowState, summary: rootBlocker.summary, feasible: rootBlocker.feasible,
@@ -3500,6 +3494,13 @@ export class SurrealCompanyCore implements CompanyCore {
           ...(state.checkedAt ? { dispatchCheckedAt: state.checkedAt } : {}),
           ...(state.attemptAt ? { dispatchAttemptAt: state.attemptAt } : {}),
           ...(state.attemptOk !== undefined ? { dispatchAttemptOk: state.attemptOk } : {}),
+          waits: waits.available ? { ...waits, roots: waits.roots.map(wait => {
+            if (!wait.people) return wait;
+            const authors = wait.people.authors.slice(0, 6);
+            const reviewers = wait.people.reviewers.slice(0, 6);
+            const peopleOmitted = wait.people.authors.length - authors.length + wait.people.reviewers.length - reviewers.length;
+            return { ...wait, people: { ...wait.people, authors, reviewers, ...(peopleOmitted ? { peopleOmitted } : {}) } };
+          }) } : waits,
           ...(root ? { root } : {}),
         } };
     }
