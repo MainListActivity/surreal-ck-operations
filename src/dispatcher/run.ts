@@ -5,7 +5,7 @@ import { CompanyDatabase } from '../database.ts';
 import { OwnerDesk } from '../owner.ts';
 import { SurrealCompanyCore } from '../core.ts';
 import { Workforce } from '../workforce.ts';
-import { passLedger } from '../dispatch-pause.ts';
+import { passLedger, reapStaleRunningPasses } from '../dispatch-pause.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { jevFromEnv } from './jev.ts';
 import { createPaseoCli } from './paseo.ts';
@@ -30,6 +30,10 @@ process.once('SIGINT', () => stop.abort());
 process.once('SIGTERM', () => stop.abort());
 try {
   await db.bootstrap();
+  // Startup reap (SYS-DISP 876e36e2 H1, runbook §7 ★1): running rows of this host whose process is provably dead
+  // become abandoned before this process creates its first pass, so one crash no longer wedges every later drain.
+  const reaped = await reapStaleRunningPasses(db.db);
+  console.log(`${new Date().toISOString()} startup reap: scanned ${reaped.scanned}, abandoned ${reaped.reaped}, kept running ${reaped.keptUnknown}`);
   const workforce = new Workforce(db, resolve(required('SCK_CREDENTIAL_DIR')));
   const core = new SurrealCompanyCore(db);
   const dispatcher = new Dispatcher({

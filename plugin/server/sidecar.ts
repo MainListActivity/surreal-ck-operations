@@ -39,7 +39,7 @@ const BASE_TOOLS = [
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // gm only in core: dispatch maintenance pause/restore (compare-and-set on the epoch, audited) and the read-only status.
-  "dispatch_pause", "dispatch_restore", "dispatch_status",
+  "dispatch_pause", "dispatch_restore", "dispatch_status", "dispatch_audit",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
   "task_project_update",
   // gm only in core (bind a blocked execute-phase task's code repo; audited, version-guarded).
@@ -809,6 +809,7 @@ export class SidecarPool {
       case "dispatch_pause": return core.setDispatchPause(cred, { ...args, paused: true } as never);
       case "dispatch_restore": return core.setDispatchPause(cred, { ...args, paused: false } as never);
       case "dispatch_status": return core.dispatchStatus(cred);
+      case "dispatch_audit": return core.dispatchAudit(cred, String(args.operationId ?? ""));
       case "project_disciplines_update": return core.updateProjectDisciplines(cred, args as never);
       case "deliverable_publish": {
         // 显式 taskId 供经理代发/补发（免租约）；缺省才取当前租约任务。

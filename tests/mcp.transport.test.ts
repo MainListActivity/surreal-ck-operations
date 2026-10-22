@@ -114,6 +114,7 @@ test('real SDK initialize/list/call and authenticated core identity', async () =
     expect(tools).toContain('dispatch_pause');
     expect(tools).toContain('dispatch_restore');
     expect(tools).toContain('dispatch_status');
+    expect(tools).toContain('dispatch_audit');
     // SYS01 R1: the recovery entry for a worktree whose references were cut from a page.
     expect(tools).toContain('read_worktree_refs');
     const result = await connection.client.callTool({ name: 'get_context', arguments: { employeeId: 'gm-01', role: 'gm' } });

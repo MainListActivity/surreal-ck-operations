@@ -8,7 +8,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { Workforce } from '../src/workforce.ts';
-import { passLedger, readPauseState, writePause } from '../src/dispatch-pause.ts';
+import { passLedger, readPauseState } from '../src/dispatch-pause.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
@@ -301,68 +301,70 @@ run('R-B (6) a review lease held before the pause can accept or return while pau
   } finally { await w.close(); }
 });
 
-run('R-A regression: admin config can no longer set paused without the epoch, gate and audit, and refuses pause_epoch', async () => {
-  const w = await startFork('admin-config');
+// SYS-DISP 876e36e2 H2 + ruling item 6 rewrote the two R-A cases: the admin CLI entry now refuses both maintenance
+// keys before any write (the authorized surfaces are wired), and the gm pause/restore lifecycle is verifiable
+// end to end through dispatch_audit, the bounded forensics read deployment QA needs.
+run('R-A regression: admin config refuses paused and pause_epoch before any write and names the real commands', async () => {
+  const w = await startFork('admin-refuse');
+  const cli = async (...args: string[]) => {
+    const child = Bun.spawn(['bun', join(import.meta.dir, '..', 'src', 'admin.ts'), ...args], {
+      cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
+      env: { ...process.env, SCK_PRODUCT_ENV: '/dev/null', SCK_CREDENTIAL_DIR: join(w.dir, 'cli-credentials'),
+        SURREAL_URL: w.url, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: ROOT_PASSWORD,
+        SCK_COMPANY_NS: w.namespace, SCK_COMPANY_DB: 'control_plane' },
+    });
+    const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    return { code: await child.exited, out, err };
+  };
   try {
     const before = await readPauseState(w.db.db);
     expect(before.paused).toBe(false);
-    // The operator path (src/admin.ts `config paused true`) now runs the same transaction as the manager pause.
-    const written = await writePause(w.db.db, { paused: true, actor: 'admin', actorRole: 'operator', expectedEpoch: null,
-      evidence: JSON.stringify({ source: 'admin config paused', value: true }) });
-    expect(written).toMatchObject({ operation: 'dispatch_pause', paused: true, epoch: 1, before: { paused: false, epoch: 0 } });
+    for (const [key, value] of [['paused', 'true'], ['paused', 'false'], ['pause_epoch', '7']] as const) {
+      const refused = await cli('config', key, value);
+      expect(refused.code).not.toBe(0); // stable refusal: {ok:false, code} on stdout with exit 1, like retire/revoke
+      expect(refused.out).toContain('"ok": false');
+      expect(refused.out).toContain('"code": "invalid"');
+      expect(refused.out).toContain('dispatch_pause');
+      expect(refused.out).toContain('dispatch_restore');
+    }
+    // The refusal happens before any write: state and epoch never moved, and no audit row was written.
     const after = await readPauseState(w.db.db);
-    expect(after).toMatchObject({ paused: true, epoch: 1 });
-    const [gate] = await w.db.db.query<[unknown]>('SELECT paused, epoch FROM ONLY company_meta:dispatch_gate;');
-    expect(gate).toMatchObject({ paused: true, epoch: 1 });
-    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string; epoch: number }>]>(
-      "SELECT action, actor, epoch, sequence FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] ORDER BY sequence;");
-    expect(audits).toMatchObject([{ action: 'dispatch_pause', actor: 'admin', epoch: 1 }]);
-    // A new lease is refused while the operator pause holds, so this path cannot be a silent side door either.
-    const task = await w.makeTask('admin pause barrier');
-    await expect(w.core.claim(w.engineer, task.id)).rejects.toMatchObject({ code: 'dispatch_paused' });
-    // And the operator can restore it through the same transaction.
-    const restored = await writePause(w.db.db, { paused: false, actor: 'admin', actorRole: 'operator', expectedEpoch: null,
-      evidence: JSON.stringify({ source: 'admin config paused', value: false }) });
-    expect(restored).toMatchObject({ operation: 'dispatch_restore', paused: false, epoch: 2 });
-    expect((await w.core.claim(w.engineer, task.id)).task.state).toBe('doing');
+    expect(after.paused).toBe(false);
+    expect(after.epoch).toBe(before.epoch);
+    const [audits] = await w.db.db.query<[Array<{ c?: number }>]>(
+      "SELECT count() AS c FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] GROUP ALL;");
+    expect(audits?.[0]?.c ?? 0).toBe(0);
+    // Other config keys keep their old behaviour exactly: they still write through.
+    const maxRunning = await cli('config', 'max_running', '3');
+    expect(maxRunning.code).toBe(0);
+    expect(maxRunning.out).toContain('"maxRunning": 3');
   } finally { await w.close(); }
 });
 
-run('R-A end to end: the admin CLI writes the pause through the transaction, refuses pause_epoch, and restores', async () => {
-  const w = await startFork('admin-cli');
+run('R-A end to end: the gm pause lifecycle audits both operations and dispatch_audit reads them back (gm only)', async () => {
+  const w = await startFork('audit-read');
   try {
-    const cli = async (...args: string[]) => {
-      const child = Bun.spawn(['bun', join(import.meta.dir, '..', 'src', 'admin.ts'), ...args], {
-        cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
-        env: { ...process.env, SCK_PRODUCT_ENV: '/dev/null', SCK_CREDENTIAL_DIR: join(w.dir, 'cli-credentials'),
-          SURREAL_URL: w.url, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: ROOT_PASSWORD,
-          SCK_COMPANY_NS: w.namespace, SCK_COMPANY_DB: 'control_plane' },
-      });
-      const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      return { code: await child.exited, out, err };
-    };
-
-    const paused = await cli('config', 'paused', 'true');
-    expect(paused.code).toBe(0);
-    expect(paused.out).toContain('"operation": "dispatch_pause"');
-    expect(await readPauseState(w.db.db)).toMatchObject({ paused: true, epoch: 1 });
-    const [gate] = await w.db.db.query<[unknown]>('SELECT paused, epoch FROM ONLY company_meta:dispatch_gate;');
-    expect(gate).toMatchObject({ paused: true, epoch: 1 });
-    const [audits] = await w.db.db.query<[Array<{ action: string; actor: string }>]>(
-      "SELECT action, actor, sequence FROM audit WHERE action IN ['dispatch_pause', 'dispatch_restore'] ORDER BY sequence;");
-    expect(audits).toMatchObject([{ action: 'dispatch_pause', actor: 'admin' }]);
-    // The epoch is not an operator-settable key: the CLI refuses it and points at the pause itself.
-    const epoch = await cli('config', 'pause_epoch', '7');
-    expect(epoch.code).not.toBe(0);
-    expect(epoch.err).toContain('dispatch_pause');
-    expect(await readPauseState(w.db.db)).toMatchObject({ paused: true, epoch: 1 });
-    // Other config keys still work unchanged.
-    const maxRunning = await cli('config', 'max_running', '3');
-    expect(maxRunning.code).toBe(0);
-    // And the same CLI restores it, moving the epoch again.
-    const restored = await cli('config', 'paused', 'false');
-    expect(restored.code).toBe(0);
-    expect(restored.out).toContain('"operation": "dispatch_restore"');
-    expect(await readPauseState(w.db.db)).toMatchObject({ paused: false, epoch: 2 });
+    const task = await w.makeTask('audit lifecycle');
+    const before = await w.core.dispatchStatus(w.gm);
+    expect(before.paused).toBe(false);
+    const paused = await w.core.setDispatchPause(w.gm, { paused: true, expectedEpoch: before.epoch,
+      reason: '维护停派：审计取证回归', idempotencyKey: `audit-pause-${crypto.randomUUID()}`, drainTimeoutSeconds: 10 });
+    expect(paused).toMatchObject({ operation: 'dispatch_pause', paused: true, epoch: before.epoch + 1,
+      drained: { drained: true } });
+    const pauseAudit = await w.core.dispatchAudit(w.gm, paused.operationId);
+    expect(pauseAudit).toMatchObject({ operationId: paused.operationId, action: 'dispatch_pause', paused: true,
+      previousPaused: false, epoch: before.epoch + 1, previousEpoch: before.epoch });
+    expect(typeof pauseAudit.sequence).toBe('number');
+    expect(pauseAudit.actor.length).toBeGreaterThan(0);
+    await expect(w.core.claim(w.engineer, task.id)).rejects.toMatchObject({ code: 'dispatch_paused' });
+    const restored = await w.core.setDispatchPause(w.gm, { paused: false, expectedEpoch: paused.epoch,
+      reason: '维护结束恢复派工', idempotencyKey: `audit-restore-${crypto.randomUUID()}` });
+    const restoreAudit = await w.core.dispatchAudit(w.gm, restored.operationId);
+    expect(restoreAudit).toMatchObject({ action: 'dispatch_restore', paused: false, previousPaused: true, epoch: restored.epoch });
+    expect((await w.core.claim(w.engineer, task.id)).task.state).toBe('doing');
+    // Bounded read: gm only, input validated, and only dispatch maintenance rows are reachable.
+    await expect(w.core.dispatchAudit(w.engineer, paused.operationId)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(w.core.dispatchAudit(w.gm, 'short')).rejects.toMatchObject({ code: 'invalid' });
+    await expect(w.core.dispatchAudit(w.gm, `audit:${crypto.randomUUID()}`)).rejects.toMatchObject({ code: 'not_found' });
   } finally { await w.close(); }
 });

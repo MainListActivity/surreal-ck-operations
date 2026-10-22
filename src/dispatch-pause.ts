@@ -6,6 +6,7 @@
 // way back to dispatching.
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
+import process from 'node:process';
 import { RecordId, type Surreal } from 'surrealdb';
 
 /** Compare-and-set failure: the caller's epoch is no longer the current one. */
@@ -112,6 +113,63 @@ export interface DrainStatus { drained: boolean; blocking: number | null; waited
  * under drain (or not yet recorded an epoch, which counts as old).
  */
 const OLD_RUNNING_PASSES = `SELECT VALUE count() FROM dispatch_pass WHERE state = 'running' AND (epoch = NONE OR epoch < $epoch) GROUP ALL;`;
+
+/**
+ * A process probe for the startup reaper: signal 0 never delivers, it only asks the kernel whether the pid exists.
+ * ESRCH is the one answer that proves death; EPERM means a process is there under another owner, and anything else
+ * is unknown. All non-ESRCH outcomes are returned as "not provably dead", so the row stays running (fail closed).
+ */
+export function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+
+export interface ReapSummary { scanned: number; reaped: number; keptUnknown: number; reapedIds: string[] }
+
+/**
+ * Startup reaper (runbook §7 ★1, SYS-DISP 876e36e2 H1). A killed process never runs the pass finally block, so its
+ * dispatch_pass row stays running forever and every later dispatch_pause drains to false. Each dispatcher process runs
+ * this once, before creating its own first pass: running rows of this host whose pid is provably dead become abandoned
+ * — a new state value, chosen over a flag because every drain query already filters state='running' and abandoned rows
+ * then fall out of drain and into the existing 1-day ledger prune, with no row deleted. Rows from other hosts, missing
+ * or malformed instances, pids that still answer, and any failed read are left running: death must be provable, never
+ * guessed. A pass that ends between the read and the write fails the row check and aborts that transaction instead of leaving a false audit.
+ */
+export async function reapStaleRunningPasses(db: Surreal, host = hostname(), alive: (pid: number) => boolean = processAlive,
+  selfPid: number = process.pid): Promise<ReapSummary> {
+  const summary: ReapSummary = { scanned: 0, reaped: 0, keptUnknown: 0, reapedIds: [] };
+  let rows: Array<{ id: RecordId; instance?: string }>;
+  try {
+    const [found] = await run(db, "SELECT id, instance FROM dispatch_pass WHERE state = 'running';", {}) as [Array<{ id: RecordId; instance?: string }> | undefined];
+    rows = found ?? [];
+  } catch {
+    // Ledger unreadable: keep every row running and let the dispatcher start anyway. Drain stays fail closed.
+    return { ...summary, scanned: -1 };
+  }
+  for (const row of rows) {
+    summary.scanned++;
+    const parts = (row.instance ?? '').split(':');
+    const pid = Number(parts[1]);
+    if (parts[0] !== host || !Number.isSafeInteger(pid) || pid <= 0 || pid === selfPid || !parts[2] || parts.length !== 3) { summary.keptUnknown++; continue; }
+    if (alive(pid)) { summary.keptUnknown++; continue; }
+    try {
+      // Same transaction updates the row and writes the audit (conventions as in PAUSE_TXN): the reaping is auditable.
+      // RETURN AFTER gives nothing when the pass ended between the read and this write; the THROW aborts the whole
+      // transaction, so no audit row can claim a pass that finished on its own terms.
+      await run(db, `BEGIN;
+        LET $u = (UPDATE ONLY $pass SET state = 'abandoned', finished_at = time::now() WHERE state = 'running' RETURN AFTER);
+        IF $u = NONE { THROW 'stale reap: pass no longer running' };
+        CREATE ONLY $audit CONTENT { actor: 'system:dispatcher', action: 'dispatch_pass_reaped', instance: $instance,
+          evidence: $evidence, at: time::now() };
+        COMMIT;`, { pass: row.id, audit: new RecordId('audit', randomUUID()), instance: row.instance,
+          evidence: JSON.stringify({ source: 'dispatcher startup reap', host, pid, reason: 'running row of a process provably dead (ESRCH)' }) });
+      summary.reaped++; summary.reapedIds.push(String(row.id));
+    } catch {
+      summary.keptUnknown++; // write failed: the row stays running, never a guess in the other direction
+    }
+  }
+  return summary;
+}
 
 /** Number of passes that started under an epoch older than `epoch`, or have not recorded one yet, and are still running. */
 export async function oldRunningPasses(db: Surreal, epoch: number): Promise<number> {

@@ -1,13 +1,13 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Surreal } from 'surrealdb';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
-import { passLedger, waitForDrain } from '../src/dispatch-pause.ts';
+import { passLedger, reapStaleRunningPasses, waitForDrain } from '../src/dispatch-pause.ts';
 import { readJsonFile, reqDir, resDir } from '../src/comm.ts';
 import { connectCompanyClient } from '../src/mcp/client.ts';
 import { createMcpHttpService } from '../src/mcp/server.ts';
@@ -347,4 +347,74 @@ run('sidecar on the real core: a paused claim is denied; a restarted channel kee
   } finally {
     pool.close();
   }
+});
+
+// SYS-DISP 876e36e2 H1: the startup reaper against the real company fork. The row states, the audit row and the drain
+// effect must hold on SurrealDB itself, not only in the decision unit test (tests/dispatch-pause-reap.test.ts).
+run('H1 reap: orphan running row of a provably dead pid becomes abandoned, and the pause then drains to true', async () => {
+  await ensureOpen();
+  // Fixture hygiene: the fork database is shared across cases. End any running row an earlier case left behind so the
+  // counts below see only this case's orphan. (These are test-fork rows; production data is never in reach here.)
+  await db.db.query("UPDATE dispatch_pass SET state = 'done', finished_at = time::now() WHERE state = 'running';", {});
+  const dead = Bun.spawn(['/bin/sleep', '0.05']);
+  await dead.exited; // kernel has reaped it: processAlive(dead.pid) is the ESRCH death proof now
+  const instance = `${hostname()}:${dead.pid}:orphan1`;
+  await passLedger(db.db, instance).begin(); // never ended: exactly what a killed process leaves behind (runbook §7 ★1)
+  const s0 = await status();
+  // Fail closed first: an orphan counts as blocking, and no timeout makes it drained.
+  expect(await waitForDrain(db.db, s0.epoch + 1, 300)).toMatchObject({ drained: false, blocking: 1 });
+  const summary = await reapStaleRunningPasses(db.db);
+  expect(summary.reaped).toBeGreaterThanOrEqual(1);
+  const [orphan] = await db.db.query<[Array<{ state?: string; finished_at?: string }> | undefined]>(
+    'SELECT state, finished_at FROM dispatch_pass WHERE instance = $i;', { i: instance });
+  expect(orphan).toMatchObject([{ state: 'abandoned' }]);
+  expect(orphan?.[0]?.finished_at).toBeTruthy(); // retired through the existing non-running prune path, never deleted here
+  const [audits] = await db.db.query<[Array<{ actor?: string; action?: string }>]>(
+    "SELECT actor, action FROM audit WHERE action = 'dispatch_pass_reaped' AND instance = $i;", { i: instance });
+  expect(audits).toMatchObject([{ actor: 'system:dispatcher', action: 'dispatch_pass_reaped' }]);
+  // The defect this task exists for: after the reap, dispatch_pause reaches drained=true instead of timing out forever.
+  const paused = await pause(gmA, s0.epoch, '维护停派：孤儿回收后端到端排空', 10);
+  expect(paused.drained).toMatchObject({ drained: true, blocking: 0 });
+  await restore(gmA, paused.epoch);
+});
+
+run('H1 fail closed on the fork: live-pid row and cross-host row both stay running through the reap', async () => {
+  const live = Bun.spawn(['/bin/sleep', '30']);
+  const liveInstance = `${hostname()}:${live.pid}:live1`;
+  const foreignInstance = 'sck-other-host:999999:foreign1';
+  const malformed = `${hostname()}:999998`; // host and pid but no uuid part: shape unrecognised, never a guess
+  try {
+    // Fixture hygiene (shared fork database): end leftover running rows so `blocking: 3` counts only this case's rows.
+    await db.db.query("UPDATE dispatch_pass SET state = 'done', finished_at = time::now() WHERE state = 'running';", {});
+    const good = await passLedger(db.db, liveInstance).begin();
+    const foreign = await passLedger(db.db, foreignInstance).begin();
+    const bad = await passLedger(db.db, malformed).begin();
+    const summary = await reapStaleRunningPasses(db.db);
+    expect(summary.reaped).toBe(0);
+    const rows = await db.db.query<Array<{ instance: string; state: string }>>(
+      'SELECT instance, state FROM dispatch_pass WHERE instance IN [$a, $b, $c] ORDER BY instance;',
+      { a: liveInstance, b: foreignInstance, c: malformed });
+    expect(rows.map(r => r.state)).toEqual(['running', 'running', 'running']);
+    // And drain still counts all three: keeping them is the fail-closed side of the rule, not a cleanup shortcut.
+    const s0 = await status();
+    expect(await waitForDrain(db.db, s0.epoch + 1, 300)).toMatchObject({ drained: false, blocking: 3 });
+    await good.end('done'); await foreign.end('done'); await bad.end('done');
+    live.kill(); await live.exited;
+  } finally { live.kill(); }
+});
+
+run('H1 reap audit stays with the row: re-run over the same ledger reaps nothing twice', async () => {
+  // Fixture hygiene (shared fork database): start from a clean running set so scanned==0 is this case alone.
+  await db.db.query("UPDATE dispatch_pass SET state = 'done', finished_at = time::now() WHERE state = 'running';", {});
+  const dead = Bun.spawn(['/bin/sleep', '0.05']);
+  await dead.exited;
+  const instance = `${hostname()}:${dead.pid}:again1`;
+  await passLedger(db.db, instance).begin();
+  const first = await reapStaleRunningPasses(db.db);
+  expect(first.reaped).toBeGreaterThanOrEqual(1);
+  const second = await reapStaleRunningPasses(db.db);
+  expect(second.scanned).toBe(0); // the abandoned row no longer matches state='running'
+  const [audits] = await db.db.query<[Array<{ c?: number }>]>(
+    'SELECT count() AS c FROM audit WHERE action = $a AND instance = $i GROUP ALL;', { a: 'dispatch_pass_reaped', i: instance });
+  expect(audits).toMatchObject([{ c: 1 }]);
 });

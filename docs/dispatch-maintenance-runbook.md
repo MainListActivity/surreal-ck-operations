@@ -9,10 +9,10 @@
 ## 0. 边界
 
 1. 首次从旧版切到新版，使用静默窗口（第 2 节，Q0 至 Q5），不使用任何暂停开关。
-2. 新版上线并通过 Q3 之后，维护停派只使用 dispatch_pause、dispatch_status、dispatch_restore（第 4 节）。
+2. 新版上线并通过 Q3 之后，维护停派只使用 dispatch_pause、dispatch_status、dispatch_restore（审计取证读取用 dispatch_audit，见第 4 节）。
 3. 以下路径禁止用于维护停派：
    - 旧版布尔暂停：老板 UI 的暂停按钮、owner_command 的 pause 与 resume、宿主 RPC company.pause.set。
-   - `admin config paused`：它现在经暂停事务写入纪元、闸门与审计（见第 7 节第 4 条），不再是绕过屏障的旁路；但没有比较并交换，也不等待排空，因此仍不作为维护停派手段。
+   - `admin config paused` / `admin config pause_epoch`：维护键，命令入口在任何写入之前一律拒绝并指向 dispatch_pause/dispatch_restore（见第 7 节第 4 条）；config 其余键照常。
    - `def_ensure` 写 enabled=false：它不拦截复用（见第 7 节第 6 条）。
 4. 禁止以 owner 身份、owner CLI、SQL、环境变量、token 或守护进程凭证绕过本手册的任何一步。
 5. 本手册描述的是 PR 合入 origin/main 之后的 release 切换。PR 未合入前，install 会拒绝该 release。
@@ -79,7 +79,7 @@ SCK_RELEASE_KEEP=$(ls "$SVC/releases" | grep -E '^[0-9a-f]{40}$' | wc -l | tr -d
   1. 校验 $REL 完整（src/mcp/run.ts 与 src/dispatcher/run.ts 存在）、SHA 为 40 位、可达 origin/main，并查询插件当前 SOURCE。查询失败则拒绝，active 不变。
   2. 替换 bin/run.sh 与 bin/sck；原子切换 active 指向 $REL。
   3. 若插件 SOURCE 位于服务目录内：`plugin remove sck-company`，再 `plugin install $REL/plugin --id sck-company`。此时旧插件进程退出，旧派工器停止；新插件启动，新派工器开始 tick。
-  4. 重写 MCP plist，bootout 后 bootstrap。MCP 重启并执行 bootstrap（迁移链当前至 schema/025；以 release 内 src/database.ts 为准）。MCP 在 bootstrap 完成后才开始监听（src/mcp/run.ts），因此 /health 与 /ready 返回 200 即表示 bootstrap 已完成。
+  4. 重写 MCP plist，bootout 后 bootstrap。MCP 重启并执行 bootstrap（迁移链当前至 schema/027，集成后执行顺序 024→025→027、026 保留；以 release 内 src/database.ts 为准）。MCP 在 bootstrap 完成后才开始监听（src/mcp/run.ts），因此 /health 与 /ready 返回 200 即表示 bootstrap 已完成。
   5. 按 SCK_RELEASE_KEEP 修剪快照。
 - 不做：不重启整个 Paseo 守护进程；不另建 dispatcher、launchd 或定时器；不修改 enabled；不写 company_meta:config。
 - 输出含 `warning: plugin repoint failed`：立即进入 R1，不进入 Q3。
@@ -167,12 +167,13 @@ SCK_RELEASE_KEEP=<N> SCK_COMPONENTS=mcp sh "$PREV/scripts/company-service.sh" in
 - GM 授权与维护理由已写入任务记录。
 - idempotencyKey 在同一员工与同一操作（pause 或 restore）内标识一次调用（src/core.ts:1107）；不同 GM 之间不复用同一键。建议格式为 `afdb562c-<用途>-<UTC 时间>`，长度 8 至 200 字符。
 
-### 工具（src/mcp/server.ts:222 至 :240；src/core.ts:1094 至 :1152）
+### 工具（src/mcp/server.ts 的 dispatch_* 注册；src/core.ts 的 setDispatchPause/dispatchStatus/dispatchAudit）
 
 ```sh
 sh "$SCK" call dispatch_status '{}'
 sh "$SCK" call dispatch_pause '{"expectedEpoch":<E>,"reason":"<原因>","idempotencyKey":"<唯一串>","drainTimeoutSeconds":120}'
 sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idempotencyKey":"<唯一串>"}'
+sh "$SCK" call dispatch_audit '{"operationId":"<dispatch_pause 或 dispatch_restore 返回的 operationId>"}'
 ```
 
 | 工具 | 输入约束 | 返回 |
@@ -180,6 +181,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 | dispatch_status | 无 | paused、epoch、changedAt、runningPasses（最多 50 条，含 instance、epoch、startedAt）、oldRunning |
 | dispatch_pause | expectedEpoch 为非负整数；reason 为 2 至 500 字；idempotencyKey 为 8 至 200 字符；drainTimeoutSeconds 为 10 至 900，默认 120 | operationId、operation、paused、epoch、before、drained（含 drained、blocking、waitedMs，或为 null）、replayed |
 | dispatch_restore | 同上，不含 drainTimeoutSeconds | 同上，drained 为 null，不排空 |
+| dispatch_audit | operationId 为 8 至 100 字符（dispatch_pause 或 dispatch_restore 返回值，形如 audit:<uuid>） | action、actor、paused 与 previous_paused、epoch 与 previous_epoch、sequence、at、evidence；仅限这两类 action 的审计行 |
 
 错误码：forbidden（不是 gm，或没有 manage）；invalid（参数越界）；conflict（expectedEpoch 已过期、同一 key 的载荷不同，或并发冲突，可重试）。
 
@@ -201,7 +203,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 - 不开始维护，保持暂停。
 - 读取 dispatch_status.runningPasses。instance 的格式为 `<主机>:<pid>:<随机串>`。epoch 为 null 表示尚未记录纪元，按旧纪元计。
 - 若该 pass 对应的进程仍在运行：每 30 至 60 秒读一次 dispatch_status，等待 pass 结束。然后用新的 idempotencyKey、相同的 expectedEpoch（E+1）重新 dispatch_pause，重新等待排空。
-- 若该 pass 对应的进程已不存在（插件重载、崩溃或被强制结束）：当前版本没有自动回收，该行会一直计入 oldRunning，排空无法完成。不得手工删除或改写 dispatch_pass 行，不得改用 admin 或 owner 路径。报 GM，由 GM 决定：继续等待，或在 reason 中写明风险后恢复派工，或先实施受审的回收（见第 7 节第 1 条）。
+- 若该 pass 对应的进程已不存在（插件重载、崩溃或被强制结束）：新版派工器启动时自动收口——同一主机、pid 经信号 0 确证不存在（ESRCH）的 running 行改为 abandoned，并在同一事务写一条 audit（action 为 dispatch_pass_reaped，见第 7 节第 1 条）。重启一次派工进程，然后保持暂停并用新的 idempotencyKey、相同的 expectedEpoch（E+1）重新 dispatch_pause 即可排空。若该行仍计入 oldRunning，说明其 pid 无法确证死亡（跨主机、格式异常、存活未知或读写失败，均为设计上的失败关闭）：不得手工删除或改写 dispatch_pass 行，不得改用 owner 路径，报 GM 决定。
 - dispatch_restore 不检查 oldRunning。若 oldRunning 大于 0 时恢复，GM 须在 reason 中写明。
 
 ### 版本约束与幂等
@@ -216,7 +218,7 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 1. 选无在途任务的时刻：dispatch_status 的 oldRunning 为 0，且 Q0 式清单中没有 doing 或 review 任务。
 2. 执行第 4 节的步骤 1 至 7。pause 与 restore 之间不做维护，立即恢复。
 3. 记录：前后的 epoch、两个 operationId、两条审计行、两次 dispatch_status 的读回结果。
-4. 审计行的读取方式：当前员工侧工具没有 dispatch 审计查询。get_task_history 只按任务查询，而 dispatch 审计行不关联任务。需要 GM 指定只读取证方式。在此之前，审计行一项标记为"未验证"。
+4. 审计行读取用 dispatch_audit（gm manage，按 operationId 回读，仅限 dispatch_pause/dispatch_restore 两类行）：第 2 步与第 6 步返回的 operationId 各查一次，核对 actor、paused/epoch 前后与 sequence。
 
 ## 5. 旧版矩阵
 
@@ -232,9 +234,9 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 
 ## 6. 迁移与环境需求
 
-- 迁移：schema/025-dispatch-pause.surql。定义 `dispatch_pass` 表（SCHEMALESS，PERMISSIONS NONE）与 state 索引，均为 IF NOT EXISTS。加法迁移，不改写存量行，不需要冻结写入。由 MCP bootstrap 执行（src/database.ts:126 至 :127）。编号历史：本迁移最初为 021，main 依次占用 021（worktree 审计事件）、022（编制额度限制）、023（query snapshot）与 024（snapshot quota），故最终集成为 025。所有迁移都是加法，先后只决定执行顺序。
+- 迁移：schema/025-dispatch-pause.surql。定义 `dispatch_pass` 表（SCHEMALESS，PERMISSIONS NONE）与 state 索引，均为 IF NOT EXISTS。加法迁移，不改写存量行，不需要冻结写入。由 MCP bootstrap 执行（src/database.ts:126 至 :127）。编号历史：本迁移最初为 021，main 依次占用 021（worktree 审计事件）、022（编制额度限制）、023（query snapshot）与 024（snapshot quota），故最终集成为 025。集成时 main 已到 027（QA 观察），执行顺序 024→025→027（026 保留给 SYS02），schema_version 依次 25、27。所有迁移都是加法，先后只决定执行顺序。
 - schema_version：新版由 20 改为 25（条件 WHERE schema_version < 25）；中间经过 main 的 21、22、23、24。旧版的条件为 < 20，不会把 21–25 降回去（ddc8402 的 src/database.ts:99）。
-- 新增的数据字段与记录：company_meta:config.pause_epoch（缺省为 0）；company_meta:dispatch_gate；audit 中的 dispatch_pause 与 dispatch_restore 行；dispatch_pass 行。每个 pass 一行，已结束且超过 1 天的行在新 pass 开始时删除，running 行不删除。
+- 新增的数据字段与记录：company_meta:config.pause_epoch（缺省为 0）；company_meta:dispatch_gate；audit 中的 dispatch_pause 与 dispatch_restore 行；dispatch_pass 行。每个 pass 一行，已结束且超过 1 天的行在新 pass 开始时删除，running 行不删除。启动回收把确证死亡的同主机行改为 abandoned（不删行），abandoned 行由此进入同一条 1 天清理。
 - 环境变量：分支没有新增 process.env 读取。RUN_SCK_DISPATCH_PAUSE_TESTS 只用于 fork 测试。install 沿用 SCK_RELEASE_KEEP 与 SCK_COMPONENTS。
 - 主机准备：无。
 - 插件构建：plugin/paseo-plugin.json 的 build 步骤运行 scripts/vendor.sh，生成 plugin/server/vendor/（已被 .gitignore 忽略）。release 在切换前必须已生成 vendor。
@@ -244,15 +246,15 @@ sh "$SCK" call dispatch_restore '{"expectedEpoch":<E>,"reason":"<原因>","idemp
 
 标 ★ 的条目需要 GM 决定。
 
-1. ★ 陈旧 running 行。进程被强制结束时，pass 的 finally 不执行，行保持 running。OLD_RUNNING_PASSES（src/dispatch-pause.ts:114）不判断进程是否存活，清理只删除非 running 行（src/dispatch-pause.ts:177）。现有 fork 测试 `drain`（tests/dispatch-pause.fork.test.ts:134 起）已断言：只要旧 pass 未结束，drained 为 false，oldRunning 为 1。后果：每次插件重载或崩溃中断一个 pass 之后，之后所有 dispatch_pause 的 drained 都无法为 true。这是失败关闭，不会误报排空，但维护无法完成。建议：派工器启动时，把同一主机上 pid 已不存在的 running 行标记为 abandoned；无法判断的行保持 running。
+1. ★ 陈旧 running 行（已修复，SYS-DISP 876e36e2 H1）。旧缺陷：进程被强制结束时 pass 的 finally 不执行，行保持 running，之后所有 dispatch_pause 的 drained 都无法为 true。现在两个派工器入口都在首个 pass 前调用一次 reapStaleRunningPasses（src/dispatch-pause.ts）：独立进程在 src/dispatcher/run.ts 的 bootstrap 之后；插件在 plugin/server/dispatch.ts 的循环内、company 引导完成后、首次 tick 之前。规则：只处理 instance 为 `<主机>:<pid>:<uuid>` 三段、主机与本进程相同、且信号 0 返回 ESRCH（进程确证已死）的 running 行；把这些行改为 abandoned，并在同一事务写一条 audit（actor 为 system:dispatcher，action 为 dispatch_pass_reaped，含 instance 与证据）。跨主机、缺段或格式异常、pid 非法、pid 仍在应答（含 EPERM）、本进程自身 pid、账本读写失败，全部保持 running——死亡必须可证，绝不猜测，失败关闭。abandoned 不是 running，drain 查询自动不计；不删除任何历史行。回归：tests/dispatch-pause-reap.test.ts（判定表与失败关闭，注入探针）；tests/dispatch-pause.fork.test.ts 的 H1 用例（真实公司 fork：孤儿→回收→dispatch_pause 排空可达 true；活进程与跨主机、格式异常行保持 running 且仍计入 blocking；重复回收不重复审计）。
 2. 无任务派工不经过租约闸门。GM 与 eval 的唤醒与 spawn 走 assign（src/dispatcher/dispatcher.ts:1504，调用点 :1251、:1280、:1336），没有 task，不调用 claimLease。它们只受 pass 级 gate（:934）与排空约束。drained 为 false 时，仍在运行的旧 pass 可能完成一次无任务唤醒或生成。
 3. 持有租约的员工继续续租、提交与复核，静默收尾提醒照常发出。暂停不停止在办任务。
-4. admin config 的 paused 经暂停事务写入（本补修修复）。src/admin.ts 的 `config paused true|false` 现在调用 writePause，与经理暂停同一事务：暂停值、pause_epoch、company_meta:dispatch_gate 与审计行一起提交（actor 记为 admin，actor_role 为 operator）。因此它不再绕过屏障，也不与 claimLease 的写冲突检测脱节；`config pause_epoch` 被直接拒绝，并指向 dispatch_pause 或 owner 暂停入口。该路径仍没有比较并交换，也不等待排空，所以维护停派只使用 dispatch_pause、dispatch_status、dispatch_restore。回归：tests/dispatch-pause-tick.fork.test.ts 的 R-A 用例（写入推进纪元并留下闸门与审计行，暂停期间新租约被拒）。
+4. admin config 拒绝维护键（SYS-DISP 876e36e2 H2）。src/admin.ts 的 `config paused` 与 `config pause_epoch` 在任何写入之前被拒绝：输出 {ok:false, code:"invalid"}、退出码 1，文案指向 sck call dispatch_pause / dispatch_restore（gm manage）、dispatch_status（读取）、dispatch_audit（审计回读）。此前该入口经 writePause 直接落状态：没有比较并交换、不等待排空，是与 GM 入口并存的旁路；受权 API 两面接线完成后（core、MCP、sidecar 白名单），旁路取消。老板 UI 与 owner_command 的 pause/resume 不变，仍走 writePause 事务（见第 5 条）。config 其余键（max_running、eval_enabled 等）行为不变。回归：tests/dispatch-pause-tick.fork.test.ts 的 R-A 两用例（拒绝先于写入、无审计行产生、其余键照常可写、报错文案含两条真实命令；以及 gm 停派/恢复生命周期经 dispatch_audit 可核验）。
 5. 老板路径（UI 按钮、owner_command 的 pause 与 resume）调用 owner.setPaused（src/owner.ts:319）。它同样经过 PAUSE_TXN（纪元、审计、gate），但不做比较并交换，也不排空。老板的恢复可以解除 GM 的暂停，这是设计。
 6. ★ 复用不检查 def.enabled。staffingPool 的复用分支（src/dispatcher/dispatcher.ts:233 至 :253）没有 def.enabled 检查，只有新建分支检查（:261）。因此 def_ensure 写 enabled=false 不是停派手段。本分支未改此行为，按决定保留披露。
 7. drainTimeoutSeconds 默认 120 秒是设计默认值，未在生产测量。
 8. 本分支未经生产验证。第 4 节的生产验证由 3381c477 执行。
-9. ★ 审计行没有员工侧读取工具（见第 4 节）。
+9. ★ 审计行读取（已修复，SYS-DISP 876e36e2 裁决第 6 条）：dispatch_audit（gm manage、MCP 与 sidecar 白名单内）按 operationId 回读一条 dispatch_pause/dispatch_restore 审计行，返回 actor、paused/previous_paused、epoch/previous_epoch、sequence、at、evidence。仅限这两类 action；其他审计行（任务、凭证、worktree）不经此面暴露。部署 QA 由此核验两条维护审计，无需裸库访问。回归在 R-A 端到端用例（含 forbidden、invalid、not_found 三态）。
 10. 安装顺序与恢复风险：`company-service.sh install` 先重指插件（remove+install），再重启 MCP；`docs/company-service-operations.md` 第 3 节写的是 MCP ready 后再切插件。实际顺序意味着插件先指向新 release，若随后 MCP 重启或 bootstrap 失败，两面会短暂不一致。恢复：立即用 PREV 重新 install（双面回滚），或在 MCP 就绪后用 PREV/REL 的 plugin 重新 install+reload；不得只改 active。本迁移为加法，可以接受；非加法迁移前需统一顺序（待 GM 决定）。
 
 ## 8. 本手册编写期间的执行情况

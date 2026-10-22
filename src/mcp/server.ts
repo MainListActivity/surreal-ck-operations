@@ -330,6 +330,11 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.dispatchStatus(token(ctx))));
 
+  server.registerTool('dispatch_audit', {
+    description: 'gm only (manage): read the audit row of one dispatch maintenance operation by the operationId returned by dispatch_pause/dispatch_restore — actor, paused and epoch before/after, outbox sequence, evidence. Read-only forensics so deployment QA can verify both maintenance audits without raw database access.',
+    inputSchema: z.object({ operationId: z.string().min(8).max(100) }),
+  }, async (input, ctx) => run(token(ctx), () => core.dispatchAudit(token(ctx), input.operationId)));
+
   server.registerTool('get_task_history', {
     description: 'Read the audited history of a task (claims, checkpoints, submissions, returns, owner decisions, handover packets). Without pageSize or cursor it returns the complete history, oldest first, or response_too_large with retry guidance when it does not fit the 48 KiB budget (retry with pageSize 10, then cursor set to page.nextCursor). With pageSize or cursor, newest entries come first in pages that fit the budget; each page is returned oldest first. Evidence too large for a page is cut and flagged (evidenceTruncated, evidenceNextOffset), with evidenceBytes and evidenceSha256; read the full text with read_task_text (field evidence, auditId).',
     inputSchema: z.object({ taskId: z.string().min(1).max(200), ...pageArgs }),

@@ -796,6 +796,8 @@ export interface CompanyCore {
   setDispatchPause(credential: Credential, input: DispatchPauseInput): Promise<DispatchPauseView>;
   /** gm (manage): read-only pause state, its epoch and the dispatch passes still running. */
   dispatchStatus(credential: Credential): Promise<DispatchStatusView>;
+  /** gm (manage): read the audit row of one maintenance operation by the operationId its pause/restore returned. */
+  dispatchAudit(credential: Credential, operationId: string): Promise<DispatchAuditView>;
   /** manage (gm/product): replace only the project's disciplines vocabulary; audited. */
   updateProjectDisciplines(credential: Credential, input: { project: string; disciplines: Array<{ name: string; description?: string; roles?: Role[] }> }): Promise<ProjectView>;
   /** Ops broker gate: the caller must hold the task's current lease and the task's goal must name a project. */
@@ -830,6 +832,20 @@ export interface DispatchPauseView {
   drained: { drained: boolean; blocking: number | null; waitedMs: number } | null;
   /** True when the same idempotency key with the same payload returned the stored result. */
   replayed: boolean;
+}
+
+/** One maintenance-operation audit row, read back by the only authorized forensics surface (deployment QA). */
+export interface DispatchAuditView {
+  operationId: string;
+  action: 'dispatch_pause' | 'dispatch_restore';
+  actor: string;
+  paused: boolean;
+  previousPaused: boolean;
+  epoch: number;
+  previousEpoch: number;
+  sequence: number;
+  at: string;
+  evidence: string;
 }
 
 export interface DispatchStatusView {

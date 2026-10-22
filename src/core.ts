@@ -29,7 +29,7 @@ import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRo
 import { readGoalWorkflowWaitSnapshot } from './dispatcher/goal-roots.ts';
 import type { WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from './contracts.ts';
 import { ROLES } from './contracts.ts';
-import type { DispatchPauseInput, DispatchPauseView, DispatchStatusView } from './contracts.ts';
+import type { DispatchAuditView, DispatchPauseInput, DispatchPauseView, DispatchStatusView } from './contracts.ts';
 import { DRAIN_DEFAULT_SECONDS, DRAIN_MAX_SECONDS, DRAIN_MIN_SECONDS, PAUSE_BLOCKS_LEASE, PAUSE_EPOCH_MOVED, oldRunningPasses, readPauseState, runningPasses, waitForDrain, writePause, type PauseResult } from './dispatch-pause.ts';
 export { CompanyError };
 
@@ -1972,6 +1972,24 @@ export class SurrealCompanyCore implements CompanyCore {
     const state = await readPauseState(this.db);
     return { paused: state.paused, epoch: state.epoch, changedAt: state.changedAt,
       runningPasses: await runningPasses(this.db), oldRunning: await oldRunningPasses(this.db, state.epoch) };
+  }
+
+  /** gm only: read one maintenance audit row by the operationId its call returned (SYS-DISP 876e36e2 ruling item 6):
+   * deployment QA verifies the dispatch_pause/dispatch_restore audits without raw database access. Bounded to that
+   * action pair — every other audit row (tasks, credentials, worktrees) stays unreadable through this surface. */
+  async dispatchAudit(credential: Credential, operationId: string): Promise<DispatchAuditView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Dispatch audit is gm only');
+    requireText(operationId, 'operationId', 8, 100);
+    const idPart = operationId.startsWith('audit:') ? operationId.slice('audit:'.length) : operationId;
+    const row = await this.db.select<Record<string, unknown>>(id('audit', idPart));
+    const action = row?.action;
+    if (action !== 'dispatch_pause' && action !== 'dispatch_restore') {
+      throw new CompanyError('not_found', 'No dispatch maintenance audit row for that operationId');
+    }
+    return { operationId, action: action as DispatchAuditView['action'], actor: String(row?.actor ?? ''), paused: row?.paused === true,
+      previousPaused: row?.previous_paused === true, epoch: Number(row?.epoch), previousEpoch: Number(row?.previous_epoch),
+      sequence: Number(row?.sequence), at: String(row?.at ?? ''), evidence: String(row?.evidence ?? '') };
   }
 
   async listDefs(credential: Credential): Promise<DefView[]> {
