@@ -139,7 +139,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 2, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 400, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -351,10 +351,10 @@ export class Workforce {
       jevOwnerThreshold: typeof row?.jev_owner_threshold === 'number' ? row.jev_owner_threshold : 0.3,
       jevPickConfidence: typeof row?.jev_pick_confidence === 'number' ? row.jev_pick_confidence : 0.5,
       quotaFloorPct: typeof row?.quota_floor_pct === 'number' ? row.quota_floor_pct : 8,
-      quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : 2,
+      quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
       quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
-      sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : 150,
+      sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,
       ownerBriefHour: typeof row?.owner_brief_hour === 'number' ? row.owner_brief_hour : 9,
       minFreeMemMb: typeof row?.min_free_mem_mb === 'number' ? row.min_free_mem_mb : DEFAULT_CONFIG.minFreeMemMb,
@@ -501,6 +501,18 @@ export class Workforce {
   async touchWake(employeeId: string): Promise<void> {
     await this.db.query('UPDATE $e SET last_wake_at = time::unix(time::now()), v3_onboarded = true, wake_count = (wake_count ?? 0) + 1;',
       { e: id('employee', employeeId) });
+  }
+
+  /** Refund only the rejected wake, once per stable Paseo turn id, including after a plugin restart. */
+  async refundQuotaWake(employeeId: string, turnId: string): Promise<void> {
+    const key = createHash('sha256').update(`${employeeId}\0${turnId}`).digest('hex');
+    await this.db.query(`BEGIN;
+      LET $prior = SELECT * FROM ONLY $marker;
+      IF $prior = NONE {
+        UPDATE $e SET wake_count = math::max([0, (wake_count ?? 0) - 1]);
+        CREATE ONLY $marker CONTENT { employee: $employee, at: time::now() };
+      };
+      COMMIT;`, { e: id('employee', employeeId), employee: employeeId, marker: id('company_meta', `infra_refund_${key}`) });
   }
 
   // ---- provider health ----

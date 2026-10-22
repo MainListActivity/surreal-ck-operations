@@ -64,7 +64,9 @@ mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
     dispatchSnapshot: () => snapshot,
   },
 }) }));
+const realDispatch = await import('../plugin/server/dispatch.ts');
 mock.module('../plugin/server/dispatch.ts', () => ({
+  ...realDispatch,
   refreshModels: async () => ({}), refreshQuota: async () => [], readProviderQuotas: async () => [],
 }));
 const handlersPath = '../plugin/server/handlers.ts';
