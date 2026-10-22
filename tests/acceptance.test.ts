@@ -237,27 +237,53 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
   });
 
   test('N1: an environment-bound probe is only accepted with a deployment record for this run and head', async () => {
-    const withDeployments = (list: unknown[]) => async (args: string[]) => {
+    // N1-R: the deployment must be produced by THIS run and its success state must be read. The run link is the fact
+    // that cannot be borrowed: a same-head, same-environment, in-window deployment of another run is refused.
+    const withDeployments = (list: unknown[], statuses: unknown[] = []) => async (args: string[]) => {
       if (args[0] === 'api' && String(args[1]).includes('/deployments?')) return JSON.stringify(list);
+      if (args[0] === 'api' && String(args[1]).includes('/deployments/') && String(args[1]).includes('/statuses')) return JSON.stringify(statuses);
       return run(args);
+    };
+    // The deployment workflow is a trusted one and the run is its own; the status names the run's job.
+    const deployRun = async (args: string[]): Promise<string> => {
+      if (args[0] === 'run' && args[1] === 'view') {
+        return JSON.stringify({ headSha: 'head-1', status: 'completed', conclusion: 'success', workflowName: 'Deploy production',
+          createdAt: '2026-10-21T00:00:00.000Z', updatedAt: '2026-10-21T00:01:00.000Z' });
+      }
+      return run(args);
+    };
+    const withDeploymentsOn = (list: unknown[], statuses: unknown[] = []) => async (args: string[]) => {
+      if (args[0] === 'api' && String(args[1]).includes('/deployments?')) return JSON.stringify(list);
+      if (args[0] === 'api' && String(args[1]).includes('/deployments/') && String(args[1]).includes('/statuses')) return JSON.stringify(statuses);
+      return deployRun(args);
     };
     const envRecord = { ...record, environment: 'production' };
     const reader = async () => ({ name: 'acceptance-probe.json', content: JSON.stringify(envRecord) });
     const envProbe = { ...probe, environment: 'production' };
     const envBase = { ...base, probe: envProbe, environment: 'production' };
-    const deployment = { environment: 'production', sha: 'head-1', created_at: '2026-10-21T00:00:20.000Z' };
-    expect(await createGithubActionsAdapter(withDeployments([deployment]), reader).verify(envBase)).toMatchObject({ ok: true, environment: 'production' });
-    expect((await createGithubActionsAdapter(withDeployments([]), reader).verify(envBase)).ok).toBe(false);
-    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, environment: 'staging' }]), reader).verify(envBase)).ok).toBe(false);
-    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, created_at: '2026-10-21T00:02:00.000Z' }]), reader).verify(envBase)).ok).toBe(false);
-    expect((await createGithubActionsAdapter(withDeployments([{ ...deployment, sha: 'other-head' }]), reader).verify(envBase)).ok).toBe(false);
+    const deployment = { id: 900, environment: 'production', sha: 'head-1', created_at: '2026-10-21T00:00:20.000Z' };
+    const success = { state: 'success', environment: 'production', created_at: '2026-10-21T00:00:40.000Z',
+      log_url: 'https://github.com/o/r/actions/runs/42/job/77' };
+    // A generic CI run (the probe workflow) may not certify an environment at all.
+    expect((await createGithubActionsAdapter(withDeployments([deployment], [success]), reader).verify(envBase)).ok).toBe(false);
+    // The trusted deployment workflow, with a deployment and a success status of this run, is accepted.
+    expect(await createGithubActionsAdapter(withDeploymentsOn([deployment], [success]), reader).verify(envBase)).toMatchObject({ ok: true, environment: 'production' });
+    expect((await createGithubActionsAdapter(withDeploymentsOn([], [success]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([{ ...deployment, environment: 'staging' }], [success]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([{ ...deployment, created_at: '2026-10-21T00:02:00.000Z' }], [success]), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([{ ...deployment, sha: 'other-head' }], [success]), reader).verify(envBase)).ok).toBe(false);
+    // N1-R: a deployment of another run is refused even though the head, environment and window all match.
+    const borrowed = { ...success, log_url: 'https://github.com/o/r/actions/runs/999/job/77' };
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [borrowed]), reader).verify(envBase)).ok).toBe(false);
+    // A deployment with no success state is refused.
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [{ ...success, state: 'failure' }]), reader).verify(envBase)).ok).toBe(false);
     // A generic criterion refuses an environment-labeled probe, and a differing probe label is refused.
-    expect((await createGithubActionsAdapter(withDeployments([deployment]), reader).verify({ ...base, probe: envProbe })).ok).toBe(false);
-    expect((await createGithubActionsAdapter(withDeployments([deployment]), reader).verify({ ...envBase, probe: { ...envProbe, environment: 'staging' } })).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [success]), reader).verify({ ...base, probe: envProbe })).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [success]), reader).verify({ ...envBase, probe: { ...envProbe, environment: 'staging' } })).ok).toBe(false);
     // A plain ci-run with the same deployment is accepted; without it, refused.
     const ciBase = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', sha: 'head-1', environment: 'production' };
-    expect(await createGithubActionsAdapter(withDeployments([deployment])).verify(ciBase)).toMatchObject({ ok: true, environment: 'production' });
-    expect((await createGithubActionsAdapter(withDeployments([])).verify(ciBase)).ok).toBe(false);
+    expect(await createGithubActionsAdapter(withDeploymentsOn([deployment], [success])).verify(ciBase)).toMatchObject({ ok: true, environment: 'production' });
+    expect((await createGithubActionsAdapter(withDeploymentsOn([])).verify(ciBase)).ok).toBe(false);
   });
 
   test('R2: the Node packed probe writes no record when the Node execution fails', () => {

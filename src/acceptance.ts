@@ -12,6 +12,9 @@ import type {
   AcceptanceLayer, AcceptanceLeg, AcceptancePhase, AcceptanceRisk, AcceptanceUnmet, AcceptanceVerdict, TaskKind, WorkIntent,
 } from './contracts.ts';
 import { CompanyError } from './core-errors.ts';
+import {
+  associateDeploymentSource, type DeploymentRecord, type DeploymentStatusRecord,
+} from './deployment-source.ts';
 import { ghCli, type GhRunner } from './pr-gate.ts';
 
 export const ACCEPTANCE_CRITERIA_VERSION = 1;
@@ -649,23 +652,54 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
         return { ok: false, reason: `the probe record environment ${probeEnvironment} is not the declared environment ${input.environment}` };
       }
       let verifiedEnvironment: string | undefined;
+      // The traceable record of the deployment that certified the environment. It is written into the evidence source
+      // so a later reader can see which deployment, which status and which run the fact came from.
+      let deploymentSource: { deploymentId: string; status: string; deploymentRunId: string; deploymentJobId?: string; workflowName: string; sha: string } | undefined;
       if (input.environment !== undefined) {
-        let deployments: Array<{ environment?: string; sha?: string; created_at?: string }>;
+        // N1-R: the deployment must be causally linked to THIS run and its success terminal state must be read.
+        // Same head, same environment name and a close timestamp are not proof: an unrelated failed deployment of the
+        // same commit shares all three. The association is decided by src/deployment-source.ts.
+        let deployments: DeploymentRecord[];
         try {
           const raw = JSON.parse(await run(['api',
             `repos/${owner}/${repo}/deployments?sha=${encodeURIComponent(input.sha)}&environment=${encodeURIComponent(input.environment)}&per_page=100`]));
-          deployments = Array.isArray(raw) ? raw : [];
+          deployments = Array.isArray(raw) ? raw as DeploymentRecord[] : [];
         } catch (error) {
           return { ok: false, reason: `the environment could not be verified: ${(error as Error).message.slice(0, 160)}` };
         }
-        const windowStart = Date.parse(info.createdAt ?? '');
-        const windowEnd = Date.parse(info.updatedAt ?? '');
-        const deployment = deployments.find(item => item?.environment === input.environment &&
-          (item.sha === undefined || item.sha === input.sha) &&
-          Number.isFinite(Date.parse(item.created_at ?? '')) &&
-          Date.parse(item.created_at ?? '') >= windowStart && Date.parse(item.created_at ?? '') <= windowEnd);
-        if (!deployment) return { ok: false, reason: `the CI run has no deployment for environment ${input.environment}` };
-        verifiedEnvironment = input.environment;
+        const statusesOf = async (deployment: DeploymentRecord): Promise<DeploymentStatusRecord[]> => {
+          // Only the status list of the deployment being judged may be read: a status of another deployment can never
+          // be substituted for it.
+          const statusUrl = typeof deployment.statuses_url === 'string' ? deployment.statuses_url : '';
+          // The status list must belong to this repository. A record pointing elsewhere is not this deployment's status
+          // and must never be read as if it were.
+          if (statusUrl !== '' && !statusUrl.startsWith(`https://api.github.com/repos/${owner}/${repo}/`)) {
+            throw new Error('the deployment statuses url belongs to another repository');
+          }
+          const path = statusUrl
+            ? statusUrl.replace(/^https?:\/\/api\.github\.com\//, '')
+            : `repos/${owner}/${repo}/deployments/${deployment.id}/statuses`;
+          const raw = JSON.parse(await run(['api', path]));
+          return Array.isArray(raw) ? raw as DeploymentStatusRecord[] : [];
+        };
+        const verdict = await associateDeploymentSource({
+          run: {
+            runId, headSha: info.headSha, workflowName: info.workflowName ?? null,
+            conclusion: info.conclusion ?? null, status: info.status ?? null,
+            createdAt: info.createdAt ?? null, updatedAt: info.updatedAt ?? null,
+          },
+          environment: input.environment,
+          deployments,
+          statusesOf,
+        });
+        if (!verdict.ok) return { ok: false, reason: verdict.reason };
+        verifiedEnvironment = verdict.environment;
+        deploymentSource = {
+          deploymentId: verdict.deploymentId, status: verdict.status, deploymentRunId: verdict.deploymentRunId,
+          ...(verdict.deploymentJobId ? { deploymentJobId: verdict.deploymentJobId } : {}),
+          workflowName: verdict.workflowName, sha: verdict.sha,
+        };
+        at = verdict.at;
       }
       return {
         ok: true, sha: input.sha, at,
@@ -674,6 +708,7 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
           provider: 'github-actions', runUrl: input.runUrl, runId, workflowName: info.workflowName ?? null,
           conclusion: info.conclusion, ...(verifiedProbe ? { probe: verifiedProbe } : {}),
           ...(verifiedEnvironment !== undefined ? { environment: verifiedEnvironment } : {}),
+          ...(deploymentSource ? { deployment: deploymentSource } : {}),
           ...(input.artifactId ? { artifactId: input.artifactId } : {}),
         },
       };

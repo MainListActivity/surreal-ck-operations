@@ -223,6 +223,9 @@ test.skipIf(!existsSync('/usr/bin/python3'))('a sidecar-review gate run records 
     const release = join(home, 'releases', SHA);
     mkdirSync(join(release, 'tests'), { recursive: true });
     writeFileSync(join(release, 'tests', 'dispatcher-sidecar.fork.test.ts'), '');
+    // SYS02 N1-R: the sidecar-review gate also runs the deployment-source association tests.
+    writeFileSync(join(release, 'tests', 'deployment-source.test.ts'), '');
+    writeFileSync(join(release, 'tests', 'deployment-source.fork.test.ts'), '');
     const pinned = join(home, 'runtime-bun', 'bin', 'bun');
     writeFileSync(pinned, '#!/bin/sh\n[ "$1" = --version ] && { echo 1.4.2; exit 0; }\necho "sidecar stand-in, fork=${RUN_SCK_CHANNEL_FORK_TESTS:-0}"\nexit "${FAKE_TEST_RC:-0}"\n');
     chmodSync(pinned, 0o755);

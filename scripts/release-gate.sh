@@ -19,7 +19,9 @@ case "$gate" in
     ;;
   sidecar-review)
     gate_name=sidecar-review
-    gate_test=tests/dispatcher-sidecar.fork.test.ts
+    # SYS02 N1-R: the deployment-source association (a borrowed deployment must not certify an environment) is
+    # part of the same local-fork gate, so a regression of the source association blocks the release too.
+    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts"
     gate_why='the sidecar-review gate runs on macOS only; it uses the local company fork'
     ;;
   *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review)" >&2; exit 2;;
@@ -29,7 +31,10 @@ case "$release" in /*) ;; *) echo 'Release path must be absolute' >&2; exit 2;; 
 sha=${release##*/}
 case "$sha" in *[!0-9a-f]*) echo "refused: release dir '$sha' is not a commit sha" >&2; exit 2;; esac
 [ ${#sha} -eq 40 ] || { echo "refused: release dir '$sha' is not a 40-character commit sha" >&2; exit 2; }
-[ -f "$release/$gate_test" ] || { echo "refused: the release has no $gate_test" >&2; exit 2; }
+# The gate may name several test files; every one of them must be in the release.
+for one in $gate_test; do
+  [ -f "$release/$one" ] || { echo "refused: the release has no $one" >&2; exit 2; }
+done
 # The recorded pass is for a commit, so the content has to be that commit's (SYS01 AC-B, review B2). The ops checkout is used when
 # one can be resolved; install re-checks the content against the commit in any case, so this is the earlier, clearer refusal.
 . "$(dirname "$0")/release-content.sh"
