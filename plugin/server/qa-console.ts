@@ -31,10 +31,17 @@ type QaRead = {
     originalVerdicts?: number; originalReasons?: number; attemptAt?: string; attemptOk?: boolean;
     verdicts?: Array<{ phase?: string; dispatchable?: boolean; workflowState?: string; eligibleCount?: number;
       waitingMinutes?: number; summary?: string; checkedAt?: string;
-      reasons?: Array<{ code?: string; text?: string; candidates?: string[]; owner?: string; recovery?: string; nextTrigger?: string; basis?: string; until?: string }> }> };
+      reasons?: Array<{ code?: string; text?: string; candidates?: string[]; owner?: string; recovery?: string; nextTrigger?: string; basis?: string; until?: string; actions?: Array<{ authority?: string; label?: string; tool?: string; executable?: boolean }> }> }> };
   goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string;
     dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
-    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean };
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    root?: { taskId?: string; title?: string; phase?: string; workflowState?: string; summary?: string; feasible?: boolean;
+      waitingMinutes?: number; since?: string; checkedAt?: string; eligibleCount?: number; undispatchable?: number; others?: number;
+      noticeKey?: string; factsAvailable?: boolean; impact?: number; dependencyPath?: Array<{ taskId?: string; title?: string }>;
+      people?: { implementer?: string; authors?: string[]; reviewers?: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+      reasons?: Array<{ code?: string; text?: string; candidates?: string[]; owner?: string; recovery?: string; nextTrigger?: string; basis?: string; until?: string;
+        actions?: Array<{ authority?: string; label?: string; tool?: string; executable?: boolean }> }>;
+      reasonsOmitted?: number } };
   contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
 };
 type QaTimeline = { meta?: QaRead['meta']; history?: Array<{ auditId?: string; action?: string; actor?: string; at?: string; version?: number; evidence?: string; evidenceBytes?: number; evidenceSha256?: string; evidenceTruncated?: boolean }>; page?: { returned?: number; total?: number; hasMore?: boolean; nextCursor?: string; snapshotAt?: string } };
@@ -96,7 +103,13 @@ const dispatchHtml = (dispatch: QaRead["dispatch"]): string => {
     ? ` · 最近一次保存失败（${esc(dispatch.attemptAt)}），旧快照为 stale` : "";
   const verdicts = (dispatch.verdicts ?? []).map(v => `<div class="card"><h3>${v.phase === "review" ? "复核" : "执行"} · ${v.dispatchable ? "可派" : "无法派工"} · 工作流 ${esc(v.workflowState)} · 可选 ${esc(v.eligibleCount)} · 已等 ${esc(v.waitingMinutes)} 分钟</h3>
 <div class="meta">结论检查于 ${esc(v.checkedAt)}${v.summary ? ` · ${esc(v.summary)}` : ""}</div>
-${(v.reasons ?? []).map(r => `<div class="meta">${esc(r.code)} · ${esc(r.text)} · 候选 ${esc((r.candidates ?? []).filter(c => c !== "*").join("、") || "全局")} · 负责 ${esc(r.owner)} · 恢复 ${esc(r.recovery)}${r.until ? ` · 到 ${esc(r.until)}` : ""}</div>`).join("")}</div>`).join("");
+${(v.reasons ?? []).map(r => {
+      const actions = r.actions && r.actions.length > 0
+        ? r.actions.map(a => `${esc(a.authority ?? "未知")}：${esc(a.label ?? "未知")}${a.tool ? `（工具 ${esc(a.tool)}${a.executable === false ? "，不可执行" : ""}）` : a.executable === false ? "（不可执行）" : ""}`).join("；")
+        : "未知（旧记录未携带结构化动作）";
+      return `<div class="meta">${esc(r.code)} · ${esc(r.text)} · 候选 ${esc((r.candidates ?? []).filter(c => c !== "*").join("、") || "全局")} · 负责 ${esc(r.owner ?? "未知")} · 恢复 ${esc(r.recovery ?? "未知")}${r.until ? ` · 到 ${esc(r.until)}` : ""}</div>
+<div class="meta">下一触发 ${esc(r.nextTrigger ?? "未知")} · 依据 ${esc(r.basis ?? "未知")} · 动作 ${actions}</div>`;
+    }).join("")}</div>`).join("");
   return `<div class="card"><h3>派工评估 ${state}</h3><div class="meta">来源 ${esc(dispatch.source)} · 检查于 ${esc(dispatch.checkedAt)}${counts}${attempt}</div>${dispatch.available ? verdicts : `<div class="err">${esc(dispatch.reason ?? "派工结论不可用")}</div>`}</div>`;
 };
 const taskHtml = (read: QaRead, taskId: string | undefined): string => {
@@ -216,14 +229,40 @@ export function createQaConsoleFetch(opts: QaConsoleOptions): (req: Request) => 
         const scope = read.meta?.scope ?? known;
         if (scope?.id) scopes.set(token, scope);
         if (goal) {
-          const g = read.goal ?? {};
+          // `read` is typed at the untyped QaCore boundary: narrow the goal view to its declared shape so the
+          // dependency-path/reason/action callbacks keep their structure instead of widening to implicit any.
+          const g = (read.goal ?? {}) as NonNullable<QaRead["goal"]>;
           const coverage = g.dispatchComplete === true
             ? `完整${g.dispatchCheckedAt ? `（检查于 ${esc(g.dispatchCheckedAt)}）` : ""}`
             : `不可用/未知${g.dispatchReason ? `（${esc(g.dispatchReason)}）` : ""}`;
           const undispatchable = g.dispatchComplete === true ? esc(g.undispatchable ?? 0) : "未知（未核验）";
+          const root = g.root;
+          const rootHtml = root ? (() => {
+            const facts = root.factsAvailable === true;
+            const impact = facts ? `${esc(root.impact ?? 0)} 项` : "未知（事实不可读）";
+            const path = facts && (root.dependencyPath ?? []).length > 0
+              ? root.dependencyPath!.map(p => `${esc(p.title ?? p.taskId)}（${esc(p.taskId)}）`).join(" → ")
+              : facts ? "无后续等待" : "未知";
+            const people = facts && root.people
+              ? `实现人 ${esc(root.people.implementer ?? "未定")} · 作者 ${esc((root.people.authors ?? []).join("、") || "无")} · 复核 ${esc((root.people.reviewers ?? []).join("、") || "无")} · 提交人 ${esc(root.people.submitter ?? "未知")} · 提交 SHA ${esc(root.people.submitCommit ?? "未知")}${root.people.peopleOmitted ? ` · 另有 ${esc(root.people.peopleOmitted)} 人未列出` : ""}`
+              : "未知（事实不可读）";
+            const reasons = (root.reasons ?? []).map(r => {
+              const actions = r.actions && r.actions.length > 0
+                ? r.actions.map(a => `${esc(a.authority ?? "未知")}：${esc(a.label ?? "未知")}${a.tool ? `（工具 ${esc(a.tool)}，${a.executable === false ? "不可执行" : "可执行"}）` : a.executable === false ? "（不可执行）" : ""}`).join("；")
+                : "未知（旧记录未携带结构化动作）";
+              return `<div class="meta">${esc(r.code)} · ${esc(r.text)} · 候选 ${esc((r.candidates ?? []).filter(c => c !== "*").join("、") || "全局")} · 负责 ${esc(r.owner ?? "未知")} · 恢复 ${esc(r.recovery ?? "未知")}</div>
+<div class="meta">下一触发 ${esc(r.nextTrigger ?? "未知")} · 依据 ${esc(r.basis ?? "未知")} · 动作 ${actions}</div>`;
+            }).join("");
+            return `<div class="card"><h3>根阻点 · ${esc(root.title)}</h3>
+<div class="meta">任务 ${esc(root.taskId)} · ${esc(root.phase === "review" ? "复核" : "执行")} · 工作流 ${esc(root.workflowState)} · 可派 ${root.feasible ? "是" : "否"} · 可选 ${esc(root.eligibleCount)} 人 · 已等 ${esc(root.waitingMinutes)} 分钟${root.since ? ` · 自 ${esc(root.since)}` : ""} · 结论检查于 ${esc(root.checkedAt)}${root.noticeKey ? ` · notice ${esc(root.noticeKey)}` : ""}</div>
+<div class="meta">${esc(root.summary)} · 本目标无法派工 ${esc(root.undispatchable)} 项（另 ${esc(root.others)} 项同目标） · 影响 ${impact}</div>
+<div class="meta">依赖路径 ${path}</div>
+<div class="meta">${people}</div>
+${reasons}${root.reasonsOmitted ? `<div class="meta">另有 ${esc(root.reasonsOmitted)} 条原因未列出</div>` : ""}</div>`;
+          })() : `<div class="card"><div class="meta">根阻点：本轮 pass 中该目标无可报的阻断结论（或派工快照不可用）</div></div>`;
           return html(layout("QA 目标汇总", `${scopeLinks(scope)}${metaHtml(read, runtimeRelease)}<div class="card"><h3>目标 ${esc(g.id)}</h3>
 <div class="meta">总任务 ${esc(g.total)} · 状态计数 ${esc(JSON.stringify(g.states ?? {}))} · 派工覆盖 ${coverage} · 无法派工 ${undispatchable} · 检查于 ${esc(g.checkedAt)}</div>
-<pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>`));
+<pre>${esc(JSON.stringify(g.states ?? {}, null, 2))}</pre></div>${rootHtml}`));
         }
         return html(layout("QA 只读验收", `${scopeLinks(scope, taskId)}${metaHtml(read, runtimeRelease)}${taskHtml(read, taskId)}${dispatchHtml(read.dispatch)}${contributionHtml(read)}`));
       }

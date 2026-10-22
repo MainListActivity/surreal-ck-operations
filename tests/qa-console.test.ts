@@ -105,3 +105,55 @@ test('short inline context is rendered, every task offers a context link, and go
   expect(completePage).toContain('无法派工 2');
   expect(completePage).toContain('完整');
 });
+
+test('F1: next trigger, basis and structured actions render; missing fields show unknown, never invented', async () => {
+  const withActions = { ...readView,
+    dispatch: { ...readView.dispatch,
+      verdicts: [{ ...readView.dispatch.verdicts[0],
+        reasons: [{ code: 'implementer_mismatch', text: '任务已绑定实现负责人', candidates: ['eng-2'], owner: 'gm',
+          recovery: '经理用 implementer_takeover 显式接手', nextTrigger: '绑定实现负责人可派工', basis: 'contribution-audit',
+          actions: [{ authority: 'gm', label: '经理用 implementer_takeover 显式接手', tool: 'implementer_takeover', executable: true },
+            { authority: 'owner', label: '老板线下确认', executable: false }] }] }] } };
+  const legacy = { ...readView,
+    dispatch: { ...readView.dispatch, verdicts: [{ ...readView.dispatch.verdicts[0],
+      reasons: [{ code: 'quota', text: '订阅额度耗尽', candidates: [], owner: 'owner', recovery: '等待恢复' }] }] } };
+  const mk = (view: unknown) => createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
+    qaObservationRead: async () => view,
+  } }) as any });
+  const page = await (await mk(withActions)(new Request('http://x/q/?taskId=t1', { headers: { cookie } }))).text();
+  expect(page).toContain('下一触发 绑定实现负责人可派工');
+  expect(page).toContain('依据 contribution-audit');
+  expect(page).toContain('工具 implementer_takeover');
+  expect(page).toContain('老板线下确认（不可执行）');
+  const oldPage = await (await mk(legacy)(new Request('http://x/q/?taskId=t1', { headers: { cookie } }))).text();
+  expect(oldPage).toContain('下一触发 未知');
+  expect(oldPage).toContain('依据 未知');
+  expect(oldPage).toContain('未知（旧记录未携带结构化动作）');
+  expect(oldPage).not.toContain('implementer_takeover');
+});
+
+test('F2: the goal page renders root blocker, impact, dependency path, notice and submit SHA; facts-unavailable is unknown', async () => {
+  const rootBase = { taskId: 't9', title: '根任务', phase: 'review', workflowState: 'review', summary: '无独立复核人选',
+    feasible: false, waitingMinutes: 30, since: '2026-10-22T00:00:00Z', checkedAt: '2026-10-22T00:19:00Z',
+    eligibleCount: 0, undispatchable: 2, others: 1, noticeKey: 't9:review:1:no_candidate' };
+  const reasons = [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'gm', recovery: '经理增补编制',
+    nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool', actions: [{ authority: 'gm', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }];
+  const mk = (root: unknown) => createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: {
+    qaObservationRead: async (_a: any, input: any) => ({ meta: { scope, completeness: { dispatchComplete: true } },
+      goal: { id: input.goalId, total: 5, states: { review: 1 }, dispatchComplete: true, undispatchable: 2, dispatchCheckedAt: '2026-10-22T00:19:00Z', root } }),
+  } }) as any });
+  const page = await (await mk({ ...rootBase, factsAvailable: true, impact: 3,
+    dependencyPath: [{ taskId: 't9', title: '根任务' }, { taskId: 't10', title: '后续任务' }],
+    people: { implementer: 'eng-1', authors: ['eng-1'], reviewers: ['qa-1'], submitter: 'eng-1', submitCommit: 'abcdef1234567' }, reasons })(
+    new Request('http://x/q/?goal=1', { headers: { cookie } }))).text();
+  expect(page).toContain('根阻点 · 根任务');
+  expect(page).toContain('影响 3 项');
+  expect(page).toContain('后续任务（t10）');
+  expect(page).toContain('提交 SHA abcdef1234567');
+  expect(page).toContain('notice t9:review:1:no_candidate');
+  expect(page).toContain('工具 def_ensure');
+  const unknownPage = await (await mk({ ...rootBase, factsAvailable: false, reasons })(
+    new Request('http://x/q/?goal=1', { headers: { cookie } }))).text();
+  expect(unknownPage).toContain('未知（事实不可读）');
+  expect(unknownPage).not.toContain('影响 0 项');
+});

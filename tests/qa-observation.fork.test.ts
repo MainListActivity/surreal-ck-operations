@@ -11,6 +11,7 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
+import { Workforce } from '../src/workforce.ts';
 
 setDefaultTimeout(600_000);
 const fork = process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
@@ -231,5 +232,52 @@ fork('scope view uses bare record ids so the goal page and the core goal check a
   expect(goalBody).not.toContain('outside the QA observation scope');
   // A different goal is still refused through the same session; the check did not widen.
   const other = await owner.createGoal({ text: '另一个目标（负例）', source: 'owner:test', key: key(), tier: 'quick' });
+  await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId: other.id }), 'forbidden', /outside the QA observation scope/);
+});
+
+fork('F2: goal summary carries the root blocker, impact, dependency path and submit commit from the shared evaluator', async () => {
+  // A core with a workforce wired (the plugin process wires one; the bare core above does not) so the goal root facts are readable.
+  const factsCore = new SurrealCompanyCore(database, { workforce: new Workforce(database, credDir) });
+  const scope = await core.qaObservationGrant(tokens.gm, {
+    goalId, deploymentTaskId: deployId, qaEmployee: 'qa-obs-qa', leaseFence: qaFence, subjects: [subjectId],
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: 'F2 根阻点回归范围', idempotencyKey: key(),
+  });
+  // A chained dependent so the waiting graph has an edge behind the root.
+  const downstream = await core.createTask(tokens.gm, {
+    goalId, title: '后续等待任务', context: '依赖根阻点任务。', executorRole: 'engineering', reviewerRole: 'product',
+    kind: 'task', dependencies: [subjectId], idempotencyKey: key(),
+  });
+  const at = new Date().toISOString();
+  await database.db.query(`UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts, complete: true, originalVerdicts: 1, originalReasons: 1 };`, {
+    at,
+    verdicts: [{ noticeKey: `${subjectId}:execute:1:no_candidate`, taskId: subjectId, goalId, title: '被核验主体任务', phase: 'execute',
+      dispatchable: false, workflowState: 'ready', eligibleCount: 0, feasible: false, summary: '无独立复核人选',
+      checkedAt: at, waitingMinutes: 5,
+      reasons: [{ code: 'no_candidate', text: '该岗位与仓库下没有任何编制或员工', candidates: [], owner: 'gm',
+        recovery: '经理增补编制', nextTrigger: '新增编制或员工', basis: 'tick:staffing-pool',
+        actions: [{ authority: 'gm', label: '经理用 def_ensure 增加编制', tool: 'def_ensure', executable: true }] }] }],
+  });
+  await database.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };", { at });
+  const read = await factsCore.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });
+  const root = read.goal?.root;
+  expect(root).toBeDefined();
+  expect(root?.taskId).toBe(subjectId);
+  expect(root?.factsAvailable).toBe(true);
+  expect(root?.impact).toBeGreaterThanOrEqual(1);
+  expect(root?.dependencyPath?.some(step => step.taskId === subjectId)).toBe(true);
+  expect(root?.dependencyPath?.some(step => step.taskId === downstream.id)).toBe(true);
+  expect(root?.noticeKey).toContain('no_candidate');
+  expect(root?.checkedAt).toBe(at);
+  expect(root?.reasons[0]?.nextTrigger).toBe('新增编制或员工');
+  expect(root?.reasons[0]?.basis).toBe('tick:staffing-pool');
+  expect(root?.reasons[0]?.actions?.[0]?.tool).toBe('def_ensure');
+  // The bare core has no workforce: facts are unavailable, and impact/path/people are omitted rather than reported as zero.
+  const bare = await core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId });
+  expect(bare.goal?.root?.factsAvailable).toBe(false);
+  expect(bare.goal?.root?.impact).toBeUndefined();
+  expect(bare.goal?.root?.dependencyPath).toBeUndefined();
+  expect(bare.goal?.root?.people).toBeUndefined();
+  // Cross-goal stays forbidden with the same session.
+  const other = await owner.createGoal({ text: 'F2 跨目标负例', source: 'owner:test', key: key(), tier: 'quick' });
   await expectRefused(core.qaObservationRead({ credential: tokens.qa }, { scopeId: scope.id, goalId: other.id }), 'forbidden', /outside the QA observation scope/);
 });
