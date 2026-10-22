@@ -119,3 +119,73 @@ fork('N1-R positive: a trusted deployment of this run certifies the environment 
   expect(source).toContain('900');
   expect(source).toContain('success');
 });
+
+fork('N1-R refusal then recovery: the core first refuses a borrowed deployment, then the same attempt passes with correct evidence', async () => {
+  // One transport that can answer either way: which deployment/status it reports is switched between the two calls.
+  let mode: 'borrowed' | 'correct' = 'borrowed';
+  const ghSwitch = async (args: string[]): Promise<string> => {
+    if (args[0] === 'run' && args[1] === 'view') {
+      return JSON.stringify({
+        headSha: SHA, status: 'completed', conclusion: 'success', workflowName: 'Deploy production',
+        createdAt: '2026-10-21T23:00:00Z', updatedAt: '2026-10-21T23:02:00Z',
+      });
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/deployments?')) {
+      // Both modes point at the same head and environment and sit in the same window: only the run link differs.
+      return JSON.stringify([{
+        id: 900, environment: 'production', sha: SHA, created_at: '2026-10-21T23:00:30Z',
+        statuses_url: 'https://api.github.com/repos/o/r/deployments/900/statuses',
+      }]);
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/statuses')) {
+      const runId = mode === 'borrowed' ? '999' : RUN;
+      const state = mode === 'borrowed' ? 'failure' : 'success';
+      return JSON.stringify([{
+        state, environment: 'production', created_at: '2026-10-21T23:01:00Z',
+        log_url: `https://github.com/o/r/actions/runs/${runId}/job/4242`,
+        target_url: `https://github.com/o/r/actions/runs/${runId}/job/4242`,
+      }]);
+    }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const switchCore = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(ghSwitch) } });
+  const goal = await owner.createGoal({ text: 'N1-R 拒绝后恢复目标', source: 'owner:test', key: key(), tier: 'quick' });
+  const task = await switchCore.createTask(tokens.gm, {
+    goalId: goal.id, title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 被拒，再补本 run 的正确证据并在同一 attempt 提交。',
+    kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
+  } as never);
+  const acId = (await switchCore.getTask(tokens.gm, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
+  const claim = await switchCore.claim(tokens['eng-a'], task.id);
+
+  // 1. The borrowed (failed, other-run) deployment must be refused by the real core.
+  let refused = '';
+  try {
+    await switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
+      taskId: task.id, acId, sha: SHA, environment: 'production',
+      source: { provider: 'github-actions', runUrl: RUN_URL }, idempotencyKey: key(),
+    } as never);
+  } catch (error) { refused = String((error as Error).message); }
+  console.log('N1R_SWITCH_REFUSED', JSON.stringify({ refused }));
+  expect(refused).toMatch(/does not reference the evidence run|no successful status/);
+
+  // 2. Correct evidence in the SAME attempt: the task is still doing, the attempt has not advanced.
+  mode = 'correct';
+  const recorded = await switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
+    taskId: task.id, acId, sha: SHA, environment: 'production',
+    source: { provider: 'github-actions', runUrl: RUN_URL }, idempotencyKey: key(),
+  } as never);
+  expect(recorded.verified).toBe(true);
+  const current = await switchCore.getTask(tokens.gm, task.id);
+  expect(current.state).toBe('doing');
+  const submitted = await switchCore.submit(tokens['eng-a'], {
+    taskId: task.id, deliveryId: claim.deliveryId, fence: claim.fence, expectedVersion: current.version,
+  }, { text: '提交 N1-R 恢复：本 attempt 已补正确部署证据，交独立 QA。', idempotencyKey: key(), acceptance: { sha: SHA, environment: 'production' } });
+  expect(submitted.state).toBe('review');
+  const review = await switchCore.claim(tokens.qa, task.id);
+  const accepted = await switchCore.accept(tokens.qa, {
+    taskId: task.id, deliveryId: review.deliveryId, fence: review.fence, expectedVersion: review.task.version,
+  }, { text: '独立 QA 验收 N1-R 恢复：正确来源证据通过。', idempotencyKey: key() });
+  console.log('N1R_SWITCH_ACCEPT', JSON.stringify({ state: accepted.state, attempt: accepted.acceptanceAttempt }));
+  expect(accepted.state).toBe('done');
+  expect(accepted.acceptanceAttempt).toBe(1);
+});
