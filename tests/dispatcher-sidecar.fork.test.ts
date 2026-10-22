@@ -766,6 +766,18 @@ run('company fork: zero dispatch verdicts still report the live review dependenc
     expect(body).toContain('提交审计时点');
     expect(body).not.toContain('本轮 pass 中该目标无可报的阻断结论');
 
+    const dispatchBlocked = await w.core.createTask(w.gm, { goalId: goal.id, title: '真实派工阻断并存任务', context: '隔离 fork 回归数据',
+      executorRole: 'product', reviewerRole: 'qa', idempotencyKey: 'wait-root-dispatch-blocked-coexists' });
+    await w.tick();
+    expect(w.snapshot()?.verdicts.some(verdict => verdict.taskId === dispatchBlocked.id && !verdict.dispatchable)).toBe(true);
+    await persistDispatchObservation({ dispatcher: { dispatchSnapshot: () => w.snapshot() }, db: w.db } as never);
+    const coexistRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(coexistRead.goal?.dispatchComplete).toBe(true);
+    expect(coexistRead.goal?.undispatchable).toBe(1);
+    expect(coexistRead.goal?.root?.taskId).toBe(dispatchBlocked.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]).not.toHaveProperty('noticeKey');
+
     // Dispatch pass availability is independent from the freshly collected goal graph.
     await w.db.db.query('DELETE company_meta:dispatch_observation; DELETE company_meta:dispatch_observation_status;');
     const missingPassRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
