@@ -246,6 +246,60 @@ async function snapshotSubmitUsage(paseo: PaseoApi, ctx: Company, agent: { id: s
 /** Wake nudges a silently-ended round may get before the claim is released server-side. */
 const MAX_SILENT_NUDGES = 2;
 
+export const QA_DISPATCH_OBSERVATION_MAX_BYTES = 4 * 1024 * 1024;
+export const QA_DISPATCH_ITEM_MAX_BYTES = 256 * 1024;
+let lastObservation = '';
+async function markDispatchAttempt(ctx: Company, at: string, ok: boolean, error = ''): Promise<void> {
+  await ctx.db.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: $ok, error: $error };",
+    { at, ok, error: error.slice(0, 500) });
+}
+/**
+ * Persist the last dispatch pass for the QA observation channel (SYS-DISP 7454fc89 / B3).
+ * Every verdict and every reason is kept: the reader filters one subject and never receives a silently cut list.
+ * A pass over the safe size, or one item over the per-item cap, is stored as complete=false with no partial data;
+ * the reader then reports partial/unavailable with the original counts and the pass time. A failed write leaves the
+ * previous snapshot in place and records the attempt as failed, so the reader can mark it stale instead of current.
+ */
+export async function persistDispatchObservation(ctx: Company): Promise<void> {
+  const snapshot = ctx.dispatcher.dispatchSnapshot();
+  if (!snapshot.at) return;
+  const at = new Date(snapshot.at).toISOString();
+  const attemptAt = new Date().toISOString();
+  const originalVerdicts = snapshot.verdicts.length;
+  const originalReasons = snapshot.verdicts.reduce((sum, verdict) => sum + verdict.reasons.length, 0);
+  const itemTooLarge = snapshot.verdicts.some(verdict =>
+    Buffer.byteLength(JSON.stringify(verdict)) > QA_DISPATCH_ITEM_MAX_BYTES ||
+    verdict.reasons.some(reason => Buffer.byteLength(JSON.stringify(reason)) > QA_DISPATCH_ITEM_MAX_BYTES));
+  let complete = true;
+  let reason = '';
+  if (itemTooLarge) {
+    complete = false;
+    reason = `a single dispatch verdict or reason exceeds the ${QA_DISPATCH_ITEM_MAX_BYTES}-byte safe item size; no partial snapshot was stored`;
+  } else {
+    const bytes = Buffer.byteLength(JSON.stringify({ at, verdicts: snapshot.verdicts, complete: true, originalVerdicts, originalReasons }));
+    if (bytes > QA_DISPATCH_OBSERVATION_MAX_BYTES) {
+      complete = false;
+      reason = `the dispatch observation is ${bytes} bytes, over the ${QA_DISPATCH_OBSERVATION_MAX_BYTES}-byte safe size; no partial snapshot was stored`;
+    }
+  }
+  const record = complete
+    ? { at, verdicts: snapshot.verdicts, complete: true, originalVerdicts, originalReasons }
+    : { at, verdicts: [], complete: false, originalVerdicts, originalReasons, reason };
+  const json = JSON.stringify(record);
+  try {
+    if (json !== lastObservation) {
+      await ctx.db.db.query(
+        "UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts, complete: $complete, originalVerdicts: $ov, originalReasons: $or, reason: $reason };",
+        { at, verdicts: record.verdicts, complete: record.complete, ov: originalVerdicts, or: originalReasons, reason });
+      lastObservation = json;
+    }
+    await markDispatchAttempt(ctx, attemptAt, true);
+  } catch (error) {
+    await markDispatchAttempt(ctx, attemptAt, false, (error as Error).message).catch(() => undefined);
+    throw error;
+  }
+}
+
 export function startDispatch(server: PluginServerContext): () => void {
   let stopped = false;
   let wake: (() => void) | undefined;
@@ -256,27 +310,6 @@ export function startDispatch(server: PluginServerContext): () => void {
     wake = () => { wake = undefined; clearTimeout(timer); resolve(); };
   });
 
-/** Removes leftovers the task-scoped artifact reclaim never sees; never touches task evidence. */
-let lastObservation = '';
-/**
- * Persist the last dispatch pass's verdicts for the QA observation channel (SYS-DISP 7454fc89). The MCP service
- * runs in another process and cannot see the dispatcher's memory, so this bounded copy is what makes the QA read
- * and the company page report the same conclusion the tick acted on. A failed write never fails the tick: the QA
- * read then reports the observation as unavailable, never a fabricated verdict.
- */
-async function persistDispatchObservation(ctx: Company): Promise<void> {
-  const snapshot = ctx.dispatcher.dispatchSnapshot();
-  if (!snapshot.at) return;
-  const at = new Date(snapshot.at).toISOString();
-  let verdicts = snapshot.verdicts.slice(0, 120).map(v => ({ ...v, reasons: v.reasons.slice(0, 30) }));
-  while (verdicts.length > 0 && Buffer.byteLength(JSON.stringify({ at, verdicts })) > 40 * 1024) {
-    verdicts = verdicts.slice(0, Math.max(1, Math.floor(verdicts.length / 2)));
-  }
-  const json = JSON.stringify({ at, verdicts });
-  if (json === lastObservation) return;
-  lastObservation = json;
-  await ctx.db.db.query("UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: $verdicts };", { at, verdicts });
-}
 
 async function runLifecycleGc(ctx: Company): Promise<void> {
   const cfg = await ctx.workforce.config();

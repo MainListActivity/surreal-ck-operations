@@ -490,7 +490,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
     ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('qa_observation_session', {
-    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the company page (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the page exchanges it for a 30-minute read-only session.',
+    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the dedicated read-only QA console (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the console at the preview LAN /q/ page (returned as pagePath) exchanges it for an HttpOnly 30-minute read-only session. The console has no owner RPC and no write route.',
     inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish() }),
   }, async (input, ctx) => run(token(ctx), () => core.qaObservationSession
     ? core.qaObservationSession(token(ctx), { ...(input.scopeId ? { scopeId: input.scopeId } : {}) }) : Promise.reject({ code: 'temporarily_unavailable' })));

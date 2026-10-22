@@ -76,14 +76,42 @@ export const qaScopeView = (row: QaObservationScopeRow): QaObservationScopeView 
  * (company_meta:dispatch_observation) so the MCP process reads the same conclusion instead of re-inventing one.
  * Absent or task-not-in-pass is fail-closed: available=false, never a fabricated "dispatchable".
  */
-export const qaDispatchFor = (observation: unknown, taskId: string): QaObservationDispatch => {
-  const record = observation as { at?: string; verdicts?: unknown[] } | undefined;
+export interface QaDispatchAttempt { at?: string; ok?: boolean; error?: string }
+
+/**
+ * The last dispatcher pass's verdicts for one task, as the QA page sees them. The plugin writes the pass observation
+ * (company_meta:dispatch_observation) so the MCP process reads the same conclusion instead of re-inventing one.
+ * A complete observation keeps every verdict and every reason; an oversized pass is stored as complete=false with
+ * no partial data, and a failed latest write leaves the previous snapshot explicitly stale. Absent, incomplete,
+ * stale or task-not-in-pass is fail-closed: available=false, never a fabricated "dispatchable".
+ */
+export const qaDispatchFor = (observation: unknown, taskId: string, attempt?: QaDispatchAttempt): QaObservationDispatch => {
+  const record = observation as { at?: string; verdicts?: unknown[]; complete?: boolean; reason?: string;
+    originalVerdicts?: number; originalReasons?: number } | undefined;
+  const attemptFields = {
+    ...(attempt?.at ? { attemptAt: attempt.at } : {}),
+    ...(attempt?.ok !== undefined ? { attemptOk: attempt.ok } : {}),
+  };
   if (!record || !Array.isArray(record.verdicts)) {
-    return { available: false, source: 'dispatcher-pass', reason: 'no dispatcher pass observation' };
+    return { available: false, source: 'dispatcher-pass', reason: 'no dispatcher pass observation', ...attemptFields };
+  }
+  const base = {
+    source: 'dispatcher-pass', ...(record.at ? { checkedAt: record.at } : {}),
+    ...(record.originalVerdicts !== undefined ? { originalVerdicts: record.originalVerdicts } : {}),
+    ...(record.originalReasons !== undefined ? { originalReasons: record.originalReasons } : {}),
+    ...attemptFields,
+  };
+  if (record.complete === false) {
+    return { ...base, available: false, complete: false,
+      reason: record.reason ?? 'the dispatch observation is incomplete; no partial snapshot is presented as complete' };
+  }
+  if (attempt?.ok === false) {
+    return { ...base, available: false, complete: false,
+      reason: `the latest dispatch observation write failed${attempt.error ? `: ${attempt.error.slice(0, 200)}` : ''}; the stored snapshot is stale` };
   }
   const verdicts = record.verdicts.filter(value => (value as { taskId?: string })?.taskId === taskId);
   if (verdicts.length === 0) {
-    return { available: false, source: 'dispatcher-pass', checkedAt: record.at, reason: 'task was not in the latest dispatcher pass' };
+    return { ...base, available: false, complete: true, reason: 'task was not in the latest dispatcher pass' };
   }
-  return { available: true, source: 'dispatcher-pass', checkedAt: record.at, verdicts: verdicts as QaObservationDispatch['verdicts'] };
+  return { ...base, available: true, complete: true, verdicts: verdicts as QaObservationDispatch['verdicts'] };
 };

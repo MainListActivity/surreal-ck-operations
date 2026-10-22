@@ -3390,7 +3390,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const expiresAt = new Date(Date.now() + QA_OBSERVATION_CODE_TTL_MS).toISOString();
     await this.db.query("CREATE $sess CONTENT { scope: $scope, qa_employee: $qa, code_hash: $hash, state: 'code', code_expires_at: $expires, created_at: time::now() };",
       { sess: id('qa_observation_session', randomUUID()), scope: scope.id, qa: actor.employeeId, hash: qaHash(code), expires: expiresAt });
-    return { scope: qaScopeView(scope), code, expiresAt };
+    return { scope: qaScopeView(scope), code, expiresAt, pagePath: '/q/' };
   }
 
   /** The company page exchanges the one-time code for a browser-only restricted token. The code is consumed. */
@@ -3413,9 +3413,10 @@ export class SurrealCompanyCore implements CompanyCore {
   /** QA: full task state, contribution facts (unknown fail-closed), and the last dispatcher pass's verdicts. */
   async qaObservationRead(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView> {
     const { scope } = await this.qaObservationAuth(auth, input.scopeId);
-    const [instanceAt, observation] = await Promise.all([
+    const [instanceAt, observation, attempt] = await Promise.all([
       this.dbNow(),
       this.db.select<Record<string, unknown>>(id('company_meta', 'dispatch_observation')),
+      this.db.select<{ at?: string; ok?: boolean; error?: string }>(id('company_meta', 'dispatch_observation_status')),
     ]);
     const checkedAt = new Date().toISOString();
     const scopeView = qaScopeView(scope);
@@ -3431,8 +3432,10 @@ export class SurrealCompanyCore implements CompanyCore {
       const goalIds = new Set((goalTasks ?? []).map(row => asId(row.id)));
       const verdicts = (observation as { verdicts?: Array<{ taskId?: string; dispatchable?: boolean }> } | undefined)?.verdicts ?? [];
       const undispatchable = new Set(verdicts.filter(v => v.taskId && goalIds.has(v.taskId) && v.dispatchable === false).map(v => v.taskId)).size;
-      return { meta: baseMeta, goal: { id: input.goalId, states, total, undispatchable,
-        ...((observation as { at?: string } | undefined)?.at ? { checkedAt: (observation as { at?: string }).at } : {}) } };
+      const dispatchComplete = (observation as { complete?: boolean } | undefined)?.complete !== false && attempt?.ok !== false;
+      return { meta: { ...baseMeta, completeness: { ...baseMeta.completeness, dispatchComplete } },
+        goal: { id: input.goalId, states, total, undispatchable,
+          ...((observation as { at?: string } | undefined)?.at ? { checkedAt: (observation as { at?: string }).at } : {}) } };
     }
     if (input.taskId === undefined) throw new CompanyError('invalid', 'taskId or goalId is required');
     const taskId = input.taskId;
@@ -3442,10 +3445,12 @@ export class SurrealCompanyCore implements CompanyCore {
     if (!row.goal || asId(row.goal) !== asId(scope.goal)) throw new CompanyError('forbidden', 'the task is not in the scope goal');
     const taskView = view(row);
     const facts = (await readContributionView(this.db, taskId)).facts;
+    const dispatch = qaDispatchFor(observation, taskId, attempt);
     const context = row.context ?? '';
     const contextBytes = utf8Bytes(context);
     const inline = contextBytes <= QA_OBSERVATION_CONTEXT_INLINE_BYTES;
-    const meta: QaObservationMeta = { ...baseMeta, completeness: { complete: true, taskRead: true, contextIncluded: inline } };
+    const meta: QaObservationMeta = { ...baseMeta, completeness: { complete: true, taskRead: true, contextIncluded: inline,
+      dispatchComplete: dispatch.available && dispatch.complete !== false } };
     return {
       meta,
       task: inline ? taskView : { ...taskView, context: '' },
@@ -3454,7 +3459,7 @@ export class SurrealCompanyCore implements CompanyCore {
         unknown: facts.unknown.map(entry => ({ actor: entry.actor, action: entry.action, ...(entry.at ? { at: entry.at } : {}), reason: entry.reason })),
         ...(facts.implementer ? { implementer: facts.implementer } : {}), ambiguous: facts.ambiguous,
       },
-      dispatch: qaDispatchFor(observation, taskId),
+      dispatch,
       ...(inline ? {} : { contextOmitted: true, contextBytes, contextSha256: HASH(context), contextRead: { taskId, field: 'context' as const, offset: 0 } }),
     };
   }

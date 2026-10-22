@@ -587,12 +587,18 @@ export interface QaObservationDispatchVerdict {
 }
 export interface QaObservationDispatch {
   available: boolean; source: string; checkedAt?: string; reason?: string;
+  /** true only when the stored pass is a complete observation; false means partial/unavailable, never a silent cut. */
+  complete?: boolean;
+  /** Counts of the pass before any storage decision; a reader can compare them with what it received. */
+  originalVerdicts?: number; originalReasons?: number;
+  /** The latest persistence attempt: the stored snapshot is stale when the last write failed. */
+  attemptAt?: string; attemptOk?: boolean;
   verdicts?: QaObservationDispatchVerdict[];
 }
 export interface QaObservationMeta {
   checkedAt: string; dataSource: 'live'; instanceAt: string; runtimeRelease?: string;
   scope: QaObservationScopeView;
-  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean };
+  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean; dispatchComplete?: boolean };
 }
 export interface QaObservationReadInput { scopeId?: string; taskId?: string; goalId?: string; }
 export interface QaObservationContribution {
@@ -614,7 +620,7 @@ export interface QaObservationTextSegment {
   meta: QaObservationMeta; taskId: string; field: 'context' | 'evidence'; auditId?: string;
   totalBytes: number; sha256: string; offset: number; bytes: number; nextOffset: number | null; text: string;
 }
-export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; }
+export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
 export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
 
 export interface CompanyCore {

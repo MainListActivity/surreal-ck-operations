@@ -1263,180 +1263,18 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
 }
 
 
-// ---- QA 受限只读取证（SYS-DISP 7454fc89）：正规公司页面上的只读 tab。 ----
-// 登录码由 QA 本人的 sck 会话（qa_observation_session）生成，一次性换成本页的受限会话；
-// 页面不持有 owner token/员工凭证，只能调用 company.qa.read/timeline/text 三个只读 RPC。
-type QaScopeView = {
-  id?: string; goalId?: string; deploymentTaskId?: string; subjects?: string[]; expiresAt?: string;
-  version?: number; status?: string; leaseHolder?: string; leaseFence?: number;
-};
-type QaReadView = {
-  meta?: { checkedAt?: string; dataSource?: string; instanceAt?: string; runtimeRelease?: string; scope?: QaScopeView; completeness?: Record<string, unknown> };
-  task?: Record<string, unknown>;
-  contribution?: { authors?: string[]; reviewers?: string[]; excluded?: string[]; unknown?: Array<{ actor?: string; action?: string; reason?: string }>; implementer?: string; ambiguous?: boolean };
-  dispatch?: { available?: boolean; source?: string; checkedAt?: string; reason?: string; verdicts?: Array<{ phase?: string; dispatchable?: boolean; workflowState?: string; eligibleCount?: number; waitingMinutes?: number; summary?: string; checkedAt?: string; reasons?: Array<{ code?: string; text?: string; candidates?: string[]; owner?: string; recovery?: string }> }> };
-  goal?: { id?: string; states?: Record<string, number>; total?: number; undispatchable?: number; checkedAt?: string };
-  contextOmitted?: boolean; contextBytes?: number;
-};
-type QaTimelineView = { history?: Array<{ auditId?: string; action?: string; actor?: string; at?: string; version?: number; evidence?: string; evidenceTruncated?: boolean }>; page?: { hasMore?: boolean; nextCursor?: string; total?: number; returned?: number } };
-
-function QaTab({ ctx }: { ctx: Ctx }) {
-  const s = makeStyles(ctx);
-  const loginRpc = useRpc(rpc.qaLogin);
-  const readRpc = useRpc(rpc.qaRead);
-  const timelineRpc = useRpc(rpc.qaTimeline);
-  const textRpc = useRpc(rpc.qaText);
-  const [code, setCode] = useState("");
-  const [token, setToken] = useState<string | undefined>(undefined);
-  const [scope, setScope] = useState<QaScopeView | undefined>(undefined);
-  const [subject, setSubject] = useState<string | undefined>(undefined);
-  const [notice, setNotice] = useState<string | undefined>(undefined);
-  const [detail, setDetail] = useState<string | undefined>(undefined);
-  const login = useMutation({
-    mutationFn: () => loginRpc({ code: code.trim() }),
-    onSuccess: (value) => {
-      const v = value as { token?: string; scope?: QaScopeView };
-      setToken(v.token); setScope(v.scope); setSubject(v.scope?.subjects?.[0]); setNotice(undefined); setDetail(undefined);
-    },
-    onError: (error) => setNotice(String((error as Error)?.message ?? error).slice(0, 300)),
-  });
-  const read = useQuery({
-    queryKey: ["qa-read", token, subject],
-    queryFn: () => readRpc({ token: token!, ...(subject ? { taskId: subject } : {}) }),
-    enabled: Boolean(token && subject), refetchInterval: 15_000,
-  });
-  const timeline = useQuery({
-    queryKey: ["qa-timeline", token, subject],
-    queryFn: () => timelineRpc({ token: token!, taskId: subject!, pageSize: 10 }),
-    enabled: Boolean(token && subject),
-  });
-  const goalRead = useMutation({
-    mutationFn: () => readRpc({ token: token!, ...(scope?.goalId ? { goalId: scope.goalId } : {}) }),
-    onSuccess: (value) => setDetail(JSON.stringify((value as QaReadView).goal, null, 2)),
-    onError: (error) => setNotice(String((error as Error)?.message ?? error).slice(0, 300)),
-  });
-  const text = useMutation({
-    mutationFn: (input: { field: "context" | "evidence"; auditId?: string }) => textRpc({ token: token!, taskId: subject!, ...input }),
-    onSuccess: (value) => {
-      const v = value as { text?: string; field?: string; bytes?: number; totalBytes?: number; nextOffset?: number | null };
-      setDetail(v.text ? `正文（${v.field}，${v.bytes ?? 0}/${v.totalBytes ?? 0} 字节${v.nextOffset ? `，下一段 offset=${v.nextOffset}` : ""}）：\n${v.text}` : "正文为空");
-    },
-    onError: (error) => setNotice(String((error as Error)?.message ?? error).slice(0, 300)),
-  });
-  const r = read.data as QaReadView | undefined;
-  const t = timeline.data as QaTimelineView | undefined;
-  const task = r?.task;
-  const meta = r?.meta;
-  const dispatch = r?.dispatch;
-  const contribution = r?.contribution;
-  const unknown = contribution?.unknown ?? [];
-  return (
-    <View style={{ gap: 12 }}>
-      <View style={s.card}>
-        <Text style={s.text}>QA 受限只读验收：输入由本任务 sck 会话生成的一次性登录码。本页不持有 owner token 或员工凭证；所有读取只在本 scope 的 allowlist 内，页面没有任何写操作。</Text>
-        <TextInput style={s.input} value={code} onChangeText={setCode} placeholder="一次性登录码" autoCapitalize="none" autoCorrect={false} />
-        <View style={s.row}>
-          <Pressable accessibilityRole="button" style={s.button} onPress={() => login.mutate()}><Text style={s.buttonText}>进入只读验收</Text></Pressable>
-          {token && <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={() => { setToken(undefined); setScope(undefined); setSubject(undefined); setDetail(undefined); setNotice(undefined); }}><Text style={s.buttonSecondaryText}>退出</Text></Pressable>}
-        </View>
-        {notice && <Text style={[s.muted, { color: "#d97706" }]}>{notice}</Text>}
-      </View>
-      {token && scope && (
-        <View style={s.card}>
-          <Text style={s.text}>scope {scope.id} · goal {scope.goalId} · 部署任务 {scope.deploymentTaskId}</Text>
-          <Text style={s.muted}>QA {scope.leaseHolder} · fence {scope.leaseFence} · 到期 {scope.expiresAt} · 版本 {scope.version}</Text>
-          <View style={s.row}>
-            {(scope.subjects ?? []).map(id => (
-              <Pressable key={id} accessibilityRole="button" style={[s.chip, subject === id && s.chipActive]}
-                onPress={() => { setSubject(id); setDetail(undefined); }}>
-                <Text style={[s.chipText, subject === id && s.chipTextActive]}>{id.slice(0, 8)}</Text>
-              </Pressable>
-            ))}
-            <Pressable accessibilityRole="button" style={s.chip} onPress={() => goalRead.mutate()}><Text style={s.chipText}>目标汇总</Text></Pressable>
-            <Pressable accessibilityRole="button" style={s.chip} onPress={() => { void read.refetch(); void timeline.refetch(); }}><Text style={s.chipText}>刷新</Text></Pressable>
-          </View>
-        </View>
-      )}
-      {meta && (
-        <View style={s.card}>
-          <Text style={s.muted}>检查于 {clockOf(meta.checkedAt ?? "")} · 数据源 {meta.dataSource ?? "live"} · 实例时点 {clockOf(meta.instanceAt ?? "")}{meta.runtimeRelease ? ` · release ${meta.runtimeRelease}` : ""}</Text>
-          <Text style={s.muted}>完整性 {JSON.stringify(meta.completeness ?? {})}</Text>
-        </View>
-      )}
-      {task && (
-        <View style={s.card}>
-          <Text style={s.text}>{String(task.title ?? "")}</Text>
-          <Text style={s.muted}>状态 {String(task.state ?? "")} · 版本 {String(task.version ?? "")} · 执行 {String(task.executorRole ?? "")} · 复核 {String(task.reviewerRole ?? "")} · 实现人 {String(task.implementer ?? "未知")} · 当前租约 {String(task.currentEmployee ?? "无")}</Text>
-          <Text style={s.muted}>goal {String(task.goalId ?? "")} · kind {String(task.kind ?? "")} · 依赖 {(task.dependencies as string[] | undefined)?.length ?? 0} 项 · 等待 {task.waiting ? JSON.stringify(task.waiting) : "无"}</Text>
-          {r?.contextOmitted && (
-            <View style={s.row}>
-              <Text style={s.muted}>正文未内联（{r.contextBytes ?? 0} 字节），按段读取：</Text>
-              <Pressable accessibilityRole="button" style={s.chip} onPress={() => text.mutate({ field: "context" })}><Text style={s.chipText}>读取正文第一段</Text></Pressable>
-            </View>
-          )}
-        </View>
-      )}
-      {dispatch && (
-        <View style={s.card}>
-          <Text style={s.text}>派工评估 {dispatch.available ? "（来自最近一次 dispatcher pass）" : "不可用（失败关闭）"}</Text>
-          <Text style={s.muted}>{dispatch.available ? `检查于 ${clockOf(dispatch.checkedAt ?? "")} · 来源 ${dispatch.source ?? ""}` : `原因：${dispatch.reason ?? "未知"}${dispatch.checkedAt ? ` · 检查于 ${clockOf(dispatch.checkedAt)}` : ""}`}</Text>
-          {(dispatch.verdicts ?? []).map((v, i) => (
-            <View key={i} style={{ gap: 2, marginTop: 4 }}>
-              <Text style={s.text}>{v.phase === "review" ? "复核" : "执行"} · {v.dispatchable ? "可派" : "无法派工"} · 工作流 {v.workflowState ?? ""} · 可选 {v.eligibleCount ?? 0} 人 · 已等 {v.waitingMinutes ?? 0} 分钟</Text>
-              {v.summary && <Text style={{ color: "#d97706", fontSize: 13 }}>{v.summary}</Text>}
-              {(v.reasons ?? []).map((reason, j) => (
-                <Text key={j} style={s.muted}>{reason.code} · {reason.text} · 候选 {(reason.candidates ?? []).filter(c => c !== "*").join("、") || "全局"} · 负责 {reason.owner} · 恢复 {reason.recovery}</Text>
-              ))}
-              <Text style={s.muted}>结论检查于 {clockOf(v.checkedAt ?? "")}</Text>
-            </View>
-          ))}
-        </View>
-      )}
-      {contribution && (
-        <View style={s.card}>
-          <Text style={s.text}>贡献者（作者回避）</Text>
-          <Text style={s.muted}>作者 {(contribution.authors ?? []).join("、") || "无"} · 复核 {(contribution.reviewers ?? []).join("、") || "无"} · 回避 {(contribution.excluded ?? []).join("、") || "无"} · 实现人 {contribution.implementer ?? "未定"}{contribution.ambiguous ? " · 作者不唯一" : ""}</Text>
-          {unknown.length > 0 && <Text style={{ color: "#d97706", fontSize: 13 }}>未知贡献 {unknown.length} 条（fail-closed）：{unknown.map(u => `${u.actor ?? "?"}:${u.action ?? "?"}`).join("、")}</Text>}
-        </View>
-      )}
-      {t && (
-        <View style={s.card}>
-          <Text style={s.text}>审计时间线（本页 {(t.history ?? []).length} 条{t.page?.total !== undefined ? ` / 共 ${t.page.total} 条` : ""}）</Text>
-          {(t.history ?? []).map((entry, i) => (
-            <View key={entry.auditId ?? i} style={{ gap: 2, marginTop: 4 }}>
-              <Text style={s.muted}>{clockOf(entry.at ?? "")} · {entry.action} · {entry.actor}{entry.version !== undefined ? ` · v${entry.version}` : ""}{entry.evidenceTruncated ? " · 证据已截断" : ""}</Text>
-              {entry.evidence && <Text style={s.muted} numberOfLines={4}>{entry.evidence}</Text>}
-              {entry.auditId && entry.evidenceTruncated && (
-                <Pressable accessibilityRole="button" style={s.chip} onPress={() => text.mutate({ field: "evidence", auditId: entry.auditId })}><Text style={s.chipText}>读取完整证据</Text></Pressable>
-              )}
-            </View>
-          ))}
-          {t.page?.hasMore && <Text style={s.muted}>还有更多；本页只读展示前 10 条。</Text>}
-        </View>
-      )}
-      {detail && (
-        <View style={s.card}>
-          <Text style={s.text}>只读详情</Text>
-          <Text style={s.mono}>{detail}</Text>
-        </View>
-      )}
-    </View>
-  );
-}
-
 export function CompanySurface(props: PluginSurfaceProps) {
   const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };
   const s = makeStyles(ctx);
   const briefRpc = useRpc(rpc.brief);
   const brief = useQuery({ queryKey: ["brief"], queryFn: () => briefRpc({}), refetchInterval: 15_000 });
-  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster" | "qa">("pulse");
+  const [tab, setTab] = useState<"pulse" | "inbox" | "new" | "goals" | "roster">("pulse");
   const tabs = [
     { id: "pulse" as const, title: "动态" },
     { id: "inbox" as const, title: "收件箱" },
     { id: "new" as const, title: "发目标" },
     { id: "goals" as const, title: "目标进展" },
     { id: "roster" as const, title: "编制" },
-    { id: "qa" as const, title: "QA 验收" },
   ];
   return (
     <View style={s.screen}>
@@ -1453,7 +1291,6 @@ export function CompanySurface(props: PluginSurfaceProps) {
         {tab === "new" && <NewGoalTab ctx={ctx} brief={brief.data} />}
         {tab === "goals" && <GoalsTab ctx={ctx} brief={brief.data} />}
         {tab === "roster" && <RosterTab ctx={ctx} brief={brief.data} />}
-        {tab === "qa" && <QaTab ctx={ctx} />}
       </ScrollView>
     </View>
   );
