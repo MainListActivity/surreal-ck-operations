@@ -5,8 +5,8 @@
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
   writeFileAtomic, type CommRequest, type CommResponse,
@@ -17,6 +17,16 @@ import type { EmployeeInst, SupervisedTask, Workforce } from "./vendor/src/workf
 import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
+
+/** The release the service is running (the `active` symlink); undefined when it cannot be read. */
+const qaRuntimeRelease = (): string | undefined => {
+  try { return basename(realpathSync(join(serviceHome(), "active"))); } catch { return undefined; }
+};
+/** Stamp the actual running release onto a QA read answer; never a guessed value. */
+const withQaRelease = <T extends { meta: object }>(value: T): T => {
+  const release = qaRuntimeRelease();
+  return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+};
 
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
@@ -765,15 +775,15 @@ export class SidecarPool {
         : Promise.reject(Object.assign(new Error("core does not expose qa_observation_session"), { code: "temporarily_unavailable" }));
       case "qa_observation_read": return withinReplyCeiling(async () => {
         if (!core.qaObservationRead) throw Object.assign(new Error("core does not expose qa_observation_read"), { code: "temporarily_unavailable" });
-        return core.qaObservationRead({ credential: cred }, args as never);
+        return withQaRelease(await core.qaObservationRead({ credential: cred }, args as never));
       });
       case "qa_observation_timeline": return withinReplyCeiling(async () => {
         if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
-        return core.qaObservationTimeline({ credential: cred }, args as never);
+        return withQaRelease(await core.qaObservationTimeline({ credential: cred }, args as never));
       });
       case "qa_observation_text": return withinReplyCeiling(async () => {
         if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
-        return core.qaObservationText({ credential: cred }, args as never);
+        return withQaRelease(await core.qaObservationText({ credential: cred }, args as never));
       });
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)

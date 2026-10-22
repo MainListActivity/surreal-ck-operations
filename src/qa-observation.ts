@@ -48,8 +48,13 @@ export interface QaObservationSessionRow {
 
 /** A SurrealDB record id as the bare id, with or without the ⟨⟩ wrapping. */
 export const qaId = (value: unknown): string => {
-  const text = String(value);
-  return text.includes('⟨') ? text.split('⟨').pop()!.replace('⟩', '') : text;
+  // Same identity contract as core's asId: a RecordId yields its bare id, and the fork's escaped `task:⟨uuid⟩`
+  // rendering yields the uuid without the table prefix. The QA scope view is compared against bare ids in core
+  // (the goal check) and used in page links, so a `goal:`-prefixed string would be refused as another goal.
+  if (value instanceof RecordId) return String(value.id);
+  const raw = String(value);
+  const unescaped = raw.includes('⟨') ? raw.split('⟨').pop()!.replace('⟩', '') : raw;
+  return unescaped.includes(':') ? unescaped.split(':').slice(1).join(':') : unescaped;
 };
 
 export const qaHash = (value: string): string => createHash('sha256').update(value).digest('hex');
