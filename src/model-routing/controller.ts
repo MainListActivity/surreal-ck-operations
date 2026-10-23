@@ -16,6 +16,9 @@ import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 const exec = promisify(execFile);
+/** magpie names a plugin installed from a path by that absolute path, not by its file stem. */
+export const selectorPath = (home: string) =>
+  join(home, "model-routing", "sck-performance.gateway.js");
 export interface RoutingConfig {
   enabled?: boolean;
   disabledModels?: string[];
@@ -51,8 +54,15 @@ export class ModelRoutingController {
         maxBuffer: 1024 * 1024,
         env: magpieEnvironment(),
       });
-    } catch {
-      throw Error(`magpie management command failed: ${args[0]}`);
+    } catch (error) {
+      const why = String((error as { stderr?: string }).stderr ?? "")
+        .trim()
+        .split("\n")
+        .pop()
+        ?.slice(0, 200);
+      throw Error(
+        `magpie management command failed: ${args.slice(0, 2).join(" ")}${why ? `: ${why}` : ""}`,
+      );
     }
   }
   refresh(force = false): Promise<void> {
@@ -195,7 +205,7 @@ export class ModelRoutingController {
         ]);
     } else await saveMagpieGroups(this.cli, groupsToSet);
 
-    const selector = join(dir, "sck-performance.gateway.js");
+    const selector = selectorPath(this.home);
     const source = await readFile(this.sourcePath, "utf8");
     let old = "";
     try {
@@ -214,7 +224,7 @@ export class ModelRoutingController {
       await this.command([
         "plugin",
         "options",
-        "sck-performance",
+        selector,
         JSON.stringify(options),
       ]);
     groups.__selector = digest(source);

@@ -9,7 +9,10 @@ import {
 import { join, resolve } from "node:path";
 import { loadDatabaseConfig } from "../src/config.ts";
 import { CompanyDatabase } from "../src/database.ts";
-import { ModelRoutingController } from "../src/model-routing/controller.ts";
+import {
+  ModelRoutingController,
+  selectorPath,
+} from "../src/model-routing/controller.ts";
 import { RecordId } from "surrealdb";
 import { restoreRoutingSettings } from "../src/model-routing/gateway.ts";
 import { createPaseoCli } from "../src/dispatcher/paseo.ts";
@@ -125,7 +128,7 @@ try {
     }
     execFileSync(
       "/Applications/magpie.app/Contents/MacOS/magpie",
-      ["plugin", "off", "sck-performance"],
+      ["plugin", "off", selectorPath(serviceHome())],
       { stdio: "ignore", timeout: 20000 },
     );
     console.log(JSON.stringify({ restored, pendingSessionReloads: pending }));
