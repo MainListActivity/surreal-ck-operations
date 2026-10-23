@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
+import { scoreModels } from './model-routing/store.ts';
+import { QUOTA_RELEASE } from './dispatcher/quota-failure.ts';
 import type { EmployeeScore, Role, TaskId } from './contracts.ts';
 
 const HASH = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -24,6 +26,8 @@ export interface EvalState {
   participants: string[];
   metrics: Record<string, EvalMetrics>;
   timeline: EvalTimelineEntry[];
+  timelineTruncated?: boolean;
+  modelExecutions?: Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>;
 }
 
 const TIMELINE_LIMIT = 40;
@@ -44,6 +48,22 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
      SELECT payload.employee AS employee FROM outbox WHERE task = $task AND kind = 'revoked';`,
     { task });
 
+  // Remove only claim-only rounds positively identified as infrastructure failures.
+  // Keep genuine work from the same employee in any earlier/later round.
+  const ignoredClaims = new Set<number>();
+  const open = new Map<string, { index: number; worked: boolean }>();
+  for (const [index, r] of auditRows.entries()) {
+    if (!(r.actor instanceof RecordId) || r.actor.table.name !== 'employee') continue;
+    const employee = asId(r.actor);
+    if (r.action === 'claim') open.set(employee, { index, worked: false });
+    const round = open.get(employee);
+    if (!round) continue;
+    if (['checkpoint', 'submit', 'accept', 'return', 'block'].includes(r.action)) round.worked = true;
+    if (r.action === 'released') {
+      if (r.evidence?.includes(QUOTA_RELEASE) && !round.worked) ignoredClaims.add(round.index);
+      open.delete(employee);
+    }
+  }
   const participants = new Set<string>();
   const metrics = new Map<string, EvalMetrics>();
   const metric = (emp: string) => {
@@ -53,9 +73,11 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   };
   const timeline: EvalTimelineEntry[] = [];
   let lastSubmitter: string | undefined;
-  for (const r of auditRows) {
-    const isEmployee = r.actor instanceof RecordId && r.actor.table.name === 'employee';
-    const actor = isEmployee ? asId(r.actor as RecordId) : String(r.actor ?? 'system');
+  for (const [index, r] of auditRows.entries()) {
+    if (ignoredClaims.has(index)) continue;
+    const infrastructure = r.action === 'released' && r.evidence?.includes(QUOTA_RELEASE);
+    const isEmployee = !infrastructure && r.actor instanceof RecordId && r.actor.table.name === 'employee';
+    const actor = infrastructure ? 'infrastructure' : isEmployee ? asId(r.actor as RecordId) : String(r.actor ?? 'system');
     if (r.action !== 'evaluated' && timeline.length < TIMELINE_LIMIT) {
       timeline.push({ at: String(r.at ?? ''), action: r.action, actor,
         evidence: typeof r.evidence === 'string' ? r.evidence.slice(0, TIMELINE_EVIDENCE_CHARS) : undefined });
@@ -79,7 +101,12 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   }
   if (excludeEmployeeId) participants.delete(excludeEmployeeId);
 
+  const [modelExecutions] = await db.query<[NonNullable<EvalState['modelExecutions']>]>(
+    "SELECT employee,model,fence,phase,<string>at AS at,<string>ended_at AS ended_at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' ORDER BY at ASC LIMIT 2001;", {task});
+  if (modelExecutions.length>2000) throw new Error("Model evidence exceeds 2000 executions; final evaluation requires a complete timeline");
   return {
+    modelExecutions,
+    timelineTruncated:auditRows.length>TIMELINE_LIMIT,
     taskId, goalId: row.goal ? asId(row.goal) : undefined,
     title: row.title, context: String(row.context ?? '').slice(0, CONTEXT_CHARS),
     state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
@@ -98,6 +125,14 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
   const dims = ['quality', 'evidence', 'discipline', 'timeliness', 'overall'] as const;
   for (const s of scores) {
     if (!state.participants.includes(s.employee)) return `Not a participant: ${s.employee}`;
+    const required = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+    if (required.size>1 && [...required].some(m=>!s.modelScores?.some(a=>a.model===m))) return `Missing model assessments: ${s.employee}`;
+    const models = s.modelScores;
+    if (models) {
+      const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+      if (new Set(models.map(m=>m.model)).size !== models.length) return `Duplicate model assessment: ${s.employee}`;
+      for (const m of models) if (!actual.has(m.model) || !Number.isFinite(m.overall) || m.overall<1 || m.overall>5) return `Invalid model assessment: ${m.model}`;
+    }
     for (const d of dims) {
       if (typeof s[d] !== 'number' || !Number.isFinite(s[d]) || s[d] < 1 || s[d] > 5) return `Invalid ${d} score`;
     }
@@ -114,6 +149,8 @@ export async function writeScorecards(
   db: Surreal,
   input: { taskId: TaskId; summary: string; judge: string; judgeKind: 'llm' | 'jev'; scores: ScoredEmployee[]; state: EvalState; topPerformer?: string },
 ): Promise<{ recorded: number; participants: string[] }> {
+  const invalid = validateScores(input.state,input.scores);
+  if(invalid) throw new Error(invalid);
   const task = id('task', input.taskId);
   const written = new Set<string>();
   for (const s of input.scores) {
@@ -130,6 +167,8 @@ export async function writeScorecards(
       overall: s.overall, notes: s.notes, metrics: input.state.metrics[s.employee], by: input.judge,
       judgeKind: input.judgeKind, confidence: s.confidence, probabilities: s.probabilities, flagged: s.flagged === true,
     });
+    const actualModels = await scoreModels(db, input.taskId, s.employee, s.overall, s.modelScores);
+    await db.query('UPDATE $card SET model_scores=$assessments,configured_model=$configured,model=$model,actual_models=$models, model_attribution=$basis RETURN NONE;', {card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0,24)), assessments:s.modelScores,models:actualModels, configured:emp?.model,model:actualModels.length===1?actualModels[0]:actualModels.length?'mixed':'unknown', basis:actualModels.length ? 'gateway-completed-requests' : 'unknown'});
     written.add(s.employee);
   }
 
@@ -173,6 +212,32 @@ export async function rescoreAggregates(db: Surreal): Promise<{ employees: numbe
 
 export async function rescore(db: Surreal, table: 'employee' | 'employee_def', key: string, scoreField: 'employee' | 'def'): Promise<void> {
   const [[agg]] = await db.query<[[{ avg?: number; n?: number }]]>(
-    `SELECT math::mean(overall) AS avg, count() AS n FROM scorecard WHERE ${scoreField} = $key GROUP ALL;`, { key });
+    `SELECT math::mean(overall) AS avg, count() AS n FROM scorecard WHERE ${scoreField} = $key AND excluded_infrastructure != true GROUP ALL;`, { key });
   await db.query('UPDATE $r SET scored = $n, avg_score = $a;', { r: id(table, key), n: agg?.n ?? 0, a: agg?.avg ?? undefined });
+}
+
+
+/** Conservative, reversible repair: retain original scorecards; exclude only proven quota-only participants. */
+export async function repairInfrastructureScores(db: Surreal, execute = false): Promise<{ candidates: string[]; applied: boolean }> {
+  const [cards] = await db.query<[Array<{id: RecordId; task: RecordId; employee: string}>]>(
+    "SELECT id, task, employee FROM scorecard WHERE excluded_infrastructure != true AND task IN (SELECT VALUE task FROM audit WHERE action = 'released' AND string::contains(evidence ?? '', $marker));", { marker: QUOTA_RELEASE });
+  const states = new Map<string, EvalState>();
+  const candidates: string[] = [];
+  for (const card of cards) {
+    const taskId = asId(card.task);
+    let state = states.get(taskId);
+    if (!state) { state = await collectEvalState(db, taskId); states.set(taskId, state); }
+    if (state.participants.includes(card.employee)) continue;
+    // Absence alone is not proof (old/incomplete audit data). Require the explicit
+    // infrastructure release for this exact employee, which collectEvalState labels.
+    const [releases] = await db.query<[Array<{id: RecordId}>]>(
+      "SELECT id FROM audit WHERE task = $task AND actor = $actor AND action = 'released' AND string::contains(evidence ?? '', $marker) LIMIT 1;",
+      { task: card.task, actor: id('employee', card.employee), marker: QUOTA_RELEASE });
+    if (!releases.length) continue;
+    candidates.push(asId(card.id));
+    if (execute) await db.query('UPDATE $card SET excluded_infrastructure = true, exclusion_reason = $reason, exclusion_at = time::now();',
+      { card: card.id, reason: QUOTA_RELEASE });
+  }
+  if (execute) await rescoreAggregates(db);
+  return { candidates, applied: execute };
 }

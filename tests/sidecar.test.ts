@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
@@ -72,6 +72,7 @@ const core = {
   relayOwnerDecision: async () => taskView('x'), relayDirection: async () => {},
   resume: async () => taskView('x'), recordScore: async () => ({ recorded: 1, participants: [] }),
   listOutbox: async () => [],
+  qaObservationRead: async (c: string, input: Record<string, unknown>) => ({ meta: { checkedAt: 'x', dataSource: 'live', instanceAt: 'x', scope: {}, completeness: {} }, task: { id: input.taskId }, __cred: c }),
 };
 
 const workforce = { rotate: async () => 'tok-rotated' };
@@ -174,7 +175,7 @@ describe('sidecar', () => {
     expect(call.text).toBe('half done');
   });
 
-  test('relay forwards the declared acceptance fields and refuses a malformed one', async () => {
+test('relay forwards the declared acceptance fields and refuses a malformed one', async () => {
     const i = inst('e-acceptance');
     const env = pool.env(i);
     await pool.claim(i, task('task-acceptance'));
@@ -186,6 +187,30 @@ describe('sidecar', () => {
     const bad = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'acc2', 'submit', { text: '交付完成。', acceptance: 'head-1' });
     expect(bad.ok).toBe(false);
     expect(bad.error).toContain('acceptance must be an object');
+  });
+
+  test('QA reads carry the actual running release, and never a fabricated one', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'sck-sidecar-home-'));
+    const sha = 'c'.repeat(40);
+    mkdirSync(join(home, 'releases', sha), { recursive: true });
+    symlinkSync(join(home, 'releases', sha), join(home, 'active'));
+    const prevHome = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    try {
+      const i = inst('e-qa');
+      const env = pool.env(i);
+      await pool.claim(i, task('task-qa'));
+      const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'qa1', 'qa_observation_read', { taskId: 'task-qa' });
+      expect(answer.ok).toBe(true);
+      expect((answer.data as { meta: { runtimeRelease?: string } }).meta.runtimeRelease).toBe(sha);
+      unlinkSync(join(home, 'active'));
+      const after = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY, 'qa2', 'qa_observation_read', { taskId: 'task-qa' });
+      expect(after.ok).toBe(true);
+      expect((after.data as { meta: { runtimeRelease?: string } }).meta.runtimeRelease).toBeUndefined();
+    } finally {
+      if (prevHome === undefined) delete process.env.SCK_SERVICE_HOME; else process.env.SCK_SERVICE_HOME = prevHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('relay rejects a wrong comm key and claim_next', async () => {
@@ -523,6 +548,23 @@ describe('sidecar', () => {
     fresh.close();
   });
 
+  test('adopt keeps unknown leases unroutable until an authoritative retry confirms idle', async () => {
+    const i = inst('e-unconfirmed', { paseoAgentId: 'agent-unconfirmed', credential: undefined });
+    let unavailable = true;
+    const recoveringCore = { ...core, activeLeases: async () => {
+      if (unavailable) throw new Error('database unavailable');
+      return [];
+    }};
+    const fresh = new SidecarPool({ core: recoveringCore as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    try {
+      await fresh.adopt([i]);
+      expect(fresh.routingLease('agent-unconfirmed')).toBeUndefined();
+      unavailable = false;
+      await fresh.adopt([i]);
+      expect(fresh.routingLease('agent-unconfirmed')).toMatchObject({ task: '', phase: 'idle' });
+    } finally { fresh.close(); }
+  });
+
   test('adopt fails closed when the complete lease lookup is ambiguous', async () => {
     const i = inst('e-ambiguous', { paseoAgentId: 'agent-ambiguous', role: 'qa', credential: undefined });
     const expires = new Date(Date.now() + 60_000).toISOString();
@@ -534,6 +576,7 @@ describe('sidecar', () => {
     authRole = 'qa';
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     await fresh.adopt([i]);
+    expect(fresh.routingLease('agent-ambiguous')).toBeUndefined();
     const env = fresh.env(i);
     const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'amb1', 'checkpoint', { text: 'ambiguous lease must not revive' });
     expect(checkpoint.ok).toBe(false);

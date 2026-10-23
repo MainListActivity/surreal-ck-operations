@@ -119,7 +119,7 @@ function fixture(goals: Array<{ id: string; project?: string }>) {
     writeScope: async () => [],
     claimDenial: () => undefined,
     bindAgent: () => {},
-    commDirFor: () => '/tmp/comm',
+    commDirFor: id => `/tmp/comm/${id}`,
     scratchDirFor: instId => `/tmp/${instId}-scratch`,
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
@@ -154,9 +154,10 @@ describe('triage groups due goals by project repoPath', () => {
     // Task-less anchor: no taskId, the goal's project id resolves the workspace repo.
     expect(f.readWorkspaceCalls.map(c => c.taskId)).toEqual([undefined, undefined]);
     expect(f.readWorkspaceCalls.map(c => c.project).sort()).toEqual(['pa', 'pb']);
-    expect(f.spawnCwds.sort()).toEqual([
-      `${PROJ_A}-sck-shared`,
-      `${PROJ_B}-sck-shared`,
+    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
+    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
+      PROJ_A,
+      PROJ_B,
     ]);
     // Each wake is a distinct employee (assigned prevents reuse across groups).
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
@@ -176,7 +177,7 @@ describe('triage groups due goals by project repoPath', () => {
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(1);
     expect(f.readWorkspaceCalls).toHaveLength(1);
     expect(f.readWorkspaceCalls[0]!.project).toBe('pa');
-    expect(f.spawnCwds).toEqual([`${PROJ_A}-sck-shared`]);
+    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
   });
 
   test('project goals are never anchored on the opsRepo workspace', async () => {
@@ -188,7 +189,7 @@ describe('triage groups due goals by project repoPath', () => {
 
     expect(f.readWorkspaceCalls.every(c => c.project === 'pa')).toBe(true);
     expect(f.spawnCwds.every(cwd => cwd !== OPS && !cwd.startsWith(`${OPS}-`))).toBe(true);
-    expect(f.spawnCwds).toEqual([`${PROJ_A}-sck-shared`]);
+    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
     expect(f.instances.every(i => i.repoHome === PROJ_A)).toBe(true);
   });
 
@@ -204,7 +205,7 @@ describe('triage groups due goals by project repoPath', () => {
     expect(f.readWorkspaceCalls).toHaveLength(1);
     expect(f.readWorkspaceCalls[0]!.project).toBeUndefined();
     expect(f.readWorkspaceCalls[0]!.taskId).toBeUndefined();
-    expect(f.spawnCwds).toEqual([`${OPS}-sck-shared`]);
+    expect(f.instances.map(i => i.repoHome)).toEqual([OPS]);
   });
 
   test('mixed: opsRepo group and project group dispatch separately', async () => {
@@ -217,9 +218,10 @@ describe('triage groups due goals by project repoPath', () => {
 
     expect(report.woke).toHaveLength(3);
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
-    expect(f.spawnCwds.sort()).toEqual([
-      `${OPS}-sck-shared`,
-      `${PROJ_A}-sck-shared`,
+    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
+    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
+      OPS,
+      PROJ_A,
     ].sort());
     expect(f.dispatches.map(d => d.key).sort()).toEqual(['goal:goal-a1', 'goal:goal-ops1', 'goal:goal-ops2']);
   });

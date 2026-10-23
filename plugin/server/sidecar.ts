@@ -1,12 +1,15 @@
+import { taskTier } from './vendor/src/model-routing/policy.ts';
+import type { RoutingLease } from './vendor/src/model-routing/gateway.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
 // SCK_COMM_DIR/SCK_COMM_KEY in their spawn env and never see auth material.
 // The sidecar claims tasks on the instance's behalf (dispatcher calls claim()),
 // keeps the lease alive while a turn runs, relays `sck call` requests through
 // req/res files, and ingests report.md/blocker.md when a turn ends.
+import { OpsCircuit } from "./ops-circuit";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
   blockerPath, commDir, ensureCommDirs, readJsonFile, readTextFile, reportPath, reqDir, resDir,
   writeFileAtomic, type CommRequest, type CommResponse,
@@ -18,13 +21,23 @@ import { guardRelayResponse } from "./vendor/src/response-budget.ts";
 import { isPaged, parseReclaimInput, parseWorktreeInput, taskIdOf } from "./vendor/src/query-input.ts";
 import { arriving, SNAPSHOT_TOOLS, withinReplyCeiling } from "./vendor/src/reply-clock.ts";
 
+/** The release the service is running (the `active` symlink); undefined when it cannot be read. */
+const qaRuntimeRelease = (): string | undefined => {
+  try { return basename(realpathSync(join(serviceHome(), "active"))); } catch { return undefined; }
+};
+/** Stamp the actual running release onto a QA read answer; never a guessed value. */
+const withQaRelease = <T extends { meta: object }>(value: T): T => {
+  const release = qaRuntimeRelease();
+  return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+};
+
 const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
-  "record_score", "heartbeat", "deliverable_publish",
+  "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
@@ -37,8 +50,16 @@ const BASE_TOOLS = [
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
+  "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
+  "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
+  // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
+  "independence_set",
+  // Manage capability only in core: registers an identity principal (the only cross-employee identity link); audited.
+  "identity_principal_set",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
+  // gm or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
+  "independence_check",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -84,6 +105,8 @@ interface LiveClaim {
   blockerHash?: string;
   /** Turns that ended without any closeout artifact while this claim was live. */
   nudges?: number;
+  routing?: RoutingLease;
+  routingExpiresAt?: number;
 }
 
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
@@ -97,6 +120,8 @@ export class SidecarPool {
   private readonly quarantined = new Set<string>();
   private readonly creds = new Map<string, string>();
   private readonly keys = new Map<string, string>();
+  private readonly routingUnconfirmed = new Set<string>();
+  private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
   private readonly instByAgent = new Map<string, string>();
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
@@ -106,11 +131,32 @@ export class SidecarPool {
 
   /** Last claim denial code per instance: the dispatcher reads it after a lost claim (see claimDenial). */
   private readonly denials = new Map<string, string>();
-  constructor(private readonly deps: SidecarDeps) {}
+  private readonly opsCircuit: OpsCircuit;
+  constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
+
+  routingSession(ref:string):{employee:string;comm:string;role?:string}|undefined {
+    const employee=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
+    if(!employee||!this.launched.has(employee)||this.quarantined.has(employee))return;
+    return {employee,comm:commDir(this.deps.runDir,employee),role:this.routingEmployees.get(employee)?.role};
+  }
+
+  /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
+  routingLease(ref:string):RoutingLease|undefined {
+    const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
+    if(!inst||this.quarantined.has(inst)||!this.launched.has(inst)||this.routingUnconfirmed.has(inst))return;
+    const live=this.claims.get(inst);
+    if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
+    const role=this.routingEmployees.get(inst)?.role;
+    // A task lease authorizes task writes, not the employee's ability to speak.
+    // submit/review consumes the lease before Claude's next call handles the tool result.
+    // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
+    if(role)return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
+  }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
   env(inst: EmployeeInst): Record<string, string> {
+    this.routingEmployees.set(inst.id,{role:inst.role});
     if (this.quarantined.has(inst.id) || (inst.paseoAgentId && !this.canReuse(inst))) {
       throw Object.assign(new Error("session channel cannot be restored; retire the instance"), { code: "stale_channel" });
     }
@@ -311,8 +357,11 @@ export class SidecarPool {
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
     this.archive(blockerPath(dir), "stale");
+    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
+      routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:inst.role,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
+      routingExpiresAt:Date.parse(result.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
     this.startBeat(inst.id);
@@ -323,14 +372,17 @@ export class SidecarPool {
   /** Spawn/wake/workspace-handoff rollback after a pre-claim: hand the lease back without a
    * reviewer verdict — never routed through returnTask, which would fake a return and bounce
    * a review task back to doing. Cores without the release op let the lease expire on its own. */
-  async releaseClaim(instId: string, _taskId: string, reason: string): Promise<void> {
+  async releaseClaim(instId: string, _taskId: string, reason: string, options: { strict?: boolean } = {}): Promise<void> {
     const live = this.claims.get(instId);
-    this.endLease(instId);
+    if (!options.strict) this.endLease(instId);
     if (!live) return;
     try {
       const cred = await this.credentialFor(instId);
+      if (options.strict && !this.deps.core.release) throw new Error("core release unavailable");
       await this.deps.core.release?.(cred, live.proof, { text: `【通道回滚】${reason}`, idempotencyKey: `sidecar-release:${instId}:${live.proof.deliveryId}` });
+      if (options.strict && this.claims.get(instId) === live) this.endLease(instId);
     } catch (error) {
+      if (options.strict) throw error;
       this.log(`releaseClaim ${instId} failed (lease will expire): ${(error as Error).message}`);
     }
   }
@@ -338,7 +390,7 @@ export class SidecarPool {
   /** Turn ended: ingest the agent's artifacts, then let the lease live or die.
    * The keepalive is NOT stopped here — the claim may outlive this turn (multi-turn
    * work), and a claim whose beat died becomes an orphan no heartbeat can expire. */
-  async settle(agentId: string): Promise<SettleResult> {
+  async settle(agentId: string, options: { infrastructureFailure?: boolean } = {}): Promise<SettleResult> {
     const instId = this.instByAgent.get(agentId);
     if (!instId) return { status: "no_claim" };
     const dir = commDir(this.deps.runDir, instId);
@@ -370,9 +422,9 @@ export class SidecarPool {
     }
     // Turn closed with the round still open: keep the lease while the caller decides
     // between a wake nudge and a server-side release; the count feeds that decision.
-    live.nudges = (live.nudges ?? 0) + 1;
+    if (!options.infrastructureFailure) live.nudges = (live.nudges ?? 0) + 1;
     this.log(`turn ended without new report/blocker: ${instId} on ${live.taskId} (silent turn ${live.nudges})`);
-    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges } };
+    return { status: "silent", silent: { instId, taskId: live.taskId, nudges: live.nudges ?? 0 } };
   }
 
   private async finish(
@@ -440,6 +492,7 @@ export class SidecarPool {
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
+    this.routingUnconfirmed.delete(instId);
     this.launched.delete(instId);
     this.quarantined.add(instId);
     this.creds.delete(instId);
@@ -456,6 +509,7 @@ export class SidecarPool {
    */
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
+      this.routingEmployees.set(inst.id,{role:inst.role});
       if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
       try {
         const cred = await this.deps.workforce.rotate(inst.id); // retired/revoked insts throw
@@ -485,6 +539,8 @@ export class SidecarPool {
     // instance keeps its seat (and any artifacts it wrote) across the restart.
     for (const inst of insts) {
       if (!this.launched.has(inst.id) || this.claims.has(inst.id)) continue;
+      // A failed/ambiguous lookup must not turn an in-flight employee into idle routing.
+      this.routingUnconfirmed.add(inst.id);
       try { await this.rebuildClaim(inst); }
       catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
@@ -521,6 +577,7 @@ export class SidecarPool {
       return;
     }
     if (!mine.length) {
+      this.routingUnconfirmed.delete(inst.id);
       // No server lease: the channel may still be live, but claim.json and artifacts are dead.
       this.endLease(inst.id);
       this.archive(reportPath(dir), "stale");
@@ -550,8 +607,11 @@ export class SidecarPool {
       worktree: task.worktree,
       evidenceDir,
     } as ClaimResult & { evidenceDir: string };
+    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: lease.state,
+      routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:inst.role,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},
+      routingExpiresAt:Date.parse(task.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });
     this.startBeat(inst.id);
@@ -594,7 +654,10 @@ export class SidecarPool {
       void (async () => {
         try {
           const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
-          if (this.claims.get(instId) === live) live.proof.expectedVersion = result.task.version;
+          if (this.claims.get(instId) === live) {
+            live.proof.expectedVersion = result.task.version;
+            if(result.task.leaseExpiresAt)live.routingExpiresAt=Date.parse(result.task.leaseExpiresAt);
+          }
         } catch (error) {
           // Version drift (a concurrent write bumped the task) must not kill the
           // lease: re-read the task and resync the proof. End it only when the
@@ -607,6 +670,7 @@ export class SidecarPool {
                 && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
               live.proof.expectedVersion = task.version;
               live.proof.fence = task.fence;
+              if(task.leaseExpiresAt)live.routingExpiresAt=Date.parse(task.leaseExpiresAt);
               this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
               return;
             }
@@ -692,7 +756,14 @@ export class SidecarPool {
     if (gateway) {
       // The lease decides the task: a taskId in the request is dropped so ops tools only ever act for the task in hand.
       const { taskId: _requested, ...rest } = args;
-      return gateway.call(cred, live().taskId, tool, rest);
+      const claim = live();
+      if (gateway !== ops) return gateway.call(cred, claim.taskId, tool, rest);
+      return this.opsCircuit.run({ employee: instId, task: claim.taskId, delivery: claim.proof.deliveryId, tool,
+        check: () => { live(); }, invoke: () => gateway.call(cred, claim.taskId, tool, rest),
+        block: text => writeOp(proof => core.block(cred, proof, "gm", {
+          text, idempotencyKey: `ops-circuit:${claim.proof.deliveryId}:${tool}`,
+        }), true),
+      });
     }
     switch (tool) {
       case "list_worktrees": return withinReplyCeiling(async () => {
@@ -788,9 +859,46 @@ export class SidecarPool {
       case "contributor_dryrun": return core.contributorDryRun
         ? core.contributorDryRun(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose contributor_dryrun"), { code: "temporarily_unavailable" }));
+      case "qa_observation_grant": return core.qaObservationGrant
+        ? core.qaObservationGrant(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_grant"), { code: "temporarily_unavailable" }));
+      case "qa_observation_revoke": return core.qaObservationRevoke
+        ? core.qaObservationRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_revoke"), { code: "temporarily_unavailable" }));
+      case "qa_observation_status": return core.qaObservationStatus
+        ? core.qaObservationStatus(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_status"), { code: "temporarily_unavailable" }));
+      case "qa_observation_session": return core.qaObservationSession
+        ? core.qaObservationSession(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose qa_observation_session"), { code: "temporarily_unavailable" }));
+      case "qa_observation_read": return withinReplyCeiling(async () => {
+        if (!core.qaObservationRead) throw Object.assign(new Error("core does not expose qa_observation_read"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationRead({ credential: cred }, args as never));
+      });
+      case "qa_observation_timeline": return withinReplyCeiling(async () => {
+        if (!core.qaObservationTimeline) throw Object.assign(new Error("core does not expose qa_observation_timeline"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationTimeline({ credential: cred }, args as never));
+      });
+      case "qa_observation_text": return withinReplyCeiling(async () => {
+        if (!core.qaObservationText) throw Object.assign(new Error("core does not expose qa_observation_text"), { code: "temporarily_unavailable" });
+        return withQaRelease(await core.qaObservationText({ credential: cred }, args as never));
+      });
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
+      case "independence_set": return core.setIndependence
+        ? core.setIndependence(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose independence_set"), { code: "temporarily_unavailable" }));
+      case "identity_principal_set": return core.setIdentityPrincipal
+        ? core.setIdentityPrincipal(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose identity_principal_set"), { code: "temporarily_unavailable" }));
+      case "independence_check": return core.independenceCheck
+        ? core.independenceCheck(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose independence_check"), { code: "temporarily_unavailable" }));
+      case "get_model_evidence": return withinReplyCeiling(async()=> {
+        if(!core.modelEvidence) throw new Error("Model evidence unavailable");
+        return core.modelEvidence(cred,taskIdOf(args.taskId));
+      });
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

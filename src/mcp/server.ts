@@ -1,3 +1,5 @@
+import { basename } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
@@ -65,17 +67,19 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
+  // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
+  const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
+    ? error.details : undefined;
   // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
   const message = code !== 'internal_error' && typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
     ? error.message.slice(0, 500)
     : '';
-  const structured = { ok: false as const, code, retryable, error: message || code };
+  const structured = { ok: false as const, code, retryable, error: message || code, ...(details ? { details } : {}) };
   // The text copy is the same JSON as structuredContent, for refusals as for answers, so every result parses the same way (SYS01, D1).
   return {
     isError: true,
     content: [{ type: 'text' as const, text: JSON.stringify(structured) }],
-    structuredContent: structured,
-  };
+    structuredContent: structured,  };
 }
 
 function toolResult(data: unknown) {
@@ -284,6 +288,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   server.registerTool('create_task', {
     description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
+      modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
@@ -487,6 +492,46 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.implementerTakeover(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('independence_set', {
+    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),
+      sources: z.array(z.string().min(1).max(200)).max(20),
+      mode: z.enum(['execute_handlers', 'all_handlers']),
+      excluded: z.array(z.string().min(1).max(200)).max(100).optional(),
+      reason: z.string().min(1).max(2048),
+      expectedVersion: z.number().int().positive(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIndependence
+    ? core.setIndependence(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('independence_check', {
+    description: 'gm or qa, read-only: the formal candidate-level preflight of the independence gate. Answers whether one employee would be refused by one task independence policy at one stage: clear (the gate would admit them), conflict (it would refuse, with the same via/source/matched/role/principal and the contribution auditRef its refusal cites), unverifiable (the exclusion could not be read, so the gate fails closed — never a pass), or not_applicable (the task has no policy). The policy field echoes the registered revision, stages, mode, sources, excluded, setBy and setAt so qa can read the real values back. stage defaults to the task current phase (review while in review, else execute). Writes nothing at all: no lease, no version, no audit, no dispatch — so a done or void task is still readable. gm always, qa always; every other role is refused.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      employeeId: z.string().min(1).max(200),
+      stage: z.enum(['execute', 'review']).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.independenceCheck
+    ? core.independenceCheck(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('identity_principal_set', {
+    description: 'Manager (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      principalId: z.string().min(1).max(200).optional(),
+      employees: z.array(z.string().min(1).max(200)).min(1).max(20),
+      reason: z.string().min(8).max(2000),
+      expectedVersion: z.number().int().positive().optional(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIdentityPrincipal
+    ? core.setIdentityPrincipal(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('task_project_update', {
     description: 'gm only: rebind a blocked, un-leased, never-submitted task to a registered project (task-level override over goal.project). Version-guarded, idempotent, audited; releases the stale worktree assignment through the normal lifecycle. Refuses doing/review/done tasks, active leases, submitted results and owner-blocked tasks.',
     inputSchema: z.object({
@@ -507,6 +552,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.bindTaskCodeRepo(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('get_model_evidence', {
+    description:'eval/gm only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
+    inputSchema:z.object({taskId:z.string().min(1).max(200)}),
+  },async(input,ctx)=>run(token(ctx),()=> {
+    if(!core.modelEvidence) throw new Error('Model evidence unavailable');
+    return core.modelEvidence(token(ctx),input.taskId);
+  }));
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
     inputSchema: z.object({
@@ -514,6 +566,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       summary: z.string().min(1).max(20000),
       scores: z.array(z.object({
         employee: z.string().min(1),
+        modelScores: z.array(z.object({model:z.string().min(1).max(200),overall:z.number().min(1).max(5),notes:z.string().max(2000).optional()})).max(50).optional(),
         quality: z.number().min(1).max(5),
         evidence: z.number().min(1).max(5),
         discipline: z.number().min(1).max(5),
@@ -523,6 +576,78 @@ function registerTools(server: McpServer, core: CompanyCore) {
       })).max(50),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.recordScore(token(ctx), input)));
+  // ---- QA 受限只读取证（SYS-DISP 7454fc89） ----
+  const qaRelease = (): string | undefined => {
+    try { return process.env.SCK_RELEASE ?? basename(realpathSync(process.cwd())); } catch { return undefined; }
+  };
+  const withRelease = <T extends { meta: object }>(value: T): T => {
+    const release = qaRelease();
+    return (release ? { ...value, meta: { ...value.meta, runtimeRelease: release } } : value) as T;
+  };
+  server.registerTool('qa_observation_grant', {
+    description: 'gm only (manage): register a time-bounded, read-only QA observation scope. It binds one deployment task in QA review, its live review lease holder and fence, the same goal, an allowlist of subject task ids, an expiry (1 minute to 24 hours), a reason and an idempotency key. The scope cannot expand itself, read other goals, or expose SQL/files. The same key with the same payload returns the original scope; a different payload is a conflict.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100), deploymentTaskId: z.string().min(1).max(200),
+      qaEmployee: z.string().min(1).max(200), leaseFence: z.number().int().positive(),
+      subjects: z.array(z.string().min(1).max(200)).min(1).max(50),
+      expiresAt: z.string().min(10).max(40), reason: z.string().min(8).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationGrant
+    ? core.qaObservationGrant(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_revoke', {
+    description: 'gm only (manage): revoke a QA observation scope with compare-and-set on its version. The revoked scope fails closed on the QA side immediately; the same idempotency key with the same payload returns the original result.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
+    ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_status', {
+    description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.qaObservationStatus
+    ? core.qaObservationStatus(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_session', {
+    description: 'qa only: exchange the caller\'s live sck session and its active observation scope for a one-time login code for the dedicated read-only QA console (5 minutes). The code is a restricted, single-use login seam, not the employee credential and not the owner token; the console at the preview LAN /q/ page (returned as pagePath) exchanges it for an HttpOnly 30-minute read-only session. The console has no owner RPC and no write route.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish() }),
+  }, async (input, ctx) => run(token(ctx), () => core.qaObservationSession
+    ? core.qaObservationSession(token(ctx), { ...(input.scopeId ? { scopeId: input.scopeId } : {}) }) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('qa_observation_read', {
+    description: 'qa only (the scope must still bind the live QA review lease holder and fence): read one allowlisted subject of the scope. A task subject returns its full state (a long context is omitted and flagged, read it with qa_observation_text), contribution facts with unknown rows fail-closed, the last dispatcher pass\'s verdicts and all reasons for the task, and checkedAt/dataSource/instanceAt/runtimeRelease/scope/completeness. A goal subject returns the controlled goal summary only. Read-only; no task text of unlisted tasks is ever returned.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200).nullish(), goalId: z.string().min(1).max(100).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationRead) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationRead({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.goalId ? { goalId: input.goalId } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_timeline', {
+    description: 'qa only: one stored page of an allowlisted task\'s audit history (newest-first pages, oldest-first within a page), within the 48 KiB budget. Evidence too large for a page is cut and flagged; read it whole with qa_observation_text. Continue with page.nextCursor until page.hasMore is false; a cursor is bound to the scope, task and caller.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200), ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationTimeline) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationTimeline({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId,
+      ...(input.pageSize !== undefined && input.pageSize !== null ? { pageSize: input.pageSize } : {}),
+      ...(input.cursor ? { cursor: input.cursor } : {}),
+    }));
+  }));
+  server.registerTool('qa_observation_text', {
+    description: 'qa only: one byte segment of an allowlisted task\'s context or one audit entry\'s evidence. Returns the whole text\'s size and SHA-256; a segment past offset 0 requires expectSha256 from the first segment, so a changed text is refused instead of mixed. Segments never split a character.',
+    inputSchema: z.object({ scopeId: z.string().min(1).max(200).nullish(), taskId: z.string().min(1).max(200),
+      field: z.enum(['context', 'evidence']), auditId: z.string().min(1).max(200).nullish(),
+      offset: z.number().int().min(0).max(1_000_000_000).nullish(), limit: z.number().int().min(4).max(24576).nullish(),
+      expectSha256: z.string().regex(/^[0-9a-f]{64}$/).nullish() }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.qaObservationText) return Promise.reject({ code: 'temporarily_unavailable' });
+    return withRelease(await core.qaObservationText({ credential: token(ctx) }, {
+      ...(input.scopeId ? { scopeId: input.scopeId } : {}), taskId: input.taskId, field: input.field,
+      ...(input.auditId ? { auditId: input.auditId } : {}),
+      ...(input.offset !== undefined && input.offset !== null ? { offset: input.offset } : {}),
+      ...(input.limit !== undefined && input.limit !== null ? { limit: input.limit } : {}),
+      ...(input.expectSha256 ? { expectSha256: input.expectSha256 } : {}),
+    }));
+  }));
 }
 
 export function createMcpHttpService(options: McpServiceOptions) {
@@ -661,4 +786,6 @@ export function createMcpHttpService(options: McpServiceOptions) {
     port: server.port,
     async close() { await handler.close(); server.stop(); },
   };
+
+
 }

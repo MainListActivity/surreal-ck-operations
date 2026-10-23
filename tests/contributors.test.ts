@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { deriveContributors, executeGate, type ContributionEvent, type WorkPhase } from '../src/contributors.ts';
+import { deriveContributors, executeGate, type ContributionEvent, type ContributionFacts, type WorkPhase } from '../src/contributors.ts';
+import { retirementRefusals, type RetirementCandidate } from '../src/retirement.ts';
 
 // Replays of real hand-offs. Phase-tagged rows are what new code writes; untagged rows are legacy.
 const ev = (action: string, actor?: string, phase?: WorkPhase): ContributionEvent => ({ action, actor, phase });
 const legacy = (action: string, actor?: string): ContributionEvent => ev(action, actor);
+const candidate = (facts: ContributionFacts, over: Partial<RetirementCandidate> = {}): RetirementCandidate =>
+  ({ taskId: 'T', version: 1, state: 'ready', facts, ...over });
 
 describe('deriveContributors', () => {
   test('A implements, B reviews and returns, A fixes, B reviews again: B never becomes an author', () => {
@@ -18,6 +21,8 @@ describe('deriveContributors', () => {
     expect(facts.implementer).toBe('A');
     expect(facts.ambiguous).toBe(false);
     expect(facts.excluded).toEqual(['A']);
+    // A reviewer who decided reviews twice is still no execute handler.
+    expect(facts.strictExcluded).toEqual(['A']);
   });
 
   test('a review-only holder is a reviewer, not an author, and a fresh task has no implementer yet', () => {
@@ -27,14 +32,87 @@ describe('deriveContributors', () => {
     expect(facts.implementer).toBeUndefined();
     expect(facts.ambiguous).toBe(false);
     expect(facts.excluded).toEqual([]);
+    expect(facts.strictExcluded).toEqual([]);
   });
 
-  test('an execute claim that was revoked before any submit still makes its holder the permanent author', () => {
+  // SYS-DISP IR01 (Q1, manager decision B): the ordinary review rule is the running baseline's — an actor who never SUBMITTED is a
+  // prior hand (demoted, still eligible), not a permanent author. Only code-writing evidence authors permanently.
+  test('an execute claim that was revoked before any submit is a prior hand, not an author', () => {
     const facts = deriveContributors([ev('claim', 'X', 'execute'), ev('released', 'X', 'execute'), ev('claim', 'Y', 'review')]);
+    expect(facts.authors).toEqual([]);
+    // The running baseline's rule is phase-blind: every holder who never submitted is a prior hand, in either phase, so
+    // the pool demotes them instead of excluding them.
+    expect(facts.hands).toEqual(['X', 'Y']);
+    expect(facts.implementer).toBeUndefined();
+    expect(facts.reviewers).toEqual(['Y']);
+    expect(facts.excluded).toEqual([]);
+    // A strict source excludes the execute-phase handler only: the review-phase holder is not an execute handler.
+    expect(facts.strictExcluded).toEqual(['X']);
+  });
+
+  // 7cf393f8 B1: strictExcluded names every execute-phase handler. Claiming or returning a review afterwards never takes a hand
+  // out of it, or the independence gate and the retirement gate would lose the very person Q1=B says they must keep.
+  test('an execute hand who later claimed and returned a review stays a strict handler beside the author', () => {
+    const facts = deriveContributors([
+      ev('claim', 'H', 'execute'), ev('checkpoint', 'H', 'execute'),
+      ev('claim', 'A', 'execute'), ev('submit', 'A'),
+      ev('claim', 'H', 'review'), ev('return', 'H'),
+    ]);
+    expect(facts.authors).toEqual(['A']);
+    expect(facts.implementer).toBe('A');
+    expect(facts.reviewers).toEqual(['H']);
+    expect(facts.hands).toEqual(['H']);
+    expect(facts.excluded).toEqual(['A']);
+    expect(facts.strictExcluded).toEqual(['A', 'H']);
+    expect(facts.ambiguous).toBe(false);
+  });
+
+  test('several execute hands with no recorded implementer stay ambiguous after each of them reviewed', () => {
+    const facts = deriveContributors([
+      ev('claim', 'H1', 'execute'), ev('released', 'H1', 'execute'),
+      ev('claim', 'H2', 'execute'), ev('released', 'H2', 'execute'),
+      ev('claim', 'H1', 'review'), ev('return', 'H1'), ev('claim', 'H2', 'review'), ev('return', 'H2'),
+    ]);
+    expect(facts.authors).toEqual([]);
+    expect(facts.implementer).toBeUndefined();
+    expect(facts.ambiguous).toBe(true);
+    expect(facts.strictExcluded).toEqual(['H1', 'H2']);
+    expect(executeGate(facts)).toEqual({ implementer: undefined, unresolved: true });
+  });
+
+  test('a reviewer who never held an execute lease is no strict handler, however many reviews they decided', () => {
+    const facts = deriveContributors([
+      ev('claim', 'A', 'execute'), ev('submit', 'A'), ev('claim', 'R', 'review'), ev('return', 'R'),
+      ev('claim', 'A', 'execute'), ev('submit', 'A'), ev('claim', 'R', 'review'), ev('accept', 'R'),
+    ]);
+    expect(facts.reviewers).toEqual(['R']);
+    expect(facts.strictExcluded).toEqual(['A']);
+  });
+
+  test('the retirement gate keeps refusing an execute hand who later reviewed, and still lets a pure reviewer retire', () => {
+    const withHand = deriveContributors([
+      ev('claim', 'H', 'execute'), ev('checkpoint', 'H', 'execute'),
+      ev('claim', 'A', 'execute'), ev('submit', 'A'),
+      ev('claim', 'H', 'review'), ev('return', 'H'),
+    ]);
+    // The task is back in rework and records no implementer: the gate relates the unfinished code to its execute handlers.
+    expect(retirementRefusals('H', [candidate(withHand)])).toEqual([{ taskId: 'T', state: 'ready', phase: 'execute', reason: 'legacy_implementer' }]);
+    expect(retirementRefusals('A', [candidate(withHand)])).toEqual([{ taskId: 'T', state: 'ready', phase: 'execute', reason: 'legacy_implementer' }]);
+    const pure = deriveContributors([ev('claim', 'A', 'execute'), ev('submit', 'A'), ev('claim', 'R', 'review'), ev('return', 'R')]);
+    expect(retirementRefusals('R', [candidate(pure)])).toEqual([]);
+    const several = deriveContributors([
+      ev('claim', 'H1', 'execute'), ev('released', 'H1', 'execute'), ev('claim', 'H2', 'execute'), ev('released', 'H2', 'execute'),
+      ev('claim', 'H1', 'review'), ev('return', 'H1'), ev('claim', 'H2', 'review'), ev('return', 'H2'),
+    ]);
+    expect(retirementRefusals('H1', [candidate(several)])).toEqual([{ taskId: 'T', state: 'ready', phase: 'execute', reason: 'implementer_unresolved' }]);
+  });
+
+  test('an execute holder who submits is a permanent author and the implementer of a single-author task', () => {
+    const facts = deriveContributors([ev('claim', 'X', 'execute'), ev('submit', 'X')]);
     expect(facts.authors).toEqual(['X']);
     expect(facts.implementer).toBe('X');
-    expect(facts.reviewers).toEqual(['Y']);
     expect(facts.excluded).toEqual(['X']);
+    expect(facts.hands).toEqual([]);
   });
 
   test('a review-phase block or checkpoint never authors', () => {

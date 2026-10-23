@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { evaluateDispatch, goalRootBlockers, submitCommitOf, type GoalRootFacts } from '../src/dispatcher/dispatch-blocked.ts';
+import { evaluateDispatch, goalRootBlockers, goalWorkflowWaitRoots, submitCommitOf, type GoalRootFacts, type GoalWorkflowTaskFact } from '../src/dispatcher/dispatch-blocked.ts';
 
 // SYS-DISP AC02/AC03: one root blocker per goal card, from the same verdicts the tick and the queue read.
 const NOW = Date.UTC(2026, 9, 20, 1, 0);
@@ -70,4 +70,94 @@ test('the submit commit comes from the evidence text only when the text names on
   expect(submitCommitOf('提交：`c33ee8b`，PR #1469')).toBe('c33ee8b');
   expect(submitCommitOf('验证 commit 9f1a2b3c4d5e，之前提交 A84634C')).toBe('a84634c');
   expect(submitCommitOf('PR #1469，未写提交号')).toBeUndefined();
+});
+
+
+test('workflow wait roots classify active lease and gates, count only in-goal impact, and keep stable order', () => {
+  const collectedAt = '2026-10-20T01:00:00.000Z';
+  const task = (taskId: string, extra: Partial<GoalWorkflowTaskFact> = {}): GoalWorkflowTaskFact => ({
+    taskId, goalId: 'g1', title: taskId, state: 'blocked', dependencies: [], ...extra,
+  });
+  const facts: GoalRootFacts = { dependencies: new Map(), titles: new Map(), people: new Map(), collectedAt,
+    tasks: new Map([
+      ['lease', task('lease', { state: 'review', reviewerRole: 'qa', currentEmployee: 'qa-1', leaseExpiresAt: Date.parse(collectedAt) / 1000 + 60 })],
+      ['wait-1', task('wait-1', { dependencies: ['lease'] })],
+      ['wait-2', task('wait-2', { dependencies: ['wait-1'] })],
+      ['manager', task('manager', { blockedTo: 'gm' })],
+      ['owner', task('owner', { blockedTo: 'owner' })],
+    ]) };
+  const summary = goalWorkflowWaitRoots(facts);
+  expect(summary).toMatchObject({ available: true, checkedAt: collectedAt, totalRoots: 3, shownRoots: 3 });
+  expect(summary.roots.map(root => root.kind)).toEqual(['manager', 'owner', 'active_lease']);
+  expect(summary.roots[2]).toMatchObject({ taskId: 'lease', workflowState: 'review', impact: 2,
+    dependencyPath: [{ taskId: 'lease', title: 'lease' }, { taskId: 'wait-1', title: 'wait-1' }, { taskId: 'wait-2', title: 'wait-2' }] });
+});
+
+test('workflow waits fail closed for cycles, missing dependencies, hidden edges and unknown states', () => {
+  const task = (taskId: string, extra: Partial<GoalWorkflowTaskFact> = {}): GoalWorkflowTaskFact => ({
+    taskId, goalId: 'g1', title: taskId, state: 'blocked', dependencies: [], ...extra,
+  });
+  const summary = goalWorkflowWaitRoots({ dependencies: new Map(), titles: new Map(), people: new Map(),
+    collectedAt: '2026-10-20T01:00:00.000Z', tasks: new Map([
+      ['cycle-a', task('cycle-a', { dependencies: ['cycle-b'] })],
+      ['cycle-b', task('cycle-b', { dependencies: ['cycle-a'] })],
+      ['missing', task('missing', { dependencies: ['absent'] })],
+      ['hidden', task('hidden', { dependencies: ['inside'], hiddenDependencies: 1 })],
+      ['inside', task('inside', { state: 'ready' })],
+      ['bad-state', task('bad-state', { state: 'future' })],
+    ]) });
+  expect(summary.roots.map(root => root.taskId)).toEqual(['bad-state', 'cycle-a', 'hidden', 'missing']);
+  expect(summary.roots.find(root => root.taskId === 'cycle-a')).toMatchObject({ kind: 'unknown', unknownReason: '依赖关系存在循环' });
+  const missing = summary.roots.find(root => root.taskId === 'missing')!;
+  expect(missing.kind).toBe('unknown');
+  expect(missing).not.toHaveProperty('impact');
+  expect(missing).not.toHaveProperty('dependencyPath');
+  expect(summary.roots.find(root => root.taskId === 'hidden')).toMatchObject({ kind: 'unknown', unknownReason: '存在当前目标不可见范围的依赖' });
+  expect(summary.roots.find(root => root.taskId === 'bad-state')).toMatchObject({ kind: 'unknown', workflowState: 'unknown' });
+  expect(summary.roots.every(root => root.impact === undefined)).toBe(true);
+});
+
+test('owner void gate satisfies only a goal anchor, while ordinary dependants remain unknown', () => {
+  const ownerGate: GoalWorkflowTaskFact = { taskId: 'owner-gate', goalId: 'g1', title: '老板关口', state: 'void', reviewerRole: 'owner', dependencies: [] };
+  const otherWait: GoalWorkflowTaskFact = { taskId: 'other-wait', goalId: 'g1', title: '另一个等待根', state: 'ready', dependencies: [] };
+  const anchor: GoalWorkflowTaskFact = { taskId: 'anchor', goalId: 'g1', title: '目标锚点', state: 'blocked', goalAnchor: true, dependencies: ['owner-gate', 'other-wait'] };
+  const ordinary: GoalWorkflowTaskFact = { taskId: 'ordinary', goalId: 'g1', title: '普通依赖', state: 'blocked', dependencies: ['owner-gate'] };
+  const summary = goalWorkflowWaitRoots({ dependencies: new Map(), titles: new Map(), people: new Map(),
+    collectedAt: '2026-10-20T01:00:00.000Z', tasks: new Map([[ownerGate.taskId, ownerGate], [otherWait.taskId, otherWait], [anchor.taskId, anchor], [ordinary.taskId, ordinary]]) });
+  expect(summary.roots.find(root => root.taskId === 'anchor')).toBeUndefined();
+  expect(summary.roots.find(root => root.taskId === 'other-wait')).toMatchObject({ kind: 'dependency', impact: 1 });
+  expect(summary.roots.find(root => root.taskId === 'ordinary')).toMatchObject({ kind: 'unknown', unknownReason: '非目标锚点仍依赖已作废的老板关口' });
+});
+
+test('workflow waits report no roots after all dependencies are terminal and expose truncation counts', () => {
+  const done: GoalWorkflowTaskFact = { taskId: 'done', goalId: 'g1', title: 'done', state: 'done', dependencies: [] };
+  const finished: GoalWorkflowTaskFact = { taskId: 'finished', goalId: 'g1', title: 'finished', state: 'blocked', dependencies: ['done'] };
+  const facts: GoalRootFacts = { dependencies: new Map(), titles: new Map(), people: new Map(), collectedAt: '2026-10-20T01:00:00.000Z',
+    tasks: new Map([['done', done], ['finished', finished]]) };
+  expect(goalWorkflowWaitRoots(facts).roots).toMatchObject([{ taskId: 'finished', kind: 'unknown', workflowState: 'blocked' }]);
+  const noWaits = goalWorkflowWaitRoots({ ...facts, tasks: new Map([['done', done]]) });
+  expect(noWaits).toMatchObject({ totalRoots: 0, shownRoots: 0, truncated: false, roots: [] });
+  const many = new Map<string, GoalWorkflowTaskFact>();
+  for (let i = 0; i < 3; i++) many.set(`unknown-${i}`, { taskId: `unknown-${i}`, goalId: 'g1', title: `u${i}`, state: 'future', dependencies: [] });
+  expect(goalWorkflowWaitRoots({ ...facts, tasks: many }, 2)).toMatchObject({ totalRoots: 3, shownRoots: 2, truncated: true });
+});
+
+
+test('workflow wait roots mark a bounded dependency path when the impact chain exceeds the path limit', () => {
+  const tasks = new Map<string, GoalWorkflowTaskFact>();
+  tasks.set('root', { taskId: 'root', goalId: 'g1', title: 'root', state: 'ready', dependencies: [] });
+  for (let i = 1; i <= 10; i++) tasks.set(`blocked-${i}`, { taskId: `blocked-${i}`, goalId: 'g1', title: `blocked-${i}`,
+    state: 'blocked', dependencies: [i === 1 ? 'root' : `blocked-${i - 1}`] });
+  const [root] = goalWorkflowWaitRoots({ dependencies: new Map(), titles: new Map(), people: new Map(), collectedAt: '2026-10-20T01:00:00.000Z', tasks }).roots;
+  expect(root).toMatchObject({ taskId: 'root', kind: 'dependency', impact: 10, dependencyPathTruncated: true });
+  expect(root?.dependencyPath).toHaveLength(8);
+});
+
+test('workflow wait root ordering is stable when input maps arrive in a different insertion order', () => {
+  const make = (ids: string[]) => goalWorkflowWaitRoots({ dependencies: new Map(), titles: new Map(), people: new Map(),
+    collectedAt: '2026-10-20T01:00:00.000Z', tasks: new Map(ids.map(taskId => [taskId, {
+      taskId, goalId: 'g1', title: taskId, state: 'future', dependencies: [],
+    }])) }).roots.map(root => root.taskId);
+  expect(make(['z-root', 'a-root', 'm-root'])).toEqual(['a-root', 'm-root', 'z-root']);
+  expect(make(['m-root', 'z-root', 'a-root'])).toEqual(['a-root', 'm-root', 'z-root']);
 });

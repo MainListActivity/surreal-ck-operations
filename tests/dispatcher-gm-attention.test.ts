@@ -52,6 +52,11 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     insts: async () => instances,
     tasks: async () => rows,
     providerHealth: async () => new Map(),
+    newKey: () => `fixture-key-${++next}`,
+    openManagerWakes: async () => [],
+    acquireManagerWake: async (input: unknown, token: string) => ({ key: token, token, attempt: 1, input }),
+    markManagerWakeRunning: async () => true,
+    finishManagerWake: async () => true,
     lastDispatch: async () => undefined,
     recordDispatch: async () => {},
     touchWake: async () => {},
@@ -117,7 +122,7 @@ function fixture(tasks: Array<{ id: string; repoPath?: string }>) {
     writeScope: async () => [],
     claimDenial: () => undefined,
     bindAgent: () => {},
-    commDirFor: () => '/tmp/comm',
+    commDirFor: id => `/tmp/comm/${id}`,
     scratchDirFor: instId => `/tmp/${instId}-scratch`,
     releaseClaim: async () => {},
     releaseWorkspace: async () => {},
@@ -152,9 +157,10 @@ describe('gm-attention groups pendingGm by repoPath', () => {
     expect(report.woke).toHaveLength(2);
     expect(f.readWorkspaceCalls).toHaveLength(2);
     expect(f.readWorkspaceCalls.map(c => c.taskId).sort()).toEqual(['task-a1', 'task-b1']);
-    expect(f.spawnCwds.sort()).toEqual([
-      `${PROJ_A}-sck-shared`,
-      `${PROJ_B}-sck-shared`,
+    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
+    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
+      PROJ_A,
+      PROJ_B,
     ]);
     // Each wake is a distinct employee (assigned prevents reuse across groups).
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
@@ -172,7 +178,7 @@ describe('gm-attention groups pendingGm by repoPath', () => {
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(1);
     expect(f.readWorkspaceCalls).toHaveLength(1);
     expect(f.readWorkspaceCalls[0]!.taskId).toBe('task-a1');
-    expect(f.spawnCwds).toEqual([`${PROJ_A}-sck-shared`]);
+    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
   });
 
   test('project-only pendingGm is never anchored on opsRepo workspace', async () => {
@@ -184,8 +190,8 @@ describe('gm-attention groups pendingGm by repoPath', () => {
 
     expect(f.readWorkspaceCalls.every(c => c.taskId !== undefined)).toBe(true);
     expect(f.spawnCwds.every(cwd => cwd !== OPS && !cwd.startsWith(`${OPS}-`))).toBe(true);
-    expect(f.spawnCwds).toEqual([`${PROJ_A}-sck-shared`]);
-    expect(f.instances.every(i => i.repoHome === PROJ_A || i.cwd === `${PROJ_A}-sck-shared`)).toBe(true);
+    expect(f.instances.map(i => i.repoHome)).toEqual([PROJ_A]);
+    expect(f.instances.every(i => i.repoHome === PROJ_A || i.cwd === PROJ_A)).toBe(true);
   });
 
   test('repoPath=undefined tasks group under opsRepo', async () => {
@@ -201,7 +207,7 @@ describe('gm-attention groups pendingGm by repoPath', () => {
     // readTask is the first undefined-repoPath task; readWorkspace still gets its taskId
     // so core can resolve project=undefined → opsRepo shared tree.
     expect(f.readWorkspaceCalls[0]!.taskId).toBe('ops-1');
-    expect(f.spawnCwds).toEqual([`${OPS}-sck-shared`]);
+    expect(f.instances.map(i => i.repoHome)).toEqual([OPS]);
   });
 
   test('mixed: opsRepo group and project group dispatch separately', async () => {
@@ -214,9 +220,10 @@ describe('gm-attention groups pendingGm by repoPath', () => {
 
     expect(report.woke).toHaveLength(3);
     expect(new Set(report.woke.map(w => w.employee)).size).toBe(2);
-    expect(f.spawnCwds.sort()).toEqual([
-      `${OPS}-sck-shared`,
-      `${PROJ_A}-sck-shared`,
+    expect(f.spawnCwds.every(cwd => cwd.startsWith('/tmp/comm/'))).toBe(true);
+    expect(f.instances.map(i => i.repoHome).sort()).toEqual([
+      OPS,
+      PROJ_A,
     ].sort());
   });
 });

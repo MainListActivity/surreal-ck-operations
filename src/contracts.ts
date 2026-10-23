@@ -225,6 +225,9 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
   implementer?: EmployeeId;
+  /** Independence policy (SYS-DISP IR01): contributors of the source tasks, and named employees, may not take or decide this task. */
+  independence?: IndependencePolicy;
+  modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -437,6 +440,7 @@ export interface CreateTask {
   /** SYS02: controlled environment declaration for this task (e.g. production); evidence must match it exactly. */
   acceptanceEnvironment?: string;
   idempotencyKey: string;
+  modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (gm/product only): both drafts must be owner-reviewed
@@ -567,6 +571,122 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
+/** The phase a policy applies to: taking and writing code (execute), or deciding a review. */
+export type IndependenceStage = 'execute' | 'review';
+
+/**
+ * Which contributors of a source task count. `execute_handlers`: every execute-phase handler of the source (its authors, including a
+ * claim that never submitted, and its implementer). `all_handlers`: those plus every reviewer of the source.
+ */
+export type IndependenceMode = 'execute_handlers' | 'all_handlers';
+
+/** Who may not take or decide a task: the contributors of its source tasks and the employees a manager names (SYS-DISP IR01). */
+export interface IndependencePolicy {
+  /** Format version. Only 1 is understood; any other value fails closed. */
+  schema: 1;
+  /** Starts at 1 and rises by one with every accepted change. */
+  revision: number;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  /** Employees named explicitly (for example a code author or QA). Only these employees and anyone sharing a registered identity principal with them are excluded (SYS-DISP Q3): a definition is a capacity template, never an identity, so its other employees stay independent. */
+  excluded: EmployeeId[];
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/**
+ * A registered identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several employeeIds one
+ * person for independence purposes. This is the ONLY cross-employee identity key: a definition, provider, model, name or
+ * directory never implies it, and an unregistered link is never recognized.
+ */
+export interface IdentityPrincipalView {
+  id: string;
+  /** Employees registered to this principal. */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/**
+ * Candidate-level read-only preflight (SYS-DISP IR01): would this one employee be excluded by this one task's policy at this stage,
+ * exactly as the claim/submit gate would refuse them? A read only: it never takes a lease, never advances a version and never writes
+ * anything, so an already finished task stays readable — which is the tool's main use.
+ */
+export interface IndependenceCheckInput {
+  taskId: TaskId;
+  employeeId: EmployeeId;
+  /** Stage to judge at; omit to infer it from the task's current phase (review while in review, execute otherwise). */
+  stage?: IndependenceStage;
+}
+
+/**
+ * The preflight answer. `clear` means the gate would admit the candidate at this stage; `conflict` means it would refuse (with the
+ * same `via`/`source`/`matched`/`role`/`principal`/`auditRef` facts the refusal carries); `unverifiable` means the exclusion could not
+ * be read and the gate fails closed, so it is NEVER a pass; `not_applicable` means the task has no policy (legacy behaviour).
+ */
+export type IndependenceVerdict = 'clear' | 'conflict' | 'unverifiable' | 'not_applicable';
+
+/** The registered policy as the preflight echoes it, so QA can read the actual values back without a second source. */
+export interface IndependenceCheckPolicyView {
+  revision: number;
+  stages: IndependenceStage[];
+  mode: IndependenceMode;
+  sources: TaskId[];
+  excluded: EmployeeId[];
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/** One preflight reading: the verdict with the facts behind it, and the policy actually registered on the task. */
+export interface IndependenceCheckView {
+  taskId: TaskId;
+  employeeId: EmployeeId;
+  stage: IndependenceStage;
+  verdict: IndependenceVerdict;
+  via?: 'contributor' | 'explicit' | 'same_principal';
+  /** Source task the match came from (a contributor match, or an identifier link to one). */
+  source?: TaskId;
+  matched?: EmployeeId;
+  role?: 'author' | 'implementer' | 'reviewer';
+  /** Registered principal that made the match, when the match came from an identity link. */
+  principal?: string;
+  /** The contribution audit row that proves the match, as the refusal's details.conflicts cites it. */
+  auditRef?: string;
+  reason: string;
+  /** Present whenever the task has a policy; absent when there is none (verdict not_applicable). */
+  policy?: IndependenceCheckPolicyView;
+}
+
+/** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
+export interface SetIndependence {
+  taskId: TaskId;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  excluded?: EmployeeId[];
+  reason: string;
+  /** Compare-and-set: refuse when the task version has moved. */
+  expectedVersion: number;
+  idempotencyKey: string;
+}
+
+/** Manager write of an identity principal: register the link, or set its exact employee set, under a compare-and-set. */
+export interface SetIdentityPrincipal {
+  /** Existing principal to change; omit to register a new one. */
+  principalId?: string;
+  /** The complete employee set of the principal after the write (at least 1, at most 20). */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  /** Compare-and-set on the principal row: refuse when it has moved. Omit for a new principal. */
+  expectedVersion?: number;
+  idempotencyKey: string;
+}
+
 /** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
 export interface ImplementerTakeover {
   taskId: TaskId;
@@ -693,6 +813,134 @@ export interface ContributorDryRunView {
   }>;
 }
 
+
+/** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记的范围视图。不携带任何凭证。 */
+export interface QaObservationScopeView {
+  id: string; goalId: string; deploymentTaskId: string; qaEmployee: string;
+  leaseHolder: string; leaseFence: number; subjects: string[];
+  status: 'active' | 'revoked'; expiresAt: string; version: number;
+  reason: string; createdAt: string; revokedAt?: string; revokedReason?: string;
+}
+/** GM 登记 scope：绑定正在审的部署任务、同 goal、QA 实际复核租约 holder/fence、任务 allowlist、期限与理由。 */
+export interface QaObservationGrant {
+  goalId: string; deploymentTaskId: string; qaEmployee: string; leaseFence: number;
+  subjects: string[]; expiresAt: string; reason: string; idempotencyKey: string;
+}
+export interface QaObservationRevoke { scopeId: string; expectedVersion: number; reason: string; idempotencyKey: string; }
+/** 读接口的两种调用身份：员工本人的 sck 凭证，或浏览器受限会话令牌（都不是 owner token）。 */
+export interface QaObservationAuth { credential?: Credential; token?: string; }
+export interface QaObservationDispatchReason {
+  code: string; text: string; candidates: string[]; owner: string; recovery: string;
+  nextTrigger: string; basis: string; until?: string;
+  /**
+   * Structured recovery actions with their authority and tool (F1). Observations written before this field existed do not
+   * carry it: the page shows the action as unknown rather than inventing one.
+   */
+  actions?: Array<{ authority: string; label: string; tool?: string; executable: boolean }>;
+}
+
+/**
+ * The goal-level root blocker for a QA goal summary (F2). Built by the same server-side evaluator the owner pulse uses
+ * (goalRootBlockers over the pass's verdicts); the QA channel never re-derives a parallel conclusion.
+ * `factsAvailable` is false when the waiting graph / people could not be read: impact, dependencyPath and people are then
+ * omitted (unknown), never reported as zero or empty-as-fact.
+ */
+export interface QaObservationGoalRoot {
+  taskId: string; title: string; phase: 'execute' | 'review'; workflowState: 'ready' | 'doing' | 'review';
+  summary: string; feasible: boolean; waitingMinutes: number; since?: string; checkedAt: string;
+  eligibleCount: number; undispatchable: number; others: number;
+  /** The notice key of the root verdict, so a QA can name the episode the owner was told about. */
+  noticeKey?: string;
+  factsAvailable: boolean;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  reasons: QaObservationDispatchReason[];
+  reasonsOmitted?: number;
+}
+export interface QaObservationGoalWaitRoot {
+  goalId?: string;
+  taskId: string;
+  title: string;
+  workflowState: 'ready' | 'doing' | 'review' | 'blocked' | 'done' | 'void' | 'unknown';
+  kind: 'dependency' | 'manager' | 'owner' | 'active_lease' | 'unknown';
+  basis: string;
+  waitingForRole: string;
+  nextTrigger: string;
+  goalRootCount: number;
+  impact?: number;
+  dependencyPath?: Array<{ taskId: string; title: string }>;
+  dependencyPathTruncated?: boolean;
+  unknownReason?: string;
+  people?: { implementer?: string; authors: string[]; reviewers: string[]; submitter?: string; submitCommit?: string; peopleOmitted?: number };
+  peopleSource?: 'contributor-audit';
+  submitterSource?: 'submit-audit';
+  submitCommitSource?: 'submit-audit-evidence';
+  peopleCheckedAt?: string;
+  submitCheckedAt?: string;
+}
+export interface QaObservationGoalWaitSummary {
+  source: 'workflow-graph';
+  available: boolean;
+  checkedAt?: string;
+  totalRoots: number;
+  shownRoots: number;
+  truncated: boolean;
+  /** true when the cut was made for the response byte budget, not only by the root limit: roots or paths were shortened. */
+  budgetLimited?: boolean;
+  reason?: string;
+  roots: QaObservationGoalWaitRoot[];
+}
+
+export interface QaObservationDispatchVerdict {
+  phase: 'execute' | 'review'; dispatchable: boolean; workflowState: string;
+  eligibleCount: number; feasible: boolean; summary: string;
+  reasons: QaObservationDispatchReason[]; checkedAt: string; since?: string; waitingMinutes: number;
+}
+export interface QaObservationDispatch {
+  available: boolean; source: string; checkedAt?: string; reason?: string;
+  /** true only when the stored pass is a complete observation; false means partial/unavailable, never a silent cut. */
+  complete?: boolean;
+  /** Counts of the pass before any storage decision; a reader can compare them with what it received. */
+  originalVerdicts?: number; originalReasons?: number;
+  /** The latest persistence attempt: the stored snapshot is stale when the last write failed. */
+  attemptAt?: string; attemptOk?: boolean;
+  verdicts?: QaObservationDispatchVerdict[];
+}
+export interface QaObservationMeta {
+  checkedAt: string; dataSource: 'live'; instanceAt: string; runtimeRelease?: string;
+  scope: QaObservationScopeView;
+  completeness: { complete: boolean; taskRead?: boolean; contextIncluded?: boolean; timelinePaged?: boolean; dispatchComplete?: boolean };
+}
+export interface QaObservationReadInput { scopeId?: string; taskId?: string; goalId?: string; }
+export interface QaObservationContribution {
+  authors: string[]; reviewers: string[]; excluded: string[];
+  unknown: Array<{ actor: string; action: string; at?: string; reason: string }>;
+  implementer?: string; ambiguous: boolean;
+}
+export interface QaObservationReadView {
+  meta: QaObservationMeta;
+  task?: TaskView;
+  contribution?: QaObservationContribution;
+  dispatch?: QaObservationDispatch;
+  goal?: { id: string; states: Record<string, number>; total: number; undispatchable?: number; checkedAt?: string;
+    dispatchAvailable?: boolean; dispatchComplete?: boolean; dispatchSource?: string; dispatchReason?: string;
+    dispatchCheckedAt?: string; dispatchAttemptAt?: string; dispatchAttemptOk?: boolean;
+    /** Workflow waits are read from a separately timed, goal-scoped graph, not the dispatcher pass. */
+    waits?: QaObservationGoalWaitSummary;
+    /** F2: the goal's root blocker from the same evaluator the owner page reads, with impact and dependency path. */
+    root?: QaObservationGoalRoot };
+  contextOmitted?: boolean; contextBytes?: number; contextSha256?: string;
+  contextRead?: { taskId: string; field: 'context'; offset: number };
+}
+export interface QaObservationTimelineView { meta: QaObservationMeta; history: HistoryEntry[]; page: PageInfo }
+export interface QaObservationTextSegment {
+  meta: QaObservationMeta; taskId: string; field: 'context' | 'evidence'; auditId?: string;
+  totalBytes: number; sha256: string; offset: number; bytes: number; nextOffset: number | null; text: string;
+}
+export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
+export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
+
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
@@ -751,14 +999,32 @@ export interface CompanyCore {
   adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
+  setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
+  /** Manager (manage capability): register an identity principal, or add/remove employees from it. Optional for old adapters. */
+  setIdentityPrincipal?(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView>;
+  /**
+   * gm and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
+   * stage. Writes nothing, so a done or void task stays readable. Optional for old adapters.
+   */
+  independenceCheck?(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView>;
   /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
    */
-  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;
-  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
+  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
+  /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
+  qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
+  qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;
+  qaObservationStatus?(credential: Credential): Promise<QaObservationScopeView[]>;
+  qaObservationSession?(credential: Credential, input: { scopeId?: string }): Promise<QaObservationSessionView>;
+  qaObservationLogin?(code: string): Promise<QaObservationLoginView>;
+  qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
+  qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
+  qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
+
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;
   companyBrief(credential: Credential): Promise<CompanyBrief>;
@@ -806,6 +1072,7 @@ export interface CompanyCore {
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
+  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>>;
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
 }
 
@@ -844,7 +1111,10 @@ export interface EnsureDef {
   quotaLimited?: boolean;
 }
 
+export interface ModelAssessment { model: string; overall: number; notes?: string }
+
 export interface EmployeeScore {
+  modelScores?: ModelAssessment[];
   employee: EmployeeId;
   quality: number;
   evidence: number;

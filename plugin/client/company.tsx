@@ -340,6 +340,11 @@ const reasonRows = (v: unknown): DispatchReasonView[] => arr<Record<string, unkn
   })),
 }));
 
+const workflowWaitStateOf = (v: unknown): "ready" | "doing" | "review" | "blocked" | "done" | "void" | "unknown" =>
+  v === "ready" || v === "doing" || v === "review" || v === "blocked" || v === "done" || v === "void" ? v : "unknown";
+const workflowWaitKindOf = (v: unknown): "dependency" | "manager" | "owner" | "active_lease" | "unknown" =>
+  v === "dependency" || v === "manager" || v === "owner" || v === "active_lease" ? v : "unknown";
+
 /** 把 wire 上的 pulse 响应收敛成完整视图模型：缺字段/条目畸形时给安全默认，渲染路径不再裸读。 */
 export function normalizePulse(raw: unknown): Pulse {
   const o = (raw ?? {}) as Record<string, unknown>;
@@ -380,6 +385,29 @@ export function normalizePulse(raw: unknown): Pulse {
       people: goalPeople(b.people),
       reasons: reasonRows(b.reasons),
     })),
+    workflowWaits: arr<Record<string, unknown>>(o.workflowWaits).map(w => {
+      const people = w.people && typeof w.people === "object" ? w.people as Record<string, unknown> : undefined;
+      return {
+        goalId: str(w.goalId) || undefined, taskId: str(w.taskId), title: str(w.title),
+        workflowState: workflowWaitStateOf(w.workflowState), kind: workflowWaitKindOf(w.kind),
+        basis: str(w.basis), waitingForRole: str(w.waitingForRole), nextTrigger: str(w.nextTrigger), goalRootCount: num(w.goalRootCount),
+        impact: typeof w.impact === "number" && Number.isFinite(w.impact) ? w.impact : undefined,
+        dependencyPath: arr<Record<string, unknown>>(w.dependencyPath).map(p => ({ taskId: str(p.taskId), title: str(p.title) })),
+        unknownReason: str(w.unknownReason) || undefined, dependencyPathTruncated: w.dependencyPathTruncated === true,
+        people: people ? { implementer: str(people.implementer) || undefined, authors: arr<unknown>(people.authors).map(str),
+          reviewers: arr<unknown>(people.reviewers).map(str), submitter: str(people.submitter) || undefined,
+          submitCommit: str(people.submitCommit) || undefined, peopleOmitted: num(people.peopleOmitted) || undefined } : undefined,
+        peopleSource: str(w.peopleSource) || undefined, submitterSource: str(w.submitterSource) || undefined,
+        submitCommitSource: str(w.submitCommitSource) || undefined, peopleCheckedAt: str(w.peopleCheckedAt) || undefined,
+        submitCheckedAt: str(w.submitCheckedAt) || undefined,
+      };
+    }),
+    workflowWaitSummary: (() => {
+      const summary = (o.workflowWaitSummary ?? {}) as Record<string, unknown>;
+      return { source: "workflow-graph" as const, available: summary.available === true,
+        checkedAt: str(summary.checkedAt) || undefined, totalRoots: num(summary.totalRoots), truncated: summary.truncated === true,
+        reason: str(summary.reason) || undefined };
+    })(),
     dispatchBlocked: arr<Record<string, unknown>>(o.dispatchBlocked).map(v => ({
       taskId: str(v.taskId), goalId: str(v.goalId) || undefined, title: str(v.title),
       phase: v.phase === "review" ? "review" : "execute", workflowState: workflowOf(v.workflowState), summary: str(v.summary),
@@ -388,7 +416,7 @@ export function normalizePulse(raw: unknown): Pulse {
       reasons: reasonRows(v.reasons),
     })),
     bounds: {
-      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), ready: bound(marks.ready),
+      dispatchBlocked: bound(marks.dispatchBlocked), goalBlockers: bound(marks.goalBlockers), workflowWaits: bound(marks.workflowWaits), ready: bound(marks.ready),
       doing: bound(marks.doing), stuck: bound(marks.stuck), waiting: bound(marks.waiting), recentDone: bound(marks.recentDone),
       goals: bound(marks.goals), resources: bound(marks.resources),
     },
@@ -397,6 +425,8 @@ export function normalizePulse(raw: unknown): Pulse {
 
 /** The workflow state of a blocked item, in the owner's words. */
 const WORKFLOW_LABEL: Record<"ready" | "doing" | "review", string> = { ready: "就绪", doing: "在办无人持有", review: "待复核" };
+const WAIT_KIND_LABEL = { dependency: "正常依赖等待", manager: "经理关口", owner: "老板关口", active_lease: "活租约等待", unknown: "等待未知" } as const;
+const WAIT_STATE_LABEL = { ready: "就绪", doing: "执行中", review: "待复核", blocked: "依赖阻塞", done: "完成", void: "作废", unknown: "未知" } as const;
 /** A time of day from an ISO instant, in UTC as the server states it; an absent instant reads as unknown. */
 const clockOf = (iso: string): string => (iso ? `${iso.slice(5, 16).replace("T", " ")}（UTC）` : "未知");
 
@@ -446,6 +476,29 @@ function PulseTab({ ctx }: { ctx: Ctx }) {
             <Text style={s.muted}>{t.reason} · {t.taskId.slice(0, 8)}</Text>
           </View>
         ))}
+      </Section>
+      <Section title="目标工作流等待" count={p.workflowWaitSummary.totalRoots} ctx={ctx}>
+        {!p.workflowWaitSummary.available ? (
+          <Text style={s.muted}>等待图不可读：{p.workflowWaitSummary.reason ?? "未知"}</Text>
+        ) : p.workflowWaits.length === 0 && p.workflowWaitSummary.totalRoots > 0 ? (
+          <Text style={s.muted}>等待根 {p.workflowWaitSummary.totalRoots} 个，均未纳入本页字节预算；见下方截断说明。</Text>
+        ) : p.workflowWaits.length === 0 ? (
+          <Text style={s.muted}>当前没有已识别的目标等待根。</Text>
+        ) : p.workflowWaits.map(root => (
+          <View key={`${root.goalId ?? ""}:${root.taskId}`} style={s.card}>
+            <Text style={s.text}>{WAIT_KIND_LABEL[root.kind]} · {root.title}</Text>
+            <Text style={s.muted}>工作流 {WAIT_STATE_LABEL[root.workflowState]} · 处理岗位 {root.waitingForRole || "未知"} · 根数 {root.goalRootCount}{root.impact !== undefined ? ` · 影响 ${root.impact} 项` : " · 影响未知"}</Text>
+            <Text style={s.muted}>依据 {root.basis || "未知"} · 下一触发 {root.nextTrigger || "未知"}{root.unknownReason ? ` · ${root.unknownReason}` : ""}</Text>
+            {root.dependencyPath && root.dependencyPath.length > 0 && <Text style={s.muted}>依赖路径（根在前）：{root.dependencyPath.map(item => item.title).join(" → ")}{root.dependencyPathTruncated ? " · 路径已截断" : ""}</Text>}
+            {root.people && <Text style={s.muted}>人物来源 {root.peopleSource ?? "未知"} · 实现者 {root.people.implementer ?? "未绑定"} · 作者 {root.people.authors.join("、") || "未记录"} · 复核者 {root.people.reviewers.join("、") || "未记录"}{root.people.peopleOmitted ? ` · 另有 ${root.people.peopleOmitted} 人未列出` : ""}</Text>}
+            {(root.people?.submitter || root.people?.submitCommit) && <Text style={s.muted}>提交人 {root.people.submitter ?? "未记录"}（{root.submitterSource ?? "来源未知"}） · 提交 SHA {root.people.submitCommit ?? "未记录"}（{root.submitCommitSource ?? "来源未知"}）</Text>}
+            {root.peopleCheckedAt && <Text style={s.muted}>人物来源采集于 {clockOf(root.peopleCheckedAt)}</Text>}
+            {root.submitCheckedAt && <Text style={s.muted}>提交审计采集于 {clockOf(root.submitCheckedAt)}</Text>}
+          </View>
+        ))}
+        {p.workflowWaitSummary.available && <Text style={s.muted}>来源 workflow-graph · 采集于 {clockOf(p.workflowWaitSummary.checkedAt ?? "")}{p.dispatchAt ? ` · dispatcher pass ${clockOf(p.dispatchAt)}` : " · dispatcher pass 未记录"}</Text>}
+        {p.workflowWaitSummary.truncated || p.bounds.workflowWaits.truncated ? <Text style={s.muted}>等待根列表已截断：显示 {p.bounds.workflowWaits.shown} / {p.workflowWaitSummary.totalRoots}{p.bounds.workflowWaits.shown === 0 ? "（单项超出本页字节份额，见下方说明）" : ""}。</Text> : null}
+        {p.workflowWaits.some(root => root.kind === "active_lease") && <Text style={s.muted}>活租约中的复核任务来自独立工作流图，可能未纳入最近 dispatcher pass；这不表示不可派工。</Text>}
       </Section>
       <Section title="就绪待领" count={p.ready.length} ctx={ctx}>
         {p.ready.length === 0 && <Text style={s.muted}>没有排队等认领的任务。</Text>}
@@ -1065,6 +1118,39 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   );
 }
 
+function ModelRankingCard({ctx}: {ctx:Ctx}) {
+  const s=makeStyles(ctx);
+  const get=useRpc(rpc.modelRanking), save=useRpc(rpc.saveModelRanking);
+  const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
+  const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
+  const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [selectOpen,setSelectOpen]=useState(false);
+  const current=draft??{rules:query.data?.rules??"",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
+  return <Section title="模型排序" ctx={ctx}><View style={s.card}>
+    <Text style={s.muted}>按你的规则为 Opus、Sonnet、Haiku 组内模型排序；分组成员仍由你控制。</Text>
+    {query.isError&&<Text style={s.muted}>设置读取失败，请稍后重试。</Text>}
+    {query.data&&!query.data.configured&&<Text style={s.muted}>Jev 尚未配置，暂时保留现有顺序。</Text>}
+    <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:100,textAlignVertical:"top"}]}
+      placeholder="例如：优先免费且稳定的模型；额度不足 10% 时靠后，质量相近时优先缓存命中率和输出速度。"
+      value={current.rules} onChangeText={rules=>setDraft({...current,rules})}/>
+    <Text style={s.text}>刷新间隔</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={s.buttonSecondary} onPress={()=>setSelectOpen(!selectOpen)}>
+      <Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""} ▾</Text>
+    </Pressable>
+    {selectOpen&&<View style={s.card}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}}
+      style={s.buttonSecondary} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}>
+      <Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text>
+    </Pressable>)}</View>}
+    <Pressable accessibilityRole="button" disabled={busy||!query.data} style={s.button} onPress={async()=>{
+      setBusy(true);setMessage("");try{await save(current);await query.refetch();setDraft(undefined);setMessage("已保存，下次员工请求到达时刷新排序。");}
+      catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}
+    }}><Text style={s.buttonText}>{busy?"保存中…":"保存排序规则"}</Text></Pressable>
+    {!!message&&<Text style={s.muted}>{message}</Text>}
+    <Text style={s.muted}>{query.data?.at?`最近刷新：${query.data.at}`:"尚未刷新"}；到期后由下一次员工请求触发后台刷新。</Text>
+    {!!query.data?.error&&<Text style={s.muted}>{query.data.error}</Text>}
+    {Object.entries(query.data?.orders??{}).map(([group,ids])=><ExpandableText key={group} ctx={ctx} text={`${group}：${ids.join(" → ")}`} lines={2} style={s.muted}/>)}
+  </View></Section>;
+}
+
 function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -1081,6 +1167,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const refreshAll = () => void queryClient.invalidateQueries();
   return (
     <View style={{ gap: 12 }}>
+      <ModelRankingCard ctx={ctx}/>
       <Section title="派工开关" ctx={ctx}>
         <View style={[s.card, s.row]}>
           <Text style={[s.text, { flex: 1 }]}>{r?.paused ? "派工已暂停" : "派工运行中"}</Text>
@@ -1116,7 +1203,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         const insts = r?.instances ?? [];
         // 「需要处理」只放异常：耗尽/不健康的订阅、低额度窗口、停用编制、会话异常实例。
         const problems: string[] = [];
-        for (const h of health.filter(h => h.state !== "healthy"))
+        for (const h of health.filter(h => h.state !== "healthy" && h.state !== "probe"))
           problems.push(`订阅 ${h.provider}：${h.state}${h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}`);
         for (const u of usage) {
           for (const w of u.windows.filter(w => (w.remainingPct ?? 100) <= 15))
@@ -1156,7 +1243,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 })}
                 {usage.length === 0 && <Text style={s.muted}>暂无额度数据。</Text>}
                 {health.map(h => (
-                  <Text key={h.provider} style={s.muted}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
+                  <Text key={h.provider} style={s.muted}>{h.provider}：{h.state === "probe" ? "冷却结束，待探测" : h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
                 ))}
                 {r?.bounds?.usage?.truncated && <Text style={s.muted}>额度只列出 {r.bounds.usage.shown} 项，共 {r.bounds.usage.total} 项。</Text>}
                 {r?.bounds?.health?.truncated && <Text style={s.muted}>健康只列出 {r.bounds.health.shown} 项，共 {r.bounds.health.total} 项。</Text>}
@@ -1261,6 +1348,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
     </View>
   );
 }
+
 
 export function CompanySurface(props: PluginSurfaceProps) {
   const ctx: Ctx = { theme: props.theme, compact: props.layout.compact, navigation: props.navigation };

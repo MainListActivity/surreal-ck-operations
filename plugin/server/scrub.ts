@@ -92,6 +92,7 @@ function withinLookup<T>(work: Promise<T>, fallback: T, signal: AbortSignal): Pr
 export interface ScrubOptions {
   /** Directory for the zsh startup shim; without it company shells keep whatever the user's startup files export. */
   zdotdir?: string;
+  modelEnv?: (request: {agentId:string;env:Record<string,string>;provider?:string}) => Promise<Record<string,string>>;
 }
 
 /**
@@ -120,6 +121,7 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
   return server.before("agent.session_open", async ({ request }, { paseo, signal }) => {
     if (!(await isCompany(request, paseo, signal))) return undefined;
     const env = scrubEnv(request.env ?? {}, inherited);
+    if (options.modelEnv) Object.assign(env, await options.modelEnv(request));
     const blanked = Object.keys(env).filter(name => env[name] === "" && request.env?.[name] === undefined);
     if (zdotdir && env.ZDOTDIR === undefined) env.ZDOTDIR = zdotdir;
     console.log(`scrub ${request.agentId} (${request.reason}): blanked ${blanked.length} credential variable(s)${blanked.length ? ` [${blanked.join(", ")}]` : ""}${env.ZDOTDIR === zdotdir && zdotdir ? "; zsh startup shimmed" : ""}`);

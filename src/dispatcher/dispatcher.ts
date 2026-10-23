@@ -1,3 +1,4 @@
+import { managedModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
@@ -11,18 +12,38 @@ import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
 import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
-import type { HostResources } from './host.ts';
+import { reclaimIdleSessions } from './idle-sessions.ts';
+import { memoryBlocked, type HostResources } from './host.ts';
 import type { ArtifactTrigger } from './artifact-reclaim.ts';
 import type { ArtifactReclaimResult } from './artifact-sweeper.ts';
 import { summarizeReclaim } from './artifact-sweeper.ts';
 import { executeGate } from '../contributors.ts';
 import { isRetireRefused } from '../retirement.ts';
+import { independenceHit, independenceText, type IndependenceScope } from '../independence.ts';
 import { BLOCK_TEXT, dispatchNoticeText, evaluateDispatch, globalBlock, holderLabel, managerActionKey, repoName, reviewPlanOf, type BlockCode, type DispatchPhase, type DispatchVerdict, type EvaluatedEntry, type GlobalBlock, type WorkflowState } from './dispatch-blocked.ts';
-
 export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-blocked.ts';
 
+/**
+ * Weight factor for a prior hand of a review task (SYS-DISP IR01): they claimed execute but never wrote code with
+ * decisive evidence, so their review is still independent and eligible — at a demoted weight, exactly the pre-SYS-DISP
+ * rule. Only a strict independence source excludes them outright (see independence.ts).
+ */
+export const PRIOR_HAND_WEIGHT_FACTOR = 0.15;
+
+/**
+ * Deterministic order for an all-managed pool: the least recently woken instance first. A prior hand goes last, the same demotion
+ * the weighted pick applies — never out of the pool, just after every fresh session. A session without a recorded wake sorts last:
+ * nothing says it is the stalest. The caller passes `hands` for a review only; the execute path has no recusal set.
+ */
+export function managedRecencyOrder<T extends { id: string; lastWakeAt?: number }>(items: readonly T[], hands?: ReadonlySet<string>): T[] {
+  return [...items].sort((a, b) =>
+    Number(hands?.has(a.id) ?? false) - Number(hands?.has(b.id) ?? false) ||
+    (a.lastWakeAt ?? Number.MAX_SAFE_INTEGER) - (b.lastWakeAt ?? Number.MAX_SAFE_INTEGER) ||
+    a.id.localeCompare(b.id));
+}
+
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
-export const EXHAUSTED_PATTERN = /out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
+export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
 const LOG_TAIL_ENTRIES = 60;
 // Task-level cooldown after a claim denial; a version bump re-arms the task.
@@ -87,8 +108,9 @@ export function providerCapacity(provider: string, providerMax: Record<string, n
 }
 
 /**
- * Execute gate: the bound implementer, or `unresolved` when several authors leave no single one. `unknown` means the
- * authorship history could not be read: every candidate waits as unknown (never busy) until the history reads again.
+ * Execute gate: the bound implementer, or `unresolved` when several authors or several claim-only handlers leave no single
+ * one (SYS-DISP IR01/Q1). `unknown` means the authorship history could not be read: every candidate waits as unknown
+ * (never busy) until the history reads again.
  */
 export interface ExecuteGate { implementer?: string; unresolved: boolean; unknown?: boolean }
 
@@ -130,6 +152,8 @@ export interface StaffingEntry {
   code?: BlockCode;
   /** Recovery time of a quota block, ISO 8601. Absent when no time can be proven. */
   until?: string;
+  /** Owner-facing annotation that does not block eligibility (for example a demoted prior hand). */
+  note?: string;
 }
 
 export interface StaffingInput {
@@ -148,6 +172,11 @@ export interface StaffingInput {
    * A fresh task (no implementer, not ambiguous) has no gate; the first claimant becomes the implementer.
    */
   implementer?: ExecuteGate;
+  /**
+   * Independence scope of this task at this stage (SYS-DISP IR02): the registered identities it excludes, or unverifiable when the
+   * source history cannot be read. Excluded candidates are never eligible, whatever their continuity, weight or fallback.
+   */
+  independence?: IndependenceScope;
   defs: EmployeeDef[];
   insts: EmployeeInst[];
   states: ReadonlyMap<string, InstState>;
@@ -216,6 +245,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   };
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
+    if(managedModel(def))return true; // request routing is task-scoped at the company gateway
     const target = def && resolveSlot(def);
     // What the provider serves wins over what the spawn asked for: a subscription can switch the
     // model under a live session, and dispatching into it would run work on a model nobody chose.
@@ -228,7 +258,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
-  const capHit = (provider: string, exempt = false): Block | undefined => {
+  const capHit = (provider: string, exempt = false, managed = false): Block | undefined => {
+    if (managed) return undefined; // Magpie owns model/account capacity; maxRunning guards the Mac.
     if (!exempt) {
       const quota = quotaOf(provider);
       if (quota) return quota;
@@ -243,11 +274,27 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * unresolved pool block everyone; a spawn is never the implementer (it is a new employee id), so spawns carry the same block.
    */
   const gate = (id: string | undefined): Block | undefined => {
-    if (!p.implementer) return undefined;
+    const until=p.task?.row?.model_route_until;
+    const routing:Block|undefined=until&&until>p.now?['quota','模型组暂不可用，等待通道恢复',new Date(until*1000).toISOString()]:undefined;
+    if (!p.implementer) return routing;
     if (p.implementer.unknown) return ['unknown', BLOCK_TEXT.unknown];
     if (p.implementer.unresolved) return ['implementer_unresolved', BLOCK_TEXT.implementer_unresolved];
     if (p.implementer.implementer && id !== p.implementer.implementer) return ['implementer_mismatch', BLOCK_TEXT.implementer_mismatch];
-    return undefined;
+    return routing;
+  };
+  // Independence (SYS-DISP IR02): an excluded identity never takes the task — the employeeId itself, or the registered principal it
+  // shares with an excluded one — and a scope that cannot be read blocks every candidate as unknown. A definition is not an
+  // identity: a spawn of the same def is a new, independent employee.
+  const independenceBlock = (employee: string | undefined, principal: string | undefined): Block | undefined => {
+    const scope = p.independence;
+    if (!scope) return undefined;
+    if (scope.kind === 'unverifiable') {
+      // A named source says whose history cannot be read: the candidate is unknown, never clear and never busy.
+      return ['unknown', scope.source === undefined ? BLOCK_TEXT.unknown
+        : `来源任务 ${scope.source} 的贡献者历史读取失败或不存在，不能判定独立性（不视为忙），恢复后自动重判`];
+    }
+    const hit = independenceHit(scope.index, employee, principal);
+    return hit ? ['independence_conflict', independenceText(hit)] : undefined;
   };
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
@@ -260,19 +307,26 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     // Recusal and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
       gate(inst.id) ??
+      independenceBlock(inst.id, inst.principal) ??
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
+      (def && !def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      capHit(inst.provider ?? '', def?.quotaLimited === false);
+      capHit(inst.provider ?? '', def?.quotaLimited === false, managedModel(def));
+    // A prior hand (claim-only, never wrote code) stays eligible at a demoted weight: the pre-SYS-DISP review rule,
+    // kept for ordinary tasks. A strict independence source still excludes them (independenceBlock above).
+    const priorHand = !hit && (p.recusal?.hands.has(inst.id) ?? false);
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
-      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
+      weight: (managedModel(def) ? 1 : effectiveWeight(def)) * (priorHand ? PRIOR_HAND_WEIGHT_FACTOR : 1),
+      share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2],
+      note: priorHand ? '经手过本任务（未写码），降权兜底' : undefined });
   }
   for (const def of p.defs) {
     if (def.role !== p.role) continue;
@@ -280,15 +334,16 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
       gate(undefined) ??
+      independenceBlock(undefined, undefined) ??
       (p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
       (!def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
-      capHit(def.provider, def.quotaLimited === false);
+      capHit(def.provider, def.quotaLimited === false, managedModel(def));
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
-      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
+      weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
   for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
@@ -304,11 +359,15 @@ export function otherRepoCount(insts: readonly EmployeeInst[], role: string, hom
 }
 
 /**
- * Review recusal: hard exclusion of every author (anyone who submitted, or held an execute-phase lease) and of
- * the implementer. Reviewing, returning or accepting never makes someone an author (contributors.ts).
+ * Review recusal (SYS-DISP IR01): hard exclusion for authors and the implementer — nobody accepts their own
+ * delivery — and a demoted weight for `hands`, who held an execute lease but never wrote code. Reviewing,
+ * returning or accepting never makes someone an author (contributors.ts).
  */
 export interface ReviewRecusal {
+  /** Submitted (or is the implementer, or an unknown-phase row): never reviews this task. */
   authors: ReadonlySet<string>;
+  /** Claimed execute but never submitted: eligible at PRIOR_HAND_WEIGHT_FACTOR. */
+  hands: ReadonlySet<string>;
 }
 
 /** Shared audit-based recusal lookup. Unknown history must never become an empty set. */
@@ -318,7 +377,7 @@ export async function readReviewRecusal(
 ): Promise<ReviewRecusal | undefined> {
   try {
     const facts = await workforce.contributors(task.id);
-    return { authors: new Set(facts.excluded) };
+    return { authors: new Set(facts.excluded), hands: new Set(facts.hands) };
   } catch (error) {
     log(`contributors read failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
@@ -342,17 +401,19 @@ export interface ReviewStaffingPreview {
 /** Task-scoped estimate; the public role/home pool stays independent of review recusal. */
 export async function reviewStaffingPreviews(
   tasks: readonly SupervisedTask[],
-  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'recusal'>,
-  workforce: Pick<Workforce, 'contributors'>,
+  base: Omit<StaffingInput, 'role' | 'home' | 'task' | 'excludeSubmitter' | 'recusal' | 'independence'>,
+  workforce: Pick<Workforce, 'contributors' | 'independenceScope'>,
 ): Promise<ReviewStaffingPreview[]> {
   const previews: ReviewStaffingPreview[] = [];
   for (const task of tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)) {
     const recusal = await readReviewRecusal(workforce, task);
     const home = task.repoPath ?? base.opsRepo;
+    const independence = task.independence ? await workforce.independenceScope(task.independence, 'review') : undefined;
     const entries = staffingPool({ ...base, role: task.reviewerRole, home, task,
-      excludeSubmitter: true, recusal });
+      excludeSubmitter: true, recusal, independence });
     previews.push({ taskId: task.id, title: task.title, purpose: 'review', role: task.reviewerRole, home,
-      status: recusal === undefined ? 'history_unavailable' : entries.some(entry => entry.eligible) ? 'ready' : 'blocked',
+      status: recusal === undefined || independence?.kind === 'unverifiable' ? 'history_unavailable'
+        : entries.some(entry => entry.eligible) ? 'ready' : 'blocked',
       entries: recusal === undefined
         ? entries.map(e => ({ ...e, eligible: false, share: 0, code: 'unknown' as const, reason: BLOCK_TEXT.unknown }))
         : entries });
@@ -528,7 +589,7 @@ export interface TickReport {
  * owner-facing answers are measured against the same function the tick uses.
  */
 export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar: boolean; log?: (message: string) => void },
-  verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince'>, at = Date.now()): Promise<DispatchSnapshot> {
+  verdicts: DispatchVerdict[], wf: Pick<Workforce, 'contributors' | 'readySince' | 'independenceScope'>, at = Date.now()): Promise<DispatchSnapshot> {
   const busyBy = new Map<string, number>();
   for (const inst of p.insts) {
     if (p.states.get(inst.id) !== 'busy') continue;
@@ -872,7 +933,7 @@ export class Dispatcher {
           // An exempt def keeps running through a spent subscription: its parked session is
           // restarted on the normal retry interval instead of waiting out the provider cooldown.
           const exempt = defs.find(d => d.id === inst.def)?.quotaLimited === false;
-          if (fresh && !report.exhausted.includes(inst.provider)) {
+          if (fresh && !managedModel(defs.find(d => d.id === inst.def)) && !report.exhausted.includes(inst.provider)) {
             // A quota row that knows when the window resets beats the exponential backoff: the
             // provider is unusable until then, and probing earlier only burns another session.
             const resetsAt = quotaByProvider.get(inst.provider)?.resetsAt;
@@ -954,6 +1015,13 @@ export class Dispatcher {
         await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
       }
     }
+    for (const inst of insts) {
+      if (states.get(inst.id)!=='idle' || !defs.some(d=>d.id===inst.def && !d.enabled)) continue;
+      if (await this.retireGated(inst, '编制已统一为 Claude，旧会话完成后正常退出', 'rotation', report)) {
+        report.retired.push(inst.id);
+        if(inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(()=>undefined);
+      }
+    }
     insts = insts.filter(i => !report.retired.includes(i.id));
 
     // 2b. Jev decisions: goal triage, release go/no-go, owner-escalation routing. Undecided items stay with gm/product.
@@ -971,10 +1039,17 @@ export class Dispatcher {
       // An unreadable gate hides which session is bound, so nothing is rotated in that pass (fail-closed).
       const bound = new Set([...gates.values()].flatMap(gate => gate?.implementer ? [gate.implementer] : []));
       const rotationSafe = ![...gates.values()].includes(null);
+      if (rotationSafe) {
+        const idleRetired = await reclaimIdleSessions({ instances: insts, states, held: holding, bound, now,
+          minutes: cfg.sessionIdleMinutes ?? 120, workforce: wf, paseo,
+          archiveScene: inst => this.archiveInstScene(inst), log: text => this.log(text),
+        }).catch(error => { this.log(`idle cleanup failed safely: ${(error as Error).message}`); return [] as string[]; });
+        report.retired.push(...idleRetired);
+      }
       let inspected = 0;
       for (const inst of insts) {
         if (!rotationSafe) break;
-        if (states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
+        if (report.retired.includes(inst.id) || states.get(inst.id) !== 'idle' || holding.has(inst.id) || bound.has(inst.id) || !inst.paseoAgentId) continue;
         // Sidecar mode: a credential-file instance can never take new work (the pool
         // refuses to claim for it), so an idle one only wastes a provider seat and
         // misleads Jev's staffing picks. Retire it on sight.
@@ -991,7 +1066,7 @@ export class Dispatcher {
         // all stay valid. Realign it in place, and when that is not possible leave it for the next
         // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
-        const target = def ? resolveModel(def) : undefined;
+        const target = def?.model?.startsWith('group/sck-') ? undefined : def ? resolveModel(def) : undefined;
         const served = runtimeModels.get(inst.id) ?? inst.model;
         // Realign only once the subscription has recovered. A provider that switched models because
         // its standard allowance ran out switches back on its own at reset; asking every pass during
@@ -1051,6 +1126,13 @@ export class Dispatcher {
       ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
+    // Independence scopes (SYS-DISP IR02): each work item whose policy names its stage reads its exclusion once per pass, from the same
+    // audit stream the claim gate reads. An unreadable source blocks that task's pool as unknown; it is never read as clear.
+    const independence = new Map<string, IndependenceScope>();
+    for (const item of work) {
+      const scope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, item.purpose) : undefined;
+      if (scope) independence.set(`${item.purpose}:${item.task.id}`, scope);
+    }
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
@@ -1079,7 +1161,7 @@ export class Dispatcher {
     // pass waits. Supervision above already ran — stalled leases still get reclaimed.
     // A probe error fails open (logged) rather than halting dispatch forever.
     const host = this.hostResources();
-    const underFloor = Boolean(host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb));
+    const underFloor = Boolean(host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb));
     const headroom = cfg.artifactHeadroomMb ?? 0;
     const pressure = Boolean(host && host.freeDiskMb < cfg.minFreeDiskMb + headroom);
     let reclaimAttempt: ArtifactReclaimResult | undefined;
@@ -1104,12 +1186,12 @@ export class Dispatcher {
         }
       }
     }
-    if (host && (host.freeMemMb < cfg.minFreeMemMb || host.freeDiskMb < cfg.minFreeDiskMb)) {
+    if (host && (memoryBlocked(host, cfg.minFreeMemMb) || host.freeDiskMb < cfg.minFreeDiskMb)) {
       const why = reclaimAttempt?.disabled
         ? `；终态产物回收被${reclaimAttempt.disabledReason === 'env' ? '环境硬停（SCK_ARTIFACT_RECLAIM=0）' : '配置关闭（artifact_reclaim_enabled=false）'}，无法自动腾出空间`
         : '';
       await this.notice('resources',
-        `宿主机资源不足，本轮暂停派工：空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
+        `宿主机资源不足，本轮暂停派工：内存压力 ${host.memoryPressure ?? '未知（按空闲内存判断）'}，空闲内存 ${host.freeMemMb} MB（下限 ${cfg.minFreeMemMb} MB）、空闲磁盘 ${(host.freeDiskMb / 1024).toFixed(1)} GB（下限 ${(cfg.minFreeDiskMb / 1024).toFixed(0)} GB）。在办任务不受影响，水位恢复后自动继续派工${why}。`, report);
       if (reclaimAttempt?.disabled) {
         await this.notice('resources-reclaim-blocked',
           `资源闸门正在阻塞全部派工，但终态产物回收不可用（${reclaimAttempt.disabledReason === 'env' ? 'SCK_ARTIFACT_RECLAIM=0 环境硬停' : 'artifact_reclaim_enabled=false'}）。空闲磁盘 ${host.freeDiskMb} MB，低于下限 ${cfg.minFreeDiskMb} MB。请恢复回收配置，或用 admin reclaim-artifacts --execute 手工回收。`, report, { force: true });
@@ -1143,7 +1225,8 @@ export class Dispatcher {
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned, reserved,
-        implementer: executeGateFor(executeGates, role, task, excludeSubmitter) });
+        implementer: executeGateFor(executeGates, role, task, excludeSubmitter),
+        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined });
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
       recusal?: ReviewRecusal, reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, excludeSubmitter, recusal, reserved).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
@@ -1158,7 +1241,7 @@ export class Dispatcher {
      */
     const struckImplementer = (employeeId: string): boolean => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down';
+      return !inst || states.get(inst.id) === 'down' || defs.some(d => d.id === inst.def && !d.enabled);
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1244,7 +1327,9 @@ export class Dispatcher {
       recusal?: ReviewRecusal, anchorHome?: string, reserved?: ReadonlySet<string>) => {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
       const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal, reserved);
-      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def));
+      // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
+      const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def))
+        * (recusal?.hands.has(inst.id) ? PRIOR_HAND_WEIGHT_FACTOR : 1);
       // Continuity beats weights: the previous holder keeps the task when it is still available.
       // Review work never hits this: an author's former holder is already out; a claim-only
       // hand surviving as previousEmployee is continuity, not a conflict.
@@ -1254,16 +1339,22 @@ export class Dispatcher {
       const live = candidates.filter(i => states.get(i.id) === 'idle');
       const usable = live.length ? live : candidates;
       const pool = usable.filter(i => i.id !== avoid);
-      return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
+      const available = pool.length ? pool : usable;
+      if (available.length && available.every(i => managedModel(defs.find(d => d.id === i.def))))
+        return managedRecencyOrder(available, recusal?.hands)[0];
+      return weightedOrder(available, weight, rand)[0];
     };
     const spawnable = (role: string, home: string, task?: SupervisedTask, forReview = false,
       reserved?: ReadonlySet<string>) =>
-      weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
+      eligibleDefs(role, home, task, forReview, reserved).every(managedModel)
+        ? eligibleDefs(role, home, task, forReview, reserved).sort((a,b) => a.id.localeCompare(b.id))
+        : weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
     // Review 派工的作者在进 Jev 前就已从 reuse 候选剔除（staffingPool 的回避名单），其余候选都可被选中；
     // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
     const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>): Promise<AssignPreference | undefined> => {
+      if (item.role !== 'story-author' && defs.filter(d => d.enabled && d.role === item.role).every(managedModel)) return undefined;
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       const cacheKey = `${item.purpose}:${item.task.id}`;
@@ -1358,8 +1449,10 @@ export class Dispatcher {
           await this.settleBlocked(item.task, 'execute', home, undefined, now, report);
           continue;
         }
+        // The future review of this task is judged with its review-stage independence too, so capacity is never reserved for a reviewer the policy excludes.
+        const reviewScope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, 'review') : undefined;
         const reviewPlan = (recusal: ReviewRecusal, pool: EmployeeInst[] = insts) => reviewPlanOf(staffingPool({ ...poolBase,
-          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal }));
+          insts: pool, role: item.task.reviewerRole, home, task: item.task, excludeSubmitter: true, recusal, independence: reviewScope }));
         const plan = reviewPlan(authors);
         if (!plan.feasible) {
           const blocked = poolFor(item.role, home, item.task).map(entry => entry.eligible
@@ -1377,7 +1470,7 @@ export class Dispatcher {
           if (entry.kind !== 'spawn' || !entry.eligible) continue;
           const seat = { id: `pending:${entry.key}`, def: entry.ref, role: item.role, provider: entry.provider,
             model: entry.model, repoHome: home, cwd: home } as EmployeeInst;
-          if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]) }, [...insts, seat]).feasible) held.add(entry.key);
+          if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]), hands: new Set() }, [...insts, seat]).feasible) held.add(entry.key);
         }
         if (held.size) {
           reserved = held;
@@ -1587,6 +1680,16 @@ export class Dispatcher {
 
     const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
     for (const todo of pendingGm) {
+      const home = todo.task.repoPath ?? this.deps.env.opsRepo;
+      const noticeKey = `gm-unavailable:${home}`;
+      // Use the exact same pools as assign, without acquiring a wake only to
+      // immediately release it. This remains quiet across dispatcher restarts.
+      if (!eligibleInsts('gm', home, undefined, false).length && !eligibleDefs('gm', home).length) {
+        await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理；待办保留，检查经理编制、额度和容量。候选恢复后自动唤醒。`, report);
+        continue;
+      }
+      await owner.resolveNotice(noticeKey);
+      if (running >= cfg.maxRunning) continue;
       let claim: ManagerWakeClaim | undefined;
       try {
         claim = await wf.acquireManagerWake!({
@@ -1737,15 +1840,17 @@ export class Dispatcher {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
         const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
-        if (!dispatched && jevReady && task.evalAttempts < 3) {
+        let fullHistory = task.row.model_eval_full_history===true;
+        if (!dispatched && !fullHistory && jevReady && task.evalAttempts < 3) {
           const outcome = await this.jevEvaluate(task, cfg, report);
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
+          if (outcome === 'full-history') fullHistory=true;
         }
         // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
         // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
         // re-enables escalation for quick tasks.
-        const llmReady = llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
+        const llmReady = fullHistory ? defs.some(d=>d.role==='eval' && d.enabled) : llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
         if (!llmReady) {
           if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
             await this.notice(`eval-stuck:${task.id}`,
@@ -1774,23 +1879,45 @@ export class Dispatcher {
    * Returns 'done' when scorecards were written, 'retry' to try again next tick,
    * 'escalate' to hand the task to the LLM eval role.
    */
-  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate'> {
+  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate' | 'full-history'> {
     const { workforce: wf, jev } = this.deps;
     if (!jev) return 'escalate';
     const attempts = await wf.bumpEvalAttempt(task.id);
     let parsed: JevScoreAnswers;
     try {
       const state = await wf.evalState(task.id);
+      if(state.timelineTruncated && state.modelExecutions?.length) {
+        await wf.requireFullModelEvaluation(task.id);
+        return 'full-history'; // persisted across retries/restarts; eval reads complete paged history
+      }
       const questions = jevEvalQuestions(state.participants);
+      const modelJudgements: Array<{key:string;employee:string;model:string}> = [];
+      for (const employee of state.participants) {
+        const models = [...new Set((state.modelExecutions ?? []).filter(r=>r.employee===employee && r.model).map(r=>r.model!))];
+        for (const model of models) {
+          const key = `m${modelJudgements.length}`;
+          modelJudgements.push({key,employee,model});
+          questions[key] = {type:'score',instructions:`根据实际执行轮次和全部提交、退回、修复、最终验收记录，给员工 ${employee} 使用模型 ${model} 的实际贡献打1到5分。区分造成返工和修复返工，排除账号额度、网络等基础设施故障；不得按调用次数分配质量。证据不足时降低置信度。`,criteria:['1：严重缺陷造成返工','2：明显未达标','3：基本完成','4：可靠交付','5：高质量完成或有效修复']};
+        }
+      }
       const result = Object.keys(questions).length
         ? await jev.ask({
           task: { id: task.id, title: state.title, context: state.context, executorRole: state.executorRole, reviewerRole: state.reviewerRole },
           participants: state.participants,
           metrics: state.metrics,
           timeline: state.timeline,
+          modelExecutions: state.modelExecutions,
         }, questions)
         : { model: jev.model, answers: {} };
       parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
+      for (const judgement of modelJudgements) {
+        const answer = result.answers[judgement.key];
+        const entry = parsed.scores.find(s=>s.employee===judgement.employee);
+        if (entry && answer?.type==='score' && Number.isFinite(answer.score)) {
+          (entry.modelScores ??= []).push({model:judgement.model,overall:Math.max(1,Math.min(5,answer.score!)),notes:'最终任务验收后的模型独立评价'});
+          parsed.minConfidence = Math.min(parsed.minConfidence,answer.confidence ?? 0);
+        } else parsed.minConfidence = 0;
+      }
       const quickNoEscalate = task.goalTier === 'quick' && !cfg.evalQuickLlm;
       if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev' || quickNoEscalate) {
         const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +

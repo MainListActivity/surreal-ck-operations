@@ -1,5 +1,6 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
+import type { IndependencePolicy } from './contracts.ts';
 
 /**
  * Who has touched an engineering task's code, derived from the task's audit stream.
@@ -17,8 +18,8 @@ import { CompanyError } from './core-errors.ts';
  *    actor's next decisive action: submit = execute, accept/return = review. A row with no
  *    decisive follow-up is unknown and its actor counts as an author (fail-closed).
  *  - Implementer: the explicit `implementer` field when set, otherwise the single author.
- *    Several authors with no explicit implementer is ambiguous: nobody may execute until a
- *    manager records one.
+ *    Several authors, or several claim-only handlers, with no explicit implementer is
+ *    ambiguous: nobody may execute until a manager records one.
  *  - Consistency: every authorship change bumps the task version in the same transaction as
  *    its audit row. Lease transactions compare the version they read the facts at, so a
  *    change that lands in between is refused and the caller re-reads (CONTRIBUTION_MOVED).
@@ -58,14 +59,33 @@ export interface ContributionFacts {
   unknown: UnknownContribution[];
   /** Explicit implementer, or the only author when there is exactly one. */
   implementer?: string;
-  /** Several authors and no explicit implementer: nobody may execute until a manager records one. */
+  /** Several authors, or several claim-only handlers, and no explicit implementer: nobody may execute until a manager records one. */
   ambiguous: boolean;
-  /** Authors plus the implementer. Nobody in this set may review or accept the task. */
+  /**
+   * Ordinary recusal set: authors plus the implementer. A claim-only holder (took an execute lease, never wrote code
+   * with decisive evidence) is NOT here — they are `hands`, demoted but still eligible (SYS-DISP IR01: an ordinary
+   * task's plain review recusal rule is unchanged).
+   */
   excluded: string[];
+  /**
+   * Holders with no code-writing evidence, in either phase: they held a lease (claimed, checkpointed, released, or decided a
+   * review) but never submitted, and their rows are not unknown-phase. Demoted for review, never hard-excluded, unless a
+   * policy names this task as a source of another — see `strictExcluded`, which the independence gate and the retirement
+   * gate use.
+   */
+  hands: string[];
+  /**
+   * Every execute-phase handler: authors, implementer and the execute-phase `hands`, including one who later claimed or
+   * returned a review. Never a pure reviewer. What a strict independence source excludes, and whom the retirement gate
+   * refuses when no implementer is recorded.
+   */
+  strictExcluded: string[];
 }
 
 /** Audit actions that can carry authorship. Everything else (resume, defer, ops_call, takeover) is ignored. */
-export const CONTRIBUTION_ACTIONS = ['claim', 'checkpoint', 'released', 'block', 'submit', 'accept', 'return'] as const;
+// `implementer_bound` is written by implementerTakeover (manager and system): being bound as the implementer is the record
+// that this employee writes the task's code, so it authors and never reviews — even after the binding moves on (SYS-DISP IR01/Q1).
+export const CONTRIBUTION_ACTIONS = ['claim', 'checkpoint', 'released', 'block', 'submit', 'accept', 'return', 'implementer_bound'] as const;
 
 /** Phrase a transaction raises when the contribution facts it was built from are stale (see readContributionView). */
 export const CONTRIBUTION_MOVED = 'contribution history moved';
@@ -130,30 +150,67 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   const authors = new Set<string>();
   const reviewers = new Set<string>();
   const unknown: UnknownContribution[] = [];
+  const hands = new Set<string>();
+  // Execute-phase holders with no code-writing evidence. Collected on their own rows, not derived from `hands`: a hand who
+  // later claimed or returned a review is still one of them, and reviewing never undoes having held the code.
+  const executeHands = new Set<string>();
   const roles = rolesOf(rows, open);
+  // The pre-SYS-DISP recusal rule (SYS-DISP IR01/Q1, manager decision B): an actor who ever SUBMITTED is an author; an actor
+  // who only held an execute lease and never submitted is a prior hand (demoted, still eligible). Reviewers are review-phase
+  // holders who are neither. Unknown-phase rows stay fail-closed as authors.
+  const submitted = new Set(rows.filter(event => event.action === 'submit').map(event => event.actor!));
+  const bound = new Set(rows.filter(event => event.action === 'implementer_bound').map(event => event.actor!));
   rows.forEach((event, index) => {
     const actor = event.actor!;
     const role = roles[index]!;
     if (role === 'reviewer') {
       reviewers.add(actor);
+      // The pre-SYS-DISP rule is phase-blind: any holder who never submitted is a prior hand, in either phase. A
+      // reviewer who only claimed the review and never decided it is demoted too, so they stay eligible but never
+      // outrank a fresh reviewer.
+      if (!submitted.has(actor)) hands.add(actor);
       return;
     }
-    authors.add(actor);
     if (role === 'unknown') {
+      // No decisive evidence either way: fail closed as an author, and say so to the owner.
+      authors.add(actor);
       unknown.push({ actor, action: event.action, at: event.at, reason: '历史行缺少阶段且之后无可判定动作，按作者处理（fail-closed）' });
+      return;
     }
+    // A recorded implementer (submit, or a takeover that bound them to write the code) is a real author. A claim-only
+    // holder is a prior hand: demoted, still eligible.
+    if (submitted.has(actor) || bound.has(actor)) {
+      authors.add(actor);
+      return;
+    }
+    hands.add(actor);
+    executeHands.add(actor);
   });
   const sortedAuthors = [...authors].sort();
   const explicit = explicitImplementer || undefined;
+  // The implementer is the recorded one, else the single author. A prior hand is never inferred as the implementer: only
+  // recorded authorship (a submit) or an explicit gm takeover binds a task to one engineer.
   const implementer = explicit ?? (sortedAuthors.length === 1 ? sortedAuthors[0] : undefined);
-  const excluded = [...new Set([...sortedAuthors, ...(implementer ? [implementer] : [])])].sort();
+  const excluded = [...new Set([...sortedAuthors, ...(explicit ? [explicit] : [])])].sort();
+  const handsOnly = [...executeHands].filter(actor => !excluded.includes(actor)).sort();
+  const demoted = [...hands].filter(actor => !excluded.includes(actor)).sort();
   return {
     authors: sortedAuthors,
     reviewers: [...reviewers].filter(actor => !excluded.includes(actor)).sort(),
     unknown,
     implementer,
-    ambiguous: !explicit && sortedAuthors.length > 1,
+    // Ambiguity is a real multi-author state: several people wrote code and nobody is recorded as the implementer, so
+    // nobody may execute until a manager records one. It is also the state of several prior hands with no recorded
+    // implementer: more than one person held the code and no submit names who wrote it, which is exactly the "who wrote
+    // this?" question a manager must answer. A single prior hand is not ambiguous — they are demoted, and the manager can
+    // bind them or the task waits.
+    ambiguous: !explicit && (sortedAuthors.length > 1 || handsOnly.length > 1),
     excluded,
+    // The prior hands a review pool demotes: every claim-only holder, in either phase.
+    hands: demoted,
+    // Every execute-phase handler: authors, implementer and the execute claim-only holders. What a strict source excludes and
+    // what the retirement gate relates to an unfinished task.
+    strictExcluded: [...new Set([...excluded, ...handsOnly])].sort(),
   };
 }
 
@@ -168,21 +225,30 @@ export function openLeaseOf(holder: string | null | undefined, state: string | n
   return { actor: holder, phase: state === 'review' ? 'review' : 'execute' };
 }
 
-/** The facts and the task version they were read at. `version` is undefined when the task does not exist. */
+/**
+ * The facts, the task version they were read at, the state, open holder and explicit implementer, and the independence policy.
+ * All read in one transaction, so a policy change (which bumps the version) is never seen without the version it moved to.
+ * `version` is undefined when the task does not exist.
+ */
 export interface ContributionView {
   facts: ContributionFacts;
+  checkedAt?: string;
   version?: number;
-  /** The task's state, open holder and explicit implementer, read in the same transaction as the facts (retirement gate). */
+  /** The task's state, open holder and explicit implementer, read in the same transaction as the facts (retirement gate),
+   * plus the independence policy: one read, so a policy change is never seen without the version it moved to. */
   state?: string;
   holder?: string;
   explicitImplementer?: string;
+  policy?: IndependencePolicy;
 }
 
 interface ContributionRead {
+  checkedAt?: string | null;
   implementer?: string | null;
   version?: number | null;
   state?: string | null;
   holder?: string | null;
+  policy?: IndependencePolicy | null;
   rows?: Array<{ action: string; actor?: unknown; phase?: string | null; at?: unknown }> | null;
 }
 
@@ -193,10 +259,10 @@ interface ContributionRead {
  */
 export async function readContributionView(db: Surreal, taskId: string): Promise<ContributionView> {
   const responses = await db.query<unknown[]>(`BEGIN TRANSACTION;
-    LET $row = SELECT implementer, version, state, current_employee AS holder FROM ONLY $task;
+    LET $at = time::now();
+    LET $row = SELECT implementer, version, state, current_employee AS holder, independence AS policy FROM ONLY $task;
     LET $rows = SELECT action, actor, phase, at FROM audit WHERE task = $task AND action IN $actions ORDER BY at ASC;
-    RETURN { read: { implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, rows: $rows } };
-    COMMIT TRANSACTION;`,
+    RETURN { read: { checkedAt: <string>$at, implementer: $row.implementer, version: $row.version, state: $row.state, holder: $row.holder, policy: $row.policy, rows: $rows } };    COMMIT TRANSACTION;`,
   { task: new RecordId('task', taskId), actions: [...CONTRIBUTION_ACTIONS] }).responses();
   const found = responses.every(response => response.success)
     ? responses.map(response => response.success ? response.result : undefined)
@@ -213,11 +279,12 @@ export async function readContributionView(db: Surreal, taskId: string): Promise
   const open = openLeaseOf(read.holder, read.state);
   return {
     facts: deriveContributors(events, read.implementer ?? undefined, open),
+    checkedAt: read.checkedAt ?? undefined,
     version: typeof read.version === 'number' ? read.version : undefined,
     state: read.state ?? undefined,
     holder: read.holder ?? undefined,
     explicitImplementer: read.implementer ?? undefined,
-  };
+    policy: read.policy ?? undefined,  };
 }
 
 /** The facts only, for callers that do not check the version (dispatcher reads, previews). */
@@ -328,7 +395,7 @@ export function proposeImplementer(taskId: string, facts: ContributionFacts, exp
   const unknownNote = facts.unknown.length ? `；${facts.unknown.length} 条历史无法判定阶段，按作者处理` : '';
   if (recorded) return { ...base, status: 'bound', implementer: recorded, note: `已绑定实现负责人，不做变更${unknownNote}` };
   if (facts.ambiguous) {
-    return { ...base, status: 'manager_decision', note: `多个作者且无显式实现负责人，需经理用 implementer_takeover 指定其一${unknownNote}` };
+    return { ...base, status: 'manager_decision', note: `多名经手人且无显式实现负责人，需经理用 implementer_takeover 指定其一${unknownNote}` };
   }
   if (facts.authors.length === 1) {
     return { ...base, status: 'proposal', suggestedImplementer: facts.authors[0],

@@ -80,6 +80,8 @@ export interface StartPreviewOptions {
   coreFactory?: CoreFactory;
   /** 老板审核台 handler：/o/ 前缀的请求先走它（自带 token 门控），不进核心文件路由。 */
   consoleFetch?: FetchHandler;
+  /** QA 专属只读验收台 handler：/q/ 前缀的请求先走它（受限 cookie 门控），不进核心文件路由。 */
+  qaFetch?: FetchHandler;
   log?: (msg: string) => void;
 }
 
@@ -126,8 +128,11 @@ export function startPreview(opts: StartPreviewOptions = {}): PreviewHandle {
   const listen = (L: Listener, host: string, port: number, handlerFor: () => FetchHandler | undefined) => {
     if (stopped || L.dead) return;
     const consoleHandler = opts.consoleFetch;
+    const qaHandler = opts.qaFetch;
     const server = createServer((req, res) => {
-      const handler = (consoleHandler && req.url?.startsWith("/o/")) ? consoleHandler : handlerFor();
+      const path = req.url ?? "/";
+      const handler = (L.name === "lan" && qaHandler && (path === "/q" || path.startsWith("/q/"))) ? qaHandler
+        : (consoleHandler && path.startsWith("/o/")) ? consoleHandler : handlerFor();
       if (!handler) { res.writeHead(503).end("preview core unavailable"); return; }
       Promise.resolve().then(async () => {
         const request = toRequest(req);

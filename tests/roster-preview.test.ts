@@ -32,7 +32,7 @@ const contributors = async (): Promise<ContributionFacts> => {
   historyCalls++;
   if (historyFails) throw new Error('synthetic read failure');
   const authors = emptyHistory ? [] : ['author', 'rework-submitter'];
-  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors };
+  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors, hands: [], strictExcluded: authors };
 };
 // One dispatch pass as far as the owner-facing answers are concerned: the observed sessions and the snapshot of the inputs it reads.
 let observed = { at: 0, sessions: new Map<string, Session>() };
@@ -42,16 +42,23 @@ const tick = async () => {
   const states = new Map<string, InstState>(insts.map(i => [i.id, sessions.get(i.id)?.state ?? 'unknown']));
   snapshot = await snapshotOf({ now: Math.floor(Date.now() / 1000), cfg: { providerMax: { codex: 3 } } as unknown as PassInputs['cfg'],
     defs, insts, states, health: new Map(), quotaBlocked: new Map(), tasks: taskRows, slots: new Map() },
-    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, readySince: async () => new Map() });
+    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, independenceScope: async () => undefined, readySince: async () => new Map() });
 };
 // Mutable answers for the whole-answer size test: the pulse reads its doing rows, recent accepts and daily brief from these.
 let briefOverride: Record<string, unknown> | undefined;
 let doingOverride: Array<Record<string, unknown>> = [];
 let recentOverride: Array<Record<string, unknown>> = [];
+let healthOverride: Array<Record<string, unknown>> = [];
 const queryRows = (sql: string): unknown[][] =>
+  sql.includes("FROM provider_health") ? [healthOverride] :
   sql.includes("state = 'doing'") ? [doingOverride] : sql.includes("action IN ['accept'") ? [recentOverride] : [[]];
+const dbQuery = (sql: string) => sql.includes('BEGIN TRANSACTION;')
+  ? { responses: async () => [{ success: true, result: sql.includes('LET $rows = SELECT')
+    ? { read: { at: new Date().toISOString(), rows: [] } }
+    : { read: { at: new Date().toISOString(), submits: [] } } }] }
+  : Promise.resolve(queryRows(sql));
 mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
-  opsRepo: '/ops', db: { db: { query: async (sql: string) => queryRows(sql) } },
+  opsRepo: '/ops', db: { db: { query: dbQuery } },
   owner: { briefData: async () => briefOverride ?? ({ stuck: [], waiting: [], resources: [], goals: [],
     last24h: { done: 0, returned: 0, rolledBack: 0, rejected: 0, retired: 0 }, churn: { created: 0, retired: 0, claimLost: 0 } }) },
   workforce: {
@@ -64,7 +71,9 @@ mock.module('../plugin/server/company.ts', () => ({ company: async () => ({
     dispatchSnapshot: () => snapshot,
   },
 }) }));
+const realDispatch = await import('../plugin/server/dispatch.ts');
 mock.module('../plugin/server/dispatch.ts', () => ({
+  ...realDispatch,
   refreshModels: async () => ({}), refreshQuota: async () => [], readProviderQuotas: async () => [],
 }));
 const handlersPath = '../plugin/server/handlers.ts';
@@ -329,14 +338,14 @@ test('pulse RPC: with every list full, the whole answer stays within the 48 KiB 
     last24h: { done: 1, returned: 0, rolledBack: 0, rejected: 0, retired: 0 },
     churn: { created: 0, retired: 0, claimLost: 0 },
   };
-  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, ready: 300, doing: 300, stuck: 200,
+  const totals: Record<PulseListName, number> = { dispatchBlocked: 1_500, goalBlockers: 300, workflowWaits: 0, ready: 300, doing: 300, stuck: 200,
     waiting: 200, recentDone: 50, goals: 100, resources: 100 };
   try {
     const response = await callPulse();
     for (const name of Object.keys(totals) as PulseListName[]) {
       const list = response[name];
-      expect(response.bounds[name]).toEqual({ total: totals[name], shown: list.length, truncated: true });
-      expect(list.length).toBeGreaterThan(0);
+      expect(response.bounds[name]).toEqual({ total: totals[name], shown: list.length, truncated: totals[name] > 0 });
+      if (totals[name] > 0) expect(list.length).toBeGreaterThan(0);
       expect(list.length).toBeLessThanOrEqual(PULSE_LIST_CAPS[name].items);
       expect(bytesOf(list)).toBeLessThanOrEqual(PULSE_LIST_CAPS[name].bytes);
     }
@@ -390,4 +399,25 @@ test('roster answer: with every list full, each list keeps its cap and the whole
     expect(answer.bounds[name]).toEqual({ total: 500, shown: list.length, truncated: true });
   }
   expect(bytesOf(answer)).toBeLessThanOrEqual(ROSTER_BUDGET_BYTES);
+});
+
+
+test('roster RPC: record IDs identify providers and expired cooldowns are probeable without becoming healthy', async () => {
+  const { RecordId } = await import('surrealdb');
+  healthOverride = [
+    { id: new RecordId('provider_health','factory-droid'), state: 'exhausted', until: 1, last_error: 'synthetic rejection' },
+    { id: new RecordId('provider_health','grok'), state: 'exhausted', until: Math.floor(Date.now()/1000)+3600 },
+    { id: new RecordId('provider_health','codex'), state: 'healthy' },
+  ];
+  try {
+    const response = await callRoster();
+    expect(response.health).toEqual([
+      { provider: 'factory-droid', state: 'probe', until: 1, lastError: 'synthetic rejection' },
+      { provider: 'grok', state: 'exhausted', until: Number(healthOverride[1]!.until) },
+      { provider: 'codex', state: 'healthy' },
+    ]);
+    expect(healthOverride[0]!.state).toBe('exhausted');
+    const overview = await callPulse();
+    expect(overview).toBeDefined();
+  } finally { healthOverride = []; }
 });

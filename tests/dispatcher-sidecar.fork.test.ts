@@ -14,6 +14,7 @@ import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
 import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath } from '../src/comm.ts';
 import type { ClaimResult, LeaseProof } from '../src/contracts.ts';
+import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse } from '../src/response-budget.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
 const CLIENT_CLI = join(import.meta.dir, '..', 'src', 'mcp', 'client-cli.ts');
@@ -201,8 +202,8 @@ run('company fork: two rounds, A implements, B returns, A reworks, B re-reviews;
  * A real company fork for the real-tick scenarios below: the actual core, dispatcher and sidecar pool over a fresh database.
  * Paseo is a fake: the test drives each session's status and last error, and agents get real comm directories to relay through.
  */
-async function startCompanyFork(name: string) {
-  const dir = mkdtempSync(join(tmpdir(), `channel-fork-${name}-`));
+async function startCompanyFork(name: string, tempRoot = tmpdir()) {
+  const dir = mkdtempSync(join(tempRoot, `channel-fork-${name}-`));
   const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
   const port = reservation.port!; reservation.stop(true);
   const rootPassword = 'isolated-channel-test-only';
@@ -249,6 +250,7 @@ async function startCompanyFork(name: string) {
       await next.adopt(await wf.insts());
     },
     verdicts: () => last?.dispatchVerdicts() ?? [],
+    snapshot: () => last?.dispatchSnapshot(),
     close: async () => {
       for (const id of agentRows.keys()) pool?.detachAgent(id);
       pool?.close();
@@ -692,3 +694,158 @@ run('company fork: plugin reload recovers a live review lease for report_blocker
     await w.close();
   }
 }, 90000);
+
+
+run('company fork: zero dispatch verdicts still report the live review dependency root through QA goal API and console', async () => {
+  const w = await startCompanyFork('qa-wait-roots');
+  try {
+    const enrollment = new LocalEnrollmentAdmin(w.db);
+    const engineer = await enrollment.enroll('wait-root-engineer', 'engineering', ['execute', 'review']);
+    const qa2 = await enrollment.enroll('wait-root-qa-two', 'qa', ['execute', 'review']);
+    const goal = await w.owner.createGoal({ text: '依赖等待根真实 tick 回归', source: 'fork:test', key: 'qa-wait-root-goal' });
+    await w.db.db.query("UPDATE ONLY type::record('goal', $id) SET state = 'active', tier = 'quick', anchors = [];", { id: goal.id });
+    const root = await w.core.createTask(w.gm, { goalId: goal.id, title: '活租约复核根', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'wait-root-create' });
+    const rootClaim = await w.core.claim(engineer, root.id);
+    await w.core.submit(engineer, { taskId: rootClaim.task.id, deliveryId: rootClaim.deliveryId, fence: rootClaim.fence, expectedVersion: rootClaim.task.version },
+      { text: '隔离公司 fork 回归根任务已提交，用于只读目标等待摘要验证。', idempotencyKey: 'wait-root-submit' });
+    await w.core.claim(qa2, root.id);
+    const downstream = await w.core.createTask(w.gm, { goalId: goal.id, title: '直接依赖等待任务', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', dependencies: [root.id], idempotencyKey: 'wait-root-downstream' });
+    const leaf = await w.core.createTask(w.gm, { goalId: goal.id, title: '多级依赖等待任务', context: '隔离 fork 回归数据', executorRole: 'engineering', reviewerRole: 'qa', dependencies: [downstream.id], idempotencyKey: 'wait-root-leaf' });
+    expect((await w.core.getTask(w.gm, downstream.id)).state).toBe('blocked');
+    expect((await w.core.getTask(w.gm, leaf.id)).state).toBe('blocked');
+
+    const scope = await w.core.qaObservationGrant(w.gm, {
+      goalId: goal.id, deploymentTaskId: root.id, qaEmployee: 'wait-root-qa-two', leaseFence: (await w.core.getTask(w.gm, root.id)).fence, subjects: [root.id],
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '隔离 fork 目标等待根回归', idempotencyKey: 'wait-root-scope',
+    });
+    const factsCore = new SurrealCompanyCore(w.db, { workforce: w.wf });
+
+    await w.tick();
+    expect(w.snapshot()?.verdicts).toEqual([]);
+    const { persistDispatchObservation } = await import('../plugin/server/dispatch.ts');
+    await persistDispatchObservation({ dispatcher: { dispatchSnapshot: () => w.snapshot() }, db: w.db } as never);
+    const observation = await w.db.db.select<{ at?: string; complete?: boolean; originalVerdicts?: number; verdicts?: unknown[] }>(
+      new RecordId('company_meta', 'dispatch_observation'));
+    expect(observation?.complete).toBe(true);
+    expect(observation?.originalVerdicts).toBe(0);
+    expect(observation?.verdicts).toEqual([]);
+
+    const read = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(read.goal?.dispatchComplete).toBe(true);
+    expect(read.goal?.undispatchable).toBe(0);
+    expect((read.goal as any)?.waits).toBeDefined();
+    expect((read.goal as any)?.waits?.roots).toHaveLength(1);
+    expect((read.goal as any)?.waits?.roots?.[0]).toMatchObject({
+      taskId: root.id, title: '活租约复核根', workflowState: 'review', kind: 'active_lease', impact: 2,
+    });
+    expect(JSON.stringify((read.goal as any)?.waits)).toContain(downstream.id);
+    expect(JSON.stringify((read.goal as any)?.waits)).toContain(leaf.id);
+    expect((read.goal as any)?.waits?.source).toBe('workflow-graph');
+    expect((read.goal as any)?.waits?.checkedAt).toBeTruthy();
+    expect((read.goal as any)?.waits?.roots?.[0]?.peopleSource).toBe("contributor-audit");
+    expect((read.goal as any)?.waits?.roots?.[0]?.submitterSource).toBe("submit-audit");
+    expect((read.goal as any)?.waits?.roots?.[0]?.peopleCheckedAt).toBeTruthy();
+    expect((read.goal as any)?.waits?.roots?.[0]?.submitCheckedAt).toBeTruthy();
+    expect(Date.parse((read.goal as any).waits.checkedAt)).toBeGreaterThanOrEqual(Date.parse(observation!.at!));
+    // The answer the real core returns is what the relay measures: it must pass the same budget check the sidecar applies,
+    // because qa_observation_read has no paging input to recover from response_too_large.
+    expect(answerBytes(read)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    const relayed = guardRelayResponse({ ok: true as const, data: read });
+    expect(relayed).toMatchObject({ ok: true });
+    expect((relayed as { data?: unknown }).data).toBe(read);
+    expect((read.goal as any)?.waits?.budgetLimited).toBeUndefined();
+
+    const session = await factsCore.qaObservationSession(qa2, { scopeId: scope.id });
+    const { createQaConsoleFetch } = await import('../plugin/server/qa-console.ts');
+    const app = createQaConsoleFetch({ home: '/nonexistent', company: async () => ({ core: factsCore }) as never });
+    const login = await app(new Request('http://x/q/login', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `code=${encodeURIComponent(session.code)}`,
+    }));
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const page = await app(new Request('http://x/q/?goal=1', { headers: { cookie } }));
+    const body = await page.text();
+    expect(page.status).toBe(200);
+    expect(body).toContain('活租约复核根');
+    expect(body).toContain('直接依赖等待任务');
+    expect(body).toContain('多级依赖等待任务');
+    expect(body).toContain('活租约');
+    expect(body).toContain('人物时点');
+    expect(body).toContain('提交审计时点');
+    expect(body).not.toContain('本轮 pass 中该目标无可报的阻断结论');
+
+    const dispatchBlocked = await w.core.createTask(w.gm, { goalId: goal.id, title: '真实派工阻断并存任务', context: '隔离 fork 回归数据',
+      executorRole: 'product', reviewerRole: 'qa', idempotencyKey: 'wait-root-dispatch-blocked-coexists' });
+    await w.tick();
+    expect(w.snapshot()?.verdicts.some(verdict => verdict.taskId === dispatchBlocked.id && !verdict.dispatchable)).toBe(true);
+    await persistDispatchObservation({ dispatcher: { dispatchSnapshot: () => w.snapshot() }, db: w.db } as never);
+    const coexistRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(coexistRead.goal?.dispatchComplete).toBe(true);
+    expect(coexistRead.goal?.undispatchable).toBe(1);
+    expect(coexistRead.goal?.root?.taskId).toBe(dispatchBlocked.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect((coexistRead.goal as any)?.waits?.roots?.[0]).not.toHaveProperty('noticeKey');
+
+    // Dispatch pass availability is independent from the freshly collected goal graph.
+    await w.db.db.query('DELETE company_meta:dispatch_observation; DELETE company_meta:dispatch_observation_status;');
+    const missingPassRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(missingPassRead.goal?.dispatchAvailable).toBe(false);
+    expect(missingPassRead.goal?.dispatchComplete).toBe(false);
+    expect(missingPassRead.goal?.undispatchable).toBeUndefined();
+    expect((missingPassRead.goal as any)?.waits?.available).toBe(true);
+    expect((missingPassRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect((missingPassRead.goal as any)?.waits?.checkedAt).toBeTruthy();
+    const missingPassPage = await app(new Request('http://x/q/?goal=1', { headers: { cookie } }));
+    const missingPassBody = await missingPassPage.text();
+    expect(missingPassBody).toContain('活租约复核根');
+    expect(missingPassBody).toContain('派工覆盖 不可用/未知');
+
+    const oldPassAt = '2020-01-01T00:00:00.000Z';
+    await w.db.db.query("UPSERT company_meta:dispatch_observation CONTENT { at: $at, verdicts: [], complete: false, originalVerdicts: 3, originalReasons: 0, reason: 'partial fork observation' };", { at: oldPassAt });
+    await w.db.db.query("UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: true, error: '' };", { at: oldPassAt });
+    const incompleteRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(incompleteRead.goal?.dispatchAvailable).toBe(false);
+    expect(incompleteRead.goal?.dispatchComplete).toBe(false);
+    expect(incompleteRead.goal?.dispatchCheckedAt).toBe(oldPassAt);
+    expect((incompleteRead.goal as any)?.waits?.available).toBe(true);
+    expect((incompleteRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect(Date.parse((incompleteRead.goal as any).waits.checkedAt)).toBeGreaterThan(Date.parse(oldPassAt));
+
+    await w.db.db.query("UPDATE company_meta:dispatch_observation SET complete = true, verdicts = []; UPSERT company_meta:dispatch_observation_status CONTENT { at: $at, ok: false, error: 'write failed' };", { at: oldPassAt });
+    const staleRead = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    expect(staleRead.goal?.dispatchAvailable).toBe(false);
+    expect(staleRead.goal?.dispatchComplete).toBe(false);
+    expect(staleRead.goal?.dispatchReason).toMatch(/stale/);
+    expect(staleRead.goal?.dispatchCheckedAt).toBe(oldPassAt);
+    expect((staleRead.goal as any)?.waits?.available).toBe(true);
+    expect((staleRead.goal as any)?.waits?.roots?.[0]?.taskId).toBe(root.id);
+    expect(Date.parse((staleRead.goal as any).waits.checkedAt)).toBeGreaterThan(Date.parse(oldPassAt));
+
+    const foreignGoal = await w.owner.createGoal({ text: '隔离外目标边界任务', source: 'fork:test', key: 'wait-root-foreign-goal', tier: 'quick' });
+    const foreign = await w.core.createTask(w.gm, { goalId: foreignGoal.id, title: '外目标不可见标题', context: '隔离 fork 外目标数据', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'wait-root-foreign-task' });
+    await w.db.db.query('UPDATE ONLY $task SET dependencies += $dependency;', { task: new RecordId('task', downstream.id), dependency: new RecordId('task', foreign.id) });
+    const isolated = await factsCore.qaObservationRead({ credential: qa2 }, { scopeId: scope.id, goalId: goal.id });
+    const isolatedWaits = (isolated.goal as any)?.waits;
+    expect(JSON.stringify(isolatedWaits)).not.toContain(foreign.id);
+    expect(JSON.stringify(isolatedWaits)).not.toContain('外目标不可见标题');
+    expect(isolatedWaits.roots.some((row: any) => row.impact !== undefined || row.dependencyPath?.some((step: any) => step.taskId === foreign.id))).toBe(false);
+
+    const duringReadScope = await w.core.qaObservationGrant(w.gm, {
+      goalId: goal.id, deploymentTaskId: root.id, qaEmployee: 'wait-root-qa-two', leaseFence: (await w.core.getTask(w.gm, root.id)).fence,
+      subjects: [root.id], expiresAt: new Date(Date.now() + 3_600_000).toISOString(), reason: '隔离 fork 采集期间租约变更验证', idempotencyKey: 'wait-root-scope-during-read',
+    });
+    let fenceChangedDuringRead = false;
+    const fencingCore = new SurrealCompanyCore(w.db, { workforce: {
+      contributors: async () => {
+        if (!fenceChangedDuringRead) {
+          fenceChangedDuringRead = true;
+          await w.db.db.query('UPDATE ONLY $task SET fence += 1;', { task: new RecordId('task', root.id) });
+        }
+        return { authors: [], reviewers: [] };
+      },
+    } as never });
+    await expect(fencingCore.qaObservationRead({ credential: qa2 }, { scopeId: duringReadScope.id, goalId: goal.id }))
+      .rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/lease changed/) });
+  } finally {
+    await w.close();
+  }
+}, 60000);

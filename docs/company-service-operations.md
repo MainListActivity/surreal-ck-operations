@@ -96,6 +96,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 **兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
 只有证明兼容的目标才能切换；旧版本（如 9854fe0、475b5c2 及其后的旧快照）不是固定可回退版本。没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复，不得把破坏复核阶段的旧版当成可用性恢复，也不得以伪 accept 或改库换取回滚条件。窗口内切换前仍须按第 4 节采样并证明没有活复核租约（或使用已独立部署验收、支持复核 adopt 的版本）。
 
+**已写策略的数据不能切到不执行策略的代码（IR06）**：切换守卫在 RW06 之外再用 `scripts/independence-guard.sh` 读取目标自身代码，确认它带 `src/independence.ts` 的协议常量、`src/core.ts` 的来源版本守卫（`INDEPENDENCE_GUARD_SQL` 与 `independenceGate`）与 `src/contracts.ts` 的策略及身份视图；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。线上数据可能已带有独立性策略（`independence_set`），把这份数据切到没有该契约的目标上，被排除的来源经手人、其登记 principal 同伴与点名员工会被直接放行认领——这正是 IR06 拒绝回滚旧 release 的原因。拒绝同样发生在任何切换副作用之前，并输出 `excluded tasks=unknown`；没有可用兼容目标时，保持当前健康版本、受控 hold，或走受审的前向修复（换回带该契约的代码即可让同一份数据重新生效，无需改数据）。守卫只读目标树并匹配声明，只能证明目标带有这份契约，不能证明其行为：它与 RW06 同属标记式探针，不执行目标代码，不能替代真实派工与隔离演练证据。
+
 **先停用受影响编制再回滚**：由经理通过现有管理通道暂停这些编制，记录原 enabled 状态，防止旧 core 对新岗位/策略继续派工；核对在办任务并保留租约、comm、登记与审计。回滚目标须同时兼容当前岗位与 WT01/WT02 登记，不能任意选更早版本；不删除 schema、历史或任务数据。
 
 ```sh
@@ -341,3 +343,40 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 已披露的残留（SYS01 复核）：`deploy-mcp-remote.sh` 安装远端 Bun 时直接执行 bun.sh 的安装脚本，未做 sha256 校验；`scripts/release-content.sh` 的清单比较只看文件内容，不看权限位。前者列为后续跟进。`release-gate.sh` 按目录名取 SHA 一项已关闭：`release-gate.sh` 与 `company-service.sh install` 都调用 `scripts/release-content.sh`，把目录内容与提交归档逐文件比较（依赖、生成的 `plugin/server/vendor`、`vault/build` 与 `.runtime/` 不计入），内容不符即拒绝。
 
 `deploy-mcp-remote.sh` 在任何远端步骤前核对同一记录（Bun 版本取 `SCK_BUN_VERSION`，缺省 1.4.2）。随后在远端执行 `runtime-bun/bin/bun --version`，实际版本与门禁不符时在上传载荷前拒绝，不复用旧二进制。两项都通过后才上传 release、写入 `service.env`、切换 `current` 并重启。`SCK_REMOTE_HOME` 只供测试覆盖：`tests/ci-gates.test.ts` 以桩化的 ssh 与 scp 运行脚本，不触及真实主机；生产路径不设置。最终集成提交若与审查过的提交不同，必须对该集成 SHA 重新生成门禁记录，不能复制旧记录或改写 JSON。
+
+## Magpie 四档模型与最终绩效路由
+
+故事作者保持原有编制、客户端和模型。其余角色各保留一个 Claude 编制，合并原岗位轨；产品默认 `group/sck-sonnet`，GM 默认 `group/sck-opus`，其他岗位（含 QA、eval）默认 `group/sck-haiku`。Fable 仅作为老板手动入口，不进入员工请求；员工网关把旧会话残留的 Fable 模型名映射到岗位默认档位，老板个人通过 Magpie 手动使用 Fable。旧客户端编制停用，已有任务及历史身份保留；旧会话完成任务、解除实现人绑定后按既有退役保护正常回收。
+
+四个公开入口为 `group/sck-fable`、`group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku`。员工网关把每个请求改写成一个 magpie 档位分组：租约档位是上限，手动选择可以降到更便宜的档，不能升档；任何具体模型名（含 Claude Code 自带的 `claude/claude-sonnet-5-5` 等）都改写成租约档位分组。网关从不发送具体模型 ID：2026-10-23 曾因固定了一个下架的具体模型，被 magpie 改由 Claude 订阅的 sonnet 应答并继续固定，越出档位。岗位不再拆分能力档和绩效排名。请求名含 Haiku 也属于任务工作，只有 count_tokens 为辅助接口。老板个人配置和压缩窗口471000不改。
+
+`src/model-routing/benchmarks.json` 保留 AA Intelligence Index 来源及采集时间。老板规则：任何档位的模型 AA 分数不得低于 38（`AA_FLOOR`），没有公开分数的模型不进入任何档位，新上架模型同样按此过滤。分界线以模型为锚（老板 2026-10-23 定，`TIER_ANCHORS`），锚模型被 AA 重新打分时分界线随之移动：分数不高于 deepseek-v4.1-flash 的进入 Sonnet，Haiku 与 Sonnet 共用同一组成员；高于 deepseek-v4.1-flash、不高于 claude-sonnet-5.5 的进入 Opus（含 gpt-6.1-sol、claude-sonnet-5.5）；高于 claude-sonnet-5.5 的进入 Fable。Fable 只供老板手动使用，其模型被排除时暂用 Opus 的成员；档位是能力分段，不等同于模型厂商品牌。空档只借用更强档。模型绩效采用统一排名、八任务先验、30天半衰期；相同规范模型名跨账号共享证据。`tierOverrides` 和 `disabledModels` 允许维护时校正和排除。首次四档迁移清除旧三档覆盖，重新按快照初始化。
+
+派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度、顺序回退和档内隔离；公司代码只维护四个分组的成员与顺序。
+
+只有四个 magpie 分组 `sck-fable/opus/sonnet/haiku`（`routing=order`、`stays=session`）。**分组成员归老板管**：自动分档只在 `GROUPING_VERSION` 变化时整体初始化一次，此后只把从未见过的新模型（AA ≥38）放进对应档位；老板在 magpie 里手动增删的成员不会被覆盖，手动移出的模型记入 `model-routing/membership.json` 的已知列表，不会被自动加回，手动加入的模型即使没有 AA 分数也保留。后台每五分钟只按 AA 先验与模型绩效重排各组成员顺序（读取 magpie `providers.json`，写入经 magpie 自身的保存接口）；同一租约用 `x-magpie-session` 由 magpie 保持在同一模型，额度或故障时由 magpie 在组内回退。不再有 magpie 选择中间件、best/explore 中间分组和网关模型固定；升级后首次同步会卸载旧的 `sck-performance` 中间件并删除 `sck-route-*` 分组。故事作者正在使用的旧组保留。请求热路径不查询远端数据库：租约来自 sidecar 内存，执行元数据经本地 fsync+rename 队列入库，不保存提示词/回复/密钥。
+
+有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾；工程、产品等已登记会话此时按岗位默认档位继续调用，记录 task 为空、phase=idle，不进入任务模型绩效。GM/eval 的 planning 行为不变。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。插件重载恢复期间模型网关返回503及 Retry-After:1，恢复完成后才核对会话；未登记会话仍拒绝409。
+
+任务经过所有提交、退回和修复，最终达到 done 后才进入 eval。普通返工中不结算。eval 使用 `get_task_history` 和 `get_model_evidence` 关联 employee、实际 model、fence、阶段和时间，分别评价返工责任与修复贡献。`record_score.scores[].modelScores` 为实际模型独立的 overall/notes；单模型可继承该员工的最终综合分，多模型缺少独立判断时不虚构质量分。每模型按1/模型数量分配参与者样本权重，请求数量不决定质量。历史记录写 actual_models，配置保留 configured_model。已重新打开的任务不进入排序，重新结算按确定ID替换旧样本。上线测试中的模型选择与评分证据来自隔离公司 fork，不制造生产绩效。
+
+发布从 main 固定提交生成快照，运行加法迁移033。暂停新派工后、切换生产代码前执行新 main release 的迁移入口（此时旧租约继续有效）：
+
+```sh
+"$HOME/Library/Application Support/SurrealCKCompany/runtime-bun/bin/bun" "$SCK_RELEASE_DIR/scripts/model-routing-admin.ts" migrate
+```
+
+迁移先备份完整编制到私有 model-routing/employee-defs-four-tier-before.json，准备四档分组和插件，再停用非故事作者的旧客户端编制、更新 Claude 编制/员工默认模型，最后启用。切换双面 release 后，仅空闲无租约会话更新 Paseo 模型默认和 v2 网关配置；忙会话先完成当前工作。`model-routing-admin.ts status` 查看计数。恢复维护前的 paused 状态，核对真实派工与实际模型执行。
+
+回滚：先暂停新派工，用本 release 的 `model-routing-admin.ts disable` 恢复编制和员工私有网关设置并停用插件；等待 pendingSessionReloads 清零，再按双面回滚流程恢复前一 release。历史证据不删除。
+
+
+### Jev 组内排序
+
+老板工作台「编制 → 模型排序」提供自然语言规则与 2/5/10 分钟下拉选项（默认 5）。保存只更新这两个设置并重置触发时钟，下一次有效员工模型请求（含 count_tokens）到达公司网关后，后台启动一次刷新；同一时刻只有一轮，前台请求不等待数据库、额度查询或 Jev。到期且没有新请求时不调用 Jev。重启后首个请求会刷新。
+
+每轮共用一次数据采集，对 `sck-opus`、`sck-sonnet`、`sck-haiku` 各独立调用一次 Jev。输入包含组内每个模型的订阅标签（不传邮箱）、最紧窗口剩余额度百分比、AA 排名和分数、每百万 token 输入/输出/缓存命中价格（Magpie 标注免费时为 0）、近 7 天缓存命中率与输出 tokens/s、首 token 延迟，以及已最终验收任务的模型绩效和样本权重。缺失数据保持未知；调用失败、答案不完整或置信度低时保留该组顺序，界面显示刷新结果。保存期间旧轮次作废，关闭插件停止发布结果。
+
+AA 榜单与价格保存在服务目录 `model-routing/aa.json`，每日刷新，失败保留最后可用快照；锚模型不齐或页面解析异常时不替换数据。自动分组版本不变，仅初始化及首次出现的新模型参与分组，仍遵守 AA≥38 和现有锚模型规则；手动增删成员不会因重新评分而重置。Jev 只能排列当前组内成员，不能跨组添加模型。Fable 不参与 Jev 或绩效排序，保留老板顺序。Magpie 自己提供组内回退与会话粘性，网关始终发送原生组名；不设置 effort 上限。
+
+设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查三组结果和 Magpie 顺序，同时确认成员集合及 Fable 顺序未变。

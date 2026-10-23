@@ -51,6 +51,17 @@ test('unknown state is material at once: infeasible, and never reported as busy'
   expect(v.reasons.some(r => r.code === 'session_busy')).toBe(false);
 });
 
+test('independence reasons name the source task and each excluded candidate in the verdict and the notice', () => {
+  const v = verdict([
+    { key: 't-src', eligible: false, code: 'independence_conflict', reason: '来源任务 P1 的经手人 t-src，不能接手或复核本任务' },
+    { key: 'spawn:eng-factory', eligible: false, code: 'independence_conflict', reason: '与来源任务 P1 的经手人 t-src 同源（同一登记编制），不能接手或复核本任务' },
+  ]);
+  expect(v).toMatchObject({ dispatchable: false, feasible: false });
+  expect(v.reasons).toEqual([expect.objectContaining({ code: 'independence_conflict', candidates: ['spawn:eng-factory', 't-src'] })]);
+  expect(v.reasons[0]!.text).toContain('P1');
+  expect(dispatchNoticeText(v)).toContain('（spawn:eng-factory、t-src）');
+});
+
 test('no candidate at all is a manager decision: infeasible until staff is added', () => {
   const v = verdict([]);
   expect(v).toMatchObject({ dispatchable: false, feasible: false });

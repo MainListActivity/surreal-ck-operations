@@ -557,12 +557,12 @@ test('MR02: explicit blockedTo=gm uses the same in-flight ownership', async () =
   expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 1 });
 });
 
-test('MR02: a candidate-free assign releases only its own pending attempt and retries later', async () => {
+test('MR02: candidate-free assignment waits without acquiring a pending attempt', async () => {
   const f = fixture([{ id: 'mr02-prefail', state: 'ready', repoPath: OPS }]);
   f.defs[0]!.enabled = false;
   const first = await f.tick();
   expect(first.woke.filter(w => w.task === 'mr02-prefail')).toHaveLength(0);
-  expect([...f.wakes.values()][0]).toMatchObject({ state: 'finished' });
+  expect(f.wakes.size).toBe(0);
   f.defs[0]!.enabled = true;
   const second = await f.tick();
   expect(second.woke.filter(w => w.task === 'mr02-prefail')).toHaveLength(1);
@@ -668,4 +668,28 @@ test('MR02: a pending attempt without external start is released after the conse
   const second = await f.tick();
   expect(second.woke.filter(w => w.task === 'mr02-pending-crash')).toHaveLength(1);
   expect([...f.wakes.values()][0]).toMatchObject({ state: 'running', attempt: 2 });
+});
+
+
+test('no eligible GM never acquires/releases wake claims on repeated ticks; recovery wakes immediately', async () => {
+  const f = fixture([{ id: 'fixture-no-gm', blockedTo: 'gm' }]);
+  f.defs.find(d => d.role === 'gm')!.enabled = false;
+  for (let n = 0; n < 4; n++) await f.tick(); // fixture recreates Dispatcher: includes restart behavior
+  expect(f.wakes.size).toBe(0);
+  expect(f.prompts).toHaveLength(0);
+  expect([...f.notices.keys()].some(k => k.startsWith('gm-unavailable:'))).toBe(true);
+  f.defs.find(d => d.role === 'gm')!.enabled = true;
+  expect((await f.tick()).woke.some(w => w.task === 'fixture-no-gm')).toBe(true);
+});
+
+test('a persisted full-history model evaluation dispatches an eval employee even for quick/jev-only settings',async()=>{
+  const f=fixture([]);
+  f.defs.push({id:'eval-claude',role:'eval',provider:'claude',model:'group/sck-haiku',enabled:true,maxInstances:2,priority:0,weight:1,scored:0,errorStreak:0});
+  const original=f.wf.config.bind(f.wf);
+  f.wf.config=async()=>({...await original(),evalEnabled:true,evalEngine:'jev',evalQuickLlm:false});
+  f.wf.pendingEvaluations=async()=>[{id:'long-rework',title:'long-rework',state:'done',executorRole:'engineering',reviewerRole:'qa',kind:'task',version:8,goalTier:'quick',evalAttempts:4,row:{model_eval_full_history:true}} as SupervisedTask];
+  const report=await f.tick();
+  expect(report.evals).toContain('long-rework');
+  expect(report.woke.some(w=>w.employee.startsWith('eval-claude'))).toBe(true);
+  expect(f.prompts.at(-1)?.prompt).toContain('get_model_evidence');
 });

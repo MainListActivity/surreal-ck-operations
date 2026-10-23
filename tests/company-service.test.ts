@@ -35,12 +35,14 @@ function executable(path: string, content: string) {
   chmodSync(path, 0o755);
 }
 
-// The review-wait contract RW06's switch guard requires (src/review-wait-capability.ts, the restoring unlock in core, and the
-// view fields in contracts). A fixture release without it is the "old target" case the guard must refuse.
-const REVIEW_WAIT_FILES = {
+// Both switch contracts a capable release carries: RW06 (persistent review-wait state) and IR06 (source-contributor dynamic
+// avoidance). A fixture release without them is the "old target" case each guard must refuse. The two contracts share
+// src/core.ts and src/contracts.ts, so their markers live in the same fixture files.
+const CAPABILITY_FILES = {
   'src/review-wait-capability.ts': "export const REVIEW_WAIT_PROTOCOL = 'review-wait/1';\n",
-  'src/core.ts': "export const UNLOCK = `\n  LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\n  UPDATE $t SET resume_state = NONE;\n`;\n",
-  'src/contracts.ts': 'export interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\n',
+  'src/independence.ts': 'export const INDEPENDENCE_LIMITS = { sources: 20, excluded: 100 } as const;\n',
+  'src/core.ts': "export const UNLOCK = `\n  LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;\n  UPDATE $t SET resume_state = NONE;\n`;\nconst INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards`;\nexport class Core {\n  private async independenceGate(taskId: string) { return taskId; }\n}\n",
+  'src/contracts.ts': 'export interface TaskView {\n  resumeState?: string;\n  resumeRole?: string;\n}\nexport interface IndependencePolicy { schema: 1 }\nexport interface IdentityPrincipalView { id: string }\n',
 };
 
 // SYS02 C2: the acceptance baseline contract the target guard requires (baseline declarations, the evaluator merge,
@@ -59,11 +61,11 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-    const files = { ...REVIEW_WAIT_FILES, ...ACCEPTANCE_FILES };
+const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES };
     mkdirSync(join(dir, 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
     appendFileSync(join(dir, 'src', 'core.ts'), "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n");
-    // The plugin surface runs the same core; its generated vendor must carry the contract too.
+    // The plugin surface runs the same core; its generated vendor must carry both contracts too.
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) {

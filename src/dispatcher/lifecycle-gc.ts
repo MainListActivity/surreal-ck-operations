@@ -93,7 +93,7 @@ async function sizeOf(path: string): Promise<number> {
   return total;
 }
 
-export interface GcResult { removed: string[]; bytes: number; skipped: number }
+export interface GcResult { removed: string[]; bytes: number; skipped: number; kept?: Array<{ name: string; reason: string }>; failed?: string[] }
 
 /**
  * Dead employee channels: a `comm/<instance>` dir whose instance is not live and
@@ -102,15 +102,25 @@ export interface GcResult { removed: string[]; bytes: number; skipped: number }
  */
 export async function sweepInstanceDirs(opts: {
   root: string; now: Date; graceMs: number; keep: ReadonlySet<string>; dryRun?: boolean;
+  protect?: (path: string) => Promise<string | undefined>;
 }): Promise<GcResult> {
-  const result: GcResult = { removed: [], bytes: 0, skipped: 0 };
+  const result: GcResult = { removed: [], bytes: 0, skipped: 0, kept: [], failed: [] };
   const cutoff = opts.now.getTime() - opts.graceMs;
+  const keep = (name: string, reason: string) => { result.skipped++; result.kept!.push({ name, reason }); };
   for (const entry of await entries(opts.root)) {
-    if (!INSTANCE_DIR.test(entry.name) || opts.keep.has(entry.name)) { result.skipped++; continue; }
-    if (entry.mtimeMs > cutoff) { result.skipped++; continue; }
-    result.bytes += await sizeOf(entry.path);
+    if (!INSTANCE_DIR.test(entry.name)) { keep(entry.name, 'foreign-name'); continue; }
+    if (opts.keep.has(entry.name)) { keep(entry.name, 'live-instance'); continue; }
+    if (entry.mtimeMs > cutoff) { keep(entry.name, 'grace-period'); continue; }
+    let reason;
+    try { reason = await opts.protect?.(entry.path); } catch { reason = 'inspection-failed'; }
+    if (reason) { keep(entry.name, reason); continue; }
+    const bytes = await sizeOf(entry.path);
+    if (!opts.dryRun) {
+      try { await rm(entry.path, { recursive: true, force: true }); }
+      catch { result.failed!.push(entry.name); keep(entry.name, 'remove-failed'); continue; }
+    }
+    result.bytes += bytes;
     result.removed.push(entry.name);
-    if (!opts.dryRun) await rm(entry.path, { recursive: true, force: true }).catch(() => undefined);
   }
   return result;
 }

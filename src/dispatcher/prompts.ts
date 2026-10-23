@@ -95,6 +95,8 @@ export function evalPrompt(inst: EmployeeInst, task: SupervisedTask, env: Prompt
    若 get_task_history 返回 response_too_large，给同一参数加 {"pageSize":10}，再把返回的 page.nextCursor 作为 cursor 逐页读取，直到 page.hasMore 为 false；任务正文或超长证据用 read_task_text 分段读取。
    get_context 带 taskId 只读该任务，答复不含公司块（companyIncluded 为 false）；若返回 response_too_large，任务正文用 read_task_text 分段读取。需要公司方向、目标与项目时，按答复中的 companyRead 字段，用 {"scope":"company","pageSize":25} 分页读取，逐页用 page.nextCursor 作为 cursor 续读，直到 page.hasMore 为 false；不要为此改用 includeCompany。
    history 里出现的员工编号（claim/checkpoint/submit/review/revoked 的 actor 或 payload）即参与者；dispatcher、owner、gm-relay 不是员工，不评分。
+   ${call.replace('<工具名>', 'get_model_evidence').replace('<JSON参数>', JSON.stringify({ taskId: task.id }))}
+   模型执行记录按 employee/model/fence/phase 关联完整提交与退回历史。任务最终验收后结算，返工中不结算。为每个实际参与模型提供 modelScores:[{model,overall,notes}]，区分返工责任和修复贡献；基础设施故障不扣模型质量，不按请求次数分配质量。同一模型整轮只记一次。
 2. 对每位参与者按 1–5 分打分（可以取 0.5 步进）：quality 交付质量、evidence 证据是否真实完整、discipline 流程纪律（是否及时 checkpoint、按协议操作、是否中断导致交接）、timeliness 推进效率，再加 overall 总分与 notes 评语。
    被中断收回租约的员工 discipline/timeliness 应偏低；接手交接并完成好的员工可给高分。评审的是这一轮的行为，不看资历。你的评分会进入该员工定义的 avg_score，直接影响同类员工以后接到任务的概率，请客观。
 3. 上报（scores 覆盖全部参与者，缺一不可；若确实没有参与者就传空数组）：
