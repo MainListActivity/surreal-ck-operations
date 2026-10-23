@@ -157,6 +157,16 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - 与普通 review 的分界（IR01/Q1）：普通任务的复核回避保持原规则——提交过（写过码）的人硬回避；只持有过租约、未写码的经手人 `hands` 降权（`PRIOR_HAND_WEIGHT_FACTOR`）仍可领取与裁决复核。该规则与阶段无关：执行或复核阶段只领取未提交者都是 `hands`。被经理或系统指定为实现负责人（`implementer_takeover`）或首次执行领取绑定为实现负责人的人，写码事实以 `implementer_bound` 审计行留痕，是真实作者，绑定后来转移也不改写该事实。只有策略指定的来源任务，才按 `mode` 硬排除其全部执行经手人（含 claimed-but-never-submitted）。历史行缺阶段且之后无可判定动作的，仍按作者 fail-closed。
 - 多名经手人都未提交且没有记录的实现负责人时，任务视为归属不明（`ambiguous`）：无人可执行，等经理 `implementer_takeover` 指定；这与「只领取未写码」的降权不同，不因修复而丢失。
 - 拒绝返回结构化原因：`forbidden`，`details.conflicts` 含任务、来源任务、员工、命中方式（`contributor` / `explicit` / `same_principal`）、角色与审计引用（不含凭证）。
+
+## 候选级只读预检（independence_check）
+
+`independence_check`（SYS-DISP IR01–IR05）是上面策略的只读入口：给一个 `{taskId, employeeId, stage?}`，回答「这个人在这条任务的这个阶段会不会被拒绝」——供经理与 QA 用正式接口独立读回策略与结论，替代「导出回包」这类二次转述证据。
+
+- 判定与 `claim` / `submit` / 裁决的门禁同源：直接复用门禁读的同一份来源贡献索引与同一套登记身份关联，冲突时给出的 `via` / `source` / `matched` / `role` / `principal` / `auditRef` 与拒绝里 `details.conflicts` 的字段一致，不存在第二套判定。
+- 结论：`clear`（门禁会放行）、`conflict`（会被拒绝）、`unverifiable`（来源贡献读不到、身份表读不到、或策略版本不认识——门禁在这几种情况下失败关闭，因此绝不返回 `clear`）、`not_applicable`（该任务没有策略，旧行为不变）。`stage` 缺省按任务当前阶段推断（`review` 态取 review，其余取 execute）；策略没点名该阶段时门禁本就不读，结论为 `clear`。
+- `policy` 字段回显实际登记的 `revision` / `stages` / `mode` / `sources` / `excluded` / `setBy` / `setAt`；无策略时不回显。除策略文本外不回显任何凭证类信息。
+- 授权：gm 恒可读，qa 可读（QA 需独立复核且不持有 manage），其余角色 `forbidden`。不读通道或凭证文件。
+- 纯读：不领租约、不推进任务版本、不写审计 / outbox / 派工观察、不改任务任何字段，因此**已完成（done）或已作废的任务同样可读**——被核验的目标常常已经完成，这是该工具的主要用途。回退该工具不影响门禁的失败关闭。
 ## 身份关联（identity_principal_set）
 
 经理（manage 能力）可登记 principal：把多个 employeeId 显式绑定为同一个人，用于独立性策略的同源判定（SYS-DISP IR02/Q3）。

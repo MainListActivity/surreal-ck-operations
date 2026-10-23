@@ -4,7 +4,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -20,7 +20,7 @@ import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type Snapsho
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
-import { normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
+import { checkIndependence, INDEPENDENCE_LIMITS, normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -1873,6 +1873,42 @@ export class SurrealCompanyCore implements CompanyCore {
       if (keep === 0 || Buffer.byteLength(JSON.stringify(view), 'utf8') <= DRY_RUN_BYTE_BUDGET) return view;
       keep = Math.floor(keep / 2);
     }
+  }
+
+  /**
+   * gm and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
+   * stage — the formal read-only preflight that the source-avoidance registrations prove their criteria with, replacing an exported
+   * reply as evidence. The exclusion comes from the gate's own reader and index, so a reading cannot drift from what a claim or a
+   * submit actually does, and nothing is written: no lease, version, audit row, outbox event or dispatch observation. A done or void
+   * task stays readable, which is the tool's main use.
+   *
+   * A task without a policy is not_applicable (legacy behaviour unchanged). A source that cannot be read, an unreadable identity
+   * table, or a policy this build cannot enforce is unverifiable — never clear, because the gate fails closed on exactly those. qa may
+   * read it (independent review without manage); every other role is refused.
+   */
+  async independenceCheck(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm' && actor.role !== 'qa') {
+      throw new CompanyError('forbidden', 'Only a manager or qa may read the independence preflight');
+    }
+    requireText(input.taskId, 'taskId', 1, INDEPENDENCE_LIMITS.idChars);
+    requireText(input.employeeId, 'employeeId', 1, INDEPENDENCE_LIMITS.idChars);
+    if (input.stage !== undefined && input.stage !== 'execute' && input.stage !== 'review') {
+      throw new CompanyError('invalid', 'stage must be execute or review');
+    }
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', `Task not found: ${input.taskId}`);
+    // The stage is inferred from the phase the task is in now, the way a claim reads it: review while in review, execute otherwise.
+    const stage: IndependenceStage = input.stage ?? (row.state === 'review' ? 'review' : 'execute');
+    const registered = row.independence ? policyView(row.independence) : undefined;
+    if (registered === undefined) {
+      return { taskId: input.taskId, employeeId: input.employeeId, stage, verdict: 'not_applicable',
+        reason: 'the task has no independence policy, so the gate takes no independence read for it' };
+    }
+    // The policy echo is the registered value itself, so qa reads the real fields back instead of trusting a relayed reply.
+    const policy: IndependenceCheckPolicyView = { revision: registered.revision, stages: registered.stages, mode: registered.mode,
+      sources: registered.sources, excluded: registered.excluded, setBy: registered.setBy, setAt: registered.setAt };
+    return { ...await checkIndependence(this.db, input.taskId, registered, stage, input.employeeId, this.independenceReadHook), policy };
   }
 
   /**
