@@ -105,6 +105,7 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
   implementer?: EmployeeId;
+  modelTier?: 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -313,6 +314,7 @@ export interface CreateTask {
   project?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
+  modelTier?: 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (gm/product only): both drafts must be owner-reviewed

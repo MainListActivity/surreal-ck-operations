@@ -45,6 +45,7 @@ try {
   if (!ready) throw new Error('Company fork fixture did not become healthy');
   const explicit = process.argv.slice(2).filter(arg => arg.endsWith('.test.ts'));
   const targets = explicit.length ? explicit : process.argv.includes('--all') ? [] : [
+    'tests/model-routing.test.ts', 'tests/model-routing.fork.test.ts',
     'tests/worktree-lock.test.ts', 'tests/worktree-reclaim.test.ts', 'tests/worktree-registry.fork.test.ts',
     'tests/artifact-reclaim.test.ts', 'tests/artifact-sweeper.test.ts', 'tests/artifact-reclaim.fork.test.ts',
     'tests/magpie-quota.test.ts', 'tests/agent-model.test.ts', 'tests/quota-store.fork.test.ts',
