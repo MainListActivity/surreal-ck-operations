@@ -35,7 +35,7 @@ test("catalog matches exact benchmark versions, admits only AA >= 38 and omits g
     estimated: false,
   });
   expect(models.find((m) => m.model === "claude-haiku-5-5")?.tier).toBe(
-    "opus",
+    "sonnet",
   );
   // Owner rule: unscored (mystery) and below the floor (mimo-v2.6-flash, 37.9) enter no tier; 38.1 does.
   expect(models.some((m) => m.model === "mystery" || m.model === "mimo-v2.6-flash")).toBe(false);
@@ -45,6 +45,56 @@ test("catalog matches exact benchmark versions, admits only AA >= 38 and omits g
     estimated: false,
   });
   expect(classify([{ id: "relay/claude-opus-5-5-preview" }])).toEqual([]);
+});
+test("tier lines are the owner's anchor models: deepseek-v4.1-flash and below is Sonnet/Haiku, up to sonnet-5.5 is Opus", () => {
+  const tiers = Object.fromEntries(classify([
+    { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }, { id: "a/gpt-6.1-sol" },
+    { id: "a/gpt-6-astra" }, { id: "a/claude-sonnet-5-5" }, { id: "a/claude-opus-5-5" },
+  ]).map((m) => [m.model, m.tier]));
+  expect(tiers).toEqual({
+    "deepseek-v4.1-flash": "sonnet", "kimi-k3": "sonnet",
+    "gpt-6.1-sol": "opus", "gpt-6-astra": "opus", "claude-sonnet-5-5": "opus",
+    "claude-opus-5-5": "fable",
+  });
+});
+test("Haiku serves the Sonnet pool, and Fable serves Opus while its own models are excluded", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  const calls: string[][] = [];
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true, disabledModels: ["a/claude-opus-5-5"] }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, join(scratch, "controller-pools"), "unused", {
+    fetch: (async () => Response.json({ data: [{ id: "a/claude-opus-5-5" }, { id: "a/gpt-6.1-sol" }, { id: "a/deepseek-v4.1-flash" }] })) as unknown as typeof fetch,
+    command: async (args) => { calls.push(args); },
+  });
+  await controller.refresh(true);
+  const members = Object.fromEntries(calls.filter((c) => c[1] === "add").map((c) => [c[2], c[3]]));
+  expect(members).toEqual({
+    "sck-fable": "models=a/gpt-6.1-sol", "sck-opus": "models=a/gpt-6.1-sol",
+    "sck-sonnet": "models=a/deepseek-v4.1-flash", "sck-haiku": "models=a/deepseek-v4.1-flash",
+  });
+});
+test("after the one-time grouping, membership is the owner's: manual edits stay, only unseen models are placed", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  let catalog = [{ id: "a/gpt-6.1-sol" }, { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }];
+  const store: Record<string, string[]> = {};
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, join(scratch, "controller-owner"), "unused", {
+    fetch: (async () => Response.json({ data: catalog })) as unknown as typeof fetch,
+    command: async (args) => { if (args[0] === "group" && args[1] === "add") store[args[2]!] = args[3]!.slice(7).split(","); },
+    groups: () => store,
+  });
+  await controller.refresh(true);
+  expect([...store["sck-sonnet"]!].sort()).toEqual(["a/deepseek-v4.1-flash", "a/kimi-k3"]);
+  // The owner takes kimi out of Sonnet and puts an unscored model into Haiku by hand.
+  store["sck-sonnet"] = ["a/deepseek-v4.1-flash"];
+  store["sck-haiku"] = [...store["sck-haiku"]!, "a/hand-picked"];
+  // A model magpie has never served before appears.
+  catalog = [...catalog, { id: "b/glm-5.3-flash" }];
+  await controller.refresh(true);
+  expect(store["sck-sonnet"]!.includes("a/kimi-k3")).toBe(false);
+  expect(store["sck-haiku"]).toContain("a/hand-picked");
+  expect(store["sck-sonnet"]).toContain("b/glm-5.3-flash");
+  expect(store["sck-haiku"]).toContain("b/glm-5.3-flash");
+  expect(store["sck-opus"]).toEqual(["a/gpt-6.1-sol"]);
 });
 test("four explicit tiers and owner-approved role defaults never depend on task titles", () => {
   expect(taskTier({ model_tier: "haiku", executor_role: "engineering" })).toBe("haiku");
@@ -314,6 +364,7 @@ test("controller writes only the four magpie tier groups, removes the retired se
   const { mkdirSync } = await import("node:fs");
   mkdirSync(join(home, "model-routing"), { recursive: true });
   writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-haiku-best": "x", __selector: "y", __options: "z" }));
+  const store: Record<string, string[]> = {};
   const controller = new ModelRoutingController(db as any, home, "unused", {
     fetch: (async () =>
       Response.json({
@@ -325,7 +376,9 @@ test("controller writes only the four magpie tier groups, removes the retired se
       })) as unknown as typeof fetch,
     command: async (args) => {
       calls.push(args);
+      if (args[0] === "group" && args[1] === "add") store[args[2]!] = args[3]!.slice(7).split(",");
     },
+    groups: () => store,
   });
   await controller.refresh(true);
   expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
