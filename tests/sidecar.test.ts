@@ -532,6 +532,23 @@ describe('sidecar', () => {
     fresh.close();
   });
 
+  test('adopt keeps unknown leases unroutable until an authoritative retry confirms idle', async () => {
+    const i = inst('e-unconfirmed', { paseoAgentId: 'agent-unconfirmed', credential: undefined });
+    let unavailable = true;
+    const recoveringCore = { ...core, activeLeases: async () => {
+      if (unavailable) throw new Error('database unavailable');
+      return [];
+    }};
+    const fresh = new SidecarPool({ core: recoveringCore as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+    try {
+      await fresh.adopt([i]);
+      expect(fresh.routingLease('agent-unconfirmed')).toBeUndefined();
+      unavailable = false;
+      await fresh.adopt([i]);
+      expect(fresh.routingLease('agent-unconfirmed')).toMatchObject({ task: '', phase: 'idle' });
+    } finally { fresh.close(); }
+  });
+
   test('adopt fails closed when the complete lease lookup is ambiguous', async () => {
     const i = inst('e-ambiguous', { paseoAgentId: 'agent-ambiguous', role: 'qa', credential: undefined });
     const expires = new Date(Date.now() + 60_000).toISOString();
@@ -543,6 +560,7 @@ describe('sidecar', () => {
     authRole = 'qa';
     const fresh = new SidecarPool({ core: core as never, workforce: workforce as never, runDir, heartbeatMs: 10_000, sweepMs: 20 });
     await fresh.adopt([i]);
+    expect(fresh.routingLease('agent-ambiguous')).toBeUndefined();
     const env = fresh.env(i);
     const checkpoint = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'amb1', 'checkpoint', { text: 'ambiguous lease must not revive' });
     expect(checkpoint.ok).toBe(false);
