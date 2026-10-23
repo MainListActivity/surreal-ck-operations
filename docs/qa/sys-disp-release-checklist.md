@@ -50,7 +50,7 @@
 5. 受影响测试，在公司 fork 隔离库上运行。不得用裸 `bun test` 直连生产库：
    - 根：`bun run typecheck`；插件：`cd plugin && bun run typecheck`。
    - `bun run test:service`、`bun run test:channel`、`bun run test:bridge`，以及全量 `bun run test`，与 §5 基线逐项对照。
-   - `bun scripts/test-worktrees.ts tests/retire-gate.fork.test.ts`，应为 18 项全部通过。
+   - `bun scripts/test-worktrees.ts tests/retire-gate.fork.test.ts`，应为 19 项全部通过。
    - `bun scripts/test-worktrees.ts tests/retire-gate-revoke.fork.test.ts`，应为 10 项全部通过（撤凭证门禁、场景回收的非拒绝失败、复核阶段合法动作）。
    - 受影响文件集：`bun scripts/test-worktrees.ts` 加下列 14 个文件（共 157 项），应为 134 通过、23 跳过、0 失败：`contributor-cas.integration`、`mcp-run-reclaim.fork`、`worktree-scene`、`worktree-lock`、`implementer-binding.integration`、`dispatcher-sidecar.fork`、`retire-gate.fork`、`v3.integration`、`db.integration`、`retire-gate-revoke.fork`、`dispatch-episode.fork`、`internal-ai-proof.fork`、`paseo-dead-paths`、`worktree-registry.fork`（均为 `tests/` 下的 `.test.ts`）。
 6. 记录两面 SHA、`pnpm-lock.yaml` 哈希、vendor 生成物哈希与全部测试数字。
@@ -75,7 +75,7 @@
 | `test:channel` | 132 通过，13 跳过，0 失败 | 132 通过，13 跳过，0 失败（13 个文件，145 项） |
 | `test:bridge` | 372 通过，23 跳过，0 失败 | 372 通过，23 跳过，0 失败（24 个文件，395 项） |
 | 全量 | 982 个：938 通过，33 跳过，11 失败（gm-attention 5，triage 5，GitHub 重试 1） | 1011 个：967 通过，33 跳过，11 失败（失败名单与基线逐名相同） |
-| `retire-gate.fork.test.ts` | 基线不存在 | 18 项，全部通过 |
+| `retire-gate.fork.test.ts` | 基线不存在 | 19 项，全部通过 |
 | `retire-gate-revoke.fork.test.ts` | 基线不存在 | 10 项，全部通过（修复前 ca5c11e 上 9 项失败、1 项通过） |
 | 受影响 14 个文件 | 基线不存在 | 157 项：134 通过，23 跳过，0 失败 |
 
@@ -102,7 +102,7 @@
 - 层 1，存活与就绪：`/health` 与 `/ready` 均返回 200。
 - 层 2，真实 sck：用已登记员工通道执行 `sck call get_context '{}'`，核对返回。
 - 层 3，调度与活租约 adopt：插件重注册后，已有活租约的会话由 sidecar 的 adopt 恢复，不被误退役、不被重派。经理安排一次真实派工，核对 spawn、claim 与任务记录。
-- 退役门禁：生产上不执行退役测试，不制造退役或租约故障。门禁以 release 与 vendor 哈希、§3 的隔离测试（18 项与 10 项）及受影响文件集共同证明。
+- 退役门禁：生产上不执行退役测试，不制造退役或租约故障。门禁以 release 与 vendor 哈希、§3 的隔离测试（19 项与 10 项）及受影响文件集共同证明。
 - UI：Paseo Company 页面按 §10 的路径只读核对，不在生产造数。
 - 恢复编制（F-C，成功路径）：层 1 至层 3 全部通过，且 §6 的前置条件仍然成立之后，经理按 §6 第 3 步记录的原值逐个用 `def_ensure` 恢复 `enabled`（以 `def_list` 读出的完整定义为基础，只改 `enabled`）。原本即为 false 的编制保持 false。不归档作者，不减少席位，不启用原停用渠道。任一层未通过，不恢复，报经理。
 

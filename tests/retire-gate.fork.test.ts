@@ -255,7 +255,7 @@ test('(g1) a legacy task with no implementer field: its sole derived author is r
   expect(await isRetired(author)).toBe(false);
 });
 
-test('(g2) a legacy task with several authors and no implementer: every author is refused until a manager records one', async () => {
+test('(g2) a legacy task with one author and one claim-only handler and no implementer: both are refused until a manager records one', async () => {
   const first = await engineer('amb-a');
   const second = await engineer('amb-b');
   const t = await newTask('R1 g2 ambiguous');
@@ -264,9 +264,11 @@ test('(g2) a legacy task with several authors and no implementer: every author i
   await database.db.query('UPDATE $task SET implementer = NONE;', { task: new RecordId('task', t.id) });
   await database.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", phase: "execute", version: 0, at: time::now() };',
     { task: new RecordId('task', t.id), actor: employeeRef(second) });
+  // SYS-DISP IR01/Q1 (GM v71): a claim-only handler is a demoted hand, not erased — 实现者和退役门禁不得因该修复失效.
+  // With no recorded implementer every execute-phase handler is refused, the author and the hand alike.
   for (const who of [first, second]) {
     const error = await refusal(workforce.retire(who, WHY, 'manual'));
-    expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'review', phase: 'review', reason: 'implementer_unresolved' })]);
+    expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'review', phase: 'review', reason: 'legacy_implementer' })]);
     // The task waits for its review, and the takeover is an execute-phase action only (SYS-DISP F-D): the legal action says to wait.
     expect(error.details?.legalActions.join('\n')).not.toContain('implementer_takeover');
     expect(error.details?.legalActions.join('\n')).toContain('复核');
@@ -317,6 +319,24 @@ test('(g5) a pure reviewer is never labelled an author: it retires normally on f
   await expect(workforce.retire(reviewer, WHY, 'manual')).resolves.toBeUndefined();
   expect(await isRetired(reviewer)).toBe(true);
   expect(await isRetired(author)).toBe(false);
+});
+
+test('(g6) several claim-only handlers, no author and no implementer: every handler is refused as unresolved', async () => {
+  const one = await engineer('hands-one');
+  const two = await engineer('hands-two');
+  const t = await newTask('R1 g6 hands only');
+  for (const who of [one, two]) {
+    await database.db.query('CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", phase: "execute", version: 0, at: time::now() };',
+      { task: new RecordId('task', t.id), actor: employeeRef(who) });
+  }
+  // Nobody submitted anything and no implementer is recorded: the facts are ambiguous (SYS-DISP IR01/Q1/v77:
+  // 多名经手人都未提交且无记录实现负责人时保持 ambiguous), so every handler is refused until a manager records one.
+  for (const who of [one, two]) {
+    const error = await refusal(workforce.retire(who, WHY, 'manual'));
+    expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: t.id, state: 'ready', phase: 'execute', reason: 'implementer_unresolved' })]);
+    expect(error.details?.legalActions.join('\n')).toContain('implementer_takeover');
+    expect(await isRetired(who)).toBe(false);
+  }
 });
 
 test('(h) the admin retire command refuses an employee with an active lease through the same boundary: exit 1, stable code, nothing written', async () => {

@@ -18,8 +18,8 @@ import type { IndependencePolicy } from './contracts.ts';
  *    actor's next decisive action: submit = execute, accept/return = review. A row with no
  *    decisive follow-up is unknown and its actor counts as an author (fail-closed).
  *  - Implementer: the explicit `implementer` field when set, otherwise the single author.
- *    Several authors with no explicit implementer is ambiguous: nobody may execute until a
- *    manager records one.
+ *    Several authors, or several claim-only handlers, with no explicit implementer is
+ *    ambiguous: nobody may execute until a manager records one.
  *  - Consistency: every authorship change bumps the task version in the same transaction as
  *    its audit row. Lease transactions compare the version they read the facts at, so a
  *    change that lands in between is refused and the caller re-reads (CONTRIBUTION_MOVED).
@@ -59,7 +59,7 @@ export interface ContributionFacts {
   unknown: UnknownContribution[];
   /** Explicit implementer, or the only author when there is exactly one. */
   implementer?: string;
-  /** Several authors and no explicit implementer: nobody may execute until a manager records one. */
+  /** Several authors, or several claim-only handlers, and no explicit implementer: nobody may execute until a manager records one. */
   ambiguous: boolean;
   /**
    * Ordinary recusal set: authors plus the implementer. A claim-only holder (took an execute lease, never wrote code
@@ -70,10 +70,10 @@ export interface ContributionFacts {
   /**
    * Execute-phase holders with no code-writing evidence: they claimed (or checkpointed/released) but never submitted,
    * and their rows are not unknown-phase. Demoted for review, never hard-excluded, unless a policy names this task as
-   * a source of another — see `strictExcluded`, which is what the independence gate uses.
+   * a source of another — see `strictExcluded`, which the independence gate and the retirement gate use.
    */
   hands: string[];
-  /** Every execute-phase handler: authors, implementer and `hands`. What a strict independence source excludes. */
+  /** Every execute-phase handler: authors, implementer and `hands`. What a strict independence source excludes, and whom the retirement gate refuses when no implementer is recorded. */
   strictExcluded: string[];
 }
 
@@ -200,7 +200,8 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
     excluded,
     // The prior hands a review pool demotes: every claim-only holder, in either phase.
     hands: demoted,
-    // Every execute-phase handler: authors, implementer and the execute claim-only holders. What a strict source excludes.
+    // Every execute-phase handler: authors, implementer and the execute claim-only holders. What a strict source excludes and
+    // what the retirement gate relates to an unfinished task.
     strictExcluded: [...new Set([...excluded, ...handsOnly])].sort(),
   };
 }
@@ -386,7 +387,7 @@ export function proposeImplementer(taskId: string, facts: ContributionFacts, exp
   const unknownNote = facts.unknown.length ? `；${facts.unknown.length} 条历史无法判定阶段，按作者处理` : '';
   if (recorded) return { ...base, status: 'bound', implementer: recorded, note: `已绑定实现负责人，不做变更${unknownNote}` };
   if (facts.ambiguous) {
-    return { ...base, status: 'manager_decision', note: `多个作者且无显式实现负责人，需经理用 implementer_takeover 指定其一${unknownNote}` };
+    return { ...base, status: 'manager_decision', note: `多名经手人且无显式实现负责人，需经理用 implementer_takeover 指定其一${unknownNote}` };
   }
   if (facts.authors.length === 1) {
     return { ...base, status: 'proposal', suggestedImplementer: facts.authors[0],

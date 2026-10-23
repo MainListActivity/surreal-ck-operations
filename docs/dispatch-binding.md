@@ -5,7 +5,7 @@
 
 ## 一、规则
 
-- **作者**：提交过任务的人，或持有过执行阶段租约的人（认领、检查点、阻塞、释放）。作者身份永久保留，退回、撤销或改派都不会移除它。
+- **作者**：提交过任务的人，或经 `implementer_bound` 绑定的实现人。只持有过执行阶段租约、从未提交的经手人是 `hands`（降权，仍可领取与裁决复核；退役门禁中他们与作者同被拒，见下）。作者身份永久保留，退回、撤销或改派都不会移除它。
 - **复核人**：在复核阶段持有过任务、且不是作者或实现人的人。复核、退回、验收都不会使其成为作者，它可以重复复核，但不能实现。
 - **实现人**：首次执行阶段认领时绑定（`task.implementer`）。退回默认回到实现人修复，保留其登记分支与现场。
 - **独立复核**：`accept`、`return` 与复核阶段的认领，对全部作者与实现人一律拒绝，不只看最后一次提交人。
@@ -15,7 +15,7 @@
 - **退役硬门禁**：所有退役与撤凭证都经同一边界 `gateCredentialChange`（判定与写入都在 `src/retirement.ts`）。退役经 `Workforce.retire`（`admin retire`、调度器各退役点与场景回收），撤凭证经 `LocalEnrollmentAdmin.revoke`（`admin revoke`，安全撤销）。插件内的调度依赖也调用同一函数（随 vendor 重生成生效）。下列员工一律拒绝，且拒绝先于任何写入：
   - 仍持有任一任务的有效租约（任何阶段）：`active_lease`；
   - 是未结束任务（非 `done`、`void`）的显式实现人，包括返修（`ready`）、待复核（`review`）与阻塞（`blocked`，依赖或经理等待）：`bound_implementer`；
-  - 旧任务缺实现人字段：是唯一派生作者时为 `legacy_implementer`，多作者且无实现人时为 `implementer_unresolved`。无法判定阶段的旧行按作者计。
+  - 旧任务缺实现人字段：该任务的每个执行阶段经手人都被拒绝——作者、派生实现人，以及只领取/检查点/释放过但从未提交的经手人（`hands`；降权不等于解除关系）。归属不明（多名作者或多名只领取未提交的经手人）时为 `implementer_unresolved`，否则为 `legacy_implementer`。无法判定阶段的旧行按作者计；只参与复核的人不拒绝。
 
   不拒绝：只参与过复核、既不是作者也不是实现人的人；`done` 或 `void` 任务上的历史作者。作者身份永久保留，退役也不移除。
 
@@ -108,7 +108,7 @@
 - **写权预检与认领**：`tests/worktree-registry.fork.test.ts` 的 LANE 用例在公司 fork 上验证：预检报告的持有者与认领的拒绝一致（`worktree_busy`），拒绝时任务保持就绪，持有者提交后预检为空，认领落入同一条线的工作树。
 - **未知状态与审计读取失败**：同一文件中，会话状态为 `unknown` 时任务保持就绪、不派工、不显示为忙碌，实现人不被退役；状态恢复后续做，并写入 `dispatch_unblocked` 审计行。契约审计读取失败时结论同为 `unknown`，恢复后自动消警。
 - **复核容量与 04195c93 重放**：`tests/review-capacity-replay.fork.test.ts` 在真实核心与调度器上运行。作者 A、B、C 全部回避、席位已满、额度为 0 时，花名册与脉冲给出同一根因，三人的复核认领被拒绝；第四复核人 D 被唤醒，真实核心接受其认领。04195c93 的已保存历史经产品推导函数只读重放，结论为 `manager_decision`，不写库。重放输出默认写入临时目录（`SCK_B5_OUT_DIR` 可指定），已保存的复核证据不会被普通运行覆盖。
-- **退役门禁**：`tests/retire-gate.fork.test.ts`（18 项，公司 fork 真实库）覆盖：活租约、返修、待复核与阻塞绑定的拒绝；无在办关系的正常退役与重复调用幂等；认领与接手同退役的竞争（两侧抖动交错 f1、f2），以及决定后钩子确定性交错（k、k2）；legacy 失败关闭、完成任务旧作者可退役、纯复核人不误标作者（g1 至 g5）；`admin retire` 子进程（h、h2）；调度器 tick（i）与场景回收（j）。`tests/retire-gate-revoke.fork.test.ts`（10 项，公司 fork 真实库）覆盖：撤凭证的活租约与返修绑定拒绝（写入前即拒绝，凭证不变）；无在办关系的撤凭证、安全撤销标记保留与幂等；`admin revoke` 子进程拒绝（退出码 1）；决定后认领的确定性交错；认领与撤凭证竞争（24 轮，两者不会同时成功，活租约持有人不被撤凭证）；场景回收的非拒绝失败（真实 `Workforce.retire` 与 `createSceneCleaner`）；复核阶段合法动作不推荐 `implementer_takeover`，多条动作分隔。sidecar 入口的覆盖：轮换保留实现人用例见 `tests/dispatcher-sidecar.fork.test.ts`（"company fork: session rotation never retires the bound implementer of an active task"），它在公司 fork 真实库上经真实 `Dispatcher.tick` 与 `SidecarPool` 的请求、回应覆盖轮换退役路径（Paseo 为内存网关）。插件重启 adopt 的轮换凭证与绑定重写见 `tests/sidecar-plugin-integration.test.ts`（替身 Paseo，与门禁无关）；真实插件进程的 adopt 由发布清单 §7 层 3 核对。原残余 N1（手工归档检查）已由硬门禁关闭，不再依赖人工确认。
+- **退役门禁**：`tests/retire-gate.fork.test.ts`（19 项，公司 fork 真实库）覆盖：活租约、返修、待复核与阻塞绑定的拒绝；无在办关系的正常退役与重复调用幂等；认领与接手同退役的竞争（两侧抖动交错 f1、f2），以及决定后钩子确定性交错（k、k2）；legacy 失败关闭、无实现人字段时作者与只领取未提交经手人同被拒（g2）、多名经手人且无作者为 `implementer_unresolved`（g6）、完成任务旧作者可退役、纯复核人不误标作者（g1 至 g6）；`admin retire` 子进程（h、h2）；调度器 tick（i）与场景回收（j）。`tests/retire-gate-revoke.fork.test.ts`（10 项，公司 fork 真实库）覆盖：撤凭证的活租约与返修绑定拒绝（写入前即拒绝，凭证不变）；无在办关系的撤凭证、安全撤销标记保留与幂等；`admin revoke` 子进程拒绝（退出码 1）；决定后认领的确定性交错；认领与撤凭证竞争（24 轮，两者不会同时成功，活租约持有人不被撤凭证）；场景回收的非拒绝失败（真实 `Workforce.retire` 与 `createSceneCleaner`）；复核阶段合法动作不推荐 `implementer_takeover`，多条动作分隔。sidecar 入口的覆盖：轮换保留实现人用例见 `tests/dispatcher-sidecar.fork.test.ts`（"company fork: session rotation never retires the bound implementer of an active task"），它在公司 fork 真实库上经真实 `Dispatcher.tick` 与 `SidecarPool` 的请求、回应覆盖轮换退役路径（Paseo 为内存网关）。插件重启 adopt 的轮换凭证与绑定重写见 `tests/sidecar-plugin-integration.test.ts`（替身 Paseo，与门禁无关）；真实插件进程的 adopt 由发布清单 §7 层 3 核对。原残余 N1（手工归档检查）已由硬门禁关闭，不再依赖人工确认。
 - **未覆盖或仅部分覆盖**：
   - Paseo 只采样了 0.12.0 版本与上列只读命令；其他版本、`workspace create` 的返回形状与 `LastUsage` 字段未验证。
   - `paseo ls` 失败时整轮 tick 抛错：不派工、不退役，但不会把各会话逐个标记为 `unknown`。该行为未改，待定。

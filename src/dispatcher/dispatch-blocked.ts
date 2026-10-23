@@ -138,7 +138,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   resources: '宿主机资源低于水位',
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
-  implementer_unresolved: '多个作者且无实现负责人，需经理指定',
+  implementer_unresolved: '多名经手人且无实现负责人，需经理指定',
   implementer_unavailable: '实现人会话已失效，系统自动改派在岗工程员工',
   implementer_quota: '实现人订阅额度持续不可用，需等待恢复或经理接手',
   author_recusal: '本任务作者（写过或提交过）不能复核',
