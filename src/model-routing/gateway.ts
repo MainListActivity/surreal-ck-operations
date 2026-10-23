@@ -18,6 +18,7 @@ import {
   modelIdentity,
   taskTier,
   selectedTier,
+  employeeTier,
   type Tier,
 } from "./policy.ts";
 export interface RoutingLease {
@@ -180,7 +181,9 @@ export async function startModelGateway(
       }
       // A user-selected Haiku is real task work, just like the other three tiers.
       const auxiliary = match[2]!.endsWith("count_tokens");
-      const tier = selectedTier(body.model) ?? lease.tier;
+      const selected = selectedTier(body.model) ?? lease.tier;
+      // Fable is an owner-only Magpie entry. Legacy busy employees can still send their old Fable name.
+      const tier = lease.role!=='story-author' && selected==='fable' ? employeeTier(lease.role) : selected;
       // Older releases may already have injected the gateway into a story-author comm directory.
       // Preserve that author's configured model rather than applying the new employee defaults.
       const requested = lease.role==='story-author' && typeof body.model==='string' ? body.model : `group/sck-${tier}`;
