@@ -3,6 +3,8 @@
 // fixtures are seeded in separate namespaces. Only namespace B receives the new version's write (a paged read that creates
 // company_meta:cursor_key). The previous runtime then runs against both, and its decisions must match.
 // Gated by RUN_SCK_ROLLBACK_FORK_TESTS=1 (scripts/test-worktrees.ts sets it).
+// The independence isolation evidence (a policy written by the new code, then the old release on the same data) is
+// tests/rollback-isolation-independence.fork.test.ts, which pins 20b384e — the release deployed as `active` today.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';

@@ -456,7 +456,7 @@ export interface IndependencePolicy {
   stages: IndependenceStage[];
   sources: TaskId[];
   mode: IndependenceMode;
-  /** Employees named explicitly (for example a code author or QA). Their registered definition's siblings are excluded too. */
+  /** Employees named explicitly (for example a code author or QA). Only these employees and anyone sharing a registered identity principal with them are excluded (SYS-DISP Q3): a definition is a capacity template, never an identity, so its other employees stay independent. */
   excluded: EmployeeId[];
   reason: string;
   setBy: EmployeeId;

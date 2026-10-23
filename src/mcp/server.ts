@@ -426,7 +426,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('independence_set', {
-    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers) and the named employees, and same-definition siblings of either, may not take the task (execute) or decide it (review). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
+    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200),
       stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),

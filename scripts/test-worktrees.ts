@@ -59,7 +59,7 @@ try {
     'tests/owner-aging.fork.test.ts', 'tests/pipelines.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/loop-breaker.fork.test.ts', 'tests/owner-commands.fork.test.ts',
     'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts',
     'tests/input-bounds.integration.test.ts',
-    'tests/rollback-isolation.fork.test.ts', 'tests/null-absent.fork.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
     'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
