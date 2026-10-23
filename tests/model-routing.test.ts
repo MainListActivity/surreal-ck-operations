@@ -17,39 +17,84 @@ import {
   routingEnv,
   type RoutingLease,
 } from "../src/model-routing/gateway.ts";
-// @ts-ignore Gateway module is deliberately plain JS, executed by magpie's JS runtime.
-import { onRequest } from "../magpie/sck-performance.gateway.js";
 const models = classify([
   { id: "claude/claude-opus-5-5" },
   { id: "codex/gpt-6-astra" },
   { id: "claude/claude-haiku-5-5" },
   { id: "relay/mystery" },
+  { id: "relay/mimo-v2.6-flash" },
+  { id: "codex/gpt-6-luna" },
   { id: "group/any" },
   { id: "auto/gpt-6-astra" },
   { id: "remote-magpie/group/x" },
 ]);
-test("catalog matches exact benchmark versions, conservatively classifies unknown models and omits group aliases", () => {
-  expect(models).toHaveLength(4);
+test("catalog matches exact benchmark versions, admits only AA >= 38 and omits group aliases", () => {
+  expect(models.map((m) => m.model).sort()).toEqual(["claude-haiku-5-5", "claude-opus-5-5", "gpt-6-astra", "gpt-6-luna"]);
   expect(models.find((m) => m.model === "claude-opus-5-5")).toMatchObject({
     tier: "fable",
     estimated: false,
   });
   expect(models.find((m) => m.model === "claude-haiku-5-5")?.tier).toBe(
-    "opus",
+    "sonnet",
   );
-  // Unbenchmarked is unknown, not weak: neutral tier, ranked last by its prior.
-  expect(models.find((m) => m.model === "mystery")).toMatchObject({
-    tier: "sonnet",
-    estimated: true,
-    benchmark: undefined,
-  });
+  // Owner rule: unscored (mystery) and below the floor (mimo-v2.6-flash, 37.9) enter no tier; 38.1 does.
+  expect(models.some((m) => m.model === "mystery" || m.model === "mimo-v2.6-flash")).toBe(false);
+  expect(models.find((m) => m.model === "gpt-6-luna")?.tier).toBe("sonnet");
   expect(classify([{ id: "sn/deepseek-v4.1-flash" }])[0]).toMatchObject({
     benchmark: "deepseek-v4-1-flash-1017",
     estimated: false,
   });
-  expect(
-    classify([{ id: "relay/claude-opus-5-5-preview" }])[0]?.benchmark,
-  ).toBeUndefined();
+  expect(classify([{ id: "relay/claude-opus-5-5-preview" }])).toEqual([]);
+});
+test("tier lines are the owner's anchor models: deepseek-v4.1-flash and below is Sonnet/Haiku, up to sonnet-5.5 is Opus", () => {
+  const tiers = Object.fromEntries(classify([
+    { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }, { id: "a/gpt-6.1-sol" },
+    { id: "a/gpt-6-astra" }, { id: "a/claude-sonnet-5-5" }, { id: "a/claude-opus-5-5" },
+  ]).map((m) => [m.model, m.tier]));
+  expect(tiers).toEqual({
+    "deepseek-v4.1-flash": "sonnet", "kimi-k3": "sonnet",
+    "gpt-6.1-sol": "opus", "gpt-6-astra": "opus", "claude-sonnet-5-5": "opus",
+    "claude-opus-5-5": "fable",
+  });
+});
+test("Haiku serves the Sonnet pool, and Fable serves Opus while its own models are excluded", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  const calls: string[][] = [];
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true, disabledModels: ["a/claude-opus-5-5"] }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, join(scratch, "controller-pools"), "unused", {
+    fetch: (async () => Response.json({ data: [{ id: "a/claude-opus-5-5" }, { id: "a/gpt-6.1-sol" }, { id: "a/deepseek-v4.1-flash" }] })) as unknown as typeof fetch,
+    command: async (args) => { calls.push(args); },
+  });
+  await controller.refresh(true);
+  const members = Object.fromEntries(calls.filter((c) => c[1] === "add").map((c) => [c[2], c[3]]));
+  expect(members).toEqual({
+    "sck-fable": "models=a/gpt-6.1-sol", "sck-opus": "models=a/gpt-6.1-sol",
+    "sck-sonnet": "models=a/deepseek-v4.1-flash", "sck-haiku": "models=a/deepseek-v4.1-flash",
+  });
+});
+test("after the one-time grouping, membership is the owner's: manual edits stay, only unseen models are placed", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  let catalog = [{ id: "a/gpt-6.1-sol" }, { id: "a/deepseek-v4.1-flash" }, { id: "a/kimi-k3" }];
+  const store: Record<string, string[]> = {};
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, join(scratch, "controller-owner"), "unused", {
+    fetch: (async () => Response.json({ data: catalog })) as unknown as typeof fetch,
+    command: async (args) => { if (args[0] === "group" && args[1] === "add") store[args[2]!] = args[3]!.slice(7).split(","); },
+    groups: () => store,
+  });
+  await controller.refresh(true);
+  expect([...store["sck-sonnet"]!].sort()).toEqual(["a/deepseek-v4.1-flash", "a/kimi-k3"]);
+  // The owner takes kimi out of Sonnet and puts an unscored model into Haiku by hand.
+  store["sck-sonnet"] = ["a/deepseek-v4.1-flash"];
+  store["sck-haiku"] = [...store["sck-haiku"]!, "a/hand-picked"];
+  // A model magpie has never served before appears.
+  catalog = [...catalog, { id: "b/glm-5.3-flash" }];
+  await controller.refresh(true);
+  expect(store["sck-sonnet"]!.includes("a/kimi-k3")).toBe(false);
+  expect(store["sck-haiku"]).toContain("a/hand-picked");
+  expect(store["sck-sonnet"]).toContain("b/glm-5.3-flash");
+  expect(store["sck-haiku"]).toContain("b/glm-5.3-flash");
+  expect(store["sck-opus"]).toEqual(["a/gpt-6.1-sol"]);
 });
 test("four explicit tiers and owner-approved role defaults never depend on task titles", () => {
   expect(taskTier({ model_tier: "haiku", executor_role: "engineering" })).toBe("haiku");
@@ -64,7 +109,7 @@ test("four explicit tiers and owner-approved role defaults never depend on task 
 });
 test("task evidence changes priority without allowing one tiny sample to dominate or crossing domains", () => {
   const now = Date.now();
-  const weak = models.find((m) => m.model === "mystery")!;
+  const weak = { id: "relay/mystery", model: "mystery", tier: "sonnet" as const, prior: 2.5, estimated: true, context: 32768 };
   const strong = models.find((m) => m.model === "claude-opus-5-5")!;
   const results = Array.from({ length: 60 }, () => ({
     model: weak.id,
@@ -115,32 +160,6 @@ test("one model served through several accounts shares its task evidence", () =>
   const ranked = rank([a!, b!, opus], results, "engineering");
   expect(ranked[0]?.id).toBe(opus.id);
   expect(ranked.find((m) => m.id === b!.id)?.samples).toBe(30);
-});
-test("selector is deterministic per task lease, explores candidates and preserves unrelated requests", () => {
-  const options = {
-    routes: {
-      "group/sck-opus": [
-        { group: "group/first" },
-        { group: "group/second" },
-        { group: "group/third" },
-      ],
-    },
-  };
-  const chosen = new Set();
-  for (let i = 0; i < 1000; i++) {
-    const body = {
-      model: "group/sck-opus",
-      metadata: { user_id: `lease-${i}` },
-      tools: [{ name: "x" }],
-    };
-    const a = onRequest(body, { options });
-    expect(a).toEqual(onRequest(body, { options }));
-    expect(a.tools).toEqual(body.tools);
-    expect(body.model).toBe("group/sck-opus");
-    chosen.add(a.model);
-  }
-  expect(chosen.size).toBe(3);
-  expect(onRequest({ model: "personal/model" }, { options })).toBeUndefined();
 });
 test("actual model identity never turns an unresolved group into a model score", () => {
   expect(modelIdentity("claude", "claude-opus-5-5")).toBe(
@@ -279,18 +298,17 @@ describe("streaming task gateway", () => {
       await g.stop();
     }
   });
-  test("manual Haiku is task work and switching tiers never reuses another tier's pin", async () => {
-    const rows:any[]=[], sent:string[]=[]; const pins=new Map<string,string>();
+  test("every request names a magpie tier group: cheaper tiers allowed, never above the lease, never a concrete model", async () => {
+    const rows:any[]=[], sent:string[]=[];
     const g=await startModelGateway({lease:async()=>lease,record:async r=>{rows.push(r)},complete:async()=>{},
-      pins:{get:k=>pins.get(k),set:(k,v)=>{if(v)pins.set(k,v);else pins.delete(k)}},
-      fetchImpl:(async (_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}',{headers:{'x-magpie-provider':'relay','x-magpie-model':`actual-${sent.length}`}})}) as typeof fetch},0);
+      fetchImpl:(async (_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}',{headers:{'x-magpie-provider':'claude','x-magpie-model':'claude-sonnet-5-5'}})}) as typeof fetch},0);
     try {
-      for(const model of ['haiku','sonnet','opus']) {
+      // Twice the same: magpie having served a concrete model must not turn the next request into it.
+      for(const model of ['haiku','sonnet','opus','group/sck-fable','claude/claude-sonnet-5-5[1m]','claude/claude-sonnet-5-5[1m]']) {
         const r=await fetch(`http://127.0.0.1:${g.port}/a/x/v1/messages`,{method:'POST',body:JSON.stringify({model,messages:[]})});await r.text();
       }
-      expect(sent).toEqual(['group/sck-haiku','group/sck-sonnet','group/sck-opus']);
-      expect(rows.every(r=>r.phase==='execute')).toBe(true);
-      expect(pins.size).toBe(3);
+      expect(sent).toEqual(['group/sck-haiku','group/sck-sonnet','group/sck-opus','group/sck-opus','group/sck-opus','group/sck-opus']);
+      expect(rows.every(r=>r.phase==='execute' && r.model==='claude/claude-sonnet-5-5')).toBe(true);
     } finally {await g.stop()}
   });
   test("quota/failed requests retain infrastructure evidence and are not successful model work", async () => {
@@ -327,60 +345,72 @@ describe("streaming task gateway", () => {
   });
 });
 
-test("controller publishes complete model groups before selector options and reruns idempotently", async () => {
+test("controller writes only the four magpie tier groups, removes the retired selector and reruns idempotently", async () => {
   const { ModelRoutingController } = await import(
     "../src/model-routing/controller.ts"
   );
   const calls: string[][] = [];
   let status: any;
+  const home = join(scratch, "controller");
   const db = {
     query: async (sql: string, vars: any) =>
       sql.includes("SELECT enabled")
         ? [{ enabled: true }]
-        : sql.includes("FROM model_scorecard")
+        : sql.includes("FROM model_scorecard") || sql.includes("story-author")
           ? [[]]
           : ((status = vars), []),
   };
-  const controller = new ModelRoutingController(
-    db as any,
-    join(scratch, "controller"),
-    join(import.meta.dir, "../magpie/sck-performance.gateway.js"),
-    "unused",
-    {
-      fetch: (async () =>
-        Response.json({
-          data: [
-            { id: "claude/claude-opus-5-5" },
-            { id: "claude/claude-haiku-5-5" },
-            { id: "relay/mystery" },
-          ],
-        })) as unknown as typeof fetch,
-      command: async (args) => {
-        calls.push(args);
-      },
+  // State left by the release that rewrote tiers into concrete-model route groups.
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(home, "model-routing"), { recursive: true });
+  writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-haiku-best": "x", __selector: "y", __options: "z" }));
+  const store: Record<string, string[]> = {};
+  const controller = new ModelRoutingController(db as any, home, "unused", {
+    fetch: (async () =>
+      Response.json({
+        data: [
+          { id: "claude/claude-opus-5-5" },
+          { id: "claude/claude-haiku-5-5" },
+          { id: "relay/mystery" },
+        ],
+      })) as unknown as typeof fetch,
+    command: async (args) => {
+      calls.push(args);
+      if (args[0] === "group" && args[1] === "add") store[args[2]!] = args[3]!.slice(7).split(",");
     },
-  );
+    groups: () => store,
+  });
   await controller.refresh(true);
-  expect(status.models).toHaveLength(3);
-  // A path plugin is addressed by its absolute path; the bare stem is "no plugin" to magpie.
-  const selector = join(scratch, "controller", "model-routing", "sck-performance.gateway.js");
-  expect(calls.find((c) => c[0] === "plugin" && c[1] === "add")).toEqual(["plugin", "add", selector]);
-  expect(calls.at(-1)?.slice(0, 3)).toEqual(["plugin", "on", selector]);
-  const options = JSON.parse(calls.find(c=>c[0]==="plugin" && c[1]==="options")![3]!);
-  expect(options.routes["group/sck-fable"][0].model).toBe(
-    "claude/claude-opus-5-5",
-  );
-  expect(
-    calls
-      .filter((c) => c[0] === "group")
-      .every((c) => c.includes("routing=order") && c.includes("stays=session")),
-  ).toBe(true);
+  expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
+  const groups = calls.filter((c) => c[0] === "group" && c[1] === "add");
+  expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
+  expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=session"))).toBe(true);
+  expect(groups.every((c) => !c.join(" ").includes("mystery"))).toBe(true);
+  expect(calls).toContainEqual(["plugin", "rm", join(home, "model-routing", "sck-performance.gateway.js")]);
+  expect(calls).toContainEqual(["group", "rm", "sck-route-haiku-best"]);
+  expect(calls.some((c) => c[0] === "plugin" && c[1] !== "rm")).toBe(false);
+  expect(status.routes["group/sck-fable"][0].model).toBe("claude/claude-opus-5-5");
   const n = calls.length;
   await controller.refresh(true);
-  expect(calls.length).toBe(n+1);
-  expect(calls.at(-1)).toEqual(["plugin","on",selector]);
+  expect(calls.length).toBe(n);
 });
 
+test("removing a route group that is already gone does not fail the sync", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  const home = join(scratch, "controller-gone");
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(home, "model-routing"), { recursive: true });
+  writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-opus-best": "x" }));
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, home, "unused", {
+    fetch: (async () => Response.json({ data: [{ id: "claude/claude-opus-5-5" }] })) as unknown as typeof fetch,
+    command: async (args) => {
+      if (args[0] === "group" && args[1] === "rm") throw Error('magpie management command failed: group rm: magpie: no group "sck-route-opus-best"');
+    },
+  });
+  await controller.refresh(true);
+  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
+});
 test("durable local queue never waits for remote DB, survives restart and retains completions during a slow flush", async () => {
   const { ExecutionJournal } = await import("../src/model-routing/journal.ts");
   const dir = join(scratch, "queue");
@@ -425,17 +455,6 @@ test("durable local queue never waits for remote DB, survives restart and retain
   expect(() => readFileSync(join(dir, "request-1.json"), "utf8")).toThrow();
 });
 
-test("model pins survive restart, expire and are released when the selected model fails", async () => {
-  const { RoutingPins } = await import("../src/model-routing/pins.ts");
-  const path = join(scratch, "pins.json");
-  const pins = new RoutingPins(path);
-  pins.set("lease", "relay/a");
-  expect(new RoutingPins(path).get("lease")).toBe("relay/a");
-  pins.set("lease", undefined);
-  expect(new RoutingPins(path).get("lease")).toBeUndefined();
-  writeFileSync(path, JSON.stringify({ old: { model: "relay/old", at: 0 } }));
-  expect(new RoutingPins(path).get("old")).toBeUndefined();
-});
 
 test("in-band SSE errors and truncated responses never count as completed model work", async () => {
   for (const data of [
@@ -482,67 +501,6 @@ test("in-band SSE errors and truncated responses never count as completed model 
   }
 });
 
-test("a pinned model is reused after policy changes and quota failure falls back through its tier group", async () => {
-  const pins = new Map<string, string>();
-  const input: string[] = [];
-  let unavailable = false;
-  const g = await startModelGateway(
-    {
-      pins: {
-        get: (k) => pins.get(k),
-        set: (k, v) => {
-          if (v) pins.set(k, v);
-          else pins.delete(k);
-        },
-      },
-      lease: async () => ({
-        employee: "e",
-        task: "t",
-        fence: 1,
-        role: "engineering",
-        tier: "opus",
-        phase: "execute",
-      }),
-      record: async () => {},
-      complete: async () => {},
-      fetchImpl: (async (_url: any, init: any) => {
-        const m = JSON.parse(String(init!.body)).model;
-        input.push(m);
-        if (unavailable && m === "relay/first")
-          return new Response("{}", { status: 429 });
-        return new Response("{}", {
-          headers: {
-            "x-magpie-provider": "relay",
-            "x-magpie-model": unavailable ? "second" : "first",
-          },
-        });
-      }) as unknown as typeof fetch,
-    },
-    0,
-  );
-  try {
-    const send = async () => {
-      const r = await fetch(`http://127.0.0.1:${g.port}/a/e/v1/messages`, {
-        method: "POST",
-        body: "{}",
-      });
-      await r.text();
-    };
-    await send();
-    await send();
-    unavailable = true;
-    await send();
-    expect(input).toEqual([
-      "group/sck-opus",
-      "relay/first",
-      "relay/first",
-      "group/sck-opus",
-    ]);
-    expect([...pins.values()]).toEqual(["relay/second"]);
-  } finally {
-    await g.stop();
-  }
-});
 
 test("routing settings rollback preserves edits and restores only its managed keys", async () => {
   const { restoreRoutingSettings } = await import(
@@ -603,14 +561,14 @@ test("magpie management batches group saves, keeps DB secrets out of child env a
 });
 
 
-test("upstream connection failures release a model pin so the next request re-enters its group", async () => {
-  const pins=new Map<string,string>(),sent:string[]=[];
+test("an upstream connection failure is a 502 and the next request still names the tier group", async () => {
+  const sent:string[]=[];
   const g=await startModelGateway({lease:async()=>({employee:'worker',task:'task',fence:1,role:'qa',tier:'haiku',phase:'execute'}),
-    record:async()=>{},complete:async()=>{},pins:{get:k=>pins.get(k),set:(k,v)=>{if(v)pins.set(k,v);else pins.delete(k)}},
+    record:async()=>{},complete:async()=>{},
     fetchImpl:(async(_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);if(sent.length===2)throw Error('ECONNRESET');return new Response('{}',{headers:{'x-magpie-provider':'relay','x-magpie-model':'actual'}})}) as typeof fetch},0);
   try {
     for(let n=0;n<3;n++){const r=await fetch(`http://127.0.0.1:${g.port}/a/worker/v1/messages`,{method:'POST',body:'{}'});expect(r.status).toBe(n===1?502:200);await r.text()}
-    expect(sent).toEqual(['group/sck-haiku','relay/actual','group/sck-haiku']);
+    expect(sent).toEqual(['group/sck-haiku','group/sck-haiku','group/sck-haiku']);
   } finally {await g.stop()}
 });
 
@@ -654,7 +612,5 @@ test("Fable stays owner-only even when a legacy busy employee sends a Fable mode
   try {
     for(const model of ['claude-fable-5-1','group/sck-fable']){const r=await fetch(`http://127.0.0.1:${g.port}/a/legacy/v1/messages`,{method:'POST',body:JSON.stringify({model})});await r.text();}
     expect(sent).toEqual(['group/sck-haiku','group/sck-haiku']);
-    const direct=onRequest({model:'group/sck-fable'},{options:{routes:{'group/sck-fable':[{group:'group/sck-route-fable-best'}]}}});
-    expect(direct.model).toBe('group/sck-route-fable-best');
   }finally{await g.stop()}
 });

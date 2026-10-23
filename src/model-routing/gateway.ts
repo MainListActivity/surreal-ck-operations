@@ -19,6 +19,7 @@ import {
   taskTier,
   selectedTier,
   employeeTier,
+  tierRank,
   type Tier,
 } from "./policy.ts";
 export interface RoutingLease {
@@ -35,10 +36,6 @@ export interface GatewayDeps {
   complete(id: string, completed: boolean): Promise<void>;
   upstream?: string;
   fetchImpl?: typeof fetch;
-  pins?: {
-    get(key: string): string | undefined;
-    set(key: string, model: string | undefined): void;
-  };
 }
 export const ROUTING_PORT = 18779;
 /** Project-local settings override a user's global settings.env without changing their personal sessions. */
@@ -179,11 +176,14 @@ export async function startModelGateway(
         res.writeHead(400).end();
         return;
       }
-      // A user-selected Haiku is real task work, just like the other three tiers.
       const auxiliary = match[2]!.endsWith("count_tokens");
-      const selected = selectedTier(body.model) ?? lease.tier;
-      // Fable is an owner-only Magpie entry. Legacy busy employees can still send their old Fable name.
-      const tier = lease.role!=='story-author' && selected==='fable' ? employeeTier(lease.role) : selected;
+      // Containment is magpie's: every request names one of its tier groups, and a group never serves
+      // outside its members. A concrete model ID is never sent — an unserved one can be answered by
+      // the Claude sign-in instead (sonnet, 2026-10-23). The lease's tier is a ceiling: a request may
+      // pick a cheaper tier, never a stronger one, and Fable stays owner-only.
+      const ceiling = lease.tier === 'fable' ? employeeTier(lease.role) : lease.tier;
+      const asked = selectedTier(body.model);
+      const tier = asked && tierRank(asked) > tierRank(ceiling) ? asked : ceiling;
       // Older releases may already have injected the gateway into a story-author comm directory.
       // Preserve that author's configured model rather than applying the new employee defaults.
       const requested = lease.role==='story-author' && typeof body.model==='string' ? body.model : `group/sck-${tier}`;
@@ -222,31 +222,13 @@ export async function startModelGateway(
         if (typeof v === "string") headers.set(name, v);
       }
       const started = Date.now();
-      const pin = auxiliary ? undefined : deps.pins?.get(session);
-      if (pin) body.model = pin;
-      const send = () =>
-        (deps.fetchImpl ?? fetch)(new URL(match[2]!, upstream), {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: AbortSignal.any([abort.signal, AbortSignal.timeout(900000)]),
-        });
-      let reply;
-      try { reply = await send(); } catch (error) {
-        if (!abort.signal.aborted) deps.pins?.set(session, undefined);
-        throw error;
-      }
-      if (
-        pin &&
-        [400, 401, 402, 403, 404, 408, 413, 429, 500, 502, 503, 504].includes(
-          reply.status,
-        )
-      ) {
-        await reply.body?.cancel();
-        deps.pins?.set(session, undefined);
-        body.model = requested;
-        reply = await send();
-      }
+      // Stickiness to one model per lease is magpie's (`stays=session` on x-magpie-session).
+      const reply = await (deps.fetchImpl ?? fetch)(new URL(match[2]!, upstream), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([abort.signal, AbortSignal.timeout(900000)]),
+      });
       const model = modelIdentity(
         reply.headers.get("x-magpie-provider"),
         reply.headers.get("x-magpie-model"),
@@ -261,7 +243,6 @@ export async function startModelGateway(
         else res.end();
         return;
       }
-      if (model && reply.ok && !auxiliary) deps.pins?.set(session, model);
       const retrySeconds = Math.max(
         15,
         Math.min(900, Number(reply.headers.get("retry-after")) || 60),
@@ -355,13 +336,10 @@ export async function startModelGateway(
           callback();
         },
       });
-      if (reply.body) {
-        try { await pipeline(Readable.fromWeb(reply.body as never), tap, res); }
-        catch (error) { if (!abort.signal.aborted) deps.pins?.set(session, undefined); throw error; }
-      }
+      if (reply.body)
+        await pipeline(Readable.fromWeb(reply.body as never), tap, res);
       else res.end();
       const completed = !failed && (!sse || terminal);
-      if (!completed && !auxiliary) deps.pins?.set(session, undefined);
       await deps.complete(execution, completed);
     } catch {
       if (execution) await deps.complete(execution, false).catch(() => {});

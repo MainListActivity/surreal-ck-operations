@@ -47,6 +47,15 @@ export function employeeTier(role?: string): Tier {
 export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
   return def?.role !== "story-author" && def?.provider === "claude" && !!def?.model?.startsWith("group/sck-") && !!selectedTier(def.model?.replace(/^group\/sck-(engineering|writing|general)-/, ""));
 }
+/** Owner rule: no tier may hold a model scoring below this on the AA Intelligence Index. Unscored is not admitted. */
+export const AA_FLOOR = 38;
+export const tierRank = (t: Tier) => TIERS.indexOf(t);
+/** Owner rule (2026-10-23): boundaries are models, not numbers, so a rescored anchor moves its line.
+ * <= deepseek-v4.1-flash: Sonnet and Haiku (one shared pool); above it up to and including
+ * claude-sonnet-5.5: Opus; above sonnet-5.5: Fable. */
+export const TIER_ANCHORS = { opusAbove: "deepseek-v4.1-flash", fableAbove: "claude-sonnet-5-5" } as const;
+/** Haiku has no band of its own; it serves the Sonnet pool. */
+export const tierPool = (t: Tier): Tier => (t === "haiku" ? "sonnet" : t);
 const normalize = (s: string) =>
   s
     .toLowerCase()
@@ -55,7 +64,29 @@ const normalize = (s: string) =>
 /** One model served through several accounts shares its task evidence. */
 export const canonicalModel = (id: string) =>
   normalize(id.slice(id.lastIndexOf("/") + 1));
-/** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark. */
+/** Exact version, or the same version with a dated snapshot suffix (e.g. "-1017"); any other suffix is not. */
+function benchmarkOf(model: string) {
+  const canonical = normalize(model);
+  return (
+    benchmark.models.find((b) => b.slug === canonical) ??
+    benchmark.models.find(
+      (b) =>
+        b.slug.startsWith(`${canonical}-`) &&
+        /^\d{4,8}$/.test(b.slug.slice(canonical.length + 1)),
+    )
+  );
+}
+function anchorScore(model: string): number {
+  const score = benchmarkOf(model)?.score;
+  if (score === undefined) throw Error(`tier anchor ${model} has no AA score`);
+  return score;
+}
+export function tierOf(score: number): Tier {
+  return score > anchorScore(TIER_ANCHORS.fableAbove) ? "fable"
+    : score > anchorScore(TIER_ANCHORS.opusAbove) ? "opus" : "sonnet";
+}
+/** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark.
+ * Models without a public score, or below AA_FLOOR, are left out of every tier. */
 export function classify(catalog: CatalogModel[]): ModelCandidate[] {
   return catalog
     .filter(
@@ -67,29 +98,24 @@ export function classify(catalog: CatalogModel[]): ModelCandidate[] {
         (!m.native_endpoints ||
           m.native_endpoints.some((p) => /messages|responses|chat/.test(p))),
     )
-    .map<ModelCandidate>((m) => {
+    .map<ModelCandidate & { score?: number }>((m) => {
       const model = m.id.slice(m.id.lastIndexOf("/") + 1);
-      const canonical = normalize(model);
-      // A dated snapshot slug (e.g. "-1017") is the same version; any other suffix is not.
-      const b =
-        benchmark.models.find((b) => b.slug === canonical) ??
-        benchmark.models.find(
-          (b) =>
-            b.slug.startsWith(`${canonical}-`) &&
-            /^\d{4,8}$/.test(b.slug.slice(canonical.length + 1)),
-        );
+      const b = benchmarkOf(model);
       const score = b?.score;
       return {
         id: m.id,
         model,
-        tier: score === undefined ? "sonnet" : score >= 50 ? "fable" : score >= 43 ? "opus" : score >= 33 ? "sonnet" : "haiku",
+        tier: score === undefined ? "sonnet" : tierOf(score),
         prior:
           score === undefined ? 2.5 : Math.max(1, Math.min(5, 1 + score / 15)),
         benchmark: b?.slug,
         estimated: b?.estimated ?? true,
         context: m.context_window ?? m.context_length ?? 32768,
+        score,
       };
     })
+    .filter((m) => m.score !== undefined && m.score >= AA_FLOOR)
+    .map(({ score: _score, ...m }): ModelCandidate => m)
     .sort((a, b) => b.prior - a.prior || a.id.localeCompare(b.id));
 }
 /** Decayed task evidence with an eight-task prior; calls/tokens never become independent quality samples. */
