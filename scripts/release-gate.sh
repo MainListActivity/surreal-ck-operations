@@ -54,12 +54,14 @@ log="$out_dir/$sha.log"
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 set +e
+# gate_test is a space-separated list and is expanded unquoted on purpose: bun reads every argument as a filter, so quoting it
+# would hand bun the whole list as one argument, which matches no file at all.
 if [ "$gate" = slow-pipe ]; then
   # The red control runs too: the pre-SYS01 client must still lose bytes through the same pipe, or the harness is not trusted.
-  (cd "$release" && SCK_COMM_CONTROL=1 "$BUN" test "$gate_test") > "$log" 2>&1
+  (cd "$release" && SCK_COMM_CONTROL=1 "$BUN" test $gate_test) > "$log" 2>&1
 else
   # Exercise the real client-cli -> sidecar -> company-fork path, including plugin reload recovery.
-  (cd "$release" && RUN_SCK_CHANNEL_FORK_TESTS=1 "$BUN" test "$gate_test") > "$log" 2>&1
+  (cd "$release" && RUN_SCK_CHANNEL_FORK_TESTS=1 "$BUN" test $gate_test) > "$log" 2>&1
 fi
 rc=$?
 set -e
