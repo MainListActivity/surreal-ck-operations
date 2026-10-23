@@ -1,7 +1,7 @@
 import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { CONTRIBUTION_ACTIONS, readContributionView, type ContributionFacts, type ContributionView } from './contributors.ts';
-import type { EmployeeId, IndependenceMode, IndependencePolicy, IndependenceStage, TaskId } from './contracts.ts';
+import type { EmployeeId, IndependenceCheckView, IndependenceMode, IndependencePolicy, IndependenceStage, TaskId } from './contracts.ts';
 
 /**
  * Independence policy (SYS-DISP IR01-IR02): which contributors of other tasks may not take or decide a task. Contributors come from
@@ -260,13 +260,13 @@ export async function readIndependenceSnapshot(db: Surreal, policy: Independence
  * be trusted, and so is a snapshot that cannot be read: the pool blocks both instead of reading them as clear.
  */
 export async function readIndependenceScope(db: Surreal, policy: IndependencePolicy | undefined,
-  stage: IndependenceStage): Promise<IndependenceScope | undefined> {
+  stage: IndependenceStage, hook?: (taskId: TaskId) => Promise<void>): Promise<IndependenceScope | undefined> {
   if (!policy) return undefined;
   const fault = policyFault(policy);
   if (fault !== undefined) return { kind: 'unverifiable', reason: fault };
   if (!policy.stages.includes(stage)) return undefined;
   try {
-    return { kind: 'index', index: (await readIndependenceSnapshot(db, policy)).index };
+    return { kind: 'index', index: (await readIndependenceSnapshot(db, policy, hook)).index };
   } catch (error) {
     const source = error instanceof CompanyError && typeof error.details === 'object' && error.details !== null
       ? (error.details as { source?: unknown }).source : undefined;
@@ -318,4 +318,51 @@ export async function refuseIfExcluded(db: Surreal, task: TaskId, index: Indepen
   const conflict = await conflictOf(db, task, employee, hit);
   const via = conflict.source === undefined ? conflict.via : `${conflict.via} of source ${conflict.source}`;
   throw new CompanyError('forbidden', `independence conflict: ${employee} may not take or decide ${task} (${via})`, false, { conflicts: [conflict] });
+}
+
+/** A preflight reading: the verdict with the facts behind it. Core adds the echo of the request and of the policy. */
+export type IndependenceReading = Omit<IndependenceCheckView, 'policy'>;
+
+/**
+ * The candidate-level read-only preflight (SYS-DISP IR01-IR04): the verdict the gate would give for one employee on one task at one
+ * stage. The exclusion comes from the gate's own reader (`readIndependenceScope`, same sources and same mode), the identity link is
+ * the same registered one the gate reads, and a conflict cites the same fields `refuseIfExcluded` puts in `details.conflicts` — so a
+ * reading can never drift from what a claim or submit would actually do. Nothing is written.
+ *
+ * An unreadable source or identity table, and a policy this build cannot enforce, are `unverifiable` — never `clear`, because the
+ * gate fails closed on exactly those. A stage the policy does not name takes no read at all in the gate, so it is `clear`.
+ */
+export async function checkIndependence(db: Surreal, taskId: TaskId, policy: IndependencePolicy, stage: IndependenceStage,
+  employee: EmployeeId, hook?: (taskId: TaskId) => Promise<void>): Promise<IndependenceReading> {
+  const scope = await readIndependenceScope(db, policy, stage, hook);
+  if (scope === undefined) {
+    return { taskId, employeeId: employee, stage, verdict: 'clear',
+      reason: `stage ${stage} is not named by the policy, so the gate takes no independence read here` };
+  }
+  if (scope.kind === 'unverifiable') {
+    return { taskId, employeeId: employee, stage, verdict: 'unverifiable', reason: scope.reason,
+      ...(scope.source === undefined ? {} : { source: scope.source }) };
+  }
+  let principal: string | undefined;
+  try {
+    principal = (await readEmployeePrincipals(db, [employee])).get(employee);
+  } catch (error) {
+    return { taskId, employeeId: employee, stage, verdict: 'unverifiable',
+      reason: error instanceof Error ? error.message : String(error) };
+  }
+  const hit = independenceHit(scope.index, employee, principal);
+  if (hit === undefined) {
+    return { taskId, employeeId: employee, stage, verdict: 'clear',
+      reason: `no source contributor and no named employee excludes ${employee} at stage ${stage}` };
+  }
+  const conflict = await conflictOf(db, taskId, employee, hit);
+  const via = conflict.source === undefined ? conflict.via : `${conflict.via} of source ${conflict.source}`;
+  return { taskId, employeeId: employee, stage, verdict: 'conflict',
+    via: conflict.via,
+    ...(conflict.source === undefined ? {} : { source: conflict.source }),
+    ...(conflict.matched === undefined ? {} : { matched: conflict.matched }),
+    ...(conflict.role === undefined ? {} : { role: conflict.role }),
+    ...(conflict.principal === undefined ? {} : { principal: conflict.principal }),
+    ...(conflict.auditRef === undefined ? {} : { auditRef: conflict.auditRef }),
+    reason: `independence conflict: ${employee} may not take or decide ${taskId} (${via})` };
 }

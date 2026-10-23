@@ -480,6 +480,56 @@ export interface IdentityPrincipalView {
   setAt: string;
 }
 
+/**
+ * Candidate-level read-only preflight (SYS-DISP IR01): would this one employee be excluded by this one task's policy at this stage,
+ * exactly as the claim/submit gate would refuse them? A read only: it never takes a lease, never advances a version and never writes
+ * anything, so an already finished task stays readable — which is the tool's main use.
+ */
+export interface IndependenceCheckInput {
+  taskId: TaskId;
+  employeeId: EmployeeId;
+  /** Stage to judge at; omit to infer it from the task's current phase (review while in review, execute otherwise). */
+  stage?: IndependenceStage;
+}
+
+/**
+ * The preflight answer. `clear` means the gate would admit the candidate at this stage; `conflict` means it would refuse (with the
+ * same `via`/`source`/`matched`/`role`/`principal`/`auditRef` facts the refusal carries); `unverifiable` means the exclusion could not
+ * be read and the gate fails closed, so it is NEVER a pass; `not_applicable` means the task has no policy (legacy behaviour).
+ */
+export type IndependenceVerdict = 'clear' | 'conflict' | 'unverifiable' | 'not_applicable';
+
+/** The registered policy as the preflight echoes it, so QA can read the actual values back without a second source. */
+export interface IndependenceCheckPolicyView {
+  revision: number;
+  stages: IndependenceStage[];
+  mode: IndependenceMode;
+  sources: TaskId[];
+  excluded: EmployeeId[];
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/** One preflight reading: the verdict with the facts behind it, and the policy actually registered on the task. */
+export interface IndependenceCheckView {
+  taskId: TaskId;
+  employeeId: EmployeeId;
+  stage: IndependenceStage;
+  verdict: IndependenceVerdict;
+  via?: 'contributor' | 'explicit' | 'same_principal';
+  /** Source task the match came from (a contributor match, or an identifier link to one). */
+  source?: TaskId;
+  matched?: EmployeeId;
+  role?: 'author' | 'implementer' | 'reviewer';
+  /** Registered principal that made the match, when the match came from an identity link. */
+  principal?: string;
+  /** The contribution audit row that proves the match, as the refusal's details.conflicts cites it. */
+  auditRef?: string;
+  reason: string;
+  /** Present whenever the task has a policy; absent when there is none (verdict not_applicable). */
+  policy?: IndependenceCheckPolicyView;
+}
+
 /** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
 export interface SetIndependence {
   taskId: TaskId;
@@ -820,6 +870,11 @@ export interface CompanyCore {
   setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
   /** Manager (manage capability): register an identity principal, or add/remove employees from it. Optional for old adapters. */
   setIdentityPrincipal?(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView>;
+  /**
+   * gm and qa, read-only (SYS-DISP IR01-IR05): the verdict the independence gate would give for one employee on one task at one
+   * stage. Writes nothing, so a done or void task stays readable. Optional for old adapters.
+   */
+  independenceCheck?(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView>;
   /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the

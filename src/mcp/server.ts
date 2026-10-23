@@ -442,6 +442,17 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.setIndependence(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('independence_check', {
+    description: 'gm or qa, read-only: the formal candidate-level preflight of the independence gate. Answers whether one employee would be refused by one task independence policy at one stage: clear (the gate would admit them), conflict (it would refuse, with the same via/source/matched/role/principal and the contribution auditRef its refusal cites), unverifiable (the exclusion could not be read, so the gate fails closed — never a pass), or not_applicable (the task has no policy). The policy field echoes the registered revision, stages, mode, sources, excluded, setBy and setAt so qa can read the real values back. stage defaults to the task current phase (review while in review, else execute). Writes nothing at all: no lease, no version, no audit, no dispatch — so a done or void task is still readable. gm always, qa always; every other role is refused.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      employeeId: z.string().min(1).max(200),
+      stage: z.enum(['execute', 'review']).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.independenceCheck
+    ? core.independenceCheck(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('identity_principal_set', {
     description: 'Manager (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
     inputSchema: z.object({

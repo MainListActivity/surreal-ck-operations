@@ -58,6 +58,8 @@ const BASE_TOOLS = [
   "identity_principal_set",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
+  // gm or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
+  "independence_check",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -851,6 +853,9 @@ export class SidecarPool {
       case "identity_principal_set": return core.setIdentityPrincipal
         ? core.setIdentityPrincipal(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose identity_principal_set"), { code: "temporarily_unavailable" }));
+      case "independence_check": return core.independenceCheck
+        ? core.independenceCheck(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose independence_check"), { code: "temporarily_unavailable" }));
       case "get_model_evidence": return withinReplyCeiling(async()=> {
         if(!core.modelEvidence) throw new Error("Model evidence unavailable");
         return core.modelEvidence(cred,taskIdOf(args.taskId));
