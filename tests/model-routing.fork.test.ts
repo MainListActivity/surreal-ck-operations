@@ -175,7 +175,8 @@ run('fork: Factory roster physically removes other native defs, preserves author
   expect(after.some(d=>['engineering-codex','qa-grok'].includes(d.id))).toBe(false);
   expect(after.find(d=>d.id==='engineering-factory')).toMatchObject({provider:'factory-droid',model:'native-model',thinking:'high',enabled:true,maxInstances:3});
   expect(after.find(d=>d.id==='engineering-factory')?.quotaLimited).not.toBe(false);
-  expect(after.find(d=>d.id==='engineering-claude')).toMatchObject({model:'group/sck-haiku',thinking:'medium',tracks:['web','mobile']});
+  expect(after.find(d=>d.id==='engineering-claude')).toMatchObject({model:'group/sck-haiku',thinking:'medium'});
+  expect(after.find(d=>d.id==='engineering-claude')?.tracks?.toSorted()).toEqual(['mobile','web']);
   expect(after.find(d=>d.id==='story-native')).toEqual(before);
   const [history]=await db.db.query<[any]>('SELECT * FROM ONLY employee:historical;');expect(String(history.def)).toContain('engineering-codex');
   await applyRoutingRoster(wf,db.db);expect((await wf.defs()).find(d=>d.id==='engineering-factory')).toEqual(after.find(d=>d.id==='engineering-factory'));

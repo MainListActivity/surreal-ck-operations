@@ -1235,7 +1235,7 @@ export class Dispatcher {
      */
     const struckImplementer = (employeeId: string): boolean => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down' || defs.some(d => d.id === inst.def && !d.enabled);
+      return !inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled));
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1269,9 +1269,9 @@ export class Dispatcher {
         }
         // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
         const excluded = new Set<string>([...facts.excluded, implementer]);
-        const successor = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
           .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
-          .map(entry => entry.key).sort()[0];
+          .sort((a,b)=>a.key.localeCompare(b.key)))[0]?.key;
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
             reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })

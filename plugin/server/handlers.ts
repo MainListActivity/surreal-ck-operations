@@ -1,3 +1,4 @@
+import { factoryFirst } from './vendor/src/dispatcher/provider-order.ts';
 import { basename, join } from "node:path";
 import { realpathSync } from "node:fs";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -216,7 +217,7 @@ export function registerHandlers(server: PluginServerContext): void {
     // query order (weight DESC, priority, id) still decides.
     const liveDefIds = new Set(insts.map(i => i.def));
     const defRank = (d: { id: string; enabled: boolean }) => d.enabled ? (liveDefIds.has(d.id) ? 0 : 1) : 2;
-    const orderedDefs = [...defs].sort((a, b) => Number(b.provider==='factory-droid')-Number(a.provider==='factory-droid') || defRank(a) - defRank(b));
+    const orderedDefs = factoryFirst([...defs].sort((a, b) => defRank(a) - defRank(b)));
     const healthView = providerHealthView(health, Math.floor(Date.now() / 1000));
     const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
       entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,
