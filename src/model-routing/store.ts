@@ -1,15 +1,19 @@
 import { RecordId, type Surreal } from "surrealdb";
+import type { ModelAssessment } from "../contracts.ts";
 import { digest, domainOf, type ModelResult } from "./policy.ts";
-/** Rebuildable, idempotent attribution: mixed executions get fractional task evidence, never a last-model guess. */
+/** Final acceptance only. Each actual model receives its own eval judgement, once per participant/task. */
 export async function scoreModels(
   db: Surreal,
   taskId: string,
   employee: string,
   overall: number,
+  assessments?: ModelAssessment[],
 ): Promise<string[]> {
   if (!Number.isFinite(overall) || overall < 1 || overall > 5)
     throw Error("invalid model score");
   const task = new RecordId("task", taskId);
+  const state = await db.select<{state:string}>(task);
+  if (state?.state !== "done") throw Error("model performance settles only after final task acceptance");
   const [rows] = await db.query<
     [
       Array<{
@@ -26,8 +30,8 @@ export async function scoreModels(
   const counts = new Map<string, { n: number; domain: string }>();
   for (const r of rows) {
     if (!r.model) continue;
-    const k = `${r.domain}\0${r.model}`;
-    const x = counts.get(k) ?? { n: 0, domain: r.domain };
+    const k = `general\0${r.model}`;
+    const x = counts.get(k) ?? { n: 0, domain: "general" };
     x.n++;
     counts.set(k, x);
   }
@@ -38,6 +42,11 @@ export async function scoreModels(
   let i = 0;
   for (const [key, r] of counts) {
     const model = key.split("\0")[1]!;
+    const assessment = assessments?.find(a => a.model === model);
+    // A mixed-model task needs an evidence-based judgement per model; call share is not quality.
+    if (!assessment && counts.size > 1) continue;
+    const score = assessment?.overall ?? overall;
+    if (!Number.isFinite(score) || score<1 || score>5) throw Error("invalid model assessment");
     vars[`card${i}`] = new RecordId(
       "model_scorecard",
       digest(`${taskId}\0${employee}\0${key}`),
@@ -46,11 +55,12 @@ export async function scoreModels(
       task,
       employee,
       model,
-      domain: r.domain,
-      overall,
-      weight: r.n / rows.length,
+      domain: "general",
+      overall: score,
+      notes:assessment?.notes,
+      weight: 1 / counts.size,
       at: new Date(),
-      basis: "completed-request-share",
+      basis: assessment ? "final-eval-model-assessment" : "final-eval-single-model",
     };
     sql += `CREATE ONLY $card${i} CONTENT $data${i};`;
     i++;
@@ -60,7 +70,7 @@ export async function scoreModels(
 }
 export async function readModelResults(db: Surreal): Promise<ModelResult[]> {
   const [rows] = await db.query<[ModelResult[]]>(
-    "SELECT model,domain,overall,weight,<string>at AS at FROM model_scorecard WHERE at>time::now()-180d ORDER BY at DESC LIMIT 10000;",
+    "SELECT model,domain,overall,weight,<string>at AS at FROM model_scorecard WHERE at>time::now()-180d AND task.state='done' ORDER BY at DESC LIMIT 10000;",
   );
   return rows;
 }

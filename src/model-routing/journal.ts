@@ -103,12 +103,13 @@ export class ExecutionJournal {
             task: RecordId;
             employee: string;
             overall: number;
+            model_scores?: import("../contracts.ts").ModelAssessment[];
             configured_model?: string;
             model?: string;
           }>,
         ]
       >(
-        "SELECT task,employee,overall,configured_model,model FROM scorecard WHERE task IN $tasks;",
+        "SELECT task,employee,overall,configured_model,model,model_scores FROM scorecard WHERE task IN $tasks AND task.state='done';",
         { tasks: tasks.map((t) => new RecordId("task", t)) },
       );
       for (const card of cards) {
@@ -117,6 +118,7 @@ export class ExecutionJournal {
           String(card.task.id),
           card.employee,
           card.overall,
+          card.model_scores,
         );
         await db.query(
           "UPDATE $card SET configured_model=$configured,model=$model,actual_models=$models,model_attribution=$basis RETURN NONE;",

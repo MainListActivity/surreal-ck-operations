@@ -205,7 +205,7 @@ interface TaskRow {
   project?: RecordId;
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
-  model_tier?: 'high' | 'medium' | 'low';
+  model_tier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
@@ -681,7 +681,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (requiredTrack !== undefined && input.discipline !== requiredTrack) {
       throw new CompanyError('invalid', `executorRole ${input.executorRole} requires discipline=${requiredTrack}`);
     }
-    if (input.modelTier !== undefined && !['high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
+    if (input.modelTier !== undefined && !['fable','opus','sonnet','haiku','high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
     const kind = input.kind ?? 'task';
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
@@ -3159,6 +3159,13 @@ export class SurrealCompanyCore implements CompanyCore {
    * Scorecards are idempotent per (task, employee); writing marks task.evaluated_at so the
    * dispatcher stops dispatching judges, and rolls the average into employee and employee_def.
    */
+  async modelEvidence(credential: Credential, taskId: TaskId) {
+    const actor = await this.authorized(credential);
+    if (!['eval','gm'].includes(actor.role)) throw new CompanyError('forbidden','Only eval or gm may read model evaluation evidence');
+    const state = await collectEvalState(this.db,taskId,actor.employeeId);
+    return state.modelExecutions ?? [];
+  }
+
   async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }> {
     const actor = await this.authorized(credential);
     if (actor.role !== 'eval') throw new CompanyError('forbidden', 'Only eval employees may record scores');

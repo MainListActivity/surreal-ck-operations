@@ -29,7 +29,7 @@ run(
         task: "fixture",
         employee: "fixture-worker",
         fence: 3,
-        tier: "medium",
+        tier: "sonnet",
       });
       expect(await deps.lease("employee:fixture-worker")).toMatchObject({
         task: "fixture",
@@ -84,6 +84,12 @@ run(
         metrics: {},
         timeline: [],
       };
+      // No model credit while execution/rework/review is still in progress.
+      await db.db.query("UPDATE task:fixture SET state='review';");
+      await expect(scoreModels(db.db,'fixture','fixture-worker',5)).rejects.toThrow('final task acceptance');
+      await db.db.query("UPDATE task:fixture SET state='done';");
+      await scoreModels(db.db,'fixture','fixture-worker',5);
+      expect(await readModelResults(db.db)).toHaveLength(0); // mixed executions need explicit model judgements
       await writeScorecards(db.db, {
         taskId: "fixture",
         summary: "fixture",
@@ -93,6 +99,7 @@ run(
         scores: [
           {
             employee: "fixture-worker",
+            modelScores:[{model:"relay/actual-model",overall:5},{model:"relay/second",overall:2}],
             quality: 5,
             evidence: 5,
             discipline: 5,
@@ -112,7 +119,7 @@ run(
       });
       const results = await readModelResults(db.db);
       expect(results).toHaveLength(2);
-      expect(results.every((r) => Math.abs(r.weight - 1 / 3) < 1e-8)).toBe(
+      expect(results.every((r) => Math.abs(r.weight - 1 / 2) < 1e-8)).toBe(
         true,
       );
       expect(
@@ -122,12 +129,15 @@ run(
           "engineering",
         )[0]?.id,
       ).toBe("relay/actual-model");
-      await scoreModels(db.db, "fixture", "fixture-worker", 5);
+      await scoreModels(db.db, "fixture", "fixture-worker", 5,[{model:"relay/actual-model",overall:5},{model:"relay/second",overall:2}]);
       expect(await readModelResults(db.db)).toHaveLength(2);
       await db.db.query(
         'UPDATE task:fixture SET state="doing",current_employee="fixture-worker",lease_expires_at=1;',
       );
       expect(await deps.lease("fixture-agent")).toBeUndefined();
+      expect(await readModelResults(db.db)).toHaveLength(0);
+      const [reopened]=await db.db.query<[any]>("SELECT evaluated_at FROM ONLY task:fixture;");
+      expect(reopened.evaluated_at).toBeUndefined();
     } finally {
       await db.close();
     }

@@ -128,10 +128,10 @@ export class SidecarPool {
   constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
 
-  routingSession(ref:string):{employee:string;comm:string}|undefined {
+  routingSession(ref:string):{employee:string;comm:string;role?:string}|undefined {
     const employee=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
     if(!employee||!this.launched.has(employee)||this.quarantined.has(employee))return;
-    return {employee,comm:commDir(this.deps.runDir,employee)};
+    return {employee,comm:commDir(this.deps.runDir,employee),role:this.routingEmployees.get(employee)?.role};
   }
 
   /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
@@ -141,7 +141,7 @@ export class SidecarPool {
     const live=this.claims.get(inst);
     if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
     const role=this.routingEmployees.get(inst)?.role;
-    if(role==='gm'||role==='eval')return {employee:inst,task:'',fence:0,role,tier:'high',phase:'planning'};
+    if(role==='gm'||role==='eval')return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:'planning'};
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
@@ -349,7 +349,7 @@ export class SidecarPool {
     this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
-      routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:result.task.executorRole,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
+      routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:inst.role,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
       routingExpiresAt:Date.parse(result.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
@@ -594,7 +594,7 @@ export class SidecarPool {
     } as ClaimResult & { evidenceDir: string };
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: lease.state,
-      routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:task.executorRole,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},
+      routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:inst.role,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},
       routingExpiresAt:Date.parse(task.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });

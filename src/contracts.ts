@@ -105,7 +105,7 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
   implementer?: EmployeeId;
-  modelTier?: 'high' | 'medium' | 'low';
+  modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -314,7 +314,7 @@ export interface CreateTask {
   project?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
-  modelTier?: 'high' | 'medium' | 'low';
+  modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (gm/product only): both drafts must be owner-reviewed
@@ -805,6 +805,7 @@ export interface CompanyCore {
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
+  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>>;
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
 }
 
@@ -843,7 +844,10 @@ export interface EnsureDef {
   quotaLimited?: boolean;
 }
 
+export interface ModelAssessment { model: string; overall: number; notes?: string }
+
 export interface EmployeeScore {
+  modelScores?: ModelAssessment[];
   employee: EmployeeId;
   quality: number;
   evidence: number;

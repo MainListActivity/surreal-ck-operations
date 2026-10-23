@@ -26,6 +26,7 @@ export interface EvalState {
   participants: string[];
   metrics: Record<string, EvalMetrics>;
   timeline: EvalTimelineEntry[];
+  modelExecutions?: Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>;
 }
 
 const TIMELINE_LIMIT = 40;
@@ -99,7 +100,11 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   }
   if (excludeEmployeeId) participants.delete(excludeEmployeeId);
 
+  const [modelExecutions] = await db.query<[NonNullable<EvalState['modelExecutions']>]>(
+    "SELECT employee,model,fence,phase,<string>at AS at,<string>ended_at AS ended_at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' ORDER BY at ASC LIMIT 2001;", {task});
+  if (modelExecutions.length>2000) throw new Error("Model evidence exceeds 2000 executions; final evaluation requires a complete timeline");
   return {
+    modelExecutions,
     taskId, goalId: row.goal ? asId(row.goal) : undefined,
     title: row.title, context: String(row.context ?? '').slice(0, CONTEXT_CHARS),
     state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
@@ -118,6 +123,12 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
   const dims = ['quality', 'evidence', 'discipline', 'timeliness', 'overall'] as const;
   for (const s of scores) {
     if (!state.participants.includes(s.employee)) return `Not a participant: ${s.employee}`;
+    const models = s.modelScores;
+    if (models) {
+      const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+      if (new Set(models.map(m=>m.model)).size !== models.length) return `Duplicate model assessment: ${s.employee}`;
+      for (const m of models) if (!actual.has(m.model) || !Number.isFinite(m.overall) || m.overall<1 || m.overall>5) return `Invalid model assessment: ${m.model}`;
+    }
     for (const d of dims) {
       if (typeof s[d] !== 'number' || !Number.isFinite(s[d]) || s[d] < 1 || s[d] > 5) return `Invalid ${d} score`;
     }
@@ -150,8 +161,8 @@ export async function writeScorecards(
       overall: s.overall, notes: s.notes, metrics: input.state.metrics[s.employee], by: input.judge,
       judgeKind: input.judgeKind, confidence: s.confidence, probabilities: s.probabilities, flagged: s.flagged === true,
     });
-    const actualModels = await scoreModels(db, input.taskId, s.employee, s.overall);
-    await db.query('UPDATE $card SET configured_model=$configured,model=$model,actual_models=$models, model_attribution=$basis RETURN NONE;', {card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0,24)), models:actualModels, configured:emp?.model,model:actualModels.length===1?actualModels[0]:actualModels.length?'mixed':'unknown', basis:actualModels.length ? 'gateway-completed-requests' : 'unknown'});
+    const actualModels = await scoreModels(db, input.taskId, s.employee, s.overall, s.modelScores);
+    await db.query('UPDATE $card SET model_scores=$assessments,configured_model=$configured,model=$model,actual_models=$models, model_attribution=$basis RETURN NONE;', {card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0,24)), assessments:s.modelScores,models:actualModels, configured:emp?.model,model:actualModels.length===1?actualModels[0]:actualModels.length?'mixed':'unknown', basis:actualModels.length ? 'gateway-completed-requests' : 'unknown'});
     written.add(s.employee);
   }
 
