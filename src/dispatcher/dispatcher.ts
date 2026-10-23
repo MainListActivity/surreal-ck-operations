@@ -1,3 +1,4 @@
+import { managedModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
 import { effectiveWeight, MANAGER_WAKE_PENDING_GRACE_SECONDS, MANAGER_WAKE_TURN_GRACE_SECONDS, managerWakeKey, weightedOrder } from '../workforce.ts';
@@ -231,7 +232,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   };
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
-    if(def?.provider==='claude'&&def.model?.startsWith('group/sck-'))return true; // request routing is task-scoped at the company gateway
+    if(managedModel(def))return true; // request routing is task-scoped at the company gateway
     const target = def && resolveSlot(def);
     // What the provider serves wins over what the spawn asked for: a subscription can switch the
     // model under a live session, and dispatching into it would run work on a model nobody chose.
@@ -244,7 +245,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * Quota, probe and full concurrency are separate codes: owners act on them differently. A passed cooldown admits one trial
    * session; while it runs, the rest wait as probe_busy, which never carries a recovery time.
    */
-  const capHit = (provider: string, exempt = false): Block | undefined => {
+  const capHit = (provider: string, exempt = false, managed = false): Block | undefined => {
+    if (managed) return undefined; // Magpie owns model/account capacity; maxRunning guards the Mac.
     if (!exempt) {
       const quota = quotaOf(provider);
       if (quota) return quota;
@@ -296,19 +298,20 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
+      (def && !def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
       (p.sidecar && inst.credentialFile ? ['credential_file', BLOCK_TEXT.credential_file] : undefined) ??
       (!trackOk(p.task, def?.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (!currentModel(inst) ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
-      capHit(inst.provider ?? '', def?.quotaLimited === false);
+      capHit(inst.provider ?? '', def?.quotaLimited === false, managedModel(def));
     // A prior hand (claim-only, never wrote code) stays eligible at a demoted weight: the pre-SYS-DISP review rule,
     // kept for ordinary tasks. A strict independence source still excludes them (independenceBlock above).
     const priorHand = !hit && (p.recusal?.hands.has(inst.id) ?? false);
     entries.push({ kind: 'reuse', key: inst.id, ref: inst.id, role: p.role,
       provider: inst.provider ?? '', model: inst.model ?? def?.model, def, inst,
-      weight: effectiveWeight(def) * (priorHand ? PRIOR_HAND_WEIGHT_FACTOR : 1),
+      weight: (managedModel(def) ? 1 : effectiveWeight(def)) * (priorHand ? PRIOR_HAND_WEIGHT_FACTOR : 1),
       share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2],
       note: priorHand ? '经手过本任务（未写码），降权兜底' : undefined });
   }
@@ -324,10 +327,10 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (!trackOk(p.task, def.tracks) ? ['track_mismatch', BLOCK_TEXT.track_mismatch] : undefined) ??
       (resolved === undefined ? ['model_slot', BLOCK_TEXT.model_slot] : undefined) ??
       (seats >= def.maxInstances ? ['seat_full', `编制席位已满（${seats}/${def.maxInstances} 个实例，仓库 ${repoName(p.home)}）`] : undefined) ??
-      capHit(def.provider, def.quotaLimited === false);
+      capHit(def.provider, def.quotaLimited === false, managedModel(def));
     entries.push({ kind: 'spawn', key: `spawn:${def.id}`, ref: def.id, role: p.role,
       provider: def.provider, model: resolved ?? def.model, def,
-      weight: effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
+      weight: managedModel(def) ? 1 : effectiveWeight(def), share: 0, eligible: !hit, reason: hit?.[1], code: hit?.[0], until: hit?.[2] });
   }
   const total = entries.filter(e => e.eligible).reduce((s, e) => s + Math.max(0, e.weight), 0);
   for (const e of entries) e.share = e.eligible && total > 0 ? Math.max(0, e.weight) / total : 0;
@@ -917,7 +920,7 @@ export class Dispatcher {
           // An exempt def keeps running through a spent subscription: its parked session is
           // restarted on the normal retry interval instead of waiting out the provider cooldown.
           const exempt = defs.find(d => d.id === inst.def)?.quotaLimited === false;
-          if (fresh && !report.exhausted.includes(inst.provider)) {
+          if (fresh && !managedModel(defs.find(d => d.id === inst.def)) && !report.exhausted.includes(inst.provider)) {
             // A quota row that knows when the window resets beats the exponential backoff: the
             // provider is unusable until then, and probing earlier only burns another session.
             const resetsAt = quotaByProvider.get(inst.provider)?.resetsAt;
@@ -997,6 +1000,13 @@ export class Dispatcher {
         await this.revoke(task, `员工 ${task.currentEmployee} 会话${state === 'idle' ? '空闲' : state === 'unknown' ? '状态未知' : '失联'}且超过 ${cfg.stallMinutes} 分钟没有 checkpoint`, inst, report);
       } else if (expired) {
         await this.revoke(task, `员工 ${task.currentEmployee} 结束本轮但未交接，租约已过期`, inst, report, 'expire');
+      }
+    }
+    for (const inst of insts) {
+      if (states.get(inst.id)!=='idle' || !defs.some(d=>d.id===inst.def && !d.enabled)) continue;
+      if (await this.retireGated(inst, '编制已统一为 Claude，旧会话完成后正常退出', 'rotation', report)) {
+        report.retired.push(inst.id);
+        if(inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(()=>undefined);
       }
     }
     insts = insts.filter(i => !report.retired.includes(i.id));
@@ -1218,7 +1228,7 @@ export class Dispatcher {
      */
     const struckImplementer = (employeeId: string): boolean => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down';
+      return !inst || states.get(inst.id) === 'down' || defs.some(d => d.id === inst.def && !d.enabled);
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1316,16 +1326,22 @@ export class Dispatcher {
       const live = candidates.filter(i => states.get(i.id) === 'idle');
       const usable = live.length ? live : candidates;
       const pool = usable.filter(i => i.id !== avoid);
-      return weightedOrder(pool.length ? pool : usable, weight, rand)[0];
+      const available = pool.length ? pool : usable;
+      if (available.length && available.every(i => managedModel(defs.find(d => d.id === i.def))))
+        return [...available].sort((a,b) => (a.lastWakeAt ?? 0) - (b.lastWakeAt ?? 0) || a.id.localeCompare(b.id))[0];
+      return weightedOrder(available, weight, rand)[0];
     };
     const spawnable = (role: string, home: string, task?: SupervisedTask, forReview = false,
       reserved?: ReadonlySet<string>) =>
-      weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
+      eligibleDefs(role, home, task, forReview, reserved).every(managedModel)
+        ? eligibleDefs(role, home, task, forReview, reserved).sort((a,b) => a.id.localeCompare(b.id))
+        : weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
     // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
     // Review 派工的作者在进 Jev 前就已从 reuse 候选剔除（staffingPool 的回避名单），其余候选都可被选中；
     // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
     const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>): Promise<AssignPreference | undefined> => {
+      if (item.role !== 'story-author' && defs.filter(d => d.enabled && d.role === item.role).every(managedModel)) return undefined;
       if (!this.deps.jev || !cfg.jevDecisions) return undefined;
       const home = item.task.repoPath ?? this.deps.env.opsRepo;
       const cacheKey = `${item.purpose}:${item.task.id}`;
@@ -1811,15 +1827,17 @@ export class Dispatcher {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
         const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
-        if (!dispatched && jevReady && task.evalAttempts < 3) {
+        let fullHistory = task.row.model_eval_full_history===true;
+        if (!dispatched && !fullHistory && jevReady && task.evalAttempts < 3) {
           const outcome = await this.jevEvaluate(task, cfg, report);
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
+          if (outcome === 'full-history') fullHistory=true;
         }
         // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
         // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
         // re-enables escalation for quick tasks.
-        const llmReady = llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
+        const llmReady = fullHistory ? defs.some(d=>d.role==='eval' && d.enabled) : llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
         if (!llmReady) {
           if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
             await this.notice(`eval-stuck:${task.id}`,
@@ -1848,23 +1866,45 @@ export class Dispatcher {
    * Returns 'done' when scorecards were written, 'retry' to try again next tick,
    * 'escalate' to hand the task to the LLM eval role.
    */
-  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate'> {
+  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate' | 'full-history'> {
     const { workforce: wf, jev } = this.deps;
     if (!jev) return 'escalate';
     const attempts = await wf.bumpEvalAttempt(task.id);
     let parsed: JevScoreAnswers;
     try {
       const state = await wf.evalState(task.id);
+      if(state.timelineTruncated && state.modelExecutions?.length) {
+        await wf.requireFullModelEvaluation(task.id);
+        return 'full-history'; // persisted across retries/restarts; eval reads complete paged history
+      }
       const questions = jevEvalQuestions(state.participants);
+      const modelJudgements: Array<{key:string;employee:string;model:string}> = [];
+      for (const employee of state.participants) {
+        const models = [...new Set((state.modelExecutions ?? []).filter(r=>r.employee===employee && r.model).map(r=>r.model!))];
+        for (const model of models) {
+          const key = `m${modelJudgements.length}`;
+          modelJudgements.push({key,employee,model});
+          questions[key] = {type:'score',instructions:`根据实际执行轮次和全部提交、退回、修复、最终验收记录，给员工 ${employee} 使用模型 ${model} 的实际贡献打1到5分。区分造成返工和修复返工，排除账号额度、网络等基础设施故障；不得按调用次数分配质量。证据不足时降低置信度。`,criteria:['1：严重缺陷造成返工','2：明显未达标','3：基本完成','4：可靠交付','5：高质量完成或有效修复']};
+        }
+      }
       const result = Object.keys(questions).length
         ? await jev.ask({
           task: { id: task.id, title: state.title, context: state.context, executorRole: state.executorRole, reviewerRole: state.reviewerRole },
           participants: state.participants,
           metrics: state.metrics,
           timeline: state.timeline,
+          modelExecutions: state.modelExecutions,
         }, questions)
         : { model: jev.model, answers: {} };
       parsed = parseJevEval(state.participants, result.answers, cfg.jevFlagThreshold);
+      for (const judgement of modelJudgements) {
+        const answer = result.answers[judgement.key];
+        const entry = parsed.scores.find(s=>s.employee===judgement.employee);
+        if (entry && answer?.type==='score' && Number.isFinite(answer.score)) {
+          (entry.modelScores ??= []).push({model:judgement.model,overall:Math.max(1,Math.min(5,answer.score!)),notes:'最终任务验收后的模型独立评价'});
+          parsed.minConfidence = Math.min(parsed.minConfidence,answer.confidence ?? 0);
+        } else parsed.minConfidence = 0;
+      }
       const quickNoEscalate = task.goalTier === 'quick' && !cfg.evalQuickLlm;
       if (state.participants.length === 0 || parsed.minConfidence >= cfg.jevMinConfidence || cfg.evalEngine === 'jev' || quickNoEscalate) {
         const summary = `Jev 评审（${result.model}）：${parsed.topPerformer ? `本轮最佳 ${parsed.topPerformer}；` : ''}` +

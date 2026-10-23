@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import benchmark from "./benchmarks.json";
-export type Tier = "high" | "medium" | "low";
+export const TIERS = ["fable", "opus", "sonnet", "haiku"] as const;
+export type Tier = typeof TIERS[number];
+export type TierInput = Tier | "high" | "medium" | "low";
 export type Domain = "engineering" | "writing" | "general";
 export interface CatalogModel {
   id: string;
@@ -27,39 +29,23 @@ export interface ModelResult {
 }
 export const digest = (s: string) =>
   createHash("sha256").update(s).digest("hex").slice(0, 16);
-export const domainOf = (role: string): Domain =>
-  ["engineering", "qa"].includes(role)
-    ? "engineering"
-    : [
-          "ai-content",
-          "concept-design",
-          "asset-production",
-          "screenwriter",
-          "story-author",
-          "cinematography",
-        ].includes(role)
-      ? "writing"
-      : "general";
-export function taskTier(task: {
-  model_tier?: string;
-  kind?: string;
-  executor_role?: string;
-  reviewer_role?: string;
-  title?: string;
-}): Tier {
-  if (["high", "medium", "low"].includes(task.model_tier ?? ""))
-    return task.model_tier as Tier;
-  if (
-    task.reviewer_role === "owner" ||
-    ["gm", "engineering", "screenwriter", "story-author"].includes(
-      task.executor_role ?? "",
-    ) ||
-    /release|deploy|security|上线|发布|安全/.test(`${task.kind} ${task.title}`)
-  )
-    return "high";
-  if (/格式|整理|归档|抄录|同步看板|format|archive/i.test(task.title ?? ""))
-    return "low";
-  return "medium";
+/** Roles remain audit metadata; all four tiers share one performance ranking. */
+export const domainOf = (_role: string): Domain => "general";
+export function selectedTier(model: unknown): Tier | undefined {
+  if (typeof model !== "string") return;
+  const legacy: Record<string, Tier> = {high:"opus",medium:"sonnet",low:"haiku"};
+  if (legacy[model]) return legacy[model];
+  const match = model.match(/^(?:group\/sck-|claude-)?(fable|opus|sonnet|haiku)(?:[-\d.].*)?$/i);
+  return match?.[1]?.toLowerCase() as Tier | undefined;
+}
+export function taskTier(task: {model_tier?: string; kind?: string; executor_role?: string; reviewer_role?: string; title?: string}): Tier {
+  return selectedTier(task.model_tier) ?? employeeTier(task.executor_role);
+}
+export function employeeTier(role?: string): Tier {
+  return role === "gm" ? "opus" : role === "product" ? "sonnet" : "haiku";
+}
+export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
+  return def?.role !== "story-author" && def?.provider === "claude" && !!def?.model?.startsWith("group/sck-") && !!selectedTier(def.model?.replace(/^group\/sck-(engineering|writing|general)-/, ""));
 }
 const normalize = (s: string) =>
   s
@@ -96,12 +82,7 @@ export function classify(catalog: CatalogModel[]): ModelCandidate[] {
       return {
         id: m.id,
         model,
-        tier:
-          score !== undefined && score >= 48
-            ? "high"
-            : score === undefined || score >= 38
-              ? "medium" // unbenchmarked: neutral tier, ranked last by its prior until task evidence arrives
-              : "low",
+        tier: score === undefined ? "sonnet" : score >= 50 ? "fable" : score >= 43 ? "opus" : score >= 33 ? "sonnet" : "haiku",
         prior:
           score === undefined ? 2.5 : Math.max(1, Math.min(5, 1 + score / 15)),
         benchmark: b?.slug,
@@ -115,7 +96,7 @@ export function classify(catalog: CatalogModel[]): ModelCandidate[] {
 export function rank(
   models: ModelCandidate[],
   results: ModelResult[],
-  domain: Domain,
+  _domain: string = "general",
   now = Date.now(),
 ): Array<ModelCandidate & { score: number; samples: number }> {
   return models
@@ -126,7 +107,6 @@ export function rank(
       for (const r of results)
         if (
           canonicalModel(r.model) === canonicalModel(m.id) &&
-          r.domain === domain &&
           Number.isFinite(r.overall) &&
           r.overall >= 1 &&
           r.overall <= 5 &&

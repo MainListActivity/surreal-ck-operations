@@ -17,6 +17,8 @@ import {
   domainOf,
   modelIdentity,
   taskTier,
+  selectedTier,
+  employeeTier,
   type Tier,
 } from "./policy.ts";
 export interface RoutingLease {
@@ -71,7 +73,7 @@ export function installRoutingSettings(
     "\n";
   writeFileSync(file + ".sck-tmp", next, { mode: 0o600 });
   renameSync(file + ".sck-tmp", file);
-  writeFileSync(join(comm, ".sck-model-router"), "v1", { mode: 0o600 });
+  writeFileSync(join(comm, ".sck-model-router"), "v2", { mode: 0o600 });
 }
 export function restoreRoutingSettings(comm: string): boolean {
   const file = join(comm, ".claude", "settings.local.json"),
@@ -177,15 +179,16 @@ export async function startModelGateway(
         res.writeHead(400).end();
         return;
       }
-      // Claude Code's small-fast calls (titles, command-prefix checks, summaries) keep their own
-      // cheap model: they are not the task's work, never pin the lease and never score a model.
-      const auxiliary =
-        typeof body.model === "string" && /haiku/i.test(body.model);
-      const requested = auxiliary
-        ? (body.model as string)
-        : `group/sck-${domainOf(lease.role)}-${lease.tier}`;
+      // A user-selected Haiku is real task work, just like the other three tiers.
+      const auxiliary = match[2]!.endsWith("count_tokens");
+      const selected = selectedTier(body.model) ?? lease.tier;
+      // Fable is an owner-only Magpie entry. Legacy busy employees can still send their old Fable name.
+      const tier = lease.role!=='story-author' && selected==='fable' ? employeeTier(lease.role) : selected;
+      // Older releases may already have injected the gateway into a story-author comm directory.
+      // Preserve that author's configured model rather than applying the new employee defaults.
+      const requested = lease.role==='story-author' && typeof body.model==='string' ? body.model : `group/sck-${tier}`;
       body.model = requested;
-      const session = `sck-${digest(`${lease.task}:${lease.employee}:${lease.fence}:${lease.phase}`)}`;
+      const session = `sck-${digest(`${lease.task}:${lease.employee}:${lease.fence}:${lease.phase}:${tier}`)}`;
       const cooling = auxiliary ? 0 : (cooldowns.get(session) ?? 0);
       if (cooling > Date.now()) {
         res
@@ -228,7 +231,11 @@ export async function startModelGateway(
           body: JSON.stringify(body),
           signal: AbortSignal.any([abort.signal, AbortSignal.timeout(900000)]),
         });
-      let reply = await send();
+      let reply;
+      try { reply = await send(); } catch (error) {
+        if (!abort.signal.aborted) deps.pins?.set(session, undefined);
+        throw error;
+      }
       if (
         pin &&
         [400, 401, 402, 403, 404, 408, 413, 429, 500, 502, 503, 504].includes(
@@ -272,7 +279,7 @@ export async function startModelGateway(
         fence: lease.fence,
         phase: auxiliary ? "auxiliary" : lease.phase,
         domain: domainOf(lease.role),
-        tier: lease.tier,
+        tier,
         requested,
         model: model ?? null,
         status: reply.status,
@@ -348,8 +355,10 @@ export async function startModelGateway(
           callback();
         },
       });
-      if (reply.body)
-        await pipeline(Readable.fromWeb(reply.body as never), tap, res);
+      if (reply.body) {
+        try { await pipeline(Readable.fromWeb(reply.body as never), tap, res); }
+        catch (error) { if (!abort.signal.aborted) deps.pins?.set(session, undefined); throw error; }
+      }
       else res.end();
       const completed = !failed && (!sse || terminal);
       if (!completed && !auxiliary) deps.pins?.set(session, undefined);
@@ -412,7 +421,7 @@ export function databaseGateway(db: Surreal): GatewayDeps {
           task: "",
           fence: 0,
           role: e.role,
-          tier: "high",
+          tier: taskTier({executor_role:e.role}),
           phase: "planning",
         };
       const [task] = await db.query<[any]>(

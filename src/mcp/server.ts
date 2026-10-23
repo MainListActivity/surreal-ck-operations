@@ -272,7 +272,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   server.registerTool('create_task', {
     description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
-      modelTier: z.enum(['high','medium','low']).optional(),
+      modelTier: z.enum(['fable','opus','sonnet','haiku','high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),
@@ -475,6 +475,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
     ? core.bindTaskCodeRepo(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('get_model_evidence', {
+    description:'eval/gm only: actual models and execution fences for final task evaluation. Combine with full submission/return/accept history; request counts are not quality scores.',
+    inputSchema:z.object({taskId:z.string().min(1).max(200)}),
+  },async(input,ctx)=>run(token(ctx),()=> {
+    if(!core.modelEvidence) throw new Error('Model evidence unavailable');
+    return core.modelEvidence(token(ctx),input.taskId);
+  }));
   server.registerTool('record_score', {
     description: 'eval employees only: record a performance scorecard for every participant of a finished task.',
     inputSchema: z.object({
@@ -482,6 +489,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
       summary: z.string().min(1).max(20000),
       scores: z.array(z.object({
         employee: z.string().min(1),
+        modelScores: z.array(z.object({model:z.string().min(1).max(200),overall:z.number().min(1).max(5),notes:z.string().max(2000).optional()})).max(50).optional(),
         quality: z.number().min(1).max(5),
         evidence: z.number().min(1).max(5),
         discipline: z.number().min(1).max(5),

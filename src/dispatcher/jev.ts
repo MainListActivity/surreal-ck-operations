@@ -101,7 +101,7 @@ const SCORE_LEVELS = [
 ];
 
 export interface JevScoreAnswers {
-  scores: { employee: string; quality: number; evidence: number; discipline: number; timeliness: number; overall: number; confidence: number; probabilities?: Record<string, Record<string, number>> }[];
+  scores: { modelScores?: import("../contracts.ts").ModelAssessment[]; employee: string; quality: number; evidence: number; discipline: number; timeliness: number; overall: number; confidence: number; probabilities?: Record<string, Record<string, number>> }[];
   /** confidence 最低的一题；全部缺省时按 0 计，触发升级。 */
   minConfidence: number;
   flagged: string[];

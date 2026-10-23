@@ -31,6 +31,7 @@ export default function contribute(server: PluginServerContext) {
     if(!ctx.modelRouting.enabled) return {};
     const ref=request.env.SCK_COMM_DIR ? `employee:${basename(request.env.SCK_COMM_DIR)}` : request.agentId;
     const session=ctx.sidecar.routingSession(ref);
+    if(session?.role === "story-author") return {};
     if(!session)throw new Error("公司模型路由尚未恢复员工会话登记");
     const env=routingEnv(`employee:${session.employee}`);
     installRoutingSettings(session.comm,env);

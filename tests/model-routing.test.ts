@@ -6,6 +6,8 @@ import {
   classify,
   rank,
   taskTier,
+  selectedTier,
+  employeeTier,
   domainOf,
   modelIdentity,
 } from "../src/model-routing/policy.ts";
@@ -29,15 +31,15 @@ const models = classify([
 test("catalog matches exact benchmark versions, conservatively classifies unknown models and omits group aliases", () => {
   expect(models).toHaveLength(4);
   expect(models.find((m) => m.model === "claude-opus-5-5")).toMatchObject({
-    tier: "high",
+    tier: "fable",
     estimated: false,
   });
   expect(models.find((m) => m.model === "claude-haiku-5-5")?.tier).toBe(
-    "medium",
+    "opus",
   );
   // Unbenchmarked is unknown, not weak: neutral tier, ranked last by its prior.
   expect(models.find((m) => m.model === "mystery")).toMatchObject({
-    tier: "medium",
+    tier: "sonnet",
     estimated: true,
     benchmark: undefined,
   });
@@ -49,14 +51,16 @@ test("catalog matches exact benchmark versions, conservatively classifies unknow
     classify([{ id: "relay/claude-opus-5-5-preview" }])[0]?.benchmark,
   ).toBeUndefined();
 });
-test("task tiers honor explicit choice and keep complex/release work high", () => {
-  expect(taskTier({ model_tier: "low", executor_role: "engineering" })).toBe(
-    "low",
-  );
-  expect(taskTier({ executor_role: "engineering" })).toBe("high");
-  expect(taskTier({ title: "上线申请" })).toBe("high");
-  expect(taskTier({ title: "格式整理" })).toBe("low");
-  expect(domainOf("story-author")).toBe("writing");
+test("four explicit tiers and owner-approved role defaults never depend on task titles", () => {
+  expect(taskTier({ model_tier: "haiku", executor_role: "engineering" })).toBe("haiku");
+  expect(taskTier({ executor_role: "engineering",title:"发布高风险功能" })).toBe("haiku");
+  expect(employeeTier("gm")).toBe("opus");
+  expect(employeeTier("product")).toBe("sonnet");
+  expect(employeeTier("qa")).toBe("haiku");
+  expect(selectedTier("claude-fable-5-1")).toBe("fable");
+  expect(selectedTier("group/sck-haiku")).toBe("haiku");
+  expect(taskTier({model_tier:"high"})).toBe("opus");
+  expect(domainOf("story-author")).toBe("general");
 });
 test("task evidence changes priority without allowing one tiny sample to dominate or crossing domains", () => {
   const now = Date.now();
@@ -86,7 +90,7 @@ test("task evidence changes priority without allowing one tiny sample to dominat
       "engineering",
     )[0]?.id,
   ).toBe(weak.id);
-  expect(rank([weak, strong], results, "writing")[0]?.id).toBe(strong.id);
+  expect(rank([weak, strong], results, "writing", now)).toEqual(rank([weak,strong],results,"engineering",now));
   expect(
     rank(
       [weak, strong],
@@ -115,7 +119,7 @@ test("one model served through several accounts shares its task evidence", () =>
 test("selector is deterministic per task lease, explores candidates and preserves unrelated requests", () => {
   const options = {
     routes: {
-      "group/sck-engineering-high": [
+      "group/sck-opus": [
         { group: "group/first" },
         { group: "group/second" },
         { group: "group/third" },
@@ -125,14 +129,14 @@ test("selector is deterministic per task lease, explores candidates and preserve
   const chosen = new Set();
   for (let i = 0; i < 1000; i++) {
     const body = {
-      model: "group/sck-engineering-high",
+      model: "group/sck-opus",
       metadata: { user_id: `lease-${i}` },
       tools: [{ name: "x" }],
     };
     const a = onRequest(body, { options });
     expect(a).toEqual(onRequest(body, { options }));
     expect(a.tools).toEqual(body.tools);
-    expect(body.model).toBe("group/sck-engineering-high");
+    expect(body.model).toBe("group/sck-opus");
     chosen.add(a.model);
   }
   expect(chosen.size).toBe(3);
@@ -169,7 +173,7 @@ describe("streaming task gateway", () => {
     task: "task-1",
     fence: 4,
     role: "engineering",
-    tier: "high",
+    tier: "opus",
     phase: "execute",
   };
   test("correlates actual model with the lease and streams bytes without forwarding credentials", async () => {
@@ -221,7 +225,7 @@ describe("streaming task gateway", () => {
       expect(r.status).toBe(200);
       expect(await r.text()).toContain('"text":"ok"');
       for (let i = 0; i < 20 && !complete.length; i++) await Bun.sleep(5);
-      expect(input.body.model).toBe("group/sck-engineering-high");
+      expect(input.body.model).toBe("group/sck-opus");
       expect(input.headers.get("authorization")).toBe("Bearer magpie-claude");
       expect(input.headers.get("x-magpie-session")).toMatch(/^sck-/);
       expect(rows[0]).toMatchObject({
@@ -275,58 +279,19 @@ describe("streaming task gateway", () => {
       await g.stop();
     }
   });
-  test("small-fast calls keep their model, never pin the lease and are marked auxiliary", async () => {
-    const rows: any[] = [],
-      sent: string[] = [],
-      pins = new Map<string, string>();
-    const g = await startModelGateway(
-      {
-        lease: async () => lease,
-        record: async (r) => {
-          rows.push(r);
-        },
-        complete: async () => {},
-        pins: {
-          get: (k) => pins.get(k),
-          set: (k, v) => (v ? pins.set(k, v) : pins.delete(k)),
-        },
-        fetchImpl: (async (_url: any, init: any) => {
-          const model = JSON.parse(init.body).model;
-          sent.push(model);
-          return new Response("{}", {
-            status: model.includes("haiku") ? 429 : 200,
-            headers: {
-              "x-magpie-provider": "claude",
-              "x-magpie-model": model.includes("haiku")
-                ? "claude-haiku-5-5"
-                : "claude-opus-5-5",
-            },
-          });
-        }) as unknown as typeof fetch,
-      },
-      0,
-    );
+  test("manual Haiku is task work and switching tiers never reuses another tier's pin", async () => {
+    const rows:any[]=[], sent:string[]=[]; const pins=new Map<string,string>();
+    const g=await startModelGateway({lease:async()=>lease,record:async r=>{rows.push(r)},complete:async()=>{},
+      pins:{get:k=>pins.get(k),set:(k,v)=>{if(v)pins.set(k,v);else pins.delete(k)}},
+      fetchImpl:(async (_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}',{headers:{'x-magpie-provider':'relay','x-magpie-model':`actual-${sent.length}`}})}) as typeof fetch},0);
     try {
-      const post = (model: string) =>
-        fetch(`http://127.0.0.1:${g.port}/a/x/v1/messages`, {
-          method: "POST",
-          body: JSON.stringify({ model, messages: [] }),
-        }).then((r) => r.text());
-      await post("group/haiku5.5");
-      await post("group/never-stuck");
-      await post("group/haiku5.5");
-      expect(sent).toEqual([
-        "group/haiku5.5",
-        "group/sck-engineering-high",
-        "group/haiku5.5",
-      ]);
-      expect(rows[0]).toMatchObject({ phase: "auxiliary", status: 429 });
-      expect(rows[1]).toMatchObject({ phase: "execute", status: 200 });
-      // The auxiliary 429 did not cool the lease down, and the main model stays pinned.
-      expect([...pins.values()]).toEqual(["claude/claude-opus-5-5"]);
-    } finally {
-      await g.stop();
-    }
+      for(const model of ['haiku','sonnet','opus']) {
+        const r=await fetch(`http://127.0.0.1:${g.port}/a/x/v1/messages`,{method:'POST',body:JSON.stringify({model,messages:[]})});await r.text();
+      }
+      expect(sent).toEqual(['group/sck-haiku','group/sck-sonnet','group/sck-opus']);
+      expect(rows.every(r=>r.phase==='execute')).toBe(true);
+      expect(pins.size).toBe(3);
+    } finally {await g.stop()}
   });
   test("quota/failed requests retain infrastructure evidence and are not successful model work", async () => {
     const rows: any[] = [];
@@ -400,9 +365,9 @@ test("controller publishes complete model groups before selector options and rer
   // A path plugin is addressed by its absolute path; the bare stem is "no plugin" to magpie.
   const selector = join(scratch, "controller", "model-routing", "sck-performance.gateway.js");
   expect(calls.find((c) => c[0] === "plugin" && c[1] === "add")).toEqual(["plugin", "add", selector]);
-  expect(calls.at(-1)?.slice(0, 3)).toEqual(["plugin", "options", selector]);
-  const options = JSON.parse(calls.at(-1)![3]!);
-  expect(options.routes["group/sck-engineering-high"][0].model).toBe(
+  expect(calls.at(-1)?.slice(0, 3)).toEqual(["plugin", "on", selector]);
+  const options = JSON.parse(calls.find(c=>c[0]==="plugin" && c[1]==="options")![3]!);
+  expect(options.routes["group/sck-fable"][0].model).toBe(
     "claude/claude-opus-5-5",
   );
   expect(
@@ -412,7 +377,8 @@ test("controller publishes complete model groups before selector options and rer
   ).toBe(true);
   const n = calls.length;
   await controller.refresh(true);
-  expect(calls.length).toBe(n);
+  expect(calls.length).toBe(n+1);
+  expect(calls.at(-1)).toEqual(["plugin","on",selector]);
 });
 
 test("durable local queue never waits for remote DB, survives restart and retains completions during a slow flush", async () => {
@@ -484,7 +450,7 @@ test("in-band SSE errors and truncated responses never count as completed model 
           task: "t",
           fence: 1,
           role: "engineering",
-          tier: "high",
+          tier: "opus",
           phase: "execute",
         }),
         record: async () => {},
@@ -534,7 +500,7 @@ test("a pinned model is reused after policy changes and quota failure falls back
         task: "t",
         fence: 1,
         role: "engineering",
-        tier: "high",
+        tier: "opus",
         phase: "execute",
       }),
       record: async () => {},
@@ -567,10 +533,10 @@ test("a pinned model is reused after policy changes and quota failure falls back
     unavailable = true;
     await send();
     expect(input).toEqual([
-      "group/sck-engineering-high",
+      "group/sck-opus",
       "relay/first",
       "relay/first",
-      "group/sck-engineering-high",
+      "group/sck-opus",
     ]);
     expect([...pins.values()]).toEqual(["relay/second"]);
   } finally {
@@ -634,4 +600,61 @@ test("magpie management batches group saves, keeps DB secrets out of child env a
     if (old === undefined) delete process.env.SURREAL_ROOT_PASS;
     else process.env.SURREAL_ROOT_PASS = old;
   }
+});
+
+
+test("upstream connection failures release a model pin so the next request re-enters its group", async () => {
+  const pins=new Map<string,string>(),sent:string[]=[];
+  const g=await startModelGateway({lease:async()=>({employee:'worker',task:'task',fence:1,role:'qa',tier:'haiku',phase:'execute'}),
+    record:async()=>{},complete:async()=>{},pins:{get:k=>pins.get(k),set:(k,v)=>{if(v)pins.set(k,v);else pins.delete(k)}},
+    fetchImpl:(async(_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);if(sent.length===2)throw Error('ECONNRESET');return new Response('{}',{headers:{'x-magpie-provider':'relay','x-magpie-model':'actual'}})}) as typeof fetch},0);
+  try {
+    for(let n=0;n<3;n++){const r=await fetch(`http://127.0.0.1:${g.port}/a/worker/v1/messages`,{method:'POST',body:'{}'});expect(r.status).toBe(n===1?502:200);await r.text()}
+    expect(sent).toEqual(['group/sck-haiku','relay/actual','group/sck-haiku']);
+  } finally {await g.stop()}
+});
+
+test("roster simplification preserves story authors, role tracks and review seats", async () => {
+  const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
+  const defs=[{id:'qa-codex',role:'qa',provider:'codex',model:'native',enabled:true,tracks:['web']},
+    {id:'qa-claude',role:'qa',provider:'claude',model:'old',enabled:true,tracks:['mobile']},
+    {id:'gm-old',role:'gm',provider:'grok',model:'native',enabled:true},
+    {id:'story',role:'story-author',provider:'codex',model:'keep-me',enabled:true},
+    {id:'product-claude',role:'product',provider:'claude',model:'old',enabled:true}];
+  const changes=planRoutingRoster(defs);
+  expect(changes.some(d=>d.role==='story-author')).toBe(false);
+  expect(changes.find(d=>d.id==='qa-codex')?.enabled).toBe(false);
+  expect(changes.find(d=>d.id==='qa-claude')).toMatchObject({model:'group/sck-haiku',maxInstances:2,tracks:['web','mobile']});
+  expect(changes.find(d=>d.role==='gm' && d.enabled)).toMatchObject({provider:'claude',model:'group/sck-opus'});
+  expect(changes.find(d=>d.role==='product' && d.enabled)?.model).toBe('group/sck-sonnet');
+  expect(changes.filter(d=>d.enabled).every(d=>!d.model.includes('fable'))).toBe(true);
+});
+
+
+test("merging a wildcard track definition never narrows the surviving Claude role",async()=>{
+  const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
+  const changes=planRoutingRoster([{id:'engineering-claude',role:'engineering',provider:'claude',model:'old',enabled:true,tracks:[]},
+    {id:'engineering-codex',role:'engineering',provider:'codex',model:'old',enabled:true,tracks:['web']}]);
+  expect(changes.find(d=>d.enabled)?.tracks).toEqual([]);
+});
+
+
+test("story authors already using the old gateway keep their configured model",async()=>{
+  let sent='';
+  const g=await startModelGateway({lease:async()=>({employee:'author',task:'story',fence:1,role:'story-author',tier:'haiku',phase:'execute'}),record:async()=>{},complete:async()=>{},
+    fetchImpl:(async(_url:any,init:any)=>{sent=JSON.parse(init.body).model;return new Response('{}')}) as typeof fetch},0);
+  try {const r=await fetch(`http://127.0.0.1:${g.port}/a/author/v1/messages`,{method:'POST',body:JSON.stringify({model:'group/sck-writing-high'})});await r.text();expect(sent).toBe('group/sck-writing-high')}finally{await g.stop()}
+});
+
+
+test("Fable stays owner-only even when a legacy busy employee sends a Fable model name",async()=>{
+  const sent:string[]=[];
+  const g=await startModelGateway({lease:async()=>({employee:'legacy',task:'real-task',fence:4,role:'engineering',tier:'haiku',phase:'review'}),record:async()=>{},complete:async()=>{},
+    fetchImpl:(async(_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}')}) as typeof fetch},0);
+  try {
+    for(const model of ['claude-fable-5-1','group/sck-fable']){const r=await fetch(`http://127.0.0.1:${g.port}/a/legacy/v1/messages`,{method:'POST',body:JSON.stringify({model})});await r.text();}
+    expect(sent).toEqual(['group/sck-haiku','group/sck-haiku']);
+    const direct=onRequest({model:'group/sck-fable'},{options:{routes:{'group/sck-fable':[{group:'group/sck-route-fable-best'}]}}});
+    expect(direct.model).toBe('group/sck-route-fable-best');
+  }finally{await g.stop()}
 });

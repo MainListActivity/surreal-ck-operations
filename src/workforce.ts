@@ -586,6 +586,10 @@ export class Workforce {
   }
 
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
+  async requireFullModelEvaluation(taskId: TaskId): Promise<void> {
+    await this.db.query("UPDATE $task SET model_eval_full_history=true WHERE state='done';",{task:id('task',taskId)});
+  }
+
   async evalState(taskId: TaskId): Promise<EvalState> {
     return collectEvalState(this.db, taskId);
   }

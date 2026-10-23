@@ -124,6 +124,7 @@ export class CompanyDatabase {
     // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
     await this.db.query(loadSchema('027-qa-observation.surql'));
     await this.db.query(loadSchema('032-model-routing.surql'));
+    await this.db.query(loadSchema('033-four-tier-routing.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');
     // 独立性策略（SYS-DISP 8c732ae6 IR01）：028 由本线取用（025/026 为在办 lane 预占，027 已被 QA 取证占用）；只新增字段，旧行不动。
     await this.db.query(loadSchema('028-independence-policy.surql'));

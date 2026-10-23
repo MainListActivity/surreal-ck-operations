@@ -342,3 +342,14 @@ test('pool: aggregate magpie group backoff applies even to a native-quota-exempt
  expect(staffingPool(input).find(e=>e.kind==='reuse')?.code).toBe('quota');
  expect(staffingPool({...input,now:1_000_061}).some(e=>e.eligible)).toBe(true);
 });
+
+
+test('managed Claude pool ignores subscription model quotas and provider capacity but preserves lease and recusal gates',()=>{
+  const d=def('d1',{provider:'claude',model:'group/sck-haiku',quotaLimited:false,avgScore:1});
+  const i=inst('i1',{provider:'claude',model:'actual-model'});
+  const p=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),providerMax:{claude:0},busyBy:new Map([['claude',20]]),quotaBlocked:new Map([['claude','spent']]),health:new Map([['claude',{provider:'claude',state:'exhausted',failures:4,until:2000000}]])});
+  expect(staffingPool(p).every(e=>e.eligible)).toBe(true);
+  expect(staffingPool(p).every(e=>e.weight===1)).toBe(true);
+  expect(staffingPool({...p,holding:new Set(['i1'])}).find(e=>e.key==='i1')?.code).toBe('held');
+  expect(staffingPool({...p,defs:[{...d,enabled:false}]}).find(e=>e.key==='i1')?.code).toBe('def_disabled');
+});
