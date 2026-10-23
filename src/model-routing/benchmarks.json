@@ -1,0 +1,1342 @@
+{
+  "source": "https://artificialanalysis.ai/leaderboards/models",
+  "retrievedAt": "2026-10-23T01:22:47.003966+00:00",
+  "index": "Artificial Analysis Intelligence Index",
+  "models": [
+    {
+      "slug": "jt-35b-flash",
+      "score": 18.6626376411117,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-omni-plus",
+      "score": 20.3839890713777,
+      "estimated": true
+    },
+    {
+      "slug": "nova-2-0-omni-reasoning-medium",
+      "score": 13.6465213725579,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-122b-a10b-non-reasoning",
+      "score": 17.7480154665397,
+      "estimated": true
+    },
+    {
+      "slug": "gemma-4-12b-non-reasoning",
+      "score": 9.37989472421056,
+      "estimated": true
+    },
+    {
+      "slug": "claude-sonnet-5-5-medium",
+      "score": 40.838652287929,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-3-270m",
+      "score": 5.11705960692171,
+      "estimated": true
+    },
+    {
+      "slug": "claude-fable-5-1-low",
+      "score": 46.8163422014862,
+      "estimated": false
+    },
+    {
+      "slug": "apodex-1-1",
+      "score": 26.4103686249117,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-1-sol-xhigh",
+      "score": 51.0377679093761,
+      "estimated": false
+    },
+    {
+      "slug": "gemini-3-5-flash-lite",
+      "score": 22.1685424839812,
+      "estimated": false
+    },
+    {
+      "slug": "step-5",
+      "score": 43.7343049141614,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-2b-non-reasoning",
+      "score": 6.18559190112645,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-omni-30b-a3b-instruct",
+      "score": 6.00611816793457,
+      "estimated": true
+    },
+    {
+      "slug": "granite-4-2-3b",
+      "score": 9.05588232376756,
+      "estimated": false
+    },
+    {
+      "slug": "nova-2-0-pro-reasoning-medium",
+      "score": 14.1554948903666,
+      "estimated": true
+    },
+    {
+      "slug": "inkling",
+      "score": 24.9847810999384,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-397b-a17b",
+      "score": 18.4204249294815,
+      "estimated": false
+    },
+    {
+      "slug": "granite-4-2-30b",
+      "score": 12.68315341158,
+      "estimated": false
+    },
+    {
+      "slug": "k2-horizon-7b",
+      "score": 20.5958819421354,
+      "estimated": false
+    },
+    {
+      "slug": "mimo-v2-6-flash",
+      "score": 37.8843590141754,
+      "estimated": false
+    },
+    {
+      "slug": "mistral-small-4-non-reasoning",
+      "score": 8.99008610259603,
+      "estimated": true
+    },
+    {
+      "slug": "solar-pro4",
+      "score": 26.5600314812231,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-oss-20b-low",
+      "score": 9.95295342568922,
+      "estimated": true
+    },
+    {
+      "slug": "o3",
+      "score": 20.200754789201,
+      "estimated": true
+    },
+    {
+      "slug": "k-exaone-2-0-0803",
+      "score": 19.6904943371003,
+      "estimated": true
+    },
+    {
+      "slug": "glm-5-3-flash",
+      "score": 41.807466113455,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-luna-xhigh",
+      "score": 34.5587320217785,
+      "estimated": false
+    },
+    {
+      "slug": "north-mini-code",
+      "score": 9.91462776590372,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-astra-xhigh",
+      "score": 52.3863277108782,
+      "estimated": false
+    },
+    {
+      "slug": "nova-2-0-omni",
+      "score": 8.15087501101863,
+      "estimated": true
+    },
+    {
+      "slug": "granite-4-0-micro",
+      "score": 5.10657830942846,
+      "estimated": true
+    },
+    {
+      "slug": "claude-haiku-5-5-high",
+      "score": 37.8240211671094,
+      "estimated": false
+    },
+    {
+      "slug": "grok-4-7-low",
+      "score": 42.2166560223448,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-9b-non-reasoning",
+      "score": 13.2659955355465,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-122b-a10b",
+      "score": 15.5694009312969,
+      "estimated": false
+    },
+    {
+      "slug": "hermes-4-llama-3-1-70b",
+      "score": 6.65822068462287,
+      "estimated": true
+    },
+    {
+      "slug": "nvidia-nemotron-3-nano-30b-a3b",
+      "score": 6.8478519055181,
+      "estimated": true
+    },
+    {
+      "slug": "mimo-v2-6-pro",
+      "score": 46.3242065310383,
+      "estimated": false
+    },
+    {
+      "slug": "claude-sonnet-5-5-high",
+      "score": 46.7533528066958,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-next-80b-a3b-instruct",
+      "score": 9.64335007559183,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-5-6-terra-medium",
+      "score": 30.0938023419377,
+      "estimated": false
+    },
+    {
+      "slug": "grok-4-7-high",
+      "score": 46.3321770885625,
+      "estimated": false
+    },
+    {
+      "slug": "minimax-m3",
+      "score": 29.2202932236316,
+      "estimated": false
+    },
+    {
+      "slug": "nemotron-3-5-lightning",
+      "score": 12.8572306217144,
+      "estimated": false
+    },
+    {
+      "slug": "phi-4-multimodal",
+      "score": 5.80520041934726,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-9b",
+      "score": 11.1961650827156,
+      "estimated": false
+    },
+    {
+      "slug": "nvidia-nemotron-nano-9b-v2",
+      "score": 6.84412514839364,
+      "estimated": true
+    },
+    {
+      "slug": "command-a-plus",
+      "score": 13.1335002685349,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-astra",
+      "score": 52.673669395513,
+      "estimated": false
+    },
+    {
+      "slug": "claude-opus-5-5",
+      "score": 57.6223698102963,
+      "estimated": false
+    },
+    {
+      "slug": "exaone-4-0-32b",
+      "score": 6.32621718534092,
+      "estimated": true
+    },
+    {
+      "slug": "g9v3-3b",
+      "score": 10.841600440564,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-4b-non-reasoning",
+      "score": 10.812307683746,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-397b-a17b-non-reasoning",
+      "score": 21.4366547759392,
+      "estimated": true
+    },
+    {
+      "slug": "k2-horizon-3-7b",
+      "score": 15.6103951330976,
+      "estimated": false
+    },
+    {
+      "slug": "olmo-3-7b-think",
+      "score": 5.61691854830355,
+      "estimated": true
+    },
+    {
+      "slug": "hyperclova-x-seed-think-32b",
+      "score": 11.3648115832519,
+      "estimated": true
+    },
+    {
+      "slug": "hypernova-60b",
+      "score": 11.7380211033452,
+      "estimated": true
+    },
+    {
+      "slug": "nova-micro",
+      "score": 5.8765232381273,
+      "estimated": true
+    },
+    {
+      "slug": "mistral-large-4",
+      "score": 38.3770408917494,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-8-27b-non-reasoning",
+      "score": 20.1502427055595,
+      "estimated": false
+    },
+    {
+      "slug": "muse-spark-open",
+      "score": 38.8666662997805,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-luna-medium",
+      "score": 29.9251773515762,
+      "estimated": false
+    },
+    {
+      "slug": "intellect-3",
+      "score": 10.6061102858178,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-oss-20b",
+      "score": 8.9675171856126,
+      "estimated": false
+    },
+    {
+      "slug": "olmo-3-1-32b-think",
+      "score": 7.12364412279906,
+      "estimated": true
+    },
+    {
+      "slug": "nex-n2-pro",
+      "score": 28.1990972887912,
+      "estimated": true
+    },
+    {
+      "slug": "claude-fable-5-1-medium",
+      "score": 48.9206162609523,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-1-sol-high",
+      "score": 50.2377777519769,
+      "estimated": false
+    },
+    {
+      "slug": "command-a",
+      "score": 6.9581988704518,
+      "estimated": true
+    },
+    {
+      "slug": "lfm2-5-vl-1-6b",
+      "score": 4.83423948,
+      "estimated": true
+    },
+    {
+      "slug": "jt-mini",
+      "score": 12.2117782837313,
+      "estimated": true
+    },
+    {
+      "slug": "claude-fable-5-1",
+      "score": 53.3549259623252,
+      "estimated": false
+    },
+    {
+      "slug": "molmo2-8b",
+      "score": 5.00251209304105,
+      "estimated": true
+    },
+    {
+      "slug": "mistral-small-4",
+      "score": 11.2675794141469,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-0-8b-non-reasoning",
+      "score": 5.40008099703412,
+      "estimated": true
+    },
+    {
+      "slug": "claude-haiku-5-5-xhigh",
+      "score": 41.2489304677024,
+      "estimated": false
+    },
+    {
+      "slug": "claude-haiku-5-5-low",
+      "score": 29.4523685891139,
+      "estimated": false
+    },
+    {
+      "slug": "ling-3-0-flash-vl",
+      "score": 24.5693054077875,
+      "estimated": false
+    },
+    {
+      "slug": "minicpm-v4-6-1-3b",
+      "score": 5.69026588282761,
+      "estimated": true
+    },
+    {
+      "slug": "claude-opus-5-5-low",
+      "score": 42.3077781466168,
+      "estimated": false
+    },
+    {
+      "slug": "exaone-4-0-32b-reasoning",
+      "score": 8.17836973273723,
+      "estimated": true
+    },
+    {
+      "slug": "sarvam-105b",
+      "score": 8.7905508357489,
+      "estimated": true
+    },
+    {
+      "slug": "llama-3-1-instruct-405b",
+      "score": 7.2893092121128,
+      "estimated": true
+    },
+    {
+      "slug": "jt-4-1-flash-236b-a21b",
+      "score": 33.9172581709394,
+      "estimated": false
+    },
+    {
+      "slug": "ring-flash-2-0",
+      "score": 7.15340447175535,
+      "estimated": true
+    },
+    {
+      "slug": "lfm2-5-1-2b-instruct",
+      "score": 5.20951181661378,
+      "estimated": true
+    },
+    {
+      "slug": "apertus-70b-instruct",
+      "score": 5.11462775284761,
+      "estimated": true
+    },
+    {
+      "slug": "doubao-seed-code",
+      "score": 16.9467715940932,
+      "estimated": true
+    },
+    {
+      "slug": "exaone-4-5-33b",
+      "score": 13.2058394009382,
+      "estimated": true
+    },
+    {
+      "slug": "kimi-k3-low",
+      "score": 30.0666987529068,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-4-e4b-non-reasoning",
+      "score": 7.45765296912625,
+      "estimated": true
+    },
+    {
+      "slug": "ling-3-1-flash-1019",
+      "score": 43.8973584978265,
+      "estimated": false
+    },
+    {
+      "slug": "k2-horizon-mova-36b-a4b",
+      "score": 25.3037790731435,
+      "estimated": false
+    },
+    {
+      "slug": "granite-4-0-350m",
+      "score": 4.83423948,
+      "estimated": true
+    },
+    {
+      "slug": "muse-glimmer",
+      "score": 17.4754176089465,
+      "estimated": false
+    },
+    {
+      "slug": "grok-4-7",
+      "score": 46.4465506302286,
+      "estimated": false
+    },
+    {
+      "slug": "kimi-linear-48b-a3b-instruct",
+      "score": 7.30037362771236,
+      "estimated": true
+    },
+    {
+      "slug": "solar-open-100b-reasoning",
+      "score": 10.3644352600556,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-5-3-codex",
+      "score": 32.5028174368983,
+      "estimated": true
+    },
+    {
+      "slug": "lfm2-5-1-2b-thinking",
+      "score": 5.22188553175398,
+      "estimated": true
+    },
+    {
+      "slug": "k2-think-v2",
+      "score": 11.4956908518183,
+      "estimated": true
+    },
+    {
+      "slug": "nvidia-nemotron-3-ultra-550b-a55b",
+      "score": 22.9279123422858,
+      "estimated": false
+    },
+    {
+      "slug": "longcat-2-0",
+      "score": 19.1123256610623,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-2b",
+      "score": 6.94413664133259,
+      "estimated": true
+    },
+    {
+      "slug": "tri-21b-think-v0-5",
+      "score": 8.98704047108094,
+      "estimated": true
+    },
+    {
+      "slug": "granite-4-0-h-small",
+      "score": 6.04930220974964,
+      "estimated": true
+    },
+    {
+      "slug": "llama-3-2-instruct-11b-vision",
+      "score": 5.40802026647316,
+      "estimated": true
+    },
+    {
+      "slug": "longcat-flash-lite",
+      "score": 11.4709079965186,
+      "estimated": true
+    },
+    {
+      "slug": "nova-2-0-lite-reasoning",
+      "score": 13.3740793005281,
+      "estimated": true
+    },
+    {
+      "slug": "solar-mini4",
+      "score": 24.0522018844171,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-luna-non-reasoning",
+      "score": 18.4678465935701,
+      "estimated": false
+    },
+    {
+      "slug": "minicpm5-2b",
+      "score": 12.463354831996,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-5-4b",
+      "score": 13.1248174602542,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-8-27b-medium",
+      "score": 27.5508228231586,
+      "estimated": false
+    },
+    {
+      "slug": "motif-2-12-7b",
+      "score": 9.18748556817538,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-6-35b-a3b-non-reasoning",
+      "score": 15.2320772647744,
+      "estimated": true
+    },
+    {
+      "slug": "ministral-3-3b",
+      "score": 4.83760020546443,
+      "estimated": false
+    },
+    {
+      "slug": "reflection-beam",
+      "score": 30.3334426348039,
+      "estimated": false
+    },
+    {
+      "slug": "hermes-4-llama-3-1-70b-reasoning",
+      "score": 7.90579275030455,
+      "estimated": true
+    },
+    {
+      "slug": "ling-3-0-flash-fin",
+      "score": 22.5965828940594,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-4-26b-a4b",
+      "score": 16.671930040086,
+      "estimated": true
+    },
+    {
+      "slug": "nvidia-nemotron-nano-12b-v2-vl-reasoning",
+      "score": 7.47796854824097,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-omni-flash",
+      "score": 12.4740069826994,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-6-luna",
+      "score": 38.1245186869738,
+      "estimated": false
+    },
+    {
+      "slug": "nova-2-0-lite-reasoning-low",
+      "score": 11.8041280807831,
+      "estimated": true
+    },
+    {
+      "slug": "magistral-small-2509",
+      "score": 8.59366235978288,
+      "estimated": true
+    },
+    {
+      "slug": "gemma-4-26b-a4b-non-reasoning",
+      "score": 13.1303772801787,
+      "estimated": true
+    },
+    {
+      "slug": "ministral-3-14b",
+      "score": 6.04436817215002,
+      "estimated": false
+    },
+    {
+      "slug": "inkling-small",
+      "score": 25.6582584411942,
+      "estimated": false
+    },
+    {
+      "slug": "gemini-3-8-flash-medium",
+      "score": 39.7740187061926,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-4-e2b-non-reasoning",
+      "score": 6.47543520107148,
+      "estimated": true
+    },
+    {
+      "slug": "sarvam-30b",
+      "score": 6.55971145066503,
+      "estimated": true
+    },
+    {
+      "slug": "mercury-2-5",
+      "score": 12.3408453757638,
+      "estimated": false
+    },
+    {
+      "slug": "nova-2-0-lite",
+      "score": 8.73661367769335,
+      "estimated": true
+    },
+    {
+      "slug": "nvidia-nemotron-3-nano-30b-a3b-reasoning",
+      "score": 8.8961440122188,
+      "estimated": false
+    },
+    {
+      "slug": "deepseek-v4-flash-vision",
+      "score": 34.8390628035969,
+      "estimated": false
+    },
+    {
+      "slug": "minicpm5-1b",
+      "score": 8.79664321370212,
+      "estimated": true
+    },
+    {
+      "slug": "jamba-1-7-large",
+      "score": 6.0710365237197,
+      "estimated": true
+    },
+    {
+      "slug": "claude-haiku-5-5",
+      "score": 43.3950199670746,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-luna-high",
+      "score": 32.9282054150837,
+      "estimated": false
+    },
+    {
+      "slug": "nemotron-3-5-bolt-74b-a9b",
+      "score": 21.4072054842003,
+      "estimated": false
+    },
+    {
+      "slug": "nanbeige4-1-3b",
+      "score": 8.4012282586083,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-8-27b-low",
+      "score": 26.2047978189896,
+      "estimated": false
+    },
+    {
+      "slug": "solar-open2-250b",
+      "score": 24.7365297627523,
+      "estimated": true
+    },
+    {
+      "slug": "ling-3-0-tiny",
+      "score": 11.0636233769305,
+      "estimated": false
+    },
+    {
+      "slug": "celeris-1",
+      "score": 6.3469533538601,
+      "estimated": false
+    },
+    {
+      "slug": "tiny-aya-global",
+      "score": 4.83423948,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-5-6-terra-high",
+      "score": 34.2376558067555,
+      "estimated": false
+    },
+    {
+      "slug": "a-x-k2",
+      "score": 21.4612645385074,
+      "estimated": false
+    },
+    {
+      "slug": "exaone-4-0-1-2b",
+      "score": 5.22938457197929,
+      "estimated": true
+    },
+    {
+      "slug": "hermes-4-llama-3-1-405b-reasoning",
+      "score": 7.49497809925135,
+      "estimated": true
+    },
+    {
+      "slug": "deepseek-v4-pro",
+      "score": 35.9967791278402,
+      "estimated": false
+    },
+    {
+      "slug": "magistral-medium-2509",
+      "score": 11.8254509953707,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-6-35b-a3b",
+      "score": 18.2289900189843,
+      "estimated": false
+    },
+    {
+      "slug": "apertus-8b-instruct",
+      "score": 4.83423948,
+      "estimated": true
+    },
+    {
+      "slug": "gemini-3-8-flash",
+      "score": 40.9262321765904,
+      "estimated": false
+    },
+    {
+      "slug": "nemotron-3-nano-omni-30b-a3b",
+      "score": 10.2506761710987,
+      "estimated": true
+    },
+    {
+      "slug": "kimi-k2-7-code",
+      "score": 25.8121062401836,
+      "estimated": false
+    },
+    {
+      "slug": "qwen3-8-2-4t-a95b",
+      "score": 39.9461723105325,
+      "estimated": false
+    },
+    {
+      "slug": "olmo-3-7b-instruct",
+      "score": 5.24099718758815,
+      "estimated": true
+    },
+    {
+      "slug": "jt-4-1-flash-236b-a21b-non-reasoning",
+      "score": 27.2926268381758,
+      "estimated": true
+    },
+    {
+      "slug": "llama-4-maverick",
+      "score": 9.29902687437199,
+      "estimated": false
+    },
+    {
+      "slug": "olmo-3-1-32b-instruct",
+      "score": 6.49671923993574,
+      "estimated": true
+    },
+    {
+      "slug": "ministral-3-8b",
+      "score": 5.47767370454416,
+      "estimated": false
+    },
+    {
+      "slug": "claude-sonnet-5-5-xhigh",
+      "score": 51.8955544183089,
+      "estimated": false
+    },
+    {
+      "slug": "llama-3-3-instruct-70b",
+      "score": 7.66380859299009,
+      "estimated": true
+    },
+    {
+      "slug": "nemotron-cascade-2-30b-a3b",
+      "score": 11.6708359406601,
+      "estimated": true
+    },
+    {
+      "slug": "r1-1776",
+      "score": 6.43857605749744,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-8-flash-next",
+      "score": 39.8223021864741,
+      "estimated": false
+    },
+    {
+      "slug": "claude-fable-5-1-xhigh",
+      "score": 53.2032587538944,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-5-6-terra-non-reasoning",
+      "score": 20.7797013584503,
+      "estimated": false
+    },
+    {
+      "slug": "llama-3-2-instruct-90b-vision",
+      "score": 6.4088295766243,
+      "estimated": true
+    },
+    {
+      "slug": "claude-fable-5-1-high",
+      "score": 51.1515708852237,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-5-6-terra-xhigh",
+      "score": 37.9513370742927,
+      "estimated": false
+    },
+    {
+      "slug": "k2-horizon-0-9b",
+      "score": 3.04760621054014,
+      "estimated": false
+    },
+    {
+      "slug": "nvidia-nemotron-3-nano-4b",
+      "score": 4.76910061591993,
+      "estimated": false
+    },
+    {
+      "slug": "phi-4-mini",
+      "score": 6.32860508899613,
+      "estimated": true
+    },
+    {
+      "slug": "nova-2-0-pro",
+      "score": 9.95904965562327,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-6-1-sol-medium",
+      "score": 47.7833271274065,
+      "estimated": false
+    },
+    {
+      "slug": "k2-v2",
+      "score": 9.87390600007694,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-6-astra-low",
+      "score": 45.7819243120341,
+      "estimated": false
+    },
+    {
+      "slug": "ernie-5-0-thinking-preview",
+      "score": 14.2551784975475,
+      "estimated": true
+    },
+    {
+      "slug": "ling-3-1-flash",
+      "score": 41.0906200397391,
+      "estimated": false
+    },
+    {
+      "slug": "granite-4-0-h-350m",
+      "score": 4.83423948,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-5-0-8b",
+      "score": 6.12847840160203,
+      "estimated": true
+    },
+    {
+      "slug": "apriel-v1-6-15b-thinker",
+      "score": 13.401396407375,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-7-plus",
+      "score": 25.1622215821984,
+      "estimated": false
+    },
+    {
+      "slug": "deephermes-3-mistral-24b-preview",
+      "score": 6.07426212371414,
+      "estimated": true
+    },
+    {
+      "slug": "nvidia-nemotron-nano-12b-v2-vl",
+      "score": 5.82045753777258,
+      "estimated": true
+    },
+    {
+      "slug": "step-3-vl-10b",
+      "score": 7.69391371030502,
+      "estimated": true
+    },
+    {
+      "slug": "llama-4-scout",
+      "score": 6.45126865234633,
+      "estimated": false
+    },
+    {
+      "slug": "granite-4-2-8b",
+      "score": 11.0812712267815,
+      "estimated": false
+    },
+    {
+      "slug": "ernie-4-5-300b-a47b",
+      "score": 7.50448042633837,
+      "estimated": true
+    },
+    {
+      "slug": "claude-haiku-5-5-medium",
+      "score": 34.4646519474657,
+      "estimated": false
+    },
+    {
+      "slug": "molmo-7b-d",
+      "score": 5.56262049746202,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-8-27b",
+      "score": 33.6762858057476,
+      "estimated": false
+    },
+    {
+      "slug": "motif-3",
+      "score": 33.566562209723,
+      "estimated": true
+    },
+    {
+      "slug": "gemma-4-e2b",
+      "score": 7.77445525187484,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-8-max",
+      "score": 45.4152084980521,
+      "estimated": false
+    },
+    {
+      "slug": "claude-sonnet-5-5",
+      "score": 56.0001286580794,
+      "estimated": false
+    },
+    {
+      "slug": "hy3",
+      "score": 25.2972775731571,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-1-sol",
+      "score": 51.8332597011541,
+      "estimated": false
+    },
+    {
+      "slug": "nova-2-0-omni-reasoning-low",
+      "score": 11.1140626232787,
+      "estimated": true
+    },
+    {
+      "slug": "jamba-1-7-mini",
+      "score": 5.21767706986744,
+      "estimated": true
+    },
+    {
+      "slug": "trinity-large-thinking",
+      "score": 10.8242425924218,
+      "estimated": false
+    },
+    {
+      "slug": "deephermes-3-llama-3-1-8b-preview",
+      "score": 5.08032603461277,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-omni-30b-a3b-reasoning",
+      "score": 7.76082961984319,
+      "estimated": true
+    },
+    {
+      "slug": "k2-horizon-375b-a23b",
+      "score": 30.5015302696723,
+      "estimated": false
+    },
+    {
+      "slug": "claude-sonnet-5-5-low",
+      "score": 35.8681594577587,
+      "estimated": false
+    },
+    {
+      "slug": "gemini-3-1-pro-preview",
+      "score": 29.7185656132261,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-5-6-terra",
+      "score": 42.0829248239494,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-luna-low",
+      "score": 21.5261980080866,
+      "estimated": false
+    },
+    {
+      "slug": "g9v3-39a5b",
+      "score": 21.8316172646825,
+      "estimated": true
+    },
+    {
+      "slug": "diffusiongemma-26b-a4b",
+      "score": 9.51014305662543,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-5-5-instant-06-26",
+      "score": 26.0135173401368,
+      "estimated": false
+    },
+    {
+      "slug": "falcon-h1r-7b",
+      "score": 7.82776928077145,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-next-80b-a3b-reasoning",
+      "score": 11.1973684395653,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-oss-120b-low",
+      "score": 10.2105650347196,
+      "estimated": true
+    },
+    {
+      "slug": "glm-5-3-low",
+      "score": 34.2990078159643,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-5-6-terra-low",
+      "score": 27.496203401716,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-4-31b",
+      "score": 14.6689500745828,
+      "estimated": false
+    },
+    {
+      "slug": "glm-5-3",
+      "score": 44.777392385614,
+      "estimated": false
+    },
+    {
+      "slug": "llama-3-1-nemotron-ultra-253b-v1-reasoning",
+      "score": 7.52746905624501,
+      "estimated": true
+    },
+    {
+      "slug": "gemma-4-31b-non-reasoning",
+      "score": 13.9198819005287,
+      "estimated": true
+    },
+    {
+      "slug": "minicpm5-1b-non-reasoning",
+      "score": 8.69473818567247,
+      "estimated": true
+    },
+    {
+      "slug": "gemini-4-argon",
+      "score": 52.5605655745982,
+      "estimated": false
+    },
+    {
+      "slug": "hermes-4-llama-3-1-405b",
+      "score": 7.41221110231024,
+      "estimated": true
+    },
+    {
+      "slug": "minimax-m3-1-flash",
+      "score": 42.7057475126235,
+      "estimated": false
+    },
+    {
+      "slug": "deepseek-v4-pro-non-reasoning",
+      "score": 20.3605101726847,
+      "estimated": false
+    },
+    {
+      "slug": "exaone-4-0-1-2b-reasoning",
+      "score": 5.27138994054015,
+      "estimated": true
+    },
+    {
+      "slug": "gemma-4-e4b",
+      "score": 8.90908441839731,
+      "estimated": false
+    },
+    {
+      "slug": "k2-v2-low",
+      "score": 7.31130007284626,
+      "estimated": true
+    },
+    {
+      "slug": "granite-4-0-h-nano-1b",
+      "score": 5.1945517329943,
+      "estimated": true
+    },
+    {
+      "slug": "reka-flash-3",
+      "score": 5.64602230491152,
+      "estimated": true
+    },
+    {
+      "slug": "mistral-medium-3-5",
+      "score": 14.1889227802691,
+      "estimated": false
+    },
+    {
+      "slug": "k2-v2-medium",
+      "score": 9.01595166538807,
+      "estimated": true
+    },
+    {
+      "slug": "mi-dm-k-2-5-pro-dec28",
+      "score": 11.0361387091137,
+      "estimated": true
+    },
+    {
+      "slug": "claude-opus-5-5-xhigh",
+      "score": 55.9873505840139,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-astra-high",
+      "score": 50.9191471636152,
+      "estimated": false
+    },
+    {
+      "slug": "lfm2-5-2-6b",
+      "score": 8.38708534765242,
+      "estimated": true
+    },
+    {
+      "slug": "lfm2-5-8b-a1b",
+      "score": 7.21643567343487,
+      "estimated": true
+    },
+    {
+      "slug": "nemotron-3-5-super-vl",
+      "score": 26.4910658661689,
+      "estimated": false
+    },
+    {
+      "slug": "nova-premier",
+      "score": 9.15908119897819,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-6-1-sol-low",
+      "score": 42.0835618555848,
+      "estimated": false
+    },
+    {
+      "slug": "gpt-6-astra-medium",
+      "score": 49.5704363034369,
+      "estimated": false
+    },
+    {
+      "slug": "muse-wonder-full",
+      "score": 55.8021199855616,
+      "estimated": false
+    },
+    {
+      "slug": "claude-opus-5-5-medium",
+      "score": 51.2434931792768,
+      "estimated": false
+    },
+    {
+      "slug": "ring-2-6-1t",
+      "score": 16.6172363768618,
+      "estimated": false
+    },
+    {
+      "slug": "phi-4",
+      "score": 5.92257028113751,
+      "estimated": true
+    },
+    {
+      "slug": "gpt-oss-120b",
+      "score": 11.6028431512592,
+      "estimated": false
+    },
+    {
+      "slug": "deepseek-v4-1-flash-1017",
+      "score": 45.0965048681912,
+      "estimated": false
+    },
+    {
+      "slug": "nvidia-nemotron-nano-9b-v2-reasoning",
+      "score": 7.42882284148722,
+      "estimated": true
+    },
+    {
+      "slug": "claude-opus-5-5-high",
+      "score": 53.5831959822067,
+      "estimated": false
+    },
+    {
+      "slug": "agnes-2-5-pro-beta",
+      "score": 35.2413300369053,
+      "estimated": true
+    },
+    {
+      "slug": "nova-2-0-pro-reasoning-low",
+      "score": 12.7754507441167,
+      "estimated": true
+    },
+    {
+      "slug": "gemini-3-8-flash-low",
+      "score": 33.4548106699132,
+      "estimated": false
+    },
+    {
+      "slug": "jamba-reasoning-3b",
+      "score": 5.66829948484426,
+      "estimated": true
+    },
+    {
+      "slug": "kimi-k3",
+      "score": 43.5938229518782,
+      "estimated": false
+    },
+    {
+      "slug": "quasar-438b",
+      "score": 26.7372536607816,
+      "estimated": false
+    },
+    {
+      "slug": "lfm2-24b-a2b",
+      "score": 5.94753271655266,
+      "estimated": true
+    },
+    {
+      "slug": "nova-2-0-lite-reasoning-medium",
+      "score": 12.4823794919822,
+      "estimated": true
+    },
+    {
+      "slug": "kat-coder-pro-v2",
+      "score": 21.7045082420985,
+      "estimated": true
+    },
+    {
+      "slug": "qwen3-coder-next",
+      "score": 9.23682203219174,
+      "estimated": false
+    },
+    {
+      "slug": "gemma-4-12b",
+      "score": 14.1847516647736,
+      "estimated": true
+    },
+    {
+      "slug": "muse-wonder",
+      "score": 52.393894697293,
+      "estimated": false
+    }
+  ]
+}

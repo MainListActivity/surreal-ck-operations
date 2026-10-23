@@ -369,6 +369,9 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           gcRefreshedAt = Date.now();
           await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
+        // Policy compilation may wait on the remote DB and magpie management. It never holds dispatch or inference.
+        void ctx.modelRouting.refresh().catch(error => console.warn(`model routing refresh failed: ${(error as Error).message}`));
+        await timing.measure("model-journal",()=>ctx.modelJournal.drain(ctx.db.db));
         const report = await timing.measure("tick", () => ctx.dispatcher.tick());
         await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;
@@ -376,6 +379,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
           report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
           report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
+        await ctx.modelRouting.activateIdle().catch(error=>console.warn(`model routing session activation: ${(error as Error).message}`));
         await timing.measure("heartbeat", async () => { await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();"); });
       } catch (error) {
         failures++;
