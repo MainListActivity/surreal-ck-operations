@@ -1,9 +1,10 @@
 // SYS02 N1-R: the full core path with the REAL adapter.
 //
 // The negative side is covered by the product's counter-example (a borrowed failed deployment must not certify the
-// environment). This file proves the positive side on the same real core: a trusted deployment workflow whose
-// deployment and success status name the evidence run produces a verified machine evidence, the task reaches review,
-// and a NON-author reviewer accepts it. It also proves the source keeps the traceable identifiers.
+// environment), by a borrowed deploy job, and by the unit negatives in tests/deployment-source.test.ts. This file
+// proves the positive side on the same real core: a trusted deployment workflow whose deployment and success status
+// name the evidence run produces a verified machine evidence, the task reaches review, and a NON-author reviewer
+// accepts it. It also proves the source keeps the traceable identifiers, including the verified deploy job.
 import { afterAll, beforeAll, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -45,6 +46,10 @@ const gh = async (args: string[]): Promise<string> => {
       id: 900, environment: 'production', sha: SHA, created_at: '2026-10-21T23:00:30Z',
       statuses_url: 'https://api.github.com/repos/o/r/deployments/900/statuses',
     }]);
+  }
+  if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/')) {
+    // The job the deployment status names, as the repository reports it: this run, this head.
+    return JSON.stringify({ run_id: Number(RUN), head_sha: SHA });
   }
   if (args[0] === 'api' && String(args[1]).includes('/statuses')) {
     return JSON.stringify([{
@@ -118,11 +123,14 @@ fork('N1-R positive: a trusted deployment of this run certifies the environment 
   console.log('N1R_SOURCE_FIELD', source);
   expect(source).toContain('900');
   expect(source).toContain('success');
+  // A5: the job is part of the recorded trace and was read back from the repository.
+  expect(source).toContain('4242');
+  expect(source).toContain('jobVerified');
 });
 
-fork('N1-R refusal then recovery: the core first refuses a borrowed deployment, then the same attempt passes with correct evidence', async () => {
-  // One transport that can answer either way: which deployment/status it reports is switched between the two calls.
-  let mode: 'borrowed' | 'correct' = 'borrowed';
+fork('N1-R refusal then recovery: the core refuses a borrowed deployment and a wrong job, then the same attempt passes with correct evidence', async () => {
+  // One transport that can answer either way: which deployment/status it reports is switched between the calls.
+  let mode: 'borrowed' | 'wrong-job' | 'correct' = 'borrowed';
   const ghSwitch = async (args: string[]): Promise<string> => {
     if (args[0] === 'run' && args[1] === 'view') {
       return JSON.stringify({
@@ -136,6 +144,10 @@ fork('N1-R refusal then recovery: the core first refuses a borrowed deployment, 
         id: 900, environment: 'production', sha: SHA, created_at: '2026-10-21T23:00:30Z',
         statuses_url: 'https://api.github.com/repos/o/r/deployments/900/statuses',
       }]);
+    }
+    if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/')) {
+      // The wrong-job mode borrows the deploy job of another run: the status link looks perfect, the job read-back is not.
+      return JSON.stringify({ run_id: Number(mode === 'wrong-job' ? '999' : RUN), head_sha: SHA });
     }
     if (args[0] === 'api' && String(args[1]).includes('/statuses')) {
       const runId = mode === 'borrowed' ? '999' : RUN;
@@ -151,29 +163,32 @@ fork('N1-R refusal then recovery: the core first refuses a borrowed deployment, 
   const switchCore = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(ghSwitch) } });
   const goal = await owner.createGoal({ text: 'N1-R 拒绝后恢复目标', source: 'owner:test', key: key(), tier: 'quick' });
   const task = await switchCore.createTask(tokens.gm, {
-    goalId: goal.id, title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 被拒，再补本 run 的正确证据并在同一 attempt 提交。',
+    goalId: goal.id, title: 'N1-R 拒绝后恢复', context: '先借别的 run 的失败 deployment 与别的 run 的 job 各被拒一次，再补本 run 的正确证据并在同一 attempt 提交。',
     kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa', acceptanceEnvironment: 'production', idempotencyKey: key(),
   } as never);
   const acId = (await switchCore.getTask(tokens.gm, task.id)).acceptanceCriteria?.find(c => c.kind === 'machine')!.id;
   const claim = await switchCore.claim(tokens['eng-a'], task.id);
-
-  // 1. The borrowed (failed, other-run) deployment must be refused by the real core.
-  let refused = '';
-  try {
-    await switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
-      taskId: task.id, acId, sha: SHA, environment: 'production',
-      source: { provider: 'github-actions', runUrl: RUN_URL }, idempotencyKey: key(),
-    } as never);
-  } catch (error) { refused = String((error as Error).message); }
-  console.log('N1R_SWITCH_REFUSED', JSON.stringify({ refused }));
-  expect(refused).toMatch(/does not reference the evidence run|no successful status/);
-
-  // 2. Correct evidence in the SAME attempt: the task is still doing, the attempt has not advanced.
-  mode = 'correct';
-  const recorded = await switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
+  const record = async () => switchCore.recordAcceptanceEvidence(tokens['eng-a'], {
     taskId: task.id, acId, sha: SHA, environment: 'production',
     source: { provider: 'github-actions', runUrl: RUN_URL }, idempotencyKey: key(),
   } as never);
+  const refuse = async () => { try { await record(); return ''; } catch (error) { return String((error as Error).message); } };
+
+  // 1. The borrowed (failed, other-run) deployment must be refused by the real core.
+  const borrowed = await refuse();
+  console.log('N1R_SWITCH_REFUSED', JSON.stringify({ borrowed }));
+  expect(borrowed).toMatch(/names another run|does not reference the evidence run|no successful status/);
+
+  // 2. A deployment whose status names THIS run's job, but whose job belongs to another run, must be refused too:
+  //    the job participates in the decision, so a borrowed job is the same symptom as a borrowed run link.
+  mode = 'wrong-job';
+  const wrongJob = await refuse();
+  console.log('N1R_SWITCH_WRONG_JOB', JSON.stringify({ wrongJob }));
+  expect(wrongJob).toContain(`job 4242 belongs to run 999, not run ${RUN}`);
+
+  // 3. Correct evidence in the SAME attempt: the task is still doing, the attempt has not advanced.
+  mode = 'correct';
+  const recorded = await record();
   expect(recorded.verified).toBe(true);
   const current = await switchCore.getTask(tokens.gm, task.id);
   expect(current.state).toBe('doing');

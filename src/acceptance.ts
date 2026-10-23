@@ -654,7 +654,7 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
       let verifiedEnvironment: string | undefined;
       // The traceable record of the deployment that certified the environment. It is written into the evidence source
       // so a later reader can see which deployment, which status and which run the fact came from.
-      let deploymentSource: { deploymentId: string; status: string; deploymentRunId: string; deploymentJobId?: string; workflowName: string; sha: string } | undefined;
+      let deploymentSource: { deploymentId: string; status: string; deploymentRunId: string; deploymentJobId?: string; jobVerified?: true; workflowName: string; sha: string } | undefined;
       if (input.environment !== undefined) {
         // N1-R: the deployment must be causally linked to THIS run and its success terminal state must be read.
         // Same head, same environment name and a close timestamp are not proof: an unrelated failed deployment of the
@@ -682,6 +682,14 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
           const raw = JSON.parse(await run(['api', path]));
           return Array.isArray(raw) ? raw as DeploymentStatusRecord[] : [];
         };
+        // N1-R job axis: a job named by the record or by the success status link is read back from this repository.
+        // A job that resolves to another run or another head, and a job that cannot be read at all, both fail the
+        // association — an unverifiable job id is never trusted on its face.
+        const jobOf = async (jobId: string) => {
+          const raw = JSON.parse(await run(['api', `repos/${owner}/${repo}/actions/jobs/${jobId}`]));
+          const job = raw as { run_id?: number | string | null; head_sha?: string | null; name?: string | null };
+          return { runId: job.run_id === undefined || job.run_id === null ? null : String(job.run_id), headSha: job.head_sha ?? null, name: job.name ?? null };
+        };
         const verdict = await associateDeploymentSource({
           run: {
             runId, headSha: info.headSha, workflowName: info.workflowName ?? null,
@@ -691,12 +699,14 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
           environment: input.environment,
           deployments,
           statusesOf,
+          jobOf,
         });
         if (!verdict.ok) return { ok: false, reason: verdict.reason };
         verifiedEnvironment = verdict.environment;
         deploymentSource = {
           deploymentId: verdict.deploymentId, status: verdict.status, deploymentRunId: verdict.deploymentRunId,
           ...(verdict.deploymentJobId ? { deploymentJobId: verdict.deploymentJobId } : {}),
+          ...(verdict.jobVerified ? { jobVerified: true as const } : {}),
           workflowName: verdict.workflowName, sha: verdict.sha,
         };
         at = verdict.at;

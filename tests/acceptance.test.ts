@@ -252,9 +252,11 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
       }
       return run(args);
     };
-    const withDeploymentsOn = (list: unknown[], statuses: unknown[] = []) => async (args: string[]) => {
+    // A5: the deploy job the success status names is read back from the repository and must be this run's job.
+    const withDeploymentsOn = (list: unknown[], statuses: unknown[] = [], deployJob: Record<string, unknown> = { run_id: 42, head_sha: 'head-1' }) => async (args: string[]) => {
       if (args[0] === 'api' && String(args[1]).includes('/deployments?')) return JSON.stringify(list);
       if (args[0] === 'api' && String(args[1]).includes('/deployments/') && String(args[1]).includes('/statuses')) return JSON.stringify(statuses);
+      if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/4242')) return JSON.stringify(deployJob);
       return deployRun(args);
     };
     const envRecord = { ...record, environment: 'production' };
@@ -263,7 +265,7 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     const envBase = { ...base, probe: envProbe, environment: 'production' };
     const deployment = { id: 900, environment: 'production', sha: 'head-1', created_at: '2026-10-21T00:00:20.000Z' };
     const success = { state: 'success', environment: 'production', created_at: '2026-10-21T00:00:40.000Z',
-      log_url: 'https://github.com/o/r/actions/runs/42/job/77' };
+      log_url: 'https://github.com/o/r/actions/runs/42/job/4242' };
     // A generic CI run (the probe workflow) may not certify an environment at all.
     expect((await createGithubActionsAdapter(withDeployments([deployment], [success]), reader).verify(envBase)).ok).toBe(false);
     // The trusted deployment workflow, with a deployment and a success status of this run, is accepted.
@@ -273,8 +275,16 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     expect((await createGithubActionsAdapter(withDeploymentsOn([{ ...deployment, created_at: '2026-10-21T00:02:00.000Z' }], [success]), reader).verify(envBase)).ok).toBe(false);
     expect((await createGithubActionsAdapter(withDeploymentsOn([{ ...deployment, sha: 'other-head' }], [success]), reader).verify(envBase)).ok).toBe(false);
     // N1-R: a deployment of another run is refused even though the head, environment and window all match.
-    const borrowed = { ...success, log_url: 'https://github.com/o/r/actions/runs/999/job/77' };
+    const borrowed = { ...success, log_url: 'https://github.com/o/r/actions/runs/999/job/4242' };
     expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [borrowed]), reader).verify(envBase)).ok).toBe(false);
+    // A5: a deploy job that belongs to another run, or one that cannot be read back, is refused.
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [success], { run_id: 999, head_sha: 'head-1' }), reader).verify(envBase)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [success], { run_id: 42, head_sha: 'other-head' }), reader).verify(envBase)).ok).toBe(false);
+    const jobUnreadable = async (args: string[]) => {
+      if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/4242')) throw new Error('HTTP 500');
+      return withDeploymentsOn([deployment], [success])(args);
+    };
+    expect((await createGithubActionsAdapter(jobUnreadable, reader).verify(envBase)).ok).toBe(false);
     // A deployment with no success state is refused.
     expect((await createGithubActionsAdapter(withDeploymentsOn([deployment], [{ ...success, state: 'failure' }]), reader).verify(envBase)).ok).toBe(false);
     // A generic criterion refuses an environment-labeled probe, and a differing probe label is refused.
