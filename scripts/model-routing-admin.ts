@@ -60,7 +60,7 @@ try {
         enabled:def.enabled,tracks:def.tracks,maxInstances:def.maxInstances,quotaLimited:def.quotaLimited});
     }
     // Persist Claude employees' new defaults; a busy conversation reloads only after its current lease ends.
-    await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'group/sck-opus' ELSE IF role='product' THEN 'group/sck-sonnet' ELSE 'group/sck-haiku' END END
+    await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'group/sck-opus' ELSE IF role='product' THEN 'group/sck-sonnet' ELSE 'group/sck-haiku' END
       WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;`);
     console.log(JSON.stringify({rosterChanges:changes.map(d=>({id:d.id,role:d.role,provider:d.provider,model:d.model,enabled:d.enabled})),storyAuthors:'unchanged'}));
 
