@@ -50,9 +50,9 @@
 5. 受影响测试，在公司 fork 隔离库上运行。不得用裸 `bun test` 直连生产库：
    - 根：`bun run typecheck`；插件：`cd plugin && bun run typecheck`。
    - `bun run test:service`、`bun run test:channel`、`bun run test:bridge`，以及全量 `bun run test`，与 §5 基线逐项对照。
-   - `bun scripts/test-worktrees.ts tests/retire-gate.fork.test.ts`，应为 19 项全部通过。
+   - `bun scripts/test-worktrees.ts tests/retire-gate.fork.test.ts`，应为 20 项全部通过。
    - `bun scripts/test-worktrees.ts tests/retire-gate-revoke.fork.test.ts`，应为 10 项全部通过（撤凭证门禁、场景回收的非拒绝失败、复核阶段合法动作）。
-   - 受影响文件集：`bun scripts/test-worktrees.ts` 加下列 14 个文件（共 170 项），应为 147 通过、23 跳过、0 失败：`contributor-cas.integration`、`mcp-run-reclaim.fork`、`worktree-scene`、`worktree-lock`、`implementer-binding.integration`、`dispatcher-sidecar.fork`、`retire-gate.fork`、`v3.integration`、`db.integration`、`retire-gate-revoke.fork`、`dispatch-episode.fork`、`internal-ai-proof.fork`、`paseo-dead-paths`、`worktree-registry.fork`（均为 `tests/` 下的 `.test.ts`）。
+   - 受影响文件集：`bun scripts/test-worktrees.ts` 加下列 14 个文件（共 171 项），应为 148 通过、23 跳过、0 失败：`contributor-cas.integration`、`mcp-run-reclaim.fork`、`worktree-scene`、`worktree-lock`、`implementer-binding.integration`、`dispatcher-sidecar.fork`、`retire-gate.fork`、`v3.integration`、`db.integration`、`retire-gate-revoke.fork`、`dispatch-episode.fork`、`internal-ai-proof.fork`、`paseo-dead-paths`、`worktree-registry.fork`（均为 `tests/` 下的 `.test.ts`）。
 6. 记录两面 SHA、`pnpm-lock.yaml` 哈希、vendor 生成物哈希与全部测试数字。
 
 ## 4. 切换前采样（回滚候选）
@@ -75,9 +75,9 @@
 | `test:channel` | 132 通过，13 跳过，0 失败 | 132 通过，13 跳过，0 失败（13 个文件，145 项） |
 | `test:bridge` | 372 通过，23 跳过，0 失败 | 372 通过，23 跳过，0 失败（24 个文件，395 项） |
 | 全量 | 982 个：938 通过，33 跳过，11 失败（gm-attention 5，triage 5，GitHub 重试 1） | 1011 个：967 通过，33 跳过，11 失败（失败名单与基线逐名相同） |
-| `retire-gate.fork.test.ts` | 基线不存在 | 19 项，全部通过 |
+| `retire-gate.fork.test.ts` | 基线不存在 | 20 项，全部通过 |
 | `retire-gate-revoke.fork.test.ts` | 基线不存在 | 10 项，全部通过（修复前 ca5c11e 上 9 项失败、1 项通过） |
-| 受影响 14 个文件 | 基线不存在 | 170 项：147 通过，23 跳过，0 失败 |
+| 受影响 14 个文件 | 基线不存在 | 171 项：148 通过，23 跳过，0 失败 |
 
 失败名单与基线逐项相同，才算通过。新增失败须先查清，不能以“已知失败”忽略。名单对照见最终头的证据目录（见 PR #1469 正文）中的 `name-diff-vs-baseline.txt`：基线中 981 项的状态不变；1 项旧名称（`employee pre-retire failures do not block scene cleanup; already-retired rows count as handled`，`tests/worktree-scene.test.ts`）被改写为两项新名称；另新增 28 项门禁测试（18 与 10）。因此全量通过数比基线多 29 项，跳过与失败数不变。
 
