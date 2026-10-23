@@ -1455,6 +1455,7 @@ test('dispatcher: idle sessions past the wake/context limits are rotated out', a
   await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 }, session_max_wakes: 5, session_max_input_k: 150 };");
   const defs = await workforce.defs();
   const engDef = defs.find(d => d.role === 'engineering')!;
+  await database.db.query('UPDATE $def SET enabled=true;', {def:new RecordId('employee_def',engDef.id)}); // isolate rotation from earlier disabled-roster fixtures
   const paseo = new FakePaseo();
   const dispatcher = new Dispatcher({ workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
 

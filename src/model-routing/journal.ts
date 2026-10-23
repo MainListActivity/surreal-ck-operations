@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { RecordId, type Surreal } from "surrealdb";
-import { scoreModels } from "./store.ts";
+import { scoreModels, ModelAssessmentRequired } from "./store.ts";
 import { createHash } from "node:crypto";
 /** Local write-ahead queue. The inference path never awaits a database operation. */
 export class ExecutionJournal {
@@ -103,21 +103,28 @@ export class ExecutionJournal {
             task: RecordId;
             employee: string;
             overall: number;
+            model_scores?: import("../contracts.ts").ModelAssessment[];
             configured_model?: string;
             model?: string;
           }>,
         ]
       >(
-        "SELECT task,employee,overall,configured_model,model FROM scorecard WHERE task IN $tasks;",
+        "SELECT task,employee,overall,configured_model,model,model_scores FROM scorecard WHERE task IN $tasks AND task.state='done';",
         { tasks: tasks.map((t) => new RecordId("task", t)) },
       );
       for (const card of cards) {
-        const models = await scoreModels(
+        let models:string[];
+        try { models = await scoreModels(
           db,
           String(card.task.id),
           card.employee,
           card.overall,
-        );
+          card.model_scores,
+        ); } catch(error) {
+          if(!(error instanceof ModelAssessmentRequired)) throw error;
+          models=error.models;
+          await db.query("BEGIN; UPDATE $task SET evaluated_at=NONE,eval_attempts=0 WHERE state='done'; DELETE model_scorecard WHERE task=$task AND employee=$employee; COMMIT;",{task:card.task,employee:card.employee});
+        }
         await db.query(
           "UPDATE $card SET configured_model=$configured,model=$model,actual_models=$models,model_attribution=$basis RETURN NONE;",
           {

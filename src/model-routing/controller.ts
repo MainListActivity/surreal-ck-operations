@@ -6,12 +6,16 @@ import { join } from "node:path";
 import { type Surreal } from "surrealdb";
 import {
   classify,
+  TIERS,
+  selectedTier,
   digest,
   rank,
   type CatalogModel,
   type Domain,
   type Tier,
 } from "./policy.ts";
+import { setAgentModel } from "../dispatcher/agent-model.ts";
+import { employeeTier } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
@@ -78,24 +82,26 @@ export class ModelRoutingController {
     if (!this.enabled || Date.now() - this.sessionsChecked < 30000) return;
     this.sessionsChecked = Date.now();
     const [rows] = await this.db.query<
-      [Array<{ paseo_agent_id: string; workspace_cwd?: string }>]
+      [Array<{ paseo_agent_id: string; workspace_cwd?: string; role:string }>]
     >(
-      "SELECT paseo_agent_id,workspace_cwd FROM employee WHERE provider='claude' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
+      "SELECT paseo_agent_id,workspace_cwd,role FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true AND revoked!=true AND paseo_agent_id!=NONE AND active_task=NONE LIMIT 100;",
     );
     const paseo = createPaseoCli(undefined, { timeoutMs: 5000 });
     const pending = rows
       .filter(
         (row) =>
           row.workspace_cwd &&
-          !existsSync(join(row.workspace_cwd, ".sck-model-router")),
+          ( !existsSync(join(row.workspace_cwd, ".sck-model-router")) || readFileSync(join(row.workspace_cwd, ".sck-model-router"),"utf8") !== "v2" ),
       )
       .slice(0, 3);
     for (const row of pending) {
       const status = await paseo
         .status(row.paseo_agent_id)
         .catch(() => undefined);
-      if (status?.status === "idle" && status.pendingPermissions === 0)
+      if (status?.status === "idle" && status.pendingPermissions === 0) {
+        if (!await setAgentModel(row.paseo_agent_id,`group/sck-${employeeTier(row.role)}`)) continue;
         await paseo.reload(row.paseo_agent_id);
+      }
     }
   }
   async prepare(): Promise<void> {
@@ -120,7 +126,7 @@ export class ModelRoutingController {
       (m) => !config?.disabledModels?.includes(m.id),
     );
     for (const m of models)
-      if (config?.tierOverrides?.[m.id]) m.tier = config.tierOverrides[m.id]!;
+      if (config?.tierOverrides?.[m.id]) m.tier = selectedTier(config.tierOverrides[m.id]) ?? m.tier;
     if (!models.length) throw Error("no usable magpie models");
     const results = await readModelResults(this.db);
     const dir = join(this.home, "model-routing");
@@ -145,7 +151,7 @@ export class ModelRoutingController {
       if (previous[id] !== signature)
         groupsToSet.push({ id, models: members, signature });
     };
-    const tiers: Tier[] = ["high", "medium", "low"];
+    const tiers = TIERS;
     for (const [level, tier] of tiers.entries()) {
       // An empty tier borrows the next stronger one: an upgrade, never a silent downgrade.
       const bucket =
@@ -156,42 +162,19 @@ export class ModelRoutingController {
           .find((b) => b.length) ?? [];
       if (!bucket.length)
         throw Error(`magpie tier ${tier} has no models or stronger fallback`);
-      add(
-        `sck-${tier}`,
-        rank(bucket, results, "general").map((m) => m.id),
-      );
-      for (const domain of ["engineering", "writing", "general"] as Domain[]) {
-        const ordered = rank(bucket, results, domain);
-        const alias = `group/sck-${domain}-${tier}`;
-        routes[alias] = [];
-        add(
-          alias.slice(6),
-          ordered.map((m) => m.id),
-        );
-        // Two complete fallback plans per domain/tier keep the GUI and model catalog bounded.
-        // The exploration head rotates every refresh; every candidate remains in each plan's fallbacks.
-        const round = Math.floor(Date.now() / 300000);
-        const selected =
-          ordered.length > 1
-            ? [ordered[0]!, ordered[1 + (round % (ordered.length - 1))]!]
-            : [ordered[0]!];
-        for (const [choice, first] of selected.entries()) {
-          const id = `sck-route-${tier}-${domain}-${choice === 0 ? "best" : "explore"}`;
-          add(id, [
-            first.id,
-            ...ordered.filter((m) => m.id !== first.id).map((m) => m.id),
-          ]);
-          routes[alias]!.push({
-            model: first.id,
-            group: `group/${id}`,
-            score: first.score,
-            samples: first.samples,
-          });
-        }
+      const ordered = rank(bucket, results);
+      const alias = `group/sck-${tier}`;
+      routes[alias] = [];
+      add(`sck-${tier}`, ordered.map(m => m.id));
+      // Four public tiers. Internal plans only implement exploration with native ordered fallbacks.
+      const round = Math.floor(Date.now() / 300000);
+      const selected = ordered.length > 1 ? [ordered[0]!, ordered[1 + round % (ordered.length - 1)]!] : [ordered[0]!];
+      for (const [choice, first] of selected.entries()) {
+        const id = `sck-route-${tier}-${choice === 0 ? "best" : "explore"}`;
+        add(id, [first.id, ...ordered.filter(m => m.id !== first.id).map(m => m.id)]);
+        routes[alias]!.push({model:first.id,group:`group/${id}`,score:first.score,samples:first.samples});
       }
     }
-    for (const tier of tiers)
-      routes[`group/sck-${tier}`] = routes[`group/sck-general-${tier}`]!;
     // Only private sck-* groups are touched; existing user groups/providers/accounts are never rewritten.
     if (this.io.command) {
       for (const g of groupsToSet)
@@ -227,6 +210,13 @@ export class ModelRoutingController {
         selector,
         JSON.stringify(options),
       ]);
+    await this.command(["plugin", "on", selector]);
+    const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
+    for (const id of Object.keys(previous)) {
+      if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
+      if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
+      else await this.command(['group','rm',id]);
+    }
     groups.__selector = digest(source);
     groups.__options = optionsHash;
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {

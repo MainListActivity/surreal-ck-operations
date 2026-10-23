@@ -117,7 +117,7 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     expect(build.exitCode).toBe(0);
     vault = await startVault(socket);
     client = new VaultClient(socket);
-  });
+  }, 30_000); // Swift cold compilation can exceed Bun's 5s hook default on the 16GB host.
 
   afterAll(() => {
     vault?.kill();
