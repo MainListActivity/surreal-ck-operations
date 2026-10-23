@@ -352,6 +352,7 @@ test('managed Claude pool ignores subscription model quotas and provider capacit
   expect(staffingPool(p).every(e=>e.weight===1)).toBe(true);
   expect(staffingPool({...p,holding:new Set(['i1'])}).find(e=>e.key==='i1')?.code).toBe('held');
   expect(staffingPool({...p,defs:[{...d,enabled:false}]}).find(e=>e.key==='i1')?.code).toBe('def_disabled');
+  expect(staffingPool({...p,defs:[]}).find(e=>e.key==='i1')?.code).toBe('def_disabled');
 });
 
 // 7cf393f8 B2 merge: main's all-managed pick orders by last wake, this lane's pool demotes a prior hand. Both rules hold: a
