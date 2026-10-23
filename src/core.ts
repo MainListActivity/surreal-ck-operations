@@ -1,3 +1,4 @@
+import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -485,14 +486,12 @@ export class SurrealCompanyCore implements CompanyCore {
     if (typeof credential !== 'string' || !credential.startsWith('sck_') || credential.length > 200) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
-    const t0 = Date.now();
-    const [rows] = await this.db.query<[EmployeeRow[]]>(
-      'SELECT *, def.tracks AS tracks FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
-    );
+    const [rows] = await authenticationLookup(() => HASH(credential), digest => this.db.query<[EmployeeRow[]]>(
+      'SELECT *, def.tracks AS tracks FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest }
+    ));
     // credential_digest is a SHA-256 over a high-entropy random token; the argon2
     // re-verify added nothing (same row, same secret) and under launchd QoS a
     // memory-hard KDF is throttled ~500x — it was the 50s stall per request.
-    console.log(`auth timing: query=${Date.now() - t0}ms`);
     const row = rows?.[0];
     // retired = the registered instance (Paseo agent binding) is gone; a credential
     // that outlives its instance is treated as leaked and dies with it.
