@@ -110,11 +110,13 @@ export class ModelRoutingController {
     }
     return modelFacts(ids, { catalog: this.catalog as never, quota, usage, performance });
   }
-  async applyOrders(orders: Record<string, string[]>): Promise<void> {
+  async applyOrders(orders: Record<string, string[]>, isCurrent: () => boolean = () => true): Promise<void> {
     // Serialize behind any periodic sync, then re-read the owner's current membership.
-    if (this.pending) await this.pending;
+    while (this.pending) await this.pending;
+    if (!isCurrent()) return;
     this.orders = { ...this.orders, ...orders };
-    await this.refresh(true);
+    this.pending = this.sync(false,isCurrent).finally(() => {this.pending=undefined;});
+    await this.pending;
   }
   refresh(force = false): Promise<void> {
     if (this.pending) return this.pending;
@@ -154,7 +156,7 @@ export class ModelRoutingController {
   async prepare(): Promise<void> {
     await this.sync(true);
   }
-  private async sync(preparing = false) {
+  private async sync(preparing = false, isCurrent: () => boolean = () => true) {
     const [config] = await this.db.query<[RoutingConfig | undefined]>(
       "SELECT enabled,disabledModels,tierOverrides FROM ONLY company_meta:model_routing;",
     );
@@ -219,6 +221,8 @@ export class ModelRoutingController {
         ? bucket.map((m) => m.id)
         : [...current, ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !current.includes(m.id)).map((m) => m.id)];
       if (!ids.length) {
+        groups[`sck-${tier}`] = digest("[]");
+        routes[`group/sck-${tier}`] = [];
         if (initializing) throw Error(`magpie tier ${tier} has no models or stronger fallback`);
         continue; // emptied by hand: leave it as the owner set it
       }
@@ -238,8 +242,10 @@ export class ModelRoutingController {
     }
     const nextKnown = [...new Set([...known, ...models.map((m) => m.id), ...(config?.disabledModels ?? [])])];
     // Only private sck-* groups are touched; existing user groups/providers/accounts are never rewritten.
+    if (!isCurrent()) return;
     if (this.io.command) {
-      for (const g of groupsToSet)
+      for (const g of groupsToSet) {
+        if (!isCurrent()) return;
         await this.command([
           "group",
           "add",
@@ -248,7 +254,9 @@ export class ModelRoutingController {
           "routing=order",
           "stays=session",
         ]);
-    } else await saveMagpieGroups(this.cli, groupsToSet);
+      }
+    } else await saveMagpieGroups(this.cli, groupsToSet, isCurrent);
+    if (!isCurrent()) return;
 
     // The old selector rewrote a tier to concrete-model route groups; once it is out, those groups go too.
     if (previous.__selector) {

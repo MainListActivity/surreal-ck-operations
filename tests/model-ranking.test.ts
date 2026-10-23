@@ -106,3 +106,24 @@ test('blocked background facts never delay the model HTTP request',async()=>{
  try{const r=await fetch(`http://127.0.0.1:${gateway.port}/a/e/v1/messages/count_tokens`,{method:'POST',body:'{}',signal:AbortSignal.timeout(1000)});expect(r.status).toBe(200);expect(f.applied).toHaveLength(0);}
  finally{release();await refresher.settled();await gateway.stop();}
 });
+
+test('save/stop while apply is waiting prevents stale publication at the write boundary',async()=>{
+ for(const action of ['save','stop']){
+  const f=fixture();let entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>entered=resolve),wait=new Promise<void>(resolve=>release=resolve);
+  const published:unknown[]=[];
+  const r=new RankingRefresher({...f.deps,apply:async(orders,isCurrent)=>{entered();await wait;if(isCurrent())published.push(orders);}});
+  r.trigger();await started;
+  if(action==='save')await saveRankingSettings(f.db as any,{rules:'new rules',refreshMinutes:5},r);else r.stop();
+  release();await r.settled();expect(published).toHaveLength(0);
+ }
+});
+test('controller rechecks invalidation after waiting for an existing sync',async()=>{
+ const home=scratch();let release!:()=>void,entered!:()=>void;
+ const wait=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+ const calls:string[][]=[];let valid=true;
+ const db={query:async(sql:string)=>{if(sql.includes('SELECT enabled')){entered();await wait;return [{enabled:true}];}return [[]];}};
+ const controller=new ModelRoutingController(db as any,home,'unused',{fetch:(async()=>Response.json({data:[{id:'p/gpt-6.1-sol'},{id:'p/deepseek-v4.1-flash'}]})) as unknown as typeof fetch,command:async args=>{calls.push(args);}});
+ const syncing=controller.refresh(true);await started;const applying=controller.applyOrders({'sck-opus':['old/model']},()=>valid);
+ valid=false;release();await syncing;const before=calls.length;await applying;expect(calls.length).toBe(before);
+});

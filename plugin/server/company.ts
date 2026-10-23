@@ -71,7 +71,7 @@ export function company(): Promise<Company> {
     const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
     const modelRanking = new RankingRefresher({db:db.db, jev:jevFromEnv(), groups:readMagpieGroups,
       facts:async ids => { await modelRouting.refresh(); return modelRouting.rankingFacts(ids); },
-      apply:orders=>modelRouting.applyOrders(orders),log:message=>console.warn(message)});
+      apply:(orders,isCurrent)=>modelRouting.applyOrders(orders,isCurrent),log:message=>console.warn(message)});
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
 
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);

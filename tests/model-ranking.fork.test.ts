@@ -14,8 +14,9 @@ run('fork: ranking settings preserve routing config; request-triggered three-gro
   await saveRankingSettings(db.db,{rules:'免费优先',refreshMinutes:2},refresher);
   const [config]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_routing;');
   expect(config).toMatchObject({enabled:true,disabledModels:['keep/excluded'],ranking_rules:'免费优先',ranking_refresh_minutes:2});
+  await db.db.query("UPSERT company_meta:model_ranking CONTENT {orders:{kept:['old/model']}};");
   refresher.trigger(0);await refresher.settled();expect(calls).toBe(3);expect(applied).toHaveLength(1);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
-  expect(status.orders).toEqual({'sck-opus':['a/y','a/x'],'sck-sonnet':['a/x'],'sck-haiku':['a/y']});expect(status.refresh_minutes).toBe(2);expect(status.at).toBeDefined();
+  expect(status.orders).toEqual({kept:['old/model'],'sck-opus':['a/y','a/x'],'sck-sonnet':['a/x'],'sck-haiku':['a/y']});expect(status.refresh_minutes).toBe(2);expect(status.at).toBeDefined();
  }finally{await db.close();}
 });

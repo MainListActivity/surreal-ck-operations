@@ -156,7 +156,7 @@ export interface RefresherDeps {
   groups(): Record<string, string[]>;
   facts(ids: string[]): Promise<ModelFacts[]>;
   /** Hand the new orders to the controller, which writes them into magpie. */
-  apply(orders: Record<string, string[]>): Promise<void>;
+  apply(orders: Record<string, string[]>, isCurrent: () => boolean): Promise<void>;
   log?(message: string): void;
 }
 
@@ -204,10 +204,10 @@ export class RankingRefresher {
         } catch { errors.push(`${tier} 刷新失败，保留原顺序`); }
       }
       if (revision !== this.revision || this.stopped) return;
-      if (Object.keys(orders).length) await this.deps.apply(orders);
+      if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
       if (revision !== this.revision || this.stopped) return;
       await this.deps.db.query(
-        "UPSERT company_meta:model_ranking MERGE {at:time::now(), orders:$orders, error:$error, refresh_minutes:$minutes};",
+        "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),error=$error,refresh_minutes=$minutes;",
         { orders, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
     } catch {
       if (revision === this.revision && !this.stopped) await this.deps.db.query(

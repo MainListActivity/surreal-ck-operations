@@ -20,6 +20,7 @@ export interface ManagedGroup {
 export async function saveMagpieGroups(
   cli: string,
   groups: ManagedGroup[],
+  isCurrent: () => boolean = () => true,
 ): Promise<void> {
   if (!groups.length) return;
   for (const group of groups)
@@ -84,6 +85,7 @@ export async function saveMagpieGroups(
     }
     if (!ready) throw Error("magpie management page did not become ready");
     for (const group of groups) {
+      if (!isCurrent()) return;
       const r = await fetch(base + "/api/groups/save", {
         method: "POST",
         headers,
