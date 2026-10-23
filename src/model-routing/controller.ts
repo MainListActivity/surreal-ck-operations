@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { type Surreal } from "surrealdb";
 import {
@@ -20,8 +20,8 @@ import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 const exec = promisify(execFile);
-/** magpie names a plugin installed from a path by that absolute path, not by its file stem. */
-export const selectorPath = (home: string) =>
+/** The retired in-gateway selector. magpie names a path plugin by its absolute path; removed on sync. */
+const legacySelector = (home: string) =>
   join(home, "model-routing", "sck-performance.gateway.js");
 export interface RoutingConfig {
   enabled?: boolean;
@@ -36,7 +36,6 @@ export class ModelRoutingController {
   constructor(
     private readonly db: Surreal,
     private readonly home: string,
-    private readonly sourcePath: string,
     private readonly cli = "/Applications/magpie.app/Contents/MacOS/magpie",
     private readonly io: {
       fetch?: typeof fetch;
@@ -136,10 +135,7 @@ export class ModelRoutingController {
       previous = JSON.parse(await readFile(join(dir, "groups.json"), "utf8"));
     } catch {}
     const groups: Record<string, string> = {};
-    const routes: Record<
-      string,
-      Array<{ model: string; group: string; score: number; samples: number }>
-    > = {};
+    const routes: Record<string, Array<{ model: string; score: number; samples: number }>> = {};
     const groupsToSet: Array<{
       id: string;
       models: string[];
@@ -162,18 +158,10 @@ export class ModelRoutingController {
           .find((b) => b.length) ?? [];
       if (!bucket.length)
         throw Error(`magpie tier ${tier} has no models or stronger fallback`);
+      // The tier is one magpie group, ordered by performance; magpie owns fallback and stickiness.
       const ordered = rank(bucket, results);
-      const alias = `group/sck-${tier}`;
-      routes[alias] = [];
       add(`sck-${tier}`, ordered.map(m => m.id));
-      // Four public tiers. Internal plans only implement exploration with native ordered fallbacks.
-      const round = Math.floor(Date.now() / 300000);
-      const selected = ordered.length > 1 ? [ordered[0]!, ordered[1 + round % (ordered.length - 1)]!] : [ordered[0]!];
-      for (const [choice, first] of selected.entries()) {
-        const id = `sck-route-${tier}-${choice === 0 ? "best" : "explore"}`;
-        add(id, [first.id, ...ordered.filter(m => m.id !== first.id).map(m => m.id)]);
-        routes[alias]!.push({model:first.id,group:`group/${id}`,score:first.score,samples:first.samples});
-      }
+      routes[`group/sck-${tier}`] = ordered.map(m => ({ model: m.id, score: m.score, samples: m.samples }));
     }
     // Only private sck-* groups are touched; existing user groups/providers/accounts are never rewritten.
     if (this.io.command) {
@@ -188,37 +176,17 @@ export class ModelRoutingController {
         ]);
     } else await saveMagpieGroups(this.cli, groupsToSet);
 
-    const selector = selectorPath(this.home);
-    const source = await readFile(this.sourcePath, "utf8");
-    let old = "";
-    try {
-      old = await readFile(selector, "utf8");
-    } catch {}
-    if (old !== source) {
-      await writeFile(`${selector}.tmp`, source, { mode: 0o600 });
-      await rename(`${selector}.tmp`, selector);
+    // The old selector rewrote a tier to concrete-model route groups; once it is out, those groups go too.
+    if (previous.__selector) {
+      await this.command(["plugin", "rm", legacySelector(this.home)]).catch(() => {});
+      await unlink(legacySelector(this.home)).catch(() => {});
     }
-    // Installation is idempotent by path in magpie's registry; options follow only after all groups exist.
-    if (previous.__selector !== digest(source))
-      await this.command(["plugin", "add", selector]);
-    const options = { routes };
-    const optionsHash = digest(JSON.stringify(options));
-    if (previous.__options !== optionsHash)
-      await this.command([
-        "plugin",
-        "options",
-        selector,
-        JSON.stringify(options),
-      ]);
-    await this.command(["plugin", "on", selector]);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
       if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
       else await this.command(['group','rm',id]);
     }
-    groups.__selector = digest(source);
-    groups.__options = optionsHash;
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {
       mode: 0o600,
     });

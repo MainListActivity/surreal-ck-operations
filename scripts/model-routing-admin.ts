@@ -11,7 +11,6 @@ import { loadDatabaseConfig } from "../src/config.ts";
 import { CompanyDatabase } from "../src/database.ts";
 import {
   ModelRoutingController,
-  selectorPath,
 } from "../src/model-routing/controller.ts";
 import { RecordId } from "surrealdb";
 import { restoreRoutingSettings } from "../src/model-routing/gateway.ts";
@@ -45,11 +44,7 @@ try {
     await db.db.query(
       "UPSERT company_meta:model_routing MERGE {enabled:false,preparing:true,tierOverrides:{}};",
     );
-    const router = new ModelRoutingController(
-      db.db,
-      serviceHome(),
-      join(release, "magpie", "sck-performance.gateway.js"),
-    );
+    const router = new ModelRoutingController(db.db, serviceHome());
     await router.prepare();
     // Apply the owner-approved roster before switching the running release. Never rewrite a live native session's provider.
     const changes = planRoutingRoster(defs);
@@ -136,11 +131,6 @@ try {
       }
       else pending++;
     }
-    execFileSync(
-      "/Applications/magpie.app/Contents/MacOS/magpie",
-      ["plugin", "off", selectorPath(serviceHome())],
-      { stdio: "ignore", timeout: 20000 },
-    );
     console.log(JSON.stringify({ restored, pendingSessionReloads: pending }));
   }
   const [status] = await db.db.query<[any]>(

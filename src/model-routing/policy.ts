@@ -47,6 +47,9 @@ export function employeeTier(role?: string): Tier {
 export function managedModel(def: {provider?: string; model?: string; role?: string} | undefined): boolean {
   return def?.role !== "story-author" && def?.provider === "claude" && !!def?.model?.startsWith("group/sck-") && !!selectedTier(def.model?.replace(/^group\/sck-(engineering|writing|general)-/, ""));
 }
+/** Owner rule: no tier may hold a model scoring below this on the AA Intelligence Index. Unscored is not admitted. */
+export const AA_FLOOR = 38;
+export const tierRank = (t: Tier) => TIERS.indexOf(t);
 const normalize = (s: string) =>
   s
     .toLowerCase()
@@ -55,7 +58,8 @@ const normalize = (s: string) =>
 /** One model served through several accounts shares its task evidence. */
 export const canonicalModel = (id: string) =>
   normalize(id.slice(id.lastIndexOf("/") + 1));
-/** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark. */
+/** Exact version matches only. A preview/opaque vendor alias never inherits another model's benchmark.
+ * Models without a public score, or below AA_FLOOR, are left out of every tier. */
 export function classify(catalog: CatalogModel[]): ModelCandidate[] {
   return catalog
     .filter(
@@ -67,7 +71,7 @@ export function classify(catalog: CatalogModel[]): ModelCandidate[] {
         (!m.native_endpoints ||
           m.native_endpoints.some((p) => /messages|responses|chat/.test(p))),
     )
-    .map<ModelCandidate>((m) => {
+    .map<ModelCandidate & { score?: number }>((m) => {
       const model = m.id.slice(m.id.lastIndexOf("/") + 1);
       const canonical = normalize(model);
       // A dated snapshot slug (e.g. "-1017") is the same version; any other suffix is not.
@@ -88,8 +92,11 @@ export function classify(catalog: CatalogModel[]): ModelCandidate[] {
         benchmark: b?.slug,
         estimated: b?.estimated ?? true,
         context: m.context_window ?? m.context_length ?? 32768,
+        score,
       };
     })
+    .filter((m) => m.score !== undefined && m.score >= AA_FLOOR)
+    .map(({ score: _score, ...m }): ModelCandidate => m)
     .sort((a, b) => b.prior - a.prior || a.id.localeCompare(b.id));
 }
 /** Decayed task evidence with an eight-task prior; calls/tokens never become independent quality samples. */
