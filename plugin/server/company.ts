@@ -148,7 +148,8 @@ export function company(): Promise<Company> {
     });
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
     const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
-    const modelGateway = await startModelGateway({lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
+    let routingReady=false;
+    const modelGateway = await startModelGateway({ready:()=>routingReady,lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,
@@ -194,7 +195,9 @@ export function company(): Promise<Company> {
       },
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
-    await sidecar.adopt(await workforce.insts());
+    try { await sidecar.adopt(await workforce.insts()); }
+    catch(error) { await modelGateway.stop(); throw error; }
+    routingReady=true;
     return { modelJournal, modelRouting, stopModelGateway:modelGateway.stop, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls

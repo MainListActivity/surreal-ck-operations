@@ -145,7 +145,10 @@ export class SidecarPool {
     const live=this.claims.get(inst);
     if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
     const role=this.routingEmployees.get(inst)?.role;
-    if(role==='gm'||role==='eval')return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:'planning'};
+    // A task lease authorizes task writes, not the employee's ability to speak.
+    // submit/review consumes the lease before Claude's next call handles the tool result.
+    // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
+    if(role)return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
