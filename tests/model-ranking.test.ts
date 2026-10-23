@@ -43,12 +43,14 @@ test('facts use tightest quota, never leak account emails, zero free prices and 
  const facts=modelFacts(['p/gpt-6.1-sol','unknown/x'],{catalog:[{id:'p/gpt-6.1-sol',magpie_label:'免费'}],quota,usage:new Map(),performance:new Map()});
  expect(facts[0]?.price).toEqual({free:true,input:0,output:0,cacheHit:0});expect(facts[1]).toMatchObject({accounts:[],price:{free:false}});expect(facts[1]?.aa).toBeUndefined();
 });
-test('Jev receives complete facts once per group, rejects partial/low-confidence answers',async()=>{
+test('Jev receives complete facts once per group, rejects partial answers but orders low-confidence mid scores',async()=>{
  let calls=0;const facts=[fact('p/a'),fact('p/b')];
  const jev={model:'fixture',ask:async(state:any,q:any)=>{calls++;expect(state.ownerRules).toBe('速度优先');expect(state.models.m0.id).toBe('p/a');return response(q);}};
  expect(await jevOrder(jev,'sonnet','速度优先',facts)).toEqual(['p/b','p/a']);expect(calls).toBe(1);
  await expect(jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{}})},'opus','',facts)).rejects.toThrow();
- await expect(jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{m0:{type:'score',score:3,confidence:0.1}}})},'opus','',[fact('p/a')])).rejects.toThrow();
+ await expect(jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{m0:{type:'score',score:3}}})},'opus','',facts)).rejects.toThrow();
+ // Production shape: a middling model's confidence is the mass on its modal level and can be ~0.2.
+ expect(await jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{m0:{type:'score',score:2.15,confidence:0.16},m1:{type:'score',score:3.6,confidence:0.67}}})},'opus','',facts)).toEqual(['p/b','p/a']);
 });
 function fixture(){
  let settings={ranking_rules:'便宜优先',ranking_refresh_minutes:5};const writes:any[]=[];const calls:string[]=[];let factsCalls=0;
