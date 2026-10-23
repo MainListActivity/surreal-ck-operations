@@ -1,0 +1,45 @@
+name: Acceptance probe
+# SYS02 C3: the producer reads the target run's annotation while the target job is in progress, and a Node job builds the
+# fixture with Bun but executes the bundle with Node. Both upload artifacts the server adapter re-verifies.
+on:
+  push:
+    branches: [lane/a7b6d581-ops-governance]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  statuses: read
+jobs:
+  running:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Read the target annotation while the target job is in progress
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/acceptance-target-probe.ts --workflow "Acceptance target" --job target --out acceptance-probe.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-running
+          path: acceptance-probe.json
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build with Bun and execute the default request path with Node
+        run: bun scripts/acceptance-node-probe.ts --out acceptance-probe.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-node
+          path: acceptance-probe.json

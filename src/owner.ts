@@ -9,6 +9,7 @@ import { asId, CompanyError, depUnsatisfiedFor, HASH, id, REQUIRED_TRACKS, requi
 import { assertRoleContract, loadContract } from './role-contract.ts';
 import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
+import { acceptanceError, acceptanceSubject, evaluateAcceptance, humanSignoffs, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow, type HumanSignoff } from './acceptance.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -114,10 +115,19 @@ export class OwnerDesk {
     const vars: Record<string, unknown> = { goal, tier, via, source: `triage:${via}`.slice(0, 200) };
     const creates = template.tasks.map((t, i) => {
       vars[`t${i}`] = ids[t.ref];
-      vars[`spec${i}`] = { title: `[目标] ${row.title} · ${t.title}`, context: t.context, kind: t.kind,
+      const specVars: Record<string, unknown> = { title: `[目标] ${row.title} · ${t.title}`, context: t.context, kind: t.kind,
         executor_role: t.executorRole, reviewer_role: t.reviewerRole, dependencies: t.deps.map(d => ids[d]) };
+      // SYS02: the quick chain is a real code delivery; carry its versioned criteria. Absent on plan/manual/acceptance rows.
+      if (t.acceptanceCriteria && t.acceptanceCriteria.length > 0) {
+        specVars.acceptance_criteria = t.acceptanceCriteria;
+        specVars.acceptance_version = 1;
+      }
+      vars[`spec${i}`] = specVars;
       return `CREATE ONLY $t${i} CONTENT { title: $spec${i}.title, context: $spec${i}.context, kind: $spec${i}.kind,
           executor_role: $spec${i}.executor_role, reviewer_role: $spec${i}.reviewer_role, dependencies: $spec${i}.dependencies,
+          acceptance_criteria: $spec${i}.acceptance_criteria,
+          acceptance_version: IF array::len($spec${i}.acceptance_criteria ?? []) > 0 THEN 1 ELSE NONE END,
+          acceptance_legacy: false, acceptance_head: NONE, acceptance_environment: NONE, acceptance_attempt: 0,
           state: IF array::len($spec${i}.dependencies) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, goal: $goal, resume_state: 'ready', created_at: time::now() };
         ${EMIT_CREATED(`$t${i}`)}`;
@@ -155,6 +165,20 @@ export class OwnerDesk {
       return view(prior.result);
     }
     const evidence = `来源：${input.source}\n决定：${input.decision}\n${input.note ?? ''}`.trim();
+    // SYS02 AC03/AC06: an owner approval calls the same evaluator. Machine evidence must be server-verified; the owner
+    // signs required human criteria here, in the same transaction that closes the gate. The owner gate is never auto-approved.
+    let humanEvidence: HumanSignoff[] = [];
+    if (input.decision === 'approve') {
+      const taskRow = await this.db.select<AcceptanceTaskRow>(id('task', input.taskId));
+      if (!taskRow) throw new CompanyError('not_found', 'task not found');
+      const gate = await loadAcceptanceGate(this.db);
+      const verdict = evaluateAcceptance({
+        subject: acceptanceSubject(taskRow), evidence: await loadAcceptanceEvidence(this.db, input.taskId),
+        phase: 'owner', actor: { employeeId: 'owner', role: 'owner', human: true, owner: true }, gate,
+      });
+      if (!verdict.ok) throw acceptanceError(verdict);
+      humanEvidence = humanSignoffs(verdict, input.taskId, 'owner', taskRow.acceptance_attempt ?? 0);
+    }
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'task not found' };
@@ -173,11 +197,21 @@ export class OwnerDesk {
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'owner_' + $decision, evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $task, kind: 'owner_decision', sequence: $sequence.value, payload: { decision: $decision, state: $next.state }, at: time::now() };
-      IF $decision = 'approve' { ${UNLOCK_SQL} };
+      IF $decision = 'approve' {
+        FOR $e IN $human_evidence {
+          CREATE acceptance_evidence CONTENT {
+            task: $task, ac_id: $e.acId, kind: 'human', sha: $e.sha, environment: $t.acceptance_environment,
+            attempt: $e.attempt,
+            evidence_type: 'review-signoff', source: { provider: 'owner' }, verified: true, verifier: 'owner',
+            actor: 'owner', at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
+          };
+        };
+        ${UNLOCK_SQL}
+      };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
-      task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest,
+      task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest, human_evidence: humanEvidence,
     });
     return view(rows.at(-2) as TaskRow);
   }

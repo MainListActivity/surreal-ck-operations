@@ -121,6 +121,13 @@ export class CompanyDatabase {
     await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
     await this.db.query(loadSchema('024-snapshot-quota.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
+// SYS02 验收（本 lane，编号 026）：只新增表与 gate 记录。
+    await this.db.query(loadSchema('026-acceptance.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 26 WHERE schema_version < 26;');
+    // SYS02 gate record: additive and disabled on install. The release application enables the scope it lists (AC06).
+    await this.db.query(`IF (SELECT * FROM ONLY company_meta:acceptance_gate) = NONE {
+      CREATE ONLY company_meta:acceptance_gate CONTENT { version: 1, enabled: false, scope: 'code-deliveries', criteria_version: 1 };
+    };`);
     // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
     await this.db.query(loadSchema('027-qa-observation.surql'));
     await this.db.query(loadSchema('032-model-routing.surql'));

@@ -47,7 +47,7 @@ const BASE_TOOLS = [
   // gm only in core (read-only acceptance-reference preview; compare-and-set repair of a quick goal's voided gate).
   "goal_acceptance_preview", "goal_acceptance_repair",
   // SYS01 bounded reads: gm-only company summary and byte-segment reads of long text (core enforces both).
-  "get_admin_summary", "read_task_text", "read_worktree_refs",
+  "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
   // gm only in core (record a task's code implementer when the bound one cannot continue; compare-and-set, audited).
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
@@ -708,9 +708,35 @@ export class SidecarPool {
     // arrival as the answer: a stalled re-issue is refused recoverably inside the one deadline instead of delaying past it.
     const resolveCred = () => (forceRotate ? this.rotateCredential(instId) : this.credentialFor(instId));
     const cred = SNAPSHOT_TOOLS.has(tool) ? await withinReplyCeiling(resolveCred) : await resolveCred();
+    // SYS02: the relay forwards the structured acceptance fields the caller declared. A malformed one is refused here
+    // instead of being dropped: a silently dropped head would reach the gate as a missing declaration.
+    const acceptance = (): { sha?: string; environment?: string } | undefined => {
+      const raw = args.acceptance;
+      if (raw === undefined || raw === null) return undefined;
+      if (typeof raw !== "object" || Array.isArray(raw)) {
+        throw Object.assign(new Error("acceptance must be an object with sha and/or environment"), { code: "invalid" });
+      }
+      const value = raw as Record<string, unknown>;
+      const out: { sha?: string; environment?: string } = {};
+      if (value.sha !== undefined) {
+        if (typeof value.sha !== "string" || value.sha.length === 0 || value.sha.length > 200) {
+          throw Object.assign(new Error("acceptance.sha must be a non-empty string up to 200 characters"), { code: "invalid" });
+        }
+        out.sha = value.sha;
+      }
+      if (value.environment !== undefined) {
+        if (typeof value.environment !== "string" || !/^[a-z][a-z0-9._-]{0,49}$/.test(value.environment)) {
+          throw Object.assign(new Error("acceptance.environment must be a controlled environment name"), { code: "invalid" });
+        }
+        out.environment = value.environment;
+      }
+      return Object.keys(out).length > 0 ? out : undefined;
+    };
+    const declared = acceptance();
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
+      ...(declared ? { acceptance: declared } : {}),
     });
     const live = () => {
       const claim = this.claims.get(instId);
@@ -792,6 +818,19 @@ export class SidecarPool {
       case "read_worktree_refs": return core.worktreeRefs
         ? core.worktreeRefs(cred, args)
         : Promise.reject(Object.assign(new Error("core does not expose read_worktree_refs"), { code: "temporarily_unavailable" }));
+      // SYS02: the acceptance gate tools ride the same channel; core owns authorization and the source adapter.
+      case "record_acceptance_evidence": return core.recordAcceptanceEvidence
+        ? core.recordAcceptanceEvidence(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose record_acceptance_evidence"), { code: "temporarily_unavailable" }));
+      case "acceptance_status": return core.acceptanceStatus
+        ? core.acceptanceStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_status"), { code: "temporarily_unavailable" }));
+      case "acceptance_gate": return core.acceptanceGate
+        ? core.acceptanceGate(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose acceptance_gate"), { code: "temporarily_unavailable" }));
+      case "set_acceptance_gate": return core.setAcceptanceGate
+        ? core.setAcceptanceGate(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose set_acceptance_gate"), { code: "temporarily_unavailable" }));
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);

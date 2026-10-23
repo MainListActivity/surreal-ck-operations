@@ -105,6 +105,9 @@ case "$action" in
     # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
     # "nothing waits yet" as safe would race a defer that lands right after it.
     review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
+    # SYS02 C2: the same content-bound guard for the acceptance baseline, before the bin copies, the active symlink,
+    # the plugin repoint, the MCP restart or release pruning (and before the release gates, which are read-only).
+    acceptance_target_supported "$release" || { acceptance_refuse "$release"; exit 1; }
     # IR06 C1: the same rule for the independence contract. Production data may already carry a policy
     # (independence_set), so a target that does not enforce it would let an excluded contributor, its registered
     # principal companion or a named employee claim. Refused here, before the bin copies, the active symlink, the

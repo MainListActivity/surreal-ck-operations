@@ -65,6 +65,8 @@ git -C "$repo_root" archive --format=tar "$commit" > "$staging/release.tar"
 # remote runs the MCP service, not the plugin). Refused before any step reaches the host.
 mkdir -p "$staging/probe" && tar -x -f "$staging/release.tar" -C "$staging/probe"
 review_wait_target_supported "$staging/probe" core || { review_wait_refuse "$staging/probe" core; exit 1; }
+# SYS02 C2: the remote payload must also carry the acceptance baseline contract; refused before any ssh/scp step.
+acceptance_target_supported "$staging/probe" core || { acceptance_refuse "$staging/probe" core; exit 1; }
 # IR06 C1: the same contract on the same payload (core scope: the remote runs the MCP service, not the plugin).
 # Refused before any step reaches the host.
 independence_target_supported "$staging/probe" core || { independence_refuse "$staging/probe" core; exit 1; }

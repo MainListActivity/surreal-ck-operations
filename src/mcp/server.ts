@@ -24,7 +24,23 @@ const proofShape = {
 const evidenceShape = {
   text: z.string().min(1),
   idempotencyKey: z.string().min(1),
+  // SYS02: the head a submission is bound to; machine evidence must match it.
+  acceptance: z.object({ sha: z.string().min(1).max(200).optional(), environment: z.string().min(1).max(100).optional() }).optional(),
 };
+// SYS02 structured acceptance criteria. The schema documents the shape; core validates and owns the gate.
+const acceptanceCriterionShape = z.object({
+  id: z.string().min(1).max(50),
+  kind: z.enum(['machine', 'human']),
+  required: z.boolean(),
+  layer: z.enum(['unit', 'integration', 'fork', 'ci', 'runtime', 'manual']),
+  evidence: z.enum(['ci-run', 'probe', 'artifact', 'review-signoff']),
+  verify: z.string().min(1).max(120),
+  description: z.string().max(500).optional(),
+  risk: z.enum(['code', 'data', 'external-timing', 'permission', 'packaging', 'runtime']).optional(),
+  legs: z.array(z.enum(['implement', 'release', 'deploy', 'goal', 'owner'])).min(1).max(5).optional(),
+  environment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
+});
+const acceptanceCriteriaShape = z.array(acceptanceCriterionShape).min(1).max(20);
 
 export type McpServiceOptions = Readonly<{
   core: CompanyCore;
@@ -283,6 +299,8 @@ function registerTools(server: McpServer, core: CompanyCore) {
       workIntent: z.object({ kind: z.enum(['read', 'code', 'assets']), paths: z.array(z.string()).optional(), lane: z.string().regex(/^[a-zA-Z0-9_-]{1,60}$/).optional() }).optional(),
       kind: z.enum(['task', 'gate']).optional(), goalId: z.string().min(1).optional(),
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+      acceptanceCriteria: acceptanceCriteriaShape.optional(),
+      acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
       revises: z.string().min(1).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createTask(token(ctx), input)));
@@ -343,8 +361,56 @@ function registerTools(server: McpServer, core: CompanyCore) {
       // The 50-dependency limit is enforced by core.createDelivery, the same validator the sidecar
       // reaches. Keeping it out of this schema preserves the structured `invalid` result.
       dependencies: z.array(z.string().min(1)).optional(), idempotencyKey: z.string().min(1),
+      acceptanceCriteria: acceptanceCriteriaShape.optional(),
+      acceptanceEnvironment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
+  server.registerTool('record_acceptance_evidence', {
+    description: 'SYS02: record verified machine evidence for one acceptance criterion. The server reads the GitHub Actions run (or its artifact/probe) and refuses a run from another head, a non-successful run, an expired artifact, an out-of-window probe, or a source the caller may not read. Model text never becomes a pass fact.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200), acId: z.string().min(1).max(50), sha: z.string().min(1).max(200),
+      environment: z.string().min(1).max(100).optional(),
+      source: z.object({
+        provider: z.literal('github-actions'),
+        runUrl: z.string().min(1).max(500),
+        artifactId: z.string().min(1).max(100).optional(),
+        probe: z.object({
+          runId: z.string().min(1).max(100), jobId: z.string().min(1).max(100).optional(),
+          readAt: z.string().min(1).max(40), inProgress: z.boolean(),
+          observationHash: z.string().regex(/^[0-9a-f]{64}$/),
+          probeVersion: z.string().min(1).max(40).optional(), producerRunId: z.string().min(1).max(100).optional(),
+          targetRunId: z.string().min(1).max(100).optional(), targetJobId: z.string().min(1).max(100).optional(),
+          targetWorkflow: z.string().min(1).max(200).optional(), targetStatus: z.string().min(1).max(40).optional(),
+          kind: z.string().min(1).max(40).optional(), nodeVersion: z.string().min(1).max(40).optional(),
+          bundleHash: z.string().regex(/^[0-9a-f]{64}$/).optional(), annotationHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+          channel: z.string().min(1).max(40).optional(), statusCreatedAt: z.string().min(1).max(40).optional(),
+          environment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
+        }).optional(),
+      }),
+      idempotencyKey: z.string().min(1),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.recordAcceptanceEvidence
+    ? core.recordAcceptanceEvidence(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('acceptance_status', {
+    description: 'SYS02: read the versioned gate record and the current acceptance verdict for one task: every criterion, the verified evidence, and the unmet list. The task holder, its reviewer, or gm may read it.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.acceptanceStatus
+    ? core.acceptanceStatus(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('acceptance_gate', {
+    description: 'gm only: read the versioned acceptance gate record (enabled, enabledAt, scope, criteriaVersion).',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.acceptanceGate
+    ? core.acceptanceGate(token(ctx))
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('set_acceptance_gate', {
+    description: 'gm only: change the acceptance gate with an expectedVersion and a reason. The before/after and the reason are audited; an executor cannot self-approve an exemption. Enabling records enabledAt, the cutoff that marks older tasks legacy.',
+    inputSchema: z.object({ enabled: z.boolean(), reason: z.string().min(4).max(2000),
+      expectedVersion: z.number().int().nonnegative(), idempotencyKey: z.string().min(1) }),
+  }, async (input, ctx) => run(token(ctx), () => core.setAcceptanceGate
+    ? core.setAcceptanceGate(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('record_owner_decision', {
     description: 'gm only: record an owner decision given in direct conversation (approve/reject a gate, or reply to an owner question). Quote the owner verbatim.',

@@ -13,6 +13,14 @@ import { ProjectStore } from './projects.ts';
 import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
+import {
+  ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createGithubActionsAdapter, criteriaForLeg,
+  acceptanceLegForSubject, acceptanceTargetAttempt, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
+  isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
+  loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
+  type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
+} from './acceptance.ts';
+import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
 import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
@@ -225,6 +233,15 @@ interface TaskRow {
   jev_release_version?: number;
   jev_route_version?: number;
   owner_rerouted?: boolean;
+  /** SYS02 acceptance fields (schema 026); every one is optional, so rows written before SYS02 stay valid. */
+  acceptance_criteria?: AcceptanceCriterion[];
+  acceptance_version?: number;
+  acceptance_legacy?: boolean;
+  acceptance_head?: string;
+  acceptance_environment?: string;
+  acceptance_attempt?: number;
+  acceptance_chain?: string;
+  created_at?: unknown;
   work_intent?: WorkIntent;
   worktree?: WorktreeAssignment;
   repo_path?: string;
@@ -317,6 +334,13 @@ export function view(row: TaskRow): TaskView {
     supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
     lineage: row.lineage ? asId(row.lineage) : undefined,
     revisionNo: row.revision_no ?? undefined,
+    acceptanceCriteria: row.acceptance_criteria ?? undefined,
+    acceptanceVersion: row.acceptance_version ?? undefined,
+    acceptanceLegacy: row.acceptance_legacy ?? undefined,
+    acceptanceHead: row.acceptance_head ?? undefined,
+    acceptanceEnvironment: row.acceptance_environment ?? undefined,
+    acceptanceAttempt: row.acceptance_attempt ?? undefined,
+    acceptanceChain: row.acceptance_chain ?? undefined,
   };
 }
 
@@ -497,11 +521,14 @@ export class SurrealCompanyCore implements CompanyCore {
   readonly checkpointLimit: number;
   /** Optional pre-submit check of implementation deliveries; returns why the submission cannot go to review. */
   private readonly submitCheck?: SubmitCheck;
+  /** SYS02: read-only source adapter that verifies CI runs, artifacts and probes; tests inject a deterministic one. */
+  private readonly acceptanceAdapter: AcceptanceSourceAdapter;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
-  private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void> }) {
+private readonly independenceReadHook?: (taskId: string) => Promise<void>;
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter } }) {
     this.submitCheck = options?.submitCheck;
+    this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     this.contributionReadHook = options?.contributionReadHook;
     this.independenceReadHook = options?.independenceReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
@@ -693,7 +720,7 @@ export class SurrealCompanyCore implements CompanyCore {
     return echoTask(await this.createTaskRecord(credential, input, { external: true }));
   }
 
-  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean } = {}): Promise<TaskView> {
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
     // External create_task only: the raw list is bounded before de-duplication. Internal delivery
@@ -722,6 +749,27 @@ export class SurrealCompanyCore implements CompanyCore {
     }
     validateIntent(input.workIntent);
     if (input.workIntent?.kind === 'code' && input.executorRole !== 'engineering') throw new CompanyError('invalid', 'Code writes require engineering');
+    // SYS02 AC01: new code deliveries need structured criteria while the gate is enabled. Old rows stay valid because the
+    // gate record is versioned and the evaluator marks pre-enablement rows legacy (AC06).
+    let acceptanceCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
+    const acceptanceGate = await loadAcceptanceGate(this.db);
+    const trustedCode = isTrustedCodeDeliverable({ kind: input.kind ?? 'task', workIntent: input.workIntent });
+    const leg = acceptanceLegForSubject({ kind: input.kind ?? 'task', workIntent: input.workIntent });
+    if (acceptanceGate.enabled && trustedCode) {
+      // The server baseline is unremovable: custom criteria only supplement it (SYS02 C1).
+      acceptanceCriteria = mergeAcceptanceCriteria(leg, acceptanceCriteria);
+    }
+    // N1: the environment requirement is a controlled creation-time declaration, either the task value or the single
+    // environment named by its criteria. An executor cannot introduce or relabel it at submit time.
+    const declaresEnvironment = input.acceptanceEnvironment !== undefined ||
+      acceptanceCriteria.some(criterion => criterion.environment !== undefined);
+    if (declaresEnvironment && leg !== 'deploy') {
+      // Before the merge there is no deployment to verify, so an implement or release leg cannot carry an environment
+      // requirement: the deploy leg is the one that runs against a real environment.
+      throw new CompanyError('invalid',
+        `acceptance environment requirements apply to the deploy leg only; this task is the ${leg} leg`);
+    }
+    const acceptanceEnvironment = effectiveEnvironment(acceptanceCriteria, input.acceptanceEnvironment);
     // 必配轨岗位（如 screenwriter）：任务必须带指定轨，缺轨/错轨显式拒绝，防止无轨任务落到专属编制。
     const requiredTrack = REQUIRED_TRACKS[input.executorRole];
     if (requiredTrack !== undefined && input.discipline !== requiredTrack) {
@@ -746,7 +794,13 @@ export class SurrealCompanyCore implements CompanyCore {
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
       project: input.project ? id('project', input.project) : undefined,
-      discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
+discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
+      acceptance_criteria: acceptanceCriteria,
+      acceptance_version: acceptanceCriteria.length > 0 ? ACCEPTANCE_CRITERIA_VERSION : undefined,
+      acceptance_chain: options.acceptanceChain,
+      acceptance_environment: acceptanceEnvironment,
+      // A task created while the gate is off is legacy: enabling later never retroactively gates it (SYS02 AC06).
+      acceptance_legacy: !acceptanceGate.enabled,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -764,7 +818,10 @@ export class SurrealCompanyCore implements CompanyCore {
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
-          kind: $kind, goal: $goal, created_at: time::now()
+          kind: $kind, goal: $goal, created_at: time::now(),
+          ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
+          acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
+          acceptance_attempt: 0${options.acceptanceChain !== undefined ? ', acceptance_chain: $acceptance_chain' : ''}
         };
         ${GOAL_ANCHOR_SQL}
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
@@ -1976,6 +2033,11 @@ export class SurrealCompanyCore implements CompanyCore {
       }
     }
     const specs = deliveryChain(input.title, input.spec);
+    // SYS02: the delivery carries one versioned criteria set; each leg gets the criteria that name it, or its defaults.
+    const explicitCriteria = validateAcceptanceCriteria(input.acceptanceCriteria);
+    const acceptanceGate = await loadAcceptanceGate(this.db);
+    const acceptanceChain = HASH(`delivery\0${input.idempotencyKey}`).slice(0, 16);
+    const legNames: AcceptanceLeg[] = ['implement', 'release', 'deploy'];
     // The legs are returned together: each echo gets an equal share of the item budget, so the whole answer fits (SYS01).
     const legLimit = Math.floor(ITEM_BUDGET_BYTES / specs.length);
     const lane = input.lane ?? `delivery-${HASH(input.idempotencyKey).slice(0, 8)}`;
@@ -1983,6 +2045,13 @@ export class SurrealCompanyCore implements CompanyCore {
     let dependencies = [...new Set(input.dependencies ?? [])];
     for (const [index, spec] of specs.entries()) {
       // The leg is echoed once, below, at its share of the budget: an echo here too would cut its lists twice (SYS01 R3).
+      const legName = legNames[index] ?? 'implement';
+      const matching = explicitCriteria.length > 0 ? criteriaForLeg(explicitCriteria, legName) : [];
+      // Gate on: pass only the caller's matching criteria; createTaskRecord merges the unremovable baseline for this leg.
+      // Gate off: preserve the old default-criteria behaviour.
+      const acceptanceCriteria = acceptanceGate.enabled
+        ? (matching.length > 0 ? matching : undefined)
+        : (matching.length > 0 ? matching : defaultAcceptanceCriteria(legName));
       const task = await this.createTaskRecord(credential, {
         ...spec, goalId: input.goalId, dependencies, idempotencyKey: `${input.idempotencyKey}:delivery:${index}`,
         // Every leg persists the same project override so the chain stays on one project.
@@ -1991,11 +2060,123 @@ export class SurrealCompanyCore implements CompanyCore {
         workIntent: { kind: spec.kind === 'release' ? 'read' : 'code', lane },
         // Only the implementation leg carries the discipline track; release/deploy legs stay generic.
         discipline: index === 0 ? input.discipline : undefined,
-      });
+        acceptanceCriteria,
+        // N1: the environment requirement is a deploy-leg fact. The implement and release legs run against the PR head,
+        // where no deployment exists yet, so they stay generic CI.
+        acceptanceEnvironment: spec.kind === 'deploy' ? input.acceptanceEnvironment : undefined,
+      }, { acceptanceChain });
       created.push(task);
       dependencies = [task.id];
     }
     return created.map(task => echoTask(task, legLimit));
+  }
+
+  /** SYS02: read the gate and the current verdict for one task (its holder, reviewer, or gm). */
+  async acceptanceStatus(credential: Credential, input: { taskId: TaskId }): Promise<AcceptanceStatusView> {
+    const actor = await this.authenticate(credential);
+    await this.getTask(credential, input.taskId);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const gate = await loadAcceptanceGate(this.db);
+    const phase: AcceptancePhase = row.state === 'review' ? (row.reviewer_role === 'owner' ? 'owner' : 'accept') : 'submit';
+    // A task still being worked is preparing its next submission; review/done read the attempt that is already submitted.
+    const attempt = acceptanceTargetAttempt(row);
+    const verdict = evaluateAcceptance({
+      subject: acceptanceSubject(row, undefined, { attempt }), evidence: await loadAcceptanceEvidence(this.db, input.taskId), phase,
+      actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
+    });
+    return { taskId: input.taskId, gate, verdict };
+  }
+
+  /** SYS02: gm read of the versioned gate record. */
+  async acceptanceGate(credential: Credential): Promise<AcceptanceGateView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may read the acceptance gate record');
+    return loadAcceptanceGate(this.db);
+  }
+
+  /** SYS02 AC06: gm changes the gate with a version check and a reason audit; an executor can never self-approve it. */
+  async setAcceptanceGate(credential: Credential, input: AcceptanceGateInput): Promise<AcceptanceGateView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may change the acceptance gate');
+    requireText(input.reason, 'reason', 4, 2000);
+    const current = await loadAcceptanceGate(this.db);
+    const next: AcceptanceGateView = {
+      ...current, version: current.version + 1, enabled: input.enabled,
+      ...(input.enabled && !current.enabled ? { enabledAt: new Date().toISOString() } : {}),
+    };
+    try {
+      await this.db.query(`BEGIN;
+        LET $gate = SELECT * FROM ONLY company_meta:acceptance_gate;
+        IF $gate = NONE OR $gate.version != $expected { THROW 'acceptance gate moved' };
+        UPDATE ONLY company_meta:acceptance_gate SET version = $version, enabled = $enabled,
+          enabled_at = $enabled_at, scope = $scope, criteria_version = $criteria;
+        CREATE audit CONTENT { actor: $actor, action: 'acceptance_gate', evidence: $evidence, at: time::now() };
+        COMMIT;`, {
+        // The CAS compares the caller's expected version to the stored one, never the version this call just read.
+        expected: input.expectedVersion, version: next.version, enabled: next.enabled, enabled_at: next.enabledAt ?? null,
+        scope: next.scope, criteria: next.criteriaVersion, actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ before: current, after: next, reason: input.reason }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/acceptance gate moved|failed transaction/i.test(message)) throw new CompanyError('conflict', 'The acceptance gate moved; read it again');
+      throw error;
+    }
+    return next;
+  }
+
+  /** SYS02 AC02: the source adapter, not the model, decides whether a machine criterion is satisfied. */
+  async recordAcceptanceEvidence(credential: Credential, input: AcceptanceEvidenceInput): Promise<AcceptanceEvidenceRecord> {
+    const actor = await this.authenticate(credential);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (input.source?.provider !== 'github-actions') throw new CompanyError('invalid', 'acceptance evidence source must be github-actions');
+    const holds = row.current_employee === actor.employeeId && ['doing', 'review'].includes(row.state) &&
+      (row.lease_expires_at ?? 0) > Date.now() / 1000;
+    if (actor.role !== 'gm' && !holds) throw new CompanyError('forbidden', 'Acceptance evidence is recorded by the task holder or gm');
+    const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
+    const criterion = criteria.find(item => item.id === input.acId);
+    if (!criterion) throw new CompanyError('not_found', `acceptance criterion ${input.acId} not found on this task`);
+    if (criterion.kind !== 'machine') throw new CompanyError('invalid', `${input.acId} is a human criterion; it is signed at independent review`);
+    if (criterion.evidence === 'probe' && (!input.source.probe || !input.source.artifactId)) throw new CompanyError('invalid', `${input.acId}: a probe requires the CI artifact that carries its record and the record itself`);
+    if (criterion.evidence === 'artifact' && !input.source.artifactId) throw new CompanyError('invalid', `${input.acId} requires an artifactId`);
+    const gate = await loadAcceptanceGate(this.db);
+    // N1: the expected environment comes from the controlled task/AC declaration, never from the caller's label. The
+    // adapter must return that same verified environment (GitHub deployments for the run/head) or the row is refused.
+    const declaredEnvironment = effectiveEnvironment(criteria, row.acceptance_environment);
+    if (criterion.environment !== undefined && criterion.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `${input.acId}: criterion environment ${criterion.environment} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
+    if (input.environment !== undefined && input.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `acceptance evidence environment ${input.environment} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
+    // N2: evidence targets the attempt the task is heading for: the next submission while the work is in progress, the
+    // submitted one afterwards. The status read and the evaluator use the same rule.
+    const targetAttempt = acceptanceTargetAttempt(row);
+    const verified = await this.acceptanceAdapter.verify({
+      provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
+      sha: input.sha, environment: declaredEnvironment, probe: input.source.probe,
+      verify: criterion.verify, risk: criterion.risk,
+    });
+    if (!verified.ok) {
+      await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence_rejected', evidence: $evidence, at: time::now() };`,
+        { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
+          evidence: JSON.stringify({ acId: input.acId, sha: input.sha, reason: verified.reason }).slice(0, 30000) });
+      throw new CompanyError('invalid', `acceptance evidence rejected: ${verified.reason}`);
+    }
+    if (verified.environment !== declaredEnvironment) {
+      throw new CompanyError('invalid', `acceptance evidence environment ${verified.environment ?? 'unknown'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+    }
+    const evidence = await recordAcceptanceEvidenceRow(this.db, {
+      taskId: input.taskId, acId: input.acId, kind: 'machine', sha: input.sha, environment: verified.environment,
+      evidenceType: criterion.evidence, source: verified.source, verifier: 'github-actions', actor: actor.employeeId,
+      at: verified.at, criteriaVersion: gate.criteriaVersion, taskVersion: row.version, attempt: targetAttempt,
+    });
+    await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence', evidence: $evidence, at: time::now() };`,
+      { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ acId: input.acId, sha: input.sha, evidenceType: criterion.evidence, environment: verified.environment, attempt: targetAttempt, digest: evidence.digest }) });
+    return evidence;
   }
 
   // ---- 受控编制管理工具（manage = gm/product） ----
@@ -2114,12 +2295,64 @@ export class SurrealCompanyCore implements CompanyCore {
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
     }
+    let prHead: string | undefined;
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
-        const reason = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
-        if (reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${reason}`);
+        const checked = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
+        if (checked?.reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+        // The PR gate's actual head is authoritative: a declared acceptance head cannot outlive a moved PR head (B2).
+        prHead = checked?.head;
       }
+    }
+    // SYS02 AC03: submit and independent accept call the same evaluator. submit binds the new head; accept signs the human
+    // criteria in the transaction that moves the task to done. Missing/untrusted/old-head evidence is refused here.
+    let acceptance: { head?: string; environment?: string; human: HumanSignoff[] } | undefined;
+    if (action === 'submit' || action === 'accept') {
+      const row = await this.db.select<TaskRow>(id('task', proof.taskId));
+      if (!row) throw new CompanyError('not_found', 'Task not found');
+      const gate = await loadAcceptanceGate(this.db);
+      const evidenceRows = await loadAcceptanceEvidence(this.db, proof.taskId);
+      const criteria = validateAcceptanceCriteria(row.acceptance_criteria);
+      const declaredEnvironment = effectiveEnvironment(criteria, row.acceptance_environment);
+      const attempt = action === 'submit' ? (row.acceptance_attempt ?? 0) + 1 : (row.acceptance_attempt ?? 0);
+      const gateSubject = acceptanceSubject(row, undefined, { environment: declaredEnvironment, attempt });
+      const legacy = isLegacyAcceptance(gateSubject, gate);
+      const declared = action === 'submit' ? evidence?.acceptance?.sha : undefined;
+      if (action === 'submit' && prHead !== undefined) {
+        // The PR gate's actual head is authoritative. A declared head that contradicts it is always refused; a missing
+        // declared head is refused only while the gate is on for a non-legacy row. With the gate off, or on a legacy row,
+        // the old path is kept: a submit that merely names its PR must not be turned away for a head it never declared.
+        if (declared !== undefined && declared !== prHead) {
+          throw new CompanyError('conflict', `the submitted acceptance head ${declared} is not the PR head ${prHead}; update the acceptance evidence to the current head`);
+        }
+        if (declared === undefined && gate.enabled && !legacy) {
+          throw new CompanyError('conflict', `the submitted acceptance head is missing; the PR head is ${prHead}; update the acceptance evidence to the current head`);
+        }
+      }
+      const head = action === 'submit' ? (prHead ?? declared) : row.acceptance_head;
+      const submittedEnvironment = action === 'submit' ? evidence?.acceptance?.environment : undefined;
+      const subject = acceptanceSubject(row, head, { environment: declaredEnvironment, attempt });
+      // N1: submit uses this submission's target environment, checked against the controlled declaration. Accept uses the
+      // persisted value. Undefined only matches undefined: it is a generic CI fact, never a wildcard for production.
+      if (action === 'submit' && !legacy && submittedEnvironment !== declaredEnvironment) {
+        throw new CompanyError('invalid',
+          `the submitted acceptance environment ${submittedEnvironment ?? 'is missing'} is not the declared environment ${declaredEnvironment ?? 'none'}`);
+      }
+      const verdict = evaluateAcceptance({
+        subject, evidence: evidenceRows,
+        phase: action === 'submit' ? 'submit' : 'accept',
+        actor: { employeeId: actor.employeeId, role: actor.role ?? '', human: true }, gate,
+      });
+      if (!verdict.ok) throw acceptanceError(verdict);
+      const persistedEnvironment = action === 'submit'
+        ? (legacy ? (submittedEnvironment ?? declaredEnvironment) : declaredEnvironment)
+        : (row.acceptance_environment ?? declaredEnvironment);
+      acceptance = {
+        ...(head !== undefined ? { head } : {}),
+        ...(persistedEnvironment !== undefined ? { environment: persistedEnvironment } : {}),
+        human: action === 'accept' ? humanSignoffs(verdict, proof.taskId, actor.employeeId, row.acceptance_attempt ?? 0) : [],
+      };
     }
     const flags = {
       heartbeat: action === 'heartbeat', checkpoint: action === 'checkpoint',
@@ -2186,10 +2419,21 @@ export class SurrealCompanyCore implements CompanyCore {
         handover = IF $heartbeat OR $checkpoint THEN $t.handover ELSE NONE END,
         previous_employee = IF $heartbeat OR $checkpoint THEN $t.previous_employee ELSE NONE END,
         accepted_by = IF $accept THEN $employee ELSE $t.accepted_by END,
+        acceptance_head = IF $submit AND $has_head THEN $acceptance_head ELSE $t.acceptance_head END,
+        acceptance_environment = IF $submit THEN (IF $has_environment THEN $acceptance_environment ELSE NONE END) ELSE $t.acceptance_environment END,
+        acceptance_attempt = IF $submit THEN ($t.acceptance_attempt ?? 0) + 1 ELSE $t.acceptance_attempt END,
         version = IF $heartbeat THEN $t.version ELSE $t.version + 1 END
         RETURN AFTER;
       IF !$heartbeat AND !$checkpoint { UPDATE ONLY $actor SET active_task = NONE };
       IF $accept {
+        FOR $e IN $human_evidence {
+          CREATE acceptance_evidence CONTENT {
+            task: $task, ac_id: $e.acId, kind: 'human', sha: $e.sha, environment: $t.acceptance_environment,
+            attempt: $e.attempt,
+            evidence_type: 'review-signoff', source: { provider: 'reviewer' }, verified: true, verifier: 'reviewer',
+            actor: $employee, at: time::now(), criteria_version: $e.criteriaVersion, task_version: $next.version, digest: $e.digest
+          };
+        };
         ${UNLOCK_SQL}
       };
       IF !$heartbeat {
@@ -2208,6 +2452,9 @@ export class SurrealCompanyCore implements CompanyCore {
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
         ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
+        has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
+        human_evidence: acceptance?.human ?? [],
         excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
         indep_guards: gate?.guards ?? [],
