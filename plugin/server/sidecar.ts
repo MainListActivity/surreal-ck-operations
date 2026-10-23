@@ -118,6 +118,7 @@ export class SidecarPool {
   private readonly quarantined = new Set<string>();
   private readonly creds = new Map<string, string>();
   private readonly keys = new Map<string, string>();
+  private readonly routingUnconfirmed = new Set<string>();
   private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
   private readonly instByAgent = new Map<string, string>();
@@ -141,11 +142,14 @@ export class SidecarPool {
   /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
   routingLease(ref:string):RoutingLease|undefined {
     const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
-    if(!inst||this.quarantined.has(inst)||!this.launched.has(inst))return;
+    if(!inst||this.quarantined.has(inst)||!this.launched.has(inst)||this.routingUnconfirmed.has(inst))return;
     const live=this.claims.get(inst);
     if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
     const role=this.routingEmployees.get(inst)?.role;
-    if(role==='gm'||role==='eval')return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:'planning'};
+    // A task lease authorizes task writes, not the employee's ability to speak.
+    // submit/review consumes the lease before Claude's next call handles the tool result.
+    // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
+    if(role)return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
@@ -351,6 +355,7 @@ export class SidecarPool {
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
     this.archive(blockerPath(dir), "stale");
+    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
       routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:inst.role,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
@@ -485,6 +490,7 @@ export class SidecarPool {
     if (!instId) return;
     if ([...this.instByAgent.values()].includes(instId)) return;
     this.endLease(instId);
+    this.routingUnconfirmed.delete(instId);
     this.launched.delete(instId);
     this.quarantined.add(instId);
     this.creds.delete(instId);
@@ -531,6 +537,8 @@ export class SidecarPool {
     // instance keeps its seat (and any artifacts it wrote) across the restart.
     for (const inst of insts) {
       if (!this.launched.has(inst.id) || this.claims.has(inst.id)) continue;
+      // A failed/ambiguous lookup must not turn an in-flight employee into idle routing.
+      this.routingUnconfirmed.add(inst.id);
       try { await this.rebuildClaim(inst); }
       catch (error) { this.log(`adopt lease check ${inst.id} failed: ${(error as Error).message}`); }
     }
@@ -567,6 +575,7 @@ export class SidecarPool {
       return;
     }
     if (!mine.length) {
+      this.routingUnconfirmed.delete(inst.id);
       // No server lease: the channel may still be live, but claim.json and artifacts are dead.
       this.endLease(inst.id);
       this.archive(reportPath(dir), "stale");
@@ -596,6 +605,7 @@ export class SidecarPool {
       worktree: task.worktree,
       evidenceDir,
     } as ClaimResult & { evidenceDir: string };
+    this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: lease.state,
       routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:inst.role,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},

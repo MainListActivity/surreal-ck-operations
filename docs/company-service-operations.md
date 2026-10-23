@@ -354,6 +354,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 只有四个 magpie 分组 `sck-fable/opus/sonnet/haiku`（`routing=order`、`stays=session`）。**分组成员归老板管**：自动分档只在 `GROUPING_VERSION` 变化时整体初始化一次，此后只把从未见过的新模型（AA ≥38）放进对应档位；老板在 magpie 里手动增删的成员不会被覆盖，手动移出的模型记入 `model-routing/membership.json` 的已知列表，不会被自动加回，手动加入的模型即使没有 AA 分数也保留。后台每五分钟只按 AA 先验与模型绩效重排各组成员顺序（读取 magpie `providers.json`，写入经 magpie 自身的保存接口）；同一租约用 `x-magpie-session` 由 magpie 保持在同一模型，额度或故障时由 magpie 在组内回退。不再有 magpie 选择中间件、best/explore 中间分组和网关模型固定；升级后首次同步会卸载旧的 `sck-performance` 中间件并删除 `sck-route-*` 分组。故事作者正在使用的旧组保留。请求热路径不查询远端数据库：租约来自 sidecar 内存，执行元数据经本地 fsync+rename 队列入库，不保存提示词/回复/密钥。
 
+有效员工会话的模型调用资格与任务写入租约分开：submit/review 成功会立即消耗任务租约，随后 Claude 仍需处理工具结果、输出收尾；工程、产品等已登记会话此时按岗位默认档位继续调用，记录 task 为空、phase=idle，不进入任务模型绩效。GM/eval 的 planning 行为不变。新任务写入和供应商操作仍须原有有效租约；未登记、隔离或过期的在途租约不会获得任务权限。插件重载恢复期间模型网关返回503及 Retry-After:1，恢复完成后才核对会话；未登记会话仍拒绝409。
+
 任务经过所有提交、退回和修复，最终达到 done 后才进入 eval。普通返工中不结算。eval 使用 `get_task_history` 和 `get_model_evidence` 关联 employee、实际 model、fence、阶段和时间，分别评价返工责任与修复贡献。`record_score.scores[].modelScores` 为实际模型独立的 overall/notes；单模型可继承该员工的最终综合分，多模型缺少独立判断时不虚构质量分。每模型按1/模型数量分配参与者样本权重，请求数量不决定质量。历史记录写 actual_models，配置保留 configured_model。已重新打开的任务不进入排序，重新结算按确定ID替换旧样本。上线测试中的模型选择与评分证据来自隔离公司 fork，不制造生产绩效。
 
 发布从 main 固定提交生成快照，运行加法迁移033。暂停新派工后、切换生产代码前执行新 main release 的迁移入口（此时旧租约继续有效）：

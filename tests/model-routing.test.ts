@@ -614,3 +614,17 @@ test("Fable stays owner-only even when a legacy busy employee sends a Fable mode
     expect(sent).toEqual(['group/sck-haiku','group/sck-haiku']);
   }finally{await g.stop()}
 });
+
+test('gateway recovery returns retryable 503 until sidecar adoption is ready, then applies normal identity checks',async()=>{
+  let ready=false,lookups=0;
+  const g=await startModelGateway({ready:()=>ready,lease:async()=>{lookups++;return undefined},record:async()=>{},complete:async()=>{}} as any,0);
+  try{
+    const cold=await fetch(`http://127.0.0.1:${g.port}/a/unknown/v1/messages`,{method:'POST',body:'{}'});
+    expect(cold.status).toBe(503);expect(cold.headers.get('retry-after')).toBe('1');await cold.text();
+    expect(lookups).toBe(0);
+    ready=true;
+    const warm=await fetch(`http://127.0.0.1:${g.port}/a/unknown/v1/messages`,{method:'POST',body:'{}'});
+    expect(warm.status).toBe(409);await warm.text();
+    expect(lookups).toBe(1);
+  }finally{await g.stop()}
+});

@@ -105,3 +105,39 @@ test('健康 launch 写绑定，重启 adopt 重铸通道：轮换凭证、重�
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('review closeout can finish inference after consuming the task lease without restoring task write rights',async()=>{
+  const {startModelGateway}=await import('../src/model-routing/gateway.ts');
+  const root=mkdtempSync(join(tmpdir(),'closeout-409-'));
+  const rows:Array<Record<string,unknown>>=[];
+  let reviews=0;
+  const pool=new SidecarPool({runDir:join(root,'comm'),sweepMs:2,heartbeatMs:1_000_000,
+    workforce:{rotate:async()=> 'synthetic-credential'} as unknown as SidecarDeps['workforce'],
+    core:{claim:async()=>({task:{id:'review-task',state:'review',version:3},deliveryId:'delivery',fence:2,leaseExpiresAt:new Date(Date.now()+60000).toISOString(),history:[]}),
+      accept:async()=>{reviews++;return{id:'review-task',state:'done',version:4}}} as unknown as SidecarDeps['core']});
+  const inst:EmployeeInst={id:'product-fixture',role:'product',credential:'synthetic-credential'};
+  const env=pool.env(inst);pool.bindAgent(inst.id,'closeout-agent');
+  const gateway=await startModelGateway({lease:async ref=>pool.routingLease(ref),record:async row=>{rows.push(row)},complete:async()=>{},
+    fetchImpl:(async()=>new Response('data: {"type":"message_stop"}\n\n',{headers:{'content-type':'text/event-stream','x-magpie-provider':'relay','x-magpie-model':'actual'}})) as unknown as typeof fetch},0);
+  let seq=0;
+  const relay=async()=>{
+    const file=`${++seq}.json`;
+    writeFileSync(join(env.SCK_COMM_DIR!,'req',file),JSON.stringify({key:env.SCK_COMM_KEY,tool:'review',args:{decision:'accept',text:'validated'}}));
+    const output=join(env.SCK_COMM_DIR!,'res',file);
+    for(let n=0;n<300&&!existsSync(output);n++)await Bun.sleep(5);
+    return JSON.parse(readFileSync(output,'utf8'));
+  };
+  try{
+    await pool.claim(inst,{id:'review-task'} as SupervisedTask);
+    expect(pool.routingLease('closeout-agent')?.task).toBe('review-task');
+    expect((await relay()).ok).toBe(true);
+    expect(reviews).toBe(1);
+    const response=await fetch(`http://127.0.0.1:${gateway.port}/a/closeout-agent/v1/messages`,{method:'POST',body:JSON.stringify({model:'sonnet',messages:[]})});
+    expect(response.status).toBe(200);await response.text();
+    expect(rows[0]).toMatchObject({employee:inst.id,task:'',phase:'idle'});
+    expect((await relay()).ok).toBe(false);
+    expect(reviews).toBe(1);
+    pool.detachAgent('closeout-agent');
+    expect(pool.routingLease('closeout-agent')).toBeUndefined();
+  }finally{pool.detachAgent('closeout-agent');await gateway.stop();rmSync(root,{recursive:true,force:true})}
+});

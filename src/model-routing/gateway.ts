@@ -31,6 +31,8 @@ export interface RoutingLease {
   phase: string;
 }
 export interface GatewayDeps {
+  /** Startup only: do not misreport recovery in progress as a lost task lease. */
+  ready?: () => boolean;
   lease(agent: string): Promise<RoutingLease | undefined>;
   record(row: Record<string, unknown>): Promise<void>;
   complete(id: string, completed: boolean): Promise<void>;
@@ -146,6 +148,10 @@ export async function startModelGateway(
     });
     let execution: string | undefined;
     try {
+      if (deps.ready && !deps.ready()) {
+        res.writeHead(503,{"content-type":"application/json","retry-after":"1"}).end(JSON.stringify({error:{type:"api_error",message:"公司会话正在恢复，请稍后重试。"}}));
+        return;
+      }
       const lease = await deps.lease(decodeURIComponent(match[1]!));
       if (!lease) {
         res
@@ -400,7 +406,7 @@ export function databaseGateway(db: Surreal): GatewayDeps {
           fence: 0,
           role: e.role,
           tier: taskTier({executor_role:e.role}),
-          phase: "planning",
+          phase: e.role==='gm'||e.role==='eval'?"planning":"idle",
         };
       const [task] = await db.query<[any]>(
         "SELECT id,state,kind,title,executor_role,reviewer_role,model_tier,current_employee,fence,lease_expires_at FROM ONLY $task;",
