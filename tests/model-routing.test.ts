@@ -285,10 +285,10 @@ describe("streaming task gateway", () => {
       pins:{get:k=>pins.get(k),set:(k,v)=>{if(v)pins.set(k,v);else pins.delete(k)}},
       fetchImpl:(async (_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}',{headers:{'x-magpie-provider':'relay','x-magpie-model':`actual-${sent.length}`}})}) as typeof fetch},0);
     try {
-      for(const model of ['haiku','sonnet','fable']) {
+      for(const model of ['haiku','sonnet','opus']) {
         const r=await fetch(`http://127.0.0.1:${g.port}/a/x/v1/messages`,{method:'POST',body:JSON.stringify({model,messages:[]})});await r.text();
       }
-      expect(sent).toEqual(['group/sck-haiku','group/sck-sonnet','group/sck-fable']);
+      expect(sent).toEqual(['group/sck-haiku','group/sck-sonnet','group/sck-opus']);
       expect(rows.every(r=>r.phase==='execute')).toBe(true);
       expect(pins.size).toBe(3);
     } finally {await g.stop()}
@@ -644,4 +644,17 @@ test("story authors already using the old gateway keep their configured model",a
   const g=await startModelGateway({lease:async()=>({employee:'author',task:'story',fence:1,role:'story-author',tier:'haiku',phase:'execute'}),record:async()=>{},complete:async()=>{},
     fetchImpl:(async(_url:any,init:any)=>{sent=JSON.parse(init.body).model;return new Response('{}')}) as typeof fetch},0);
   try {const r=await fetch(`http://127.0.0.1:${g.port}/a/author/v1/messages`,{method:'POST',body:JSON.stringify({model:'group/sck-writing-high'})});await r.text();expect(sent).toBe('group/sck-writing-high')}finally{await g.stop()}
+});
+
+
+test("Fable stays owner-only even when a legacy busy employee sends a Fable model name",async()=>{
+  const sent:string[]=[];
+  const g=await startModelGateway({lease:async()=>({employee:'legacy',task:'real-task',fence:4,role:'engineering',tier:'haiku',phase:'review'}),record:async()=>{},complete:async()=>{},
+    fetchImpl:(async(_url:any,init:any)=>{sent.push(JSON.parse(init.body).model);return new Response('{}')}) as typeof fetch},0);
+  try {
+    for(const model of ['claude-fable-5-1','group/sck-fable']){const r=await fetch(`http://127.0.0.1:${g.port}/a/legacy/v1/messages`,{method:'POST',body:JSON.stringify({model})});await r.text();}
+    expect(sent).toEqual(['group/sck-haiku','group/sck-haiku']);
+    const direct=onRequest({model:'group/sck-fable'},{options:{routes:{'group/sck-fable':[{group:'group/sck-route-fable-best'}]}}});
+    expect(direct.model).toBe('group/sck-route-fable-best');
+  }finally{await g.stop()}
 });
