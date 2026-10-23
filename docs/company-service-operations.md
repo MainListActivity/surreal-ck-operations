@@ -344,13 +344,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 故事作者保持原有编制、客户端和模型。其余角色各保留一个 Claude 编制，合并原岗位轨；产品默认 `group/sck-sonnet`，GM 默认 `group/sck-opus`，其他岗位（含 QA、eval）默认 `group/sck-haiku`。Fable 仅作为老板手动入口，不进入员工请求；员工网关把旧会话残留的 Fable 模型名映射到岗位默认档位，老板个人通过 Magpie 手动使用 Fable。旧客户端编制停用，已有任务及历史身份保留；旧会话完成任务、解除实现人绑定后按既有退役保护正常回收。
 
-四个公开入口为 `group/sck-fable`、`group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku`。Claude Code/Paseo 手动选档优先于租约默认，跨档更换独立的模型固定记录。岗位不再拆分能力档和绩效排名。请求名含 Haiku 也属于任务工作，只有 count_tokens 为辅助接口。老板个人配置和压缩窗口471000不改。
+四个公开入口为 `group/sck-fable`、`group/sck-opus`、`group/sck-sonnet`、`group/sck-haiku`。员工网关把每个请求改写成一个 magpie 档位分组：租约档位是上限，手动选择可以降到更便宜的档，不能升档；任何具体模型名（含 Claude Code 自带的 `claude/claude-sonnet-5-5` 等）都改写成租约档位分组。网关从不发送具体模型 ID：2026-10-23 曾因固定了一个下架的具体模型，被 magpie 改由 Claude 订阅的 sonnet 应答并继续固定，越出档位。岗位不再拆分能力档和绩效排名。请求名含 Haiku 也属于任务工作，只有 count_tokens 为辅助接口。老板个人配置和压缩窗口471000不改。
 
-`src/model-routing/benchmarks.json` 保留 AA Intelligence Index 来源及采集时间。精确版本按 >=50 / >=43 / >=33 / 其余初始化 Fable/Opus/Sonnet/Haiku；档位是能力分段，不等同于模型厂商品牌。未知版本标 `estimated`，暂放 Sonnet、先验2.5；不得冒称已测评。空档只借用更强档。模型绩效采用统一排名、八任务先验、30天半衰期；相同规范模型名跨账号共享证据。`tierOverrides` 和 `disabledModels` 允许维护时校正和排除。首次四档迁移清除旧三档覆盖，重新按快照初始化。
+`src/model-routing/benchmarks.json` 保留 AA Intelligence Index 来源及采集时间。老板规则：任何档位的模型 AA 分数不得低于 38（`AA_FLOOR`），没有公开分数的模型不进入任何档位，新上架模型同样按此过滤。精确版本按 >=50 / >=43 / >=33 / 其余初始化 Fable/Opus/Sonnet/Haiku（分界线待老板确认重定）；档位是能力分段，不等同于模型厂商品牌。空档只借用更强档。模型绩效采用统一排名、八任务先验、30天半衰期；相同规范模型名跨账号共享证据。`tierOverrides` 和 `disabledModels` 允许维护时校正和排除。首次四档迁移清除旧三档覆盖，重新按快照初始化。
 
-派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度与顺序回退，插件维护四档组内绩效优先级。
+派工器只处理角色/岗位轨、仓库与写入隔离、独立验收、实现人连续性、租约和本机总并发。受管员工复用空闲会话，保留返工接续，不再按订阅额度/账号并发/配置模型漂移或员工分数挑模型，也不再调用 Jev 做二次员工选择。故事作者维持原派工策略。Magpie 负责模型/账号可用性、额度、顺序回退和档内隔离；公司代码只维护四个分组的成员与顺序。
 
-`magpie/sck-performance.gateway.js` 使用 onRequest 读取内存策略；后台每五分钟更新目录和分组。四个公开组之外，每档有 best/explore 两个原生完整回退方案用于10%探索；旧角色分组删除，但故事作者正在使用的旧组保留。请求热路径不查询远端数据库：租约来自 sidecar 内存，执行元数据经本地 fsync+rename 队列入库，不保存提示词/回复/密钥。网络异常解除模型固定；停用后重新启用显式恢复插件。
+只有四个 magpie 分组 `sck-fable/opus/sonnet/haiku`（`routing=order`、`stays=session`），后台每五分钟按 AA 先验与模型绩效重写成员顺序；同一租约用 `x-magpie-session` 由 magpie 保持在同一模型，额度或故障时由 magpie 在组内回退。不再有 magpie 选择中间件、best/explore 中间分组和网关模型固定；升级后首次同步会卸载旧的 `sck-performance` 中间件并删除 `sck-route-*` 分组。故事作者正在使用的旧组保留。请求热路径不查询远端数据库：租约来自 sidecar 内存，执行元数据经本地 fsync+rename 队列入库，不保存提示词/回复/密钥。
 
 任务经过所有提交、退回和修复，最终达到 done 后才进入 eval。普通返工中不结算。eval 使用 `get_task_history` 和 `get_model_evidence` 关联 employee、实际 model、fence、阶段和时间，分别评价返工责任与修复贡献。`record_score.scores[].modelScores` 为实际模型独立的 overall/notes；单模型可继承该员工的最终综合分，多模型缺少独立判断时不虚构质量分。每模型按1/模型数量分配参与者样本权重，请求数量不决定质量。历史记录写 actual_models，配置保留 configured_model。已重新打开的任务不进入排序，重新结算按确定ID替换旧样本。上线测试中的模型选择与评分证据来自隔离公司 fork，不制造生产绩效。
 

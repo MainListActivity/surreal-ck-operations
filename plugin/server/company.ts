@@ -65,7 +65,7 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const { ModelRoutingController } = await import("./vendor/src/model-routing/controller.ts");
     const { startModelGateway } = await import("./vendor/src/model-routing/gateway.ts");
-    const modelRouting = new ModelRoutingController(db.db, serviceHome(), join(serviceHome(), "active", "magpie", "sck-performance.gateway.js"));
+    const modelRouting = new ModelRoutingController(db.db, serviceHome());
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
 
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
@@ -148,9 +148,7 @@ export function company(): Promise<Company> {
     });
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
     const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
-    const {RoutingPins}=await import("./vendor/src/model-routing/pins.ts");
-    const pins=new RoutingPins(join(serviceHome(),"model-routing","pins.json"));
-    const modelGateway = await startModelGateway({pins,lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
+    const modelGateway = await startModelGateway({lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,

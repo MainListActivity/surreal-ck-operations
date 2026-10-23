@@ -7,7 +7,7 @@ import {
   startModelGateway,
 } from "../src/model-routing/gateway.ts";
 import { scoreModels, readModelResults } from "../src/model-routing/store.ts";
-import { rank, classify } from "../src/model-routing/policy.ts";
+import { rank } from "../src/model-routing/policy.ts";
 import { writeScorecards, type EvalState } from "../src/scoring.ts";
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === "1" ? test : test.skip;
 run(
@@ -136,7 +136,7 @@ run(
       );
       expect(
         rank(
-          classify([{ id: "relay/actual-model" }, { id: "relay/untried" }]),
+          ["relay/actual-model", "relay/untried"].map((id) => ({ id, model: id.slice(6), tier: "sonnet" as const, prior: 2.5, estimated: true, context: 32768 })),
           results,
           "engineering",
         )[0]?.id,
