@@ -13,6 +13,9 @@ export interface Company {
   workforce: import("./vendor/src/workforce").Workforce;
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
   core: import("./vendor/src/contracts").CompanyCore;
+  modelRouting: import("./vendor/src/model-routing/controller").ModelRoutingController;
+  stopModelGateway: () => Promise<void>;
+  modelJournal: import("./vendor/src/model-routing/journal").ExecutionJournal;
   sidecar: import("./sidecar").SidecarPool;
   /** Agent home repo — the default project staffing pools are scoped to. */
   opsRepo: string;
@@ -60,6 +63,11 @@ export function company(): Promise<Company> {
     const db = new CompanyDatabase(loadDatabaseConfig());
     await db.connect();
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
+    const { ModelRoutingController } = await import("./vendor/src/model-routing/controller.ts");
+    const { startModelGateway } = await import("./vendor/src/model-routing/gateway.ts");
+    const modelRouting = new ModelRoutingController(db.db, serviceHome(), join(serviceHome(), "active", "magpie", "sck-performance.gateway.js"));
+    void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
+
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
     const owner = new OwnerDesk(db);
     // Workforce also powers the manage-only def_* tools exposed through the sidecar.
@@ -138,6 +146,11 @@ export function company(): Promise<Company> {
       runDir,
       log: message => console.log(message),
     });
+    const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
+    const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
+    const {RoutingPins}=await import("./vendor/src/model-routing/pins.ts");
+    const pins=new RoutingPins(join(serviceHome(),"model-routing","pins.json"));
+    const modelGateway = await startModelGateway({pins,lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,
@@ -184,7 +197,7 @@ export function company(): Promise<Company> {
     });
     // Rebuild agent↔instance bindings and live leases after a plugin restart.
     await sidecar.adopt(await workforce.insts());
-    return { db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return { modelJournal, modelRouting, stopModelGateway:modelGateway.stop, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

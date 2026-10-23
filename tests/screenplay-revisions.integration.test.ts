@@ -94,6 +94,9 @@ test('a+b: real owner rejection opens the controlled revision edge; dependents o
   await expect(revise(tokens.gm, { revises: v1.id, title: '动画剧本 v2' })).rejects.toThrow();
   await reject(v1.id);
   expect((await task(v1.id)).state).toBe('ready');
+  // Both genuine events may fall within one JS millisecond. Keep the database's ns ordering.
+  await database.db.query(`UPDATE audit SET at=<datetime>'2026-01-01T00:00:00.123000001Z' WHERE task=$task AND action='submit';
+    UPDATE audit SET at=<datetime>'2026-01-01T00:00:00.123000002Z' WHERE task=$task AND action='owner_reject';`,{task:new RecordId('task',v1.id)});
 
   // Legal revision: same call is idempotent, product could do it too.
   const v2 = await revise(tokens.gm, { revises: v1.id, title: '动画剧本 v2' });

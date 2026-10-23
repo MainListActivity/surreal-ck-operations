@@ -10,6 +10,7 @@ import { refreshModels, refreshQuota } from "./dispatch";
 import { serviceHome } from "./env";
 import * as rpc from "../shared/rpc";
 import type { Pulse, Roster } from "../shared/types";
+import { providerHealthView } from "./vendor/src/dispatcher/provider-health-view.ts";
 
 const SOURCE = "owner:paseo-plugin";
 
@@ -182,7 +183,7 @@ export function registerHandlers(server: PluginServerContext): void {
     const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
     const { rosterAnswer } = await import("./vendor/src/dispatcher/roster-answer.ts");
     const cfg = await workforce.config();
-    const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
+    const [health] = await db.db.query<[any[]]>("SELECT id, provider, state, last_error, until FROM provider_health;");
     // Session status, staffing pools, review previews and dispatch-blocked rows are the pass's own snapshot (SYS-DISP R4). The roster
     // never recomputes them from the live database, so it cannot disagree with the dispatch decisions of the same pass.
     const observed = dispatcher.sessionSnapshot();
@@ -201,7 +202,7 @@ export function registerHandlers(server: PluginServerContext): void {
     const liveDefIds = new Set(insts.map(i => i.def));
     const defRank = (d: { id: string; enabled: boolean }) => d.enabled ? (liveDefIds.has(d.id) ? 0 : 1) : 2;
     const orderedDefs = [...defs].sort((a, b) => defRank(a) - defRank(b));
-    const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
+    const healthView = providerHealthView(health, Math.floor(Date.now() / 1000));
     const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
       entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,
         eligible: e.eligible, reason: e.reason, code: e.code, model: e.model }));
@@ -250,10 +251,10 @@ export function registerHandlers(server: PluginServerContext): void {
     // Live lists (doing, stuck, waiting, resources, goals) read the database now and are labelled by `at`. Every list is capped.
     const snapshot = dispatcher.dispatchSnapshot();
     const verdicts = snapshot.verdicts;
-    const [health] = await db.db.query<[any[]]>("SELECT provider, state, last_error, until FROM provider_health;");
+    const [health] = await db.db.query<[any[]]>("SELECT id, provider, state, last_error, until FROM provider_health;");
     const defs = await workforce.defs();
-    const healthView = health.map(h => ({ provider: String(h.provider).split("⟨").pop()?.replace("⟩", "") ?? String(h.provider), state: h.state, lastError: h.last_error, until: h.until }));
-    const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state as "healthy" | "exhausted", until: h.until, failures: 0, lastError: h.lastError }]));
+    const healthView = providerHealthView(health, nowS);
+    const healthMap = new Map(healthView.map(h => [h.provider, { provider: h.provider, state: h.state === "healthy" ? "healthy" as const : "exhausted" as const, until: h.until, failures: 0, lastError: h.lastError }]));
     const quotaBlocked = quotaBlockedProviders(await readProviderQuotas(db.db), cfg, now);
     const executeBlock = new Map(verdicts.filter(v => v.phase === "execute").map(v => [v.taskId, v]));
 

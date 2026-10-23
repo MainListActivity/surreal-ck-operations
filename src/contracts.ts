@@ -107,6 +107,7 @@ export interface TaskView {
   implementer?: EmployeeId;
   /** Independence policy (SYS-DISP IR01): contributors of the source tasks, and named employees, may not take or decide this task. */
   independence?: IndependencePolicy;
+  modelTier?: 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
   /** Typed screenplay-revision edge: this draft is the legal next version of `revises`. */
@@ -315,6 +316,7 @@ export interface CreateTask {
   project?: string;
   dependencies?: TaskId[];
   idempotencyKey: string;
+  modelTier?: 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   /**
    * Controlled screenplay-revision edge (gm/product only): both drafts must be owner-reviewed

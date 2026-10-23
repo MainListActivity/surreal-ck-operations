@@ -334,3 +334,11 @@ test('pool: the seat cap still bounds an exempt def', () => {
   }));
   expect(entries.every(e => !e.eligible && e.code === 'provider_capacity')).toBe(true);
 });
+
+test('pool: aggregate magpie group backoff applies even to a native-quota-exempt harness',()=>{
+ const d=def('d1',{quotaLimited:false});const i=inst('i1');const task={row:{model_route_until:1_000_060}} as SupervisedTask;
+ const input=base({defs:[d],insts:[i],states:new Map([['i1','idle']]),task});
+ expect(staffingPool(input).filter(e=>e.eligible)).toHaveLength(0);
+ expect(staffingPool(input).find(e=>e.kind==='reuse')?.code).toBe('quota');
+ expect(staffingPool({...input,now:1_000_061}).some(e=>e.eligible)).toBe(true);
+});

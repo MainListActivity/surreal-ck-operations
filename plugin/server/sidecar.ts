@@ -1,3 +1,5 @@
+import { taskTier } from './vendor/src/model-routing/policy.ts';
+import type { RoutingLease } from './vendor/src/model-routing/gateway.ts';
 // Per-agent sidecar pool. Each company employee instance gets a private comm
 // directory and an in-memory credential held by the plugin; agents receive only
 // SCK_COMM_DIR/SCK_COMM_KEY in their spawn env and never see auth material.
@@ -101,6 +103,8 @@ interface LiveClaim {
   blockerHash?: string;
   /** Turns that ended without any closeout artifact while this claim was live. */
   nudges?: number;
+  routing?: RoutingLease;
+  routingExpiresAt?: number;
 }
 
 /** What settle() found for a finished turn; `silent` carries the still-open round. */
@@ -114,6 +118,7 @@ export class SidecarPool {
   private readonly quarantined = new Set<string>();
   private readonly creds = new Map<string, string>();
   private readonly keys = new Map<string, string>();
+  private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
   private readonly instByAgent = new Map<string, string>();
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
@@ -127,8 +132,25 @@ export class SidecarPool {
   constructor(private readonly deps: SidecarDeps) { this.opsCircuit = new OpsCircuit(deps.runDir); }
   private log(message: string) { this.deps.log?.(message); }
 
+  routingSession(ref:string):{employee:string;comm:string}|undefined {
+    const employee=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
+    if(!employee||!this.launched.has(employee)||this.quarantined.has(employee))return;
+    return {employee,comm:commDir(this.deps.runDir,employee)};
+  }
+
+  /** Read-only projection of the sidecar's authoritative local claim; never queries the remote DB. */
+  routingLease(ref:string):RoutingLease|undefined {
+    const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
+    if(!inst||this.quarantined.has(inst)||!this.launched.has(inst))return;
+    const live=this.claims.get(inst);
+    if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
+    const role=this.routingEmployees.get(inst)?.role;
+    if(role==='gm'||role==='eval')return {employee:inst,task:'',fence:0,role,tier:'high',phase:'planning'};
+  }
+
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */
   env(inst: EmployeeInst): Record<string, string> {
+    this.routingEmployees.set(inst.id,{role:inst.role});
     if (this.quarantined.has(inst.id) || (inst.paseoAgentId && !this.canReuse(inst))) {
       throw Object.assign(new Error("session channel cannot be restored; retire the instance"), { code: "stale_channel" });
     }
@@ -331,6 +353,8 @@ export class SidecarPool {
     this.archive(blockerPath(dir), "stale");
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: result.task.state === "review" ? "review" : "doing",
+      routing: {employee:inst.id,task:task.id,fence:result.fence,role:inst.role,tier:taskTier({model_tier:result.task.modelTier,kind:result.task.kind,title:result.task.title,executor_role:result.task.executorRole,reviewer_role:result.task.reviewerRole}),phase:result.task.state==='review'?'review':'execute'},
+      routingExpiresAt:Date.parse(result.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: result.deliveryId, fence: result.fence, expectedVersion: result.task.version },
     });
     this.startBeat(inst.id);
@@ -477,6 +501,7 @@ export class SidecarPool {
    */
   async adopt(insts: EmployeeInst[]): Promise<void> {
     for (const inst of insts) {
+      this.routingEmployees.set(inst.id,{role:inst.role});
       if (inst.credentialFile || !inst.paseoAgentId || this.canReuse(inst)) continue;
       try {
         const cred = await this.deps.workforce.rotate(inst.id); // retired/revoked insts throw
@@ -573,6 +598,8 @@ export class SidecarPool {
     } as ClaimResult & { evidenceDir: string };
     this.claims.set(inst.id, {
       instId: inst.id, taskId: task.id, phase: lease.state,
+      routing: {employee:inst.id,task:task.id,fence:task.fence,role:inst.role,tier:taskTier({model_tier:task.modelTier,kind:task.kind,title:task.title,executor_role:task.executorRole,reviewer_role:task.reviewerRole}),phase:lease.state==='review'?'review':'execute'},
+      routingExpiresAt:Date.parse(task.leaseExpiresAt),
       proof: { taskId: task.id, deliveryId: lease.deliveryId, fence: task.fence, expectedVersion: task.version },
     });
     this.startBeat(inst.id);
@@ -615,7 +642,10 @@ export class SidecarPool {
       void (async () => {
         try {
           const result = await this.callWithCred(instId, cred => this.deps.core.heartbeat(cred, live.proof));
-          if (this.claims.get(instId) === live) live.proof.expectedVersion = result.task.version;
+          if (this.claims.get(instId) === live) {
+            live.proof.expectedVersion = result.task.version;
+            if(result.task.leaseExpiresAt)live.routingExpiresAt=Date.parse(result.task.leaseExpiresAt);
+          }
         } catch (error) {
           // Version drift (a concurrent write bumped the task) must not kill the
           // lease: re-read the task and resync the proof. End it only when the
@@ -628,6 +658,7 @@ export class SidecarPool {
                 && (!task.leaseExpiresAt || Date.parse(task.leaseExpiresAt) > Date.now())) {
               live.proof.expectedVersion = task.version;
               live.proof.fence = task.fence;
+              if(task.leaseExpiresAt)live.routingExpiresAt=Date.parse(task.leaseExpiresAt);
               this.log(`heartbeat ${instId} resynced after: ${(error as Error).message}`);
               return;
             }

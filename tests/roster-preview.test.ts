@@ -48,7 +48,9 @@ const tick = async () => {
 let briefOverride: Record<string, unknown> | undefined;
 let doingOverride: Array<Record<string, unknown>> = [];
 let recentOverride: Array<Record<string, unknown>> = [];
+let healthOverride: Array<Record<string, unknown>> = [];
 const queryRows = (sql: string): unknown[][] =>
+  sql.includes("FROM provider_health") ? [healthOverride] :
   sql.includes("state = 'doing'") ? [doingOverride] : sql.includes("action IN ['accept'") ? [recentOverride] : [[]];
 const dbQuery = (sql: string) => sql.includes('BEGIN TRANSACTION;')
   ? { responses: async () => [{ success: true, result: sql.includes('LET $rows = SELECT')
@@ -397,4 +399,25 @@ test('roster answer: with every list full, each list keeps its cap and the whole
     expect(answer.bounds[name]).toEqual({ total: 500, shown: list.length, truncated: true });
   }
   expect(bytesOf(answer)).toBeLessThanOrEqual(ROSTER_BUDGET_BYTES);
+});
+
+
+test('roster RPC: record IDs identify providers and expired cooldowns are probeable without becoming healthy', async () => {
+  const { RecordId } = await import('surrealdb');
+  healthOverride = [
+    { id: new RecordId('provider_health','factory-droid'), state: 'exhausted', until: 1, last_error: 'synthetic rejection' },
+    { id: new RecordId('provider_health','grok'), state: 'exhausted', until: Math.floor(Date.now()/1000)+3600 },
+    { id: new RecordId('provider_health','codex'), state: 'healthy' },
+  ];
+  try {
+    const response = await callRoster();
+    expect(response.health).toEqual([
+      { provider: 'factory-droid', state: 'probe', until: 1, lastError: 'synthetic rejection' },
+      { provider: 'grok', state: 'exhausted', until: Number(healthOverride[1]!.until) },
+      { provider: 'codex', state: 'healthy' },
+    ]);
+    expect(healthOverride[0]!.state).toBe('exhausted');
+    const overview = await callPulse();
+    expect(overview).toBeDefined();
+  } finally { healthOverride = []; }
 });

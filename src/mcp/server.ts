@@ -272,6 +272,7 @@ function registerTools(server: McpServer, core: CompanyCore) {
   server.registerTool('create_task', {
     description: 'Create a managed company task; requires core manage capability. project optionally binds this one task to a registered project (takes precedence over the goal\'s project). revises=<直接上一版任务id> creates the controlled screenplay-revision edge: gm/product only, both drafts must be owner-reviewed screenwriter tasks on the 编剧 track (kind=task) in the same goal and project, and the target must be the unapproved chain tip whose latest submission was really rejected by the owner; the old draft voids with a supersededBy pointer and downstreams resolve to the chain tip.',
     inputSchema: z.object({
+      modelTier: z.enum(['high','medium','low']).optional(),
       title: z.string().min(1), context: z.string().min(1),
       executorRole: z.enum(roles), reviewerRole: z.enum(reviewerRoles),
       discipline: z.string().min(1).max(60).optional(),

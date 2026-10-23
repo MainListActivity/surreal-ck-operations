@@ -341,3 +341,29 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 已披露的残留（SYS01 复核）：`deploy-mcp-remote.sh` 安装远端 Bun 时直接执行 bun.sh 的安装脚本，未做 sha256 校验；`scripts/release-content.sh` 的清单比较只看文件内容，不看权限位。前者列为后续跟进。`release-gate.sh` 按目录名取 SHA 一项已关闭：`release-gate.sh` 与 `company-service.sh install` 都调用 `scripts/release-content.sh`，把目录内容与提交归档逐文件比较（依赖、生成的 `plugin/server/vendor`、`vault/build` 与 `.runtime/` 不计入），内容不符即拒绝。
 
 `deploy-mcp-remote.sh` 在任何远端步骤前核对同一记录（Bun 版本取 `SCK_BUN_VERSION`，缺省 1.4.2）。随后在远端执行 `runtime-bun/bin/bun --version`，实际版本与门禁不符时在上传载荷前拒绝，不复用旧二进制。两项都通过后才上传 release、写入 `service.env`、切换 `current` 并重启。`SCK_REMOTE_HOME` 只供测试覆盖：`tests/ci-gates.test.ts` 以桩化的 ssh 与 scp 运行脚本，不触及真实主机；生产路径不设置。最终集成提交若与审查过的提交不同，必须对该集成 SHA 重新生成门禁记录，不能复制旧记录或改写 JSON。
+
+## Magpie 模型分档与绩效路由
+
+模型选择与员工身份分开。公司 Claude 执行通道通过本机 `127.0.0.1:18779` 网关调用 magpie，能使用 magpie 目录中的其他供应商模型；员工、岗位轨、实现人绑定、租约和独立验收规则沿用现有流程。其他客户端的存量会话不伪造实际模型证据。
+
+`src/model-routing/benchmarks.json` 保存带来源与采集时间的公开 Intelligence Index 快照。精确版本匹配（含 `-1017` 这类日期快照后缀）按 >=48 / >=38 / 其余分高/中/低；没有公开数据、预览名和不透明别名明确标为 `estimated`，放中档并以 2.5 的先验排在该档末尾，由任务证据提升：未测出不等于能力弱（如 deepseek-v4.1-flash 实际任务表现较好）。某档为空时借用更高一档，只升不降。同一模型经不同账号提供（如 `codex/…` 与 `remote-magpie/codex/…`）共享任务证据，按规范模型名汇总。`company_meta:model_routing.tierOverrides` 可覆盖已核实的模型分档，`disabledModels` 可排除通道。更新模型目录每五分钟进行；不把模糊相似名称自动当作同一模型。
+
+任务可在 `create_task` 指定 `modelTier=high|medium|low`；省略时，工程、经理、长篇/编剧、上线和老板关口默认高档，常规任务中档，明确的整理归档任务低档。每档按 engineering/writing/general 分别学习优先级。模型评分使用最近180天任务证据、30天半衰期和8个样本的公开排名先验；混合执行按成功请求份额分配一个参与者的任务权重。评分有真实模型、请求完成和HTTP状态的正面证据才归因；断流、额度错误及缺失模型标识不虚构成功记录。`scorecard.configured_model` 保留配置，`actual_models` 与 `model_scorecard.model` 记录实际模型ID，多模型显示 mixed，缺少实证显示 unknown。
+
+选择插件是 `magpie/sck-performance.gateway.js`，使用 `onRequest`（250ms限额）读取 magpie 内存选项，选中一个完整的原生顺序回退组；避免从只有账号信息的 `strategies` 席位猜测模型。后台先生成完整分组，再发布插件选项。10% 的首次选择探索组内其他模型；网关按任务/参与者/租约fence/阶段固定成功模型，额度或通道失败时回到本档原生回退组。模型组整体额度拒绝会写入任务派工退避；原生 Claude 订阅额度不再代表整个分组的可用性，magpie 仍执行每个真实账号的额度上限。
+
+Claude Code 的小模型辅助请求（模型名含 haiku：标题、命令前缀检查、摘要等）保留原模型，不进入分档组、不固定租约模型、不触发组退避，执行记录标 `phase=auxiliary` 且不计入模型评分。
+
+网关运行在 `sck-company` 插件进程内：插件 reload（每次发布）会中断在途流式请求，Claude Code 按网络错误自动重试；插件启动失败时已切到网关的 Claude 员工无法推理，按下方回滚恢复直连 magpie。
+
+推理请求路径不查询远端数据库：sidecar 的内存租约决定任务与档位，本地 fsync+rename 队列保存无提示词/回复/密钥的执行元数据，后台批量入库。队列按版本确认，远端写入期间的完成更新不会被误删；评分后迟到的完成记录会重算归因，不会重复增加样本。远端数据库不可用时保留最后一份路由策略与本地队列。lease 到期则本地拒绝新推理。
+
+发布仍执行上述 main 双面流程。新 release 的 MCP bootstrap 完成加法迁移032后，在暂停新增派工的维护窗口执行：
+
+```sh
+"$HOME/Library/Application Support/SurrealCKCompany/runtime-bun/bin/bun" "$SCK_RELEASE_DIR/scripts/model-routing-admin.ts" enable
+```
+
+该操作先准备分组和插件，完成后才启用路由；备份 Claude 编制的模型/额度门禁配置，并将其模型显示设为分档组。插件 reload 后自动只为无租约且空闲的 Claude 会话刷新启动配置；忙会话先完成当前工作。员工私有目录的 `.claude/settings.local.json` 覆盖网关地址，保留其余设置与原值备份；老板个人的压缩窗口471000及个人会话不被改写。用 `model-routing-admin.ts status` 查看模型/分档计数，`company_meta:model_routing_status` 查看模型清单、证据来源和排序。
+
+功能回滚：先暂停新派工，执行同一 main release 中的 `model-routing-admin.ts disable`，恢复编制与员工本地设置并停用选择插件。输出 `pendingSessionReloads` 非零时，等待这些忙会话完成并恢复其会话，再按前述双面流程切回旧代码；旧 release 没有18779网关，不能先切旧代码再恢复客户端。模型证据表和历史不删除。

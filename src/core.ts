@@ -1,3 +1,4 @@
+import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -205,6 +206,8 @@ interface TaskRow {
   project?: RecordId;
   /** Explicit code-repo binding (schema 017); workspace/dispatch routing only, never business project resolution. */
   code_repo_path?: string;
+  model_tier?: 'high' | 'medium' | 'low';
+  model_route_until?:number;
   handover?: boolean;
   previous_employee?: string;
   /** Bound code implementer: set at the first execute claim or by an explicit gm takeover (schemaless). */
@@ -307,6 +310,7 @@ export function view(row: TaskRow): TaskView {
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
     independence: row.independence ? policyView(row.independence) : undefined,
+    modelTier: row.model_tier,
     workIntent: row.work_intent, worktree: row.worktree,
     revises: row.revises ? asId(row.revises) : undefined,
     supersededBy: row.superseded_by ? asId(row.superseded_by) : undefined,
@@ -524,14 +528,12 @@ export class SurrealCompanyCore implements CompanyCore {
     if (typeof credential !== 'string' || !credential.startsWith('sck_') || credential.length > 200) {
       throw new CompanyError('unauthorized', 'Invalid credential');
     }
-    const t0 = Date.now();
-    const [rows] = await this.db.query<[EmployeeRow[]]>(
-      'SELECT *, def.tracks AS tracks FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest: HASH(credential) }
-    );
+    const [rows] = await authenticationLookup(() => HASH(credential), digest => this.db.query<[EmployeeRow[]]>(
+      'SELECT *, def.tracks AS tracks FROM employee WHERE credential_digest = $digest LIMIT 1;', { digest }
+    ));
     // credential_digest is a SHA-256 over a high-entropy random token; the argon2
     // re-verify added nothing (same row, same secret) and under launchd QoS a
     // memory-hard KDF is throttled ~500x — it was the 50s stall per request.
-    console.log(`auth timing: query=${Date.now() - t0}ms`);
     const row = rows?.[0];
     // retired = the registered instance (Paseo agent binding) is gone; a credential
     // that outlives its instance is treated as leaked and dies with it.
@@ -724,6 +726,7 @@ export class SurrealCompanyCore implements CompanyCore {
     if (requiredTrack !== undefined && input.discipline !== requiredTrack) {
       throw new CompanyError('invalid', `executorRole ${input.executorRole} requires discipline=${requiredTrack}`);
     }
+    if (input.modelTier !== undefined && !['high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
     const kind = input.kind ?? 'task';
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
@@ -742,7 +745,7 @@ export class SurrealCompanyCore implements CompanyCore {
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind, goal: input.goalId ? id('goal', input.goalId) : undefined,
       project: input.project ? id('project', input.project) : undefined,
-      discipline: input.discipline, work_intent: input.workIntent,
+      discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -756,7 +759,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          discipline: $discipline, work_intent: $work_intent, project: $project,
+          discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
@@ -848,13 +851,15 @@ export class SurrealCompanyCore implements CompanyCore {
     const [lastSubmit] = await this.db.query<[Array<{ at: unknown }>]>(
       "SELECT at FROM audit WHERE task = $task AND action = 'submit' ORDER BY at DESC LIMIT 1;",
       { task: id('task', targetId) });
-    const [rejectRows] = await this.db.query<[Array<{ id: RecordId; at: unknown }>]>(
-      "SELECT id, at FROM audit WHERE task = $task AND action = 'owner_reject' ORDER BY at DESC LIMIT 1;",
-      { task: id('task', targetId) });
     const submitAt = lastSubmit?.[0]?.at;
-    const reject = rejectRows?.[0];
     if (!submitAt) throw new CompanyError('conflict', 'revises target was never submitted');
-    if (!reject || !(new Date(String(reject.at)).getTime() > new Date(String(submitAt)).getTime())) {
+    // Keep the database's nanosecond precision: JavaScript Date truncates two real,
+    // ordered events in the same millisecond and used to reject a valid revision.
+    const [rejectRows] = await this.db.query<[Array<{ id: RecordId; at: unknown }>]>(
+      "SELECT id, at FROM audit WHERE task = $task AND action = 'owner_reject' AND at > $submitted ORDER BY at DESC LIMIT 1;",
+      { task: id('task', targetId), submitted: submitAt });
+    const reject = rejectRows?.[0];
+    if (!reject) {
       throw new CompanyError('conflict', 'revises target lacks a real owner rejection on its latest submission');
     }
     const nextNo = (target.revision_no ?? 1) + 1;
@@ -875,7 +880,7 @@ export class SurrealCompanyCore implements CompanyCore {
       reviewer: input.reviewerRole, dependencies: dependencies.map(dep => id('task', dep)),
       kind: 'task', goal: input.goalId ? id('goal', input.goalId) : undefined,
       project: input.project ? id('project', input.project) : undefined,
-      discipline: input.discipline, work_intent: input.workIntent,
+      discipline: input.discipline, work_intent: input.workIntent, model_tier: input.modelTier,
       sup_evidence: `被 task:${taskId} 取代（v${nextNo - 1} → v${nextNo}，谱系 task:${lineageId}）；驳回审计 audit:${asId(reject.id)}`,
       create_evidence: `修订自 task:${targetId}（v${nextNo - 1} → v${nextNo}）；驳回审计 audit:${asId(reject.id)}`,
     };
@@ -904,7 +909,7 @@ export class SurrealCompanyCore implements CompanyCore {
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
-          discipline: $discipline, work_intent: $work_intent, project: $project,
+          discipline: $discipline, work_intent: $work_intent, project: $project, model_tier: $model_tier,
           dependencies: $dependencies, state: IF array::len($unfinished) = 0 THEN 'ready' ELSE 'blocked' END,
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,

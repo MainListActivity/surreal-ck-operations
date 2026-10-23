@@ -231,6 +231,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   };
   const currentModel = (inst: EmployeeInst): boolean => {
     const def = p.defs.find(d => d.id === inst.def);
+    if(def?.provider==='claude'&&def.model?.startsWith('group/sck-'))return true; // request routing is task-scoped at the company gateway
     const target = def && resolveSlot(def);
     // What the provider serves wins over what the spawn asked for: a subscription can switch the
     // model under a live session, and dispatching into it would run work on a model nobody chose.
@@ -258,11 +259,13 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
    * unresolved pool block everyone; a spawn is never the implementer (it is a new employee id), so spawns carry the same block.
    */
   const gate = (id: string | undefined): Block | undefined => {
-    if (!p.implementer) return undefined;
+    const until=p.task?.row?.model_route_until;
+    const routing:Block|undefined=until&&until>p.now?['quota','模型组暂不可用，等待通道恢复',new Date(until*1000).toISOString()]:undefined;
+    if (!p.implementer) return routing;
     if (p.implementer.unknown) return ['unknown', BLOCK_TEXT.unknown];
     if (p.implementer.unresolved) return ['implementer_unresolved', BLOCK_TEXT.implementer_unresolved];
     if (p.implementer.implementer && id !== p.implementer.implementer) return ['implementer_mismatch', BLOCK_TEXT.implementer_mismatch];
-    return undefined;
+    return routing;
   };
   // Independence (SYS-DISP IR02): an excluded identity never takes the task — the employeeId itself, or the registered principal it
   // shares with an excluded one — and a scope that cannot be read blocks every candidate as unknown. A definition is not an
@@ -1040,7 +1043,7 @@ export class Dispatcher {
         // all stay valid. Realign it in place, and when that is not possible leave it for the next
         // pass rather than throwing the session away.
         const def = defs.find(d => d.id === inst.def);
-        const target = def ? resolveModel(def) : undefined;
+        const target = def?.model?.startsWith('group/sck-') ? undefined : def ? resolveModel(def) : undefined;
         const served = runtimeModels.get(inst.id) ?? inst.model;
         // Realign only once the subscription has recovered. A provider that switched models because
         // its standard allowance ran out switches back on its own at reset; asking every pass during

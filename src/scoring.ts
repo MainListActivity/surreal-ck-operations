@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { RecordId, type Surreal } from 'surrealdb';
+import { scoreModels } from './model-routing/store.ts';
 import { QUOTA_RELEASE } from './dispatcher/quota-failure.ts';
 import type { EmployeeScore, Role, TaskId } from './contracts.ts';
 
@@ -149,6 +150,8 @@ export async function writeScorecards(
       overall: s.overall, notes: s.notes, metrics: input.state.metrics[s.employee], by: input.judge,
       judgeKind: input.judgeKind, confidence: s.confidence, probabilities: s.probabilities, flagged: s.flagged === true,
     });
+    const actualModels = await scoreModels(db, input.taskId, s.employee, s.overall);
+    await db.query('UPDATE $card SET configured_model=$configured,model=$model,actual_models=$models, model_attribution=$basis RETURN NONE;', {card: id('scorecard', HASH(`${input.taskId}${s.employee}`).slice(0,24)), models:actualModels, configured:emp?.model,model:actualModels.length===1?actualModels[0]:actualModels.length?'mixed':'unknown', basis:actualModels.length ? 'gateway-completed-requests' : 'unknown'});
     written.add(s.employee);
   }
 
