@@ -1118,6 +1118,39 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   );
 }
 
+function ModelRankingCard({ctx}: {ctx:Ctx}) {
+  const s=makeStyles(ctx);
+  const get=useRpc(rpc.modelRanking), save=useRpc(rpc.saveModelRanking);
+  const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
+  const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
+  const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [selectOpen,setSelectOpen]=useState(false);
+  const current=draft??{rules:query.data?.rules??"",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
+  return <Section title="模型排序" ctx={ctx}><View style={s.card}>
+    <Text style={s.muted}>按你的规则为 Opus、Sonnet、Haiku 组内模型排序；分组成员仍由你控制。</Text>
+    {query.isError&&<Text style={s.muted}>设置读取失败，请稍后重试。</Text>}
+    {query.data&&!query.data.configured&&<Text style={s.muted}>Jev 尚未配置，暂时保留现有顺序。</Text>}
+    <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:100,textAlignVertical:"top"}]}
+      placeholder="例如：优先免费且稳定的模型；额度不足 10% 时靠后，质量相近时优先缓存命中率和输出速度。"
+      value={current.rules} onChangeText={rules=>setDraft({...current,rules})}/>
+    <Text style={s.text}>刷新间隔</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={s.buttonSecondary} onPress={()=>setSelectOpen(!selectOpen)}>
+      <Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""} ▾</Text>
+    </Pressable>
+    {selectOpen&&<View style={s.card}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}}
+      style={s.buttonSecondary} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}>
+      <Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text>
+    </Pressable>)}</View>}
+    <Pressable accessibilityRole="button" disabled={busy||!query.data} style={s.button} onPress={async()=>{
+      setBusy(true);setMessage("");try{await save(current);await query.refetch();setDraft(undefined);setMessage("已保存，下次员工请求到达时刷新排序。");}
+      catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}
+    }}><Text style={s.buttonText}>{busy?"保存中…":"保存排序规则"}</Text></Pressable>
+    {!!message&&<Text style={s.muted}>{message}</Text>}
+    <Text style={s.muted}>{query.data?.at?`最近刷新：${query.data.at}`:"尚未刷新"}；到期后由下一次员工请求触发后台刷新。</Text>
+    {!!query.data?.error&&<Text style={s.muted}>{query.data.error}</Text>}
+    {Object.entries(query.data?.orders??{}).map(([group,ids])=><ExpandableText key={group} ctx={ctx} text={`${group}：${ids.join(" → ")}`} lines={2} style={s.muted}/>)}
+  </View></Section>;
+}
+
 function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -1134,6 +1167,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const refreshAll = () => void queryClient.invalidateQueries();
   return (
     <View style={{ gap: 12 }}>
+      <ModelRankingCard ctx={ctx}/>
       <Section title="派工开关" ctx={ctx}>
         <View style={[s.card, s.row]}>
           <Text style={[s.text, { flex: 1 }]}>{r?.paused ? "派工已暂停" : "派工运行中"}</Text>

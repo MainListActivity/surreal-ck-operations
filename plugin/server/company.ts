@@ -13,6 +13,7 @@ export interface Company {
   workforce: import("./vendor/src/workforce").Workforce;
   dispatcher: import("./vendor/src/dispatcher/dispatcher").Dispatcher;
   core: import("./vendor/src/contracts").CompanyCore;
+  modelRanking: import("./vendor/src/model-routing/ranking").RankingRefresher;
   modelRouting: import("./vendor/src/model-routing/controller").ModelRoutingController;
   stopModelGateway: () => Promise<void>;
   modelJournal: import("./vendor/src/model-routing/journal").ExecutionJournal;
@@ -66,6 +67,11 @@ export function company(): Promise<Company> {
     const { ModelRoutingController } = await import("./vendor/src/model-routing/controller.ts");
     const { startModelGateway } = await import("./vendor/src/model-routing/gateway.ts");
     const modelRouting = new ModelRoutingController(db.db, serviceHome());
+    const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
+    const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
+    const modelRanking = new RankingRefresher({db:db.db, jev:jevFromEnv(), groups:readMagpieGroups,
+      facts:async ids => { await modelRouting.refresh(); return modelRouting.rankingFacts(ids); },
+      apply:(orders,isCurrent)=>modelRouting.applyOrders(orders,isCurrent),log:message=>console.warn(message)});
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
 
     const workforce = new Workforce(db, process.env.SCK_CREDENTIAL_DIR ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/private/credentials`);
@@ -149,7 +155,7 @@ export function company(): Promise<Company> {
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
     const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
     let routingReady=false;
-    const modelGateway = await startModelGateway({ready:()=>routingReady,lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
+    const modelGateway = await startModelGateway({ready:()=>routingReady,onRequest:()=>modelRanking.trigger(),lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,
@@ -198,7 +204,7 @@ export function company(): Promise<Company> {
     try { await sidecar.adopt(await workforce.insts()); }
     catch(error) { await modelGateway.stop(); throw error; }
     routingReady=true;
-    return { modelJournal, modelRouting, stopModelGateway:modelGateway.stop, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return { modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

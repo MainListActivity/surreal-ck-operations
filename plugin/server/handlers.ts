@@ -178,6 +178,21 @@ export function registerHandlers(server: PluginServerContext): void {
     return { dataUri: `data:${attachmentMime(input.name)};base64,${buf.toString("base64")}`, mime: attachmentMime(input.name), sizeBytes: buf.byteLength };
   });
 
+  ownerHandle(rpc.modelRanking, async () => {
+    const ctx = await company();
+    const { rankingSettings } = await import("./vendor/src/model-routing/ranking.ts");
+    const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
+    const settings = await rankingSettings(ctx.db.db);
+    const [status] = await ctx.db.db.query<[{at?:Date;error?:string;orders?:Record<string,string[]>}|undefined]>("SELECT at,error,orders FROM ONLY company_meta:model_ranking;");
+    return {...settings,configured:!!jevFromEnv(),at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
+  });
+  ownerHandle(rpc.saveModelRanking, async (input: RpcInput<typeof rpc.saveModelRanking>) => {
+    const ctx = await company();
+    const { saveRankingSettings } = await import("./vendor/src/model-routing/ranking.ts");
+    await saveRankingSettings(ctx.db.db,input,ctx.modelRanking);
+    return {ok:true};
+  });
+
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo, dispatcher } = await company();
     const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
