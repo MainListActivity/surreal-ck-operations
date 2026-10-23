@@ -3,11 +3,13 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { type Surreal } from "surrealdb";
 import {
   classify,
   TIERS,
   selectedTier,
+  tierPool,
   digest,
   rank,
   type CatalogModel,
@@ -20,6 +22,17 @@ import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 const exec = promisify(execFile);
+/** Bump to re-run the one-time grouping (owner rule changes). Otherwise membership is the owner's. */
+export const GROUPING_VERSION = "anchors-2026-10-23";
+/** magpie keeps routing groups in providers.json; read-only here, writes go through its save API. */
+export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string[]> {
+  try {
+    const groups = (JSON.parse(readFileSync(file, "utf8")) as { groups?: Array<{ id: string; members?: string[] }> }).groups ?? [];
+    return Object.fromEntries(groups.map((g) => [g.id, g.members ?? []]));
+  } catch {
+    return {};
+  }
+}
 /** The retired in-gateway selector. magpie names a path plugin by its absolute path; removed on sync. */
 const legacySelector = (home: string) =>
   join(home, "model-routing", "sck-performance.gateway.js");
@@ -40,6 +53,7 @@ export class ModelRoutingController {
     private readonly io: {
       fetch?: typeof fetch;
       command?: (args: string[]) => Promise<void>;
+      groups?: () => Record<string, string[]>;
     } = {},
   ) {
     try {
@@ -136,33 +150,47 @@ export class ModelRoutingController {
     } catch {}
     const groups: Record<string, string> = {};
     const routes: Record<string, Array<{ model: string; score: number; samples: number }>> = {};
-    const groupsToSet: Array<{
-      id: string;
-      models: string[];
-      signature: string;
-    }> = [];
-    const add = (id: string, members: string[]) => {
-      const signature = digest(JSON.stringify(members));
-      groups[id] = signature;
-      if (previous[id] !== signature)
-        groupsToSet.push({ id, models: members, signature });
-    };
+    const groupsToSet: Array<{ id: string; models: string[]; signature: string }> = [];
+    // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
+    // only places models this controller has never seen; manual adds and removals in magpie stay.
+    // The controller only reorders members by ranking.
+    const live = this.io.groups?.() ?? (this.io.command ? {} : readMagpieGroups());
+    let state: { version?: string; known?: string[] } = {};
+    try {
+      state = JSON.parse(await readFile(join(dir, "membership.json"), "utf8"));
+    } catch {}
+    const initializing = state.version !== GROUPING_VERSION;
+    const known = new Set(initializing ? [] : state.known ?? []);
+    const fresh = models.filter((m) => !known.has(m.id));
+    const byId = new Map(models.map((m) => [m.id, m]));
     const tiers = TIERS;
     for (const [level, tier] of tiers.entries()) {
-      // An empty tier borrows the next stronger one: an upgrade, never a silent downgrade.
+      // An empty staff tier borrows the next stronger one: an upgrade, never a silent downgrade.
+      // Fable is owner-only and has nothing stronger; while its models are excluded it serves Opus.
+      const pool = (t: Tier) => models.filter((m) => m.tier === tierPool(t));
       const bucket =
-        tiers
-          .slice(0, level + 1)
-          .reverse()
-          .map((t) => models.filter((m) => m.tier === t))
+        [...tiers.slice(0, level + 1).reverse(), ...(tier === "fable" ? (["opus"] as Tier[]) : [])]
+          .map(pool)
           .find((b) => b.length) ?? [];
-      if (!bucket.length)
-        throw Error(`magpie tier ${tier} has no models or stronger fallback`);
-      // The tier is one magpie group, ordered by performance; magpie owns fallback and stickiness.
-      const ordered = rank(bucket, results);
-      add(`sck-${tier}`, ordered.map(m => m.id));
-      routes[`group/sck-${tier}`] = ordered.map(m => ({ model: m.id, score: m.score, samples: m.samples }));
+      const current = live[`sck-${tier}`];
+      const ids = initializing || !current
+        ? bucket.map((m) => m.id)
+        : [...current, ...fresh.filter((m) => tierPool(m.tier) === tierPool(tier) && !current.includes(m.id)).map((m) => m.id)];
+      if (!ids.length) {
+        if (initializing) throw Error(`magpie tier ${tier} has no models or stronger fallback`);
+        continue; // emptied by hand: leave it as the owner set it
+      }
+      // A model added by hand may have no score: it keeps a neutral prior and is still ordered.
+      const candidates = ids.map((id) => byId.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier, prior: 2.5, estimated: true, context: 0 });
+      const ordered = rank(candidates, results);
+      const members = ordered.map((m) => m.id);
+      const signature = digest(JSON.stringify(members));
+      groups[`sck-${tier}`] = signature;
+      if (JSON.stringify(current) !== JSON.stringify(members))
+        groupsToSet.push({ id: `sck-${tier}`, models: members, signature });
+      routes[`group/sck-${tier}`] = ordered.map((m) => ({ model: m.id, score: m.score, samples: m.samples }));
     }
+    const nextKnown = [...new Set([...known, ...models.map((m) => m.id), ...(config?.disabledModels ?? [])])];
     // Only private sck-* groups are touched; existing user groups/providers/accounts are never rewritten.
     if (this.io.command) {
       for (const g of groupsToSet)
@@ -189,6 +217,8 @@ export class ModelRoutingController {
       // (or a concurrent one) must not fail every later sync.
       else await this.command(['group','rm',id]).catch((e: Error) => { if (!/no group/.test(e.message)) throw e; });
     }
+    await writeFile(join(dir, "membership.json.tmp"), JSON.stringify({ version: GROUPING_VERSION, known: nextKnown }), { mode: 0o600 });
+    await rename(join(dir, "membership.json.tmp"), join(dir, "membership.json"));
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {
       mode: 0o600,
     });
