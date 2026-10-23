@@ -16,6 +16,7 @@ import {
 import { RecordId } from "surrealdb";
 import { restoreRoutingSettings } from "../src/model-routing/gateway.ts";
 import { createPaseoCli } from "../src/dispatcher/paseo.ts";
+import { setAgentModel } from "../src/dispatcher/agent-model.ts";
 import { execFileSync } from "node:child_process";
 import { TIERS, employeeTier } from "../src/model-routing/policy.ts";
 import { planRoutingRoster } from "../src/model-routing/roster.ts";
@@ -33,6 +34,7 @@ try {
   if (mode === "enable" || mode === "migrate") {
     const [maintenance] = await db.db.query<[any]>("SELECT paused FROM ONLY company_meta:config;");
     if(maintenance?.paused!==true) throw Error("Pause dispatch before roster migration; existing leases continue normally");
+    await db.db.query(readFileSync(join(release,"schema","033-four-tier-routing.surql"),"utf8"));
     const workforce = new Workforce(db, join(serviceHome(), "private", "credentials"));
     const defs = await workforce.defs();
     const dir = join(serviceHome(), "model-routing");
@@ -51,6 +53,8 @@ try {
     await router.prepare();
     // Apply the owner-approved roster before switching the running release. Never rewrite a live native session's provider.
     const changes = planRoutingRoster(defs);
+    const created = changes.filter(d=>!defs.some(old=>old.id===d.id)).map(d=>new RecordId('employee_def',d.id));
+    await db.db.query("UPDATE company_meta:model_routing SET created_defs=array::union(created_defs??[],$created);",{created});
     for (const def of changes) {
       await workforce.upsertDef(def.id, {role:def.role as any,provider:def.provider,model:def.model,
         enabled:def.enabled,tracks:def.tracks,maxInstances:def.maxInstances,quotaLimited:def.quotaLimited});
@@ -86,23 +90,30 @@ try {
       "model-routing",
       "employee-defs-four-tier-before.json",
     );
+    const workforce = new Workforce(db, join(serviceHome(), "private", "credentials"));
+    const [migration] = await db.db.query<[any]>("SELECT created_defs FROM ONLY company_meta:model_routing;");
+    await db.db.query("UPDATE employee_def SET enabled=false WHERE id IN $created RETURN NONE;",{created:migration?.created_defs ?? []});
     if (existsSync(backup)) {
-      const workforce = new Workforce(db, join(serviceHome(), "private", "credentials"));
       for (const def of JSON.parse(readFileSync(backup, "utf8"))) {
+        if(def.role==='story-author') continue;
         await workforce.upsertDef(def.id,{role:def.role,provider:def.provider,model:def.model,thinking:def.thinking,
-          tracks:def.tracks,maxInstances:def.maxInstances,priority:def.priority,weight:def.weight,enabled:def.enabled,quotaLimited:def.quotaLimited});
+          tracks:def.tracks,maxInstances:def.maxInstances,priority:def.priority,weight:def.weight,enabled:def.enabled,quotaLimited:def.quotaLimited ?? true});
       }
     }
+    await db.db.query("UPDATE employee SET model=def.model WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;");
     const [employees] = await db.db.query<
       [
         Array<{
           workspace_cwd?: string;
           paseo_agent_id?: string;
           active_task?: unknown;
+          model?: string;
+          def?:RecordId;
+          id?:RecordId;
         }>,
       ]
     >(
-      "SELECT workspace_cwd,paseo_agent_id,active_task FROM employee WHERE provider='claude' AND retired!=true;",
+      "SELECT id,def,model,workspace_cwd,paseo_agent_id,active_task FROM employee WHERE provider='claude' AND role!='story-author' AND retired!=true;",
     );
     const paseo = createPaseoCli(undefined, { timeoutMs: 5000 });
     let restored = 0,
@@ -114,8 +125,15 @@ try {
       const status = await paseo
         .status(e.paseo_agent_id)
         .catch(() => undefined);
-      if (!e.active_task && status?.status === "idle")
-        await paseo.reload(e.paseo_agent_id);
+      if (!e.active_task && status?.status === "idle") {
+        if(migration?.created_defs?.some((d:any)=>String(d)===String(e.def))) {
+          try {await workforce.retire(String(e.id?.id),'模型路由回滚，停用迁移新增编制','rotation');await paseo.archive(e.paseo_agent_id);}
+          catch {pending++;}
+        } else {
+          if(e.model) await setAgentModel(e.paseo_agent_id,e.model);
+          await paseo.reload(e.paseo_agent_id);
+        }
+      }
       else pending++;
     }
     execFileSync(

@@ -214,7 +214,8 @@ export class ModelRoutingController {
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
       if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
-      await this.command(['group','rm',id]);
+      if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
+      else await this.command(['group','rm',id]);
     }
     groups.__selector = digest(source);
     groups.__options = optionsHash;

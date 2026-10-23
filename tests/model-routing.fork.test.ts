@@ -21,6 +21,17 @@ run(
     try {
       await db.connect();
       await db.bootstrap();
+      const {Workforce}=await import('../src/workforce.ts');
+      const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
+      const wf=new Workforce(db,'/unused-fixture-credentials');
+      await wf.upsertDef('gm-grok',{role:'gm',provider:'grok',model:'old-gm'});
+      await wf.upsertDef('story-claude',{role:'story-author',provider:'claude',model:'keep-story',tracks:['原著']});
+      const before=await wf.defs();
+      for(const d of planRoutingRoster(before)) await wf.upsertDef(d.id,{role:d.role as any,provider:d.provider,model:d.model,enabled:d.enabled,tracks:d.tracks,maxInstances:d.maxInstances,quotaLimited:d.quotaLimited});
+      const migrated=await wf.defs();
+      expect(migrated.find(d=>d.id==='gm-grok')?.enabled).toBe(false);
+      expect(migrated.find(d=>d.id==='gm-claude')).toMatchObject({model:'group/sck-opus',provider:'claude',quotaLimited:false});
+      expect(migrated.find(d=>d.id==='story-claude')?.model).toBe('keep-story');
       await db.db
         .query(`CREATE task:fixture CONTENT {title:'fixture',context:'fixture',state:'doing',executor_role:'engineering',reviewer_role:'qa',model_tier:'medium',current_employee:'fixture-worker',lease_expires_at:time::unix(time::now())+120,fence:3};
    CREATE employee:⟨fixture-worker⟩ CONTENT {role:'engineering',paseo_agent_id:'fixture-agent',active_task:task:fixture,provider:'claude',model:'configured-group-alias'};`);
@@ -81,6 +92,7 @@ run(
         executorRole: "engineering",
         reviewerRole: "qa",
         participants: ["fixture-worker"],
+        modelExecutions:[{employee:'fixture-worker',model:'relay/actual-model',fence:3,phase:'execute',at:new Date().toISOString()},{employee:'fixture-worker',model:'relay/second',fence:4,phase:'execute',at:new Date().toISOString()}],
         metrics: {},
         timeline: [],
       };
@@ -88,7 +100,7 @@ run(
       await db.db.query("UPDATE task:fixture SET state='review';");
       await expect(scoreModels(db.db,'fixture','fixture-worker',5)).rejects.toThrow('final task acceptance');
       await db.db.query("UPDATE task:fixture SET state='done';");
-      await scoreModels(db.db,'fixture','fixture-worker',5);
+      await expect(scoreModels(db.db,'fixture','fixture-worker',5)).rejects.toThrow('Missing final model assessments');
       expect(await readModelResults(db.db)).toHaveLength(0); // mixed executions need explicit model judgements
       await writeScorecards(db.db, {
         taskId: "fixture",

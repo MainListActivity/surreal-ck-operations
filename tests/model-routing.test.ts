@@ -90,7 +90,7 @@ test("task evidence changes priority without allowing one tiny sample to dominat
       "engineering",
     )[0]?.id,
   ).toBe(weak.id);
-  expect(rank([weak, strong], results, "writing")).toEqual(rank([weak,strong],results,"engineering"));
+  expect(rank([weak, strong], results, "writing", now)).toEqual(rank([weak,strong],results,"engineering",now));
   expect(
     rank(
       [weak, strong],
@@ -628,4 +628,20 @@ test("roster simplification preserves story authors, role tracks and review seat
   expect(changes.find(d=>d.role==='gm' && d.enabled)).toMatchObject({provider:'claude',model:'group/sck-opus'});
   expect(changes.find(d=>d.role==='product' && d.enabled)?.model).toBe('group/sck-sonnet');
   expect(changes.filter(d=>d.enabled).every(d=>!d.model.includes('fable'))).toBe(true);
+});
+
+
+test("merging a wildcard track definition never narrows the surviving Claude role",async()=>{
+  const {planRoutingRoster}=await import('../src/model-routing/roster.ts');
+  const changes=planRoutingRoster([{id:'engineering-claude',role:'engineering',provider:'claude',model:'old',enabled:true,tracks:[]},
+    {id:'engineering-codex',role:'engineering',provider:'codex',model:'old',enabled:true,tracks:['web']}]);
+  expect(changes.find(d=>d.enabled)?.tracks).toEqual([]);
+});
+
+
+test("story authors already using the old gateway keep their configured model",async()=>{
+  let sent='';
+  const g=await startModelGateway({lease:async()=>({employee:'author',task:'story',fence:1,role:'story-author',tier:'haiku',phase:'execute'}),record:async()=>{},complete:async()=>{},
+    fetchImpl:(async(_url:any,init:any)=>{sent=JSON.parse(init.body).model;return new Response('{}')}) as typeof fetch},0);
+  try {const r=await fetch(`http://127.0.0.1:${g.port}/a/author/v1/messages`,{method:'POST',body:JSON.stringify({model:'group/sck-writing-high'})});await r.text();expect(sent).toBe('group/sck-writing-high')}finally{await g.stop()}
 });

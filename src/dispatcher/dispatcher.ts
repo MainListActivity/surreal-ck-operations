@@ -1818,6 +1818,7 @@ export class Dispatcher {
     let parsed: JevScoreAnswers;
     try {
       const state = await wf.evalState(task.id);
+      if(state.timelineTruncated && state.modelExecutions?.length) return 'escalate'; // eval reads complete paged history
       const questions = jevEvalQuestions(state.participants);
       const modelJudgements: Array<{key:string;employee:string;model:string}> = [];
       for (const employee of state.participants) {

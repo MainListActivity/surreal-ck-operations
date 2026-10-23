@@ -26,6 +26,7 @@ export interface EvalState {
   participants: string[];
   metrics: Record<string, EvalMetrics>;
   timeline: EvalTimelineEntry[];
+  timelineTruncated?: boolean;
   modelExecutions?: Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>;
 }
 
@@ -105,6 +106,7 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   if (modelExecutions.length>2000) throw new Error("Model evidence exceeds 2000 executions; final evaluation requires a complete timeline");
   return {
     modelExecutions,
+    timelineTruncated:auditRows.length>TIMELINE_LIMIT,
     taskId, goalId: row.goal ? asId(row.goal) : undefined,
     title: row.title, context: String(row.context ?? '').slice(0, CONTEXT_CHARS),
     state: row.state, executorRole: row.executor_role, reviewerRole: row.reviewer_role,
@@ -123,6 +125,8 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
   const dims = ['quality', 'evidence', 'discipline', 'timeliness', 'overall'] as const;
   for (const s of scores) {
     if (!state.participants.includes(s.employee)) return `Not a participant: ${s.employee}`;
+    const required = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
+    if (required.size>1 && [...required].some(m=>!s.modelScores?.some(a=>a.model===m))) return `Missing model assessments: ${s.employee}`;
     const models = s.modelScores;
     if (models) {
       const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
@@ -145,6 +149,8 @@ export async function writeScorecards(
   db: Surreal,
   input: { taskId: TaskId; summary: string; judge: string; judgeKind: 'llm' | 'jev'; scores: ScoredEmployee[]; state: EvalState; topPerformer?: string },
 ): Promise<{ recorded: number; participants: string[] }> {
+  const invalid = validateScores(input.state,input.scores);
+  if(invalid) throw new Error(invalid);
   const task = id('task', input.taskId);
   const written = new Set<string>();
   for (const s of input.scores) {

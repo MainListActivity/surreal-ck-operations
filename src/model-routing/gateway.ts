@@ -181,7 +181,9 @@ export async function startModelGateway(
       // A user-selected Haiku is real task work, just like the other three tiers.
       const auxiliary = match[2]!.endsWith("count_tokens");
       const tier = selectedTier(body.model) ?? lease.tier;
-      const requested = `group/sck-${tier}`;
+      // Older releases may already have injected the gateway into a story-author comm directory.
+      // Preserve that author's configured model rather than applying the new employee defaults.
+      const requested = lease.role==='story-author' && typeof body.model==='string' ? body.model : `group/sck-${tier}`;
       body.model = requested;
       const session = `sck-${digest(`${lease.task}:${lease.employee}:${lease.fence}:${lease.phase}:${tier}`)}`;
       const cooling = auxiliary ? 0 : (cooldowns.get(session) ?? 0);

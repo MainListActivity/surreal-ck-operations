@@ -37,7 +37,7 @@ const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
-  "record_score", "heartbeat", "deliverable_publish",
+  "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
   // Manage capability (gm/product) only, enforced in core; writes land in audit.
   "def_list", "def_ensure", "project_disciplines_update",
   // gm only in core (rebind a blocked task to a registered project; audited, version-guarded).
@@ -831,6 +831,10 @@ export class SidecarPool {
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
+      case "get_model_evidence": return withinReplyCeiling(async()=> {
+        if(!core.modelEvidence) throw new Error("Model evidence unavailable");
+        return core.modelEvidence(cred,taskIdOf(args.taskId));
+      });
       case "record_score": return core.recordScore(cred, args as never);
       case "def_list": return core.listDefs(cred);
       case "def_ensure": return core.ensureDef(cred, args as never);

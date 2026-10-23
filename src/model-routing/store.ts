@@ -1,6 +1,9 @@
 import { RecordId, type Surreal } from "surrealdb";
 import type { ModelAssessment } from "../contracts.ts";
 import { digest, domainOf, type ModelResult } from "./policy.ts";
+export class ModelAssessmentRequired extends Error {
+  constructor(readonly models:string[]) {super('Missing final model assessments')}
+}
 /** Final acceptance only. Each actual model receives its own eval judgement, once per participant/task. */
 export async function scoreModels(
   db: Surreal,
@@ -35,6 +38,8 @@ export async function scoreModels(
     x.n++;
     counts.set(k, x);
   }
+  const actual = [...new Set(rows.flatMap(r=>r.model?[r.model]:[]))].sort();
+  if(counts.size>1 && actual.some(model=>!assessments?.some(a=>a.model===model))) throw new ModelAssessmentRequired(actual);
   // Replace all fractional evidence in one transaction; partial failures leave the previous evaluation intact.
   const vars: Record<string, unknown> = { task, employee };
   let sql =
@@ -44,7 +49,6 @@ export async function scoreModels(
     const model = key.split("\0")[1]!;
     const assessment = assessments?.find(a => a.model === model);
     // A mixed-model task needs an evidence-based judgement per model; call share is not quality.
-    if (!assessment && counts.size > 1) continue;
     const score = assessment?.overall ?? overall;
     if (!Number.isFinite(score) || score<1 || score>5) throw Error("invalid model assessment");
     vars[`card${i}`] = new RecordId(
