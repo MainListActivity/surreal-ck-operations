@@ -68,12 +68,17 @@ export interface ContributionFacts {
    */
   excluded: string[];
   /**
-   * Execute-phase holders with no code-writing evidence: they claimed (or checkpointed/released) but never submitted,
-   * and their rows are not unknown-phase. Demoted for review, never hard-excluded, unless a policy names this task as
-   * a source of another — see `strictExcluded`, which the independence gate and the retirement gate use.
+   * Holders with no code-writing evidence, in either phase: they held a lease (claimed, checkpointed, released, or decided a
+   * review) but never submitted, and their rows are not unknown-phase. Demoted for review, never hard-excluded, unless a
+   * policy names this task as a source of another — see `strictExcluded`, which the independence gate and the retirement
+   * gate use.
    */
   hands: string[];
-  /** Every execute-phase handler: authors, implementer and `hands`. What a strict independence source excludes, and whom the retirement gate refuses when no implementer is recorded. */
+  /**
+   * Every execute-phase handler: authors, implementer and the execute-phase `hands`, including one who later claimed or
+   * returned a review. Never a pure reviewer. What a strict independence source excludes, and whom the retirement gate
+   * refuses when no implementer is recorded.
+   */
   strictExcluded: string[];
 }
 
@@ -146,6 +151,9 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   const reviewers = new Set<string>();
   const unknown: UnknownContribution[] = [];
   const hands = new Set<string>();
+  // Execute-phase holders with no code-writing evidence. Collected on their own rows, not derived from `hands`: a hand who
+  // later claimed or returned a review is still one of them, and reviewing never undoes having held the code.
+  const executeHands = new Set<string>();
   const roles = rolesOf(rows, open);
   // The pre-SYS-DISP recusal rule (SYS-DISP IR01/Q1, manager decision B): an actor who ever SUBMITTED is an author; an actor
   // who only held an execute lease and never submitted is a prior hand (demoted, still eligible). Reviewers are review-phase
@@ -176,6 +184,7 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
       return;
     }
     hands.add(actor);
+    executeHands.add(actor);
   });
   const sortedAuthors = [...authors].sort();
   const explicit = explicitImplementer || undefined;
@@ -183,8 +192,7 @@ export function deriveContributors(events: readonly ContributionEvent[], explici
   // recorded authorship (a submit) or an explicit gm takeover binds a task to one engineer.
   const implementer = explicit ?? (sortedAuthors.length === 1 ? sortedAuthors[0] : undefined);
   const excluded = [...new Set([...sortedAuthors, ...(explicit ? [explicit] : [])])].sort();
-  // A reviewer who also wrote code is an author, not a demoted hand.
-  const handsOnly = [...hands].filter(actor => !excluded.includes(actor) && !reviewers.has(actor)).sort();
+  const handsOnly = [...executeHands].filter(actor => !excluded.includes(actor)).sort();
   const demoted = [...hands].filter(actor => !excluded.includes(actor)).sort();
   return {
     authors: sortedAuthors,

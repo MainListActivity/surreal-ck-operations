@@ -339,6 +339,40 @@ test('(g6) several claim-only handlers, no author and no implementer: every hand
   }
 });
 
+test('(g7) a claim-only handler who later took and returned the review is still an execute handler: refused like one who never reviewed', async () => {
+  // 7cf393f8 B1: strictExcluded used to be "all hands minus reviewers", so a hand who then reviewed the task dropped out of the gate.
+  const legacyHand = (taskId: string, who: string) => database.db.query(
+    'CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", phase: "execute", version: 0, at: time::now() };',
+    { task: new RecordId('task', taskId), actor: employeeRef(who) });
+  const control = await engineer('g7-control-hand');
+  const controlAuthor = await engineer('g7-control-author');
+  const plain = await newTask('R1 g7 hand who never reviews');
+  await legacyHand(plain.id, control);
+  const first = await core.claim(tokenOf(controlAuthor), plain.id);
+  await core.submit(tokenOf(controlAuthor), proofOf(first), { text: DELIVERY, idempotencyKey: key() });
+  await database.db.query('UPDATE $task SET implementer = NONE;', { task: new RecordId('task', plain.id) });
+  const controlError = await refusal(workforce.retire(control, WHY, 'manual'));
+  expect(controlError.details?.reasons).toEqual([expect.objectContaining({ taskId: plain.id, reason: 'legacy_implementer' })]);
+
+  const hand = await engineer('g7-reviewed-hand');
+  const author = await engineer('g7-reviewed-author');
+  const mixed = await newTask('R1 g7 hand who reviewed');
+  await legacyHand(mixed.id, hand);
+  const second = await core.claim(tokenOf(author), mixed.id);
+  await core.submit(tokenOf(author), proofOf(second), { text: DELIVERY, idempotencyKey: key() });
+  const review = await core.claim(tokenOf(hand), mixed.id);
+  await core.returnTask(tokenOf(hand), proofOf(review), { text: REVIEW, idempotencyKey: key() });
+  await database.db.query('UPDATE $task SET implementer = NONE;', { task: new RecordId('task', mixed.id) });
+  expect(await task(mixed.id)).toMatchObject({ state: 'ready' });
+  const facts = await workforce.contributors(mixed.id);
+  expect(facts.reviewers).toEqual([hand]);
+  expect(facts.strictExcluded).toEqual([author, hand].sort());
+  const error = await refusal(workforce.retire(hand, WHY, 'manual'));
+  expect(error.details?.reasons).toEqual([expect.objectContaining({ taskId: mixed.id, state: 'ready', phase: 'execute', reason: 'legacy_implementer' })]);
+  expect(await isRetired(hand)).toBe(false);
+  expect(await isRetired(control)).toBe(false);
+});
+
 test('(h) the admin retire command refuses an employee with an active lease through the same boundary: exit 1, stable code, nothing written', async () => {
   const holder = await engineer('cli-lease');
   const t = await newTask('R1 h admin lease');

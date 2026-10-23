@@ -1,8 +1,8 @@
-// IR06 rollback isolation drill on the company fork (never production). The release deployed as `active` today,
-// 20b384e, carries NO independence code at all: src/independence.ts does not exist, core has no
+// IR06 rollback isolation drill on the company fork (never production). It pins 20b384e as its old-version oracle: that
+// release carries NO independence code at all — src/independence.ts does not exist, core has no
 // INDEPENDENCE_GUARD_SQL / independenceGate / setIndependence, contracts has no IndependencePolicy or
-// IdentityPrincipalView, and its schema stops at 027. This drill proves what that means for data that ALREADY holds a
-// policy, and that a forward fix restores the isolation without touching the data.
+// IdentityPrincipalView, and its schema stops at 027. The drill proves what rolling back to it means for data that ALREADY
+// holds a policy, and that a forward fix restores the isolation without touching the data.
 //
 // One namespace, in the production order:
 //   A. the old code bootstraps the namespace to its own schema (027) and enrols the employees;
@@ -27,7 +27,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { readIndependenceSnapshot } from '../src/independence.ts';
 
 const ROOT = join(import.meta.dir, '..');
-/** The release deployed as `active` today. Its git tree is the old-version oracle. */
+/** The pinned pre-independence release (schema 027). Its git tree is the old-version oracle. */
 const OLD_RELEASE = '20b384e7661f607cdc21318e58b30bde260e6356';
 const run = process.env.RUN_SCK_ROLLBACK_FORK_TESTS === '1' ? describe : describe.skip;
 const EVIDENCE = 'IR06 回滚隔离演练：来源经手人动态回避的合成证据文本。';

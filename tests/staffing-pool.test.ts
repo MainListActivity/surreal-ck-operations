@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { executeGateFor, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
+import { executeGateFor, managedRecencyOrder, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import { buildIndependenceIndex } from '../src/independence.ts';
 import { deriveContributors } from '../src/contributors.ts';
@@ -352,4 +352,28 @@ test('managed Claude pool ignores subscription model quotas and provider capacit
   expect(staffingPool(p).every(e=>e.weight===1)).toBe(true);
   expect(staffingPool({...p,holding:new Set(['i1'])}).find(e=>e.key==='i1')?.code).toBe('held');
   expect(staffingPool({...p,defs:[{...d,enabled:false}]}).find(e=>e.key==='i1')?.code).toBe('def_disabled');
+});
+
+// 7cf393f8 B2 merge: main's all-managed pick orders by last wake, this lane's pool demotes a prior hand. Both rules hold: a
+// managed base weight is still cut by the prior-hand factor, and the deterministic pick still takes the hand only after fresh sessions.
+test('managed pool: the managed base weight composes with the prior-hand demotion instead of replacing it', () => {
+  const d = def('d1', { provider: 'claude', model: 'group/sck-haiku', quotaLimited: false });
+  const hand = inst('eng-hand', { provider: 'claude' });
+  const fresh = inst('eng-fresh', { provider: 'claude' });
+  const pool = staffingPool(base({ defs: [d], insts: [hand, fresh], states: new Map([['eng-hand', 'idle'], ['eng-fresh', 'idle']]),
+    recusal: { authors: new Set<string>(), hands: new Set(['eng-hand']) } }));
+  const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(by.get('eng-fresh')!.weight).toBe(1);
+  expect(by.get('eng-hand')!.weight).toBeCloseTo(PRIOR_HAND_WEIGHT_FACTOR);
+  expect(by.get('eng-hand')!.note).toContain('降权兜底');
+});
+
+test('managed recency order: least recently woken first, a prior hand last, and an unknown wake time after any recorded one', () => {
+  const at = (id: string, lastWakeAt?: number) => ({ id, lastWakeAt });
+  expect(managedRecencyOrder([at('a', 30), at('b', 10), at('c', 20)]).map(i => i.id)).toEqual(['b', 'c', 'a']);
+  // The hand is not dropped: with every fresh session unavailable it is still the pick. It just never outranks one.
+  expect(managedRecencyOrder([at('hand', 1), at('fresh', 99)], new Set(['hand'])).map(i => i.id)).toEqual(['fresh', 'hand']);
+  expect(managedRecencyOrder([at('hand', 1)], new Set(['hand'])).map(i => i.id)).toEqual(['hand']);
+  // No recorded wake is never a claim to be the stalest session.
+  expect(managedRecencyOrder([at('never'), at('woken', 50)]).map(i => i.id)).toEqual(['woken', 'never']);
 });

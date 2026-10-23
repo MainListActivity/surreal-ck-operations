@@ -121,7 +121,8 @@ function contributorsOf(facts: ContributionFacts, mode: IndependenceMode): Array
   for (const employee of facts.strictExcluded) {
     if (!roles.has(employee)) roles.set(employee, facts.authors.includes(employee) ? 'author' : 'implementer');
   }
-  if (mode === 'all_handlers') for (const employee of facts.reviewers) roles.set(employee, 'reviewer');
+  // An execute hand who later reviewed is in `reviewers` too: they keep the execute-phase label they were excluded under.
+  if (mode === 'all_handlers') for (const employee of facts.reviewers) if (!roles.has(employee)) roles.set(employee, 'reviewer');
   return [...roles];
 }
 

@@ -73,6 +73,12 @@ test('a target that carries the contract is supported, and the plugin vendor mus
   }
 });
 
+test('the real worktree is a target both entry points would accept: its source and its generated vendor mirror carry the contract', () => {
+  // Not a fixture: a release cut from this branch must pass the probe the install and remote paths call, vendor included.
+  expect(guard('independence_target_supported', ROOT).code).toBe(0);
+  expect(guard('independence_target_supported', ROOT, 'core').code).toBe(0);
+});
+
 test('old or incomplete targets are refused: no module, no source guard, no gate method, missing views, unmatched vendor', () => {
   const noModule = release({ 'src/independence.ts': '' });
   const noGuardSql = release({ 'src/core.ts': 'export const OTHER = 1;\nclass Core {\n  private async independenceGate(t: string) { return t; }\n}\n' });

@@ -30,6 +30,18 @@ export type { BlockCode, DispatchPhase, DispatchVerdict } from './dispatch-block
  */
 export const PRIOR_HAND_WEIGHT_FACTOR = 0.15;
 
+/**
+ * Deterministic order for an all-managed pool: the least recently woken instance first. A prior hand goes last, the same demotion
+ * the weighted pick applies — never out of the pool, just after every fresh session. A session without a recorded wake sorts last:
+ * nothing says it is the stalest. The caller passes `hands` for a review only; the execute path has no recusal set.
+ */
+export function managedRecencyOrder<T extends { id: string; lastWakeAt?: number }>(items: readonly T[], hands?: ReadonlySet<string>): T[] {
+  return [...items].sort((a, b) =>
+    Number(hands?.has(a.id) ?? false) - Number(hands?.has(b.id) ?? false) ||
+    (a.lastWakeAt ?? Number.MAX_SAFE_INTEGER) - (b.lastWakeAt ?? Number.MAX_SAFE_INTEGER) ||
+    a.id.localeCompare(b.id));
+}
+
 /** Provider error text that means the subscription is out of budget or rate limited, not that the session is broken. */
 export const EXHAUSTED_PATTERN = /usage cap reached|out of credits|add credits|credit balance|usage balance|balance exhausted|payment required|quota|usage limit|rate.?limit|too many requests|\b402\b|\b429\b|limit reached|insufficient|billing|exceeded your|try again (in|later)|model_usage_exhausted|usage_exhausted|credits exhausted|out of usage|at capacity/i;
 const LEASE_SECONDS = 600;
@@ -96,8 +108,9 @@ export function providerCapacity(provider: string, providerMax: Record<string, n
 }
 
 /**
- * Execute gate: the bound implementer, or `unresolved` when several authors leave no single one. `unknown` means the
- * authorship history could not be read: every candidate waits as unknown (never busy) until the history reads again.
+ * Execute gate: the bound implementer, or `unresolved` when several authors or several claim-only handlers leave no single
+ * one (SYS-DISP IR01/Q1). `unknown` means the authorship history could not be read: every candidate waits as unknown
+ * (never busy) until the history reads again.
  */
 export interface ExecuteGate { implementer?: string; unresolved: boolean; unknown?: boolean }
 
@@ -1328,7 +1341,7 @@ export class Dispatcher {
       const pool = usable.filter(i => i.id !== avoid);
       const available = pool.length ? pool : usable;
       if (available.length && available.every(i => managedModel(defs.find(d => d.id === i.def))))
-        return [...available].sort((a,b) => (a.lastWakeAt ?? 0) - (b.lastWakeAt ?? 0) || a.id.localeCompare(b.id))[0];
+        return managedRecencyOrder(available, recusal?.hands)[0];
       return weightedOrder(available, weight, rand)[0];
     };
     const spawnable = (role: string, home: string, task?: SupervisedTask, forReview = false,

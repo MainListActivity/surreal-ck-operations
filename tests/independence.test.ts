@@ -41,6 +41,20 @@ test('strict mode leaves reviewers of a source out; all_handlers adds them', () 
   expect(independenceHit(all, 't-rev')).toMatchObject({ via: 'contributor', source: 'P', role: 'reviewer' });
 });
 
+// 7cf393f8 B1: an execute hand who later claimed or returned a review of the same source is still one of its execute handlers.
+test('strict mode excludes an execute hand who later reviewed the same source; all_handlers does not relabel them a reviewer', () => {
+  const source = facts([claim('t-hand'), claim('t-sub'), { action: 'submit', actor: 't-sub' },
+    claim('t-hand', 'review'), { action: 'return', actor: 't-hand' }, claim('t-rev', 'review'), { action: 'return', actor: 't-rev' }]);
+  const strict = buildIndependenceIndex({ policy: policy(), sources: [{ taskId: 'P', facts: source }], principalOf });
+  expect(independenceHit(strict, 't-hand')).toMatchObject({ via: 'contributor', source: 'P', matched: 't-hand' });
+  expect(independenceHit(strict, 't-sub')).toMatchObject({ via: 'contributor', source: 'P', role: 'author' });
+  expect(independenceHit(strict, 't-rev')).toBeUndefined();
+  const all = buildIndependenceIndex({ policy: policy({ mode: 'all_handlers' }), sources: [{ taskId: 'P', facts: source }], principalOf });
+  expect(independenceHit(all, 't-hand')).toMatchObject({ via: 'contributor', source: 'P' });
+  expect(independenceHit(all, 't-hand')?.role).not.toBe('reviewer');
+  expect(independenceHit(all, 't-rev')).toMatchObject({ via: 'contributor', source: 'P', role: 'reviewer' });
+});
+
 test('a legacy row without a phase or a decisive follow-up is an author (fail-closed)', () => {
   const source = facts([{ action: 'checkpoint', actor: 't-legacy' }]);
   const index = buildIndependenceIndex({ policy: policy(), sources: [{ taskId: 'P', facts: source }], principalOf });

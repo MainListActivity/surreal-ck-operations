@@ -374,6 +374,34 @@ test('an ordinary task keeps the claim-only review rule: the prior hand may clai
   expect((await failureOf(core.claim(tokens.alias, dependent.id))).message).toContain('independence conflict');
 });
 
+// 7cf393f8 B1: strictExcluded used to be "all hands minus reviewers", so a hand who then took and returned the source's own review
+// escaped a strict source: the independence gate let them claim the dependent. Reviewing never undoes having held the code.
+test('a strict source excludes an execute hand who later reviewed that source, as it does one who never did', async () => {
+  const legacyHand = (taskId: string, who: string) => database.db.query(
+    'CREATE audit CONTENT { task: $task, actor: $actor, action: "checkpoint", phase: "execute", version: 0, at: time::now() };',
+    { task: new RecordId('task', taskId), actor: new RecordId('employee', who) });
+  const source = await engineering('source whose execute hand later reviewed it');
+  await legacyHand(source.id, 't-indep');
+  const written = await core.claim(tokens.exec, source.id);
+  await core.submit(tokens.exec, proofOf(written), { text: EVIDENCE, idempotencyKey: key() });
+  await legacyHand(source.id, 't-explicit');
+  // On an ordinary task a hand is demoted, not recused: they may take the review and return it.
+  const reviewing = await core.claim(tokens.indep, source.id);
+  await core.returnTask(tokens.indep, proofOf(reviewing), { text: EVIDENCE, idempotencyKey: key() });
+  const { facts } = await readContributionView(database.db, source.id);
+  expect(facts).toMatchObject({ authors: ['t-exec'], reviewers: ['t-indep'], strictExcluded: ['t-exec', 't-explicit', 't-indep'] });
+
+  const dependent = await engineering('dependent whose strict source has a hand who reviewed it');
+  await setPolicy(dependent.id, [source.id]);
+  for (const who of ['exec', 'explicit', 'indep'] as const) {
+    const refusal = await failureOf(core.claim(tokens[who]!, dependent.id));
+    expect(refusal.code).toBe('forbidden');
+    expect(refusal.message).toContain('independence conflict');
+    expect(refusal.details).toMatchObject({ conflicts: [expect.objectContaining({ source: source.id, employee: `t-${who}`, via: 'contributor' })] });
+  }
+  expect((await core.claim(tokens.alias, dependent.id)).task.currentEmployee).toBe('t-alias');
+});
+
 test('the dispatcher reads the same exclusion from the audit stream: the contributor and its alias are out, the independent engineer stays in', async () => {
   const parent = await engineering('parent for the candidate pool');
   await authorParent('src', parent.id);
