@@ -21,3 +21,11 @@
 发布必须跑根/插件 typecheck、全量 fork 回归、PR CI 和当前 SHA 的 slow-pipe / sidecar-review 本机门禁。两面发布和回滚遵循 `docs/company-service-operations.md`；保留上一固定版本，回滚同时恢复 MCP 与插件来源。配置回滚单独恢复发布前记录的值。
 
 老板审批关口不属于技术故障，继续由老板本人决定；本修复不代批内容。孤儿进程、磁盘归档、status-tunnel、防睡眠和 Paseo daemon 托管属于独立主机维护范围，未在本变更中修改。
+
+## 后续修复（2026-10-23，报告第 1/3/6/7 项）
+
+- magpie 的 `until HH:MM UTC±H[:MM]` 按明确偏移解释当天；带 `Mon D` 的日期允许跨年。多个账号取最早有效恢复时间。过去、无时区、无效日期和超过 14 天的时间均继续使用退避，不凭空猜下一天。
+- 名单与动态接口从 `provider_health` 记录 ID 读取供应商名。冷却到期展示为 `probe`（冷却结束，待探测），不把数据库状态改为健康，不清空失败次数与错误历史；成功探测仍走原恢复逻辑。
+- 鉴权日志增加摘要计算、客户端查询总耗时、总耗时及开始时并发数。`query` 包含网络、同连接等待和服务端执行，不能直接称为慢 SQL。调度每轮记录 init/config/quota/models/gc/tick/observation/heartbeat 分段耗时。诊断仅记录固定阶段名、数字和成功标记，不记录 SQL、参数、凭证、结果或原始错误。
+- 当前采样未复现十几秒鉴权延迟，因此没有增加凭证缓存、放松撤销检查或修改索引。再次慢时先看 `dispatch timing:` 定位阶段，再关联 `auth timing:` 判断是否查询累计等待。
+- 本机 `org.surrealck.status-tunnel` 因公钥认证失败反复重启，现停用并保留 plist 与备份；LAN 预览不依赖它。需恢复公网签名预览时，先修 SSH 身份配置，再 `launchctl enable gui/$(id -u)/org.surrealck.status-tunnel`、`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.status-tunnel.plist`。停用状态属于主机维护，回滚代码不会自动重新启用隧道。

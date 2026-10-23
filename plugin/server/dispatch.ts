@@ -1,3 +1,4 @@
+import { DispatchTimings } from "./vendor/src/diagnostics.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
 import { settleCompanyTurn } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
@@ -350,37 +351,40 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
     let failures = 0;
     while (!stopped) {
       let wait = 20_000;
+      const timing = new DispatchTimings();
       try {
-        const ctx: Company = await company();
-        wait = (await ctx.workforce.config()).pollSeconds * 1000;
+        const ctx: Company = await timing.measure("init", () => company());
+        wait = (await timing.measure("config", () => ctx.workforce.config())).pollSeconds * 1000;
         // Refresh quota and model slots BEFORE the tick so a newly published model is
         // resolved, stale idle sessions are retired, and new work spawns on it in the
         // same dispatch pass instead of lagging one poll behind. Quota runs without a
         // Paseo handle too: magpie is the source for the providers Paseo never lists.
         if (Date.now() - quotaRefreshedAt > 300_000) {
-          await refreshQuota(paseoHandle, ctx).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
+          await timing.measure("quota", () => refreshQuota(paseoHandle, ctx)).catch((error) => console.warn(`quota refresh failed: ${(error as Error).message}`));
         }
         if (paseoHandle && Date.now() - modelsRefreshedAt > 300_000) {
-          await refreshModels(paseoHandle, ctx).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
+          await timing.measure("models", () => refreshModels(paseoHandle!, ctx)).catch((error) => console.warn(`model refresh failed: ${(error as Error).message}`));
         }
         if (Date.now() - gcRefreshedAt > GC_MS) {
           gcRefreshedAt = Date.now();
-          await runLifecycleGc(ctx).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
+          await timing.measure("gc", () => runLifecycleGc(ctx)).catch((error) => console.warn(`lifecycle gc failed: ${(error as Error).message}`));
         }
-        const report = await ctx.dispatcher.tick();
-        await persistDispatchObservation(ctx).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
+        const report = await timing.measure("tick", () => ctx.dispatcher.tick());
+        await timing.measure("observation", () => persistDispatchObservation(ctx)).catch((error) => console.warn(`dispatch observation write failed: ${(error as Error).message}`));
         failures = 0;
         const changed = report.commands || report.revoked.length || report.woke.length || report.retired.length ||
           report.exhausted.length || (report.recovered?.length ?? 0) || report.notices.length || report.evals.length || (report.decisions?.length ?? 0) ||
           report.reclaimed;
         if (changed) console.log(`tick ${JSON.stringify(report)}`);
-        await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();");
+        await timing.measure("heartbeat", async () => { await ctx.db.db.query("UPSERT company_meta:dispatcher_heartbeat SET at = time::now();"); });
       } catch (error) {
         failures++;
         wait = Math.min(wait * 2 ** Math.min(failures, 5), 300_000);
         console.error(`tick failed: ${(error as Error).message}`);
         // A dropped SurrealDB socket never heals on its own; rebuild it so the next tick can run.
         await company().then(c => c.db.ensureConnected()).catch(() => {});
+      } finally {
+        console.log(`dispatch timing: ${JSON.stringify(timing.summary())}`);
       }
       await nap(wait);
     }

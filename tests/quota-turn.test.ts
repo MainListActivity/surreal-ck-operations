@@ -33,3 +33,23 @@ test('dispatcher also recognizes a cap without an HTTP code after the lifecycle 
 test('magpie request-rejected envelope is recognized even without a structured failed outcome', () => {
   expect(quotaFailure({ kind: 'completed' }, [{ type: 'assistant_message', text: 'API Error: request rejected (429) — usage cap reached until 08:00' }], now)).toBeDefined();
 });
+
+const refusalAt = (message: string, at: string) => quotaFailure({ kind: 'completed' },
+  [{ type: 'assistant_message', text: `API Error: 429 usage cap reached ${message}` }], Date.parse(at))?.resetsAt;
+const seconds = (iso: string) => Date.parse(iso) / 1000;
+test('magpie clock uses the explicit offset, including fractional-hour offsets and a different UTC date', () => {
+  expect(refusalAt('until 08:00 UTC-4', '2026-10-22T06:00:00Z')).toBe(seconds('2026-10-22T12:00:00Z'));
+  expect(refusalAt('until 08:00 UTC+5:30', '2026-10-22T01:00:00Z')).toBe(seconds('2026-10-22T02:30:00Z'));
+  expect(refusalAt('until 21:00 UTC-4', '2026-10-23T00:00:00Z')).toBe(seconds('2026-10-23T01:00:00Z'));
+});
+test('magpie dated resets cover later days and New Year; multiple held accounts use the soonest reset', () => {
+  expect(refusalAt('until Oct 24 08:00 UTC-4', '2026-10-22T23:00:00Z')).toBe(seconds('2026-10-24T12:00:00Z'));
+  expect(refusalAt('until Jan 2 08:00 UTC+8', '2026-12-31T12:00:00Z')).toBe(seconds('2027-01-02T00:00:00Z'));
+  expect(refusalAt('until Oct 24 08:00 UTC-4; another account until 08:00 UTC-4', '2026-10-22T06:00:00Z')).toBe(seconds('2026-10-22T12:00:00Z'));
+});
+test('invalid, stale, timezone-free and excessively distant clocks retain bounded-backoff fallback', () => {
+  for (const text of ['until 08:00', 'until 25:00 UTC-4', 'until 08:00 UTC+5:99', 'until 08:00 UTC+99',
+    'until Feb 30 08:00 UTC-4', 'until Nov 24 08:00 UTC-4', 'until 01:00 UTC+8']) {
+    expect(refusalAt(text, '2026-10-22T06:00:00Z')).toBeUndefined();
+  }
+});

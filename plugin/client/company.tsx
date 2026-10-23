@@ -1169,7 +1169,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
         const insts = r?.instances ?? [];
         // 「需要处理」只放异常：耗尽/不健康的订阅、低额度窗口、停用编制、会话异常实例。
         const problems: string[] = [];
-        for (const h of health.filter(h => h.state !== "healthy"))
+        for (const h of health.filter(h => h.state !== "healthy" && h.state !== "probe"))
           problems.push(`订阅 ${h.provider}：${h.state}${h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}`);
         for (const u of usage) {
           for (const w of u.windows.filter(w => (w.remainingPct ?? 100) <= 15))
@@ -1209,7 +1209,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
                 })}
                 {usage.length === 0 && <Text style={s.muted}>暂无额度数据。</Text>}
                 {health.map(h => (
-                  <Text key={h.provider} style={s.muted}>{h.provider}：{h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
+                  <Text key={h.provider} style={s.muted}>{h.provider}：{h.state === "probe" ? "冷却结束，待探测" : h.state}{h.lastError ? `（${h.lastError.slice(0, 80)}）` : ""}</Text>
                 ))}
                 {r?.bounds?.usage?.truncated && <Text style={s.muted}>额度只列出 {r.bounds.usage.shown} 项，共 {r.bounds.usage.total} 项。</Text>}
                 {r?.bounds?.health?.truncated && <Text style={s.muted}>健康只列出 {r.bounds.health.shown} 项，共 {r.bounds.health.total} 项。</Text>}
