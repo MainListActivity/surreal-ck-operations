@@ -1358,7 +1358,7 @@ test('dispatcher: native Factory is preferred, full capacity falls back to Claud
   let calls=0;
   const dispatcher=new Dispatcher({workforce,owner,paseo,env:{opsRepo:'/ops',sckBin:'/bin/sck',paseoBin:'/bin/paseo'},rand:()=>0,
     jev:{model:'spy',ask:async()=>{calls++;throw Error('staffing must not ask Jev');}},
-    quota:async()=>[{provider:'factory-droid',sessionPct:90,weeklyPct:90,status:'available'}]});
+    quota:async()=>[{provider:'factory-droid',sessionPct:90,weeklyPct:90,status:'available',summary:'fixture 90% available'}]});
   const first=await core.createTask(tokens.gm,{title:'Factory priority first',context:'Synthetic regression',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
   const second=await core.createTask(tokens.gm,{title:'Claude capacity fallback',context:'Synthetic regression',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
   const report=await dispatcher.tick();
