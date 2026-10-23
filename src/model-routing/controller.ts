@@ -9,6 +9,7 @@ import {
   classify,
   TIERS,
   selectedTier,
+  canonicalModel,
   tierPool,
   digest,
   rank,
@@ -21,6 +22,9 @@ import { employeeTier } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
+import { loadAa, refreshAa } from "./aa.ts";
+import { useBenchmarks } from "./policy.ts";
+import { modelFacts, quotaAccounts, usageStats, type ModelFacts } from "./ranking.ts";
 const exec = promisify(execFile);
 /** Bump to re-run the one-time grouping (owner rule changes). Otherwise membership is the owner's. */
 export const GROUPING_VERSION = "anchors-2026-10-23";
@@ -43,6 +47,9 @@ export interface RoutingConfig {
 }
 export class ModelRoutingController {
   enabled = false;
+  /** Latest Jev order per group; members it has not seen yet follow in performance order. */
+  private orders: Record<string, string[]> = {};
+  private catalog: CatalogModel[] = [];
   private updated = 0;
   private sessionsChecked = 0;
   private pending?: Promise<void>;
@@ -81,6 +88,33 @@ export class ModelRoutingController {
         `magpie management command failed: ${args.slice(0, 2).join(" ")}${why ? `: ${why}` : ""}`,
       );
     }
+  }
+  private async output(args: string[]): Promise<string> {
+    const { stdout } = await exec(this.cli, args, { timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: magpieEnvironment() });
+    return stdout;
+  }
+  /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
+  async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
+    const [quota, usage, results] = await Promise.all([
+      this.output(["quota", "--json"]).then((t) => quotaAccounts(JSON.parse(t))).catch(() => new Map()),
+      this.output(["usage", "--csv", "--days", "7"]).then(usageStats).catch(() => new Map()),
+      readModelResults(this.db),
+    ]);
+    const known = new Map(classify(this.catalog).map((m) => [m.id, m]));
+    const candidates = ids.map((id) => known.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier: "sonnet" as Tier, prior: 2.5, estimated: true, context: 0 });
+    const performance = new Map<string, {score:number;samples:number}>();
+    for (const candidate of candidates) {
+      const evidence = results.filter(r => canonicalModel(r.model) === canonicalModel(candidate.id));
+      const samples = evidence.reduce((sum,r) => sum + r.weight, 0);
+      if (samples > 0) performance.set(candidate.id,{score:Math.round(evidence.reduce((sum,r)=>sum+r.overall*r.weight,0)/samples*100)/100,samples});
+    }
+    return modelFacts(ids, { catalog: this.catalog as never, quota, usage, performance });
+  }
+  async applyOrders(orders: Record<string, string[]>): Promise<void> {
+    // Serialize behind any periodic sync, then re-read the owner's current membership.
+    if (this.pending) await this.pending;
+    this.orders = { ...this.orders, ...orders };
+    await this.refresh(true);
   }
   refresh(force = false): Promise<void> {
     if (this.pending) return this.pending;
@@ -135,6 +169,14 @@ export class ModelRoutingController {
     );
     if (!reply.ok) throw Error(`magpie catalog unavailable: ${reply.status}`);
     const catalog = (await reply.json()) as { data: CatalogModel[] };
+    this.catalog = catalog.data;
+    const dir0 = join(this.home, "model-routing");
+    await mkdir(dir0, { recursive: true, mode: 0o700 });
+    // Daily AA scores and prices, so new models are placed by today's leaderboard, not the bundled one.
+    const aa = this.io.command ? loadAa(join(dir0, "aa.json")) : await refreshAa(join(dir0, "aa.json"));
+    if (aa) useBenchmarks(aa.models);
+    const [ranking] = await this.db.query<[{ orders?: Record<string, string[]> } | undefined]>("SELECT orders FROM ONLY company_meta:model_ranking;");
+    this.orders = { ...ranking?.orders, ...this.orders };
     const models = classify(catalog.data).filter(
       (m) => !config?.disabledModels?.includes(m.id),
     );
@@ -182,7 +224,11 @@ export class ModelRoutingController {
       }
       // A model added by hand may have no score: it keeps a neutral prior and is still ordered.
       const candidates = ids.map((id) => byId.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier, prior: 2.5, estimated: true, context: 0 });
-      const ordered = rank(candidates, results);
+      const byRank = rank(candidates, results);
+      const jev = tier === "fable" ? [] : this.orders[`sck-${tier}`] ?? [];
+      const at = (id: string) => { const i = jev.indexOf(id); return i < 0 ? jev.length : i; };
+      const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
+      const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
       const members = ordered.map((m) => m.id);
       const signature = digest(JSON.stringify(members));
       groups[`sck-${tier}`] = signature;

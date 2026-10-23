@@ -367,3 +367,14 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 迁移先备份完整编制到私有 model-routing/employee-defs-four-tier-before.json，准备四档分组和插件，再停用非故事作者的旧客户端编制、更新 Claude 编制/员工默认模型，最后启用。切换双面 release 后，仅空闲无租约会话更新 Paseo 模型默认和 v2 网关配置；忙会话先完成当前工作。`model-routing-admin.ts status` 查看计数。恢复维护前的 paused 状态，核对真实派工与实际模型执行。
 
 回滚：先暂停新派工，用本 release 的 `model-routing-admin.ts disable` 恢复编制和员工私有网关设置并停用插件；等待 pendingSessionReloads 清零，再按双面回滚流程恢复前一 release。历史证据不删除。
+
+
+### Jev 组内排序
+
+老板工作台「编制 → 模型排序」提供自然语言规则与 2/5/10 分钟下拉选项（默认 5）。保存只更新这两个设置并重置触发时钟，下一次有效员工模型请求（含 count_tokens）到达公司网关后，后台启动一次刷新；同一时刻只有一轮，前台请求不等待数据库、额度查询或 Jev。到期且没有新请求时不调用 Jev。重启后首个请求会刷新。
+
+每轮共用一次数据采集，对 `sck-opus`、`sck-sonnet`、`sck-haiku` 各独立调用一次 Jev。输入包含组内每个模型的订阅标签（不传邮箱）、最紧窗口剩余额度百分比、AA 排名和分数、每百万 token 输入/输出/缓存命中价格（Magpie 标注免费时为 0）、近 7 天缓存命中率与输出 tokens/s、首 token 延迟，以及已最终验收任务的模型绩效和样本权重。缺失数据保持未知；调用失败、答案不完整或置信度低时保留该组顺序，界面显示刷新结果。保存期间旧轮次作废，关闭插件停止发布结果。
+
+AA 榜单与价格保存在服务目录 `model-routing/aa.json`，每日刷新，失败保留最后可用快照；锚模型不齐或页面解析异常时不替换数据。自动分组版本不变，仅初始化及首次出现的新模型参与分组，仍遵守 AA≥38 和现有锚模型规则；手动增删成员不会因重新评分而重置。Jev 只能排列当前组内成员，不能跨组添加模型。Fable 不参与 Jev 或绩效排序，保留老板顺序。Magpie 自己提供组内回退与会话粘性，网关始终发送原生组名；不设置 effort 上限。
+
+设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查三组结果和 Magpie 顺序，同时确认成员集合及 Fable 顺序未变。

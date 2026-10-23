@@ -64,12 +64,31 @@ const normalize = (s: string) =>
 /** One model served through several accounts shares its task evidence. */
 export const canonicalModel = (id: string) =>
   normalize(id.slice(id.lastIndexOf("/") + 1));
+export interface BenchmarkRow {
+  slug: string;
+  score: number;
+  estimated?: boolean;
+  /** USD per 1M tokens; absent when AA does not publish it. */
+  priceInput?: number | null;
+  priceOutput?: number | null;
+  priceCacheHit?: number | null;
+}
+/** The bundled snapshot until the daily AA refresh (aa.ts) supplies a newer one. */
+let dataset: BenchmarkRow[] = benchmark.models;
+export function useBenchmarks(rows: BenchmarkRow[]): void {
+  if (rows.length) dataset = rows;
+}
+/** 1-based position by AA Intelligence Index among all published models. */
+export function aaRankOf(model: string): number | undefined {
+  const b = benchmarkOf(model);
+  return b ? dataset.filter((x) => x.score > b.score).length + 1 : undefined;
+}
 /** Exact version, or the same version with a dated snapshot suffix (e.g. "-1017"); any other suffix is not. */
-function benchmarkOf(model: string) {
+export function benchmarkOf(model: string): BenchmarkRow | undefined {
   const canonical = normalize(model);
   return (
-    benchmark.models.find((b) => b.slug === canonical) ??
-    benchmark.models.find(
+    dataset.find((b) => b.slug === canonical) ??
+    dataset.find(
       (b) =>
         b.slug.startsWith(`${canonical}-`) &&
         /^\d{4,8}$/.test(b.slug.slice(canonical.length + 1)),

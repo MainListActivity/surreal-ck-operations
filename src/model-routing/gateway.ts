@@ -33,6 +33,8 @@ export interface RoutingLease {
 export interface GatewayDeps {
   /** Startup only: do not misreport recovery in progress as a lost task lease. */
   ready?: () => boolean;
+  /** Schedules background ranking only; never awaited on the request path. */
+  onRequest?: () => void;
   lease(agent: string): Promise<RoutingLease | undefined>;
   record(row: Record<string, unknown>): Promise<void>;
   complete(id: string, completed: boolean): Promise<void>;
@@ -167,6 +169,7 @@ export async function startModelGateway(
           );
         return;
       }
+      deps.onRequest?.();
       const chunks: Buffer[] = [];
       let size = 0;
       for await (const chunk of req) {
