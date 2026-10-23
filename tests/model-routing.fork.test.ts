@@ -155,3 +155,29 @@ run(
     }
   },
 );
+
+run('fork: Factory roster physically removes other native defs, preserves authors and native settings, and retries safely',async()=>{
+ const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'factory_roster_fixture',database:'control_plane'});
+ try{
+  await db.connect();await db.bootstrap();
+  const {Workforce}=await import('../src/workforce.ts');const {applyRoutingRoster}=await import('../src/model-routing/roster.ts');
+  const wf=new Workforce(db,'/unused-fixture-credentials');
+  await wf.upsertDef('engineering-factory',{role:'engineering',provider:'factory-droid',model:'native-model',thinking:'high',tracks:['web'],enabled:false,maxInstances:3,quotaLimited:false});
+  await wf.upsertDef('engineering-claude',{role:'engineering',provider:'claude',model:'old',thinking:'medium',tracks:['mobile']});
+  await wf.upsertDef('engineering-codex',{role:'engineering',provider:'codex',model:'old',tracks:['web']});
+  await wf.upsertDef('qa-grok',{role:'qa',provider:'grok',model:'old',enabled:false});
+  await wf.upsertDef('story-native',{role:'story-author',provider:'codex',model:'unchanged',thinking:'high',tracks:['原著']});
+  const before=(await wf.defs()).find(d=>d.id==='story-native');
+  await expect(applyRoutingRoster(wf,db.db)).rejects.toThrow('Pause dispatch');
+  await db.db.query('UPSERT company_meta:config MERGE {paused:true};');
+  await db.db.query("CREATE employee:historical CONTENT {def:employee_def:`engineering-codex`,role:'engineering',provider:'codex'};");
+  await applyRoutingRoster(wf,db.db);const after=await wf.defs();
+  expect(after.some(d=>['engineering-codex','qa-grok'].includes(d.id))).toBe(false);
+  expect(after.find(d=>d.id==='engineering-factory')).toMatchObject({provider:'factory-droid',model:'native-model',thinking:'high',enabled:true,maxInstances:3});
+  expect(after.find(d=>d.id==='engineering-factory')?.quotaLimited).not.toBe(false);
+  expect(after.find(d=>d.id==='engineering-claude')).toMatchObject({model:'group/sck-haiku',thinking:'medium',tracks:['web','mobile']});
+  expect(after.find(d=>d.id==='story-native')).toEqual(before);
+  const [history]=await db.db.query<[any]>('SELECT * FROM ONLY employee:historical;');expect(String(history.def)).toContain('engineering-codex');
+  await applyRoutingRoster(wf,db.db);expect((await wf.defs()).find(d=>d.id==='engineering-factory')).toEqual(after.find(d=>d.id==='engineering-factory'));
+ }finally{await db.close();}
+});

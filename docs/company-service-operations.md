@@ -380,3 +380,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 AA 榜单与价格保存在服务目录 `model-routing/aa.json`，每日刷新，失败保留最后可用快照；锚模型不齐或页面解析异常时不替换数据。自动分组版本不变，仅初始化及首次出现的新模型参与分组，仍遵守 AA≥38 和现有锚模型规则；手动增删成员不会因重新评分而重置。Jev 只能排列当前组内成员，不能跨组添加模型。Fable 不参与 Jev 或绩效排序，保留老板顺序。Magpie 自己提供组内回退与会话粘性，网关始终发送原生组名；不设置 effort 上限。
 
 设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查三组结果和 Magpie 顺序，同时确认成员集合及 Fable 顺序未变。
+
+
+### Factory 优先的原生员工编制
+
+编制保留 Claude、Factory（`factory-droid`）及故事作者特例；删除其他 provider 的非故事作者定义。Factory 保留原生 provider、模型与思考设置，并恢复额度门禁；Claude 继续使用岗位默认的 Magpie 组。老板编制列表把 Factory 排在前面。
+
+派工选人不调用 Jev。资格检查（岗位/轨道、项目、额度与健康、席位与并发、原实现人绑定、验收回避及独立性）通过后，先复用 Factory，再使用可新建的 Factory 席位；Factory 没有可用候选时复用或新建 Claude。候选排序在本机执行，不为派工产生 Jev 调用。组内模型排序、最终验收绩效和上线判断仍使用各自原有机制。
+
+从已合入 main 的固定 release 执行 `bun scripts/model-routing-admin.ts roster` 前暂停新增派工。该模式备份原编制后新增/更新保留定义并物理删除其余非 Claude 定义，不重建 Magpie 分组或改写排序规则。旧实例、任务和绩效历史保留；删除定义的实例不得接新任务，在途租约照常收尾，空闲且不再被未完成任务保护时退休。完成后检查 Factory 模型/provider 未变、非保留定义为零、故事作者前后相同，再恢复原派工开关。
