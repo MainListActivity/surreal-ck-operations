@@ -342,6 +342,22 @@ test("controller writes only the four magpie tier groups, removes the retired se
   expect(calls.length).toBe(n);
 });
 
+test("removing a route group that is already gone does not fail the sync", async () => {
+  const { ModelRoutingController } = await import("../src/model-routing/controller.ts");
+  const home = join(scratch, "controller-gone");
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(home, "model-routing"), { recursive: true });
+  writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-opus-best": "x" }));
+  const db = { query: async (sql: string) => (sql.includes("SELECT enabled") ? [{ enabled: true }] : [[]]) };
+  const controller = new ModelRoutingController(db as any, home, "unused", {
+    fetch: (async () => Response.json({ data: [{ id: "claude/claude-opus-5-5" }] })) as unknown as typeof fetch,
+    command: async (args) => {
+      if (args[0] === "group" && args[1] === "rm") throw Error('magpie management command failed: group rm: magpie: no group "sck-route-opus-best"');
+    },
+  });
+  await controller.refresh(true);
+  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
+});
 test("durable local queue never waits for remote DB, survives restart and retains completions during a slow flush", async () => {
   const { ExecutionJournal } = await import("../src/model-routing/journal.ts");
   const dir = join(scratch, "queue");

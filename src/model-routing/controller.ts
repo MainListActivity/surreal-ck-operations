@@ -185,7 +185,9 @@ export class ModelRoutingController {
     for (const id of Object.keys(previous)) {
       if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
-      else await this.command(['group','rm',id]);
+      // Already gone is done: a sync that died after removing groups but before writing groups.json
+      // (or a concurrent one) must not fail every later sync.
+      else await this.command(['group','rm',id]).catch((e: Error) => { if (!/no group/.test(e.message)) throw e; });
     }
     await writeFile(join(dir, "groups.json.tmp"), JSON.stringify(groups), {
       mode: 0o600,
