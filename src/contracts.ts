@@ -105,6 +105,8 @@ export interface TaskView {
   previousEmployee?: EmployeeId;
   /** Bound code implementer (execute phase). Set at the first execute claim or by an explicit gm takeover. */
   implementer?: EmployeeId;
+  /** Independence policy (SYS-DISP IR01): contributors of the source tasks, and named employees, may not take or decide this task. */
+  independence?: IndependencePolicy;
   modelTier?: 'fable' | 'opus' | 'sonnet' | 'haiku' | 'high' | 'medium' | 'low';
   workIntent?: WorkIntent;
   worktree?: WorktreeAssignment;
@@ -438,6 +440,72 @@ export interface RetireTask {
   expectedVersion?: number;
 }
 
+/** The phase a policy applies to: taking and writing code (execute), or deciding a review. */
+export type IndependenceStage = 'execute' | 'review';
+
+/**
+ * Which contributors of a source task count. `execute_handlers`: every execute-phase handler of the source (its authors, including a
+ * claim that never submitted, and its implementer). `all_handlers`: those plus every reviewer of the source.
+ */
+export type IndependenceMode = 'execute_handlers' | 'all_handlers';
+
+/** Who may not take or decide a task: the contributors of its source tasks and the employees a manager names (SYS-DISP IR01). */
+export interface IndependencePolicy {
+  /** Format version. Only 1 is understood; any other value fails closed. */
+  schema: 1;
+  /** Starts at 1 and rises by one with every accepted change. */
+  revision: number;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  /** Employees named explicitly (for example a code author or QA). Only these employees and anyone sharing a registered identity principal with them are excluded (SYS-DISP Q3): a definition is a capacity template, never an identity, so its other employees stay independent. */
+  excluded: EmployeeId[];
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/**
+ * A registered identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several employeeIds one
+ * person for independence purposes. This is the ONLY cross-employee identity key: a definition, provider, model, name or
+ * directory never implies it, and an unregistered link is never recognized.
+ */
+export interface IdentityPrincipalView {
+  id: string;
+  /** Employees registered to this principal. */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  setBy: EmployeeId;
+  setAt: string;
+}
+
+/** Manager write of a task's independence policy: creates the first one, or replaces it under a compare-and-set. */
+export interface SetIndependence {
+  taskId: TaskId;
+  stages: IndependenceStage[];
+  sources: TaskId[];
+  mode: IndependenceMode;
+  excluded?: EmployeeId[];
+  reason: string;
+  /** Compare-and-set: refuse when the task version has moved. */
+  expectedVersion: number;
+  idempotencyKey: string;
+}
+
+/** Manager write of an identity principal: register the link, or set its exact employee set, under a compare-and-set. */
+export interface SetIdentityPrincipal {
+  /** Existing principal to change; omit to register a new one. */
+  principalId?: string;
+  /** The complete employee set of the principal after the write (at least 1, at most 20). */
+  employees: EmployeeId[];
+  /** Why these are one person (required, audited). */
+  reason: string;
+  /** Compare-and-set on the principal row: refuse when it has moved. Omit for a new principal. */
+  expectedVersion?: number;
+  idempotencyKey: string;
+}
+
 /** gm (manage): record a new code implementer for an execute-phase task whose bound implementer cannot continue. */
 export interface ImplementerTakeover {
   taskId: TaskId;
@@ -748,13 +816,16 @@ export interface CompanyCore {
   adminSummary?(credential: Credential, input: Record<string, unknown>): Promise<AdminSummary>;
   /** gm (manage): record the code implementer of an execute-phase task; audited, idempotent, version-checked. */
   implementerTakeover?(credential: Credential, input: ImplementerTakeover): Promise<TaskView>;
+  /** Manager (manage capability): write a task's independence policy. Optional for old adapters. */
+  setIndependence?(credential: Credential, input: SetIndependence): Promise<TaskView>;
+  /** Manager (manage capability): register an identity principal, or add/remove employees from it. Optional for old adapters. */
+  setIdentityPrincipal?(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView>;
   /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
    */
-  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;
-  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
+  systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
   /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
   qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;

@@ -51,17 +51,19 @@ function toolError(error: unknown) {
   const code = /^[a-z][a-z0-9_]{1,63}$/.test(raw) ? raw : 'internal_error';
   const retryable = code === 'temporarily_unavailable' && typeof error === 'object' && error !== null
     && 'retryable' in error && error.retryable === true;
+  // Structured reasons (independence conflicts name the task, source and employee) travel in structuredContent only; never credentials.
+  const details = typeof error === 'object' && error !== null && 'details' in error && typeof error.details === 'object' && error.details !== null
+    ? error.details : undefined;
   // The message is written for the caller (CompanyError, budget refusals). Unknown errors are reported by code alone.
   const message = code !== 'internal_error' && typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
     ? error.message.slice(0, 500)
     : '';
-  const structured = { ok: false as const, code, retryable, error: message || code };
+  const structured = { ok: false as const, code, retryable, error: message || code, ...(details ? { details } : {}) };
   // The text copy is the same JSON as structuredContent, for refusals as for answers, so every result parses the same way (SYS01, D1).
   return {
     isError: true,
     content: [{ type: 'text' as const, text: JSON.stringify(structured) }],
-    structuredContent: structured,
-  };
+    structuredContent: structured,  };
 }
 
 function toolResult(data: unknown) {
@@ -422,6 +424,35 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.implementerTakeover
     ? core.implementerTakeover(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('independence_set', {
+    description: 'Manager (manage capability) only: write a task independence policy. Contributors of the source tasks (every execute-phase handler, including a claim that never submitted; with all_handlers also the reviewers), the named employees, and anyone sharing a registered identity principal with either, may not take the task (execute) or decide it (review). A definition, provider, model, name or directory is never an identity, so its other employees stay independent (SYS-DISP Q3). Compare-and-set on expectedVersion; refused while the task is leased; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      stages: z.array(z.enum(['execute', 'review'])).min(1).max(2),
+      sources: z.array(z.string().min(1).max(200)).max(20),
+      mode: z.enum(['execute_handlers', 'all_handlers']),
+      excluded: z.array(z.string().min(1).max(200)).max(100).optional(),
+      reason: z.string().min(1).max(2048),
+      expectedVersion: z.number().int().positive(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIndependence
+    ? core.setIndependence(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('identity_principal_set', {
+    description: 'Manager (manage capability) only: register an identity principal, or set its exact employee set, under a compare-and-set. A principal is the ONLY link that makes two employeeIds one person for independence purposes: contributors of a source task, and employees a manager names, may not take (execute) or decide (review) a task, and neither may anyone who shares a registered principal with them. A definition, provider, model, name or directory never implies the link, and an unregistered link is never recognized. Requires a reason (audited); refused while any named employee holds a live lease; a second write with the same idempotencyKey and payload returns the original result.',
+    inputSchema: z.object({
+      principalId: z.string().min(1).max(200).optional(),
+      employees: z.array(z.string().min(1).max(200)).min(1).max(20),
+      reason: z.string().min(8).max(2000),
+      expectedVersion: z.number().int().positive().optional(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.setIdentityPrincipal
+    ? core.setIdentityPrincipal(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_project_update', {

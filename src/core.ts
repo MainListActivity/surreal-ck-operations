@@ -4,7 +4,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -20,6 +20,7 @@ import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type Snapsho
 import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
+import { normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -233,7 +234,14 @@ interface TaskRow {
   superseded_by?: RecordId;
   lineage?: RecordId;
   revision_no?: number;
+  /** Independence policy (schema 023, SYS-DISP IR01): written only by setIndependence, read with the contribution facts. */
+  independence?: IndependenceRow | null;
+  /** Version this task was last checked against as a source of a dependent's gated write (schema 023). */
+  independence_guard?: number | null;
 }
+
+/** A stored policy: the API shape, with `setAt` as the driver returns it (a Date, or a string in tests). */
+type IndependenceRow = Omit<IndependencePolicy, 'setAt'> & { setAt: Date | string };
 
 /** Compact row for the complete active-lease lookup; keeps task context text out of the recovery path. */
 interface ActiveLeaseRow {
@@ -249,9 +257,20 @@ interface ActiveLeaseRow {
   fence: number;
   version: number;
 }
-
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
 export type { TaskRow };
+
+/** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
+function policyView(policy: IndependenceRow): IndependencePolicy {
+  return { ...policy, setAt: policy.setAt instanceof Date ? policy.setAt.toISOString() : String(policy.setAt) };
+}
+
+/** A principal as the API states it, whatever the driver returned for `setAt`. */
+function principalView(principalId: string, employees: readonly string[], reason: string, setBy: string,
+  setAt: Date | string | undefined): IdentityPrincipalView {
+  return { id: principalId, employees: [...employees], reason, setBy,
+    setAt: setAt instanceof Date ? setAt.toISOString() : String(setAt ?? '') };
+}
 
 /**
  * Why a blocked row waits, in terms every view can show (RW06 C3 / RW05). The facts are the row's own: `blocked_to` names a
@@ -291,6 +310,7 @@ export function view(row: TaskRow): TaskView {
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
+    independence: row.independence ? policyView(row.independence) : undefined,
     modelTier: row.model_tier,
     workIntent: row.work_intent, worktree: row.worktree,
     revises: row.revises ? asId(row.revises) : undefined,
@@ -354,6 +374,23 @@ const briefTask = (row: GoalAcceptanceTaskRow): GoalAcceptanceTask => ({
   submitted: Boolean(row.submitted_by), leaseHolder: isLeased(row) ? row.current_employee : undefined,
   dependencies: (row.dependencies ?? []).map(asId).sort(),
 });
+
+/**
+ * Source guard of a gated lease write (SYS-DISP IR03). Every source the gate read must still be at the version it was read at, or the
+ * write is refused and the caller re-reads. The write also stamps each source: a concurrent authorship change on a source always bumps
+ * its version in the same transaction, so the two conflict instead of one landing between the read and the other's commit.
+ */
+const INDEPENDENCE_GUARD_SQL = `FOR $g IN $indep_guards {
+        IF (SELECT VALUE version FROM ONLY $g.task) != $g.version { THROW 'contribution history moved: independence source' };
+        UPDATE ONLY $g.task SET independence_guard = $g.version;
+      };`;
+
+/** The gate one stage reads: the exclusion index and the source versions the write must be guarded by. */
+interface IndependenceGate {
+  taskId: string;
+  index: IndependenceIndex;
+  guards: Array<{ task: RecordId; version: number }>;
+}
 
 // ---- Bounded reads (SYS01). Every response, complete or paged, fits the 48 KiB budget measured as serialized
 // UTF-8. A complete answer is returned whole or refused (C2, C3); a paged answer reads a stored listing (C4). ----
@@ -462,9 +499,11 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly submitCheck?: SubmitCheck;
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void> }) {
+  private readonly independenceReadHook?: (taskId: string) => Promise<void>;
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void> }) {
     this.submitCheck = options?.submitCheck;
     this.contributionReadHook = options?.contributionReadHook;
+    this.independenceReadHook = options?.independenceReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) {
       throw new CompanyError('invalid', 'Invalid lease duration');
@@ -609,6 +648,12 @@ export class SurrealCompanyCore implements CompanyCore {
           if (takeover) {
             const kind = takeover[1]!.toLowerCase();
             throw new CompanyError(kind === 'moved' ? 'conflict' : 'invalid', `Implementer takeover ${kind}: ${takeover[2]!.trim()}`);
+          }
+          // Independence policy writes: a moved version or a live lease is a conflict; a closed task is invalid; the actor is denied.
+          const independence = /independence (moved|refused|invalid|denied): ([^'"\n]+)/i.exec(cause);
+          if (independence) {
+            const kind = independence[1]!.toLowerCase();
+            throw new CompanyError(kind === 'denied' ? 'forbidden' : kind === 'invalid' ? 'invalid' : 'conflict', `Independence ${kind}: ${independence[2]!.trim()}`);
           }
           // The gm that repaired a goal acceptance reference is the candidate's author for four-eyes purposes: it may not review or accept that candidate.
           if (/goal acceptance repairer/i.test(cause)) throw new CompanyError('self_review', 'Repairing gm cannot review or accept the repaired goal candidate; another gm must');
@@ -923,6 +968,8 @@ export class SurrealCompanyCore implements CompanyCore {
       if (facts.ambiguous) throw new CompanyError('forbidden', 'Task claim denied: implementer unresolved, manager takeover required');
       if (facts.implementer && facts.implementer !== actor.employeeId) throw new CompanyError('forbidden', 'Task claim denied: bound to another implementer');
     }
+    // Independence (SYS-DISP IR03): refused before a worktree is allocated, exactly as the claim transaction would refuse it.
+    await this.refuseIndependent(await this.independenceGate(taskId, task.independence, reviewing ? 'review' : 'execute'), actor.employeeId);
     const project = await this.taskProject(taskId);
     // Code-repo routing: an explicit binding wins over the business project repo; the
     // business `project` itself stays with taskProject for claim.json/opsScope.
@@ -987,16 +1034,43 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
-   * Runs one lease transaction against a fresh contribution view. When the facts it was built from moved under it (another
-   * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale
-   * facts is never accepted (SYS-DISP AC04, AC06).
+   * The independence gate of one stage (SYS-DISP IR03): the exclusion read now, and the source versions the write must be guarded by.
+   * Undefined when the policy does not name this stage, so legacy tasks and ungated stages take no extra read. A policy this build cannot
+   * enforce refuses here whatever its stages; a source that cannot be read or does not exist refuses too. Nothing is written.
    */
-  private async withContributionRetry<T>(taskId: string, attempt: (contrib: ContributionView) => Promise<T>): Promise<T> {
+  private async independenceGate(taskId: string, policy: IndependencePolicy | undefined,
+    stage: IndependenceStage | undefined): Promise<IndependenceGate | undefined> {
+    if (!policy || !stage) return undefined;
+    const fault = policyFault(policy);
+    if (fault !== undefined) throw new CompanyError('forbidden', fault);
+    if (!policy.stages.includes(stage)) return undefined;
+    const snapshot = await readIndependenceSnapshot(this.db, policy, this.independenceReadHook);
+    return { taskId, index: snapshot.index, guards: snapshot.sources.map(source => ({ task: id('task', source.taskId), version: source.version })) };
+  }
+
+  /** Refuses `employee` when the gate excludes them: `forbidden`, with the structured conflict in `details`. Writes nothing. */
+  private async refuseIndependent(gate: IndependenceGate | undefined, employee: string): Promise<void> {
+    if (!gate) return;
+    const principal = (await readEmployeePrincipals(this.db, [employee])).get(employee);
+    await refuseIfExcluded(this.db, gate.taskId, gate.index, employee, principal);
+  }
+
+  /**
+   * Runs one lease transaction against fresh facts (SYS-DISP AC04, AC06). When the facts it was built from moved under it (another
+   * authorship change landed first), the transaction is refused and this re-reads and tries again: a check that used stale facts is
+   * never accepted. A stage the policy names is gated before the write: a contributor of a source is refused with the structured
+   * conflict, and the write carries the source guards, so a source that moved since the read refuses it and the whole check runs
+   * again (CONTRIBUTION_MOVED). Other stages and legacy tasks run exactly as before.
+   */
+  private async withContributionRetry<T>(taskId: string, actor: string, stageOf: (state?: string) => IndependenceStage | undefined,
+    attempt: (contrib: ContributionView, gate?: IndependenceGate) => Promise<T>): Promise<T> {
     for (let round = 0; ; round++) {
       const contrib = await readContributionView(this.db, taskId);
+      const gate = await this.independenceGate(taskId, contrib.policy, stageOf(contrib.state));
       await this.contributionReadHook?.(taskId);
       try {
-        return await attempt(contrib);
+        await this.refuseIndependent(gate, actor);
+        return await attempt(contrib, gate);
       } catch (error) {
         if (round < 4 && isContributionMoved(error)) continue;
         throw error;
@@ -1006,7 +1080,8 @@ export class SurrealCompanyCore implements CompanyCore {
 
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
-    const row = await this.withContributionRetry(taskId, contrib => this.txTask(`BEGIN;
+    const row = await this.withContributionRetry(taskId, actor.employeeId, state => state === 'review' ? 'review' : 'execute',
+      (contrib, gate) => this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
@@ -1014,6 +1089,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
+      ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
         IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
@@ -1055,6 +1131,13 @@ export class SurrealCompanyCore implements CompanyCore {
       };
       IF !$same {
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'claim', version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END, evidence: IF $assignment != NONE THEN type::string($assignment) ELSE NONE END };
+        // The first execute claim of an unbound engineering task makes this employee its implementer. That binding is the
+        // record that they write the task's code, so it is kept as a contribution row: an implementer whose lease was later
+        // revoked, or whose binding moved on to the next engineer, is still a real author and never reviews their own
+        // delivery (SYS-DISP IR01/Q1: a claim-only holder is a demoted hand, but a bound implementer is not one).
+        IF $t.state != 'review' AND $t.executor_role = 'engineering' AND $t.implementer = NONE {
+          CREATE ONLY $bound_audit CONTENT { task: $task, actor: $actor, action: 'implementer_bound', phase: 'execute', version: $next.version, at: time::now() };
+        };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
@@ -1068,6 +1151,7 @@ export class SurrealCompanyCore implements CompanyCore {
       // 空 tracks、无 def 的员工与缺轨任务一律 forbidden（claim 端，派工端同规则过滤）。
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
       excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
+      indep_guards: gate?.guards ?? [], bound_audit: id('audit', randomUUID()),
     }));
     const taskView = view(row);
     const project = await this.taskProject(taskId);
@@ -2016,6 +2100,7 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $t.lease_expires_at <= $now { THROW 'lease expired' };
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
+      ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
         IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
@@ -2079,14 +2164,17 @@ export class SurrealCompanyCore implements CompanyCore {
       ${idem ? 'CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
       COMMIT;`;
+    // Gated stages (SYS-DISP IR03): submit is an execute write; accept and return are review decisions. Other actions take no gate.
+    const gatedStage: IndependenceStage | undefined = action === 'submit' ? 'execute' : action === 'accept' || action === 'return' ? 'review' : undefined;
     try {
-      const row = await this.withContributionRetry(proof.taskId, contrib => this.txTask(query, {
+      const row = await this.withContributionRetry(proof.taskId, actor.employeeId, () => gatedStage, (contrib, gate) => this.txTask(query, {
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
         ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
+        indep_guards: gate?.guards ?? [],
       }));
       return view(row);
     } catch (error) {
@@ -2728,6 +2816,166 @@ export class SurrealCompanyCore implements CompanyCore {
   }
 
   /**
+   * Manager write of a task's independence policy (SYS-DISP IR01). Manage capability only. Creates the first policy, or replaces the
+   * current one under a compare-and-set on the task version. Refused while the task is leased, so a lease is never changed silently.
+   * An accepted write bumps the revision and the version in one transaction with its audit row; the same key and payload replay.
+   */
+  async setIndependence(credential: Credential, input: SetIndependence): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    requireText(input.taskId, 'taskId', 1, 200);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    const fields = normalizeIndependence({ taskId: input.taskId, stages: input.stages, sources: input.sources, mode: input.mode,
+      excluded: input.excluded, reason: input.reason });
+    const idem = this.idemId(actor.employeeId, 'independence_set', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, ...fields, expectedVersion: input.expectedVersion }));
+    const prior = await this.replay(idem, digest);
+    if (prior) return prior;
+    const current = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    if (current.state === 'done' || current.state === 'void') throw new CompanyError('invalid', 'Independence invalid: task is closed');
+    if (current.version !== input.expectedVersion) throw new CompanyError('conflict', 'Independence moved: task version changed; re-read and retry');
+    if (current.current_employee && (current.lease_expires_at ?? 0) > Math.floor(Date.now() / 1000)) {
+      throw new CompanyError('conflict', 'Independence refused: the task is leased; release it or wait for the lease to end');
+    }
+    for (const source of fields.sources) {
+      if (!(await this.db.select<TaskRow>(id('task', source)))) throw new CompanyError('not_found', `Independence source not found: ${source}`);
+    }
+    for (const employee of fields.excluded) {
+      if (!(await this.db.select<EmployeeRow>(id('employee', employee)))) throw new CompanyError('invalid', `Independence excluded employee not found: ${employee}`);
+    }
+    const revision = (current.independence?.revision ?? 0) + 1;
+    const evidence = `${input.reason}\n[independence_set] task=${input.taskId} revision=${revision} stages=${fields.stages.join(',')} mode=${fields.mode} sources=${fields.sources.join(',') || 'none'} excluded=${fields.excluded.join(',') || 'none'} expectedVersion=${input.expectedVersion}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'independence denied: actor revoked or forbidden' };
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'independence invalid: task not found' };
+      IF $t.version != $expected { THROW 'independence moved: task version changed' };
+      IF $t.state IN ['done', 'void'] { THROW 'independence invalid: task is closed' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'independence refused: task is leased' };
+      LET $next = UPDATE ONLY $task SET
+        independence = { schema: 1, revision: $revision, stages: $stages, sources: $sources, mode: $mode, excluded: $excluded, reason: $reason, setBy: $employee, setAt: time::now() },
+        version = $t.version + 1
+        RETURN AFTER;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'independence_set', evidence: $evidence, version: $next.version, at: time::now() };
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      RETURN $next;
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, task: id('task', input.taskId), expected: input.expectedVersion,
+      revision, stages: fields.stages, sources: fields.sources, mode: fields.mode, excluded: fields.excluded, reason: fields.reason,
+      evidence, digest, idem, audit: id('audit', randomUUID()),
+    };
+    try {
+      return view(await this.txTask<TaskRow>(query, vars));
+    } catch (error) {
+      const replayedAfterFailure = await this.replay(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
+   * Manager write of an identity principal (SYS-DISP IR02/Q3): the explicit, manage-controlled link that makes several
+   * employeeIds one person for independence purposes. This is the only cross-employee identity key — a definition, provider,
+   * model, name or directory never implies it — so registering one is a deliberate, audited act with a required reason.
+   * The write sets the principal's exact employee set under a compare-and-set on the principal row, is idempotent per
+   * (key, payload), and refuses while any named employee holds a live lease: an identity is never changed under a running
+   * task. Removing an employee leaves its history rows as they are (audit facts are never rewritten).
+   */
+  async setIdentityPrincipal(credential: Credential, input: SetIdentityPrincipal): Promise<IdentityPrincipalView> {
+    const actor = await this.authorized(credential, 'manage');
+    const employees = [...new Set((input.employees ?? []).filter((employee): employee is string => typeof employee === 'string'))];
+    if (employees.length === 0) throw new CompanyError('invalid', 'Invalid principal: name at least one employee');
+    if (employees.length > 20) throw new CompanyError('invalid', 'Invalid principal: at most 20 employees');
+    for (const employee of employees) requireText(employee, 'employee', 1, 200);
+    requireText(input.reason, 'reason', 8, 2000);
+    if (input.principalId !== undefined) requireText(input.principalId, 'principalId', 1, 200);
+    if (input.expectedVersion !== undefined && (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1)) {
+      throw new CompanyError('invalid', 'Invalid expectedVersion');
+    }
+    const idem = this.idemId(actor.employeeId, 'identity_principal_set', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ principalId: input.principalId ?? '', employees, reason: input.reason,
+      expectedVersion: input.expectedVersion ?? 0 }));
+    // A new principal gets its id before the transaction, so the idempotency row and the audit row name the same id.
+    const principalId = input.principalId ?? `p_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    const replayed = await this.replayPrincipal(idem, digest);
+    if (replayed) return replayed;
+    const existing = input.principalId === undefined ? undefined : await this.db.select<{ version?: number }>(id('principal', input.principalId));
+    if (input.principalId !== undefined && !existing) throw new CompanyError('not_found', `Principal not found: ${input.principalId}`);
+    const version = (existing?.version ?? 0) + 1;
+    // An identity is never changed under a running task: no named employee may hold a live lease. `task.current_employee`
+    // stores the plain employee id (see the lease readers), so this compares strings and reads the lease's own row.
+    const [leased] = await this.db.query<[Array<{ current_employee?: string }>]>(
+      'SELECT current_employee FROM task WHERE current_employee IN $ids AND lease_expires_at > time::unix(time::now());', { ids: employees });
+    if ((leased ?? []).length > 0) {
+      throw new CompanyError('conflict', `Principal refused: ${leased[0]!.current_employee} holds a live lease; release it or wait for the lease to end`);
+    }
+    for (const employee of employees) {
+      const row = await this.db.select<EmployeeRow>(id('employee', employee));
+      if (!row) throw new CompanyError('not_found', `Employee not found: ${employee}`);
+    }
+    const evidence = `${input.reason}\n[identity_principal_set] principal=${input.principalId ?? '(new)'} employees=${employees.join(',')} expectedVersion=${input.expectedVersion ?? 0}`;
+    const query = `BEGIN;
+      LET $now = time::unix(time::now());
+      LET $who = SELECT * FROM ONLY $actor;
+      IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'principal denied: actor revoked or forbidden' };
+      LET $p = SELECT * FROM ONLY $principal;
+      IF $p = NONE AND $existing { THROW 'principal not found' };
+      IF $p != NONE AND $p.version != $expected { THROW 'principal moved: version changed' };
+      FOR $e IN $employees {
+        LET $row = SELECT * FROM ONLY $e;
+        IF $row = NONE OR $row.revoked = true { THROW 'principal invalid: employee missing or revoked' };
+        // The lease lives on the task row (current_employee); re-checked here so a lease granted between the read and this
+        // write conflicts instead of silently re-identifying a running holder.
+        LET $leased = SELECT VALUE current_employee FROM task WHERE current_employee IN $ids AND lease_expires_at > $now;
+        IF array::len($leased) > 0 { THROW 'principal refused: employee is leased' };
+      };
+      LET $next = UPSERT ONLY $principal CONTENT { reason: $reason, employees: $employees, version: $version, created_at: time::now() } RETURN AFTER;
+      FOR $e IN $employees { UPDATE ONLY $e SET principal = $principal; };
+      CREATE ONLY $audit CONTENT { actor: $actor, action: 'identity_principal_set', evidence: $evidence, version: $version, at: time::now() };
+      // The idempotent result stores the very timestamp the write returns, so a replay is byte-identical to the first call.
+      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $principal, employees: $employees, reason: $reason, set_by: $employee, set_at: $next.created_at } };
+      RETURN { created_at: $next.created_at, set_by: $employee };
+      COMMIT;`;
+    const vars = {
+      actor: id('employee', actor.employeeId), employee: actor.employeeId, principal: id('principal', principalId),
+      employees: employees.map(employee => id('employee', employee)),
+      // task.current_employee stores the plain employee id (see the lease readers), so the guard compares strings.
+      ids: employees,
+      reason: input.reason, version, existing: input.principalId !== undefined, expected: input.expectedVersion ?? 0,
+      evidence, digest, idem, audit: id('audit', randomUUID()),
+    };
+    try {
+      const written = await this.txTask<{ created_at?: Date | string; set_by?: unknown }>(query, vars);
+      return principalView(principalId, employees, input.reason,
+        written.set_by instanceof RecordId ? asId(written.set_by) : String(written.set_by ?? actor.employeeId),
+        written.created_at);
+    } catch (error) {
+      const replayedAfterFailure = await this.replayPrincipal(idem, digest);
+      if (replayedAfterFailure) return replayedAfterFailure;
+      throw error;
+    }
+  }
+
+  /**
+   * Idempotent replay of a principal write: the same key and payload returns the stored result verbatim (same principal id, same
+   * setBy and setAt), and a different payload under that key conflicts. The stored row is the API view the first write returned.
+   */
+  private async replayPrincipal(ident: RecordId, payloadDigest: string): Promise<IdentityPrincipalView | undefined> {
+    const prior = await this.db.select<IdempotencyRow & { result?: unknown }>(ident);
+    if (!prior) return undefined;
+    if (prior.payload_digest !== payloadDigest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+    const result = prior.result as { id?: unknown; employees?: unknown[]; reason?: string; set_by?: string; set_at?: Date | string } | undefined;
+    if (!result?.id) return undefined;
+    // The driver hands record links back as RecordId values, so the stored view is normalized to the API's plain ids.
+    const id = result.id instanceof RecordId ? asId(result.id) : String(result.id);
+    const employees = (result.employees ?? []).map(value => value instanceof RecordId ? asId(value) : String(value));
+    return principalView(id, employees, result.reason ?? '', result.set_by ?? '', result.set_at);
+  }
+
+  /**
    * gm only (manage): records the code implementer of an engineering task whose bound implementer cannot continue
    * (withdrawn, departed, durable quota or runtime failure). The task must be in execute phase: ready or doing, or blocked
    * with an execute resume state. A block raised in review resumes in review, so it is refused like any review-phase task. One compare-and-set
@@ -2796,6 +3044,11 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
       UPDATE ONLY $target SET implementer_bound_at = time::now();
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
+      // Being bound as the implementer is the record that this employee writes this task's code (SYS-DISP IR01/Q1: a real
+      // implementer never reviews its own delivery, even after the binding moves on to the next engineer). The row carries the
+      // new implementer as its actor in the execute phase, so the contribution derivation reads it as authorship rather than
+      // treating a claim-only holder and a bound implementer alike.
+      CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
@@ -2806,7 +3059,8 @@ export class SurrealCompanyCore implements CompanyCore {
       target: id('employee', input.toEmployee), target_key: input.toEmployee,
       replacement: input.replacementReviewer ? id('employee', input.replacementReviewer) : undefined,
       excluded_ids: [...new Set([...facts.excluded, input.toEmployee])].map(employee => id('employee', employee)),
-      seen: contrib.version ?? -1, evidence, digest, idem, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      seen: contrib.version ?? -1, evidence, digest, idem, audit: id('audit', randomUUID()),
+      bound: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     };
     try {
       return view(await this.txTask<TaskRow>(query, vars));
@@ -2871,6 +3125,9 @@ export class SurrealCompanyCore implements CompanyCore {
       IF $holder != NONE { UPDATE employee SET active_task = NONE WHERE active_task = $task };
       UPDATE ONLY $target SET implementer_bound_at = time::now();
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'implementer_takeover', evidence: $evidence, version: $next.version, at: time::now() };
+      // The same authorship record the manager's takeover writes (see implementerTakeover): the new implementer is the
+      // person who writes this task's code and never reviews it.
+      CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key, automatic: true }, at: time::now() };
       CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
@@ -2879,7 +3136,7 @@ export class SurrealCompanyCore implements CompanyCore {
     const vars = {
       task: id('task', input.taskId), expected: input.expectedVersion, target: id('employee', input.toEmployee),
       target_key: input.toEmployee, seen: contrib.version ?? -1, evidence, digest, idem, actor,
-      audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      audit: id('audit', randomUUID()), bound: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
     };
     try {
       return view(await this.txTask<TaskRow>(query, vars));

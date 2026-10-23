@@ -32,7 +32,7 @@ const contributors = async (): Promise<ContributionFacts> => {
   historyCalls++;
   if (historyFails) throw new Error('synthetic read failure');
   const authors = emptyHistory ? [] : ['author', 'rework-submitter'];
-  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors };
+  return { authors, reviewers: [], unknown: [], ambiguous: false, excluded: authors, hands: [], strictExcluded: authors };
 };
 // One dispatch pass as far as the owner-facing answers are concerned: the observed sessions and the snapshot of the inputs it reads.
 let observed = { at: 0, sessions: new Map<string, Session>() };
@@ -42,7 +42,7 @@ const tick = async () => {
   const states = new Map<string, InstState>(insts.map(i => [i.id, sessions.get(i.id)?.state ?? 'unknown']));
   snapshot = await snapshotOf({ now: Math.floor(Date.now() / 1000), cfg: { providerMax: { codex: 3 } } as unknown as PassInputs['cfg'],
     defs, insts, states, health: new Map(), quotaBlocked: new Map(), tasks: taskRows, slots: new Map() },
-    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, readySince: async () => new Map() });
+    { opsRepo: '/ops', sidecar: true }, verdicts, { contributors, independenceScope: async () => undefined, readySince: async () => new Map() });
 };
 // Mutable answers for the whole-answer size test: the pulse reads its doing rows, recent accepts and daily brief from these.
 let briefOverride: Record<string, unknown> | undefined;

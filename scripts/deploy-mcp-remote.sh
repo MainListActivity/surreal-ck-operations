@@ -12,6 +12,7 @@
 # src/mcp/sync-gate.ts.
 set -eu
 . "$(dirname "$0")/review-wait-guard.sh"
+. "$(dirname "$0")/independence-guard.sh"
 
 host=${SCK_REMOTE_HOST:-ubuntu@129.146.179.37}
 # Deploys authenticate with a dedicated, passphrase-protected key that is never
@@ -64,6 +65,9 @@ git -C "$repo_root" archive --format=tar "$commit" > "$staging/release.tar"
 # remote runs the MCP service, not the plugin). Refused before any step reaches the host.
 mkdir -p "$staging/probe" && tar -x -f "$staging/release.tar" -C "$staging/probe"
 review_wait_target_supported "$staging/probe" core || { review_wait_refuse "$staging/probe" core; exit 1; }
+# IR06 C1: the same contract on the same payload (core scope: the remote runs the MCP service, not the plugin).
+# Refused before any step reaches the host.
+independence_target_supported "$staging/probe" core || { independence_refuse "$staging/probe" core; exit 1; }
 
 sed -n \
   -e 's/^SURREAL_ROOT_USER=/SURREAL_ROOT_USER=/p' \

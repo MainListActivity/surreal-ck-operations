@@ -111,7 +111,10 @@ test('dry-run is gm-only and read-only: it names the authors, the open reviewer 
   expect(row.authors).toEqual([authorId]);
   expect(row.excluded).toContain(authorId);
   expect(row.reviewers).toEqual([reviewerId]);
-  expect((row.timeline ?? []).map(entry => entry.role).filter(role => role !== 'none')).toEqual(['author', 'author', 'reviewer']);
+  // The timeline names every contribution row: the execute claim, the implementer binding it recorded, the submit and the
+  // review claim. The binding is its own row so a later takeover never erases who wrote the code.
+  expect((row.timeline ?? []).map(entry => entry.role).filter(role => role !== 'none')).toEqual(['author', 'author', 'author', 'reviewer']);
+  expect((row.timeline ?? []).map(entry => entry.action)).toContain('implementer_bound');
   expect((await core.getTask(tokens.gm, task.id)).version).toBe(beforeVersion);
   expect(await auditCount(task.id)).toBe(beforeAudit);
 

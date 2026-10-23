@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
-import { executeGateFor, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
+import { executeGateFor, managedRecencyOrder, PRIOR_HAND_WEIGHT_FACTOR, quotaBlockedProviders, staffingPool, type StaffingInput } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
+import { buildIndependenceIndex } from '../src/independence.ts';
+import { deriveContributors } from '../src/contributors.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 import type { ProviderQuota } from '../src/contracts.ts';
 
@@ -163,7 +165,7 @@ test('pool: review hard-excludes every author; other candidates keep their full 
     defs: [d], insts: [author, reviewer, fresh],
     states: new Map([['eng-author', 'idle'], ['eng-reviewer', 'idle'], ['eng-fresh', 'idle']]),
     task, excludeSubmitter: true,
-    recusal: { authors: new Set(['eng-author', 'eng-rework']) },
+    recusal: { authors: new Set(['eng-author', 'eng-rework']), hands: new Set() },
   }));
   const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
   expect(by.get('eng-author')!.eligible).toBe(false);
@@ -172,6 +174,33 @@ test('pool: review hard-excludes every author; other candidates keep their full 
   expect(by.get('eng-reviewer')!.eligible).toBe(true);
   expect(by.get('eng-reviewer')!.weight).toBeCloseTo(by.get('eng-fresh')!.weight);
   expect(by.get('eng-fresh')!.eligible).toBe(true);
+});
+
+// SYS-DISP IR01 (Q1): an ordinary task's plain review rule is unchanged by an independence policy elsewhere. A prior hand —
+// claimed execute, never wrote code — is demoted, not excluded, so a task never starves behind them.
+test('pool: a prior hand (claimed, never wrote code) is demoted but eligible, and a strict source excludes it outright', () => {
+  const d = def('d1');
+  const hand = inst('eng-hand');
+  const fresh = inst('eng-fresh');
+  const task = {} as StaffingInput['task'];
+  const base0: Partial<StaffingInput> = { defs: [d], insts: [hand, fresh],
+    states: new Map([['eng-hand', 'idle'], ['eng-fresh', 'idle']]), task, excludeSubmitter: true };
+  // No policy: the claim-only holder is eligible at the demoted weight (the pre-SYS-DISP rule).
+  const demoted = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) } }));
+  const byDemoted = new Map(demoted.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(byDemoted.get('eng-hand')!.eligible).toBe(true);
+  expect(byDemoted.get('eng-hand')!.weight).toBeCloseTo(byDemoted.get('eng-fresh')!.weight * PRIOR_HAND_WEIGHT_FACTOR);
+  expect(byDemoted.get('eng-hand')!.note).toContain('降权兜底');
+  // A strict independence source that names this task: the same holder is excluded outright, demotion never applies.
+  const index = buildIndependenceIndex({ policy: { mode: 'execute_handlers', excluded: [] },
+    sources: [{ taskId: 'P', facts: deriveContributors([{ action: 'claim', actor: 'eng-hand', phase: 'execute' }]) }],
+    principalOf: () => undefined });
+  const strict = staffingPool(base({ ...base0, recusal: { authors: new Set(['eng-author']), hands: new Set(['eng-hand']) },
+    independence: { kind: 'index', index } }));
+  const byStrict = new Map(strict.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(byStrict.get('eng-hand')!.eligible).toBe(false);
+  expect(byStrict.get('eng-hand')!.code).toBe('independence_conflict');
+  expect(byStrict.get('eng-fresh')!.eligible).toBe(true);
 });
 
 test('pool: without a recusal set (execute path or read failure) recusal is unchanged', () => {
@@ -184,7 +213,7 @@ test('pool: without a recusal set (execute path or read failure) recusal is unch
   // review 且贡献者读取失败（空集）：提交者仍由 excludeSubmitter 兜底拦住。
   const review = staffingPool(base({
     defs: [d], insts: [author], states: new Map([['eng-author', 'idle']]),
-    task, excludeSubmitter: true, recusal: { authors: new Set<string>() },
+    task, excludeSubmitter: true, recusal: { authors: new Set<string>(), hands: new Set() },
   }));
   expect(review.find(e => e.kind === 'reuse')!.reason).toBe(BLOCK_TEXT.author_recusal);
 });
@@ -323,4 +352,28 @@ test('managed Claude pool ignores subscription model quotas and provider capacit
   expect(staffingPool(p).every(e=>e.weight===1)).toBe(true);
   expect(staffingPool({...p,holding:new Set(['i1'])}).find(e=>e.key==='i1')?.code).toBe('held');
   expect(staffingPool({...p,defs:[{...d,enabled:false}]}).find(e=>e.key==='i1')?.code).toBe('def_disabled');
+});
+
+// 7cf393f8 B2 merge: main's all-managed pick orders by last wake, this lane's pool demotes a prior hand. Both rules hold: a
+// managed base weight is still cut by the prior-hand factor, and the deterministic pick still takes the hand only after fresh sessions.
+test('managed pool: the managed base weight composes with the prior-hand demotion instead of replacing it', () => {
+  const d = def('d1', { provider: 'claude', model: 'group/sck-haiku', quotaLimited: false });
+  const hand = inst('eng-hand', { provider: 'claude' });
+  const fresh = inst('eng-fresh', { provider: 'claude' });
+  const pool = staffingPool(base({ defs: [d], insts: [hand, fresh], states: new Map([['eng-hand', 'idle'], ['eng-fresh', 'idle']]),
+    recusal: { authors: new Set<string>(), hands: new Set(['eng-hand']) } }));
+  const by = new Map(pool.filter(e => e.kind === 'reuse').map(e => [e.ref, e]));
+  expect(by.get('eng-fresh')!.weight).toBe(1);
+  expect(by.get('eng-hand')!.weight).toBeCloseTo(PRIOR_HAND_WEIGHT_FACTOR);
+  expect(by.get('eng-hand')!.note).toContain('降权兜底');
+});
+
+test('managed recency order: least recently woken first, a prior hand last, and an unknown wake time after any recorded one', () => {
+  const at = (id: string, lastWakeAt?: number) => ({ id, lastWakeAt });
+  expect(managedRecencyOrder([at('a', 30), at('b', 10), at('c', 20)]).map(i => i.id)).toEqual(['b', 'c', 'a']);
+  // The hand is not dropped: with every fresh session unavailable it is still the pick. It just never outranks one.
+  expect(managedRecencyOrder([at('hand', 1), at('fresh', 99)], new Set(['hand'])).map(i => i.id)).toEqual(['fresh', 'hand']);
+  expect(managedRecencyOrder([at('hand', 1)], new Set(['hand'])).map(i => i.id)).toEqual(['hand']);
+  // No recorded wake is never a claim to be the stalest session.
+  expect(managedRecencyOrder([at('never'), at('woken', 50)]).map(i => i.id)).toEqual(['woken', 'never']);
 });

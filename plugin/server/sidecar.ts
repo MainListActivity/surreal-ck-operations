@@ -52,6 +52,10 @@ const BASE_TOOLS = [
   "implementer_takeover",
   "qa_observation_grant", "qa_observation_revoke", "qa_observation_status", "qa_observation_session",
   "qa_observation_read", "qa_observation_timeline", "qa_observation_text",
+  // Manage capability (gm/product) only in core: writes a task's independence policy under a compare-and-set; audited.
+  "independence_set",
+  // Manage capability only in core: registers an identity principal (the only cross-employee identity link); audited.
+  "identity_principal_set",
   // gm only in core (read-only dry-run of who authored and reviewed each engineering task).
   "contributor_dryrun",
 ];
@@ -831,6 +835,12 @@ export class SidecarPool {
       case "implementer_takeover": return core.implementerTakeover
         ? core.implementerTakeover(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose implementer_takeover"), { code: "temporarily_unavailable" }));
+      case "independence_set": return core.setIndependence
+        ? core.setIndependence(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose independence_set"), { code: "temporarily_unavailable" }));
+      case "identity_principal_set": return core.setIdentityPrincipal
+        ? core.setIdentityPrincipal(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose identity_principal_set"), { code: "temporarily_unavailable" }));
       case "get_model_evidence": return withinReplyCeiling(async()=> {
         if(!core.modelEvidence) throw new Error("Model evidence unavailable");
         return core.modelEvidence(cred,taskIdOf(args.taskId));

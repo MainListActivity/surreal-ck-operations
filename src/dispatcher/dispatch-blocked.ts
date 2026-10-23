@@ -26,8 +26,7 @@ export type WorkflowState = 'ready' | 'doing' | 'review';
 /** Stable machine codes. The text is for owners; codes drive grouping, notices and auto-clear. */
 export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
-  | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'no_candidate'
-  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
+  | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'independence_conflict' | 'no_candidate'  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
   | 'write_scope';
 
@@ -129,8 +128,7 @@ export interface EvaluateInput {
 
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
-  'author_recusal', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',
-  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
+  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
 ]);
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
@@ -140,10 +138,11 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   resources: '宿主机资源低于水位',
   max_running: '全局在办会话已达上限，等待空位',
   implementer_mismatch: '任务已绑定实现负责人，其他人不能接手代码',
-  implementer_unresolved: '多个作者且无实现负责人，需经理指定',
+  implementer_unresolved: '多名经手人且无实现负责人，需经理指定',
   implementer_unavailable: '实现人会话已失效，系统自动改派在岗工程员工',
   implementer_quota: '实现人订阅额度持续不可用，需等待恢复或经理接手',
   author_recusal: '本任务作者（写过或提交过）不能复核',
+  independence_conflict: '来源任务的经手人或经理指定回避的员工不能接手或复核，且暂无其它合格候选',
   no_candidate: '该岗位与仓库下没有任何编制或员工',
   session_busy: '会话占用中或异常',
   held: '持有在办任务',
@@ -164,8 +163,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
   paused: 'gm', budget: 'owner', resources: 'gm', max_running: 'gm',
-  implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', no_candidate: 'gm',
-  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
+  implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
   write_scope: 'gm', probe_busy: 'gm',
@@ -181,6 +179,7 @@ const RECOVERY: Record<BlockCode, string> = {
   implementer_unavailable: '系统自动改派，无需经理；暂无候选时等候选人空闲后自动重试',
   implementer_quota: '等待额度恢复，或经理用 implementer_takeover 接手',
   author_recusal: '经理增补独立复核人选（编制扩容或新员工），不能由作者自验',
+  independence_conflict: '经理增补独立候选人选（编制扩容或新员工），来源经手人不能接手或复核',
   no_candidate: '经理为该岗位或仓库增加编制或员工',
   session_busy: '等待在办任务完成或租约到期',
   held: '等待在办任务完成或租约到期',
@@ -209,6 +208,7 @@ const NEXT: Record<BlockCode, string> = {
   implementer_unavailable: '出现可派候选，系统自动改派',
   implementer_quota: '额度恢复或经理接手',
   author_recusal: '出现独立候选人选',
+  independence_conflict: '出现独立于来源任务的合格候选人选',
   no_candidate: '新增编制或员工',
   session_busy: '候选会话空闲',
   held: '在办租约结束或任务完成',
@@ -231,7 +231,7 @@ const NEXT: Record<BlockCode, string> = {
 const BASIS: Record<BlockCode, string> = {
   paused: 'tick:global-gate', budget: 'tick:global-gate', resources: 'tick:global-gate', max_running: 'tick:global-gate',
   implementer_mismatch: 'contribution-audit', implementer_unresolved: 'contribution-audit', implementer_unavailable: 'tick:session-status', implementer_quota: 'tick:provider-health', author_recusal: 'contribution-audit',
-  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
+  independence_conflict: 'contribution-audit',  no_candidate: 'tick:staffing-pool', session_busy: 'paseo:session-status', held: 'tick:staffing-pool', assigned: 'tick:staffing-pool',
   credential_file: 'tick:staffing-pool', track_mismatch: 'tick:staffing-pool', model_slot: 'tick:model-slots',
   quota: 'tick:quota-rows', provider_capacity: 'tick:quota-rows', seat_full: 'tick:staffing-pool',
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
@@ -253,6 +253,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   ],
   implementer_quota: [{ authority: 'gm', label: '经理用 implementer_takeover 接手，或等待额度恢复', tool: 'implementer_takeover', executable: true }],
   author_recusal: [{ authority: 'gm', label: '经理用 def_ensure 增补独立复核编制，或新增员工', tool: 'def_ensure', executable: true }],
+  independence_conflict: [{ authority: 'gm', label: '经理用 def_ensure 增补独立编制，或新增员工（来源经手人不能接手）', tool: 'def_ensure', executable: true }],
   no_candidate: [{ authority: 'gm', label: '经理用 def_ensure 为该岗位与仓库增加编制', tool: 'def_ensure', executable: true }],
   session_busy: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
   held: [{ authority: 'gm', label: '等待在办任务完成或租约到期', executable: false }],
@@ -337,15 +338,19 @@ export function managerActionKey(taskId: string, phase: string, since: number, r
   return `${taskId}:${phase}:${since}:${reason}`;
 }
 
-/** Owner-facing text of one reason. Quota and seat reasons read their candidates, so the verdict states the facts it rests on. */
+/** The distinct owner-facing reasons of a group's candidates, sorted, so a repeated tick reads the same. */
+const detailsOf = (list: readonly EvaluatedEntry[]): string =>
+  [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；');
+
+/**
+ * Owner-facing text of one reason. Quota, seat and independence reasons read their candidates, so the verdict states the facts it
+ * rests on: an independence conflict names its source task and excluded employee, and an unreadable source names itself.
+ */
 function reasonText(code: BlockCode, list: readonly EvaluatedEntry[], until: string | undefined, home: string): string {
   if (code === 'quota') return `${BLOCK_TEXT.quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
   if (code === 'implementer_quota') return `${BLOCK_TEXT.implementer_quota}，${until ? `恢复时间 ${until}` : '恢复时间未知'}`;
-  if (code === 'seat_full') {
-    return [...new Set(list.map(entry => entry.reason).filter((r): r is string => r !== undefined))].sort().join('；')
-      || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
-  }
-  return BLOCK_TEXT[code];
+  if (code === 'seat_full') return detailsOf(list) || `${BLOCK_TEXT.seat_full}（仓库 ${repoName(home)}）`;
+  if (code === 'independence_conflict' || code === 'unknown') return detailsOf(list) || BLOCK_TEXT[code];  return BLOCK_TEXT[code];
 }
 
 /** Evaluates one task phase. Pure: the same inputs always produce the same verdict and summary text. */

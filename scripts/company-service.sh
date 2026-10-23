@@ -12,6 +12,7 @@ components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/bun-runtime.sh"
 . "$(dirname "$0")/release-content.sh"
 . "$(dirname "$0")/review-wait-guard.sh"
+. "$(dirname "$0")/independence-guard.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -104,6 +105,12 @@ case "$action" in
     # symlink, the plugin repoint, the MCP restart or release pruning. There is no zero-row exception: a check that treated
     # "nothing waits yet" as safe would race a defer that lands right after it.
     review_wait_target_supported "$release" || { review_wait_refuse "$release"; exit 1; }
+    # IR06 C1: the same rule for the independence contract. Production data may already carry a policy
+    # (independence_set), so a target that does not enforce it would let an excluded contributor, its registered
+    # principal companion or a named employee claim. Refused here, before the bin copies, the active symlink, the
+    # plugin repoint, the MCP restart or release pruning. No zero-row exception either: "no policy today" would race
+    # a policy write, and would miss the data that already holds one.
+    independence_target_supported "$release" || { independence_refuse "$release"; exit 1; }
     check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     check_gate sidecar-review "$sha" || {
