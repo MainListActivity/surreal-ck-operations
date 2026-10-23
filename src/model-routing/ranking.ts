@@ -139,9 +139,11 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
       criteria: LEVELS,
     }])),
   );
+  // score is the expectation over the five levels, so a mid-ranked model is still placed correctly
+  // even though its confidence (mass on the single most likely level) is low. Only gaps are rejected.
   for (const key of keys) {
     const a = answers[key];
-    if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4 || (a.confidence ?? 0) < 0.6) throw Error("Jev 排序结果不完整或置信度不足，保留原顺序");
+    if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4) throw Error("Jev 排序结果不完整");
   }
   return facts
     .map((f, i) => ({ id: f.id, i, score: answers[keys[i]!]!.score! }))
@@ -201,7 +203,11 @@ export class RankingRefresher {
           const facts = members.map(id => byId.get(id));
           if (facts.some(f => !f)) throw Error("missing facts");
           orders[`sck-${tier}`] = await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[]);
-        } catch { errors.push(`${tier} 刷新失败，保留原顺序`); }
+        } catch (e) {
+          // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
+          this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
+          errors.push(`${tier} 刷新失败，保留原顺序`);
+        }
       }
       if (revision !== this.revision || this.stopped) return;
       if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
@@ -209,7 +215,8 @@ export class RankingRefresher {
       await this.deps.db.query(
         "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),error=$error,refresh_minutes=$minutes;",
         { orders, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
-    } catch {
+    } catch (e) {
+      this.deps.log?.(`模型排序刷新失败：${(e as Error).message.slice(0, 200)}`);
       if (revision === this.revision && !this.stopped) await this.deps.db.query(
         "UPSERT company_meta:model_ranking MERGE {at:time::now(),error:'刷新失败，保留现有顺序'};").catch(() => undefined);
     }
