@@ -7,9 +7,8 @@
 // accepts it. It also proves the source keeps the traceable identifiers, including the verified deploy job.
 import { afterAll, beforeAll, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
@@ -20,12 +19,16 @@ import type { ClaimResult } from '../src/contracts.ts';
 
 setDefaultTimeout(180_000);
 const NS = 'sck_n1r_core_1f462a97';
-// The same guard the release gate's fork file uses: the case runs only when a fork run is requested.
-const fork = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' || process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1' ? test : test.skip;
-const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
-const credDir = mkdtempSync(join(tmpdir(), 'sck-n1r-core-'));
-const enrollment = new LocalEnrollmentAdmin(database);
-const owner = new OwnerDesk(database);
+const forkEnv = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' || process.env.RUN_SCK_WORKTREE_FORK_TESTS === '1';
+// The same guard the release gate's fork file uses: the cases run only when a fork run is requested. A plain bridge run
+// has no fork environment, so this file must build nothing at import time — and it brings its own isolated database,
+// the way the other fork suites do, so it never reads or touches the product database.
+const fork = forkEnv ? test : test.skip;
+const dir = mkdtempSync(join(tmpdir(), 'sck-n1r-core-'));
+let server: ReturnType<typeof Bun.spawn> | undefined;
+let database: CompanyDatabase;
+let core: SurrealCompanyCore;
+let owner: OwnerDesk;
 const tokens: Record<string, string> = {};
 const key = () => crypto.randomUUID();
 
@@ -61,22 +64,35 @@ const gh = async (args: string[]): Promise<string> => {
   throw new Error(`unexpected gh ${args.join(' ')}`);
 };
 
-const core = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(gh) } });
 const proofOf = (c: ClaimResult) => ({ taskId: c.task.id, deliveryId: c.deliveryId, fence: c.fence, expectedVersion: c.task.version });
 
 beforeAll(async () => {
+  if (!forkEnv) return;
+  const reservation = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('fixture') });
+  const port = reservation.port!; reservation.stop(true);
+  const rootPassword = 'isolated-n1r-fork-only';
+  server = Bun.spawn([join(homedir(), '.surrealdb/surreal'), 'start', '--bind', `127.0.0.1:${port}`, '--user', 'root', '--pass', rootPassword,
+    '--log', 'error', `rocksdb:${dir}/db`], { stdout: 'ignore', stderr: 'ignore' });
+  let ready = false;
+  for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
+  if (!ready) throw new Error('the N1-R fork fixture did not become healthy');
+  database = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: 'root', rootPassword, namespace: NS, database: 'control_plane' });
   await database.connect();
-  await database.db.query(`DEFINE NAMESPACE IF NOT EXISTS ${NS};`);
-  await database.db.use({ namespace: NS });
-  await database.db.query('REMOVE DATABASE IF EXISTS control_plane;');
   await database.bootstrap();
+  const enrollment = new LocalEnrollmentAdmin(database);
+  owner = new OwnerDesk(database);
+  core = new SurrealCompanyCore(database, { acceptance: { adapter: createGithubActionsAdapter(gh) } });
   for (const [n, r, c] of [['gm','gm',['execute','review','manage']], ['eng-a','engineering',['execute','review']], ['qa','qa',['execute','review']]] as const)
     tokens[n] = await enrollment.enroll(`t-${n}`, r, c);
   const gate = await core.acceptanceGate(tokens.gm);
   await core.setAcceptanceGate(tokens.gm, { enabled: true, reason: 'N1-R core positive', expectedVersion: gate.version, idempotencyKey: key() });
-}, 30_000);
-afterAll(async () => { await database.close(); rmSync(credDir, { recursive: true, force: true }); });
-beforeEach(async () => { await database.db.query('UPDATE employee SET active_task = NONE;'); });
+}, 60_000);
+afterAll(async () => {
+  if (database) await database.close();
+  if (server) { server.kill(); await server.exited; }
+  rmSync(dir, { recursive: true, force: true });
+});
+beforeEach(async () => { if (forkEnv) await database.db.query('UPDATE employee SET active_task = NONE;'); });
 
 fork('N1-R positive: a trusted deployment of this run certifies the environment and a non-author accepts', async () => {
   const goal = await owner.createGoal({ text: 'N1-R 核心正例目标', source: 'owner:test', key: key(), tier: 'quick' });
