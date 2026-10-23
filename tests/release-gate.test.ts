@@ -21,6 +21,21 @@ function fakeBun(path: string, version: string, label: string) {
   chmodSync(path, 0o755);
 }
 
+// The files the sidecar-review gate runs (scripts/release-gate.sh): the sidecar regression plus the deployment-source association.
+const SIDECAR_REVIEW_FILES = [
+  'tests/dispatcher-sidecar.fork.test.ts',
+  'tests/deployment-source.test.ts',
+  'tests/deployment-source.fork.test.ts',
+];
+
+// A stand-in Bun that writes the arguments it was handed, one per line, so the shape of the call is visible: a quoted
+// multi-file list arrives as one argument holding spaces, which bun reads as a single filter that matches no file.
+function recordingBun(path: string, argvFile: string) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `#!/bin/sh\n[ "$1" = --version ] && { echo ${PINNED}; exit 0; }\nprintf '%s\\n' "$@" > "${argvFile}"\nprintf 'control=%s fork=%s\\n' "\${SCK_COMM_CONTROL:-0}" "\${RUN_SCK_CHANNEL_FORK_TESTS:-0}"\nexit 0\n`);
+  chmodSync(path, 0o755);
+}
+
 // The gate's first check is `uname -s` (Darwin only). Each run's uname answers `-s` with FAKE_KERNEL (Darwin unless a test sets it) and
 // runs the real uname for anything else, so the refusal cases reach their own checks on any host.
 function fakeUname(path: string) {
@@ -376,4 +391,46 @@ describe('release content is bound to the commit, not to the directory name', ()
     // The gate itself refuses a release whose content is not the commit it would record a pass for.
     expect(readFileSync(GATE, 'utf8')).toContain('release_matches_commit "$release" "$sha" "$gate_ops_repo"');
   });
+});
+
+// SYS02 补修 4: the sidecar-review gate names three test files (one name went to three in the N1-R commit). Bun reads every
+// argument as a filter, so the list has to arrive as three arguments. Handed the whole list as one quoted argument, bun prints
+// "filters did not match any test files" and the gate records a fail for a healthy release — which is what blocked the 9cb39a24
+// deploy leg on cefec68f.
+test.skipIf(!existsSync('/usr/bin/python3'))('the sidecar-review gate hands bun the three test files as separate arguments', () => {
+  const home = serviceHome();
+  try {
+    // The gate must name exactly these files: the list here and the list the script runs may not drift apart.
+    expect(readFileSync(GATE, 'utf8')).toContain(SIDECAR_REVIEW_FILES.join(' '));
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    for (const file of SIDECAR_REVIEW_FILES) writeFileSync(join(release, file), '');
+    const argvFile = join(home, 'argv.txt');
+    recordingBun(join(home, 'runtime-bun', 'bin', 'bun'), argvFile);
+    const run = sh(GATE, ['sidecar-review', release], home);
+    expect(run.code).toBe(0);
+    const argv = readFileSync(argvFile, 'utf8').split('\n').filter(Boolean);
+    expect(argv).toEqual(['test', ...SIDECAR_REVIEW_FILES]);
+    // The defect's signature: one argument carrying the whole list instead of three paths.
+    expect(argv.filter(arg => arg.includes(' '))).toEqual([]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!existsSync('/usr/bin/python3'))('the slow-pipe gate still hands bun one file, with the control mode', () => {
+  const home = serviceHome();
+  try {
+    const release = join(home, 'releases', SHA);
+    mkdirSync(join(release, 'tests'), { recursive: true });
+    writeFileSync(join(release, 'tests', 'comm-slow-pipe.test.ts'), '');
+    const argvFile = join(home, 'argv.txt');
+    recordingBun(join(home, 'runtime-bun', 'bin', 'bun'), argvFile);
+    const run = sh(GATE, ['slow-pipe', release], home);
+    expect(run.code).toBe(0);
+    expect(readFileSync(argvFile, 'utf8').split('\n').filter(Boolean)).toEqual(['test', 'tests/comm-slow-pipe.test.ts']);
+    expect(readFileSync(join(home, 'gates', 'comm-slow-pipe', `${SHA}.log`), 'utf8')).toContain('control=1');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
