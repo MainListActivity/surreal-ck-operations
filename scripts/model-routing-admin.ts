@@ -130,7 +130,7 @@ try {
           try {await workforce.retire(String(e.id?.id),'模型路由回滚，停用迁移新增编制','rotation');await paseo.archive(e.paseo_agent_id);}
           catch {pending++;}
         } else {
-          if(e.model) await setAgentModel(e.paseo_agent_id,e.model);
+          if(e.model && !await setAgentModel(e.paseo_agent_id,e.model)) {pending++;continue;}
           await paseo.reload(e.paseo_agent_id);
         }
       }

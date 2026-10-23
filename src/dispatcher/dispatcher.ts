@@ -1774,15 +1774,17 @@ export class Dispatcher {
         // A recent eval dispatch (LLM or Jev in flight) pauses both engines for this task.
         const last = await wf.lastDispatch(task.id, task.version, 'eval');
         const dispatched = last && now - last.at < cfg.redispatchMinutes * 60;
-        if (!dispatched && jevReady && task.evalAttempts < 3) {
+        let fullHistory = task.row.model_eval_full_history===true;
+        if (!dispatched && !fullHistory && jevReady && task.evalAttempts < 3) {
           const outcome = await this.jevEvaluate(task, cfg, report);
           if (outcome === 'done') { report.evals.push(task.id); continue; }
           if (outcome === 'retry') continue;
+          if (outcome === 'full-history') fullHistory=true;
         }
         // quick-tier work is small by definition: the Jev verdict (even low-confidence) is good
         // enough, and a whole LLM judge session costs more than the task did. eval_quick_llm
         // re-enables escalation for quick tasks.
-        const llmReady = llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
+        const llmReady = fullHistory ? defs.some(d=>d.role==='eval' && d.enabled) : llmCapable && (cfg.evalQuickLlm || task.goalTier !== 'quick');
         if (!llmReady) {
           if (cfg.evalEngine === 'jev' || task.evalAttempts >= 3) {
             await this.notice(`eval-stuck:${task.id}`,
@@ -1811,14 +1813,17 @@ export class Dispatcher {
    * Returns 'done' when scorecards were written, 'retry' to try again next tick,
    * 'escalate' to hand the task to the LLM eval role.
    */
-  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate'> {
+  private async jevEvaluate(task: SupervisedTask, cfg: CompanyConfig, report: TickReport): Promise<'done' | 'retry' | 'escalate' | 'full-history'> {
     const { workforce: wf, jev } = this.deps;
     if (!jev) return 'escalate';
     const attempts = await wf.bumpEvalAttempt(task.id);
     let parsed: JevScoreAnswers;
     try {
       const state = await wf.evalState(task.id);
-      if(state.timelineTruncated && state.modelExecutions?.length) return 'escalate'; // eval reads complete paged history
+      if(state.timelineTruncated && state.modelExecutions?.length) {
+        await wf.requireFullModelEvaluation(task.id);
+        return 'full-history'; // persisted across retries/restarts; eval reads complete paged history
+      }
       const questions = jevEvalQuestions(state.participants);
       const modelJudgements: Array<{key:string;employee:string;model:string}> = [];
       for (const employee of state.participants) {

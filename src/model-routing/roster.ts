@@ -8,7 +8,7 @@ export interface RoutingDef {
 /** One Claude definition per role. Story-author definitions and their subscriptions remain untouched. */
 export function planRoutingRoster(defs: RoutingDef[]): Array<RoutingDef> {
   const changes: RoutingDef[] = [];
-  for (const role of [...new Set(defs.filter(d=>d.enabled && d.role!=='story-author').map(d=>d.role))]) {
+  for (const role of [...new Set([...defs.filter(d=>d.enabled && d.role!=='story-author').map(d=>d.role),'eval'])]) {
     const roleDefs = defs.filter(d=>d.role===role);
     const selected = roleDefs.filter(d=>d.provider==='claude').sort((a,b)=>Number(b.enabled)-Number(a.enabled)||a.id.localeCompare(b.id))[0];
     const id = selected?.id ?? `${role}-claude`;

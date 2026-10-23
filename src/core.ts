@@ -218,6 +218,7 @@ interface TaskRow {
   /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
   quota_resets_at?: number | null;
   evaluated_at?: string;
+  model_eval_full_history?: boolean;
   eval_via?: string;
   eval_attempts?: number;
   jev_release_version?: number;
