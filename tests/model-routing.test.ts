@@ -397,11 +397,10 @@ test("controller publishes complete model groups before selector options and rer
   );
   await controller.refresh(true);
   expect(status.models).toHaveLength(3);
-  expect(calls.at(-1)?.slice(0, 3)).toEqual([
-    "plugin",
-    "options",
-    "sck-performance",
-  ]);
+  // A path plugin is addressed by its absolute path; the bare stem is "no plugin" to magpie.
+  const selector = join(scratch, "controller", "model-routing", "sck-performance.gateway.js");
+  expect(calls.find((c) => c[0] === "plugin" && c[1] === "add")).toEqual(["plugin", "add", selector]);
+  expect(calls.at(-1)?.slice(0, 3)).toEqual(["plugin", "options", selector]);
   const options = JSON.parse(calls.at(-1)![3]!);
   expect(options.routes["group/sck-engineering-high"][0].model).toBe(
     "claude/claude-opus-5-5",
