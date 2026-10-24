@@ -9,6 +9,12 @@ export function magpieEnvironment(): NodeJS.ProcessEnv {
     ),
   );
 }
+/**
+ * How long an employee session keeps the member that answered it. `auto` keeps it while the prompt
+ * cache is worth keeping and routes afresh after that, so a member that filled up (a vendor queue
+ * behind a few seats) does not hold every long-lived lease forever. magpie stores it as no field.
+ */
+export const GROUP_STAYS = "auto";
 export interface ManagedGroup {
   id: string;
   models: string[];
@@ -94,7 +100,7 @@ export async function saveMagpieGroups(
           name: group.id,
           members: group.models,
           routing: "order",
-          affinity: "session",
+          affinity: GROUP_STAYS,
         }),
         signal: AbortSignal.timeout(45000),
       });

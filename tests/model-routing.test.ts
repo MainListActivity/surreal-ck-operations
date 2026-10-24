@@ -375,6 +375,7 @@ test("controller writes only the four magpie tier groups, removes the retired se
   mkdirSync(join(home, "model-routing"), { recursive: true });
   writeFileSync(join(home, "model-routing", "groups.json"), JSON.stringify({ "sck-route-haiku-best": "x", __selector: "y", __options: "z" }));
   const store: Record<string, string[]> = {};
+  const affinity: Record<string, string> = {};
   const controller = new ModelRoutingController(db as any, home, "unused", {
     fetch: (async () =>
       Response.json({
@@ -386,15 +387,16 @@ test("controller writes only the four magpie tier groups, removes the retired se
       })) as unknown as typeof fetch,
     command: async (args) => {
       calls.push(args);
-      if (args[0] === "group" && args[1] === "add") store[args[2]!] = args[3]!.slice(7).split(",");
+      if (args[0] === "group" && args[1] === "add") { store[args[2]!] = args[3]!.slice(7).split(","); affinity[args[2]!] = args.find((x) => x.startsWith("stays="))!.slice(6); }
     },
     groups: () => store,
+    affinity: () => affinity,
   });
   await controller.refresh(true);
   expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
   const groups = calls.filter((c) => c[0] === "group" && c[1] === "add");
   expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
-  expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=session"))).toBe(true);
+  expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=auto"))).toBe(true);
   expect(groups.every((c) => !c.join(" ").includes("mystery"))).toBe(true);
   expect(calls).toContainEqual(["plugin", "rm", join(home, "model-routing", "sck-performance.gateway.js")]);
   expect(calls).toContainEqual(["group", "rm", "sck-route-haiku-best"]);
@@ -403,6 +405,10 @@ test("controller writes only the four magpie tier groups, removes the retired se
   const n = calls.length;
   await controller.refresh(true);
   expect(calls.length).toBe(n);
+  // Groups written by the release that pinned every lease (stays=session) are rewritten though their members match.
+  affinity["sck-haiku"] = "session";
+  await controller.refresh(true);
+  expect(calls.slice(n).filter((c) => c[1] === "add").map((c) => [c[2], c.at(-1)])).toEqual([["sck-haiku", "stays=auto"]]);
 });
 
 test("removing a route group that is already gone does not fail the sync", async () => {
@@ -561,7 +567,7 @@ test("magpie management batches group saves, keeps DB secrets out of child env a
     expect(saved.rows[0]).toMatchObject({
       members: ["relay/a"],
       routing: "order",
-      affinity: "session",
+      affinity: "auto",
     });
     expect(() => process.kill(saved.pid, 0)).toThrow();
   } finally {
