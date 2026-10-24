@@ -41,7 +41,7 @@ import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBS
 
 import { CompanyError } from './core-errors.ts';
 import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
-import { createCompanyGithubGateway } from './external-actions.ts';
+import { createCompanyGithubGateway, githubRepoSlug } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
@@ -3254,35 +3254,57 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authorized(credential);
     return this.dispositions.requestExternalAction(actor, input, this.externalActionGateway(),
       async (prerequisite, target) => {
-      if (actor.role === 'gm' || actor.role === 'product') return;
       if (!prerequisite) throw new CompanyError('forbidden', 'Cancelling a CI run requires manager capability or the task the run belongs to');
       const task = await this.db.select<TaskRow>(id('task', prerequisite.taskId));
       if (!task) throw new CompanyError('not_found', 'Prerequisite task not found');
-      // 当事人只认「这个人跟这条任务有关系」：当前持有人、实现者、提交人。**不再**拿岗位与任务的执行岗/评审岗比对——
-      // 那等于让任何一个同岗位员工对仓库里任何一条任务都成为当事人，于是任何 engineering 员工都能取消任意 run（QA V2）。
-      const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
-        task.submitted_by === actor.employeeId;
-      if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
-      // run 还必须绑定到这条前置任务：它的 head 分支要等于任务登记的树分支。任务没有登记分支时失败关闭——
+      // 当事人这一关只对非经理生效。
+      if (actor.role !== 'gm' && actor.role !== 'product') {
+        // 当事人只认「这个人跟这条任务有关系」：当前持有人、实现者、提交人。**不再**拿岗位与任务的执行岗/评审岗比对——
+        // 那等于让任何一个同岗位员工对仓库里任何一条任务都成为当事人，于是任何 engineering 员工都能取消任意 run（QA V2）。
+        const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
+          task.submitted_by === actor.employeeId;
+        if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
+      }
+      // 经理（gm/product）按设计不受 run↔任务绑定约束：他们的取消权本来就是仓库级的应急动作，而记录里仍然有前置任务、
+      // 前置版本与真实员工 ID。绑定核对是对**非经理当事人**的约束——防止任何员工把别人的 run 说成自己任务的 run。
+      // 依据照实记成 manager_exempt，不假装核过绑定。
+      if (actor.role === 'gm' || actor.role === 'product') return { binding: 'manager_exempt' as const };
+      // 绑定核对：run 必须绑定到这条前置任务，head 分支要等于任务登记的树分支。任务没有登记分支时失败关闭——
       // 没有可核对的身份就不能声称这条 run 属于它（QA V2）。
       const branch = task.worktree?.branch;
       if (!branch) {
         throw new CompanyError('forbidden', 'Cancelling a CI run requires the prerequisite task to have a registered branch to bind the run to');
       }
       const observed = await this.externalActionGateway().observeRun(target);
-      if (observed.readable !== true || observed.exists !== true) {
+      // QA D4：读得到、但 provider 说不存在这条 run 是一个**确定的**事实（不是「读不出来」），所以要放它走到网关，
+      // 由网关落成 refused；只有真的读不出来（网络/权限）才是无法核对、必须在这里就拒绝的情形。
+      if (observed.readable !== true) {
         const why = (observed as { error?: string }).error ?? 'the run is not readable';
         throw new CompanyError('forbidden', `The run ${target.repo}#${target.runId} could not be bound to task ${prerequisite.taskId}: ${why}`);
       }
-      if ((observed.headBranch ?? '') !== branch) {
+      if (observed.exists === true && (observed.headBranch ?? '') !== branch) {
         throw new CompanyError('forbidden',
           `Run ${target.repo}#${target.runId} is on branch ${observed.headBranch ?? 'unknown'}, not the prerequisite task's registered branch ${branch}`);
       }
+      // QA D5：仓库绑定。任务登记的仓库标识能比（GitHub slug，或能解析出 slug 的 remote）时必须与 run 的仓库相同；
+      // 登记的是本地路径这类比不出 slug 的值时只按分支绑定，并把「依据是分支」如实写进审计证据，不谎称核过仓库。
+      const declared = task.worktree?.repo ?? '';
+      const declaredSlug = declared ? githubRepoSlug(declared) : undefined;
+      if (declaredSlug && declaredSlug.toLowerCase() !== target.repo.toLowerCase()) {
+        throw new CompanyError('forbidden',
+          `Run ${target.repo}#${target.runId} is in repository ${target.repo}, not the prerequisite task's registered repository ${declaredSlug}`);
+      }
+      return { binding: declaredSlug ? 'repo+branch' as const : 'branch_only' as const };
     });
   }
 
   async reconcileCiRuns(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }) {
-    const actor = await this.authorized(credential);
+    // AC03/QA D6：对账是**写**账本的动作（它为带外变更建 unknown_actor 行），所以它和事后归因一样是经理的判断：
+    // 普通员工不得用它往账本里写行。只读的那一面是 list_external_actions，不受影响。
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm' && actor.role !== 'product') {
+      throw new CompanyError('forbidden', 'Reconciling external actions requires the gm or product role');
+    }
     if (!Array.isArray(input.runs) || input.runs.length === 0 || input.runs.length > 50) throw new CompanyError('invalid', 'runs must hold 1-50 entries');
     return this.dispositions.reconcileExternalActions(actor, input, this.externalActionGateway());
   }

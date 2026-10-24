@@ -199,10 +199,14 @@ run('SYS03 manager disposition on the company fork', () => {
       decidedAudits: await countRows("SELECT count() AS n FROM audit WHERE task = $t AND action = 'disposition_decided' GROUP ALL;", { t: id('task', e2.id) }),
       versionMovedBy: e2After.version - e2VersionBefore,
     };
-    // A replay from a different employee (or after a restart) reads the same result instead of writing a second one.
-    const replay = await core.decideDisposition(gmB, { ...decideInput, claimToken: 'replay-without-claim-token', episodeVersion: 1,
-      idempotencyKey: 'sys03-decide-e2-replay' });
-    obs.replay = { outcome: replay.outcome, taskVersion: (replay.decision?.result as { taskVersion?: number } | undefined)?.taskVersion };
+    // QA D1：重放只对**当前认领的持有人**开放，而且要它自己的 token。同一持有人（或重启后的同一个会话）重放读到
+    // 同一份回执、不写第二条；另一个员工拿着别人的 token 重放只能被拒绝——上一版这里返回成功，等于把别人那条
+    // 决定的内容连同「已重放」的假象交给任何员工。跨员工接手是另一条受控路径（claim_disposition 的 takeover）。
+    const replay = await core.decideDisposition(gmA, { ...decideInput, idempotencyKey: 'sys03-decide-e2-replay' });
+    const leakedReplay = await core.decideDisposition(gmB, { ...decideInput, idempotencyKey: 'sys03-decide-e2-leaked' })
+      .then(() => 'allowed', (error: Error) => (error as { code?: string }).code ?? error.message);
+    obs.replay = { outcome: replay.outcome, leaked: leakedReplay,
+      taskVersion: (replay.decision?.result as { taskVersion?: number } | undefined)?.taskVersion };
     obs.replayMovedTask = (await rowOf(e2.id)).version - e2After.version;
 
     // ---- AC02: the repair decision builds exactly one chain and takes the source episode out of the gate.
@@ -599,10 +603,12 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(ledger.deferredAudits).toBe(1);
     expect(ledger.decidedAudits).toBe(1);
     expect(ledger.versionMovedBy).toBe(1);
-    const replay = obs.replay as { outcome: string; taskVersion?: number };
+    const replay = obs.replay as { outcome: string; taskVersion?: number; leaked: string };
     expect(replay.outcome).toBe('replayed');
     expect(replay.taskVersion).toBeNumber();
     expect(obs.replayMovedTask).toBe(0);
+    // QA D1：同一个 token 从别人手里交出来不算重放，只算越权读别人的决定。
+    expect(replay.leaked).toBe('forbidden');
   });
 
   test('AC02: one repair decision builds one chain and takes the source episode out of the gate', () => {

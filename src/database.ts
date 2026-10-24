@@ -149,6 +149,10 @@ export class CompanyDatabase {
       CREATE ONLY company_meta:policy_epoch CONTENT { value: 0 };
     };`);
     await this.db.query('UPDATE company_meta:installation SET schema_version = 35 WHERE schema_version < 35;');
+    // SYS03 第三轮（QA v23 退回，编号 036）：重放围栏与出口占位两个新字段。只新增字段，旧版 release 读到多出来的
+    // 字段会忽略、新版对旧行按 NONE 兜底，所以新旧两版能同时对着同一批行工作（RB01）。
+    await this.db.query(loadSchema('036-disposition-replay-fence.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 36 WHERE schema_version < 36;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
