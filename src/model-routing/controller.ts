@@ -160,7 +160,7 @@ export class ModelRoutingController {
   }
   /** Owner's decision on a vendor name; a model not yet in any group is placed by it on the next sync. */
   async setAlias(model: string, slug: string | null): Promise<{synchronized:boolean}> {
-    while(this.pending) await this.pending;
+    while(this.pending) await this.pending.catch(()=>undefined);
     let synchronized=true;
     const operation=async()=>{
       const dir = join(this.home, "model-routing");

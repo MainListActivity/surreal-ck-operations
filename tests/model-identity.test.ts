@@ -197,3 +197,22 @@ test('manual save reports successful persistence even when the following group s
  expect(readInventory(home).decisions['vendor/opaque']).toMatchObject({by:'owner',slug:'glm-5-3'});
  const restarted=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});await restarted.c.refresh(true);expect(restarted.asks()).toBe(0);
 });
+
+test('a failed in-flight background sync cannot reject a queued manual confirmation before saving',async()=>{
+ const home=scratch();const f=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});
+ let entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+ f.io.jev.ask=async()=>{entered();await gate;throw Error('fixture unavailable');};
+ const refresh=f.c.refresh(true);await started;
+ const manual=f.c.setAlias('vendor/opaque','glm-5-3');
+ const failed=refresh.catch(error=>error);release();
+ expect((await failed).message).toBe('fixture unavailable');
+ expect(await manual).toEqual({synchronized:true});
+ expect(readInventory(home).decisions['vendor/opaque']).toMatchObject({by:'owner',slug:'glm-5-3'});
+});
+test('inherited property names are not valid Jev answer choices',async()=>{
+ useBenchmarks(ROWS);
+ for(const choice of ['constructor','toString','__proto__']){
+  await expect(askAlias({model:'f',ask:async()=>({model:'f',answers:{same:{type:'choice',choice,confidence:1}}})},{id:'vendor/opaque'})).rejects.toThrow();
+ }
+});

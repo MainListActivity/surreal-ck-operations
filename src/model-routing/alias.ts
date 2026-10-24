@@ -80,7 +80,7 @@ export async function askAlias(
     { same: { type: "choice", instructions: `${model.id} 与下列哪个 Artificial Analysis 榜单模型是同一个模型？`, criteria: options } },
   );
   const a = answers.same;
-  if(a?.type!=='choice'||!a.choice||!(a.choice in options)||!Number.isFinite(a.confidence)||a.confidence!<0||a.confidence!>1)throw Error('Jev model identity answer is incomplete');
+  if(a?.type!=='choice'||!a.choice||!Object.hasOwn(options,a.choice)||!Number.isFinite(a.confidence)||a.confidence!<0||a.confidence!>1)throw Error('Jev model identity answer is incomplete');
   const picked = a?.type === "choice" && a.choice && a.choice !== "none" ? candidates[Number(a.choice.slice(1))] : undefined;
   const confident = (a?.confidence ?? 0) >= ALIAS_CONFIDENCE;
   return {
