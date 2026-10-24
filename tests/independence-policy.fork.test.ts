@@ -97,7 +97,8 @@ test('a fresh bootstrap loads the independence migrations: task has both policy 
   const [info] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(info?.fields ?? {})).toEqual(expect.arrayContaining(['independence', 'independence_guard']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(29);
+  // 标记只说明 029 已被 bootstrap 加载，具体数字会随后续迁移前进（其它线还在往上加），所以这里不钉死版本号。
+  expect(marker?.[0]?.schema_version).toBeGreaterThanOrEqual(29);
   // The identity link is additive: the field exists on employee, and no employee carries a principal until a manager registers one.
   const [table] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE employee;');
   expect(Object.keys(table?.fields ?? {})).toContain('principal');

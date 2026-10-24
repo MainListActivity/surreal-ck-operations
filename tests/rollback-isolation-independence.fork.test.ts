@@ -313,7 +313,8 @@ run('IR06 rollback isolation: a policy written by the new code, then the deploye
     expect(oldSurface).toEqual({ setIndependence: false, setIdentityPrincipal: false, independenceGate: false });
     // The data survives both bootstraps: the old schema already holds the policy and the principal link.
     expect(schemaFacts.oldBefore).toBe(27);
-    expect(schemaFacts.afterNew).toBe(29);
+    // 新版 bootstrap 把标记推到本项目当前的 schema 版本：只要求越过 029（后续线的迁移还会往上加）。
+    expect(schemaFacts.afterNew).toBeGreaterThanOrEqual(29);
     expect(schemaFacts.oldIndependenceField).toBe(true);
     expect(schemaFacts.oldPrincipalField).toBe(true);
     // The source really has a contributor, and the registered principal really links the two sessions.

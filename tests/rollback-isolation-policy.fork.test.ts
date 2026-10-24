@@ -286,9 +286,9 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
   test('前提：部署中的 release 没有策略面，新版只追加迁移，状态字面量一个都没多', () => {
     expect(oldSurface).toEqual({ hasPolicySet: false, hasPolicyPlan: false, hasPolicyEnforce: false, hasVerdict: false, policyFile: false });
     expect(schemaFacts.oldBefore).toBe(27);
-    expect(schemaFacts.afterNew).toBe(34);
-    // 旧版在自己的 schema 上再跑一次 bootstrap，读到的是 034 的库：标记不回退，数据没被改写。
-    expect(schemaFacts.afterOldBoot).toBe(34);
+    expect(schemaFacts.afterNew).toBeGreaterThanOrEqual(34);
+    // 旧版在自己的 schema 上再跑一次 bootstrap，读到的还是新版升上来的库：标记不回退，数据没被改写。
+    expect(schemaFacts.afterOldBoot).toBe(schemaFacts.afterNew);
     expect(vocabulary.old).toEqual(vocabulary.current);
     expect(vocabulary.current).toContain('blocked');
   });
