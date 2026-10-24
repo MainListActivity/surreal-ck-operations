@@ -8,6 +8,8 @@ import {
   domainOfPayload, domainPayload, impliedIntent, normalizePayload, policyActiveAt, policyDigest, policyHash, renderContract,
   resolveEffective, type EffectiveContract, type PolicyRow, type PolicyScopeLink,
 } from '../src/policy.ts';
+import { scanInFlightTasks } from '../src/policy-store.ts';
+import { answerBytes, fitCount, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 
 const chain = (over: Partial<Record<'task' | 'goal' | 'project', string>> = {}): PolicyScopeLink[] => [
   ...(over.task ? [{ scope: 'task' as const, scopeRef: over.task }] : []),
@@ -262,5 +264,117 @@ describe('渲染与差异', () => {
     expect(diff[0]?.after).toContain('w v2');
     expect(contractDiff(after, after)).toEqual([]);
     expect(renderContract(resolveEffective([], chain(), 3, 100))).toContain('无机器策略生效');
+  });
+});
+describe('R1 候选集扫描：与判定同源、分页读到底、截断显式', () => {
+  /**
+   * 假 DB：每一页都按**当下的** rows 重新排序再切页，与真实库"每次查询都读现在这张表"一致。
+   * 这一点是必须的：若在建 fake 时就把排序结果快照下来，并发插入的那条永远读不到，
+   * 用例会变成空测（偏移量实现也能通过），证明不了 keyset 的任何事。
+   * 排序按 (created_at DESC, id DESC)，与真实扫描的 ORDER BY 同一个全序。
+   */
+  const pagingDb = (rows: Array<{ id: string; created_at: number }>) => {
+    const queries: string[] = [];
+    const order = () => [...rows].sort((left, right) => right.created_at - left.created_at || (left.id < right.id ? 1 : -1));
+    const seen = { injected: 0 };
+    return {
+      queries,
+      seen,
+      db: {
+        async query<T>(sql: string, vars?: Record<string, unknown>): Promise<T> {
+          queries.push(sql);
+          const size = Number(/LIMIT (\d+)/.exec(sql)?.[1] ?? 0);
+          if (!size) throw new Error(`scan did not page: ${sql}`);
+          const at = vars?.after_at as number | undefined;
+          const id = vars?.after_id as string | undefined;
+          const start = Number(/START (\d+)/.exec(sql)?.[1] ?? 0);
+          const live = order();
+          if (live.some(row => row.id === 'task-newest')) seen.injected += 1;
+          // 偏移量也照真实语义实现：变异实验（把实现换回 LIMIT/START）才能在被如实模拟的库上变红，
+          // 而不是因为假库不认 START 而变红。keyset 从不发 START，start 恒为 0。
+          const rest = at === undefined ? live
+            : live.filter(row => row.created_at < at || (row.created_at === at && row.id < (id ?? '')));
+          return [rest.slice(start, start + size)] as T;
+        },
+      },
+    };
+  };
+
+  test('读到底：跨页取回全部在办任务，一条都不丢', async () => {
+    const all = Array.from({ length: 5 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
+    const { db, queries } = pagingDb(all);
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(db, 2, 10);
+    expect(scan.rows.map(row => row.id)).toEqual(all.map(row => row.id));
+    expect(scan.scanned).toBe(5);
+    expect(scan.truncated).toBe(false);
+    expect(scan.scanLimit).toBe(20);
+    // 三页：2 + 2 + 1，最后一页不满 → 停止；没有"读满一页就当读完"。
+    expect(queries).toHaveLength(3);
+  });
+
+  test('keyset 翻页在并发写入下不重不漏（偏移量翻页会整页错位）', async () => {
+    // 第一页读完后，库的最前面插进一条新任务：偏移量翻页会把第二页整体往后挤（重复一条并漏掉最后一条），
+    // keyset 翻页不会——它按 (created_at, id) 接着上一条往下读。
+    // 这条用例必须真的读到那条并发插入的行（seen.injected > 0），否则它证明不了任何事。
+    const all = Array.from({ length: 6 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
+    const { db, seen } = pagingDb(all);
+    let calls = 0;
+    const racing = {
+      query: async <T>(sql: string, vars?: Record<string, unknown>): Promise<T> => {
+        calls += 1;
+        if (calls === 2) all.unshift({ id: 'task-newest', created_at: 999 }); // 并发新建：偏移量翻页会漏一条并重复一条
+        return await db.query<T>(sql, vars);
+      },
+    };
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(racing, 2, 10);
+    const ids = scan.rows.map(row => row.id);
+    expect(seen.injected).toBeGreaterThan(0);   // 那条并发插入的行确实被后续查询读到了：不是空测
+    expect(new Set(ids).size).toBe(ids.length); // 不重
+    expect(ids).toEqual(['task-0', 'task-1', 'task-2', 'task-3', 'task-4', 'task-5']); // 不漏（新建的那条不挤掉别人）
+  });
+
+  test('读满上限：显式报告 truncated，绝不静默截断', async () => {
+    const all = Array.from({ length: 9 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
+    const { db, queries } = pagingDb(all);
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(db, 2, 2);
+    expect(scan.scanned).toBe(4);
+    expect(scan.scanLimit).toBe(4);
+    expect(scan.truncated).toBe(true);
+    expect(queries).toHaveLength(2);
+  });
+
+  test('候选集没有 policy_hash 预筛：SQL 里既没有该条件，也没有隐式上限', async () => {
+    const { db, queries } = pagingDb([]);
+    await scanInFlightTasks(db, 200, 50);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).not.toContain('policy_hash');
+    expect(queries[0]).toContain("state NOT IN ['done', 'void']");
+    expect(queries[0]).toContain('LIMIT 200');
+    // 第一页不带 keyset 条件；后续页才有（见上一条）。
+    expect(queries[0]).not.toContain('after_at');
+  });
+});
+
+describe('R1(b) 试算分页的字节边界', () => {
+  test('页大小的选择让每一页都在 48 KiB 预算内（按真实序列化大小裁，不按条数猜）', () => {
+    // policy_plan 的 pagePolicyPlan 用 answerBytes 做 fitCount；这里用同一度量核对"一页装不下就少装几条"的边界。
+    const entry = (index: number) => ({ id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      title: `受影响任务 ${index} —— 一个足够长的标题，用来逼近响应预算`, state: 'ready' as const,
+      fromHash: 'd'.repeat(64), toHash: 'e'.repeat(64), losesAuthorization: true,
+      reason: 'policy forbids role engineering from taking code work here' });
+    const page = (count: number) => ({ scopeChain: [{ scope: 'company' as const }],
+      before: { hash: 'a'.repeat(64), version: 1, domains: [] }, after: { hash: 'b'.repeat(64), version: 2, domains: [] }, diff: [],
+      scanned: 500, scanLimit: 10_000, truncated: false, planHash: 'c'.repeat(64),
+      page: { pageSize: 200, returned: count, total: 500, hasMore: true, nextCursor: 'v1.x.y', budgetBytes: RESPONSE_BUDGET_BYTES },
+      affectedTasks: Array.from({ length: count }, (_, index) => entry(index)) });
+    // 条目本身很小，200 条会超预算：fitCount 会往下裁到一个能装下的条数，而不是整份拒绝。
+    expect(answerBytes(page(200))).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+    const fit = fitCount(Array.from({ length: 200 }, (_, index) => entry(index)),
+      subset => answerBytes(page(subset.length)), RESPONSE_BUDGET_BYTES);
+    expect(fit).toBeGreaterThan(0);
+    expect(fit).toBeLessThan(200);
+    expect(answerBytes(page(fit))).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    // 每多一条就一定更贵（fitCount 的前提）：边界上的下一条确实装不下。
+    expect(answerBytes(page(fit + 1))).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
   });
 });

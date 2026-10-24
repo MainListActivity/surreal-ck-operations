@@ -473,8 +473,8 @@ export function echoClaim(claim: ClaimResult): ClaimEcho & { task: TaskView } {
 export interface CursorBody {
   /** Format version. */
   v: 1;
-  /** Which listing the cursor continues (context, history or worktrees). */
-  k: 'context' | 'history' | 'worktrees';
+  /** Which listing the cursor continues (context, history, worktrees or a policy plan). */
+  k: 'context' | 'history' | 'worktrees' | 'policy-plan';
   /** Employee the cursor was issued to. */
   c: string;
   /** Digest of the query the cursor belongs to (filters only, not the page size or projection). */

@@ -1363,6 +1363,24 @@ export interface PolicyPlanInput {
   expiresAt?: string;
   source: PolicySource;
   ownerQuote?: string;
+  /** 受影响清单的分页（SYS06 R1(b)）：不给就一页，装不下就明确提示怎么翻页；给了就只返回一页。 */
+  pageSize?: number;
+  /** 上一页 page.nextCursor。光标绑定同一份试算（同一调用者、同一提案、同一 planHash）。 */
+  cursor?: string;
+}
+
+/**
+ * policy_plan 一页的元数据（SYS06 R1(b)）：affectedTasks 只是 total 里的这一页，正文按真实序列化大小裁到 48 KiB 预算内。
+ * 单条就超预算时没有可分页的余地（总数 1 也装不下），这时抛 invalid 并给出该条的字节数——不是 response_too_large，
+ * 也不是"收窄查询"能解决的：受影响清单没有收窄入参。
+ */
+export interface PolicyPlanPage {
+  pageSize: number;
+  returned: number;
+  total: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  budgetBytes: number;
 }
 
 /** 试算（dry-run）：算出契约差异与受影响任务，写任何东西之前先给人看。 */
@@ -1371,11 +1389,24 @@ export interface PolicyPlanView {
   before: EffectiveContract;
   after: EffectiveContract;
   diff: Array<{ domain: PolicyDomain; before: string; after: string; scope?: PolicyScope; scopeRef?: string }>;
-  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。 */
+  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。一页的内容见 page；planHash 覆盖全量。 */
   affectedTasks: Array<{ id: TaskId; title: string; state: TaskState; currentEmployee?: EmployeeId; fromHash?: string; toHash: string; losesAuthorization: boolean;
     /** 会拦下它的原因（与派工/领取的拒绝理由同源）；losesAuthorization=false 时省略。 */
     reason?: string }>;
-  /** 试算结果落在当前生效 epoch 上的指纹：执行时用它做 CAS，防止按旧试算执行新策略。 */
+  /** 候选集扫描的事实（SYS06 R1）：扫了多少在办任务、上限是多少。 */
+  scanned: number;
+  scanLimit: number;
+  /** 扫描被上限截断（不止 200*50 条在办任务）；与 page 无关，是候选集本身不完整的显式信号。 */
+  truncated: boolean;
+  /** 受影响清单的分页：受影响总数、这一页与下一页光标。 */
+  page: PolicyPlanPage;
+  /**
+   * 试算结果的指纹：覆盖生效 epoch、after 契约 hash 与全量受影响清单（与分页无关，翻页时不变）。
+   * 它只用于翻页光标的绑定与人工核对——policy_enforce **不读它**：隔离时对每个**点名**任务按当时的有效契约重新判定，
+   * 所以被点名的那批里，该隔离的会隔离、不该隔离的不会被误伤（判定结果变了就如实报 blocked/absent）。
+   * 但 policy_enforce 只处理点名的 taskIds：试算之后**新出现**且失去授权的在办任务不在这一批里，不会被碰，
+   * 执行前若在办清单可能已经变了，应先重跑 `policy_plan` 再按新清单隔离。
+   */
   planHash: string;
 }
 
