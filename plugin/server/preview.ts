@@ -58,7 +58,8 @@ const toRequest = (req: IncomingMessage): Request => {
     (init as RequestInit & { duplex: string }).duplex = "half";
     (init as { body?: unknown }).body = Readable.toWeb(req);
   }
-  return new Request(`http://preview.local${req.url ?? "/"}`, init);
+  // Keep the HTTP authority: owner-console POSTs validate Origin against this URL.
+  return new Request(`http://${req.headers.host ?? "preview.local"}${req.url ?? "/"}`, init);
 };
 
 const send = async (res: ServerResponse, out: Response): Promise<void> => {
