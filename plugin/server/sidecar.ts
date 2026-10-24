@@ -60,6 +60,9 @@ const BASE_TOOLS = [
   "contributor_dryrun",
   // gm or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
   "independence_check",
+  // SYS06 effective policy layer: gm/product only in core. Set/revoke one version of a typed machine policy, read the
+  // current effective contract, dry-run a change, or isolate the in-flight tasks that lost authorization.
+  "policy_set", "policy_revoke", "policy_list", "policy_effective", "policy_plan", "policy_enforce",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -895,6 +898,24 @@ export class SidecarPool {
       case "independence_check": return core.independenceCheck
         ? core.independenceCheck(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose independence_check"), { code: "temporarily_unavailable" }));
+      case "policy_set": return core.policySet
+        ? core.policySet(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_set"), { code: "temporarily_unavailable" }));
+      case "policy_revoke": return core.policyRevoke
+        ? core.policyRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_revoke"), { code: "temporarily_unavailable" }));
+      case "policy_list": return core.policyList
+        ? core.policyList(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_list"), { code: "temporarily_unavailable" }));
+      case "policy_effective": return core.policyEffective
+        ? core.policyEffective(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_effective"), { code: "temporarily_unavailable" }));
+      case "policy_plan": return core.policyPlan
+        ? core.policyPlan(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_plan"), { code: "temporarily_unavailable" }));
+      case "policy_enforce": return core.policyEnforce
+        ? core.policyEnforce(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_enforce"), { code: "temporarily_unavailable" }));
       case "get_model_evidence": return withinReplyCeiling(async()=> {
         if(!core.modelEvidence) throw new Error("Model evidence unavailable");
         return core.modelEvidence(cred,taskIdOf(args.taskId));

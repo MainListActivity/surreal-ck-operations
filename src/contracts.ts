@@ -256,6 +256,15 @@ export interface TaskView {
    * SHA-256 of its whole value. The whole value is not readable through read_task_text.
    */
   fieldsTruncated?: Record<string, FieldCut>;
+  /** 创建时的有效契约登记（SYS06 AC03）：策略版本与 hash，以及逐域契约本体。旧行没有它，语义是"无有效契约"。 */
+  policyVersion?: number;
+  policyHash?: string;
+  policyContract?: EffectiveContract;
+  /** 本租约的契约登记：策略变了以后两者不等，旧 claim 的写动作被拒（下一次相关动作前核版本）。 */
+  leasePolicyVersion?: number;
+  leasePolicyHash?: string;
+  /** 被策略收权隔离的原因（可见状态：blocked，等待 GM），旧 release 也认得这个状态。 */
+  policyBlockReason?: string;
 }
 
 /** A list of a task echo that was cut: its whole count, and the SHA-256 of its whole JSON (SYS01 R3). */
@@ -488,6 +497,12 @@ export interface ClaimResult {
   /** Project environment of the task's goal: where it ships, how to verify, red lines. Credentials are never part of it. */
   project?: ProjectView;
   worktree?: WorktreeAssignment;
+  /**
+   * The effective policy contract this claim was granted under (SYS06 AC03). Rendered so the prompt carries exactly the current
+   * contract; `history` on the policy itself stays queryable. Undeniable: the claim is refused before it is written if a
+   * change since the read dropped the authorization.
+   */
+  policy?: PolicyEffectiveView;
 }
 
 /** Result of the ops broker gate; `project` is the id of the project the task's goal belongs to. */
@@ -1009,6 +1024,24 @@ export interface CompanyCore {
    */
   independenceCheck?(credential: Credential, input: IndependenceCheckInput): Promise<IndependenceCheckView>;
   /**
+   * 有效策略层（SYS06 P1），manage 能力持有者（gm/product）：
+   * 写入一版机器策略（显式替代、来源可核、同域冲突拒绝）、撤销、历史与当前有效视图查询、
+   * 变更试算（dry-run 差异 + 受影响任务，只读）与执行隔离（把失去授权的在办任务置为可见的 blocked）。
+   */
+  policySet?(credential: Credential, input: PolicySet): Promise<PolicyView>;
+  policyRevoke?(credential: Credential, input: PolicyRevoke): Promise<PolicyView>;
+  policyList?(credential: Credential, input: PolicyListInput): Promise<PolicyView[]>;
+  policyEffective?(credential: Credential, input: PolicyEffectiveInput): Promise<PolicyEffectiveView>;
+  policyPlan?(credential: Credential, input: PolicyPlanInput): Promise<PolicyPlanView>;
+  policyEnforce?(credential: Credential, input: PolicyEnforceInput): Promise<PolicyEnforceView>;
+  /**
+   * Ops broker 侧的受控工具/账号边界（SYS06 AC02 ③）：范围内生效的 tool_scope 决定允许清单与判定结果。
+   * 判定与任务侧同源（policy.ts），别名规范形也与账户层一致；传了 tool 就返回该次调用的允许/拒绝结论。
+   */
+  policyToolScope?(project: string, input?: { tool?: string; alias?: string; toolNames?: readonly string[] }): Promise<{
+    version: number; hash: string; allowedTools?: string[]; allowedAliases?: string[]; verdict: PolicyVerdict;
+  }>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
@@ -1182,4 +1215,129 @@ export interface CompanyBrief {
 export interface EnrollmentAdmin {
   enroll(employeeId: EmployeeId, role: Role, capabilities: Principal['capabilities']): Promise<Credential>;
   revoke(employeeId: EmployeeId): Promise<void>;
+}
+
+// ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
+// 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
+import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
+export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
+
+/** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */
+export interface PolicyView {
+  id: string;
+  policyId: string;
+  version: number;
+  scope: PolicyScope;
+  scopeRef?: string;
+  domain: PolicyDomain;
+  status: PolicyStatus;
+  effectiveAt: string;
+  expiresAt?: string;
+  supersedes?: string;
+  supersededBy?: string;
+  /** 撤销留下的历史事实：谁撤的、为什么（历史不可变，撤销只关掉"当前生效"）。 */
+  revokedBy?: string;
+  revokeReason?: string;
+  authorization: PolicyAuthorization;
+  payload: PolicyPayload;
+  hash: string;
+  createdBy: EmployeeId;
+  createdAt: string;
+}
+
+/**
+ * 写入一版机器策略。授权来源只有老板转录（owner，须能对回一条已登记的老板方向）与经理/运营（manager）两种；
+ * 同（作用域, 域）已有生效版本时必须显式 supersedes，否则拒绝——不允许"最新一条文本"静默覆盖。
+ */
+export interface PolicySet {
+  policyId: string;
+  scope: PolicyScope;
+  scopeRef?: string;
+  domain: PolicyDomain;
+  payload: PolicyPayload;
+  /** 被本版替代的版本（record id）；同域首次登记时省略。 */
+  supersedes?: string;
+  /** ISO 8601；缺省立即生效。 */
+  effectiveAt?: string;
+  /** ISO 8601；临时授权到期即自动退出有效视图，旧 claim 不能靠它继续写。 */
+  expiresAt?: string;
+  source: PolicySource;
+  /** source=owner 时必须给出，且必须与已登记的老板方向一致；伪造的引文被拒绝。 */
+  ownerQuote?: string;
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface PolicyRevoke {
+  policyId: string;
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface PolicyListInput {
+  scope?: PolicyScope;
+  scopeRef?: string;
+  domain?: PolicyDomain;
+  /** true 时连被替代/被撤销的版本一起列出（历史查询）。 */
+  includeInactive?: boolean;
+}
+
+export interface PolicyEffectiveInput {
+  taskId?: TaskId;
+  project?: string;
+  goal?: string;
+  /** 直接给作用域链的显式形式（dry-run 预览用）；给了 taskId/project/goal 时忽略。 */
+  scopeChain?: Array<{ scope: PolicyScope; scopeRef?: string }>;
+}
+
+export interface PolicyEffectiveView {
+  version: number;
+  hash: string;
+  chain: Array<{ scope: PolicyScope; scopeRef?: string }>;
+  domains: EffectiveDomain[];
+  /** 逐域渲染的当前有效契约；提示里只渲染这一段，历史文本留在 policy 表。 */
+  rendered: string;
+  /** 人读的必要说明（非机器契约）：到期与被替代的当前事实。 */
+  notes: string[];
+}
+
+export interface PolicyPlanInput {
+  policyId: string;
+  scope: PolicyScope;
+  scopeRef?: string;
+  domain: PolicyDomain;
+  payload: PolicyPayload;
+  supersedes?: string;
+  effectiveAt?: string;
+  expiresAt?: string;
+  source: PolicySource;
+  ownerQuote?: string;
+}
+
+/** 试算（dry-run）：算出契约差异与受影响任务，写任何东西之前先给人看。 */
+export interface PolicyPlanView {
+  scopeChain: Array<{ scope: PolicyScope; scopeRef?: string }>;
+  before: EffectiveContract;
+  after: EffectiveContract;
+  diff: Array<{ domain: PolicyDomain; before: string; after: string; scope?: PolicyScope; scopeRef?: string }>;
+  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。 */
+  affectedTasks: Array<{ id: TaskId; title: string; state: TaskState; currentEmployee?: EmployeeId; fromHash?: string; toHash: string; losesAuthorization: boolean;
+    /** 会拦下它的原因（与派工/领取的拒绝理由同源）；losesAuthorization=false 时省略。 */
+    reason?: string }>;
+  /** 试算结果落在当前生效 epoch 上的指纹：执行时用它做 CAS，防止按旧试算执行新策略。 */
+  planHash: string;
+}
+
+/** 执行试算结果：对已失去授权的在办任务做可见隔离（置为等待 GM 的 blocked），旧 release 也认得这个状态，不会误派工。 */
+export interface PolicyEnforceInput {
+  taskIds?: TaskId[];
+  reason: string;
+  idempotencyKey: string;
+}
+
+export interface PolicyEnforceView {
+  blocked: TaskId[];
+  alreadyBlocked: TaskId[];
+  absent: TaskId[];
+  audited: number;
 }

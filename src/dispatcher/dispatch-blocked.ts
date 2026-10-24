@@ -28,7 +28,7 @@ export type BlockCode =
   | 'paused' | 'budget' | 'resources' | 'max_running'
   | 'implementer_mismatch' | 'implementer_unresolved' | 'implementer_unavailable' | 'implementer_quota' | 'author_recusal' | 'independence_conflict' | 'no_candidate'  | 'session_busy' | 'held' | 'assigned' | 'credential_file' | 'track_mismatch' | 'model_slot'
   | 'quota' | 'probe_busy' | 'provider_capacity' | 'seat_full' | 'def_disabled' | 'wake_failed' | 'unknown' | 'review_capacity'
-  | 'write_scope';
+  | 'write_scope' | 'policy_blocked';
 
 /** One staffing entry, reduced to what the evaluator reads. `key` is the employee id or `spawn:<def>`. */
 export interface EvaluatedEntry {
@@ -128,7 +128,7 @@ export interface EvaluateInput {
 
 /** Codes that only an owner edit (task, roster, pool) can change; waiting never clears them. */
 const PERMANENT: ReadonlySet<BlockCode> = new Set<BlockCode>([
-  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity',
+  'author_recusal', 'independence_conflict', 'implementer_mismatch', 'implementer_unresolved', 'implementer_quota', 'track_mismatch',  'credential_file', 'def_disabled', 'no_candidate', 'review_capacity', 'policy_blocked',
 ]);
 
 /** Owner-facing text per code. The staffing pool and the evaluator both read this table. */
@@ -159,6 +159,7 @@ export const BLOCK_TEXT: Record<BlockCode, string> = {
   review_capacity: '后续独立复核缺合格人选：合格复核人不能同时实现，且无合规空余席位',
   write_scope: '同线或重叠目录的在办写者占用了工作树，代码写权须等待',
   probe_busy: '单次探测会话占用中（冷却已过，探测结束前不派其他会话）',
+  policy_blocked: '有效策略契约不再授权本任务（被收权、到期或隔离），派工前已被拦下',
 };
 
 const OWNER: Record<BlockCode, RecoveryAuthority> = {
@@ -166,7 +167,7 @@ const OWNER: Record<BlockCode, RecoveryAuthority> = {
   implementer_mismatch: 'gm', implementer_unresolved: 'gm', implementer_unavailable: 'system', implementer_quota: 'gm', author_recusal: 'gm', independence_conflict: 'gm', no_candidate: 'gm',  session_busy: 'gm', held: 'gm', assigned: 'gm', credential_file: 'gm', track_mismatch: 'gm', model_slot: 'gm',
   quota: 'owner', provider_capacity: 'gm', seat_full: 'gm', def_disabled: 'gm', wake_failed: 'gm', unknown: 'gm',
   review_capacity: 'gm',
-  write_scope: 'gm', probe_busy: 'gm',
+  write_scope: 'gm', probe_busy: 'gm', policy_blocked: 'gm',
 };
 
 const RECOVERY: Record<BlockCode, string> = {
@@ -196,6 +197,7 @@ const RECOVERY: Record<BlockCode, string> = {
   review_capacity: '经理为复核岗位增补编制或员工；不能由作者自验，也不能让实现人兼任本任务复核',
   write_scope: '等待同线或重叠目录的在办写者结束，或经理拆线',
   probe_busy: '等待单次探测会话结束，探测结果决定恢复或再次冷却',
+  policy_blocked: '经理用 policy_plan 看差异，并按新契约重派或恢复授权',
 };
 
 const NEXT: Record<BlockCode, string> = {
@@ -225,6 +227,7 @@ const NEXT: Record<BlockCode, string> = {
   review_capacity: '出现不同于实现人的合格复核人选，或复核岗位有合规空余席位',
   write_scope: '同线或重叠目录的在办写者结束，或经理拆线',
   probe_busy: '探测会话结束',
+  policy_blocked: '有效策略契约重新授权或任务被隔离/重派',
 };
 
 /** The source each code is read from. Stable strings: the roster, the cards and the brief show them as they are. */
@@ -237,6 +240,7 @@ const BASIS: Record<BlockCode, string> = {
   def_disabled: 'tick:workforce-defs', wake_failed: 'tick:wake', unknown: 'read:state-or-audit',
   review_capacity: 'tick:review-capacity',
   write_scope: 'tick:worktree-scope', probe_busy: 'tick:provider-health',
+  policy_blocked: 'read:policy-contract',
 };
 
 /** Recovery actions per code. Only the ones with a tool are executable; the rest name who must act outside the system. */
@@ -270,6 +274,7 @@ const ACTIONS: Record<BlockCode, RecoveryAction[]> = {
   review_capacity: [{ authority: 'gm', label: '经理用 def_ensure 为复核岗位与仓库增加编制（不新增订阅）', tool: 'def_ensure', executable: true }],
   write_scope: [{ authority: 'gm', label: '等待同线或重叠目录的在办写者结束，或经理拆线', executable: false }],
   probe_busy: [{ authority: 'gm', label: '等待单次探测会话结束', executable: false }],
+  policy_blocked: [{ authority: 'gm', label: '经理用 policy_plan 看差异并按新契约重派或隔离受影响任务', tool: 'policy_plan', executable: true }],
 };
 
 const PHASE_LABEL: Record<DispatchPhase, string> = { execute: '执行', review: '复核' };

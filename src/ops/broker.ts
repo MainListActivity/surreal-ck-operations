@@ -55,7 +55,7 @@ export type OpsTool = typeof OPS_TOOLS[number];
 type Args = Record<string, unknown>;
 
 export interface OpsDeps {
-  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'>;
+  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope'>>;
   projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'> & Partial<Pick<ProjectStore, 'ensureSealed' | 'rotateSealed'>>;
   proofStore?: CompanyProofStore;
   serviceHome?: string;
@@ -228,6 +228,16 @@ export class OpsBroker {
     const scope = await this.deps.core.opsScope(credential, taskId);
     const ctx = await this.context(scope, args.env);
     try {
+      // SYS06 AC02 ③：范围内生效的 tool_scope 决定这次调用能不能过。判定在 core（与任务侧同一份 policy.ts），
+      // 这里只把工具名与别名递进去；提示词、任务描述写什么都不改变这条结论。
+      const boundary = this.deps.core.policyToolScope
+        ? await this.deps.core.policyToolScope(scope.project, {
+            tool, toolNames: OPS_TOOLS, ...(typeof args.alias === 'string' ? { alias: args.alias } : {}),
+          })
+        : undefined;
+      if (boundary && !boundary.verdict.ok) {
+        throw new CompanyError(boundary.verdict.code, `有效策略拒绝：${boundary.verdict.reason}`);
+      }
       const { value, audit } = await handler(ctx, args);
       if (audit) await this.audit(ctx, audit.action, audit.evidence);
       return value;
@@ -322,7 +332,11 @@ export class OpsBroker {
 
   private async info(ctx: Ctx): Promise<Outcome> {
     const names = await this.deps.projects.sealedNames(ctx.scope.project, ctx.env);
+    // 读出范围内生效的 tool_scope：列出的工具与账号别名只保留被授权的那些，读的人看到的边界就是真的边界。
+    const boundary = this.deps.core.policyToolScope ? await this.deps.core.policyToolScope(ctx.scope.project) : undefined;
+    const tools = boundary?.allowedTools ? OPS_TOOLS.filter(tool => boundary.allowedTools!.includes(tool)) : OPS_TOOLS;
     const accounts = names.map(aliasFromSecretName).filter((alias): alias is string => !!alias)
+      .filter(alias => boundary?.allowedAliases === undefined || boundary.allowedAliases.includes(alias))
       .map(alias => ({ alias, username: accountUsername(alias, ctx.cfg.accounts.prefix) }));
     const supplierKinds = new Map<string, Set<string>>();
     for (const name of names) {
@@ -332,7 +346,9 @@ export class OpsBroker {
     return {
       value: {
         project: ctx.scope.project, env: ctx.env, productUrl: ctx.cfg.product.url, roles: ctx.cfg.roles,
-        tools: OPS_TOOLS, internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
+        tools, toolScope: boundary ? { version: boundary.version, hash: boundary.hash,
+          allowedTools: boundary.allowedTools ?? null, allowedAliases: boundary.allowedAliases ?? null, newSpend: false } : null,
+        internalAiProof: { configured: !!this.proofBridge, contracts: proofToolContracts, issuer: 'urn:surreal-ck:company:internal-ai:v1', statusPath: '/internal-ai/status', identityReadPath: '/api/internal-ai/identity', paidCallsAllowed: 0 }, accounts, workspacePrefix: ctx.cfg.accounts.workspacePrefix, limits: ctx.cfg.limits,
         supplierPlanSampling: {
           provider: SUPPLIER_PROVIDER, adapter: SUPPLIER_ADAPTER, service: SUPPLIER_SERVICE,
           aliases: [...supplierKinds.entries()].map(([alias, kinds]) => ({ alias, credentials: [...kinds].sort() })),

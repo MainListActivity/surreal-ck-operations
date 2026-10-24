@@ -62,8 +62,9 @@ try {
     'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',
-    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
+    'tests/effective-policy.test.ts', 'tests/effective-policy.fork.test.ts',
     'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts', 'tests/independence-check.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,

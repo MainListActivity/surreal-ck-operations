@@ -5,6 +5,7 @@ import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValida
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
 import { REQUIRED_TRACKS } from '../core';
+import { ROLES } from '../contracts';
 import type { Role } from '../contracts';
 import { isPaged, parseReclaimInput } from '../query-input';
 import { arrivedAt, arriving, currentTool, noteTool, SNAPSHOT_TOOLS, withinReplyCeiling } from '../reply-clock';
@@ -530,6 +531,87 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.setIdentityPrincipal
     ? core.setIdentityPrincipal(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  // SYS06 有效策略层：机器策略只认受限 schema，判定只由 policy 表里的字段决定——提示词内容改不动允许/拒绝。
+  const policyPayloadSchema = z.discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('write_authority'),
+      codeRoles: z.array(z.enum(ROLES as unknown as [Role, ...Role[]])).min(0).max(64),
+      intents: z.array(z.enum(['read', 'code', 'assets'])).min(1).max(64),
+      lanes: z.array(z.string().min(1).max(80)).min(1).max(64).optional(),
+    }).catchall(z.unknown()),
+    z.object({
+      kind: z.literal('tool_scope'),
+      allowedTools: z.array(z.string().min(1).max(80)).min(1).max(64),
+      allowedAliases: z.array(z.string().min(1).max(80)).min(1).max(64),
+      newSpend: z.literal(false),
+    }).catchall(z.unknown()),
+    z.object({
+      kind: z.literal('gate'),
+      requireOwnerApproval: z.boolean(),
+      requireIndependentReviewer: z.boolean(),
+      requiredCriteriaLegs: z.array(z.enum(['implement', 'release', 'deploy'])).min(1).max(3),
+    }).catchall(z.unknown()),
+  ]);
+  const policyScopeSchema = z.enum(['company', 'project', 'goal', 'task']);
+  const policyDomainSchema = z.enum(['write_authority', 'tool_scope', 'gate']);
+
+  server.registerTool('policy_set', {
+    description: 'gm or product (manage) only: write one version of a machine policy. Three domains, each with a fixed typed payload and no free text: write_authority (codeRoles/intents/lanes), tool_scope (allowedTools/allowedAliases, newSpend must be false), gate (requireOwnerApproval/requireIndependentReviewer/requiredCriteriaLegs). Scopes are the chain task > goal > project > company; the nearest active version of a domain wins. Versions only grow and never change in place: replacing an active version requires the explicit supersedes record id, a second active version in the same scope+domain is refused, cross-scope supersede, cycles, expired targets and a forged ownerQuote are refused. source=owner needs the gm role and a quote that matches a registered owner direction. Compare-and-set on the internal policy epoch; a second call with the same idempotencyKey and payload returns the original version.',
+    inputSchema: z.object({
+      policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
+      domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
+      effectiveAt: z.string().min(4).max(40).optional(), expiresAt: z.string().min(4).max(40).optional(),
+      source: z.enum(['owner', 'manager']), ownerQuote: z.string().min(2).max(4000).optional(),
+      reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.policySet
+    ? core.policySet(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('policy_revoke', {
+    description: 'gm or product (manage) only: revoke the active version of a machine policy. Emergency revocation is immediate: the policy epoch moves, so the effective contract every in-flight task and lease is checked against no longer contains this authorization. The row stays as history (queryable via policy_list includeInactive); it is only no longer the authorizing version. Idempotent per (key, payload).',
+    inputSchema: z.object({ policyId: z.string().min(1).max(200), reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.policyRevoke
+    ? core.policyRevoke(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('policy_list', {
+    description: 'gm or product (manage) only, read-only: list machine policy versions. By default only versions that are currently active (not superseded, not revoked); includeInactive adds the full history, so an active version A that was explicitly superseded by B is still queryable after B takes over. Every row carries the scope, domain, typed payload, authorization source and owner quote, effective/expiry times and content hash.',
+    inputSchema: z.object({ scope: policyScopeSchema.optional(), scopeRef: z.string().min(1).max(200).optional(),
+      domain: policyDomainSchema.optional(), includeInactive: z.boolean().optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.policyList
+    ? core.policyList(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('policy_effective', {
+    description: 'Read-only: the effective policy contract for a task, a goal/project scope, or an explicit scope chain. Returns the version, the content hash, the chain, the per-domain winning versions, the rendered contract text a prompt is allowed to carry, and human notes about what expired/was superseded. Machine allow/deny never depends on prompt text: the same call answers the same verdict with any prompt. Task access is limited to the task roles plus gm/product/qa/eval; goal/project/chain views are manager-only.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200).optional(), goal: z.string().min(1).max(200).optional(),
+      project: z.string().min(1).max(200).optional(),
+      scopeChain: z.array(z.object({ scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional() })).min(1).max(8).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.policyEffective
+    ? core.policyEffective(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('policy_plan', {
+    description: 'gm or product (manage) only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. planHash is the fingerprint of the projected result, so a plan can be shown, reviewed and then executed without acting on a guess. Writes nothing.',
+    inputSchema: z.object({
+      policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
+      domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
+      effectiveAt: z.string().min(4).max(40).optional(), expiresAt: z.string().min(4).max(40).optional(),
+      source: z.enum(['owner', 'manager']), ownerQuote: z.string().min(2).max(4000).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.policyPlan
+    ? core.policyPlan(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('policy_enforce', {
+    description: 'gm or product (manage) only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=gm, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-gm task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list.',
+    inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(200).optional(),
+      reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.policyEnforce
+    ? core.policyEnforce(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('task_project_update', {

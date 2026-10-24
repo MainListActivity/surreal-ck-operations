@@ -23,7 +23,7 @@ pnpm run company status                       # 公司运行概况
 - [运行手册](docs/agent-operations.md)：服务组成、员工编制、运行参数、排障。
 - [模板](docs/templates.md)：G1 范围提案、真人验收操作手册、G3、checkpoint 与通用交付/验收单。
 - [员工通道](docs/sidecar-channel.md)：sidecar 架构、零凭证模型、comm 文件协议与 `ops_*` 运维工具边界。
-- [任务服务运维](docs/company-service-operations.md)、[核心契约](docs/core-contract.md)、[MCP 接入](docs/mcp-adapter.md)。
+- [任务服务运维](docs/company-service-operations.md)、[核心契约](docs/core-contract.md)、[有效策略](docs/effective-policy.md)、[MCP 接入](docs/mcp-adapter.md)。
 - [业务流程](docs/playbooks.md)、[经营节奏](docs/management.md)。
 
 任务、身份、租约与审计存于自托管 SurrealDB 的 `sck_agent_company/control_plane`（与产品同一实例、独立 namespace，地址与凭证读自产品 `.env`），GitHub Issue 为投影看板。员工按 `employee_def.weight` 加权派工；任务完成后由 `eval` 评审员打绩效分并回馈权重。v2 的 `scripts/queue.py` 与 `agents/registry.json` 仅用于收尾旧工单。

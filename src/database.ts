@@ -139,6 +139,12 @@ export class CompanyDatabase {
     // 登记身份（SYS-DISP IR02/Q3）：029 由本线取用；只新增表与字段，不改任何已有员工行。
     await this.db.query(loadSchema('029-identity-principal.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
+    // 有效策略层（SYS06 P1）：034 由本线取用（030/031 未占用，032/033 已被模型路由取用）；只新增表与字段，旧行不动。
+    await this.db.query(loadSchema('034-effective-policy.surql'));
+    await this.db.query(`IF (SELECT * FROM ONLY company_meta:policy_epoch) = NONE {
+      CREATE ONLY company_meta:policy_epoch CONTENT { value: 0 };
+    };`);
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

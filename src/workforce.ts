@@ -10,6 +10,8 @@ import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
 import { collectEvalState, writeScorecards, type EvalState, type ScoredEmployee } from './scoring.ts';
 import { readContributors, readContributionView, type ContributionFacts } from './contributors.ts';
 import { readIndependenceScope, type IndependenceScope } from './independence.ts';
+import { dispatchVerdict } from './policy.ts';
+import { chainOfTaskRow, readEffectiveContract, readTaskPolicyRow, registeredDomainsOf } from './policy-store.ts';
 import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 /**
@@ -601,6 +603,23 @@ export class Workforce {
    */
   async independenceScope(policy: IndependencePolicy | undefined, stage: IndependenceStage): Promise<IndependenceScope | undefined> {
     return readIndependenceScope(this.db, policy, stage);
+  }
+
+  /**
+   * The task's verdict under the effective policy contract (SYS06 AC02/RB01): the dispatch-time half of the same judgement the
+   * claim path and the ops broker read. It reads the same `policy` rows through policy-store.ts and decides with the same
+   * policy.ts, so a task this returns `blocked` for can never be dispatched to anyone — and never becomes "busy" instead.
+   */
+  async policyDispatchVerdict(taskId: TaskId): Promise<{ verdict: 'clear' | 'stale' | 'blocked'; reason?: string; hash?: string } | undefined> {
+    const row = await readTaskPolicyRow(this.db, taskId);
+    if (!row) return undefined;
+    const chain = chainOfTaskRow(row);
+    const { contract } = await readEffectiveContract(this.db, chain, Math.floor(Date.now() / 1000));
+    return dispatchVerdict({ state: row.state, executorRole: row.executor_role as Role,
+      ...(row.work_intent ? { workIntent: row.work_intent } : {}),
+      ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
+      ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
+      registeredDomains: registeredDomainsOf(row) }, contract);
   }
 
   /** Authorship facts (authors, reviewers, implementer) from the audit stream: the review and execute gates. */

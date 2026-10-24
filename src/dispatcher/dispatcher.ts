@@ -177,6 +177,12 @@ export interface StaffingInput {
    * source history cannot be read. Excluded candidates are never eligible, whatever their continuity, weight or fallback.
    */
   independence?: IndependenceScope;
+  /**
+   * Tasks whose effective policy contract no longer authorizes them (SYS06 AC02/RB01), keyed by task id: the reason string.
+   * Read once per pass from the same source the claim gate and the ops broker read. A task here is held back for every
+   * candidate — this is never a per-candidate judgement, and no candidate is ever reported as merely busy for it.
+   */
+  policyBlocks?: ReadonlyMap<string, string>;
   defs: EmployeeDef[];
   insts: EmployeeInst[];
   states: ReadonlyMap<string, InstState>;
@@ -296,6 +302,12 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const hit = independenceHit(scope.index, employee, principal);
     return hit ? ['independence_conflict', independenceText(hit)] : undefined;
   };
+  // Effective policy contract (SYS06 AC02/RB01): a task whose contract no longer authorizes it is held back for the whole pool,
+  // before any per-candidate gate, so no candidate is reported as busy and no spawn is offered for it.
+  const policyBlock: Block | undefined = (() => {
+    const reason = p.task ? p.policyBlocks?.get(p.task.id) : undefined;
+    return reason ? ['policy_blocked', reason] : undefined;
+  })();
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
     trackOkFor(p.role as Role, task, tracks);
@@ -306,6 +318,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const def = p.defs.find(d => d.id === inst.def);
     // Recusal and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
+      policyBlock ??
       gate(inst.id) ??
       independenceBlock(inst.id, inst.principal) ??
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
@@ -333,6 +346,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     const resolved = resolveSlot(def);
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
+      policyBlock ??
       gate(undefined) ??
       independenceBlock(undefined, undefined) ??
       (p.reserved?.has(`spawn:${def.id}`) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
@@ -559,6 +573,8 @@ export interface PassInputs {
   slots: Map<string, string>;
   /** instId → served model, from the same `paseo.list()` read the pass used. */
   runtimeModels?: Map<string, string>;
+  /** taskId → why the effective policy contract no longer authorizes it, read once in this pass (SYS06 AC02/RB01). */
+  policyBlocks?: Map<string, string>;
 }
 
 export interface TickReport {
@@ -597,7 +613,7 @@ export async function snapshotOf(p: PassInputs, opts: { opsRepo: string; sidecar
   }
   const holding = new Set(p.tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
   const poolBase = { defs: p.defs, insts: p.insts, states: p.states, holding, health: p.health, quotaBlocked: p.quotaBlocked,
-    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels,
+    busyBy, providerMax: p.cfg.providerMax, slots: p.slots, runtimeModels: p.runtimeModels, policyBlocks: p.policyBlocks,
     opsRepo: opts.opsRepo, sidecar: opts.sidecar, now: p.now };
   const homes = [...new Set([opts.opsRepo, ...p.insts.map(i => i.repoHome ?? i.cwd ?? opts.opsRepo), ...p.tasks.map(t => t.repoPath ?? opts.opsRepo)])];
   const roles = [...new Set([...p.defs.map(d => d.role), ...p.insts.map(i => i.role)])];
@@ -1133,6 +1149,19 @@ export class Dispatcher {
       const scope = item.task.independence ? await this.deps.workforce.independenceScope(item.task.independence, item.purpose) : undefined;
       if (scope) independence.set(`${item.purpose}:${item.task.id}`, scope);
     }
+    // Effective policy contracts (SYS06 AC02/RB01): each work item's verdict is read once per pass, from the same policy rows
+    // the claim gate and the ops broker read. A task that lost authorization is held back for every candidate; the read failing
+    // blocks it too (fails closed), never silently dispatchable.
+    const policyBlocks = new Map<string, string>();
+    for (const item of work) {
+      const verdict = await this.deps.workforce.policyDispatchVerdict(item.task.id)
+        .catch(error => { this.log(`policy verdict read failed for ${item.task.id}: ${(error as Error).message}`); return undefined; });
+      if (verdict && verdict.verdict !== 'clear') {
+        policyBlocks.set(item.task.id, verdict.verdict === 'blocked' ? (verdict.reason ?? BLOCK_TEXT.policy_blocked)
+          : `有效策略契约已变更（${verdict.hash?.slice(0, 16) ?? 'unknown'}），本次派工按旧契约读出，需重新领取`);
+      }
+    }
+    this.passInputs.policyBlocks = policyBlocks;
     // Episodes of work that left the queue end here, before any pass-wide gate below returns early.
     await this.endStaleEpisodes(tasks, new Set(work.map(item => `${item.task.id}:${item.purpose}`)));
     const gmBlocked = tasks.filter(t => t.state === 'blocked' && t.blockedTo === 'gm');
@@ -1219,7 +1248,7 @@ export class Dispatcher {
     const rand = this.deps.rand ?? Math.random;
     // The candidate pool is evaluated by staffingPool — the same function the owner
     // page previews — so dispatch gating and the roster can never drift apart.
-    const poolBase = { defs, states, holding, health, quotaBlocked, busyBy,
+    const poolBase = { defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
