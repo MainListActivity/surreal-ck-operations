@@ -27,7 +27,7 @@ import {
 import { setAgentModel } from "../dispatcher/agent-model.ts";
 import { employeeTier } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
-import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
+import { GROUP_STAYS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 import { loadAa, refreshAa } from "./aa.ts";
 import { useBenchmarks } from "./policy.ts";
@@ -62,6 +62,15 @@ export function readMagpieGroups(file = join(homedir(), ".config", "magpie", "pr
     return {};
   }
 }
+/** Each group's stickiness as magpie stored it; the default (`auto`) is stored as no field. */
+export function readMagpieAffinity(file = join(homedir(), ".config", "magpie", "providers.json")): Record<string, string> {
+  try {
+    const groups = (JSON.parse(readFileSync(file, "utf8")) as { groups?: Array<{ id: string; affinity?: string }> }).groups ?? [];
+    return Object.fromEntries(groups.map((g) => [g.id, g.affinity ?? "auto"]));
+  } catch {
+    return {};
+  }
+}
 /** The retired in-gateway selector. magpie names a path plugin by its absolute path; removed on sync. */
 const legacySelector = (home: string) =>
   join(home, "model-routing", "sck-performance.gateway.js");
@@ -87,6 +96,7 @@ export class ModelRoutingController {
       command?: (args: string[]) => Promise<void>;
       output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
+      affinity?: () => Record<string, string>;
       jev?: JevClient;
     } = {},
   ) {
@@ -287,6 +297,7 @@ export class ModelRoutingController {
     const initializing = state.version !== GROUPING_VERSION;
     const known = new Set(initializing ? [] : state.known ?? []);
     const live = this.io.groups?.() ?? (this.io.command ? {} : readMagpieGroups());
+    const stays = this.io.affinity?.() ?? (this.io.groups || this.io.command ? {} : readMagpieAffinity());
     const inventoryFile=join(dir0,"inventory.json");
     const inventory=await loadInventory(inventoryFile);
     const aliasFile = join(dir0, "aliases.json");
@@ -382,7 +393,8 @@ export class ModelRoutingController {
       }
       const signature = digest(JSON.stringify(members));
       groups[`sck-${tier}`] = signature;
-      if (JSON.stringify(current) !== JSON.stringify(members))
+      // A group whose stickiness differs is rewritten too: membership alone would leave it as it was.
+      if (JSON.stringify(current) !== JSON.stringify(members) || (stays[`sck-${tier}`] ?? GROUP_STAYS) !== GROUP_STAYS)
         groupsToSet.push({ id: `sck-${tier}`, models: members, signature });
       routes[`group/sck-${tier}`] = ordered.map((m) => ({ model: m.id, score: m.score, samples: m.samples }));
     }
@@ -398,7 +410,7 @@ export class ModelRoutingController {
           g.id,
           `models=${g.models.join(",")}`,
           "routing=order",
-          "stays=session",
+          `stays=${GROUP_STAYS}`,
         ]);
       }
     } else await saveMagpieGroups(this.cli, groupsToSet, isCurrent);

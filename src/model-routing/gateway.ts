@@ -232,7 +232,7 @@ export async function startModelGateway(
         if (typeof v === "string") headers.set(name, v);
       }
       const started = Date.now();
-      // Stickiness to one model per lease is magpie's (`stays=session` on x-magpie-session).
+      // Stickiness per lease is magpie's (`stays=auto` on x-magpie-session: while the cache is worth it).
       const reply = await (deps.fetchImpl ?? fetch)(new URL(match[2]!, upstream), {
         method: "POST",
         headers,
