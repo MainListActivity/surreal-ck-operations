@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
+import type { AuditEntry, ModelRankingTable, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -152,7 +152,7 @@ export const roster = defineRpc({
 export const modelRanking = defineRpc({
   name: "company.model-ranking.get",
   input: z.object({}),
-  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
+  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),tables:record<ModelRankingTable[]>().default([]),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
 });
 export const saveModelRanking = defineRpc({
   name: "company.model-ranking.save",
