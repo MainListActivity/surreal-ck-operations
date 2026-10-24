@@ -1170,7 +1170,7 @@ function RelayHeading({ctx,step,title,subtitle}: {ctx:Ctx;step:string;title:stri
   </View>;
 }
 
-function ModelRankingList({ctx,table,width=ctx.compact?390:1100}: {ctx:Ctx;table:import("../shared/types").ModelRankingTable;width?:number}) {
+function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: {ctx:Ctx;table:import("../shared/types").ModelRankingTable;width?:number;onPin?:(model:string,pinned:boolean)=>Promise<void>;pinBusy?:boolean}) {
   const s=relayStyles(ctx),c=relayColors(ctx);
   const [expanded,setExpanded]=useState<string|null>(null);
   const mobile=width<=600,wide=width>900;
@@ -1178,7 +1178,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100}: {ctx:Ctx;table
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
       <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>按 Magpie 当前顺序排列，JEV 分数越高越优先，数据基于近 7 天统计。</Text>}
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>置顶模型固定在前且不参与 JEV 评分，其余按 JEV 分数排序。</Text>}
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
@@ -1197,8 +1197,8 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100}: {ctx:Ctx;table
       ];
       const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
       return <View key={row.model} style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
-        <Pressable accessibilityRole="button" accessibilityLabel={`第 ${index+1} 名 ${row.model}`} accessibilityState={{expanded:open}}
-          onPress={()=>setExpanded(open?null:row.model)} style={[s.row,{minHeight:mobile?52:62,paddingVertical:mobile?7:10,paddingHorizontal:mobile?8:12,gap:mobile?7:12}]}>
+        <View style={{flexDirection:"row",alignItems:"center"}}><Pressable accessibilityRole="button" accessibilityLabel={`第 ${index+1} 名 ${row.model}`} accessibilityState={{expanded:open}}
+          onPress={()=>setExpanded(open?null:row.model)} style={[s.row,{flex:1,minWidth:0,minHeight:mobile?52:62,paddingVertical:mobile?7:10,paddingHorizontal:mobile?8:12,gap:mobile?7:12}]}>
           <View style={{width:mobile?28:34,height:mobile?28:34,borderRadius:mobile?8:12,backgroundColor:c.surface2,alignItems:"center",justifyContent:"center"}}><Text style={[s.muted,{fontSize:mobile?9:11,fontWeight:"700"}]}>#{index+1}</Text></View>
           <View style={{flex:1,minWidth:0}}><View style={[s.row,{gap:8}]}>
             <Text numberOfLines={1} style={[s.text,{flexShrink:1,fontSize:mobile?12:13,fontWeight:"700"}]}>{short.slice(slash+1)}</Text>
@@ -1208,9 +1208,12 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100}: {ctx:Ctx;table
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
           <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>JEV</Text>
-            <Text accessibilityLabel={row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
+            <Text accessibilityLabel={row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
-        </Pressable>
+        </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
+          onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>
+          <Text style={{fontSize:mobile?10:11,color:row.pinned?c.accent:c.foregroundMuted}}>{row.pinned?"取消置顶":"置顶"}</Text>
+        </Pressable></View>
         {open&&<View style={{paddingLeft:mobile?43:58,paddingRight:mobile?9:14,paddingBottom:mobile?10:14}}>
           <Text selectable numberOfLines={1} style={{color:c.foregroundMuted,fontSize:mobile?8:9,lineHeight:14,fontFamily:"Menlo",backgroundColor:c.path,borderRadius:8,paddingHorizontal:mobile?7:9,paddingVertical:mobile?5:7,marginVertical:mobile?9:12}}>{row.model}</Text>
           <View style={{flexDirection:"row",flexWrap:"wrap",gap:mobile?7:8}}>{metrics.map(metric=><View key={metric.label} style={{flexBasis:wide?"14%":"28%",flexGrow:1,minWidth:0,gap:2,borderLeftWidth:1,borderColor:c.border,paddingLeft:mobile?8:10}}>
@@ -1226,7 +1229,8 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100}: {ctx:Ctx;table
 
 function ModelRankingCard({ctx}: {ctx:Ctx}) {
   const c=relayColors(ctx);
-  const get=useRpc(rpc.modelRanking),save=useRpc(rpc.saveModelRanking);
+  const get=useRpc(rpc.modelRanking),save=useRpc(rpc.saveModelRanking),pin=useRpc(rpc.pinModelRanking);
+  const [pinBusy,setPinBusy]=useState(false),[pinMessage,setPinMessage]=useState("");
   const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
   const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
   const [group,setGroup]=useState("sck-haiku"),[width,setWidth]=useState(ctx.compact?390:1100);
@@ -1266,7 +1270,8 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <View style={[s.panel,{flex:wide?1:undefined,width:wide?undefined:"100%",minWidth:0}]}>
         <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle="依据当前规则生成的实时排序"/>
         <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
-        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width}/>:<Text style={s.muted}>尚无分组成员。</Text>}
+        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，不再发送给 JEV 排序。":"已取消置顶，下次刷新参与 JEV 排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
+        {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
         {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功评分":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
       </View>
     </View>

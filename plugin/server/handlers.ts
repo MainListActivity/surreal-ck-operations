@@ -179,6 +179,11 @@ export function registerHandlers(server: PluginServerContext): void {
     return { dataUri: `data:${attachmentMime(input.name)};base64,${buf.toString("base64")}`, mime: attachmentMime(input.name), sizeBytes: buf.byteLength };
   });
 
+  ownerHandle(rpc.pinModelRanking, async (input: RpcInput<typeof rpc.pinModelRanking>) => {
+    const ctx = await company();
+    await ctx.modelRanking.setPin(input.group,input.model,input.pinned);
+    return {ok:true};
+  });
   ownerHandle(rpc.modelRanking, async () => {
     const ctx = await company();
     const { modelRankingView } = await import("./model-ranking.ts");

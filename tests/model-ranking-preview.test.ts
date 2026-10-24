@@ -83,3 +83,10 @@ test('Figma palette follows Paseo light/dark appearance including RGB surfaces',
  expect(h.colors({theme:{colors:{surface0:'rgb(12, 14, 18)'}}}).surface1).toBe(dark.surface1);
  expect(h.colors({theme:{colors:{surface0:'hsl(240 6% 7%)'}}}).surface1).toBe(dark.surface1);
 });
+
+test('ranking row has an independent pin action and clearly labels a pinned model',async()=>{
+ const h=harness(undefined),calls:unknown[]=[];
+ const nodes=h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/a:max',pinned:true,accounts:[]}]},onPin:async(...args:unknown[])=>{calls.push(args);}});
+ expect(h.text()).toContain('已置顶');
+ const button=nodes.find(n=>n.props.accessibilityLabel==='取消置顶 p/a:max');expect(button).toBeDefined();await button.props.onPress();expect(calls).toEqual([['p/a:max',false]]);
+});
