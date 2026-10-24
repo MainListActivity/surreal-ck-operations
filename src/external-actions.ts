@@ -11,16 +11,18 @@ import type { ExternalActionGateway, ExternalActionTarget } from './disposition.
 
 /** One JSON object through gh, kept small: only the fields the ledger needs are projected with --jq. */
 const readRun = async (run: GhRunner, target: ExternalActionTarget): Promise<{
-  status?: string; conclusion?: string; account?: string; createdAt?: string;
+  status?: string; conclusion?: string; account?: string; createdAt?: string; headBranch?: string; headSha?: string;
 }> => {
   const raw = await run(['api', `repos/${target.repo}/actions/runs/${target.runId}`, '--jq',
-    '{status: .status, conclusion: .conclusion, account: (.triggering_actor.login // .actor.login // null), createdAt: (.created_at // null)}']);
-  const parsed = JSON.parse(raw) as { status?: string | null; conclusion?: string | null; account?: string | null; createdAt?: string | null };
+    '{status: .status, conclusion: .conclusion, account: (.triggering_actor.login // .actor.login // null), createdAt: (.created_at // null), headBranch: (.head_branch // null), headSha: (.head_sha // null)}']);
+  const parsed = JSON.parse(raw) as { status?: string | null; conclusion?: string | null; account?: string | null; createdAt?: string | null; headBranch?: string | null; headSha?: string | null };
   return {
     status: parsed.status ?? undefined,
     conclusion: parsed.conclusion ?? undefined,
     account: parsed.account ?? undefined,
     createdAt: parsed.createdAt ?? undefined,
+    headBranch: parsed.headBranch ?? undefined,
+    headSha: parsed.headSha ?? undefined,
   };
 };
 
@@ -32,7 +34,7 @@ export function createCompanyGithubGateway(run: GhRunner = ghCli): ExternalActio
   const target = (t: ExternalActionTarget) => `repos/${t.repo}/actions/runs/${t.runId}`;
 
   return {
-    async cancelRun(t) {
+    async cancelRun(t, context) {
       if (!t.repo || !t.runId) return { confirmed: false, error: 'a run target needs both repo and runId' };
       let before: Awaited<ReturnType<typeof readRun>> | undefined;
       try {
@@ -43,8 +45,18 @@ export function createCompanyGithubGateway(run: GhRunner = ghCli): ExternalActio
         if (/not found|404/i.test(message)) return { refused: true, reason: `run ${t.repo}#${t.runId} is not known to the provider: ${message}` };
         return { confirmed: false, error: `run ${t.repo}#${t.runId} could not be read: ${message}` };
       }
-      // Already in a terminal state: nothing to cancel. This is a definite provider answer, not an unknown.
+      // Already in a terminal state. **On a first request** that is a definite provider answer, not an unknown: there is
+      // nothing to cancel. **On a replay** (we already asked for this actionKey) a terminal run whose conclusion is a
+      // cancellation is the cancellation we asked for — a crash between the provider accepting and the receipt being
+      // written lands here, and recording it as `refused` would deny an action that really happened (QA V5).
       if (['completed'].includes(before.status ?? '')) {
+        if (context?.retryAfterRequest && /cancel/i.test(before.conclusion ?? '')) {
+          return {
+            confirmed: true, runStatus: before.status, externalAccount: before.account,
+            observed: { before: before.status ?? null, after: before.status ?? null, conclusion: before.conclusion ?? null,
+              account: before.account ?? before.account ?? null, replay: 'already-terminal-cancelled' },
+          };
+        }
         return { refused: true, reason: `run ${t.repo}#${t.runId} is already ${before.status} (${before.conclusion ?? 'no conclusion'})` };
       }
       try {
@@ -71,7 +83,7 @@ export function createCompanyGithubGateway(run: GhRunner = ghCli): ExternalActio
       try {
         const row = await readRun(run, t);
         return { readable: true, exists: true, runStatus: row.status, conclusion: row.conclusion,
-          externalAccount: row.account, attribution: 'unknown_actor' };
+          externalAccount: row.account, headBranch: row.headBranch, headSha: row.headSha, attribution: 'unknown_actor' };
       } catch (error) {
         const message = String((error as Error)?.message ?? error);
         // gh reports a missing run as an error as well; a 404 is an absent run (a real, readable fact), not an unreadable one.

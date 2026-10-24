@@ -8,6 +8,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
+import { relayWebTheme } from "../shared/relay-design.ts";
 
 type CompanyApi = {
   owner: {
@@ -23,10 +24,8 @@ type CompanyApi = {
   workforce: {
     revokeTaskLease(taskId: string, reason: string, handover: string, actor: string): Promise<{ ok: boolean; employee?: string }>;
   };
-  db: { db: {
-    query<T>(q: string, vars?: Record<string, unknown>): Promise<T>;
-    select<T>(record: unknown): Promise<T | undefined>;
-  } };
+  db: { db: import("surrealdb").Surreal };
+  modelRanking: import("./vendor/src/model-routing/ranking.ts").RankingRefresher;
   opsRepo: string;
 };
 
@@ -102,6 +101,23 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
 
     try {
       if (req.method === "GET" && sub === "/") return text(PAGE, 200, "text/html; charset=utf-8");
+      if (req.method === "GET" && sub === "/ranking") {
+        const { rankingPage }=await import("./ranking-page.ts");
+        return text(rankingPage,200,"text/html; charset=utf-8");
+      }
+      if (req.method === "GET" && sub === "/api/model-ranking") {
+        const { modelRankingView }=await import("./model-ranking.ts");
+        return json(await modelRankingView((await opts.company()).db.db));
+      }
+      if (req.method === "POST" && sub === "/api/model-ranking") {
+        if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
+        const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown};
+        if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes(b.refreshMinutes as number))return json({error:"排序规则或刷新间隔无效"},400);
+        const { saveRankingSettings }=await import("./vendor/src/model-routing/ranking.ts");
+        const ctx=await opts.company();
+        await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:b.refreshMinutes as number},ctx.modelRanking);
+        return json({ok:true});
+      }
       if (req.method === "GET" && sub === "/api/inbox") return json(await (await opts.company()).owner.inbox());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
       if (req.method === "GET" && sub === "/api/tasks") {
@@ -210,46 +226,52 @@ const PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>公司审核台</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}
-body{margin:0;font:15px/1.55 -apple-system,system-ui,sans-serif;background:#0d0f14;color:#e6e8ee}
-header{position:sticky;top:0;background:#161a22;border-bottom:1px solid #262b38;padding:12px 16px;display:flex;gap:12px;align-items:center;z-index:9}
-header b{font-size:16px}header span{color:#8b93a7;font-size:12px}
-nav{display:flex;gap:4px;padding:8px 12px;background:#11141b;border-bottom:1px solid #262b38;position:sticky;top:49px;z-index:8;overflow-x:auto}
-nav button{background:none;border:1px solid #2a3140;border-radius:8px;color:#9aa3b8;padding:6px 12px;font-size:13px;white-space:nowrap}
-nav button.on{color:#fff;border-color:#4d8dff;background:#1b2740}
+${relayWebTheme}*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 -apple-system,system-ui,sans-serif;background:var(--relay-bg);color:var(--relay-text)}
+header{position:sticky;top:0;background:var(--relay-panel);border-bottom:1px solid var(--relay-border);padding:12px 16px;display:flex;gap:12px;align-items:center;z-index:9}
+header b{font-size:16px}header span{color:var(--relay-muted);font-size:12px}
+nav{display:flex;gap:4px;padding:8px 12px;background:var(--relay-input);border-bottom:1px solid var(--relay-border);position:sticky;top:49px;z-index:8;overflow-x:auto}
+nav button{background:none;border:1px solid var(--relay-border);border-radius:8px;color:var(--relay-muted);padding:6px 12px;font-size:13px;white-space:nowrap}
+nav button.on{color:#fff;border-color:var(--relay-accent);background:var(--relay-control)}
 main{padding:12px;max-width:760px;margin:0 auto}
-.card{background:#161a22;border:1px solid #262b38;border-radius:12px;padding:14px;margin-bottom:12px}
+.card{background:var(--relay-panel);border:1px solid var(--relay-border);border-radius:12px;padding:14px;margin-bottom:12px}
 .card h3{margin:0 0 4px;font-size:15px}
-.meta{color:#8b93a7;font-size:12px;margin-bottom:8px;word-break:break-all}
-.body{white-space:pre-wrap;word-break:break-word;font-size:14px;color:#cfd5e3;max-height:300px;overflow:auto;background:#10131a;border-radius:8px;padding:10px;margin:8px 0}
+.meta{color:var(--relay-muted);font-size:12px;margin-bottom:8px;word-break:break-all}
+.body{white-space:pre-wrap;word-break:break-word;font-size:14px;color:var(--relay-text);max-height:300px;overflow:auto;background:var(--relay-input);border-radius:8px;padding:10px;margin:8px 0}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 button.act{border:none;border-radius:8px;padding:9px 16px;font-size:14px;font-weight:600}
-.ok{background:#2f7d4f;color:#fff}.no{background:#8a3a3a;color:#fff}.mid{background:#2a4d8f;color:#fff}
+.ok{background:#2f7d4f;color:#fff}.no{background:#8a3a3a;color:#fff}.mid{background:var(--relay-accent);color:#fff}
 button:disabled{opacity:.5}
-textarea{width:100%;background:#10131a;border:1px solid #2a3140;border-radius:8px;color:#e6e8ee;padding:8px;font:14px/1.5 inherit;min-height:60px;margin-top:8px}
-a{color:#6fa3ff;word-break:break-all}
-.att{display:block;padding:8px 10px;background:#10131a;border-radius:8px;margin-top:6px;font-size:13px}
-.empty{color:#67707f;text-align:center;padding:30px 0}
+textarea{width:100%;background:var(--relay-input);border:1px solid var(--relay-border);border-radius:8px;color:var(--relay-text);padding:8px;font:14px/1.5 inherit;min-height:60px;margin-top:8px}
+a{color:var(--relay-score);word-break:break-all}
+.att{display:block;padding:8px 10px;background:var(--relay-input);border-radius:8px;margin-top:6px;font-size:13px}
+.empty{color:var(--relay-faint);text-align:center;padding:30px 0}
 .notice{display:flex;justify-content:space-between;gap:10px;align-items:center}
-.notice button{background:#2a3140;color:#cfd5e3;border:none;border-radius:8px;padding:6px 12px;font-size:13px}
-.doc{cursor:pointer;padding:9px 10px;background:#10131a;border-radius:8px;margin-top:6px;font-size:14px}
-.trow{padding:10px 0;border-top:1px solid #262b38}
+.notice button{background:var(--relay-border);color:var(--relay-text);border:none;border-radius:8px;padding:6px 12px;font-size:13px}
+.doc{cursor:pointer;padding:9px 10px;background:var(--relay-input);border-radius:8px;margin-top:6px;font-size:14px}
+.trow{padding:10px 0;border-top:1px solid var(--relay-border)}
 .trow:first-child{border-top:none}
 .trow .row{margin-top:6px}
 .trow .act{padding:6px 12px;font-size:13px}
-.docbody{white-space:pre-wrap;font:13px/1.6 ui-monospace,Menlo,monospace;background:#10131a;border-radius:8px;padding:12px;margin-top:8px;max-height:60vh;overflow:auto}
-.tier{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid #2a3140;color:#9aa3b8}
-.st{font-size:11px;color:#8b93a7}
+.docbody{white-space:pre-wrap;font:13px/1.6 ui-monospace,Menlo,monospace;background:var(--relay-input);border-radius:8px;padding:12px;margin-top:8px;max-height:60vh;overflow:auto}
+.tier{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--relay-border);color:var(--relay-muted)}
+.st{font-size:11px;color:var(--relay-muted)}
 .glist .card{cursor:default}
-.err{color:#ff9a9a;font-size:13px;margin-top:8px;white-space:pre-wrap}
-.okm{color:#7fd0a0;font-size:13px;margin-top:8px}
-h4.sec{color:#9aa3b8;font-size:12px;letter-spacing:.08em;margin:20px 0 8px}
+.err{color:var(--relay-danger);font-size:13px;margin-top:8px;white-space:pre-wrap}
+.okm{color:var(--relay-success);font-size:13px;margin-top:8px}
+h4.sec{color:var(--relay-muted);font-size:12px;letter-spacing:.08em;margin:20px 0 8px}
+
+header{height:68px;padding:0 4vw;background:var(--relay-bg)}header .brand-mark{width:30px;height:30px;display:grid;place-items:center;border-radius:9px;background:var(--relay-accent);color:white;font-size:14px;font-weight:700}
+nav{top:68px;background:var(--relay-bg);padding:10px 4vw;gap:7px}nav button{border-color:transparent;border-radius:9px}nav button.on{background:var(--relay-tab);color:var(--relay-score);border-color:var(--relay-border)}
+main{max-width:1240px;width:92vw;padding:30px 0 60px}.card{border-radius:16px;padding:22px;box-shadow:var(--relay-shadow)}textarea{border-radius:13px;padding:14px}.refresh-button{margin-left:auto;background:var(--relay-control);color:var(--relay-text);border:1px solid var(--relay-border);border-radius:9px;padding:7px 12px}
+@media(max-width:600px){header{height:60px;padding:0 18px}nav{top:60px;padding:8px 12px}main{width:auto;padding:20px 12px 40px}.card{padding:16px}}
 </style></head><body>
-<header><b>公司审核台</b><span id="stat"></span><button onclick="load()" style="margin-left:auto;background:#2a3140;color:#cfd5e3;border:none;border-radius:8px;padding:6px 12px">刷新</button></header>
+<header><span class="brand-mark">M</span><b>公司审核台</b><span id="stat"></span><button onclick="load()" class="refresh-button">刷新</button></header>
 <nav>
 <button data-t="todo" class="on" onclick="tab('todo')">待办</button>
 <button data-t="goals" onclick="tab('goals')">目标</button>
 <button data-t="docs" onclick="tab('docs')">手册</button>
+<button onclick="location.href='ranking'">模型排序</button>
 <button data-t="gm" onclick="tab('gm')">给经理留言</button>
 </nav>
 <main id="m"></main>

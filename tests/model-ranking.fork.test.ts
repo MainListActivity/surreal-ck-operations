@@ -1,7 +1,7 @@
 import {expect,test} from 'bun:test';
 import {CompanyDatabase} from '../src/database.ts';
 import {loadDatabaseConfig} from '../src/config.ts';
-import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
+import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES,rankingTables} from '../src/model-routing/ranking.ts';
 const run=process.env.RUN_SCK_CHANNEL_FORK_TESTS==='1'?test:test.skip;
 run('fork: ranking settings preserve routing config; request-triggered three-group results persist',async()=>{
  const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
@@ -23,6 +23,9 @@ run('fork: ranking settings preserve routing config; request-triggered three-gro
   refresher.trigger(0);await refresher.settled();expect(calls).toBe(3);expect(applied).toHaveLength(1);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
   expect(status.orders).toEqual({kept:['old/model'],'sck-opus':['a/y','a/x'],'sck-sonnet':['a/x'],'sck-haiku':['a/y']});expect(status.refresh_minutes).toBe(2);expect(status.at).toBeDefined();
+  expect(status.results['sck-opus']).toMatchObject({tier:'opus',rules:'免费优先',model:'fixture'});
+  expect(status.results['sck-opus'].rows.map((r:any)=>[r.facts.id,r.score])).toEqual([['a/y',1],['a/x',0]]);
+  expect(status.results['sck-opus'].answers.m0.score).toBe(0);
   expect((await rankingRequests(db.db)).map(s=>s.tier)).toEqual(['opus','sonnet','haiku']);
   await saveRankingSettings(db.db,{rules:'质量优先',refreshMinutes:2},refresher);
   expect(await rankingRequests(db.db)).toEqual(sent); // editing rules cannot rewrite historical input
@@ -34,7 +37,15 @@ run('fork: ranking settings preserve routing config; request-triggered three-gro
   const afterFailure=await rankingRequests(db.db);
   expect(afterFailure).toHaveLength(3);
   expect(afterFailure.find(s=>s.tier==='haiku')!.payload.model).toBe('failed-fixture');
-  const [kept]=await db.db.query<[any]>('SELECT orders,error FROM ONLY company_meta:model_ranking;');
+  const [kept]=await db.db.query<[any]>('SELECT orders,error,results FROM ONLY company_meta:model_ranking;');
   expect(kept.orders).toEqual(status.orders);expect(kept.error).toBe('haiku 刷新失败，保留原顺序');
+  expect(kept.results['sck-haiku'].rules).toBe('质量优先');
+  const reconnected=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
+  try {
+    await reconnected.connect();await reconnected.useDatabase();
+    const [persisted]=await reconnected.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
+    const tables=rankingTables({'sck-haiku':['a/y']},persisted.results,await rankingRequests(reconnected.db));
+    expect(tables[0]).toMatchObject({scored:true,rules:'质量优先',rows:[{model:'a/y',jevScore:0}]});
+  } finally {await reconnected.close();}
  }finally{await db.close();}
 });
