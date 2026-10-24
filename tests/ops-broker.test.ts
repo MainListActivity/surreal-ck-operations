@@ -3,13 +3,15 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
-import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode } from '../src/ops/broker.ts';
+import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode, type OpsDeps } from '../src/ops/broker.ts';
+import type { OriginRequest } from '../src/ops/origin.ts';
+import { parseBrokerConfig } from '../src/ops/config.ts';
 import { verifyPassword } from '../src/ops/password.ts';
 import { brokerConfig, FakeCompany, FakeWorld, OPS_CLIENT, OPS_DIRECT_CLIENT, OPS_DIRECT_REDIRECT, OPS_REDIRECT, OPS_RESOURCE, TENANT } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; qa: string; outputs: unknown[] }
 
-function rig(patch: Record<string, unknown> = {}, hasEnv = true): Rig {
+function rig(patch: Record<string, unknown> = {}, hasEnv = true, deps: Partial<OpsDeps> = {}): Rig {
   const world = new FakeWorld();
   const company = new FakeCompany();
   if (hasEnv) company.env('demo', 'production', brokerConfig(patch), { healthUrl: 'https://app.test/health' });
@@ -17,7 +19,7 @@ function rig(patch: Record<string, unknown> = {}, hasEnv = true): Rig {
     core: company.core, projects: company.projects as never, secretKey: () => Buffer.alloc(32),
     controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
     fetch: world.fetch, now: world.now, d1: () => world.d1, queryAsUser: world.queryAsUser, browser: world.browser,
-    sleep: async (ms) => { world.clock += ms; },
+    sleep: async (ms) => { world.clock += ms; }, ...deps,
   });
   return { world, company, broker, qa: company.lease('qa-1', 'qa', 'task-1'), outputs: [] };
 }
@@ -51,7 +53,7 @@ describe('ops gate', () => {
       'ops_idp_provision_rotate',
       'ops_info', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_revoke', 'ops_internal_ai_rotate_key', 'ops_internal_ai_trust',
       'ops_invitation_issue', 'ops_login', 'ops_logout', 'ops_member_add', 'ops_member_list', 'ops_member_remove',
-      'ops_operator_login', 'ops_query', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
+      'ops_operator_login', 'ops_origin_health', 'ops_origin_logs', 'ops_origin_status', 'ops_query', 'ops_request', 'ops_supplier_plan_sample', 'ops_workspace_ensure',
     ]);
   });
 
@@ -107,7 +109,7 @@ describe('ops info and health', () => {
     const info = await call(r, 'ops_info');
     expect(info.accounts).toEqual([{ alias: 'QA_ONE', username: 'sck-qa-one' }]);
     expect(info.tools).toEqual([...OPS_TOOLS]);
-    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true, idpProvisionRotate: false });
+    expect(info.can).toEqual({ createAccounts: true, queryWorkspaceData: true, browserLogin: true, operatorLogin: false, opsAudienceLogin: false, idpPrincipals: true, idpProvisionRotate: false, originHost: false });
     // Public client metadata is listed for alignment checks; never secret material.
     expect(info.clients).toEqual({ customer: { clientId: 'client-ck-1234', redirectUri: 'https://app.test/auth/callback' } });
     expectNoLeaks(r);
@@ -117,6 +119,61 @@ describe('ops info and health', () => {
     const r = rig();
     const health = await call(r, 'ops_health');
     expect(health).toMatchObject({ reachable: true, status: 200, ok: true, body: { ok: true } });
+  });
+});
+
+describe('ops origin host', () => {
+  const ORIGIN = { host: 'origin.test', user: 'sckops', keyFile: '/keys/ops', knownHosts: '/keys/Application Support/known_hosts' };
+  const originRig = (reply: (request: OriginRequest) => Record<string, unknown>) => {
+    const sent: OriginRequest[] = [];
+    const r = rig({ origin: ORIGIN }, true, { originAgent: async (origin, request) => {
+      expect(origin).toEqual(ORIGIN);
+      sent.push(request);
+      return reply(request);
+    } });
+    return { r, sent };
+  };
+
+  test('status, health and logs go to the agent as fixed requests and come back redacted and audited', async () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEifQ.c2lnbmF0dXJlLXZhbHVl';
+    const { r, sent } = originRig(request => request.op === 'logs'
+      ? { ok: true, service: request.service, matched: 7, returned: 1, truncated: true, lines: [`login ok ${jwt}`] }
+      : { ok: true, services: { surrealdb: { active: 'active' } }, token: 'raw-secret-value' });
+    expect((await call(r, 'ops_info')).can.originHost).toBe(true);
+    expect(await call(r, 'ops_origin_status')).toEqual({ services: { surrealdb: { active: 'active' } }, token: '[redacted]' });
+    await call(r, 'ops_origin_health');
+    const logs = await call(r, 'ops_origin_logs', { service: 'surreal-ck-hono', since: '6h', lines: 50, grep: 'login', priority: 'err' });
+    expect(logs).toMatchObject({ matched: 7, truncated: true, lines: ['login ok [redacted]'] });
+    expect(sent).toEqual([{ op: 'status' }, { op: 'health' }, { op: 'logs', service: 'surreal-ck-hono', since: '6h', lines: 50, grep: 'login', priority: 'err' }]);
+    expect(r.company.audits.map(a => a.evidence)).toEqual([
+      'ops_origin_status host=origin.test', 'ops_origin_health host=origin.test',
+      'ops_origin_logs host=origin.test service=surreal-ck-hono since=6h matched=7 grep=login',
+    ]);
+    expectNoLeaks(r, [jwt, 'raw-secret-value']);
+  });
+
+  test('log requests outside the allowlist or bounds never reach the host', async () => {
+    const { r, sent } = originRig(() => ({ ok: true }));
+    for (const args of [{}, { service: 'shadowsocks' }, { service: 'caddy', since: '73h' }, { service: 'caddy', since: '1d' },
+      { service: 'caddy', lines: 501 }, { service: 'caddy', lines: '5' }, { service: 'caddy', grep: '' }, { service: 'caddy', priority: 'debug' }]) {
+      expect((await failure(call(r, 'ops_origin_logs', args))).code).toBe('invalid');
+    }
+    expect(sent).toHaveLength(0);
+    await call(r, 'ops_origin_logs', { service: 'caddy' });
+    expect(sent).toEqual([{ op: 'logs', service: 'caddy', since: '30m', lines: 200 }]);
+  });
+
+  test('an environment without an origin host says so', async () => {
+    const r = rig({}, true, { originAgent: async () => { throw new Error('must not connect'); } });
+    expect((await failure(call(r, 'ops_origin_status'))).code).toBe('not_configured');
+  });
+
+  test('origin settings are validated so nothing can smuggle ssh options', () => {
+    const base = brokerConfig();
+    expect(parseBrokerConfig({ ...base, origin: ORIGIN }).origin).toEqual(ORIGIN);
+    for (const bad of [{ user: '-oProxyCommand=x' }, { host: 'a b' }, { keyFile: 'relative' }, { knownHosts: '/a"b' }]) {
+      expect(() => parseBrokerConfig({ ...base, origin: { ...ORIGIN, ...bad } })).toThrow(/origin/);
+    }
   });
 });
 
