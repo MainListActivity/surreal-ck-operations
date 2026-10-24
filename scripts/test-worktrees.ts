@@ -64,6 +64,8 @@ try {
     'tests/input-bounds.integration.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/disposition.integration.fork.test.ts', 'tests/disposition-channel.fork.test.ts', 'tests/disposition-rollback-isolation.fork.test.ts',
+    // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
+    'tests/disposition-rehearsal.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
     'tests/effective-policy.test.ts', 'tests/effective-policy.fork.test.ts',

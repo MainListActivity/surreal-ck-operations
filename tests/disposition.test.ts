@@ -3,7 +3,7 @@
 // concurrency, idempotency and rollback drills live in disposition.integration.fork.test.ts and
 // disposition-rollback-isolation.fork.test.ts.
 import { expect, test } from 'bun:test';
-import { createCompanyGithubGateway } from '../src/external-actions.ts';
+import { createCompanyGithubGateway, githubRepoSlug } from '../src/external-actions.ts';
 import { dispositionBusinessKey, dispositionEpisodeKey, dispositionNoticeKey } from '../src/disposition.ts';
 
 test('episode identity is task + phase + episode start, and the same episode keeps one key', () => {
@@ -89,7 +89,7 @@ test('AC03 (QA V5): a replay that finds the run terminal-cancelled reads it as t
   // 重放（我们已经为同一个 actionKey 发过请求，崩溃点在 provider 取消之后、回执之前）：同一个终态就是
   // 我们自己那次取消生效了，记 confirmed 并附 provider 读回。
   const replay = await createCompanyGithubGateway(terminal.run)
-    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { retryAfterRequest: true });
+    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { replay: true });
   expect(replay).toMatchObject({ confirmed: true, runStatus: 'completed' });
   if (!('confirmed' in replay) || replay.confirmed !== true) throw new Error('expected a confirmation');
   expect(replay.observed).toMatchObject({ conclusion: 'cancelled', replay: 'already-terminal-cancelled' });
@@ -97,8 +97,60 @@ test('AC03 (QA V5): a replay that finds the run terminal-cancelled reads it as t
   // 重放时终态不是取消（运行自己失败了）→ 仍然是拒绝，绝不把失败读成成功。
   const failedRun = scripted({ match: isRead, out: runJson('completed', 'failure', 'shared-bot') });
   expect(await createCompanyGithubGateway(failedRun.run)
-    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { retryAfterRequest: true }))
+    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { replay: true }))
     .toMatchObject({ refused: true });
+});
+
+test('AC05 (QA D3): a replay of a request that has not settled reads the run, posts nothing and stays unknown', async () => {
+  // 取消请求已经发出去（回执丢了），run 还在跑：重放只读状态。绝不能第二次 POST，也绝不能伪报 confirmed——
+  // 诚实的结果是 result_unknown，等 provider 真的落成 cancelled 之后再读一次才变 confirmed。
+  const pending = scripted({ match: isRead, out: runJson('in_progress', null, 'shared-bot') });
+  const gateway = createCompanyGithubGateway(pending.run);
+  const unsettled = await gateway.cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { replay: true });
+  expect(unsettled).toMatchObject({ confirmed: false });
+  if (!('error' in unsettled)) throw new Error('expected an unknown');
+  expect(unsettled.error).toContain('has not settled');
+  expect(unsettled.observed).toMatchObject({ replay: 'not-settled-yet' });
+  expect(pending.calls.filter(isCancel)).toHaveLength(0);
+
+  // 它真的落定成 cancelled 之后，同一个 key 的再一次重放就是 confirmed（这就是 G4 那条路径的收尾）。
+  const settled = scripted({ match: isRead, out: runJson('completed', 'cancelled', 'shared-bot') });
+  expect(await createCompanyGithubGateway(settled.run)
+    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { replay: true }))
+    .toMatchObject({ confirmed: true, runStatus: 'completed' });
+  expect(settled.calls.filter(isCancel)).toHaveLength(0);
+});
+
+test('AC05 (QA D2/D3): the provider exit is claimed once, so a rival request under one action key posts nothing', async () => {
+  // 并发下只有把 post_claimed 从「没发过」翻成「发过」的那一次调用会真的 POST；对手不 POST 且如实回 unknown。
+  const gh = scripted(
+    { match: isRead, out: runJson('in_progress', null, 'shared-bot') },
+    { match: isCancel, out: '' },
+  );
+  const gateway = createCompanyGithubGateway(gh.run);
+  const won = await gateway.cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' },
+    { claimRequest: async () => true });
+  expect(won).toMatchObject({ confirmed: true });
+  expect(gh.calls.filter(isCancel)).toHaveLength(1);
+
+  const lost = await gateway.cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' },
+    { claimRequest: async () => false });
+  expect(lost).toMatchObject({ confirmed: false });
+  if (!('error' in lost)) throw new Error('expected an unknown');
+  expect(lost.error).toContain('posted nothing');
+  expect(gh.calls.filter(isCancel)).toHaveLength(1);
+});
+
+test('QA D5: a repository identifier only compares as a repo when it resolves to a GitHub slug', () => {
+  // 能比的形式：登记的就是 slug，或者是能解析出 slug 的 remote。
+  expect(githubRepoSlug('surreal-ck/operations-fixture')).toBe('surreal-ck/operations-fixture');
+  expect(githubRepoSlug('https://github.com/surreal-ck/operations-fixture')).toBe('surreal-ck/operations-fixture');
+  expect(githubRepoSlug('https://github.com/surreal-ck/operations-fixture.git')).toBe('surreal-ck/operations-fixture');
+  expect(githubRepoSlug('git at github.com:surreal-ck/operations-fixture.git')).toBe('surreal-ck/operations-fixture');
+  // 比不出来的形式（本地路径、裸名字）：返回 undefined，调用方只能记「依据是分支」而不是假装核过仓库。
+  expect(githubRepoSlug('/Users/y/IdeaProjects/surreal-ck')).toBeUndefined();
+  expect(githubRepoSlug('surreal-ck')).toBeUndefined();
+  expect(githubRepoSlug('')).toBeUndefined();
 });
 
 test('AC03: an unreadable run or a failed cancel request is result_unknown, not a fabricated success', async () => {
