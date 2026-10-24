@@ -183,7 +183,7 @@ export interface RankingResultSnapshot {
 export interface RankingTableRow {
   model: string;
   aaScore?: number; aaRank?: number; effort?: string;
-  tokensPerSecond?: number; ttftMs?: number;
+  tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
   accounts: ModelFacts["accounts"];
   performanceScore?: number; performanceSamples?: number;
   jevScore?: number; jevConfidence?: number;
@@ -204,6 +204,8 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const facts = judged?.facts ?? (!result ? legacy.find(f => f.id === model) : undefined);
       return { model, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
+        stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
+        stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
         performanceSamples: facts?.performance?.samples, jevScore: judged?.score, jevConfidence: judged?.confidence };
     });
