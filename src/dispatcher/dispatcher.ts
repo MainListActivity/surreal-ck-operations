@@ -494,7 +494,7 @@ export interface DispatcherDeps {
   /**
    * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
    * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
-   * failure that cannot be restarted). Returns true when the binding moved. Undefined disables the automatic successor:
+   * failure that cannot be restarted, or its repo no longer matches an explicit code-repo rebind). Returns true when the binding moved. Undefined disables the automatic successor:
    * the block then names the manager's takeover instead.
    */
   autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
@@ -1285,11 +1285,19 @@ export class Dispatcher {
     /**
      * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
      * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
-     * idle, exhausted and unknown are not struck: those recover on their own.
+     * idle, exhausted and unknown are not struck unless an explicit code-repo rebind has left
+     * that session outside the task's repository: waiting cannot move a repository-bound session.
      */
-    const struckImplementer = (employeeId: string): boolean => {
+    const implementerUnavailableReason = (employeeId: string, task: SupervisedTask, home: string): string | undefined => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled));
+      if (!inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled)))
+        return '员工退役/撤凭证，或会话归档、无法就地重启';
+      // A manager's explicit code-repo correction changes the task's dispatch home, not the
+      // existing session's home. That session is permanently outside this task's legal pool.
+      // Do not loosen cross-repo admission or infer a correction from a project change alone.
+      if (task.codeRepoPath === home && (inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
+        return `任务代码仓已显式改绑为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
+      return undefined;
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1310,7 +1318,8 @@ export class Dispatcher {
     };
     const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
       const implementer = boundImplementer(task);
-      if (!implementer || !struckImplementer(implementer)) return false;
+      const unavailable = implementer && implementerUnavailableReason(implementer, task, home);
+      if (!implementer || !unavailable) return false;
       const takeover = this.deps.autoTakeover;
       if (takeover) {
         let facts;
@@ -1323,12 +1332,13 @@ export class Dispatcher {
         }
         // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
         const excluded = new Set<string>([...facts.excluded, implementer]);
-        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned,
+          independence: independence.get(`execute:${task.id}`) })
           .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
           .sort((a,b)=>a.key.localeCompare(b.key)))[0]?.key;
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
-            reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
+            reason: `自动接替：原实现人 ${implementer} 已不可用（${unavailable}），系统把代码交给同仓在岗工程员工` })
             .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
           if (moved) {
             report.decisions.push(`auto-takeover:${task.id}=${successor}`);
