@@ -3,6 +3,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createConsoleFetch,consoleUrl} from '../plugin/server/console.ts';
+import {startPreview} from '../plugin/server/preview.ts';
 import {rankingPage} from '../plugin/server/ranking-page.ts';
 import {relayDesignCss} from '../plugin/shared/relay-design.ts';
 const homes:string[]=[];
@@ -19,7 +20,7 @@ function fixture(){
  const fetch=createConsoleFetch({home,lanBase:()=> 'http://localhost',company:async()=>({db:{db},modelRanking:{setPin:async(...args:unknown[])=>{pins.push(args);},reset:(minutes:number)=>resets.push(minutes)}} as any)});
  const base=consoleUrl(home,()=> 'http://localhost')+'/';
  const request=(path:string,body?:unknown,origin?:string)=>fetch(new Request(base+path,body===undefined?undefined:{method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify(body)}));
- return {fetch,request,resets,pins};
+ return {fetch,request,resets,pins,home,base};
 }
 test('owner ranking page uses supplied Figma layout, real API, light/dark tokens and a review-console return link',async()=>{
  const f=fixture();expect((await f.fetch(new Request('http://localhost/o/wrong/ranking'))).status).toBe(404);
@@ -46,4 +47,14 @@ test('owner pin endpoint validates membership arguments and origin independently
  expect(f.pins).toEqual([]);
  expect((await f.request('api/model-ranking/pin',{group:'sck-haiku',model:'p/a:max',pinned:true},'http://localhost')).status).toBe(200);
  expect(f.pins).toEqual([['sck-haiku','p/a:max',true]]);expect(f.resets).toEqual([]);
+});
+
+test('real preview HTTP transport preserves browser origin for pinning and rejects foreign sites',async()=>{
+ const f=fixture();const server=startPreview({home:f.home,port:0,secret:'',consoleFetch:f.fetch,coreFactory:()=>async()=>new Response('unused'),log:()=>{}});
+ try {
+  const port=await server.ready,origin=`http://127.0.0.1:${port}`,path=new URL(f.base).pathname+'api/model-ranking/pin';
+  const send=(site:string)=>fetch(origin+path,{method:'POST',headers:{'content-type':'application/json',origin:site},body:JSON.stringify({group:'sck-haiku',model:'p/a:max',pinned:true})});
+  const good=await send(origin);expect(good.status).toBe(200);expect(f.pins).toEqual([['sck-haiku','p/a:max',true]]);
+  expect((await send('http://other.example')).status).toBe(403);expect(f.pins).toHaveLength(1);
+ } finally {await server.stop();}
 });
