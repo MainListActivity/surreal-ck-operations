@@ -12,6 +12,7 @@ import { readContributors, readContributionView, type ContributionFacts } from '
 import { readIndependenceScope, type IndependenceScope } from './independence.ts';
 import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
+import { DispositionLedger, dispositionEpisodeKey, type DispositionDecisionView, type DispositionPhase, type HolderNoticeView } from './disposition.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
  * Never hand this object to the MCP adapter.
@@ -320,8 +321,22 @@ export const MANAGER_WAKE_PENDING_GRACE_SECONDS = 120;
 /** An observed idle turn is a definite end only after the external action has had this long to start. */
 export const MANAGER_WAKE_TURN_GRACE_SECONDS = 60;
 
+/** SYS03: the disposition facts the wake loop needs for one episode, read without any credential (dispatcher). */
+export interface DispositionEpisodeFacts {
+  episode: string;
+  taskId: string;
+  phase: DispositionPhase;
+  sinceMs: number;
+  status: 'claimed' | 'decided';
+  holder?: string;
+  leaseExpiresAt?: number;
+  decision?: DispositionDecisionView;
+}
+
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
+  /** SYS03: the disposition ledger, read here for the dispatcher's pre-wake guard and for notice delivery. */
+  private readonly dispositions: DispositionLedger;
   /**
    * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
    * write, so a test can land a claim or takeover in exactly that window.
@@ -329,6 +344,7 @@ export class Workforce {
   constructor(private readonly database: CompanyDatabase, private readonly credentialDir: string,
     private readonly retirementHook?: (employeeId: string) => Promise<void>) {
     this.enrollment = new LocalEnrollmentAdmin(database);
+    this.dispositions = new DispositionLedger(database);
   }
   private get db() { return this.database.db; }
   private async now(): Promise<number> {
@@ -846,6 +862,94 @@ export class Workforce {
         CREATE $audit CONTENT { task: $task_ref, actor: 'system:dispatcher', action: 'manager_action_closed', evidence: $evidence, at: time::now() };
       };
       COMMIT;`, { d: record, task_ref: id('task', action.taskId), resolution, audit, evidence });
+  }
+
+  // ---- SYS03 disposition ledger (dispatcher-facing, read-only + the two resolution writes) ----
+
+  /**
+   * SYS03 AC01: the disposition state a wake loop is about to act on, read in ONE query (exact ids, no per-task round
+   * trip — the dispatcher runs on a single ~50KB/s channel). Read-only.
+   *
+   * `byTask` is the fallback for a manager gate whose persisted episode start the dispatcher itself clears every pass:
+   * a blocked-to-gm task is not a work-queue item, so `endStaleEpisodes` drops its `dispatch_blocked_since`. Without
+   * this fallback the same reminder would present a different episode every tick, and a manager deciding it once could
+   * never suppress the next wake. Picking the newest claim of the task is the best evidence available for that gate.
+   */
+  async dispositionFacts(input: { episodes: readonly string[]; tasks: readonly string[] }): Promise<{
+    byEpisode: Map<string, DispositionEpisodeFacts>; byTask: Map<string, DispositionEpisodeFacts> }> {
+    const byEpisode = new Map<string, DispositionEpisodeFacts>();
+    const byTask = new Map<string, DispositionEpisodeFacts>();
+    const episodes = [...new Set(input.episodes.filter(episode => episode.length > 0))];
+    const tasks = [...new Set(input.tasks.filter(taskId => taskId.length > 0))];
+    if (!episodes.length && !tasks.length) return { byEpisode, byTask };
+    type Row = { episode?: string; task?: unknown; phase?: string; episode_since?: number; status?: string; holder?: string;
+      lease_expires_at?: number; decision_action?: string; decision_business_key?: string; decision_actor?: string;
+      decision_at?: unknown; decision_task_version?: number; decision_result?: Record<string, unknown> };
+    const [rows] = await this.db.query<[Row[]]>('SELECT * FROM disposition_claim WHERE episode IN $episodes OR task IN $tasks;',
+      { episodes, tasks: tasks.map(taskId => id('task', taskId)) });
+    for (const row of rows ?? []) {
+      const facts = this.dispositionFactsOf(row);
+      if (!facts) continue;
+      if (episodes.includes(facts.episode)) byEpisode.set(facts.episode, facts);
+      const known = byTask.get(facts.taskId);
+      if (!known || known.sinceMs < facts.sinceMs) byTask.set(facts.taskId, facts);
+    }
+    return { byEpisode, byTask };
+  }
+
+  private dispositionFactsOf(row: { episode?: string; task?: unknown; phase?: string; episode_since?: number; status?: string;
+    holder?: string; lease_expires_at?: number; decision_action?: string; decision_business_key?: string; decision_actor?: string;
+    decision_at?: unknown; decision_task_version?: number; decision_result?: Record<string, unknown> }): DispositionEpisodeFacts | undefined {
+    const episode = row.episode ?? '';
+    if (!episode) return undefined;
+    const result = row.decision_result ?? undefined;
+    return {
+      episode,
+      taskId: asId(row.task),
+      phase: row.phase === 'review' ? 'review' : 'execute',
+      sinceMs: row.episode_since ?? 0,
+      status: row.status === 'decided' ? 'decided' : 'claimed',
+      holder: row.holder || undefined,
+      leaseExpiresAt: typeof row.lease_expires_at === 'number' ? row.lease_expires_at : undefined,
+      decision: row.status === 'decided'
+        ? { action: row.decision_action ?? '', businessKey: row.decision_business_key || undefined,
+          actor: row.decision_actor || undefined, at: row.decision_at === undefined ? undefined : String(row.decision_at),
+          taskVersion: row.decision_task_version, result, repairTaskId: (result?.repairTaskId as string | undefined) ?? undefined }
+        : undefined,
+    };
+  }
+
+  /** The episode key the wake loop and the ledger agree on: task + phase + episode start in milliseconds. */
+  episodeKey(taskId: string, phase: DispositionPhase, episodeMs: number): string {
+    return dispositionEpisodeKey(taskId, phase, episodeMs);
+  }
+
+  /**
+   * SYS03 AC01/AC04: a decided episode is resolved, so its leftover manager todo and any in-flight manager wake are
+   * closed with the decision as the resolution. Called by the wake loop before it would start another session for that
+   * episode, so a handled episode never produces a second GM session — not in this pass, and not after a restart,
+   * because the closed rows are the same durable bookkeeping the next dispatcher reads.
+   */
+  async resolveDecidedEpisode(input: { taskId: string; phase: DispositionPhase; episodeMs: number; resolution: string }): Promise<number> {
+    const todos = (await this.openManagerActions())
+      .filter(row => row.taskId === input.taskId && row.phase === input.phase && row.episode === input.episodeMs);
+    let closed = 0;
+    for (const todo of todos) {
+      await this.closeManagerAction(todo, input.resolution);
+      closed++;
+    }
+    const wakes = await this.finishManagerWakesForTask(input.taskId, input.resolution);
+    return closed + wakes;
+  }
+
+  /** SYS03 AC04: holder notices still waiting for delivery, oldest first (resend after reconnect or plugin restart). */
+  async pendingHolderNotices(limit = 25): Promise<HolderNoticeView[]> {
+    return this.dispositions.pendingNotices(limit);
+  }
+
+  /** SYS03 AC04: a delivery receipt. A failed attempt is recorded on the notice and keeps it pending — never lost. */
+  async markHolderNotices(ids: string[], outcome: { agent?: string; error?: string }): Promise<number> {
+    return this.dispositions.markNotices(ids, outcome);
   }
 
   // ---- manager wake ownership (MR02) ----

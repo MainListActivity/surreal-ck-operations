@@ -139,6 +139,10 @@ export class CompanyDatabase {
     // 登记身份（SYS-DISP IR02/Q3）：029 由本线取用；只新增表与字段，不改任何已有员工行。
     await this.db.query(loadSchema('029-identity-principal.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
+    // SYS03 经理处置账本（本 lane，编号 034；030/031 为在办 lane 预占）：只新增表与唯一索引，
+    // 不改写 task/audit/outbox/dispatch 的任何既有字段或行，回滚旧版即忽略这些新状态（RB01）。
+    await this.db.query(loadSchema('034-disposition.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
