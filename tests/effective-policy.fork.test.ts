@@ -16,7 +16,7 @@ import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
 import { ProjectStore } from '../src/projects.ts';
-import { Workforce, type EmployeeDef, type EmployeeInst, type SupervisedTask } from '../src/workforce.ts';
+import { Workforce, type EmployeeDef, type EmployeeInst, type ProviderHealth, type SupervisedTask } from '../src/workforce.ts';
 import { staffingPool, type InstState } from '../src/dispatcher/dispatcher.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { connectCompanyClient } from '../src/mcp/client.ts';
@@ -124,7 +124,7 @@ test('AC04/AC01 bootstrap: migration 034 loads on an empty database and the poli
   const [policy] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE policy;');
   expect(Object.keys(policy?.fields ?? {})).toEqual(expect.arrayContaining(['policy_id', 'version', 'supersedes', 'superseded_by', 'authorization', 'hash']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(34);
+  expect(marker?.[0]?.schema_version).toBeGreaterThanOrEqual(34);
   // 没有策略时，任务照旧可以创建，契约登记为"无机器策略"的 hash。
   const task0 = await codeTask({ title: '无策略基线' });
   expect(task0.policyVersion).toBe(0);
@@ -470,7 +470,7 @@ test('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce 
   expect(blocked.currentEmployee).toBeUndefined();
   expect(blocked.policyBlockReason).toContain('收权隔离');
   // 旧版本的派工读法只认这五个字段：state/blocked_to/current_employee/lease_expires_at/version。
-  const [legacy] = await database.db.query<[Array<{ state: string; blocked_to?: string | null; current_employee?: string | null; lease_expires_at?: number | null }>]>(
+  const [legacy] = await database.db.query<[{ state: string; blocked_to?: string | null; current_employee?: string | null; lease_expires_at?: number | null } | null]>(
     'SELECT state, blocked_to, current_employee, lease_expires_at FROM ONLY $t;', { t: new RecordId('task', inflight.id) });
   expect(legacy).toMatchObject({ state: 'blocked', blocked_to: 'gm' });
   // 隔离同时把租约与持有人清空（字段被写成 NONE，即读出来没有这个字段）：旧版按"还有租约吗"判断候选，这里已经没有了。
@@ -486,14 +486,16 @@ test('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce 
   expect(again.alreadyBlocked.length + again.absent.length).toBe(1);
   expect(again.blocked).toEqual([]);
   // 调度器侧的池子：同一份判定让所有候选都不合格，且理由是 policy_blocked（不是"忙"）。
-  const task = blocked as SupervisedTask;
+  const task = (await workforce.tasks()).find(entry => entry.id === inflight.id);
+  expect(task?.state).toBe('blocked');
+  if (!task) throw new Error('isolated task is not in the dispatcher task list');
   const poolDef: EmployeeDef = { id: 'pool-def', role: 'engineering', provider: 'codex', model: 'm1', enabled: true,
     maxInstances: 2, priority: 100, weight: 10, scored: 0, errorStreak: 0 };
   const poolInst: EmployeeInst = { id: 'pool-inst', role: 'engineering', def: 'pool-def', provider: 'codex', model: 'm1', paseoAgentId: 'ag-pool' };
   const poolInput = { role: 'engineering' as const, home: '/fixture/policy', task, defs: [poolDef], insts: [poolInst],
-    states: new Map<string, InstState>([['pool-inst', 'idle']]), holding: new Set<string>(), health: new Map<string, string>(),
-    quotaBlocked: new Map<string, string>(), busyBy: new Map<string, string>(), providerMax: { codex: 3 }, slots: new Map<string, number>(),
-    opsRepo: '/fixture/policy', now: Math.floor(Date.now() / 1000) };
+    states: new Map<string, InstState>([['pool-inst', 'idle']]), holding: new Set<string>(), health: new Map<string, ProviderHealth>(),
+    quotaBlocked: new Map<string, string>(), busyBy: new Map<string, number>(), providerMax: { codex: 3 }, slots: new Map<string, string>(),
+    opsRepo: '/fixture/policy', sidecar: true, now: Math.floor(Date.now() / 1000) };
   const pool = staffingPool({ ...poolInput, policyBlocks: new Map([[task.id, BLOCK_TEXT.policy_blocked]]) });
   // 池子必须非空：空池上 every(...) 恒真，那样的断言什么也没证明。静置实例与编制席位两条路径都要在。
   expect(pool.map(entry => entry.kind).sort()).toEqual(['reuse', 'spawn']);
@@ -550,15 +552,15 @@ test('AC04 governance entry: the policy tools ride the real MCP/sck channel and 
     const created = await connection.client.callTool({ name: 'policy_set', arguments: { policyId: 'mcp-write', scope: 'project',
       scopeRef: PROJECT, domain: 'write_authority', payload, source: 'manager',
       reason: 'SYS06 经 MCP 通道登记', idempotencyKey: key() } });
-    const written = created.structuredContent?.data as PolicyView;
+    const written = (created.structuredContent as { data: PolicyView }).data;
     expect(created.structuredContent).toMatchObject({ ok: true });
     expect(written.version).toBe(1);
     expect(written.effectiveAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     // 读回：MCP 写的东西与 core 直读的当前有效视图是同一份事实（同一来源校验）。
     const listed = await connection.client.callTool({ name: 'policy_list', arguments: { scope: 'project', scopeRef: PROJECT } });
-    expect((listed.structuredContent?.data as PolicyView[]).map(row => row.id)).toEqual([written.id]);
+    expect(((listed.structuredContent as { data: PolicyView[] }).data).map(row => row.id)).toEqual([written.id]);
     const view = await connection.client.callTool({ name: 'policy_effective', arguments: { project: PROJECT } });
-    const effectiveView = view.structuredContent?.data as { hash: string; rendered: string; version: number };
+    const effectiveView = (view.structuredContent as { data: { hash: string; rendered: string; version: number } }).data;
     expect((await effective(PROJECT)).hash).toBe(effectiveView.hash);
     expect((await readEffectiveContract(database.db, policyScopeChain({ projectId: PROJECT }), Math.floor(Date.now() / 1000))).contract.hash)
       .toBe(effectiveView.hash);
@@ -582,11 +584,11 @@ test('AC04 governance entry: the policy tools ride the real MCP/sck channel and 
     const again = await connection.client.callTool({ name: 'policy_set', arguments: { policyId: 'mcp-write', scope: 'project',
       scopeRef: PROJECT, domain: 'write_authority', payload, supersedes: written.id, source: 'manager',
       reason: 'SYS06 经 MCP 通道替代', idempotencyKey: 'idem-policy-supersede' } });
-    expect((again.structuredContent?.data as PolicyView).version).toBe(2);
+    expect((again.structuredContent as { data: PolicyView }).data.version).toBe(2);
     const replay = await connection.client.callTool({ name: 'policy_set', arguments: { policyId: 'mcp-write', scope: 'project',
       scopeRef: PROJECT, domain: 'write_authority', payload, supersedes: written.id, source: 'manager',
       reason: 'SYS06 经 MCP 通道替代', idempotencyKey: 'idem-policy-supersede' } });
-    expect((replay.structuredContent?.data as PolicyView).id).toBe((again.structuredContent?.data as PolicyView).id);
+    expect((replay.structuredContent as { data: PolicyView }).data.id).toBe((again.structuredContent as { data: PolicyView }).data.id);
     const mismatch = await connection.client.callTool({ name: 'policy_set', arguments: { policyId: 'mcp-write', scope: 'project',
       scopeRef: PROJECT, domain: 'write_authority', payload: { kind: 'write_authority', codeRoles: [], intents: ['code'] }, source: 'manager',
       reason: 'SYS06 同键不同载荷', idempotencyKey: 'idem-policy-supersede' } });

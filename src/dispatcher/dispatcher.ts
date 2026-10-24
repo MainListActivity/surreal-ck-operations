@@ -1150,13 +1150,25 @@ export class Dispatcher {
       if (scope) independence.set(`${item.purpose}:${item.task.id}`, scope);
     }
     // Effective policy contracts (SYS06 AC02/RB01): each work item's verdict is read once per pass, from the same policy rows
-    // the claim gate and the ops broker read. A task that lost authorization is held back for every candidate; the read failing
-    // blocks it too (fails closed), never silently dispatchable.
+    // the claim gate and the ops broker read. A task that lost authorization is held back for every candidate.
+    // The read only happens when a policy layer is really injected: a stand-in workforce has none, so it has no contract to
+    // violate (the real Workforce always carries the method — the type requires it, only a test double can bypass it). A read
+    // that does fail is held back too: an unreadable contract must never be read as "no restriction".
     const policyBlocks = new Map<string, string>();
-    for (const item of work) {
-      const verdict = await this.deps.workforce.policyDispatchVerdict(item.task.id)
-        .catch(error => { this.log(`policy verdict read failed for ${item.task.id}: ${(error as Error).message}`); return undefined; });
-      if (verdict && verdict.verdict !== 'clear') {
+    const verdictOf = typeof this.deps.workforce.policyDispatchVerdict === 'function'
+      ? this.deps.workforce.policyDispatchVerdict.bind(this.deps.workforce)
+      : undefined;
+    if (verdictOf) {
+      for (const item of work) {
+        let verdict: Awaited<ReturnType<Workforce['policyDispatchVerdict']>>;
+        try {
+          verdict = await verdictOf(item.task.id);
+        } catch (error) {
+          this.log(`policy verdict read failed for ${item.task.id}: ${(error as Error).message}`);
+          policyBlocks.set(item.task.id, `有效策略契约读取失败（${(error as Error).message}），按失败关闭拦下`);
+          continue;
+        }
+        if (!verdict || verdict.verdict === 'clear') continue;
         policyBlocks.set(item.task.id, verdict.verdict === 'blocked' ? (verdict.reason ?? BLOCK_TEXT.policy_blocked)
           : `有效策略契约已变更（${verdict.hash?.slice(0, 16) ?? 'unknown'}），本次派工按旧契约读出，需重新领取`);
       }
