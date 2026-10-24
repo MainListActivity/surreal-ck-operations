@@ -855,3 +855,47 @@ run('company fork: zero dispatch verdicts still report the live review dependenc
     await w.close();
   }
 }, 60000);
+
+run('company fork: an explicit code repo rebind replaces the old-repo implementer and resumes without a manager loop',async()=>{
+ const w=await startCompanyFork('repo-rebind-successor');
+ try{
+  await w.wf.upsertDef('fixture-eng',{role:'engineering',provider:'codex',model:'fixture',maxInstances:1});
+  await w.wf.upsertDef('fixture-eng-new',{role:'engineering',provider:'grok',model:'fixture',maxInstances:1});
+  await w.wf.upsertDef('fixture-qa',{role:'qa',provider:'codex',model:'fixture',maxInstances:1});
+  const task=await w.core.createTask(w.gm,{title:'Cross-repo code binding must not strand the implementer',context:'Synthetic regression only',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:'repo-rebind-create'});
+  expect((await w.tick()).woke.some(r=>r.task===task.id)).toBe(true);
+  const A=(await w.wf.insts()).find(i=>i.role==='engineering')!;
+  expect((await w.relay(w.envs.get(A.paseoAgentId!)!,'report_blocker',{to:'gm',text:'Synthetic code repo mismatch before any delivery',idempotencyKey:'repo-rebind-block'})).ok).toBe(true);
+  w.agentRows.get(A.paseoAgentId!)!.status='idle';
+  const {canonicalRepoPath}=await import('../src/core.ts');
+  const nextRepo=canonicalRepoPath(join(w.dir,'new-code-repo'));
+  await w.db.db.query("CREATE project:rebound_fixture CONTENT {name:'Rebound fixture',repo_path:$repo,created_at:time::now()};",{repo:nextRepo});
+  const blocked=await w.core.getTask(w.gm,task.id);
+  await w.core.bindTaskCodeRepo(w.gm,{taskId:task.id,codeRepoPath:nextRepo,expectedVersion:blocked.version,text:'Manager explicitly corrects the code repository',idempotencyKey:'repo-rebind-bind'});
+  await w.core.resume(w.gm,task.id,{text:'Resume after the explicit repository correction',idempotencyKey:'repo-rebind-resume'});
+  const C=await w.wf.spawnInst((await w.wf.defs()).find(d=>d.id==='fixture-eng-new')!);
+  const envC=w.pool.env(C);
+  const agentId=`agent-${C.id}`;
+  await w.wf.bind(C.id,{agentId,cwd:w.pool.commDirFor(C.id),repoHome:nextRepo,model:'fixture'});
+  w.pool.bindAgent(C.id,agentId);w.agentRows.set(agentId,{id:agentId,status:'idle'});
+  const moved=await w.tick();
+  expect(moved.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+  expect(await w.core.getTask(w.gm,task.id)).toMatchObject({state:'ready',implementer:C.id,codeRepoPath:nextRepo});
+  expect(moved.woke.some(r=>r.employee.startsWith('gm-'))).toBe(false);
+  const history=await w.core.history(w.gm,task.id);
+  expect(history.find(r=>r.action==='implementer_takeover')).toMatchObject({actor:'system:dispatcher'});
+  expect(history.find(r=>r.action==='implementer_takeover')?.evidence).toContain('代码仓');
+  expect((await w.tick()).woke.find(r=>r.task===task.id)?.employee).toBe(C.id);
+  const claim=readJsonFile<ClaimResult>(join(w.pool.commDirFor(C.id),'claim.json'))!;
+  expect(claim.task.codeRepoPath).toBe(nextRepo);
+  expect((await w.relay(envC,'submit',{text:'Synthetic successor delivery',idempotencyKey:'repo-rebind-submit'})).ok).toBe(true);
+  w.agentRows.get(agentId)!.status='idle';
+  const review=await w.tick();
+  const reviewer=review.woke.find(r=>r.task===task.id)!;
+  expect(reviewer.employee).not.toBe(A.id);expect(reviewer.employee).not.toBe(C.id);
+  expect((await w.relay(w.envs.get((await w.wf.insts()).find(i=>i.id===reviewer.employee)!.paseoAgentId!)!,'review',{decision:'accept',text:'Independent synthetic successor acceptance',idempotencyKey:'repo-rebind-accept'})).ok).toBe(true);
+  expect((await w.core.getTask(w.gm,task.id)).state).toBe('done');
+  const contributions=await w.wf.contributors(task.id);
+  expect(contributions.excluded).toContain(A.id);expect(contributions.excluded).toContain(C.id);
+ }finally{await w.close();}
+},90000);

@@ -738,3 +738,21 @@ test('Factory provider concurrency cap falls back even with spare definition sea
  f.wf.config=async()=>({...await config(),providerMax:{'factory-droid':1,claude:4,codex:8}});
  expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
 });
+
+test('a repository difference without an explicit code repo binding never authorizes automatic takeover',async()=>{
+ const f=fixture([{id:'repo-overlay-only',state:'ready',implementer:'eng-1',repoPath:PROJ_A}]);
+ const calls:unknown[]=[];
+ await f.tick({autoTakeover:async input=>{calls.push(input);return true;}});
+ expect(calls).toEqual([]);
+ expect(f.rows[0]!.implementer).toBe('eng-1');
+ expect(f.last!.dispatchVerdicts().find(v=>v.taskId==='repo-overlay-only')!.dispatchable).toBe(false);
+});
+
+test('same-repo bound implementer stays assigned after an explicit code repo binding',async()=>{
+ const f=fixture([{id:'same-repo',state:'ready',implementer:'eng-1',repoPath:OPS}]);
+ f.rows[0]!.codeRepoPath=OPS;
+ const calls:unknown[]=[];
+ const report=await f.tick({autoTakeover:async input=>{calls.push(input);return true;}});
+ expect(calls).toEqual([]);
+ expect(report.woke.find(w=>w.task==='same-repo')?.employee).toBe('eng-1');
+});
