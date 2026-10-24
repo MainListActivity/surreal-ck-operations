@@ -5,14 +5,14 @@ import {join} from 'node:path';
 import bundled from '../src/model-routing/benchmarks.json';
 import {useBenchmarks,aaRankOf,classify} from '../src/model-routing/policy.ts';
 import {parseAaLeaderboard,refreshAa,loadAa} from '../src/model-routing/aa.ts';
-import {usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
+import {usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES,type ModelFacts} from '../src/model-routing/ranking.ts';
 import {ModelRoutingController} from '../src/model-routing/controller.ts';
 import {startModelGateway} from '../src/model-routing/gateway.ts';
 const dirs:string[]=[];
 const scratch=()=>{const p=mkdtempSync(join(tmpdir(),'sck-ranking-'));dirs.push(p);return p;};
 afterEach(()=>{useBenchmarks(bundled.models);for(const d of dirs.splice(0))rmSync(d,{recursive:true,force:true});});
 const flight=(rows:unknown[])=>`<script>self.__next_f.push(${JSON.stringify([1,`data:{"initialModels":${JSON.stringify(rows)},"x":1}`])})</script>`;
-const fact=(id:string)=>({id,accounts:[],price:{free:false}});
+const fact=(id:string):ModelFacts=>({id,accounts:[],price:{free:false}});
 const response=(questions:Record<string,unknown>)=>({model:'fixture',answers:Object.fromEntries(Object.keys(questions).map((k,i)=>[k,{type:'score' as const,score:i%5,confidence:0.95}]))});
 
 test('AA flight parser preserves prices, escapes and estimates, ignores deprecated/unscored rows',()=>{
@@ -186,7 +186,7 @@ test('request snapshot exactly matches the serialized body and is available befo
 test('unavailable live usage cancels the refresh before any Jev call or ranking publication',async()=>{
  const f=fixture();let reads=0;
  const controller=new ModelRoutingController({query:async()=>[[]]} as any,scratch(),'unused',{
-  output:async()=> '[]', fetch:(async()=>{reads++;return new Response('unavailable',{status:503});}) as typeof fetch,
+  output:async()=> '[]', fetch:(async()=>{reads++;return new Response('unavailable',{status:503});}) as unknown as typeof fetch,
  });
  f.deps.facts=async(ids:string[])=>controller.rankingFacts(ids);
  const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
