@@ -1250,7 +1250,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <View style={[s.row,{justifyContent:"space-between",alignItems:"flex-end"}]}><View style={{flex:1,maxWidth:600}}>
         <Text style={{color:c.accent,fontSize:11,fontWeight:"800",letterSpacing:1.8,marginBottom:12}}>ROUTING CONSOLE</Text>
         <Text style={{color:c.foreground,fontSize:mobile?38:58,lineHeight:mobile?42:62,fontWeight:"700",letterSpacing:-1.8,marginBottom:16}}>模型排序</Text>
-        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>为不同模型组配置路由优先级，系统会综合能力、速度与可用额度自动选择最佳模型。</Text>
+        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>Haiku、Sonnet 按规则自动排序；Opus 的成员、顺序和组内配置由你在 Magpie 手动维护。</Text>
       </View>{!mobile&&<View style={[s.row,{borderWidth:1,borderColor:c.border,borderRadius:14,paddingVertical:12,paddingHorizontal:15}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><View><Text style={[s.text,{fontSize:12,fontWeight:"700"}]}>{failed?"同步异常":unconfigured?"尚未配置":query.data?"运行正常":"正在加载"}</Text><Text style={s.muted}>{query.data?.at?new Date(query.data.at).toLocaleString():"等待同步"}</Text></View></View>}</View>
     </View>
     <View style={{flexDirection:wide?"row":"column",gap:18,alignItems:"flex-start"}}>

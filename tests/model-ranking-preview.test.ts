@@ -71,7 +71,7 @@ test('ranking group selector defaults to Haiku and switches lists without showin
   {group:'sck-opus',scored:true,rows:[{model:'p/opus',jevScore:4,accounts:[]}]},
   {group:'sck-haiku',scored:true,rows:[{model:'p/haiku',jevScore:2,accounts:[]}]},
  ]};
- const h=harness(data);let nodes=h.render('ModelRankingCard',{ctx:rankingCtx});expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/haiku')).toBe(true);expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/opus')).toBe(false);
+ const h=harness(data);let nodes=h.render('ModelRankingCard',{ctx:rankingCtx});expect(h.text()).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/haiku')).toBe(true);expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/opus')).toBe(false);
  nodes.find(n=>n.props.accessibilityLabel==='查看 sck-opus 模型排序').props.onPress();
  nodes=h.render('ModelRankingCard',{ctx:rankingCtx});expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/opus')).toBe(true);expect(nodes.some(n=>n.props.accessibilityLabel==='第 1 名 p/haiku')).toBe(false);
 });

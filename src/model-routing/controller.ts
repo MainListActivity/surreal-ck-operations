@@ -351,6 +351,9 @@ export class ModelRoutingController {
     const issues: MemberIssue[] = [];
     const tiers = TIERS;
     for (const [level, tier] of tiers.entries()) {
+      // Opus belongs to the owner in Magpie: no creation, membership/effort normalization,
+      // new-model placement, persisted pins, ranking or routing/stickiness writes.
+      if (tier === "opus") continue;
       // An empty staff tier borrows the next stronger one: an upgrade, never a silent downgrade.
       // Fable is owner-only and has nothing stronger; while its models are excluded it serves Opus.
       const pool = (t: Tier) => models.filter((m) => m.tier === tierPool(t));
@@ -426,7 +429,7 @@ export class ModelRoutingController {
     await saveInventory(inventoryFile,inventory);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
-      if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
+      if (id === 'sck-opus' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
       // Already gone is done: a sync that died after removing groups but before writing groups.json
       // (or a concurrent one) must not fail every later sync.

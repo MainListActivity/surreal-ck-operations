@@ -26,7 +26,7 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  const f=fixture();expect((await f.fetch(new Request('http://localhost/o/wrong/ranking'))).status).toBe(404);
  const response=await f.request('ranking');expect(response.status).toBe(200);const html=await response.text();
  for(const part of ['class="workspace"','class="settings-panel"','class="results-panel"','class="model-list"','model-row-main','role="tablist"','href="./"','api/model-ranking','aria-expanded'])expect(html).toContain(part);
- expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).not.toContain('\\u6A21');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
+ expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(html).not.toContain('\\u6A21');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
  const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
  expect(()=>new Function(script)).not.toThrow();
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
