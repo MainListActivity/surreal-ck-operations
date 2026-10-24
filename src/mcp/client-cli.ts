@@ -83,7 +83,7 @@ function printAnswer(result: unknown): void {
 async function pipedArguments(): Promise<string> {
   try {
     const stat = fstatSync(0);
-    if (!stat.isFIFO() && !stat.isFile()) return '';
+    if (!stat.isFIFO() && !stat.isFile() && !stat.isSocket()) return '';
   } catch {
     return '';
   }
