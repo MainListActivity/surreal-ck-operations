@@ -192,3 +192,41 @@ test('unavailable live usage cancels the refresh before any Jev call or ranking 
  const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
  expect(reads).toBe(1);expect(f.calls).toEqual([]);expect(f.applied).toEqual([]);
 });
+
+test('successful Jev snapshots retain exact decimal scores, raw answers, facts, and stable ties',async()=>{
+ const facts=[{...fact('p/a'),aa:{score:45.1,rank:30},usage:{...usageStats(nativeUsage([channel('p','a',164,1000)])).get('p/a')!}},fact('p/b'),fact('p/c')];
+ let snapshot:any;
+ const answers={m0:{type:'score' as const,score:3.712345,confidence:0.8},m1:{type:'score' as const,score:3.712345,confidence:0.4},m2:{type:'score' as const,score:0,confidence:1}};
+ expect(await jevOrder({model:'configured',ask:async()=>({model:'served-jev',answers})},'haiku','速度优先',facts,undefined,result=>{snapshot=result;})).toEqual(['p/a','p/b','p/c']);
+ expect(snapshot).toMatchObject({tier:'haiku',model:'served-jev',rules:'速度优先',answers});
+ expect(snapshot.rows.map((row:any)=>row.score)).toEqual([3.712345,3.712345,0]);
+ facts[0]!.aa!.score=99;expect(snapshot.rows[0].facts.aa.score).toBe(45.1);
+ let published=false;
+ await expect(jevOrder({model:'broken',ask:async()=>({model:'broken',answers:{m0:{type:'score',score:5}}})},'haiku','',[fact('p/a')],undefined,()=>{published=true;})).rejects.toThrow();
+ expect(published).toBe(false);
+});
+
+test('refresh persists successful snapshots with orders, excludes failed groups and invalidated results',async()=>{
+ const f=fixture();
+ f.deps.jev.ask=async(state:any,q:any)=>{if(state.group==='group/sck-sonnet')throw Error('down');return response(q);};
+ const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
+ const publication=f.writes.find(w=>w?.results);
+ expect(Object.keys(publication.results)).toEqual(['sck-opus','sck-haiku']);
+ expect(publication.orders['sck-opus']).toEqual(publication.results['sck-opus'].rows.map((row:any)=>row.facts.id));
+ expect(publication.results['sck-haiku'].rows[0].score).toBe(0);
+});
+
+test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
+ const {rankingTables}=await import('../src/model-routing/ranking.ts');
+ let snapshot:any;
+ await jevOrder({model:'jev',ask:async()=>({model:'jev',answers:{m0:{type:'score',score:3.25},m1:{type:'score',score:0}}})},'haiku','旧规则',[
+  {...fact('p/a:max'),accounts:[{account:'p #1',remainingPct:0}],aa:{rank:30,score:45.1},performance:{score:4.72,samples:2.5}},fact('p/b'),
+ ],undefined,r=>{snapshot=r;});
+ const requests:any=[{tier:'haiku',at:'new-at',payload:{state:{ownerRules:'新规则',models:{m0:{...fact('p/a:max'),aa:{rank:1,score:99}},m1:fact('p/a:high')}}}}];
+ const groups={'sck-haiku':['p/b','p/a:max','p/a:high','p/new']};
+ const table=rankingTables(groups,{'sck-haiku':snapshot},requests)[0]!;
+ expect(table.rules).toBe('旧规则');expect(table.rows.map(r=>r.model)).toEqual(groups['sck-haiku']);
+ expect(table.rows[0]?.jevScore).toBe(0);expect(table.rows[1]).toMatchObject({jevScore:3.25,aaScore:45.1,accounts:[{account:'p #1',remainingPct:0}],performanceSamples:2.5});
+ expect(table.rows[2]?.jevScore).toBeUndefined();expect(table.rows[2]?.aaScore).toBeUndefined();
+ const legacy=rankingTables(groups,{},requests)[0]!;expect(legacy.scored).toBe(false);expect(legacy.at).toBe('new-at');expect(legacy.rows[1]?.aaScore).toBe(99);expect(legacy.rows.every(r=>r.jevScore===undefined)).toBe(true);
+});

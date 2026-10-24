@@ -1132,11 +1132,60 @@ function RankingJson({ctx,label,value,depth=0}: {ctx:Ctx;label:string;value:unkn
   </View>;
 }
 
+function ModelRankingList({ctx,table}: {ctx:Ctx;table:import("../shared/types").ModelRankingTable}) {
+  const s=makeStyles(ctx);
+  const number=(value:number|undefined,digits=1)=>value===undefined?"未知":value.toFixed(digits);
+  return <View style={{gap:12}}>
+    <View style={{gap:4}}>
+      <Text style={s.h2}>{table.group.replace("sck-","").toUpperCase()} · {table.rows.length} 个模型</Text>
+      <Text style={s.muted}>{table.at?`${table.scored?"最近成功评分":"历史请求数据"}：${new Date(table.at).toLocaleString()}`:"尚无排序数据"}</Text>
+      {!!table.rules&&<Text style={s.muted}>本轮规则：{table.rules}</Text>}
+      <Text style={s.muted}>按 Magpie 当前顺序排列，JEV 分数越高越优先；速度为本轮采集的近 7 天统计。</Text>
+      {!table.scored&&<Text style={s.muted}>历史排序未记录 JEV 分数，下一轮成功刷新后显示。</Text>}
+    </View>
+    {table.rows.map((row,index)=>{
+      const short=row.model.replace(/^remote-magpie\//,"");
+      const split=short.lastIndexOf("/"), provider=short.slice(0,split), model=short.slice(split+1);
+      const metrics=[
+        {label:"AA 智能分",value:number(row.aaScore),detail:row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`},
+        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:"近 7 天实测"},
+        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:"近 7 天平均"},
+        {label:"剩余额度",value:row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知",detail:"订阅最紧窗口"},
+        {label:"历史绩效",value:row.performanceScore===undefined?"未知":`${number(row.performanceScore,2)} / 5`,detail:row.performanceSamples===undefined?"暂无样本":`样本权重 ${number(row.performanceSamples,2)}`},
+      ];
+      return <View key={row.model} accessibilityLabel={`第 ${index+1} 名 ${row.model}`} style={s.card}>
+        <View style={{flexDirection:"row",gap:12,alignItems:"flex-start"}}>
+          <View style={[s.badge,{paddingVertical:6,paddingHorizontal:10}]}><Text style={[s.text,{fontWeight:"600"}]}>#{index+1}</Text></View>
+          <View style={{flex:1,minWidth:0,gap:4}}>
+            <Text selectable style={[s.text,{fontSize:ctx.compact?14:15,fontWeight:"600"}]}>{model}</Text>
+            <View style={s.row}><Text style={s.muted}>{provider}</Text>{!!row.effort&&<View style={s.badge}><Text style={s.badgeText}>{row.effort.toUpperCase()}</Text></View>}</View>
+          </View>
+          <View style={{alignItems:"flex-end",gap:2}}>
+            <Text style={s.muted}>JEV 分数</Text>
+            <Text selectable accessibilityLabel={row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`}
+              style={[s.text,{fontSize:ctx.compact?17:20,fontWeight:"600",color:ctx.theme.colors.accent}]}>
+              {row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}
+            </Text>
+            <Text style={s.muted}>{row.jevScore===undefined?"等待刷新":"满分 4"}</Text>
+          </View>
+        </View>
+        <Text selectable style={s.mono}>{row.model}</Text>
+        <View style={{flexDirection:"row",flexWrap:"wrap",gap:12,borderTopWidth:1,borderColor:ctx.theme.colors.border,paddingTop:12}}>
+          {metrics.map(metric=><View key={metric.label} style={{flexGrow:1,flexBasis:ctx.compact?"43%":"16%",minWidth:90,gap:3}}>
+            <Text style={s.muted}>{metric.label}</Text><Text selectable style={[s.text,{fontWeight:"600"}]}>{metric.value}</Text><Text style={s.muted}>{metric.detail}</Text>
+          </View>)}
+        </View>
+      </View>;
+    })}
+  </View>;
+}
+
 function ModelRankingCard({ctx}: {ctx:Ctx}) {
   const s=makeStyles(ctx);
   const get=useRpc(rpc.modelRanking), save=useRpc(rpc.saveModelRanking);
   const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
   const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
+  const [group,setGroup]=useState("sck-haiku");
   const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [selectOpen,setSelectOpen]=useState(false);
   const current=draft??{rules:query.data?.rules??"智能程度和速度综合优先",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
   return <Section title="模型排序" ctx={ctx}><View style={s.card}>
@@ -1162,8 +1211,14 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
     {!!message&&<Text style={s.muted}>{message}</Text>}
     <Text style={s.muted}>{query.data?.at?`最近刷新：${query.data.at}`:"尚未刷新"}；到期后由下一次员工请求触发后台刷新。</Text>
     {!!query.data?.error&&<Text style={s.muted}>{query.data.error}</Text>}
-    {Object.entries(query.data?.orders??{}).map(([group,ids])=><ExpandableText key={group} ctx={ctx} text={`${group}：${ids.join(" → ")}`} lines={2} style={s.muted}/>)}
-    <Text style={s.h2}>最近发送给 Jev 的内容</Text>
+    <View style={s.row}>{(query.data?.tables??[]).map(table=><Pressable key={table.group} accessibilityRole="button"
+      accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:group===table.group}}
+      style={[s.chip,group===table.group&&s.chipActive]} onPress={()=>setGroup(table.group)}>
+      <Text style={group===table.group?s.chipTextActive:s.chipText}>{table.group.replace("sck-","").toUpperCase()} · {table.rows.length}</Text>
+    </Pressable>)}</View>
+    {(()=>{const tables=query.data?.tables??[];const selected=tables.find(table=>table.group===group)??tables[0];return selected?<ModelRankingList ctx={ctx} table={selected}/>:null;})()}
+    {query.data&&!query.data.tables?.length&&<Text style={s.muted}>尚无分组成员。</Text>}
+    <Collapsible title="最近发送给 Jev 的内容" ctx={ctx}>
     <Text style={s.muted}>每组保留最近一次调用前的实际请求快照；包含规则、模型数据、字段说明和评分问题。调用失败时仍保留该次请求。</Text>
     {!query.data?.requests.length&&<Text style={s.muted}>尚无请求快照，下一次排序调用后显示；历史调用无法补回。</Text>}
     {query.data?.requests.map(request=><View key={request.tier} style={s.card}>
@@ -1172,6 +1227,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <RankingJson ctx={ctx} label="请求内容" value={request.payload}/>
       <ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={s.mono}/>
     </View>)}
+    </Collapsible>
   </View></Section>;
 }
 

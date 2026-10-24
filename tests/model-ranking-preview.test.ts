@@ -1,7 +1,7 @@
 import {expect,test} from 'bun:test';
 const page=await Bun.file(new URL('../plugin/client/company.tsx',import.meta.url)).text();
 const source=page.slice(page.indexOf('function RankingJson('),page.indexOf('function RosterTab('));
-const compiled=new Bun.Transpiler({loader:'tsx',tsconfig:{compilerOptions:{jsx:'react',jsxFactory:'React.createElement'}}}).transformSync(source+'\nreturn {ModelRankingCard,RankingJson,ModelIdentityCard};');
+const compiled=new Bun.Transpiler({loader:'tsx',tsconfig:{compilerOptions:{jsx:'react',jsxFactory:'React.createElement'}}}).transformSync(source+'\nreturn {ModelRankingCard,RankingJson,ModelIdentityCard,ModelRankingList};');
 function harness(data:any) {
  const elements:any[]=[];let states:any[]=[];let cursor=0;
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):{type,props:props??{},children}};
@@ -47,4 +47,27 @@ test('identity UI separates grouped/history from pending and hides completed dec
  const history=nodes.find(n=>n.type==='Pressable'&&n.children.some((c:any)=>c?.children?.some((t:any)=>typeof t==='string'&&t.includes('查看历史裁决'))));
  history.props.onPress();nodes=h.render('ModelIdentityCard',{ctx:{}});
  expect(nodes.filter(n=>n.type==='TextInput')).toHaveLength(5);
+});
+
+const rankingCtx={compact:true,theme:{colors:{accent:'#2563eb',border:'#ddd'}}};
+test('model list renders each member with rank, real Jev score and metrics, preserving zero and unknown values',()=>{
+ const h=harness(undefined);
+ h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',at:'2026-10-24T08:06:10Z',rules:'智能程度和速度综合优先',scored:true,rows:[
+  {model:'remote-magpie/codearts/deepseek:max',jevScore:3.712345,aaScore:45.1,aaRank:30,effort:'max',tokensPerSecond:164,ttftMs:15205,accounts:[{account:'p #1',remainingPct:0}],performanceScore:4.72,performanceSamples:2.5},
+  {model:'p/zero',jevScore:0,tokensPerSecond:0,accounts:[]},
+  {model:'p/new',accounts:[]},
+ ]}});
+ const text=h.text();for(const value of ['#1','codearts','deepseek:max','3.7123','45.1','164 tok/s','15.21 秒','0.0%','4.72 / 5','样本权重 2.50','#2','0.0000','0 tok/s','未评分'])expect(text).toContain(value);
+ expect(text).not.toContain('历史排序未记录');
+ expect(h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:false,rows:[{model:'p/old',accounts:[]}]}}).some(n=>n.type==='ScrollView')).toBe(false);
+ expect(h.text()).toContain('未记录');expect(h.text()).toContain('历史排序未记录');
+});
+test('ranking group selector defaults to Haiku and switches lists without showing another group scores',()=>{
+ const data={rules:'默认规则',refreshMinutes:5,configured:true,orders:{},requests:[],tables:[
+  {group:'sck-opus',scored:true,rows:[{model:'p/opus',jevScore:4,accounts:[]}]},
+  {group:'sck-haiku',scored:true,rows:[{model:'p/haiku',jevScore:2,accounts:[]}]},
+ ]};
+ const h=harness(data);let nodes=h.render('ModelRankingCard',{ctx:rankingCtx});expect(h.text()).toContain('p/haiku');expect(h.text()).not.toContain('p/opus');
+ nodes.find(n=>n.props.accessibilityLabel==='查看 sck-opus 模型排序').props.onPress();
+ h.render('ModelRankingCard',{ctx:rankingCtx});expect(h.text()).toContain('p/opus');expect(h.text()).not.toContain('p/haiku');
 });
