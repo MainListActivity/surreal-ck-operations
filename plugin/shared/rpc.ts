@@ -152,7 +152,7 @@ export const roster = defineRpc({
 export const modelRanking = defineRpc({
   name: "company.model-ranking.get",
   input: z.object({}),
-  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string()))}),
+  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
 });
 export const saveModelRanking = defineRpc({
   name: "company.model-ranking.save",
