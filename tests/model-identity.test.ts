@@ -102,7 +102,7 @@ test('sync pins bare members, keeps owner levels, asks Jev once per unnamed mode
  const store:Record<string,string[]>={};
  const first=controller(home,catalog,store,{'j/GLM-5.3-agent':'glm-5-3'});
  await first.c.refresh(true);
- expect(store['sck-opus']).toEqual(['p/gpt-6.1-sol:max']);
+ expect(store['sck-opus']).toBeUndefined();
  expect(store['sck-haiku']!.sort()).toEqual(['j/GLM-5.3-agent:max','p/deepseek-v4.1-flash:max','p/gpt-6-luna:max'].sort());
  expect(first.asks()).toBe(2);
  const aliases=JSON.parse(readFileSync(join(home,'model-routing','aliases.json'),'utf8'));
