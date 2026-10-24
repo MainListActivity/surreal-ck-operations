@@ -1118,20 +1118,35 @@ function RegisterDefCard({ ctx, editing, onDone, onCancel }: {
   );
 }
 
+/** Preserve JSON keys while giving the request a readable, collapsible structure on any width. */
+function RankingJson({ctx,label,value,depth=0}: {ctx:Ctx;label:string;value:unknown;depth?:number}) {
+  const s=makeStyles(ctx);
+  const [open,setOpen]=useState(depth<1);
+  if(value===null||typeof value!=="object") return <Text selectable style={s.text}>{label}：{JSON.stringify(value)}</Text>;
+  const entries=Object.entries(value);
+  return <View style={{gap:6}}>
+    <Pressable accessibilityRole="button" accessibilityState={{expanded:open}} onPress={()=>setOpen(!open)}>
+      <Text style={s.text}>{open?"▾":"▸"} {label}（{entries.length} 项）</Text>
+    </Pressable>
+    {open&&<View style={{paddingLeft:12,gap:6}}>{entries.map(([key,item])=><RankingJson key={key} ctx={ctx} label={key} value={item} depth={depth+1}/>)}</View>}
+  </View>;
+}
+
 function ModelRankingCard({ctx}: {ctx:Ctx}) {
   const s=makeStyles(ctx);
   const get=useRpc(rpc.modelRanking), save=useRpc(rpc.saveModelRanking);
   const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
   const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
   const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [selectOpen,setSelectOpen]=useState(false);
-  const current=draft??{rules:query.data?.rules??"",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
+  const current=draft??{rules:query.data?.rules??"智能程度和速度综合优先",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
   return <Section title="模型排序" ctx={ctx}><View style={s.card}>
     <Text style={s.muted}>按你的规则为 Opus、Sonnet、Haiku 组内模型排序；分组成员仍由你控制。</Text>
     {query.isError&&<Text style={s.muted}>设置读取失败，请稍后重试。</Text>}
     {query.data&&!query.data.configured&&<Text style={s.muted}>Jev 尚未配置，暂时保留现有顺序。</Text>}
     <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:100,textAlignVertical:"top"}]}
-      placeholder="例如：优先免费且稳定的模型；额度不足 10% 时靠后，质量相近时优先缓存命中率和输出速度。"
+      placeholder="智能程度和速度综合优先"
       value={current.rules} onChangeText={rules=>setDraft({...current,rules})}/>
+    <Text style={s.muted}>留空时使用默认规则：智能程度和速度综合优先。</Text>
     <Text style={s.text}>刷新间隔</Text>
     <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={s.buttonSecondary} onPress={()=>setSelectOpen(!selectOpen)}>
       <Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""} ▾</Text>
@@ -1148,6 +1163,15 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
     <Text style={s.muted}>{query.data?.at?`最近刷新：${query.data.at}`:"尚未刷新"}；到期后由下一次员工请求触发后台刷新。</Text>
     {!!query.data?.error&&<Text style={s.muted}>{query.data.error}</Text>}
     {Object.entries(query.data?.orders??{}).map(([group,ids])=><ExpandableText key={group} ctx={ctx} text={`${group}：${ids.join(" → ")}`} lines={2} style={s.muted}/>)}
+    <Text style={s.h2}>最近发送给 Jev 的内容</Text>
+    <Text style={s.muted}>每组保留最近一次调用前的实际请求快照；包含规则、模型数据、字段说明和评分问题。调用失败时仍保留该次请求。</Text>
+    {!query.data?.requests.length&&<Text style={s.muted}>尚无请求快照，下一次排序调用后显示；历史调用无法补回。</Text>}
+    {query.data?.requests.map(request=><View key={request.tier} style={s.card}>
+      <Text style={s.h2}>{request.tier.toUpperCase()}</Text>
+      <Text style={s.muted}>调用开始：{new Date(request.at).toLocaleString()}</Text>
+      <RankingJson ctx={ctx} label="请求内容" value={request.payload}/>
+      <ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={s.mono}/>
+    </View>)}
   </View></Section>;
 }
 

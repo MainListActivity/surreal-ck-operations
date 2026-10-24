@@ -6,6 +6,7 @@ import { aaRankOfScore, canonicalModel, resolveBenchmark, splitMember, type Effo
 export const RANKED_TIERS: Tier[] = ["opus", "sonnet", "haiku"];
 export const REFRESH_MINUTES = [2, 5, 10] as const;
 export const DEFAULT_REFRESH_MINUTES = 5;
+export const DEFAULT_RANKING_RULES = "智能程度和速度综合优先";
 
 export interface RankingSettings {
   rules: string;
@@ -120,13 +121,12 @@ export function modelFacts(
 const LEVELS = ["最后考虑", "靠后", "中等", "靠前", "首选"];
 
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
-export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[]): Promise<string[]> {
+export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>): Promise<string[]> {
   const keys = facts.map((_, i) => `m${i}`);
   if (!facts.length) return [];
-  const { answers } = await jev.ask(
-    {
+  const state = {
       group: `group/sck-${tier}`,
-      ownerRules: rules || "（老板未设置额外规则）",
+      ownerRules: rules.trim() || DEFAULT_RANKING_RULES,
       models: Object.fromEntries(facts.map((f, i) => [keys[i], f])),
       notes: [
         "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
@@ -134,13 +134,16 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
         "usage：近 7 天实际调用，cacheHitRate 为缓存命中占提示 token 比例，tokensPerSecond 为输出速度，ttftMs 为首 token 中位延迟。",
         "performance：公司任务验收后的模型绩效（1–5 分）与样本数，样本少时参考价值低。",
       ],
-    },
-    Object.fromEntries(facts.map((f, i) => [keys[i], {
+    };
+  const questions = Object.fromEntries(facts.map((f, i) => [keys[i], {
       type: "score" as const,
       instructions: `按老板规则，并综合能力、额度、价格、缓存命中、速度和绩效，${f.id} 在本组内应排多靠前？`,
       criteria: LEVELS,
-    }])),
-  );
+    }]));
+  // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
+  const payload: RankingRequestPayload = JSON.parse(JSON.stringify({ model: jev.model, state, questions }));
+  await beforeAsk?.(payload);
+  const { answers } = await jev.ask(payload.state, payload.questions);
   // score is the expectation over the five levels, so a mid-ranked model is still placed correctly
   // even though its confidence (mass on the single most likely level) is low. Only gaps are rejected.
   for (const key of keys) {
@@ -151,6 +154,24 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
     .map((f, i) => ({ id: f.id, i, score: answers[keys[i]!]!.score! }))
     .sort((a, b) => b.score - a.score || a.i - b.i)
     .map((x) => x.id);
+}
+
+export interface RankingRequestPayload {
+  model: string;
+  state: Record<string, unknown>;
+  questions: Record<string, import("../dispatcher/jev.ts").JevQuestion>;
+}
+export interface RankingRequestSnapshot {
+  tier: string;
+  at: string;
+  payload: RankingRequestPayload;
+}
+
+/** Bounded history: keep the most recent attempted request per ranked group across restarts. */
+export async function rankingRequests(db: Surreal): Promise<RankingRequestSnapshot[]> {
+  const [rows] = await db.query<[RankingRequestSnapshot[]]>(
+    "SELECT tier,at,payload FROM company_meta WHERE id IN [company_meta:model_ranking_request_opus,company_meta:model_ranking_request_sonnet,company_meta:model_ranking_request_haiku];");
+  return RANKED_TIERS.flatMap(tier => rows.filter(row => row.tier === tier));
 }
 
 export interface RefresherDeps {
@@ -204,7 +225,11 @@ export class RankingRefresher {
         try {
           const facts = members.map(id => byId.get(id));
           if (facts.some(f => !f)) throw Error("missing facts");
-          orders[`sck-${tier}`] = await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[]);
+          orders[`sck-${tier}`] = await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
+            await this.deps.db.query(
+              "UPSERT type::record('company_meta',$key) SET tier=$tier,at=$at,payload=$payload;",
+              { key: `model_ranking_request_${tier}`, tier, at: new Date().toISOString(), payload });
+          });
         } catch (e) {
           // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
           this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
@@ -228,10 +253,10 @@ export class RankingRefresher {
 export async function rankingSettings(db: Surreal): Promise<RankingSettings> {
   const [row] = await db.query<[{ ranking_rules?: string; ranking_refresh_minutes?: number } | undefined]>(
     "SELECT ranking_rules, ranking_refresh_minutes FROM ONLY company_meta:model_routing;");
-  return { rules: row?.ranking_rules ?? "", refreshMinutes: REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never) ? row!.ranking_refresh_minutes! : DEFAULT_REFRESH_MINUTES };
+  return { rules: row?.ranking_rules?.trim() || DEFAULT_RANKING_RULES, refreshMinutes: REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never) ? row!.ranking_refresh_minutes! : DEFAULT_REFRESH_MINUTES };
 }
 export async function saveRankingSettings(db: Surreal, settings: RankingSettings, refresher: RankingRefresher): Promise<void> {
   if (!REFRESH_MINUTES.includes(settings.refreshMinutes as never) || typeof settings.rules !== 'string' || settings.rules.length > 8000) throw Error('排序规则或刷新间隔无效');
-  await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes};", {rules:settings.rules,minutes:settings.refreshMinutes});
+  await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes};", {rules:settings.rules.trim() || DEFAULT_RANKING_RULES,minutes:settings.refreshMinutes});
   refresher.reset(settings.refreshMinutes);
 }

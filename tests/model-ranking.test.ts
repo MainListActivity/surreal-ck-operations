@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import bundled from '../src/model-routing/benchmarks.json';
 import {useBenchmarks,aaRankOf,classify} from '../src/model-routing/policy.ts';
 import {parseAaLeaderboard,refreshAa,loadAa} from '../src/model-routing/aa.ts';
-import {parseCsv,usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings} from '../src/model-routing/ranking.ts';
+import {parseCsv,usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
 import {ModelRoutingController} from '../src/model-routing/controller.ts';
 import {startModelGateway} from '../src/model-routing/gateway.ts';
 const dirs:string[]=[];
@@ -89,7 +89,7 @@ test('saving during a refresh invalidates old rules, stopped refresher cannot pu
 });
 test('Jev failure retains group order and records a safe error, retry waits for interval',async()=>{
  const f=fixture();f.deps.jev.ask=async()=>{throw Error('private upstream error');};
- const r=new RankingRefresher(f.deps);r.trigger(0);await r.settled();expect(f.applied).toHaveLength(0);expect(f.writes[0].error).not.toContain('private');
+ const r=new RankingRefresher(f.deps);r.trigger(0);await r.settled();expect(f.applied).toHaveLength(0);expect(f.writes.find(w=>w?.error)?.error).not.toContain('private');
 });
 test('controller applies persisted group-local orders but preserves manual membership and Fable ordering',async()=>{
  const home=scratch();const store:Record<string,string[]>={};let orders:Record<string,string[]>={};
@@ -128,4 +128,26 @@ test('controller rechecks invalidation after waiting for an existing sync',async
  const controller=new ModelRoutingController(db as any,home,'unused',{fetch:(async()=>Response.json({data:[{id:'p/gpt-6.1-sol'},{id:'p/deepseek-v4.1-flash'}]})) as unknown as typeof fetch,command:async args=>{calls.push(args);}});
  const syncing=controller.refresh(true);await started;const applying=controller.applyOrders({'sck-opus':['old/model']},()=>valid);
  valid=false;release();await syncing;const before=calls.length;await applying;expect(calls.length).toBe(before);
+});
+
+test('empty and whitespace rules use the default in settings, saved values and the actual request',async()=>{
+ const f=fixture();const r=new RankingRefresher(f.deps);
+ for(const rules of ['', '   ']) {
+  await saveRankingSettings(f.db as any,{rules,refreshMinutes:5},r);
+  expect((await rankingSettings(f.db as any)).rules).toBe(DEFAULT_RANKING_RULES);
+  await jevOrder({model:'fixture',ask:async(state:any,q:any)=>{
+   expect(state.ownerRules).toBe('智能程度和速度综合优先');return response(q);
+  }},'haiku',rules,[fact('p/a')]);
+ }
+});
+test('request snapshot exactly matches the serialized body and is available before a failed Jev attempt',async()=>{
+ let snapshot:any;
+ const facts=[{...fact('p/a'),usage:undefined}];
+ await expect(jevOrder({model:'fixture',ask:async(state,questions)=>{
+  expect(snapshot).toEqual(JSON.parse(JSON.stringify({model:'fixture',state,questions})));
+  expect(Object.hasOwn((snapshot.state.models as any).m0,'usage')).toBe(false);
+  throw Error('upstream unavailable');
+ }},'opus','速度优先',facts,async payload=>{snapshot=structuredClone(payload);})).rejects.toThrow('upstream unavailable');
+ expect(snapshot.state.ownerRules).toBe('速度优先');
+ expect(snapshot.questions.m0.criteria).toEqual(['最后考虑','靠后','中等','靠前','首选']);
 });
