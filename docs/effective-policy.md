@@ -14,7 +14,7 @@
 
 | 域 | 字段 | 语义 |
 | --- | --- | --- |
-| `write_authority` | `codeRoles: Role[]`、`intents: ('read'\|'code'\|'assets')[]`、`lanes?: string[]` | 允许承接 code 意图任务的岗位、本作用域允许出现的工作意图、可选线名白名单。空 `codeRoles` = 冻结代码写权，只能由 owner 来源授权。 |
+| `write_authority` | `codeRoles: Role[]`、`intents: ('read'\|'code'\|'assets')[]`、`lanes?: string[]` | 允许承接 code 意图任务的岗位、本作用域允许出现的工作意图、可选线名白名单。空 `codeRoles` = 冻结代码写权，只能由 owner 来源授权。白名单生效时，code 任务必须**同时声明线名并挂在某个目标下**（没有目标就没有轨分支，只能落到 `task/<id8>` 的临时分支），否则一律 `forbidden`——缺声明是拒绝，不是放行。 |
 | `tool_scope` | `allowedTools: string[]`、`allowedAliases: string[]`、`newSpend: false` | 受控工具与账号别名白名单；`newSpend` 只能是 `false`，本层从不放开支出能力。 |
 | `gate` | `requireOwnerApproval: boolean`、`requireIndependentReviewer: boolean`、`requiredCriteriaLegs: AcceptanceLeg[]` | 老板关口与独立验收岗只能被加强。 |
 

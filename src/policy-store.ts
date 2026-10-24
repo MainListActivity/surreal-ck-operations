@@ -81,6 +81,8 @@ export async function readEffectiveContract(db: PolicyStore, chain: readonly Pol
 /** 任务行上与策略判定有关的字段（带上 goal.project 投影，作用域链需要它）。 */
 export interface PolicyTaskRow {
   id: unknown; state: string; executor_role: string;
+  /** 未声明 work_intent 时按 kind 解析出"这条任务会被怎么跑"（与 claim 建树同一规则）。 */
+  kind?: string | null;
   work_intent?: { kind: string; lane?: string } | null;
   policy_hash?: string | null; policy_block_reason?: string | null;
   policy_contract?: { domains?: Array<{ domain: string }> } | null;

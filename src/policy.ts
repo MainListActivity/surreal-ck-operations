@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { CompanyError } from './core-errors.ts';
 import { ROLES } from './contracts.ts';
-import type { AcceptanceLeg, PolicyView, ReviewerRole, Role, WorkIntent } from './contracts.ts';
+import type { AcceptanceLeg, PolicyView, ReviewerRole, Role, TaskKind, WorkIntent } from './contracts.ts';
 
 /**
  * 有效策略层（SYS06 P1）的机器策略：受限类型化 schema + 显式替代关系 + 生效/到期语义。
@@ -250,20 +250,42 @@ export const domainPayload = <T extends PolicyPayload['kind']>(contract: Effecti
   contract.domains.find(entry => entry.domain === (kind as PolicyDomain))?.payload as
     Extract<PolicyPayload, { kind: T }> | undefined;
 
+/**
+ * 未声明意图的任务按 claim 建树的同一规则解析：工程岗的非发布任务按代码写，其余按读。
+ * 这条规则只有一处（worktree-registry.ts 的 claimShape 也用它），否则"判定放行的任务"与"实际拿到写树的任务"
+ * 会各说各话——AC02① 的绕过正是从这个缝里来的：payload 带 lanes 白名单，而判定只看出生字段，不看它实际会怎么写。
+ */
+export const impliedIntent = (role: Role, kind: TaskKind): WorkIntent =>
+  ({ kind: role === 'engineering' && kind !== 'release' ? 'code' : 'read' });
+
 /** code 意图任务的写权判定：岗位必须在 codeRoles 内，意图与线名也必须被授权。 */
-export function checkWriteAuthority(contract: EffectiveContract, input: { role: Role; intent?: WorkIntent }): PolicyVerdict {
+export function checkWriteAuthority(contract: EffectiveContract,
+  input: { role: Role; kind: TaskKind; goalId?: string; intent?: WorkIntent }): PolicyVerdict {
   const payload = domainPayload(contract, 'write_authority');
   if (!payload) return { ok: true };
-  const intent = input.intent;
+  // 未声明意图时按"它会被怎么跑"判定，而不是当作没有可判的东西放过去（缺数据是拒绝，不是通过）。
+  const intent = input.intent ?? impliedIntent(input.role, input.kind);
   const role = input.role;
-  if (intent && !payload.intents.includes(intent.kind)) {
+  if (!payload.intents.includes(intent.kind)) {
     return { ok: false, code: 'forbidden', reason: `policy ${payload.kind} forbids work intent ${intent.kind} here` };
   }
-  if (intent?.kind === 'code' && !payload.codeRoles.includes(role)) {
+  if (intent.kind === 'code' && !payload.codeRoles.includes(role)) {
     return { ok: false, code: 'forbidden', reason: `policy forbids role ${role} from taking code work here` };
   }
-  if (intent?.kind === 'code' && payload.lanes && intent.lane !== undefined && !payload.lanes.includes(intent.lane)) {
-    return { ok: false, code: 'forbidden', reason: `policy forbids code work on lane ${intent.lane}` };
+  if (intent.kind === 'code' && payload.lanes) {
+    // 白名单生效时必须判定"这条 code 任务会落到哪条轨上"：线名未声明、或任务不在任何目标下（没有 goalId 就
+    // 只能建 task/<id8> 的临时分支，不是任何一条轨）都不在白名单内 → 失败关闭，绝不因为字段缺失而放行。
+    if (intent.lane === undefined) {
+      return { ok: false, code: 'forbidden',
+        reason: `policy requires code work on this scope to declare a lane (allowed: ${payload.lanes.join(', ') || 'none'})` };
+    }
+    if (!input.goalId) {
+      return { ok: false, code: 'forbidden',
+        reason: `policy forbids code work on lane ${intent.lane} outside a goal (a lane needs a goal to have a lane branch)` };
+    }
+    if (!payload.lanes.includes(intent.lane)) {
+      return { ok: false, code: 'forbidden', reason: `policy forbids code work on lane ${intent.lane}` };
+    }
   }
   return { ok: true };
 }
@@ -344,6 +366,10 @@ export function policyView(row: PolicyRow): PolicyView {
 export interface PolicyTaskFacts {
   state: string;
   executorRole: Role;
+  /** 任务的 kind：未声明意图时按它解析出"这条任务会被怎么跑"（见 impliedIntent）。 */
+  kind?: TaskKind;
+  /** 任务所属目标：lanes 白名单下，没有目标就没有轨分支可言。 */
+  goalId?: string;
   workIntent?: { kind: string; lane?: string };
   policyHash?: string;
   policyBlockReason?: string;
@@ -363,7 +389,8 @@ export function dispatchVerdict(facts: PolicyTaskFacts, contract: EffectiveContr
       reason: '原授权版本已到期或被撤销：当前有效契约里没有生效的写权/工具/关口版本，需经理按新契约重新授权或隔离本任务' };
   }
   const intent = facts.workIntent ? { kind: facts.workIntent.kind, ...(facts.workIntent.lane !== undefined ? { lane: facts.workIntent.lane } : {}) } as WorkIntent : undefined;
-  const verdict = checkWriteAuthority(contract, { role: facts.executorRole, intent });
+  const verdict = checkWriteAuthority(contract, { role: facts.executorRole, kind: facts.kind ?? 'task',
+    ...(facts.goalId ? { goalId: facts.goalId } : {}), ...(intent ? { intent } : {}) });
   if (!verdict.ok || facts.policyBlockReason) {
     return { verdict: 'blocked', reason: verdict.ok ? facts.policyBlockReason : verdict.reason, hash: contract.hash };
   }

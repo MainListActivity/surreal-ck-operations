@@ -812,7 +812,8 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     // SYS06 AC02/AC03：机器策略在创建前判定（写权、老板关口），生效契约登记到任务上。判定只读 policy 表。
     const policyChain = this.policyChain({ goalId: input.goalId, projectId: input.project, includeTask: false });
     const { contract: policyContract, epoch: policyEpoch } = await this.effectiveContractFor(policyChain);
-    const writeVerdict = checkWriteAuthority(policyContract, { role: input.executorRole, intent: input.workIntent });
+    const writeVerdict = checkWriteAuthority(policyContract, { role: input.executorRole, kind,
+      ...(input.goalId ? { goalId: input.goalId } : {}), ...(input.workIntent ? { intent: input.workIntent } : {}) });
     if (!writeVerdict.ok) {
       throw new CompanyError(writeVerdict.code,
         `策略拒绝创建：${writeVerdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
@@ -1086,7 +1087,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const policyRow = await this.taskRowWithProject(taskId);
       if (!policyRow) throw new CompanyError('not_found', 'Task not found');
       const { contract } = await this.effectiveContractFor(this.chainOfRow(policyRow));
-      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: actor.role,
+      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: actor.role, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
         ...(task.workIntent ? { workIntent: task.workIntent } : {}),
         ...(policyRow.policy_hash ? { policyHash: policyRow.policy_hash } : {}),
         ...(policyRow.policy_block_reason ? { policyBlockReason: policyRow.policy_block_reason } : {}),
@@ -1213,7 +1215,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const { contract: policyContract, rows: policyRows, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
     if (current.state !== 'review') {
       const currentTask = view(current);
-      const verdict = dispatchVerdict({ state: current.state, executorRole: actor.role,
+      const verdict = dispatchVerdict({ state: current.state, executorRole: actor.role, kind: currentTask.kind,
+        ...(currentTask.goalId ? { goalId: currentTask.goalId } : {}),
         ...(currentTask.workIntent ? { workIntent: currentTask.workIntent } : {}),
         ...(current.policy_hash ? { policyHash: current.policy_hash } : {}),
         ...(current.policy_block_reason ? { policyBlockReason: current.policy_block_reason } : {}),
@@ -3534,7 +3537,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const next = resolveEffective([...projected, synthetic], taskChain, epoch + 1, now);
       if ((row.policy_hash ?? '') === next.hash) continue;
       // 与派工/领取同源：试算里的"失去授权"就是那次判定会拦下的情形（含域整体消失的到期/撤销）。
-      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole,
+      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
         ...(task.workIntent ? { workIntent: task.workIntent } : {}),
         ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
         ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
@@ -3568,7 +3572,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const chain = this.chainOfRow(row);
       const { contract } = await this.effectiveContractFor(chain);
       const task = view(row);
-      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole,
+      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
         ...(task.workIntent ? { workIntent: task.workIntent } : {}),
         ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
         ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
@@ -3636,7 +3641,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const { contract } = await this.effectiveContractFor(chain);
     const task = view(row);
     // 判定复用 policy.ts 的 dispatchVerdict：调度器（workforce）走的是同一段，两边结论不会分叉。
-    return dispatchVerdict({ state: row.state, executorRole: task.executorRole,
+    return dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+      ...(task.goalId ? { goalId: task.goalId } : {}),
       ...(task.workIntent ? { workIntent: task.workIntent } : {}),
       ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
       ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),

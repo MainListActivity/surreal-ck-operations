@@ -160,8 +160,10 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
     if (tDep.state !== 'blocked') throw new Error(`fixture: a task with an unfinished dependency is not blocked (${tDep.state})`);
 
     // 冻结代码写权（空 codeRoles 只能由老板来源授权）：先试算，再落地，拿到受影响任务清单。
+    // intents 保留 read：冻结的是"代码写权"，不是把只读也一起停掉——SYS06 的判定按任务实际会被怎么跑解析意图，
+    // 不声明意图的工程岗任务就是 code，所以这一版之后新建的对照任务必须显式声明 read 才建得出来。
     const frozen = { policyId: 'rb01-write', domain: 'write_authority', source: 'owner',
-      ownerQuote: '冻结本项目全部代码写权', reason: 'RB01 回滚隔离彩排：冻结代码写权', payload: { kind: 'write_authority', codeRoles: [], intents: ['code'] } };
+      ownerQuote: '冻结本项目全部代码写权', reason: 'RB01 回滚隔离彩排：冻结代码写权', payload: { kind: 'write_authority', codeRoles: [], intents: ['code', 'read'] } };
     const epochOf = async () => (await newDb.db.query<[number | null]>(
       'RETURN (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;'))[0] ?? 0;
     const epochBefore = await epochOf();
@@ -181,8 +183,9 @@ run('RB01 rollback isolation: the policy layer writes, then the deployed release
     const enforced = await core.policyEnforce(gm, { taskIds: inFlight, reason: 'RB01 回滚隔离彩排：收权隔离在办任务', idempotencyKey: key() });
     isolatedIds = enforced.blocked;
     // 冻结之后新建的任务：它登记的契约就是这一版（v2），所以新版认为它可以派工——用来证明候选池不是"一律不合格"。
-    const control = await core.createTask(gm, { title: 'RB01 对照（无意图，冻结后建）', context: 'RB01 回滚隔离彩排的合成对照任务',
-      executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() });
+    // 显式声明只读意图：冻结的是代码写权，只读任务照旧可建（不声明意图的工程岗任务会被解析成 code 而建不出来）。
+    const control = await core.createTask(gm, { title: 'RB01 对照（冻结后建的只读任务）', context: 'RB01 回滚隔离彩排的合成对照任务',
+      executorRole: 'engineering', reviewerRole: 'qa', workIntent: { kind: 'read' }, idempotencyKey: key() });
     controlId = control.id;
     protectedTasks = [
       { label: '收权隔离（ready）', id: tReady.id, expectState: 'blocked', expectBlockedTo: 'gm', expectResume: 'ready' },

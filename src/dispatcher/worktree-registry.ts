@@ -5,8 +5,9 @@ import { rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { RecordId } from 'surrealdb';
 import type { Surreal } from 'surrealdb';
-import type { Principal, ProjectView, TaskView, WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from '../contracts.ts';
+import type { Principal, ProjectView, Role, TaskView, WorkIntent, WorktreeAssignment, WorktreeView, WriteScopeHolder } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { impliedIntent } from '../policy.ts';
 import { MAX_ASSET_PATHS, MAX_ASSET_PATH_CHARS } from '../input-bounds.ts';
 import {
   decideReclaim, parseGraceDays, reclaimEnabledFrom, type ReclaimTrigger,
@@ -122,7 +123,7 @@ const refState = (r: Ref): 'active' | 'recovery' | 'released' => {
 
 /** What a claim asks for: its intent, the lane it joins, and the branch it must be on (undefined: a shared read tree). */
 function claimShape(task: TaskView, role: string) {
-  const intent: WorkIntent = task.state === 'review' ? { kind: 'read' } : task.workIntent ?? { kind: role === 'engineering' && task.kind !== 'release' ? 'code' : 'read' };
+  const intent: WorkIntent = task.state === 'review' ? { kind: 'read' } : task.workIntent ?? impliedIntent(role as Role, task.kind);
   // A lane is one serial relay chain of a goal: every task tagged with it shares one tree and one branch.
   const laneName = intent.kind === 'assets' ? undefined : task.workIntent?.lane;
   const lane = laneName && task.goalId ? `${task.goalId}:${laneName}` : undefined;

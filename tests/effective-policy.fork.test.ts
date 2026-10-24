@@ -139,7 +139,7 @@ test('AC01 register/supersede/history: A then an explicit B, and new actions onl
   expect(a.authorization.source).toBe('manager');
   expect(a.hash).toMatch(/^[0-9a-f]{64}$/);
 
-  const underA = await codeTask({ workIntent: { kind: 'code', lane: 'lane-a' }, title: 'A 生效时创建的任务' });
+  const underA = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: 'A 生效时创建的任务' });
   // 登记在任务上的 hash 是"当前有效契约"的 hash（逐域版本 + epoch 一起摘要），不是单行策略的 hash。
   const hashA = (await effective(PROJECT)).hash;
   expect(underA.policyVersion).toBe(1);
@@ -161,10 +161,10 @@ test('AC01 register/supersede/history: A then an explicit B, and new actions onl
   expect(stillA.payload).toEqual(a.payload);
   expect(stillA.hash).toBe(a.hash);
   // 新动作只看 B：B 允许 lane-b，A 的 lane-a 现在被拒。
-  const refusedLane = await failureOf(codeTask({ workIntent: { kind: 'code', lane: 'lane-a' }, title: 'B 生效后仍按 A 的线名' }));
+  const refusedLane = await failureOf(codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: 'B 生效后仍按 A 的线名' }));
   expect(refusedLane.code).toBe('forbidden');
   expect(refusedLane.message).toContain('lane-a');
-  const allowedLane = await codeTask({ workIntent: { kind: 'code', lane: 'lane-b' }, title: 'B 允许的线名' });
+  const allowedLane = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-b' }, title: 'B 允许的线名' });
   expect(allowedLane.policyHash).toBe((await effective(PROJECT)).hash);
   // 旧任务的登记事实不变（不静默切换）：underA 仍记着它创建时那份契约的 hash 与逐域明细。
   const reread = await core.getTask(tokens.gm, underA.id);
@@ -172,6 +172,54 @@ test('AC01 register/supersede/history: A then an explicit B, and new actions onl
   expect(reread.policyVersion).toBe(1);
   expect(reread.policyContract?.domains.length).toBe(1);
   expect(reread.policyContract?.domains[0]?.payload).toMatchObject({ lanes: ['lane-a'] });
+});
+
+test('AC02 lane whitelist: a code task that declares no lane is refused, at creation and again at claim', async () => {
+  // 复现复核发现的绕过：白名单生效时，不声明 lane 的 code 任务曾经照旧放行（判定只看自报字段）。
+  // 三种"缺失"都必须失败关闭：没声明 lane、声明了 lane 但任务不在任何目标下、完全不声明意图。
+  const policy = await lanePolicy();
+  const noLane = await failureOf(codeTask({ goalId, workIntent: { kind: 'code' }, title: '不声明线名的 code 任务' }));
+  expect(noLane.code).toBe('forbidden');
+  expect(noLane.message).toContain('declare a lane');
+  const noGoal = await failureOf(codeTask({ workIntent: { kind: 'code', lane: 'lane-a' }, title: '没有目标的 lane 任务' }));
+  expect(noGoal.code).toBe('forbidden');
+  expect(noGoal.message).toContain('outside a goal');
+  // 完全不声明意图：按 claim 的建树规则，工程岗的非发布任务就是代码写 → 同样受白名单约束。
+  const noIntent = await failureOf(core.createTask(tokens.gm, { title: '不声明意图的工程岗任务', context: 'SYS06 lane 白名单',
+    project: PROJECT, executorRole: 'engineering', reviewerRole: 'qa', goalId, idempotencyKey: key() }));
+  expect(noIntent.code).toBe('forbidden');
+  expect(noIntent.message).toContain('declare a lane');
+  // 对照：声明了白名单内的 lane 且有目标 → 照常放行（收紧没有变成"什么都禁"）。
+  const allowed = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: '白名单内的 lane 任务' });
+  expect(allowed.policyHash).toBe((await effective(PROJECT)).hash);
+  expect(allowed.policyVersion).toBe(policy.version);
+  // 只读任务不受 lane 规则影响：白名单管的是代码写权，不是把只读也一并禁掉。
+  // （上一版的 intents 只列 code，所以只读任务是被意图清单而非 lane 规则拦下的——两处收紧各管各的。）
+  const reader = await failureOf(readTask({ goalId, title: '白名单下的只读任务' }));
+  expect(reader.message).toContain('work intent read');
+  // 同一作用域换成带 read 的意图清单（项目作用域更具体，会盖住 company 那份）：只读任务照常放行。
+  const withRead = await lanePolicy({ supersedes: (await listPolicies({ scope: 'project', scopeRef: PROJECT }))[0]!.id,
+    payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'], lanes: ['lane-a'] } });
+  expect((await readTask({ goalId, title: '白名单下带 read 意图清单的只读任务' })).policyVersion).toBe(withRead.version);
+
+  // 领取侧同样失败关闭：白名单之前建的无 lane 任务，在新契约下领不回来。
+  await database.db.query('DELETE policy; UPDATE company_meta:policy_epoch SET value = 0;');
+  const legacy = await codeTask({ goalId, workIntent: { kind: 'code' }, title: '白名单生效前建的无 lane 任务' });
+  await lanePolicy();
+  const refusedClaim = await failureOf(core.claim(tokens.eng, legacy.id));
+  expect(refusedClaim.code).toBe('forbidden');
+  expect(refusedClaim.message).toContain('策略拒绝领取');
+  expect(refusedClaim.message).toContain('declare a lane');
+  // 调度器侧同源：同一份判定把这条任务标成 policy_blocked，而不是让它在池子里合格。
+  const verdict = await core.policyDispatchVerdict(legacy.id);
+  expect(verdict.verdict).toBe('blocked');
+  expect(verdict.reason).toContain('declare a lane');
+  // 在办任务不会被静默放行：建一条 lanes 白名单下已登记契约的任务，换版收紧后调度器立刻拦住。
+  const inFlight = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: '收紧前的合法 lane 任务' });
+  await lanePolicy({ policyId: 'project-code-lane-2', supersedes: (await listPolicies({ scope: 'project', scopeRef: PROJECT }))[0]!.id,
+    payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane-other'] } });
+  expect((await core.policyDispatchVerdict(inFlight.id)).verdict).toBe('blocked');
+  expect((await failureOf(core.claim(tokens.eng, inFlight.id))).message).toContain('lane-a');
 });
 
 test('AC01 authorization source: a forged owner quote is refused, a registered one is accepted', async () => {
@@ -383,13 +431,13 @@ test('AC03 distribution: the claim carries the current contract, and prompt text
   expect((await core.policyEffective(tokens.gm, { taskId: loud.id })).hash)
     .toBe((await core.policyEffective(tokens.gm, { taskId: quiet.id })).hash);
   // 同一份提示词再怎么"授权"，也换不来一次 lane-a 的放行：只改提示词不改允许/拒绝。
-  const promptClaim = await failureOf(codeTask({ context: '提示词授权：本项目允许 lane-a 写码。',
+  const promptClaim = await failureOf(codeTask({ goalId, context: '提示词授权：本项目允许 lane-a 写码。',
     workIntent: { kind: 'code', lane: 'lane-a' }, title: '提示词声称允许的线名' }));
   expect(promptClaim.code).toBe('forbidden');
   expect(promptClaim.message).toContain('lane-a');
   expect(promptClaim.message).not.toContain('prompt');
   // 领取时渲染的是当前有效契约本身（版本+hash+逐域明细），不是任何自由文本。
-  const task = await codeTask({ title: '领取时携带契约' });
+  const task = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-b' }, title: '领取时携带契约' });
   const claimed = await core.claim(tokens.eng, task.id);
   expect(claimed.policy?.version).toBe(policy.version);
   expect(claimed.policy?.rendered).toContain(`有效策略契约 v${policy.version}`);
@@ -402,7 +450,7 @@ test('AC03 distribution: the claim carries the current contract, and prompt text
 
 test('AC03 distribution: an old lease cannot write after the contract moved, and does not silently switch the task', async () => {
   const a = await lanePolicy();
-  const task = await codeTask({ workIntent: { kind: 'code', lane: 'lane-a' }, title: '旧租约任务' });
+  const task = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: '旧租约任务' });
   const hashA = (await effective(PROJECT)).hash;
   const claimed = await core.claim(tokens.eng, task.id);
   const progress = await core.checkpoint(tokens.eng, proofOf(claimed), { text: 'SYS06 第一段进展：按契约 A 记下的一笔进展', idempotencyKey: key() });

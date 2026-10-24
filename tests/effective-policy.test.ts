@@ -5,7 +5,7 @@ import { CompanyError } from '../src/core-errors.ts';
 import { canonicalAlias } from '../src/ops/accounts.ts';
 import {
   canonicalAliasValue, checkGateCreation, checkToolScope, checkWriteAuthority, contractDiff, dispatchVerdict,
-  domainOfPayload, domainPayload, normalizePayload, policyActiveAt, policyDigest, policyHash, renderContract,
+  domainOfPayload, domainPayload, impliedIntent, normalizePayload, policyActiveAt, policyDigest, policyHash, renderContract,
   resolveEffective, type EffectiveContract, type PolicyRow, type PolicyScopeLink,
 } from '../src/policy.ts';
 
@@ -136,16 +136,65 @@ describe('三个域的判定', () => {
     const policies = [row({ policyId: 'w', scope: 'company', domain: 'write_authority',
       payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane/allowed'] } })];
     const c = contract(policies);
-    expect(checkWriteAuthority(c, { role: 'engineering', intent: { kind: 'code', lane: 'lane/allowed' } })).toEqual({ ok: true });
-    expect(checkWriteAuthority(c, { role: 'qa', intent: { kind: 'code', lane: 'lane/allowed' } }).ok).toBe(false);
-    expect(checkWriteAuthority(c, { role: 'engineering', intent: { kind: 'assets' } }).ok).toBe(false);
-    expect(checkWriteAuthority(c, { role: 'engineering', intent: { kind: 'code', lane: 'lane/other' } }).ok).toBe(false);
+    const goal = { kind: 'task' as const, goalId: 'goal-1' };
+    expect(checkWriteAuthority(c, { role: 'engineering', ...goal, intent: { kind: 'code', lane: 'lane/allowed' } })).toEqual({ ok: true });
+    expect(checkWriteAuthority(c, { role: 'qa', ...goal, intent: { kind: 'code', lane: 'lane/allowed' } }).ok).toBe(false);
+    expect(checkWriteAuthority(c, { role: 'engineering', ...goal, intent: { kind: 'assets' } }).ok).toBe(false);
+    expect(checkWriteAuthority(c, { role: 'engineering', ...goal, intent: { kind: 'code', lane: 'lane/other' } }).ok).toBe(false);
     // intents 是"本作用域允许承接的意图清单"：只列 code 时连 read 任务都不放行，这是纯粹收紧。
-    expect(checkWriteAuthority(c, { role: 'qa', intent: { kind: 'read' } }).ok).toBe(false);
+    expect(checkWriteAuthority(c, { role: 'qa', ...goal, intent: { kind: 'read' } }).ok).toBe(false);
     const widened = contract([row({ policyId: 'w', scope: 'company', domain: 'write_authority',
       payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } })]);
-    expect(checkWriteAuthority(widened, { role: 'qa', intent: { kind: 'read' } })).toEqual({ ok: true });
-    expect(checkWriteAuthority(contract([]), { role: 'qa', intent: { kind: 'code' } })).toEqual({ ok: true });
+    expect(checkWriteAuthority(widened, { role: 'qa', ...goal, intent: { kind: 'read' } })).toEqual({ ok: true });
+    expect(checkWriteAuthority(contract([]), { role: 'qa', kind: 'task', intent: { kind: 'code' } })).toEqual({ ok: true });
+  });
+
+  // AC02① 的绕过口：lanes 白名单只对"自报 lane"的任务生效。判定的输入必须是这条任务**实际会被怎么跑**，
+  // 缺字段不是"没有可判的"，而是拒绝——否则不声明 lane 就成了白名单的旁路。
+  test('write_authority under a lanes whitelist fails closed when the lane is missing', () => {
+    const c = contract([row({ policyId: 'w', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane-a'] } })]);
+    // 负例：声明了意图但没声明 lane → 拒。
+    const noLane = checkWriteAuthority(c, { role: 'engineering', kind: 'task', goalId: 'goal-1', intent: { kind: 'code' } });
+    expect(noLane.ok).toBe(false);
+    expect(noLane.ok === false && noLane.reason).toContain('declare a lane');
+    // 负例：声明了合法 lane 但任务不在任何目标下 → 没有轨分支可言，拒。
+    const noGoal = checkWriteAuthority(c, { role: 'engineering', kind: 'task', intent: { kind: 'code', lane: 'lane-a' } });
+    expect(noGoal.ok).toBe(false);
+    expect(noGoal.ok === false && noGoal.reason).toContain('outside a goal');
+    // 负例：完全不声明意图的工程岗任务，按 claim 的建树规则就是 code 写 → 同样受白名单约束，拒。
+    const noIntent = checkWriteAuthority(c, { role: 'engineering', kind: 'task', goalId: 'goal-1' });
+    expect(noIntent.ok).toBe(false);
+    expect(noIntent.ok === false && noIntent.reason).toContain('declare a lane');
+    // 放行面：lane 在白名单内、任务有目标。
+    expect(checkWriteAuthority(c, { role: 'engineering', kind: 'task', goalId: 'goal-1', intent: { kind: 'code', lane: 'lane-a' } }))
+      .toEqual({ ok: true });
+    // 未声明意图的 qa 任务解析成 read：intents 只列 code 时被意图清单拦下（不是被 lane 规则误伤）。
+    const qaNoIntent = checkWriteAuthority(c, { role: 'qa', kind: 'task', goalId: 'goal-1' });
+    expect(qaNoIntent.ok).toBe(false);
+    expect(qaNoIntent.ok === false && qaNoIntent.reason).toContain('work intent read');
+    // 未声明意图的发布任务解析成 read，不是 code：工程岗的非发布任务才是 code，release 不是。
+    const release = contract([row({ policyId: 'w', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } })]);
+    expect(checkWriteAuthority(release, { role: 'engineering', kind: 'release' })).toEqual({ ok: true });
+    // 未声明意图时按岗位+kind 解析：工程岗 task → code（走 codeRoles，放行）；qa task → read（codeRoles 管不到，放行）。
+    expect(checkWriteAuthority(release, { role: 'engineering', kind: 'task' })).toEqual({ ok: true });
+    expect(checkWriteAuthority(release, { role: 'qa', kind: 'task' })).toEqual({ ok: true });
+    // 同一份契约下 qa 显式声明 code 意图 → 被 codeRoles 拦下：区别在意图，不在岗位本身。
+    expect(checkWriteAuthority(release, { role: 'qa', kind: 'task', intent: { kind: 'code' } }).ok).toBe(false);
+    // 冻结只冻代码写权：同一份契约把 codeRoles 清空后，工程岗 task（=code）被拒，工程岗 release（=read）照旧放行。
+    const frozen = contract([row({ policyId: 'w2', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: [], intents: ['code', 'read'] } })]);
+    expect(checkWriteAuthority(frozen, { role: 'engineering', kind: 'task' }).ok).toBe(false);
+    expect(checkWriteAuthority(frozen, { role: 'engineering', kind: 'release' })).toEqual({ ok: true });
+  });
+
+  test('the lane rule resolves the same intent the claim will build the worktree from', () => {
+    expect(impliedIntent('engineering', 'task')).toEqual({ kind: 'code' });
+    expect(impliedIntent('engineering', 'gate')).toEqual({ kind: 'code' });
+    expect(impliedIntent('engineering', 'release')).toEqual({ kind: 'read' });
+    expect(impliedIntent('qa', 'task')).toEqual({ kind: 'read' });
+    expect(impliedIntent('gm', 'task')).toEqual({ kind: 'read' });
   });
 
   test('tool_scope: tools outside this layer are untouched, and aliases compare in their canonical form', () => {
@@ -170,14 +219,27 @@ describe('三个域的判定', () => {
   test('a task that lost authorization is blocked for dispatch, and an unauthorized one is never stale-clear', () => {
     const c = contract([row({ policyId: 'w', scope: 'company', domain: 'write_authority',
       payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'] } })]);
-    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', workIntent: { kind: 'code' } }, c).verdict).toBe('clear');
-    expect(dispatchVerdict({ state: 'ready', executorRole: 'qa', workIntent: { kind: 'code' } }, c).verdict).toBe('blocked');
-    expect(dispatchVerdict({ state: 'doing', executorRole: 'qa', workIntent: { kind: 'code' } }, c).reason).toContain('code work');
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task', workIntent: { kind: 'code' } }, c).verdict).toBe('clear');
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'qa', kind: 'task', workIntent: { kind: 'code' } }, c).verdict).toBe('blocked');
+    expect(dispatchVerdict({ state: 'doing', executorRole: 'qa', kind: 'task', workIntent: { kind: 'code' } }, c).reason).toContain('code work');
     // 已隔离的任务无论契约怎么说都保持 blocked。
-    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', workIntent: { kind: 'code' }, policyBlockReason: '收权隔离' }, c).verdict).toBe('blocked');
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task', workIntent: { kind: 'code' }, policyBlockReason: '收权隔离' }, c).verdict).toBe('blocked');
     // 契约换了但仍然授权 = stale：派工可继续，claim 会重新登记。
-    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', workIntent: { kind: 'code' }, policyHash: 'old-hash' }, c).verdict).toBe('stale');
-    expect(dispatchVerdict({ state: 'done', executorRole: 'qa', workIntent: { kind: 'code' } }, c).verdict).toBe('clear');
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task', workIntent: { kind: 'code' }, policyHash: 'old-hash' }, c).verdict).toBe('stale');
+    expect(dispatchVerdict({ state: 'done', executorRole: 'qa', kind: 'task', workIntent: { kind: 'code' } }, c).verdict).toBe('clear');
+    // 未声明意图不是"没有可判的"：工程岗的非发布任务按 claim 的建树规则就是 code 写，冻结后必须被拦下（缺数据 = 拒绝）。
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task' }, c).verdict).toBe('clear');
+    const frozen = contract([row({ policyId: 'w2', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: [], intents: ['code'] } })]);
+    const noIntentFrozen = dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task' }, frozen);
+    expect(noIntentFrozen.verdict).toBe('blocked');
+    expect(noIntentFrozen.reason).toContain('code work');
+    // 发布任务未声明意图时解析成 read，不占写权：空 codeRoles 冻结的是代码写，不是发布（read 在意图清单里）。
+    const frozenAll = contract([row({ policyId: 'w3', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: [], intents: ['code', 'read'] } })]);
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'release' }, frozenAll).verdict).toBe('clear');
+    // 同一份契约下工程岗的普通任务仍是 code → 被冻结拦下。
+    expect(dispatchVerdict({ state: 'ready', executorRole: 'engineering', kind: 'task' }, frozenAll).verdict).toBe('blocked');
   });
 });
 

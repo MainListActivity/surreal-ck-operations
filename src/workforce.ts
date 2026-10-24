@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { IndependencePolicy, IndependenceStage, Principal, RetirementKind, Role, TaskId } from './contracts.ts';
+import type { IndependencePolicy, IndependenceStage, Principal, RetirementKind, Role, TaskId, TaskKind } from './contracts.ts';
 import { managerActionKey } from './dispatcher/dispatch-blocked.ts';
 import { asId, CompanyError, HASH, id, ROLES, UNLOCK_SQL, view, type TaskRow } from './core.ts';
 import { LocalEnrollmentAdmin, revokedCredentialDigest } from './enrollment.ts';
@@ -616,6 +616,8 @@ export class Workforce {
     const chain = chainOfTaskRow(row);
     const { contract } = await readEffectiveContract(this.db, chain, Math.floor(Date.now() / 1000));
     return dispatchVerdict({ state: row.state, executorRole: row.executor_role as Role,
+      kind: (row.kind ?? 'task') as TaskKind,
+      ...(row.goal ? { goalId: asId(row.goal) } : {}),
       ...(row.work_intent ? { workIntent: row.work_intent } : {}),
       ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
       ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
