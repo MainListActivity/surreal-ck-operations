@@ -1,6 +1,6 @@
 import type { Surreal } from "surrealdb";
 import type { JevClient } from "../dispatcher/jev.ts";
-import { aaRankOf, benchmarkOf, canonicalModel, type Tier } from "./policy.ts";
+import { aaRankOfScore, canonicalModel, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
 /** Fable is owner-only and keeps the owner's order; the three staff tiers are ranked by Jev. */
 export const RANKED_TIERS: Tier[] = ["opus", "sonnet", "haiku"];
@@ -21,7 +21,8 @@ export interface ModelFacts {
   id: string;
   /** Accounts behind this model's provider. Labels only: no e-mail or sign-in leaves the machine. */
   accounts: Array<{ account: string; remainingPct?: number }>;
-  aa?: { rank: number; score: number };
+  /** The score at the level the member is pinned to (effort), not the model's best. */
+  aa?: { rank: number; score: number; effort?: Effort };
   /** USD per 1M tokens; 0 when magpie serves it free. */
   price: { free: boolean; input?: number | null; output?: number | null; cacheHit?: number | null };
   usage?: UsageStat;
@@ -93,21 +94,22 @@ const FREE = /(^|[^a-z])free([^a-z]|$)|免费/i;
 export function modelFacts(
   ids: string[],
   sources: {
-    catalog: Array<{ id: string; display_name?: string; magpie_label?: string; owned_by?: string; pricing?: { input?: number; output?: number }; free?: boolean }>;
+    catalog: Array<{ id: string; reasoning_levels?: string[]; display_name?: string; magpie_label?: string; owned_by?: string; pricing?: { input?: number; output?: number }; free?: boolean }>;
     quota: Map<string, ModelFacts["accounts"]>;
     usage: Map<string, UsageStat>;
     performance: Map<string, { score: number; samples: number }>;
   },
 ): ModelFacts[] {
   return ids.map((id) => {
-    const entry = sources.catalog.find((m) => m.id === id);
+    const base = splitMember(id).id;
+    const entry = sources.catalog.find((m) => m.id === base);
     const free = entry?.free === true || (entry?.pricing?.input === 0 && entry?.pricing?.output === 0) || FREE.test(`${id} ${entry?.display_name ?? ""} ${entry?.magpie_label ?? ""} ${entry?.owned_by ?? ""}`);
-    const model = id.slice(id.lastIndexOf("/") + 1);
-    const b = benchmarkOf(model);
+    const resolved = resolveBenchmark(id, entry?.reasoning_levels);
+    const b = resolved?.row;
     return {
       id,
-      accounts: sources.quota.get(providerOf(id)) ?? [],
-      aa: b ? { rank: aaRankOf(model)!, score: Math.round(b.score * 10) / 10 } : undefined,
+      accounts: sources.quota.get(providerOf(base)) ?? [],
+      aa: b ? { rank: aaRankOfScore(b.score), score: Math.round(b.score * 10) / 10, effort: resolved.effort } : undefined,
       price: free ? { free, input: 0, output: 0, cacheHit: 0 } : { free, input: b?.priceInput, output: b?.priceOutput, cacheHit: b?.priceCacheHit },
       usage: sources.usage.get(canonicalModel(id)),
       performance: sources.performance.get(id),
@@ -128,7 +130,7 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
       models: Object.fromEntries(facts.map((f, i) => [keys[i], f])),
       notes: [
         "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
-        "aa.rank：Artificial Analysis 智能指数全榜名次，越小越强。price：每百万 token 美元，free=true 为免费。",
+        "aa.rank：Artificial Analysis 智能指数全榜名次，越小越强；aa.effort 是该成员被固定的思考等级，分数即在该等级下测得。price：每百万 token 美元，free=true 为免费。",
         "usage：近 7 天实际调用，cacheHitRate 为缓存命中占提示 token 比例，tokensPerSecond 为输出速度，ttftMs 为首 token 中位延迟。",
         "performance：公司任务验收后的模型绩效（1–5 分）与样本数，样本少时参考价值低。",
       ],

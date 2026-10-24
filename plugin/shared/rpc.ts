@@ -160,6 +160,20 @@ export const saveModelRanking = defineRpc({
   output: z.object({ok:z.boolean()}),
 });
 
+export const modelIdentity = defineRpc({
+  name: "company.model-identity.get",
+  input: z.object({}),
+  output: z.object({
+    aliases:z.array(z.object({model:z.string(),slug:z.string().nullable(),by:z.enum(["jev","owner"]),confidence:z.number().optional(),suggested:z.string().optional(),aa:z.object({name:z.string(),score:z.number()}).optional()})),
+    issues:z.array(z.object({group:z.string(),member:z.string(),reason:z.string()})),
+  }),
+});
+export const setModelAlias = defineRpc({
+  name: "company.model-alias.set",
+  input: z.object({model:z.string().min(1).max(300),slug:z.string().min(1).max(200).nullable()}),
+  output: z.object({ok:z.boolean()}),
+});
+
 export const providerOptions = defineRpc({
   name: "company.provider.options",
   input: z.object({}),

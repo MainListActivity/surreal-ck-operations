@@ -379,6 +379,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.surrealck.vault.plis
 
 AA 榜单与价格保存在服务目录 `model-routing/aa.json`，每日刷新，失败保留最后可用快照；锚模型不齐或页面解析异常时不替换数据。自动分组版本不变，仅初始化及首次出现的新模型参与分组，仍遵守 AA≥38 和现有锚模型规则；手动增删成员不会因重新评分而重置。Jev 只能排列当前组内成员，不能跨组添加模型。Fable 不参与 Jev 或绩效排序，保留老板顺序。Magpie 自己提供组内回退与会话粘性，网关始终发送原生组名；不设置 effort 上限。
 
+### 思考等级与模型对应（老板 2026-10-23 定）
+
+AA 按思考等级分别打分（显示名括号里的 Max/Xhigh/High…，slug 常省略最高档），因此分档用的是**该成员实际发送等级**下的分数：自动入组或成员写成裸 ID 时，控制器按 Magpie 目录 `reasoning_levels` 中能发送的等级，选该模型分数最高的等级，并把成员写成 `provider/model:<等级>` 固定（如 `codex/gpt-6-luna:max`，38.1 分才达门槛）。Magpie 发不出 AA 测分等级的不入组（如只提供 low/high/xhigh 的 deepseek-v4.1-flash）；厂商在模型 ID 里已写死等级的（`gpt-6-luna-max`，无可选等级）按 AA 显示名匹配，不加后缀。老板手动写上的等级保持不变。各组成员若在其发送等级下无分数、低于 38 或分数落在别的档，记入 `company_meta:model_routing_status.issues` 并在「编制 → 模型与 AA 榜单对应」提示，只提示不移除。
+
+名称匹配：AA slug 与显示名（去括号再拼等级）都参与精确匹配；去掉厂商前缀（`zai_glm-5.3-flash`）和 Magpie 上下文变体后缀（`grok-4.7@500k`）；日期快照后缀照旧。规则仍对不上的新模型，每个只问一次 Jev（选择题：按名称相近取 8 个 AA 候选加「都不是」），置信 ≥0.7 才采用，否则只记为建议；结果存 `model-routing/aliases.json`，老板可在同一页面改为某个 slug 或设为不对应，尚未进组的模型下次同步按新分数分组。远端 Magpie 新增模型需要本地重新拉取清单：控制器每天对 `preset=remote-magpie` 的供应商执行一次 `magpie provider refresh`。
+
 设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查三组结果和 Magpie 顺序，同时确认成员集合及 Fable 顺序未变。
 
 
