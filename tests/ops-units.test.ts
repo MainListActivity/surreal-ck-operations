@@ -465,6 +465,8 @@ describe('sessions', () => {
     expect(() => store.get(mine.id, 'e1', 'other', 'production')).toThrow(/unknown session/);
     expect(() => store.get(mine.id, 'e1', 'demo', 'staging')).toThrow(/unknown session/);
     expect(store.get(mine.id, 'e1', 'demo', 'production').id).toBe(mine.id);
+    // No handle at all is the caller's mistake (an empty argument list), reported as such.
+    expect(() => store.get(undefined, 'e1', 'demo', 'production')).toThrow(/session is required/);
     expect(store.secrets('e1').length).toBe(8);
     clock += 6 * 60 * 60_000 + 1;
     expect(() => store.get(mine.id, 'e1', 'demo', 'production')).toThrow(/expired/);
