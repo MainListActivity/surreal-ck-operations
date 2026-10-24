@@ -48,7 +48,8 @@ const scripted = (...answers: Array<{ match: (args: string[]) => boolean; out?: 
 };
 
 const runJson = (status: string, conclusion: string | null, account: string | null) =>
-  JSON.stringify({ status, conclusion, account, createdAt: '2026-10-23T00:00:00Z' });
+  JSON.stringify({ status, conclusion, account, createdAt: '2026-10-23T00:00:00Z',
+    headBranch: 'lane/sys03-fixture', headSha: 'abcdef0123456789' });
 const isRead = (args: string[]) => args[0] === 'api' && args[1] !== undefined && !args[1].startsWith('--method') && !args.includes('POST');
 const isCancel = (args: string[]) => args.includes('POST') && args.some(a => a.endsWith('/cancel'));
 
@@ -78,6 +79,28 @@ test('AC03: a run the provider does not know, or one already terminal, is a defi
   expect(terminal.calls.filter(isCancel)).toHaveLength(0);
 });
 
+test('AC03 (QA V5): a replay that finds the run terminal-cancelled reads it as the cancellation we asked for', async () => {
+  // 第一次请求读到终态 = provider 的明确拒绝，且不发取消请求。
+  const terminal = scripted({ match: isRead, out: runJson('completed', 'cancelled', 'shared-bot') });
+  expect(await createCompanyGithubGateway(terminal.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ refused: true });
+  expect(terminal.calls.filter(isCancel)).toHaveLength(0);
+
+  // 重放（我们已经为同一个 actionKey 发过请求，崩溃点在 provider 取消之后、回执之前）：同一个终态就是
+  // 我们自己那次取消生效了，记 confirmed 并附 provider 读回。
+  const replay = await createCompanyGithubGateway(terminal.run)
+    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { retryAfterRequest: true });
+  expect(replay).toMatchObject({ confirmed: true, runStatus: 'completed' });
+  if (!('confirmed' in replay) || replay.confirmed !== true) throw new Error('expected a confirmation');
+  expect(replay.observed).toMatchObject({ conclusion: 'cancelled', replay: 'already-terminal-cancelled' });
+
+  // 重放时终态不是取消（运行自己失败了）→ 仍然是拒绝，绝不把失败读成成功。
+  const failedRun = scripted({ match: isRead, out: runJson('completed', 'failure', 'shared-bot') });
+  expect(await createCompanyGithubGateway(failedRun.run)
+    .cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }, { retryAfterRequest: true }))
+    .toMatchObject({ refused: true });
+});
+
 test('AC03: an unreadable run or a failed cancel request is result_unknown, not a fabricated success', async () => {
   const unreadable = scripted({ match: isRead, fail: 'dial tcp: connection refused' });
   expect(await createCompanyGithubGateway(unreadable.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
@@ -94,7 +117,9 @@ test('AC03: an unreadable run or a failed cancel request is result_unknown, not 
 test('AC03: reconciliation reads the provider as unknown_actor, and an absent run is a readable fact', async () => {
   const gateway = createCompanyGithubGateway(scripted({ match: isRead, out: runJson('completed', 'cancelled', 'shared-bot') }).run);
   expect(await gateway.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
-    .toMatchObject({ readable: true, exists: true, runStatus: 'completed', externalAccount: 'shared-bot', attribution: 'unknown_actor' });
+    .toMatchObject({ readable: true, exists: true, runStatus: 'completed', externalAccount: 'shared-bot',
+      // QA V2：受控外部动作要用这个字段把 run 绑到前置任务的登记分支上。
+      headBranch: 'lane/sys03-fixture', attribution: 'unknown_actor' });
 
   const absent = createCompanyGithubGateway(scripted({ match: isRead, fail: 'gh: Not Found (HTTP 404)' }).run);
   expect(await absent.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))

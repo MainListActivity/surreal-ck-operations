@@ -1132,47 +1132,155 @@ function RankingJson({ctx,label,value,depth=0}: {ctx:Ctx;label:string;value:unkn
   </View>;
 }
 
+/** Resolve appearance from Paseo's surface; preserve the reference design's purple brand in both modes. */
+function relayColors(ctx:Ctx) {
+  const match=ctx.theme.colors.surface0?.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  const hex=match?.[1];const rgb=hex?.length===3?hex.split("").map(x=>x+x).join(""):hex;
+  const cssRgb=ctx.theme.colors.surface0?.match(/^rgba?\(\s*([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)/i);
+  const channels=rgb?[parseInt(rgb.slice(0,2),16),parseInt(rgb.slice(2,4),16),parseInt(rgb.slice(4,6),16)]:cssRgb?.slice(1,4).map(Number);
+  const hsl=ctx.theme.colors.surface0?.startsWith("hsl")?ctx.theme.colors.surface0.match(/[\d.]+%/g):null;
+  const light=channels ? (channels[0]!*299+channels[1]!*587+channels[2]!*114)/1000>128 : hsl?.[1]?parseFloat(hsl[1])>50:true;
+  return {...ctx.theme.colors,
+    surface0:light?"#f5f6fa":"#0b0d10",surface1:light?"#ffffff":"#15171c",surface2:light?"#eef0f5":"#23262d",
+    foreground:light?"#202330":"#f1f2f4",foregroundMuted:light?"#606776":"#989da8",border:light?"rgba(31,36,51,.12)":"rgba(255,255,255,.08)",
+    accent:light?"#7154df":"#826cf6",accentForeground:"#ffffff",score:light?"#694bcf":"#9b87ff",
+    tab:light?"#ffffff":"#2a2d34",input:light?"#f8f9fc":"#101216",row:light?"#ffffff":"#111318",path:light?"#f2f3f8":"#0d0f12",
+    statusSuccess:light?"#177958":"#70dcb3",statusWarning:light?"#8a6200":"#ffc26a",
+  };
+}
+
+/** Layout and spacing follow redesign/src/App.tsx; colors follow the selected Paseo theme. */
+function relayStyles(ctx:Ctx) {
+  const c=relayColors(ctx);
+  return {
+    text:{color:c.foreground,fontSize:13,lineHeight:20},
+    muted:{color:c.foregroundMuted,fontSize:11,lineHeight:17},
+    panel:{backgroundColor:c.surface1,borderColor:c.border,borderWidth:1,borderRadius:22,padding:ctx.compact?16:26,gap:0},
+    row:{flexDirection:"row" as const,alignItems:"center" as const,gap:12},
+    accent:{color:c.accent},
+    step:{width:34,height:34,borderRadius:10,backgroundColor:c.surface2,alignItems:"center" as const,justifyContent:"center" as const},
+    input:{backgroundColor:c.input,color:c.foreground,borderColor:c.border,borderWidth:1,borderRadius:13,padding:14,fontSize:13,lineHeight:22},
+  };
+}
+
+function RelayHeading({ctx,step,title,subtitle}: {ctx:Ctx;step:string;title:string;subtitle:string}) {
+  const s=relayStyles(ctx);
+  return <View style={[s.row,{marginBottom:22}]}><View style={s.step}><Text style={[s.muted,s.accent,{fontWeight:"700"}]}>{step}</Text></View>
+    <View style={{flex:1}}><Text style={[s.text,{fontSize:15,fontWeight:"700"}]}>{title}</Text><Text style={s.muted}>{subtitle}</Text></View>
+  </View>;
+}
+
+function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: {ctx:Ctx;table:import("../shared/types").ModelRankingTable;width?:number;onPin?:(model:string,pinned:boolean)=>Promise<void>;pinBusy?:boolean}) {
+  const s=relayStyles(ctx),c=relayColors(ctx);
+  const [expanded,setExpanded]=useState<string|null>(null);
+  const mobile=width<=600,wide=width>900;
+  const number=(value:number|undefined,digits=1)=>value===undefined?"未知":value.toFixed(digits);
+  return <View style={{gap:mobile?5:8}}>
+    <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
+      <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>置顶模型固定在前且不参与 JEV 评分，其余按 JEV 分数排序。</Text>}
+      </View>
+      <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
+    </View>
+    {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>历史排序未记录 JEV 分数，下一轮成功刷新后显示。</Text>}
+    {table.rows.map((row,index)=>{
+      const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
+      const open=expanded===row.model;
+      const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
+      const metrics=[
+        {label:"AA 智能分",value:number(row.aaScore),detail:row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`},
+        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:"近 7 天实测"},
+        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:"近 7 天平均"},
+        {label:"剩余额度",value:quota,detail:"订阅最紧窗口"},
+        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:row.stabilitySamples===undefined?"暂无样本":`近 7 天 ${row.stabilitySamples} 次请求`},
+        {label:"样本权重",value:number(row.performanceSamples,2),detail:row.performanceScore===undefined?"绩效未知":`历史绩效 ${number(row.performanceScore,2)} / 5`},
+      ];
+      const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
+      return <View key={row.model} style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
+        <View style={{flexDirection:"row",alignItems:"center"}}><Pressable accessibilityRole="button" accessibilityLabel={`第 ${index+1} 名 ${row.model}`} accessibilityState={{expanded:open}}
+          onPress={()=>setExpanded(open?null:row.model)} style={[s.row,{flex:1,minWidth:0,minHeight:mobile?52:62,paddingVertical:mobile?7:10,paddingHorizontal:mobile?8:12,gap:mobile?7:12}]}>
+          <View style={{width:mobile?28:34,height:mobile?28:34,borderRadius:mobile?8:12,backgroundColor:c.surface2,alignItems:"center",justifyContent:"center"}}><Text style={[s.muted,{fontSize:mobile?9:11,fontWeight:"700"}]}>#{index+1}</Text></View>
+          <View style={{flex:1,minWidth:0}}><View style={[s.row,{gap:8}]}>
+            <Text numberOfLines={1} style={[s.text,{flexShrink:1,fontSize:mobile?12:13,fontWeight:"700"}]}>{short.slice(slash+1)}</Text>
+            {!mobile&&index===0&&row.jevScore!==undefined&&<View style={{backgroundColor:c.surface2,paddingHorizontal:6,paddingVertical:3,borderRadius:5}}><Text style={{color:c.statusSuccess,fontSize:9}}>推荐</Text></View>}
+          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)}</Text></View>
+          {wide&&stat("智能分",number(row.aaScore),72)}
+          {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
+          {wide&&stat("额度",quota,64)}
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>JEV</Text>
+            <Text accessibilityLabel={row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
+          </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
+        </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
+          onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>
+          <Text style={{fontSize:mobile?10:11,color:row.pinned?c.accent:c.foregroundMuted}}>{row.pinned?"取消置顶":"置顶"}</Text>
+        </Pressable></View>
+        {open&&<View style={{paddingLeft:mobile?43:58,paddingRight:mobile?9:14,paddingBottom:mobile?10:14}}>
+          <Text selectable numberOfLines={1} style={{color:c.foregroundMuted,fontSize:mobile?8:9,lineHeight:14,fontFamily:"Menlo",backgroundColor:c.path,borderRadius:8,paddingHorizontal:mobile?7:9,paddingVertical:mobile?5:7,marginVertical:mobile?9:12}}>{row.model}</Text>
+          <View style={{flexDirection:"row",flexWrap:"wrap",gap:mobile?7:8}}>{metrics.map(metric=><View key={metric.label} style={{flexBasis:wide?"14%":"28%",flexGrow:1,minWidth:0,gap:2,borderLeftWidth:1,borderColor:c.border,paddingLeft:mobile?8:10}}>
+            <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.label}</Text><Text selectable style={[s.text,{fontSize:mobile?11:12,fontWeight:"700"}]}>{metric.value}</Text>
+            {!mobile&&<Text style={[s.muted,{fontSize:9}]}>{metric.detail}</Text>}
+          </View>)}</View>
+          {mobile&&row.performanceScore!==undefined&&<Text style={[s.muted,{fontSize:9,marginTop:7}]}>历史绩效 {number(row.performanceScore,2)} / 5</Text>}
+        </View>}
+      </View>;
+    })}
+  </View>;
+}
+
 function ModelRankingCard({ctx}: {ctx:Ctx}) {
-  const s=makeStyles(ctx);
-  const get=useRpc(rpc.modelRanking), save=useRpc(rpc.saveModelRanking);
+  const c=relayColors(ctx);
+  const get=useRpc(rpc.modelRanking),save=useRpc(rpc.saveModelRanking),pin=useRpc(rpc.pinModelRanking);
+  const [pinBusy,setPinBusy]=useState(false),[pinMessage,setPinMessage]=useState("");
   const query=useQuery({queryKey:["model-ranking"],queryFn:()=>get({}),refetchInterval:15000});
   const [draft,setDraft]=useState<{rules:string;refreshMinutes:2|5|10}>();
-  const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [selectOpen,setSelectOpen]=useState(false);
+  const [group,setGroup]=useState("sck-haiku"),[width,setWidth]=useState(ctx.compact?390:1100);
+  const s=relayStyles({...ctx,compact:width<=600});
+  const [savedAt,setSavedAt]=useState<number>();
+  const [busy,setBusy]=useState(false),[message,setMessage]=useState(""),[selectOpen,setSelectOpen]=useState(false);
   const current=draft??{rules:query.data?.rules??"智能程度和速度综合优先",refreshMinutes:(query.data?.refreshMinutes??5) as 2|5|10};
-  return <Section title="模型排序" ctx={ctx}><View style={s.card}>
-    <Text style={s.muted}>按你的规则为 Opus、Sonnet、Haiku 组内模型排序；分组成员仍由你控制。</Text>
-    {query.isError&&<Text style={s.muted}>设置读取失败，请稍后重试。</Text>}
-    {query.data&&!query.data.configured&&<Text style={s.muted}>Jev 尚未配置，暂时保留现有顺序。</Text>}
-    <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:100,textAlignVertical:"top"}]}
-      placeholder="智能程度和速度综合优先"
-      value={current.rules} onChangeText={rules=>setDraft({...current,rules})}/>
-    <Text style={s.muted}>留空时使用默认规则：智能程度和速度综合优先。</Text>
-    <Text style={s.text}>刷新间隔</Text>
-    <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={s.buttonSecondary} onPress={()=>setSelectOpen(!selectOpen)}>
-      <Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""} ▾</Text>
-    </Pressable>
-    {selectOpen&&<View style={s.card}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}}
-      style={s.buttonSecondary} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}>
-      <Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text>
-    </Pressable>)}</View>}
-    <Pressable accessibilityRole="button" disabled={busy||!query.data} style={s.button} onPress={async()=>{
-      setBusy(true);setMessage("");try{await save(current);await query.refetch();setDraft(undefined);setMessage("已保存，下次员工请求到达时刷新排序。");}
-      catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}
-    }}><Text style={s.buttonText}>{busy?"保存中…":"保存排序规则"}</Text></Pressable>
-    {!!message&&<Text style={s.muted}>{message}</Text>}
-    <Text style={s.muted}>{query.data?.at?`最近刷新：${query.data.at}`:"尚未刷新"}；到期后由下一次员工请求触发后台刷新。</Text>
-    {!!query.data?.error&&<Text style={s.muted}>{query.data.error}</Text>}
-    {Object.entries(query.data?.orders??{}).map(([group,ids])=><ExpandableText key={group} ctx={ctx} text={`${group}：${ids.join(" → ")}`} lines={2} style={s.muted}/>)}
-    <Text style={s.h2}>最近发送给 Jev 的内容</Text>
-    <Text style={s.muted}>每组保留最近一次调用前的实际请求快照；包含规则、模型数据、字段说明和评分问题。调用失败时仍保留该次请求。</Text>
-    {!query.data?.requests.length&&<Text style={s.muted}>尚无请求快照，下一次排序调用后显示；历史调用无法补回。</Text>}
-    {query.data?.requests.map(request=><View key={request.tier} style={s.card}>
-      <Text style={s.h2}>{request.tier.toUpperCase()}</Text>
-      <Text style={s.muted}>调用开始：{new Date(request.at).toLocaleString()}</Text>
-      <RankingJson ctx={ctx} label="请求内容" value={request.payload}/>
-      <ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={s.mono}/>
-    </View>)}
-  </View></Section>;
+  const tables=query.data?.tables??[],selected=tables.find(t=>t.group===group)??tables[0];
+  const mobile=width<=600,wide=width>900;
+  const failed=query.isError||!!query.data?.error,unconfigured=query.data&&!query.data.configured;
+  return <View onLayout={e=>setWidth(e.nativeEvent.layout.width)} style={{width:"100%",maxWidth:1240,alignSelf:"center",backgroundColor:c.surface0}}>
+    <View style={[s.row,{height:mobile?60:68,borderBottomWidth:1,borderColor:c.border,justifyContent:"space-between",paddingHorizontal:mobile?6:12}]}>
+      <View style={[s.row,{gap:11}]}><View style={{width:30,height:30,borderRadius:9,backgroundColor:c.accent,alignItems:"center",justifyContent:"center"}}><Text style={{color:c.accentForeground,fontSize:14,fontWeight:"700"}}>M</Text></View><Text style={[s.text,{fontSize:14,fontWeight:"700"}]}>Model Relay</Text></View>
+      <View style={[s.row,{gap:8,paddingHorizontal:12,paddingVertical:7,borderWidth:1,borderColor:c.border,borderRadius:999}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><Text style={s.muted}>实时数据</Text></View>
+    </View>
+    <View style={{paddingTop:mobile?30:64,paddingBottom:mobile?25:36}}>
+      <View style={[s.row,{justifyContent:"space-between",alignItems:"flex-end"}]}><View style={{flex:1,maxWidth:600}}>
+        <Text style={{color:c.accent,fontSize:11,fontWeight:"800",letterSpacing:1.8,marginBottom:12}}>ROUTING CONSOLE</Text>
+        <Text style={{color:c.foreground,fontSize:mobile?38:58,lineHeight:mobile?42:62,fontWeight:"700",letterSpacing:-1.8,marginBottom:16}}>模型排序</Text>
+        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>为不同模型组配置路由优先级，系统会综合能力、速度与可用额度自动选择最佳模型。</Text>
+      </View>{!mobile&&<View style={[s.row,{borderWidth:1,borderColor:c.border,borderRadius:14,paddingVertical:12,paddingHorizontal:15}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><View><Text style={[s.text,{fontSize:12,fontWeight:"700"}]}>{failed?"同步异常":unconfigured?"尚未配置":query.data?"运行正常":"正在加载"}</Text><Text style={s.muted}>{query.data?.at?new Date(query.data.at).toLocaleString():"等待同步"}</Text></View></View>}</View>
+    </View>
+    <View style={{flexDirection:wide?"row":"column",gap:18,alignItems:"flex-start"}}>
+      <View style={[s.panel,{width:wide?340:"100%"}]}>
+        <RelayHeading ctx={ctx} step="01" title="排序规则" subtitle="用自然语言描述你的分组策略"/>
+        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginBottom:9}]}>自定义规则</Text>
+        <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:118,textAlignVertical:"top"}]} value={current.rules} onChangeText={rules=>setDraft({...current,rules})} placeholder="例如：智能程度和速度综合优先" placeholderTextColor={c.foregroundMuted}/>
+        <Text style={[s.muted,{marginTop:8,fontSize:11}]}>留空时采用默认规则：智能程度和速度综合优先。</Text>
+        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginTop:20,marginBottom:9}]}>刷新间隔</Text>
+        <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={[s.input,s.row,{height:45,justifyContent:"space-between",paddingVertical:0}]} onPress={()=>setSelectOpen(!selectOpen)}><Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""}</Text><Text style={s.muted}>⌄</Text></Pressable>
+        {selectOpen&&<View style={[s.input,{marginTop:6,gap:12}]}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}><Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text></Pressable>)}</View>}
+        <Pressable accessibilityRole="button" disabled={busy||!query.data} style={[s.row,{height:47,borderRadius:13,backgroundColor:savedAt?"#2ea77e":c.accent,paddingHorizontal:16,justifyContent:"space-between",marginTop:22,opacity:busy?0.6:1}]} onPress={async()=>{setBusy(true);setSavedAt(undefined);setMessage("");try{await save(current);await query.refetch();setDraft(previous=>previous&&(previous.rules!==current.rules||previous.refreshMinutes!==current.refreshMinutes)?previous:undefined);setMessage("已保存，下次员工请求到达时刷新排序。");const at=Date.now();setSavedAt(at);setTimeout(()=>setSavedAt(previous=>previous===at?undefined:previous),2200);}catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}}}><Text style={{color:c.accentForeground,fontSize:13,fontWeight:"700"}}>{busy?"保存中…":savedAt?"已保存规则":"保存排序规则"}</Text><Text style={{color:c.accentForeground,fontSize:18}}>{savedAt?"✓":"→"}</Text></Pressable>
+        {!!message&&<Text style={[s.muted,{marginTop:8}]}>{message}</Text>}
+        <View style={{borderTopWidth:1,borderColor:c.border,marginTop:24,paddingTop:19,gap:5}}><Text style={[s.muted,{fontSize:10}]}>最近刷新</Text><Text style={[s.text,{fontSize:11,fontFamily:"Menlo"}]}>{query.data?.at?new Date(query.data.at).toLocaleString():"尚未刷新"}</Text><Text style={[s.muted,{fontSize:10}]}>到期后由下一次员工请求触发后台刷新。</Text></View>
+        {unconfigured&&<Text style={[s.muted,{marginTop:8}]}>Jev 尚未配置，暂时保留现有顺序。</Text>}{failed&&<Text style={{color:c.statusWarning,fontSize:12,marginTop:8}}>{query.data?.error??"设置读取失败，请稍后重试。"}</Text>}
+      </View>
+      <View style={[s.panel,{flex:wide?1:undefined,width:wide?undefined:"100%",minWidth:0}]}>
+        <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle="依据当前规则生成的实时排序"/>
+        <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
+        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，不再发送给 JEV 排序。":"已取消置顶，下次刷新参与 JEV 排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
+        {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
+        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功评分":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
+      </View>
+    </View>
+    <View style={{marginTop:18}}><Collapsible title="最近发送给 Jev 的内容" ctx={ctx}>
+      <Text style={s.muted}>每组保留最近一次调用前的实际请求快照，调用失败时仍保留。</Text>
+      {!query.data?.requests.length&&<Text style={s.muted}>尚无请求快照，下一次排序调用后显示；历史调用无法补回。</Text>}
+      {query.data?.requests.map(request=><View key={request.tier} style={{gap:8,marginTop:12}}><Text style={s.text}>{request.tier.toUpperCase()} · 调用开始：{new Date(request.at).toLocaleString()}</Text><RankingJson ctx={ctx} label="请求内容" value={request.payload}/><ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={{color:c.foregroundMuted,fontSize:11,fontFamily:"Menlo"}}/></View>)}
+    </Collapsible></View>
+  </View>;
 }
 
 /** Vendor names no rule matches: Jev's one-time call, and the owner's correction of it. */

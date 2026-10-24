@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Surreal } from "surrealdb";
-import type { JevClient } from "../dispatcher/jev.ts";
+import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
 /** Fable is owner-only and keeps the owner's order; the three staff tiers are ranked by Jev. */
@@ -12,6 +12,16 @@ export const DEFAULT_RANKING_RULES = "智能程度和速度综合优先";
 export interface RankingSettings {
   rules: string;
   refreshMinutes: number;
+}
+/** Exact member IDs, including effort; each group's array is the owner's pin order. */
+export type RankingPins = Record<string, string[]>;
+export async function rankingPins(db: Surreal): Promise<RankingPins> {
+  const [row] = await db.query<[{pins?:RankingPins}|undefined]>("SELECT pins FROM ONLY company_meta:model_ranking;");
+  return row?.pins ?? {};
+}
+export function pinnedOrder(members: string[], pins: string[] = []): string[] {
+  const head = [...new Set(pins)].filter(id => members.includes(id));
+  return [...head, ...members.filter(id => !head.includes(id))];
 }
 export interface UsageStat {
   source: "magpie";
@@ -120,7 +130,7 @@ export function modelFacts(
 const LEVELS = ["最后考虑", "靠后", "中等", "靠前", "首选"];
 
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
-export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>): Promise<string[]> {
+export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void): Promise<string[]> {
   const keys = facts.map((_, i) => `m${i}`);
   if (!facts.length) return [];
   const state = {
@@ -143,17 +153,21 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
   // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
   const payload: RankingRequestPayload = JSON.parse(JSON.stringify({ model: jev.model, state, questions }));
   await beforeAsk?.(payload);
-  const { answers } = await jev.ask(payload.state, payload.questions);
+  const response = await jev.ask(payload.state, payload.questions);
+  const { answers } = response;
   // score is the expectation over the five levels, so a mid-ranked model is still placed correctly
   // even though its confidence (mass on the single most likely level) is low. Only gaps are rejected.
   for (const key of keys) {
     const a = answers[key];
     if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4) throw Error("Jev 排序结果不完整");
   }
-  return facts
-    .map((f, i) => ({ id: f.id, i, score: answers[keys[i]!]!.score! }))
+  const rows = facts
+    .map((f, i) => ({ facts: f, i, score: answers[keys[i]!]!.score!, confidence: answers[keys[i]!]!.confidence }))
     .sort((a, b) => b.score - a.score || a.i - b.i)
-    .map((x) => x.id);
+    .map(({ i, ...row }) => row);
+  afterAnswer?.({ tier, at: new Date().toISOString(), model: response.model, rules: state.ownerRules,
+    rows: JSON.parse(JSON.stringify(rows)), answers: JSON.parse(JSON.stringify(answers)) });
+  return rows.map(row => row.facts.id);
 }
 
 export interface RankingRequestPayload {
@@ -165,6 +179,50 @@ export interface RankingRequestSnapshot {
   tier: string;
   at: string;
   payload: RankingRequestPayload;
+}
+
+/** Last successfully applied response and the exact facts used to judge it; never mixed with later attempts. */
+export interface RankingResultSnapshot {
+  tier: Tier;
+  at: string;
+  model: string;
+  rules: string;
+  rows: Array<{ facts: ModelFacts; score: number; confidence?: number }>;
+  answers: JevResult["answers"];
+  /** Observations for pinned members, kept outside the Jev request and scored rows. */
+  pinnedFacts?: ModelFacts[];
+}
+export interface RankingTableRow {
+  model: string; pinned?: boolean;
+  aaScore?: number; aaRank?: number; effort?: string;
+  tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
+  accounts: ModelFacts["accounts"];
+  performanceScore?: number; performanceSamples?: number;
+  jevScore?: number; jevConfidence?: number;
+}
+export interface RankingTable {
+  group: string; at?: string; rules?: string; scored: boolean;
+  rows: RankingTableRow[];
+}
+/** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
+export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}): RankingTable[] {
+  return RANKED_TIERS.map(tier => {
+    const group = `sck-${tier}`, result = results[group];
+    const request = requests.find(r => r.tier === tier);
+    const legacy = Object.values((request?.payload.state.models ?? {}) as Record<string,ModelFacts>);
+    const rows = (groups[group] ?? []).map(model => {
+      const judged = result?.rows.find(row => row.facts.id === model);
+      // Once a successful snapshot exists, do not borrow facts from a later failed/pending request.
+      const facts = judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? (!result ? legacy.find(f => f.id === model) : undefined);
+      return { model, pinned: (pins[group] ?? []).includes(model), aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+        tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
+        stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
+        stabilitySamples: facts?.usage?.requests,
+        accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
+        performanceSamples: facts?.performance?.samples, jevScore: (pins[group] ?? []).includes(model) ? undefined : judged?.score, jevConfidence: (pins[group] ?? []).includes(model) ? undefined : judged?.confidence };
+    });
+    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result, rows };
+  }).filter(table => table.rows.length > 0);
 }
 
 /** Bounded history: keep the most recent attempted request per ranked group across restarts. */
@@ -193,6 +251,7 @@ export class RankingRefresher {
   private running?: Promise<void>;
   private revision = 0;
   private stopped = false;
+  private pinning?: Promise<void>;
   constructor(private readonly deps: RefresherDeps) {}
   reset(minutes = DEFAULT_REFRESH_MINUTES): void {
     this.last = undefined;
@@ -202,34 +261,66 @@ export class RankingRefresher {
   stop(): void { this.stopped = true; this.revision++; }
   settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   trigger(now = Date.now()): void {
-    if (this.stopped || !this.deps.jev || this.running || (this.last !== undefined && now - this.last < this.minutes * 60000)) return;
+    if (this.stopped || !this.deps.jev || this.running || this.pinning || (this.last !== undefined && now - this.last < this.minutes * 60000)) return;
     this.last = now;
     const revision = this.revision;
     this.running = Promise.resolve().then(() => this.run(revision)).catch(() => this.deps.log?.("模型排序刷新失败，保留现有顺序"))
       .finally(() => { this.running = undefined; });
+  }
+  /** Invalidate in-flight Jev results before waiting; serialize edits from both owner surfaces. */
+  setPin(group: string, model: string, pinned: boolean): Promise<void> {
+    if (!RANKED_TIERS.some(t => group === `sck-${t}`) || !model || model.length > 300 || typeof pinned !== 'boolean')
+      return Promise.reject(Error('置顶参数无效'));
+    this.reset(this.minutes);
+    const previous = this.pinning;
+    const operation = (async () => {
+      await previous?.catch(() => undefined);
+      await this.settled();
+      if (this.stopped) throw Error('排序服务已停止');
+      const members = this.deps.groups()[group] ?? [];
+      if (!members.includes(model)) throw Error('模型已不在当前分组，请刷新列表');
+      const pins = await rankingPins(this.deps.db);
+      const next = (pins[group] ?? []).filter(id => id !== model);
+      if (pinned) {
+        // Repeated clicks are idempotent, including the position among other pins.
+        if (pins[group]?.includes(model)) next.splice(pins[group].indexOf(model), 0, model);
+        else next.push(model);
+      }
+      const orders = {[group]: pinnedOrder(members, next)};
+      await this.deps.db.query(
+        "UPSERT company_meta:model_ranking SET pins=object::extend(pins ?? {},$pins),orders=object::extend(orders ?? {},$orders);",
+        {pins:{[group]:next},orders});
+      await this.deps.apply(orders, () => !this.stopped);
+    })();
+    const tracked = operation.finally(() => { if (this.pinning === tracked) this.pinning = undefined; });
+    this.pinning = tracked;
+    return tracked;
   }
   private async run(revision: number): Promise<void> {
     try {
       const settings = await rankingSettings(this.deps.db);
       this.minutes = settings.refreshMinutes;
       const live = this.deps.groups();
+      const pins = await rankingPins(this.deps.db);
       const ids = [...new Set(RANKED_TIERS.flatMap(t => live[`sck-${t}`] ?? []))];
       const allFacts = await this.deps.facts(ids);
       const byId = new Map(allFacts.map(f => [f.id, f]));
       const orders: Record<string, string[]> = {};
       const errors: string[] = [];
+      const results: Record<string,RankingResultSnapshot> = {};
       for (const tier of RANKED_TIERS) {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
         try {
-          const facts = members.map(id => byId.get(id));
+          const pinned = pinnedOrder(members, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
+          const facts = members.filter(id => !pinned.includes(id)).map(id => byId.get(id));
           if (facts.some(f => !f)) throw Error("missing facts");
-          orders[`sck-${tier}`] = await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
+          orders[`sck-${tier}`] = [...pinned, ...await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
             await this.deps.db.query(
               "UPSERT type::record('company_meta',$key) SET tier=$tier,at=$at,payload=$payload;",
               { key: `model_ranking_request_${tier}`, tier, at: new Date().toISOString(), payload });
-          });
+          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts:pinned.map(id => byId.get(id)!).filter(Boolean)}; })];
         } catch (e) {
           // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
           this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
@@ -240,8 +331,8 @@ export class RankingRefresher {
       if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
       if (revision !== this.revision || this.stopped) return;
       await this.deps.db.query(
-        "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),error=$error,refresh_minutes=$minutes;",
-        { orders, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
+        "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results),error=$error,refresh_minutes=$minutes;",
+        { orders, results, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
     } catch (e) {
       this.deps.log?.(`模型排序刷新失败：${(e as Error).message.slice(0, 200)}`);
       if (revision === this.revision && !this.stopped) await this.deps.db.query(

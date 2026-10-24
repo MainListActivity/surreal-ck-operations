@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import bundled from '../src/model-routing/benchmarks.json';
 import {useBenchmarks,aaRankOf,classify} from '../src/model-routing/policy.ts';
 import {parseAaLeaderboard,refreshAa,loadAa} from '../src/model-routing/aa.ts';
-import {usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES,type ModelFacts} from '../src/model-routing/ranking.ts';
+import {usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES,rankingTables,type ModelFacts} from '../src/model-routing/ranking.ts';
 import {ModelRoutingController} from '../src/model-routing/controller.ts';
 import {startModelGateway} from '../src/model-routing/gateway.ts';
 const dirs:string[]=[];
@@ -191,4 +191,87 @@ test('unavailable live usage cancels the refresh before any Jev call or ranking 
  f.deps.facts=async(ids:string[])=>controller.rankingFacts(ids);
  const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
  expect(reads).toBe(1);expect(f.calls).toEqual([]);expect(f.applied).toEqual([]);
+});
+
+test('successful Jev snapshots retain exact decimal scores, raw answers, facts, and stable ties',async()=>{
+ const facts=[{...fact('p/a'),aa:{score:45.1,rank:30},usage:{...usageStats(nativeUsage([channel('p','a',164,1000)])).get('p/a')!}},fact('p/b'),fact('p/c')];
+ let snapshot:any;
+ const answers={m0:{type:'score' as const,score:3.712345,confidence:0.8},m1:{type:'score' as const,score:3.712345,confidence:0.4},m2:{type:'score' as const,score:0,confidence:1}};
+ expect(await jevOrder({model:'configured',ask:async()=>({model:'served-jev',answers})},'haiku','速度优先',facts,undefined,result=>{snapshot=result;})).toEqual(['p/a','p/b','p/c']);
+ expect(snapshot).toMatchObject({tier:'haiku',model:'served-jev',rules:'速度优先',answers});
+ expect(snapshot.rows.map((row:any)=>row.score)).toEqual([3.712345,3.712345,0]);
+ facts[0]!.aa!.score=99;expect(snapshot.rows[0].facts.aa.score).toBe(45.1);
+ let published=false;
+ await expect(jevOrder({model:'broken',ask:async()=>({model:'broken',answers:{m0:{type:'score',score:5}}})},'haiku','',[fact('p/a')],undefined,()=>{published=true;})).rejects.toThrow();
+ expect(published).toBe(false);
+});
+
+test('refresh persists successful snapshots with orders, excludes failed groups and invalidated results',async()=>{
+ const f=fixture();
+ f.deps.jev.ask=async(state:any,q:any)=>{if(state.group==='group/sck-sonnet')throw Error('down');return response(q);};
+ const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
+ const publication=f.writes.find(w=>w?.results);
+ expect(Object.keys(publication.results)).toEqual(['sck-opus','sck-haiku']);
+ expect(publication.orders['sck-opus']).toEqual(publication.results['sck-opus'].rows.map((row:any)=>row.facts.id));
+ expect(publication.results['sck-haiku'].rows[0].score).toBe(0);
+});
+
+test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
+ const {rankingTables}=await import('../src/model-routing/ranking.ts');
+ let snapshot:any;
+ await jevOrder({model:'jev',ask:async()=>({model:'jev',answers:{m0:{type:'score',score:3.25},m1:{type:'score',score:0}}})},'haiku','旧规则',[
+  {...fact('p/a:max'),usage:usageStats(nativeUsage([channel('p','a',100,1000)])).get('p/a'),accounts:[{account:'p #1',remainingPct:0}],aa:{rank:30,score:45.1},performance:{score:4.72,samples:2.5}},fact('p/b'),
+ ],undefined,r=>{snapshot=r;});
+ const requests:any=[{tier:'haiku',at:'new-at',payload:{state:{ownerRules:'新规则',models:{m0:{...fact('p/a:max'),aa:{rank:1,score:99}},m1:fact('p/a:high')}}}}];
+ const groups={'sck-haiku':['p/b','p/a:max','p/a:high','p/new']};
+ const table=rankingTables(groups,{'sck-haiku':snapshot},requests)[0]!;
+ expect(table.rules).toBe('旧规则');expect(table.rows.map(r=>r.model)).toEqual(groups['sck-haiku']);
+ expect(table.rows[0]?.jevScore).toBe(0);expect(table.rows[1]).toMatchObject({jevScore:3.25,aaScore:45.1,accounts:[{account:'p #1',remainingPct:0}],performanceSamples:2.5,stabilityPct:90,stabilitySamples:10});
+ expect(table.rows[2]?.jevScore).toBeUndefined();expect(table.rows[2]?.aaScore).toBeUndefined();
+ const legacy=rankingTables(groups,{},requests)[0]!;expect(legacy.scored).toBe(false);expect(legacy.at).toBe('new-at');expect(legacy.rows[1]?.aaScore).toBe(99);expect(legacy.rows.every(r=>r.jevScore===undefined)).toBe(true);
+});
+
+test('pins exclude exact effort IDs from Jev, persist immediately, and serialize across owner surfaces',async()=>{
+ let pins:Record<string,string[]>={};let stored:Record<string,string[]>={};let fail=false;
+ const members:Record<string,string[]>={'sck-haiku':['p/a:max','p/b:max','p/a:high']};
+ const sent:any[]=[];const published:any[]=[];
+ const db={query:async(sql:string,v?:any)=>{
+  if(sql.startsWith('SELECT pins'))return [{pins}];
+  if(sql.startsWith('SELECT ranking_rules'))return [{}];
+  if(sql.includes('SET pins=')){pins={...pins,...v.pins};stored={...stored,...v.orders};}
+  return [undefined];
+ }};
+ const deps={db:db as any,groups:()=>members,facts:async(ids:string[])=>ids.map(fact),apply:async(orders:Record<string,string[]>,current:()=>boolean)=>{if(current()){published.push(orders);Object.assign(members,orders);}},jev:{model:'fixture',ask:async(state:any,q:any)=>{sent.push(state);if(fail)throw Error('upstream');return response(q);}}};
+ const r=new RankingRefresher(deps);
+ await Promise.all([r.setPin('sck-haiku','p/b:max',true),r.setPin('sck-haiku','p/a:max',true)]);
+ expect(pins).toEqual({'sck-haiku':['p/b:max','p/a:max']});expect(stored['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);expect(sent).toHaveLength(0);
+ await r.setPin('sck-haiku','p/b:max',true);expect(pins['sck-haiku']).toEqual(['p/b:max','p/a:max']);
+ r.trigger(1);await r.settled();expect(Object.values(sent[0].models).map((f:any)=>f.id)).toEqual(['p/a:high']);expect(members['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);
+ await r.setPin('sck-haiku','p/a:high',true);const before=sent.length;
+ const restarted=new RankingRefresher(deps);restarted.trigger(2);await restarted.settled();expect(sent).toHaveLength(before);expect(members['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);
+ await restarted.setPin('sck-haiku','p/b:max',false);restarted.trigger(3);await restarted.settled();expect(Object.values(sent.at(-1).models).map((f:any)=>f.id)).toEqual(['p/b:max']);expect(members['sck-haiku']).toEqual(['p/a:max','p/a:high','p/b:max']);
+ fail=true;await restarted.setPin('sck-haiku','p/a:high',false);restarted.trigger(4);await restarted.settled();expect(members['sck-haiku'][0]).toBe('p/a:max');
+ await expect(r.setPin('sck-fable','p/a:max',true)).rejects.toThrow();await expect(r.setPin('sck-haiku','p/missing',true)).rejects.toThrow();
+});
+
+test('pin invalidates an in-flight Jev result before publishing the manual order',async()=>{
+ const f=fixture();let entered!:()=>void,release!:()=>void;const started=new Promise<void>(r=>entered=r),wait=new Promise<void>(r=>release=r);
+ const r=new RankingRefresher({...f.deps,jev:{model:'fixture',ask:async(_s:any,q:any)=>{entered();await wait;return response(q);}}});
+ r.trigger();await started;const pin=r.setPin('sck-opus','p/a',true);release();await pin;
+ expect(f.applied).toEqual([{'sck-opus':['p/a','p/b']}]);
+});
+
+test('controller refresh enforces persisted pins ahead of cached Jev orders without adding absent members',async()=>{
+ const home=scratch(),store:Record<string,string[]>={};let pins:Record<string,string[]>={};
+ const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:sql.includes('SELECT orders')?[{orders:{'sck-haiku':['p/b','p/a']},pins}]:[[]]};
+ const io={fetch:(async()=>Response.json({data:[{id:'p/gpt-6.1-sol'},{id:'p/deepseek-v4.1-flash'},{id:'p/kimi-k3'}]})) as unknown as typeof fetch,groups:()=>store,command:async(args:string[])=>{if(args[1]==='add')store[args[2]!]=args[3]!.slice(7).split(',');}};
+ const c=new ModelRoutingController(db as any,home,'unused',io);await c.refresh(true);
+ store['sck-haiku']=['p/b','p/a'];pins={'sck-haiku':['p/missing','p/a']};await c.refresh(true);expect(store['sck-haiku']).toEqual(['p/a','p/b']);
+ const restarted=new ModelRoutingController(db as any,home,'unused',io);await restarted.refresh(true);expect(store['sck-haiku']).toEqual(['p/a','p/b']);
+});
+
+test('pinned rows keep observed metrics outside Jev scores and never borrow another effort',()=>{
+ const result={tier:'haiku' as const,at:'2026-10-24T12:00:00Z',model:'fixture',rules:'speed',rows:[{facts:fact('p/b'),score:3}],answers:{},pinnedFacts:[{...fact('p/a:max'),aa:{rank:2,score:45},usage:{source:'magpie' as const,period:'7d' as const,collectedAt:'now',scope:'provider-model' as const,requests:10,errors:0,speedSamples:10,ttftSamples:10,tokensPerSecond:100}}]};
+ const rows=rankingTables({'sck-haiku':['p/a:max','p/a:high','p/b']},{'sck-haiku':result},[],{'sck-haiku':['p/a:max']})[0]!.rows;
+ expect(rows[0]).toMatchObject({pinned:true,aaScore:45,tokensPerSecond:100});expect(rows[0]!.jevScore).toBeUndefined();expect(rows[1]!.aaScore).toBeUndefined();expect(rows[2]!.jevScore).toBe(3);
 });

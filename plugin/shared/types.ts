@@ -282,3 +282,15 @@ export interface PermissionRequest {
   role?: string;
   request: { id: string; kind?: string; summary?: string; detail?: string };
 }
+
+/** Actual Magpie member order with facts from its latest successful Jev ranking. */
+export interface ModelRankingTable {
+  group: string; at?: string; rules?: string; scored: boolean;
+  rows: Array<{
+    model: string; pinned?: boolean; aaScore?: number; aaRank?: number; effort?: string;
+    tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
+    accounts: Array<{account: string; remainingPct?: number}>;
+    performanceScore?: number; performanceSamples?: number;
+    jevScore?: number; jevConfidence?: number;
+  }>;
+}

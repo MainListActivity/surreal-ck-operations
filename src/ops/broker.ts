@@ -42,6 +42,20 @@ import { ProofSigner } from './proof-signer.ts';
 import { identitySchema, sha256, proofToolContracts, proofToolSchemas, type ProofIdentity, type ProofTool } from './proof-contract.ts';
 import type { ProofFiles } from './proof-files.ts';
 
+type ProofDependencyStage = 'identity-login' | 'identity-workspaces' | 'identity-scope' | 'identity-billing' | 'identity-data' | 'product-delivery';
+/** Only fixed stage names, elapsed milliseconds and a typed error code cross the proof boundary. */
+class ProofDependencyError extends CompanyError {
+  constructor(stage: ProofDependencyStage, error: unknown, elapsedMs: number) {
+    const source = error instanceof CompanyError ? error : undefined;
+    super(source?.code ?? 'upstream_error', `internal AI proof failed at ${stage} (${source?.code ?? 'upstream_error'}; ${elapsedMs}ms)`, source?.retryable ?? true);
+  }
+}
+async function proofDependency<T>(stage: ProofDependencyStage, work: () => Promise<T>): Promise<T> {
+  const started = performance.now();
+  try { return await work(); }
+  catch (error) { throw new ProofDependencyError(stage, error, Math.round(performance.now() - started)); }
+}
+
 export const OPS_TOOLS = [
   'ops_info', 'ops_health', 'ops_account_ensure', 'ops_login', 'ops_operator_login', 'ops_logout', 'ops_workspace_ensure',
   'ops_member_list', 'ops_member_add', 'ops_member_remove', 'ops_request', 'ops_query', 'ops_browser_login',
@@ -190,7 +204,7 @@ export class OpsBroker {
       deliver: async (jwt, scope, env, handle) => {
         const ctx = await this.context(scope, env); const session = this.session(ctx, { session: handle });
         if (session.kind === 'customer') throw new CompanyError('forbidden', 'proof delivery requires ops audience');
-        const result = await this.product(ctx, session, 'POST', '/api/ops/internal-ai/company-proof', { proof: jwt });
+        const result = await proofDependency('product-delivery', () => this.product(ctx, session, 'POST', '/api/ops/internal-ai/company-proof', { proof: jwt }));
         const errorCode = proofDeliverErrorCode(result);
         return { status: result.status, ok: result.ok, ...(errorCode ? { errorCode } : {}) };
       },
@@ -265,7 +279,7 @@ export class OpsBroker {
       const handleRef = typeof args.proofHandle === 'string' ? sha256(args.proofHandle) : value && typeof value === 'object' && 'proofHandle' in value ? sha256(String(value.proofHandle)) : 'none';
       return { value, audit: { action: 'ops_proof', evidence: `${tool} keyId=${keyId} digest=${digest} proofRef=${handleRef}` } };
     } catch (error) {
-      throw new CompanyError(error instanceof CompanyError ? error.code : 'upstream_error', 'internal AI proof request denied or unavailable');
+      throw new CompanyError(error instanceof CompanyError ? error.code : 'upstream_error', error instanceof ProofDependencyError ? error.message : 'internal AI proof request denied or unavailable', error instanceof CompanyError && error.retryable);
     }
   }
 
@@ -276,26 +290,36 @@ export class OpsBroker {
   /** Credentials originate in the sealed alias mapping; this path never ensures/repairs accounts or members. */
   private async proofIdentities(scope: OpsScope, env: string, files: ProofFiles): Promise<ProofIdentity[]> {
     const ctx = await this.context(scope, env);
-    const result: ProofIdentity[] = [];
-    for (const expected of files.manifest.identities) {
+    // Both aliases must be read live, but independent IdP flows must not spend two 75s
+    // login budgets serially inside a tool call whose caller waits about 120s.
+    // Settle both flows before returning errors. Membership checks then use one temporary
+    // session at a time so they cannot evict an employee's existing operator session.
+    const resolutions = await Promise.allSettled(files.manifest.identities.map(async expected => {
       const password = await this.sealedPassword(ctx, expected.alias);
       if (!password) throw new CompanyError('not_found', 'approved alias is not registered');
       const username = accountUsername(expected.alias, ctx.cfg.accounts.prefix);
-      const login = await passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'customer' });
+      const login = await proofDependency('identity-login', () => passwordLogin(ctx.cfg, username, password, { fetch: this.deps.fetch, now: this.now, channel: 'customer' }));
+      return { expected, username, login };
+    }));
+    for (const resolution of resolutions) if (resolution.status === 'rejected') throw resolution.reason;
+    const result: ProofIdentity[] = [];
+    for (const resolution of resolutions) {
+      if (resolution.status !== 'fulfilled') throw new CompanyError('upstream_error', 'identity login unavailable', true);
+      const { expected, username, login } = resolution.value;
       const session = this.sessions.create({ employeeId: scope.actor.employeeId, project: scope.project, env, alias: expected.alias, username, kind: 'customer', token: login.accessToken, expiresAt: login.expiresAt });
       try {
         const slug = files.manifest.workspaceSlug;
-        const item = (await this.listWorkspaces(ctx, session)).workspaces.find(w => w.slug === slug);
+        const item = (await proofDependency('identity-workspaces', () => this.listWorkspaces(ctx, session))).workspaces.find(w => w.slug === slug);
         if (!item || item.role !== expected.workspaceRole) throw new CompanyError('forbidden', 'approved workspace membership unavailable');
-        await this.switchTo(ctx, session, item);
-        const response = await this.product(ctx, session, 'GET', '/api/internal-ai/identity?workspaceSlug=' + encodeURIComponent(slug));
+        await proofDependency('identity-scope', () => this.switchTo(ctx, session, item));
+        const response = await proofDependency('identity-billing', () => this.product(ctx, session, 'GET', '/api/internal-ai/identity?workspaceSlug=' + encodeURIComponent(slug)));
         if (!response.ok) throw new CompanyError('not_configured', 'trusted billing identity capability unavailable');
         const parsed = identitySchema.safeParse(response.body);
         if (!parsed.success) throw new CompanyError('upstream_error', 'trusted identity response unavailable');
         const identity = parsed.data;
         const tokenPayload: unknown = JSON.parse(Buffer.from(session.token.split('.')[1] ?? '', 'base64url').toString());
         const subject = tokenPayload && typeof tokenPayload === 'object' && 'sub' in tokenPayload ? tokenPayload.sub : undefined;
-        const [users] = await this.runQuery(ctx, session, item.dbName, "SELECT subject, is_admin FROM user WHERE kind = 'human' AND disabled_at = NONE AND subject = $subject", { subject: identity.subject }) as [Array<{ subject: string; is_admin: boolean }>];
+        const [users] = await proofDependency('identity-data', () => this.runQuery(ctx, session, item.dbName, "SELECT subject, is_admin FROM user WHERE kind = 'human' AND disabled_at = NONE AND subject = $subject", { subject: identity.subject })) as [Array<{ subject: string; is_admin: boolean }>];
         if (identity.subject !== subject || identity.database !== item.dbName || identity.workspaceRole !== expected.workspaceRole || identity.billingRole !== expected.billingRole || users?.length !== 1 || users[0]?.subject !== identity.subject || users[0]?.is_admin !== (expected.workspaceRole === 'admin')) throw new CompanyError('forbidden', 'trusted identity membership mismatch');
         result.push({ ...identity, alias: expected.alias });
       } finally { this.sessions.drop(session.id); }
