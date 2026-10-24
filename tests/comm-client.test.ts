@@ -169,3 +169,19 @@ test('a direct call prints one answer: the data within the budget on success; on
     await service.close();
   }
 });
+
+test('zsh "jq … | sck call tool \"$(cat)\"" sends the piped JSON, not an empty argument list', async () => {
+  const dir = commDir();
+  try {
+    // zsh leaves "$(cat)" empty in the last pipeline stage, so the client gets '' and the JSON on stdin.
+    const child = Bun.spawn(['/bin/zsh', '-fc', `printf '%s' '{"session":"s_1","method":"GET","path":"/api/ops/x"}' | "${process.execPath}" "${CLIENT}" call ops_request "$(cat)"`],
+      { cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }) });
+    const file = await waitForRequest(dir);
+    const request = JSON.parse(readFileSync(join(reqDir(dir), file), 'utf8'));
+    expect(request.args).toEqual({ session: 's_1', method: 'GET', path: '/api/ops/x' });
+    child.kill();
+    await child.exited;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
