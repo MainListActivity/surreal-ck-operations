@@ -166,12 +166,14 @@ export const modelIdentity = defineRpc({
   output: z.object({
     aliases:z.array(z.object({model:z.string(),slug:z.string().nullable(),by:z.enum(["jev","owner"]),confidence:z.number().optional(),suggested:z.string().optional(),aa:z.object({name:z.string(),score:z.number()}).optional()})),
     issues:z.array(z.object({group:z.string(),member:z.string(),reason:z.string()})),
+    inventory:z.object({at:z.string(),grouped:z.array(z.object({model:z.string(),groups:z.array(z.string())})),
+      decidedUngrouped:z.array(z.object({model:z.string(),by:z.string(),slug:z.string().nullable(),at:z.string(),reason:z.string(),present:z.boolean(),confidence:z.number().optional(),suggested:z.string().optional()})),pending:z.array(z.string())}).optional(),
   }),
 });
 export const setModelAlias = defineRpc({
   name: "company.model-alias.set",
   input: z.object({model:z.string().min(1).max(300),slug:z.string().min(1).max(200).nullable()}),
-  output: z.object({ok:z.boolean()}),
+  output: z.object({ok:z.boolean(),synchronized:z.boolean().optional()}),
 });
 
 export const providerOptions = defineRpc({
