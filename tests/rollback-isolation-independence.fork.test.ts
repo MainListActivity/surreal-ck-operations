@@ -313,7 +313,8 @@ run('IR06 rollback isolation: a policy written by the new code, then the deploye
     expect(oldSurface).toEqual({ setIndependence: false, setIdentityPrincipal: false, independenceGate: false });
     // The data survives both bootstraps: the old schema already holds the policy and the principal link.
     expect(schemaFacts.oldBefore).toBe(27);
-    expect(schemaFacts.afterNew).toBe(29);
+    // The new bootstrap's marker is the highest appended module: each new schema module raises it (SYS03's 034 → 34).
+    expect(schemaFacts.afterNew).toBe(34);
     expect(schemaFacts.oldIndependenceField).toBe(true);
     expect(schemaFacts.oldPrincipalField).toBe(true);
     // The source really has a contributor, and the registered principal really links the two sessions.

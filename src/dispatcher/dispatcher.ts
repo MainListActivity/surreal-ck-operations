@@ -55,6 +55,19 @@ const RELOAD_RETRY_SECONDS = 300;
 const PERSISTENT_QUOTA_FAILURES = 2;
 /** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
 const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
+/** SYS03 AC04: holder notices delivered per pass, so a long backlog cannot turn one tick into hundreds of sends. */
+const HOLDER_NOTICE_BATCH = 20;
+
+/**
+ * SYS03 AC04: the text a holder receives. Self-contained (task, episode, this attempt) and it points at the tool that
+ * reads the newest decision, because the holder's own snapshot may predate it — the reminder itself is never the
+ * authority on what happened to the episode.
+ */
+const holderNoticeText = (notice: { taskId: string; episode: string; kind: string; text: string; deliveries: number }): string =>
+  `【公司通知·${notice.kind}】${notice.text}\n`
+  + `任务 ${notice.taskId}，episode ${notice.episode}；这是第 ${notice.deliveries + 1} 次投递。\n`
+  + `你手上的状态可能已经过时：先用 sck call disposition_status '{"taskId":"${notice.taskId}"}' 读这个任务最新的处置与决定，`
+  + `按最新决定行事，不要基于旧提醒重复动作。`;
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -1555,7 +1568,9 @@ export class Dispatcher {
       }
     }
 
-    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string };
+    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string;
+      /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
+      episodeUnknown?: boolean };
     const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
@@ -1579,9 +1594,58 @@ export class Dispatcher {
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
       pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
         wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
+        episodeUnknown: !task.dispatchBlockedSince,
         wakeReason: 'blocked_to_gm' });
     }
     for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
+
+    // SYS03 AC01：拉起新会话前核验这个 episode 的最新处置状态。上一条待办可能已经被另一个经理处置完了
+    // （resume/defer/依赖/retire/修复），或者正被另一位经理持活租约处理——这两种都不该再启动新会话。
+    // 已被处置的旧待办连同它在飞的 manager wake 在本轮就关掉，所以下一轮它不会再变成"旧提醒"。
+    // 读不到账本就整轮不发经理唤醒：宁可晚一轮，也不能凭一个读不到的 episode 再拉起一位经理。
+    if (pendingGm.length && typeof wf.dispositionFacts === 'function') {
+      const episodeKeys = [...new Set(pendingGm.map(todo => wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode)))];
+      const taskIds = [...new Set(pendingGm.map(todo => todo.task.id))];
+      let facts: Awaited<ReturnType<typeof wf.dispositionFacts>> | undefined;
+      try { facts = await wf.dispositionFacts({ episodes: episodeKeys, tasks: taskIds }); }
+      catch (error) { this.log(`disposition episode read failed: ${(error as Error).message}`); }
+      if (!facts) {
+        this.log('disposition episode state unavailable; suppressing all gm wake this pass');
+        pendingGm.length = 0;
+      } else {
+        const kept: PendingGm[] = [];
+        for (const todo of pendingGm) {
+          // SYS03 AC01：episode 身份就是（任务, 阶段, 开始时刻）。只有身份相等，才谈得上"这个 episode 已被处置"。
+          const exact = facts.byEpisode.get(wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode));
+          // byTask 兜底只在"调度器认不出这次提醒的身份"时可用：门禁任务的持久起点会被调度器自己清掉
+          // （见 dispositionFacts），提醒身上只剩任务版本号，按 episode 查必然落空。
+          // 兜底只认**仍在处理中**（claimed）的行——活租约说明现在正有经理在处理这个门禁，不该再拉起第二位；
+          // **decided 的行一律不兜底**：每个处置动作（resume/defer/retire/repair）都把任务带出经理门禁，
+          // 所以"任务此刻还在门禁里 + 有一条已处置的行"只可能意味着那是一条旧 episode，而这个任务已经形成了
+          // 全新的 episode；此时必须照常唤醒经理，否则这条提醒每轮都被旧处置压掉，任务永久饥饿（评审 AC01 缺口）。
+          const fallback = exact ?? (todo.episodeUnknown ? facts.byTask.get(todo.task.id) : undefined);
+          const row = exact ?? (fallback?.status === 'claimed' && fallback.holder && (fallback.leaseExpiresAt ?? 0) > now
+            ? fallback : undefined);
+          // 没有登记行是常态：这个 episode 还没有经理领过，照常唤醒。
+          if (!row) { kept.push(todo); continue; }
+          if (row.status === 'decided') {
+            const resolution = `episode already disposed (${row.decision?.action ?? 'decided'})`;
+            report.decisions.push(`gm-disposition-handled:${todo.task.id}`);
+            await wf.resolveDecidedEpisode({ taskId: todo.task.id, phase: row.phase, episodeMs: row.sinceMs, resolution })
+              .catch(error => this.log(`disposition episode close failed for ${todo.task.id}: ${(error as Error).message}`));
+            continue;
+          }
+          // 活租约：决定还在路上，等同 MR02 的在飞 episode，不再拉起第二位经理。租约失效后这里自然放行。
+          if (row.holder && (row.leaseExpiresAt ?? 0) > now) {
+            report.decisions.push(`gm-disposition-held:${todo.task.id}`);
+            continue;
+          }
+          kept.push(todo);
+        }
+        pendingGm.length = 0;
+        pendingGm.push(...kept);
+      }
+    }
 
     // Every current episode, not only the ones whose throttle expired, keeps its in-flight
     // owner alive. Throttle controls a new wake; it must never release an old one.
@@ -1712,6 +1776,40 @@ export class Dispatcher {
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
       assigned.add(result.id);
       report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
+    }
+
+    // SYS03 AC04：持久 outbox 的持有人通知。取消/依赖等待/恢复/撤租/接手/结果未知都已经和审计在同一个事务里落库，
+    // 这里只负责把还没投递的通知送进仍在线、仍空闲的持有人会话——通道重连或插件重启后的补发走的是同一条路径。
+    // 投递失败只把错误记在通知上、留待下一轮重试：已确认的决定不回滚，通知也不从待发队列里丢掉。
+    if (running < cfg.maxRunning && typeof wf.pendingHolderNotices === 'function' && typeof wf.markHolderNotices === 'function') {
+      let waiting: Awaited<ReturnType<typeof wf.pendingHolderNotices>> | undefined;
+      try { waiting = await wf.pendingHolderNotices(HOLDER_NOTICE_BATCH); }
+      catch (error) { this.log(`holder notice read failed: ${(error as Error).message}`); }
+      for (const notice of waiting ?? []) {
+        if (running >= cfg.maxRunning) break;
+        // 持有人是员工 ID，会话只是它的一个实例：只投给这一轮还在线、空闲、且没被本轮派工的实例。
+        const holder = insts.find(candidate => candidate.id === notice.holder && candidate.paseoAgentId
+          && !assigned.has(candidate.id) && states.get(candidate.id) === 'idle');
+        if (!holder) {
+          // 会话不在线或正在别的活上：通知留着，下一轮再试，持有人也可以自己读 holder_notices。
+          report.decisions.push(`holder-notice-wait:${notice.taskId}`);
+          continue;
+        }
+        try {
+          await paseo.send(holder.paseoAgentId!, holderNoticeText(notice));
+          this.lastStatus.set(holder.paseoAgentId!, 'running');
+          this.onboarded.add(holder.id);
+          await wf.touchWake(holder.id);
+          states.set(holder.id, 'busy');
+          assigned.add(holder.id);
+          running++;
+          await wf.markHolderNotices([notice.noticeKey], { agent: holder.id });
+          report.decisions.push(`holder-notice:${holder.id}:${notice.kind}`);
+        } catch (error) {
+          await wf.markHolderNotices([notice.noticeKey], { error: String((error as Error).message).slice(0, 200) }).catch(() => 0);
+          this.log(`holder notice send failed for ${notice.holder}: ${(error as Error).message}`);
+        }
+      }
     }
 
     const triage = await owner.triagePending();

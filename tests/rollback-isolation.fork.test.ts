@@ -32,7 +32,8 @@ type Relay = { exit: number; keys?: string[] | null; taskCount?: number | null; 
 type Outcome = {
   ok: boolean; error?: string; bootstrap?: boolean; taskTotal?: number;
   ticks?: Array<Record<string, unknown>>; spawns?: string[]; tasks?: Record<string, TaskOutcome>;
-  relays?: { getContext: Relay; getTaskHistory: Relay; listWorktrees: Relay; getAdminSummary: Relay; readTaskText: Relay };
+  relays?: { getContext: Relay; getTaskHistory: Relay; listWorktrees: Relay; getAdminSummary: Relay; readTaskText: Relay;
+    dispositionStatus: Relay; holderNotices: Relay };
   logs?: string[];
 };
 
