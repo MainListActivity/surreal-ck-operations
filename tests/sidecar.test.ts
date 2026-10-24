@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
+import { SidecarPool, blockerQuotaReset } from '../plugin/server/sidecar.ts';
 import { commDir, reqDir, resDir, reportPath, blockerPath, readJsonFile } from '../src/comm.ts';
 import type { ActiveLease, ClaimResult, LeaseProof, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
@@ -16,7 +16,7 @@ const claimResult = (taskId: string): ClaimResult => ({
   task: taskView(taskId), deliveryId: `d-${taskId}`, fence: 7, leaseExpiresAt: new Date().toISOString(), history: [],
 });
 
-interface Call { tool: string; proof?: LeaseProof; text?: string; to?: string; acceptance?: { sha?: string; environment?: string } }
+interface Call { tool: string; proof?: LeaseProof; text?: string; to?: string; acceptance?: { sha?: string; environment?: string }; quotaResetsAt?: string }
 const calls: Call[] = [];
 
 let employeeForGetTask = 'eng-x';
@@ -37,7 +37,10 @@ const core = {
     calls.push({ tool: 'submit', proof: snap(proof), text: ev.text, acceptance: ev.acceptance });
     return taskView(proof.taskId);
   },
-  block: async (_c: string, proof: LeaseProof, to: string, ev: { text: string }) => { calls.push({ tool: 'block', proof: snap(proof), to, text: ev.text }); return taskView(proof.taskId); },
+  block: async (_c: string, proof: LeaseProof, to: string, ev: { text: string }, quotaResetsAt?: string) => {
+    calls.push({ tool: 'block', proof: snap(proof), to, text: ev.text, quotaResetsAt });
+    return taskView(proof.taskId);
+  },
   accept: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'accept', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
   returnTask: async (_c: string, proof: LeaseProof, ev: { text: string }) => { calls.push({ tool: 'return', proof: snap(proof), text: ev.text }); return taskView(proof.taskId); },
   authenticate: async () => ({ employeeId: 'eng-x', role: authRole, capabilities: ['execute'] as const }),
@@ -116,6 +119,7 @@ const relay = async (envDir: string, key: string, name: string, tool: string, ar
 
 let runDir: string;
 let pool: SidecarPool;
+const logs: string[] = [];
 beforeEach(() => {
   calls.length = 0;
   opsCalls.length = 0;
@@ -127,11 +131,13 @@ beforeEach(() => {
   refCalls.length = 0;
   reclaimCalls.length = 0;
   auditCalls.length = 0;
+  logs.length = 0;
   employeeForGetTask = 'eng-x';
   authRole = 'engineering';
   activeLeaseRows = [];
   runDir = mkdtempSync(join(tmpdir(), 'sck-sidecar-'));
-  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, media, runDir, heartbeatMs: 10_000, sweepMs: 20,
+    log: message => { logs.push(message); } });
 });
 afterEach(() => { rmSync(runDir, { recursive: true, force: true }); });
 
@@ -272,6 +278,112 @@ test('relay forwards the declared acceptance fields and refuses a malformed one'
       JSON.stringify({ key: env.SCK_COMM_KEY, tool: 'checkpoint', args: { text: 'x' } }));
     await until(() => existsSync(join(resDir(env.SCK_COMM_DIR), 'late.json')));
     expect(readJsonFile<{ ok: boolean }>(join(resDir(env.SCK_COMM_DIR), 'late.json'))!.ok).toBe(false);
+  });
+
+  test('SYS-QUOTA AC02: the blocker.md declaration is the first non-blank line, and only that line', () => {
+    // Leading blank lines are fine; the key tolerates the hand-written spelling variants; the
+    // instant itself is not validated here (core owns that for both entry points).
+    expect(blockerQuotaReset('\n\nquotaResetsAt: 2026-10-24T04:40:00Z\n正文')).toEqual({ quotaResetsAt: '2026-10-24T04:40:00Z' });
+    expect(blockerQuotaReset('QUOTA_RESETS_AT：2026-10-24T04:40:00Z\n正文')).toEqual({ quotaResetsAt: '2026-10-24T04:40:00Z' });
+    expect(blockerQuotaReset('没有额度字段的普通阻塞说明')).toEqual({});
+    expect(blockerQuotaReset('')).toEqual({});
+    expect(blockerQuotaReset('需要经理定夺\nquotaResetsAt: 2026-10-24T04:40:00Z')).toEqual({ misplaced: true });
+    expect(() => blockerQuotaReset('quotaResetsAt:  ')).toThrow('no value');
+  });
+
+  test('SYS-QUOTA AC01: report_blocker forwards quotaResetsAt to core.block, and forwards none when absent', async () => {
+    const resetAt = new Date(Date.now() + 3600_000).toISOString();
+    const withQuota = inst('e-quota');
+    const env = pool.env(withQuota);
+    await pool.claim(withQuota, task('task-q1'));
+    const declared = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'q1', 'report_blocker',
+      { to: 'gm', text: '订阅额度用尽，等恢复', idempotencyKey: 'q1', quotaResetsAt: resetAt });
+    expect(declared.ok).toBe(true);
+    // The 5th argument is the only write gate for quota_resets_at (core.block → recordQuotaGate):
+    // assert it by identity, so deleting the argument again fails here instead of in production.
+    expect(calls.filter(c => c.tool === 'block')).toEqual([{
+      tool: 'block', proof: { taskId: 'task-q1', deliveryId: 'd-task-q1', fence: 7, expectedVersion: 1 },
+      to: 'gm', text: '订阅额度用尽，等恢复', quotaResetsAt: resetAt,
+    }]);
+
+    const withoutQuota = inst('e-quota-plain');
+    const plainEnv = pool.env(withoutQuota);
+    await pool.claim(withoutQuota, task('task-q2'));
+    const plain = await relay(plainEnv.SCK_COMM_DIR, plainEnv.SCK_COMM_KEY!, 'q2', 'report_blocker',
+      { to: 'gm', text: '普通阻塞，没有额度恢复时间', idempotencyKey: 'q2' });
+    expect(plain.ok).toBe(true);
+    const blocks = calls.filter(c => c.tool === 'block');
+    expect(blocks).toHaveLength(2);
+    expect(blocks[1]!.quotaResetsAt).toBeUndefined();
+    expect(blocks[1]!.to).toBe('gm');
+  });
+
+  test('SYS-QUOTA AC01: a malformed quotaResetsAt is refused, never dropped, and the lease survives it', async () => {
+    const i = inst('e-quota-bad');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-q3'));
+    const send = (args: Record<string, unknown>) => relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `bad-${Math.random()}`, 'report_blocker', args);
+    const refused = async (args: Record<string, unknown>) => {
+      const res = await send(args);
+      expect(res.ok).toBe(false);
+      expect(res.error).toStartWith('invalid:');
+      return res.error!;
+    };
+    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: 1_800_000_000 });
+    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: '' });
+    await refused({ to: 'gm', text: '额度用尽', quotaResetsAt: null });
+    // A near-miss key would otherwise be an unknown argument and silently lose the reset.
+    expect(await refused({ to: 'gm', text: '额度用尽', quota_resets_at: new Date(Date.now() + 3600_000).toISOString() }))
+      .toContain('quotaResetsAt');
+    // Every refusal happened before core.block and before the lease was consumed.
+    expect(calls.filter(c => c.tool === 'block')).toHaveLength(0);
+    const resetAt = new Date(Date.now() + 3600_000).toISOString();
+    const accepted = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'q3-ok', 'report_blocker',
+      { to: 'gm', text: '额度用尽，改好格式再报', idempotencyKey: 'q3-ok', quotaResetsAt: resetAt });
+    expect(accepted.ok).toBe(true);
+    expect(calls.filter(c => c.tool === 'block')[0]!.quotaResetsAt).toBe(resetAt);
+  });
+
+  test('SYS-QUOTA AC02: settle carries blocker.md\'s leading quotaResetsAt into core.block', async () => {
+    const i = inst('e-quota-file');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-q4'));
+    pool.bindAgent('e-quota-file', 'agent-q4');
+    const resetAt = new Date(Date.now() + 3600_000).toISOString();
+    writeFileSync(blockerPath(env.SCK_COMM_DIR), `quotaResetsAt: ${resetAt}\n\n订阅额度用尽，等恢复后再继续。`);
+    await pool.settle('agent-q4');
+    const blocks = calls.filter(c => c.tool === 'block');
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.to).toBe('gm');
+    expect(blocks[0]!.quotaResetsAt).toBe(resetAt);
+    expect(blocks[0]!.text).toContain('订阅额度用尽');
+  });
+
+  test('SYS-QUOTA AC02: a quotaResetsAt below the first line stays prose and is reported, not applied', async () => {
+    const i = inst('e-quota-misplaced');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-q5'));
+    pool.bindAgent('e-quota-misplaced', 'agent-q5');
+    const resetAt = new Date(Date.now() + 3600_000).toISOString();
+    writeFileSync(blockerPath(env.SCK_COMM_DIR), `需要经理定夺范围\n\nquotaResetsAt: ${resetAt}`);
+    await pool.settle('agent-q5');
+    const blocks = calls.filter(c => c.tool === 'block');
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.quotaResetsAt).toBeUndefined();
+    // Not a silent drop: the sidecar says which line was ignored.
+    expect(logs.some(line => line.includes('mentions quotaResetsAt after its first line'))).toBe(true);
+  });
+
+  test('SYS-QUOTA AC02: a blocker.md that declares the field with no value is refused, not filed', async () => {
+    const i = inst('e-quota-empty');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-q6'));
+    pool.bindAgent('e-quota-empty', 'agent-q6');
+    writeFileSync(blockerPath(env.SCK_COMM_DIR), 'quotaResetsAt:   \n订阅额度用尽');
+    await pool.settle('agent-q6');
+    expect(calls.filter(c => c.tool === 'block')).toHaveLength(0);
+    expect(logs.some(line => line.includes('declares quotaResetsAt with no value'))).toBe(true);
+    expect(readdirSync(env.SCK_COMM_DIR).some(f => f.startsWith('blocker.md.failed-'))).toBe(true);
   });
 
   test('a stale report file present before claim is never submitted', async () => {

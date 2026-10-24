@@ -70,6 +70,41 @@ const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
 
+/** A leading blocker.md line that declares the subscription quota reset the way `report_blocker` takes it.
+ *  The key tolerates case and `_` separators because this line is written by hand; the instant itself is
+ *  handed to core.block unvalidated, so `parseQuotaResetsAt` stays the one validator both entries share. */
+const BLOCKER_QUOTA_LINE = /^\s*quota_?resets_?at\s*[:：]\s*(.*)$/i;
+
+/**
+ * Reads the quota reset a blocker.md declares. The declaration is the file's first non-blank line — the
+ * file entry point's equivalent of `report_blocker`'s `quotaResetsAt`:
+ *
+ *     quotaResetsAt: 2026-10-24T04:40:00Z
+ *     正文…
+ *
+ * Only that line counts: a declaration further down (or one merely quoted in prose) must not silently
+ * turn into hours of provider cooldown, so it is reported back through `misplaced` for the caller to log.
+ * A line that declares the field with nothing after it is refused, exactly like a malformed call.
+ */
+export function blockerQuotaReset(text: string): { quotaResetsAt?: string; misplaced?: boolean } {
+  const lines = text.split(/\r?\n/);
+  const head = lines.findIndex(line => line.trim() !== "");
+  if (head < 0) return {};
+  const declared = BLOCKER_QUOTA_LINE.exec(lines[head]!);
+  if (!declared) {
+    return lines.some(line => BLOCKER_QUOTA_LINE.test(line))
+      ? { misplaced: true }
+      : {};
+  }
+  const value = declared[1]!.trim();
+  if (value === "") {
+    throw Object.assign(new Error(
+      "blocker.md declares quotaResetsAt with no value; write `quotaResetsAt: <ISO 8601 with a timezone offset>` as its first line",
+    ), { code: "invalid" });
+  }
+  return { quotaResetsAt: value };
+}
+
 /** Capability broker behind the `ops_*` tools (OpsBroker). Credentials and login tokens stay on its side. */
 export interface OpsGateway {
   readonly tools: readonly string[];
@@ -437,7 +472,18 @@ export class SidecarPool {
     const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
-      if (to) await this.deps.core.block(cred, live.proof, to, evidence);
+      if (to) {
+        // SYS-QUOTA: a blocker.md declares its quota reset on its leading line; the file entry and
+        // `sck call report_blocker` must carry the same field, or the same block means two things
+        // depending on how the employee wrote it. A declaration the parser cannot use is refused
+        // (never dropped quietly): the block fails, the artifact is archived as `.failed-`, and the
+        // reason is logged. A line further down stays prose and is reported instead of applied.
+        const declared = blockerQuotaReset(text);
+        if (declared.misplaced) {
+          this.log(`sidecar ${live.taskId} for ${instId}: blocker.md mentions quotaResetsAt after its first line; ignored — the declaration only counts as the first line`);
+        }
+        await this.deps.core.block(cred, live.proof, to, evidence, declared.quotaResetsAt);
+      }
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
       if (this.claims.get(instId) === live) {
@@ -736,6 +782,27 @@ export class SidecarPool {
       return Object.keys(out).length > 0 ? out : undefined;
     };
     const declared = acceptance();
+    // SYS-QUOTA: the relay forwards the subscription quota reset the caller declared on a block.
+    // A declared field is never dropped quietly — a dropped reset leaves the provider dispatchable
+    // and the manager unparked, which is the P0 this seam caused. A value of the wrong shape is
+    // refused here; the instant itself is validated by core.block (parseQuotaResetsAt), the only
+    // writer of quota_resets_at, so both the call entry and the file entry below refuse the same
+    // texts with the same `invalid` refusal. A near-miss key is refused too, rather than silently
+    // ignored as an unknown argument.
+    const quotaReset = (): string | undefined => {
+      const raw = args.quotaResetsAt;
+      if (raw === undefined) {
+        const misspelled = Object.keys(args).find(key => key !== "quotaResetsAt" && /^quota_?resets_?at$/i.test(key));
+        if (misspelled) {
+          throw Object.assign(new Error(`report_blocker takes quotaResetsAt, not ${misspelled}`), { code: "invalid" });
+        }
+        return undefined;
+      }
+      if (typeof raw !== "string" || raw.trim().length === 0) {
+        throw Object.assign(new Error("quotaResetsAt must be an ISO 8601 instant with a timezone offset, e.g. 2026-10-18T10:12:00-04:00"), { code: "invalid" });
+      }
+      return raw;
+    };
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
@@ -837,7 +904,7 @@ export class SidecarPool {
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
-      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence()), true);
+      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence(), quotaReset()), true);
       case "create_task": return core.createTask(cred, args as never);
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);
