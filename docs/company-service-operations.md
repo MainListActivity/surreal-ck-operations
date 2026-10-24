@@ -435,4 +435,4 @@ broker 侧在项目环境配置加 `origin: {host, user:"sckops", keyFile, known
 sh scripts/sandbox/install.sh
 ```
 
-已在运行的会话要等下一次打开会话（新建、resume、refresh）才进沙箱。沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
+插件每次打开公司交互会话时都会重读 `~/.paseo/config.json`。provider 不在 claude、factory-droid、antigravity 之列（codex 由多个 agent 共用同一个 app-server 进程，无法按会话进沙箱），或配置没有指向包装脚本时，直接拒绝打开会话（fail closed）；只读历史不受影响。已在运行的会话会沿用旧的启动方式，要重新打开会话才进沙箱：空闲时执行 `paseo agent reload <id>`。沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
