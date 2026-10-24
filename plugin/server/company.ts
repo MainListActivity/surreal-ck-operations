@@ -66,7 +66,7 @@ export function company(): Promise<Company> {
     await db.useDatabase(); // schema is owned by the launchd MCP service; we only query.
     const { ModelRoutingController } = await import("./vendor/src/model-routing/controller.ts");
     const { startModelGateway } = await import("./vendor/src/model-routing/gateway.ts");
-    const modelRouting = new ModelRoutingController(db.db, serviceHome());
+    const modelRouting = new ModelRoutingController(db.db, serviceHome(), undefined, { jev: jevFromEnv() });
     const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
     const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
     const modelRanking = new RankingRefresher({db:db.db, jev:jevFromEnv(), groups:readMagpieGroups,

@@ -1151,6 +1151,41 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
   </View></Section>;
 }
 
+/** Vendor names no rule matches: Jev's one-time call, and the owner's correction of it. */
+function ModelIdentityCard({ctx}: {ctx:Ctx}) {
+  const s=makeStyles(ctx);
+  const get=useRpc(rpc.modelIdentity), set=useRpc(rpc.setModelAlias);
+  const query=useQuery({queryKey:["model-identity"],queryFn:()=>get({}),refetchInterval:30000});
+  const [drafts,setDrafts]=useState<Record<string,string>>({});
+  const [all,setAll]=useState(false), [message,setMessage]=useState("");
+  const aliases=query.data?.aliases??[];
+  const shown=all?aliases:aliases.filter(a=>a.slug||a.suggested||a.by==="owner");
+  const apply=async(model:string,slug:string|null)=>{
+    setMessage("");try{await set({model,slug});await query.refetch();setDrafts(d=>({...d,[model]:""}));setMessage("已保存；尚未进组的模型会在下次同步时按新分数分组。");}
+    catch(e){setMessage(`保存失败：${(e as Error).message}`);}
+  };
+  return <Section title="模型与 AA 榜单对应" ctx={ctx}><View style={s.card}>
+    <Text style={s.muted}>分档按 AA 分数，且分数对应测得时的思考等级；组内成员会固定在该等级。名称对不上的新模型由 Jev 判断一次，你可以改。</Text>
+    {query.isError&&<Text style={s.muted}>读取失败，请稍后重试。</Text>}
+    {!!query.data?.issues.length&&<Text style={s.text}>不符合分档规则的成员（只提示，不会自动移除）</Text>}
+    {query.data?.issues.map(i=><Text key={i.group+i.member} style={s.muted}>{i.group}：{i.member} — {i.reason}</Text>)}
+    <Text style={s.text}>名称对应</Text>
+    {shown.map(a=><View key={a.model} style={s.card}>
+      <Text style={s.text}>{a.model}</Text>
+      <Text style={s.muted}>{a.slug?`= ${a.aa?.name??a.slug}（${a.aa?.score??"?"}）`:a.suggested?`Jev 倾向 ${a.aa?.name??a.suggested}（${a.aa?.score??"?"}），但不够确定，未采用`:"不对应任何 AA 模型"}
+        {a.by==="owner"?" · 你设定":a.confidence!==undefined?` · Jev 置信 ${a.confidence.toFixed(2)}`:""}</Text>
+      <TextInput accessibilityLabel={`${a.model} 对应的 AA slug`} style={s.input} placeholder={a.suggested??"AA slug，例如 qwen3-8-flash-next"}
+        value={drafts[a.model]??""} onChangeText={v=>setDrafts(d=>({...d,[a.model]:v}))}/>
+      <View style={{flexDirection:"row",gap:8}}>
+        <Pressable accessibilityRole="button" style={s.buttonSecondary} disabled={!(drafts[a.model]||a.suggested)} onPress={()=>void apply(a.model,(drafts[a.model]||a.suggested)!.trim())}><Text style={s.text}>采用</Text></Pressable>
+        <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>void apply(a.model,null)}><Text style={s.text}>设为不对应</Text></Pressable>
+      </View>
+    </View>)}
+    {aliases.length>shown.length||all?<Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>setAll(!all)}><Text style={s.text}>{all?"只看有对应或待确认的":`显示全部 ${aliases.length} 个`}</Text></Pressable>:null}
+    {!!message&&<Text style={s.muted}>{message}</Text>}
+  </View></Section>;
+}
+
 function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   const s = makeStyles(ctx);
   const queryClient = useQueryClient();
@@ -1168,6 +1203,7 @@ function RosterTab({ ctx, brief }: { ctx: Ctx; brief?: Brief }) {
   return (
     <View style={{ gap: 12 }}>
       <ModelRankingCard ctx={ctx}/>
+      <ModelIdentityCard ctx={ctx}/>
       <Section title="派工开关" ctx={ctx}>
         <View style={[s.card, s.row]}>
           <Text style={[s.text, { flex: 1 }]}>{r?.paused ? "派工已暂停" : "派工运行中"}</Text>

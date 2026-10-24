@@ -194,6 +194,12 @@ export function registerHandlers(server: PluginServerContext): void {
     return {ok:true};
   });
 
+  ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
+  ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
+    await (await company()).modelRouting.setAlias(input.model, input.slug);
+    return {ok:true};
+  });
+
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
     const { db, workforce, opsRepo, dispatcher } = await company();
     const { dispatchBlockedRows } = await import("./vendor/src/dispatcher/dispatch-list.ts");
