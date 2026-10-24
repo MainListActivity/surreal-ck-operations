@@ -1,6 +1,7 @@
+import { z } from "zod";
 import type { Surreal } from "surrealdb";
 import type { JevClient } from "../dispatcher/jev.ts";
-import { aaRankOfScore, canonicalModel, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
+import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
 /** Fable is owner-only and keeps the owner's order; the three staff tiers are ranked by Jev. */
 export const RANKED_TIERS: Tier[] = ["opus", "sonnet", "haiku"];
@@ -13,7 +14,16 @@ export interface RankingSettings {
   refreshMinutes: number;
 }
 export interface UsageStat {
+  source: "magpie";
+  period: "7d";
+  since?: string;
+  collectedAt: string;
+  /** Matches Magpie's native summary: this provider/model, across historical effort levels. */
+  scope: "provider-model";
   requests: number;
+  errors: number;
+  speedSamples: number;
+  ttftSamples: number;
   cacheHitRate?: number;
   tokensPerSecond?: number;
   ttftMs?: number;
@@ -30,51 +40,40 @@ export interface ModelFacts {
   performance?: { score: number; samples: number };
 }
 
-/** RFC 4180 rows: magpie's error columns can hold commas and quotes. */
-export function parseCsv(text: string): Array<Record<string, string>> {
-  const rows: string[][] = [];
-  let row: string[] = [], field = "", quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (quoted) {
-      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
-      else if (c === '"') quoted = false;
-      else field += c;
-    } else if (c === '"') quoted = true;
-    else if (c === ",") { row.push(field); field = ""; }
-    else if (c === "\n") { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
-    else field += c;
-  }
-  if (field || row.length) { row.push(field); rows.push(row); }
-  const [head, ...body] = rows;
-  return head ? body.map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ""]))) : [];
-}
+const usageNumber = z.number().finite().nonnegative().default(0);
+const nativeUsageSchema = z.object({
+  period: z.literal("7d"), since: z.string().optional(),
+  models: z.array(z.object({
+    provider: z.string(), model: z.string(),
+    calls: usageNumber, errors: usageNumber,
+    input: usageNumber, cache_read: usageNumber, cache_write: usageNumber,
+    decode_out: usageNumber, decode_ms: usageNumber, decode_n: usageNumber,
+    ttft_ms: usageNumber, timed: usageNumber,
+  })),
+});
 
-/** Per canonical model: cache-hit share of prompt tokens, decode speed and time to first token. */
-export function usageStats(csv: string): Map<string, UsageStat> {
-  const acc = new Map<string, { n: number; prompt: number; hit: number; out: number; decodeMs: number; ttft: number[] }>();
-  for (const r of parseCsv(csv)) {
-    if (r.status !== "200" || !r.served_model) continue;
-    const key = canonicalModel(r.served_model);
-    const a = acc.get(key) ?? { n: 0, prompt: 0, hit: 0, out: 0, decodeMs: 0, ttft: [] };
-    const num = (k: string) => Number(r[k]) || 0;
-    a.n++;
-    a.prompt += num("input_tokens") + num("cache_read_tokens") + num("cache_write_tokens");
-    a.hit += num("cache_read_tokens");
-    const decode = num("duration_ms") - num("ttft_ms");
-    if (num("output_tokens") > 0 && decode > 0) { a.out += num("output_tokens"); a.decodeMs += decode; }
-    if (num("ttft_ms") > 0) a.ttft.push(num("ttft_ms"));
+/** Consume Magpie's own timed decode totals. CSV output/duration cannot reproduce its reasoning
+ * and stream-window rules. Keep the full provider/model path; names alone conflate different relays. */
+export function usageStats(snapshot: unknown, collectedAt = new Date().toISOString()): Map<string, UsageStat> {
+  const data = nativeUsageSchema.parse(snapshot);
+  const acc = new Map<string, { calls: number; errors: number; prompt: number; hit: number; out: number; decodeMs: number; decodeN: number; ttft: number; timed: number }>();
+  for (const r of data.models) {
+    if (!r.provider || !r.model) continue;
+    const key = `${r.provider}/${r.model}`;
+    const a = acc.get(key) ?? { calls: 0, errors: 0, prompt: 0, hit: 0, out: 0, decodeMs: 0, decodeN: 0, ttft: 0, timed: 0 };
+    a.calls += r.calls; a.errors += r.errors;
+    a.prompt += r.input + r.cache_read + r.cache_write; a.hit += r.cache_read;
+    a.out += r.decode_out; a.decodeMs += r.decode_ms; a.decodeN += r.decode_n;
+    a.ttft += r.ttft_ms; a.timed += r.timed;
     acc.set(key, a);
   }
-  return new Map([...acc].map(([k, a]) => {
-    a.ttft.sort((x, y) => x - y);
-    return [k, {
-      requests: a.n,
-      cacheHitRate: a.prompt ? Math.round((a.hit / a.prompt) * 1000) / 1000 : undefined,
-      tokensPerSecond: a.decodeMs ? Math.round(a.out / (a.decodeMs / 1000)) : undefined,
-      ttftMs: a.ttft.length ? a.ttft[Math.floor(a.ttft.length / 2)] : undefined,
-    }];
-  }));
+  return new Map([...acc].map(([key, a]) => [key, {
+    source: "magpie", period: data.period, since: data.since, collectedAt, scope: "provider-model",
+    requests: a.calls, errors: a.errors, speedSamples: a.decodeN, ttftSamples: a.timed,
+    cacheHitRate: a.prompt ? Math.round(a.hit / a.prompt * 1000) / 1000 : undefined,
+    tokensPerSecond: a.decodeN && a.decodeMs > 0 ? Math.round(a.out / (a.decodeMs / 1000)) : undefined,
+    ttftMs: a.timed ? Math.floor(a.ttft / a.timed) : undefined,
+  }]));
 }
 
 /** `magpie quota --json`: per provider, each account's tightest window. */
@@ -112,7 +111,7 @@ export function modelFacts(
       accounts: sources.quota.get(providerOf(base)) ?? [],
       aa: b ? { rank: aaRankOfScore(b.score), score: Math.round(b.score * 10) / 10, effort: resolved.effort } : undefined,
       price: free ? { free, input: 0, output: 0, cacheHit: 0 } : { free, input: b?.priceInput, output: b?.priceOutput, cacheHit: b?.priceCacheHit },
-      usage: sources.usage.get(canonicalModel(id)),
+      usage: sources.usage.get(base),
       performance: sources.performance.get(id),
     };
   });
@@ -131,7 +130,8 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
       notes: [
         "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
         "aa.rank：Artificial Analysis 智能指数全榜名次，越小越强；aa.effort 是该成员被固定的思考等级，分数即在该等级下测得。price：每百万 token 美元，free=true 为免费。",
-        "usage：近 7 天实际调用，cacheHitRate 为缓存命中占提示 token 比例，tokensPerSecond 为输出速度，ttftMs 为首 token 中位延迟。",
+        "usage：本轮排序前实时读取 Magpie /v1/magpie/usage?period=7d 原生统计；collectedAt 为采集时间，since 为窗口起点。严格按完整供应商/模型路径匹配，含该通道历史各思考等级；缺失表示无该通道数据，不借用其他供应商。",
+        "usage.tokensPerSecond 使用 Magpie decode_out/decode_ms 的原生测速口径，speedSamples 为实测速样本数；ttftMs 为原生平均首 token 延迟，ttftSamples 为样本数；requests 含失败次数 errors，cacheHitRate 为缓存命中占提示 token 比例。",
         "performance：公司任务验收后的模型绩效（1–5 分）与样本数，样本少时参考价值低。",
       ],
     };

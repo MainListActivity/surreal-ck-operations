@@ -84,6 +84,7 @@ export class ModelRoutingController {
     private readonly io: {
       fetch?: typeof fetch;
       command?: (args: string[]) => Promise<void>;
+      output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
       jev?: JevClient;
     } = {},
@@ -115,6 +116,7 @@ export class ModelRoutingController {
     }
   }
   private async output(args: string[]): Promise<string> {
+    if (this.io.output) return this.io.output(args);
     const { stdout } = await exec(this.cli, args, { timeout: 60000, maxBuffer: 32 * 1024 * 1024, env: magpieEnvironment() });
     return stdout;
   }
@@ -176,7 +178,13 @@ export class ModelRoutingController {
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
     const [quota, usage, results] = await Promise.all([
       this.output(["quota", "--json"]).then((t) => quotaAccounts(JSON.parse(t))).catch(() => new Map()),
-      this.output(["usage", "--csv", "--days", "7"]).then(usageStats).catch(() => new Map()),
+      (async () => {
+        const response = await (this.io.fetch ?? fetch)("http://127.0.0.1:3425/v1/magpie/usage?period=7d", {
+          cache: "no-store", headers: { "cache-control": "no-cache" }, signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) throw Error(`Magpie usage API failed (${response.status})`);
+        return usageStats(await response.json());
+      })(),
       readModelResults(this.db),
     ]);
     const known = new Map(classify(this.catalog).map((m) => [m.id, m]));
