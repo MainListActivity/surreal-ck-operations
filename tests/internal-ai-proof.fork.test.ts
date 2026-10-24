@@ -35,6 +35,7 @@ let identityAvailable = true;
 // Trusted-identity read counters at the product boundary: one full identities resolution reads
 // /api/internal-ai/identity once per manifest alias (two aliases → two reads).
 let identityReads = 0, identityFailAfter = 0, identityDelayMs = 0;
+let loginBarrier: ((username: string) => Promise<void>) | undefined;
 async function connect() {
   database = new CompanyDatabase({url: url + '/rpc', rootUser:'root', rootPassword:'root', namespace:'proof_test', database:'control_plane'});
   await database.connect(); await database.bootstrap(); core = new SurrealCompanyCore(database); projects = new ProjectStore(database.db);
@@ -50,6 +51,7 @@ function broker() {
   ops = new OpsBroker({ core, projects, secretKey: () => key, proofStore: new CompanyProofStore(database.db, now), serviceHome:dir, now,
     fetch: async (input, init) => {
       const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url);
+      if (u.pathname === '/api/login/ck/password' && loginBarrier) await loginBarrier(new URLSearchParams(String(init?.body)).get('username') ?? '');
       if (u.pathname === '/api/internal-ai/identity') {
         identityReads++;
         if (identityDelayMs) clock += identityDelayMs; // 注入 IdP 慢读：假时钟前进，验证解析不在 60 秒窗内
@@ -389,6 +391,53 @@ check('prove resolves identities once per request; IdP failure after the first r
   identityAvailable=true;
   expect(await request('ops_internal_ai_prove',proofArgs('flake'))).toEqual(p);
 });
+check('proof resolves both live aliases concurrently and does not deliver before both pass', async () => {
+  let arrived = 0;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  loginBarrier = async () => {
+    arrived++;
+    if (arrived === 2) release();
+    await Promise.race([gate, Bun.sleep(200).then(() => { throw new Error('second alias never started'); })]);
+  };
+  const originalDelivered = delivered;
+  try {
+    const result = await request('ops_internal_ai_prove', proofArgs('concurrent-aliases'));
+    expect(result.proofHandle).toBeString();
+    expect(arrived).toBe(2);
+    expect(delivered).toBe(originalDelivered);
+  } finally { loginBarrier = undefined; release(); }
+});
+
+check('a failed alias waits for its sibling cleanup, exposes only its stage and never delivers', async () => {
+  let arrived = 0, completed = 0;
+  const originalDelivered = delivered;
+  loginBarrier = async username => {
+    arrived++;
+    if (username === 'sck-lca04-removable') throw new Error('synthetic-password-and-subject-must-stay-private');
+    await Bun.sleep(40);
+    completed++;
+  };
+  try {
+    const error = await request('ops_internal_ai_prove', proofArgs('concurrent-alias-failure')).then(() => undefined, error => error);
+    expect(error).toMatchObject({ code: 'upstream_error', retryable: true });
+    expect(error.message).toContain('identity-login');
+    expect(error.message).not.toContain('synthetic-password-and-subject');
+    expect(arrived).toBe(3);
+    expect(completed).toBe(1);
+    expect(delivered).toBe(originalDelivered);
+  } finally { loginBarrier = undefined; }
+});
+
+check('parallel logins keep an existing operator session when seven handles are open', async () => {
+  const sessions: unknown[] = [];
+  try {
+    for (let i = 0; i < 7; i++) sessions.push((await request('ops_login', { alias: 'LCA04_OPS', audience: 'ops' })).session);
+    expect((await request('ops_internal_ai_prove', proofArgs('operator-session-preserved'))).proofHandle).toBeString();
+    for (const session of sessions) expect(await request('ops_logout', { session })).toEqual({ closed: true });
+  } finally { ops.release('test-consumer'); }
+});
+
 check('deliver resolves identities outside the freshness window; a >60s IdP pass still reaches the product',async()=>{
   identityDelayMs=35_000; // 两个别名各读一次身份 → 每次完整解析推假时钟约 +70s，旧实现会在 valid 内超窗
   const clock0=clock, delivered0=delivered; // files() 的字节与后续用例的 delivered JWT 都以 clock0 为基准：一并恢复
