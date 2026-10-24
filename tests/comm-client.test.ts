@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureCommDirs, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
@@ -167,5 +167,26 @@ test('a direct call prints one answer: the data within the budget on success; on
     expect(refused.err).toContain('no such task');
   } finally {
     await service.close();
+  }
+});
+
+// zsh leaves "$(cat)" empty in the last pipeline stage, so the client gets '' and the JSON on stdin.
+const PIPED = '{"session":"s_1","method":"GET","path":"/api/ops/x"}';
+const zshPipe = (dir: string) => Bun.spawn(['/bin/zsh', '-fc', `printf '%s' '${PIPED}' | "${process.execPath}" "${CLIENT}" call ops_request "$(cat)"`],
+  { cwd: ROOT, stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }) });
+const emptyArgWithPipe = (dir: string) => Bun.spawn([process.execPath, CLIENT, 'call', 'ops_request', ''],
+  { cwd: ROOT, stdin: new Blob([PIPED]), stdout: 'pipe', stderr: 'pipe', env: cleanEnv({ SCK_COMM_DIR: dir, SCK_COMM_KEY: 'comm-client-key' }) });
+for (const [name, spawn] of [['an empty argument with piped stdin', emptyArgWithPipe], ['a real zsh "jq … | sck call tool \"$(cat)\""', zshPipe]] as const)
+test.skipIf(spawn === zshPipe && !existsSync('/bin/zsh'))(`${name} sends the piped JSON, not an empty argument list`, async () => {
+  const dir = commDir();
+  try {
+    const child = spawn(dir);
+    const file = await waitForRequest(dir);
+    const request = JSON.parse(readFileSync(join(reqDir(dir), file), 'utf8'));
+    expect(request.args).toEqual({ session: 's_1', method: 'GET', path: '/api/ops/x' });
+    child.kill();
+    await child.exited;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

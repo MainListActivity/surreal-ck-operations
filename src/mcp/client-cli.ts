@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { unlinkSync, writeSync } from 'node:fs';
+import { fstatSync, unlinkSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJsonFile, reqDir, resDir, writeFileAtomic, type CommResponse } from '../comm.ts';
 import { connectCompanyClient } from './client';
@@ -78,11 +78,24 @@ function printAnswer(result: unknown): void {
   writeStdout(`${JSON.stringify(answer.data ?? null)}\n`);
 }
 
+/** zsh expands `jq … | sck call tool "$(cat)"` to an empty argument (its `$(cat)` never sees the pipe) and the JSON
+ * waits on stdin instead. An explicit empty argument with piped stdin reads it, briefly, rather than calling with {}. */
+async function pipedArguments(): Promise<string> {
+  try {
+    const stat = fstatSync(0);
+    if (!stat.isFIFO() && !stat.isFile() && !stat.isSocket()) return '';
+  } catch {
+    return '';
+  }
+  const text = await Promise.race([Bun.stdin.text(), new Promise<string>(resolve => setTimeout(() => resolve(''), 3000))]);
+  return text;
+}
+
 async function main(): Promise<void> {
   const [command, name, json] = Bun.argv.slice(2);
   if (!['list', 'call'].includes(command ?? '')) fail('invalid_arguments', 'usage: bun src/mcp/client-cli.ts list | call <tool> [json-arguments]');
   if (command === 'call' && !name) fail('invalid_arguments', 'tool name is required');
-  const args = argumentsOf(json);
+  const args = argumentsOf(json === '' ? await pipedArguments() : json);
 
   // Comm mode: the plugin sidecar owns the credential; the agent relays requests
   // through its private comm directory and never sees any auth material.
