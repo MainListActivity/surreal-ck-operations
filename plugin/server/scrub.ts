@@ -1,6 +1,7 @@
 // Company agents are children of the Paseo daemon, so they inherit whatever credentials its
 // environment holds (Cloudflare token, Jev key, ...). Credentials belong to the ops broker:
-// every company session is launched with those variables blanked.
+// every company session is launched with those variables blanked, and marked so the provider
+// launcher (scripts/sandbox/launch.sh) starts it inside the employee sandbox.
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -19,6 +20,8 @@ const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELE
 const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
 
 const LOOKUP_MS = 2_000;
+/** Read by scripts/sandbox/launch.sh, which Paseo runs in place of each provider binary. */
+export const SANDBOX_MARKER = { SCK_SANDBOX: "employee" } as const;
 const ZSH_STARTUP = [".zshenv", ".zprofile", ".zshrc", ".zlogin"];
 
 type Env = Record<string, string | undefined>;
@@ -120,7 +123,7 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
   };
   return server.before("agent.session_open", async ({ request }, { paseo, signal }) => {
     if (!(await isCompany(request, paseo, signal))) return undefined;
-    const env = scrubEnv(request.env ?? {}, inherited);
+    const env: Record<string, string> = { ...scrubEnv(request.env ?? {}, inherited), ...SANDBOX_MARKER };
     if (options.modelEnv) Object.assign(env, await options.modelEnv(request));
     const blanked = Object.keys(env).filter(name => env[name] === "" && request.env?.[name] === undefined);
     if (zdotdir && env.ZDOTDIR === undefined) env.ZDOTDIR = zdotdir;

@@ -186,7 +186,7 @@ describe('agent.session_open hook', () => {
   test('a marked company launch is scrubbed without asking the daemon anything', async () => {
     const h = hook();
     const out = await h.open({ ...base, reason: 'create', env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' } });
-    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '' });
+    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '', SCK_SANDBOX: 'employee' });
     expect(h.lookups()).toBe(0);
   });
 
@@ -200,6 +200,8 @@ describe('agent.session_open hook', () => {
     const h = hook({ company: 'surreal-ck' });
     const first = await h.open({ ...base, reason: 'resume', env: {} });
     expect(first?.env.CLOUDFLARE_API_TOKEN).toBe('');
+    // The resumed session carries no channel variable, so the sandbox marker is what keeps it sandboxed.
+    expect(first?.env.SCK_SANDBOX).toBe('employee');
     await h.open({ ...base, reason: 'refresh', env: {} });
     expect(h.lookups()).toBe(1);
   });

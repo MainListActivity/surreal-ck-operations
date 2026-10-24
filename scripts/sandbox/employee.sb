@@ -1,0 +1,67 @@
+;; Seatbelt profile for company employee sessions (sandbox-exec -f employee.sb -D HOME=… -D SERVICE=…).
+;; Employees run as the owner's own macOS user, so file modes protect nothing between them and the
+;; company's credentials. This profile keeps the session and every child it starts away from:
+;;  - credential stores (service private dir, ssh keys and control sockets, Paseo, Magpie, Cloudflare);
+;;  - channels that run commands outside the sandbox (Paseo daemon API, launchd, AppleEvents, LaunchServices, cron);
+;;  - code and configuration the owner's unsandboxed tools run later (plugin releases, shell rc, ~/.claude, bins).
+;; Everything else stays allowed: repos, worktrees, evidence, the model gateway, git push through ssh-agent.
+(version 1)
+(allow default)
+
+(define home (param "HOME"))
+(define service (param "SERVICE"))
+(define (under base rel) (subpath (string-append base rel)))
+(define (at base rel) (literal (string-append base rel)))
+
+(deny file-read* file-write*
+  (under service "/private")
+  (under home "/.ssh")
+  (under home "/.paseo")
+  (under home "/.config/magpie")
+  (under home "/.cloudflared")
+  (under home "/.wrangler")
+  (under home "/Library/Preferences/.wrangler"))
+;; git over ssh: ssh-agent holds the GitHub key; ssh itself only reads these.
+(allow file-read*
+  (at home "/.ssh/config")
+  (at home "/.ssh/known_hosts")
+  (at home "/.ssh/id_ed25519.pub"))
+
+(deny file-write*
+  (under service "/releases")
+  (under service "/release-staging")
+  (under service "/active")
+  (under service "/runtime-bun")
+  (under service "/bin")
+  (under service "/sandbox")
+  (under service "/zdot")
+  (under service "/vault")
+  (under home "/Library/LaunchAgents")
+  (under home "/.local/bin")
+  (under home "/.local/share/claude")
+  (under home "/.bun/bin")
+  (under home "/node/bin")
+  (subpath "/Applications")
+  (subpath "/opt/homebrew")
+  (at home "/.zshrc") (at home "/.zshenv") (at home "/.zprofile") (at home "/.zlogin")
+  (at home "/.bashrc") (at home "/.bash_profile") (at home "/.profile") (at home "/.gitconfig")
+  (at home "/.claude/settings.json") (at home "/.claude/CLAUDE.md") (at home "/.claude/RTK.md")
+  (under home "/.claude/hooks") (under home "/.claude/commands") (under home "/.claude/agents")
+  (under home "/.claude/skills") (under home "/.claude/plugins"))
+
+(deny network-outbound
+  (remote ip "localhost:6767")
+  (remote unix-socket (subpath (string-append home "/.ssh")))
+  (remote unix-socket (subpath (string-append home "/.paseo")))
+  (remote unix-socket (subpath (string-append service "/vault"))))
+
+(deny process-exec
+  (literal "/bin/launchctl")
+  (literal "/usr/bin/osascript")
+  (literal "/usr/bin/open")
+  (literal "/usr/bin/crontab")
+  (literal "/usr/bin/at")
+  (literal "/usr/bin/batch")
+  (subpath "/Applications/Paseo.app/Contents/Resources/bin"))
+(deny appleevent-send)
+(deny lsopen)

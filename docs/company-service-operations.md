@@ -419,3 +419,20 @@ ssh <owner>@<host> 'sudo sh /tmp/install-remote.sh "$(cat tunnel.pub)" "$(cat op
 ```
 
 broker 侧在项目环境配置加 `origin: {host, user:"sckops", keyFile, knownHosts}`（本机绝对路径）即开放 `ops_origin_*`；`ops_info.can.originHost` 反映是否已配置。服务白名单在 agent 与 `src/ops/origin.ts` 两处保持一致。写操作（重启、改配置、升级 SurrealDB）不在此通道内。
+
+## 员工沙箱
+
+员工与老板、插件同是 macOS 用户 `y`，文件权限挡不住员工读公司凭证。所以公司会话一律在 Seatbelt 沙箱（`scripts/sandbox/employee.sb`）里启动，子进程会继承：
+
+- **不可读写**：`<服务目录>/private`、`~/.ssh`（只放行 `config`、`known_hosts`、`id_ed25519.pub`，git 经 ssh-agent 推送）、`~/.paseo`、`~/.config/magpie`、Cloudflare/wrangler 配置。
+- **不可连接**：Paseo daemon `localhost:6767`（员工会话里的 Paseo MCP 因此失效，公司流程不依赖它）、`~/.ssh` 与 `~/.paseo` 下的 unix socket、`sck-vault` socket。
+- **不可执行**：`launchctl`、`osascript`、`open`、`crontab`/`at`、Paseo CLI；同时禁止 AppleEvents 和 LaunchServices。
+- **不可写**：插件发布与运行时目录、沙箱自身、`~/Library/LaunchAgents`、shell 启动文件、`~/.gitconfig`、`~/.claude` 的全局设置/hooks/skills/plugins、`~/.local/bin`、`~/.local/share/claude`、`~/.bun/bin`、`~/node/bin`、`/Applications`、`/opt/homebrew`。
+
+接线方式：插件在 `agent.session_open` 给公司会话加 `SCK_SANDBOX=employee`（resume 的会话按 label 识别后同样加上）。Paseo 的 `claude`、`factory-droid`、`antigravity` provider 命令替换成 `<服务目录>/sandbox/bin/*` 包装脚本，经 `launch.sh` 处理：有标记或 `SCK_COMM_DIR` 的会话进沙箱，profile 缺失时拒绝启动（exit 78）；老板自己的会话和 Paseo 的版本/登录探测原样运行。安装或更新（幂等，会备份 `~/.paseo/config.json` 并执行 `paseo reload`）：
+
+```sh
+sh scripts/sandbox/install.sh
+```
+
+已在运行的会话要等下一次打开会话（新建、resume、refresh）才进沙箱。沙箱挡不住的同用户风险：埋进共享仓库、留给老板日后运行的代码（`.git/hooks`、依赖脚本），`~/.claude.json` 里的 MCP 配置（claude 本身要写这个文件），以及钥匙串里允许 `security` 读取的条目。要彻底隔离，只能让员工改用独立的 macOS 用户运行。
