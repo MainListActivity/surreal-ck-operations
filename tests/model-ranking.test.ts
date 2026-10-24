@@ -5,14 +5,14 @@ import {join} from 'node:path';
 import bundled from '../src/model-routing/benchmarks.json';
 import {useBenchmarks,aaRankOf,classify} from '../src/model-routing/policy.ts';
 import {parseAaLeaderboard,refreshAa,loadAa} from '../src/model-routing/aa.ts';
-import {parseCsv,usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
+import {usageStats,quotaAccounts,modelFacts,jevOrder,RankingRefresher,saveRankingSettings,rankingSettings,DEFAULT_RANKING_RULES,type ModelFacts} from '../src/model-routing/ranking.ts';
 import {ModelRoutingController} from '../src/model-routing/controller.ts';
 import {startModelGateway} from '../src/model-routing/gateway.ts';
 const dirs:string[]=[];
 const scratch=()=>{const p=mkdtempSync(join(tmpdir(),'sck-ranking-'));dirs.push(p);return p;};
 afterEach(()=>{useBenchmarks(bundled.models);for(const d of dirs.splice(0))rmSync(d,{recursive:true,force:true});});
 const flight=(rows:unknown[])=>`<script>self.__next_f.push(${JSON.stringify([1,`data:{"initialModels":${JSON.stringify(rows)},"x":1}`])})</script>`;
-const fact=(id:string)=>({id,accounts:[],price:{free:false}});
+const fact=(id:string):ModelFacts=>({id,accounts:[],price:{free:false}});
 const response=(questions:Record<string,unknown>)=>({model:'fixture',answers:Object.fromEntries(Object.keys(questions).map((k,i)=>[k,{type:'score' as const,score:i%5,confidence:0.95}]))});
 
 test('AA flight parser preserves prices, escapes and estimates, ignores deprecated/unscored rows',()=>{
@@ -32,10 +32,41 @@ test('daily benchmark supplies rank, future models and anchor classification',()
  useBenchmarks([{slug:'deepseek-v4-1-flash-1017',score:45},{slug:'claude-sonnet-5-5',score:56},{slug:'future',score:49},{slug:'weak',score:37}]);
  expect(aaRankOf('future')).toBe(2);expect(classify([{id:'p/future'},{id:'p/weak'}]).map(x=>[x.id,x.tier])).toEqual([['p/future','opus']]);
 });
-test('usage parses quoted CSV, caches, decode speed and rejects failed or unidentified calls',()=>{
- const csv='served_model,status,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,duration_ms,ttft_ms,error\r\na/model,200,10,80,10,100,1500,500,"comma, and ""quote"""\r\nb/model,200,10,80,10,200,2500,500,\r\na/model,429,0,0,0,1000,1,0,\r\n,200,100,0,0,10,1000,0,';
- expect(parseCsv(csv)[0]?.error).toBe('comma, and "quote"');
- expect(usageStats(csv).get('model')).toMatchObject({requests:2,cacheHitRate:0.8,tokensPerSecond:100,ttftMs:500});
+const nativeUsage=(models:unknown[])=>({period:'7d',since:'2026-10-18T00:00:00Z',models});
+const channel=(provider:string,model:string,decode_out:number,decode_ms:number)=>({provider,model,calls:10,errors:1,input:10,cache_read:80,cache_write:10,timed:8,ttft_ms:4000,decode_n:6,decode_out,decode_ms,output:999999,reasoning:888888});
+test('native Magpie usage keeps complete provider/model identity and uses Magpie decode totals',()=>{
+ const usage=usageStats(nativeUsage([
+  channel('remote-magpie','codearts/deepseek-v4.1-flash',100,1000),
+  channel('remote-magpie','workbuddy/deepseek-v4.1-flash',100,4000),
+  channel('remote-magpie','group/auto-deepseek-v4-1-flash',9999,1000),
+ ]),'2026-10-24T03:10:00Z');
+ expect(usage.get('remote-magpie/codearts/deepseek-v4.1-flash')).toMatchObject({requests:10,errors:1,cacheHitRate:0.8,tokensPerSecond:100,ttftMs:500,speedSamples:6,ttftSamples:8,source:'magpie',period:'7d',collectedAt:'2026-10-24T03:10:00Z',scope:'provider-model'});
+ expect(usage.get('remote-magpie/workbuddy/deepseek-v4.1-flash')?.tokensPerSecond).toBe(25);
+ const facts=modelFacts(['remote-magpie/codearts/deepseek-v4.1-flash:max','remote-magpie/workbuddy/deepseek-v4.1-flash:max','remote-magpie/sn/deepseek-v4.1-flash:max'],{catalog:[],quota:new Map(),usage,performance:new Map()});
+ expect(facts.map(f=>f.usage?.tokensPerSecond)).toEqual([100,25,undefined]);
+});
+test('native usage combines same-channel shards with weighted totals, omits unmeasured speed, never serializes account labels',()=>{
+ const rows=[{...channel('p','m',100,1000),id:'p/m @ private@example.com',host:'private@example.com'},channel('p','m',100,4000),{...channel('p','unknown',0,0),decode_n:0,timed:0}];
+ const stats=usageStats(nativeUsage(rows));
+ expect(stats.get('p/m')).toMatchObject({tokensPerSecond:40,requests:20,speedSamples:12,ttftMs:500});
+ expect(stats.get('p/unknown')?.tokensPerSecond).toBeUndefined();
+ expect(stats.get('p/unknown')?.ttftMs).toBeUndefined();
+ expect(JSON.stringify([...stats])).not.toContain('@');
+ expect(()=>usageStats({models:[]})).toThrow();
+});
+test('every rankingFacts collection fetches live native Magpie statistics and fails closed on an unavailable API',async()=>{
+ let calls=0;let down=false;
+ const db={query:async()=>[[]]};
+ const controller=new ModelRoutingController(db as any,scratch(),'unused',{
+  output:async(args:string[])=>{expect(args).toEqual(['quota','--json']);return '[]';},
+  fetch:(async(url:any,options:any)=>{
+   expect(String(url)).toBe('http://127.0.0.1:3425/v1/magpie/usage?period=7d');expect(options.cache).toBe('no-store');calls++;
+   return down?new Response('unavailable',{status:503}):Response.json(nativeUsage([channel('p','m',100*calls,1000)]));
+  }) as typeof fetch,
+ });
+ expect((await controller.rankingFacts(['p/m']))[0]?.usage?.tokensPerSecond).toBe(100);
+ expect((await controller.rankingFacts(['p/m']))[0]?.usage?.tokensPerSecond).toBe(200);
+ down=true;await expect(controller.rankingFacts(['p/m'])).rejects.toThrow();expect(calls).toBe(3);
 });
 test('facts use tightest quota, never leak account emails, zero free prices and keep missing facts unknown',()=>{
  const quota=quotaAccounts([{provider:'p',name:'private@example.com',windows:[{remaining:85},{remaining:7}]},{provider:'p',windows:[{remaining:NaN}]}]);
@@ -150,4 +181,14 @@ test('request snapshot exactly matches the serialized body and is available befo
  }},'opus','速度优先',facts,async payload=>{snapshot=structuredClone(payload);})).rejects.toThrow('upstream unavailable');
  expect(snapshot.state.ownerRules).toBe('速度优先');
  expect(snapshot.questions.m0.criteria).toEqual(['最后考虑','靠后','中等','靠前','首选']);
+});
+
+test('unavailable live usage cancels the refresh before any Jev call or ranking publication',async()=>{
+ const f=fixture();let reads=0;
+ const controller=new ModelRoutingController({query:async()=>[[]]} as any,scratch(),'unused',{
+  output:async()=> '[]', fetch:(async()=>{reads++;return new Response('unavailable',{status:503});}) as unknown as typeof fetch,
+ });
+ f.deps.facts=async(ids:string[])=>controller.rankingFacts(ids);
+ const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
+ expect(reads).toBe(1);expect(f.calls).toEqual([]);expect(f.applied).toEqual([]);
 });
