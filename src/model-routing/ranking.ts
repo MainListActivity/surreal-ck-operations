@@ -3,8 +3,8 @@ import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
-/** Fable is owner-only and keeps the owner's order; the three staff tiers are ranked by Jev. */
-export const RANKED_TIERS: Tier[] = ["opus", "sonnet", "haiku"];
+/** Opus is maintained entirely in Magpie; only Sonnet and Haiku are ranked by Jev. */
+export const RANKED_TIERS: Tier[] = ["sonnet", "haiku"];
 export const REFRESH_MINUTES = [2, 5, 10] as const;
 export const DEFAULT_REFRESH_MINUTES = 5;
 export const DEFAULT_RANKING_RULES = "智能程度和速度综合优先";
@@ -127,7 +127,15 @@ export function modelFacts(
   });
 }
 
-const LEVELS = ["最后考虑", "靠后", "中等", "靠前", "首选"];
+// Each level is evaluated independently. Describe its conditions rather than relying on
+// the model to infer an ordering from generic labels or instructions hidden in state.
+const LEVELS = [
+  "最后考虑：触发老板规则中明确要求排最后或降到末尾的条件，其他能力、绩效、速度或价格优势不能抵消。没有明确末尾条件时，才表示综合优先级最低。",
+  "靠后：未触发老板规则中必须排最后的条件，但按规则综合判断优先级偏低。",
+  "中等：未触发老板规则中必须排最后的条件，按规则综合判断优先级中等。",
+  "靠前：未触发老板规则中必须排最后的条件，按规则综合判断优先级较高。",
+  "首选：未触发老板规则中必须排最后的条件，按规则综合判断属于本组最优先的选择。",
+];
 
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
 export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void): Promise<string[]> {
@@ -147,8 +155,8 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
     };
   const questions = Object.fromEntries(facts.map((f, i) => [keys[i], {
       type: "score" as const,
-      instructions: `按老板规则，并综合能力、额度、价格、缓存命中、速度和绩效，${f.id} 在本组内应排多靠前？`,
-      criteria: LEVELS,
+      instructions: `老板的完整排序规则：${state.ownerRules}。规则中的明确优先关系和排最后条件优先于其他综合优势，不能抵消。根据 state.models.${keys[i]}（${f.id}）的事实，评估它在本组内的优先程度。该通道平均首 token 延迟：${f.usage?.ttftMs === undefined ? "未知" : `${f.usage.ttftMs / 1000} 秒`}；这不是生成速度。缺失数据表示未知，不推断为满足或违反条件。`,
+      criteria: LEVELS.map(level => `老板规则「${state.ownerRules}」。${level}`),
     }]));
   // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
   const payload: RankingRequestPayload = JSON.parse(JSON.stringify({ model: jev.model, state, questions }));

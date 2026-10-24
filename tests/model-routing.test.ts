@@ -69,7 +69,7 @@ test("Haiku serves the Sonnet pool, and Fable serves Opus while its own models a
   await controller.refresh(true);
   const members = Object.fromEntries(calls.filter((c) => c[1] === "add").map((c) => [c[2], c[3]]));
   expect(members).toEqual({
-    "sck-fable": "models=a/gpt-6.1-sol", "sck-opus": "models=a/gpt-6.1-sol",
+    "sck-fable": "models=a/gpt-6.1-sol",
     "sck-sonnet": "models=a/deepseek-v4.1-flash", "sck-haiku": "models=a/deepseek-v4.1-flash",
   });
 });
@@ -95,7 +95,7 @@ test("after the one-time grouping, membership is the owner's: manual edits stay,
   expect(store["sck-haiku"]).toContain("a/hand-picked");
   expect(store["sck-sonnet"]).toContain("b/glm-5.3-flash");
   expect(store["sck-haiku"]).toContain("b/glm-5.3-flash");
-  expect(store["sck-opus"]).toEqual(["a/gpt-6.1-sol"]);
+  expect(store["sck-opus"]).toBeUndefined();
 });
 test("four explicit tiers and owner-approved role defaults never depend on task titles", () => {
   expect(taskTier({ model_tier: "haiku", executor_role: "engineering" })).toBe("haiku");
@@ -355,7 +355,7 @@ describe("streaming task gateway", () => {
   });
 });
 
-test("controller writes only the four magpie tier groups, removes the retired selector and reruns idempotently", async () => {
+test("controller writes only the automatic magpie tier groups, removes the retired selector and reruns idempotently", async () => {
   const { ModelRoutingController } = await import(
     "../src/model-routing/controller.ts"
   );
@@ -395,7 +395,7 @@ test("controller writes only the four magpie tier groups, removes the retired se
   await controller.refresh(true);
   expect(status.models.map((m: any) => m.id)).toEqual(["claude/claude-opus-5-5", "claude/claude-haiku-5-5"]);
   const groups = calls.filter((c) => c[0] === "group" && c[1] === "add");
-  expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
+  expect(groups.map((c) => c[2])).toEqual(["sck-fable", "sck-sonnet", "sck-haiku"]);
   expect(groups.every((c) => c.includes("routing=order") && c.includes("stays=auto"))).toBe(true);
   expect(groups.every((c) => !c.join(" ").includes("mystery"))).toBe(true);
   expect(calls).toContainEqual(["plugin", "rm", join(home, "model-routing", "sck-performance.gateway.js")]);
@@ -425,7 +425,7 @@ test("removing a route group that is already gone does not fail the sync", async
     },
   });
   await controller.refresh(true);
-  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-fable", "sck-opus", "sck-sonnet", "sck-haiku"]);
+  expect(Object.keys(JSON.parse(readFileSync(join(home, "model-routing", "groups.json"), "utf8")))).toEqual(["sck-fable", "sck-sonnet", "sck-haiku"]);
 });
 test("durable local queue never waits for remote DB, survives restart and retains completions during a slow flush", async () => {
   const { ExecutionJournal } = await import("../src/model-routing/journal.ts");
@@ -643,4 +643,30 @@ test('gateway recovery returns retryable 503 until sidecar adoption is ready, th
     expect(warm.status).toBe(409);await warm.text();
     expect(lookups).toBe(1);
   }finally{await g.stop()}
+});
+
+test('Opus is never created, rebuilt, reordered, appended to or removed by controller sync',async()=>{
+ const {ModelRoutingController,GROUPING_VERSION}=await import('../src/model-routing/controller.ts');
+ const {mkdirSync}=await import('node:fs');
+ for(const initial of [undefined,[],['owner/custom:high','p/gpt-6.1-sol:low']]){
+  const home=join(scratch,`manual-opus-${initial===undefined?'absent':initial.length}`);
+  mkdirSync(join(home,'model-routing'),{recursive:true});
+  writeFileSync(join(home,'model-routing','groups.json'),JSON.stringify({'sck-opus':'old-signature'}));
+  const groups:Record<string,string[]>=initial===undefined?{}:{'sck-opus':[...initial]};
+  const calls:string[][]=[];
+  let catalog=[{id:'p/deepseek-v4.1-flash'},{id:'p/gpt-6.1-sol'}];
+  const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:sql.includes('SELECT orders')?[{orders:{'sck-opus':['p/gpt-6.1-sol:low','owner/custom:high']},pins:{'sck-opus':['p/gpt-6.1-sol:low']}}]:[[]]};
+  const controller=new ModelRoutingController(db as any,home,'unused',{
+   fetch:(async()=>Response.json({data:catalog})) as unknown as typeof fetch,groups:()=>groups,
+   command:async args=>{calls.push(args);if(args[0]==='group'&&args[1]==='add')groups[args[2]!]=args[3]!.slice(7).split(',');},
+  });
+  await controller.prepare(); // no membership stamp: first install must also leave Opus alone
+  writeFileSync(join(home,'model-routing','membership.json'),JSON.stringify({version:GROUPING_VERSION,known:catalog.map(m=>m.id)}));
+  catalog=[...catalog,{id:'p/claude-sonnet-5-5'}];
+  await controller.applyOrders({'sck-opus':['p/gpt-6.1-sol:max']});
+  await controller.refresh(true);
+  if(initial===undefined)expect(groups['sck-opus']).toBeUndefined();
+  else expect(groups['sck-opus']).toEqual(initial);
+  expect(calls.filter(args=>args[0]==='group'&&args[2]==='sck-opus')).toEqual([]);
+ }
 });
