@@ -788,4 +788,11 @@ select {
 }
 
 .error-message{color:var(--relay-danger);font-size:12px;margin-top:12px}.empty-state{color:var(--relay-muted);padding:24px 0;text-align:center}.mobile-performance{display:none}@media(max-width:600px){.mobile-performance{display:block;color:var(--relay-muted);font-size:9px;margin-top:7px}}.request-details{margin-top:22px;color:var(--relay-muted);font-size:12px}.request-details pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--relay-input);padding:12px;border-radius:12px;max-height:400px;overflow:auto}
+
+.model-row-header{display:flex;align-items:center;min-width:0}
+.model-row-header .model-row-main{flex:1;min-width:0}
+.pin-button{flex-shrink:0;margin-right:10px;padding:8px 6px;min-height:44px;background:transparent;border:0;color:var(--relay-muted);font-size:11px;cursor:pointer}
+.pin-button[aria-pressed="true"]{color:var(--relay-accent)}
+.pin-button:disabled{opacity:.5;cursor:wait}
+@media(max-width:600px){.pin-button{margin-right:5px;padding:6px 3px;font-size:10px}}
 `;

@@ -109,6 +109,15 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const { modelRankingView }=await import("./model-ranking.ts");
         return json(await modelRankingView((await opts.company()).db.db));
       }
+      if (req.method === "POST" && sub === "/api/model-ranking/pin") {
+        if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
+        const b=await req.json() as {group?:unknown;model?:unknown;pinned?:unknown};
+        if(!["sck-haiku","sck-sonnet","sck-opus"].includes(b.group as string)||typeof b.model!=="string"||!b.model||b.model.length>300||typeof b.pinned!=="boolean")return json({error:"置顶参数无效"},400);
+        try {
+          await (await opts.company()).modelRanking.setPin(b.group as string,b.model,b.pinned);
+          return json({ok:true});
+        } catch { return json({error:"置顶更新失败，请刷新后重试"},409); }
+      }
       if (req.method === "POST" && sub === "/api/model-ranking") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown};

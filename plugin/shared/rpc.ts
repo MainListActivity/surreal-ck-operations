@@ -160,6 +160,12 @@ export const saveModelRanking = defineRpc({
   output: z.object({ok:z.boolean()}),
 });
 
+export const pinModelRanking = defineRpc({
+  name: "company.model-ranking.pin",
+  input: z.object({group:z.enum(["sck-haiku","sck-sonnet","sck-opus"]),model:z.string().min(1).max(300),pinned:z.boolean()}),
+  output: z.object({ok:z.boolean()}),
+});
+
 export const modelIdentity = defineRpc({
   name: "company.model-identity.get",
   input: z.object({}),

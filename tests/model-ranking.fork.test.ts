@@ -1,7 +1,7 @@
 import {expect,test} from 'bun:test';
 import {CompanyDatabase} from '../src/database.ts';
 import {loadDatabaseConfig} from '../src/config.ts';
-import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES,rankingTables} from '../src/model-routing/ranking.ts';
+import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES,rankingTables,rankingPins} from '../src/model-routing/ranking.ts';
 const run=process.env.RUN_SCK_CHANNEL_FORK_TESTS==='1'?test:test.skip;
 run('fork: ranking settings preserve routing config; request-triggered three-group results persist',async()=>{
  const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
@@ -40,11 +40,18 @@ run('fork: ranking settings preserve routing config; request-triggered three-gro
   const [kept]=await db.db.query<[any]>('SELECT orders,error,results FROM ONLY company_meta:model_ranking;');
   expect(kept.orders).toEqual(status.orders);expect(kept.error).toBe('haiku 刷新失败，保留原顺序');
   expect(kept.results['sck-haiku'].rules).toBe('质量优先');
+  await refresher.setPin('sck-opus','a/x',true);
+  expect((await rankingPins(db.db))['sck-opus']).toEqual(['a/x']);
+  await refresher.setPin('sck-sonnet','a/x',true);
+  expect(await rankingPins(db.db)).toEqual({'sck-opus':['a/x'],'sck-sonnet':['a/x']});
+  refresher.trigger(5);await refresher.settled();
+  expect((await rankingRequests(db.db)).find(s=>s.tier==='opus')!.payload.state.models).toEqual({m0:{id:'a/y',accounts:[],price:{free:true,input:0,output:0,cacheHit:0}}});
   const reconnected=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
   try {
     await reconnected.connect();await reconnected.useDatabase();
     const [persisted]=await reconnected.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
     const tables=rankingTables({'sck-haiku':['a/y']},persisted.results,await rankingRequests(reconnected.db));
+    expect((await rankingPins(reconnected.db))['sck-opus']).toEqual(['a/x']);
     expect(tables[0]).toMatchObject({scored:true,rules:'质量优先',rows:[{model:'a/y',jevScore:0}]});
   } finally {await reconnected.close();}
  }finally{await db.close();}

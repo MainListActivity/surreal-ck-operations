@@ -31,7 +31,7 @@ import { saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
 import { loadAa, refreshAa } from "./aa.ts";
 import { useBenchmarks } from "./policy.ts";
-import { modelFacts, quotaAccounts, usageStats, type ModelFacts } from "./ranking.ts";
+import { pinnedOrder, modelFacts, quotaAccounts, usageStats, type ModelFacts } from "./ranking.ts";
 import { aliasMap, askAlias, loadAliases, saveAliases } from "./alias.ts";
 import {loadInventory,saveInventory,inventoryAliases,recordDecision,reconcileInventory,inventoryView} from "./inventory.ts";
 import type { JevClient } from "../dispatcher/jev.ts";
@@ -306,7 +306,7 @@ export class ModelRoutingController {
       }
       useAliases(aliasMap(aliases));
     }
-    const [ranking] = await this.db.query<[{ orders?: Record<string, string[]> } | undefined]>("SELECT orders FROM ONLY company_meta:model_ranking;");
+    const [ranking] = await this.db.query<[{ orders?: Record<string, string[]>; pins?: Record<string, string[]> } | undefined]>("SELECT orders,pins FROM ONLY company_meta:model_ranking;");
     this.orders = { ...ranking?.orders, ...this.orders };
     const models = classify(catalog.data).filter(
       (m) => !config?.disabledModels?.includes(m.id),
@@ -373,7 +373,9 @@ export class ModelRoutingController {
       };
       const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
       const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
-      const members = ordered.map((m) => m.id);
+      const members = tier === "fable" ? ordered.map(m => m.id) : pinnedOrder(ordered.map(m => m.id), ranking?.pins?.[`sck-${tier}`]);
+      const positions = new Map(members.map((id, i) => [id, i]));
+      ordered.sort((a,b) => positions.get(a.id)! - positions.get(b.id)!);
       for (const member of members) {
         const reason = memberIssue(tier, member, levelsOf(member));
         if (reason) issues.push({ group: `sck-${tier}`, member, reason });

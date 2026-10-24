@@ -8,18 +8,18 @@ import {relayDesignCss} from '../plugin/shared/relay-design.ts';
 const homes:string[]=[];
 afterEach(()=>{for(const home of homes.splice(0))rmSync(home,{recursive:true,force:true});});
 function fixture(){
- const home=mkdtempSync(join(tmpdir(),'sck-ranking-console-'));homes.push(home);let settings={ranking_rules:'原规则',ranking_refresh_minutes:5};const resets:number[]=[];
+ const home=mkdtempSync(join(tmpdir(),'sck-ranking-console-'));homes.push(home);let settings={ranking_rules:'原规则',ranking_refresh_minutes:5};const resets:number[]=[];const pins:unknown[]=[];
  const db={query:async(sql:string,vars?:any)=>{
   if(sql.startsWith('SELECT ranking_rules'))return [settings];
-  if(sql.startsWith('SELECT at,error,orders,results'))return [{at:new Date('2026-10-24T08:00:00Z'),orders:{},results:{}}];
+  if(sql.startsWith('SELECT at,error,orders,results,pins'))return [{at:new Date('2026-10-24T08:00:00Z'),orders:{},results:{}}];
   if(sql.startsWith('SELECT tier,at,payload'))return [[]];
   if(sql.startsWith('UPSERT company_meta:model_routing')){settings={ranking_rules:vars.rules,ranking_refresh_minutes:vars.minutes};return [undefined];}
   throw Error('Unexpected query');
  }};
- const fetch=createConsoleFetch({home,lanBase:()=> 'http://localhost',company:async()=>({db:{db},modelRanking:{reset:(minutes:number)=>resets.push(minutes)}} as any)});
+ const fetch=createConsoleFetch({home,lanBase:()=> 'http://localhost',company:async()=>({db:{db},modelRanking:{setPin:async(...args:unknown[])=>{pins.push(args);},reset:(minutes:number)=>resets.push(minutes)}} as any)});
  const base=consoleUrl(home,()=> 'http://localhost')+'/';
  const request=(path:string,body?:unknown,origin?:string)=>fetch(new Request(base+path,body===undefined?undefined:{method:'POST',headers:{'content-type':'application/json',...(origin?{origin}:{})},body:JSON.stringify(body)}));
- return {fetch,request,resets};
+ return {fetch,request,resets,pins};
 }
 test('owner ranking page uses supplied Figma layout, real API, light/dark tokens and a review-console return link',async()=>{
  const f=fixture();expect((await f.fetch(new Request('http://localhost/o/wrong/ranking'))).status).toBe(404);
@@ -37,4 +37,13 @@ test('owner ranking GET shares settings without triggering a refresh; saves vali
  for(const body of [{rules:'x',refreshMinutes:15},{rules:5,refreshMinutes:5},{rules:'x'.repeat(8001),refreshMinutes:5}])expect((await f.request('api/model-ranking',body)).status).toBe(400);
  expect(f.resets).toEqual([]);expect((await f.request('api/model-ranking',{rules:'速度优先',refreshMinutes:2},'http://localhost')).status).toBe(200);
  expect(f.resets).toEqual([2]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({rules:'速度优先',refreshMinutes:2});
+});
+
+test('owner pin endpoint validates membership arguments and origin independently of rule saves',async()=>{
+ const f=fixture();
+ expect((await f.request('api/model-ranking/pin',{group:'sck-haiku',model:'p/a:max',pinned:true},'https://other.example')).status).toBe(403);
+ for(const body of [{group:'sck-fable',model:'p/a',pinned:true},{group:'sck-haiku',model:'',pinned:true},{group:'sck-haiku',model:'p/a',pinned:'true'}])expect((await f.request('api/model-ranking/pin',body)).status).toBe(400);
+ expect(f.pins).toEqual([]);
+ expect((await f.request('api/model-ranking/pin',{group:'sck-haiku',model:'p/a:max',pinned:true},'http://localhost')).status).toBe(200);
+ expect(f.pins).toEqual([['sck-haiku','p/a:max',true]]);expect(f.resets).toEqual([]);
 });
