@@ -52,7 +52,7 @@ rtk proxy sh scripts/company-service.sh uninstall
 
 **R3 「我的提交不是 active 的祖先」＝硬停**：禁止自行 `install` 更早的 release——那是回滚，会撤掉别条线刚上线的改动。必须 `report_blocker to=gm`，写明本单合并提交、当时 active SHA、核对时刻与差异，由经理决定是否重新发布。
 
-**R4 §5 双面回滚的沙箱边界**：回滚是沙箱外通道的执行动作；部署腿的义务是**只读证明回滚目标仍被当前（受审）release 的守卫放行**，逐目标实测（`rc=0` 即放行）：
+**R4 §5 双面回滚的沙箱边界**：回滚是沙箱外通道的执行动作；部署腿的义务是**只读证明回滚目标仍被当前（受审）release 的守卫放行**，在**当前 active release 根目录**下逐目标实测（守卫脚本即该 release 自带的版本；`rc=0` 即放行）：
 
 ```sh
 sh -c '. scripts/review-wait-guard.sh;  review_wait_target_supported  "<目标 release>"'; echo rc=$?
@@ -122,10 +122,10 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 ### 4. 双面验证与恢复派工
 
-- `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`/health`、`/ready` 都返回 200（端口与进程按 R1 第 4 步取得）。不要用 `company-service.sh status`：它调用 launchctl，员工沙箱里被拒后会打印 `not loaded`，这不是服务未加载的证据。
-- 插件面：`paseo plugin ls sck-company`（**沙箱外通道执行**，员工会话里被拒）必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本；部署腿侧的员工通道同源核对见 R1 第 5 步。
-- 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按「交付预览服务」节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
+- `rtk proxy readlink "<服务目录>/active"` 必须等于本次 release；`/health`、`/ready` 都返回 200（端口与进程按 R1 第 4 步取得）。不要用 `company-service.sh status`：它调用 launchctl，员工沙箱里被拒后会打印 `not loaded`，这不是服务未加载的证据。
+- 插件面：`paseo plugin ls sck-company`（**沙箱外通道执行**，员工会话里被拒）必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `<本次 release>/plugin`**。只看 running 不足以证明已切版本；部署腿侧的员工通道同源核对见 R1 第 5 步。
+- 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "<本次 release>/schema" "<本次 release>/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
+- 用真实已登记员工通道 `rtk proxy "<服务目录>/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按「交付预览服务」节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。**部署腿可独立执行的只有 §0 R1 第 2、4、5 步里的只读探针**（不需要 launchd；`company-service.sh status` 与上面的 `paseo plugin ls` 在员工沙箱里都会被拒，由沙箱外通道核对）；每份结论须带核对时刻（UTC），见 §0 R5。
 
