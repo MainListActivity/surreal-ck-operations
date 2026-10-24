@@ -1568,7 +1568,9 @@ export class Dispatcher {
       }
     }
 
-    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string };
+    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string;
+      /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
+      episodeUnknown?: boolean };
     const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
@@ -1592,6 +1594,7 @@ export class Dispatcher {
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
       pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
         wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
+        episodeUnknown: !task.dispatchBlockedSince,
         wakeReason: 'blocked_to_gm' });
     }
     for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
@@ -1612,10 +1615,17 @@ export class Dispatcher {
       } else {
         const kept: PendingGm[] = [];
         for (const todo of pendingGm) {
-          // 按 episode 精确匹配；门禁任务的持久 episode 标记会被调度器自己清掉（见 dispositionFacts），
-          // 那时按任务取最新处置，否则同一提醒每轮都换一个身份，处置过一次也压不住下一次唤醒。
-          const row = facts.byEpisode.get(wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode))
-            ?? facts.byTask.get(todo.task.id);
+          // SYS03 AC01：episode 身份就是（任务, 阶段, 开始时刻）。只有身份相等，才谈得上"这个 episode 已被处置"。
+          const exact = facts.byEpisode.get(wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode));
+          // byTask 兜底只在"调度器认不出这次提醒的身份"时可用：门禁任务的持久起点会被调度器自己清掉
+          // （见 dispositionFacts），提醒身上只剩任务版本号，按 episode 查必然落空。
+          // 兜底只认**仍在处理中**（claimed）的行——活租约说明现在正有经理在处理这个门禁，不该再拉起第二位；
+          // **decided 的行一律不兜底**：每个处置动作（resume/defer/retire/repair）都把任务带出经理门禁，
+          // 所以"任务此刻还在门禁里 + 有一条已处置的行"只可能意味着那是一条旧 episode，而这个任务已经形成了
+          // 全新的 episode；此时必须照常唤醒经理，否则这条提醒每轮都被旧处置压掉，任务永久饥饿（评审 AC01 缺口）。
+          const fallback = exact ?? (todo.episodeUnknown ? facts.byTask.get(todo.task.id) : undefined);
+          const row = exact ?? (fallback?.status === 'claimed' && fallback.holder && (fallback.leaseExpiresAt ?? 0) > now
+            ? fallback : undefined);
           // 没有登记行是常态：这个 episode 还没有经理领过，照常唤醒。
           if (!row) { kept.push(todo); continue; }
           if (row.status === 'decided') {

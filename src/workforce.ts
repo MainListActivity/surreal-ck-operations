@@ -872,8 +872,9 @@ export class Workforce {
    *
    * `byTask` is the fallback for a manager gate whose persisted episode start the dispatcher itself clears every pass:
    * a blocked-to-gm task is not a work-queue item, so `endStaleEpisodes` drops its `dispatch_blocked_since`. Without
-   * this fallback the same reminder would present a different episode every tick, and a manager deciding it once could
-   * never suppress the next wake. Picking the newest claim of the task is the best evidence available for that gate.
+   * this fallback the same reminder would present a different episode every tick. It is the newest claim of the task,
+   * and the wake loop may only use it for an IN-FLIGHT claim: a decided row belongs to an episode that is already over,
+   * so it must never suppress a wake for the episode the task has formed since (see the SYS03 guard in dispatcher.ts).
    */
   async dispositionFacts(input: { episodes: readonly string[]; tasks: readonly string[] }): Promise<{
     byEpisode: Map<string, DispositionEpisodeFacts>; byTask: Map<string, DispositionEpisodeFacts> }> {

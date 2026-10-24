@@ -398,6 +398,20 @@ run('SYS03 manager disposition on the company fork', () => {
     const d2 = await dBlocked('sys03-d-held');                   // live claim, no decision: no second manager
     const d3 = await dBlocked('sys03-d-race');                   // the manager decides during the pass
     const d4 = await dBlocked('sys03-d-notice', holderSeat.id);  // decided before the tick; the holder must hear about it
+    // AC01 negative regression: a task whose episode E1 was disposed must be woken again once it forms a NEW episode E2.
+    const d5 = await dBlocked('sys03-d-reblock');
+    const d5Claim = await dCore.claimDisposition(dGm, { taskId: d5.id, phase: 'execute', sinceMs: d5.sinceMs, reason: 'E1：先处置一次，随后任务会形成新 episode' });
+    const d5Decide = await dCore.decideDisposition(dGm, { taskId: d5.id, phase: 'execute', sinceMs: d5.sinceMs,
+      claimToken: d5Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedTaskVersion: d5.version,
+      dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d5' });
+    // The task leaves that gate… and later blocks to gm again: a brand-new episode E2 with its own start.
+    const d5E2Since = Math.floor(Date.now() / 1000) + 60;
+    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+      current_employee = NONE, lease_expires_at = NONE, dispatch_blocked_phase = 'execute',
+      dispatch_blocked_since = $since, dependencies = [], version = version + 1;`,
+      { t: id('task', d5.id), since: d5E2Since });
+    const d5E2 = await dRowOf(d5.id);
+    const d6 = await dBlocked('sys03-d-reblock-control');        // never claimed: the pass must not be quiet for everyone
     const heldBefore = await dRowOf(d2.id);
     const d2Claim = await dCore.claimDisposition(dGm, { taskId: d2.id, phase: 'execute', sinceMs: d2.sinceMs, reason: '活租约：该 episode 正被处理' });
     const d3Claim = await dCore.claimDisposition(dGm, { taskId: d3.id, phase: 'execute', sinceMs: d3.sinceMs, reason: '竞态：该 episode 正在被处理' });
@@ -420,6 +434,24 @@ run('SYS03 manager disposition on the company fork', () => {
     };
 
     const firstTick = await newDispatcher().tick();
+    // The two diagnoses the negative regression rests on: the disposed E1 is what a by-task fallback would have found,
+    // while the episode the task is in now (E2) has no claim of its own.
+    const reblockFacts = await realFacts({ episodes: [`${d5.id}:execute:${d5E2Since * 1000}`], tasks: [d5.id, d6.id] });
+
+    // AC01 negative regression, second shape: the very case where the fallback IS consulted — the dispatcher has just
+    // cleared this gate's persisted start (`endStaleEpisodes` does that to every gm-gated task), so the reminder carries
+    // only the task version and the ledger must answer by task. The disposed E1 must still not suppress E2.
+    const d7 = await dBlocked('sys03-d-reblock-cleared');
+    const d7Claim = await dCore.claimDisposition(dGm, { taskId: d7.id, phase: 'execute', sinceMs: d7.sinceMs, reason: 'E1：先处置一次，随后持久起点被调度器清掉' });
+    await dCore.decideDisposition(dGm, { taskId: d7.id, phase: 'execute', sinceMs: d7.sinceMs,
+      claimToken: d7Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedTaskVersion: d7.version,
+      dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d7' });
+    await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
+      current_employee = NONE, lease_expires_at = NONE, dispatch_blocked_phase = NONE,
+      dispatch_blocked_since = NONE, dependencies = [], version = version + 1;`, { t: id('task', d7.id) });
+    const d7Cleared = await dRowOf(d7.id);
+    const clearedFacts = await realFacts({ episodes: [], tasks: [d7.id] });
+
     const heldAfterTick1 = await dRowOf(d2.id);
     const pendingAfterTick1 = await dWf.pendingHolderNotices();
     // The plugin/channel restarts: a new dispatcher over the same durable state. The holder session is idle now.
@@ -429,10 +461,20 @@ run('SYS03 manager disposition on the company fork', () => {
     const thirdTick = await restarted.tick();
     obs.dispatch = {
       decideBeforeTick: d4Decide.outcome,
-      ids: { wake: d1.id, held: d2.id, race: d3.id, notice: d4.id },
+      ids: { wake: d1.id, held: d2.id, race: d3.id, notice: d4.id, reblock: d5.id, control: d6.id, reblockCleared: d7.id },
       tick1: { woke: firstTick.woke.map(w => w.task), handled: firstTick.decisions.filter(d => d.startsWith('gm-disposition-')) },
-      tick2: { woke: secondTick.woke.map(w => w.task), delivered: secondTick.decisions.filter(d => d.startsWith('holder-notice')) },
-      tick3: { woke: thirdTick.woke.map(w => w.task) },
+      tick2: { woke: secondTick.woke.map(w => w.task), handled: secondTick.decisions.filter(d => d.startsWith('gm-disposition-')),
+        delivered: secondTick.decisions.filter(d => d.startsWith('holder-notice')) },
+      tick3: { woke: thirdTick.woke.map(w => w.task), handled: thirdTick.decisions.filter(d => d.startsWith('gm-disposition-')) },
+      reblock: { claim: d5Claim.outcome, decision: d5Decide.outcome, e2SinceMs: d5E2Since * 1000, e2: d5E2,
+        facts: { byEpisodeForE2: reblockFacts.byEpisode.get(`${d5.id}:execute:${d5E2Since * 1000}`)?.status ?? null,
+          byTaskStatus: reblockFacts.byTask.get(d5.id)?.status ?? null,
+          byTaskSinceMs: reblockFacts.byTask.get(d5.id)?.sinceMs ?? null, e1SinceMs: d5.sinceMs,
+          controlClaim: reblockFacts.byTask.has(d6.id) },
+        claimRows: await rawDispatch('SELECT episode, status FROM disposition_claim WHERE task = $t;', { t: id('task', d5.id) }) },
+      cleared: { episodeVersionBefore: d7Cleared.version, facts: { byTaskStatus: clearedFacts.byTask.get(d7.id)?.status ?? null,
+        byTaskSinceMs: clearedFacts.byTask.get(d7.id)?.sinceMs ?? null, e1SinceMs: d7.sinceMs },
+        startCleared: d7Cleared.dispatch_blocked_since ?? null },
       pendingAfterTick1: pendingAfterTick1.length,
       pendingAfterTick2: (await dWf.pendingHolderNotices()).length,
       sends: sends.map(s => ({ agent: s.agent, mentionsTask: s.text.includes(d4.id), mentionsTool: s.text.includes('disposition_status') })),
@@ -597,6 +639,41 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(dispatch.held.after).toMatchObject({ state: 'blocked', blocked_to: 'gm' });
     expect(dispatch.race.state).toBe('blocked');
     expect(dispatch.race.blocked_to ?? null).toBeNull();
+  });
+
+  test('AC01: a disposed episode never suppresses the episode the task forms afterwards', () => {
+    const dispatch = obs.dispatch as { ids: Record<string, string>;
+      reblock: { claim: string; decision: string; e2SinceMs: number; e2: TaskFact; e1SinceMs: number;
+        facts: { byEpisodeForE2: string | null; byTaskStatus: string | null; byTaskSinceMs: number | null; e1SinceMs: number; controlClaim: boolean };
+        claimRows: Array<{ episode: string; status: string }> };
+      cleared: { episodeVersionBefore: number; startCleared: number | null;
+        facts: { byTaskStatus: string | null; byTaskSinceMs: number | null; e1SinceMs: number } };
+      tick1: { woke: string[]; handled: string[] }; tick2: { woke: string[]; handled: string[] }; tick3: { woke: string[]; handled: string[] } };
+    // The setup really is the reviewer's shape: the task is in a NEW episode (its own start), while the only row a
+    // by-task lookup can reach is the one for the disposed E1.
+    expect(dispatch.reblock.claim).toBe('claimed');
+    expect(dispatch.reblock.decision).toBe('decided');
+    expect(dispatch.reblock.facts.byEpisodeForE2).toBeNull();
+    expect(dispatch.reblock.facts.byTaskStatus).toBe('decided');
+    expect(dispatch.reblock.facts.byTaskSinceMs).toBe(dispatch.reblock.facts.e1SinceMs);
+    expect(dispatch.reblock.e2.dispatch_blocked_since! * 1000).toBe(dispatch.reblock.e2SinceMs);
+    expect(dispatch.reblock.e2SinceMs).not.toBe(dispatch.reblock.facts.e1SinceMs);
+    expect(dispatch.reblock.claimRows).toHaveLength(1);
+    // A task that formed a new episode is woken again, in the same pass and not only once.
+    expect(dispatch.tick1.woke).toContain(dispatch.ids.reblock);
+    expect(dispatch.tick1.handled).not.toContain(`gm-disposition-handled:${dispatch.ids.reblock}`);
+    // The never-claimed control proves the pass was not quiet for everyone.
+    expect(dispatch.reblock.facts.controlClaim).toBe(false);
+    expect(dispatch.tick1.woke).toContain(dispatch.ids.control);
+    // Second shape: the fallback IS consulted (the dispatcher cleared the gate's persisted start) and must answer
+    // "unregistered", not "already disposed": the row by task is the decided E1, and the task is in a newer episode.
+    expect(dispatch.cleared.startCleared).toBeNull();
+    expect(dispatch.cleared.facts.byTaskStatus).toBe('decided');
+    expect(dispatch.cleared.facts.byTaskSinceMs).toBe(dispatch.cleared.facts.e1SinceMs);
+    expect(dispatch.tick2.woke).toContain(dispatch.ids.reblockCleared);
+    for (const tick of [dispatch.tick1, dispatch.tick2, dispatch.tick3]) {
+      expect(tick.handled).not.toContain(`gm-disposition-handled:${dispatch.ids.reblockCleared}`);
+    }
   });
 
   test('AC04: a notice survives the tick that cannot deliver it and goes out after the restart, exactly once', () => {
