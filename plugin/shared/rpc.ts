@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import type { AuditEntry, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
+import type { AuditEntry, ModelRankingTable, Brief, Inbox, PermissionRequest, ProviderOptionsResult, Pulse, Roster, TaskAttachment, TaskView } from "./types";
 
 const record = <T>() => z.custom<T>(value => typeof value === "object" && value !== null);
 const key = z.string().min(1);
@@ -152,7 +152,7 @@ export const roster = defineRpc({
 export const modelRanking = defineRpc({
   name: "company.model-ranking.get",
   input: z.object({}),
-  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
+  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),tables:record<ModelRankingTable[]>().default([]),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
 });
 export const saveModelRanking = defineRpc({
   name: "company.model-ranking.save",
@@ -166,12 +166,14 @@ export const modelIdentity = defineRpc({
   output: z.object({
     aliases:z.array(z.object({model:z.string(),slug:z.string().nullable(),by:z.enum(["jev","owner"]),confidence:z.number().optional(),suggested:z.string().optional(),aa:z.object({name:z.string(),score:z.number()}).optional()})),
     issues:z.array(z.object({group:z.string(),member:z.string(),reason:z.string()})),
+    inventory:z.object({at:z.string(),grouped:z.array(z.object({model:z.string(),groups:z.array(z.string())})),
+      decidedUngrouped:z.array(z.object({model:z.string(),by:z.string(),slug:z.string().nullable(),at:z.string(),reason:z.string(),present:z.boolean(),confidence:z.number().optional(),suggested:z.string().optional()})),pending:z.array(z.string())}).optional(),
   }),
 });
 export const setModelAlias = defineRpc({
   name: "company.model-alias.set",
   input: z.object({model:z.string().min(1).max(300),slug:z.string().min(1).max(200).nullable()}),
-  output: z.object({ok:z.boolean()}),
+  output: z.object({ok:z.boolean(),synchronized:z.boolean().optional()}),
 });
 
 export const providerOptions = defineRpc({

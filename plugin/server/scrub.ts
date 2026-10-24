@@ -1,7 +1,8 @@
 // Company agents are children of the Paseo daemon, so they inherit whatever credentials its
 // environment holds (Cloudflare token, Jev key, ...). Credentials belong to the ops broker:
-// every company session is launched with those variables blanked.
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+// every company session is launched with those variables blanked, and marked so the provider
+// launcher (scripts/sandbox/launch.sh) starts it inside the employee sandbox.
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
@@ -19,6 +20,27 @@ const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELE
 const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
 
 const LOOKUP_MS = 2_000;
+/** Read by scripts/sandbox/launch.sh, which Paseo runs in place of each provider binary. */
+export const SANDBOX_MARKER = { SCK_SANDBOX: "employee" } as const;
+/** Providers whose launch scripts/sandbox/install.sh wraps; codex shares one app-server across agents and cannot be. */
+const WRAPPERS: Record<string, string> = { claude: "claude", "factory-droid": "droid", antigravity: "agy" };
+
+/**
+ * Why a company session of this provider would start outside the sandbox, or undefined when Paseo
+ * launches it through the installed wrapper. Read on every open so a reverted config fails closed.
+ */
+export function sandboxGap(provider: string, paseoConfig: string, wrapperDir: string): string | undefined {
+  const wrapper = WRAPPERS[provider];
+  if (!wrapper) return `provider ${provider} 无法放进员工沙箱`;
+  let command: unknown;
+  try {
+    command = JSON.parse(readFileSync(paseoConfig, "utf8"))?.agents?.providers?.[provider]?.command;
+  } catch (error) {
+    return `读不到 Paseo 配置（${(error as Error).message}）`;
+  }
+  if (!Array.isArray(command) || command[0] !== join(wrapperDir, wrapper))
+    return `Paseo 的 ${provider} 启动命令没有指向 ${wrapperDir}，先运行 scripts/sandbox/install.sh`;
+}
 const ZSH_STARTUP = [".zshenv", ".zprofile", ".zshrc", ".zlogin"];
 
 type Env = Record<string, string | undefined>;
@@ -93,6 +115,8 @@ export interface ScrubOptions {
   /** Directory for the zsh startup shim; without it company shells keep whatever the user's startup files export. */
   zdotdir?: string;
   modelEnv?: (request: {agentId:string;env:Record<string,string>;provider?:string}) => Promise<Record<string,string>>;
+  /** Refuses an interactive company session the sandbox would not cover; history views stay readable. */
+  sandbox?: (provider: string) => string | undefined;
 }
 
 /**
@@ -120,7 +144,12 @@ export function registerScrub(server: PluginServerContext, inherited: Env = proc
   };
   return server.before("agent.session_open", async ({ request }, { paseo, signal }) => {
     if (!(await isCompany(request, paseo, signal))) return undefined;
-    const env = scrubEnv(request.env ?? {}, inherited);
+    const gap = request.purpose === "history" ? undefined : options.sandbox?.(request.provider);
+    if (gap) {
+      console.warn(`scrub ${request.agentId} (${request.reason}): refused, ${gap}`);
+      throw new Error(`公司会话必须在员工沙箱中启动：${gap}`);
+    }
+    const env: Record<string, string> = { ...scrubEnv(request.env ?? {}, inherited), ...SANDBOX_MARKER };
     if (options.modelEnv) Object.assign(env, await options.modelEnv(request));
     const blanked = Object.keys(env).filter(name => env[name] === "" && request.env?.[name] === undefined);
     if (zdotdir && env.ZDOTDIR === undefined) env.ZDOTDIR = zdotdir;

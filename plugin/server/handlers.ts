@@ -181,11 +181,8 @@ export function registerHandlers(server: PluginServerContext): void {
 
   ownerHandle(rpc.modelRanking, async () => {
     const ctx = await company();
-    const { rankingSettings, rankingRequests } = await import("./vendor/src/model-routing/ranking.ts");
-    const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
-    const settings = await rankingSettings(ctx.db.db);
-    const [status] = await ctx.db.db.query<[{at?:Date;error?:string;orders?:Record<string,string[]>}|undefined]>("SELECT at,error,orders FROM ONLY company_meta:model_ranking;");
-    return {...settings,requests:await rankingRequests(ctx.db.db),configured:!!jevFromEnv(),at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
+    const { modelRankingView } = await import("./model-ranking.ts");
+    return modelRankingView(ctx.db.db);
   });
   ownerHandle(rpc.saveModelRanking, async (input: RpcInput<typeof rpc.saveModelRanking>) => {
     const ctx = await company();
@@ -196,8 +193,8 @@ export function registerHandlers(server: PluginServerContext): void {
 
   ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
   ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
-    await (await company()).modelRouting.setAlias(input.model, input.slug);
-    return {ok:true};
+    const result=await (await company()).modelRouting.setAlias(input.model, input.slug);
+    return {ok:true,...result};
   });
 
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {
