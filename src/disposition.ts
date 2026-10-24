@@ -85,8 +85,13 @@ export interface DispositionDecideInput {
   claimToken: string;
   episodeVersion: number;
   action: DispositionActionName;
-  /** 任务版本的 CAS：决定写入必须带上读到的版本。 */
-  expectedTaskVersion: number;
+  /**
+   * 任务版本的 CAS：决定写入必须带上读到的版本。
+   * 字段名与其余工具（claim/submit/review 的 proof、resume_task、retire_task）一致，都是 `expectedVersion`；
+   * SYS03 首版在这里写成 `expectedTaskVersion`，而 MCP 入参与 sidecar 透传的都是 `expectedVersion`，
+   * 于是经通道过来的决定永远读不到版本、被当成非法入参拒掉（QA V1）。这里统一为 `expectedVersion`。
+   */
+  expectedVersion: number;
   text: string;
   /** action=defer/dependency：并入的依赖；action=repair：修复任务内容。 */
   dependencies?: string[];
@@ -222,14 +227,21 @@ export interface ExternalActionView {
  * 测试注入 fake 端点。`cancelRun` 结果未知时如实回 unknown，不许伪报成功。
  */
 export interface ExternalActionGateway {
-  cancelRun(target: ExternalActionTarget): Promise<
+  /**
+   * `context.retryAfterRequest` 为真表示这次调用是在我们已经为同一个 actionKey 发过一次请求之后的重放。
+   * 网关据此区分两种「已经是终态」：**第一次请求**时它已经终态 = provider 明确拒绝（refused）；
+   * **重放**时读到它已经终态且结论是取消 = 我们自己那次请求已经生效（confirmed，附 provider 读回的状态）。
+   */
+  cancelRun(target: ExternalActionTarget, context?: { retryAfterRequest?: boolean }): Promise<
     | { confirmed: true; runStatus?: string; externalAccount?: string; observed?: Record<string, unknown> }
     /** The provider gave a definite no (the run does not exist, or it is already terminal): recorded as refused. */
     | { refused: true; reason: string }
     /** The outcome cannot be judged (unreadable, request failed): recorded as result_unknown and retried under one key. */
     | { confirmed: false; error: string }>;
   observeRun(target: ExternalActionTarget): Promise<
-    | { readable: true; exists: boolean; runStatus?: string; conclusion?: string; externalAccount?: string; attribution: 'unknown_actor' }
+    | { readable: true; exists: boolean; runStatus?: string; conclusion?: string; externalAccount?: string;
+      /** The run's head branch: the caller binds a controlled action to the task's registered branch with it. */
+      headBranch?: string; headSha?: string; attribution: 'unknown_actor' }
     | { readable: false; error: string }>;
 }
 
@@ -434,6 +446,18 @@ export class DispositionLedger {
       actor_ref: id('employee', actor.employeeId),
       evidence: JSON.stringify({ episode, holder: actor.employeeId, reason: input.reason }) });
     if (!row) throw new CompanyError('conflict', 'Disposition claim disappeared during release');
+    // AC04：撤租也要有通知（claim_revoked），否则解除认领对任何人都不可见。收件人是**任务**的当前持有人——
+    // outbox 的其它通知也都发给他，而这个变化改的正是他的任务视图；撤租者本人不需要通知自己。
+    const taskRow = await this.db.select<Row>(id('task', input.taskId));
+    const taskHolder = text(taskRow?.current_employee);
+    const releasedVersion = num(row.episode_version);
+    if (taskHolder && taskHolder !== actor.employeeId && releasedVersion !== undefined) {
+      await this.noticeOrRecordFailure({
+        episode, taskId: input.taskId, holder: taskHolder, kind: 'claim_revoked', version: releasedVersion,
+        text: `${actor.employeeId} 已撤回对该阻塞 episode 的处置认领（原因：${input.reason}），episode 重新可被认领`,
+        payload: { releasedBy: actor.employeeId, episodeVersion: releasedVersion },
+      }, 'release_disposition');
+    }
     return this.claimView(row, actor.employeeId, true);
   }
 
@@ -450,7 +474,7 @@ export class DispositionLedger {
     requireText(input.taskId, 'taskId', 1, 200);
     requireText(input.claimToken, 'claimToken', 8, 200);
     if (!Number.isSafeInteger(input.episodeVersion) || input.episodeVersion < 1) throw new CompanyError('invalid', 'Invalid episodeVersion');
-    if (!Number.isSafeInteger(input.expectedTaskVersion) || input.expectedTaskVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) throw new CompanyError('invalid', 'Invalid expectedVersion');
     requireText(input.text, 'text', 4, 8000);
     requireText(input.idempotencyKey, 'idempotencyKey', 8, 200);
     const dependencies = action === 'defer' || action === 'dependency' ? [...new Set(input.dependencies ?? [])] : [];
@@ -468,9 +492,11 @@ export class DispositionLedger {
     }
     const episode = dispositionEpisodeKey(input.taskId, phase, input.sinceMs);
     const businessKey = dispositionBusinessKey(episode, action, input.businessKey);
+    // 幂等摘要沿用历史的键名 expectedTaskVersion：已经按上一版落库的在飞 disposition_action 记录重放时
+    // 摘要必须逐位相同，否则同一个业务操作会被判成「换了入参」而 conflict。改的只是入参字段名。
     const payload = {
       taskId: input.taskId, phase, sinceMs: input.sinceMs, action,
-      expectedTaskVersion: input.expectedTaskVersion, text: input.text,
+      expectedTaskVersion: input.expectedVersion, text: input.text,
       dependencies: [...dependencies].sort(), repair: input.repair ?? null,
     };
     const digest = HASH(JSON.stringify(payload));
@@ -523,10 +549,10 @@ export class DispositionLedger {
       COMMIT;`, {
       claim: this.claimId(episode), task: id('task', input.taskId), a: this.actionId(businessKey),
       d_token: input.claimToken, me: actor.employeeId, me_ref: id('employee', actor.employeeId),
-      episode_version: input.episodeVersion, now: await this.now(), expected: input.expectedTaskVersion,
+      episode_version: input.episodeVersion, now: await this.now(), expected: input.expectedVersion,
       action, business_key: businessKey, episode, phase, digest,
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
-      evidence: JSON.stringify({ episode, action, businessKey, expectedTaskVersion: input.expectedTaskVersion, claimToken: input.claimToken }),
+      evidence: JSON.stringify({ episode, action, businessKey, expectedTaskVersion: input.expectedVersion, claimToken: input.claimToken }),
     }).catch(async error => {
       // 并发对手已经占了同一个业务键（或服务器以准入冲突拒绝了这次写入但对手已经建行）：读它，
       // 决定是重放还是在飞；确实什么都没写才把错误抛回去。
@@ -553,15 +579,15 @@ export class DispositionLedger {
       result = await applier.resume({ taskId: input.taskId, text: input.text, idempotencyKey });
     } else if (action === 'defer' || action === 'dependency') {
       result = await applier.defer({ taskId: input.taskId, text: input.text, dependencies: [...new Set(input.dependencies ?? [])],
-        expectedTaskVersion: input.expectedTaskVersion, idempotencyKey });
+        expectedTaskVersion: input.expectedVersion, idempotencyKey });
     } else if (action === 'retire') {
-      result = await applier.retire({ taskId: input.taskId, text: input.text, expectedTaskVersion: input.expectedTaskVersion, idempotencyKey });
+      result = await applier.retire({ taskId: input.taskId, text: input.text, expectedTaskVersion: input.expectedVersion, idempotencyKey });
     } else {
       const repaired = await applier.repair({ repairKey: businessKey, taskId: input.taskId, text: input.text,
-        expectedTaskVersion: input.expectedTaskVersion, repair: input.repair! });
+        expectedTaskVersion: input.expectedVersion, repair: input.repair! });
       repairTaskId = repaired.taskId;
       const row = await this.db.select<Row>(id('task', input.taskId));
-      result = { taskVersion: repaired.sourceTaskVersion ?? num(row?.version) ?? input.expectedTaskVersion,
+      result = { taskVersion: repaired.sourceTaskVersion ?? num(row?.version) ?? input.expectedVersion,
         state: repaired.sourceState ?? (text(row?.state) || 'blocked') };
     }
     const holder = holderBefore ?? (text((await this.db.select<Row>(id('task', input.taskId)))?.current_employee) || undefined);
@@ -589,6 +615,24 @@ export class DispositionLedger {
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE $outbox CONTENT { task: $task, kind: 'disposition_decided', sequence: $sequence.value,
         payload: { episode: $episode, action: $action, business_key: $business_key, holder: $holder }, at: time::now() };
+      -- AC04：持有人通知与决定同事务落库。分成两步写过的话，在这两步之间崩溃就会让一个已经确认的处置
+      -- 永远不发通知（QA V3）；同一个 notice_key 的重复写入在这里被存在性检查挡掉，所以重放也不会重复投递。
+      IF $notice_holder != NONE {
+        LET $n1 = SELECT * FROM ONLY $notice_1;
+        IF $n1 = NONE {
+          CREATE $notice_1 CONTENT { notice_key: $notice_key_1, episode: $episode, task: $task, holder: $notice_holder,
+            kind: $nkind_1, text: $ntext_1, payload: $npayload_1, created_at: time::now(), delivered_at: NONE,
+            deliveries: 0, last_attempt_at: NONE, last_error: NONE };
+        };
+        IF $nkind_2 != NONE {
+          LET $n2 = SELECT * FROM ONLY $notice_2;
+          IF $n2 = NONE {
+            CREATE $notice_2 CONTENT { notice_key: $notice_key_2, episode: $episode, task: $task, holder: $notice_holder,
+              kind: $nkind_2, text: $ntext_2, payload: $npayload_2, created_at: time::now(), delivered_at: NONE,
+              deliveries: 0, last_attempt_at: NONE, last_error: NONE };
+          };
+        };
+      };
       RETURN $a;
       COMMIT;`, {
       action_row: this.actionId(businessKey), claim: this.claimId(episode), task: id('task', input.taskId),
@@ -599,6 +643,18 @@ export class DispositionLedger {
       me_ref: id('employee', actor.employeeId), action, business_key: businessKey, episode,
       holder: holder ?? null, resolution: `disposition:${action}`,
       audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
+      notice_1: this.noticeId(dispositionNoticeKey(episode, noticeKind, result.taskVersion)),
+      notice_key_1: dispositionNoticeKey(episode, noticeKind, result.taskVersion),
+      nkind_1: noticeKind,
+      // 通知的收件人用 undefined（绑定成 NONE）而不是 null：`holder` 字段是 TYPE string，NULL 会被拒。
+      notice_holder: holder,
+      ntext_1: `${action === 'dependency' ? 'defer' : action} 处置已生效：${input.text.slice(0, 400)}`,
+      npayload_1: { action, businessKey, state: result.state, taskVersion: result.taskVersion, repairTaskId: repairTaskId ?? null },
+      notice_2: this.noticeId(dispositionNoticeKey(episode, 'dependency_wait', result.taskVersion)),
+      notice_key_2: dispositionNoticeKey(episode, 'dependency_wait', result.taskVersion),
+      nkind_2: action === 'repair' && repairTaskId ? 'dependency_wait' : undefined,
+      ntext_2: `已按处置建单修复链：${input.repair?.title ?? ''}`,
+      npayload_2: { repairTaskId: repairTaskId ?? null, businessKey },
       evidence: JSON.stringify({ episode, action, businessKey, taskVersion: result.taskVersion, repairTaskId, holder }),
     });
     if (!confirmed) {
@@ -607,26 +663,15 @@ export class DispositionLedger {
       if (raced && text(raced.state) === 'confirmed') return this.decideReplay(raced);
       throw new CompanyError('conflict', 'Disposition decision was overtaken before it could be recorded');
     }
-    if (holder) {
-      await this.notice({
-        episode, taskId: input.taskId, holder, kind: noticeKind, version: result.taskVersion,
-        text: `${action === 'dependency' ? 'defer' : action} 处置已生效：${input.text.slice(0, 400)}`,
-        payload: { action, businessKey, state: result.state, taskVersion: result.taskVersion, repairTaskId: repairTaskId ?? null },
-      });
-      if (action === 'repair' && repairTaskId) {
-        await this.notice({
-          episode, taskId: input.taskId, holder, kind: 'dependency_wait', version: result.taskVersion,
-          text: `已按处置建单修复链：${input.repair!.title}`,
-          payload: { repairTaskId, businessKey },
-        });
-      }
-    }
     return { outcome: 'decided', decision: { action, businessKey, actor: actor.employeeId, at: new Date().toISOString(),
       taskVersion: result.taskVersion, result: { state: result.state }, repairTaskId }, repairTaskId };
   }
 
   private async decideReplay(row: Row): Promise<DispositionDecideOutcome> {
     const result = (row.result ?? {}) as Record<string, unknown>;
+    // 补发（AC04）：上一版把通知写在确认事务之后，所以历史行可能已经确认却没有通知；重放这条决定时按同一
+    // notice_key 补一次。notice 本身按 noticeKey 去重，补发不会造成第二次投递。
+    await this.backfillDecisionNotices(row, result).catch(() => undefined);
     return {
       outcome: 'replayed',
       decision: {
@@ -638,6 +683,30 @@ export class DispositionLedger {
       task: result,
       repairTaskId: text(result.repairTaskId) || undefined,
     };
+  }
+
+  /**
+   * AC04 补发：上一版把持有人通知写在确认事务**之后**，所以历史行可能已经确认却没有通知。按同一 notice_key 再写
+   * 一次是幂等的（不存在才建），因此重放一条决定既不会重复投递，也能把缺口补上。持有人从 claim 行读——决定不覆盖它。
+   */
+  private async backfillDecisionNotices(row: Row, result: Record<string, unknown>): Promise<void> {
+    const episode = text(row.episode);
+    const taskId = asId(row.task);
+    const version = num(row.task_version_after);
+    if (!episode || !taskId || version === undefined) return;
+    const claim = await this.db.select<Row>(this.claimId(episode));
+    const holder = text(claim?.holder);
+    if (!holder) return;
+    const action = requireAction(text(row.action));
+    const repairTaskId = text(result.repairTaskId) || undefined;
+    const base = { episode, taskId, holder, version };
+    await this.notice({ ...base, kind: noticeKindFor(action),
+      text: `${action === 'dependency' ? 'defer' : action} 处置已生效（补发）`,
+      payload: { action, state: result.state, taskVersion: version, repairTaskId: repairTaskId ?? null, backfill: true } });
+    if (action === 'repair' && repairTaskId) {
+      await this.notice({ ...base, kind: 'dependency_wait', text: '已按处置建单修复链（补发）',
+        payload: { repairTaskId, backfill: true } });
+    }
   }
 
   /** 在飞的处置：给调用方一个「结果未知，按同一幂等键重试」的可读快照，而不是另起一项处置。 */
@@ -727,6 +796,27 @@ export class DispositionLedger {
     return this.noticeView(created);
   }
 
+  /**
+   * AC04：通知写失败绝不能回滚已经确认的状态变化，但也绝不能无声丢弃。失败时落一条审计行，让账本留下
+   * 「这次变化本该通知谁、为什么没通知出去」，而不是在内存里 catch 掉了事（QA V3）。
+   */
+  private async noticeOrRecordFailure(input: { episode: string; taskId: string; holder: string; kind: DispositionNoticeKind;
+    version: number; text: string; payload?: Record<string, unknown> }, note: string): Promise<HolderNoticeView | undefined> {
+    try {
+      return await this.notice(input);
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      const evidence = JSON.stringify({ noticeKind: input.kind,
+        noticeKey: dispositionNoticeKey(input.episode, input.kind, input.version), holder: input.holder, note, error: message });
+      await this.run(`BEGIN;
+        CREATE $audit CONTENT { task: $task, actor: $me_ref, action: 'disposition_notice_failed',
+          evidence: $evidence, at: time::now() };
+        COMMIT;`, { audit: id('audit', randomUUID()), task: input.taskId ? id('task', input.taskId) : undefined,
+        me_ref: id('employee', input.holder), evidence }).catch(() => undefined);
+      return undefined;
+    }
+  }
+
   /** 未投递的通知（调度器每轮补发；插件重启/通道重连后同样从这里恢复）。 */
   async pendingNotices(limit = 50): Promise<HolderNoticeView[]> {
     const [rows] = await this.db.query<[Row[]]>(
@@ -779,7 +869,9 @@ export class DispositionLedger {
    * confirmed；网关异常/不可判定则 result_unknown（按同一 actionKey 重试幂等，不会重复发起真实动作）。
    */
   async requestExternalAction(actor: { employeeId: string; role: string }, input: ExternalActionRequestInput,
-    gateway: ExternalActionGateway, authorize: (task?: { taskId: string; version: number }) => Promise<void>): Promise<ExternalActionView> {
+    gateway: ExternalActionGateway,
+    authorize: (task: { taskId: string; version: number } | undefined, target: ExternalActionTarget,
+      retryAfterRequest: boolean) => Promise<void>): Promise<ExternalActionView> {
     if (input.kind !== 'ci-run-cancel') throw new CompanyError('invalid', 'Invalid external action kind');
     requireText(input.repo, 'repo', 1, 200);
     requireText(input.runId, 'runId', 1, 100);
@@ -800,13 +892,16 @@ export class DispositionLedger {
       if (prerequisiteVersion !== input.prerequisiteVersion) throw new CompanyError('conflict', 'Prerequisite task version moved');
     }
     // 授权关口与任务本身同源（不扩大 GM 权限）：由注入的 authorize 判定调用者是否是该前置任务的持有人/实现者，或持有 manage。
-    await authorize(input.prerequisiteTaskId === undefined ? undefined : { taskId: input.prerequisiteTaskId, version: prerequisiteVersion! });
-
     const target: ExternalActionTarget = { provider: 'github', repo: input.repo, runId: input.runId };
     const requestToken = randomUUID();
     const existing = await this.db.select<Row>(this.externalId(input.actionKey));
     if (existing && text(existing.state) === 'confirmed') return this.externalViewOf(existing);
     if (existing && text(existing.state) === 'refused') return this.externalViewOf(existing);
+    // 授权关口与任务本身同源（不扩大 GM 权限）：由注入的 authorize 判定调用者是否是该前置任务的当事人，
+    // 并且把目标 run 交给它去核对绑定关系（run 必须属于这个前置任务的登记分支）。target 与是否已有记录
+    // 都要在判定之前算好：重放时网关需要知道「这次不是第一次请求」才能把终态读回判成 confirmed 而不是 refused。
+    await authorize(input.prerequisiteTaskId === undefined ? undefined : { taskId: input.prerequisiteTaskId, version: prerequisiteVersion! },
+      target, existing !== undefined);
     if (!existing) {
       const created = await this.run<Row>(`BEGIN;
         LET $row = CREATE ONLY $d CONTENT { action_key: $key, kind: $kind, provider: 'github', target: $target,
@@ -833,7 +928,8 @@ export class DispositionLedger {
       await this.db.query('UPDATE ONLY $d SET attempts = attempts + 1, request_token = $d_token, updated_at = time::now();',
         { d: this.externalId(input.actionKey), d_token: requestToken });
     }
-    const observed = await gateway.cancelRun(target).catch(error => ({ confirmed: false as const, error: String((error as Error)?.message ?? error) }));
+    const observed = await gateway.cancelRun(target, { retryAfterRequest: existing !== undefined })
+      .catch(error => ({ confirmed: false as const, error: String((error as Error)?.message ?? error) }));
     return this.settleExternalAction(actor, input, target, observed, requestToken);
   }
 
@@ -869,12 +965,12 @@ export class DispositionLedger {
     const view = this.externalViewOf(row ?? (await this.db.select<Row>(this.externalId(input.actionKey))) ?? {});
     if (state === 'result_unknown' && view.requestedBy) {
       // 结果未知也要让持有人知道：外部动作没确认前不能默默丢失。
-      await this.notice({
+      await this.noticeOrRecordFailure({
         episode: `external:${view.actionKey}`, taskId: input.prerequisiteTaskId ?? '', holder: view.requestedBy,
         kind: 'external_action_unknown', version: view.attempts,
         text: `外部动作（${view.kind} ${input.repo}#${input.runId}）结果未知：${String((observed as { error?: string }).error ?? '网关未给出确定结果')}`,
         payload: { actionKey: view.actionKey, repo: input.repo, runId: input.runId },
-      }).catch(() => undefined);
+      }, 'external_action_unknown');
     }
     return view;
   }

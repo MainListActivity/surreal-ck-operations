@@ -20,7 +20,7 @@
 // Gated by RUN_SCK_ROLLBACK_FORK_TESTS=1 (scripts/test-worktrees.ts sets it).
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
@@ -31,8 +31,14 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
 
 const ROOT = join(import.meta.dir, '..');
-/** The release deployed as `active` today, and the commit this lane branched from: the old-version oracle. */
-const OLD_RELEASE = '3a31f5d4ebad5242025767fd1f08f5deb64346fd';
+/**
+ * The old-version oracle: the release a rollback would actually land on. QA V8 指出首版把它写成了 lane 起点的
+ * `3a31f5d4`，而那并不是本次部署前的活动发布（`e0ce6a95`）——演练必须对着**真实回滚目标**跑，否则它证明的是
+ * 「回滚到更旧的版本也不会误派工」，而不是「回滚到会接手的那一版不会误派工」。
+ * 回滚目标随发布推进而变化，所以这里给出当前目标的默认值，并允许部署腿用 `SCK_RB01_OLD_RELEASE` 指向落库那一刻
+ * `active` 指向的提交重跑（仓库只读、由 git archive 抽出，不 checkout）。
+ */
+const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? 'e0ce6a95fc5c488eea6000aa89dcd34b0c87383c';
 const TICKS = 3;
 /** Tasks the previous dispatcher must never claim, wake or change at all. */
 const PROTECTED = ['rb01-waiting', 'rb01-gated-owner', 'rb01-held', 'rb01-done', 'rb01-void', 'rb01-lease-held'];
@@ -211,7 +217,7 @@ run('RB01 rollback isolation: SYS03 disposal states against the previous release
       { taskId: gateEpisode.taskId, phase: 'execute', sinceMs: gateEpisode.sinceMs, reason: 'RB01 演练：处置该门禁 episode' });
     const gateDecision = await seededB.core.decideDisposition(seededB.gm, { taskId: gateEpisode.taskId, phase: 'execute',
       sinceMs: gateEpisode.sinceMs, claimToken: gateClaim.claim.token!, episodeVersion: gateClaim.claim.episodeVersion,
-      action: 'defer', expectedTaskVersion: gateEpisode.version, dependencies: [idOf('rb01-waiting')],
+      action: 'defer', expectedVersion: gateEpisode.version, dependencies: [idOf('rb01-waiting')],
       text: 'RB01 演练：该 episode 已处置，原任务改为等待依赖。', idempotencyKey: 'rb01-sys03-defer' });
     // 2. A repair decision: one chain, and the source waits on it instead of sitting in the gate.
     const repairEpisode = await episodeOf('rb01-repair-source');
@@ -219,7 +225,7 @@ run('RB01 rollback isolation: SYS03 disposal states against the previous release
       { taskId: repairEpisode.taskId, phase: 'execute', sinceMs: repairEpisode.sinceMs, reason: 'RB01 演练：修复链处置该 episode' });
     const repairDecision = await seededB.core.decideDisposition(seededB.gm, { taskId: repairEpisode.taskId, phase: 'execute',
       sinceMs: repairEpisode.sinceMs, claimToken: repairClaim.claim.token!, episodeVersion: repairClaim.claim.episodeVersion,
-      action: 'repair', expectedTaskVersion: repairEpisode.version, text: 'RB01 演练：建修复链，原任务改为等待修复完成。',
+      action: 'repair', expectedVersion: repairEpisode.version, text: 'RB01 演练：建修复链，原任务改为等待修复完成。',
       repair: { title: 'rb01 修复链', context: 'RB01 isolation drill repair chain', executorRole: 'engineering', reviewerRole: 'qa',
         dependencies: [idOf('rb01-waiting')] }, idempotencyKey: 'rb01-sys03-repair' });
     const repairChainId = repairDecision.repairTaskId!;
@@ -266,6 +272,7 @@ run('RB01 rollback isolation: SYS03 disposal states against the previous release
     const [versionAfter] = await forkB.db.query<[{ schema_version?: number } | undefined]>('SELECT schema_version FROM ONLY company_meta:installation;')
     schemaVersion.after = versionAfter?.schema_version;
     if (process.env.SCK_RB01_EVIDENCE_DIR) {
+      mkdirSync(process.env.SCK_RB01_EVIDENCE_DIR, { recursive: true });
       writeFileSync(join(process.env.SCK_RB01_EVIDENCE_DIR, 'rb01-sys03-rollback-results.json'), JSON.stringify({
         previousRelease: OLD_RELEASE, ticks: TICKS, versionsBeforeRollback,
         rowCounts: { seed: seedCounts, newTables: newTableCounts },
@@ -310,9 +317,16 @@ run('RB01 rollback isolation: SYS03 disposal states against the previous release
       expect(outcomes[label].ok).toBe(true);
       expect(outcomes[label].ticks).toHaveLength(TICKS);
       expect(outcomes[label].taskTotal).toBeGreaterThan(0);
-      // Liveness of the old runtime's own tool surface. `get_context` additionally refuses the drill's bogus cursor by
-      // name on the current release (cursor verification), which is its own designed behaviour, not a SYS03 difference.
+      // Liveness of the old runtime's own tool surface: an ordinary read that predates SYS03 and must still work.
       expect(outcomes[label].relays!.getTaskHistory.exit).toBe(0);
+      // QA V8: `get_context` is probed with a **deliberately bogus** cursor, and the old release refuses it by name —
+      // cursors are versioned and signed, so a made-up one fails verification. That is the release's own designed
+      // behaviour (it exists identically before and after SYS03), not a cursor the new version issued and the old one
+      // rejected: nothing in this drill hands a new-version cursor to the old runtime. Recorded here so the evidence
+      // explains itself instead of leaving a bare failure.
+      const ctx = outcomes[label].relays!.getContext;
+      expect(ctx.exit).not.toBe(0);
+      expect(`${ctx.stdout ?? ''}${ctx.stderr ?? ''}`).toContain('cursor');
     }
     expect(outcomes.B.bootstrap).toBe(true);
   });
