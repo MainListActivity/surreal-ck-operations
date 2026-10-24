@@ -18,6 +18,7 @@ import { egoBrowserInjector, oidcUserEntry, type BrowserInjector } from './brows
 import { controlPlaneEnv, parseBrokerConfig, type BrokerConfig, type ControlPlaneEnv } from './config.ts';
 import { cloudflareD1, type D1Client } from './d1.ts';
 import { opsFetch, type Fetcher } from './fetcher.ts';
+import { originLogsRequest, sshOriginAgent, type OriginAgent, type OriginRequest } from './origin.ts';
 import { surrealQueryAsUser, type QueryAsUser } from './data.ts';
 import { jwtExpiry, jwtSubject, LoginError, passwordLogin, type LoginTokens } from './idp.ts';
 import { audienceUrl, clientId, describeSpaClient, redirectUriList, registerSpaClient, spaClientName } from './idp-clients.ts';
@@ -48,7 +49,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample',
+  'ops_supplier_plan_sample', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -71,6 +72,7 @@ export interface OpsDeps {
   d1?: (config: BrokerConfig, env: ControlPlaneEnv) => D1Client;
   queryAsUser?: QueryAsUser;
   browser?: BrowserInjector;
+  originAgent?: OriginAgent;
 }
 
 interface Ctx {
@@ -217,6 +219,9 @@ export class OpsBroker {
       ops_idp_provision_rotate: (ctx, args) => this.idpProvisionRotate(ctx, args),
       ops_invitation_issue: (ctx, args) => this.invitationIssue(ctx, args),
       ops_supplier_plan_sample: (ctx, args) => this.supplierPlanSample(ctx, args),
+      ops_origin_status: (ctx) => this.origin(ctx, { op: 'status' }),
+      ops_origin_health: (ctx) => this.origin(ctx, { op: 'health' }),
+      ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -344,7 +349,7 @@ export class OpsBroker {
           ...(ctx.cfg.ops ? { operator: { clientId: ctx.cfg.ops.clientId, redirectUri: ctx.cfg.ops.redirectUri, resource: ctx.cfg.ops.resource ?? null } } : {}),
           ...(ctx.cfg.idp.ops ? { opsAudience: { clientId: ctx.cfg.idp.ops.clientId, audience: ctx.cfg.idp.ops.audience, redirectUri: ctx.cfg.idp.ops.redirectUri } } : {}),
         },
-        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx), idpProvisionRotate: this.canEnsure(ctx) && !!ctx.cfg.ops },
+        can: { createAccounts: this.canEnsure(ctx), queryWorkspaceData: !!ctx.cfg.data, browserLogin: true, operatorLogin: !!ctx.cfg.ops, opsAudienceLogin: !!ctx.cfg.idp.ops, idpPrincipals: this.canEnsure(ctx), idpProvisionRotate: this.canEnsure(ctx) && !!ctx.cfg.ops, originHost: !!ctx.cfg.origin },
         preview: await this.previewStatus(),
       },
     };
@@ -404,6 +409,15 @@ export class OpsBroker {
     let body: unknown = raw;
     try { body = JSON.parse(raw); } catch { /* not JSON */ }
     return { value: { url, reachable: true, status: response.status, ok: response.ok, ms: this.now() - started, body: redactJson(body) } };
+  }
+
+  /** Status, health probes and journal tails of the origin host; the agent there redacts first, this redacts again. */
+  private async origin(ctx: Ctx, request: OriginRequest): Promise<Outcome> {
+    if (!ctx.cfg.origin) throw new CompanyError('not_configured', `${ctx.scope.project}/${ctx.env} has no origin host configured`);
+    const { ok: _ok, ...reply } = await (this.deps.originAgent ?? sshOriginAgent)(ctx.cfg.origin, request);
+    const value = redactJson(reply, this.sessions.secrets(ctx.scope.actor.employeeId));
+    const detail = request.op === 'logs' ? ` service=${request.service} since=${request.since} matched=${String(reply.matched)}${request.grep ? ` grep=${request.grep}` : ''}` : '';
+    return { value, audit: { action: 'ops_call', evidence: `ops_origin_${request.op} host=${ctx.cfg.origin.host}${detail}` } };
   }
 
   // ---------- accounts ----------
