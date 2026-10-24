@@ -117,6 +117,10 @@ async function main(): Promise<Record<string, unknown>> {
     };
     const shape = (data: unknown) => (data && typeof data === 'object' && !Array.isArray(data) ? Object.keys(data).sort() : null);
     const ownTaskId = asId(holder.id) as string;
+    // The cursor below is deliberately bogus, and it is the drill's only liveness probe of `get_context` on the old
+    // runtime: the release verifies cursors (they are versioned and signed), so a made-up one is refused by name. That
+    // refusal is the old release's own designed behaviour, present before and after SYS03 — the drill records it so a
+    // reviewer can tell it apart from a SYS03 difference instead of reading it as a new failure (QA V8).
     const ctx = await call('get_context', { pageSize: 2, cursor: 'v1.not-a-real-cursor.AAAA' });
     const hist = await call('get_task_history', { taskId: ownTaskId, pageSize: 1 });
     const worktrees = await call('list_worktrees', { pageSize: 1 });

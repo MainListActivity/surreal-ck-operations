@@ -93,11 +93,13 @@ const authorParent = async (author: 'src' | 'alias', parentId: string) => {
 };
 
 // R1 (v18 return): migration 023 must be loaded by the bootstrap of an empty database, not only exist as a file.
-test('a fresh bootstrap loads the independence migrations: task has both policy fields and the schema marker reads 29', async () => {
+test('a fresh bootstrap loads the independence migrations: task has both policy fields and the schema marker has passed 29', async () => {
   const [info] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(info?.fields ?? {})).toEqual(expect.arrayContaining(['independence', 'independence_guard']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBe(29);
+  // QA V7：marker 是**全库**最高已加载模块的编号，不是本模块的编号——写死 29 会让之后任何一条 lane 的
+  // 新增迁移（SYS03 的 034）把这条与本模块无关的断言弄红。这里要证明的是「023 确实随 bootstrap 加载进来了」。
+  expect(marker?.[0]?.schema_version).toBeGreaterThanOrEqual(29);
   // The identity link is additive: the field exists on employee, and no employee carries a principal until a manager registers one.
   const [table] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE employee;');
   expect(Object.keys(table?.fields ?? {})).toContain('principal');

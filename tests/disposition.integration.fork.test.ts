@@ -70,6 +70,9 @@ run('SYS03 manager disposition on the company fork', () => {
     // ---------------------------------------------------------------- namespace 1: the ledger surface
     const gatewayCalls: Array<{ repo: string; runId: string }> = [];
     let gatewayMode: 'confirmed' | 'refused' | 'unknown' = 'confirmed';
+    /** QA V2：受控外部动作要核对 run 的 head 分支与前置任务登记分支一致，所以这里的桩要能改分支。 */
+    const FIXTURE_BRANCH = 'task/sys03-ci-fixture';
+    let observedBranch = FIXTURE_BRANCH;
     const gateway: ExternalActionGateway = {
       cancelRun: async target => {
         gatewayCalls.push({ repo: target.repo, runId: target.runId });
@@ -79,7 +82,7 @@ run('SYS03 manager disposition on the company fork', () => {
         return { confirmed: false, error: 'provider endpoint unreachable' };
       },
       observeRun: async () => ({ readable: true, exists: true, runStatus: 'completed', conclusion: 'cancelled',
-        externalAccount: 'shared-bot', attribution: 'unknown_actor' }),
+        externalAccount: 'shared-bot', headBranch: observedBranch, attribution: 'unknown_actor' }),
     };
     const core = new SurrealCompanyCore(db, { externalActions: { gateway } });
     const enrollment = new LocalEnrollmentAdmin(db);
@@ -88,6 +91,8 @@ run('SYS03 manager disposition on the company fork', () => {
     const gmC = await enrollment.enroll('sys03-gm-c', 'gm', ['execute', 'review', 'manage']);
     const product = await enrollment.enroll('sys03-product', 'product', ['execute', 'review', 'manage']);
     const eng = await enrollment.enroll('sys03-eng-a', 'engineering', ['execute', 'review']);
+    // QA V2 负例：与前置任务执行岗**同岗位**、但不是这条任务当事人的工程员工。
+    const engB = await enrollment.enroll('sys03-eng-b', 'engineering', ['execute', 'review']);
     const stranger = await enrollment.enroll('sys03-cs-a', 'cs', ['execute']);
     const byEmployee: Record<string, Credential> = { 'sys03-gm-a': gmA, 'sys03-gm-b': gmB, 'sys03-gm-c': gmC };
     await db.db.upsert(new RecordId('company_meta', 'config')).content({ eval_enabled: false, jev_decisions: false,
@@ -181,7 +186,7 @@ run('SYS03 manager disposition on the company fork', () => {
     const e2Token = e2Claim.claim.token!;
     const e2VersionBefore = (await rowOf(e2.id)).version;
     const decideInput = { taskId: e2.id, phase: 'execute' as const, sinceMs: e2.sinceMs, claimToken: e2Token, episodeVersion: 1,
-      action: 'defer' as const, expectedTaskVersion: e2VersionBefore, dependencies: [e1.id], text: TEXT,
+      action: 'defer' as const, expectedVersion: e2VersionBefore, dependencies: [e1.id], text: TEXT,
       idempotencyKey: 'sys03-decide-e2' };
     const decideRace = await Promise.all(Array.from({ length: 20 }, () =>
       core.decideDisposition(gmA, decideInput).then(v => v.outcome, (error: Error) => `error:${error.message}`)));
@@ -204,7 +209,7 @@ run('SYS03 manager disposition on the company fork', () => {
     const e3Claim = await core.claimDisposition(gmA, claimOf(e3, '修复链处置：经理领取该 episode'));
     const e3Token = e3Claim.claim.token!;
     const repairInput = { taskId: e3.id, phase: 'execute' as const, sinceMs: e3.sinceMs, claimToken: e3Token, episodeVersion: 1,
-      action: 'repair' as const, expectedTaskVersion: (await rowOf(e3.id)).version, text: TEXT,
+      action: 'repair' as const, expectedVersion: (await rowOf(e3.id)).version, text: TEXT,
       repair: { title: 'sys03-e3 修复链', context: 'SYS03 synthetic repair chain', executorRole: 'engineering', reviewerRole: 'qa',
         dependencies: [e1.id] }, idempotencyKey: 'sys03-decide-e3-repair' };
     const repaired = await core.decideDisposition(gmA, repairInput);
@@ -238,7 +243,7 @@ run('SYS03 manager disposition on the company fork', () => {
       repair: async () => { throw new Error('unexpected repair'); },
     });
     const crashInput = { taskId: crashTask.id, phase: 'execute' as const, sinceMs: crashTask.sinceMs, claimToken: crashToken,
-      episodeVersion: 1, action: 'defer' as const, expectedTaskVersion: crashTask.version, dependencies: [e1.id], text: TEXT,
+      episodeVersion: 1, action: 'defer' as const, expectedVersion: crashTask.version, dependencies: [e1.id], text: TEXT,
       idempotencyKey: 'sys03-crash-decide' };
     const crashOutcome = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'gm' }, crashInput, crashApplier())
       .then(v => `outcome:${v.outcome}`, (error: Error) => `error:${error.message}`);
@@ -266,7 +271,7 @@ run('SYS03 manager disposition on the company fork', () => {
       };
     };
     const takenInput = { taskId: takenTask.id, phase: 'execute' as const, sinceMs: takenTask.sinceMs, claimToken: takenToken,
-      episodeVersion: 1, action: 'repair' as const, expectedTaskVersion: takenTask.version, text: TEXT,
+      episodeVersion: 1, action: 'repair' as const, expectedVersion: takenTask.version, text: TEXT,
       repair: { title: 'sys03 交接修复链', context: 'SYS03 synthetic takeover chain', executorRole: 'engineering', reviewerRole: 'qa' },
       idempotencyKey: 'sys03-takeover-decide' };
     const beforeTakeover = await ledger.decide({ employeeId: 'sys03-gm-a', role: 'gm' }, takenInput, chainApplier(true))
@@ -279,6 +284,54 @@ run('SYS03 manager disposition on the company fork', () => {
         { ...takenInput, claimToken: takenOver.claim.token! }, chainApplier(false))
         .then(v => ({ outcome: v.outcome, repairTaskId: v.repairTaskId }), (error: Error) => ({ outcome: `error:${error.message}` })),
       chains: [...chains] };
+
+    // ---- QA V4: a crash between the REAL applier's task write and its receipt, replayed by ANOTHER manager.
+    // 这一段刻意用真实应用器（不是注入的桩）：QA V4 的缺口就在真实应用器的幂等身份上——它按员工的 ID 算幂等键，
+    // 于是接手者重放同一个业务键查不到记录，又拿旧版本去撞任务版本 CAS，决定永远卡在 requested。
+    // 崩溃点用 DB 状态构造（等价于「任务写入已落库、回执没落」）：把已确认的处置回写成 requested，并把认领恢复成可接手。
+    const v4Task = await blocked('sys03-v4-swap-replay', { resume: 'ready' });
+    const v4ClaimA = await core.claimDisposition(gmA, claimOf(v4Task, 'QA V4：经理 A 领取该 episode'));
+    const v4TokenA = v4ClaimA.claim.token!;
+    const v4Seen = (await rowOf(v4Task.id)).version;
+    const v4BusinessKey = `${v4Task.id}:execute:${v4Task.sinceMs}\0defer`;
+    obs.v4SwapReplay = { first: await core.decideDisposition(gmA, { taskId: v4Task.id, phase: 'execute' as const,
+      sinceMs: v4Task.sinceMs, claimToken: v4TokenA, episodeVersion: 1, action: 'defer' as const, expectedVersion: v4Seen,
+      dependencies: [e1.id], text: TEXT, idempotencyKey: 'sys03-v4-decide' }).then(v => v.outcome) };
+    await rawQuery(`UPDATE disposition_action SET state = 'requested', confirmed_at = NONE WHERE business_key = $k;`, { k: v4BusinessKey });
+    await rawQuery(`UPDATE disposition_claim SET status = 'claimed', decision_action = NONE, decision_business_key = NONE,
+      decision_actor = NONE, decision_at = NONE, decision_task_version = NONE, decision_result = NONE,
+      lease_expires_at = time::unix(time::now()) - 10 WHERE episode = $e;`, { e: `${v4Task.id}:execute:${v4Task.sinceMs}` });
+    // 认领行的记录号是 episode 的哈希，不按字面量拼；按 episode 字段读回来。
+    const [v4Claims] = await rawQuery<[Array<{ episode_version: number }>]>(
+      'SELECT episode_version FROM disposition_claim WHERE episode = $e;', { e: `${v4Task.id}:execute:${v4Task.sinceMs}` });
+    const v4EpisodeVersion = v4Claims[0]!.episode_version;
+    const v4Takeover = await core.claimDisposition(gmB,
+      { ...claimOf(v4Task, 'QA V4：B 受控接手崩溃后的同一条业务操作'), takeover: true, expectedEpisodeVersion: v4EpisodeVersion });
+    // 接手者拿的是**已经过期的 expectedVersion**（A 那次已经让任务版本动过），正是旧写法会卡死的地方。
+    Object.assign(obs.v4SwapReplay as object, {
+      takeover: v4Takeover.outcome,
+      replay: await core.decideDisposition(gmB, { taskId: v4Task.id, phase: 'execute' as const, sinceMs: v4Task.sinceMs,
+        claimToken: v4Takeover.claim.token!, episodeVersion: v4Takeover.claim.episodeVersion, action: 'defer' as const,
+        expectedVersion: v4Seen, dependencies: [e1.id], text: TEXT, idempotencyKey: 'sys03-v4-decide' })
+        .then(v => `outcome:${v.outcome}`, (error: Error) => `error:${(error as { code?: string }).code ?? error.message}`),
+      deferredAudits: await countRows("SELECT count() AS n FROM audit WHERE task = $t AND action = 'deferred' GROUP ALL;", { t: id('task', v4Task.id) }),
+      actionRows: await countRows('SELECT count() AS n FROM disposition_action WHERE business_key = $k GROUP ALL;', { k: v4BusinessKey }),
+    });
+
+    // ---- QA V6: twenty concurrent REPAIR decisions on one episode build one chain, like the defer case.
+    const v6Task = await blocked('sys03-v6-repair-race', { resume: 'ready' });
+    const v6Claim = await core.claimDisposition(gmA, claimOf(v6Task, 'QA V6：二十个并发修复决定'));
+    const v6Input = { taskId: v6Task.id, phase: 'execute' as const, sinceMs: v6Task.sinceMs, claimToken: v6Claim.claim.token!,
+      episodeVersion: 1, action: 'repair' as const, expectedVersion: (await rowOf(v6Task.id)).version, text: TEXT,
+      repair: { title: 'sys03-v6 并发修复链', context: 'SYS03 synthetic concurrent repair', executorRole: 'engineering',
+        reviewerRole: 'qa', dependencies: [e1.id] }, idempotencyKey: 'sys03-v6-decide-repair' };
+    const v6Race = await Promise.all(Array.from({ length: 20 }, () =>
+      core.decideDisposition(gmA, v6Input).then(v => v.outcome, (error: Error) => `error:${error.message}`)));
+    obs.v6RepairRace = { outcomes: v6Race,
+      chains: await countRows("SELECT count() AS n FROM task WHERE title = 'sys03-v6 并发修复链' GROUP ALL;", {}),
+      actionRows: await countRows('SELECT count() AS n FROM disposition_action WHERE business_key = $k GROUP ALL;',
+        { k: `${v6Task.id}:execute:${v6Task.sinceMs}\0repair` }),
+      decidedAudits: await countRows("SELECT count() AS n FROM audit WHERE task = $t AND action = 'disposition_decided' GROUP ALL;", { t: id('task', v6Task.id) }) };
 
     // ---- AC04: the holder hears about the outcome, and only the holder may acknowledge it.
     const holderNotices = await core.dispositionNotices(eng);
@@ -298,6 +351,13 @@ run('SYS03 manager disposition on the company fork', () => {
 
     // ---- AC03: the controlled external exit through the real core authorization.
     const ciTarget = { repo: 'surreal-ck/operations-fixture', runId: '4711' };
+    // ---- QA V2: a controlled external action must be bound to the prerequisite task. Give e1 the registered branch
+    // the run is on, and hand it to sys03-eng-a so there is a real party; sys03-eng-b is the same-role non-party
+    // negative. Both facts are read by core.cancelCiRun's authorization before the gateway is ever asked to cancel.
+    await rawQuery(`UPDATE ONLY $t SET worktree = $wt, current_employee = $holder;`, {
+      t: id('task', e1.id),
+      wt: { branch: FIXTURE_BRANCH, mode: 'exclusive', repo: ciTarget.repo, id: 'sys03-fixture-tree', intent: { kind: 'code' } },
+      holder: 'sys03-eng-a' });
     const e1Version = (await rowOf(e1.id)).version;
     const confirmed = await core.cancelCiRun(gmA, { kind: 'ci-run-cancel', ...ciTarget, reason: '经理取消不再需要的 CI 运行',
       prerequisiteTaskId: e1.id, prerequisiteVersion: e1Version, actionKey: 'sys03-ci-cancel-1' });
@@ -336,6 +396,19 @@ run('SYS03 manager disposition on the company fork', () => {
       stalePrerequisite: await core.cancelCiRun(gmA, { kind: 'ci-run-cancel', repo: ciTarget.repo, runId: '4717',
         reason: '前置任务版本已经变动时的取消请求', prerequisiteTaskId: e1.id, prerequisiteVersion: e1Version + 99, actionKey: 'sys03-ci-cancel-7' })
         .then(v => `state:${v.state}`, (error: Error) => `error:${(error as { code?: string }).code ?? error.message}`),
+      // QA V2：同岗位但不是当事人——旧写法用「岗位 == 任务的执行岗」放行，任何一个工程员工都能取消任意 run。
+      sameRoleNotParty: await core.cancelCiRun(engB, { kind: 'ci-run-cancel', repo: ciTarget.repo, runId: '4718',
+        reason: '同岗位但不是这条任务当事人的取消请求', prerequisiteTaskId: e1.id, prerequisiteVersion: e1Version, actionKey: 'sys03-ci-cancel-8' })
+        .then(v => `state:${v.state}`, (error: Error) => `error:${(error as { code?: string }).code ?? error.message}`),
+      // QA V2：run 不在前置任务的登记分支上——即使调用者是当事人也不放行。
+      runNotBound: await (async () => {
+        observedBranch = 'task/someone-elses-branch';
+        const outcome = await core.cancelCiRun(eng, { kind: 'ci-run-cancel', repo: ciTarget.repo, runId: '4719',
+          reason: 'run 不在前置任务登记分支上的取消请求', prerequisiteTaskId: e1.id, prerequisiteVersion: e1Version, actionKey: 'sys03-ci-cancel-9' })
+          .then(v => `state:${v.state}`, (error: Error) => `error:${(error as { code?: string }).code ?? error.message}`);
+        observedBranch = FIXTURE_BRANCH;
+        return outcome;
+      })(),
     };
     const reconciled = await core.reconcileCiRuns(gmA, { runs: [{ repo: ciTarget.repo, runId: '9001' }] });
     obs.reconcile = { unknownActor: reconciled.unknownActor.length, attribution: reconciled.unknownActor[0]?.attribution,
@@ -402,7 +475,7 @@ run('SYS03 manager disposition on the company fork', () => {
     const d5 = await dBlocked('sys03-d-reblock');
     const d5Claim = await dCore.claimDisposition(dGm, { taskId: d5.id, phase: 'execute', sinceMs: d5.sinceMs, reason: 'E1：先处置一次，随后任务会形成新 episode' });
     const d5Decide = await dCore.decideDisposition(dGm, { taskId: d5.id, phase: 'execute', sinceMs: d5.sinceMs,
-      claimToken: d5Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedTaskVersion: d5.version,
+      claimToken: d5Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedVersion: d5.version,
       dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d5' });
     // The task leaves that gate… and later blocks to gm again: a brand-new episode E2 with its own start.
     const d5E2Since = Math.floor(Date.now() / 1000) + 60;
@@ -417,7 +490,7 @@ run('SYS03 manager disposition on the company fork', () => {
     const d3Claim = await dCore.claimDisposition(dGm, { taskId: d3.id, phase: 'execute', sinceMs: d3.sinceMs, reason: '竞态：该 episode 正在被处理' });
     const d4Claim = await dCore.claimDisposition(dGm, { taskId: d4.id, phase: 'execute', sinceMs: d4.sinceMs, reason: '通知：处置已在该轮之前完成' });
     const d4Decide = await dCore.decideDisposition(dGm, { taskId: d4.id, phase: 'execute', sinceMs: d4.sinceMs,
-      claimToken: d4Claim.claim.token!, episodeVersion: 1, action: 'defer', expectedTaskVersion: d4.version,
+      claimToken: d4Claim.claim.token!, episodeVersion: 1, action: 'defer', expectedVersion: d4.version,
       dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d4' });
 
     // The decision lands between the pass' task read and the pre-wake verification: the injection replays that window.
@@ -427,7 +500,7 @@ run('SYS03 manager disposition on the company fork', () => {
       if (!injected && input.episodes.includes(`${d3.id}:execute:${d3.sinceMs}`)) {
         injected = true;
         await dCore.decideDisposition(dGm, { taskId: d3.id, phase: 'execute', sinceMs: d3.sinceMs, claimToken: d3Claim.claim.token!,
-          episodeVersion: 1, action: 'defer', expectedTaskVersion: d3.version, dependencies: [d1.id], text: TEXT,
+          episodeVersion: 1, action: 'defer', expectedVersion: d3.version, dependencies: [d1.id], text: TEXT,
           idempotencyKey: 'sys03-d-decide-d3-race' }).catch(() => undefined);
       }
       return realFacts(input);
@@ -444,7 +517,7 @@ run('SYS03 manager disposition on the company fork', () => {
     const d7 = await dBlocked('sys03-d-reblock-cleared');
     const d7Claim = await dCore.claimDisposition(dGm, { taskId: d7.id, phase: 'execute', sinceMs: d7.sinceMs, reason: 'E1：先处置一次，随后持久起点被调度器清掉' });
     await dCore.decideDisposition(dGm, { taskId: d7.id, phase: 'execute', sinceMs: d7.sinceMs,
-      claimToken: d7Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedTaskVersion: d7.version,
+      claimToken: d7Claim.claim!.token!, episodeVersion: 1, action: 'defer', expectedVersion: d7.version,
       dependencies: [d1.id], text: TEXT, idempotencyKey: 'sys03-d-decide-d7' });
     await rawDispatch(`UPDATE ONLY $t SET state = 'blocked', blocked_to = 'gm', resume_state = 'doing',
       current_employee = NONE, lease_expires_at = NONE, dispatch_blocked_phase = NONE,
@@ -565,6 +638,27 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(new Set(outcome.chains).size).toBe(1);
   });
 
+  test('QA V4: after a receipt-only crash, another manager replays the same business key instead of stalling', () => {
+    const v4 = obs.v4SwapReplay as { first: string; takeover: string; replay: string; deferredAudits: number; actionRows: number };
+    expect(v4.first).toBe('decided');
+    expect(v4.takeover).toBe('taken_over');
+    // 修复前：接手者用的是按员工 ID 算的幂等键，查不到 A 的记录，于是又拿过期的 expectedVersion 去写，
+    // 被任务版本 CAS 拒掉（error:conflict），决定永远停在 requested。修复后应读到同一结果。
+    expect(v4.replay).toBe('outcome:decided');
+    // 同一条业务操作只落一次任务变更、一条处置行。
+    expect(v4.deferredAudits).toBe(1);
+    expect(v4.actionRows).toBe(1);
+  });
+
+  test('QA V6: twenty concurrent repair decisions build one chain and one receipt', () => {
+    const race = obs.v6RepairRace as { outcomes: string[]; chains: number; actionRows: number; decidedAudits: number };
+    expect(race.outcomes.filter(o => o === 'decided')).toHaveLength(1);
+    expect(race.outcomes.filter(o => o.startsWith('error'))).toEqual([]);
+    expect(race.chains).toBe(1);
+    expect(race.actionRows).toBe(1);
+    expect(race.decidedAudits).toBe(1);
+  });
+
   test('AC04: the outcome reaches the holder, nobody else may acknowledge it, and the tools read the latest decision', () => {
     const notice = obs.notice as { count: number; kinds: string[]; holder: string; ofOther: number; ackByOther: string };
     expect(notice.count).toBeGreaterThan(1);
@@ -608,6 +702,10 @@ run('SYS03 manager disposition on the company fork', () => {
     expect(authz.stranger).toMatch(/^error:/);
     expect(authz.unboundRun).toMatch(/^error:/);
     expect(authz.stalePrerequisite).toMatch(/^error:/);
+    // QA V2: a same-role employee who is not a party of the task is refused, and so is a run whose branch is not the
+    // task's registered branch — the two holes the old role-equality check left open.
+    expect(authz.sameRoleNotParty).toMatch(/^error:forbidden/);
+    expect(authz.runNotBound).toMatch(/^error:forbidden/);
     expect(authz.taskParty).toBe('state:confirmed');
     const reconcile = obs.reconcile as { unknownActor: number; attribution: string; account: string; requestedBy: string | null };
     expect(reconcile.unknownActor).toBe(1);
