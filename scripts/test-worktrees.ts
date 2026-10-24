@@ -56,15 +56,17 @@ try {
     'tests/dispatcher-sidecar.fork.test.ts', 'tests/dispatch-episode.fork.test.ts', 'tests/review-capacity-replay.fork.test.ts',
     'tests/idle-sessions.fork.test.ts', 'tests/ops-denial-circuit.fork.test.ts', 'tests/ops-denial-circuit.test.ts', 'tests/host-resources.test.ts', 'tests/scratch-gc.test.ts', 'tests/test-runner-cleanup.test.ts',
     'tests/quota-turn.test.ts', 'tests/turn-closeout.test.ts', 'tests/quota-scoring.fork.test.ts',
-    'tests/dispatcher-sidecar.test.ts', 'tests/dispatcher-manager-routing.test.ts', 'tests/sidecar.test.ts',
+    'tests/dispatcher-sidecar.test.ts', 'tests/dispatcher-manager-routing.test.ts', 'tests/sidecar.test.ts', 'tests/sidecar-quota-gate.fork.test.ts',
     'tests/sidecar-late-lease.test.ts', 'tests/mcp.transport.test.ts', 'tests/worktrees.test.ts',
     'tests/owner-aging.fork.test.ts', 'tests/pipelines.fork.test.ts', 'tests/story-author.fork.test.ts', 'tests/cinematography.fork.test.ts', 'tests/owner-reassign.fork.test.ts', 'tests/pr-gate.fork.test.ts', 'tests/loop-breaker.fork.test.ts', 'tests/owner-commands.fork.test.ts',
     'tests/goal-acceptance-repair.integration.test.ts', 'tests/query-paging.integration.test.ts', 'tests/acceptance-gate.fork.test.ts',
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/disposition.integration.fork.test.ts', 'tests/disposition-channel.fork.test.ts', 'tests/disposition-rollback-isolation.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
+    'tests/effective-policy.test.ts', 'tests/effective-policy.fork.test.ts',
     'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts', 'tests/independence-check.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,

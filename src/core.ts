@@ -22,6 +22,7 @@ import {
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
+import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
 import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
@@ -29,6 +30,12 @@ import { arrivedAt } from './reply-clock.ts';
 import type { EmployeeDef, Workforce } from './workforce.ts';
 import { CONTRIBUTION_MOVED, isContributionMoved, openLeaseOf, proposeImplementer, readAuditTimelineWindow, readContributionView, type ContributionView } from './contributors.ts';
 import { checkIndependence, INDEPENDENCE_LIMITS, normalizeIndependence, policyFault, readEmployeePrincipals, readIndependenceSnapshot, refuseIfExcluded, type IndependenceIndex } from './independence.ts';
+import {
+  POLICY_DOMAINS, POLICY_ID_PATTERN, POLICY_SCOPES, POLICY_SOURCES, checkGateCreation, checkWriteAuthority, contractDiff,
+  dispatchVerdict, domainOfPayload, domainPayload, normalizePayload, policyActiveAt, policyHash, renderContract, resolveEffective,
+  checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
+} from './policy.ts';
+import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, type PolicyDbRow } from './policy-store.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -257,7 +264,18 @@ interface TaskRow {
   independence?: IndependenceRow | null;
   /** Version this task was last checked against as a source of a dependent's gated write (schema 023). */
   independence_guard?: number | null;
+  /** 有效策略层的契约登记（schema 034）：创建时与每次 claim 时写入，策略变了以后两者不等即拒绝继续写。 */
+  policy_version?: number | null;
+  policy_hash?: string | null;
+  policy_contract?: EffectiveContract | null;
+  lease_policy_version?: number | null;
+  lease_policy_hash?: string | null;
+  policy_block_reason?: string | null;
+  /** 连接读法的投影（goal.project），只在带该投影的查询里出现。 */
+  goal_project?: RecordId;
 }
+
+/** policy 表的一行（snake_case），只在 core 内部出现；对外的形状是 PolicyRow。 */
 
 /** A stored policy: the API shape, with `setAt` as the driver returns it (a Date, or a string in tests). */
 type IndependenceRow = Omit<IndependencePolicy, 'setAt'> & { setAt: Date | string };
@@ -343,6 +361,12 @@ export function view(row: TaskRow): TaskView {
     acceptanceEnvironment: row.acceptance_environment ?? undefined,
     acceptanceAttempt: row.acceptance_attempt ?? undefined,
     acceptanceChain: row.acceptance_chain ?? undefined,
+    policyVersion: row.policy_version ?? undefined,
+    policyHash: row.policy_hash ?? undefined,
+    policyContract: row.policy_contract ?? undefined,
+    leasePolicyVersion: row.lease_policy_version ?? undefined,
+    leasePolicyHash: row.lease_policy_hash ?? undefined,
+    policyBlockReason: row.policy_block_reason ?? undefined,
   };
 }
 
@@ -699,6 +723,13 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
             const kind = takeover[1]!.toLowerCase();
             throw new CompanyError(kind === 'moved' ? 'conflict' : 'invalid', `Implementer takeover ${kind}: ${takeover[2]!.trim()}`);
           }
+          // 有效策略层（SYS06）：epoch 或替代目标移动是 conflict，作用域/来源越权是 forbidden，其余（同域冲突、成环）按 conflict。
+          const policyMoved = /policy (moved|conflict): ([^'"\n]+)/i.exec(cause);
+          if (policyMoved) throw new CompanyError('conflict', `Policy ${policyMoved[1]!.toLowerCase()}: ${policyMoved[2]!.trim()}`);
+          if (/policy denied/i.test(cause)) throw new CompanyError('forbidden', 'Policy write denied');
+          if (/policy changed/i.test(cause)) {
+            throw new CompanyError('conflict', '策略已变更：本次动作按的契约已过期，重新领取或按新契约办理（旧 claim 与旧提示不能继续授权写）');
+          }
           // Independence policy writes: a moved version or a live lease is a conflict; a closed task is invalid; the actor is denied.
           const independence = /independence (moved|refused|invalid|denied): ([^'"\n]+)/i.exec(cause);
           if (independence) {
@@ -805,6 +836,25 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     if (input.modelTier !== undefined && !['fable','opus','sonnet','haiku','high','medium','low'].includes(input.modelTier)) throw new CompanyError('invalid', 'Invalid model tier');
     const kind = input.kind ?? 'task';
     if (!['task', 'gate', 'release', 'deploy'].includes(kind)) throw new CompanyError('invalid', 'Invalid task kind');
+    // SYS06 AC02/AC03：机器策略在创建前判定（写权、老板关口），生效契约登记到任务上。判定只读 policy 表。
+    const policyChain = this.policyChain({ goalId: input.goalId, projectId: input.project, includeTask: false });
+    const { contract: policyContract, epoch: policyEpoch } = await this.effectiveContractFor(policyChain);
+    const writeVerdict = checkWriteAuthority(policyContract, { role: input.executorRole, kind,
+      ...(input.goalId ? { goalId: input.goalId } : {}), ...(input.workIntent ? { intent: input.workIntent } : {}) });
+    if (!writeVerdict.ok) {
+      throw new CompanyError(writeVerdict.code,
+        `策略拒绝创建：${writeVerdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
+    }
+    const gateVerdict = checkGateCreation(policyContract, { leg, kind, executorRole: input.executorRole, reviewerRole: input.reviewerRole });
+    if (!gateVerdict.ok) {
+      throw new CompanyError(gateVerdict.code, `策略拒绝创建：${gateVerdict.reason}（policy v${policyContract.version}）`);
+    }
+    const policyGate = domainPayload(policyContract, 'gate');
+    if (policyGate?.requiredCriteriaLegs.includes(leg) && trustedCode) {
+      // 策略可以在全局验收闸门关闭时仍要求这条腿带基线验收条件：只加强，不放宽。
+      acceptanceCriteria = mergeAcceptanceCriteria(leg, acceptanceCriteria);
+    }
+    const policyEvidence = `policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)} chain=${policyChain.map(link => `${link.scope}${link.scopeRef ? `:${link.scopeRef}` : ''}`).join('>')}`;
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
     if (input.revises !== undefined) return this.createRevision(actor, input, dependencies);
@@ -830,6 +880,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       acceptance_environment: acceptanceEnvironment,
       // A task created while the gate is off is legacy: enabling later never retroactively gates it (SYS02 AC06).
       acceptance_legacy: !acceptanceGate.enabled,
+      policy_version: policyContract.version, policy_hash: policyContract.hash, policy_contract: policyContract,
+      policy_evidence: policyEvidence, expected_policy_epoch: policyEpoch,
     };
     try {
       const row = await this.txTask(`BEGIN;
@@ -840,6 +892,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           IF $d = NONE { THROW 'dependency not found' };
         };
         ${RESOLVE_DEP_SQL('$dependencies', '$dep')}
+        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
+        IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since it was read; re-read policy_effective and retry' };
         LET $unfinished = SELECT VALUE id FROM task WHERE id IN $dep_resolved AND ${DEP_UNSATISFIED};
         LET $created = CREATE ONLY $task CONTENT {
           title: $title, context: $context, executor_role: $executor, reviewer_role: $reviewer,
@@ -848,12 +902,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           version: 1, fence: 0, submitted_by: NONE, current_employee: NONE,
           delivery_id: NONE, lease_expires_at: NONE, resume_role: NONE, resume_state: 'ready', blocked_to: NONE,
           kind: $kind, goal: $goal, created_at: time::now(),
+          policy_version: $policy_version, policy_hash: $policy_hash, policy_contract: $policy_contract,
           ${acceptanceCriteria.length > 0 ? 'acceptance_criteria: $acceptance_criteria, acceptance_version: $acceptance_version,' : ''}
           acceptance_legacy: $acceptance_legacy, acceptance_head: NONE, acceptance_environment: $acceptance_environment,
           acceptance_attempt: 0${options.acceptanceChain !== undefined ? ', acceptance_chain: $acceptance_chain' : ''}
         };
         ${GOAL_ANCHOR_SQL}
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, at: time::now() };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $policy_evidence, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
         CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $created };
@@ -1056,6 +1111,24 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     // Independence (SYS-DISP IR03): refused before a worktree is allocated, exactly as the claim transaction would refuse it.
     await this.refuseIndependent(await this.independenceGate(taskId, task.independence, reviewing ? 'review' : 'execute'), actor.employeeId);
+    // SYS06 AC02: a task whose effective contract no longer authorizes this work is refused before any worktree is allocated.
+    // 复核相位同样要判：调度器已经按 policyBlocks 拦下 review 队列，员工直连 claim 不能给出相反结论。判定用**任务自身**
+    // 的执行岗与意图（与调度器 policyDispatchVerdict 同源），不是评审岗位——被 blocked 的任务谁也领不走，也就不可能
+    // 从评审缝拿到执行缝拒绝发的独占写树。
+    {
+      const policyRow = await this.taskRowWithProject(taskId);
+      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
+      const { contract } = await this.effectiveContractFor(this.chainOfRow(policyRow));
+      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: task.executorRole, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
+        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
+        ...(policyRow.policy_hash ? { policyHash: policyRow.policy_hash } : {}),
+        ...(policyRow.policy_block_reason ? { policyBlockReason: policyRow.policy_block_reason } : {}),
+        registeredDomains: registeredDomainsOf(policyRow) }, contract);
+      if (verdict.verdict === 'blocked') {
+        throw new CompanyError('forbidden', `策略拒绝领取：${verdict.reason}（policy v${contract.version} hash=${contract.hash.slice(0, 16)}）`);
+      }
+    }
     const project = await this.taskProject(taskId);
     // Code-repo routing: an explicit binding wins over the business project repo; the
     // business `project` itself stays with taskProject for claim.json/opsScope.
@@ -1166,6 +1239,26 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
+    // SYS06 AC02/AC03：派工/领取前的机器策略判定，并把本租约的生效契约登记下来（lease_policy_*）。
+    // 复核相位同样要判：问的是"这条任务还在授权范围内吗"，所以用任务自身的执行岗与意图（与调度器同源），不是评审岗位；
+    // 被 blocked 的任务连评审都领不走，评审缝就不会发出执行缝拒绝发的独占写树。
+    const current = await this.taskRowWithProject(taskId);
+    if (!current) throw new CompanyError('not_found', 'Task not found');
+    const policyChain = this.chainOfRow(current);
+    const { contract: policyContract, rows: policyRows, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
+    {
+      const currentTask = view(current);
+      const verdict = dispatchVerdict({ state: current.state, executorRole: currentTask.executorRole, kind: currentTask.kind,
+        ...(currentTask.goalId ? { goalId: currentTask.goalId } : {}),
+        ...(currentTask.workIntent ? { workIntent: currentTask.workIntent } : {}),
+        ...(current.policy_hash ? { policyHash: current.policy_hash } : {}),
+        ...(current.policy_block_reason ? { policyBlockReason: current.policy_block_reason } : {}),
+        registeredDomains: registeredDomainsOf(current) }, policyContract);
+      if (verdict.verdict === 'blocked') {
+        throw new CompanyError('forbidden',
+          `策略拒绝领取：${verdict.reason}（policy v${policyContract.version} hash=${policyContract.hash.slice(0, 16)}）`);
+      }
+    }
     const row = await this.withContributionRetry(taskId, actor.employeeId, state => state === 'review' ? 'review' : 'execute',
       (contrib, gate) => this.txTask(`BEGIN;
       LET $now = time::unix(time::now());
@@ -1175,6 +1268,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
+      LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
+      IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the claim was read' };
       ${INDEPENDENCE_GUARD_SQL}
       IF $t.state = 'review' {
         IF $t.submitted_by = $employee OR ($excluded CONTAINS $employee) { THROW 'self review denied' };
@@ -1207,6 +1302,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         progress_at = IF $same THEN $t.progress_at ELSE $now END,
         fence = IF $same THEN $t.fence ELSE $t.fence + 1 END,
         version = IF $same THEN $t.version ELSE $t.version + 1 END,
+        lease_policy_version = $policy_version,
+        lease_policy_hash = $policy_hash,
+        policy_block_reason = IF $t.policy_block_reason != NONE THEN $t.policy_block_reason ELSE NONE END,
         worktree = IF $assignment != NONE THEN $assignment ELSE $t.worktree END
         RETURN AFTER;
       UPDATE ONLY $actor SET active_task = $task, workspace_read_active = false;
@@ -1238,6 +1336,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       req: REQUIRED_TRACKS[actor.role] ?? null, has_req: REQUIRED_TRACKS[actor.role] !== undefined,
       excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
       indep_guards: gate?.guards ?? [], bound_audit: id('audit', randomUUID()),
+      policy_version: policyContract.version, policy_hash: policyContract.hash, expected_policy_epoch: policyEpochAtClaim,
     }));
     const taskView = view(row);
     const project = await this.taskProject(taskId);
@@ -1245,7 +1344,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
-      project, worktree: taskView.worktree };
+      project, worktree: taskView.worktree,
+      // 提示里只渲染当前有效契约（SYS06 AC03）：旧文本留在 policy 历史里，claim.json 拿到的是这一份。
+      policy: this.policyEffectiveView(policyChain, policyContract, policyRows) };
   }
 
   /**
@@ -2325,6 +2426,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       if (prior) return prior;
     }
     let prHead: string | undefined;
+    // SYS06 AC03: 下一次相关动作前核版本。租约登记的契约 hash 与当前有效契约不一致时，这笔写被拒——
+    // 旧 claim 与旧提示都不能授权继续写（心跳不算写动作，只续租约）。
+    let policyHashNow: string | undefined;
+    if (action !== 'heartbeat') {
+      const policyRow = await this.taskRowWithProject(proof.taskId);
+      if (!policyRow) throw new CompanyError('not_found', 'Task not found');
+      policyHashNow = (await this.effectiveContractFor(this.chainOfRow(policyRow))).contract.hash;
+    }
     if (action === 'submit' && evidence && this.submitCheck) {
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
@@ -2399,6 +2508,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $t.current_employee != $employee OR $t.delivery_id != $delivery OR $t.fence != $fence OR $t.version != $expected { THROW 'stale lease or version' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
       ${INDEPENDENCE_GUARD_SQL}
+      IF !$heartbeat AND $t.lease_policy_hash != NONE AND $t.lease_policy_hash != $policy_hash {
+        THROW 'policy changed: the effective contract moved since this lease was claimed; re-claim to continue'
+      };
       IF $t.state = 'review' {
         LET $repairs = SELECT VALUE count() FROM audit WHERE task = $task AND action = 'goal_acceptance_repair' AND actor = $actor GROUP ALL;
         IF ($repairs[0] ?? 0) > 0 { THROW 'goal acceptance repairer cannot review' };
@@ -2487,6 +2599,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         excluded: contrib.facts.excluded, bound: contrib.facts.implementer ?? '', ambiguous: contrib.facts.ambiguous, seen: contrib.version ?? -1,
         audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()), idem, digest,
         indep_guards: gate?.guards ?? [],
+        policy_hash: policyHashNow ?? null,
       }));
       return view(row);
     } catch (error) {
@@ -3360,6 +3473,443 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * current one under a compare-and-set on the task version. Refused while the task is leased, so a lease is never changed silently.
    * An accepted write bumps the revision and the version in one transaction with its audit row; the same key and payload replay.
    */
+  // ---- 有效策略层（SYS06 P1）----
+  // 判定只用 policy 表里的受限字段：提示词、context、任务标题都不是授权来源，改提示内容不改变允许/拒绝。
+  // 写入只走 manage 能力持有者；老板来源的策略必须能对回一条已登记的老板方向（伪造引文被拒）。
+
+  /** 策略作用域链：任务 → 目标 → 项目 → 公司，越靠前越具体，命中即覆盖更宽的域。 */
+  // 读取与判定都在 policy-store.ts / policy.ts：调度器（workforce）读的是同一批行、同一份判定。
+  private policyChain(input: { taskId?: string; goalId?: string; projectId?: string; includeTask?: boolean }): PolicyScopeLink[] {
+    return policyScopeChain(input);
+  }
+
+  private chainOfRow(row: Pick<TaskRow, 'id' | 'goal' | 'project' | 'goal_project'>): PolicyScopeLink[] {
+    return chainOfTaskRow(row);
+  }
+
+  private readPolicyRows(chain: readonly PolicyScopeLink[]): Promise<PolicyRow[]> {
+    return readPolicyRows(this.db, chain);
+  }
+
+  /** 单行动态读法：带上 goal.project 投影，策略作用域链需要它。 */
+  private async taskRowWithProject(taskId: string): Promise<(TaskRow & { goal_project?: RecordId }) | undefined> {
+    return await readTaskPolicyRow(this.db, taskId) as (TaskRow & { goal_project?: RecordId }) | undefined;
+  }
+
+  private policyEpoch(): Promise<number> {
+    return readPolicyEpoch(this.db);
+  }
+
+  private effectiveContractFor(chain: readonly PolicyScopeLink[]): Promise<{ contract: EffectiveContract; rows: PolicyRow[]; epoch: number }> {
+    return readEffectiveContract(this.db, chain, Math.floor(Date.now() / 1000));
+  }
+
+  /** 契约视图 + 人读说明：到期与被替代的当前事实写在 notes 里，机器判定只看 domains。 */
+  private policyEffectiveView(chain: Array<{ scope: PolicyScope; scopeRef?: string }>, contract: EffectiveContract, rows: PolicyRow[]): PolicyEffectiveView {
+    const now = Math.floor(Date.now() / 1000);
+    const notes: string[] = [];
+    for (const row of rows) {
+      if (row.status === 'revoked') notes.push(`${row.policyId} v${row.version} 已撤销（${row.revokeReason ?? '无原因'}），不再授权`);
+      else if (row.supersededBy) notes.push(`${row.policyId} v${row.version} 已被替代，历史可查，不再授权`);
+      else if (row.expiresAt !== undefined && row.expiresAt <= now) notes.push(`${row.policyId} v${row.version} 临时授权已于 ${new Date(row.expiresAt * 1000).toISOString()} 到期`);
+      else if (row.effectiveAt > now) notes.push(`${row.policyId} v${row.version} 将于 ${new Date(row.effectiveAt * 1000).toISOString()} 生效`);
+    }
+    return { version: contract.version, hash: contract.hash, chain, domains: contract.domains, rendered: renderContract(contract), notes: [...new Set(notes)] };
+  }
+
+  /**
+   * 提案校验（写入与试算共用）：作用域引用存在、来源可核、版本单调、替代关系显式且不越权/不成环、同域冲突必须显式替代。
+   * 只读，写任何东西之前先把事实查清楚——迁移现有冲突配置时先列事实与候选，不自动决定优先级。
+   */
+  private async validatePolicyProposal(actor: Principal, input: PolicyPlanInput): Promise<{ chain: PolicyScopeLink[]; rows: PolicyRow[]; epoch: number; version: number; target?: PolicyRow }> {
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may write a machine policy');
+    requireText(input.policyId, 'policyId', 3, 60);
+    if (!POLICY_ID_PATTERN.test(input.policyId)) throw new CompanyError('invalid', 'policyId must be lowercase letters, digits, hyphen or underscore');
+    if (!POLICY_SCOPES.includes(input.scope)) throw new CompanyError('invalid', `unknown policy scope: ${input.scope}`);
+    if (!POLICY_DOMAINS.includes(input.domain)) throw new CompanyError('invalid', `unknown policy domain: ${input.domain}`);
+    if (input.scope === 'company') {
+      if (input.scopeRef !== undefined) throw new CompanyError('invalid', 'company scope carries no scopeRef');
+    } else {
+      requireText(input.scopeRef ?? '', 'scopeRef', 1, 200);
+      if (input.scope === 'project' && !(await this.projects.get(input.scopeRef!))) {
+        throw new CompanyError('not_found', `project ${input.scopeRef} not found`);
+      }
+      if (input.scope === 'goal' && !(await this.db.select(id('goal', input.scopeRef!)))) {
+        throw new CompanyError('not_found', `goal ${input.scopeRef} not found`);
+      }
+      if (input.scope === 'task' && !(await this.db.select(id('task', input.scopeRef!)))) {
+        throw new CompanyError('not_found', `task ${input.scopeRef} not found`);
+      }
+    }
+    const payload = normalizePayload(input.payload);
+    const domain = domainOfPayload(payload);
+    if (domain !== input.domain) throw new CompanyError('invalid', `payload kind ${domain} does not match domain ${input.domain}`);
+    if (!POLICY_SOURCES.includes(input.source)) throw new CompanyError('invalid', `unknown authorization source: ${input.source}`);
+    if (input.source === 'owner') {
+      if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may transcribe an owner direction into a policy');
+      requireText(input.ownerQuote ?? '', 'ownerQuote', 2, 4000);
+      const [matched] = await this.db.query<[Array<{ id: RecordId }>]>(
+        'SELECT id FROM direction WHERE string::contains(text, $quote) LIMIT 1;', { quote: input.ownerQuote });
+      if (!matched?.length) throw new CompanyError('forbidden', 'ownerQuote 与任何已登记的老板方向都不匹配：伪造的引文不能作为授权来源');
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
+    if (!Number.isFinite(effectiveAt)) throw new CompanyError('invalid', 'effectiveAt is not a valid time');
+    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
+    if (expiresAt !== undefined && !Number.isFinite(expiresAt)) throw new CompanyError('invalid', 'expiresAt is not a valid time');
+    if (expiresAt !== undefined && expiresAt <= effectiveAt) throw new CompanyError('invalid', 'expiresAt must be after effectiveAt');
+    if (input.supersedes === undefined && input.domain === 'write_authority' && payload.kind === 'write_authority' && payload.codeRoles.length === 0) {
+      // 空的 codeRoles 是"冻结代码写权"的合法收紧，但必须显式说明原因，且只能由老板来源授权。
+      if (input.source !== 'owner') throw new CompanyError('forbidden', 'Freezing all code writes requires an owner-sourced policy');
+    }
+    const chain = this.policyChain({ taskId: input.scope === 'task' ? input.scopeRef : undefined,
+      goalId: input.scope === 'goal' ? input.scopeRef : undefined,
+      projectId: input.scope === 'project' ? input.scopeRef : undefined, includeTask: input.scope === 'task' });
+    const rows = await this.readPolicyRows(chain);
+    const epoch = await this.policyEpoch();
+    const versions = rows.filter(row => row.policyId === input.policyId).map(row => row.version);
+    const version = (versions.length ? Math.max(...versions) : 0) + 1;
+    let target: PolicyRow | undefined;
+    if (input.supersedes !== undefined) {
+      requireText(input.supersedes, 'supersedes', 1, 200);
+      // 目标按 id 全局读：读不到才是 not_found；读到了但不在本次新版本的作用域链上，那是越权替代（forbidden），
+      // 不能含糊成"找不到"——跨项目/跨目标的替代必须给出它自己的理由。
+      const rawTarget = await this.db.select<PolicyDbRow>(id('policy', input.supersedes));
+      if (!rawTarget) throw new CompanyError('not_found', 'supersedes target not found');
+      target = policyRowView(rawTarget);
+      if (target.domain !== domain) throw new CompanyError('conflict', `supersedes target governs ${target.domain}, not ${domain}`);
+      const covered = chain.some(link => link.scope === target!.scope &&
+        (link.scopeRef ?? '') === (target!.scopeRef ?? ''));
+      if (!covered) throw new CompanyError('forbidden', 'cross-scope supersede refused: the target is outside this policy scope');
+      if (target.status !== 'active' || target.supersededBy !== undefined) throw new CompanyError('conflict', 'supersedes target is no longer the active version');
+      if (target.expiresAt !== undefined && target.expiresAt <= now) throw new CompanyError('conflict', 'supersedes target is an expired temporary policy');
+      // 成环：目标的替代链上出现同一 policy id 的任何版本，说明谱系已经不是一条直线。
+      const seen = new Set<string>([target.id]);
+      let cursor = target.supersedes;
+      for (let hop = 0; cursor !== undefined && hop < 64; hop++) {
+        if (seen.has(cursor)) throw new CompanyError('conflict', 'policy supersede cycle detected');
+        seen.add(cursor);
+        const parent: PolicyRow | undefined = (await this.readPolicyRows(chain)).find(row => row.id === cursor);
+        if (!parent) break;
+        if (parent.policyId === input.policyId) throw new CompanyError('conflict', `policy supersede cycle: ${input.policyId} is already in the supersede chain`);
+        cursor = parent.supersedes;
+      }
+    }
+    const competing = rows.filter(row => row.domain === domain && row.scope === input.scope &&
+      (row.scopeRef ?? '') === (input.scopeRef ?? '') && policyActiveAt(row, now) && row.id !== target?.id);
+    if (competing.length) {
+      throw new CompanyError('conflict',
+        `an active ${domain} policy already governs ${input.scope}${input.scopeRef ? `:${input.scopeRef}` : ''} (${competing.map(row => `${row.policyId} v${row.version}`).join(', ')}); supersede it explicitly`);
+    }
+    return { chain, rows, epoch, version, target };
+  }
+
+  /** 写入一版机器策略：显式替代 + 同事务 CAS（epoch 与目标仍是活跃版本），历史只增不改。 */
+  async policySet(credential: Credential, input: PolicySet): Promise<PolicyView> {
+    const actor = await this.authorized(credential, 'manage');
+    requireText(input.reason, 'reason', 2, 4000);
+    const proposal: PolicyPlanInput = { policyId: input.policyId, scope: input.scope, scopeRef: input.scopeRef, domain: input.domain,
+      payload: input.payload, supersedes: input.supersedes, effectiveAt: input.effectiveAt, expiresAt: input.expiresAt,
+      source: input.source, ownerQuote: input.ownerQuote };
+    // 幂等重放先于一切校验：同一个请求第二次来时，它引用的替代目标可能已经被它自己替代掉了，
+    // 再走一遍校验就会把"重放"判成 conflict。摘要只覆盖调用方给的输入（版本号是读出来的派生状态，
+    // 算进去会让重放因为版本已前进而失败）。
+    const idem = this.idemId(actor.employeeId, 'policy_set', input.idempotencyKey);
+    const digest = HASH(JSON.stringify(proposal));
+    const prior = await this.replayPolicy(idem, digest);
+    if (prior) return prior;
+    const { epoch, version, target } = await this.validatePolicyProposal(actor, proposal);
+    const payload = normalizePayload(input.payload);
+    const domain = domainOfPayload(payload);
+    const now = Math.floor(Date.now() / 1000);
+    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
+    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
+    const hash = policyHash({ policyId: input.policyId, version, scope: input.scope, scopeRef: input.scopeRef,
+      domain, effectiveAt, expiresAt, payload });
+    const policyId = randomUUID();
+    const policy = id('policy', policyId);
+    const evidence = `policy_set ${input.policyId} v${version} scope=${input.scope}${input.scopeRef ? `:${input.scopeRef}` : ''} domain=${domain} ` +
+      `source=${input.source} supersedes=${target?.id ?? 'none'} hash=${hash.slice(0, 16)} epoch=${epoch} → ${epoch + 1}\n理由：${input.reason}`;
+    // 可选字段用条件片段注入：SurrealDB 的 option<int> 不接受 NULL，option<record<policy>> 也不接受用 NULL 去
+    // 取 ONLY（"Expected a single result output"）。没有替代目标时这两句根本不出现，语义上更贴近"没有这个字段"。
+    const supersedeGuard = target ? `
+          LET $t = SELECT * FROM ONLY $supersedes_arg;
+          IF $t = NONE { THROW 'policy moved: supersede target not found' };
+          IF $t.status != 'active' OR $t.superseded_by != NONE { THROW 'policy moved: supersede target is no longer the active version' };
+          IF $t.domain != $domain { THROW 'policy conflict: supersede target governs another domain' };` : '';
+    const competitorClause = target ? ' AND id != $supersedes_arg' : '';
+    const supersedesField = target ? 'supersedes: $supersedes_arg,' : 'supersedes: NONE,';
+    const expiresField = expiresAt === undefined ? '' : 'expires_at: $expires_at,';
+    const closeOutTarget = target ? `UPDATE ONLY $supersedes_arg SET superseded_by = $policy, status = 'superseded';` : '';
+    const vars = {
+      actor: id('employee', actor.employeeId), policy, scope: input.scope, scope_ref: input.scopeRef ?? '',
+      domain, effective_at: effectiveAt, version, hash,
+      ...(expiresAt === undefined ? {} : { expires_at: expiresAt }),
+      ...(target ? { supersedes_arg: id('policy', target.id) } : {}),
+      authorization: { source: input.source, employeeId: actor.employeeId, at: now, ...(input.ownerQuote ? { ownerQuote: input.ownerQuote } : {}) },
+      payload, policy_id: input.policyId, expected_epoch: epoch, evidence,
+      idem, digest, audit: id('audit', randomUUID()),
+    };
+    try {
+      const row = await this.txTask<PolicyDbRow>(`BEGIN;
+        LET $who = SELECT * FROM ONLY $actor;
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'policy denied: actor revoked or forbidden' };
+        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
+        IF $epoch != $expected_epoch { THROW 'policy moved: the effective policy epoch moved since the proposal was read' };${supersedeGuard}
+        LET $competing = SELECT VALUE id FROM policy WHERE domain = $domain AND scope = $scope
+          AND (scope_ref ?? '') = $scope_ref AND status = 'active' AND superseded_by = NONE${competitorClause};
+        IF array::len($competing) > 0 { THROW 'policy conflict: another active policy already governs this scope and domain' };
+        LET $created = CREATE ONLY $policy CONTENT {
+          policy_id: $policy_id, version: $version, scope: $scope, scope_ref: $scope_ref, domain: $domain,
+          status: 'active', effective_at: $effective_at, ${expiresField}
+          ${supersedesField} superseded_by: NONE, authorization: $authorization, payload: $payload,
+          hash: $hash, created_by: $actor, created_at: time::now()
+        };
+        ${closeOutTarget}
+        UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
+        CREATE audit CONTENT { actor: $actor, action: 'policy_set', evidence: $evidence, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $policy, version: $version } };
+        RETURN $created;
+        COMMIT;`, vars);
+      return policyApiView(policyRowView(row));
+    } catch (error) {
+      const replay = await this.replayPolicy(idem, digest);
+      if (replay) return replay;
+      throw error;
+    }
+  }
+
+  /**
+   * 撤销一版当前有效的策略：紧急收权立即生效——epoch +1 后所有按旧契约登记的租约在下一次写动作前核版本时被拒。
+   * 历史行仍在，只是不再是有效版本的授权依据。
+   */
+  async policyRevoke(credential: Credential, input: PolicyRevoke): Promise<PolicyView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may revoke a machine policy');
+    requireText(input.policyId, 'policyId', 1, 200);
+    requireText(input.reason, 'reason', 2, 4000);
+    const idem = this.idemId(actor.employeeId, 'policy_revoke', input.idempotencyKey);
+    const digest = HASH(JSON.stringify({ policyId: input.policyId, reason: input.reason }));
+    const prior = await this.replayPolicy(idem, digest);
+    if (prior) return prior;
+    const current = (await this.db.select(id('policy', input.policyId))) as PolicyDbRow | undefined;
+    if (!current) throw new CompanyError('not_found', 'Policy not found');
+    if (current.status !== 'active') throw new CompanyError('conflict', 'Policy is not the active version');
+    const evidence = `policy_revoke ${current.policy_id} v${current.version} by ${actor.employeeId}\n理由：${input.reason}`;
+    try {
+      const row = await this.txTask<PolicyDbRow>(`BEGIN;
+        LET $who = SELECT * FROM ONLY $actor;
+        IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities OR $who.role NOT IN ['gm', 'product'] { THROW 'policy denied: actor revoked or forbidden' };
+        LET $t = SELECT * FROM ONLY $policy;
+        IF $t = NONE { THROW 'policy not found' };
+        IF $t.status != 'active' OR $t.superseded_by != NONE { THROW 'policy moved: not the active version' };
+        LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
+        LET $revoked = UPDATE ONLY $policy SET status = 'revoked', revoked_by = $actor, revoke_reason = $reason RETURN AFTER;
+        UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
+        CREATE audit CONTENT { actor: $actor, action: 'policy_revoke', evidence: $evidence, at: time::now() };
+        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $policy, version: $t.version } };
+        RETURN $revoked;
+        COMMIT;`, {
+        actor: id('employee', actor.employeeId), policy: id('policy', input.policyId), reason: input.reason,
+        evidence, digest, idem,
+      });
+      return policyApiView(policyRowView(row));
+    } catch (error) {
+      const replay = await this.replayPolicy(idem, digest);
+      if (replay) return replay;
+      throw error;
+    }
+  }
+
+  private async replayPolicy(ident: RecordId, digest: string): Promise<PolicyView | undefined> {
+    const prior = await this.db.select<{ payload_digest: string; result: { id: RecordId } }>(ident);
+    if (!prior) return undefined;
+    if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
+    const row = await this.db.select<PolicyDbRow>(prior.result.id);
+    return row ? policyApiView(policyRowView(row)) : undefined;
+  }
+
+  /** 策略版本列表：默认只给当前有效（含各作用域链上生效的）版本；includeInactive 时连历史一起给。 */
+  async policyList(credential: Credential, input: PolicyListInput): Promise<PolicyView[]> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may read machine policies');
+    const clauses: string[] = [];
+    const vars: Record<string, unknown> = {};
+    if (input.scope !== undefined) { clauses.push('scope = $scope'); vars.scope = input.scope; }
+    if (input.scopeRef !== undefined) { clauses.push("(scope_ref ?? '') = $scope_ref"); vars.scope_ref = input.scopeRef; }
+    if (input.domain !== undefined) { clauses.push('domain = $domain'); vars.domain = input.domain; }
+    if (!input.includeInactive) clauses.push("status = 'active' AND superseded_by = NONE");
+    const [rows] = await this.db.query<[PolicyDbRow[]]>(
+      `SELECT * FROM policy${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY scope, domain, policy_id, version;`, vars);
+    return (rows ?? []).map(row => policyApiView(policyRowView(row)));
+  }
+
+  /** 当前有效视图：给任务/项目/目标算出生效契约（含逐域渲染文本）；写不写策略都不影响它。 */
+  async policyEffective(credential: Credential, input: PolicyEffectiveInput): Promise<PolicyEffectiveView> {
+    const actor = await this.authorized(credential);
+    let chain: Array<{ scope: PolicyScope; scopeRef?: string }>;
+    if (input.taskId !== undefined) {
+      const row = await this.db.select<TaskRow>(id('task', input.taskId));
+      if (!row) throw new CompanyError('not_found', 'Task not found');
+      if (actor.role !== row.executor_role && actor.role !== row.reviewer_role && !['gm', 'product', 'qa', 'eval'].includes(actor.role)) {
+        throw new CompanyError('forbidden', 'Task policy access denied');
+      }
+      chain = this.chainOfRow(row);
+    } else if (input.scopeChain !== undefined) {
+      chain = input.scopeChain.map(link => ({ scope: link.scope, ...(link.scopeRef !== undefined ? { scopeRef: link.scopeRef } : {}) }));
+    } else {
+      if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may read a scope policy view');
+      if (input.goal !== undefined && !(await this.db.select(id('goal', input.goal)))) throw new CompanyError('not_found', 'Goal not found');
+      if (input.project !== undefined && !(await this.projects.get(input.project))) throw new CompanyError('not_found', 'Project not found');
+      chain = this.policyChain({ goalId: input.goal, projectId: input.project, includeTask: false });
+    }
+    const { contract, rows } = await this.effectiveContractFor(chain);
+    return this.policyEffectiveView(chain, contract, rows);
+  }
+
+  /** 变更试算：算出差量与受影响任务，写任何东西之前先给人看（只读）。 */
+  async policyPlan(credential: Credential, input: PolicyPlanInput): Promise<PolicyPlanView> {
+    const actor = await this.authorized(credential, 'manage');
+    const { chain, target } = await this.validatePolicyProposal(actor, input);
+    const payload = normalizePayload(input.payload);
+    const domain = domainOfPayload(payload);
+    const now = Math.floor(Date.now() / 1000);
+    const effectiveAt = input.effectiveAt === undefined ? now : Math.floor(Date.parse(input.effectiveAt) / 1000);
+    const expiresAt = input.expiresAt === undefined ? undefined : Math.floor(Date.parse(input.expiresAt) / 1000);
+    const { contract: before, rows, epoch } = await this.effectiveContractFor(chain);
+    const versions = rows.filter(row => row.policyId === input.policyId).map(row => row.version);
+    const synthetic: PolicyRow = {
+      id: 'policy:dry-run', policyId: input.policyId, version: (versions.length ? Math.max(...versions) : 0) + 1,
+      scope: input.scope, scopeRef: input.scopeRef, domain, status: 'active', effectiveAt, expiresAt,
+      supersedes: target?.id, authorization: { source: input.source, employeeId: actor.employeeId, at: now, ...(input.ownerQuote ? { ownerQuote: input.ownerQuote } : {}) },
+      payload, hash: policyHash({ policyId: input.policyId, version: (versions.length ? Math.max(...versions) : 0) + 1,
+        scope: input.scope, scopeRef: input.scopeRef, domain, effectiveAt, expiresAt, payload }), createdAt: now, createdBy: actor.employeeId,
+    };
+    const projected = rows.map(row => row.id === target?.id ? { ...row, status: 'superseded' as PolicyStatus, supersededBy: synthetic.id } : row);
+    const after = resolveEffective([...projected, synthetic], chain, epoch + 1, now);
+    const [candidates] = await this.db.query<[Array<TaskRow & { goal_project?: RecordId }>]>(
+      `SELECT *, goal.project AS goal_project
+       FROM task WHERE state NOT IN ['done', 'void'] AND policy_hash != NONE
+       ORDER BY created_at DESC LIMIT 200;`);
+    const affectedTasks: PolicyPlanView['affectedTasks'] = [];
+    for (const row of candidates ?? []) {
+      const task = view(row);
+      const taskChain = this.chainOfRow(row);
+      const next = resolveEffective([...projected, synthetic], taskChain, epoch + 1, now);
+      if ((row.policy_hash ?? '') === next.hash) continue;
+      // 与派工/领取同源：试算里的"失去授权"就是那次判定会拦下的情形（含域整体消失的到期/撤销）。
+      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
+        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
+        ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
+        ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
+        registeredDomains: registeredDomainsOf(row) }, next);
+      affectedTasks.push({ id: task.id, title: task.title, state: task.state, currentEmployee: task.currentEmployee,
+        fromHash: row.policy_hash ?? undefined, toHash: next.hash, losesAuthorization: verdict.verdict === 'blocked',
+        ...(verdict.verdict === 'blocked' ? { reason: verdict.reason } : {}) });
+    }
+    const diff = contractDiff(before, after);
+    const planHash = HASH(JSON.stringify({ epoch, after: after.hash, affected: affectedTasks.map(t => `${t.id}:${t.toHash}`).sort() }));
+    return { scopeChain: chain, before, after, diff, affectedTasks, planHash };
+  }
+
+  /**
+   * 执行隔离（RB01）：把已经不再被有效契约授权的在办任务置为可见的 blocked（等待 GM）并释放租约。
+   * 这条路径是刻意选的：blocked+blocked_to=gm 是旧 release 也认得的隔离状态，回滚到旧版时它们不会被误派工，
+   * 而只写新字段（旧版会忽略）会留下"旧版照派、新版拒领"的窗口。
+   */
+  async policyEnforce(credential: Credential, input: PolicyEnforceInput): Promise<PolicyEnforceView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only a manager may enforce a policy change');
+    requireText(input.reason, 'reason', 2, 4000);
+    if (!input.taskIds?.length) throw new CompanyError('invalid', 'policyEnforce needs the task ids it should isolate (from policy_plan)');
+    if (input.taskIds.length > 200) throw new CompanyError('invalid', 'policyEnforce is limited to 200 tasks per call');
+    const blocked: string[] = [], alreadyBlocked: string[] = [], absent: string[] = [];
+    let audited = 0;
+    for (const taskId of [...new Set(input.taskIds)]) {
+      const row = await this.db.select<TaskRow>(id('task', taskId));
+      if (!row) { absent.push(taskId); continue; }
+      if (row.state === 'done' || row.state === 'void') { absent.push(taskId); continue; }
+      const chain = this.chainOfRow(row);
+      const { contract } = await this.effectiveContractFor(chain);
+      const task = view(row);
+      const verdict = dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+        ...(task.goalId ? { goalId: task.goalId } : {}),
+        ...(task.workIntent ? { workIntent: task.workIntent } : {}),
+        ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
+        ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
+        registeredDomains: registeredDomainsOf(row) }, contract);
+      if (verdict.verdict === 'clear') { absent.push(taskId); continue; }
+      const reason = verdict.verdict === 'stale'
+        ? `策略隔离：${row.policy_block_reason ?? '原授权已换版，需按新契约重新领取'}`
+        : `策略收权隔离：${verdict.reason}`;
+      const evidence = `policy_enforce task=${taskId} from=${row.policy_hash ?? 'none'} to=${contract.hash} 理由：${input.reason}`;
+      try {
+        const next = await this.txTask<TaskRow>(`BEGIN;
+          LET $who = SELECT * FROM ONLY $actor;
+          IF $who = NONE OR $who.revoked = true OR 'manage' NOT IN $who.capabilities { THROW 'policy denied: actor revoked or forbidden' };
+          LET $t = SELECT * FROM ONLY $task;
+          IF $t = NONE { THROW 'policy invalid: task not found' };
+          IF $t.state IN ['done', 'void'] { THROW 'policy invalid: task is closed' };
+          LET $next = UPDATE ONLY $task SET
+            state = 'blocked', blocked_to = 'gm', resume_state = IF $t.state IN ['ready','doing','review'] THEN $t.state ELSE $t.resume_state END,
+            resume_role = IF $t.state IN ['ready','doing','review'] THEN (IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END) ELSE $t.resume_role END,
+            policy_block_reason = $reason, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+            version = $t.version + 1
+            RETURN AFTER;
+          UPDATE employee SET active_task = NONE WHERE active_task = $task;
+          CREATE audit CONTENT { task: $task, actor: $actor, action: 'policy_blocked', evidence: $evidence, version: $next.version, at: time::now() };
+          RETURN $next;
+          COMMIT;`, {
+          actor: id('employee', actor.employeeId), task: id('task', taskId), reason, evidence,
+        });
+        audited++;
+        if (next.state === 'blocked' && row.policy_block_reason) alreadyBlocked.push(taskId); else blocked.push(taskId);
+      } catch (error) {
+        if (error instanceof CompanyError && error.code === 'invalid') { absent.push(taskId); continue; }
+        throw error;
+      }
+    }
+    return { blocked, alreadyBlocked, absent, audited };
+  }
+
+  /**
+   * 给 ops broker 用的工具/别名边界：范围内生效的 tool_scope 决定允许清单，undefined 表示不设机器限制。
+   * 判定本身复用 policy.ts 的 checkToolScope，broker 只负责把工具名与别名递进来——两边不会各判一套。
+   */
+  async policyToolScope(project: string, input?: { tool?: string; alias?: string; toolNames?: readonly string[] }): Promise<{
+    version: number; hash: string; allowedTools?: string[]; allowedAliases?: string[]; verdict: PolicyVerdict;
+  }> {
+    const chain = this.policyChain({ projectId: project, includeTask: false });
+    const { contract } = await this.effectiveContractFor(chain);
+    const payload = domainPayload(contract, 'tool_scope');
+    const verdict: PolicyVerdict = input?.tool === undefined ? { ok: true }
+      : checkToolScope(contract, { tool: input.tool, alias: input.alias, toolNames: input.toolNames ?? [input.tool] });
+    return { version: contract.version, hash: contract.hash,
+      ...(payload ? { allowedTools: payload.allowedTools, allowedAliases: payload.allowedAliases } : {}), verdict };
+  }
+
+  /**
+   * 调度器派工前的只读判定（SYS06 AC02）：任务在当前有效契约下是否仍可被派工。
+   * 返回 blocked 时调度器按 policy_blocked 拦住候选；返回 stale 表示契约已变但仍授权——claim 会重新登记，
+   * 不静默改变已批的艺术要求（本层不改验收条件与 context）。
+   */
+  async policyDispatchVerdict(taskId: TaskId): Promise<{ verdict: 'clear' | 'stale' | 'blocked'; reason?: string; hash?: string }> {
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state === 'done' || row.state === 'void') return { verdict: 'clear' };
+    const chain = this.chainOfRow(row);
+    const { contract } = await this.effectiveContractFor(chain);
+    const task = view(row);
+    // 判定复用 policy.ts 的 dispatchVerdict：调度器（workforce）走的是同一段，两边结论不会分叉。
+    return dispatchVerdict({ state: row.state, executorRole: task.executorRole, kind: task.kind,
+      ...(task.goalId ? { goalId: task.goalId } : {}),
+      ...(task.workIntent ? { workIntent: task.workIntent } : {}),
+      ...(row.policy_hash ? { policyHash: row.policy_hash } : {}),
+      ...(row.policy_block_reason ? { policyBlockReason: row.policy_block_reason } : {}),
+      registeredDomains: registeredDomainsOf(row) }, contract);
+  }
+
   async setIndependence(credential: Credential, input: SetIndependence): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     requireText(input.taskId, 'taskId', 1, 200);

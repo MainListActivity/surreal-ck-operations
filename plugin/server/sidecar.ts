@@ -60,6 +60,9 @@ const BASE_TOOLS = [
   "contributor_dryrun",
   // gm or qa in core (read-only preflight of one candidate against a task's independence policy; writes nothing).
   "independence_check",
+  // SYS06 effective policy layer: gm/product only in core. Set/revoke one version of a typed machine policy, read the
+  // current effective contract, dry-run a change, or isolate the in-flight tasks that lost authorization.
+  "policy_set", "policy_revoke", "policy_list", "policy_effective", "policy_plan", "policy_enforce",
   // SYS03 经理处置账本：episode 认领/决定/释放、只读状态、持有人通知（core 判定角色与能力；产物落审计与通知 outbox）。
   "claim_disposition", "release_disposition", "disposition_status", "decide_disposition", "holder_notices",
   // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定经理/任务当事人），只读对账标 unknown_actor，归因只由 gm 带证据做。
@@ -70,6 +73,41 @@ const BASE_TOOLS = [
 const RETIRED_TOOLS = new Set(["get_secret", "put_secret"]);
 
 const hash = (text: string | undefined) => (text === undefined ? undefined : createHash("sha256").update(text).digest("hex"));
+
+/** A leading blocker.md line that declares the subscription quota reset the way `report_blocker` takes it.
+ *  The key tolerates case and `_` separators because this line is written by hand; the instant itself is
+ *  handed to core.block unvalidated, so `parseQuotaResetsAt` stays the one validator both entries share. */
+const BLOCKER_QUOTA_LINE = /^\s*quota_?resets_?at\s*[:：]\s*(.*)$/i;
+
+/**
+ * Reads the quota reset a blocker.md declares. The declaration is the file's first non-blank line — the
+ * file entry point's equivalent of `report_blocker`'s `quotaResetsAt`:
+ *
+ *     quotaResetsAt: 2026-10-24T04:40:00Z
+ *     正文…
+ *
+ * Only that line counts: a declaration further down (or one merely quoted in prose) must not silently
+ * turn into hours of provider cooldown, so it is reported back through `misplaced` for the caller to log.
+ * A line that declares the field with nothing after it is refused, exactly like a malformed call.
+ */
+export function blockerQuotaReset(text: string): { quotaResetsAt?: string; misplaced?: boolean } {
+  const lines = text.split(/\r?\n/);
+  const head = lines.findIndex(line => line.trim() !== "");
+  if (head < 0) return {};
+  const declared = BLOCKER_QUOTA_LINE.exec(lines[head]!);
+  if (!declared) {
+    return lines.some(line => BLOCKER_QUOTA_LINE.test(line))
+      ? { misplaced: true }
+      : {};
+  }
+  const value = declared[1]!.trim();
+  if (value === "") {
+    throw Object.assign(new Error(
+      "blocker.md declares quotaResetsAt with no value; write `quotaResetsAt: <ISO 8601 with a timezone offset>` as its first line",
+    ), { code: "invalid" });
+  }
+  return { quotaResetsAt: value };
+}
 
 /** Capability broker behind the `ops_*` tools (OpsBroker). Credentials and login tokens stay on its side. */
 export interface OpsGateway {
@@ -438,7 +476,18 @@ export class SidecarPool {
     const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
-      if (to) await this.deps.core.block(cred, live.proof, to, evidence);
+      if (to) {
+        // SYS-QUOTA: a blocker.md declares its quota reset on its leading line; the file entry and
+        // `sck call report_blocker` must carry the same field, or the same block means two things
+        // depending on how the employee wrote it. A declaration the parser cannot use is refused
+        // (never dropped quietly): the block fails, the artifact is archived as `.failed-`, and the
+        // reason is logged. A line further down stays prose and is reported instead of applied.
+        const declared = blockerQuotaReset(text);
+        if (declared.misplaced) {
+          this.log(`sidecar ${live.taskId} for ${instId}: blocker.md mentions quotaResetsAt after its first line; ignored — the declaration only counts as the first line`);
+        }
+        await this.deps.core.block(cred, live.proof, to, evidence, declared.quotaResetsAt);
+      }
       else await this.deps.core.submit(cred, live.proof, evidence);
       this.log(`sidecar ${to ? "blocked" : "submitted"} ${live.taskId} for ${instId}`);
       if (this.claims.get(instId) === live) {
@@ -737,6 +786,27 @@ export class SidecarPool {
       return Object.keys(out).length > 0 ? out : undefined;
     };
     const declared = acceptance();
+    // SYS-QUOTA: the relay forwards the subscription quota reset the caller declared on a block.
+    // A declared field is never dropped quietly — a dropped reset leaves the provider dispatchable
+    // and the manager unparked, which is the P0 this seam caused. A value of the wrong shape is
+    // refused here; the instant itself is validated by core.block (parseQuotaResetsAt), the only
+    // writer of quota_resets_at, so both the call entry and the file entry below refuse the same
+    // texts with the same `invalid` refusal. A near-miss key is refused too, rather than silently
+    // ignored as an unknown argument.
+    const quotaReset = (): string | undefined => {
+      const raw = args.quotaResetsAt;
+      if (raw === undefined) {
+        const misspelled = Object.keys(args).find(key => key !== "quotaResetsAt" && /^quota_?resets_?at$/i.test(key));
+        if (misspelled) {
+          throw Object.assign(new Error(`report_blocker takes quotaResetsAt, not ${misspelled}`), { code: "invalid" });
+        }
+        return undefined;
+      }
+      if (typeof raw !== "string" || raw.trim().length === 0) {
+        throw Object.assign(new Error("quotaResetsAt must be an ISO 8601 instant with a timezone offset, e.g. 2026-10-18T10:12:00-04:00"), { code: "invalid" });
+      }
+      return raw;
+    };
     const evidence = (): Evidence => ({
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
@@ -838,7 +908,7 @@ export class SidecarPool {
       case "checkpoint": return writeOp(p => core.checkpoint(cred, p, evidence()));
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
-      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence()), true);
+      case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence(), quotaReset()), true);
       case "create_task": return core.createTask(cred, args as never);
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);
@@ -938,6 +1008,24 @@ export class SidecarPool {
       case "independence_check": return core.independenceCheck
         ? core.independenceCheck(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose independence_check"), { code: "temporarily_unavailable" }));
+      case "policy_set": return core.policySet
+        ? core.policySet(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_set"), { code: "temporarily_unavailable" }));
+      case "policy_revoke": return core.policyRevoke
+        ? core.policyRevoke(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_revoke"), { code: "temporarily_unavailable" }));
+      case "policy_list": return core.policyList
+        ? core.policyList(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_list"), { code: "temporarily_unavailable" }));
+      case "policy_effective": return core.policyEffective
+        ? core.policyEffective(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_effective"), { code: "temporarily_unavailable" }));
+      case "policy_plan": return core.policyPlan
+        ? core.policyPlan(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_plan"), { code: "temporarily_unavailable" }));
+      case "policy_enforce": return core.policyEnforce
+        ? core.policyEnforce(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose policy_enforce"), { code: "temporarily_unavailable" }));
       case "get_model_evidence": return withinReplyCeiling(async()=> {
         if(!core.modelEvidence) throw new Error("Model evidence unavailable");
         return core.modelEvidence(cred,taskIdOf(args.taskId));

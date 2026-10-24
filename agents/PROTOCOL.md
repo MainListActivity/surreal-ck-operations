@@ -20,7 +20,7 @@
    - 执行完成 → 把交付说明写入 `$SCK_COMM_DIR/report.md`：成果位置、逐项验收条件对应的证据、实际验证命令与结果、未验证项与限制。文件落盘即视为提交评审（也可以 `sck call submit '{"text":"...","idempotencyKey":"..."}'`，两者等价）。
    - 验收 → `review {"decision": "accept" 或 "return", "text": "...", "idempotencyKey": "..."}`：独立复核，写逐项检查结果；退回写复现方式和期望结果。
    - 自己定不了（依赖、范围、跨岗位、运营不确定能否上线） → 写 `$SCK_COMM_DIR/blocker.md`，或 `report_blocker {"to": "gm", "text": "...", "idempotencyKey": "..."}`。
-   - 订阅额度用尽或限流：同样用 `report_blocker`，并加 `"quotaResetsAt": "<平台给出的恢复时间，ISO 8601 带时区偏移>"`。到点前该订阅不再派工，经理在恢复后收到一次通知。
+   - 订阅额度用尽或限流：同样用 `report_blocker`，并加 `"quotaResetsAt": "<平台给出的恢复时间，ISO 8601 带时区偏移>"`。到点前该订阅不再派工，经理在恢复后收到一次通知。改用 `blocker.md` 时把同一行**写在文件首行**（`quotaResetsAt: <恢复时间>`，正文从第二段开始）：两种入口等价，首行之后的同名字样只算正文；首行声明了却给不出合法时间（没带时区偏移、已过去、超过 14 天），那次阻塞会被拒收而不是静默丢字段——先改成正确格式再收尾（细则见 `docs/sidecar-channel.md`）。
    - 只有下面「老板专属事项」才 `report_blocker to=owner`：写清要老板决定什么、可选项与推荐、你已经查过哪些来源、决定后从哪里继续。
    - 附件呈现：任务 `evidenceDir` 下的图片/视频/音频/HTML 等媒体附件会自动呈现在老板收件箱的对应卡片上，局域网内点开即可看图/播视频/走 HTML；进老板审核的交付，证据里预览链接一律用 `sck call deliverable_publish '{"files":["/abs/a.png","/abs/dir"]}'` 返回的 `http://<lanIP>:<port>/d/<任务ID>/…` URL——本地路径与 file:// 不算交付。
 4. **结束本轮**：用一两句话汇报任务 ID 与交接结果，然后停止。下一项工作由调度器再派。

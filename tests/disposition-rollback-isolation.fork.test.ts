@@ -16,7 +16,7 @@
 //                                                        a dependency) and closes the `gm-manager-action` rows the old
 //                                                        release reads, so no session is raised for a disposed episode.
 //   the new manager tools                              → refused: the old tool registry answers `unknown_tool`.
-//   company_meta:installation.schema_version 34        → untouched: the old release only bumps the marker upward.
+//   company_meta:installation.schema_version 035       → untouched: the old release only bumps the marker upward.
 // Gated by RUN_SCK_ROLLBACK_FORK_TESTS=1 (scripts/test-worktrees.ts sets it).
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
@@ -387,8 +387,10 @@ run('RB01 rollback isolation: SYS03 disposal states against the previous release
 
   test('the new tables are neither read nor written by the rollback, and the schema marker is not downgraded', () => {
     for (const table of NEW_TABLES) expect(newTableCounts.after[table]).toBe(newTableCounts.written[table]);
-    expect(schemaVersion.before).toBe(34);
-    expect(schemaVersion.after).toBe(34);
+    // 合线后最高模块是本线的 035（主干已收的 034 是 SYS03 处置账本）：只断言下界，
+    // “不降级”的语义仍由下一行 before === after 守住。
+    expect(schemaVersion.before).toBeGreaterThanOrEqual(34);
+    expect(schemaVersion.after).toBeGreaterThanOrEqual(34);
     expect(schemaVersion.before).toBe(schemaVersion.after);
   });
 
