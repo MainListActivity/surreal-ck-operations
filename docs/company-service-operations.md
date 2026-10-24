@@ -34,7 +34,7 @@ rtk proxy sh scripts/company-service.sh uninstall
 
 **两个事实先摆清**：①公司员工会话一律在 Seatbelt 沙箱里运行（profile 源码 `scripts/sandbox/employee.sb`，安装后为 `<服务目录>/sandbox/employee.sb`），该 profile 明文 `deny file-write*` 写 `<服务目录>/releases`、`release-staging`、`active`、`bin`、`runtime-bun`、`sandbox`、`vault`，并 `deny process-exec` `/Applications/Paseo.app/Contents/Resources/bin`（Paseo CLI）与 `/bin/launchctl`（详见「员工沙箱」节）。②下面 §2、§3、§5 的切换动作（建 release 目录、`company-service.sh install`、`paseo plugin install/reload`、双面回滚）全部落在这些禁止项里。
 
-所以 **§2/§3/§5 的命令不是部署腿能执行的**，照着直抄只会拿到 `Operation not permitted`：实测 `mkdir <服务目录>/releases/<sha>` 被拒、`paseo plugin ls` 被拒、`/bin/launchctl` 被拒；`sh scripts/company-service.sh status` 因内部调用 launchctl 同样被拒（部署腿不要用它，用 R1 第 4 步的 `/health`、`/ready` 与 `lsof`）。部署腿按下面 R1–R5 行事，**不执行 install / reload / 切 active / 回滚，也不调用 launchctl**。
+所以 **§2/§3/§5 的命令不是部署腿能执行的**，照着直抄只会拿到 `Operation not permitted`：实测 `mkdir <服务目录>/releases/<sha>` 被拒、`paseo plugin ls` 被拒、`/bin/launchctl` 被拒；`sh scripts/company-service.sh status` 因内部调用 launchctl 同样被拒，并会误打印 `not loaded`（部署腿不要用它，用 R1 第 4 步的 `/health`、`/ready` 与 `lsof`）。部署腿按下面 R1–R5 行事，**不执行 install / reload / 切 active / 回滚，也不调用 launchctl**。
 
 本节只改文档，不放松任何安全控制：不得把 `releases/` 之类目录加入沙箱可写路径，不得用 `dangerouslyDisableSandbox`、换会话绕开沙箱或让员工会话代跑切换。
 
@@ -43,12 +43,12 @@ rtk proxy sh scripts/company-service.sh uninstall
 1. **合入**：本单 PR 合入 `origin/main`（§1 的合入职责仍在部署腿），记下合并提交 SHA。
 2. **血缘**：读 `<服务目录>/active` 得到 release SHA（release 目录名即它快照的提交），再 `git -C <ops checkout> merge-base --is-ancestor <本单合并提交> <active SHA>`；退出码 0 = 本单提交已在该 release 内。
 3. **内容同源**（release＝该提交树 + 依赖 + 生成 vendor）：`sh -c '. scripts/release-content.sh; release_matches_commit "<release 目录>" "<active SHA>" "<ops checkout>"'`，退出码 0 = 逐 blob 与提交树一致（比较会跳过 `node_modules`、`plugin/server/vendor`、`vault/build`、`.runtime`）。`<ops checkout>` 必须指向 `.git` 是**目录**的运营仓库 checkout（如 `/Users/y/IdeaProjects/surreal-ck-operations`）；指向 worktree（`.git` 是文件）会直接返回非 0，那不是内容不一致。
-4. **双面只读核对**（全部不需要 launchd；端口以监听事实为准，`private/service.env` 员工不可读）：`lsof -nP -iTCP -sTCP:LISTEN | grep -i bun` 列出 bun 监听，其中 cwd 指向某 release 目录的那个就是 MCP（`lsof -p <pid> | awk '$4=="cwd"{print $NF}'`；本机同一时刻可能还有别的 bun 监听，别按名字猜端口），取到端口后 `curl --fail http://127.0.0.1:<mcp-port>/health` 与 `/ready` 均 200；`lsof -p <pid> | awk '$4=="cwd"{print $NF}'` 的 cwd 指向本次 release、`txt` 指向 `<服务目录>/runtime-bun/bin/bun`；`diff -qr "<release>/schema" "<release>/plugin/server/vendor/schema"` 无差异；`<服务目录>/gates/comm-slow-pipe/<SHA>.json` 与 `<服务目录>/gates/sidecar-review/<SHA>.json` 存在、`result` 为 `pass` 且 `bun` 等于运行时版本（`<服务目录>/runtime-bun/bin/bun --version`）。
+4. **双面只读核对**（全部不需要 launchd；端口以监听事实为准，`private/service.env` 员工不可读）：`lsof -nP -iTCP -sTCP:LISTEN | grep -i bun` 列出 bun 监听，其中 cwd 指向某 release 目录的那个就是 MCP（`lsof -a -p <pid> -d cwd -Fn | sed -n 's/^n//p'`，取完整路径，不要用 awk 取末列——默认服务目录含空格会被截断；本机同一时刻可能还有别的 bun 监听，别按名字猜端口），取到端口后 `curl --fail http://127.0.0.1:<mcp-port>/health` 与 `/ready` 均 200；`lsof -a -p <pid> -d cwd -Fn | sed -n 's/^n//p'` 的 cwd 指向本次 release、`lsof -a -p <pid> -d txt -Fn | sed -n 's/^n//p' | head -n 1` 指向 `<服务目录>/runtime-bun/bin/bun`；`diff -qr "<release>/schema" "<release>/plugin/server/vendor/schema"` 无差异；`<服务目录>/gates/comm-slow-pipe/<SHA>.json` 与 `<服务目录>/gates/sidecar-review/<SHA>.json` 存在、`result` 为 `pass` 且 `bun` 等于运行时版本（`<服务目录>/runtime-bun/bin/bun --version`）。
 5. **员工通道面同源**：用真实 `sck` 通道的只读调用（`sck call __list__`、`sck call get_context`）比对在线 sidecar 报出的工具集与本单提交引入的工具名——在线 sidecar 报得出本单新增的工具，才说明插件面跑的是含本单提交的构建。新旧构建的判别力取决于本单是否新增了工具名；本单没新增工具时，改用本单改动的行为面（例如新字段的拒绝路径），仍不能用破坏性调用。
 6. **不要**用破坏性调用做正向实测：例如带 `quotaResetsAt` 的 `report_blocker` 会给自身 provider 写 `provider_health`、阻塞自身任务；这类正向实测归 QA 腿在验收时做。
 7. **交 QA 时写明**：验收头、核对时刻（UTC）、当时 active SHA，并区分直接证据（MCP 进程 cwd、release 目录内容）与间接证据（侧车工具集、门禁记录）。
 
-**R2 切换通道不在员工工具面上**：生成固定 release 与 `install` / `reload` / 回滚由**员工沙箱之外**的受控通道串行执行（老板会话或受权维护通道）。员工侧工具面（`sck call __list__`）没有部署/host 执行类工具，`ops_*` 也不提供切换。部署腿取得的「切换已完成 + 当时 active SHA」回执，只用 R1 第 2–5 步的只读事实合成：`readlink <服务目录>/active`、`ls -ltd <服务目录>/releases/*`、本次 SHA 的门禁记录、MCP 进程 cwd、以及自身 `sck` 通道仍可用（插件重指后 sidecar `adopt()` 会恢复在编通道与活租约）。**没有回执不得宣布部署完成。**
+**R2 切换通道不在员工工具面上**：生成固定 release 与 `install` / `reload` / 回滚由**员工沙箱之外**的受控通道串行执行（老板会话或受权维护通道）。员工侧工具面（`sck call __list__` 的工具名）中名字含 install/deploy/rollback/reload/paseo/ssh/exec/host/switch/launch/activate 的为零，含 release 的只有任务层的 `release_disposition`；`ops_*` 不得视为切换通道。部署腿取得的「切换已完成 + 当时 active SHA」回执，只用 R1 第 2–5 步的只读事实合成：`readlink <服务目录>/active`、`ls -ltd <服务目录>/releases/*`、本次 SHA 的门禁记录、MCP 进程 cwd、以及自身 `sck` 通道仍可用（插件重指后 sidecar `adopt()` 会恢复在编通道与活租约）。**没有回执不得宣布部署完成。**
 
 **R3 「我的提交不是 active 的祖先」＝硬停**：禁止自行 `install` 更早的 release——那是回滚，会撤掉别条线刚上线的改动。必须 `report_blocker to=gm`，写明本单合并提交、当时 active SHA、核对时刻与差异，由经理决定是否重新发布。
 
@@ -66,7 +66,7 @@ sh -c '. scripts/independence-guard.sh; independence_target_supported "<目标 r
 
 ### 1. 合入 main 并固定提交
 
-以下操作仅由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main checkout 直接写代码，不自行建树或切分支。先记录 `active` 的完整路径和插件 SOURCE/DIRECTORY，保留上一版双面回滚目录及依赖。**合入是部署腿的职责，切换不是**：§2 起的所有 install/reload/active 切换与 §5 的回滚都由沙箱外通道执行，部署腿只按 §0 R1 做只读核对（原因见 §0）。
+§1 的合入与提交核对由已获上线批准的部署腿在其登记任务分支/工作目录执行，不在共享 main checkout 直接写代码，不自行建树或切分支。切换前记录 `active` 的完整路径和插件 SOURCE/DIRECTORY、保留上一版双面回滚目录及依赖，由沙箱外通道执行（部署腿只读取 `readlink`，见 §0 R1）。**合入是部署腿的职责，切换不是**：§2 起的所有 install/reload/active 切换与 §5 的回滚都由沙箱外通道执行，部署腿只按 §0 R1 做只读核对（原因见 §0）。
 
 变更在登记任务分支完成、通过评审后，按正常流程 PR 合入 `origin/main`（不允许把未合并的基线/任务分支直接切 release）。
 
@@ -122,12 +122,12 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 ### 4. 双面验证与恢复派工
 
-- `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`rtk proxy sh "$SCK_RELEASE_DIR/scripts/company-service.sh" status` 应显示 MCP running；`/health`、`/ready` 都返回 200。
-- `paseo plugin ls sck-company` 必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本。
+- `rtk proxy readlink "$SCK_RELEASE_ROOT/active"` 必须等于本次 release；`/health`、`/ready` 都返回 200（端口与进程按 R1 第 4 步取得）。不要用 `company-service.sh status`：它调用 launchctl，员工沙箱里被拒后会打印 `not loaded`，这不是服务未加载的证据。
+- 插件面：`paseo plugin ls sck-company`（**沙箱外通道执行**，员工会话里被拒）必须为 running、enabled、无 error，**SOURCE 和 DIRECTORY 都必须等于 `$SCK_RELEASE_DIR/plugin`**。只看 running 不足以证明已切版本；部署腿侧的员工通道同源核对见 R1 第 5 步。
 - 比对 release `schema/` 与 `plugin/server/vendor/schema/`：`rtk proxy diff -qr "$SCK_RELEASE_DIR/schema" "$SCK_RELEASE_DIR/plugin/server/vendor/schema"` 无差异。vendor 的 TypeScript 多一行 `// @ts-nocheck`，核对 core 时去掉该首行再比对源文件，记录基线 SHA 与生成物哈希。
-- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按下节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
+- 用真实已登记员工通道 `rtk proxy "$SCK_RELEASE_ROOT/bin/sck" call get_context '{}'` 验证 core 可用；恢复维护前的编制状态后，由经理安排一次实际派工，核对 spawn/claim 与任务记录，不能把命令成功当成已验证派工。无分页参数的 `get_context` 默认不含公司块（答复中 `companyIncluded` 为 false），所以公司块再大也不会让它超限。若它返回 `response_too_large`，说明匹配的任务本身超过 48 KiB 整包预算，即旧的全量任务查询过宽，应视为需要分页的查询问题，而不是可忽略的正常结果：改用 `'{"pageSize":25}'`，并把返回的 `page.nextCursor` 作为 `cursor` 逐页读取，直到 `page.hasMore` 为 false；需要收窄时加 `state`、`goalId`、`role` 或 `since`。公司方向、目标与项目用 `'{"scope":"company","pageSize":25}'` 分页读取（`companyRead` 字段给出同样的参数），按段的长度与 SHA-256 重组。`response_too_large` 时核心仍在运行，可用分页调用复验。预览健康与监听进程按「交付预览服务」节检查。公司块中的项目环境（`envs`、凭证别名与角色）只对 gm 与持有该项目有效任务租约的员工返回；其它员工看到项目身份，并得到 `envsWithheld: true`。老板控制台仍是完整视图。
 
-证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。**本节全部探针只读，部署腿可独立执行**（不需要 launchd，也不要 `company-service.sh status`——它调用 launchctl，在员工沙箱里会被拒）；每份结论须带核对时刻（UTC），见 §0 R5，只读清单见 §0 R1 第 4–5 步。
+证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。**部署腿可独立执行的只有 §0 R1 第 2、4、5 步里的只读探针**（不需要 launchd；`company-service.sh status` 与上面的 `paseo plugin ls` 在员工沙箱里都会被拒，由沙箱外通道核对）；每份结论须带核对时刻（UTC），见 §0 R5。
 
 ### 5. 双面回滚
 
@@ -185,7 +185,7 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 **员工交付发布工具 `deliverable_publish`**（sidecar 基础工具，`sck call deliverable_publish '{"files":[绝对路径…],"taskId"?}'`）：把文件/目录复制进 `$SCK_SERVICE_HOME/deliverables/<taskId>/` 并返回 `/d/` 路由的 LAN 可点 URL；taskId 缺省取在手租约。同名覆盖、隐藏名跳过、symlink 解引用；任一输入路径无效即整体报错不落半截包。员工证据里的预览链接一律用它返回的 URL。收件箱 `attachments.url` 当前按老板 LAN 口径直接返回 `/e/` 无签名 URL；公网签名通道（preview-sign + 签名面 :18778 + 隧道/Caddy）保留待用，配置 `SCK_PREVIEW_SECRET` 后插件 reload 即激活签名面。
 
-**部署（插件面同步之外多一步退役桥接）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走上文「插件面同步」的基线集成、固定 release 打包、launchd install 与 `paseo plugin install <release>/plugin` 重注册流程——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
+**部署（插件面同步之外多一步退役桥接；本段全部动作属沙箱外切换通道，部署腿不执行，见 §0 R2）**：先 `launchctl bootout gui/$(id -u)/org.surrealck.deliverable-preview` 退役旧桥接（plist 可留档），再走上文「插件面同步」的基线集成、固定 release 打包、launchd install 与 `paseo plugin install <release>/plugin` 重注册流程——插件侧 EADDRINUSE 每 2s 重试至 teardown，bootout 先行即无竞态。`lsof -nP -iTCP:18777 -sTCP:LISTEN` 与 `:18778` 确认监听进程已是 Paseo/插件而非独立 bun，`curl http://<lanIP>:18777/healthz` 200 即接管完成，旧 `/e/`、`/d/` URL 不变继续有效。
 
 **状态观测**：`ops_info` 响应含 `preview` 段 `{lan:{running,port,lanUrl,uptime,lastError}, signed:{configured,running,port,uptime,lastError}, roots, lastError}`——loopback 探测 healthz 为准，失败回读插件写的 `$SCK_SERVICE_HOME/preview-status.json`。插件日志前缀 `[preview]`。
 
@@ -227,7 +227,7 @@ WT02 在 WT01 登记之上启用按归属回收：持久引用是唯一删除依
 
 QA 步骤对应如下。统计工作树数量时，先以 gm 身份执行 `list_worktrees` 分页读取，或对具体任务带 `taskId` 读取。遇到 `response_too_large` 时改用 `'{"pageSize":25}'` 并按 `page.nextCursor` 逐页读完。`get_admin_summary` 为 gm 专用的只读汇总，口径与完整性标志见 [query-paging.md](./query-paging.md) 第 5 节。发布后的真实员工 sck 最终验收由 QA 任务 `6b6cb5b9` 执行。
 
-本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。**下面提到 install/reload/launchd 的步骤属沙箱外切换通道，部署腿不执行**（员工会话会被沙箱拒绝，见 §0）；部署腿对它们的对应动作是 §0 R1 的只读核对：
+本链实现提交只创建 PR，不发布。上线申请批准后的部署腿执行以下验证，具体演练见 [WT01 分配手册](./qa/worktree-allocation.md) 与 [WT02 生命周期手册](./qa/worktree-lifecycle.md)。**下面提到建立固定 release、install/reload/launchd 的步骤属沙箱外切换通道，部署腿不执行**（员工会话会被沙箱拒绝，见 §0）；部署腿对它们的对应动作是 §0 R1 的只读核对：
 
 1. 记录 MCP active release 提交、插件 SOURCE/DIRECTORY 对应的固定 release 基线、vendor 的 core/schema 哈希及进程 running；在已批准提交建立固定 release，运行依赖安装和本地 fork 回归。MCP bootstrap 新增 schema 011/012（只新增结构，无数据删除/改写）；插件必须在 bootstrap 成功后同步相同 src/schema。
 2. 按上文双面流程把生产基线、v3 在途提交与已批准主线集成为固定 release，重生成 vendor/schema，由沙箱外通道安装 launchd，再用 `paseo plugin install <release>/plugin` 重注册并 reload **现有** `sck-company`；v3 checkout 保留为 protected 历史树，不另起 dispatcher。
