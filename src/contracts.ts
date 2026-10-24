@@ -1402,8 +1402,10 @@ export interface PolicyPlanView {
   page: PolicyPlanPage;
   /**
    * 试算结果的指纹：覆盖生效 epoch、after 契约 hash 与全量受影响清单（与分页无关，翻页时不变）。
-   * 它只用于翻页光标的绑定与人工核对——policy_enforce **不读它**：隔离时对每个点名任务按当时的有效契约重新判定，
-   * 所以按旧试算执行不会放走任何一条（也不会误伤：判定结果变了就如实报 blocked/absent）。
+   * 它只用于翻页光标的绑定与人工核对——policy_enforce **不读它**：隔离时对每个**点名**任务按当时的有效契约重新判定，
+   * 所以被点名的那批里，该隔离的会隔离、不该隔离的不会被误伤（判定结果变了就如实报 blocked/absent）。
+   * 但 policy_enforce 只处理点名的 taskIds：试算之后**新出现**且失去授权的在办任务不在这一批里，不会被碰，
+   * 执行前若在办清单可能已经变了，应先重跑 `policy_plan` 再按新清单隔离。
    */
   planHash: string;
 }

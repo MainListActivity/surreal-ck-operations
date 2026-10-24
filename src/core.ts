@@ -3844,13 +3844,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const key = await this.cursorKey();
     if (input.cursor !== undefined) {
       const body = openCursor(input.cursor, key, Date.now());
-      // 分开报：别人的光标是 forbidden；同一个调用者、但提案或库已经变了是 conflict（试算结果不再对应当前事实，
-      // 从第一页重跑才对——报 forbidden 会让人以为是自己权限的问题）。
+      // 分开报：别人的光标是 forbidden；同一个调用者、但试算已经变了是 conflict（从第一页重跑才对——报 forbidden
+      // 会让人以为是自己权限的问题）。判据是 planHash：它只覆盖 epoch、after 契约 hash 与受影响清单，
+      // 所以与受影响清单无关的在办变化（例如某条无关任务新建或完成）不会让光标失效。
       if (body.k !== 'policy-plan' || body.c !== actor.employeeId) {
         throw new CompanyError('forbidden', 'cursor belongs to another caller or another listing; run the plan again');
       }
       if (body.q !== plan.planHash) {
-        throw new CompanyError('conflict', 'the plan changed since this cursor was issued (the proposal, the epoch or the in-flight tasks differ); run the plan again from its first page');
+        throw new CompanyError('conflict', 'the plan changed since this cursor was issued (the effective epoch or the affected list differ); run the plan again from its first page');
       }
       offset = body.seq;
     }

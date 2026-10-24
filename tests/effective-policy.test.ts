@@ -268,14 +268,18 @@ describe('渲染与差异', () => {
 });
 describe('R1 候选集扫描：与判定同源、分页读到底、截断显式', () => {
   /**
-   * 假 DB：按 SQL 里的 keyset 条件（created_at, id）真做分页，这样"翻页"是被执行出来的、不是被断言的。
-   * 数据按 (created_at DESC, id DESC) 排序，与真实扫描的 ORDER BY 同一个全序。
+   * 假 DB：每一页都按**当下的** rows 重新排序再切页，与真实库"每次查询都读现在这张表"一致。
+   * 这一点是必须的：若在建 fake 时就把排序结果快照下来，并发插入的那条永远读不到，
+   * 用例会变成空测（偏移量实现也能通过），证明不了 keyset 的任何事。
+   * 排序按 (created_at DESC, id DESC)，与真实扫描的 ORDER BY 同一个全序。
    */
   const pagingDb = (rows: Array<{ id: string; created_at: number }>) => {
     const queries: string[] = [];
-    const ordered = [...rows].sort((left, right) => right.created_at - left.created_at || (left.id < right.id ? 1 : -1));
+    const order = () => [...rows].sort((left, right) => right.created_at - left.created_at || (left.id < right.id ? 1 : -1));
+    const seen = { injected: 0 };
     return {
       queries,
+      seen,
       db: {
         async query<T>(sql: string, vars?: Record<string, unknown>): Promise<T> {
           queries.push(sql);
@@ -283,9 +287,14 @@ describe('R1 候选集扫描：与判定同源、分页读到底、截断显式'
           if (!size) throw new Error(`scan did not page: ${sql}`);
           const at = vars?.after_at as number | undefined;
           const id = vars?.after_id as string | undefined;
-          const rest = at === undefined ? ordered
-            : ordered.filter(row => row.created_at < at || (row.created_at === at && row.id < (id ?? '')));
-          return [rest.slice(0, size)] as T;
+          const start = Number(/START (\d+)/.exec(sql)?.[1] ?? 0);
+          const live = order();
+          if (live.some(row => row.id === 'task-newest')) seen.injected += 1;
+          // 偏移量也照真实语义实现：变异实验（把实现换回 LIMIT/START）才能在被如实模拟的库上变红，
+          // 而不是因为假库不认 START 而变红。keyset 从不发 START，start 恒为 0。
+          const rest = at === undefined ? live
+            : live.filter(row => row.created_at < at || (row.created_at === at && row.id < (id ?? '')));
+          return [rest.slice(start, start + size)] as T;
         },
       },
     };
@@ -304,21 +313,23 @@ describe('R1 候选集扫描：与判定同源、分页读到底、截断显式'
   });
 
   test('keyset 翻页在并发写入下不重不漏（偏移量翻页会整页错位）', async () => {
-    // 第一页读完后，库的最前面插进一条新任务：偏移量翻页会把第二页整体往后挤（漏掉一条或重复一条），
+    // 第一页读完后，库的最前面插进一条新任务：偏移量翻页会把第二页整体往后挤（重复一条并漏掉最后一条），
     // keyset 翻页不会——它按 (created_at, id) 接着上一条往下读。
+    // 这条用例必须真的读到那条并发插入的行（seen.injected > 0），否则它证明不了任何事。
     const all = Array.from({ length: 6 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
-    const { db } = pagingDb(all);
+    const { db, seen } = pagingDb(all);
     let calls = 0;
     const racing = {
       query: async <T>(sql: string, vars?: Record<string, unknown>): Promise<T> => {
         calls += 1;
-        if (calls === 2) all.unshift({ id: 'task-newest', created_at: 999 }); // 并发新建：偏移量翻页会漏一条
+        if (calls === 2) all.unshift({ id: 'task-newest', created_at: 999 }); // 并发新建：偏移量翻页会漏一条并重复一条
         return await db.query<T>(sql, vars);
       },
     };
     const scan = await scanInFlightTasks<{ id: string; created_at: number }>(racing, 2, 10);
     const ids = scan.rows.map(row => row.id);
-    expect(new Set(ids).size).toBe(ids.length);                                  // 不重
+    expect(seen.injected).toBeGreaterThan(0);   // 那条并发插入的行确实被后续查询读到了：不是空测
+    expect(new Set(ids).size).toBe(ids.length); // 不重
     expect(ids).toEqual(['task-0', 'task-1', 'task-2', 'task-3', 'task-4', 'task-5']); // 不漏（新建的那条不挤掉别人）
   });
 

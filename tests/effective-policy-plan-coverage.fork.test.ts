@@ -240,6 +240,34 @@ run('R1 plan coverage: a task built before the policy layer is listed, quarantin
     expect(paged.scanned).toBe(oneShot.scanned);
   });
 
+  test('R1/AC01: 跨过 200 条扫描页边界、且时间戳全同毫秒时，keyset 续读不重不漏（真实 fork 库）', async () => {
+    // 评审第 3 轮的建议项：仓库此前没有真实库用例跨过扫描页（POLICY_PLAN_SCAN_PAGE=200）。
+    // 把在办任务压到同一个毫秒，排序退化成纯 id 序，(created_at, id) 续读必须仍然不重不漏——
+    // 这正是"上线前既存任务挤在同一天创建"的样子。
+    const idOf = (row: { id: unknown }) => String((row.id as { id?: unknown })?.id ?? row.id);
+    const listInFlight = async () => (await newDb.db.query<[Array<{ id: unknown }>]>(
+      "SELECT id, created_at FROM task WHERE state NOT IN ['done', 'void'] ORDER BY created_at DESC, id DESC;"))[0].map(idOf);
+    const created: string[] = [];
+    for (let index = 0; index < 260; index++) {
+      const task = await core.createTask(gm, { title: `R1 扫描页边界样本 ${index}`,
+        context: 'SYS06 R1：跨扫描页的合成样本', executorRole: 'engineering', reviewerRole: 'qa',
+        workIntent: { kind: 'read' }, idempotencyKey: key() } as never);
+      created.push(task.id);
+    }
+    // 全部压成同一毫秒：页边界落在同一个 created_at 的组里，id 成为唯一的分页依据。
+    await newDb.db.query("UPDATE task SET created_at = d'2026-10-24T00:00:00.000Z' WHERE state NOT IN ['done', 'void'];");
+    const expected = await listInFlight();
+    expect(expected.length).toBeGreaterThan(200);            // 确实跨过了页边界（否则这条用例没有意义）
+    expect(created.every(id => expected.includes(id))).toBe(true);
+    const scan = await scanInFlightTasks<{ id: unknown; created_at?: unknown }>(newDb.db, 200, 5);
+    const got = scan.rows.map(idOf);
+    expect(got.length).toBe(expected.length);                 // 一条不少
+    expect(new Set(got).size).toBe(got.length);               // 一条不重
+    expect(got).toEqual(expected);                            // 顺序与库的全序逐位一致（含同毫秒的 id 续读）
+    expect(scan.truncated).toBe(false);
+    expect(scan.scanned).toBe(expected.length);
+  });
+
   test('R1/AC05: the isolation uses no state literal the deployed release does not know, and the old release dispatches none of them', () => {
     expect(vocabulary.old).toEqual(vocabulary.current);
     expect(vocabulary.old).toContain('blocked');
