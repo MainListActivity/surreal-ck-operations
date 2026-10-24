@@ -220,6 +220,34 @@ test('AC02 lane whitelist: a code task that declares no lane is refused, at crea
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane-other'] } });
   expect((await core.policyDispatchVerdict(inFlight.id)).verdict).toBe('blocked');
   expect((await failureOf(core.claim(tokens.eng, inFlight.id))).message).toContain('lane-a');
+  // 复核缝隙同样失败关闭：任务被判 blocked 时，评审领取也必须被拒——否则执行缝拒发、评审缝照发独占写树，
+  // 「工作树写权」就被评审相位绕过（调度器已按 policyBlocks 拦下 review 队列，直连 claim 不能给出相反结论）。
+  await database.db.query('UPDATE $t SET current_employee = NONE, lease_expires_at = NONE;', { t: new RecordId('task', inFlight.id) });
+  const verdictNow = await core.policyDispatchVerdict(inFlight.id);
+  expect(verdictNow.verdict).toBe('blocked');
+  const refusedReviewClaim = await failureOf(core.claim(tokens.qa, inFlight.id));
+  expect(refusedReviewClaim.code).toBe('forbidden');
+  expect(refusedReviewClaim.message).toContain('策略拒绝领取');
+  expect(refusedReviewClaim.message).toContain('lane-a');
+
+  // 在办的复核相位同样被拦：先按授权契约跑到 review，再换版收权 → 评审领取立刻被拒（不是等隔离）。
+  await database.db.query('DELETE policy; UPDATE company_meta:policy_epoch SET value = 0;');
+  const toReview = await lanePolicy();
+  const reviewable = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-a' }, title: '跑到 review 再收权的任务' });
+  const claimed = await core.claim(tokens.eng, reviewable.id);
+  const submitted = await core.submit(tokens.eng, proofOf(claimed), { text: 'SYS06 复核缝：按契约 A 正常执行并提交进入 review 相位', idempotencyKey: key() });
+  expect(submitted.state).toBe('review');
+  await lanePolicy({ policyId: 'project-code-lane-3', supersedes: toReview.id,
+    payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code'], lanes: ['lane-other'] } });
+  const reviewingDenied = await failureOf(core.claim(tokens.qa, reviewable.id));
+  expect(reviewingDenied.code).toBe('forbidden');
+  expect(reviewingDenied.message).toContain('策略拒绝领取');
+  // 对照：同一份契约下没被收权的复核任务照旧能领——收紧没有变成"评审一律禁"。
+  const control = await codeTask({ goalId, workIntent: { kind: 'code', lane: 'lane-other' }, title: '未被收权的复核任务' });
+  const controlClaim = await core.claim(tokens.eng, control.id);
+  const controlSubmitted = await core.submit(tokens.eng, proofOf(controlClaim), { text: 'SYS06 复核缝：未被收权的对照任务提交进入 review', idempotencyKey: key() });
+  expect(controlSubmitted.state).toBe('review');
+  expect((await core.claim(tokens.qa, control.id)).task.state).toBe('review');
 });
 
 test('AC01 authorization source: a forged owner quote is refused, a registered one is accepted', async () => {

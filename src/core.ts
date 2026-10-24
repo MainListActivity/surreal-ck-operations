@@ -1083,11 +1083,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     // Independence (SYS-DISP IR03): refused before a worktree is allocated, exactly as the claim transaction would refuse it.
     await this.refuseIndependent(await this.independenceGate(taskId, task.independence, reviewing ? 'review' : 'execute'), actor.employeeId);
     // SYS06 AC02: a task whose effective contract no longer authorizes this work is refused before any worktree is allocated.
-    if (!reviewing) {
+    // 复核相位同样要判：调度器已经按 policyBlocks 拦下 review 队列，员工直连 claim 不能给出相反结论。判定用**任务自身**
+    // 的执行岗与意图（与调度器 policyDispatchVerdict 同源），不是评审岗位——被 blocked 的任务谁也领不走，也就不可能
+    // 从评审缝拿到执行缝拒绝发的独占写树。
+    {
       const policyRow = await this.taskRowWithProject(taskId);
       if (!policyRow) throw new CompanyError('not_found', 'Task not found');
       const { contract } = await this.effectiveContractFor(this.chainOfRow(policyRow));
-      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: actor.role, kind: task.kind,
+      const verdict = dispatchVerdict({ state: policyRow.state, executorRole: task.executorRole, kind: task.kind,
         ...(task.goalId ? { goalId: task.goalId } : {}),
         ...(task.workIntent ? { workIntent: task.workIntent } : {}),
         ...(policyRow.policy_hash ? { policyHash: policyRow.policy_hash } : {}),
@@ -1208,14 +1211,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   private async claimLease(actor: Principal, taskId: TaskId, worktree?: WorktreeAssignment): Promise<ClaimResult> {
     const task = id('task', taskId);
     // SYS06 AC02/AC03：派工/领取前的机器策略判定，并把本租约的生效契约登记下来（lease_policy_*）。
-    // 复核阶段的领取不是写代码，不受 write_authority 约束；执行阶段的领取必须仍在授权范围内。
+    // 复核相位同样要判：问的是"这条任务还在授权范围内吗"，所以用任务自身的执行岗与意图（与调度器同源），不是评审岗位；
+    // 被 blocked 的任务连评审都领不走，评审缝就不会发出执行缝拒绝发的独占写树。
     const current = await this.taskRowWithProject(taskId);
     if (!current) throw new CompanyError('not_found', 'Task not found');
     const policyChain = this.chainOfRow(current);
     const { contract: policyContract, rows: policyRows, epoch: policyEpochAtClaim } = await this.effectiveContractFor(policyChain);
-    if (current.state !== 'review') {
+    {
       const currentTask = view(current);
-      const verdict = dispatchVerdict({ state: current.state, executorRole: actor.role, kind: currentTask.kind,
+      const verdict = dispatchVerdict({ state: current.state, executorRole: currentTask.executorRole, kind: currentTask.kind,
         ...(currentTask.goalId ? { goalId: currentTask.goalId } : {}),
         ...(currentTask.workIntent ? { workIntent: currentTask.workIntent } : {}),
         ...(current.policy_hash ? { policyHash: current.policy_hash } : {}),

@@ -38,7 +38,7 @@
 
 - `company_meta:policy_epoch` 是单例计数器：每次写入或撤销 +1。
 - **创建**任务时登记 `policy_version` / `policy_hash` / `policy_contract`，并写一条证据行（含生效链）。
-- **领取**时先做派工判定；通过后把 `policy_version` / `policy_hash` / `expected_policy_epoch`（CAS）写到租约上，返回 `policy` 视图（含人读 `rendered`）。
+- **领取**时先做派工判定（执行相位与复核相位同一份判定，都用任务自身的执行岗与意图）；通过后把 `policy_version` / `policy_hash` / `expected_policy_epoch`（CAS）写到租约上，返回 `policy` 视图（含人读 `rendered`）。
 - **写入动作**（非心跳）先比 `lease_policy_hash` 与当前契约 hash：不一致直接拒 `conflict`（「策略已变更：本次动作按的契约已过期」）。下一次动作前复核版本，因此旧 claim、旧提示都不能继续授权写入。
 - 任务/租约上登记过的域是 AC01 的历史事实：**当前契约里整个域消失**（临时授权到期、被撤销）时判 `blocked`，而不是"没有策略所以放行"。
 
@@ -49,7 +49,7 @@
 | 位置 | 代码 | 表现 |
 | --- | --- | --- |
 | 创建任务/关口 | `core.ts` `createTaskRecord`（`checkWriteAuthority` / `checkGateCreation`） | `forbidden`「策略拒绝创建：…」；gate 域要求的验收腿写进任务证据 |
-| 领取任务 | `core.ts` `claim` / `claimLease`（`dispatchVerdict` + epoch CAS） | `forbidden`「策略拒绝领取：…」；契约变化时 `conflict` |
+| 领取任务（执行相位与复核相位都算） | `core.ts` `claim` / `claimLease`（`dispatchVerdict` + epoch CAS） | `forbidden`「策略拒绝领取：…」；契约变化时 `conflict`。判定问的是"这条任务还在授权范围内吗"，所以用**任务自身**的执行岗与意图（与调度器同源）；被 `blocked` 的任务连复核也领不走，不会在执行缝被拒、却从复核缝拿到独占写树 |
 | 任务写入 | `core.ts` `transitionRecord`（`lease_policy_hash`） | `conflict`「策略已变更：…」 |
 | 调度器派工 | `workforce.ts` `policyDispatchVerdict` → `dispatcher.ts`（`policyBlocks`） | 该任务在整个候选池里带 `policy_blocked`，不值得再试别的实例 |
 | sidecar | `plugin/server/sidecar.ts` | 暴露 `policy_*` 五个工具，写操作由 core 按角色拒绝 |
