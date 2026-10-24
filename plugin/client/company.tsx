@@ -1183,20 +1183,33 @@ function ModelIdentityCard({ctx}: {ctx:Ctx}) {
   const [drafts,setDrafts]=useState<Record<string,string>>({});
   const [all,setAll]=useState(false), [message,setMessage]=useState("");
   const aliases=query.data?.aliases??[];
-  const shown=all?aliases:aliases.filter(a=>a.slug||a.suggested||a.by==="owner");
+  const inventory=query.data?.inventory;
+  const entries=[...aliases.map(a=>({...a,pending:false})),...(inventory?.pending??[]).filter(model=>!aliases.some(a=>a.model===model)).map(model=>({model,slug:null,by:"jev" as const,pending:true,suggested:undefined,confidence:undefined,aa:undefined}))];
+  const groupedIds=new Set(inventory?.grouped.map(m=>m.model)??[]);
+  const needsDecision=(a:typeof entries[number])=>!groupedIds.has(a.model)&&(a.pending||(!a.slug&&!!a.suggested));
+  const shown=all?entries:entries.filter(needsDecision);
   const apply=async(model:string,slug:string|null)=>{
-    setMessage("");try{await set({model,slug});await query.refetch();setDrafts(d=>({...d,[model]:""}));setMessage("已保存；尚未进组的模型会在下次同步时按新分数分组。");}
+    setMessage("");try{const result=await set({model,slug});await query.refetch();setDrafts(d=>({...d,[model]:""}));setMessage(result.synchronized===false?"裁决已保存；分组同步暂未完成，后台会重试。":"裁决已保存。已入组与已裁决未入组的记录已更新；现有分组成员不会因名称确认而移动。");}
     catch(e){setMessage(`保存失败：${(e as Error).message}`);}
   };
   return <Section title="模型与 AA 榜单对应" ctx={ctx}><View style={s.card}>
     <Text style={s.muted}>分档按 AA 分数，且分数对应测得时的思考等级；组内成员会固定在该等级。名称对不上的新模型由 Jev 判断一次，你可以改。</Text>
     {query.isError&&<Text style={s.muted}>读取失败，请稍后重试。</Text>}
-    {!!query.data?.issues.length&&<Text style={s.text}>不符合分档规则的成员（只提示，不会自动移除）</Text>}
+    {!!query.data?.issues.length&&<Text style={s.text}>分档检查（不属于待裁决；现有成员不会自动移除）</Text>}
     {query.data?.issues.map(i=><Text key={i.group+i.member} style={s.muted}>{i.group}：{i.member} — {i.reason}</Text>)}
-    <Text style={s.text}>名称对应</Text>
+    <Text style={s.h2}>本地模型记录</Text>
+    <Text style={s.muted}>首次部署处理全量，之后仅处理未裁决的模型 ID。历史裁决与分组版本无关，重启后保留。</Text>
+    <Collapsible ctx={ctx} title={`已入组（${inventory?.grouped.length??0}）`}>
+      {inventory?.grouped.map(m=><Text key={m.model} style={s.muted}>{m.model} → {m.groups.join("、")}</Text>)}
+    </Collapsible>
+    <Collapsible ctx={ctx} title={`已裁决但未入组（${inventory?.decidedUngrouped.length??0}）`}>
+      {inventory?.decidedUngrouped.map(m=><Text key={m.model} style={s.muted}>{m.model} · {m.by==="owner"?"人工":m.by==="jev"?"Jev":m.by==="group"?"曾入组":"规则匹配"} · {m.reason}{m.present?"":" · 当前目录已无此模型"}</Text>)}
+    </Collapsible>
+    <Text style={s.text}>待裁决 / 待人工确认（{entries.filter(needsDecision).length}）</Text>
+    {!shown.length&&<Text style={s.muted}>没有待裁决的映射。已处理的记录可在历史中查看。</Text>}
     {shown.map(a=><View key={a.model} style={s.card}>
       <Text style={s.text}>{a.model}</Text>
-      <Text style={s.muted}>{a.slug?`= ${a.aa?.name??a.slug}（${a.aa?.score??"?"}）`:a.suggested?`Jev 倾向 ${a.aa?.name??a.suggested}（${a.aa?.score??"?"}），但不够确定，未采用`:"不对应任何 AA 模型"}
+      <Text style={s.muted}>{a.pending?"尚未裁决，等待 Jev 或人工处理":a.slug?`= ${a.aa?.name??a.slug}（${a.aa?.score??"?"}）`:a.suggested?`Jev 倾向 ${a.aa?.name??a.suggested}（${a.aa?.score??"?"}），但不够确定，未采用`:"不对应任何 AA 模型"}
         {a.by==="owner"?" · 你设定":a.confidence!==undefined?` · Jev 置信 ${a.confidence.toFixed(2)}`:""}</Text>
       <TextInput accessibilityLabel={`${a.model} 对应的 AA slug`} style={s.input} placeholder={a.suggested??"AA slug，例如 qwen3-8-flash-next"}
         value={drafts[a.model]??""} onChangeText={v=>setDrafts(d=>({...d,[a.model]:v}))}/>
@@ -1205,7 +1218,7 @@ function ModelIdentityCard({ctx}: {ctx:Ctx}) {
         <Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>void apply(a.model,null)}><Text style={s.text}>设为不对应</Text></Pressable>
       </View>
     </View>)}
-    {aliases.length>shown.length||all?<Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>setAll(!all)}><Text style={s.text}>{all?"只看有对应或待确认的":`显示全部 ${aliases.length} 个`}</Text></Pressable>:null}
+    {entries.length>shown.length||all?<Pressable accessibilityRole="button" style={s.buttonSecondary} onPress={()=>setAll(!all)}><Text style={s.text}>{all?"只看待裁决的":`查看历史裁决（${aliases.length}）`}</Text></Pressable>:null}
     {!!message&&<Text style={s.muted}>{message}</Text>}
   </View></Section>;
 }

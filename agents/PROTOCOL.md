@@ -55,6 +55,9 @@
 |---|---|---|
 | `ops_info` | — | 项目与环境、可用工具、已登记的账号别名、配额、代理当前具备的能力 |
 | `ops_health` | — | 探测环境的健康地址 |
+| `ops_origin_status` | — | 源站主机只读概况：各服务（surreal-ck-hono、surrealdb、caddy、sck-company-mcp）运行状态、重启次数、内存，磁盘、内存、负载 |
+| `ops_origin_health` | — | 在源站本机探测各服务的本地健康端点（含状态面隧道 18778），不经公网 |
+| `ops_origin_logs` | `service`, `since?`(如 `30m`/`6h`，≤72h，缺省 30m), `lines?`(≤500，缺省 200), `grep?`(纯文本、不分大小写), `priority?`(`err`/`warning`/`info`) | 读该服务的 journal 尾部，已脱敏、限长；`matched` 是命中总数，`truncated` 表示只回了最后一段 |
 | `ops_account_ensure` | `alias` | 确保公司 IdP 里有这个测试账号：没有就创建，密码由代理生成并密封；你看不到密码 |
 | `ops_login` | `alias`, `workspace?`, `audience?` | 以该账号登录，返回会话句柄 `session`（不是 token）和该账号能进入的 workspace；账号不存在会先创建。`audience:"ops"` 时经 IdP 公共客户端直连换出运营 audience 的会话（`kind=ops`），不列 workspace、不自动建账号（无密封密码即 not_found），只能配 `ops_request` 调 `/api/ops/*`——不能进 workspace、不能浏览器登录 |
 | `ops_workspace_ensure` | `session`, `slug`, `name?` | 进入已有 workspace；不存在且给了 `name` 时创建（slug 要以项目配置的前缀开头，每天有创建上限，能复用就复用）。创建是产品侧的多步 provisioning，可能要一两分钟；调用若报 `upstream_error`（超时或 5xx），说明结果未定，用**同一个 slug 和 name** 再调一次即可复用或补完，不要换新 slug |
@@ -76,6 +79,7 @@
 - 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
 - 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
+- 源站主机只有 `ops_origin_*` 这三个只读入口：你没有、也不需要 SSH 账号或密钥，不要尝试 `ssh`/`scp` 或索要密钥。重启服务、改配置、升级 SurrealDB 等写操作属于老板，用 `report_blocker to=gm` 写明现象（附 `ops_origin_*` 的输出）和建议动作。
 - 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
 - 浏览器空间用毕即关：你的 ego-browser 任务空间在提交或阻塞前必须 `finish`（无证据要移交就 `keep:[]`）。空间每留一个页签，本机浏览器就持有一个采集断言，屏幕无法熄屏；也别为同一任务开多个空间，复用你正持有任务的这一个。
 

@@ -132,7 +132,7 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 ```sh
 # 本机（launchd 或 autossh 持久化，复用 deploy 用 SSH 通道）
-ssh -N -R 127.0.0.1:18778:127.0.0.1:18778 ubuntu@<remote-host>
+ssh -N -F /dev/null -i <tunnel-key> -o IdentitiesOnly=yes -o UserKnownHostsFile="<known_hosts>" -R 127.0.0.1:18778:127.0.0.1:18778 scktunnel@<remote-host>
 # VPS Caddyfile（data.maplayer.top 站点内追加）
 handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 ```
@@ -387,6 +387,10 @@ AA 按思考等级分别打分（显示名括号里的 Max/Xhigh/High…，slug 
 
 名称匹配：AA slug 与显示名（去括号再拼等级）都参与精确匹配；去掉厂商前缀（`zai_glm-5.3-flash`）和 Magpie 上下文变体后缀（`grok-4.7@500k`）；日期快照后缀照旧。规则仍对不上的新模型，每个只问一次 Jev（选择题：按名称相近取 8 个 AA 候选加「都不是」），置信 ≥0.7 才采用，否则只记为建议；结果存 `model-routing/aliases.json`，老板可在同一页面改为某个 slug 或设为不对应，尚未进组的模型下次同步按新分数分组。远端 Magpie 新增模型需要本地重新拉取清单：控制器每天对 `preset=remote-magpie` 的供应商执行一次 `magpie provider refresh`。
 
+本地 `model-routing/inventory.json` 是持久模型处理台账：按供应商完整模型 ID 记录当前目录、当前分组与历史裁决（规则精确匹配、Jev、人工或既有分组接纳）。首次部署扫描全量可调用模型，之后仅处理台账尚无裁决且未在组内的 ID；已裁决无对应/未达准入线的模型不会再次询问 Jev，分组版本升级、重启与暂时下架不清空历史。旧 `aliases.json` 自动迁入；该文件仍保留为映射兼容文件，必要时从台账恢复。每个 Jev 有效答案立即原子保存，后续请求或组同步失败不重问已完成的答案；无效答案不标为完成。台账损坏时停止同步，避免从空状态重新付费裁决。
+
+编制页分别显示「已入组」「已裁决但未入组」「待裁决/待人工确认」，已完成映射默认收入历史；既有组成员不会再次进入待裁决。人工修改与后台目录同步串行执行并更新台账；名称确认不代表移动已有组成员，分档警告单独展示。
+
 设置和结果分别位于 `company_meta:model_routing` 的 `ranking_rules`/`ranking_refresh_minutes` 与 `company_meta:model_ranking`。设置 RPC 只允许老板上下文。发布后通过界面保存当前规则，再对一个已登记的空闲员工调用 `count_tokens` 触发后台刷新，检查三组结果和 Magpie 顺序，同时确认成员集合及 Fable 顺序未变。
 
 
@@ -397,3 +401,21 @@ AA 按思考等级分别打分（显示名括号里的 Max/Xhigh/High…，slug 
 派工选人不调用 Jev。资格检查（岗位/轨道、项目、额度与健康、席位与并发、原实现人绑定、验收回避及独立性）通过后，先复用 Factory，再使用可新建的 Factory 席位；Factory 没有可用候选时复用或新建 Claude。候选排序在本机执行，不为派工产生 Jev 调用。组内模型排序、最终验收绩效和上线判断仍使用各自原有机制。
 
 从已合入 main 的固定 release 执行 `bun scripts/model-routing-admin.ts roster` 前暂停新增派工。该模式备份原编制后新增/更新保留定义并物理删除其余非 Claude 定义，不重建 Magpie 分组或改写排序规则。旧实例、任务和绩效历史保留；删除定义的实例不得接新任务，在途租约照常收尾，空闲且不再被未完成任务保护时退休。完成后检查 Factory 模型/provider 未变、非保留定义为零、故事作者前后相同，再恢复原派工开关。
+
+## 源站主机：受限账号与只读运维工具
+
+员工不持有源站 SSH 账号。源站上有两个专用账号，各绑一把只在本机的无口令密钥（`$SCK_SERVICE_HOME/private/origin/`，0600，连同固定的 `known_hosts`）：
+
+| 账号 | 密钥 | 能做的唯一一件事 |
+|---|---|---|
+| `scktunnel` | `tunnel-ed25519` | 开状态面反向转发 `127.0.0.1:18778`；无 shell、无本地转发、无命令（`launchd` 任务 `org.surrealck.status-tunnel`） |
+| `sckops` | `ops-ed25519` | 运行强制命令 `/usr/local/bin/sck-origin-agent`：`status`/`health`/`logs` 三个只读操作；无 sudo，经 `systemd-journal` 组读日志 |
+
+限制两层叠加：`authorized_keys` 的 `restrict,command=…`/`permitlisten=…`，以及 `sshd_config` 末尾 `# sck-origin begin…end` 的 `Match User` 块（`PermitOpen none`、`ForceCommand`）。部署/重装由老板用自己的 deploy 密钥执行（幂等）：
+
+```sh
+scp scripts/origin-agent/{sck-origin-agent.py,install-remote.sh} <owner>@<host>:/tmp/
+ssh <owner>@<host> 'sudo sh /tmp/install-remote.sh "$(cat tunnel.pub)" "$(cat ops.pub)" < /tmp/sck-origin-agent.py'
+```
+
+broker 侧在项目环境配置加 `origin: {host, user:"sckops", keyFile, knownHosts}`（本机绝对路径）即开放 `ops_origin_*`；`ops_info.can.originHost` 反映是否已配置。服务白名单在 agent 与 `src/ops/origin.ts` 两处保持一致。写操作（重启、改配置、升级 SurrealDB）不在此通道内。

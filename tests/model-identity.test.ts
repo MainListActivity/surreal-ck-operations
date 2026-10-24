@@ -6,7 +6,7 @@ import bundled from '../src/model-routing/benchmarks.json';
 import {classify,effortOfName,resolveBenchmark,splitMember,useAliases,useBenchmarks,canonicalModel,type BenchmarkRow} from '../src/model-routing/policy.ts';
 import {parseAaLeaderboard} from '../src/model-routing/aa.ts';
 import {askAlias,aliasCandidates} from '../src/model-routing/alias.ts';
-import {ModelRoutingController,memberIssue} from '../src/model-routing/controller.ts';
+import {ModelRoutingController,memberIssue,GROUPING_VERSION} from '../src/model-routing/controller.ts';
 import {modelFacts} from '../src/model-routing/ranking.ts';
 
 const dirs:string[]=[];
@@ -91,7 +91,7 @@ function controller(home:string,catalog:any[],store:Record<string,string[]>,jevA
  const c=new ModelRoutingController(db as any,home,'unused',io);
  const aa=join(home,'model-routing');mkdirSync(aa,{recursive:true});
  writeFileSync(join(aa,'aa.json'),JSON.stringify({source:'x',retrievedAt:new Date().toISOString(),models:ROWS}));
- return {c,asks:()=>asks};
+ return {c,io,asks:()=>asks};
 }
 test('sync pins bare members, keeps owner levels, asks Jev once per unnamed model and places it',async()=>{
  const home=scratch();
@@ -122,4 +122,97 @@ test('sync pins bare members, keeps owner levels, asks Jev once per unnamed mode
  await expect(second.c.setAlias('t/mystery-1','no-such-model')).rejects.toThrow();
  await second.c.setAlias('t/mystery-1','qwen3-8-flash-next');
  expect(store['sck-haiku']).toContain('t/mystery-1');
+});
+
+const baseCatalog=()=>[{id:'p/gpt-6.1-sol',reasoning_levels:ALL},{id:'p/deepseek-v4.1-flash',reasoning_levels:ALL}];
+const readInventory=(home:string)=>JSON.parse(readFileSync(join(home,'model-routing','inventory.json'),'utf8'));
+test('first full scan processes every unjudged id across bounded batches; restart and grouping version never repeat decisions',async()=>{
+ const home=scratch();const catalog=[...baseCatalog(),...Array.from({length:8},(_,i)=>({id:`vendor/opaque-${i}`}))];
+ const groups:Record<string,string[]>={};const first=controller(home,catalog,groups);
+ await first.c.refresh(true);expect(first.asks()).toBe(6);
+ let view=(await first.c.identity()).inventory;expect(view.pending).toHaveLength(2);expect(view.decidedUngrouped.filter(m=>m.by==='jev')).toHaveLength(6);
+ const second=controller(home,catalog,groups);await second.c.refresh(true);expect(second.asks()).toBe(2);
+ view=(await second.c.identity()).inventory;expect(view.pending).toEqual([]);expect(view.decidedUngrouped.filter(m=>m.by==='jev')).toHaveLength(8);
+ writeFileSync(join(home,'model-routing','membership.json'),JSON.stringify({version:'old-version',known:[]}));
+ const third=controller(home,catalog,groups);await third.c.refresh(true);expect(third.asks()).toBe(0);
+ catalog.push({id:'vendor/new-model'} as any);await third.c.refresh(true);expect(third.asks()).toBe(1);
+ await third.c.refresh(true);expect(third.asks()).toBe(1);
+});
+test('already grouped opaque models and migrated historical decisions never become new questions',async()=>{
+ const home=scratch();const store={'sck-haiku':['vendor/grouped-model']};
+ const f=controller(home,[...baseCatalog(),{id:'vendor/grouped-model'},{id:'vendor/rejected-model'}],store);
+ writeFileSync(join(home,'model-routing','membership.json'),JSON.stringify({version:GROUPING_VERSION,known:[]}));
+ writeFileSync(join(home,'model-routing','aliases.json'),JSON.stringify({'vendor/rejected-model':{slug:null,by:'jev',confidence:1,at:'2026-10-23T00:00:00Z'}}));
+ await f.c.refresh(true);expect(f.asks()).toBe(0);
+ let view=(await f.c.identity()).inventory;expect(view.grouped.find(m=>m.model==='vendor/grouped-model')?.groups).toContain('sck-haiku');
+ store['sck-haiku']=store['sck-haiku'].filter(m=>m!=='vendor/grouped-model');
+ const restarted=controller(home,[...baseCatalog(),{id:'vendor/grouped-model'},{id:'vendor/rejected-model'}],store);
+ await restarted.c.refresh(true);expect(restarted.asks()).toBe(0);
+ view=(await restarted.c.identity()).inventory;expect(view.decidedUngrouped.some(m=>m.model==='vendor/grouped-model')).toBe(true);
+});
+test('completed answers survive a later call failure and loss of the compatibility alias file',async()=>{
+ const home=scratch();const catalog=[...baseCatalog(),{id:'vendor/one'},{id:'vendor/two'}];const groups:Record<string,string[]>={};
+ const f=controller(home,catalog,groups);const original=f.io.jev.ask;let n=0;
+ f.io.jev.ask=async(state,q)=>{if(++n===2)throw Error('fixture network failure');return original(state,q);};
+ await expect(f.c.refresh(true)).rejects.toThrow('fixture network failure');
+ expect(readInventory(home).decisions['vendor/one']).toMatchObject({by:'jev',slug:null});
+ rmSync(join(home,'model-routing','aliases.json'));
+ const restarted=controller(home,catalog,groups);await restarted.c.refresh(true);expect(restarted.asks()).toBe(1);
+ expect((await restarted.c.identity()).inventory.pending).toEqual([]);
+});
+test('manual decision waits for in-flight discovery, persists, and suppresses future Jev calls',async()=>{
+ const home=scratch();const catalog=[...baseCatalog(),{id:'vendor/opaque'}];const groups:Record<string,string[]>={};
+ const f=controller(home,catalog,groups);const original=f.io.jev.ask;let entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+ f.io.jev.ask=async(state,q)=>{entered();await gate;return original(state,q);};
+ const refresh=f.c.refresh(true);await started;
+ const manual=f.c.setAlias('vendor/opaque','glm-5-3');release();await Promise.all([refresh,manual]);
+ expect(readInventory(home).decisions['vendor/opaque']).toMatchObject({by:'owner',slug:'glm-5-3'});
+ expect(groups['sck-haiku']).toContain('vendor/opaque');
+ const restarted=controller(home,catalog,groups);await restarted.c.refresh(true);expect(restarted.asks()).toBe(0);
+});
+test('malformed Jev answers are not cached as completed negative decisions',async()=>{
+ useBenchmarks(ROWS);
+ await expect(askAlias({model:'f',ask:async()=>({model:'f',answers:{}})},{id:'vendor/opaque'})).rejects.toThrow();
+});
+
+test('below-floor or unavailable reasoning levels are recorded once without a paid identity question',async()=>{
+ const home=scratch();const f=controller(home,[...baseCatalog(),{id:'w/gpt-6-luna',reasoning_levels:['xhigh']},{id:'t/deepseek-v4.1-flash',reasoning_levels:['high']}],{});
+ await f.c.refresh(true);expect(f.asks()).toBe(0);
+ const view=(await f.c.identity()).inventory;
+ expect(view.decidedUngrouped.find(m=>m.model==='w/gpt-6-luna')?.reason).toContain('低于 38');
+ expect(view.decidedUngrouped.find(m=>m.model==='t/deepseek-v4.1-flash')?.reason).toContain('没有 AA 已测等级');
+ await f.c.refresh(true);expect(f.asks()).toBe(0);
+});
+test('corrupt decision inventory fails closed instead of re-questioning all models',async()=>{
+ const home=scratch();const f=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});
+ writeFileSync(join(home,'model-routing','inventory.json'),'{broken');
+ await expect(f.c.refresh(true)).rejects.toThrow();expect(f.asks()).toBe(0);
+});
+
+test('manual save reports successful persistence even when the following group sync is unavailable',async()=>{
+ const home=scratch();const f=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});await f.c.refresh(true);
+ f.io.fetch=(async()=>{throw Error('fixture offline');}) as unknown as typeof fetch;
+ expect(await f.c.setAlias('vendor/opaque','glm-5-3')).toEqual({synchronized:false});
+ expect(readInventory(home).decisions['vendor/opaque']).toMatchObject({by:'owner',slug:'glm-5-3'});
+ const restarted=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});await restarted.c.refresh(true);expect(restarted.asks()).toBe(0);
+});
+
+test('a failed in-flight background sync cannot reject a queued manual confirmation before saving',async()=>{
+ const home=scratch();const f=controller(home,[...baseCatalog(),{id:'vendor/opaque'}],{});
+ let entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+ f.io.jev.ask=async()=>{entered();await gate;throw Error('fixture unavailable');};
+ const refresh=f.c.refresh(true);await started;
+ const manual=f.c.setAlias('vendor/opaque','glm-5-3');
+ const failed=refresh.catch(error=>error);release();
+ expect((await failed).message).toBe('fixture unavailable');
+ expect(await manual).toEqual({synchronized:true});
+ expect(readInventory(home).decisions['vendor/opaque']).toMatchObject({by:'owner',slug:'glm-5-3'});
+});
+test('inherited property names are not valid Jev answer choices',async()=>{
+ useBenchmarks(ROWS);
+ for(const choice of ['constructor','toString','__proto__']){
+  await expect(askAlias({model:'f',ask:async()=>({model:'f',answers:{same:{type:'choice',choice,confidence:1}}})},{id:'vendor/opaque'})).rejects.toThrow();
+ }
 });

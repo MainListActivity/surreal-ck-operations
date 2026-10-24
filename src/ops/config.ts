@@ -33,8 +33,13 @@ export interface BrokerConfig {
   d1?: { tenantId: string; databaseId: string };
   data?: { url: string; namespace: string };
   browser?: { bin?: string };
+  /** Read-only origin host access through a key whose sshd entry forces the origin agent. */
+  origin?: OriginConfig;
   limits: { workspacesPerDay: number; accountsPerDay: number };
 }
+
+/** Paths are local to the broker host; the key never leaves it. */
+export interface OriginConfig { host: string; user: string; keyFile: string; knownHosts: string }
 
 export interface ControlPlaneEnv {
   cloudflareToken?: string;
@@ -140,6 +145,16 @@ export function parseBrokerConfig(raw: unknown): BrokerConfig {
   if (root.browser !== undefined) {
     const browser = record(root.browser, 'browser');
     config.browser = { bin: browser.bin === undefined ? undefined : text(browser, 'bin', 'browser', /^\/[^\0]+$/) };
+  }
+  if (root.origin !== undefined) {
+    const origin = record(root.origin, 'origin');
+    const path = /^\/[^\0"\n]+$/;
+    config.origin = {
+      host: text(origin, 'host', 'origin', /^[A-Za-z0-9.-]{1,253}$/),
+      user: text(origin, 'user', 'origin', /^[a-z_][a-z0-9_-]{0,31}$/),
+      keyFile: text(origin, 'keyFile', 'origin', path),
+      knownHosts: text(origin, 'knownHosts', 'origin', path),
+    };
   }
   if (root.limits !== undefined) {
     const limits = record(root.limits, 'limits');
