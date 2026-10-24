@@ -1,5 +1,6 @@
 // 有效策略的读取层（SYS06 P1）。core（创建/领取/租约/关口）与 workforce（调度器派工前判定）都从这里读同一批
 // policy 行、并用同一份 policy.ts 判定：判定语义只有一处，两边不会各写一套 SQL 而慢慢漂移。
+import { CompanyError } from './core-errors.ts';
 import { resolveEffective, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus } from './policy.ts';
 
 /** 只用到 query 的最小 DB 面（core 与 workforce 拿到的都是同一个 Surreal 连接）。 */
@@ -114,19 +115,30 @@ export interface PolicyCandidateScan<T> { rows: T[]; scanned: number; scanLimit:
  * 分页读到底（created_at DESC, id DESC 是全序，页间不会重复或漏行）；真的读满上限就返回 `truncated: true`，
  * 由调用者在视图里显式报告，哪里都没有"读满 200 条就当读完了"。
  */
-export async function scanInFlightTasks<T>(db: PolicyStore, page = POLICY_PLAN_SCAN_PAGE,
-  maxPages = POLICY_PLAN_SCAN_MAX_PAGES): Promise<PolicyCandidateScan<T>> {
+export async function scanInFlightTasks<T extends { created_at?: unknown; id?: unknown }>(db: PolicyStore,
+  page = POLICY_PLAN_SCAN_PAGE, maxPages = POLICY_PLAN_SCAN_MAX_PAGES): Promise<PolicyCandidateScan<T>> {
   const size = Math.max(1, Math.floor(page));
   const pages = Math.max(1, Math.floor(maxPages));
   const rows: T[] = [];
   let truncated = false;
+  // keyset 翻页而不是 LIMIT/START 偏移（评审残留项）：偏移量翻页在并发新建/离开时会整页错位，
+  // 结果是漏行或重复——一次策略变更里"少看见一条在办任务"就是漏隔离一条。游标是 (created_at, id)，
+  // 与 ORDER BY 同一个全序，所以页与页之间既不重也不漏。
+  let after: { created_at: unknown; id: unknown } | undefined;
   for (let index = 0; index < pages; index++) {
     const [batch] = await db.query<[T[]]>(
       `SELECT *, goal.project AS goal_project FROM task WHERE state NOT IN ['done', 'void']
-       ORDER BY created_at DESC, id DESC LIMIT ${size} START ${index * size};`);
+       ${after ? 'AND (created_at < $after_at OR (created_at = $after_at AND id < $after_id))' : ''}
+       ORDER BY created_at DESC, id DESC LIMIT ${size};`,
+      after ? { after_at: after.created_at, after_id: after.id } : {});
     const got = batch ?? [];
     rows.push(...got);
     if (got.length < size) break;
+    const last = got[got.length - 1]!;
+    if (last.created_at === undefined || last.id === undefined) {
+      throw new CompanyError('temporarily_unavailable', 'the in-flight scan cannot page without created_at and id on the rows it reads');
+    }
+    after = { created_at: last.created_at, id: last.id };
     if (index === pages - 1) truncated = true;
   }
   return { rows, scanned: rows.length, scanLimit: size * pages, truncated };

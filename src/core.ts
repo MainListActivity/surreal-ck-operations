@@ -3778,7 +3778,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   /**
    * 试算的纯计算部分（只读、无分页）：契约 before/after、候选集扫描、全量受影响清单与 planHash。
-   * policy_plan 的分页只是把这份全量清单裁成一页；planHash 始终覆盖全量，执行侧按它做 CAS。
+   * policy_plan 的分页只是把这份全量清单裁成一页；planHash 始终覆盖全量，供翻页光标绑定与人工核对。
+   * 它不是执行侧的 CAS：policy_enforce 不读 planHash，而是对每个点名任务按当时的有效契约重新判定。
    */
   private async computePolicyPlan(actor: Principal, input: PolicyPlanInput): Promise<Omit<PolicyPlanView, 'affectedTasks' | 'page'> & {
     affectedTasks: PolicyPlanView['affectedTasks']; scopeChain: PolicyPlanView['scopeChain'];
@@ -3843,8 +3844,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const key = await this.cursorKey();
     if (input.cursor !== undefined) {
       const body = openCursor(input.cursor, key, Date.now());
-      if (body.k !== 'policy-plan' || body.c !== actor.employeeId || body.q !== plan.planHash) {
-        throw new CompanyError('forbidden', 'cursor belongs to another caller or another plan; run the plan again');
+      // 分开报：别人的光标是 forbidden；同一个调用者、但提案或库已经变了是 conflict（试算结果不再对应当前事实，
+      // 从第一页重跑才对——报 forbidden 会让人以为是自己权限的问题）。
+      if (body.k !== 'policy-plan' || body.c !== actor.employeeId) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another listing; run the plan again');
+      }
+      if (body.q !== plan.planHash) {
+        throw new CompanyError('conflict', 'the plan changed since this cursor was issued (the proposal, the epoch or the in-flight tasks differ); run the plan again from its first page');
       }
       offset = body.seq;
     }
@@ -3861,7 +3867,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const fit = (kept: typeof all): number => fitCount(kept, subset => answerBytes(build([...subset], offset)), RESPONSE_BUDGET_BYTES);
     const keptCount = fit(candidates);
     if (keptCount === 0 && candidates.length > 0) {
-      throw new CompanyError('invalid', `one affected task entry cannot fit a page (${answerBytes(build(candidates.slice(0, 1), offset))} bytes); narrow the listing`, false);
+      // 单条超预算：受影响清单没有收窄入参，这一条也补不了页——如实报它的字节数，让人知道是"这一条太大"。
+      throw new CompanyError('invalid', `one affected task entry alone is ${answerBytes(build(candidates.slice(0, 1), offset))} bytes, over the ${RESPONSE_BUDGET_BYTES}-byte budget; a single entry cannot be paged, so no page can carry it`);
     }
     return build(candidates.slice(0, keptCount), offset);
   }

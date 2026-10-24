@@ -791,3 +791,32 @@ test('R1(b): the MCP tool answers a 60-task plan with a readable page, never res
     expect(answerBytes(nextData)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
   } finally { await connection.close(); await service.close(); }
 });
+
+test('R1(b): policy_plan writes no policy and no task state — the one thing a first call may create is its cursor signing key', async () => {
+  // 评审第 2 轮的退回项 4：MCP 描述原先写 "Writes nothing"，但首次调用会 CREATE company_meta:cursor_key。
+  // 这里把真实写入面钉住：策略、任务、审计三类行都不变；唯一可能的写入是游标密钥（首次创建一次，之后不再变）。
+  await set({ policyId: 'r1b-writes', scope: 'company', domain: 'write_authority',
+    payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
+  await codeTask({ title: 'R1(b) 写入面样本' });
+  // SELECT count() ... GROUP ALL 回的是 [{count: n}]；只取 count 才是那个数。
+  const counts = async () => {
+    const [policy] = await database.db.query<[Array<{ count: number }>]>('SELECT count() FROM policy GROUP ALL;');
+    const [task] = await database.db.query<[Array<{ count: number }>]>('SELECT count() FROM task GROUP ALL;');
+    const [audit] = await database.db.query<[Array<{ count: number }>]>('SELECT count() FROM audit GROUP ALL;');
+    const [key] = await database.db.query<[Array<{ count: number }>]>('SELECT count() FROM company_meta:cursor_key GROUP ALL;');
+    return { policy: policy?.[0]?.count ?? 0, task: task?.[0]?.count ?? 0, audit: audit?.[0]?.count ?? 0, key: key?.[0]?.count ?? 0 };
+  };
+  const before = await counts();
+  const proposal = { policyId: 'r1b-writes', scope: 'company' as const, domain: 'write_authority' as const,
+    supersedes: (await listPolicies({ scope: 'company' }))[0]!.id,
+    payload: { kind: 'write_authority' as const, codeRoles: [] as never[], intents: ['code' as const] }, source: 'manager' as const };
+  await core.policyPlan(tokens.gm, proposal);
+  const after = await counts();
+  expect(after.policy).toBe(before.policy);
+  expect(after.task).toBe(before.task);
+  expect(after.audit).toBe(before.audit);
+  // 游标密钥最多创建一次：再次试算不再改它（数字不再增长）。
+  expect(after.key).toBeLessThanOrEqual(1);
+  await core.policyPlan(tokens.gm, proposal);
+  expect((await counts()).key).toBe(after.key);
+});

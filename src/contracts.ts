@@ -1370,8 +1370,9 @@ export interface PolicyPlanInput {
 }
 
 /**
- * policy_plan 一页的元数据（SYS06 R1(b)）：affectedTasks 只是 total 里的这一页，正文永远在 48 KiB 预算内。
- * 没有截断例外：第一页就装不下时抛 response_too_large，并给出 pageSize 的建议值。
+ * policy_plan 一页的元数据（SYS06 R1(b)）：affectedTasks 只是 total 里的这一页，正文按真实序列化大小裁到 48 KiB 预算内。
+ * 单条就超预算时没有可分页的余地（总数 1 也装不下），这时抛 invalid 并给出该条的字节数——不是 response_too_large，
+ * 也不是"收窄查询"能解决的：受影响清单没有收窄入参。
  */
 export interface PolicyPlanPage {
   pageSize: number;
@@ -1399,7 +1400,11 @@ export interface PolicyPlanView {
   truncated: boolean;
   /** 受影响清单的分页：受影响总数、这一页与下一页光标。 */
   page: PolicyPlanPage;
-  /** 试算结果落在当前生效 epoch 上的指纹：覆盖全量受影响清单，执行时用它做 CAS，防止按旧试算执行新策略。 */
+  /**
+   * 试算结果的指纹：覆盖生效 epoch、after 契约 hash 与全量受影响清单（与分页无关，翻页时不变）。
+   * 它只用于翻页光标的绑定与人工核对——policy_enforce **不读它**：隔离时对每个点名任务按当时的有效契约重新判定，
+   * 所以按旧试算执行不会放走任何一条（也不会误伤：判定结果变了就如实报 blocked/absent）。
+   */
   planHash: string;
 }
 

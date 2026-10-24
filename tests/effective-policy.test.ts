@@ -267,39 +267,65 @@ describe('渲染与差异', () => {
   });
 });
 describe('R1 候选集扫描：与判定同源、分页读到底、截断显式', () => {
-  /** 假 DB：按 SQL 里的 LIMIT/START 在给定数组上真做分页，这样"分页"是被执行出来的，不是被断言的。 */
-  const pagingDb = (rows: Array<{ id: string }>) => {
+  /**
+   * 假 DB：按 SQL 里的 keyset 条件（created_at, id）真做分页，这样"翻页"是被执行出来的、不是被断言的。
+   * 数据按 (created_at DESC, id DESC) 排序，与真实扫描的 ORDER BY 同一个全序。
+   */
+  const pagingDb = (rows: Array<{ id: string; created_at: number }>) => {
     const queries: string[] = [];
+    const ordered = [...rows].sort((left, right) => right.created_at - left.created_at || (left.id < right.id ? 1 : -1));
     return {
       queries,
       db: {
-        async query<T>(sql: string): Promise<T> {
+        async query<T>(sql: string, vars?: Record<string, unknown>): Promise<T> {
           queries.push(sql);
-          const match = /LIMIT (\d+) START (\d+)/.exec(sql);
-          if (!match) throw new Error(`scan did not page: ${sql}`);
-          const [, size, start] = match;
-          return [rows.slice(Number(start), Number(start) + Number(size))] as T;
+          const size = Number(/LIMIT (\d+)/.exec(sql)?.[1] ?? 0);
+          if (!size) throw new Error(`scan did not page: ${sql}`);
+          const at = vars?.after_at as number | undefined;
+          const id = vars?.after_id as string | undefined;
+          const rest = at === undefined ? ordered
+            : ordered.filter(row => row.created_at < at || (row.created_at === at && row.id < (id ?? '')));
+          return [rest.slice(0, size)] as T;
         },
       },
     };
   };
 
   test('读到底：跨页取回全部在办任务，一条都不丢', async () => {
-    const all = Array.from({ length: 5 }, (_, index) => ({ id: `task-${index}` }));
+    const all = Array.from({ length: 5 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
     const { db, queries } = pagingDb(all);
-    const scan = await scanInFlightTasks<{ id: string }>(db, 2, 10);
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(db, 2, 10);
     expect(scan.rows.map(row => row.id)).toEqual(all.map(row => row.id));
     expect(scan.scanned).toBe(5);
     expect(scan.truncated).toBe(false);
     expect(scan.scanLimit).toBe(20);
-    // 三页：0/2/4，最后一页不满 → 停止；没有"读满一页就当读完"。
+    // 三页：2 + 2 + 1，最后一页不满 → 停止；没有"读满一页就当读完"。
     expect(queries).toHaveLength(3);
   });
 
+  test('keyset 翻页在并发写入下不重不漏（偏移量翻页会整页错位）', async () => {
+    // 第一页读完后，库的最前面插进一条新任务：偏移量翻页会把第二页整体往后挤（漏掉一条或重复一条），
+    // keyset 翻页不会——它按 (created_at, id) 接着上一条往下读。
+    const all = Array.from({ length: 6 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
+    const { db } = pagingDb(all);
+    let calls = 0;
+    const racing = {
+      query: async <T>(sql: string, vars?: Record<string, unknown>): Promise<T> => {
+        calls += 1;
+        if (calls === 2) all.unshift({ id: 'task-newest', created_at: 999 }); // 并发新建：偏移量翻页会漏一条
+        return await db.query<T>(sql, vars);
+      },
+    };
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(racing, 2, 10);
+    const ids = scan.rows.map(row => row.id);
+    expect(new Set(ids).size).toBe(ids.length);                                  // 不重
+    expect(ids).toEqual(['task-0', 'task-1', 'task-2', 'task-3', 'task-4', 'task-5']); // 不漏（新建的那条不挤掉别人）
+  });
+
   test('读满上限：显式报告 truncated，绝不静默截断', async () => {
-    const all = Array.from({ length: 9 }, (_, index) => ({ id: `task-${index}` }));
+    const all = Array.from({ length: 9 }, (_, index) => ({ id: `task-${index}`, created_at: 100 - index }));
     const { db, queries } = pagingDb(all);
-    const scan = await scanInFlightTasks<{ id: string }>(db, 2, 2);
+    const scan = await scanInFlightTasks<{ id: string; created_at: number }>(db, 2, 2);
     expect(scan.scanned).toBe(4);
     expect(scan.scanLimit).toBe(4);
     expect(scan.truncated).toBe(true);
@@ -312,7 +338,9 @@ describe('R1 候选集扫描：与判定同源、分页读到底、截断显式'
     expect(queries).toHaveLength(1);
     expect(queries[0]).not.toContain('policy_hash');
     expect(queries[0]).toContain("state NOT IN ['done', 'void']");
-    expect(queries[0]).toContain('LIMIT 200 START 0');
+    expect(queries[0]).toContain('LIMIT 200');
+    // 第一页不带 keyset 条件；后续页才有（见上一条）。
+    expect(queries[0]).not.toContain('after_at');
   });
 });
 
