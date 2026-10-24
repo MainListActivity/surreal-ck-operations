@@ -18,18 +18,26 @@ import { createPaseoCli } from "../src/dispatcher/paseo.ts";
 import { setAgentModel } from "../src/dispatcher/agent-model.ts";
 import { execFileSync } from "node:child_process";
 import { TIERS, employeeTier } from "../src/model-routing/policy.ts";
-import { planRoutingRoster } from "../src/model-routing/roster.ts";
+import { applyRoutingRoster } from "../src/model-routing/roster.ts";
 import { Workforce } from "../src/workforce.ts";
 const release = resolve(import.meta.dir, "..");
 const { loadServiceEnv, serviceHome } = await import("../plugin/server/env.ts");
 loadServiceEnv();
 const mode = process.argv[2];
-if (!["enable", "migrate", "disable", "status"].includes(mode ?? ""))
-  throw Error("usage: model-routing-admin.ts enable|disable|status");
+if (!["enable", "migrate", "roster", "disable", "status"].includes(mode ?? ""))
+  throw Error("usage: model-routing-admin.ts enable|migrate|roster|disable|status");
 const db = new CompanyDatabase(loadDatabaseConfig());
 try {
   await db.connect();
   await db.useDatabase();
+  if (mode === "roster") {
+    const workforce = new Workforce(db,join(serviceHome(),"private","credentials"));
+    const dir=join(serviceHome(),"model-routing");mkdirSync(dir,{recursive:true,mode:0o700});
+    const backup=join(dir,"employee-defs-factory-first-before.json");
+    if (!existsSync(backup)) writeFileSync(backup,JSON.stringify(await workforce.defs(),null,2),{mode:0o600});
+    const result=await applyRoutingRoster(workforce,db.db);
+    console.log(JSON.stringify({changes:result.changes,removed:result.removed.map(d=>d.id),storyAuthors:'unchanged'}));
+  }
   if (mode === "enable" || mode === "migrate") {
     const [maintenance] = await db.db.query<[any]>("SELECT paused FROM ONLY company_meta:config;");
     if(maintenance?.paused!==true) throw Error("Pause dispatch before roster migration; existing leases continue normally");
@@ -47,13 +55,9 @@ try {
     const router = new ModelRoutingController(db.db, serviceHome());
     await router.prepare();
     // Apply the owner-approved roster before switching the running release. Never rewrite a live native session's provider.
-    const changes = planRoutingRoster(defs);
+    const changes = (await applyRoutingRoster(workforce,db.db)).changes;
     const created = changes.filter(d=>!defs.some(old=>old.id===d.id)).map(d=>new RecordId('employee_def',d.id));
     await db.db.query("UPDATE company_meta:model_routing SET created_defs=array::union(created_defs??[],$created);",{created});
-    for (const def of changes) {
-      await workforce.upsertDef(def.id, {role:def.role as any,provider:def.provider,model:def.model,
-        enabled:def.enabled,tracks:def.tracks,maxInstances:def.maxInstances,quotaLimited:def.quotaLimited});
-    }
     // Persist Claude employees' new defaults; a busy conversation reloads only after its current lease ends.
     await db.db.query(`UPDATE employee SET model = IF role='gm' THEN 'group/sck-opus' ELSE IF role='product' THEN 'group/sck-sonnet' ELSE 'group/sck-haiku' END
       WHERE provider='claude' AND role!='story-author' AND retired!=true RETURN NONE;`);

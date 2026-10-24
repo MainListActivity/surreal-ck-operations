@@ -117,14 +117,14 @@ beforeEach(async () => {
   await database.db.query('DELETE policy; UPDATE company_meta:policy_epoch SET value = 0;');
 });
 
-test('AC04/AC01 bootstrap: migration 034 loads on an empty database and the policy table is additive', async () => {
+test('AC04/AC01 bootstrap: migration 035 loads on an empty database and the policy table is additive', async () => {
   const [task] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE task;');
   expect(Object.keys(task?.fields ?? {})).toEqual(expect.arrayContaining([
     'policy_version', 'policy_hash', 'policy_contract', 'lease_policy_version', 'lease_policy_hash', 'policy_block_reason']));
   const [policy] = await database.db.query<[{ fields?: Record<string, string> }]>('INFO FOR TABLE policy;');
   expect(Object.keys(policy?.fields ?? {})).toEqual(expect.arrayContaining(['policy_id', 'version', 'supersedes', 'superseded_by', 'authorization', 'hash']));
   const [marker] = await database.db.query<[Array<{ schema_version: number }>]>('SELECT schema_version FROM company_meta:installation;');
-  expect(marker?.[0]?.schema_version).toBeGreaterThanOrEqual(34);
+  expect(marker?.[0]?.schema_version).toBeGreaterThanOrEqual(35);
   // 没有策略时，任务照旧可以创建，契约登记为"无机器策略"的 hash。
   const task0 = await codeTask({ title: '无策略基线' });
   expect(task0.policyVersion).toBe(0);

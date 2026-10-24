@@ -63,6 +63,10 @@ const BASE_TOOLS = [
   // SYS06 effective policy layer: gm/product only in core. Set/revoke one version of a typed machine policy, read the
   // current effective contract, dry-run a change, or isolate the in-flight tasks that lost authorization.
   "policy_set", "policy_revoke", "policy_list", "policy_effective", "policy_plan", "policy_enforce",
+  // SYS03 经理处置账本：episode 认领/决定/释放、只读状态、持有人通知（core 判定角色与能力；产物落审计与通知 outbox）。
+  "claim_disposition", "release_disposition", "disposition_status", "decide_disposition", "holder_notices",
+  // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定经理/任务当事人），只读对账标 unknown_actor，归因只由 gm 带证据做。
+  "cancel_ci_run", "reconcile_ci_runs", "attribute_ci_run", "list_external_actions",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -914,6 +918,45 @@ export class SidecarPool {
       case "resume_task": return core.resume(cred, taskIdOf(args.taskId), evidence());
       case "defer_task_until": return core.deferTaskUntil(cred, args as never);
       case "retire_task": return core.retireTask(cred, args as never);
+      // SYS03 经理处置账本：授权与全部写入都在 core；这里只是同一通道上的入口（sck 与 MCP 同源判定）。
+      case "claim_disposition": return core.claimDisposition
+        ? core.claimDisposition(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose claim_disposition"), { code: "temporarily_unavailable" }));
+      case "release_disposition": return core.releaseDisposition
+        ? core.releaseDisposition(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose release_disposition"), { code: "temporarily_unavailable" }));
+      case "disposition_status": return core.dispositionStatus
+        ? core.dispositionStatus(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose disposition_status"), { code: "temporarily_unavailable" }));
+      case "decide_disposition": return core.decideDisposition
+        ? core.decideDisposition(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose decide_disposition"), { code: "temporarily_unavailable" }));
+      case "holder_notices": {
+        if (!core.dispositionNotices || !core.ackDispositionNotices) {
+          return Promise.reject(Object.assign(new Error("core does not expose holder_notices"), { code: "temporarily_unavailable" }));
+        }
+        const ids = Array.isArray(args.ids) ? args.ids as string[] : undefined;
+        return withinReplyCeiling(async () => {
+          const notices = await core.dispositionNotices!(cred, ids ? { ids } : undefined);
+          if (args.ack !== true) return { notices };
+          if (!ids?.length) throw Object.assign(new Error("ack requires the ids of the notices being acknowledged"), { code: "invalid" });
+          const receipt = await core.ackDispositionNotices!(cred, { ids, error: typeof args.error === "string" ? args.error : undefined });
+          return { notices, receipt };
+        });
+      }
+      // SYS03 受控外部动作：core 判定谁可以发起（经理，或该 run 所属任务的当事人），并记录真实内部员工 ID。
+      case "cancel_ci_run": return core.cancelCiRun
+        ? core.cancelCiRun(cred, { ...(args as Record<string, unknown>), kind: "ci-run-cancel" } as never)
+        : Promise.reject(Object.assign(new Error("core does not expose cancel_ci_run"), { code: "temporarily_unavailable" }));
+      case "reconcile_ci_runs": return core.reconcileCiRuns
+        ? core.reconcileCiRuns(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose reconcile_ci_runs"), { code: "temporarily_unavailable" }));
+      case "attribute_ci_run": return core.attributeCiRun
+        ? core.attributeCiRun(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose attribute_ci_run"), { code: "temporarily_unavailable" }));
+      case "list_external_actions": return core.listExternalActions
+        ? core.listExternalActions(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose list_external_actions"), { code: "temporarily_unavailable" }));
       case "task_project_update": return core.taskProjectUpdate
         ? core.taskProjectUpdate(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose task_project_update"), { code: "temporarily_unavailable" }));

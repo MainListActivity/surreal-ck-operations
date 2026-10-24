@@ -308,9 +308,9 @@ export function fixture(specs: TaskSpec[]) {
   };
 
   let last: Dispatcher | undefined;
-  const tick = async () => {
+  const tick = async (extra: Partial<ConstructorParameters<typeof Dispatcher>[0]> = {}) => {
     last = new Dispatcher({ workforce: wf as unknown as Workforce, owner: owner as unknown as OwnerDesk,
-      paseo, sidecar, env: { opsRepo: OPS, sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0 });
+      paseo, sidecar, env: { opsRepo: OPS, sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0, ...extra });
     return last.tick();
   };
 
@@ -692,4 +692,49 @@ test('a persisted full-history model evaluation dispatches an eval employee even
   expect(report.evals).toContain('long-rework');
   expect(report.woke.some(w=>w.employee.startsWith('eval-claude'))).toBe(true);
   expect(f.prompts.at(-1)?.prompt).toContain('get_model_evidence');
+});
+
+
+function factoryWorld() {
+  const f=fixture([{id:'factory-task',state:'ready',repoPath:OPS,facts:{authors:[],reviewers:[],excluded:[],unknown:[],ambiguous:false}}]);
+  const claude=f.defs.find(d=>d.role==='engineering')!;
+  Object.assign(claude,{provider:'claude',model:'group/sck-haiku',quotaLimited:false});
+  Object.assign(f.instances.find(i=>i.id==='eng-1')!,{provider:'claude',model:'group/sck-haiku'});
+  const factory:EmployeeDef={...claude,id:'engineering-factory',provider:'factory-droid',model:'native-factory-model',quotaLimited:true,maxInstances:1};
+  f.defs.push(factory);
+  const addFactory=(status:string)=>{
+    const inst:EmployeeInst={id:'factory-1',def:factory.id,provider:factory.provider,model:factory.model,role:factory.role,paseoAgentId:'agent-factory',cwd:OPS,repoHome:OPS};
+    f.instances.push(inst);f.agents.set('agent-factory',{id:'agent-factory',status});return inst;
+  };
+  return {...f,factory,addFactory};
+}
+test('Factory native spawn precedes idle Claude reuse and staffing never asks Jev',async()=>{
+  const f=factoryWorld();let calls=0;
+  const config=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await config(),jevDecisions:true,jevNotifyTriage:false});
+  const report=await f.tick({jev:{model:'spy',ask:async()=>{calls++;throw Error('staffing must not call Jev');}}});
+  const assigned=report.woke.find(w=>w.task==='factory-task')!;
+  expect(f.instances.find(i=>i.id===assigned.employee)).toMatchObject({provider:'factory-droid',model:'native-factory-model'});
+  expect(assigned.spawned).toBe(true);expect(calls).toBe(0);
+});
+test('Factory idle reuse precedes idle Claude reuse',async()=>{
+ const f=factoryWorld();f.addFactory('idle');
+ expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'factory-1',spawned:false});
+});
+test('Factory full seats fall back to idle Claude',async()=>{
+ const f=factoryWorld();f.addFactory('running');
+ expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
+});
+test('Factory exhausted health falls back to Claude without reopening Factory',async()=>{
+ const f=factoryWorld();f.health.set('factory-droid',{provider:'factory-droid',state:'exhausted',until:2_000_000_000,failures:1});
+ expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
+});
+test('Factory quota floor falls back to Claude',async()=>{
+ const f=factoryWorld();const config=f.wf.config.bind(f.wf);f.wf.config=async()=>({...await config(),quotaFloorPct:5,quotaWeeklyFloorPct:5});
+ const report=await f.tick({quota:async()=>[{provider:'factory-droid',sessionPct:0,weeklyPct:0,fetchedAt:new Date().toISOString(),summary:'fixture exhausted'}]});
+ expect(report.woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
+});
+test('Factory provider concurrency cap falls back even with spare definition seats',async()=>{
+ const f=factoryWorld();f.factory.maxInstances=3;f.addFactory('running');const config=f.wf.config.bind(f.wf);
+ f.wf.config=async()=>({...await config(),providerMax:{'factory-droid':1,claude:4,codex:8}});
+ expect((await f.tick()).woke.find(w=>w.task==='factory-task')).toMatchObject({employee:'eng-1',spawned:false});
 });

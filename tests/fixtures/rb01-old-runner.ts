@@ -100,7 +100,11 @@ async function main(): Promise<Record<string, unknown>> {
     const holder = after.find(row => row.title.startsWith('rb01-ready') && row.current_employee);
     const eng = (await wf.insts()).find((inst: { id: string; paseoAgentId?: string }) => inst.id === holder?.current_employee && inst.paseoAgentId);
     const env = eng ? envs.get(eng.paseoAgentId) : undefined;
-    if (!holder || !env) throw new Error('no ready task leased to an instance with a comm environment after the rollback ticks');
+    // Reported, not thrown: a drill that only says "no leased instance" hides why the previous release stayed quiet.
+    if (!holder || !env) {
+      return { ok: false, error: 'no ready task leased to an instance with a comm environment after the rollback ticks',
+        bootstrap: true, taskTotal: after.length, ticks: reports, spawns: spawns.map(s => `${s.role}:${s.def}`).sort(), tasks, logs: logs.slice(0, 40) };
+    }
     // The previous release's own client, pointed at the instance comm dir the old pool serves.
     const call = async (tool: string, args: Record<string, unknown>): Promise<Relay> => {
       const proc = Bun.spawn([process.execPath, join(OLD, 'src/mcp/client-cli.ts'), 'call', tool, JSON.stringify(args)], {
@@ -118,6 +122,9 @@ async function main(): Promise<Record<string, unknown>> {
     const worktrees = await call('list_worktrees', { pageSize: 1 });
     const summary = await call('get_admin_summary', {});
     const text = await call('read_task_text', { taskId: ownTaskId, offset: 0 });
+    // SYS03 RB01: the disposition tools the new release adds. The previous release must refuse them by name.
+    const status = await call('disposition_status', { taskId: ownTaskId });
+    const notices = await call('holder_notices', {});
     const data = (r: Relay) => (r.data ?? {}) as Record<string, unknown>;
     const relays = {
       getContext: { exit: ctx.exit, keys: shape(ctx.data), taskCount: Array.isArray(data(ctx).tasks) ? (data(ctx).tasks as unknown[]).length : null, stderr: ctx.stderr },
@@ -125,6 +132,8 @@ async function main(): Promise<Record<string, unknown>> {
       listWorktrees: { exit: worktrees.exit, isArray: Array.isArray(worktrees.data), stderr: worktrees.stderr },
       getAdminSummary: { exit: summary.exit, stdout: summary.stdout, stderr: summary.stderr },
       readTaskText: { exit: text.exit, stdout: text.stdout, stderr: text.stderr },
+      dispositionStatus: { exit: status.exit, stdout: status.stdout, stderr: status.stderr },
+      holderNotices: { exit: notices.exit, stdout: notices.stdout, stderr: notices.stderr },
     };
 
     return {

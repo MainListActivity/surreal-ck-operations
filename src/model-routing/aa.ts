@@ -46,6 +46,7 @@ export function parseAaLeaderboard(html: string): BenchmarkRow[] {
           priceInput: r.price1mInputTokens ?? null,
           priceOutput: r.price1mOutputTokens ?? null,
           priceCacheHit: r.cacheHitPrice ?? null,
+          name: typeof r.name === "string" ? r.name : undefined,
         }));
     }
   }
@@ -65,7 +66,8 @@ export function loadAa(file: string): AaSnapshot | undefined {
 /** At most one fetch a day. A failed or implausible fetch keeps the previous snapshot. */
 export async function refreshAa(file: string, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<AaSnapshot | undefined> {
   const old = loadAa(file);
-  if (old && now - Date.parse(old.retrievedAt) < DAY) return old;
+  // Snapshots from before names were kept cannot tell which reasoning level a score belongs to.
+  if (old && now - Date.parse(old.retrievedAt) < DAY && old.models.some((m) => m.name)) return old;
   if (attempts.has(file) && now - attempts.get(file)! < DAY) return old;
   attempts.set(file, now);
   try {

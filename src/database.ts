@@ -139,12 +139,16 @@ export class CompanyDatabase {
     // 登记身份（SYS-DISP IR02/Q3）：029 由本线取用；只新增表与字段，不改任何已有员工行。
     await this.db.query(loadSchema('029-identity-principal.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
-    // 有效策略层（SYS06 P1）：034 由本线取用（030/031 未占用，032/033 已被模型路由取用）；只新增表与字段，旧行不动。
-    await this.db.query(loadSchema('034-effective-policy.surql'));
+    // SYS03 经理处置账本（编号 034，随主干合入；030/031 为在办 lane 预占）：只新增表与唯一索引，
+    // 不改写 task/audit/outbox/dispatch 的任何既有字段或行，回滚旧版即忽略这些新状态（RB01）。
+    await this.db.query(loadSchema('034-disposition.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
+    // 有效策略层（SYS06 P1）：主干已取用 034（SYS03 处置账本），本线模块合线时重排为 035；只新增表与字段，旧行不动。
+    await this.db.query(loadSchema('035-effective-policy.surql'));
     await this.db.query(`IF (SELECT * FROM ONLY company_meta:policy_epoch) = NONE {
       CREATE ONLY company_meta:policy_epoch CONTENT { value: 0 };
     };`);
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 35 WHERE schema_version < 35;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

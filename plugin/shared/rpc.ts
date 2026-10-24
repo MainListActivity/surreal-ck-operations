@@ -152,11 +152,25 @@ export const roster = defineRpc({
 export const modelRanking = defineRpc({
   name: "company.model-ranking.get",
   input: z.object({}),
-  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string()))}),
+  output: z.object({rules:z.string(),refreshMinutes:z.number(),configured:z.boolean(),at:z.string().optional(),error:z.string().optional(),orders:z.record(z.string(),z.array(z.string())),requests:z.array(z.object({tier:z.string(),at:z.string(),payload:z.record(z.string(),z.unknown())})).default([])}),
 });
 export const saveModelRanking = defineRpc({
   name: "company.model-ranking.save",
   input: z.object({rules:z.string().max(8000),refreshMinutes:z.union([z.literal(2),z.literal(5),z.literal(10)])}),
+  output: z.object({ok:z.boolean()}),
+});
+
+export const modelIdentity = defineRpc({
+  name: "company.model-identity.get",
+  input: z.object({}),
+  output: z.object({
+    aliases:z.array(z.object({model:z.string(),slug:z.string().nullable(),by:z.enum(["jev","owner"]),confidence:z.number().optional(),suggested:z.string().optional(),aa:z.object({name:z.string(),score:z.number()}).optional()})),
+    issues:z.array(z.object({group:z.string(),member:z.string(),reason:z.string()})),
+  }),
+});
+export const setModelAlias = defineRpc({
+  name: "company.model-alias.set",
+  input: z.object({model:z.string().min(1).max(300),slug:z.string().min(1).max(200).nullable()}),
   output: z.object({ok:z.boolean()}),
 });
 

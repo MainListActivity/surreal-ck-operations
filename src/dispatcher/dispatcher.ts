@@ -1,3 +1,4 @@
+import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
 import { managedModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
 import type { CompanyConfig, EmployeeDef, EmployeeInst, ManagerActionRow, ManagerWakeClaim, ManagerWakeRow, ProviderHealth, SupervisedTask, Workforce } from '../workforce.ts';
@@ -10,7 +11,7 @@ import { sweepWorktrees, type GitGateway } from './worktrees.ts';
 import { agingLevel, agingText, localDate, renderBrief, type RoleCapacity } from '../owner-brief.ts';
 import type { ReclaimResult } from './worktree-registry.ts';
 import type { ReclaimTrigger } from './worktree-reclaim.ts';
-import { jevNeedsOwner, jevRelease, jevStaff, jevTriage, type RouteCandidate } from './decisions.ts';
+import { jevNeedsOwner, jevRelease, jevTriage } from './decisions.ts';
 import { jevEvalQuestions, parseJevEval, type JevClient, type JevScoreAnswers } from './jev.ts';
 import { reclaimIdleSessions } from './idle-sessions.ts';
 import { memoryBlocked, type HostResources } from './host.ts';
@@ -54,6 +55,19 @@ const RELOAD_RETRY_SECONDS = 300;
 const PERSISTENT_QUOTA_FAILURES = 2;
 /** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
 const GLOBAL_KEEP = new Set<BlockCode>(['paused', 'budget', 'resources', 'max_running', 'unknown']);
+/** SYS03 AC04: holder notices delivered per pass, so a long backlog cannot turn one tick into hundreds of sends. */
+const HOLDER_NOTICE_BATCH = 20;
+
+/**
+ * SYS03 AC04: the text a holder receives. Self-contained (task, episode, this attempt) and it points at the tool that
+ * reads the newest decision, because the holder's own snapshot may predate it — the reminder itself is never the
+ * authority on what happened to the episode.
+ */
+const holderNoticeText = (notice: { taskId: string; episode: string; kind: string; text: string; deliveries: number }): string =>
+  `【公司通知·${notice.kind}】${notice.text}\n`
+  + `任务 ${notice.taskId}，episode ${notice.episode}；这是第 ${notice.deliveries + 1} 次投递。\n`
+  + `你手上的状态可能已经过时：先用 sck call disposition_status '{"taskId":"${notice.taskId}"}' 读这个任务最新的处置与决定，`
+  + `按最新决定行事，不要基于旧提醒重复动作。`;
 
 /** `unknown`: the roster or pool has no observation for the session. It is never shown or treated as busy. */
 export type InstState = 'busy' | 'idle' | 'down' | 'exhausted' | 'unknown';
@@ -324,7 +338,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
       (p.recusal?.authors.has(inst.id) ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.excludeSubmitter && inst.id === p.task?.submittedBy ? ['author_recusal', BLOCK_TEXT.author_recusal] : undefined) ??
       (p.reserved?.has(inst.id) ? ['review_capacity', BLOCK_TEXT.review_capacity] : undefined) ??
-      (def && !def.enabled ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
+      ((inst.def && !def) || (def && !def.enabled) ? ['def_disabled', BLOCK_TEXT.def_disabled] : undefined) ??
       (!ready(inst) ? notReady(p.states.get(inst.id), inst.provider ?? '') : undefined) ??
       (p.assigned?.has(inst.id) ? ['assigned', BLOCK_TEXT.assigned] : undefined) ??
       (p.holding.has(inst.id) ? ['held', BLOCK_TEXT.held] : undefined) ??
@@ -522,7 +536,6 @@ export interface SidecarBridge {
 }
 
 /** Jev-chosen override for one dispatch: force an existing instance, or skip reuse and spawn a chosen def. */
-interface AssignPreference { instId?: string; defId?: string; skipReuse?: boolean }
 
 /**
  * Workspace anchor for task-less management dispatches (gm-attention, triage, eval).
@@ -644,12 +657,6 @@ export class Dispatcher {
   /** The last quota-floor line written. A subscription can stay below the floor for days; one line per change, not per tick. */
   private lastQuotaFloor = '';
   private readonly onboarded = new Set<string>();
-  // Jev staff verdicts keyed by task+purpose: identical candidate sets would get
-  // identical answers, so re-asking every tick only burns tokens. Re-ask only
-  // when the candidate fingerprint changes, and drop candidates whose last
-  // assign attempt failed for a cooldown window.
-  private readonly staffCache = new Map<string, { fp: string; prefer?: AssignPreference }>();
-  private readonly staffAvoid = new Map<string, Map<string, number>>();
   // Claim denials are task-state refusals (already claimed, busy worktree, gone
   // task): every candidate would hit the same wall, so a fresh denial cools the
   // task for a while instead of spawning a disposable instance every tick.
@@ -1032,8 +1039,8 @@ export class Dispatcher {
       }
     }
     for (const inst of insts) {
-      if (states.get(inst.id)!=='idle' || !defs.some(d=>d.id===inst.def && !d.enabled)) continue;
-      if (await this.retireGated(inst, '编制已统一为 Claude，旧会话完成后正常退出', 'rotation', report)) {
+      if (states.get(inst.id)!=='idle' || (!inst.def || defs.some(d=>d.id===inst.def && d.enabled))) continue;
+      if (await this.retireGated(inst, '编制已停用或删除，旧会话完成后正常退出', 'rotation', report)) {
         report.retired.push(inst.id);
         if(inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(()=>undefined);
       }
@@ -1282,7 +1289,7 @@ export class Dispatcher {
      */
     const struckImplementer = (employeeId: string): boolean => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down' || defs.some(d => d.id === inst.def && !d.enabled);
+      return !inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled));
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1316,9 +1323,9 @@ export class Dispatcher {
         }
         // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
         const excluded = new Set<string>([...facts.excluded, implementer]);
-        const successor = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
           .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
-          .map(entry => entry.key).sort()[0];
+          .sort((a,b)=>a.key.localeCompare(b.key)))[0]?.key;
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
             reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
@@ -1367,7 +1374,9 @@ export class Dispatcher {
     const pick = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
       recusal?: ReviewRecusal, anchorHome?: string, reserved?: ReadonlySet<string>) => {
       const home = task?.repoPath ?? anchorHome ?? this.deps.env.opsRepo;
-      const candidates = eligibleInsts(role, home, task, excludeSubmitter, recusal, reserved);
+      const eligible = eligibleInsts(role, home, task, excludeSubmitter, recusal, reserved);
+      const factory = eligible.filter(i => i.provider === FACTORY_PROVIDER);
+      const candidates = factory.length ? factory : eligible;
       // A prior hand is demoted in the weighted pick (PRIOR_HAND_WEIGHT_FACTOR), exactly as in the pool.
       const weight = (inst: EmployeeInst) => effectiveWeight(defs.find(d => d.id === inst.def))
         * (recusal?.hands.has(inst.id) ? PRIOR_HAND_WEIGHT_FACTOR : 1);
@@ -1390,57 +1399,6 @@ export class Dispatcher {
       eligibleDefs(role, home, task, forReview, reserved).every(managedModel)
         ? eligibleDefs(role, home, task, forReview, reserved).sort((a,b) => a.id.localeCompare(b.id))
         : weightedOrder(eligibleDefs(role, home, task, forReview, reserved), effectiveWeight, rand);
-    // Jev 在合格候选人中挑人：候选=可复用实例+可新开 def，附带绩效、订阅额度与健康度。
-    // Review 派工的作者在进 Jev 前就已从 reuse 候选剔除（staffingPool 的回避名单），其余候选都可被选中；
-    // spawn 候选是编制而非实例——新实例会得到全新 employee id，不可能是历史贡献者。
-    const routeEmployee = async (item: (typeof work)[number], recusal?: ReviewRecusal,
-      reserved?: ReadonlySet<string>): Promise<AssignPreference | undefined> => {
-      if (item.role !== 'story-author' && defs.filter(d => d.enabled && d.role === item.role).every(managedModel)) return undefined;
-      if (!this.deps.jev || !cfg.jevDecisions) return undefined;
-      const home = item.task.repoPath ?? this.deps.env.opsRepo;
-      const cacheKey = `${item.purpose}:${item.task.id}`;
-      const avoided = this.staffAvoid.get(cacheKey);
-      const dodged = (key: string) => (avoided?.get(key) ?? 0) > now;
-      const reuse = eligibleInsts(item.role, home, item.task, item.purpose === 'review', recusal, reserved).filter(i => !dodged(i.id));
-      const spawn = eligibleDefs(item.role, home, item.task, item.purpose === 'review', reserved).filter(d => !dodged(`spawn:${d.id}`));
-      if (reuse.length + spawn.length < 2) return undefined;
-      // Same candidate set → same verdict; only call Jev when the fingerprint moved.
-      const fp = `${item.role}|${item.task.version}|` +
-        [...reuse.map(i => i.id), ...spawn.map(d => `spawn:${d.id}`)].sort().join(',');
-      const hit = this.staffCache.get(cacheKey);
-      if (hit?.fp === fp) return hit.prefer;
-      const describeHealth = (provider: string) => health.get(provider)?.state ?? 'ok';
-      const candidates: RouteCandidate[] = [
-        ...reuse.map(i => {
-          const def = defs.find(d => d.id === i.def);
-          return { key: i.id, kind: 'reuse' as const, provider: i.provider ?? def?.provider ?? '', model: i.model ?? def?.model ?? '',
-            score: def?.avgScore, scored: def?.scored, quota: quotaByProvider.get(i.provider ?? def?.provider ?? '')?.summary,
-            health: describeHealth(i.provider ?? def?.provider ?? ''), continued: i.id === item.task.previousEmployee };
-        }),
-        ...spawn.map(d => ({ key: `spawn:${d.id}`, kind: 'spawn' as const, provider: d.provider, model: resolveModel(d) ?? d.model ?? '',
-          score: d.avgScore, scored: d.scored, quota: quotaByProvider.get(d.provider)?.summary,
-          health: describeHealth(d.provider) })),
-      ];
-      const directions = (await owner.brief()).directions.map(d => d.text);
-      const verdict = await jevStaff(this.deps.jev, {
-        purpose: item.purpose, directions,
-        task: { id: item.task.id, title: item.task.title, kind: item.task.kind, state: item.task.state,
-          project: item.task.repoPath, context: item.task.row.context?.slice(0, 2000) },
-        candidates,
-      }).catch(error => { this.log(`jev staff failed: ${(error as Error).message}`); return { key: undefined, confidence: 0 }; });
-      const inst = reuse.find(i => i.id === verdict.key);
-      const def = spawn.find(d => `spawn:${d.id}` === verdict.key);
-      if ((!inst && !def) || verdict.confidence < cfg.jevPickConfidence) {
-        if (verdict.key) report.decisions.push(`staff:${item.task.id}=weighted(${verdict.confidence.toFixed(2)})`);
-        this.staffCache.set(cacheKey, { fp });
-        return undefined;
-      }
-      report.decisions.push(`staff:${item.task.id}=${verdict.key}@${verdict.confidence.toFixed(2)}`);
-      this.log(`jev picked ${verdict.key} for ${item.task.id} (${verdict.confidence.toFixed(2)})`);
-      const prefer = inst ? { instId: inst.id } : { defId: def!.id, skipReuse: true };
-      this.staffCache.set(cacheKey, { fp, prefer });
-      return prefer;
-    };
 
     // Legacy role-level staffing notices (staff:<role>) are superseded by per-task dispatch-blocked notices. Resolve any
     // still open from the previous version, including roles with no queued work, so no stale row is left in the inbox.
@@ -1526,7 +1484,6 @@ export class Dispatcher {
         await this.settleBlocked(item.task, 'review', home, undefined, now, report);
         continue;
       }
-      const prefer = await routeEmployee(item, recusal, reserved);
       const pickItem = (role: string, task?: SupervisedTask, avoid?: string, excludeSubmitter = false,
         pickRecusal?: ReviewRecusal, anchorHome?: string) => pick(role, task, avoid, excludeSubmitter, pickRecusal, anchorHome, reserved);
       const spawnItem = (role: string, home: string, task?: SupervisedTask, forReview = false) =>
@@ -1534,23 +1491,13 @@ export class Dispatcher {
       this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', prefer, slotMap, recusal);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal);
       if (!result) {
         if (this.scopeDenied.delete(item.task.id)) {
           // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
           const scope = (await this.writeScopeBlock(item.task)) ?? { code: 'write_scope' as const, text: BLOCK_TEXT.write_scope };
           await this.settleBlocked(item.task, item.purpose, home, undefined, now, report, [scope]);
           continue;
-        }
-        if (prefer) {
-          // Jev's pick just failed in assign; stop re-picking the same candidate
-          // while the rest of the pool stays eligible.
-          const cacheKey = `${item.purpose}:${item.task.id}`;
-          this.staffCache.delete(cacheKey);
-          const key = prefer.instId ?? `spawn:${prefer.defId}`;
-          const map = this.staffAvoid.get(cacheKey) ?? new Map<string, number>();
-          map.set(key, now + 30 * 60 * 1000);
-          this.staffAvoid.set(cacheKey, map);
         }
         // Eligible candidates that still failed to wake or spawn are a runtime failure, not an empty pool. Entries held for
         // review capacity stay review_capacity here: they were never candidates, so they are not a wake failure.
@@ -1562,8 +1509,6 @@ export class Dispatcher {
         continue;
       }
       await this.clearBlocked(item.task, item.purpose);
-      this.staffCache.delete(`${item.purpose}:${item.task.id}`);
-      this.staffAvoid.delete(`${item.purpose}:${item.task.id}`);
       await wf.recordDispatch(item.task.id, item.task.version, item.purpose, result.id);
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);
@@ -1664,7 +1609,9 @@ export class Dispatcher {
       }
     }
 
-    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string };
+    type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string;
+      /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
+      episodeUnknown?: boolean };
     const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
@@ -1688,9 +1635,58 @@ export class Dispatcher {
       if (await this.breakLoop(task, cfg, report, gmLoopStats?.get(task.id)).catch(() => false)) continue;
       pendingGm.push({ task, action: 'resume', expectedVersion: task.version,
         wakeEpisode: task.dispatchBlockedSince ? task.dispatchBlockedSince * 1000 : task.version,
+        episodeUnknown: !task.dispatchBlockedSince,
         wakeReason: 'blocked_to_gm' });
     }
     for (const todo of managerTodos) if (todo.purpose && todo.wakeDue) pendingGm.push(todo);
+
+    // SYS03 AC01：拉起新会话前核验这个 episode 的最新处置状态。上一条待办可能已经被另一个经理处置完了
+    // （resume/defer/依赖/retire/修复），或者正被另一位经理持活租约处理——这两种都不该再启动新会话。
+    // 已被处置的旧待办连同它在飞的 manager wake 在本轮就关掉，所以下一轮它不会再变成"旧提醒"。
+    // 读不到账本就整轮不发经理唤醒：宁可晚一轮，也不能凭一个读不到的 episode 再拉起一位经理。
+    if (pendingGm.length && typeof wf.dispositionFacts === 'function') {
+      const episodeKeys = [...new Set(pendingGm.map(todo => wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode)))];
+      const taskIds = [...new Set(pendingGm.map(todo => todo.task.id))];
+      let facts: Awaited<ReturnType<typeof wf.dispositionFacts>> | undefined;
+      try { facts = await wf.dispositionFacts({ episodes: episodeKeys, tasks: taskIds }); }
+      catch (error) { this.log(`disposition episode read failed: ${(error as Error).message}`); }
+      if (!facts) {
+        this.log('disposition episode state unavailable; suppressing all gm wake this pass');
+        pendingGm.length = 0;
+      } else {
+        const kept: PendingGm[] = [];
+        for (const todo of pendingGm) {
+          // SYS03 AC01：episode 身份就是（任务, 阶段, 开始时刻）。只有身份相等，才谈得上"这个 episode 已被处置"。
+          const exact = facts.byEpisode.get(wf.episodeKey(todo.task.id, 'execute', todo.wakeEpisode));
+          // byTask 兜底只在"调度器认不出这次提醒的身份"时可用：门禁任务的持久起点会被调度器自己清掉
+          // （见 dispositionFacts），提醒身上只剩任务版本号，按 episode 查必然落空。
+          // 兜底只认**仍在处理中**（claimed）的行——活租约说明现在正有经理在处理这个门禁，不该再拉起第二位；
+          // **decided 的行一律不兜底**：每个处置动作（resume/defer/retire/repair）都把任务带出经理门禁，
+          // 所以"任务此刻还在门禁里 + 有一条已处置的行"只可能意味着那是一条旧 episode，而这个任务已经形成了
+          // 全新的 episode；此时必须照常唤醒经理，否则这条提醒每轮都被旧处置压掉，任务永久饥饿（评审 AC01 缺口）。
+          const fallback = exact ?? (todo.episodeUnknown ? facts.byTask.get(todo.task.id) : undefined);
+          const row = exact ?? (fallback?.status === 'claimed' && fallback.holder && (fallback.leaseExpiresAt ?? 0) > now
+            ? fallback : undefined);
+          // 没有登记行是常态：这个 episode 还没有经理领过，照常唤醒。
+          if (!row) { kept.push(todo); continue; }
+          if (row.status === 'decided') {
+            const resolution = `episode already disposed (${row.decision?.action ?? 'decided'})`;
+            report.decisions.push(`gm-disposition-handled:${todo.task.id}`);
+            await wf.resolveDecidedEpisode({ taskId: todo.task.id, phase: row.phase, episodeMs: row.sinceMs, resolution })
+              .catch(error => this.log(`disposition episode close failed for ${todo.task.id}: ${(error as Error).message}`));
+            continue;
+          }
+          // 活租约：决定还在路上，等同 MR02 的在飞 episode，不再拉起第二位经理。租约失效后这里自然放行。
+          if (row.holder && (row.leaseExpiresAt ?? 0) > now) {
+            report.decisions.push(`gm-disposition-held:${todo.task.id}`);
+            continue;
+          }
+          kept.push(todo);
+        }
+        pendingGm.length = 0;
+        pendingGm.push(...kept);
+      }
+    }
 
     // Every current episode, not only the ones whose throttle expired, keeps its in-flight
     // owner alive. Throttle controls a new wake; it must never release an old one.
@@ -1787,7 +1783,7 @@ export class Dispatcher {
       let result: (EmployeeInst & { spawned: boolean }) | undefined;
       try {
         result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task: group[0]!.todo.task }, { beforeExternal, afterExternal });
+          (inst, first, claim, worktree) => gmAttention(inst, group.map(item => item.todo), this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task: group[0]!.todo.task }, { beforeExternal, afterExternal });
       } catch (error) {
         this.log(`manager wake assign failed: ${(error as Error).message}`);
       }
@@ -1823,6 +1819,40 @@ export class Dispatcher {
       report.woke.push(...group.map(item => ({ task: item.todo.task.id, employee: result!.id, spawned: result!.spawned })));
     }
 
+    // SYS03 AC04：持久 outbox 的持有人通知。取消/依赖等待/恢复/撤租/接手/结果未知都已经和审计在同一个事务里落库，
+    // 这里只负责把还没投递的通知送进仍在线、仍空闲的持有人会话——通道重连或插件重启后的补发走的是同一条路径。
+    // 投递失败只把错误记在通知上、留待下一轮重试：已确认的决定不回滚，通知也不从待发队列里丢掉。
+    if (running < cfg.maxRunning && typeof wf.pendingHolderNotices === 'function' && typeof wf.markHolderNotices === 'function') {
+      let waiting: Awaited<ReturnType<typeof wf.pendingHolderNotices>> | undefined;
+      try { waiting = await wf.pendingHolderNotices(HOLDER_NOTICE_BATCH); }
+      catch (error) { this.log(`holder notice read failed: ${(error as Error).message}`); }
+      for (const notice of waiting ?? []) {
+        if (running >= cfg.maxRunning) break;
+        // 持有人是员工 ID，会话只是它的一个实例：只投给这一轮还在线、空闲、且没被本轮派工的实例。
+        const holder = insts.find(candidate => candidate.id === notice.holder && candidate.paseoAgentId
+          && !assigned.has(candidate.id) && states.get(candidate.id) === 'idle');
+        if (!holder) {
+          // 会话不在线或正在别的活上：通知留着，下一轮再试，持有人也可以自己读 holder_notices。
+          report.decisions.push(`holder-notice-wait:${notice.taskId}`);
+          continue;
+        }
+        try {
+          await paseo.send(holder.paseoAgentId!, holderNoticeText(notice));
+          this.lastStatus.set(holder.paseoAgentId!, 'running');
+          this.onboarded.add(holder.id);
+          await wf.touchWake(holder.id);
+          states.set(holder.id, 'busy');
+          assigned.add(holder.id);
+          running++;
+          await wf.markHolderNotices([notice.noticeKey], { agent: holder.id });
+          report.decisions.push(`holder-notice:${holder.id}:${notice.kind}`);
+        } catch (error) {
+          await wf.markHolderNotices([notice.noticeKey], { error: String((error as Error).message).slice(0, 200) }).catch(() => 0);
+          this.log(`holder notice send failed for ${notice.holder}: ${(error as Error).message}`);
+        }
+      }
+    }
+
     const triage = await owner.triagePending();
     if (triage.length && running < cfg.maxRunning) {
       const due: typeof triage = [];
@@ -1843,7 +1873,7 @@ export class Dispatcher {
       for (const [home, group] of triageGroups) {
         if (running >= cfg.maxRunning) break;
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { home, project: group[0].project });
+          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { home, project: group[0].project });
         if (!result) continue;
         for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
         running++;
@@ -1901,7 +1931,7 @@ export class Dispatcher {
         }
         if (running >= cfg.maxRunning || dispatched) continue;
         const result = await this.assign('eval', undefined, last?.employee, pick, spawnable,
-          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, undefined, slotMap, undefined, { task });
+          (inst, first, claim, worktree) => evalPrompt(inst, task, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { task });
         if (result) {
           await wf.recordDispatch(task.id, task.version, 'eval', result.id);
           running++;
@@ -2174,7 +2204,7 @@ export class Dispatcher {
     spawnable: (role: string, home: string, task?: SupervisedTask, forReview?: boolean) => EmployeeDef[],
     prompt: (inst: EmployeeInst, firstContact: boolean, claim?: ClaimResult, workspace?: WorktreeAssignment) => string,
     report: TickReport, insts: EmployeeInst[], forReview = false,
-    prefer?: AssignPreference, slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
+    slots?: Map<string, string>, recusal?: ReviewRecusal, anchor?: DispatchAnchor,
     hooks?: AssignHooks,
   ): Promise<(EmployeeInst & { spawned: boolean }) | undefined> {
     const { workforce: wf, paseo, env, sidecar } = this.deps;
@@ -2182,8 +2212,11 @@ export class Dispatcher {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
     }
-    const preferred = prefer?.instId ? insts.find(i => i.id === prefer.instId && i.paseoAgentId) : undefined;
-    const picked = prefer?.skipReuse ? undefined : preferred ?? pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
+    const defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
+    const candidate = pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
+    // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
+    // reuse or spawn candidate (quota, health, capacity, recusal), ordinary fallback takes over.
+    const picked = candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
     const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
@@ -2242,8 +2275,6 @@ export class Dispatcher {
         return undefined;
       }
     }
-    const defsOrdered = spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview);
-    if (prefer?.defId) defsOrdered.sort((a, b) => Number(b.id === prefer.defId) - Number(a.id === prefer.defId));
     for (const def of defsOrdered) {
       const model = this.resolveModel(def, slots ?? new Map());
       if (!model) continue;

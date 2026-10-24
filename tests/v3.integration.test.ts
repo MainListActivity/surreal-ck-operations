@@ -1343,53 +1343,28 @@ test('dispatcher: an unreadable contributor history holds review and fresh execu
   expect((await task(t.id)).state).toBe('review');
 });
 
-test('dispatcher: jev picks among eligible employees using quota and score context', async () => {
-  await database.db.query("UPDATE task SET state = 'done', evaluated_at = time::now() WHERE state != 'done';");
-  await database.db.query('DELETE provider_health;');
-  await database.db.query('UPDATE employee SET retired = true WHERE retired = false;');
-  await database.db.query('UPDATE employee_def SET enabled = true, error_streak = 0;');
-  await database.db.query("UPSERT company_meta:config MERGE { redispatch_minutes: 15, max_running: 8, eval_enabled: false, provider_max: { codex: 8, grok: 8, devin: 8 }, jev_pick_confidence: 0.5 };");
-  await workforce.upsertDef('engineering-devin', { role: 'engineering', provider: 'devin', model: 'swe-2-high', thinking: 'high', maxInstances: 2 });
-  await workforce.upsertDef('engineering-grok', { role: 'engineering', provider: 'grok', model: 'grok-4.7', thinking: 'medium', maxInstances: 2 });
-  const defs = await workforce.defs();
-  const instA = await workforce.spawnInst(defs.find(d => d.id === 'engineering-devin')!);
-  await workforce.bind(instA.id, { agentId: 'staff-a-agent', cwd: '/ops' });
-  const instB = await workforce.spawnInst(defs.find(d => d.id === 'engineering-grok')!);
-  await workforce.bind(instB.id, { agentId: 'staff-b-agent', cwd: '/ops' });
-  const paseo = new FakePaseo();
-  paseo.agents.set('staff-a-agent', { status: 'idle', error: '' });
-  paseo.agents.set('staff-b-agent', { status: 'idle', error: '' });
-  const states: Array<{ dispatch?: { candidates?: Record<string, string> } }> = [];
-  const jev: JevClient = {
-    model: 'jev-test',
-    async ask(state: unknown, _qs) {
-      states.push(state as never);
-      // Always picks instB — after it is assigned for task 1 it drops out of task 2's
-      // eligible set, which exercises the fallback to weighted dispatch.
-      return { model: 'jev-test', answers: { pick: { type: 'choice', choice: instB.id, confidence: 0.92 } } } as never;
-    },
-  };
-  const dispatcher = new Dispatcher({
-    workforce, owner, paseo, env: { opsRepo: '/ops', sckBin: '/bin/sck', paseoBin: '/bin/paseo' },
-    rand: () => 0, jev,
-    quota: async () => [
-      { provider: 'devin', summary: '余额 $0.1/$10', status: 'available' },
-      { provider: 'grok', summary: '5h 剩余 90%', status: 'available' },
-    ],
-  });
-  const t1 = await core.createTask(tokens.gm, { title: 'Jev 选人任务一', context: '生产变更，需要可靠执行', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() });
-  const t2 = await core.createTask(tokens.gm, { title: 'Jev 选人任务二', context: '常规实现', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: key() });
-  const report = await dispatcher.tick();
-  expect(report.woke.find(w => w.task === t1.id)?.employee).toBe(instB.id);
-  expect(report.decisions.some(d => d.startsWith(`staff:${t1.id}=${instB.id}`))).toBe(true);
-  // instB was already assigned this tick, so Jev's repeated pick was ineligible → weighted fallback → instA.
-  expect(report.woke.find(w => w.task === t2.id)?.employee).toBe(instA.id);
-  expect(report.decisions.some(d => d.startsWith(`staff:${t2.id}=weighted`))).toBe(true);
-  // The choice payload carried every candidate with its quota summary.
-  const candidates = states[0]?.dispatch?.candidates ?? {};
-  expect(Object.keys(candidates)).toEqual(expect.arrayContaining([instA.id, instB.id, 'spawn:engineering-devin', 'spawn:engineering-grok']));
-  expect(Object.values(candidates).join(' ')).toContain('剩余 90%');
-  expect(Object.values(candidates).join(' ')).toContain('绩效');
+test('dispatcher: native Factory is preferred, full capacity falls back to Claude, and staffing never asks Jev', async () => {
+  await database.db.query("UPDATE task SET state='done',evaluated_at=time::now() WHERE state!='done';DELETE provider_health;UPDATE employee SET retired=true WHERE retired=false;UPDATE employee_def SET enabled=false;");
+  await database.db.query("UPSERT company_meta:config MERGE {redispatch_minutes:15,max_running:8,eval_enabled:false,provider_max:{claude:8,`factory-droid`:1},jev_decisions:true,jev_notify_triage:false};");
+  await workforce.upsertDef('engineering-claude',{role:'engineering',provider:'claude',model:'group/sck-haiku',maxInstances:2,quotaLimited:false});
+  await workforce.upsertDef('engineering-factory',{role:'engineering',provider:'factory-droid',model:'claude-haiku-5-5',maxInstances:1,quotaLimited:true});
+  await workforce.upsertDef('qa-claude',{role:'qa',provider:'claude',model:'group/sck-haiku',maxInstances:2,quotaLimited:false});
+  const defs=await workforce.defs();
+  const claude=await workforce.spawnInst(defs.find(d=>d.id==='engineering-claude')!);
+  await workforce.bind(claude.id,{agentId:'staff-claude-agent',cwd:'/ops'});
+  const factory=await workforce.spawnInst(defs.find(d=>d.id==='engineering-factory')!);
+  await workforce.bind(factory.id,{agentId:'staff-factory-agent',cwd:'/ops'});
+  const paseo=new FakePaseo();paseo.agents.set('staff-claude-agent',{status:'idle',error:''});paseo.agents.set('staff-factory-agent',{status:'idle',error:''});
+  let calls=0;
+  const dispatcher=new Dispatcher({workforce,owner,paseo,env:{opsRepo:'/ops',sckBin:'/bin/sck',paseoBin:'/bin/paseo'},rand:()=>0,
+    jev:{model:'spy',ask:async()=>{calls++;throw Error('staffing must not ask Jev');}},
+    quota:async()=>[{provider:'factory-droid',sessionPct:90,weeklyPct:90,status:'available',summary:'fixture 90% available'}]});
+  const first=await core.createTask(tokens.gm,{title:'Factory priority first',context:'Synthetic regression',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
+  const second=await core.createTask(tokens.gm,{title:'Claude capacity fallback',context:'Synthetic regression',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:key()});
+  const report=await dispatcher.tick();
+  expect(report.woke.find(w=>w.task===first.id)?.employee).toBe(factory.id);
+  expect(report.woke.find(w=>w.task===second.id)?.employee).toBe(claude.id);
+  expect(calls).toBe(0);expect(report.decisions.some(d=>d.startsWith('staff:'))).toBe(false);
 });
 
 test('dispatcher: quota below floor blocks a provider until the snapshot recovers', async () => {

@@ -1,0 +1,114 @@
+// SYS03 unit tests that need no database: the episode/business/notice identities the whole ledger keys on, and the
+// controlled external exit's honest three-way outcome mapping (confirmed / refused / result_unknown). The fork-level
+// concurrency, idempotency and rollback drills live in disposition.integration.fork.test.ts and
+// disposition-rollback-isolation.fork.test.ts.
+import { expect, test } from 'bun:test';
+import { createCompanyGithubGateway } from '../src/external-actions.ts';
+import { dispositionBusinessKey, dispositionEpisodeKey, dispositionNoticeKey } from '../src/disposition.ts';
+
+test('episode identity is task + phase + episode start, and the same episode keeps one key', () => {
+  expect(dispositionEpisodeKey('task-1', 'execute', 1_700_000_000_000)).toBe('task-1:execute:1700000000000');
+  expect(dispositionEpisodeKey('task-1', 'review', 1_700_000_000_000)).toBe('task-1:review:1700000000000');
+  // A new episode (a new start) is a different key: it can be claimed and decided on its own.
+  expect(dispositionEpisodeKey('task-1', 'execute', 1_700_000_001_000))
+    .not.toBe(dispositionEpisodeKey('task-1', 'execute', 1_700_000_000_000));
+});
+
+test('the business key carries no employee identity: a swap, a restart or a replay reads the same disposition', () => {
+  const episode = dispositionEpisodeKey('task-1', 'execute', 1_700_000_000_000);
+  const key = dispositionBusinessKey(episode, 'repair');
+  expect(key).toBe(`${episode}\0repair`);
+  // Nothing about who asked is in the key — that is what stops a second repair chain after an employee change.
+  expect(dispositionBusinessKey(episode, 'repair')).toBe(key);
+  // A different action on the same episode is a different business operation, and an explicit key is namespaced.
+  expect(dispositionBusinessKey(episode, 'resume')).not.toBe(key);
+  expect(dispositionBusinessKey(episode, 'repair', 'release-2026-10-23')).toBe(dispositionBusinessKey('other-episode', 'repair', 'release-2026-10-23'));
+  expect(dispositionBusinessKey(episode, 'repair', 'release-2026-10-23')).toBe('custom\0release-2026-10-23');
+});
+
+test('notice identity includes the episode, the kind and the version, so one event notifies once', () => {
+  const episode = dispositionEpisodeKey('task-1', 'execute', 1_700_000_000_000);
+  expect(dispositionNoticeKey(episode, 'disposition_decided', 7)).toBe(`${episode}\0disposition_decided\0` + '7');
+  expect(dispositionNoticeKey(episode, 'disposition_decided', 7)).toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
+  expect(dispositionNoticeKey(episode, 'resumed', 7)).not.toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
+  expect(dispositionNoticeKey(episode, 'disposition_decided', 8)).not.toBe(dispositionNoticeKey(episode, 'disposition_decided', 7));
+});
+
+/** One scripted gh runner: every call is answered from the list, and the calls themselves are recorded. */
+const scripted = (...answers: Array<{ match: (args: string[]) => boolean; out?: string; fail?: string }>) => {
+  const calls: string[][] = [];
+  const run = async (args: string[]) => {
+    calls.push(args);
+    const answer = answers.find(a => a.match(args));
+    if (!answer) throw new Error(`unscripted gh call: ${args.join(' ')}`);
+    if (answer.fail) throw new Error(answer.fail);
+    return answer.out ?? '';
+  };
+  return { calls, run };
+};
+
+const runJson = (status: string, conclusion: string | null, account: string | null) =>
+  JSON.stringify({ status, conclusion, account, createdAt: '2026-10-23T00:00:00Z' });
+const isRead = (args: string[]) => args[0] === 'api' && args[1] !== undefined && !args[1].startsWith('--method') && !args.includes('POST');
+const isCancel = (args: string[]) => args.includes('POST') && args.some(a => a.endsWith('/cancel'));
+
+test('AC03: an accepted cancel is recorded as confirmed with the provider account kept only as an external account', async () => {
+  const gh = scripted(
+    { match: isRead, out: runJson('in_progress', null, 'shared-bot') },
+    { match: isCancel, out: '' },
+  );
+  // The readback after the cancel: same scripted answer (a real provider would already report the cancellation).
+  const view = await createCompanyGithubGateway(gh.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' });
+  expect(view).toMatchObject({ confirmed: true, runStatus: 'in_progress', externalAccount: 'shared-bot' });
+  expect(gh.calls.filter(isCancel)).toHaveLength(1);
+  expect(gh.calls.filter(isRead).length).toBeGreaterThanOrEqual(1);
+});
+
+test('AC03: a run the provider does not know, or one already terminal, is a definite refusal — never an unknown', async () => {
+  const missing = scripted({ match: isRead, fail: 'HTTP 404: Not Found (gh api ...)' });
+  expect(await createCompanyGithubGateway(missing.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ refused: true });
+  expect(missing.calls.filter(isCancel)).toHaveLength(0);
+
+  const terminal = scripted({ match: isRead, out: runJson('completed', 'success', 'shared-bot') });
+  const refused = await createCompanyGithubGateway(terminal.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' });
+  expect(refused).toMatchObject({ refused: true });
+  if (!('refused' in refused)) throw new Error('expected a refusal');
+  expect(refused.reason).toContain('completed');
+  expect(terminal.calls.filter(isCancel)).toHaveLength(0);
+});
+
+test('AC03: an unreadable run or a failed cancel request is result_unknown, not a fabricated success', async () => {
+  const unreadable = scripted({ match: isRead, fail: 'dial tcp: connection refused' });
+  expect(await createCompanyGithubGateway(unreadable.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ confirmed: false });
+
+  const failedPost = scripted(
+    { match: isRead, out: runJson('in_progress', null, 'shared-bot') },
+    { match: isCancel, fail: 'HTTP 500' },
+  );
+  expect(await createCompanyGithubGateway(failedPost.run).cancelRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ confirmed: false });
+});
+
+test('AC03: reconciliation reads the provider as unknown_actor, and an absent run is a readable fact', async () => {
+  const gateway = createCompanyGithubGateway(scripted({ match: isRead, out: runJson('completed', 'cancelled', 'shared-bot') }).run);
+  expect(await gateway.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ readable: true, exists: true, runStatus: 'completed', externalAccount: 'shared-bot', attribution: 'unknown_actor' });
+
+  const absent = createCompanyGithubGateway(scripted({ match: isRead, fail: 'gh: Not Found (HTTP 404)' }).run);
+  expect(await absent.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ readable: true, exists: false, attribution: 'unknown_actor' });
+
+  const broken = createCompanyGithubGateway(scripted({ match: isRead, fail: 'network unreachable' }).run);
+  expect(await broken.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '42' }))
+    .toMatchObject({ readable: false });
+});
+
+test('AC03: a target without both repo and run id is refused before any provider call', async () => {
+  const gh = scripted({ match: () => true, out: '{}' });
+  const gateway = createCompanyGithubGateway(gh.run);
+  expect(await gateway.cancelRun({ provider: 'github', repo: '', runId: '42' })).toMatchObject({ confirmed: false });
+  expect(await gateway.observeRun({ provider: 'github', repo: 'surreal-ck/repo', runId: '' })).toMatchObject({ readable: false });
+  expect(gh.calls).toHaveLength(0);
+});

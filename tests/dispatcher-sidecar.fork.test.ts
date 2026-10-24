@@ -494,8 +494,8 @@ run('company fork: legacy authors without a recorded implementer wake the manage
 // SYS-DISP R7 (AC07): the bound implementer's session ends for good (archived). No manager is involved: the tick hands the
 // code to a live engineer of the same repository on its own, the audit row records the system actor, and the successor
 // delivers without a manager takeover. With nobody available the same block waits instead of assigning.
-run('company fork: an archived implementer is replaced by the system on its own, and the successor delivers', async () => {
-  const w = await startCompanyFork('auto-successor');
+for (const deletedDefinition of [false,true]) run(`company fork: a struck implementer is replaced and finishes (deleted definition=${deletedDefinition})`, async () => {
+  const w = await startCompanyFork(`auto-successor-${deletedDefinition}`);
   try {
     await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 1 });
     await w.wf.upsertDef('fixture-eng-grok', { role: 'engineering', provider: 'grok', model: 'fixture', maxInstances: 1 });
@@ -517,7 +517,13 @@ run('company fork: an archived implementer is replaced by the system on its own,
     w.agentRows.get(B.paseoAgentId!)!.status = 'idle';
     // A's session ends normally: Paseo reports it archived, the employee record stays while its task is open, and the
     // retirement gate refuses to drop the session (the task is bound to it).
-    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    if (deletedDefinition) {
+      // The old native definition is physically removed, but the open task still protects its employee history.
+      await w.wf.revokeLease(task.id,A.id,'fixture definition removed','Synthetic handover');
+      w.pool.dropLease(A.id,task.id);
+      await w.db.db.query('DELETE $def;',{def:new RecordId('employee_def','fixture-eng')});
+      w.agentRows.get(A.paseoAgentId!)!.status = 'idle';
+    } else w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
     const replaced = await w.tick();
     expect(replaced.refused).toContain(A.id);
     expect(replaced.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);

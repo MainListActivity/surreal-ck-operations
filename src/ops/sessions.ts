@@ -40,6 +40,8 @@ export class SessionStore {
 
   /** Sessions are private to the employee (instance) that opened them and to one project environment. */
   get(handle: unknown, employeeId: string, project: string, env: string): OpsSession {
+    // A missing handle is a caller mistake (often an empty argument list), not a lost session: say so.
+    if (typeof handle !== 'string' || !handle) throw new CompanyError('invalid', 'session is required: pass the "session" value returned by ops_login or ops_operator_login (were the call arguments empty?)');
     const session = typeof handle === 'string' ? this.sessions.get(handle) : undefined;
     if (!session || session.employeeId !== employeeId || session.project !== project || session.env !== env) {
       throw new CompanyError('not_found', 'unknown session; call ops_login first');

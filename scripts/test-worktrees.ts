@@ -63,6 +63,8 @@ try {
     'tests/deployment-source.fork.test.ts',
     'tests/input-bounds.integration.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
+    'tests/disposition.integration.fork.test.ts', 'tests/disposition-rollback-isolation.fork.test.ts',
+    'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/snapshot-quota.fork.test.ts',
     'tests/effective-policy.test.ts', 'tests/effective-policy.fork.test.ts',
     'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts', 'tests/independence-check.fork.test.ts',  ];

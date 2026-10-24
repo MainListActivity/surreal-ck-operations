@@ -956,6 +956,23 @@ export interface QaObservationTextSegment {
 export interface QaObservationSessionView { scope: QaObservationScopeView; code: string; expiresAt: string; /** The restricted read-only page path; the QA opens the preview LAN /q/ page. */ pagePath?: string; }
 export interface QaObservationLoginView { scope: QaObservationScopeView; token: string; expiresAt: string; }
 
+/**
+ * SYS03: the manager-disposition ledger's wire shapes. They are declared once in src/disposition.ts (the module that
+ * owns the episode claim, the business idempotency key and the notice/action records) and re-exported here so the tool
+ * layers (MCP, sidecar) and the core interface share one definition instead of three drifting copies.
+ */
+export type {
+  DispositionActionName, DispositionClaimInput, DispositionClaimOutcome, DispositionClaimView, DispositionDecideInput,
+  DispositionDecideOutcome, DispositionDecisionView, DispositionNoticeKind, DispositionPhase, DispositionRepairInput,
+  DispositionStatusInput, DispositionStatusView, ExternalActionRequestInput, ExternalActionView,
+  ExternalActionTarget, HolderNoticeView,
+} from './disposition.ts';
+import type {
+  DispositionClaimInput, DispositionClaimOutcome, DispositionClaimView, DispositionDecideInput, DispositionDecideOutcome,
+  DispositionPhase, DispositionStatusInput, DispositionStatusView, ExternalActionRequestInput, ExternalActionView,
+  HolderNoticeView,
+} from './disposition.ts';
+
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
@@ -1057,6 +1074,40 @@ export interface CompanyCore {
   qaObservationRead?(auth: QaObservationAuth, input: QaObservationReadInput): Promise<QaObservationReadView>;
   qaObservationTimeline?(auth: QaObservationAuth, input: QaObservationReadInput & { pageSize?: number; cursor?: string }): Promise<QaObservationTimelineView>;
   qaObservationText?(auth: QaObservationAuth, input: { scopeId?: string; taskId: string; field: 'context' | 'evidence'; auditId?: string; offset?: number; limit?: number; expectSha256?: string }): Promise<QaObservationTextSegment>;
+  /**
+   * SYS03 AC01: claim one blocking episode's disposition. The episode is task+phase+start, keyed by a deterministic id, so
+   * two managers claiming concurrently produce exactly one winner; the loser reads `already_handled` (with the decision) or
+   * `held_by_other` (with the holder). An expired lease is taken over only with an explicit `takeover` and the episode
+   * version the caller read. Optional for old adapters.
+   */
+  claimDisposition?(credential: Credential, input: DispositionClaimInput): Promise<DispositionClaimOutcome>;
+  /** SYS03 AC01/AC04: hand a claim back before its lease expires (episode becomes claimable again); audited and notified. */
+  releaseDisposition?(credential: Credential, input: { taskId: TaskId; phase: DispositionPhase; sinceMs: number; claimToken: string; reason: string }): Promise<DispositionClaimView>;
+  /** SYS03 AC01/AC04 read-only: the episode's current claim and decision, plus the task's newest decided episodes. */
+  dispositionStatus?(credential: Credential, input: DispositionStatusInput): Promise<DispositionStatusView>;
+  /**
+   * SYS03 AC02: one episode, one decision. resume/defer/dependency/retire/repair are recorded under an actor-independent
+   * business idempotency key and a CAS on the claim token, the episode version and the task version; the task change, its
+   * audit row and the notification outbox land in one transaction. Refused for a non-holder, an expired lease, a moved
+   * version or an already handled episode.
+   */
+  decideDisposition?(credential: Credential, input: DispositionDecideInput): Promise<DispositionDecideOutcome>;
+  /** SYS03 AC04: the caller's undelivered holder notices (persistent outbox); resend survives reconnect/restart. */
+  dispositionNotices?(credential: Credential, input?: { ids?: string[] }): Promise<HolderNoticeView[]>;
+  /** SYS03 AC04: delivery receipts. A failed delivery keeps the notice pending with its error; nothing is rolled back. */
+  ackDispositionNotices?(credential: Credential, input: { ids: string[]; error?: string }): Promise<{ delivered: number }>;
+  /**
+   * SYS03 AC03: the controlled entry point for a system-side external action (today: cancel a CI run). Records the real
+   * internal employee, the target run, the reason and the prerequisite task version; requested → result_unknown →
+   * confirmed, retried idempotently under one actionKey. The shared provider account is never recorded as the owner.
+   */
+  cancelCiRun?(credential: Credential, input: ExternalActionRequestInput): Promise<ExternalActionView>;
+  /** SYS03 AC03 read-only: reconcile provider-side run state against the action records; out-of-band changes become unknown_actor. */
+  reconcileCiRuns?(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }): Promise<{ checked: number; unknownActor: ExternalActionView[]; confirmed: ExternalActionView[]; unreadable: string[] }>;
+  /** SYS03 AC03: attach manager-supplied evidence to an unknown_actor record and name the real internal employee. */
+  attributeCiRun?(credential: Credential, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView>;
+  /** SYS03 AC03 read-only: the recorded external actions. */
+  listExternalActions?(credential: Credential, input?: { actionKey?: string; state?: string; limit?: number }): Promise<ExternalActionView[]>;
 
   listOutbox(credential: Credential, after?: string): Promise<OutboxEvent[]>;
   history(credential: Credential, taskId: TaskId): Promise<HistoryEntry[]>;

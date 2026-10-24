@@ -40,6 +40,8 @@ import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
+import { DispositionLedger, type DispositionApplier, type DispositionClaimInput, type DispositionClaimOutcome, type DispositionClaimView, type DispositionDecideInput, type DispositionDecideOutcome, type DispositionPhase, type DispositionStatusInput, type DispositionStatusView, type ExternalActionRequestInput, type ExternalActionView, type HolderNoticeView, type ExternalActionGateway } from './disposition.ts';
+import { createCompanyGithubGateway } from './external-actions.ts';
 import { validateExternalDependencies } from './input-bounds.ts';
 import { WorktreeRegistry, validateIntent, type RegistryOptions } from './dispatcher/worktree-registry.ts';
 import { goalRootBlockers, type DispatchVerdict, type GoalRootFacts, type GoalRootPeople, type GoalWorkflowWaitSummary } from './dispatcher/dispatch-blocked.ts';
@@ -550,9 +552,14 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter } }) {
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+    externalActions?: { gateway?: ExternalActionGateway } }) {
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
+    // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
+    // endpoint instead of the network, while production always gets the company's authenticated gh CLI.
+    this.externalActionsGateway = options?.externalActions?.gateway;
+
     this.contributionReadHook = options?.contributionReadHook;
     this.independenceReadHook = options?.independenceReadHook;
     const seconds = options?.leaseSeconds ?? DEFAULT_LEASE_SECONDS;
@@ -563,12 +570,17 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.checkpointLimit = options?.checkpointLimit ?? DEFAULT_CHECKPOINT_LIMIT;
     this.workforce = options?.workforce;
     this.owner = new OwnerDesk(database);
+    this.dispositions = new DispositionLedger(database);
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
     this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, releaseChannel: database.releaseChannel, observe: options?.snapshotObserve });
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
+  /** SYS03: the manager-disposition ledger (episode claims, decisions, holder notices, controlled external actions). */
+  private readonly dispositions: DispositionLedger;
+  /** SYS03: the controlled external-action exit, absent in production (the gh CLI is built then). */
+  private readonly externalActionsGateway?: ExternalActionGateway;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
   private readonly snapshots: SnapshotStore;
@@ -667,6 +679,17 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     return id('idempotency', HASH(`${actor}\0${action}\0${key}`));
   }
 
+  /**
+   * SYS03 AC02: a business-level idempotency identity, derived from the business key alone — no employee in the key.
+   * The actor-scoped idemId above answers "did THIS employee already send this?"; a repair chain or a disposition must
+   * answer "has this business operation already happened?", because a swapped employee, a restarted service or a
+   * replayed request would otherwise create a second one.
+   */
+  private businessIdemId(action: string, key: string): RecordId {
+    requireText(key, 'business idempotency key', 8, 200);
+    return id('idempotency', HASH(`business\0${action}\0${key}`));
+  }
+
   private async replay(ident: RecordId, payloadDigest: string): Promise<TaskView | undefined> {
     const prior = await this.db.select<IdempotencyRow>(ident);
     if (!prior) return undefined;
@@ -751,7 +774,11 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     return echoTask(await this.createTaskRecord(credential, input, { external: true }));
   }
 
-  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string } = {}): Promise<TaskView> {
+  /**
+   * `repairKey` (SYS03 AC02) switches the create's idempotency identity from the caller's employee to the business key,
+   * so the repair chain a disposition builds exists exactly once no matter which manager, session or replay asked for it.
+   */
+  private async createTaskRecord(credential: Credential, input: CreateTask, options: { external?: boolean; acceptanceChain?: string; repairKey?: string } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Task creation denied');
     // External create_task only: the raw list is bounded before de-duplication. Internal delivery
@@ -831,7 +858,9 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     if (input.goalId !== undefined) requireText(input.goalId, 'goal', 1, 100);
     const dependencies = [...new Set(input.dependencies ?? [])];
     if (input.revises !== undefined) return this.createRevision(actor, input, dependencies);
-    const idem = this.idemId(actor.employeeId, 'create', input.idempotencyKey);
+    const idem = options.repairKey === undefined
+      ? this.idemId(actor.employeeId, 'create', input.idempotencyKey)
+      : this.businessIdemId('create', options.repairKey);
     const digest = HASH(JSON.stringify({ ...input, dependencies }));
     const prior = await this.replay(idem, digest);
     if (prior) return prior;
@@ -3113,6 +3142,201 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       await this.worktrees.reclaimEvent(task.worktree.id, 'retire').catch(() => undefined);
     }
     return task;
+  }
+
+  // ------------------------------------------------------------------ SYS03 经理处置账本
+  // 经理对一个 blocking episode 的处置走这一组方法：先认领（episode 唯一、租约、版本），再带 CAS 与全局业务
+  // 幂等键决定，最后由持久 outbox 通知当前持有人。授权与既有通道同源：角色与能力仍由本类判定，处置动作本身
+  // 复用 resume/defer/retire/create 的既有状态机，不新增任何旁路写权。
+
+  /**
+   * The episode a task is currently blocked in must be the one being claimed: a manager may not claim, and therefore
+   * decide, an episode the task is no longer in. A task carries its open episode as phase + start (unix seconds); a
+   * task without one (never blocked, or already resumed) refuses every claim, which is how a late reminder to a
+   * decided episode is turned away.
+   */
+  private async requireOpenEpisode(taskId: TaskId, phase: DispositionPhase, sinceMs: number): Promise<TaskRow> {
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state !== 'blocked') throw new CompanyError('conflict', 'The task is not blocked; there is no episode to dispose of');
+    const openPhase = row.dispatch_blocked_phase === 'review' ? 'review' : row.dispatch_blocked_phase === 'execute' ? 'execute' : undefined;
+    if (openPhase !== undefined && openPhase !== phase) {
+      throw new CompanyError('conflict', `The open episode is in the ${openPhase} phase, not ${phase}`);
+    }
+    if (row.dispatch_blocked_since !== undefined && row.dispatch_blocked_since !== null) {
+      const openSince = row.dispatch_blocked_since * 1000;
+      // The task's open episode is newer than the one being claimed: this reminder is stale (the earlier episode is
+      // already over), so the claim is refused instead of handing a manager a disposed episode.
+      if (openSince > sinceMs) {
+        throw new CompanyError('conflict', 'A newer episode has already started on this task; the reminder is stale');
+      }
+    }
+    return row;
+  }
+
+  async claimDisposition(credential: Credential, input: DispositionClaimInput): Promise<DispositionClaimOutcome> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
+    await this.requireOpenEpisode(input.taskId, input.phase, input.sinceMs);
+    return this.dispositions.claim(actor, input);
+  }
+
+  async releaseDisposition(credential: Credential,
+    input: { taskId: TaskId; phase: DispositionPhase; sinceMs: number; claimToken: string; reason: string }): Promise<DispositionClaimView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
+    return this.dispositions.release(actor, input);
+  }
+
+  async dispositionStatus(credential: Credential, input: DispositionStatusInput): Promise<DispositionStatusView> {
+    const actor = await this.authorized(credential);
+    // Managers read the episode's outcome (that is the whole point of a stale snapshot being repairable), and so does
+    // anyone who is a party of the task; only the holder ever receives the claim token.
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const manager = actor.role === 'gm' || actor.role === 'product';
+    if (!manager && actor.role !== row.executor_role && actor.role !== row.reviewer_role && row.current_employee !== actor.employeeId) {
+      throw new CompanyError('forbidden', 'Task access denied');
+    }
+    return this.dispositions.status(actor, input);
+  }
+
+  /**
+   * A decided episode needs a manager's decision to still be worth a session: the claim's role gate mirrors the action's
+   * own gate (resume/defer/repair are gm work; retire is gm/product work), and the delegated record methods re-check it in
+   * their transactions, so a claim never widens anyone's authority over the task.
+   */
+  async decideDisposition(credential: Credential, input: DispositionDecideInput): Promise<DispositionDecideOutcome> {
+    const actor = await this.authorized(credential, 'manage');
+    const manager = actor.role === 'gm' || actor.role === 'product';
+    if (!manager) throw new CompanyError('forbidden', 'Manager disposition requires the gm or product role');
+    if (input.action !== 'retire' && actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may resume, defer, wait on dependencies or build a repair chain');
+    return this.dispositions.decide(actor, input, this.dispositionApplier(credential));
+  }
+
+  async dispositionNotices(credential: Credential, input?: { ids?: string[] }): Promise<HolderNoticeView[]> {
+    const actor = await this.authorized(credential);
+    const pending = await this.dispositions.noticesFor(actor.employeeId);
+    return input?.ids ? pending.filter(notice => input.ids!.includes(notice.noticeKey)) : pending;
+  }
+
+  async ackDispositionNotices(credential: Credential, input: { ids: string[]; error?: string }): Promise<{ delivered: number }> {
+    const actor = await this.authorized(credential);
+    if (!Array.isArray(input.ids) || input.ids.length === 0 || input.ids.length > 100) throw new CompanyError('invalid', 'ids must hold 1-100 notice keys');
+    const mine = new Set((await this.dispositions.noticesFor(actor.employeeId, 200)).map(notice => notice.noticeKey));
+    // Only the holder's own notices can be acknowledged: a leaked key must not let another employee mark anyone's notice delivered.
+    const owned = input.ids.filter(key => mine.has(key));
+    if (owned.length !== input.ids.length) throw new CompanyError('forbidden', 'Notices may only be acknowledged by their holder');
+    return { delivered: await this.dispositions.markNotices(owned, { agent: actor.employeeId, error: input.error }) };
+  }
+
+  /**
+   * The controlled external-action entry point for employees (AC03): the run may be cancelled by a manager, or by the
+   * employee who holds, implemented or submitted the task the run belongs to — the same people the existing owner
+   * channel already lets report on that task. Anyone outside that set is refused here, and the record keeps the real
+   * internal employee id; the shared provider account is never recorded as a person.
+   */
+  async cancelCiRun(credential: Credential, input: ExternalActionRequestInput): Promise<ExternalActionView> {
+    const actor = await this.authorized(credential);
+    return this.dispositions.requestExternalAction(actor, input, this.externalActionGateway(), async prerequisite => {
+      if (actor.role === 'gm' || actor.role === 'product') return;
+      if (!prerequisite) throw new CompanyError('forbidden', 'Cancelling a CI run requires manager capability or the task the run belongs to');
+      const task = await this.db.select<TaskRow>(id('task', prerequisite.taskId));
+      if (!task) throw new CompanyError('not_found', 'Prerequisite task not found');
+      const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
+        task.submitted_by === actor.employeeId || actor.role === task.executor_role || actor.role === task.reviewer_role;
+      if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
+    });
+  }
+
+  async reconcileCiRuns(credential: Credential, input: { runs: Array<{ repo: string; runId: string }> }) {
+    const actor = await this.authorized(credential);
+    if (!Array.isArray(input.runs) || input.runs.length === 0 || input.runs.length > 50) throw new CompanyError('invalid', 'runs must hold 1-50 entries');
+    return this.dispositions.reconcileExternalActions(actor, input, this.externalActionGateway());
+  }
+
+  async attributeCiRun(credential: Credential, input: { actionKey: string; employeeId: string; evidence: string }): Promise<ExternalActionView> {
+    // Attribution is a manager judgement on a real person's record: gm only, and never a fabricated internal owner.
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Attributing an out-of-band external action requires gm');
+    return this.dispositions.attributeExternalAction(actor, input);
+  }
+
+  async listExternalActions(credential: Credential, input?: { actionKey?: string; state?: string; limit?: number }): Promise<ExternalActionView[]> {
+    const actor = await this.authorized(credential);
+    if (actor.role !== 'gm' && actor.role !== 'product') {
+      // A non-manager sees only the actions it requested itself, never other employees' records.
+      const [rows] = await this.db.query<[Array<Record<string, unknown>>]>(
+        'SELECT * FROM external_action WHERE requested_by = $me ORDER BY created_at DESC LIMIT $limit;',
+        { me: actor.employeeId, limit: input?.limit ?? 20 });
+      return rows.map(row => this.dispositions.externalViewOf(row));
+    }
+    return this.dispositions.externalActions(input ?? {});
+  }
+
+  /** The controlled external exit. One implementation today: the company's authenticated `gh` CLI, injected for tests. */
+  private externalActionGateway(): ExternalActionGateway {
+    return this.externalActionsGateway ?? createCompanyGithubGateway();
+  }
+
+  /**
+   * The disposition applier: the ledger decides WHO and WHEN, the existing state machine decides HOW. Every call goes
+   * through the same record methods the manager tools use (with the manager's own credential), so leases, fences,
+   * owner gates, independence, audit and outbox behave exactly as they do on the direct tools — and the idempotency key
+   * is derived from the disposition's business key, so a replay or an employee change reads the same row instead of
+   * writing a second one.
+   */
+  private dispositionApplier(credential: Credential): DispositionApplier {
+    const withKey = (text: string, businessKey: string) => `${text}\n[disposition] business_key=${businessKey}`;
+    return {
+      resume: async ({ taskId, text, idempotencyKey }) => {
+        const row = await this.resumeRecord(credential, taskId, { text: withKey(text, idempotencyKey), idempotencyKey });
+        return { taskVersion: row.version, state: row.state };
+      },
+      defer: async ({ taskId, text, dependencies, expectedTaskVersion, idempotencyKey }) => {
+        const row = await this.deferTaskUntilRecord(credential, {
+          taskId, dependencies, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
+        });
+        return { taskVersion: row.version, state: row.state };
+      },
+      retire: async ({ taskId, text, expectedTaskVersion, idempotencyKey }) => {
+        const row = await this.retireTaskRecord(credential, {
+          taskId, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
+        });
+        return { taskVersion: row.version, state: row.state };
+      },
+      repair: async ({ repairKey, taskId, text, expectedTaskVersion, repair }) => {
+        const created = await this.createTaskRecord(credential, {
+          title: repair.title,
+          context: `${repair.context}\n\n[来源] episode 处置 ${repairKey}；原任务 ${taskId}；处置说明：${text}`,
+          executorRole: repair.executorRole as Role,
+          reviewerRole: repair.reviewerRole as ReviewerRole,
+          dependencies: repair.dependencies,
+          discipline: repair.discipline,
+          goalId: repair.goalId,
+          project: repair.project,
+          workIntent: repair.workIntent,
+          idempotencyKey: `disposition-repair:${repairKey}`,
+        }, { repairKey });
+        // 原任务在本决定里换一种等待：门禁解除，改为等修复链。这样原 episode 真的结束了——旧版（不认识处置账本）
+        // 读到的也是一个"等待中"的任务，而不是一个还在门禁里的任务，回滚后不会再为它拉起经理（RB01）。
+        // 只有仍挂在 gm 门禁上的原任务能这样改（defer 的既有前置条件）；owner 门禁、review 门禁或已终态的任务保持原样，
+        // 决定结果如实记下它当时的状态，绝不假装改过。
+        const [source] = await this.db.query<[{ state?: string; blocked_to?: string; version?: number } | undefined]>(
+          'SELECT state, blocked_to, version FROM ONLY $t;', { t: id('task', taskId) });
+        if (source?.state === 'blocked' && source.blocked_to === 'gm') {
+          const deferred = await this.deferTaskUntilRecord(credential, {
+            taskId,
+            dependencies: [created.id],
+            text: withKey(`已建修复链 ${created.id}，原任务改为等待该修复完成后再继续`, `source:${repairKey}`),
+            idempotencyKey: `disposition-source:${repairKey}`,
+            expectedVersion: expectedTaskVersion,
+          });
+          return { taskId: created.id, sourceTaskVersion: deferred.version, sourceState: deferred.state };
+        }
+        return { taskId: created.id, sourceTaskVersion: source?.version, sourceState: source?.state };
+      },
+    };
   }
 
   /**

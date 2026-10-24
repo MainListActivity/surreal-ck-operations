@@ -89,7 +89,7 @@
 
 这样做的理由：新旧版本共用一个命名空间时，回滚后的旧 release 必须能安全读到新代码写下的行。旧版的派工读法是"state ∈ {ready, doing} 的执行 / review 的评审，且没有持有人"——它的候选集里本来就没有 `blocked`，`current_employee` / `lease_expires_at` 又被隔离清空，所以隔离过的任务**在任何一轮里都不会被旧版误派**；等待（`blocked_to=gm/owner`）、关口、需修的任务同理，不会被领走。
 
-`tests/rollback-isolation-policy.fork.test.ts` 在隔离 fork 库上彩排了这条链路：旧 release 先建库，新代码升到 034 并收权 + 隔离，随后连派三轮（旧版直接读 / 旧版 bootstrap 之后 / 旧版逐个试领之后）——受保护的 6 个任务零命中，而冻结之后新建的对照任务一直可派（证明这三轮不是空转）；6 次旧版领取全部被拒且行内容不变。
+`tests/rollback-isolation-policy.fork.test.ts` 在隔离 fork 库上彩排了这条链路：旧 release 先建库，新代码升到 035 并收权 + 隔离，随后连派三轮（旧版直接读 / 旧版 bootstrap 之后 / 旧版逐个试领之后）——受保护的 6 个任务零命中，而冻结之后新建的对照任务一直可派（证明这三轮不是空转）；6 次旧版领取全部被拒且行内容不变。
 
 ## 一处刻意的不对称
 

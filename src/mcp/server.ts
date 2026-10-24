@@ -4,6 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createMcpHandler, hostHeaderValidationResponse, McpServer, originValidationResponse } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 import type { CompanyCore, Credential, Evidence, LeaseProof, TaskView } from '../contracts';
+import { CompanyError } from '../core-errors';
 import { REQUIRED_TRACKS } from '../core';
 import { ROLES } from '../contracts';
 import type { Role } from '../contracts';
@@ -450,6 +451,148 @@ function registerTools(server: McpServer, core: CompanyCore) {
       expectedVersion: z.number().int().positive().optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.retireTask(token(ctx), input)));
+
+  server.registerTool('claim_disposition', {
+    description: 'Manager (gm/product, manage) only: take this blocking episode\'s disposition claim. The episode is task + phase + start (sinceMs = the episode start in milliseconds; a gm-blocked task carries it as dispatchBlockedSince seconds in get_context, a manager todo as its episode). Exactly one manager wins: a second claim answers already_handled (with the decision that closed it) or held_by_other (with the holder and lease), never a second disposition. takeover true takes over an EXPIRED lease and requires expectedEpisodeVersion. Nothing is written to the task by claiming.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      phase: z.enum(['execute', 'review']),
+      sinceMs: z.number().int().min(0),
+      reason: z.string().min(4).max(2000),
+      leaseSeconds: z.number().int().min(30).max(86400).nullish(),
+      takeover: z.boolean().nullish(),
+      expectedEpisodeVersion: z.number().int().positive().nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.claimDisposition
+    ? core.claimDisposition(token(ctx), {
+      taskId: input.taskId, phase: input.phase, sinceMs: input.sinceMs, reason: input.reason,
+      leaseSeconds: input.leaseSeconds ?? undefined, takeover: input.takeover ?? undefined,
+      expectedEpisodeVersion: input.expectedEpisodeVersion ?? undefined,
+    })
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('release_disposition', {
+    description: 'Manager: hand a disposition claim back before its lease expires (the episode becomes claimable again immediately instead of waiting for the lease, and the episode version rises). Needs the claim token from claim_disposition; only the holder may release. Audited.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      phase: z.enum(['execute', 'review']),
+      sinceMs: z.number().int().min(0),
+      claimToken: z.string().min(8).max(200),
+      reason: z.string().min(4).max(2000),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.releaseDisposition
+    ? core.releaseDisposition(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('disposition_status', {
+    description: 'Read-only: what happened to a blocking episode. Returns the newest episode\'s claim (status claimed/decided, holder, lease, episodeVersion), the decision if any (action, businessKey, the actor, the task version it landed on and the repair task it built), the episode history for the task, whether the task still has an open episode, and how many holder notices are undelivered. A manager whose snapshot is stale reads the new decision here instead of acting on the old reminder. The claim token is returned only to the holder.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      phase: z.enum(['execute', 'review']).nullish(),
+      sinceMs: z.number().int().min(0).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.dispositionStatus
+    ? core.dispositionStatus(token(ctx), { taskId: input.taskId, phase: input.phase ?? undefined, sinceMs: input.sinceMs ?? undefined })
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('decide_disposition', {
+    description: 'Manager: one episode, one decision. Records resume, defer, dependency (adds the dependencies), retire or repair (builds the repair task) behind a compare-and-set on the claim token + episodeVersion + expectedVersion (the task version you read) and an actor-independent business idempotency key, so twenty concurrent requests, a swapped employee, a restart or a replayed response all read ONE disposition and ONE repair chain. Refused for a non-holder, an expired lease, a moved version and an already handled episode; the task change, its audit row and the notification outbox land in one transaction. Requires the claim token from claim_disposition.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      phase: z.enum(['execute', 'review']),
+      sinceMs: z.number().int().min(0),
+      claimToken: z.string().min(8).max(200),
+      episodeVersion: z.number().int().positive(),
+      action: z.enum(['resume', 'defer', 'dependency', 'retire', 'repair']),
+      expectedVersion: z.number().int().positive(),
+      text: z.string().min(4).max(8000),
+      dependencies: z.array(z.string().min(1).max(200)).max(20).nullish(),
+      repair: z.object({
+        title: z.string().min(3).max(200),
+        context: z.string().min(1).max(20_000),
+        executorRole: z.string().min(1).max(60),
+        reviewerRole: z.string().min(1).max(60),
+        dependencies: z.array(z.string().min(1).max(200)).max(20).nullish(),
+        discipline: z.string().min(1).max(60).nullish(),
+        goalId: z.string().min(1).max(100).nullish(),
+        project: z.string().min(1).max(60).nullish(),
+        workIntent: z.object({
+          kind: z.enum(['read', 'code', 'assets']),
+          paths: z.array(z.string().min(1).max(4096)).max(50).nullish(),
+          lane: z.string().min(1).max(200).nullish(),
+        }).nullish(),
+      }).nullish(),
+      businessKey: z.string().min(8).max(200).nullish(),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.decideDisposition
+    ? core.decideDisposition(token(ctx), input as never)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('holder_notices', {
+    description: 'The authenticated employee\'s own undelivered notices from the persistent outbox: a disposition decided on a task they hold (resumed / dependency wait / decided), a claim taken over or released, an external action whose result is unknown. They survive a channel reconnect or a plugin restart and are deduplicated by episode+kind+version. ack true marks the listed ids delivered (ids are the noticeKey values); a delivery failure is recorded as error on the notice and keeps it pending, and never rolls back a decision. Tools naming the same decision return it again.',
+    inputSchema: z.object({
+      ids: z.array(z.string().min(1).max(200)).max(100).nullish(),
+      ack: z.boolean().nullish(),
+      error: z.string().min(1).max(2000).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), async () => {
+    if (!core.dispositionNotices) throw new CompanyError('temporarily_unavailable', 'core does not expose holder_notices');
+    const pending = await core.dispositionNotices(token(ctx), input.ids ? { ids: input.ids } : undefined);
+    if (input.ack !== true) return { notices: pending };
+    if (!input.ids?.length) throw new CompanyError('invalid', 'ack requires the ids of the notices being acknowledged');
+    if (!core.ackDispositionNotices) throw new CompanyError('temporarily_unavailable', 'core does not expose holder_notices');
+    const receipt = await core.ackDispositionNotices(token(ctx), { ids: input.ids, error: input.error ?? undefined });
+    return { notices: pending, receipt };
+  }));
+
+  server.registerTool('cancel_ci_run', {
+    description: 'The controlled entry point for cancelling a CI run (AC03): a manager, or a party of the task the run belongs to (its executor/reviewer role, holder, implementer or submitter), asks through this proxy instead of calling gh by hand. Records the real internal employee, the target run, the reason and the prerequisite task version it read (prerequisiteTaskId + prerequisiteVersion, compare-and-set), then: state confirmed with the provider\'s answer, refused when the provider definitely will not cancel (no such run, already finished), or result_unknown when the outcome cannot be judged. Retry with the same actionKey is idempotent and never fires a second real cancel. The shared GitHub account is recorded as the external account, never as a person.',
+    inputSchema: z.object({
+      runId: z.string().min(1).max(100),
+      repo: z.string().min(1).max(200),
+      reason: z.string().min(8).max(2000),
+      actionKey: z.string().min(8).max(200),
+      prerequisiteTaskId: z.string().min(1).max(200).nullish(),
+      prerequisiteVersion: z.number().int().positive().nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.cancelCiRun
+    ? core.cancelCiRun(token(ctx), {
+      kind: 'ci-run-cancel', runId: input.runId, repo: input.repo, reason: input.reason, actionKey: input.actionKey,
+      prerequisiteTaskId: input.prerequisiteTaskId ?? undefined, prerequisiteVersion: input.prerequisiteVersion ?? undefined,
+    })
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('reconcile_ci_runs', {
+    description: 'Read-only reconciliation of provider-side CI run state against the recorded controlled actions (AC03). For each run it reads what the provider says now; a run whose external change none of our records asked for is written as an out-of-band record with attribution unknown_actor and a null requester, never as an internal employee. A run nobody requested cannot be made to look like an internal action by this tool. Unreadable runs are named in `unreadable` instead of guessed at.',
+    inputSchema: z.object({
+      runs: z.array(z.object({ repo: z.string().min(1).max(200), runId: z.string().min(1).max(100) })).min(1).max(50),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.reconcileCiRuns
+    ? core.reconcileCiRuns(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('attribute_ci_run', {
+    description: 'gm only: attach manager-supplied evidence to an out-of-band external action and name the real internal employee it is attributed to (attribute_ci_run is never called by the person being attributed). Requires an evidence text of at least 20 characters, kept verbatim on the record and in the audit row; until then the record stays unknown_actor. Never converts an unknown actor into an internal one without evidence.',
+    inputSchema: z.object({
+      actionKey: z.string().min(8).max(200),
+      employeeId: z.string().min(1).max(200),
+      evidence: z.string().min(20).max(4000),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.attributeCiRun
+    ? core.attributeCiRun(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('list_external_actions', {
+    description: 'Read-only: the recorded controlled external actions with their state (requested / result_unknown / confirmed / refused), the real internal requester, the provider account, the prerequisite task and version, and the attribution (internal_employee or unknown_actor with its evidence). A manager reads every record; anyone else reads only the actions they requested themselves.',
+    inputSchema: z.object({
+      actionKey: z.string().min(1).max(200).nullish(),
+      state: z.enum(['requested', 'result_unknown', 'confirmed', 'refused']).nullish(),
+      limit: z.number().int().min(1).max(200).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.listExternalActions
+    ? core.listExternalActions(token(ctx), { actionKey: input.actionKey ?? undefined, state: input.state ?? undefined, limit: input.limit ?? undefined })
+    : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_acceptance_preview', {
     description: 'gm only (manage): read-only dry-run for repointing a quick/software goal whose manual/acceptance reference still points at an erroneously voided acceptance task. Returns the live references, the unfinished goal work, the candidate checks and the snapshot hash that goal_acceptance_repair must echo. Writes nothing.',

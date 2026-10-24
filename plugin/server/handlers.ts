@@ -1,3 +1,4 @@
+import { factoryFirst } from './vendor/src/dispatcher/provider-order.ts';
 import { basename, join } from "node:path";
 import { realpathSync } from "node:fs";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -180,16 +181,22 @@ export function registerHandlers(server: PluginServerContext): void {
 
   ownerHandle(rpc.modelRanking, async () => {
     const ctx = await company();
-    const { rankingSettings } = await import("./vendor/src/model-routing/ranking.ts");
+    const { rankingSettings, rankingRequests } = await import("./vendor/src/model-routing/ranking.ts");
     const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
     const settings = await rankingSettings(ctx.db.db);
     const [status] = await ctx.db.db.query<[{at?:Date;error?:string;orders?:Record<string,string[]>}|undefined]>("SELECT at,error,orders FROM ONLY company_meta:model_ranking;");
-    return {...settings,configured:!!jevFromEnv(),at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
+    return {...settings,requests:await rankingRequests(ctx.db.db),configured:!!jevFromEnv(),at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
   });
   ownerHandle(rpc.saveModelRanking, async (input: RpcInput<typeof rpc.saveModelRanking>) => {
     const ctx = await company();
     const { saveRankingSettings } = await import("./vendor/src/model-routing/ranking.ts");
     await saveRankingSettings(ctx.db.db,input,ctx.modelRanking);
+    return {ok:true};
+  });
+
+  ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
+  ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
+    await (await company()).modelRouting.setAlias(input.model, input.slug);
     return {ok:true};
   });
 
@@ -216,7 +223,7 @@ export function registerHandlers(server: PluginServerContext): void {
     // query order (weight DESC, priority, id) still decides.
     const liveDefIds = new Set(insts.map(i => i.def));
     const defRank = (d: { id: string; enabled: boolean }) => d.enabled ? (liveDefIds.has(d.id) ? 0 : 1) : 2;
-    const orderedDefs = [...defs].sort((a, b) => defRank(a) - defRank(b));
+    const orderedDefs = factoryFirst([...defs].sort((a, b) => defRank(a) - defRank(b)));
     const healthView = providerHealthView(health, Math.floor(Date.now() / 1000));
     const entriesView = (entries: import("./vendor/src/dispatcher/dispatcher").StaffingEntry[]) =>
       entries.map(e => ({ kind: e.kind, ref: e.ref, weight: e.weight, share: e.share,

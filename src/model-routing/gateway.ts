@@ -42,6 +42,8 @@ export interface GatewayDeps {
   fetchImpl?: typeof fetch;
 }
 export const ROUTING_PORT = 18779;
+/** What magpie's /v1/models declares for every sck-* group. */
+export const GROUP_CONTEXT_TOKENS = 1048576;
 /** Project-local settings override a user's global settings.env without changing their personal sessions. */
 export function installRoutingSettings(
   comm: string,
@@ -88,11 +90,7 @@ export function restoreRoutingSettings(comm: string): boolean {
     )
   )
     return false;
-  for (const key of [
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-  ]) {
+  for (const key of Object.keys(routingEnv(""))) {
     if (Object.hasOwn(before.env, key)) settings.env[key] = before.env[key];
     else delete settings.env[key];
   }
@@ -116,6 +114,9 @@ export function routingEnv(
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/a/${encodeURIComponent(agent)}`,
     ANTHROPIC_AUTH_TOKEN: "magpie-claude",
     ANTHROPIC_API_KEY: "",
+    // Claude Code knows no group/sck-* id and falls back to a 200k window, which caps
+    // CLAUDE_CODE_AUTO_COMPACT_WINDOW and compacts at ~167k. Declare magpie's group window.
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(GROUP_CONTEXT_TOKENS),
   };
 }
 /** Loopback only. Fixed upstream, fixed paths, no forwarded credentials, no request/response bodies stored. */
