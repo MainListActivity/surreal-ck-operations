@@ -35,7 +35,7 @@ import {
   dispatchVerdict, domainOfPayload, domainPayload, normalizePayload, policyActiveAt, policyHash, renderContract, resolveEffective,
   checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
 } from './policy.ts';
-import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, type PolicyDbRow } from './policy-store.ts';
+import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, scanInFlightTasks, type PolicyDbRow } from './policy-store.ts';
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -3754,12 +3754,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     };
     const projected = rows.map(row => row.id === target?.id ? { ...row, status: 'superseded' as PolicyStatus, supersededBy: synthetic.id } : row);
     const after = resolveEffective([...projected, synthetic], chain, epoch + 1, now);
-    const [candidates] = await this.db.query<[Array<TaskRow & { goal_project?: RecordId }>]>(
-      `SELECT *, goal.project AS goal_project
-       FROM task WHERE state NOT IN ['done', 'void'] AND policy_hash != NONE
-       ORDER BY created_at DESC LIMIT 200;`);
+    // 候选集与派工/领取判定同源（R1）：判定侧对所有在办任务跑 dispatchVerdict，这里就不能按 policy_hash 预筛——
+    // 上线前既存、没有策略登记的任务正是最需要被列出来的那批。分页读到底，读满上限时在视图里显式报告截断。
+    const scan = await scanInFlightTasks<TaskRow & { goal_project?: RecordId }>(this.db);
     const affectedTasks: PolicyPlanView['affectedTasks'] = [];
-    for (const row of candidates ?? []) {
+    for (const row of scan.rows) {
       const task = view(row);
       const taskChain = this.chainOfRow(row);
       const next = resolveEffective([...projected, synthetic], taskChain, epoch + 1, now);
@@ -3777,7 +3776,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     const diff = contractDiff(before, after);
     const planHash = HASH(JSON.stringify({ epoch, after: after.hash, affected: affectedTasks.map(t => `${t.id}:${t.toHash}`).sort() }));
-    return { scopeChain: chain, before, after, diff, affectedTasks, planHash };
+    return { scopeChain: chain, before, after, diff, affectedTasks, scanned: scan.scanned, scanLimit: scan.scanLimit,
+      truncated: scan.truncated, planHash };
   }
 
   /**

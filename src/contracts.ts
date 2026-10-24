@@ -1375,6 +1375,10 @@ export interface PolicyPlanView {
   affectedTasks: Array<{ id: TaskId; title: string; state: TaskState; currentEmployee?: EmployeeId; fromHash?: string; toHash: string; losesAuthorization: boolean;
     /** 会拦下它的原因（与派工/领取的拒绝理由同源）；losesAuthorization=false 时省略。 */
     reason?: string }>;
+  /** 候选集扫描的事实（SYS06 R1）：扫了多少在办任务、上限是多少。截断绝不静默——`truncated=true` 时这份清单不完整。 */
+  scanned: number;
+  scanLimit: number;
+  truncated: boolean;
   /** 试算结果落在当前生效 epoch 上的指纹：执行时用它做 CAS，防止按旧试算执行新策略。 */
   planHash: string;
 }

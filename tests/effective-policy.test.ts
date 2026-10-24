@@ -8,6 +8,7 @@ import {
   domainOfPayload, domainPayload, impliedIntent, normalizePayload, policyActiveAt, policyDigest, policyHash, renderContract,
   resolveEffective, type EffectiveContract, type PolicyRow, type PolicyScopeLink,
 } from '../src/policy.ts';
+import { scanInFlightTasks } from '../src/policy-store.ts';
 
 const chain = (over: Partial<Record<'task' | 'goal' | 'project', string>> = {}): PolicyScopeLink[] => [
   ...(over.task ? [{ scope: 'task' as const, scopeRef: over.task }] : []),
@@ -262,5 +263,54 @@ describe('渲染与差异', () => {
     expect(diff[0]?.after).toContain('w v2');
     expect(contractDiff(after, after)).toEqual([]);
     expect(renderContract(resolveEffective([], chain(), 3, 100))).toContain('无机器策略生效');
+  });
+});
+describe('R1 候选集扫描：与判定同源、分页读到底、截断显式', () => {
+  /** 假 DB：按 SQL 里的 LIMIT/START 在给定数组上真做分页，这样"分页"是被执行出来的，不是被断言的。 */
+  const pagingDb = (rows: Array<{ id: string }>) => {
+    const queries: string[] = [];
+    return {
+      queries,
+      db: {
+        async query<T>(sql: string): Promise<T> {
+          queries.push(sql);
+          const match = /LIMIT (\d+) START (\d+)/.exec(sql);
+          if (!match) throw new Error(`scan did not page: ${sql}`);
+          const [, size, start] = match;
+          return [rows.slice(Number(start), Number(start) + Number(size))] as T;
+        },
+      },
+    };
+  };
+
+  test('读到底：跨页取回全部在办任务，一条都不丢', async () => {
+    const all = Array.from({ length: 5 }, (_, index) => ({ id: `task-${index}` }));
+    const { db, queries } = pagingDb(all);
+    const scan = await scanInFlightTasks<{ id: string }>(db, 2, 10);
+    expect(scan.rows.map(row => row.id)).toEqual(all.map(row => row.id));
+    expect(scan.scanned).toBe(5);
+    expect(scan.truncated).toBe(false);
+    expect(scan.scanLimit).toBe(20);
+    // 三页：0/2/4，最后一页不满 → 停止；没有"读满一页就当读完"。
+    expect(queries).toHaveLength(3);
+  });
+
+  test('读满上限：显式报告 truncated，绝不静默截断', async () => {
+    const all = Array.from({ length: 9 }, (_, index) => ({ id: `task-${index}` }));
+    const { db, queries } = pagingDb(all);
+    const scan = await scanInFlightTasks<{ id: string }>(db, 2, 2);
+    expect(scan.scanned).toBe(4);
+    expect(scan.scanLimit).toBe(4);
+    expect(scan.truncated).toBe(true);
+    expect(queries).toHaveLength(2);
+  });
+
+  test('候选集没有 policy_hash 预筛：SQL 里既没有该条件，也没有隐式上限', async () => {
+    const { db, queries } = pagingDb([]);
+    await scanInFlightTasks(db, 200, 50);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).not.toContain('policy_hash');
+    expect(queries[0]).toContain("state NOT IN ['done', 'void']");
+    expect(queries[0]).toContain('LIMIT 200 START 0');
   });
 });

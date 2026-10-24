@@ -13,6 +13,7 @@ components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/release-content.sh"
 . "$(dirname "$0")/review-wait-guard.sh"
 . "$(dirname "$0")/independence-guard.sh"
+. "$(dirname "$0")/policy-guard.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -114,6 +115,12 @@ case "$action" in
     # plugin repoint, the MCP restart or release pruning. No zero-row exception either: "no policy today" would race
     # a policy write, and would miss the data that already holds one.
     independence_target_supported "$release" || { independence_refuse "$release"; exit 1; }
+    # SYS06 C1: the same rule for the versioned machine policy. Production data may already carry policy rows, task
+    # policy_*/lease_policy_* registrations and tasks quarantined as blocked+blocked_to=gm, so a target that does not
+    # execute the layer would dispatch what the current contract no longer authorises. Refused here, before the bin
+    # copies, the active symlink, the plugin repoint, the MCP restart or release pruning. No zero-row exception either:
+    # "no policy today" would race a policy write, and would miss the data that already holds one.
+    policy_target_supported "$release" || { policy_refuse "$release"; exit 1; }
     check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     check_gate sidecar-review "$sha" || {

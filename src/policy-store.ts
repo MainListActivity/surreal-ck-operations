@@ -101,3 +101,33 @@ export async function readTaskPolicyRow(db: PolicyStore, taskId: string): Promis
     `SELECT *, goal.project AS goal_project FROM ONLY type::record('task', $task);`, { task: taskId });
   return row ?? undefined;
 }
+
+/** 试算每页读多少行、最多读多少页；上限只在视图里以 `truncated` 显式报告，绝不静默丢任务。 */
+export const POLICY_PLAN_SCAN_PAGE = 200;
+export const POLICY_PLAN_SCAN_MAX_PAGES = 50;
+
+export interface PolicyCandidateScan<T> { rows: T[]; scanned: number; scanLimit: number; truncated: boolean }
+
+/**
+ * 在办任务的全量扫描（SYS06 R1）：判定侧（dispatchVerdict 的调用点）从不按 policy_hash 过滤，候选集也必须一样——
+ * 上线前既存、没有策略登记（policy_hash = NONE）的在办任务正是一次策略变更里最需要被看见的那批。
+ * 分页读到底（created_at DESC, id DESC 是全序，页间不会重复或漏行）；真的读满上限就返回 `truncated: true`，
+ * 由调用者在视图里显式报告，哪里都没有"读满 200 条就当读完了"。
+ */
+export async function scanInFlightTasks<T>(db: PolicyStore, page = POLICY_PLAN_SCAN_PAGE,
+  maxPages = POLICY_PLAN_SCAN_MAX_PAGES): Promise<PolicyCandidateScan<T>> {
+  const size = Math.max(1, Math.floor(page));
+  const pages = Math.max(1, Math.floor(maxPages));
+  const rows: T[] = [];
+  let truncated = false;
+  for (let index = 0; index < pages; index++) {
+    const [batch] = await db.query<[T[]]>(
+      `SELECT *, goal.project AS goal_project FROM task WHERE state NOT IN ['done', 'void']
+       ORDER BY created_at DESC, id DESC LIMIT ${size} START ${index * size};`);
+    const got = batch ?? [];
+    rows.push(...got);
+    if (got.length < size) break;
+    if (index === pages - 1) truncated = true;
+  }
+  return { rows, scanned: rows.length, scanLimit: size * pages, truncated };
+}

@@ -66,10 +66,10 @@
 | `policy_revoke` | `gm` / `product` | 紧急撤销：立即停止授权，历史保留撤销原因与撤销人 |
 | `policy_list` | `manage` 能力 + `gm`/`product` | 按作用域/域列出；默认只列当前生效版本，`includeInactive` 看历史 |
 | `policy_effective` | `manage` + `gm`/`product`（带 `taskId` 时该任务的执行岗/评审岗与 `qa`/`eval` 也读得到自己那份） | 当前有效契约 + 作用域链 + 人读 `rendered` + `notes`（到期/被替代/被撤销的当前事实） |
-| `policy_plan` | `gm` / `product` | 试算：差异前后版本、受影响任务与它为什么失去授权；**不写库** |
+| `policy_plan` | `gm` / `product` | 试算：差异前后版本、受影响任务与它为什么失去授权；**不写库**。候选集与派工/领取判定同源——扫的是**全部在办任务**，不按 `policy_hash` 预筛，所以策略层上线前既存、没有登记的任务也会被列出来；分页读到底，读满上限时在视图里显式给 `scanned` / `scanLimit` / `truncated`，不静默丢任务 |
 | `policy_enforce` | `gm` / `product` | 隔离在办任务：不在有效契约下仍获授权的任务一律置 `blocked` + `blocked_to=gm`，记 `policy_block_reason`、清租约与持有人；本来就被策略拦着的记 `alreadyBlocked`，已结束或判定为 `clear` 的记 `absent` |
 
-`policy_enforce` 只对 `policy_plan` 列出的受影响任务动手：`resume_state`/`resume_role` 只在 `ready`/`doing`/`review` 三态有值（`review` 记评审岗），其余状态保留它原有的 `resume_state`；每次隔离写一条 `action='policy_blocked'` 的审计，并把 `employee.active_task` 上指向它的关联清掉。
+`policy_enforce` 只对 `policy_plan` 列出的受影响任务动手：`resume_state`/`resume_role` 只在 `ready`/`doing`/`review` 三态有值（`review` 记评审岗），其余状态保留它原有的 `resume_state`；每次隔离写一条 `action='policy_blocked'` 的审计，并把 `employee.active_task` 上指向它的关联清掉。隔离的对象来自试算清单，所以清单的覆盖范围就是这条缓解路径的覆盖范围：候选集必须与判定同源，没有登记的在办任务要先被列出来，隔离才有对象。清单的完整性在视图里如实给出（`scanned` / `scanLimit` / `truncated`）；`truncated=true` 表示这次只看到了一部分在办任务，不得当它已完整。
 
 写入前必须过的校验（写入与试算共用同一段 `validatePolicyProposal`）：
 
@@ -91,16 +91,22 @@
 
 `tests/rollback-isolation-policy.fork.test.ts` 在隔离 fork 库上彩排了这条链路：旧 release 先建库，新代码升到 035 并收权 + 隔离，随后连派三轮（旧版直接读 / 旧版 bootstrap 之后 / 旧版逐个试领之后）——受保护的 6 个任务零命中，而冻结之后新建的对照任务一直可派（证明这三轮不是空转）；6 次旧版领取全部被拒且行内容不变。
 
+`tests/effective-policy-plan-coverage.fork.test.ts` 补的是同一条链路上"上线前既存任务"这一段：**旧 release 自己建**的两条在办任务（ready / doing，没有 `policy_hash` 登记）在新代码上收权后，必须被 `policy_plan` 列出、被 `policy_enforce` 隔离为 `blocked + blocked_to=gm`（并保留 `resume_state`），随后旧 release 的候选集里没有它们、试领全部被拒。
+
+切换路径上的那条门禁（"已写策略的数据不能切到不执行策略的代码"）由 `scripts/policy-guard.sh` 在 install / 远端 deploy 的副作用之前把关，见 [company-service-operations.md](./company-service-operations.md) 第 5 节。
+
 ## 一处刻意的不对称
 
 - `tool_scope` **到期**时，broker 的边界退回"没有该域 = 不设机器限制"（`policyToolScope` 读不到 payload 就返回 `ok`）。工具白名单是运维便利与支出边界，不是写权，到期松回基线不会让谁获得额外的写权限。
-- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口。
+- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口——**包括策略层上线前就已在办、没有任何策略登记（`policy_hash = NONE`）的任务**：`policy_plan` 的候选集与派工/领取判定同源，扫全部在办任务而不按 `policy_hash` 预筛，这类任务既进得来清单（`fromHash` 为空），也会被判 `blocked` 后隔离为 `blocked + blocked_to=gm`。这不是边缘情形：策略层上线那一刻，线上的在办任务全都是这一类，回滚到不执行策略的 release 时它们会被旧候选集当普通任务派工。清单的完整性是显式事实（`scanned` / `scanLimit` / `truncated`）：`truncated=true` 时不得把清单当成完整的，必须收窄作用域或分页继续处理。
 
 ## 验证
 
 ```sh
 bun scripts/test-worktrees.ts tests/effective-policy.test.ts tests/effective-policy.fork.test.ts   # 单元 + fork 库
+bun scripts/test-worktrees.ts tests/effective-policy-plan-coverage.fork.test.ts                     # R1 候选集与判定同源（要旧 release 的 commit）
 bun scripts/test-worktrees.ts tests/rollback-isolation-policy.fork.test.ts                          # RB01 彩排（要旧 release 的 commit）
+bun test tests/policy-guard.test.ts                                                                 # 切换守卫（SYS06）：正/负例与内容绑定
 ```
 
 真实通道：`tests/effective-policy.fork.test.ts` 里同时走 MCP HTTP（`createMcpHttpService` + `connectCompanyClient`）与 ops broker 入口，并断言"只改提示词/标题/证据文本"不改变判定结果。艺术类 AC 仍需真人验收，机器策略不代替它。
