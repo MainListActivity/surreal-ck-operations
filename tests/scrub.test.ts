@@ -2,7 +2,7 @@ import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { blockedPatterns, externalPatterns, installZdot, registerScrub, scrubEnv, userZshDir, zdotFiles } from '../plugin/server/scrub.ts';
+import { blockedPatterns, externalPatterns, installZdot, registerScrub, sandboxGap, scrubEnv, userZshDir, zdotFiles } from '../plugin/server/scrub.ts';
 
 const daemonEnv = {
   PATH: '/usr/bin', HOME: '/Users/x', SSH_AUTH_SOCK: '/tmp/agent.sock', OPENAI_API_KEY: 'provider-login',
@@ -186,7 +186,7 @@ describe('agent.session_open hook', () => {
   test('a marked company launch is scrubbed without asking the daemon anything', async () => {
     const h = hook();
     const out = await h.open({ ...base, reason: 'create', env: { SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k' } });
-    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '' });
+    expect(out?.env).toMatchObject({ SCK_COMM_DIR: '/c', SCK_COMM_KEY: 'k', CLOUDFLARE_API_TOKEN: '', JEV_API_KEY: '', SCK_SANDBOX: 'employee' });
     expect(h.lookups()).toBe(0);
   });
 
@@ -200,6 +200,8 @@ describe('agent.session_open hook', () => {
     const h = hook({ company: 'surreal-ck' });
     const first = await h.open({ ...base, reason: 'resume', env: {} });
     expect(first?.env.CLOUDFLARE_API_TOKEN).toBe('');
+    // The resumed session carries no channel variable, so the sandbox marker is what keeps it sandboxed.
+    expect(first?.env.SCK_SANDBOX).toBe('employee');
     await h.open({ ...base, reason: 'refresh', env: {} });
     expect(h.lookups()).toBe(1);
   });
@@ -267,5 +269,31 @@ describe('agent.session_open hook with the zsh startup shim', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe('employee sandbox gate', () => {
+  const wrappers = '/svc/sandbox/bin';
+  const config = (providers: Record<string, unknown>) => {
+    const file = join(fresh('paseo'), 'config.json');
+    writeFileSync(file, JSON.stringify({ agents: { providers } }));
+    return file;
+  };
+
+  test('a provider launched through its wrapper passes; codex, a bare binary or a missing config does not', () => {
+    const file = config({ claude: { command: ['/svc/sandbox/bin/claude'] }, 'factory-droid': { command: ['/Users/x/.local/bin/droid', 'exec'] } });
+    expect(sandboxGap('claude', file, wrappers)).toBeUndefined();
+    expect(sandboxGap('factory-droid', file, wrappers)).toContain('install.sh');
+    expect(sandboxGap('antigravity', file, wrappers)).toContain('install.sh');
+    expect(sandboxGap('codex', file, wrappers)).toContain('codex');
+    expect(sandboxGap('claude', '/nope/config.json', wrappers)).toContain('Paseo');
+  });
+
+  test('an interactive company session the sandbox does not cover is refused; history and other agents are not', async () => {
+    const h = hook({}, { sandbox: provider => provider === 'claude' ? undefined : 'not covered' });
+    await expect(h.open({ ...base, provider: 'codex', reason: 'create', env: { SCK_COMM_DIR: '/c' } })).rejects.toThrow('员工沙箱');
+    expect((await h.open({ ...base, provider: 'claude', reason: 'create', env: { SCK_COMM_DIR: '/c' } }))?.env.SCK_SANDBOX).toBe('employee');
+    expect(await h.open({ ...base, provider: 'codex', purpose: 'history', reason: 'create', env: { SCK_COMM_DIR: '/c' } })).toBeDefined();
+    expect(await h.open({ ...base, agentId: 'other', provider: 'codex', reason: 'create', env: {} })).toBeUndefined();
   });
 });
