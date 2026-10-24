@@ -2639,11 +2639,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return echoTask(await this.resumeRecord(credential, taskId, evidence));
   }
 
-  private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
+  private async resumeRecord(credential: Credential, taskId: TaskId, evidence: Evidence,
+    options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm can resume');
     requireText(evidence.text, 'evidence', 20, 30000);
-    const idem = this.idemId(actor.employeeId, 'resume', evidence.idempotencyKey);
+    // SYS03 AC02/AC05（QA V4）：处置驱动的 resume 由业务键标识，而不是由「谁发的」标识。换一位经理接手同
+    // 一个 episode 重放时，幂等身份必须与发起人无关，否则这里查不到记录、又会拿旧版本去撞任务版本 CAS 而卡住。
+    const idem = options.businessScope
+      ? this.businessIdemId('resume', evidence.idempotencyKey)
+      : this.idemId(actor.employeeId, 'resume', evidence.idempotencyKey);
     const digest = HASH(JSON.stringify({ taskId, evidence }));
     const replay = await this.replay(idem, digest);
     if (replay) return replay;
@@ -2785,7 +2790,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return echoTask(await this.deferTaskUntilRecord(credential, input));
   }
 
-  private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil): Promise<TaskView> {
+  private async deferTaskUntilRecord(credential: Credential, input: DeferTaskUntil,
+    options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may defer blocked tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -2799,7 +2805,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw new CompanyError('invalid', 'defer requires 1-20 dependencies');
     }
     if (dependencies.includes(input.taskId)) throw new CompanyError('invalid', 'A task cannot wait on itself');
-    const idem = this.idemId(actor.employeeId, 'defer', input.idempotencyKey);
+    // SYS03 AC02/AC05（QA V4）：处置驱动的 defer 幂等身份按业务键算，不掺发起人的员工 ID——接管者重放
+    // 同一条决定时必须读到同一份结果，而不是撞上「任务版本已动」。
+    const idem = options.businessScope
+      ? this.businessIdemId('defer', input.idempotencyKey)
+      : this.idemId(actor.employeeId, 'defer', input.idempotencyKey);
     const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion }));
     const replayed = await this.replay(idem, digest);
     if (replayed) return replayed;
@@ -2944,7 +2954,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return echoTask(await this.retireTaskRecord(credential, input));
   }
 
-  private async retireTaskRecord(credential: Credential, input: RetireTask): Promise<TaskView> {
+  private async retireTaskRecord(credential: Credential, input: RetireTask,
+    options: { businessScope?: boolean } = {}): Promise<TaskView> {
     const actor = await this.authorized(credential, 'manage');
     if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', 'Only gm or product may retire tasks');
     requireText(input.taskId, 'task', 1, 200);
@@ -2953,7 +2964,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (input.expectedVersion !== undefined && !Number.isSafeInteger(input.expectedVersion)) {
       throw new CompanyError('invalid', 'Invalid expectedVersion');
     }
-    const idem = this.idemId(actor.employeeId, 'retire', input.idempotencyKey);
+    // SYS03 AC02/AC05（QA V4）：处置驱动的 retire 幂等身份按业务键算，理由同 resume/defer。
+    const idem = options.businessScope
+      ? this.businessIdemId('retire', input.idempotencyKey)
+      : this.idemId(actor.employeeId, 'retire', input.idempotencyKey);
     const digest = HASH(JSON.stringify({ taskId: input.taskId, text: input.text, expectedVersion: input.expectedVersion }));
     const replayed = await this.replay(idem, digest);
     if (replayed) return replayed;
@@ -3125,14 +3139,32 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    */
   async cancelCiRun(credential: Credential, input: ExternalActionRequestInput): Promise<ExternalActionView> {
     const actor = await this.authorized(credential);
-    return this.dispositions.requestExternalAction(actor, input, this.externalActionGateway(), async prerequisite => {
+    return this.dispositions.requestExternalAction(actor, input, this.externalActionGateway(),
+      async (prerequisite, target) => {
       if (actor.role === 'gm' || actor.role === 'product') return;
       if (!prerequisite) throw new CompanyError('forbidden', 'Cancelling a CI run requires manager capability or the task the run belongs to');
       const task = await this.db.select<TaskRow>(id('task', prerequisite.taskId));
       if (!task) throw new CompanyError('not_found', 'Prerequisite task not found');
+      // 当事人只认「这个人跟这条任务有关系」：当前持有人、实现者、提交人。**不再**拿岗位与任务的执行岗/评审岗比对——
+      // 那等于让任何一个同岗位员工对仓库里任何一条任务都成为当事人，于是任何 engineering 员工都能取消任意 run（QA V2）。
       const mine = task.current_employee === actor.employeeId || task.implementer === actor.employeeId ||
-        task.submitted_by === actor.employeeId || actor.role === task.executor_role || actor.role === task.reviewer_role;
+        task.submitted_by === actor.employeeId;
       if (!mine) throw new CompanyError('forbidden', 'Cancelling this CI run requires being a party of the task it belongs to');
+      // run 还必须绑定到这条前置任务：它的 head 分支要等于任务登记的树分支。任务没有登记分支时失败关闭——
+      // 没有可核对的身份就不能声称这条 run 属于它（QA V2）。
+      const branch = task.worktree?.branch;
+      if (!branch) {
+        throw new CompanyError('forbidden', 'Cancelling a CI run requires the prerequisite task to have a registered branch to bind the run to');
+      }
+      const observed = await this.externalActionGateway().observeRun(target);
+      if (observed.readable !== true || observed.exists !== true) {
+        const why = (observed as { error?: string }).error ?? 'the run is not readable';
+        throw new CompanyError('forbidden', `The run ${target.repo}#${target.runId} could not be bound to task ${prerequisite.taskId}: ${why}`);
+      }
+      if ((observed.headBranch ?? '') !== branch) {
+        throw new CompanyError('forbidden',
+          `Run ${target.repo}#${target.runId} is on branch ${observed.headBranch ?? 'unknown'}, not the prerequisite task's registered branch ${branch}`);
+      }
     });
   }
 
@@ -3177,19 +3209,20 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const withKey = (text: string, businessKey: string) => `${text}\n[disposition] business_key=${businessKey}`;
     return {
       resume: async ({ taskId, text, idempotencyKey }) => {
-        const row = await this.resumeRecord(credential, taskId, { text: withKey(text, idempotencyKey), idempotencyKey });
+        const row = await this.resumeRecord(credential, taskId, { text: withKey(text, idempotencyKey), idempotencyKey },
+          { businessScope: true });
         return { taskVersion: row.version, state: row.state };
       },
       defer: async ({ taskId, text, dependencies, expectedTaskVersion, idempotencyKey }) => {
         const row = await this.deferTaskUntilRecord(credential, {
           taskId, dependencies, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
-        });
+        }, { businessScope: true });
         return { taskVersion: row.version, state: row.state };
       },
       retire: async ({ taskId, text, expectedTaskVersion, idempotencyKey }) => {
         const row = await this.retireTaskRecord(credential, {
           taskId, text: withKey(text, idempotencyKey), idempotencyKey, expectedVersion: expectedTaskVersion,
-        });
+        }, { businessScope: true });
         return { taskVersion: row.version, state: row.state };
       },
       repair: async ({ repairKey, taskId, text, expectedTaskVersion, repair }) => {
@@ -3218,7 +3251,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
             text: withKey(`已建修复链 ${created.id}，原任务改为等待该修复完成后再继续`, `source:${repairKey}`),
             idempotencyKey: `disposition-source:${repairKey}`,
             expectedVersion: expectedTaskVersion,
-          });
+          }, { businessScope: true });
           return { taskId: created.id, sourceTaskVersion: deferred.version, sourceState: deferred.state };
         }
         return { taskId: created.id, sourceTaskVersion: source?.version, sourceState: source?.state };
