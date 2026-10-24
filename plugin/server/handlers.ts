@@ -196,8 +196,8 @@ export function registerHandlers(server: PluginServerContext): void {
 
   ownerHandle(rpc.modelIdentity, async () => (await company()).modelRouting.identity());
   ownerHandle(rpc.setModelAlias, async (input: RpcInput<typeof rpc.setModelAlias>) => {
-    await (await company()).modelRouting.setAlias(input.model, input.slug);
-    return {ok:true};
+    const result=await (await company()).modelRouting.setAlias(input.model, input.slug);
+    return {ok:true,...result};
   });
 
   ownerHandle(rpc.roster, async (_input: unknown, { paseo }: { paseo: any }) => {

@@ -33,6 +33,7 @@ import { loadAa, refreshAa } from "./aa.ts";
 import { useBenchmarks } from "./policy.ts";
 import { modelFacts, quotaAccounts, usageStats, type ModelFacts } from "./ranking.ts";
 import { aliasMap, askAlias, loadAliases, saveAliases } from "./alias.ts";
+import {loadInventory,saveInventory,inventoryAliases,recordDecision,reconcileInventory,inventoryView} from "./inventory.ts";
 import type { JevClient } from "../dispatcher/jev.ts";
 /** New vendor names Jev is asked about per sync; models are added rarely, so this only bounds a burst. */
 const ALIAS_ASKS_PER_SYNC = 6;
@@ -140,8 +141,10 @@ export class ModelRoutingController {
   async identity(): Promise<{
     aliases: Array<{ model: string; slug: string | null; by: "jev" | "owner"; confidence?: number; suggested?: string; aa?: { name: string; score: number } }>;
     issues: MemberIssue[];
+    inventory: ReturnType<typeof inventoryView>;
   }> {
-    const aliases = await loadAliases(join(this.home, "model-routing", "aliases.json"));
+    const inventory=await loadInventory(join(this.home,"model-routing","inventory.json"));
+    const aliases = inventoryAliases(inventory,await loadAliases(join(this.home, "model-routing", "aliases.json")));
     const [status] = await this.db.query<[{ issues?: MemberIssue[] } | undefined]>("SELECT issues FROM ONLY company_meta:model_routing_status;");
     const row = (slug?: string | null) => (slug ? benchmarkRows().find((b) => b.slug === slug) : undefined);
     return {
@@ -152,28 +155,40 @@ export class ModelRoutingController {
         })
         .sort((a, b) => Number(!a.slug) - Number(!b.slug) || Number(!a.suggested) - Number(!b.suggested) || a.model.localeCompare(b.model)),
       issues: status?.issues ?? [],
+      inventory: inventoryView(inventory),
     };
   }
   /** Owner's decision on a vendor name; a model not yet in any group is placed by it on the next sync. */
-  async setAlias(model: string, slug: string | null): Promise<void> {
-    const dir = join(this.home, "model-routing");
-    if (slug !== null && !benchmarkRows().some((b) => b.slug === slug)) throw Error(`AA 榜单上没有 ${slug}`);
-    const aliases = await loadAliases(join(dir, "aliases.json"));
-    aliases[model] = { slug, by: "owner", at: new Date().toISOString() };
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    await saveAliases(join(dir, "aliases.json"), aliases);
-    const groups = this.io.groups?.() ?? readMagpieGroups();
-    if (!Object.entries(groups).some(([id, m]) => id.startsWith("sck-") && m.some((x) => splitMember(x).id === model))) {
-      try {
-        const file = join(dir, "membership.json");
-        const state = JSON.parse(await readFile(file, "utf8"));
-        state.known = (state.known ?? []).filter((id: string) => id !== model);
-        await writeFile(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
-        await rename(`${file}.tmp`, file);
-      } catch {}
-    }
-    await this.refresh(true);
+  async setAlias(model: string, slug: string | null): Promise<{synchronized:boolean}> {
+    while(this.pending) await this.pending;
+    let synchronized=true;
+    const operation=async()=>{
+      const dir = join(this.home, "model-routing");
+      if (slug !== null && !benchmarkRows().some((b) => b.slug === slug)) throw Error(`AA 榜单上没有 ${slug}`);
+      const inventory=await loadInventory(join(dir,"inventory.json"));
+      const aliases = inventoryAliases(inventory,await loadAliases(join(dir, "aliases.json")));
+      aliases[model] = { slug, by: "owner", at: new Date().toISOString() };
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await saveAliases(join(dir, "aliases.json"), aliases);
+      recordDecision(inventory,model,aliases[model]!);
+      await saveInventory(join(dir,"inventory.json"),inventory);
+      const groups = this.io.groups?.() ?? readMagpieGroups();
+      if (!Object.entries(groups).some(([id, m]) => id.startsWith("sck-") && m.some((x) => splitMember(x).id === model))) {
+        try {
+          const file = join(dir, "membership.json");
+          const state = JSON.parse(await readFile(file, "utf8"));
+          state.known = (state.known ?? []).filter((id: string) => id !== model);
+          await writeFile(`${file}.tmp`, JSON.stringify(state), { mode: 0o600 });
+          await rename(`${file}.tmp`, file);
+        } catch {}
+      }
+      try{await this.sync();}catch{ synchronized=false;console.warn("Model decision saved; group synchronization will retry"); }
+    };
+    this.pending=operation().finally(()=>{this.pending=undefined;});
+    await this.pending;
+    return {synchronized};
   }
+
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
     const [quota, usage, results] = await Promise.all([
@@ -271,20 +286,25 @@ export class ModelRoutingController {
     } catch {}
     const initializing = state.version !== GROUPING_VERSION;
     const known = new Set(initializing ? [] : state.known ?? []);
-    // A new model whose vendor name matches no AA entry by rule: Jev decides once which one it is.
+    const live = this.io.groups?.() ?? (this.io.command ? {} : readMagpieGroups());
+    const inventoryFile=join(dir0,"inventory.json");
+    const inventory=await loadInventory(inventoryFile);
     const aliasFile = join(dir0, "aliases.json");
-    const aliases = await loadAliases(aliasFile);
+    const aliases = inventoryAliases(inventory,await loadAliases(aliasFile));
     useAliases(aliasMap(aliases));
+    reconcileInventory(inventory,catalog.data,live,aliases,config?.disabledModels);
+    await saveInventory(inventoryFile,inventory);
     if (this.io.jev) {
-      const unnamed = catalog.data
-        .filter((m) => routable(m) && !known.has(m.id) && !(m.id in aliases) && !resolveBenchmark(m.id))
-        .slice(0, ALIAS_ASKS_PER_SYNC);
-      for (const m of unnamed)
-        aliases[m.id] = await askAlias(this.io.jev, m as { id: string });
-      if (unnamed.length) {
-        await saveAliases(aliasFile, aliases);
-        useAliases(aliasMap(aliases));
+      const unnamed = catalog.data.filter(m=>routable(m)&&!inventory.decisions[m.id]&&!inventory.grouped[m.id]).slice(0,ALIAS_ASKS_PER_SYNC);
+      for (const m of unnamed) {
+        if(inventory.decisions[m.id])continue;
+        const entry=await askAlias(this.io.jev,m as {id:string});
+        aliases[m.id]=entry;recordDecision(inventory,m.id,entry);
+        // Checkpoint each answer before any following call/group mutation can fail.
+        await saveInventory(inventoryFile,inventory);
+        await saveAliases(aliasFile,aliases);
       }
+      useAliases(aliasMap(aliases));
     }
     const [ranking] = await this.db.query<[{ orders?: Record<string, string[]> } | undefined]>("SELECT orders FROM ONLY company_meta:model_ranking;");
     this.orders = { ...ranking?.orders, ...this.orders };
@@ -307,7 +327,6 @@ export class ModelRoutingController {
     // Membership is the owner's. Automatic grouping runs once per GROUPING_VERSION and afterwards
     // only places models this controller has never seen; manual adds and removals in magpie stay.
     // The controller only reorders members by ranking.
-    const live = this.io.groups?.() ?? (this.io.command ? {} : readMagpieGroups());
     const fresh = models.filter((m) => !known.has(m.id));
     const byId = new Map(models.map((m) => [m.id, m]));
     const levelsOf = (member: string) => catalog.data.find((m) => m.id === splitMember(member).id)?.reasoning_levels;
@@ -388,6 +407,9 @@ export class ModelRoutingController {
       await this.command(["plugin", "rm", legacySelector(this.home)]).catch(() => {});
       await unlink(legacySelector(this.home)).catch(() => {});
     }
+    const finalGroups={...live,...Object.fromEntries(groupsToSet.map(g=>[g.id,g.models]))};
+    reconcileInventory(inventory,catalog.data,finalGroups,aliases,config?.disabledModels);
+    await saveInventory(inventoryFile,inventory);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
       if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
