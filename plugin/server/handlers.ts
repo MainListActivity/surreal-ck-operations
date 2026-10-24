@@ -181,13 +181,8 @@ export function registerHandlers(server: PluginServerContext): void {
 
   ownerHandle(rpc.modelRanking, async () => {
     const ctx = await company();
-    const { rankingSettings, rankingRequests, rankingTables } = await import("./vendor/src/model-routing/ranking.ts");
-    const { jevFromEnv } = await import("./vendor/src/dispatcher/jev.ts");
-    const settings = await rankingSettings(ctx.db.db);
-    const [status] = await ctx.db.db.query<[{at?:Date;error?:string;orders?:Record<string,string[]>;results?:Record<string,import("./vendor/src/model-routing/ranking.ts").RankingResultSnapshot>}|undefined]>("SELECT at,error,orders,results FROM ONLY company_meta:model_ranking;");
-    const requests = await rankingRequests(ctx.db.db);
-    const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
-    return {...settings,requests,tables:rankingTables(readMagpieGroups(),status?.results,requests),configured:!!jevFromEnv(),at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
+    const { modelRankingView } = await import("./model-ranking.ts");
+    return modelRankingView(ctx.db.db);
   });
   ownerHandle(rpc.saveModelRanking, async (input: RpcInput<typeof rpc.saveModelRanking>) => {
     const ctx = await company();

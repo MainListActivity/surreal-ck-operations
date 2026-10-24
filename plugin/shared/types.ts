@@ -288,7 +288,7 @@ export interface ModelRankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: Array<{
     model: string; aaScore?: number; aaRank?: number; effort?: string;
-    tokensPerSecond?: number; ttftMs?: number;
+    tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
     jevScore?: number; jevConfidence?: number;

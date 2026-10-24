@@ -220,13 +220,13 @@ test('ranking list joins current members to one successful snapshot, never a new
  const {rankingTables}=await import('../src/model-routing/ranking.ts');
  let snapshot:any;
  await jevOrder({model:'jev',ask:async()=>({model:'jev',answers:{m0:{type:'score',score:3.25},m1:{type:'score',score:0}}})},'haiku','旧规则',[
-  {...fact('p/a:max'),accounts:[{account:'p #1',remainingPct:0}],aa:{rank:30,score:45.1},performance:{score:4.72,samples:2.5}},fact('p/b'),
+  {...fact('p/a:max'),usage:usageStats(nativeUsage([channel('p','a',100,1000)])).get('p/a'),accounts:[{account:'p #1',remainingPct:0}],aa:{rank:30,score:45.1},performance:{score:4.72,samples:2.5}},fact('p/b'),
  ],undefined,r=>{snapshot=r;});
  const requests:any=[{tier:'haiku',at:'new-at',payload:{state:{ownerRules:'新规则',models:{m0:{...fact('p/a:max'),aa:{rank:1,score:99}},m1:fact('p/a:high')}}}}];
  const groups={'sck-haiku':['p/b','p/a:max','p/a:high','p/new']};
  const table=rankingTables(groups,{'sck-haiku':snapshot},requests)[0]!;
  expect(table.rules).toBe('旧规则');expect(table.rows.map(r=>r.model)).toEqual(groups['sck-haiku']);
- expect(table.rows[0]?.jevScore).toBe(0);expect(table.rows[1]).toMatchObject({jevScore:3.25,aaScore:45.1,accounts:[{account:'p #1',remainingPct:0}],performanceSamples:2.5});
+ expect(table.rows[0]?.jevScore).toBe(0);expect(table.rows[1]).toMatchObject({jevScore:3.25,aaScore:45.1,accounts:[{account:'p #1',remainingPct:0}],performanceSamples:2.5,stabilityPct:90,stabilitySamples:10});
  expect(table.rows[2]?.jevScore).toBeUndefined();expect(table.rows[2]?.aaScore).toBeUndefined();
  const legacy=rankingTables(groups,{},requests)[0]!;expect(legacy.scored).toBe(false);expect(legacy.at).toBe('new-at');expect(legacy.rows[1]?.aaScore).toBe(99);expect(legacy.rows.every(r=>r.jevScore===undefined)).toBe(true);
 });
