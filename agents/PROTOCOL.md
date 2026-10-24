@@ -79,6 +79,7 @@
 - 账号别名是任务里的名字（如 `QA1`）；实际用户名、邮箱和密码由代理按项目配置生成。证据里写别名和 workspace slug，不写 token，也不抄录接口响应里的凭证类字段（代理已遮盖，仍请不要尝试还原）。
 - 新建账号和 workspace 是真实的生产写入，代理没有删除能力：先 `ops_info` / `ops_login` 看已有的，能复用就复用；超出配额会被拒绝。
 - 报错信息只含错误码和原因，没有敏感内容；`forbidden` 表示你的岗位或任务不在放行范围，`limit_reached` 表示配额用尽，不要换花样绕过。
+- 你的会话运行在公司沙箱里：公司凭证目录、`~/.ssh` 私钥、Paseo/Magpie/Cloudflare 配置读不到；Paseo daemon、launchd、`osascript`/`open`、cron 不可用；插件发布目录、shell 启动文件、`~/.claude` 全局设置、`~/.local/bin` 等不可写。看到 `Operation not permitted` 就是到了边界，不要换路径或换工具绕过，需要的能力按下一条上报。仓库、工作树、证据目录、模型网关、`git push`、`gh` 照常可用。
 - 源站主机只有 `ops_origin_*` 这三个只读入口：你没有、也不需要 SSH 账号或密钥，不要尝试 `ssh`/`scp` 或索要密钥。重启服务、改配置、升级 SurrealDB 等写操作属于老板，用 `report_blocker to=gm` 写明现象（附 `ops_origin_*` 的输出）和建议动作。
 - 运维工具没有的能力（例如新的 Cloudflare 或 IdP 操作）：`report_blocker to=gm`，写明要做的操作、对象和原因；经理安排工程在 `src/ops/` 里增加工具。不要自己去找凭证。
 - 浏览器空间用毕即关：你的 ego-browser 任务空间在提交或阻塞前必须 `finish`（无证据要移交就 `keep:[]`）。空间每留一个页签，本机浏览器就持有一个采集断言，屏幕无法熄屏；也别为同一任务开多个空间，复用你正持有任务的这一个。

@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { installBunShim } from "./server/bun-shim";
@@ -9,7 +10,7 @@ import { startDispatch } from "./server/dispatch";
 import { loadServiceEnv, serviceHome } from "./server/env";
 import { startPreview, type PreviewHandle } from "./server/preview";
 import { routingEnv, installRoutingSettings } from "./server/vendor/src/model-routing/gateway.ts";
-import { registerScrub } from "./server/scrub";
+import { registerScrub, sandboxGap } from "./server/scrub";
 
 // The company DB lives on a remote WSS; when it drops, the SDK rejects every
 // in-flight call. A stray floating promise becoming an unhandled rejection would
@@ -25,7 +26,9 @@ export default function contribute(server: PluginServerContext) {
   installBunShim();
   loadServiceEnv(); // SCK_SCRUB_ENV lives there, and the zsh shim is written below, before the company stack boots
   registerHandlers(server);
-  const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"), modelEnv: async request => {
+  const paseoConfig = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "config.json");
+  const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"),
+    sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")), modelEnv: async request => {
     if(request.provider !== "claude") return {};
     const ctx=await company();
     if(!ctx.modelRouting.enabled) return {};
