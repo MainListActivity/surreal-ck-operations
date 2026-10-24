@@ -1363,6 +1363,23 @@ export interface PolicyPlanInput {
   expiresAt?: string;
   source: PolicySource;
   ownerQuote?: string;
+  /** 受影响清单的分页（SYS06 R1(b)）：不给就一页，装不下就明确提示怎么翻页；给了就只返回一页。 */
+  pageSize?: number;
+  /** 上一页 page.nextCursor。光标绑定同一份试算（同一调用者、同一提案、同一 planHash）。 */
+  cursor?: string;
+}
+
+/**
+ * policy_plan 一页的元数据（SYS06 R1(b)）：affectedTasks 只是 total 里的这一页，正文永远在 48 KiB 预算内。
+ * 没有截断例外：第一页就装不下时抛 response_too_large，并给出 pageSize 的建议值。
+ */
+export interface PolicyPlanPage {
+  pageSize: number;
+  returned: number;
+  total: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  budgetBytes: number;
 }
 
 /** 试算（dry-run）：算出契约差异与受影响任务，写任何东西之前先给人看。 */
@@ -1371,15 +1388,18 @@ export interface PolicyPlanView {
   before: EffectiveContract;
   after: EffectiveContract;
   diff: Array<{ domain: PolicyDomain; before: string; after: string; scope?: PolicyScope; scopeRef?: string }>;
-  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。 */
+  /** 受影响的任务：登记的契约 hash 与试算结果不同（含已在办的）。一页的内容见 page；planHash 覆盖全量。 */
   affectedTasks: Array<{ id: TaskId; title: string; state: TaskState; currentEmployee?: EmployeeId; fromHash?: string; toHash: string; losesAuthorization: boolean;
     /** 会拦下它的原因（与派工/领取的拒绝理由同源）；losesAuthorization=false 时省略。 */
     reason?: string }>;
-  /** 候选集扫描的事实（SYS06 R1）：扫了多少在办任务、上限是多少。截断绝不静默——`truncated=true` 时这份清单不完整。 */
+  /** 候选集扫描的事实（SYS06 R1）：扫了多少在办任务、上限是多少。 */
   scanned: number;
   scanLimit: number;
+  /** 扫描被上限截断（不止 200*50 条在办任务）；与 page 无关，是候选集本身不完整的显式信号。 */
   truncated: boolean;
-  /** 试算结果落在当前生效 epoch 上的指纹：执行时用它做 CAS，防止按旧试算执行新策略。 */
+  /** 受影响清单的分页：受影响总数、这一页与下一页光标。 */
+  page: PolicyPlanPage;
+  /** 试算结果落在当前生效 epoch 上的指纹：覆盖全量受影响清单，执行时用它做 CAS，防止按旧试算执行新策略。 */
   planHash: string;
 }
 

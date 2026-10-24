@@ -66,10 +66,10 @@
 | `policy_revoke` | `gm` / `product` | 紧急撤销：立即停止授权，历史保留撤销原因与撤销人 |
 | `policy_list` | `manage` 能力 + `gm`/`product` | 按作用域/域列出；默认只列当前生效版本，`includeInactive` 看历史 |
 | `policy_effective` | `manage` + `gm`/`product`（带 `taskId` 时该任务的执行岗/评审岗与 `qa`/`eval` 也读得到自己那份） | 当前有效契约 + 作用域链 + 人读 `rendered` + `notes`（到期/被替代/被撤销的当前事实） |
-| `policy_plan` | `gm` / `product` | 试算：差异前后版本、受影响任务与它为什么失去授权；**不写库**。候选集与派工/领取判定同源——扫的是**全部在办任务**，不按 `policy_hash` 预筛，所以策略层上线前既存、没有登记的任务也会被列出来；分页读到底，读满上限时在视图里显式给 `scanned` / `scanLimit` / `truncated`，不静默丢任务 |
-| `policy_enforce` | `gm` / `product` | 隔离在办任务：不在有效契约下仍获授权的任务一律置 `blocked` + `blocked_to=gm`，记 `policy_block_reason`、清租约与持有人；本来就被策略拦着的记 `alreadyBlocked`，已结束或判定为 `clear` 的记 `absent` |
+| `policy_plan` | `gm` / `product` | 试算：差异前后版本、受影响任务与它为什么失去授权；**不写库**。候选集与派工/领取判定同源——扫的是**全公司的在办任务**（与提案的作用域无关），不按 `policy_hash` 预筛，所以策略层上线前既存、没有登记的任务也会被列出来。受影响清单**按页返回**（`page`：`total` / `returned` / `hasMore` / `nextCursor` / `budgetBytes`），每页都裁到 48 KiB 响应预算内；用同一提案加 `cursor` 翻下一页，`planHash` 覆盖全量、翻页不变。数据库扫描本身的上限另由 `scanned` / `scanLimit` / `truncated` 报告 |
+| `policy_enforce` | `gm` / `product` | 隔离在办任务：不在有效契约下仍获授权的任务一律置 `blocked` + `blocked_to=gm`，记 `policy_block_reason`、清租约与持有人；本来就被策略拦着的记 `alreadyBlocked`，已结束或判定为 `clear` 的记 `absent`。**单批最多 200 个 taskId**（超过直接 `invalid`）；清单大于一页时按 `policy_plan` 的页收集 id，再分批发来 |
 
-`policy_enforce` 只对 `policy_plan` 列出的受影响任务动手：`resume_state`/`resume_role` 只在 `ready`/`doing`/`review` 三态有值（`review` 记评审岗），其余状态保留它原有的 `resume_state`；每次隔离写一条 `action='policy_blocked'` 的审计，并把 `employee.active_task` 上指向它的关联清掉。隔离的对象来自试算清单，所以清单的覆盖范围就是这条缓解路径的覆盖范围：候选集必须与判定同源，没有登记的在办任务要先被列出来，隔离才有对象。清单的完整性在视图里如实给出（`scanned` / `scanLimit` / `truncated`）；`truncated=true` 表示这次只看到了一部分在办任务，不得当它已完整。
+`policy_enforce` 只对 `policy_plan` 列出的受影响任务动手：`resume_state`/`resume_role` 只在 `ready`/`doing`/`review` 三态有值（`review` 记评审岗），其余状态保留它原有的 `resume_state`；每次隔离写一条 `action='policy_blocked'` 的审计，并把 `employee.active_task` 上指向它的关联清掉。隔离的对象来自试算清单，所以清单的覆盖范围就是这条缓解路径的覆盖范围：候选集必须与判定同源，没有登记的在办任务要先被列出来，隔离才有对象。清单的可获得性分两层，都是显式事实：**页**由 `page.total` / `page.hasMore` / `page.nextCursor` 说明（清单再大也能一页页读完，不会整份被响应预算拒掉）；**库扫描**由 `scanned` / `scanLimit` / `truncated` 说明（`truncated=true` 表示候选集本身被读上限截断了，这时连翻页也不完整，必须收窄或换小批多次）。
 
 写入前必须过的校验（写入与试算共用同一段 `validatePolicyProposal`）：
 
@@ -98,7 +98,7 @@
 ## 一处刻意的不对称
 
 - `tool_scope` **到期**时，broker 的边界退回"没有该域 = 不设机器限制"（`policyToolScope` 读不到 payload 就返回 `ok`）。工具白名单是运维便利与支出边界，不是写权，到期松回基线不会让谁获得额外的写权限。
-- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口——**包括策略层上线前就已在办、没有任何策略登记（`policy_hash = NONE`）的任务**：`policy_plan` 的候选集与派工/领取判定同源，扫全部在办任务而不按 `policy_hash` 预筛，这类任务既进得来清单（`fromHash` 为空），也会被判 `blocked` 后隔离为 `blocked + blocked_to=gm`。这不是边缘情形：策略层上线那一刻，线上的在办任务全都是这一类，回滚到不执行策略的 release 时它们会被旧候选集当普通任务派工。清单的完整性是显式事实（`scanned` / `scanLimit` / `truncated`）：`truncated=true` 时不得把清单当成完整的，必须收窄作用域或分页继续处理。
+- `write_authority` 的域**消失**（到期或被撤销）时，已经在办的任务按 `dispatchVerdict` 判 `blocked`：原来被授权、现在没有契约，绝不能读成放行。冻结但还没被隔离的任务，用 `policy_plan` 看差异 + `policy_enforce` 隔离来关闭这个窗口——**包括策略层上线前就已在办、没有任何策略登记（`policy_hash = NONE`）的任务**：`policy_plan` 的候选集与派工/领取判定同源，扫全部在办任务而不按 `policy_hash` 预筛，这类任务既进得来清单（`fromHash` 为空），也会被判 `blocked` 后隔离为 `blocked + blocked_to=gm`。这不是边缘情形：策略层上线那一刻，线上的在办任务全都是这一类，回滚到不执行策略的 release 时它们会被旧候选集当普通任务派工。清单的可获得性也是显式事实：受影响清单按 `page` 分页（每页都在 48 KiB 预算内，顺 `nextCursor` 读完），数据库扫描本身的上限由 `scanned` / `scanLimit` / `truncated` 报告；`truncated=true` 时不得把清单当成完整的，必须收窄或换小批多次。
 
 ## 验证
 
@@ -109,4 +109,4 @@ bun scripts/test-worktrees.ts tests/rollback-isolation-policy.fork.test.ts      
 bun test tests/policy-guard.test.ts                                                                 # 切换守卫（SYS06）：正/负例与内容绑定
 ```
 
-真实通道：`tests/effective-policy.fork.test.ts` 里同时走 MCP HTTP（`createMcpHttpService` + `connectCompanyClient`）与 ops broker 入口，并断言"只改提示词/标题/证据文本"不改变判定结果。艺术类 AC 仍需真人验收，机器策略不代替它。
+真实通道：`tests/effective-policy.fork.test.ts` 里同时走 MCP HTTP（`createMcpHttpService` + `connectCompanyClient`）与 ops broker 入口，并断言"只改提示词/标题/证据文本"不改变判定结果。同一文件里的 R1(b) 用例在真实 fork 库上造 60 条在办任务：默认页与 `pageSize` 页都必须在 48 KiB 预算内，顺 `page.nextCursor` 能读完 `page.total` 条（不重不漏、`planHash` 不变），且按页收集的 id 能直接分批交给 `policy_enforce`。艺术类 AC 仍需真人验收，机器策略不代替它。

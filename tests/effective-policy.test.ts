@@ -9,6 +9,7 @@ import {
   resolveEffective, type EffectiveContract, type PolicyRow, type PolicyScopeLink,
 } from '../src/policy.ts';
 import { scanInFlightTasks } from '../src/policy-store.ts';
+import { answerBytes, fitCount, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 
 const chain = (over: Partial<Record<'task' | 'goal' | 'project', string>> = {}): PolicyScopeLink[] => [
   ...(over.task ? [{ scope: 'task' as const, scopeRef: over.task }] : []),
@@ -312,5 +313,29 @@ describe('R1 候选集扫描：与判定同源、分页读到底、截断显式'
     expect(queries[0]).not.toContain('policy_hash');
     expect(queries[0]).toContain("state NOT IN ['done', 'void']");
     expect(queries[0]).toContain('LIMIT 200 START 0');
+  });
+});
+
+describe('R1(b) 试算分页的字节边界', () => {
+  test('页大小的选择让每一页都在 48 KiB 预算内（按真实序列化大小裁，不按条数猜）', () => {
+    // policy_plan 的 pagePolicyPlan 用 answerBytes 做 fitCount；这里用同一度量核对"一页装不下就少装几条"的边界。
+    const entry = (index: number) => ({ id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      title: `受影响任务 ${index} —— 一个足够长的标题，用来逼近响应预算`, state: 'ready' as const,
+      fromHash: 'd'.repeat(64), toHash: 'e'.repeat(64), losesAuthorization: true,
+      reason: 'policy forbids role engineering from taking code work here' });
+    const page = (count: number) => ({ scopeChain: [{ scope: 'company' as const }],
+      before: { hash: 'a'.repeat(64), version: 1, domains: [] }, after: { hash: 'b'.repeat(64), version: 2, domains: [] }, diff: [],
+      scanned: 500, scanLimit: 10_000, truncated: false, planHash: 'c'.repeat(64),
+      page: { pageSize: 200, returned: count, total: 500, hasMore: true, nextCursor: 'v1.x.y', budgetBytes: RESPONSE_BUDGET_BYTES },
+      affectedTasks: Array.from({ length: count }, (_, index) => entry(index)) });
+    // 条目本身很小，200 条会超预算：fitCount 会往下裁到一个能装下的条数，而不是整份拒绝。
+    expect(answerBytes(page(200))).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
+    const fit = fitCount(Array.from({ length: 200 }, (_, index) => entry(index)),
+      subset => answerBytes(page(subset.length)), RESPONSE_BUDGET_BYTES);
+    expect(fit).toBeGreaterThan(0);
+    expect(fit).toBeLessThan(200);
+    expect(answerBytes(page(fit))).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    // 每多一条就一定更贵（fitCount 的前提）：边界上的下一条确实装不下。
+    expect(answerBytes(page(fit + 1))).toBeGreaterThan(RESPONSE_BUDGET_BYTES);
   });
 });

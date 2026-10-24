@@ -738,19 +738,20 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_plan', {
-    description: 'gm or product (manage) only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. The candidate set is every in-flight task with no policy_hash prefilter, so tasks that predate the policy layer and carry no registration at all are listed too — they are exactly the ones a rollback to a release that does not execute policies would dispatch. scanned, scanLimit and truncated report the scan itself and are not a summary: truncated=true means this list is not the whole picture, so narrow the scope or page through and do not treat it as complete. planHash is the fingerprint of the projected result, so a plan can be shown, reviewed and then executed without acting on a guess. Writes nothing.',
+    description: 'gm or product (manage) only, read-only dry run: exactly the validation policy_set will run, plus what the change would do. Returns the before/after contracts, the per-domain diff, and the in-flight tasks whose registered contract hash would change, each flagged with whether it loses authorization. The candidate set is every in-flight task of the whole company with no policy_hash prefilter (it is not narrowed by the proposal scope), so tasks that predate the policy layer and carry no registration at all are listed too — they are exactly the ones a rollback to a release that does not execute policies would dispatch. affectedTasks is one page: page.total is the whole affected count, page.hasMore says whether more remain, and page.nextCursor continues them (pass it back as cursor with the same proposal); planHash covers the whole list, so a plan can be shown page by page and then executed without acting on a guess. scanned, scanLimit and truncated report the database scan itself: truncated=true means the candidate set itself was cut and the plan is not complete. Writes nothing.',
     inputSchema: z.object({
       policyId: z.string().min(3).max(60), scope: policyScopeSchema, scopeRef: z.string().min(1).max(200).optional(),
       domain: policyDomainSchema, payload: policyPayloadSchema, supersedes: z.string().min(1).max(200).optional(),
       effectiveAt: z.string().min(4).max(40).optional(), expiresAt: z.string().min(4).max(40).optional(),
       source: z.enum(['owner', 'manager']), ownerQuote: z.string().min(2).max(4000).optional(),
+      pageSize: z.number().int().min(1).max(200).optional(), cursor: z.string().min(1).max(2000).optional(),
     }),
   }, async (input, ctx) => run(token(ctx), () => core.policyPlan
     ? core.policyPlan(token(ctx), input)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('policy_enforce', {
-    description: 'gm or product (manage) only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=gm, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-gm task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list.',
+    description: 'gm or product (manage) only: isolate the in-flight tasks that policy_plan reported as losing authorization (RB01). Each named task is set to blocked with blocked_to=gm, its lease is released and the reason is recorded on the task, so every release — including an older one that knows nothing about policies — sees a waiting-on-gm task and never dispatches it. Tasks that are already closed or still authorized are reported instead of being touched. Audited per task; refuses an empty list. A call is limited to 200 task ids, while policy_plan pages through the whole list: read every page of the plan, then enforce its ids in batches of at most 200.',
     inputSchema: z.object({ taskIds: z.array(z.string().min(1).max(200)).min(1).max(200).optional(),
       reason: z.string().min(2).max(4000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.policyEnforce

@@ -24,10 +24,11 @@ import { createMcpHttpService } from '../src/mcp/server.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import { readEffectiveContract, policyScopeChain } from '../src/policy-store.ts';
 import { acceptanceLegForSubject } from '../src/acceptance.ts';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 import {
   canonicalAliasValue, checkToolScope, normalizePayload, policyDigest, type EffectiveContract,
 } from '../src/policy.ts';
-import type { ClaimResult, CreateTask, PolicySet, PolicyView, TaskView } from '../src/contracts.ts';
+import type { ClaimResult, CreateTask, PolicyPlanView, PolicySet, PolicyView, TaskView } from '../src/contracts.ts';
 
 const NS = 'sck_agent_company_test_effective_policy';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -707,4 +708,86 @@ test('AC05 machine policy classes: all three govern real work through their own 
     payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
   expect((await listPolicies({ includeInactive: true })).filter(row => row.policyId === 'cls-write').length).toBe(2);
   expect((await effective(PROJECT)).version).toBe(4);
+});
+test('R1(b): a plan larger than the 48 KiB budget is paged, not refused — every page fits and the whole list is reachable', async () => {
+  // 评审退回（R1(b)）：实现若只是"分页读库 + 视图给 truncated"，清单本身仍会被 48 KiB 响应预算整份拒绝。
+  // 这里在真实 fork 库上造 60 条在办任务（真 createTask），先收权出一条大到装不下的受影响清单，再要求：
+  //   1) 每一页 answerBytes ≤ RESPONSE_BUDGET_BYTES（MCP 面真的能发出去）；
+  //   2) 顺着 page.nextCursor 能翻完全部 total 条，一条不少、不重；
+  //   3) planHash 覆盖全量（翻页不改变它），并且按页收集的 id 能直接分批交给 policy_enforce。
+  await set({ policyId: 'r1b-write', scope: 'company', domain: 'write_authority',
+    payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
+  const created: string[] = [];
+  for (let index = 0; index < 60; index++) {
+    const task = await codeTask({ title: `R1(b) 在办任务 ${String(index).padStart(2, '0')} —— 让受影响清单超过一页的合成样本` });
+    created.push(task.id);
+  }
+  const at = new Date(Date.now() - 2000).toISOString();
+  const proposal = { policyId: 'r1b-write', scope: 'company' as const, domain: 'write_authority' as const,
+    supersedes: (await listPolicies({ scope: 'company' }))[0]!.id, effectiveAt: at,
+    payload: { kind: 'write_authority' as const, codeRoles: [] as never[], intents: ['code' as const] },
+    source: 'owner' as const, ownerQuote: '老板方向（SYS06）：本项目只允许工程岗写码' };
+  const first = await core.policyPlan(tokens.gm, { ...proposal, pageSize: 20 });
+  expect(first.page.total).toBeGreaterThanOrEqual(60);
+  expect(first.page.returned).toBeGreaterThan(0);
+  expect(first.page.returned).toBeLessThanOrEqual(20);
+  expect(answerBytes(first)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  // 全量指纹：试算不因分页而变。
+  // 一次读全（pageSize=200 是单页上限，只用来对照全量指纹）：它与分页走的是同一份全量计算。
+  const oneShot = await core.policyPlan(tokens.gm, { ...proposal, pageSize: 200 });
+  expect(oneShot.planHash).toBe(first.planHash);
+  expect(oneShot.page.total).toBe(first.page.total);
+  // 顺光标翻完：id 集合与一次读全一致（不重、不漏），每一页都在预算内。
+  const seen: string[] = [];
+  let page = first;
+  const pageSizes: number[] = [];
+  for (let guard = 0; guard < 20; guard++) {
+    expect(answerBytes(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    pageSizes.push(page.page.returned);
+    seen.push(...page.affectedTasks.map(entry => entry.id));
+    if (!page.page.hasMore) break;
+    page = await core.policyPlan(tokens.gm, { ...proposal, pageSize: 20, cursor: page.page.nextCursor! });
+    expect(page.planHash).toBe(first.planHash);
+  }
+  // 全量 id：从 total 条的全量指纹页面里拿——oneShot 一页最多 200 条，这里 60 条刚好完整。
+  // 「不漏」的判据是全量条数：翻页收集的条数必须等于 page.total，且 60 条我们自己造的都在里面。
+  expect(new Set(seen).size).toBe(seen.length);                       // 不重
+  expect(seen.length).toBe(first.page.total);                          // 不漏：正好是全量
+  expect(created.every(id => seen.includes(id))).toBe(true);            // 60 条样本一条不少
+  expect(pageSizes.length).toBeGreaterThan(1);                          // 确实翻了页
+  // 落地这一版（plan 只是试算），再按页收集的 id 分批 enforce（每批 ≤ 200）：plan → set → enforce 在超过一页的规模下仍能走完。
+  await set({ ...proposal, idempotencyKey: key() } as never);
+  // 只断言本用例造的那 60 条（库里可能还有别的用例留下的在办任务，它们本来就在清单里，但隔离面各自独立）。
+  const mine = seen.filter(id => created.includes(id));
+  expect(mine.length).toBe(60);
+  const enforced = await core.policyEnforce(tokens.gm, { taskIds: mine.slice(0, 200), reason: 'R1(b) 分页后隔离', idempotencyKey: key() });
+  expect(enforced.audited).toBe(60);
+  expect(enforced.blocked.filter(id => created.includes(id)).length).toBe(60);
+});
+
+test('R1(b): the MCP tool answers a 60-task plan with a readable page, never response_too_large', async () => {
+  const service = createMcpHttpService({ core, port: 0 });
+  const url = new URL(`http://127.0.0.1:${service.port}/mcp`);
+  const connection = await connectCompanyClient({ url, credential: tokens.gm, clientName: 'sys06-policy-paging' });
+  try {
+    await set({ policyId: 'r1b-mcp', scope: 'company', domain: 'write_authority',
+      payload: { kind: 'write_authority', codeRoles: ['engineering'], intents: ['code', 'read'] } });
+    for (let index = 0; index < 60; index++) await codeTask({ title: `R1(b) MCP 在办任务 ${index} —— 超过一页预算的合成样本` });
+    const proposal = { policyId: 'r1b-mcp', scope: 'company', domain: 'write_authority',
+      supersedes: (await listPolicies({ scope: 'company' }))[0]!.id,
+      payload: { kind: 'write_authority', codeRoles: [], intents: ['code'] }, source: 'owner', ownerQuote: '老板方向（SYS06）：本项目只允许工程岗写码' };
+    // 不给 pageSize：默认页也必须是"可读的一页"，不能整份 response_too_large。
+    const first = await connection.client.callTool({ name: 'policy_plan', arguments: proposal });
+    expect(first.structuredContent).toMatchObject({ ok: true });
+    const firstData = (first.structuredContent as { data: PolicyPlanView }).data;
+    expect(firstData.page.total).toBeGreaterThanOrEqual(60);
+    expect(firstData.page.hasMore).toBe(true);
+    expect(answerBytes(firstData)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    // 按 MCP 的提示翻下一页：页面继续可读。
+    const next = await connection.client.callTool({ name: 'policy_plan', arguments: { ...proposal, cursor: firstData.page.nextCursor! } });
+    expect(next.structuredContent).toMatchObject({ ok: true });
+    const nextData = (next.structuredContent as { data: PolicyPlanView }).data;
+    expect(nextData.page.returned).toBeGreaterThan(0);
+    expect(answerBytes(nextData)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+  } finally { await connection.close(); await service.close(); }
 });
