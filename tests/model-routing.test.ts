@@ -1,5 +1,5 @@
 import { describe, test, expect, afterAll } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
   startModelGateway,
   installRoutingSettings,
   routingEnv,
+  restoreRoutingSettings,
   type RoutingLease,
 } from "../src/model-routing/gateway.ts";
 const models = classify([
@@ -185,6 +186,15 @@ test("employee settings preserve other options and leave compaction setting alon
   expect(next.permissions).toEqual(old.permissions);
   expect(next.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("471000");
   expect(next.env.ANTHROPIC_BASE_URL).toContain(":4321/");
+  expect(next.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("1048576");
+});
+test("restoring employee settings also removes the declared context window", () => {
+  const comm = mkdtempSync(join(scratch, "restore-"));
+  mkdirSync(join(comm, ".claude"));
+  writeFileSync(join(comm, ".claude/settings.local.json"), JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "471000" } }));
+  installRoutingSettings(comm, routingEnv("employee:test", 1234));
+  expect(restoreRoutingSettings(comm)).toBe(true);
+  expect(JSON.parse(readFileSync(join(comm, ".claude/settings.local.json"), "utf8")).env).toEqual({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "471000" });
 });
 describe("streaming task gateway", () => {
   const lease: RoutingLease = {
