@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
-import type { FlowStage } from '../faults.ts';
+import { isProvablyUnsentFailure, type FlowStage } from '../faults.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, isTlsTrustFailure, opsFetch, transportErrno, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, isTlsTrustFailure, opsFetch, transportErrno, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
 
 /**
  * The machine facts of the hop that failed. The fault classifier reads them; no message is ever parsed for them,
@@ -80,6 +80,16 @@ const RETRY_MIN_LEFT_MS = 30_000;
 const RETRY_SLACK_MS = 1_000;
 const MIN_STEP_MS = 2_000;
 
+/**
+ * How many times one hop may open a fresh connection before the failure is handed back to the flow.
+ *
+ * The observed production shape is a bimodal WAN path: a healthy connection comes up in well under two seconds, and a
+ * broken one never comes up at all — the transport's 20 s connect limit is what ends it. Three attempts on the same
+ * hop therefore cost at most one broken window's worth of time, and they turn "the first connection of this hop was
+ * unlucky" into a success without replaying a single request (a connect failure writes nothing).
+ */
+const CONNECT_ATTEMPTS = 3;
+
 const fail = (what: string, detail: string | number, facts: LoginFacts) => new LoginFailure(`${what} failed (${detail})`, facts);
 
 /** The network or the upstream's availability failed, not the login itself: a fresh attempt may well succeed. */
@@ -109,6 +119,13 @@ interface Io {
   attempt: number;
   /** Sanitized hop records: phase, origin host, HTTP status or safe errno, wall time. */
   trace: Array<{ attempt: number; phase: string; host: string; ms: number; result: string }>;
+  /**
+   * Whether this hop may open another connection. A same-hop retry is only worth it while there is still budget for
+   * it: past that point the flow must fail with the real cause instead of spending what is left on connections.
+   */
+  connectRetryAllowed: () => boolean;
+  /** The fetcher to use for a retry: the same transport, opening a fresh connection from its own pool. */
+  connectFetcher: () => Fetcher;
 }
 
 /** `bun@1.2.x` or `node@22.x`, recorded once in diagnostics for runtime comparisons. */
@@ -148,28 +165,61 @@ function lastStage(io: Io): LoginStage | undefined {
   return undefined;
 }
 
-/** One request, optionally with its JSON body; a timeout while the body is read counts as a timeout of the request. */
-async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false, phase?: string): Promise<{ response: Response; body?: unknown }> {
-  const { signal, ms } = io.step();
-  const started = Date.now();
-  let host = 'unknown';
-  try { host = new URL(url).host; } catch { /* unreachable host is still recorded */ }
-  try {
-    const response = await io.fetcher(url, { ...init, signal });
-    const body = parseBody
-      ? await response.json().catch((error: Error) => { if (error.name === 'TimeoutError') throw error; return undefined; })
-      : undefined;
-    io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: `HTTP ${response.status}` });
-    return { response, body };
-  } catch (error) {
-    const { detail } = describeTransportFailure(error, ms);
-    io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
-    // An untrusted certificate fails the same way on every attempt, so it is final and never retried.
-    if (isTlsTrustFailure(error)) {
+/**
+ * Whether a failed hop may be tried again on the very same request, on a fresh connection.
+ *
+ * Only a failure that proves the connection was never established qualifies: nothing was written, so repeating the
+ * request cannot deliver anything twice. That is what makes the same-hop retry safe even for a write — and it is
+ * exactly the production shape (a new connection that never came up).
+ *
+ * EPIPE and the socket timeouts are deliberately excluded. EPIPE is a write-side error: the peer was already gone, so
+ * the request may well have been sent. For a single-use challenge or an authorization code, replaying it is not a
+ * retry but a second use. Those failures, and any failure after the request may have been written, go back to the
+ * flow, which starts over with a fresh challenge.
+ *
+ * `idempotent` says whether the request may be repeated at all when the wire state is unknown: the authorize hop is a
+ * GET, the password POST and the token exchange carry single-use material.
+ */
+function mayRepeatOnFreshConnection(facts: LoginFacts, idempotent: boolean): boolean {
+  if (isProvablyUnsentFailure(facts.errno)) return true;
+  // A reset or a socket error does not prove the request was not written. Only a request that is safe to repeat may
+  // be tried again on that basis; the login POST and the token exchange are not.
+  return idempotent && (facts.errno === 'ECONNRESET' || facts.errno === 'UND_ERR_SOCKET');
+}
+async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false, phase?: string,
+  idempotent = false): Promise<{ response: Response; body?: unknown }> {
+  for (let hopAttempt = 1; ; hopAttempt++) {
+    const { signal, ms } = io.step();
+    const started = Date.now();
+    let host = 'unknown';
+    try { host = new URL(url).host; } catch { /* unreachable host is still recorded */ }
+    try {
+      // Every attempt uses the standing connect limit; a retry opens a fresh connection through its own pool. No
+      // custom connect deadline is introduced: the existing step and budget limits bound the retry like any other
+      // request, and the standing limit is what a healthy-but-slow handshake is known to need.
+      const response = await (hopAttempt === 1 ? io.fetcher : io.connectFetcher())(url, { ...init, signal });
+      const body = parseBody
+        ? await response.json().catch((error: Error) => { if (error.name === 'TimeoutError') throw error; return undefined; })
+        : undefined;
+      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: `HTTP ${response.status}` });
+      return { response, body };
+    } catch (error) {
+      const { detail } = describeTransportFailure(error, ms);
+      io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
+      // An untrusted certificate fails the same way on every attempt, so it is final and never retried.
+      if (isTlsTrustFailure(error)) {
+        const facts = factsOf(phase ?? what, error);
+        throw fail(what, `TLS certificate not trusted: ${detail}`, { ...facts, errno: facts.errno ?? 'CERT_UNTRUSTED' });
+      }
       const facts = factsOf(phase ?? what, error);
-      throw fail(what, `TLS certificate not trusted: ${detail}`, { ...facts, errno: facts.errno ?? 'CERT_UNTRUSTED' });
+      // The same hop may be tried again only when the request provably never left the client. A failure after the
+      // request may have been written goes back to the flow, which starts over with a fresh challenge.
+      if (hopAttempt < CONNECT_ATTEMPTS && mayRepeatOnFreshConnection(facts, idempotent) && io.connectRetryAllowed()) {
+        io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: 0, result: `connect retry ${hopAttempt}/${CONNECT_ATTEMPTS - 1}` });
+        continue;
+      }
+      throw new Unavailable(what, detail, facts);
     }
-    throw new Unavailable(what, detail, factsOf(phase ?? what, error));
   }
 }
 
@@ -190,12 +240,14 @@ async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Pr
   const challenge = consentUrl.searchParams.get('consent_challenge');
   if (!challenge) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state', undefined, { stage: 'consent' });
   const cookie = browserSessionCookie(loginHeaders);
+  // The consent POST carries the single-use consent challenge: it is not idempotent, so a failure that may have
+  // reached the IdP goes back to the flow instead of being sent twice.
   const { response, body } = await request('IdP consent', io, consentUrl.toString(), {
     method: 'POST',
     redirect: 'manual',
     headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
     body: new URLSearchParams({ consent_challenge: challenge, decision: 'approve' }).toString(),
-  }, true, 'consent');
+  }, true, 'consent', false);
   if (response.status >= 500) throw new Unavailable('IdP consent', `HTTP ${response.status}`, { stage: 'consent', status: response.status });
   const location = response.headers.get('location');
   if (location) return new URL(location, consentUrl.toString());
@@ -209,7 +261,9 @@ async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Pr
 async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ challenge: string; loginApi: string }> {
   let current = authorizeUrl;
   for (let hop = 0; hop < MAX_HOPS; hop++) {
-    const { response } = await request('IdP authorize', io, current, { redirect: 'manual' }, false, `authorize#${hop}`);
+    // The authorize hop is a GET: it writes nothing, so a connection that never came up may be retried on the same
+    // hop, on a fresh connection, without spending a fresh challenge.
+    const { response } = await request('IdP authorize', io, current, { redirect: 'manual' }, false, `authorize#${hop}`, true);
     if (response.status >= 500) throw new Unavailable('IdP authorize', `HTTP ${response.status}`, { stage: 'authorize', status: response.status });
     const location = response.headers.get('location');
     if (response.status < 300 || response.status > 399 || !location) {
@@ -324,6 +378,16 @@ export async function passwordLogin(
     left,
     attempt: 0,
     trace: [],
+    // A same-hop retry only runs while the flow still has room for it: the retry is bounded by the same budget as
+    // everything else, so a broken path cannot spend more than the login is allowed to take.
+    connectRetryAllowed: () => left() >= MIN_STEP_MS && attemptLeft() >= MIN_STEP_MS,
+    connectFetcher: () => {
+      const fetcher = options.fetch ?? opsFetch;
+      const aware = fetcher as Partial<ConnectAwareFetcher>;
+      // A fresh connection on the same trust anchors; an injected fetcher without the connect-aware shape is used as
+      // it is. No custom connect deadline is introduced.
+      return typeof aware.freshConnection === 'function' ? aware.freshConnection() : fetcher;
+    },
   };
   const giveUp = (failure: Unavailable, attempts: number): LoginFailure => {
     const trace = formatTrace(io);
@@ -361,11 +425,13 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
 
   const { challenge, loginApi } = await findLoginChallenge(authorize.toString(), io);
 
+  // The password POST consumes the single-use login challenge: it is not idempotent, so a failure that may have
+  // reached the IdP is never sent twice.
   const { response: login, body: loginRaw } = await request('IdP login', io, loginApi, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ login_challenge: challenge, username, password }).toString(),
-  }, true, 'login');
+  }, true, 'login', false);
   if (login.status >= 500) throw new Unavailable('IdP login', `HTTP ${login.status}`, { stage: 'login', status: login.status });
   const loginBody = loginRaw as { redirect_uri?: string; error?: string; mfa_state?: string } | undefined;
   if (loginBody?.mfa_state) throw new LoginError('mfa_required', 'IdP asked for a second factor; the broker only supports password-only test accounts', undefined, { stage: 'login' });
@@ -388,6 +454,9 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
   const code = settled.searchParams.get('code');
   if (!code || settled.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state', undefined, { stage: 'authorize' });
 
+  // The token exchange redeems the single-use authorization code: it is not idempotent, so a failure that may have
+  // reached the token endpoint is never sent twice. A connect-phase failure, which proves the code was never sent,
+  // is the one case the hop may repeat.
   const { response: exchange, body: tokenRaw } = await request('token exchange', io, channel.tokenUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -395,7 +464,7 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
       grant_type: 'authorization_code', code, redirect_uri: channel.redirectUri, code_verifier: verifier,
       ...(channel.sendsClientId ? { client_id: channel.clientId } : {}),
     }).toString(),
-  }, true, 'exchange');
+  }, true, 'exchange', false);
   if (exchange.status >= 500) throw new Unavailable('token exchange', `HTTP ${exchange.status}`, { stage: 'exchange', status: exchange.status });
   const tokens = tokenRaw as { access_token?: string; expires_in?: number } | undefined;
   if (!exchange.ok || !tokens?.access_token) throw fail('token exchange', `HTTP ${exchange.status}`, { stage: 'exchange', status: exchange.status });

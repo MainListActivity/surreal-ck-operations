@@ -10,6 +10,18 @@ const { Agent, fetch: undiciFetch } = require('undici/index.js') as UndiciModule
 /** The slice of `fetch` the broker uses; plain functions satisfy it (Bun's `typeof fetch` also demands `preconnect`). */
 export type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/**
+ * A fetcher that can also open a fresh connection from its own pool.
+ *
+ * The production login path retries a hop whose connection never came up. Reusing the pool that just failed can hand
+ * back the same broken socket path, so the retry asks for a new connection instead. The connect limit is not changed:
+ * the standing one is what a healthy-but-slow handshake is known to need.
+ */
+export interface ConnectAwareFetcher extends Fetcher {
+  /** A fetcher on the same trust anchors whose requests open a fresh connection, not the pooled one. */
+  freshConnection: () => Fetcher;
+}
+
 /** Secret-free wording for a request that threw, naming the limit when a timeout was the cause. */
 export function describeTransportFailure(error: unknown, timeoutMs: number): { timedOut: boolean; detail: string } {
   const err = error as (Error & { cause?: unknown }) | undefined;
@@ -48,17 +60,40 @@ export interface OpsFetchOptions {
 }
 
 /** A Fetcher on a private undici dispatcher. `close` releases that dispatcher's sockets. */
-export function createOpsFetcher(options: OpsFetchOptions = {}): Fetcher & { close(): Promise<void> } {
-  const dispatcher = new Agent({
-    connect: { timeout: options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS, ...(options.ca ? { ca: options.ca } : {}) },
-  });
+export function createOpsFetcher(options: OpsFetchOptions = {}): ConnectAwareFetcher & { close(): Promise<void> } {
+  const connect = { timeout: options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS, ...(options.ca ? { ca: options.ca } : {}) };
+  const make = () => new Agent({ connect });
+  const dispatcher = make();
+  // Every `freshConnection()` gets its own dispatcher (and therefore its own connection pool), so a retry really
+  // opens a new connection instead of being handed the socket that just failed. All of them share the same connect
+  // limit and trust anchors.
+  const fresh = new Set<ReturnType<typeof make>>();
   const fetcher = (input: string | URL | Request, init?: RequestInit) => undiciFetch(input, { ...init, dispatcher });
-  return Object.assign(fetcher, { close: () => dispatcher.close() });
+  const freshConnection = (): Fetcher => {
+    const agent = make();
+    fresh.add(agent);
+    return (input: string | URL | Request, init?: RequestInit) => undiciFetch(input, { ...init, dispatcher: agent });
+  };
+  return Object.assign(fetcher, {
+    freshConnection,
+    close: async () => {
+      await dispatcher.close();
+      for (const agent of fresh) await agent.close().catch(() => undefined);
+    },
+  });
 }
 
-let shared: (Fetcher & { close(): Promise<void> }) | undefined;
-/** The transport every ops HTTP call uses unless a caller injects one. Created on first use, so importing an ops module opens no socket. */
-export const opsFetch: Fetcher = (input, init) => (shared ??= createOpsFetcher())(input, init);
+let shared: (ConnectAwareFetcher & { close(): Promise<void> }) | undefined;
+/**
+ * The transport every ops HTTP call uses unless a caller injects one. Created on first use, so importing an ops module
+ * opens no socket.
+ */
+export const opsFetch: ConnectAwareFetcher = Object.assign(
+  (input: string | URL | Request, init?: RequestInit) => (shared ??= createOpsFetcher())(input, init),
+  {
+    freshConnection: (): Fetcher => (shared ??= createOpsFetcher()).freshConnection(),
+  },
+);
 
 const TLS_TRUST_CODES = new Set([
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',

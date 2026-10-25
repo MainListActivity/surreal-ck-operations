@@ -133,13 +133,29 @@ async function attempt(scope: { taskId: string; employeeId?: string }, target: L
 }
 
 describe('the real transport', () => {
-  test('a connect timeout is recoverable: the next attempt goes through', async () => {
-    // Every flow attempt stalls, so the login gives up after its own retries and the failure reaches the fault layer.
-    const target = await idpWith({ hold: (connection) => (connection <= 3 ? 3_000 : 0) });
+  test('a connect timeout is recovered on the same hop: the login goes through without spending a flow', async () => {
+    // The first connection of the authorize hop is broken; the next one works. The same-hop retry carries the hop,
+    // so the login succeeds inside one flow and the fault layer never sees a failure.
+    const target = await idpWith({ hold: (connection) => (connection === 1 ? 3_000 : 0) });
     const taskId = await makeTask('传输：建连超时可恢复');
     const scope = { taskId, employeeId: 't-eng' };
     const first = await attempt(scope, target);
-    // The failure is a connect timeout at the authorize hop, and it may be recovered.
+    expect(first.tokens?.accessToken).toBeTruthy();
+    expect(first.reported).toBeUndefined();
+    // No fault was reported, so no recovery budget was spent.
+    const row = await budgetRow(taskId);
+    expect(row?.attempts ?? 0).toBe(0);
+    expect(row?.failed ?? false).toBe(false);
+  });
+
+  test('a connect timeout that outlives every connection is reported, then a later success settles the budget', async () => {
+    // Every connection of the authorize hop stalls, so the hop fails and the failure reaches the fault layer, where
+    // it is classified as a retryable connect fault. Then the path heals: the next attempt succeeds and the recovery
+    // budget is settled (attempts back to 0, failed false) while total_attempts keeps the audit.
+    const target = await idpWith({ hold: () => 13_000 });
+    const taskId = await makeTask('传输：建连超时进故障层');
+    const scope = { taskId, employeeId: 't-eng' };
+    const first = await attempt(scope, target);
     expect(first.reported?.allowed).toBe(true);
     expect(first.reported?.evidence.errno).toBe('UND_ERR_CONNECT_TIMEOUT');
     expect(first.reported?.evidence.hop).toBe('connect');
@@ -149,14 +165,17 @@ describe('the real transport', () => {
     const row = await budgetRow(taskId);
     expect(row?.attempts).toBe(1);
     expect(row?.failed).toBe(true);
-    // The next attempt runs after the interval and succeeds.
+    // The path heals: the next attempt runs after the interval and succeeds.
+    const healed = await idpWith({});
     clock += 10_000;
-    const second = await attempt(scope, target);
+    const second = await attempt(scope, healed);
     expect(second.tokens?.accessToken).toBeTruthy();
-    // A call that works costs no recovery budget: the recovery is over.
+    // A call that works costs no recovery budget: the recovery is over. The total keeps the audit of both
+    // reservations (the failed attempt and the successful one), so it is 2 rather than reset to 0.
     const after = await budgetRow(taskId);
     expect(after?.attempts).toBe(0);
     expect(after?.failed).toBe(false);
+    expect(after?.totalAttempts).toBe(2);
   });
 
   test('the budget runs out at the authorize stage and the refused attempt never reaches the IdP', async () => {

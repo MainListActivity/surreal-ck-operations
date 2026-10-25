@@ -127,6 +127,30 @@ const CONNECT_ERRNOS = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE',
 ]);
 
+/**
+ * The errno set that proves the connection was never established, so the request was never written.
+ *
+ * This is narrower than CONNECT_ERRNOS on purpose. EPIPE is a write-side error: it happens when the peer has already
+ * gone away, which means the request may well have been sent (and, for a single-use challenge or code, consumed).
+ * ETIMEDOUT and ESOCKETTIMEDOUT are connect-phase timeouts at the socket layer, but a timeout can also fire after
+ * the request was written. Neither proves that nothing reached the upstream, so neither may justify repeating a
+ * non-idempotent request. Only the errors below prove the connection never existed.
+ */
+const PROVABLY_UNSENT_ERRNOS = new Set([
+  'UND_ERR_CONNECT_TIMEOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH',
+]);
+
+/**
+ * Whether the failure proves the request was never written, so repeating the same request is safe even for a write.
+ *
+ * Used by the login path's same-hop retry. Deliberately stricter than the classifier's `hop === 'connect'`: the
+ * classifier records where the failure happened, while this answers whether the wire was ever touched.
+ */
+export function isProvablyUnsentFailure(errno: string | undefined): boolean {
+  if (!errno) return false;
+  return PROVABLY_UNSENT_ERRNOS.has(errno);
+}
+
 /** The errno set that means "the connection broke" — the request may have been sent, so it is never replayed blindly. */
 const RESET_ERRNOS = new Set(['ECONNRESET', 'UND_ERR_SOCKET', 'EPROTO', 'EHOSTDOWN', 'ENETRESET']);
 
