@@ -772,3 +772,21 @@ run('WT02: a tree holding only dependency output is reclaimed, and a row for a v
     "SELECT reason FROM worktree_audit WHERE event = 'fail' AND repo = $repo;", { repo: path });
   expect(ghostFails ?? []).toEqual([]);
 }, 60000);
+
+run('a routine sweep records a retention once per reason, never the same skip every pass', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng = await employee('engineering');
+  const held = await core.claim(eng, (await task(core, 'engineering')).id);
+  const audits = async () => ((await db.db.query<[Array<{ event: string }>]>(
+    'SELECT event FROM worktree_audit WHERE repo = $repo OR (repo = "*" AND trigger = "sweep");', { repo: path }))[0] ?? []);
+  const before = (await audits()).length;
+  const first = await core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  expect(first.kept.some(k => k.path === held.worktree!.worktreePath)).toBe(true);
+  const recorded = (await audits()).length;
+  expect(recorded).toBeGreaterThan(before);
+  for (let n = 0; n < 3; n++) await core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  expect((await audits()).length).toBe(recorded);
+  // A manual reclaim still records every retention it decides.
+  await core.reclaimWorktrees(gm, { repos: [path] });
+  expect((await audits()).length).toBeGreaterThan(recorded);
+}, 60000);

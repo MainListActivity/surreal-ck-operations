@@ -113,6 +113,8 @@ export interface CompanyConfig {
   quotaWarnPct: number;
   /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
   sessionMaxWakes: number;
+  /** 按岗位覆盖 sessionMaxWakes（如 { engineering: 4 }）：会话少带几轮旧任务历史，换来更小的请求上下文。 */
+  sessionMaxWakesByRole: Record<string, number>;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
   /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
@@ -148,7 +150,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -399,6 +401,8 @@ export class Workforce {
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
       quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
+      sessionMaxWakesByRole: Object.fromEntries(Object.entries(row?.session_max_wakes_by_role && typeof row.session_max_wakes_by_role === 'object' ? row.session_max_wakes_by_role : {})
+        .filter((e): e is [string, number] => typeof e[1] === 'number' && Number.isInteger(e[1]) && e[1] >= 0)),
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,

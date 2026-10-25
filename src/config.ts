@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 export interface DatabaseConfig {
   url: string;
@@ -12,14 +14,32 @@ function readProductEnv(): Record<string, string> {
   // `||` not `??`: the spawn env can inject SCK_PRODUCT_ENV set-but-empty, and '' must
   // still fall back to the default path (an explicit-but-empty value is meaningless).
   const explicit = process.env.SCK_PRODUCT_ENV;
-  const path = explicit || '/Users/y/IdeaProjects/surreal_ck/.env';
+  return readEnvFile(explicit || '/Users/y/IdeaProjects/surreal_ck/.env', !!explicit);
+}
+
+/**
+ * The company's own database (`private/company-db.env`: SURREAL_URL / SURREAL_ROOT_USER / SURREAL_ROOT_PASS) once the
+ * control plane runs on this Mac; it wins over the product .env, which keeps describing the product's server. Tests never
+ * pick it up implicitly: its URL is local, so the non-local guard below would not stop a stray `bun test` from writing
+ * into the live company database.
+ */
+function readCompanyEnv(): Record<string, string> {
+  const explicit = process.env.SCK_COMPANY_DB_ENV;
+  if (explicit) return readEnvFile(explicit, true);
+  if (process.env.NODE_ENV === 'test') return {};
+  const home = process.env.SCK_SERVICE_HOME || join(homedir(), 'Library/Application Support/SurrealCKCompany');
+  const path = join(home, 'private/company-db.env');
+  return existsSync(path) ? readEnvFile(path, true) : {};
+}
+
+function readEnvFile(path: string, required: boolean): Record<string, string> {
   // The default path is a Mac dev-machine convention; on servers everything comes
   // from the environment. Only an explicitly-set but missing file is an error.
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (error) {
-    if (explicit) throw error;
+    if (required) throw error;
     return {};
   }
   const values: Record<string, string> = {};
@@ -37,8 +57,9 @@ function readProductEnv(): Record<string, string> {
 
 export function loadDatabaseConfig(): DatabaseConfig {
   const fromFile = readProductEnv();
+  const company = readCompanyEnv();
   const get = (name: string): string => {
-    const value = process.env[name] || fromFile[name];
+    const value = process.env[name] || company[name] || fromFile[name];
     if (!value) throw new Error(`Missing ${name}`);
     return value;
   };

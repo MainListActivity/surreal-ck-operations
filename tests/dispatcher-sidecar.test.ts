@@ -396,6 +396,16 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     await d.tick();
     expect(d.sessionSnapshot().sessions.get('employee-9')?.state).toBe('down');
   });
+  test('a per-role wake limit rotates that role sooner and leaves the global limit for the rest', async () => {
+    const w = world();
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9', wakeCount: 4 } as EmployeeInst;
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
+    w.setConfig({ sessionMaxWakes: 12, sessionMaxWakesByRole: { qa: 2 } });
+    expect((await w.dispatcher().tick()).retired).not.toContain('employee-9');
+    w.setConfig({ sessionMaxWakes: 12, sessionMaxWakesByRole: { engineering: 4 } });
+    expect((await w.dispatcher().tick()).retired).toContain('employee-9');
+  });
   test('a closed session with no work keeps the retirement path', async () => {
     const w = world();
     const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
