@@ -250,7 +250,20 @@ test("a cursor reads its boundary and next page atomically while new rows arrive
   expect(second.rows.some((r) => first.rows.some((p) => p.id === r.id))).toBe(false);
   expect(second.rows[0]?.id).toBe(normalizeRequest(rows[70]).id);
   expect(second.hasMore).toBe(true);
-  rows = rows.slice(100);
+  rows = [
+    ...Array.from({ length: 430 }, (_, i) => ({
+      t: "2026-10-25T13:00:00Z",
+      response_id: `burst-${i}`,
+      provider: "real",
+      model: "actual",
+    })),
+    ...rows,
+  ];
+  now += 6000;
+  await expect(source.page({ ...filter, after: first.rows.at(-1)!.id })).rejects.toThrow(
+    "分页边界已过期",
+  );
+  rows = rows.filter((row) => row.response_id !== "row-49");
   now += 6000;
   await expect(source.page({ ...filter, after: first.rows.at(-1)!.id })).rejects.toThrow(
     "分页边界已过期",

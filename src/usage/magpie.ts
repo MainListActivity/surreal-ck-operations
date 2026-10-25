@@ -323,6 +323,12 @@ export class MagpieUsage {
     const boundary = filter.after ? normalized.findIndex((row) => row.id === filter.after) : -1;
     if (filter.after && boundary < 0) throw Error("分页边界已过期，请点击“最新请求”重新开始");
     const start = filter.after ? boundary + 1 : 0;
+    if (
+      filter.after &&
+      start + filter.limit > normalized.length &&
+      probeOffset + normalized.length < Number(r.total)
+    )
+      throw Error("分页边界已过期，请点击“最新请求”重新开始");
     const rows = normalized.slice(start, start + filter.limit);
     return {
       at: data.at,
