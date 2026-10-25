@@ -32,6 +32,12 @@ function envFile(path: string): Record<string, string> {
   return out;
 }
 
+/** R2 keys of a backup taken at `now`: hourly/20261025T1351Z.surql.zst and daily/20261025.surql.zst. */
+export function backupKeys(now: Date): { hourly: string; daily: string } {
+  const stamp = now.toISOString().replace(/[-:.]/g, '').slice(0, 13) + 'Z';
+  return { hourly: `hourly/${stamp}.surql.zst`, daily: `daily/${stamp.slice(0, 8)}.surql.zst` };
+}
+
 export interface StoredObject { key: string; size: number }
 
 /** Which objects to delete: keep the newest hourly copies, then daily copies newest-first while the total fits. */
@@ -110,21 +116,20 @@ async function backup(r2: R2): Promise<void> {
     const raw = join(dir, 'company.surql');
     await exportDb(raw);
     const packed = Bun.zstdCompressSync(readFileSync(raw), { level: 19 });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15) + 'Z';
+    const keys = backupKeys(new Date());
     if (packed.length > FILE_LIMIT) {
       const mb = (packed.length / 1048576).toFixed(1);
       await notice(`公司库备份 ${mb}MB 超过单文件 20MB 上限，本次未上传 R2。需要收紧数据保留期或清理大表。`).catch(() => {});
       throw new Error(`backup ${mb}MB exceeds the ${FILE_LIMIT / 1048576}MB file limit; not uploaded`);
     }
     const existing = await r2.list();
-    await r2.put(`hourly/${stamp}.surql.zst`, packed);
-    const day = `daily/${stamp.slice(0, 8)}.surql.zst`;
-    const uploaded = [{ key: `hourly/${stamp}.surql.zst`, size: packed.length }];
-    if (!existing.some(o => o.key === day)) { await r2.put(day, packed); uploaded.push({ key: day, size: packed.length }); }
+    await r2.put(keys.hourly, packed);
+    const uploaded = [{ key: keys.hourly, size: packed.length }];
+    if (!existing.some(o => o.key === keys.daily)) { await r2.put(keys.daily, packed); uploaded.push({ key: keys.daily, size: packed.length }); }
     const remove = prunePlan([...existing.filter(o => !uploaded.some(u => u.key === o.key)), ...uploaded]);
     for (const key of remove) await r2.delete(key);
     const total = (await r2.list()).reduce((a, o) => a + o.size, 0);
-    console.log(`backup ${stamp}: ${(packed.length / 1048576).toFixed(2)}MB uploaded, ${remove.length} pruned, R2 total ${(total / 1048576).toFixed(2)}MB`);
+    console.log(`backup ${keys.hourly}: ${(packed.length / 1048576).toFixed(2)}MB uploaded, ${remove.length} pruned, R2 total ${(total / 1048576).toFixed(2)}MB`);
     writeFileSync(join(home, 'backups', 'last-backup.json'), JSON.stringify({ at: new Date().toISOString(), bytes: packed.length, totalBytes: total }));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
