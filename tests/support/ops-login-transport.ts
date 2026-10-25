@@ -37,6 +37,7 @@ export interface StallProxy { port: number; connections: () => number; close(): 
 export function startStallProxy(upstreamPort: number, holdFor: HoldPolicy = () => 0): Promise<StallProxy> {
   let count = 0;
   const sockets = new Set<Socket>();
+  const timers = new Set<ReturnType<typeof setTimeout>>();
   const server: TcpServer = createTcpServer(client => {
     const id = ++count;
     sockets.add(client);
@@ -54,7 +55,10 @@ export function startStallProxy(upstreamPort: number, holdFor: HoldPolicy = () =
       upstream.on('close', () => client.end());
     };
     const delay = holdFor(id);
-    if (delay > 0) setTimeout(release, delay); else release();
+    if (delay > 0) {
+      const timer = setTimeout(() => { timers.delete(timer); release(); }, delay);
+      timers.add(timer);
+    } else release();
   });
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
     const port = (server.address() as { port: number }).port;
@@ -62,6 +66,8 @@ export function startStallProxy(upstreamPort: number, holdFor: HoldPolicy = () =
       port,
       connections: () => count,
       close: () => new Promise<void>(done => {
+        for (const timer of timers) clearTimeout(timer);
+        timers.clear();
         for (const socket of sockets) socket.destroy();
         server.close(() => done());
       }),
@@ -72,6 +78,12 @@ export function startStallProxy(upstreamPort: number, holdFor: HoldPolicy = () =
 export interface LoginIdpOptions {
   password: string;
   hold?: HoldPolicy;
+  /**
+   * Hold the n-th accepted connection of one hop before any byte reaches the IdP. Each hop gets its own listener and
+   * port, like the three production origins (issuer / auth / product): a fresh TCP+TLS connect per hop is what makes a
+   * connect stall on the last hop fatal in production, and this reproduces it per hop.
+   */
+  holdHop?: (hop: LoginHop, connection: number) => number;
   /** Consume the n-th password POST, then drop the socket so no answer reaches the client. */
   dropLogin?: (login: number) => boolean;
   /** HTTP status for a refused password; the reason stays `invalid_credentials`. */
@@ -80,9 +92,13 @@ export interface LoginIdpOptions {
   delayLogin?: (login: number) => number;
 }
 
+export type LoginHop = 'authorize' | 'login' | 'exchange';
+
 export interface LoginIdp {
-  /** Base URL the client uses (the proxy's loopback port). */
+  /** Base URL the client uses for the issuer origin (authorize + login). */
   origin: string;
+  /** Per-hop origins, so each hop's connection can be held independently. */
+  origins: Record<LoginHop, string>;
   counts: { authorize: number; login: number; exchange: number };
   connections: () => number;
   close(): Promise<void>;
@@ -93,12 +109,24 @@ const json = (res: import('node:http').ServerResponse, status: number, body: unk
   res.end(JSON.stringify(body));
 };
 
-/** A loopback OIDC login IdP behind a stall proxy. The login route checks the password; the token route
- * checks the PKCE verifier and the single-use code, so a replayed or forged exchange fails. */
+/** A loopback OIDC login IdP behind per-hop stall proxies. The login route checks the password; the token route
+ * checks the PKCE verifier and the single-use code, so a replayed or forged exchange fails. Each hop listens on its
+ * own port, like production's issuer / auth / product origins, so every hop opens its own TCP+TLS connection. */
 export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Promise<LoginIdp> {
   const counts = { authorize: 0, login: 0, exchange: 0 };
   const challenges = new Map<string, { state: string; redirectUri: string; codeChallenge: string }>();
   const codes = new Map<string, { redirectUri: string; codeChallenge: string }>();
+  // One listener per hop, each with its own connection counter: production reaches the issuer, the auth host and the
+  // product over three separate origins, so every hop is a cold TCP+TLS connect that can stall on its own. The legacy
+  // whole-proxy `hold` keeps one counter across all hops, so its connection numbers mean the same as before.
+  const shared = { count: 0 };
+  const holdFor = (hop: LoginHop): HoldPolicy => {
+    if (options.holdHop) return connection => options.holdHop!(hop, connection);
+    if (!options.hold) return () => 0;
+    return () => options.hold!(++shared.count);
+  };
+  // The app listens first so the proxies have an upstream port; the login origin is fixed once its proxy exists.
+  let loginOrigin = '';
   const app: HttpsServer = createHttpsServer({ key: pki.key, cert: pki.cert }, (req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -113,7 +141,9 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
           redirectUri: url.searchParams.get('redirect_uri') ?? '',
           codeChallenge: url.searchParams.get('code_challenge') ?? '',
         });
-        res.writeHead(302, { location: `/login/ck?login_challenge=${challenge}` });
+        // Absolute URL to the login origin: production redirects from the issuer to auth.maplayer.top, and the client
+        // builds the password API URL from this hop's origin, so the login hop gets its own connection.
+        res.writeHead(302, { location: `${loginOrigin}/login/ck?login_challenge=${challenge}` });
         res.end();
         return;
       }
@@ -148,25 +178,33 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
   });
   await new Promise<void>(resolve => app.listen(0, '127.0.0.1', () => resolve()));
   const upstreamPort = (app.address() as { port: number }).port;
-  const proxy = await startStallProxy(upstreamPort, options.hold);
+  const hops: Record<LoginHop, StallProxy> = {
+    authorize: await startStallProxy(upstreamPort, holdFor('authorize')),
+    login: await startStallProxy(upstreamPort, holdFor('login')),
+    exchange: await startStallProxy(upstreamPort, holdFor('exchange')),
+  };
+  loginOrigin = `https://127.0.0.1:${hops.login.port}`;
+  const total = () => hops.authorize.connections() + hops.login.connections() + hops.exchange.connections();
   return {
-    origin: `https://127.0.0.1:${proxy.port}`,
+    // The issuer origin serves authorize; the auth origin serves the login route; the product origin serves exchange.
+    origin: `https://127.0.0.1:${hops.authorize.port}`,
+    origins: { authorize: `https://127.0.0.1:${hops.authorize.port}`, login: `https://127.0.0.1:${hops.login.port}`, exchange: `https://127.0.0.1:${hops.exchange.port}` },
     counts,
-    connections: proxy.connections,
+    connections: total,
     close: async () => {
-      await proxy.close();
+      await Promise.all(Object.values(hops).map(hop => hop.close()));
       app.closeAllConnections?.();
       await new Promise<void>(done => app.close(() => done()));
     },
   };
 }
 
-/** The broker config shape the login path reads, pointed at a loopback IdP. */
-export function loginBrokerConfig(origin: string): Record<string, unknown> {
+/** The broker config shape the login path reads, pointed at a loopback IdP with a separate origin per hop. */
+export function loginBrokerConfig(origins: { authorize: string; login: string; exchange: string }): Record<string, unknown> {
   return {
     roles: ['qa', 'engineering'],
-    idp: { issuer: `${origin}/t/ck`, clientId: 'client-ck-1234', audience: 'https://auth.test', redirectUri: 'https://app.test/auth/callback' },
-    product: { url: origin },
+    idp: { issuer: `${origins.authorize}/t/ck`, clientId: 'client-ck-1234', audience: 'https://auth.test', redirectUri: 'https://app.test/auth/callback' },
+    product: { url: origins.exchange },
     accounts: { prefix: 'sck-', emailDomain: 'example.test', workspacePrefix: 'sck-' },
     d1: { tenantId: 'tenant-ck-0001', databaseId: 'db-0000-0001' },
     data: { url: 'https://data.test', namespace: 'main' },

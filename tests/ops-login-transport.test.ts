@@ -3,7 +3,7 @@ import { parseBrokerConfig } from '../src/ops/config.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { createOpsFetcher, opsFetch, OPS_CONNECT_TIMEOUT_MS } from '../src/ops/fetcher.ts';
 import { LoginError, passwordLogin, type LoginOptions, type LoginTokens } from '../src/ops/idp.ts';
-import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type TestPki } from './support/ops-login-transport.ts';
+import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type LoginIdpOptions, type TestPki } from './support/ops-login-transport.ts';
 
 // Real sockets and real TLS against a loopback IdP. Only the stall, delay and drop points are scripted.
 const PASSWORD = 'correct-pw';
@@ -18,7 +18,7 @@ afterAll(async () => {
   for (const idp of idps) await idp.close();
 });
 
-async function idp(options: { hold?: (connection: number) => number; delayLogin?: (login: number) => number; dropLogin?: (login: number) => boolean; refuseStatus?: number } = {}): Promise<LoginIdp> {
+async function idp(options: Omit<LoginIdpOptions, 'password'> = {}): Promise<LoginIdp> {
   const started = await startLoginIdp(pki, { password: PASSWORD, ...options });
   idps.push(started);
   return started;
@@ -35,7 +35,7 @@ function transport(connectTimeoutMs?: number, trusted = true) {
 }
 
 const login = (target: LoginIdp, options: LoginOptions, password = PASSWORD) =>
-  passwordLogin(parseBrokerConfig(loginBrokerConfig(target.origin)), 'sck-nobody', password, options);
+  passwordLogin(parseBrokerConfig(loginBrokerConfig(target.origins)), 'sck-nobody', password, options);
 
 async function success(run: Promise<LoginTokens>): Promise<{ tokens: LoginTokens; ms: number }> {
   const started = performance.now();
@@ -112,6 +112,40 @@ describe('bounded recovery', () => {
     expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
   }, SLOW);
 
+  // The QA failure shape (5860edac, 2026-10-24): a ~20s connect stall lands on the LAST hop (token exchange), where the
+  // old policy had already spent its one retry. A retry must be a complete fresh flow — new authorize, new challenge,
+  // new code — and the single-use code must never be replayed. A connect that never completes sends no request, so the
+  // server-side counts show only the requests that actually arrived.
+  test('a connect stall on the last hop (exchange) is retried from a fresh flow and succeeds', async () => {
+    const target = await idp({ holdHop: (hop, connection) => hop === 'exchange' && connection === 1 ? 1_500 : 0 });
+    const { tokens } = await success(login(target, { fetch: transport(400) }));
+    expect(tokens.attempts).toBe(2);
+    // The stalled exchange never reached the server; the retry ran a whole new flow and exchanged exactly once.
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(tokens.trace).toContain('a1:exchange');
+    expect(tokens.trace).toContain('UND_ERR_CONNECT_TIMEOUT');
+    expect(tokens.trace).toContain('a2:exchange');
+    expect(tokens.trace).toContain('HTTP 200');
+    // The trace names fixed phases and hosts only: no challenge, code, verifier or password material.
+    for (const secret of [PASSWORD, 'login_challenge', 'code-', 'code_verifier', '/api/', '/t/ck']) expect(tokens.trace).not.toContain(secret);
+  }, SLOW);
+
+  test('a connect stall on the authorize hop is retried from a fresh flow', async () => {
+    const target = await idp({ holdHop: (hop, connection) => hop === 'authorize' && connection === 1 ? 1_500 : 0 });
+    const { tokens } = await success(login(target, { fetch: transport(400) }));
+    expect(tokens.attempts).toBe(2);
+    // The stalled authorize never reached the server; the retry ran one full flow.
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+  }, SLOW);
+
+  test('a connect stall on the login hop is retried from a fresh flow', async () => {
+    const target = await idp({ holdHop: (hop, connection) => hop === 'login' && connection === 1 ? 1_500 : 0 });
+    const { tokens } = await success(login(target, { fetch: transport(400) }));
+    expect(tokens.attempts).toBe(2);
+    // The stalled login never reached the server; the retry re-authorized (new challenge) and logged in once.
+    expect(target.counts).toEqual({ authorize: 2, login: 1, exchange: 1 });
+  }, SLOW);
+
   test('a login dropped after the IdP consumed it is retried with a new flow, never replayed', async () => {
     const target = await idp({ dropLogin: login => login === 1 });
     const { tokens } = await success(login(target, { fetch: transport() }));
@@ -123,8 +157,23 @@ describe('bounded recovery', () => {
     const target = await idp({ delayLogin: () => 5_000 });
     const { error, ms } = await failure(login(target, { fetch: transport(), stepTimeoutMs: 300, budgetMs: 1_500, retryMinLeftMs: 100 }));
     expect(error.message).toContain('timed out');
-    expect(target.counts.login).toBeLessThanOrEqual(2);
+    // Bounded by the budget, not by a fixed attempt count: the whole call stays well under the 5s step that never ends.
+    expect(target.counts.login).toBeLessThanOrEqual(3);
     expect(ms).toBeLessThan(4_500);
+  }, SLOW);
+
+  // The core of the fix: an attempt that may still be followed cannot spend the whole budget. Its own deadline leaves
+  // one full-flow envelope (retryMinLeftMs) for the next attempt, so a stall on its last hop ends it with budget left.
+  test('a non-final attempt is capped so the retry keeps a whole-flow envelope', async () => {
+    // Scaled down from production (75s budget / 30s reserve / 25s step): 9s / 4s / 3s. The exchange hop stalls past any
+    // step limit, so attempt 1 is cut at 5s (9-4), leaving the retry its own 4s flow. Without the reserve the first
+    // attempt would consume the whole 9s and the retry would never start.
+    const target = await idp({ holdHop: (hop) => hop === 'exchange' ? 30_000 : 0 });
+    const { error, ms } = await failure(login(target, { fetch: transport(10_000), budgetMs: 9_000, retryMinLeftMs: 4_000, stepTimeoutMs: 3_000 }));
+    expect(error.message).toContain('timed out');
+    // Each attempt ran its own authorize+login: the retry is a fresh flow, never a replayed code.
+    expect(target.counts.authorize).toBeGreaterThanOrEqual(2);
+    expect(ms).toBeLessThan(14_000);
   }, SLOW);
 
   test('a budget that runs out stops the flow with a bounded, secret-free error', async () => {
