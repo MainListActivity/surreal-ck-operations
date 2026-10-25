@@ -54,6 +54,10 @@ const BUDGET_MS = 75_000;
 // Every attempt before the last reserves one envelope for the attempt after it, so a stall at the end of an earlier
 // attempt cannot spend the budget the fresh flow needs. This is what makes a last-hop connect stall recoverable.
 const RETRY_MIN_LEFT_MS = 30_000;
+// The reserve and the retry guard must not meet exactly. An attempt cut by its own deadline always ends a little late —
+// the abort fires after the deadline and the request teardown takes a moment — so without slack the next attempt sees
+// a hair under the guard's threshold and the retry the previous attempt paid for is rejected.
+const RETRY_SLACK_MS = 1_000;
 const MIN_STEP_MS = 2_000;
 
 const fail = (what: string, detail: string | number) => new CompanyError('upstream_error', `${what} failed (${detail})`, true);
@@ -285,10 +289,10 @@ export async function passwordLogin(
   };
   for (let attempt = 1; ; attempt++) {
     io.attempt = attempt;
-    // The last attempt runs on the whole remaining budget; every earlier one is capped at (left - one full envelope),
-    // so a connect stall on its last hop ends it with the retry's budget intact. That cap is the fix: the observed
-    // fatality was the one remaining attempt stalling on its final hop with nothing left to run a fresh flow.
-    attemptDeadline = attempt < MAX_ATTEMPTS ? Date.now() + Math.max(left() - retryMinLeftMs, MIN_STEP_MS) : started + budgetMs;
+    // The last attempt runs on the whole remaining budget; every earlier one is capped at (left - one full envelope -
+    // slack), so a connect stall on its last hop ends it with the retry's budget intact. That cap is the fix: the
+    // observed fatality was the one remaining attempt stalling on its final hop with nothing left to run a fresh flow.
+    attemptDeadline = attempt < MAX_ATTEMPTS ? Date.now() + Math.max(left() - retryMinLeftMs - RETRY_SLACK_MS, MIN_STEP_MS) : started + budgetMs;
     try {
       return await signIn(config, username, password, channel, io, options.now ?? Date.now);
     } catch (error) {

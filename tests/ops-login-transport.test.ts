@@ -8,6 +8,8 @@ import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type Logi
 // Real sockets and real TLS against a loopback IdP. Only the stall, delay and drop points are scripted.
 const PASSWORD = 'correct-pw';
 const SLOW = 30_000;
+// The production-constant case spends two connect stalls (20s each) plus the flows around them.
+const PRODUCTION_SHAPE = 120_000;
 let pki: TestPki;
 const idps: LoginIdp[] = [];
 const transports: Array<{ close(): Promise<void> }> = [];
@@ -166,7 +168,7 @@ describe('bounded recovery', () => {
   // one full-flow envelope (retryMinLeftMs) for the next attempt, so a stall on its last hop ends it with budget left.
   test('a non-final attempt is capped so the retry keeps a whole-flow envelope', async () => {
     // Scaled down from production (75s budget / 30s reserve / 25s step): 9s / 4s / 3s. The exchange hop stalls past any
-    // step limit, so attempt 1 is cut at 5s (9-4), leaving the retry its own 4s flow. Without the reserve the first
+    // step limit, so attempt 1 is cut at 4s (9-4-1), leaving the retry its own envelope. Without the reserve the first
     // attempt would consume the whole 9s and the retry would never start.
     const target = await idp({ holdHop: (hop) => hop === 'exchange' ? 30_000 : 0 });
     const { error, ms } = await failure(login(target, { fetch: transport(10_000), budgetMs: 9_000, retryMinLeftMs: 4_000, stepTimeoutMs: 3_000 }));
@@ -175,6 +177,35 @@ describe('bounded recovery', () => {
     expect(target.counts.authorize).toBeGreaterThanOrEqual(2);
     expect(ms).toBeLessThan(14_000);
   }, SLOW);
+
+  // The QA shape with the production constants (75s budget / 25s step / 30s reserve / 20s connect cap): a connect stall
+  // on an early hop of attempt 1, and another on the last hop (exchange) of attempt 2. The reserve and the retry guard
+  // meet at 30s of budget, so an attempt cut by its own deadline used to leave the retry a hair under the guard's
+  // threshold (left ≈ 29996ms) and the third attempt was rejected with "gave up after 2 attempts".
+  test('the production constants recover a stall on an early hop and on the last hop of the second attempt', async () => {
+    const target = await idp({
+      holdHop: (hop, connection) => {
+        // Attempt 1 stalls on the first hop: the transport's connect cap cuts it after 20s.
+        if (hop === 'authorize' && connection === 1) return 60_000;
+        // Attempt 2 gets through authorize and login, then stalls on the last hop: the attempt's own deadline cuts it.
+        if (hop === 'authorize' && connection === 2) return 2_000;
+        if (hop === 'login' && connection === 1) return 3_000;
+        if (hop === 'exchange' && connection === 1) return 60_000;
+        return 0;
+      },
+    });
+    const { tokens, ms } = await success(login(target, { fetch: transport() }));
+    expect(tokens.attempts).toBe(3);
+    expect(tokens.accessToken.startsWith('at-')).toBe(true);
+    // The stalled requests never reached the server, so only the third attempt consumed a code.
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(ms).toBeLessThan(75_000);
+    expect(tokens.trace).toContain('a1:authorize');
+    expect(tokens.trace).toContain('UND_ERR_CONNECT_TIMEOUT');
+    expect(tokens.trace).toContain('a2:exchange');
+    expect(tokens.trace).toContain('a3:exchange');
+    for (const secret of [PASSWORD, 'login_challenge', 'code-', 'code_verifier', '/api/', '/t/ck']) expect(tokens.trace).not.toContain(secret);
+  }, PRODUCTION_SHAPE);
 
   test('a budget that runs out stops the flow with a bounded, secret-free error', async () => {
     const target = await idp({ hold: () => 5_000 });
