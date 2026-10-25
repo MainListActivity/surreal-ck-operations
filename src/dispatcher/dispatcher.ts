@@ -51,6 +51,13 @@ const LOG_TAIL_ENTRIES = 60;
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
 /** A failed in-place reload is retried on this interval, not on every poll. */
 const RELOAD_RETRY_SECONDS = 300;
+/** A closed session holding work is resumed on this interval; until CLOSED_GRACE_SECONDS it is unknown, never down. */
+const CLOSED_RELOAD_RETRY_SECONDS = 60;
+const CLOSED_GRACE_SECONDS = 600;
+/** A busy holder past stallMinutes keeps its turn while its timeline tail moved within this window. */
+const ACTIVITY_WINDOW_SECONDS = 20 * 60;
+/** Timeline activity extends a stalled busy holder up to this many stallMinutes without a checkpoint. */
+const STALL_ACTIVITY_CAP = 3;
 /** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
 const PERSISTENT_QUOTA_FAILURES = 2;
 /** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
@@ -654,6 +661,10 @@ export class Dispatcher {
   private readonly lastStatus = new Map<string, string>();
   /** agentId → when the last in-place reload was attempted; a failing restart is retried, not hammered. */
   private readonly reloadAt = new Map<string, number>();
+  /** agentId → when a closed session holding work was first seen; bounds how long it reads as unknown. */
+  private readonly closedSince = new Map<string, number>();
+  /** agentId → last timeline tail of a stalled busy holder, when it last changed, and the task it was holding. */
+  private readonly activity = new Map<string, { tail: string; at: number; task: string }>();
   /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
   private readonly driftWaitLogged = new Map<string, string>();
   /** The last quota-floor line written. A subscription can stay below the floor for days; one line per change, not per tick. */
@@ -909,6 +920,7 @@ export class Dispatcher {
     // 1. Session health.
     const states = new Map<string, InstState>();
     const observedStatus = new Map<string, string>();
+    let openTasks: SupervisedTask[] | undefined;
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
         // A successor CAS can survive a failed launch or a process restart. Keep its identity
@@ -1010,6 +1022,15 @@ export class Dispatcher {
         await this.retireBroken(inst, 'Paseo 会话已归档（正常结束）', defs, report, false, 'archive');
         continue;
       }
+      if (status === 'closed') {
+        openTasks ??= await wf.tasks();
+        const resumed = await this.resumeClosed(inst, openTasks, now, report);
+        if (resumed) {
+          states.set(inst.id, resumed);
+          if (resumed !== 'unknown') { observedStatus.set(inst.id, resumed); this.lastStatus.set(inst.paseoAgentId, resumed); }
+          continue;
+        }
+      } else this.closedSince.delete(inst.paseoAgentId);
       states.set(inst.id, 'down');
       await this.retireBroken(inst, `session ${status}`, defs, report, false);
     }
@@ -1027,9 +1048,11 @@ export class Dispatcher {
       const expired = (task.leaseExpiresAt ?? 0) <= now;
       const stale = task.progressAt !== undefined && now - task.progressAt > cfg.stallMinutes * 60;
       if (state === 'busy') {
-        if (stale) {
+        if (stale && !(now - task.progressAt! <= cfg.stallMinutes * 60 * STALL_ACTIVITY_CAP &&
+          await this.stillWorking(inst!.paseoAgentId!, task, cfg.stallMinutes, now))) {
+          this.activity.delete(inst!.paseoAgentId!);
           await paseo.stop(inst!.paseoAgentId!).catch(() => undefined);
-          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，已中止其会话`, inst, report);
+          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，且会话已 ${ACTIVITY_WINDOW_SECONDS / 60} 分钟无动静或超过 ${cfg.stallMinutes * STALL_ACTIVITY_CAP} 分钟上限，已中止其会话`, inst, report);
         } else if ((task.leaseExpiresAt ?? 0) - now < cfg.extendWithinSeconds &&
           await wf.extendLease(task.id, task.currentEmployee, LEASE_SECONDS)) {
           report.extended.push(task.id);
@@ -2407,6 +2430,65 @@ export class Dispatcher {
     if (!this.deps.hostResources) return undefined;
     try { return this.deps.hostResources(); }
     catch (error) { this.log(`host resources read failed: ${(error as Error).message}`); return undefined; }
+  }
+
+  /**
+   * A Paseo daemon restart leaves every session `closed`: the process is gone, the conversation is not, and
+   * `agent reload` brings it back from persistence. Read as down, a closed implementer is struck and its code is
+   * handed to another seat that is just as closed. A closed session that holds a lease or is bound to ready/doing
+   * work is resumed in place instead; a lease holder is told to continue, since its interrupted turn will not. A
+   * session with no work keeps the retirement path, so one restart does not relaunch every idle seat at once.
+   * While resuming fails it stays unknown — not struck, not dispatched — for CLOSED_GRACE_SECONDS.
+   */
+  private async resumeClosed(inst: EmployeeInst, tasks: SupervisedTask[], now: number, report: TickReport): Promise<InstState | undefined> {
+    const agent = inst.paseoAgentId!;
+    const holding = tasks.find(t => t.currentEmployee === inst.id);
+    if (!holding && !tasks.some(t => t.implementer === inst.id && (t.state === 'ready' || t.state === 'doing'))) {
+      this.closedSince.delete(agent);
+      return undefined;
+    }
+    const since = this.closedSince.get(agent) ?? now;
+    this.closedSince.set(agent, since);
+    if (now - (this.reloadAt.get(agent) ?? 0) >= CLOSED_RELOAD_RETRY_SECONDS) {
+      this.reloadAt.set(agent, now);
+      try {
+        await this.deps.paseo.reload(agent);
+        this.closedSince.delete(agent);
+        (report.recovered ??= []).push(inst.id);
+        this.log(`recovered ${inst.id}: closed session resumed in place${holding ? ` holding ${holding.id}` : ''}`);
+        if (!holding) return 'idle';
+        try {
+          await this.deps.paseo.send(agent, `【系统】公司服务重启打断了你上一轮的工作。任务 ${holding.id}「${holding.title}」的租约仍在你名下（见 claim.json），从中断处继续执行；收尾规则不变：完成写 report.md，受阻写 blocker.md。`);
+          return 'busy';
+        } catch (error) {
+          this.log(`resume prompt to ${inst.id} failed: ${(error as Error).message}`);
+          return 'idle';
+        }
+      } catch (error) {
+        this.log(`resume closed ${inst.id} failed: ${(error as Error).message}`);
+      }
+    }
+    return now - since < CLOSED_GRACE_SECONDS ? 'unknown' : undefined;
+  }
+
+  /**
+   * progress_at moves only on checkpoint, so a long build or test run looks exactly like a hung turn. A busy holder
+   * past stallMinutes keeps its turn while its timeline tail keeps changing; one whose tail stood still for
+   * ACTIVITY_WINDOW_SECONDS is hung. The first stalled sighting of a task also asks the employee for a checkpoint.
+   */
+  private async stillWorking(agent: string, task: SupervisedTask, stallMinutes: number, now: number): Promise<boolean> {
+    const tail = await this.deps.paseo.logsTail(agent, 20).catch(() => undefined);
+    if (tail === undefined) return false;
+    const seen = this.activity.get(agent);
+    if (!seen || seen.task !== task.id) {
+      this.activity.set(agent, { tail, at: now, task: task.id });
+      await this.deps.paseo.send(agent, `【系统】任务 ${task.id} 已超过 ${stallMinutes} 分钟没有 checkpoint。到下一个可记录的节点就调用 checkpoint 写明进展；会话持续无动静将被中止并收回任务。`)
+        .catch(error => this.log(`checkpoint reminder to ${agent} failed: ${(error as Error).message}`));
+      this.log(`stalled ${task.id}: busy holder still observed, checkpoint requested`);
+      return true;
+    }
+    if (seen.tail !== tail) this.activity.set(agent, { tail, at: now, task: task.id });
+    return now - this.activity.get(agent)!.at < ACTIVITY_WINDOW_SECONDS;
   }
 
   private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport, trigger: 'revoke' | 'expire' = 'revoke') {
