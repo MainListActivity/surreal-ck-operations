@@ -98,13 +98,13 @@ export function buildRankingInput(model:string,tier:string,rules:string,facts:Mo
       'usage是排序前实时采集的Magpie近7天原生汇总，严格按完整供应商/模型路径匹配、含历史思考等级。requests含errors；tokensPerSecond为原生decode速度，speedSamples为测速数；ttftMs为平均首token毫秒，ttftSamples为计时数；cacheHitRate为token加权命中率。',
       'health来自近24小时全部路由尝试（含回退），不同于usage最终请求统计。performance为最终验收后的1–5分绩效及样本权重。'],
   };
-  const questions=Object.fromEntries(facts.map((_,i)=>[`m${i}`,{type:'score' as const,instructions:`按 state.ownerRules 和 state.rankingPolicy 评价 state.models.m${i}，引用按 trendDictionary 解码。`,
+  const questions=Object.fromEntries(facts.map((f,i)=>[`m${i}`,{type:'score' as const,instructions:`按 state.ownerRules 的完整老板规则和 state.rankingPolicy 评价 state.models.m${i}。明确的排最后条件是硬约束，命中时必须选0级，智能/速度/价格优势不能抵消；仅未命中时才综合判断。本模型近7天原生平均首token延迟：${f.usage?.ttftMs===undefined?'未知':`${f.usage.ttftMs/1000}秒`}，生成速度：${f.usage?.tokensPerSecond===undefined?'未知':`${f.usage.tokensPerSecond}token/s`}。老板未指定统计口径时用此原生平均延迟；未知不等于零。共享引用按trendDictionary解码。`,
     criteria:['末尾：满足共享规则的排最后条件，其他优势不能抵消；否则综合最低。','靠后：未触发排最后条件，综合偏低。','中等：未触发排最后条件，综合中等。','靠前：未触发排最后条件，综合较高。','首选：未触发排最后条件，综合最优先。']} ]));
   let payload:RankingRequestPayload={model,state,questions};
   const measure=()=>({stateBytes:Buffer.byteLength(JSON.stringify(payload.state),'utf8'),requestBytes:Buffer.byteLength(JSON.stringify(payload),'utf8')});
   let size=measure();
   // Switch before the hard limit, keeping headroom for new channels and growing sample histories.
-  if(size.stateBytes>RANKING_INPUT_BUDGET.stateBytes*.7||size.requestBytes>RANKING_INPUT_BUDGET.requestBytes*.7){
+  if(size.stateBytes>RANKING_INPUT_BUDGET.stateBytes*.8||size.requestBytes>RANKING_INPUT_BUDGET.requestBytes*.7){
     state.encoding='columns-v2';state.models=Object.fromEntries(Object.entries(models).map(([key,f])=>[key,FACT_COLUMNS.map(name=>name==='trends'&&f.trends?metricColumns.map(metric=>f.trends[metric]??null):f[name]??null)]));
     size=measure();
   }
