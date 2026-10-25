@@ -1,6 +1,6 @@
 import { DispatchTimings } from "./vendor/src/diagnostics.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
-import { settleCompanyTurn } from "./turn-closeout";
+import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
 import type { PluginServerContext } from "@getpaseo/plugin/server";
@@ -302,6 +302,7 @@ export async function persistDispatchObservation(ctx: Company): Promise<void> {
 
 export function startDispatch(server: PluginServerContext): () => void {
   let stopped = false;
+  const interruptions = new TurnInterruptions();
   let wake: (() => void) | undefined;
   let running = true;
 
@@ -400,6 +401,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
   const kick = () => { if (!stopped && running) wake?.(); };
   const removers = [
     server.on("agent.turn_started", (event, { paseo }) => {
+      interruptions.turnStarted(event.agent.id);
       void isCompanyAgent(paseo, event.agent).then(async ok => {
         if (ok) await (await company()).workforce.clearIdleForAgent(event.agent.id);
       }).catch((error: unknown) => console.warn(`idle activity update failed: ${(error as Error).message}`));
@@ -413,7 +415,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
         // The sidecar ingests report.md/blocker.md and lands submit/block before
         // the usage snapshot looks for freshly-reviewed tasks.
         try {
-          await settleCompanyTurn(ctx, paseo, event);
+          await settleCompanyTurn(ctx, paseo, event, interruptions);
         } catch (error) {
           console.warn(`sidecar settle failed: ${(error as Error).message}`);
         }
@@ -466,6 +468,7 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
 
   return () => {
     stopped = true;
+    interruptions.stop();
     wake?.();
     for (const remove of removers) remove();
   };

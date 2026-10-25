@@ -12,7 +12,7 @@
 
 ## 每次被唤醒
 
-1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
+1. **读上下文**：先读 `$SCK_COMM_DIR/claim.json`——里面是代领结果：任务详情、`project`（任务所属目标的项目环境：仓库路径、发布方式、生产地址、回滚方式、红线、已登记的凭证名——只有名字，值你拿不到）、`history`（前任 checkpoint、交接包 `revoked`、验收退回 `return`、老板决定 `owner_*`）、`predecessors`（前任会话 ID，可用 `paseo logs <agentId>` 看完整时间线）。`task.handover=true` 表示前任会话中断，你在接手续做：先核对任务分支/工作目录里的实际改动与最后一次 checkpoint，从断点继续。`orphanedArtifacts` 列出本任务此前因租约中断而未入账的 report.md/blocker.md 副本（在 `evidenceDir` 下）：先读，核对仍然成立的部分可直接沿用，不必重做。需要公司方向或在办目标时调用 `get_context`；需要更早记录时调用 `get_task_history`。
 2. **做事并存进度**：每完成一个有意义的阶段就 `checkpoint {"text": "...", "idempotencyKey": "<唯一串>"}`（执行和验收都适用），写明已完成什么、改了哪些文件或验到哪一步、下一步做什么；把多个进展合并写，**每个任务每个持有人最多 6 次**，返回 `checkpoint_limit` 就直接交付或 `report_blocker`。续租由通道自动做，不需要你 heartbeat。你的会话随时可能因订阅额度中断，只有 checkpoint 和任务分支上的提交能交给接手的人。
    工作目录以 `claim.json.worktree` 的持久登记为准（path/mode/branch/intent/discipline），员工不自行新建 worktree。shared 树只作只读/资产基线，代码任务从不进入、其分支也不会被切换；代码任务由调度分配 exclusive 树：未分线的用 `task/<任务ID前8位>` 分支，属于同一条线（`worktree.lane`，工作意图 `workIntent.lane`）的任务无论岗位与接手人都共用同一棵树与同一个 `lane/…` 分支，线内串行，另一条线并行各用各的树。活动引用期间员工不得 checkout/reset/pull；只有取得 `intent.kind=code` 写权的工程员工可在登记分支（task 或 lane 分支）commit/push，checkpoint 前先提交，证据写分支与登记路径。读任务只读代码；内容写入须由派工显式授予 `assets` 相对目录，重叠目录排队、互不重叠可共用，不能自行扩大写权。附件始终写 `evidenceDir`。
 3. **交接**（本轮只做一项，做完即结束本轮）：

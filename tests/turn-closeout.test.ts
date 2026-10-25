@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SidecarPool } from '../plugin/server/sidecar.ts';
-import { settleCompanyTurn } from '../plugin/server/turn-closeout.ts';
+import { settleCompanyTurn, TurnInterruptions } from '../plugin/server/turn-closeout.ts';
+import { reportPath } from '../src/comm.ts';
 
 for (const phase of ['doing', 'review'] as const) test(`completed 429: ${phase} releases once, cools provider, refunds wake, never nudges`, async () => {
   const root = mkdtempSync(join(tmpdir(), 'quota-turn-'));
@@ -41,4 +42,78 @@ test('failed circuit-breaker persistence retains the lease and sends no nudge', 
   await expect(settleCompanyTurn(ctx as never, {} as never, { agent: { id: 'a' }, turnId: 't',
     outcome: { kind: 'failed', error: { message: '429' } }, timeline: [] } as never)).rejects.toThrow('synthetic db unavailable');
   expect(calls).toEqual([]);
+});
+
+function silentWorld() {
+  const root = mkdtempSync(join(tmpdir(), 'interrupt-turn-'));
+  const calls: string[] = [];
+  const inst = { id: 'fixture-employee', role: 'engineering' as const, provider: 'claude', paseoAgentId: undefined as string | undefined, credential: 'synthetic' };
+  const workforce = { insts: async () => [inst], markExhausted: async () => {}, refundQuotaWake: async () => {} };
+  const pool = new SidecarPool({ runDir: join(root, 'comm'), heartbeatMs: 100000,
+    core: {
+      claim: async () => ({ task: { id: 'fixture-task', state: 'doing', version: 2 }, deliveryId: 'fixture-delivery', fence: 1, history: [] }),
+      release: async () => { calls.push('release'); },
+    } as never, workforce: workforce as never });
+  pool.env(inst); inst.paseoAgentId = 'fixture-agent'; pool.bindAgent(inst.id, inst.paseoAgentId);
+  const paseo = { agents: { ref: () => ({ send: async () => { calls.push('nudge'); } }) } };
+  let turn = 0;
+  const cancel = (interruptions: TurnInterruptions) => settleCompanyTurn({ sidecar: pool, workforce } as never, paseo as never,
+    { agent: { id: 'fixture-agent' }, turnId: `turn-${++turn}`, outcome: { kind: 'canceled' }, timeline: [] } as never, interruptions);
+  return { root, calls, inst, pool, cancel, close: () => { pool.close(); rmSync(root, { recursive: true, force: true }); } };
+}
+
+test('a canceled silent turn releases only after the grace, and never once the plugin stops', async () => {
+  const w = silentWorld();
+  try {
+    await w.pool.claim(w.inst, { id: 'fixture-task', state: 'doing' } as never);
+    const released = new TurnInterruptions(20);
+    await w.cancel(released);
+    expect(w.calls).toEqual([]);
+    await Bun.sleep(60);
+    expect(w.calls).toEqual(['release']);
+
+    await w.pool.claim(w.inst, { id: 'fixture-task', state: 'doing' } as never);
+    const shutdown = new TurnInterruptions(20);
+    await w.cancel(shutdown);
+    shutdown.stop();
+    await Bun.sleep(60);
+    expect(w.calls).toEqual(['release']);
+    expect(w.pool.holdsLease(w.inst.id, 'fixture-task')).toBe(true);
+    await w.cancel(shutdown);
+    await Bun.sleep(60);
+    expect(w.calls).toEqual(['release']);
+  } finally { w.close(); }
+});
+
+test('a turn started inside the grace keeps the lease of the canceled one', async () => {
+  const w = silentWorld();
+  try {
+    await w.pool.claim(w.inst, { id: 'fixture-task', state: 'doing' } as never);
+    const interruptions = new TurnInterruptions(20);
+    await w.cancel(interruptions);
+    await Bun.sleep(2);
+    interruptions.turnStarted('fixture-agent');
+    await Bun.sleep(60);
+    expect(w.calls).toEqual([]);
+    expect(w.pool.holdsLease(w.inst.id, 'fixture-task')).toBe(true);
+  } finally { w.close(); }
+});
+
+test('a report written after the lease ended is preserved with its task and listed on the next claim', async () => {
+  const w = silentWorld();
+  try {
+    await w.pool.claim(w.inst, { id: 'fixture-task', state: 'doing' } as never);
+    w.pool.dropLease(w.inst.id, 'fixture-task');
+    const dir = w.pool.commDirFor(w.inst.id);
+    writeFileSync(reportPath(dir), 'finished after the lease was revoked');
+    expect((await w.pool.settle('fixture-agent')).status).toBe('no_claim');
+    expect(existsSync(reportPath(dir))).toBe(false);
+    const evidence = join(w.root, 'evidence', 'fixture-task');
+    const kept = readdirSync(evidence).filter(f => f.startsWith('orphaned-report-fixture-employee-'));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(join(evidence, kept[0]!), 'utf8')).toBe('finished after the lease was revoked');
+    await w.pool.claim(w.inst, { id: 'fixture-task', state: 'doing' } as never);
+    const claim = JSON.parse(readFileSync(join(dir, 'claim.json'), 'utf8')) as { orphanedArtifacts?: string[] };
+    expect(claim.orphanedArtifacts).toEqual([join(evidence, kept[0]!)]);
+  } finally { w.close(); }
 });

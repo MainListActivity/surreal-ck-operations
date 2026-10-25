@@ -909,7 +909,7 @@ run('company fork: no reusable successor creates a fresh implementer and retries
     const task = await w.core.createTask(w.gm, { title: 'closed implementer with only fresh seats available', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fresh-successor-create' });
     expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
     const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
-    w.agentRows.get(A.paseoAgentId!)!.status = 'closed';
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
     // Fail the external launch after the durable takeover and claim. Recovery must reuse that identity.
     w.spawnFailures.remaining = 3;
     await w.tick();
@@ -949,7 +949,7 @@ for (const blocked of ['review', 'quota', 'capacity', 'scope'] as const) run(`co
     const task = await w.core.createTask(w.gm, { title: `fresh successor ${blocked} refusal`, context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `fresh-gate-${blocked}` });
     expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
     const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
-    w.agentRows.get(A.paseoAgentId!)!.status = 'closed';
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
     if (blocked === 'review') await w.db.db.query('UPDATE employee_def:⟨fixture-qa⟩ SET enabled = false;');
     if (blocked === 'quota') await w.wf.markExhausted('codex', 'synthetic exhausted subscription');
     if (blocked === 'capacity') await w.db.db.query('UPDATE company_meta:config SET max_running = 0;');
@@ -970,7 +970,7 @@ run('company fork: fresh successor prefers native Factory and a lost CAS leaves 
     const task = await w.core.createTask(w.gm, { title: 'fresh successor factory priority', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fresh-factory-create' });
     await w.tick();
     const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
-    w.agentRows.get(A.paseoAgentId!)!.status = 'closed';
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
     await w.wf.upsertDef('fixture-factory', { role: 'engineering', provider: 'factory-droid', model: 'fixture', maxInstances: 2 });
     const takeover = w.core.systemImplementerTakeover.bind(w.core);
     w.core.systemImplementerTakeover = async () => { throw new Error('synthetic stale version'); };

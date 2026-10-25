@@ -157,6 +157,13 @@ export interface SettleResult {
   silent?: { instId: string; taskId: string; nudges: number };
 }
 
+const ORPHAN_PREFIX = "orphaned-";
+/** Preserved artifacts of earlier leases on the task; claim.json lists them for the next holder. */
+function orphanedArtifacts(evidenceDir: string): string[] {
+  try { return readdirSync(evidenceDir).filter(f => f.startsWith(ORPHAN_PREFIX) && f.endsWith(".md")).sort().map(f => join(evidenceDir, f)); }
+  catch { return []; }
+}
+
 export class SidecarPool {
   private readonly launched = new Set<string>();
   private readonly quarantined = new Set<string>();
@@ -165,6 +172,8 @@ export class SidecarPool {
   private readonly routingUnconfirmed = new Set<string>();
   private readonly routingEmployees = new Map<string, {role:string}>();
   private readonly claims = new Map<string, LiveClaim>();
+  /** instId → task of the last lease it held; names the task a report written after the lease ended belongs to. */
+  private readonly lastTask = new Map<string, string>();
   private readonly instByAgent = new Map<string, string>();
   private readonly beats = new Map<string, ReturnType<typeof setInterval>>();
   private readonly active = new Set<string>();
@@ -394,7 +403,7 @@ export class SidecarPool {
     // directory — deliberately outside any git repo so audits never bloat it.
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir }));
+    writeFileAtomic(join(dir, "claim.json"), JSON.stringify({ ...result, evidenceDir, orphanedArtifacts: orphanedArtifacts(evidenceDir) }));
     // A new lease must not inherit a previous turn's artifacts: archive them so an
     // identical-looking new report still submits instead of matching a stale hash.
     this.archive(reportPath(dir), "stale");
@@ -441,9 +450,10 @@ export class SidecarPool {
     const live = this.claims.get(instId);
     if (!live) {
       await this.deps.core.releaseWorkspace?.(await this.credentialFor(instId)).catch(() => undefined);
-      // No lease to act on; rename stale artifacts so they are not retried forever.
+      // No lease to act on; rename stale artifacts so they are not retried forever, keeping a copy
+      // with the task so whoever claims it next can reuse work finished after the lease was lost.
       for (const [text, path] of [[blocker, blockerPath(dir)], [report, reportPath(dir)]] as const) {
-        if (text !== undefined) this.archive(path, "orphaned");
+        if (text !== undefined) this.orphan(instId, this.lastTask.get(instId), text, path);
       }
       return { status: "no_claim" };
     }
@@ -503,6 +513,9 @@ export class SidecarPool {
     }
   }
 
+  /** The instance still holds its local lease on the task. */
+  holdsLease(instId: string, taskId: string): boolean { return this.claims.get(instId)?.taskId === taskId; }
+
   /**
    * The lease was ended elsewhere (dispatcher revoked it server-side, or the task
    * moved on): drop the matching local claim so the instance can claim again.
@@ -516,6 +529,8 @@ export class SidecarPool {
 
   /** The instance no longer holds a lease: stop keepalive and drop every ops session opened under it. */
   private endLease(instId: string): void {
+    const live = this.claims.get(instId);
+    if (live) this.lastTask.set(instId, live.taskId);
     this.stopBeat(instId);
     this.claims.delete(instId);
     this.deps.ops?.release(instId);
@@ -527,6 +542,22 @@ export class SidecarPool {
 
   private archive(path: string, tag: string): void {
     try { renameSync(path, `${path}.${tag}-${Date.now().toString(36)}`); } catch { /* already gone */ }
+  }
+
+  /** Archive an artifact no lease can ingest, preserving a copy in the task's evidence dir when the task is known. */
+  private orphan(instId: string, taskId: string | undefined, text: string, path: string, tag = "orphaned"): void {
+    if (taskId) {
+      try {
+        const dir = join(dirname(this.deps.runDir), "evidence", taskId);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const kept = join(dir, `${ORPHAN_PREFIX}${basename(path, ".md")}-${instId}-${Date.now().toString(36)}.md`);
+        writeFileSync(kept, text, { mode: 0o600 });
+        this.log(`preserved ${basename(path)} of ${instId} for ${taskId} at ${kept}`);
+      } catch (error) {
+        this.log(`preserve ${basename(path)} of ${instId} failed: ${(error as Error).message}`);
+      }
+    }
+    this.archive(path, tag);
   }
 
   /** Caller must still own the captured lease. Also preserve content rewritten
@@ -632,9 +663,13 @@ export class SidecarPool {
     if (!mine.length) {
       this.routingUnconfirmed.delete(inst.id);
       // No server lease: the channel may still be live, but claim.json and artifacts are dead.
+      // Artifacts finished after the lease was lost stay with their task as evidence.
+      const lost = readJsonFile<Partial<ClaimResult>>(join(dir, "claim.json"))?.task?.id;
       this.endLease(inst.id);
-      this.archive(reportPath(dir), "stale");
-      this.archive(blockerPath(dir), "stale");
+      for (const path of [reportPath(dir), blockerPath(dir)]) {
+        const text = readTextFile(path);
+        if (text !== undefined) this.orphan(inst.id, lost, text, path, "stale");
+      }
       return;
     }
     const lease = mine[0]!;
@@ -650,6 +685,11 @@ export class SidecarPool {
     const trustedArtifacts = prior?.task?.id === task.id && prior.deliveryId === lease.deliveryId;
     const evidenceDir = join(dirname(this.deps.runDir), "evidence", task.id);
     mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    // Artifacts of another delivery are not this lease's closeout; keep them with their task.
+    if (!trustedArtifacts) for (const path of [reportPath(dir), blockerPath(dir)]) {
+      const text = readTextFile(path);
+      if (text !== undefined) this.orphan(inst.id, prior?.task?.id, text, path, "stale");
+    }
     const snapshot = {
       ...(trustedArtifacts && prior ? prior : {}),
       task,
@@ -659,6 +699,7 @@ export class SidecarPool {
       history: trustedArtifacts && Array.isArray(prior?.history) ? prior.history : [],
       worktree: task.worktree,
       evidenceDir,
+      orphanedArtifacts: orphanedArtifacts(evidenceDir),
     } as ClaimResult & { evidenceDir: string };
     this.routingUnconfirmed.delete(inst.id);
     this.claims.set(inst.id, {
@@ -676,11 +717,7 @@ export class SidecarPool {
       // turn a valid recovered lease into no_lease.
       this.log(`adopted claim.json refresh ${inst.id} failed: ${(error as Error).message}`);
     }
-    if (!trustedArtifacts) {
-      this.archive(reportPath(dir), "stale");
-      this.archive(blockerPath(dir), "stale");
-      return;
-    }
+    if (!trustedArtifacts) return;
     const blocker = readTextFile(blockerPath(dir));
     const report = readTextFile(reportPath(dir));
     if (lease.state === "review") {
