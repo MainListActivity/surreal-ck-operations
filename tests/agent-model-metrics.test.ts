@@ -32,6 +32,8 @@ test('turn IDs may repeat, partial adoption and restart stay separate, progress 
  const restored=new AgentTelemetry(d);expect(restored.view('agent',restored.turn('agent',a.key)).summary.outputTokens).toBe(20);expect(restored.current('agent')?.key).toBe(b.key);
  const adopting=s.begin('adopting',null,500,true);s.record('adopting',{id:'early',at:510,status:200,source:'company-gateway',turnKey:adopting.key});
  const adopted=s.begin('adopting','sdk-turn',400,true);expect(adopted.key).toBe(adopting.key);expect(adopted.startedAt).toBe(400);expect(s.view('adopting').summary.requests).toBe(1);
+ const older=s.begin('later-sdk',null,500,true);s.record('later-sdk',{id:'before-sdk',at:510,status:200,source:'company-gateway',turnKey:older.key});
+ const later=s.begin('later-sdk','new-sdk-turn',600,true);expect(later.key).not.toBe(older.key);expect(s.view('later-sdk').summary.requests).toBe(0);
  const partial=s.begin('other',null,500,true);s.finish('other','actual-turn',600);expect(s.turn('other',partial.key)).toMatchObject({turnId:'actual-turn',endedAt:600,partial:true});
 });
 test('native log uses exact session identity, safe decode weights and numeric-only output; no cwd or substring guesses',async()=>{

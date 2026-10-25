@@ -47,7 +47,7 @@ export class AgentTelemetry {
    if(current.turnId===turnId)return current;
    // A gateway request may precede the first panel refresh after deployment.
    // Adopt the SDK identity without orphaning requests already bound to this partial turn.
-   if(current.partial&&current.turnId===null&&turnId!==null){current.turnId=turnId;current.startedAt=Math.min(current.startedAt,at);this.save(agent);return current;}
+   if(current.partial&&current.turnId===null&&turnId!==null&&at<=current.startedAt){current.turnId=turnId;current.startedAt=Math.min(current.startedAt,at);this.save(agent);return current;}
   }
   if(current&&current.endedAt===undefined)current.endedAt=Math.max(current.startedAt,at);
   const t={key:randomUUID(),turnId,startedAt:at,partial};s.turns.push(t);s.turns=s.turns.slice(-20);this.save(agent);return t;
