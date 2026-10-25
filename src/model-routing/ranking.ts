@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { ModelTrends } from "./trends.ts";
 import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
@@ -39,6 +40,8 @@ export interface UsageStat {
   ttftMs?: number;
 }
 export interface ModelFacts {
+  trends?: ModelTrends;
+  trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
   id: string;
   /** Accounts behind this model's provider. Labels only: no e-mail or sign-in leaves the machine. */
   accounts: Array<{ account: string; remainingPct?: number }>;
@@ -137,6 +140,19 @@ const LEVELS = [
   "首选：未触发老板规则中必须排最后的条件，按规则综合判断属于本组最优先的选择。",
 ];
 
+/** Explicit units/estimators travel with every request, rather than relying on field names. */
+export const TREND_DICTIONARY = {
+  scope:"每个完整供应商/模型通道独立统计，沿用 usage 的跨历史思考等级口径，不混用其他供应商。绩效按现有 canonical model 映射归并。",
+  metrics:{ttftMs:"首个内容（含思考或工具调用）的延迟，毫秒；仅成功且有计时的请求",tokensPerSecond:"Magpie DecodeOf 原生生成速度（token/s），排除未计时、隐式思考和突发释放等不可测速请求",errorRate:"失败请求占比0–1，含没有首token的失败",cacheHitRate:"每次成功请求的缓存token/全部提示token，窗口为请求比例的均值；与usage的token加权命中率区分",ttftOver10sRate:"成功且有首token计时的请求中超过10000ms的比例",performanceScore:"最终验收任务的1–5分绩效，同一任务多名员工按原评分权重归并成一个样本",aaScore:"AA智能分",aaRank:"AA全榜名次，越小越好",remainingPct:"各订阅最紧窗口剩余比例的最小值，0–100",inputPrice:"输入价格USD/百万token",outputPrice:"输出价格USD/百万token",cacheHitPrice:"缓存命中价格USD/百万token"},
+  current:"最新一次有效实测值，不是均值；lastSampleAt与ageMs标明它是否过期；没有数据是未知，不是0。",
+  ewma:"请求使用最近1小时最多20个有效样本、半衰期5分钟；任务绩效与变动快照使用最近7天最多20个样本、半衰期24小时。按相对最新样本的真实时间指数加权。限制样本数防止高流量旧数据淹没最近变化。",
+  slopePerMinute:"同EWMA的近期窗口最多20个样本对实际时间做最小二乘回归；单位=该指标unit/分钟。至少5样本且覆盖1秒才提供。正负只代表上升下降，延迟/错误率/排名上升通常变差，速度/绩效/命中率上升通常变好。",
+  change:"启发式突变信号而非统计显著性概率：最近10样本前后各5个均值相差超过25%、前5样本3倍标准差与单位最小变化量（ms为500、ratio为0.05、score为0.25、percent为5、USD/1M为0.001、其他为1），且后5中至少4个同方向；最新请求须在15分钟内，任务/变动快照须在7天内。detected=false不证明没有变化。",
+  confidence:"samples是相应近期窗口最多20样本数；sufficient要求至少5样本、覆盖至少1秒，请求最新不超过15分钟，稀疏任务/变动快照不超过7天。false时降低采信，不据此断言趋势；快照是变动记录，重复读取相同值不增加样本，不能冒充独立请求或任务。",
+  baseline:"最近7天有效样本的均值与样本数，只作长期参照。windows给出15m/1h/24h/7d各自的样本数、均值、P50、P90（最近秩法）；不重叠前后5样本用于突变检测。",
+  rules:"老板明确的优先级和排最后条件优先；缺失、样本不足或过期数据不代表优秀或满足限制。趋势辅助排序，不自行修改老板阈值或统计口径。AA与价格等稀疏指标没有变动历史时趋势未知。",
+};
+
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
 export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void): Promise<string[]> {
   const keys = facts.map((_, i) => `m${i}`);
@@ -144,6 +160,7 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
   const state = {
       group: `group/sck-${tier}`,
       ownerRules: rules.trim() || DEFAULT_RANKING_RULES,
+      trendDictionary: TREND_DICTIONARY,
       models: Object.fromEntries(facts.map((f, i) => [keys[i], f])),
       notes: [
         "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
@@ -155,7 +172,7 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
     };
   const questions = Object.fromEntries(facts.map((f, i) => [keys[i], {
       type: "score" as const,
-      instructions: `老板的完整排序规则：${state.ownerRules}。规则中的明确优先关系和排最后条件优先于其他综合优势，不能抵消。根据 state.models.${keys[i]}（${f.id}）的事实，评估它在本组内的优先程度。该通道平均首 token 延迟：${f.usage?.ttftMs === undefined ? "未知" : `${f.usage.ttftMs / 1000} 秒`}；这不是生成速度。缺失数据表示未知，不推断为满足或违反条件。`,
+      instructions: `老板的完整排序规则：${state.ownerRules}。规则中的明确优先关系和排最后条件优先于其他综合优势，不能抵消。根据 state.models.${keys[i]}（${f.id}）的事实，评估它在本组内的优先程度。先按 trendDictionary 解释所有 trends 字段，结合当前水平与趋势，不用大样本历史平均掩盖近期变化。老板规则未指定统计口径时沿用 usage 的原有口径，不能擅自把平均值阈值换成 P90 或最后一次请求。该通道近7天平均首 token 延迟：${f.usage?.ttftMs === undefined ? "未知" : `${f.usage.ttftMs / 1000} 秒`}；这不是生成速度。缺失数据表示未知，不推断为满足或违反条件。`,
       criteria: LEVELS.map(level => `老板规则「${state.ownerRules}」。${level}`),
     }]));
   // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
@@ -202,6 +219,7 @@ export interface RankingResultSnapshot {
 }
 export interface RankingTableRow {
   model: string; pinned?: boolean;
+  trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
   accounts: ModelFacts["accounts"];
@@ -222,7 +240,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const judged = result?.rows.find(row => row.facts.id === model);
       // Once a successful snapshot exists, do not borrow facts from a later failed/pending request.
       const facts = judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? (!result ? legacy.find(f => f.id === model) : undefined);
-      return { model, pinned: (pins[group] ?? []).includes(model), aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, trends: facts?.trends, trendSource:facts?.trendSource, pinned: (pins[group] ?? []).includes(model), aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,

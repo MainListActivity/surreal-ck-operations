@@ -1,3 +1,4 @@
+import { rankingTrendDetail } from "../shared/ranking-trends.ts";
 import { relayDesignCss } from "../shared/relay-design.ts";
 
 /** Browser counterpart of the owner's Figma layout; data is supplied by the shared ranking API. */
@@ -10,13 +11,15 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const num=(v,n=1)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(n):'未知';
 let state=null,group='sck-haiku',expanded=null,dirty=false,saving=false,pinning=false,readSequence=0,saveTimer;
 const api=async(body)=>{const r=await fetch('api/model-ranking',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});const j=await r.json();if(!r.ok)throw Error(j.error||'读取失败');return j;};
+const trendDetail=${rankingTrendDetail.toString()};
 function metrics(row){return [
- ['AA 智能分',num(row.aaScore),row.aaRank===undefined?'暂无排名':'全榜第 '+row.aaRank+' 名'],
- ['生成速度',row.tokensPerSecond===undefined?'未知':num(row.tokensPerSecond,0)+' tok/s','近 7 天实测'],
- ['首 token 延迟',row.ttftMs===undefined?'未知':num(row.ttftMs/1000,2)+' 秒','近 7 天平均'],
- ['剩余额度',quota(row),'订阅最紧窗口'],
- ['请求稳定性',row.stabilityPct===undefined?'未知':num(row.stabilityPct)+'%',row.stabilitySamples===undefined?'暂无样本':'近 7 天 '+row.stabilitySamples+' 次请求'],
- ['样本权重',num(row.performanceSamples,2),row.performanceScore===undefined?'绩效未知':'历史绩效 '+num(row.performanceScore,2)+' / 5']
+ ['AA 智能分',num(row.aaScore),(row.aaRank===undefined?'暂无排名':'全榜第 '+row.aaRank+' 名')+' · '+trendDetail(row.trends?.aaScore)],
+ ['生成速度',row.tokensPerSecond===undefined?'未知':num(row.tokensPerSecond,0)+' tok/s',trendDetail(row.trends?.tokensPerSecond)],
+ ['首 token 延迟',row.ttftMs===undefined?'未知':num(row.ttftMs/1000,2)+' 秒',trendDetail(row.trends?.ttftMs)],
+ ['剩余额度',quota(row),trendDetail(row.trends?.remainingPct)],
+ ['请求稳定性',row.stabilityPct===undefined?'未知':num(row.stabilityPct)+'%','错误率趋势：'+trendDetail(row.trends?.errorRate)],
+ ['缓存命中率',row.trends?.cacheHitRate?.current===undefined?'未知':num(row.trends.cacheHitRate.current*100)+'%',trendDetail(row.trends?.cacheHitRate)],
+ ['样本权重',num(row.performanceSamples,2),trendDetail(row.trends?.performanceScore)]
  ];}
 function quota(row){return row.accounts?.length?row.accounts.map((a,i)=>(row.accounts.length>1?'#'+(i+1)+' ':'')+(a.remainingPct===undefined?'未知':num(a.remainingPct)+'%')).join(' · '):'未知';}
 function selected(){const tables=state?.tables||[];return tables.find(t=>t.group===group)||tables[0];}

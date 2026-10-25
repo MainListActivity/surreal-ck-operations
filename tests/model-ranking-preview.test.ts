@@ -1,3 +1,4 @@
+import { rankingTrendDetail } from "../plugin/shared/ranking-trends.ts";
 import {expect,test} from 'bun:test';
 const page=await Bun.file(new URL('../plugin/client/company.tsx',import.meta.url)).text();
 const source=page.slice(page.indexOf('function RankingJson('),page.indexOf('function RosterTab('));
@@ -6,8 +7,8 @@ function harness(data:any) {
  const elements:any[]=[];let states:any[]=[];let cursor=0;
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):{type,props:props??{},children}};
  const useState=(initial:any)=>{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],(next:any)=>{states[i]=typeof next==='function'?next(states[i]):next;}];};
- const components=new Function('React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
-  React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
+ const components=new Function('rankingTrendDetail','React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
+  rankingTrendDetail,React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
  const render=(name:string,props:any)=>{cursor=0;elements.length=0;const root=components[name]({...props,ctx:{theme:{colors:{surface0:"#ffffff"}},compact:false,...props.ctx}});const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}elements.push(node);node.children?.forEach(walk);};walk(root);return elements;};
  const text=()=>elements.filter(n=>n.type==='Text').map(n=>n.children.flat(Infinity).filter((v:any)=>typeof v==='string'||typeof v==='number').join('')).join('\n');
  return {render,text,colors:(ctx:any)=>components.relayColors(ctx)};
@@ -89,4 +90,13 @@ test('ranking row has an independent pin action and clearly labels a pinned mode
  const nodes=h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/a:max',pinned:true,accounts:[]}]},onPin:async(...args:unknown[])=>{calls.push(args);}});
  expect(h.text()).toContain('已置顶');
  const button=nodes.find(n=>n.props.accessibilityLabel==='取消置顶 p/a:max');expect(button).toBeDefined();await button.props.onPress();expect(calls).toEqual([['p/a:max',false]]);
+});
+
+test('mobile expanded model cards expose trend explanations and freshness',()=>{
+ const h=harness(undefined);
+ const trend={unit:'ms',sampleUnit:'request',current:12000,ewma:11000,slopePerMinute:6000,samples:10,sufficient:true,ageMs:60000,change:{detected:true,direction:'up'},baseline:{samples:5000,mean:2000},windows:{}};
+ const props={ctx:{...rankingCtx,compact:true},width:390,table:{group:'sck-haiku',scored:true,rows:[{model:'p/mobile',accounts:[],trends:{ttftMs:trend}}]}};
+ const nodes=h.render('ModelRankingList',props);nodes.find(n=>n.props.accessibilityLabel==='第 1 名 p/mobile').props.onPress();
+ h.render('ModelRankingList',props);
+ for(const word of ['EWMA','斜率','突升','7天基线','10个请求','距最新样本1分钟'])expect(h.text()).toContain(word);
 });

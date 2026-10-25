@@ -29,6 +29,8 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(html).not.toContain('\\u6A21');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
  const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
  expect(()=>new Function(script)).not.toThrow();
+ expect(html).not.toMatch(/\.metrics small\s*\{\s*display:\s*none/);
+ expect(script).toContain('EWMA');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
  expect(relayDesignCss).toContain('grid-template-columns: 340px minmax(0, 1fr)');
 });

@@ -131,6 +131,7 @@ run(
       });
       const results = await readModelResults(db.db);
       expect(results).toHaveLength(2);
+      expect(results.every(r=>r.task === "task:fixture")).toBe(true);
       expect(results.every((r) => Math.abs(r.weight - 1 / 2) < 1e-8)).toBe(
         true,
       );
