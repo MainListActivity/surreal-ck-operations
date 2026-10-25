@@ -28,13 +28,18 @@ function summary(rows: Sample[]) {
 /** Last 20 observations stop a high-volume past from swallowing a recent change. All time decay and slopes use timestamps. */
 export function metricTrend(input: Sample[], now: number, unit: string, sampleUnit: MetricTrend['sampleUnit']): MetricTrend {
   const rows = input.filter(r => finite(r.at) && finite(r.value) && r.at <= now && r.at >= now-7*DAY).sort((a,b) => a.at-b.at);
-  const recent = rows.filter(r => r.at >= now-60*MINUTE).slice(-20);
+  // Task results and value-change gauges are sparse; request-scale freshness would
+  // incorrectly mark a daily accepted task or AA update as stale within minutes.
+  const windowMs=sampleUnit==='request'?60*MINUTE:7*DAY;
+  const halfLifeMs=sampleUnit==='request'?5*MINUTE:DAY;
+  const staleAfterMs=sampleUnit==='request'?15*MINUTE:7*DAY;
+  const recent = rows.filter(r => r.at >= now-windowMs).slice(-20);
   const last = rows.at(-1);
   const age = last ? now-last.at : undefined;
   let ewma: number | undefined, slope: number | undefined;
   if (recent.length) {
     const end = recent.at(-1)!.at;
-    const weights = recent.map(r => Math.exp(-Math.LN2*(end-r.at)/(5*MINUTE)));
+    const weights = recent.map(r => Math.exp(-Math.LN2*(end-r.at)/halfLifeMs));
     ewma = recent.reduce((s,r,i) => s+r.value*weights[i]!,0)/weights.reduce((s,w)=>s+w,0);
     const origin = recent[0]!.at;
     const xs = recent.map(r => (r.at-origin)/MINUTE);
@@ -49,13 +54,13 @@ export function metricTrend(input: Sample[], now: number, unit: string, sampleUn
   const spread = previous.length ? Math.sqrt(previous.reduce((s,r)=>s+(r.value-before!)**2,0)/previous.length) : 0;
   const floor = unit === 'ms' ? 500 : unit === 'ratio' ? .05 : unit === 'score' ? .25 : unit === 'percent' ? 5 : unit === 'USD/1M' ? .001 : 1;
   const delta = before === undefined || after === undefined ? 0 : after-before;
-  const detected = previous.length === 5 && current.length === 5 && current[0]!.at>previous.at(-1)!.at && age! <= 15*MINUTE &&
+  const detected = previous.length === 5 && current.length === 5 && current[0]!.at>previous.at(-1)!.at && age! <= staleAfterMs &&
     Math.abs(delta) > Math.max(floor,Math.abs(before!)*.25,spread*3) &&
     current.filter(r => delta > 0 ? r.value>before! : r.value<before!).length >= 4;
   return {
     unit, sampleUnit, current: round(last?.value), ewma: round(ewma), slopePerMinute: round(slope), samples: recent.length,
     lastSampleAt: last ? new Date(last.at).toISOString() : undefined, ageMs: age,
-    sufficient: recent.length >= 5 && age! <= 15*MINUTE && recent.at(-1)!.at-recent[0]!.at >= MIN_TREND_SPAN_MS,
+    sufficient: recent.length >= 5 && age! <= staleAfterMs && recent.at(-1)!.at-recent[0]!.at >= MIN_TREND_SPAN_MS,
     change: detected ? { detected, direction: delta>0?'up':'down', at:new Date(current[0]!.at).toISOString(),before:round(before),after:round(after) } : { detected:false },
     baseline: { samples:rows.length, mean:round(mean(rows)) },
     windows:rows.length ? Object.fromEntries([['15m',15*MINUTE],['1h',60*MINUTE],['24h',DAY],['7d',7*DAY]].map(([name,ms])=>[name,summary(rows.filter(r=>r.at>=now-Number(ms)))])) : {},

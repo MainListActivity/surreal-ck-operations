@@ -92,3 +92,8 @@ test('retry attempts do not become independent requests or failures, including o
  const data=await readUsageSamples(now,file);
  expect(data.rows.get('p/m')?.errorRate?.map(r=>r.value)).toEqual([0,0,1,0]);
 });
+
+test('daily accepted task scores have meaningful trends at their own cadence rather than a one-hour request window',()=>{
+ const scores=[2,2.5,3,3.5,4].map((value,i)=>({at:now-(4-i)*24*60*minute,value}));
+ const t=metricTrend(scores,now,'score','task');expect(t.samples).toBe(5);expect(t.sufficient).toBe(true);expect(t.ewma).toBeGreaterThan(3);expect(t.slopePerMinute).toBeGreaterThan(0);
+});
