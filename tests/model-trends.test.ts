@@ -64,7 +64,7 @@ test('controller delivers all key trends and unit dictionary, one quality sample
  expect(f.trends?.performanceScore?.baseline.samples).toBe(1);expect(f.trends?.performanceScore?.current).toBe(4);
  let payload:any;
  await jevOrder({model:'fixture',ask:async(state,q)=>{payload=state;return {model:'fixture',answers:Object.fromEntries(Object.keys(q).map(k=>[k,{type:'score',score:3}]))};}},'haiku','首token超过10秒排最后',facts);
- expect(payload.trendDictionary.slopePerMinute).toContain('最小二乘');expect(payload.trendDictionary.columns[6]).toBe("samples");expect(payload.models.m0.trends.ttftMs[6]).toBe(10);
+ expect(payload.trendDictionary.slopePerMinute).toContain('最小二乘');expect(payload.trendDictionary.columns[6]).toBe("samples");expect(payload.refs[payload.models.m0.trends.ttftMs.$ref][6]).toBe(10);
  expect(JSON.stringify(payload)).not.toContain(home);
 });
 
@@ -108,7 +108,7 @@ test('compact input preserves every trend field and model, roundtrips legacy car
  expect(calls).toBe(1);expect(Object.keys(payload.state.models)).toHaveLength(35);
  expect(Buffer.byteLength(JSON.stringify(payload.state))).toBeLessThan(RANKING_INPUT_BUDGET.stateBytes);
  expect(payload.state.trendDictionary.columns).toEqual(TREND_COLUMNS);
- const row=payload.state.models.m0.trends.ttftMs;
+ const row=payload.state.refs[payload.state.models.m0.trends.ttftMs.$ref];
  expect(row).toEqual([10,trends.ttftMs!.ewma,trends.ttftMs!.slopePerMinute,trends.ttftMs!.change.detected?[trends.ttftMs!.change.direction,Date.parse(trends.ttftMs!.change.at!),trends.ttftMs!.change.before,trends.ttftMs!.change.after]:false,trends.ttftMs!.baseline.mean,10,10,now,0,true]);
  const table=rankingTables({'sck-haiku':[facts[0]!.id]}, {}, [{tier:'haiku',at:new Date(now).toISOString(),payload}]);
  expect(table[0]?.rows[0]?.trends?.ttftMs).toMatchObject({unit:'ms',sampleUnit:'request',current:10,ewma:trends.ttftMs!.ewma,slopePerMinute:trends.ttftMs!.slopePerMinute,lastSampleAt:new Date(now).toISOString(),sufficient:true});
@@ -124,4 +124,31 @@ test('Jev context rejections retain their safe structured error code',async()=>{
  const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>Response.json({detail:{error_type:'max_tokens_exceeded'}},{status:400})});
  try{const client=createJevClient({model:'fixture',baseUrl:`http://127.0.0.1:${server.port}`,apiKey:'fixture-only'});await expect(client.ask({},{})).rejects.toThrow('max_tokens_exceeded');}
  finally{server.stop(true);}
+});
+
+test('shared encoding keeps all models, rules and trends with substantial headroom as groups and rules grow',async()=>{
+ const {buildRankingInput,expandRankingModels}=await import('../src/model-routing/ranking-input.ts');
+ const rules='智能程度和速度综合优先；首token延迟超过10s排在最后。'+'补充规则仅作整体偏好。'.repeat(180);
+ const units={ttftMs:'ms',tokensPerSecond:'tokens/s',errorRate:'ratio',cacheHitRate:'ratio',ttftOver10sRate:'ratio',performanceScore:'score',aaScore:'score',aaRank:'rank',remainingPct:'percent',inputPrice:'USD/1M',outputPrice:'USD/1M',cacheHitPrice:'USD/1M'};
+ const facts=Array.from({length:50},(_,i)=>({id:`remote/provider/model-${i}:max`,accounts:[{account:'remote #1',remainingPct:80}],price:{free:false,input:.012,output:.021,cacheHit:.001},
+   trends:Object.fromEntries(Object.entries(units).map(([key,unit])=>[key,metricTrend(Array.from({length:10},(_,n)=>({at:now-(9-n)*minute,value:key==='ttftMs'?2000+i*200+n:10+n})),now,unit,'request')]))}));
+ const {payload,attempt}=buildRankingInput('fixture','haiku',rules,facts,['lowest','low','medium','high','highest'],now);
+ expect(attempt.stateBytes).toBeLessThan(attempt.limits.stateBytes*.8);expect(attempt.requestBytes).toBeLessThan(attempt.limits.requestBytes*.8);
+ expect(JSON.stringify(payload).split(rules).length-1).toBe(1);
+ expect(payload.state.ownerRules).toBe(rules);expect(Object.keys(payload.questions)).toHaveLength(50);
+ const decoded=expandRankingModels(payload.state);
+ expect(decoded.map(f=>f.id)).toEqual(facts.map(f=>f.id));
+ expect(decoded[12]?.accounts).toEqual(facts[12]?.accounts);
+ for(const key of Object.keys(units))expect(decoded[12]?.trends?.[key]?.baseline.samples).toBe(10);
+ expect(decoded[12]?.trends?.ttftMs?.current).toBe(facts[12]?.trends.ttftMs?.current);
+});
+
+test('preflight diagnostics precede both budget refusal and upstream failure and do not disguise the request body',async()=>{
+ const seen:any[]=[];let called=0;
+ const facts=[{id:'p/m',accounts:[],price:{free:false}}];
+ await expect(jevOrder({model:'fixture',ask:async()=>{called++;throw Error('down');}},'haiku','规则'.repeat(20000),facts,undefined,undefined,async a=>{seen.push(a);})).rejects.toThrow(/state=\d+\/48000/);
+ expect(called).toBe(0);expect(seen.map(a=>a.status)).toEqual(['budget_exceeded']);
+ seen.length=0;
+ await expect(jevOrder({model:'fixture',ask:async(s,q)=>{called++;expect(seen[0]?.stateBytes).toBe(Buffer.byteLength(JSON.stringify(s)));throw Error('down');}},'haiku','规则',facts,undefined,undefined,async a=>{seen.push(a);})).rejects.toThrow('down');
+ expect(called).toBe(1);expect(seen.map(a=>a.status)).toEqual(['prepared','upstream_error']);
 });

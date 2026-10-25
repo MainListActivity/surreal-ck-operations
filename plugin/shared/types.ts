@@ -284,6 +284,10 @@ export interface PermissionRequest {
 }
 
 /** Actual Magpie member order with facts from its latest successful Jev ranking. */
+export interface ModelRankingAttempt {
+  at:string;modelCount:number;encoding:string;stateBytes:number;requestBytes:number;
+  limits:{stateBytes:number;requestBytes:number};status:string;
+}
 export interface ModelRankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: Array<{

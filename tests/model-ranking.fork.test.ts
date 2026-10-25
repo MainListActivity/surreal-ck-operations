@@ -1,4 +1,5 @@
 import {expect,test} from 'bun:test';
+import {expandRankingModels} from '../src/model-routing/ranking-input.ts';
 import {CompanyDatabase} from '../src/database.ts';
 import {loadDatabaseConfig} from '../src/config.ts';
 import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES,rankingTables,rankingPins} from '../src/model-routing/ranking.ts';
@@ -44,7 +45,7 @@ run('fork: ranking settings preserve routing config; request-triggered two-group
   await refresher.setPin('sck-sonnet','a/x',true);
   expect(await rankingPins(db.db)).toEqual({'sck-sonnet':['a/x']});
   refresher.trigger(5);await refresher.settled();
-  expect((await rankingRequests(db.db)).find(s=>s.tier==='haiku')!.payload.state.models).toEqual({m0:{id:'a/y',accounts:[],price:{free:true,input:0,output:0,cacheHit:0}}});
+  expect(expandRankingModels((await rankingRequests(db.db)).find(s=>s.tier==='haiku')!.payload.state)).toEqual([{id:'a/y',accounts:[],price:{free:true,input:0,output:0,cacheHit:0}}]);
   const reconnected=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
   try {
     await reconnected.connect();await reconnected.useDatabase();
