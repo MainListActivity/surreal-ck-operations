@@ -1,3 +1,4 @@
+import { rankingTrendDetail } from "../shared/ranking-trends.ts";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1188,12 +1189,13 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
       const open=expanded===row.model;
       const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
       const metrics=[
-        {label:"AA 智能分",value:number(row.aaScore),detail:row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`},
-        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:"近 7 天实测"},
-        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:"近 7 天平均"},
-        {label:"剩余额度",value:quota,detail:"订阅最紧窗口"},
-        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:row.stabilitySamples===undefined?"暂无样本":`近 7 天 ${row.stabilitySamples} 次请求`},
-        {label:"样本权重",value:number(row.performanceSamples,2),detail:row.performanceScore===undefined?"绩效未知":`历史绩效 ${number(row.performanceScore,2)} / 5`},
+        {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
+        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
+        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:rankingTrendDetail(row.trends?.ttftMs)},
+        {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
+        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
+        {label:"缓存命中率",value:row.trends?.cacheHitRate?.current===undefined?"未知":`${number(row.trends.cacheHitRate.current*100)}%`,detail:rankingTrendDetail(row.trends?.cacheHitRate)},
+        {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
       ];
       const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
       return <View key={row.model} style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>

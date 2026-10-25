@@ -27,6 +27,7 @@ export interface ModelCandidate {
   context: number;
 }
 export interface ModelResult {
+  task?: string;
   model: string;
   domain: Domain;
   overall: number;

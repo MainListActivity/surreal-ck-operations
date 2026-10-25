@@ -74,7 +74,7 @@ export async function scoreModels(
 }
 export async function readModelResults(db: Surreal): Promise<ModelResult[]> {
   const [rows] = await db.query<[ModelResult[]]>(
-    "SELECT model,domain,overall,weight,<string>at AS at FROM model_scorecard WHERE at>time::now()-180d AND task.state='done' ORDER BY at DESC LIMIT 10000;",
+    "SELECT model,domain,overall,weight,<string>at AS at,<string>task AS task FROM model_scorecard WHERE at>time::now()-180d AND task.state='done' ORDER BY at DESC LIMIT 10000;",
   );
   return rows;
 }
