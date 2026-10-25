@@ -542,7 +542,12 @@ describe('ops on a flaky network', () => {
     r.world.fault(loginPage, 503, { times: 5 });
     const error = await failure(call(r, 'ops_login', { alias: 'qa-one' }));
     expect(error.code).toBe('upstream_error');
-    expect(error.message).toContain('gave up after 2 attempts');
+    expect(error.message).toContain('gave up after 3 attempts');
+    // A5: the failure names a fixed stage and carries the sanitized per-hop trace, like the proof path does.
+    expect(error.message).toContain('stage=login');
+    expect(error.message).toContain('trace: a1:authorize#0@idp.test:HTTP 302');
+    expect(error.message).toContain('a2:login@auth.test:HTTP 503');
+    expect(error.message).not.toContain('pw');
     expect(r.world.sql).toHaveLength(statements);
     expect(errorAudit(r)).toMatchObject({ action: 'ops_error' });
   });

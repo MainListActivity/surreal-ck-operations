@@ -106,7 +106,7 @@ async function attempt(scope: { taskId: string; employeeId?: string }, target: L
   options: { password?: string; idempotent?: boolean; requestSent?: boolean } = {}): Promise<Attempt> {
   const reserved = await core.reserveFault!(scope, { phase: PHASE, target: TARGET });
   if (!reserved?.allowed) return { reserved };
-  const cfg = parseBrokerConfig(loginBrokerConfig(target.origin));
+  const cfg = parseBrokerConfig(loginBrokerConfig(target.origins));
   try {
     const tokens = await passwordLogin(cfg, USERNAME, options.password ?? PASSWORD, {
       fetch: transport, now: Date.now, channel: 'customer',
@@ -134,7 +134,8 @@ async function attempt(scope: { taskId: string; employeeId?: string }, target: L
 
 describe('the real transport', () => {
   test('a connect timeout is recoverable: the next attempt goes through', async () => {
-    const target = await idpWith({ hold: (connection) => (connection <= 2 ? 3_000 : 0) });
+    // Every flow attempt stalls, so the login gives up after its own retries and the failure reaches the fault layer.
+    const target = await idpWith({ hold: (connection) => (connection <= 3 ? 3_000 : 0) });
     const taskId = await makeTask('传输：建连超时可恢复');
     const scope = { taskId, employeeId: 't-eng' };
     const first = await attempt(scope, target);
@@ -251,8 +252,8 @@ describe('the real transport', () => {
     expect(first.reported?.allowed).toBe(true);
     expect(first.reported?.evidence.status).toBe(503);
     expect(first.reported?.evidence.httpClass).toBe('server_error');
-    // The client tried the flow twice before giving up: the retry is counted, not hidden.
-    expect(target.counts.login).toBe(2);
+    // The client tried the flow three times before giving up: each retry is counted, not hidden.
+    expect(target.counts.login).toBe(3);
   });
 
   test('a write whose request may have been sent is not replayed', async () => {

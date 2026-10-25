@@ -1,3 +1,4 @@
+import {telemetry} from "./agent-metrics";
 // Lazily boots the company stack inside the plugin's Node subprocess.
 // Repo modules live under server/vendor (copied by scripts/vendor.sh at install/update).
 import { installBunShim } from "./bun-shim";
@@ -155,7 +156,22 @@ export function company(): Promise<Company> {
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
     const modelJournal=new ExecutionJournal(join(serviceHome(),"model-routing","queue"));
     let routingReady=false;
-    const modelGateway = await startModelGateway({ready:()=>routingReady,onRequest:()=>modelRanking.trigger(),lease:async ref=>sidecar.routingLease(ref),record:row=>modelJournal.record(row),complete:(id,done)=>modelJournal.complete(id,done)});
+    const metricStore=telemetry(),requestAgents=new Map<string,string>();
+    const modelGateway = await startModelGateway({ready:()=>routingReady,onRequest:()=>modelRanking.trigger(),lease:async ref=>{
+      const lease=sidecar.routingLease(ref);if(!lease?.agent)return lease;
+      try{const turn=metricStore.current(lease.agent)??metricStore.begin(lease.agent,null,Date.now(),true);return {...lease,turn_key:turn.key};}
+      catch{console.warn("agent model metrics: turn attribution unavailable");return lease;}
+    },record:async row=>{
+      await modelJournal.record(row);
+      if(typeof row.agent==='string'){
+        requestAgents.set(String(row.id),row.agent);
+        try{metricStore.record(row.agent,{id:String(row.id),at:new Date(row.at as Date).getTime(),model:typeof row.model==='string'?row.model:undefined,status:Number(row.status),source:'company-gateway',turnKey:row.turn_key as string|undefined});}catch{console.warn('agent model metrics: local observation unavailable');}
+      }
+    },progress:(id,metrics)=>{const agent=requestAgents.get(id);if(agent)metricStore.progress(agent,id,metrics);},complete:async(id,done,metrics)=>{
+      await modelJournal.complete(id,done,metrics);
+      const agent=requestAgents.get(id);requestAgents.delete(id);
+      if(agent){try{metricStore.complete(agent,id,done,metrics);}catch{console.warn('agent model metrics: local completion unavailable');}}
+    }});
     const opsRepo = process.env.SCK_AGENT_CWD ?? "/Users/y/IdeaProjects/surreal-ck-operations";
     const dispatcher = new Dispatcher({
       workforce,

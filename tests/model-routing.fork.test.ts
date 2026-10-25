@@ -51,7 +51,7 @@ run(
         {
           ...deps,
           fetchImpl: (async () =>
-            new Response('data: {"type":"message_stop"}\n\n', {
+            new Response('data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"fixture"}}\n\ndata: {"type":"message_delta","usage":{"output_tokens":12}}\n\ndata: {"type":"message_stop"}\n\n', {
               headers: {
                 "content-type": "text/event-stream",
                 "x-magpie-provider": "relay",
@@ -78,6 +78,11 @@ run(
       } finally {
         await gateway.stop();
       }
+      const [measured] = await db.db.query<[any[]]>("SELECT completed,output_tokens,ttft_ms,first_text_ms,total_ms,model FROM model_execution WHERE model='relay/actual-model';");
+      expect(measured).toHaveLength(1);
+      expect(measured[0]).toMatchObject({completed:true,output_tokens:12,model:'relay/actual-model'});
+      expect(measured[0].total_ms).toBeGreaterThanOrEqual(measured[0].ttft_ms);
+      expect(measured[0].first_text_ms).toBe(measured[0].ttft_ms);
       await db.db
         .query(`CREATE model_execution CONTENT {task:task:fixture,employee:'fixture-worker',domain:'engineering',model:'relay/second',status:200,completed:true};
     CREATE model_execution CONTENT {task:task:fixture,employee:'fixture-worker',domain:'engineering',status:200,completed:true};
