@@ -1,9 +1,9 @@
 // RB01 rollback isolation drill for SYS04's new states on the company fork (never production).
 //
-// The previous release here is a real rollback target (the commit this lane branched from, which is also an
-// ancestor of origin/main and the release the active tree points at), extracted from git and run by
-// tests/fixtures/rb01-old-runner.ts as the old runtime. Two identical fixtures are seeded in separate
-// namespaces; only namespace B receives the new writes.
+// The previous release here is a real rollback target (an ancestor of origin/main, and the release `active`
+// pointed at when this drill was last verified), extracted from git and run by tests/fixtures/rb01-old-runner.ts
+// as the old runtime. Two identical fixtures are seeded in separate namespaces; only namespace B receives the
+// new writes.
 //
 // New states, and what the previous release does with them (the design this drill verifies):
 //   fault_incident   (one row per cause, the cross-task group)        → ignored: a table it never reads.
@@ -35,7 +35,7 @@
 //
 // Gated by RUN_SCK_ROLLBACK_FORK_TESTS=1 (scripts/test-worktrees.ts sets it).
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -53,11 +53,11 @@ const ROOT = join(import.meta.dir, '..');
  * The old-version oracle: the release a rollback would actually land on. It must be a **real** rollback
  * target, not merely an older commit, otherwise the drill proves "rolling back to something even older also
  * misdispatches nothing" instead of "rolling back to the version that would take over misdispatches nothing".
- * The target moves as releases ship, so the default here names the current one and the deploy leg may point
- * `SCK_RB01_OLD_RELEASE` at whatever `active` points at when the release lands (read-only: extracted with
- * `git archive`, never checked out).
+ * The target moves as releases ship: the default names the release `active` pointed at when the drill was last
+ * verified, and the deploy leg points `SCK_RB01_OLD_RELEASE` at whatever `active` points at when the release
+ * lands (read-only: extracted with `git archive`, never checked out).
  */
-const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? '90b985b59f05e69f7677945e19d65eeb02c3da15';
+const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? '11e7db2fae3f92205410a02634c61c43e99f413a';
 const TICKS = 3;
 /** Tasks the previous dispatcher must never claim, wake or change at all. */
 const PROTECTED = ['rb01-waiting', 'rb01-gated-owner', 'rb01-held', 'rb01-done', 'rb01-void', 'rb01-lease-held'];
@@ -108,6 +108,12 @@ async function openFork(namespace: string): Promise<CompanyDatabase> {
 async function countRows(database: CompanyDatabase, table: string): Promise<number> {
   const [rows] = await database.db.query<[Array<{ n: number }>]>(`SELECT count() AS n FROM ${table} GROUP ALL;`);
   return rows?.[0]?.n ?? 0;
+}
+
+/** A digest of a whole table in id order: equal digests mean not one row was added, changed or removed. */
+async function tableDigest(database: CompanyDatabase, table: string): Promise<string> {
+  const [rows] = await database.db.query<[unknown[]]>(`SELECT * FROM ${table} ORDER BY id;`);
+  return createHash('sha256').update(JSON.stringify(rows ?? [])).digest('hex');
 }
 
 async function taskShape(database: CompanyDatabase, taskId: string): Promise<ChainShape> {
@@ -202,6 +208,8 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
   /** The episode of the exhausted fault object, and whether the manager was ever told about it. */
   const episodeBefore: { state?: string; notified?: boolean; evidence_revision?: number } = {};
   const episodeAfter: { state?: string; notified?: boolean; evidence_revision?: number } = {};
+  const refusal: { allowed?: boolean; reason?: string } = {};
+  const newTableDigests: Record<'written' | 'after', Record<string, string>> = { written: {}, after: {} };
 
   beforeAll(async () => {
     oldRoot = mkdtempSync(join(tmpdir(), 'rb01-sys04-old-'));
@@ -245,6 +253,7 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     // The budget is spent, so the fourth attempt is refused by the server.
     const refused = await store.reserve({ taskId: faultTaskId, target: TARGET, phase: PHASE,
       now: 1_700_000_000_000 + 40_000, limits });
+    Object.assign(refusal, { allowed: refused.allowed, reason: refused.reason });
     // 2. The manager is told about the cause exactly once: the episode is notified.
     const episodeKey = `${faultFingerprint(fault)}#${faultTaskId}`;
     await store.markNotified(episodeKey);
@@ -280,7 +289,10 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     const episodeBeforeRow = await store.episode(episodeRow.episode);
     Object.assign(episodeBefore, { state: episodeBeforeRow?.state, notified: episodeBeforeRow?.notified,
       evidence_revision: episodeBeforeRow?.evidenceRevision });
-    for (const table of NEW_TABLES) newTableCounts.written[table] = await countRows(forkB, table);
+    for (const table of NEW_TABLES) {
+      newTableCounts.written[table] = await countRows(forkB, table);
+      newTableDigests.written[table] = await tableDigest(forkB, table);
+    }
     const [versionB] = await forkB.db.query<[{ schema_version?: number } | undefined]>('SELECT schema_version FROM ONLY company_meta:installation;')
     schemaVersion.before = versionB?.schema_version;
 
@@ -291,7 +303,10 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     outcomes.B = await runPrevious(namespaceB, oldRoot);
 
     for (const table of tables) seedCounts.B[`after_${table}`] = await countRows(forkB, table);
-    for (const table of NEW_TABLES) newTableCounts.after[table] = await countRows(forkB, table);
+    for (const table of NEW_TABLES) {
+      newTableCounts.after[table] = await countRows(forkB, table);
+      newTableDigests.after[table] = await tableDigest(forkB, table);
+    }
     Object.assign(chainAfter, await taskShape(forkB, faultTaskId));
     const budgetAfterRow = await store.scope(budgetKey(faultTaskId, TARGET, PHASE));
     Object.assign(budgetAfter, { attempts: budgetAfterRow?.attempts, total_attempts: budgetAfterRow?.totalAttempts,
@@ -342,6 +357,8 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     }
     // The budget ran out, so the episode is exhausted and the repair chain exists.
     expect(budgetBefore.attempts).toBe(limits.maxAttempts);
+    // The fourth attempt is refused by name, not merely unallowed.
+    expect(refusal).toEqual({ allowed: false, reason: 'attempts_exhausted' });
     expect(episodeBefore.state).toBe('exhausted');
     // The manager was told about the cause exactly once.
     expect(episodeBefore.notified).toBe(true);
@@ -412,8 +429,17 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     expect(chainAfter.version).toBe(chainBefore.version);
   });
 
-  test('the new tables are neither read nor written by the rollback, and the schema marker is not downgraded', () => {
-    for (const table of NEW_TABLES) expect(newTableCounts.after[table]).toBe(newTableCounts.written[table]);
+  test('the previous release never names the new tables, and the rollback leaves their contents unchanged', () => {
+    const named: string[] = [];
+    for (const dir of ['src', 'plugin/server']) {
+      for (const file of new Bun.Glob('**/*.ts').scanSync({ cwd: join(oldRoot, dir) })) {
+        if (file.split('/').includes('vendor')) continue;
+        const text = readFileSync(join(oldRoot, dir, file), 'utf8');
+        for (const table of NEW_TABLES) if (text.includes(table)) named.push(`${dir}/${file}:${table}`);
+      }
+    }
+    expect(named).toEqual([]);
+    for (const table of NEW_TABLES) expect(newTableDigests.after[table]).toBe(newTableDigests.written[table]);
     // The highest schema the previous release knows is 036; the new one is 037. The old release only bumps the
     // marker upward, so "not downgraded" is the before === after assertion below.
     expect(schemaVersion.before).toBeGreaterThanOrEqual(36);

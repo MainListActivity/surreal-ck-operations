@@ -26,18 +26,18 @@ export function describeTransportFailure(error: unknown, timeoutMs: number): { t
   return { timedOut: false, detail: causeCode ? `${name} ${causeCode}` : name };
 }
 
-/**
- * Node's global fetch keeps undici's default connect limit of 10 s for DNS, TCP and TLS together, so a slow
- * but healthy handshake is cut before any step budget applies (reproduced on Node 24: 10.5 s, while the
- * request signal allowed 25 s). Ops traffic gets an explicit, longer limit on its own dispatcher instead.
- * It stays below the 25 s per-request limit, and every request still carries its own signal.
- */
 /** The errno-style code of a transport failure, when the runtime reported one. */
 export function transportErrno(error: unknown): string | undefined {
   const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
   return typeof cause?.code === 'string' ? cause.code : undefined;
 }
 
+/**
+ * Node's global fetch keeps undici's default connect limit of 10 s for DNS, TCP and TLS together, so a slow
+ * but healthy handshake is cut before any step budget applies (reproduced on Node 24: 10.5 s, while the
+ * request signal allowed 25 s). Ops traffic gets an explicit, longer limit on its own dispatcher instead.
+ * It stays below the 25 s per-request limit, and every request still carries its own signal.
+ */
 export const OPS_CONNECT_TIMEOUT_MS = 20_000;
 
 export interface OpsFetchOptions {

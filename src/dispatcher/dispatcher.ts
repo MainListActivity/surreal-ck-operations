@@ -1766,6 +1766,7 @@ export class Dispatcher {
       try { facts = await wf.faultEpisodes({ tasks: taskIds }); }
       catch (error) { this.log(`fault episode read failed: ${(error as Error).message}`); }
       if (!facts) {
+        report.decisions.push(`gm-fault-ledger-unreadable:${pendingGm.length}`);
         this.log('fault episode state unavailable; suppressing all gm wake this pass');
         pendingGm.length = 0;
       } else {
