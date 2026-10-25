@@ -406,28 +406,29 @@ describe('idp password login', () => {
       expect(authorizes(world)).toBe(1);
     });
 
-    test('a second failure is reported as upstream trouble that took two attempts, never as a refusal', async () => {
+    test('a second failure is reported as upstream trouble that took three attempts, never as a refusal', async () => {
       const world = await account();
       world.fault(loginPage, 503, { times: 5 });
       const error = await failure(run(world));
       expect(error.code).toBe('upstream_error');
       expect(error).not.toBeInstanceOf(LoginError);
-      expect(error.message).toMatch(/^IdP login failed \(HTTP 503\); gave up after 2 attempts; trace: /);
-      // The sanitized hop trace names the failing phase and host, both attempts included.
+      expect(error.message).toMatch(/^IdP login failed \(HTTP 503\); gave up after 3 attempts; trace: /);
+      // The sanitized hop trace names the failing phase and host, every attempt included.
       expect(error.message).toContain('a1:authorize#0@idp.test:HTTP 302');
       expect(error.message).toContain('a2:login@auth.test:HTTP 503');
-      expect(error.message).toMatch(/; runtime (bun|node)@/);
+      expect(error.message).toMatch(/; stage=login; runtime (bun|node)@/);
       expect(error.message).not.toContain('pw');
-      expect(authorizes(world)).toBe(2);
+      expect(authorizes(world)).toBe(3);
     });
 
-    test('a request nobody answers is cut off at the step limit, then retried once', async () => {
+    test('a request nobody answers is cut off at the step limit, then retried', async () => {
       const started = Date.now();
       const error = await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'u', 'p', { fetch: hang, stepTimeoutMs: 20 }));
       expect(error.code).toBe('upstream_error');
-      expect(error.message).toMatch(/^IdP authorize failed \(timed out after 20ms\); gave up after 2 attempts; trace: /);
+      expect(error.message).toMatch(/^IdP authorize failed \(timed out after 20ms\); gave up after 3 attempts; trace: /);
       expect(error.message).toContain('a1:authorize#0@idp.test:timed out after 20ms');
       expect(error.message).toContain('a2:authorize#0@idp.test:timed out after 20ms');
+      expect(error.message).toContain('a3:authorize#0@idp.test:timed out after 20ms');
       expect(Date.now() - started).toBeLessThan(2_000);
     });
 
@@ -438,7 +439,7 @@ describe('idp password login', () => {
       const error = await failure(passwordLogin(parseBrokerConfig(brokerConfig()), 'u', 'p', { fetch: async (input, init) => (
         String(input).includes('/authorize') ? new Response(null, { status: 302, headers: { location: 'https://auth.test/login/ck?login_challenge=abc' } }) : stalled(input, init)
       ), stepTimeoutMs: 20 }));
-      expect(error.message).toMatch(/^IdP login failed \(timed out after 20ms\); gave up after 2 attempts; trace: /);
+      expect(error.message).toMatch(/^IdP login failed \(timed out after 20ms\); gave up after 3 attempts; trace: /);
     });
 
     test('without room for a whole second flow the first failure is final', async () => {

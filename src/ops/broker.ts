@@ -121,6 +121,20 @@ const invalid = (message: string) => new CompanyError('invalid', message);
 /** Last few sanitized login hops for audit lines: enough to locate a flow, small enough to stay readable. */
 const tailHops = (trace: string, n = 4): string => trace.split(' | ').slice(-n).join(' | ');
 
+/**
+ * Fixed stage name for a login audit line, so a batch of failures can be located without another real login. Derived
+ * from the sanitized trace's last hop (`a<attempt>:<phase>@<host>:...`); only the four fixed names are ever returned.
+ */
+const loginStageOf = (trace: string): 'authorize' | 'login' | 'consent' | 'exchange' | 'unknown' => {
+  const last = trace.split(' | ').at(-1) ?? '';
+  const phase = last.slice(last.indexOf(':') + 1, last.indexOf('@'));
+  if (phase.startsWith('authorize')) return 'authorize';
+  if (phase === 'login') return 'login';
+  if (phase === 'consent') return 'consent';
+  if (phase === 'exchange') return 'exchange';
+  return 'unknown';
+};
+
 function text(args: Args, key: string, max = 200): string {
   const value = args[key];
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw invalid(`${key} is required (text up to ${max} chars)`);
@@ -1073,7 +1087,7 @@ export class OpsBroker {
         accountResult: ensured, workspace: session.workspace, canCreate: listing.canCreate,
         workspaces: listing.workspaces.map(({ slug, name, role }) => ({ slug, name, role })),
       },
-      audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}（attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
+      audit: { action: 'ops_login', evidence: `login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}${session.workspace ? `，进入 workspace ${session.workspace.slug}` : ''}（attempts ${tokens.attempts} lastStage ${loginStageOf(tokens.trace)} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
@@ -1103,7 +1117,7 @@ export class OpsBroker {
         session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
         audience: 'ops',
       },
-      audit: { action: 'ops_login', evidence: `login as ${username}（audience=ops，attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
+      audit: { action: 'ops_login', evidence: `login as ${username}（audience=ops，attempts ${tokens.attempts} lastStage ${loginStageOf(tokens.trace)} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
@@ -1147,7 +1161,7 @@ export class OpsBroker {
         session: session.id, kind: session.kind, alias, username, expiresAt: new Date(session.expiresAt).toISOString(),
         accountResult: ensured, operator: clipJson(redactJson(probe.body, known)),
       },
-      audit: { action: 'ops_operator_login', evidence: `operator login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}（attempts ${tokens.attempts} hops ${tailHops(tokens.trace)}）` },
+      audit: { action: 'ops_operator_login', evidence: `operator login as ${username}${ensured ? `（账号已${ensured === 'created' ? '创建' : '修复'}）` : ''}（attempts ${tokens.attempts} lastStage ${loginStageOf(tokens.trace)} hops ${tailHops(tokens.trace)}）` },
     };
   }
 
