@@ -75,7 +75,7 @@ describe('login over real TLS', () => {
     const target = await idp();
     const { tokens } = await success(login(target, { fetch: transport() }));
     expect(tokens.attempts).toBe(1);
-    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
     for (const secret of [PASSWORD, 'login_challenge', 'code-', 'code_verifier', '/api/', '/t/ck']) expect(tokens.trace).not.toContain(secret);
   }, SLOW);
 
@@ -109,14 +109,14 @@ describe('bounded recovery', () => {
     const target = await idp({ hold: connection => (connection === 1 ? 1_500 : 0) });
     const { tokens } = await success(login(target, { fetch: transport(400) }));
     expect(tokens.attempts).toBe(2);
-    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
   }, SLOW);
 
   test('a login dropped after the IdP consumed it is retried with a new flow, never replayed', async () => {
     const target = await idp({ dropLogin: login => login === 1 });
     const { tokens } = await success(login(target, { fetch: transport() }));
     expect(tokens.attempts).toBe(2);
-    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1, replays: 0 });
   }, SLOW);
 
   test('a response that outlasts the step limit is a transient failure, and the budget bounds the total', async () => {

@@ -335,6 +335,25 @@ export interface DispositionEpisodeFacts {
   decision?: DispositionDecisionView;
 }
 
+/**
+ * SYS04 AC04: the fault episode facts the dispatcher reads before it wakes a manager.
+ *
+ * `state` is the episode's own state: `opened` (one report, one notice), `converged` (further reports of the
+ * same evidence), `exhausted` (the recovery budget is spent and the repair chain is the way out) and `resolved`
+ * (the repair finished, so a later report may open a new stage). `notified` says whether the manager has
+ * already been told about this cause.
+ */
+export interface FaultEpisodeFacts {
+  episode: string;
+  fingerprint: string;
+  incident: string;
+  taskId: string;
+  phase: string;
+  state: 'opened' | 'converged' | 'exhausted' | 'stopped' | 'resolved';
+  evidenceRevision: number;
+  notified: boolean;
+}
+
 export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
   /** SYS03: the disposition ledger, read here for the dispatcher's pre-wake guard and for notice delivery. */
@@ -917,6 +936,56 @@ export class Workforce {
       if (!known || known.sinceMs < facts.sinceMs) byTask.set(facts.taskId, facts);
     }
     return { byEpisode, byTask };
+  }
+
+  /**
+   * SYS04 AC04: the fault episodes of the given tasks, newest first per task.
+   *
+   * The dispatcher reads this before it wakes a manager, so a cause that is already on the manager's desk (or
+   * whose budget is spent) does not produce a second wake. The read is a single query: an unreadable ledger is
+   * reported as undefined, and the caller then fails closed for the pass.
+   */
+  async faultEpisodes(input: { tasks: readonly string[] }): Promise<{ byTask: Map<string, FaultEpisodeFacts[]> } | undefined> {
+    const byTask = new Map<string, FaultEpisodeFacts[]>();
+    const tasks = [...new Set(input.tasks.filter(taskId => taskId.length > 0))];
+    if (!tasks.length) return { byTask };
+    type Row = { episode?: string; fingerprint?: string; incident?: string; task?: unknown; phase?: string;
+      state?: string; evidence_revision?: number; notified?: boolean; updated_at?: unknown };
+    const [rows] = await this.db.query<[Row[]]>(
+      'SELECT * FROM fault_episode WHERE task IN $tasks ORDER BY updated_at DESC;',
+      { tasks: tasks.map(taskId => id('task', taskId)) });
+    for (const row of rows ?? []) {
+      const episode = row.episode ?? '';
+      if (!episode) continue;
+      const taskId = asId(row.task);
+      const facts: FaultEpisodeFacts = {
+        episode,
+        fingerprint: row.fingerprint ?? '',
+        incident: row.incident ?? '',
+        taskId,
+        phase: row.phase ?? '',
+        state: (row.state === 'converged' || row.state === 'exhausted' || row.state === 'stopped' || row.state === 'resolved'
+          ? row.state : 'opened'),
+        evidenceRevision: row.evidence_revision ?? 0,
+        notified: row.notified ?? false,
+      };
+      const list = byTask.get(taskId);
+      if (list) list.push(facts); else byTask.set(taskId, [facts]);
+    }
+    return { byTask };
+  }
+
+  /**
+   * SYS04 AC04: record that the manager was told about one fault episode.
+   *
+   * One episode, one notice: the flag is set when the wake goes out, so ten identical reports of the same cause
+   * leave the manager with one episode to act on. A second call is a no-op.
+   */
+  async markFaultEpisodeNotified(episode: string): Promise<boolean> {
+    const [rows] = await this.db.query<[Array<{ notified?: boolean }>]>(
+      'UPDATE $episode SET notified = true, updated_at = time::now() WHERE notified = false RETURN AFTER;',
+      { episode: id('fault_episode', episode) });
+    return (rows?.length ?? 0) > 0;
   }
 
   private dispositionFactsOf(row: { episode?: string; task?: unknown; phase?: string; episode_since?: number; status?: string;

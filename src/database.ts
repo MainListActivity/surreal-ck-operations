@@ -153,6 +153,11 @@ export class CompanyDatabase {
     // 字段会忽略、新版对旧行按 NONE 兜底，所以新旧两版能同时对着同一批行工作（RB01）。
     await this.db.query(loadSchema('036-disposition-replay-fence.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 36 WHERE schema_version < 36;');
+    // SYS04 P0：故障归组、持久恢复预算与修复链（编号 037）。只新增表与索引，不改写任何既有表、字段或行：
+    // 旧版 release 读不到这四张表（忽略），也不认识 fault 状态，所以回滚后照旧派工；真正的隔离靠原任务
+    // 进入既有依赖等待语义（defer/waits），那由新版写入 task 的既有字段，不改旧字段（RB01）。
+    await this.db.query(loadSchema('037-fault-budget.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

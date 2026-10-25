@@ -36,6 +36,14 @@ import {
   checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
 } from './policy.ts';
 import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, type PolicyDbRow } from './policy-store.ts';
+import { FaultStore, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
+import {
+  DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
+  type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
+} from './faults.ts';
+
+/** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
+type FaultReportOutcome = FaultReportResult;
 import type { ContributorDryRunView } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
@@ -553,7 +561,7 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
-    externalActions?: { gateway?: ExternalActionGateway } }) {
+    externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number } }) {
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
@@ -574,6 +582,10 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.projects = new ProjectStore(database.db);
     this.worktrees = options?.worktrees ? new WorktreeRegistry(database.db, options.worktrees) : undefined;
     this.snapshots = new SnapshotStore(database.db, options?.snapshots, { channel: database.buildChannel, releaseChannel: database.releaseChannel, observe: options?.snapshotObserve });
+    // SYS04: the fault ledger (one episode per cause, one budget per fault object, one repair chain per incident).
+    this.faults = new FaultStore(database.db);
+    this.faultLimits = options?.faults?.limits ?? DEFAULT_FAULT_BUDGET;
+    this.faultClock = options?.faults?.clock ?? Date.now;
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -581,6 +593,12 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly dispositions: DispositionLedger;
   /** SYS03: the controlled external-action exit, absent in production (the gh CLI is built then). */
   private readonly externalActionsGateway?: ExternalActionGateway;
+  /** SYS04: the fault ledger — structured faults, the persistent recovery budget and the repair chain. */
+  private readonly faults: FaultStore;
+  /** SYS04: the recovery budget limits applied to a fault object. */
+  private readonly faultLimits: FaultBudgetLimits;
+  /** SYS04: the clock the budget is measured against (tests inject a controlled one). */
+  private readonly faultClock: () => number;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
   private readonly snapshots: SnapshotStore;
@@ -2699,12 +2717,239 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /**
    * `quotaResetsAt` is set only for a subscription quota or rate-limit block. The task then stays
    * quiet for gm until that instant, and the employee's provider leaves dispatch until then too.
+   *
+   * SYS04 AC01/AC02: a block may carry the machine facts of the failure that caused it (`fault`). Those facts are
+   * classified and grouped by fingerprint, and the attempt they describe is charged to the recovery budget of the
+   * fault object here — not by the employee, and not by a later retry. Without a `fault`, the block is an ordinary
+   * block: the employee blocked because it decided to, and no budget is spent.
    */
-  async block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView> {
+  async block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string, fault?: FaultInput): Promise<TaskView> {
     const until = quotaResetsAt === undefined ? undefined : parseQuotaResetsAt(quotaResetsAt, Date.now());
+    const actor = await this.authenticate(credential);
+    // The fault is recorded before the state change, so a crash between the two leaves the attempt charged (the
+    // attempt really happened) rather than a block that no budget accounts for.
+    if (fault !== undefined) await this.reportTaskFault(actor.employeeId, proof.taskId, fault);
     const view = await this.transition(credential, proof, 'block', evidence, to);
     await this.recordQuotaGate(credential, proof.taskId, until);
     return view;
+  }
+
+  /**
+   * Classify one failure and charge it against the recovery budget of the fault object.
+   *
+   * The fingerprint groups the same cause; the budget key binds the task, the controlled target and the phase, so
+   * changing the holder, rewording the error or writing the alias differently does not reset it. The attempt is
+   * spent before the caller runs it, so a caller that is refused does not run.
+   */
+  private async reportTaskFault(holder: string, taskId: TaskId, input: FaultInput): Promise<FaultReportOutcome> {
+    const fault: FaultRecord = classifyFault(input);
+    const controlledTarget = input.target ?? 'none';
+    const now = this.faultClock();
+    const result = await this.faults.report({
+      taskId, fault, target: controlledTarget, now, limits: this.faultLimits, holder,
+      // The jitter belongs to the budget scope, so every attempt of one scope waits the same reproducible amount.
+      jitterFactor: jitterFactorOf(budgetKey(taskId, controlledTarget, input.phase)),
+      // A block reports the machine facts of a failure the broker already charged: the cause is recorded, the
+      // attempt is not charged twice.
+      charge: false,
+    });
+    return { ...result, fault };
+  }
+
+  /**
+   * Reserve the next attempt of a fault object before the attempt runs (AC02).
+   *
+   * This is the half that makes the budget real. The caller asks "may I try this operation once more?", the
+   * budget is spent atomically, and only then does the caller run the operation. A caller that loops the same tool
+   * — in one session, in a new session, or after a restart — therefore runs out of budget instead of out of
+   * patience, and the server is the one that says no.
+   *
+   * The reservation is keyed by task + controlled target + phase, so it survives a holder change, a rewording of
+   * the error and a different spelling of the identity alias.
+   */
+  async reserveFault(scope: { taskId: TaskId; employeeId?: string }, input: {
+    phase: FaultPhase; target?: FaultTargetKind;
+  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown> } | undefined> {
+    const controlledTarget = input.target ?? 'none';
+    const now = this.faultClock();
+    await this.liftRepairedFaults(scope.taskId, now);
+    // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. The lease window caps the
+    // recovery deadline; the budget itself stays persisted, so a re-claimed lease keeps the same counters.
+    const task = await this.db.select<{ lease_expires_at?: number }>(id('task', scope.taskId));
+    // The lease window is stored in unix seconds; the budget clock is in milliseconds.
+    const leaseExpiresAt = task?.lease_expires_at === undefined || task?.lease_expires_at === null
+      ? undefined : task.lease_expires_at * 1000;
+    const result = await this.faults.reserve({
+      taskId: scope.taskId, target: controlledTarget, phase: input.phase, now, limits: this.faultLimits,
+      ...(scope.employeeId === undefined ? {} : { holder: scope.employeeId }),
+      ...(leaseExpiresAt === undefined || leaseExpiresAt === null ? {} : { leaseExpiresAt }),
+      jitterFactor: jitterFactorOf(budgetKey(scope.taskId, controlledTarget, input.phase)),
+    });
+    if (result.allowed) {
+      return {
+        allowed: true, attempt: result.attempt, charged: result.charged, message: '',
+        evidence: { phase: input.phase, target: controlledTarget, attempt: result.attempt, charged: result.charged },
+      };
+    }
+    return {
+      allowed: false, attempt: result.attempt, charged: false, reason: result.reason,
+      message: this.faultRefusalMessage(input.phase, result.reason, result.nextAllowedAt, result.diagnostic),
+      evidence: { phase: input.phase, target: controlledTarget, attempt: result.attempt, decision: result.reason ?? 'not_retryable' },
+    };
+  }
+
+  /** The refusal text of a budget decision. It says what to do next, in fixed words, and never quotes the upstream. */
+  private faultRefusalMessage(phase: FaultPhase, reason: string | undefined, nextAllowedAt: number | undefined,
+    diagnostic: FaultDiagnostic | undefined): string {
+    const text = reason === 'attempts_exhausted'
+      ? 'the recovery budget for this operation is spent'
+      : reason === 'deadline_passed'
+        ? 'the recovery deadline for this operation has passed'
+        : reason === 'min_interval'
+          ? `the next attempt is allowed after ${new Date(nextAllowedAt ?? 0).toISOString()}`
+          : reason === 'lease_expired'
+            ? 'the task lease ended before the next attempt; claim the task again to continue'
+            : 'this failure is not retryable';
+    const guidance = diagnostic?.guidance
+      ?? 'Read the failure facts and fix the cause before repeating the call.';
+    return `operation refused (${phase}): ${text}. ${guidance}`;
+  }
+
+  /**
+   * Settle a successful attempt of a fault object (AC02).
+   *
+   * A call that works costs no recovery budget: the reserved attempt is refunded and the recovery is over, so the
+   * next failure starts a fresh one with a fresh deadline. The cumulative count stays in the ledger for the audit.
+   */
+  async settleFault(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void> {
+    const key = budgetKey(scope.taskId, input.target ?? 'none', input.phase);
+    await this.faults.settle(key, this.faultClock());
+  }
+
+  /**
+   * Report one failure from the ops broker and record it against the fault object.
+   *
+   * The broker is the place where the machine facts of a failure are known (the phase, the identity alias, the
+   * transport errno, the HTTP status), so it is where the fault is classified. The core owns the budget, so the
+   * same rules apply no matter which employee, session or process made the call.
+   *
+   * A failure that is not retryable (a 403, a rejected password, a revoked permission, an invalid input) stops the
+   * recovery at once and says what to fix. It is never retried for the employee, and it is never reported as a
+   * network problem.
+   */
+  async reportFault(scope: { taskId: TaskId; employeeId?: string }, input: {
+    tool: string; phase: FaultPhase; stage?: FlowStage; errno?: string; status?: number; name?: string; alias?: string; elapsedMs?: number;
+    target?: FaultTargetKind; environment?: string; message?: string; idempotent?: boolean; requestSent?: boolean;
+    /** The attempt number the caller already reserved; the report must not charge it twice. */
+    attempt?: number;
+    /** False when the report only carries facts of a failure that was already charged. */
+    charge?: boolean;
+  }): Promise<{ allowed: boolean; message: string; evidence: Record<string, unknown> } | undefined> {
+    const fault = classifyFault({
+      phase: input.phase,
+      ...(input.errno === undefined ? {} : { errno: input.errno }),
+      ...(input.status === undefined ? {} : { status: input.status }),
+      ...(input.name === undefined ? {} : { name: input.name }),
+      ...(input.stage === undefined ? {} : { stage: input.stage }),
+      elapsedMs: input.elapsedMs ?? 0,
+      ...(input.alias === undefined ? {} : { identityAlias: input.alias }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.environment === undefined ? {} : { environment: input.environment }),
+      ...(input.idempotent === undefined ? {} : { idempotent: input.idempotent }),
+      ...(input.requestSent === undefined ? {} : { requestSent: input.requestSent }),
+    });
+    const now = this.faultClock();
+    const result = await this.faults.report({
+      taskId: scope.taskId, fault, target: input.target ?? 'none', now, limits: this.faultLimits,
+      ...(scope.employeeId === undefined ? {} : { holder: scope.employeeId }),
+      jitterFactor: jitterFactorOf(budgetKey(scope.taskId, input.target ?? 'none', fault.phase)),
+      ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
+      ...(input.charge === undefined ? {} : { charge: input.charge }),
+    });
+    if (result.decision.allowed) {
+      return { allowed: true, message: '', evidence: faultEvidence(fault) };
+    }
+    // The refusal says what to do next, in fixed words: the diagnosis never quotes the upstream message.
+    return {
+      allowed: false,
+      message: this.faultRefusalMessage(fault.phase, result.decision.reason, result.decision.nextAllowedAt, result.diagnostic),
+      evidence: { ...faultEvidence(fault), decision: result.decision.reason ?? 'not_retryable' },
+    };
+  }
+
+  /**
+   * A repair that is done lifts the fault it was made for (AC04): the source task may recover again, with a fresh
+   * budget and a new stage. The repair task is the one the manager created for the incident.
+   */
+  private async liftRepairedFaults(taskId: TaskId, now: number): Promise<void> {
+    const incidents = new Set((await this.faults.episodesOfTask(taskId))
+      .filter(episode => episode.state === 'exhausted' || episode.state === 'stopped')
+      .map(episode => episode.incident));
+    for (const incident of incidents) {
+      const repair = await this.faults.repair(incident);
+      if (!repair?.taskId) continue;
+      const repairTask = await this.db.select<{ state?: string }>(id('task', repair.taskId));
+      if (repairTask?.state !== 'done') continue;
+      await this.faults.liftRepair({ taskId, incident, now, limits: this.faultLimits });
+    }
+  }
+
+  /**
+   * The fault of a task whose recovery must not continue, if there is one: the budget is spent, or the cause
+   * cannot be recovered at all. The task's own episodes are read; the newest one wins, because that is the cause
+   * the manager has to deal with.
+   */
+  private async blockedFaultFor(taskId: TaskId): Promise<{ fingerprint: string; incident: string; diagnostic: FaultDiagnostic } | undefined> {
+    const episodes = await this.faults.episodesOfTask(taskId);
+    const stopped = episodes.find(episode => episode.state === 'exhausted' || episode.state === 'stopped');
+    if (!stopped) return undefined;
+    const repair = await this.faults.repair(stopped.incident);
+    const diagnostic = repair?.diagnostic;
+    if (!diagnostic) return undefined;
+    return { fingerprint: stopped.fingerprint, incident: stopped.incident, diagnostic };
+  }
+
+  /**
+   * The repair task of an exhausted fault. It is an ordinary engineering task with the structured diagnostic as
+   * its context, created by the manager who is handling the source task, so it enters the normal queue with the
+   * usual review rather than as an owner gate. The create carries a business key, so the chain exists exactly
+   * once no matter how often the budget is exhausted.
+   */
+  private async createFaultRepairTask(credential: Credential, sourceTaskId: TaskId, incident: string, fingerprint: string, diagnostic: FaultDiagnostic): Promise<TaskId> {
+    const source = await this.db.select<TaskRow>(id('task', sourceTaskId));
+    const title = `故障修复 ${diagnostic.phase}/${diagnostic.hop} ${diagnostic.errno}`;
+    const context = [
+      'SYS04 故障修复任务：一次恢复预算耗尽后的唯一修复链。',
+      `incident=${incident}`,
+      `fingerprint=${fingerprint}`,
+      `phase=${diagnostic.phase} hop=${diagnostic.hop} errno=${diagnostic.errno} httpClass=${diagnostic.httpClass} status=${diagnostic.status ?? '-'}`,
+      `attempts=${diagnostic.attempts}/${diagnostic.maxAttempts} elapsedMs=${diagnostic.elapsedMs} retryability=${diagnostic.retryability}`,
+      `diagnosis: ${diagnostic.guidance}`,
+      `sourceTask=${sourceTaskId}`,
+      source?.goal ? `goal=${asId(source.goal)}` : '',
+    ].filter(Boolean).join('\n');
+    const repairKey = `fault-repair:${incident}`;
+    try {
+      const view = await this.createTaskRecord(credential, {
+        title,
+        context,
+        executorRole: 'engineering',
+        reviewerRole: 'qa',
+        ...(source?.goal ? { goalId: asId(source.goal) } : {}),
+        workIntent: { kind: 'read' },
+        idempotencyKey: repairKey,
+      }, { repairKey });
+      return view.id;
+    } catch (error) {
+      // The chain of this incident already exists — another source task exhausted the same cause at the same
+      // time, or the ledger was cleaned up while the task was not. The repair is shared: link to it instead of
+      // failing the resume of the second task.
+      if (!(error instanceof CompanyError) || error.code !== 'conflict') throw error;
+      const prior = await this.db.select<IdempotencyRow>(this.businessIdemId('create', repairKey));
+      const existing = prior?.result?.id === undefined ? undefined : asId(prior.result.id);
+      if (!existing) throw error;
+      return existing;
+    }
   }
 
   private async recordQuotaGate(credential: Credential, taskId: TaskId, until: number | undefined): Promise<void> {
@@ -2773,6 +3018,26 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         throw new CompanyError('invalid', `Unknown resume phase: ${target}`);
       }
       if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
+    }
+    // SYS04 AC04: a resume may not walk past a fault whose recovery stopped — the budget is spent, or the cause
+    // cannot be recovered at all. The task waits for the one repair chain of that incident instead; the manager is
+    // not asked to approve the same failure again.
+    await this.liftRepairedFaults(taskId, this.faultClock());
+    const stopped = await this.blockedFaultFor(taskId);
+    if (stopped) {
+      const repairTaskId = await this.faults.ensureRepair({
+        incident: stopped.incident, fingerprint: stopped.fingerprint, sourceTaskId: taskId,
+        diagnostic: stopped.diagnostic, now: this.faultClock(),
+        createTask: () => this.createFaultRepairTask(credential, taskId, stopped.incident, stopped.fingerprint, stopped.diagnostic),
+      });
+      const deferred = await this.deferTaskUntilRecord(credential, {
+        taskId,
+        dependencies: [repairTaskId],
+        text: `恢复已停止（${stopped.diagnostic.phase}/${stopped.diagnostic.hop} ${stopped.diagnostic.errno}，${stopped.diagnostic.attempts}/${stopped.diagnostic.maxAttempts} 次）：已建唯一修复链 ${repairTaskId}，原任务等待该修复完成后再继续`,
+        idempotencyKey: `fault-source:${taskId}:${repairTaskId}`,
+        expectedVersion: before.version,
+      }, { businessScope: true });
+      return deferred;
     }
     try {
       const row = await this.txTask(`BEGIN;

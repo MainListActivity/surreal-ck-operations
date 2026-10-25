@@ -1,11 +1,31 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
+import type { FlowStage } from '../faults.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, isTlsTrustFailure, opsFetch, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, isTlsTrustFailure, opsFetch, transportErrno, type Fetcher } from './fetcher.ts';
+
+/**
+ * The machine facts of the hop that failed. The fault classifier reads them; no message is ever parsed for them,
+ * so a reworded error cannot change the classification and no credential can ride along.
+ */
+export interface LoginFacts {
+  stage: FlowStage;
+  errno?: string;
+  status?: number;
+  name?: string;
+}
+
+/** A failure of the login flow that carries those facts. */
+export class LoginFailure extends CompanyError {
+  constructor(message: string, readonly facts: LoginFacts, retryable = true) {
+    super('upstream_error', message, retryable);
+  }
+}
 
 /** Raised when the IdP refuses the login; `reason` is the IdP's error code, never a credential. */
 export class LoginError extends CompanyError {
-  constructor(readonly reason: string, message: string) {
+  /** The HTTP status the IdP answered with, when it answered at all: the classifier needs the machine fact. */
+  constructor(readonly reason: string, message: string, readonly status?: number, readonly facts?: LoginFacts) {
     super('login_failed', message);
   }
 }
@@ -54,14 +74,24 @@ const BUDGET_MS = 75_000;
 const RETRY_MIN_LEFT_MS = 30_000;
 const MIN_STEP_MS = 2_000;
 
-const fail = (what: string, detail: string | number) => new CompanyError('upstream_error', `${what} failed (${detail})`, true);
+const fail = (what: string, detail: string | number, facts: LoginFacts) => new LoginFailure(`${what} failed (${detail})`, facts);
 
 /** The network or the upstream's availability failed, not the login itself: a fresh attempt may well succeed. */
-class Unavailable extends CompanyError {
-  constructor(what: string, detail: string | number) {
-    super('upstream_error', `${what} failed (${detail})`, true);
+class Unavailable extends LoginFailure {
+  constructor(what: string, detail: string | number, facts: LoginFacts) {
+    super(`${what} failed (${detail})`, facts, true);
   }
 }
+
+/** The stage of the flow a hop belongs to. The phase strings carry a hop counter (`authorize#2`), never a credential. */
+const stageOf = (phase: string): FlowStage => {
+  const base = phase.split('#')[0].trim().toLowerCase();
+  if (base === 'authorize' || base === 'login' || base === 'consent' || base === 'exchange') return base;
+  if (base.includes('consent')) return 'consent';
+  if (base.includes('exchange') || base.includes('token')) return 'exchange';
+  if (base.includes('login')) return 'login';
+  return 'authorize';
+};
 
 interface Io {
   fetcher: Fetcher;
@@ -85,6 +115,17 @@ function formatTrace(io: Io): string {
   return io.trace.slice(-TRACE_TAIL).map(t => `a${t.attempt}:${t.phase}@${t.host}:${t.result} ${t.ms}ms`).join(' | ');
 }
 
+/** The facts of the hop that failed, read from the error's own fields — never from its message. */
+const factsOf = (phase: string, error: unknown): LoginFacts => {
+  const name = (error as { name?: unknown } | undefined)?.name;
+  const errno = transportErrno(error) ?? (name === 'TimeoutError' ? 'TimeoutError' : undefined);
+  return {
+    stage: stageOf(phase),
+    ...(errno === undefined ? {} : { errno }),
+    ...(typeof name === 'string' ? { name } : {}),
+  };
+};
+
 /** One request, optionally with its JSON body; a timeout while the body is read counts as a timeout of the request. */
 async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false, phase?: string): Promise<{ response: Response; body?: unknown }> {
   const { signal, ms } = io.step();
@@ -102,8 +143,11 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
     const { detail } = describeTransportFailure(error, ms);
     io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: Date.now() - started, result: detail });
     // An untrusted certificate fails the same way on every attempt, so it is final and never retried.
-    if (isTlsTrustFailure(error)) throw fail(what, `TLS certificate not trusted: ${detail}`);
-    throw new Unavailable(what, detail);
+    if (isTlsTrustFailure(error)) {
+      const facts = factsOf(phase ?? what, error);
+      throw fail(what, `TLS certificate not trusted: ${detail}`, { ...facts, errno: facts.errno ?? 'CERT_UNTRUSTED' });
+    }
+    throw new Unavailable(what, detail, factsOf(phase ?? what, error));
   }
 }
 
@@ -122,7 +166,7 @@ function browserSessionCookie(headers: Headers): string | undefined {
  */
 async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Promise<URL> {
   const challenge = consentUrl.searchParams.get('consent_challenge');
-  if (!challenge) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
+  if (!challenge) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state', undefined, { stage: 'consent' });
   const cookie = browserSessionCookie(loginHeaders);
   const { response, body } = await request('IdP consent', io, consentUrl.toString(), {
     method: 'POST',
@@ -130,13 +174,13 @@ async function settleConsent(consentUrl: URL, loginHeaders: Headers, io: Io): Pr
     headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
     body: new URLSearchParams({ consent_challenge: challenge, decision: 'approve' }).toString(),
   }, true, 'consent');
-  if (response.status >= 500) throw new Unavailable('IdP consent', `HTTP ${response.status}`);
+  if (response.status >= 500) throw new Unavailable('IdP consent', `HTTP ${response.status}`, { stage: 'consent', status: response.status });
   const location = response.headers.get('location');
   if (location) return new URL(location, consentUrl.toString());
   const reason = typeof (body as { error?: unknown } | undefined)?.error === 'string'
     ? ((body as { error: string }).error).replace(/[^\w.-]/g, '').slice(0, 60)
     : `http_${response.status}`;
-  throw new LoginError(reason, `IdP consent was refused (${reason})`);
+  throw new LoginError(reason, `IdP consent was refused (${reason})`, undefined, { stage: 'consent' });
 }
 
 /** Follows authorize redirects by hand until one carries the IdP's login challenge. */
@@ -144,10 +188,11 @@ async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ chall
   let current = authorizeUrl;
   for (let hop = 0; hop < MAX_HOPS; hop++) {
     const { response } = await request('IdP authorize', io, current, { redirect: 'manual' }, false, `authorize#${hop}`);
-    if (response.status >= 500) throw new Unavailable('IdP authorize', `HTTP ${response.status}`);
+    if (response.status >= 500) throw new Unavailable('IdP authorize', `HTTP ${response.status}`, { stage: 'authorize', status: response.status });
     const location = response.headers.get('location');
     if (response.status < 300 || response.status > 399 || !location) {
-      throw new LoginError('authorize_rejected', `IdP authorize did not lead to a login page (HTTP ${response.status})`);
+      throw new LoginError('authorize_rejected', `IdP authorize did not lead to a login page (HTTP ${response.status})`, response.status,
+        { stage: 'authorize', status: response.status });
     }
     const next = new URL(location, current);
     const challenge = next.searchParams.get('login_challenge');
@@ -158,7 +203,7 @@ async function findLoginChallenge(authorizeUrl: string, io: Io): Promise<{ chall
     }
     current = next.toString();
   }
-  throw new LoginError('authorize_loop', 'IdP authorize redirected too many times');
+  throw new LoginError('authorize_loop', 'IdP authorize redirected too many times', undefined, { stage: 'authorize' });
 }
 
 function jwtPayload(token: string): Record<string, unknown> | undefined {
@@ -261,8 +306,10 @@ export async function passwordLogin(
       if (attempt >= MAX_ATTEMPTS || left() < (options.retryMinLeftMs ?? RETRY_MIN_LEFT_MS)) {
         const trace = formatTrace(io);
         const attempts = attempt > 1 ? `; gave up after ${attempt} attempts` : '';
-        throw new CompanyError('upstream_error',
-          `${error.message}${attempts}${trace ? `; trace: ${trace}` : ''}; runtime ${runtimeVersion()}`, true);
+        // The facts of the hop that failed travel with the error, so the classifier sees the transport cause and
+        // not just the summary.
+        throw new LoginFailure(
+          `${error.message}${attempts}${trace ? `; trace: ${trace}` : ''}; runtime ${runtimeVersion()}`, error.facts, true);
       }
     }
   }
@@ -286,27 +333,27 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ login_challenge: challenge, username, password }).toString(),
   }, true, 'login');
-  if (login.status >= 500) throw new Unavailable('IdP login', `HTTP ${login.status}`);
+  if (login.status >= 500) throw new Unavailable('IdP login', `HTTP ${login.status}`, { stage: 'login', status: login.status });
   const loginBody = loginRaw as { redirect_uri?: string; error?: string; mfa_state?: string } | undefined;
-  if (loginBody?.mfa_state) throw new LoginError('mfa_required', 'IdP asked for a second factor; the broker only supports password-only test accounts');
+  if (loginBody?.mfa_state) throw new LoginError('mfa_required', 'IdP asked for a second factor; the broker only supports password-only test accounts', undefined, { stage: 'login' });
   if (!login.ok || !loginBody?.redirect_uri) {
     const reason = typeof loginBody?.error === 'string' ? loginBody.error.replace(/[^\w.-]/g, '').slice(0, 60) : `http_${login.status}`;
-    throw new LoginError(reason, `IdP rejected the login (${reason})`);
+    throw new LoginError(reason, `IdP rejected the login (${reason})`, login.status, { stage: 'login', status: login.status });
   }
 
   const callback = new URL(loginBody.redirect_uri);
   // Auto-approving consent is reserved for the company's own operator client (cfg.ops.clientId);
   // any other client or the customer channel asking for consent fails loudly instead.
   if (callback.searchParams.has('consent_challenge') && channel.clientId !== config.ops?.clientId) {
-    throw new LoginError('consent_required', 'IdP requires a consent decision for this client; refusing to approve automatically');
+    throw new LoginError('consent_required', 'IdP requires a consent decision for this client; refusing to approve automatically', undefined, { stage: 'consent' });
   }
   const settled = callback.searchParams.has('consent_challenge')
     ? await settleConsent(callback, login.headers, io)
     : callback;
   const oauthError = settled.searchParams.get('error');
-  if (oauthError) throw new LoginError(oauthError, `IdP returned an authorization error (${oauthError})`);
+  if (oauthError) throw new LoginError(oauthError, `IdP returned an authorization error (${oauthError})`, undefined, { stage: 'authorize' });
   const code = settled.searchParams.get('code');
-  if (!code || settled.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state');
+  if (!code || settled.searchParams.get('state') !== state) throw new LoginError('bad_callback', 'IdP callback lacked a matching code/state', undefined, { stage: 'authorize' });
 
   const { response: exchange, body: tokenRaw } = await request('token exchange', io, channel.tokenUrl, {
     method: 'POST',
@@ -316,9 +363,9 @@ async function signIn(config: BrokerConfig, username: string, password: string, 
       ...(channel.sendsClientId ? { client_id: channel.clientId } : {}),
     }).toString(),
   }, true, 'exchange');
-  if (exchange.status >= 500) throw new Unavailable('token exchange', `HTTP ${exchange.status}`);
+  if (exchange.status >= 500) throw new Unavailable('token exchange', `HTTP ${exchange.status}`, { stage: 'exchange', status: exchange.status });
   const tokens = tokenRaw as { access_token?: string; expires_in?: number } | undefined;
-  if (!exchange.ok || !tokens?.access_token) throw fail('token exchange', `HTTP ${exchange.status}`);
+  if (!exchange.ok || !tokens?.access_token) throw fail('token exchange', `HTTP ${exchange.status}`, { stage: 'exchange', status: exchange.status });
   const expiresAt = typeof tokens.expires_in === 'number' ? now() + tokens.expires_in * 1000 : jwtExpiry(tokens.access_token) ?? now() + 15 * 60_000;
   return { accessToken: tokens.access_token, expiresAt, attempts: io.attempt, trace: formatTrace(io) };
 }

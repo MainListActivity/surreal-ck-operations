@@ -32,6 +32,12 @@ export function describeTransportFailure(error: unknown, timeoutMs: number): { t
  * request signal allowed 25 s). Ops traffic gets an explicit, longer limit on its own dispatcher instead.
  * It stays below the 25 s per-request limit, and every request still carries its own signal.
  */
+/** The errno-style code of a transport failure, when the runtime reported one. */
+export function transportErrno(error: unknown): string | undefined {
+  const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
+  return typeof cause?.code === 'string' ? cause.code : undefined;
+}
+
 export const OPS_CONNECT_TIMEOUT_MS = 20_000;
 
 export interface OpsFetchOptions {
