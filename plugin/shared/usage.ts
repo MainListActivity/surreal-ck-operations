@@ -2,6 +2,10 @@ import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 const number = z.number().finite().nonnegative();
 export const usageFilterSchema = z.object({
+  after: z
+    .string()
+    .regex(/^[a-f0-9]{16}$/)
+    .optional(),
   period: z.enum(["today", "7d", "30d"]).default("today"),
   provider: z.string().max(300).optional(),
   model: z.string().max(300).optional(),
@@ -88,6 +92,7 @@ export const usageOverviewSchema = z.object({
   partial: z.boolean(),
 });
 export const usagePageSchema = z.object({
+  hasMore: z.boolean(),
   at: number,
   stale: z.boolean(),
   total: number,

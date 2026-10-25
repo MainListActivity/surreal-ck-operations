@@ -1,7 +1,7 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, ScrollView, Text, View } from "react-native";
 import {
   usageOverview,
@@ -346,10 +346,20 @@ function GlobalUsage(props: Props) {
     [model, setModel] = useState<string>(),
     [terminal, setTerminal] = useState<string>(),
     [offset, setOffset] = useState(0),
+    [boundaries, setBoundaries] = useState<Record<number, string>>({}),
     [groups, setGroups] = useState(false),
     read = useRpc(usageOverview),
     readPage = useRpc(usageRequests),
-    filter = { period, provider, model, terminal, offset, limit: 50 };
+    filter = {
+      period,
+      provider,
+      model,
+      terminal,
+      offset,
+      limit: 50,
+      after: offset ? boundaries[offset] : undefined,
+    };
+  useEffect(() => setBoundaries({}), [period, provider, model, terminal]);
   const overview = useQuery({
     queryKey: ["magpie-usage-overview", period, provider, model, terminal],
     queryFn: () => read(filter),
@@ -413,7 +423,7 @@ function GlobalUsage(props: Props) {
       )}
       {(overview.isError || page.isError) && (
         <Text style={{ color: c.foregroundMuted }}>
-          读取失败，点击“刷新用量”重试。已有快照可能过期，不以零代替失败。
+          读取失败；分页边界可能已过期，请点击“最新请求”或“刷新用量”重试。已有快照可能过期，不以零代替失败。
         </Text>
       )}
       {!data && !overview.isError && (
@@ -566,8 +576,13 @@ function GlobalUsage(props: Props) {
         <Action
           label="下一页"
           theme={theme}
-          disabled={!page.data || offset + 50 >= page.data.total || page.isFetching}
-          onPress={() => setOffset(offset + 50)}
+          disabled={!page.data || !page.data.hasMore || page.isFetching}
+          onPress={() => {
+            const last = page.data?.rows.at(-1);
+            if (!last) return;
+            setBoundaries((current) => ({ ...current, [offset + 50]: last.id }));
+            setOffset(offset + 50);
+          }}
         />
       </View>
     </ScrollView>
