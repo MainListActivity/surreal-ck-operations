@@ -25,6 +25,9 @@ export interface Company {
 }
 
 let boot: Promise<Company> | undefined;
+let readyCompany:Company|undefined;
+/** Local read only; never starts bootstrap or waits on the company database. */
+export function currentCompany(){return readyCompany;}
 
 const notify = async (title: string, text: string) => {
   const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 240);
@@ -220,7 +223,7 @@ export function company(): Promise<Company> {
     try { await sidecar.adopt(await workforce.insts()); }
     catch(error) { await modelGateway.stop(); throw error; }
     routingReady=true;
-    return { modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return readyCompany={ modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;
