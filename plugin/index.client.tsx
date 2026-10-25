@@ -5,6 +5,7 @@ import { CompanySurface } from "./client/company";
 
 export default function contribute(client: PluginClientContext) {
   client.addWorkspacePanel({id:"agent-model-metrics",title:"模型实测",icon:"Gauge",context:"agent",locations:["workspace","explorer"],Component:AgentMetricsPanel});
+  client.addCommandCenterItem({id:"open-agent-model-metrics",title:"查看模型实测",icon:"Gauge",context:"agent",onSelect({openPanel}){openPanel("agent-model-metrics",{location:"explorer"});}});
   client.addTimelineRenderer({kind:"sck-model-metrics",version:1,schema:agentMetricsViewSchema,Component:AgentMetricsTimeline});
   client.addSurface("company", CompanySurface);
   client.addSidebarItem({

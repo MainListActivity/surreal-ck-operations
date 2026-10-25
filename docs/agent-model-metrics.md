@@ -2,7 +2,7 @@
 
 ## 目标与入口
 
-按老板确认的 agent `0093a690-d8b9-4fb7-bd65-9827d7b9b62d` 方案，将实际执行模型和性能展示在 Paseo 当前 agent 的「模型实测」面板，并在每轮结束后追加时间线摘要。面板每 5 秒刷新，区分最近一次请求与本轮多次请求累计。不改变员工编制、派工、分组或 JEV 排序策略，不为生成指标发起模型请求。
+按老板确认的 agent `0093a690-d8b9-4fb7-bd65-9827d7b9b62d` 方案，将实际执行模型和性能展示在 Paseo 当前 agent 的「模型实测」面板，并在每轮结束后追加时间线摘要。在 agent 内按 ⌘K（Windows/Linux 为 Ctrl+K），选择「查看模型实测」打开 Explorer 面板；Paseo 的普通新标签菜单不列出 agent 上下文面板，故显式提供命令入口。面板每 5 秒刷新，区分最近一次请求与本轮多次请求累计。不改变员工编制、派工、分组或 JEV 排序策略，不为生成指标发起模型请求。
 
 本项目锁定的 Paseo 插件 SDK 使用 `addWorkspacePanel(context: agent)` 注册面板，使用 `addTimelineRenderer` 渲染 `sck-model-metrics@1`；服务端监听 `agent.turn_started/ended`，通过 agent ref 的 `timeline.append` 写入。面板适配 Paseo 主题与窄屏。
 
