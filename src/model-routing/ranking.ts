@@ -149,12 +149,18 @@ export type {RankingAttempt} from "./ranking-input.ts";
 
 /** Only a standalone, unambiguous numeric TTFT tail clause is executable; arbitrary prose stays with Jev. */
 export function ttftTailThreshold(rules:string):number|undefined {
-  if(/除外|例外|除非|但是|但|取消|不要|不再|无需/.test(rules))return undefined;
-  const values=rules.split(/[，,；;。\n]/).flatMap(clause=>{
-    const m=/^\s*(?:平均\s*)?(?:首\s*token|首个\s*token|TTFT)\s*(?:延迟\s*)?(?:超过|大于|>)\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)\s*(?:的(?:模型)?)?\s*(?:排在最后|排最后|放到最后|排在末尾|排末尾)\s*$/i.exec(clause);
-    if(!m)return [];const n=Number(m[1])*(["ms","毫秒"].includes(m[2]!.toLowerCase())?1:1000);
-    return Number.isFinite(n)&&n>=0?[n]:[];
-  });
+  const values:number[]=[];
+  for(const clause of rules.split(/[，,；;。\n]/).map(s=>s.trim()).filter(Boolean)) {
+    const m=/^(?:平均\s*)?(?:首\s*token|首个\s*token|TTFT)\s*(?:延迟\s*)?(?:超过|大于|>)\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)\s*(?:的(?:模型)?)?\s*(?:排在最后|排最后|放到最后|排在末尾|排末尾)$/i.exec(clause);
+    if(!m) {
+      // Compile only fully understood independent preferences. Unknown clauses may contain an
+      // exception to the tail rule in any language; do not guess from a growing blacklist.
+      if(!/^(?:智能程度和速度综合优先|智能(?:程度)?优先|速度优先|token速率未知的排前面)$/i.test(clause))return undefined;
+      continue;
+    }
+    const n=Number(m[1])*(["ms","毫秒"].includes(m[2]!.toLowerCase())?1:1000);
+    if(!Number.isFinite(n)||n<0)return undefined;values.push(n);
+  }
   const unique=[...new Set(values)];return unique.length===1?unique[0]:undefined;
 }
 const overTtftLimit=(f:ModelFacts|undefined,limit:number|undefined)=>limit!==undefined&&f?.usage?.ttftMs!==undefined&&f.usage.ttftMs>limit;
