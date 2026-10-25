@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
-import { classifyFault, type FlowStage } from '../faults.ts';
+import { isProvablyUnsentFailure, type FlowStage } from '../faults.ts';
 import type { BrokerConfig } from './config.ts';
 import { describeTransportFailure, isTlsTrustFailure, opsFetch, transportErrno, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
 
@@ -90,18 +90,6 @@ const MIN_STEP_MS = 2_000;
  */
 const CONNECT_ATTEMPTS = 3;
 
-/**
- * The connect limit of a same-hop retry.
- *
- * A connect that has not come up carries no request, so cutting it early loses nothing — while waiting the standing
- * 20 s per attempt burns the login's whole budget on connections that never existed. The value is measured, not
- * guessed: on the production path a healthy connection establishes in single-digit milliseconds at the TCP layer,
- * while a whole healthy request (DNS + TCP + TLS + round trip) measured 1.4-9.9 s. 12 s therefore leaves headroom
- * above the slowest healthy request while still cutting a broken connection well under the standing limit. The first
- * attempt of a hop keeps the standing limit; only the retries use this one.
- */
-const CONNECT_RETRY_TIMEOUT_MS = 12_000;
-
 const fail = (what: string, detail: string | number, facts: LoginFacts) => new LoginFailure(`${what} failed (${detail})`, facts);
 
 /** The network or the upstream's availability failed, not the login itself: a fresh attempt may well succeed. */
@@ -136,11 +124,8 @@ interface Io {
    * it: past that point the flow must fail with the real cause instead of spending what is left on connections.
    */
   connectRetryAllowed: () => boolean;
-  /**
-   * The fetcher to use for the next connection attempt: the standing one, or the same fetcher with a shorter connect
-   * limit for a retry.
-   */
-  connectFetcher: (connectTimeoutMs: number) => Fetcher;
+  /** The fetcher to use for a retry: the same transport, opening a fresh connection from its own pool. */
+  connectFetcher: () => Fetcher;
 }
 
 /** `bun@1.2.x` or `node@22.x`, recorded once in diagnostics for runtime comparisons. */
@@ -183,31 +168,23 @@ function lastStage(io: Io): LoginStage | undefined {
 /**
  * Whether a failed hop may be tried again on the very same request, on a fresh connection.
  *
- * The answer comes from the classifier, so the login path and the fault ledger cannot disagree about what may be
- * repeated. The classifier knows the two facts that matter:
+ * Only a failure that proves the connection was never established qualifies: nothing was written, so repeating the
+ * request cannot deliver anything twice. That is what makes the same-hop retry safe even for a write — and it is
+ * exactly the production shape (a new connection that never came up).
  *
- * - A connect-phase failure proves the connection never came up, so the request never left the client. Even a write
- *   may then be repeated: nothing was written. This is the case the production failures are made of.
- * - A failure after the connection was up (a reset, a socket error) does not prove that. For a request that may not be
- *   repeated — a password POST against a single-use challenge, a token exchange against a single-use code — the
- *   classifier answers "unknown outcome" and the failure goes back to the flow, which starts over with a fresh
- *   challenge. The code is never sent twice.
+ * EPIPE and the socket timeouts are deliberately excluded. EPIPE is a write-side error: the peer was already gone, so
+ * the request may well have been sent. For a single-use challenge or an authorization code, replaying it is not a
+ * retry but a second use. Those failures, and any failure after the request may have been written, go back to the
+ * flow, which starts over with a fresh challenge.
  *
- * `idempotent` is per hop: the authorize hop is a GET and writes nothing, the password POST and the token exchange
- * carry single-use material.
+ * `idempotent` says whether the request may be repeated at all when the wire state is unknown: the authorize hop is a
+ * GET, the password POST and the token exchange carry single-use material.
  */
 function mayRepeatOnFreshConnection(facts: LoginFacts, idempotent: boolean): boolean {
-  const fault = classifyFault({
-    phase: 'authorize',
-    stage: facts.stage,
-    ...(facts.errno === undefined ? {} : { errno: facts.errno }),
-    ...(facts.status === undefined ? {} : { status: facts.status }),
-    ...(facts.name === undefined ? {} : { name: facts.name }),
-    // Whether the request was written is not known here: the classifier decides from the errno, exactly as it does
-    // for the fault ledger. A connect errno proves it was not; a reset does not.
-    idempotent,
-  });
-  return fault.hop === 'connect' && fault.retryability === 'retryable';
+  if (isProvablyUnsentFailure(facts.errno)) return true;
+  // A reset or a socket error does not prove the request was not written. Only a request that is safe to repeat may
+  // be tried again on that basis; the login POST and the token exchange are not.
+  return idempotent && (facts.errno === 'ECONNRESET' || facts.errno === 'UND_ERR_SOCKET');
 }
 async function request(what: string, io: Io, url: string, init: RequestInit, parseBody = false, phase?: string,
   idempotent = false): Promise<{ response: Response; body?: unknown }> {
@@ -217,9 +194,10 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
     let host = 'unknown';
     try { host = new URL(url).host; } catch { /* unreachable host is still recorded */ }
     try {
-      // The first attempt uses the standing connect limit; a retry after a broken connection uses the short one and
-      // a fresh pool, so it really opens a new connection instead of reusing the one that failed.
-      const response = await (hopAttempt === 1 ? io.fetcher : io.connectFetcher(CONNECT_RETRY_TIMEOUT_MS))(url, { ...init, signal });
+      // Every attempt uses the standing connect limit; a retry opens a fresh connection through its own pool. No
+      // custom connect deadline is introduced: the existing step and budget limits bound the retry like any other
+      // request, and the standing limit is what a healthy-but-slow handshake is known to need.
+      const response = await (hopAttempt === 1 ? io.fetcher : io.connectFetcher())(url, { ...init, signal });
       const body = parseBody
         ? await response.json().catch((error: Error) => { if (error.name === 'TimeoutError') throw error; return undefined; })
         : undefined;
@@ -234,10 +212,8 @@ async function request(what: string, io: Io, url: string, init: RequestInit, par
         throw fail(what, `TLS certificate not trusted: ${detail}`, { ...facts, errno: facts.errno ?? 'CERT_UNTRUSTED' });
       }
       const facts = factsOf(phase ?? what, error);
-      // The same hop may be tried again only when the connection itself failed and the request provably never left
-      // the client: nothing was written, so no request can have been delivered and no single-use challenge or code is
-      // at stake. A failure after the request may have been written goes back to the flow, which starts over with a
-      // fresh challenge.
+      // The same hop may be tried again only when the request provably never left the client. A failure after the
+      // request may have been written goes back to the flow, which starts over with a fresh challenge.
       if (hopAttempt < CONNECT_ATTEMPTS && mayRepeatOnFreshConnection(facts, idempotent) && io.connectRetryAllowed()) {
         io.trace.push({ attempt: io.attempt, phase: phase ?? what, host, ms: 0, result: `connect retry ${hopAttempt}/${CONNECT_ATTEMPTS - 1}` });
         continue;
@@ -404,13 +380,13 @@ export async function passwordLogin(
     trace: [],
     // A same-hop retry only runs while the flow still has room for it: the retry is bounded by the same budget as
     // everything else, so a broken path cannot spend more than the login is allowed to take.
-    connectRetryAllowed: () => left() >= CONNECT_RETRY_TIMEOUT_MS + MIN_STEP_MS && attemptLeft() >= MIN_STEP_MS,
-    connectFetcher: (connectTimeoutMs: number) => {
+    connectRetryAllowed: () => left() >= MIN_STEP_MS && attemptLeft() >= MIN_STEP_MS,
+    connectFetcher: () => {
       const fetcher = options.fetch ?? opsFetch;
       const aware = fetcher as Partial<ConnectAwareFetcher>;
-      // An injected fetcher without the connect-aware shape is used as it is: the retry still opens a new request,
-      // and the transport's own connect limit applies.
-      return typeof aware.withConnectTimeout === 'function' ? aware.withConnectTimeout(connectTimeoutMs) : fetcher;
+      // A fresh connection on the same trust anchors; an injected fetcher without the connect-aware shape is used as
+      // it is. No custom connect deadline is introduced.
+      return typeof aware.freshConnection === 'function' ? aware.freshConnection() : fetcher;
     },
   };
   const giveUp = (failure: Unavailable, attempts: number): LoginFailure => {

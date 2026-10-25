@@ -148,9 +148,10 @@ describe('the real transport', () => {
     expect(row?.failed ?? false).toBe(false);
   });
 
-  test('a connect timeout that outlives every connection is recoverable through the fault layer', async () => {
-    // Every connection of the authorize hop stalls past the retry's limit, so the hop fails and the failure reaches
-    // the fault layer, where it is classified as a retryable connect fault.
+  test('a connect timeout that outlives every connection is reported, then a later success settles the budget', async () => {
+    // Every connection of the authorize hop stalls, so the hop fails and the failure reaches the fault layer, where
+    // it is classified as a retryable connect fault. Then the path heals: the next attempt succeeds and the recovery
+    // budget is settled (attempts back to 0, failed false) while total_attempts keeps the audit.
     const target = await idpWith({ hold: () => 13_000 });
     const taskId = await makeTask('传输：建连超时进故障层');
     const scope = { taskId, employeeId: 't-eng' };
@@ -164,6 +165,17 @@ describe('the real transport', () => {
     const row = await budgetRow(taskId);
     expect(row?.attempts).toBe(1);
     expect(row?.failed).toBe(true);
+    // The path heals: the next attempt runs after the interval and succeeds.
+    const healed = await idpWith({});
+    clock += 10_000;
+    const second = await attempt(scope, healed);
+    expect(second.tokens?.accessToken).toBeTruthy();
+    // A call that works costs no recovery budget: the recovery is over. The total keeps the audit of both
+    // reservations (the failed attempt and the successful one), so it is 2 rather than reset to 0.
+    const after = await budgetRow(taskId);
+    expect(after?.attempts).toBe(0);
+    expect(after?.failed).toBe(false);
+    expect(after?.totalAttempts).toBe(2);
   });
 
   test('the budget runs out at the authorize stage and the refused attempt never reaches the IdP', async () => {

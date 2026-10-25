@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { CompanyError } from '../src/core-errors.ts';
-import { createOpsFetcher, opsFetch, OPS_CONNECT_TIMEOUT_MS } from '../src/ops/fetcher.ts';
+import { createOpsFetcher, opsFetch, OPS_CONNECT_TIMEOUT_MS, type Fetcher } from '../src/ops/fetcher.ts';
 import { LoginError, passwordLogin, type LoginOptions, type LoginTokens } from '../src/ops/idp.ts';
 import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type LoginIdpOptions, type TestPki } from './support/ops-login-transport.ts';
 
@@ -295,23 +295,57 @@ describe('same-hop connect recovery', () => {
     expect(tokens.trace).not.toContain('connect retry');
   }, SLOW);
 
+  test('EPIPE after the request was written is not retried on the same hop: a fresh flow carries a fresh challenge', async () => {
+    // EPIPE is a write-side error: the peer was already gone, so the login POST may well have been consumed. It must
+    // NOT be treated as "the connection never came up" — that would send the single-use challenge a second time. The
+    // failure goes back to the flow, which authorizes again and consumes a new challenge.
+    const target = await idp();
+    const real = transport();
+    let fired = false;
+    let loginPosts = 0;
+    const wrapped: Fetcher = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes('/api/login/ck/password')) {
+        loginPosts++;
+        if (!fired) {
+          fired = true;
+          // The IdP consumed the challenge, then the response was lost with a write-side EPIPE.
+          await real(input, init);
+          throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }) });
+        }
+      }
+      return real(input, init);
+    };
+    const { tokens } = await success(login(target, { fetch: wrapped }));
+    // The flow started over: two authorize hops, and each login POST carried its own fresh challenge.
+    expect(tokens.attempts).toBe(2);
+    expect(target.counts.authorize).toBe(2);
+    expect(target.counts.login).toBe(2);
+    expect(target.counts.replays).toBe(0);
+    expect(loginPosts).toBe(2);
+    // No same-hop retry fired on the login hop: the failure was not provably unsent.
+    expect(tokens.trace).not.toContain('a1:login@127.0.0.1:connect retry');
+  }, SLOW);
+
   test('the whole login stays inside its budget even when the first hop keeps failing', async () => {
-    // Scaled down from production (75s budget / 30s reserve / 25s step): 9s / 4s / 3s. Every connection of the first
-    // hop fails, so the same-hop retries must not push the login past its budget.
-    // The connect limit is below the step limit here, so the failures are connect failures and the hop may retry.
+    // Scaled down from production (75s budget / 30s reserve / 25s step): 30s / 15s / 8s. Every connection of the
+    // first hop fails. The budget is large enough that a same-hop retry really happens, so this case proves the
+    // retries are bounded by the budget rather than by a count.
     const target = await idp({ holdHop: (hop, connection) => (hop === 'authorize' ? 13_000 : 0) });
-    const { error, ms } = await failure(login(target, { fetch: transport(700), budgetMs: 9_000, retryMinLeftMs: 4_000, stepTimeoutMs: 3_000 }));
+    const { error, ms } = await failure(login(target, { fetch: transport(700), budgetMs: 30_000, retryMinLeftMs: 15_000, stepTimeoutMs: 8_000 }));
     expect(error.code).toBe('upstream_error');
     expect(error.message).toContain('UND_ERR_CONNECT_TIMEOUT');
+    // A same-hop retry really ran: the budget was large enough for it.
+    expect(error.message).toContain('connect retry');
     // Bounded by the budget, not by the number of retries.
-    expect(ms).toBeLessThan(12_000);
+    expect(ms).toBeLessThan(32_000);
     // And the diagnostic stays secret-free.
     expect(error.message).not.toContain(PASSWORD);
-  }, 60_000);
+  }, 90_000);
 
-  test('a successful login keeps its logout semantics: the session is released, not merely minted', async () => {
-    // The recovery path must not change what a successful login means to the caller: the tokens are returned, the
-    // trace names hosts and outcomes only, and no secret rides along.
+  test('a successful login keeps its contract: tokens, a secret-free trace, and no state the caller must undo', async () => {
+    // `passwordLogin` is the flow only: it mints tokens and returns them. Session release is the broker's job
+    // (`ops_logout`), covered by the broker-level regression below — this test only pins the flow's own contract.
     const target = await idp();
     const { tokens } = await success(login(target, { fetch: transport() }));
     expect(tokens.attempts).toBe(1);
@@ -322,6 +356,22 @@ describe('same-hop connect recovery', () => {
       expect(JSON.stringify(tokens)).not.toContain(secret);
     }
   }, SLOW);
+});
+
+describe('slow but healthy handshakes', () => {
+  test('a retry on a 12-20 s healthy handshake succeeds: the retry keeps the standing connect limit', async () => {
+    // The repo already supports a 12 s handshake (the production connect limit is 20 s). A retry must not cut a
+    // handshake that the first attempt would have been allowed to complete: the retry uses the standing limit, not a
+    // shorter one. The first connection is broken, the next is a healthy 13 s handshake.
+    const target = await idp({ holdHop: (hop, connection) => (hop === 'authorize' ? (connection === 1 ? 21_000 : 13_000) : 0) });
+    const { tokens, ms } = await success(login(target, { fetch: transport() }));
+    expect(tokens.attempts).toBe(1);
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
+    // The 13 s handshake completed; the whole login still fits inside the production budget.
+    expect(ms).toBeGreaterThanOrEqual(12_500);
+    expect(ms).toBeLessThan(75_000);
+    expect(tokens.trace).toContain('connect retry');
+  }, 120_000);
 });
 
 describe('production connect limit', () => {

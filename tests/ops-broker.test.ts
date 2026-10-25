@@ -371,6 +371,17 @@ describe('ops login and sessions', () => {
     expect(error.message).not.toContain('wrong-password-123');
   });
 
+  test('a successful ops_login can be released with ops_logout, and the session stops working', async () => {
+    // The login path changed (same-hop connect retry). What a successful login means to the caller must not: the
+    // broker still mints a session that ops_logout closes, and the same session handle is dead afterwards.
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_logout', { session })).toEqual({ closed: true });
+    expect((await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('not_found');
+    // A second logout of the same handle is refused, not silently accepted.
+    expect((await failure(call(r, 'ops_logout', { session }))).code).toBe('not_found');
+  });
+
   test('sessions belong to one employee; release and logout kill them', async () => {
     const r = rig();
     const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
