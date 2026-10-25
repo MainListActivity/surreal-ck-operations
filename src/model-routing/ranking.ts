@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ModelTrends } from "./trends.ts";
+import type { ModelHealth } from "./health.ts";
 import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
@@ -51,6 +52,8 @@ export interface ModelFacts {
   price: { free: boolean; input?: number | null; output?: number | null; cacheHit?: number | null };
   usage?: UsageStat;
   performance?: { score: number; samples: number };
+  /** Every try in Magpie's routing log, including refusals handed on to the next member. */
+  health?: ModelHealth;
 }
 
 const usageNumber = z.number().finite().nonnegative().default(0);
@@ -202,6 +205,7 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
         "usage：本轮排序前实时读取 Magpie /v1/magpie/usage?period=7d 原生统计；collectedAt 为采集时间，since 为窗口起点。严格按完整供应商/模型路径匹配，含该通道历史各思考等级；缺失表示无该通道数据，不借用其他供应商。",
         "usage.tokensPerSecond 使用 Magpie decode_out/decode_ms 的原生测速口径，speedSamples 为实测速样本数；ttftMs 为原生平均首 token 延迟，ttftSamples 为样本数；requests 含失败次数 errors，cacheHitRate 为缓存命中占提示 token 比例。",
         "performance：公司任务验收后的模型绩效（1–5 分）与样本数，样本少时参考价值低。",
+        "health：Magpie 路由日志近24小时每一次尝试（含被拒后转给下一个成员的尝试）。持续报错的成员已由代码移到组末尾，不在本次评分里；这里出现的成员都可用，errors 只是偶发失败。",
       ],
     };
   const questions = Object.fromEntries(facts.map((f, i) => [keys[i], {
@@ -252,6 +256,8 @@ export interface RankingResultSnapshot {
   answers: JevResult["answers"];
   /** Observations for pinned members, kept outside the Jev request and scored rows. */
   pinnedFacts?: ModelFacts[];
+  /** Members that kept failing: placed last by code, never sent to Jev, never given a score. */
+  excludedFacts?: ModelFacts[];
 }
 export interface RankingTableRow {
   model: string; pinned?: boolean;
@@ -261,6 +267,7 @@ export interface RankingTableRow {
   accounts: ModelFacts["accounts"];
   performanceScore?: number; performanceSamples?: number;
   jevScore?: number; jevConfidence?: number;
+  health?: ModelHealth;
 }
 export interface RankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
@@ -275,15 +282,17 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
     const rows = (groups[group] ?? []).map(model => {
       const judged = result?.rows.find(row => row.facts.id === model);
       // Once a successful snapshot exists, do not borrow facts from a later failed/pending request.
-      const facts = judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? (!result ? legacy.find(f => f.id === model) : undefined);
-      return { model, trends: facts?.trends, trendSource:facts?.trendSource, pinned: (pins[group] ?? []).includes(model), aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      const excluded = result?.excludedFacts?.find(f => f.id === model);
+      const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? (!result ? legacy.find(f => f.id === model) : undefined);
+      const pinned = !excluded && (pins[group] ?? []).includes(model);
+      return { model, trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
-        performanceSamples: facts?.performance?.samples, jevScore: (pins[group] ?? []).includes(model) ? undefined : judged?.score, jevConfidence: (pins[group] ?? []).includes(model) ? undefined : judged?.confidence };
+        performanceSamples: facts?.performance?.samples, jevScore: pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
-    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result, rows };
+    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
 }
 
@@ -374,19 +383,33 @@ export class RankingRefresher {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
+        // A member that keeps failing goes last by code, before Jev and over the owner's pins:
+        // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
+        const excluded = members.filter(id => byId.get(id)?.health?.excluded);
+        const usable = members.filter(id => !excluded.includes(id));
+        const pinned = pinnedOrder(usable, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
+        const excludedFacts = excluded.map(id => byId.get(id)!);
+        const pinnedFacts = pinned.map(id => byId.get(id)!).filter(Boolean);
         try {
-          const pinned = pinnedOrder(members, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
-          const facts = members.filter(id => !pinned.includes(id)).map(id => byId.get(id));
+          const facts = usable.filter(id => !pinned.includes(id)).map(id => byId.get(id));
           if (facts.some(f => !f)) throw Error("missing facts");
           orders[`sck-${tier}`] = [...pinned, ...await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
             await this.deps.db.query(
               "UPSERT type::record('company_meta',$key) SET tier=$tier,at=$at,payload=$payload;",
               { key: `model_ranking_request_${tier}`, tier, at: new Date().toISOString(), payload });
-          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts:pinned.map(id => byId.get(id)!).filter(Boolean)}; })];
+          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts,excludedFacts}; }), ...excluded];
+          // Nothing left for Jev to judge (every member pinned or failing): the tail is still recorded.
+          if (!results[`sck-${tier}`] && excluded.length)
+            results[`sck-${tier}`] = { tier, at: new Date().toISOString(), model: "", rules: settings.rules, rows: [], answers: {}, pinnedFacts, excludedFacts };
         } catch (e) {
           // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
           this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
-          errors.push(`${tier} 刷新失败，保留原顺序`);
+          errors.push(`${tier} 刷新失败，${excluded.length ? "持续报错的成员已移到末尾，其余" : ""}保留原顺序`);
+          // Jev's answer is optional for the tail: failing members still leave the front, unscored.
+          if (excluded.length) {
+            orders[`sck-${tier}`] = [...pinned, ...usable.filter(id => !pinned.includes(id)), ...excluded];
+            results[`sck-${tier}`] = { tier, at: new Date().toISOString(), model: "", rules: settings.rules, rows: [], answers: {}, pinnedFacts, excludedFacts };
+          }
         }
       }
       if (revision !== this.revision || this.stopped) return;

@@ -292,5 +292,7 @@ export interface ModelRankingTable {
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
     jevScore?: number; jevConfidence?: number;
+    /** Magpie routing log, every try; `excluded` members were moved last by code and never sent to Jev. */
+    health?: { excluded: boolean; reason?: "unavailable" | "consecutive_errors" | "error_rate"; attempts: number; errors: number; consecutiveErrors: number; lastStatus?: number; lastAttemptAt?: string };
   }>;
 }

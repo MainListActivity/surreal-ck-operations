@@ -1,4 +1,4 @@
-import { rankingTrendDetail } from "../shared/ranking-trends.ts";
+import { rankingHealthMetric, rankingTrendDetail } from "../shared/ranking-trends.ts";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1194,6 +1194,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
         {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:rankingTrendDetail(row.trends?.ttftMs)},
         {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
         {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
+        {label:"路由尝试",...rankingHealthMetric(row.health)},
         {label:"缓存命中率",value:row.trends?.cacheHitRate?.current===undefined?"未知":`${number(row.trends.cacheHitRate.current*100)}%`,detail:rankingTrendDetail(row.trends?.cacheHitRate)},
         {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
       ];
@@ -1210,7 +1211,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
           <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>JEV</Text>
-            <Text accessibilityLabel={row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
+            <Text accessibilityLabel={row.health?.excluded?"持续报错，已移到末尾，不参与 JEV 评分":row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.health?.excluded?"持续报错":row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
           onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>

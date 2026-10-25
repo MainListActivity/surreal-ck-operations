@@ -1,4 +1,4 @@
-import { rankingTrendDetail } from "../plugin/shared/ranking-trends.ts";
+import { rankingHealthMetric, rankingTrendDetail } from "../plugin/shared/ranking-trends.ts";
 import {expect,test} from 'bun:test';
 const page=await Bun.file(new URL('../plugin/client/company.tsx',import.meta.url)).text();
 const source=page.slice(page.indexOf('function RankingJson('),page.indexOf('function RosterTab('));
@@ -7,8 +7,8 @@ function harness(data:any) {
  const elements:any[]=[];let states:any[]=[];let cursor=0;
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):{type,props:props??{},children}};
  const useState=(initial:any)=>{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],(next:any)=>{states[i]=typeof next==='function'?next(states[i]):next;}];};
- const components=new Function('rankingTrendDetail','React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
-  rankingTrendDetail,React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
+ const components=new Function('rankingTrendDetail','rankingHealthMetric','React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
+  rankingTrendDetail,rankingHealthMetric,React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
  const render=(name:string,props:any)=>{cursor=0;elements.length=0;const root=components[name]({...props,ctx:{theme:{colors:{surface0:"#ffffff"}},compact:false,...props.ctx}});const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}elements.push(node);node.children?.forEach(walk);};walk(root);return elements;};
  const text=()=>elements.filter(n=>n.type==='Text').map(n=>n.children.flat(Infinity).filter((v:any)=>typeof v==='string'||typeof v==='number').join('')).join('\n');
  return {render,text,colors:(ctx:any)=>components.relayColors(ctx)};

@@ -1,4 +1,4 @@
-import { rankingTrendDetail } from "../shared/ranking-trends.ts";
+import { rankingHealthMetric, rankingTrendDetail } from "../shared/ranking-trends.ts";
 import { relayDesignCss } from "../shared/relay-design.ts";
 
 /** Browser counterpart of the owner's Figma layout; data is supplied by the shared ranking API. */
@@ -12,12 +12,14 @@ const num=(v,n=1)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(n):'未知'
 let state=null,group='sck-haiku',expanded=null,dirty=false,saving=false,pinning=false,readSequence=0,saveTimer;
 const api=async(body)=>{const r=await fetch('api/model-ranking',body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{cache:'no-store'});const j=await r.json();if(!r.ok)throw Error(j.error||'读取失败');return j;};
 const trendDetail=${rankingTrendDetail.toString()};
+const healthMetric=${rankingHealthMetric.toString()};
 function metrics(row){return [
  ['AA 智能分',num(row.aaScore),(row.aaRank===undefined?'暂无排名':'全榜第 '+row.aaRank+' 名')+' · '+trendDetail(row.trends?.aaScore)],
  ['生成速度',row.tokensPerSecond===undefined?'未知':num(row.tokensPerSecond,0)+' tok/s',trendDetail(row.trends?.tokensPerSecond)],
  ['首 token 延迟',row.ttftMs===undefined?'未知':num(row.ttftMs/1000,2)+' 秒',trendDetail(row.trends?.ttftMs)],
  ['剩余额度',quota(row),trendDetail(row.trends?.remainingPct)],
  ['请求稳定性',row.stabilityPct===undefined?'未知':num(row.stabilityPct)+'%','错误率趋势：'+trendDetail(row.trends?.errorRate)],
+ ['路由尝试',healthMetric(row.health).value,healthMetric(row.health).detail],
  ['缓存命中率',row.trends?.cacheHitRate?.current===undefined?'未知':num(row.trends.cacheHitRate.current*100)+'%',trendDetail(row.trends?.cacheHitRate)],
  ['样本权重',num(row.performanceSamples,2),trendDetail(row.trends?.performanceScore)]
  ];}
@@ -34,7 +36,7 @@ function draw(){
  $('legacy').textContent=table&&!table.scored?'历史排序未记录 JEV 分数，下一轮成功刷新后显示。':'';
  $('model-list').innerHTML=table?.rows.map((r,i)=>{
   const short=r.model.replace(/^remote-magpie\\//,''),slash=short.lastIndexOf('/'),open=expanded===r.model;
-  const score=r.pinned?'已置顶':r.jevScore===undefined?(table.scored?'未评分':'未记录'):num(r.jevScore,4);
+  const score=r.health?.excluded?'持续报错':r.pinned?'已置顶':r.jevScore===undefined?(table.scored?'未评分':'未记录'):num(r.jevScore,4);
   const stat=(cls,label,value)=>'<div class="row-stat '+cls+'"><span>'+label+'</span><strong>'+esc(value)+'</strong></div>';
   return '<article class="model-row '+(open?'expanded':'')+'"><div class="model-row-header"><button class="model-row-main" data-index="'+i+'" aria-expanded="'+open+'" aria-label="'+esc('第 '+(i+1)+' 名 '+r.model)+'"><span class="rank">#'+(i+1)+'</span><div class="model-primary"><div class="model-name-row"><h3 title="'+esc(r.model)+'">'+esc(short.slice(slash+1))+'</h3>'+(i===0&&r.jevScore!==undefined?'<span class="tag">推荐</span>':'')+'</div><p>'+esc(short.slice(0,slash))+'</p></div>'+stat('intelligence','智能分',num(r.aaScore))+stat('speed','速度',r.tokensPerSecond===undefined?'未知':num(r.tokensPerSecond,0)+' tok/s')+stat('quota','额度',quota(r))+'<div class="score"><span>JEV</span><strong title="'+esc(r.jevScore??'未记录')+'">'+score+'</strong></div><span class="chevron">'+(open?'−':'+')+'</span></button><button class="pin-button" data-pin="'+i+'" '+(pinning?'disabled':'')+' aria-pressed="'+!!r.pinned+'" aria-label="'+esc((r.pinned?'取消置顶 ':'置顶 ')+r.model)+'">'+(r.pinned?'取消置顶':'置顶')+'</button></div>'+(open?'<div class="row-details"><div class="model-path" title="'+esc(r.model)+'">'+esc(r.model)+'</div><div class="metrics">'+metrics(r).map(([label,value,detail])=>'<div><span>'+label+'</span><strong>'+esc(value)+'</strong><small>'+esc(detail)+'</small></div>').join('')+'</div>'+(r.performanceScore===undefined?'':'<p class="mobile-performance">历史绩效 '+num(r.performanceScore,2)+' / 5</p>')+'</div>':'')+'</article>';
  }).join('')||'<p class="empty-state">尚无分组成员。</p>';
