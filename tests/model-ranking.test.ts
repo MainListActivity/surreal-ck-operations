@@ -283,6 +283,7 @@ test('owner rules are explicit in each independent question and concrete priorit
   expect(state.ownerRules).toBe(rules);
   for(const [key,q] of Object.entries(questions) as any){
    expect(q.instructions).toContain('state.ownerRules');
+   expect(q.instructions).toContain('命中时必须选0级');
    expect(q.instructions).toContain(`state.models.${key}`);
    expect(state.rankingPolicy.instructions).toContain('不能抵消');
    expect(q.criteria[0]).toContain('排最后');
@@ -324,4 +325,11 @@ test('Jev failure preserves successful scores while independent safety observati
  bad=false;r.trigger(600000);await r.settled();
  t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
  expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).not.toBe(true);expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBe(0);
+});
+
+
+test('compact questions keep the actual average latency directly readable without repeating owner rules',async()=>{
+ const rules='智能程度和速度综合优先，首token延迟超过10s的排在最后';
+ const slow={...fact('p/slow'),usage:usageStats(nativeUsage([{...channel('p','slow',1000,12000),ttft_ms:96000}])).get('p/slow')!};
+ await jevOrder({model:'fixture',ask:async(s:any,q:any)=>{expect(s.ownerRules).toBe(rules);expect(q.m0.instructions).toContain('12秒');expect(q.m0.instructions).toContain('命中时必须选0级');expect(q.m0.instructions).not.toContain(rules);return response(q);}},'haiku',rules,[slow]);
 });
