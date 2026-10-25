@@ -77,7 +77,7 @@ describe('login over real TLS', () => {
     const target = await idp();
     const { tokens } = await success(login(target, { fetch: transport() }));
     expect(tokens.attempts).toBe(1);
-    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
     for (const secret of [PASSWORD, 'login_challenge', 'code-', 'code_verifier', '/api/', '/t/ck']) expect(tokens.trace).not.toContain(secret);
   }, SLOW);
 
@@ -111,7 +111,7 @@ describe('bounded recovery', () => {
     const target = await idp({ hold: connection => (connection === 1 ? 1_500 : 0) });
     const { tokens } = await success(login(target, { fetch: transport(400) }));
     expect(tokens.attempts).toBe(2);
-    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
   }, SLOW);
 
   // The QA failure shape (5860edac, 2026-10-24): a ~20s connect stall lands on the LAST hop (token exchange), where the
@@ -123,7 +123,7 @@ describe('bounded recovery', () => {
     const { tokens } = await success(login(target, { fetch: transport(400) }));
     expect(tokens.attempts).toBe(2);
     // The stalled exchange never reached the server; the retry ran a whole new flow and exchanged exactly once.
-    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1, replays: 0 });
     expect(tokens.trace).toContain('a1:exchange');
     expect(tokens.trace).toContain('UND_ERR_CONNECT_TIMEOUT');
     expect(tokens.trace).toContain('a2:exchange');
@@ -137,7 +137,7 @@ describe('bounded recovery', () => {
     const { tokens } = await success(login(target, { fetch: transport(400) }));
     expect(tokens.attempts).toBe(2);
     // The stalled authorize never reached the server; the retry ran one full flow.
-    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
   }, SLOW);
 
   test('a connect stall on the login hop is retried from a fresh flow', async () => {
@@ -145,14 +145,14 @@ describe('bounded recovery', () => {
     const { tokens } = await success(login(target, { fetch: transport(400) }));
     expect(tokens.attempts).toBe(2);
     // The stalled login never reached the server; the retry re-authorized (new challenge) and logged in once.
-    expect(target.counts).toEqual({ authorize: 2, login: 1, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 2, login: 1, exchange: 1, replays: 0 });
   }, SLOW);
 
   test('a login dropped after the IdP consumed it is retried with a new flow, never replayed', async () => {
     const target = await idp({ dropLogin: login => login === 1 });
     const { tokens } = await success(login(target, { fetch: transport() }));
     expect(tokens.attempts).toBe(2);
-    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1, replays: 0 });
   }, SLOW);
 
   test('a response that outlasts the step limit is a transient failure, and the budget bounds the total', async () => {
@@ -198,7 +198,7 @@ describe('bounded recovery', () => {
     expect(tokens.attempts).toBe(3);
     expect(tokens.accessToken.startsWith('at-')).toBe(true);
     // The stalled requests never reached the server, so only the third attempt consumed a code.
-    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1 });
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1, replays: 0 });
     expect(ms).toBeLessThan(75_000);
     expect(tokens.trace).toContain('a1:authorize');
     expect(tokens.trace).toContain('UND_ERR_CONNECT_TIMEOUT');

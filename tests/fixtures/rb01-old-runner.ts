@@ -1,5 +1,6 @@
-// RB01 rollback drill, previous-release side. tests/rollback-isolation.fork.test.ts extracts release 8d03d35 from git,
-// vendors its plugin the way plugin/scripts/vendor.sh does, and runs this file with RB01_OLD_ROOT pointing at that tree.
+// RB01 rollback drill, previous-release side. tests/rollback-isolation.fork.test.ts and
+// tests/fault-rollback-isolation.fork.test.ts extract the previous release from git, vendor its plugin the way
+// plugin/scripts/vendor.sh does, and run this file with RB01_OLD_ROOT pointing at that tree.
 // Every company module loaded below is the previous release's code: the old Dispatcher and the old SidecarPool drive
 // the isolated fork database, and requests go through the old comm client. Only the Paseo gateway is a stub.
 // Output is one line: RB01_RESULT <json>. Nothing here reads credential files or touches the deployed release tree.

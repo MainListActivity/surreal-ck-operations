@@ -864,6 +864,20 @@ export class FakeCompany {
     (this.envs[project] ??= []).push({ name, broker, ...extra });
   }
 
+  /**
+   * SYS04: the fault ledger the broker talks to. The fake keeps the calls so a test can assert what was reserved,
+   * charged and reported, and it can be told to refuse a reservation (the spent budget).
+   */
+  readonly faults = {
+    reserved: [] as Array<{ taskId: string; phase: string; target: string }>,
+    reported: [] as Array<{ taskId: string; phase: string; errno?: string; status?: number; stage?: string; idempotent?: boolean }>,
+    settled: [] as Array<{ taskId: string; phase: string; target: string }>,
+    /** When set, the next reservation is refused with this reason. */
+    refuse: undefined as { reason: string; message: string } | undefined,
+    /** When set, the next report is refused with this message. */
+    refuseReport: undefined as string | undefined,
+  };
+
   readonly core = {
     opsScope: async (credential: string, taskId: string): Promise<OpsScope> => {
       const lease = this.leases.get(credential);
@@ -875,6 +889,27 @@ export class FakeCompany {
       this.audits.push({ employeeId: scope.actor.employeeId, taskId: scope.taskId, project: scope.project, action, evidence });
     },
     opsCount: async (project: string, action: string) => this.audits.filter(a => a.project === project && a.action === action).length,
+    reserveFault: async (scope: { taskId: string }, input: { phase: string; target?: string }) => {
+      if (this.faults.refuse) {
+        const refusal = this.faults.refuse;
+        this.faults.refuse = undefined;
+        return { allowed: false, attempt: 0, charged: false, reason: refusal.reason, message: refusal.message, evidence: {} };
+      }
+      this.faults.reserved.push({ taskId: scope.taskId, phase: input.phase, target: input.target ?? 'none' });
+      return { allowed: true, attempt: 0, charged: false, message: '', evidence: {} };
+    },
+    reportFault: async (scope: { taskId: string }, input: { phase: string; errno?: string; status?: number; stage?: string; idempotent?: boolean }) => {
+      this.faults.reported.push({ taskId: scope.taskId, phase: input.phase, errno: input.errno, status: input.status, stage: input.stage, idempotent: input.idempotent });
+      if (this.faults.refuseReport) {
+        const message = this.faults.refuseReport;
+        this.faults.refuseReport = undefined;
+        return { allowed: false, message, evidence: { decision: 'not_retryable' } };
+      }
+      return { allowed: true, message: '', evidence: {} };
+    },
+    settleFault: async (scope: { taskId: string }, input: { phase: string; target?: string }) => {
+      this.faults.settled.push({ taskId: scope.taskId, phase: input.phase, target: input.target ?? 'none' });
+    },
   };
 
   readonly projects = {

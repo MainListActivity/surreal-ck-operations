@@ -38,6 +38,9 @@ const failure = async (promise: Promise<unknown>) => {
 
 const sealedPassword = (r: Rig, alias: string) => r.company.sealed.get(`demo/production/${alias}_PASSWORD`)!;
 
+/** The last failure audit. SYS04 adds a separate fault ledger entry, so the failure is found by content, not position. */
+const errorAudit = (r: Rig) => r.company.audits.filter(a => a.action === 'ops_error').at(-1);
+
 function expectNoLeaks(r: Rig, extra: string[] = []) {
   const haystack = JSON.stringify([r.outputs, r.company.audits]);
   const secrets = [...r.world.tokens, ...r.company.sealed.values(), 'cf-token-value', ...extra];
@@ -286,8 +289,45 @@ describe('ops login and sessions', () => {
     expect(error.code).toBe('login_failed');
     expect(error.message).toContain('invalid_credentials');
     expect(error.message).not.toContain('wrong-password-123');
-    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
-    expect(r.company.audits.at(-1)!.evidence).not.toContain('wrong-password-123');
+    expect(errorAudit(r)).toMatchObject({ action: 'ops_error' });
+    // No secret reaches any audit entry, the failure one or the fault ledger one.
+    expect(JSON.stringify(r.company.audits)).not.toContain('wrong-password-123');
+  });
+
+  test('the attempt is reserved before the call and the failure is reported once, with its machine facts', async () => {
+    const r = rig({ d1: undefined });
+    r.company.sealed.set('demo/production/GHOST_PASSWORD', 'wrong-password-123');
+    await failure(call(r, 'ops_login', { alias: 'ghost' }));
+    // The reservation happened before the call, for the login phase and the IdP target.
+    expect(r.company.faults.reserved.at(-1)).toMatchObject({ phase: 'login', target: 'idp_login' });
+    // The failure was reported exactly once, with the status the IdP answered.
+    expect(r.company.faults.reported).toHaveLength(1);
+    expect(r.company.faults.reported[0]).toMatchObject({ phase: 'login', status: 401 });
+    expect(r.company.faults.reported[0]!.stage).toBe('login');
+  });
+
+  test('a refused reservation never reaches the tool and is not charged as a failure', async () => {
+    const r = rig();
+    r.company.faults.refuse = { reason: 'attempts_exhausted', message: 'operation refused (login): the recovery budget for this operation is spent.' };
+    const error = await failure(call(r, 'ops_login', { alias: 'qa-one' }));
+    expect(error.message).toContain('recovery budget');
+    // Nothing ran: the IdP was never asked.
+    expect(r.world.requests.filter(q => q.url.endsWith('/api/auth/token'))).toHaveLength(0);
+    // And the refusal is not a new failure: it costs no budget.
+    expect(r.company.faults.reported).toHaveLength(0);
+  });
+
+  test('a failure the budget refuses to recover keeps the upstream reason and adds what to do', async () => {
+    const r = rig({ d1: undefined });
+    r.company.sealed.set('demo/production/GHOST_PASSWORD', 'wrong-password-123');
+    r.company.faults.refuseReport = 'operation refused (login): this failure is not retryable. Check the account authorization.';
+    const error = await failure(call(r, 'ops_login', { alias: 'ghost' }));
+    // The upstream's own reason is kept: a refused login is still a refused login.
+    expect(error.code).toBe('login_failed');
+    expect(error.message).toContain('invalid_credentials');
+    // And the diagnosis says what to do about it.
+    expect(error.message).toContain('not retryable');
+    expect(error.message).not.toContain('wrong-password-123');
   });
 
   test('sessions belong to one employee; release and logout kill them', async () => {
@@ -509,7 +549,7 @@ describe('ops on a flaky network', () => {
     expect(error.message).toContain('a2:login@auth.test:HTTP 503');
     expect(error.message).not.toContain('pw');
     expect(r.world.sql).toHaveLength(statements);
-    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(errorAudit(r)).toMatchObject({ action: 'ops_error' });
   });
 
   test('an ordinary product call that stalls names its limit and leaves the session usable', async () => {
@@ -530,7 +570,7 @@ describe('ops on a flaky network', () => {
     expect(error).toMatchObject({ code: 'upstream_error', retryable: true });
     expect(error.message).toContain('product request timed out after 90s');
     expect(error.message).toContain('same slug');
-    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(errorAudit(r)).toMatchObject({ action: 'ops_error' });
     expect(r.company.audits.map(a => a.action)).not.toContain('ops_workspace_create');
 
     expect(await call(r, 'ops_workspace_ensure', { session, slug: 'sck-slow', name: 'Slow' }))
@@ -578,7 +618,7 @@ describe('ops audit trail', () => {
     const r2 = rig({ d1: undefined });
     r2.company.sealed.set('demo/production/QA_ONE_PASSWORD', 'stale-sealed-pass');
     await failure(call(r2, 'ops_login', { alias: 'qa-one' }));
-    expect(r2.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(errorAudit(r2)).toMatchObject({ action: 'ops_error' });
     expect(JSON.stringify(r2.company.audits)).not.toContain('stale-sealed-pass');
   });
 
@@ -715,7 +755,7 @@ describe('operator sessions', () => {
     const error = await failure(call(r, 'ops_operator_login', { alias: 'qa-ops' }));
     expect(error.code).toBe('forbidden');
     expect(error.message).toContain('platform-operator-inactive');
-    expect(r.company.audits.at(-1)).toMatchObject({ action: 'ops_error' });
+    expect(errorAudit(r)).toMatchObject({ action: 'ops_error' });
     expectNoLeaks(r);
   });
 

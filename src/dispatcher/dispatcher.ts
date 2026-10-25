@@ -1676,7 +1676,9 @@ export class Dispatcher {
 
     type PendingGm = GmTodo & { purpose?: string; wakeEpisode: number; wakeReason: string;
       /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
-      episodeUnknown?: boolean };
+      episodeUnknown?: boolean;
+      /** The fault episodes this wake tells the manager about (SYS04: one episode, one notice). */
+      faultEpisodes?: string[] };
     const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
@@ -1746,6 +1748,39 @@ export class Dispatcher {
             report.decisions.push(`gm-disposition-held:${todo.task.id}`);
             continue;
           }
+          kept.push(todo);
+        }
+        pendingGm.length = 0;
+        pendingGm.push(...kept);
+      }
+    }
+
+    // SYS04 AC04: the same cause does not wake the manager twice. An episode the manager was already told about
+    // keeps its manager todo quiet: one episode, one notice, whatever the employee reports afterwards. A new stage
+    // (new evidence, a configuration version change, or the repair finishing) opens a new episode, and that one
+    // wakes the manager again. An unreadable ledger fails closed for the pass: waking a manager for a cause that
+    // is already on their desk is exactly the repeated wake this package removes.
+    if (pendingGm.length && typeof wf.faultEpisodes === 'function') {
+      const taskIds = [...new Set(pendingGm.map(todo => todo.task.id))];
+      let facts: Awaited<ReturnType<typeof wf.faultEpisodes>> | undefined;
+      try { facts = await wf.faultEpisodes({ tasks: taskIds }); }
+      catch (error) { this.log(`fault episode read failed: ${(error as Error).message}`); }
+      if (!facts) {
+        report.decisions.push(`gm-fault-ledger-unreadable:${pendingGm.length}`);
+        this.log('fault episode state unavailable; suppressing all gm wake this pass');
+        pendingGm.length = 0;
+      } else {
+        const kept: PendingGm[] = [];
+        for (const todo of pendingGm) {
+          const episodes = facts.byTask.get(todo.task.id) ?? [];
+          const open = episodes.filter(episode => episode.state !== 'resolved');
+          const pending = open.filter(episode => !episode.notified);
+          if (open.length && !pending.length) {
+            // The manager already has every open cause of this task on their desk.
+            report.decisions.push(`gm-fault-converged:${todo.task.id}`);
+            continue;
+          }
+          todo.faultEpisodes = pending.map(episode => episode.episode);
           kept.push(todo);
         }
         pendingGm.length = 0;
@@ -1877,6 +1912,11 @@ export class Dispatcher {
         }
         if (item.todo.action === 'resume') await wf.recordDispatch(item.todo.task.id, item.todo.task.version, 'gm-attention', result.id);
         else if (item.todo.purpose) await wf.recordDispatch(item.todo.task.id, 0, item.todo.purpose, result.id);
+        // SYS04: the wake went out, so this cause is on the manager's desk: the episode is notified once.
+        for (const episode of item.todo.faultEpisodes ?? []) {
+          await wf.markFaultEpisodeNotified?.(episode).catch(error =>
+            this.log(`fault episode notify failed for ${episode}: ${(error as Error).message}`));
+        }
       }
       running++;
       busyBy.set(result.provider ?? '', (busyBy.get(result.provider ?? '') ?? 0) + 1);

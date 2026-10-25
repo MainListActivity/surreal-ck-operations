@@ -1059,6 +1059,33 @@ export interface CompanyCore {
     version: number; hash: string; allowedTools?: string[]; allowedAliases?: string[]; verdict: PolicyVerdict;
   }>;
   /**
+   * SYS04 AC01/AC02: report one machine-classified failure and charge it against the recovery budget of the fault
+   * object (task + controlled target + phase). The caller is the ops broker, which knows the phase, the identity
+   * alias and the transport facts. The budget lives here, so it applies across holders, sessions and restarts.
+   */
+  reportFault?(scope: { taskId: TaskId; employeeId?: string }, input: {
+    tool: string; phase: FaultPhase; stage?: FlowStage; errno?: string; status?: number; name?: string; alias?: string;
+    elapsedMs?: number;
+    target?: FaultTargetKind; environment?: string; message?: string; idempotent?: boolean; requestSent?: boolean;
+    /** The attempt number the caller already reserved; the report must not charge it twice. */
+    attempt?: number;
+    /** False when the report only carries facts of a failure that was already charged. */
+    charge?: boolean;
+  }): Promise<{ allowed: boolean; message: string; evidence: Record<string, unknown> } | undefined>;
+  /**
+   * SYS04 AC02: reserve the next attempt of a fault object before the attempt runs. The reservation is spent
+   * atomically, so the same operation cannot be retried past its budget by looping the tool, changing the session
+   * or restarting — the server is the one that refuses.
+   */
+  reserveFault?(scope: { taskId: TaskId; employeeId?: string }, input: {
+    phase: FaultPhase; target?: FaultTargetKind;
+  }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown> } | undefined>;
+  /**
+   * SYS04 AC02: settle a successful attempt of a fault object. A call that works costs no recovery budget: the
+   * reserved attempt is refunded and the recovery is over, so the next failure starts a fresh one.
+   */
+  settleFault?(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
@@ -1271,6 +1298,7 @@ export interface EnrollmentAdmin {
 // ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
 // 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
 import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
+import type { FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
 export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
 
 /** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */

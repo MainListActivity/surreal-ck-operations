@@ -90,6 +90,10 @@ export interface LoginIdpOptions {
   refuseStatus?: number;
   /** Milliseconds to delay the answer to the n-th password POST (1-based). */
   delayLogin?: (login: number) => number;
+  /** The status the authorize route answers with instead of its redirect. */
+  authorizeStatus?: number;
+  /** Consume the n-th token exchange, then drop the socket so no answer reaches the client. */
+  dropExchange?: (exchange: number) => boolean;
 }
 
 export type LoginHop = 'authorize' | 'login' | 'exchange';
@@ -99,7 +103,9 @@ export interface LoginIdp {
   origin: string;
   /** Per-hop origins, so each hop's connection can be held independently. */
   origins: Record<LoginHop, string>;
-  counts: { authorize: number; login: number; exchange: number };
+  counts: { authorize: number; login: number; exchange: number; replays: number };
+  /** The authorization codes the IdP issued. Every one of them is single use. */
+  issuedCodes: string[];
   connections: () => number;
   close(): Promise<void>;
 }
@@ -113,7 +119,9 @@ const json = (res: import('node:http').ServerResponse, status: number, body: unk
  * checks the PKCE verifier and the single-use code, so a replayed or forged exchange fails. Each hop listens on its
  * own port, like production's issuer / auth / product origins, so every hop opens its own TCP+TLS connection. */
 export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Promise<LoginIdp> {
-  const counts = { authorize: 0, login: 0, exchange: 0 };
+  const counts = { authorize: 0, login: 0, exchange: 0, replays: 0 };
+  const issuedCodes: string[] = [];
+  const usedCodes = new Set<string>();
   const challenges = new Map<string, { state: string; redirectUri: string; codeChallenge: string }>();
   const codes = new Map<string, { redirectUri: string; codeChallenge: string }>();
   // One listener per hop, each with its own connection counter: production reaches the issuer, the auth host and the
@@ -135,6 +143,10 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
       const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
       if (req.method === 'GET' && url.pathname === '/t/ck/authorize') {
         counts.authorize++;
+        if (options.authorizeStatus !== undefined) {
+          json(res, options.authorizeStatus, { error: 'server_error' });
+          return;
+        }
         const challenge = `lc-${randomBytes(12).toString('base64url')}`;
         challenges.set(challenge, {
           state: url.searchParams.get('state') ?? '',
@@ -158,6 +170,7 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
           if (options.dropLogin?.(login)) { req.socket.destroy(); return; }
           const code = `code-${randomBytes(16).toString('base64url')}`;
           codes.set(code, { redirectUri: pending.redirectUri, codeChallenge: pending.codeChallenge });
+          issuedCodes.push(code);
           json(res, 200, { redirect_uri: `${pending.redirectUri}?code=${code}&state=${pending.state}` });
         };
         const delay = options.delayLogin?.(login) ?? 0;
@@ -165,11 +178,15 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/auth/token') {
-        counts.exchange++;
+        const exchange = ++counts.exchange;
         const code = form.get('code') ?? '';
         const grant = codes.get(code);
         const verified = !!grant && createHash('sha256').update(form.get('code_verifier') ?? '').digest('base64url') === grant.codeChallenge;
         codes.delete(code);
+        if (grant) usedCodes.add(code);
+        // A code that was already redeemed is a replay: it is refused, and counted.
+        if (!grant && usedCodes.has(code)) counts.replays++;
+        if (options.dropExchange?.(exchange)) { req.socket.destroy(); return; }
         if (!verified) return json(res, 400, { error: 'invalid_grant' });
         return json(res, 200, { access_token: `at-${randomBytes(12).toString('base64url')}`, expires_in: 900, token_type: 'Bearer' });
       }
@@ -190,6 +207,7 @@ export async function startLoginIdp(pki: TestPki, options: LoginIdpOptions): Pro
     origin: `https://127.0.0.1:${hops.authorize.port}`,
     origins: { authorize: `https://127.0.0.1:${hops.authorize.port}`, login: `https://127.0.0.1:${hops.login.port}`, exchange: `https://127.0.0.1:${hops.exchange.port}` },
     counts,
+    issuedCodes,
     connections: total,
     close: async () => {
       await Promise.all(Object.values(hops).map(hop => hop.close()));

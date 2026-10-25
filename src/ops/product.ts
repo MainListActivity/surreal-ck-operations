@@ -1,6 +1,6 @@
 import { CompanyError } from '../core-errors.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, opsFetch, transportErrno, type Fetcher } from './fetcher.ts';
 
 export const PRODUCT_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type ProductMethod = typeof PRODUCT_METHODS[number];
@@ -24,8 +24,14 @@ export function productTimeoutMs(method: string, path: string): number {
 
 /** The product could not be reached or did not answer in time, so the request may or may not have taken effect. */
 export class ProductUnreachable extends CompanyError {
-  constructor(message: string, readonly timedOut: boolean) {
+  /** True when the request hit its time limit rather than an answer. */
+  readonly timedOut: boolean;
+  /** The machine facts of the failure: the errno, the timeout flag and the HTTP status when there was one. */
+  readonly facts: { errno?: string; status?: number; name?: string };
+  constructor(message: string, timedOut: boolean, facts: { errno?: string; status?: number; name?: string } = {}) {
     super('upstream_error', message, true);
+    this.timedOut = timedOut;
+    this.facts = facts;
   }
 }
 
@@ -81,7 +87,13 @@ export async function productRequest(
   } catch (error) {
     const { timedOut, detail } = describeTransportFailure(error, timeoutMs);
     const caveat = method === 'GET' ? '' : '; it may still have taken effect, so check before repeating it';
-    throw new ProductUnreachable(`product request ${timedOut ? detail : `failed (${detail})`}${caveat}`, timedOut);
+    // The facts travel with the error: the classifier reads the errno, never the message.
+    const errno = transportErrno(error) ?? (timedOut ? 'TimeoutError' : undefined);
+    const name = (error as { name?: unknown } | undefined)?.name;
+    throw new ProductUnreachable(`product request ${timedOut ? detail : `failed (${detail})`}${caveat}`, timedOut, {
+      ...(errno === undefined ? {} : { errno }),
+      ...(typeof name === 'string' ? { name } : {}),
+    });
   }
   let parsed: unknown = raw;
   try { parsed = raw ? JSON.parse(raw) : null; } catch { /* plain text or truncated JSON */ }

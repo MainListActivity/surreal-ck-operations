@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CompanyCore, OpsScope } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import { faultFactsOf, type FaultPhase, type FaultTargetKind } from '../faults.ts';
 import { lanIPv4 } from '../preview-core.ts';
 import type { EnvBrokerRow, ProjectStore } from '../projects.ts';
 import {
@@ -70,7 +71,7 @@ export type OpsTool = typeof OPS_TOOLS[number];
 type Args = Record<string, unknown>;
 
 export interface OpsDeps {
-  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope'>>;
+  core: Pick<CompanyCore, 'opsScope' | 'auditOps' | 'opsCount'> & Partial<Pick<CompanyCore, 'policyToolScope' | 'reportFault' | 'reserveFault' | 'settleFault'>>;
   projects: Pick<ProjectStore, 'brokerEnvs' | 'readSealed' | 'setSecret' | 'sealedNames'> & Partial<Pick<ProjectStore, 'ensureSealed' | 'rotateSealed'>>;
   proofStore?: CompanyProofStore;
   serviceHome?: string;
@@ -95,11 +96,71 @@ interface Ctx {
   env: string;
   cfg: BrokerConfig;
   row: EnvBrokerRow;
+  /**
+   * SYS04 AC02: the attempt this call reserved against the recovery budget of the fault object. The number is
+   * what the failure report carries, so an attempt is charged exactly once: by the reservation when there was one,
+   * by the report of its failure otherwise.
+   */
+  fault?: { attempt: number; charged: boolean; phase: FaultPhase; target: FaultTargetKind };
 }
 
 /** `action` decides visibility: ops_call rows stay out of handover history, everything else is shown. */
 interface Outcome { value: unknown; audit?: { action: string; evidence: string } }
 type Handler = (ctx: Ctx, args: Args) => Promise<Outcome>;
+
+/**
+ * The phase of an ops tool, in the fixed vocabulary of the fault classifier. It names the stage of the operation,
+ * not the message: the same tool always fails in the same phase, whatever the upstream says.
+ */
+const opsPhaseOf = (tool: string): FaultPhase => {
+  switch (tool) {
+    case 'ops_login': return 'login';
+    case 'ops_operator_login': return 'login';
+    case 'ops_account_ensure': return 'account_ensure';
+    case 'ops_workspace_ensure': return 'workspace_ensure';
+    case 'ops_member_list': return 'member_list';
+    case 'ops_member_add': return 'member_add';
+    case 'ops_member_remove': return 'member_remove';
+    case 'ops_logout': return 'request';
+    case 'ops_browser_login': return 'request';
+    default: return 'request';
+  }
+};
+
+/** The controlled target of an ops tool. Only the kind is recorded; a raw address never is. */
+const opsTargetOf = (tool: string, args: Args = {}): FaultTargetKind => {
+  switch (tool) {
+    case 'ops_login': return args.audience === 'ops' ? 'idp_token' : 'idp_login';
+    case 'ops_operator_login': return 'product_token';
+    case 'ops_account_ensure': return 'account';
+    case 'ops_workspace_ensure': return 'workspace';
+    case 'ops_member_list': case 'ops_member_add': case 'ops_member_remove': return 'member';
+    default: return 'internal';
+  }
+};
+
+/**
+ * Whether repeating the operation of a tool is safe.
+ *
+ * The question is about the whole operation, not about one request inside it. A login is a sequence of one-time
+ * challenges and codes: repeating the *operation* starts a fresh flow with a fresh code — the client never replays
+ * a code — so it is safe to repeat. A write that creates or changes something durable is not repeated when the
+ * outcome of the failed attempt is unknown.
+ */
+const opsIdempotentOf = (tool: string, args: Args = {}): boolean => {
+  switch (tool) {
+    case 'ops_member_add': case 'ops_member_remove': case 'ops_invitation_issue':
+    case 'ops_idp_provision_rotate': case 'ops_idp_admin_request': case 'ops_idp_principal_mint':
+    case 'ops_idp_principal_revoke': case 'ops_idp_client_register':
+      return false;
+    case 'ops_request': {
+      const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
+      return method === 'GET' || method === 'HEAD';
+    }
+    default:
+      return true;
+  }
+};
 
 interface WorkspaceItem { slug: string; name: string; dbName: string; role?: string }
 
@@ -176,7 +237,10 @@ export function proofDeliverErrorCode(result: ProductResult): string | undefined
 
 function productFailure(what: string, res: ProductResult, specific: Partial<Record<number, CompanyError['code']>> = {}): CompanyError {
   const code = specific[res.status] ?? (res.status === 401 ? 'login_failed' : res.status >= 500 ? 'upstream_error' : 'invalid');
-  return new CompanyError(code, `${what} failed: HTTP ${res.status} ${errorCode(res.body)}`, res.status >= 500);
+  // The status travels with the error: the classifier needs the machine fact, not the wording.
+  const failure = new CompanyError(code, `${what} failed: HTTP ${res.status} ${errorCode(res.body)}`, res.status >= 500);
+  (failure as CompanyError & { status?: number }).status = res.status;
+  return failure;
 }
 
 /**
@@ -186,6 +250,16 @@ function productFailure(what: string, res: ProductResult, specific: Partial<Reco
  */
 const unfinishedCreation = (slug: string, detail: string) => new CompanyError('upstream_error',
   `workspace ${slug} may not be fully created yet (${detail}); call ops_workspace_ensure again with the same slug and name to reuse or finish it, and do not switch to another slug`, true);
+
+/**
+ * A call the recovery budget refused before it ran. Nothing was charged: the refusal is the budget's answer, not a
+ * new failure of the upstream, so it is never reported as a fault.
+ */
+class BudgetRefusal extends CompanyError {
+  constructor(message: string, retryable: boolean) {
+    super('upstream_error', message, retryable);
+  }
+}
 
 export class OpsBroker {
   readonly tools: readonly string[] = OPS_TOOLS;
@@ -271,11 +345,15 @@ export class OpsBroker {
       if (boundary && !boundary.verdict.ok) {
         throw new CompanyError(boundary.verdict.code, `有效策略拒绝：${boundary.verdict.reason}`);
       }
+      // SYS04 AC02: the attempt is reserved before it runs. A refused reservation never reaches the tool.
+      await this.reserveAttempt(ctx, tool, args);
       const { value, audit } = await handler(ctx, args);
       if (audit) await this.audit(ctx, audit.action, audit.evidence);
+      // The call worked: the fault object is healthy again, so the recovery is over.
+      await this.settleAttempt(ctx);
       return value;
     } catch (error) {
-      throw await this.failed(ctx, tool, error);
+      throw await this.failed(ctx, tool, error, args);
     }
   }
 
@@ -361,14 +439,107 @@ export class OpsBroker {
     await this.deps.core.auditOps(ctx.scope, action, clip(redactText(evidence, known), 500));
   }
 
-  private async failed(ctx: Ctx, tool: string, error: unknown): Promise<CompanyError> {
+  /**
+   * Turn a failed ops call into a structured fault and charge it against the recovery budget of the fault object.
+   *
+   * SYS04 AC01/AC02/AC03: the fault facts come from the machine, not from the error text an employee would write.
+   * The phase is the tool's own stage, the identity alias is the one the call ran for, and the errno/HTTP class
+   * come from the transport. The budget is spent here, before the employee is told anything, so looping the same
+   * call — in one session or in a new one — runs out of budget instead of out of patience. A fault that is not
+   * retryable (a 403, a rejected password, a revoked permission, an invalid input) stops the recovery at once and
+   * says what to fix; it is never retried for the employee.
+   */
+  private async failed(ctx: Ctx, tool: string, error: unknown, args: Args = {}): Promise<CompanyError> {
     const known = this.sessions.secrets(ctx.scope.actor.employeeId);
     const base = error instanceof CompanyError ? error
       : new CompanyError('upstream_error', `${(error as Error)?.name ?? 'Error'}: ${String((error as Error)?.message ?? error).slice(0, 200)}`);
     const safe = new CompanyError(base.code, redactText(base.message, known), base.retryable);
+    // A call the budget refused never ran: it is the budget's answer, not a new failure of the upstream, and it
+    // costs no budget.
+    if (error instanceof BudgetRefusal) return safe;
     const quiet = safe.code === 'invalid' || safe.code === 'not_found';
     await this.audit(ctx, quiet ? 'ops_call' : 'ops_error', `${tool} → ${safe.code}: ${safe.message}`).catch(() => undefined);
+    // The budget applies to the failures a recovery could plausibly fix: a transport failure of the upstream, a
+    // refused login, and anything the upstream answered with a status. A local refusal (invalid input, not found)
+    // has no status, is not a fault to retry, and costs no budget.
+    const facts = faultFactsOf(error);
+    const upstream = safe.code === 'upstream_error' || safe.code === 'login_failed' || facts.status !== undefined;
+    if (upstream) {
+      const charged = await this.chargeFault(ctx, tool, error, safe, args, facts).catch(() => undefined);
+      if (charged) return charged;
+    }
     return safe;
+  }
+
+  /**
+   * Reserve the attempt of a fault object, before the attempt runs (AC02).
+   *
+   * The reservation is what makes the budget real: a caller that loops the same operation — in this session, in a
+   * new one, or after a restart — runs out of budget instead of out of patience, and the server is the one that
+   * says no. The first attempt of an operation costs nothing: nothing was known to be broken yet, and a call that
+   * works must not eat the recovery budget.
+   */
+  private async reserveAttempt(ctx: Ctx, tool: string, args: Args): Promise<void> {
+    const reserve = this.deps.core.reserveFault;
+    if (!reserve) return;
+    const phase = opsPhaseOf(tool);
+    const target = opsTargetOf(tool, args);
+    let result: Awaited<ReturnType<NonNullable<typeof reserve>>>;
+    try {
+      result = await reserve({ taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId }, { phase, target });
+    } catch (error) {
+      // The ledger is unavailable: the call still runs. A broken ledger must not take the ops tools down.
+      await this.audit(ctx, 'ops_fault', `reserve failed: ${(error as Error).message}`).catch(() => undefined);
+      return;
+    }
+    if (!result) return;
+    if (!result.allowed) {
+      await this.audit(ctx, 'ops_fault', `${tool} refused (${phase}): ${result.reason ?? 'not_retryable'}`).catch(() => undefined);
+      // The refusal is not a fault: nothing ran, so nothing is charged. Only the minimum interval is worth waiting
+      // for; a spent budget or an unrecoverable cause is final.
+      throw new BudgetRefusal(result.message, result.reason === 'min_interval');
+    }
+    ctx.fault = { attempt: result.attempt, charged: result.charged, phase, target };
+  }
+
+  /**
+   * Settle a successful attempt: the fault object works again, so the recovery is over and the reserved attempt is
+   * refunded. A call that works costs no recovery budget.
+   */
+  private async settleAttempt(ctx: Ctx): Promise<void> {
+    if (!ctx.fault?.charged) return;
+    await this.deps.core.settleFault?.({ taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId },
+      { phase: ctx.fault.phase, target: ctx.fault.target }).catch(() => undefined);
+  }
+
+  /**
+   * Charge one failure against the fault object's budget and report the decision. The refusal is returned to the
+   * caller as an error that says why the retry is not allowed, so the employee reads the reason instead of looping.
+   */
+  private async chargeFault(ctx: Ctx, tool: string, error: unknown, safe: CompanyError, args: Args,
+    facts: ReturnType<typeof faultFactsOf> = faultFactsOf(error)): Promise<CompanyError | undefined> {
+    const report = await this.deps.core.reportFault?.(ctx.scope, {
+      tool,
+      phase: opsPhaseOf(tool),
+      ...(facts.stage === undefined ? {} : { stage: facts.stage }),
+      ...(facts.errno === undefined ? {} : { errno: facts.errno }),
+      ...(facts.status === undefined ? {} : { status: facts.status }),
+      ...(facts.name === undefined ? {} : { name: facts.name }),
+      alias: typeof args.alias === 'string' ? args.alias : undefined,
+      target: opsTargetOf(tool, args),
+      environment: ctx.env,
+      // A write whose outcome is unknown is never replayed blindly.
+      idempotent: opsIdempotentOf(tool, args),
+      ...(ctx.fault?.charged === true ? { attempt: ctx.fault.attempt } : {}),
+    });
+    if (!report) return undefined;
+    await this.audit(ctx, 'ops_fault', JSON.stringify(report.evidence)).catch(() => undefined);
+    if (report.allowed) return undefined;
+    const decision = typeof report.evidence.decision === 'string' ? report.evidence.decision : 'not_retryable';
+    // The refusal keeps the upstream's own reason and adds what to do about it: the diagnosis never quotes a
+    // credential, and the upstream's message was redacted before it got here.
+    const code = decision === 'not_retryable' ? safe.code : 'upstream_error';
+    return new CompanyError(code, `${safe.message}; ${report.message}`, decision === 'min_interval');
   }
 
   // ---------- reads without a session ----------
