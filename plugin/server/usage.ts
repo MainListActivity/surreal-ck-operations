@@ -2,7 +2,7 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { MagpieUsage } from "./vendor/src/usage/magpie.ts";
 import { digest, TIERS } from "./vendor/src/model-routing/policy.ts";
 import { usageOverview, usageRequests, usageLive } from "../shared/usage";
-import { company } from "./company";
+import { currentCompany } from "./company";
 import { isQaContext } from "./owner-context";
 export function registerUsage(server: PluginServerContext) {
   const source = new MagpieUsage();
@@ -22,7 +22,7 @@ export function registerUsage(server: PluginServerContext) {
     const session = snapshot.agent.runtimeInfo?.sessionId ?? snapshot.agent.persistence?.sessionId;
     if (session) sessions.add(session);
     // The lease is local sidecar state. Never query the remote DB or infer sessions from model names.
-    const lease = (await company()).sidecar.routingLease(agentId);
+    const lease = currentCompany()?.sidecar.routingLease(agentId);
     if (lease)
       for (const tier of TIERS)
         sessions.add(

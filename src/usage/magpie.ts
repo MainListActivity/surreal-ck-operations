@@ -24,7 +24,55 @@ function hash(value: string) {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 export function parseMagpieJson(value: string): unknown {
-  return JSON.parse(value.replace(/"(id|route_id|seq)"\s*:\s*(\d{16,})(?=\s*[,}])/g, '"$1":"$2"'));
+  // JSON numbers may hold int64 route IDs. Preserve them before JS can round them,
+  // including the full `ids` list in incremental trace responses.
+  let result = "",
+    i = 0;
+  while (i < value.length) {
+    if (value[i] === '"') {
+      const start = i++;
+      while (i < value.length) {
+        if (value[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (value[i++] === '"') break;
+      }
+      result += value.slice(start, i);
+      continue;
+    }
+    if (value[i] === "-" || /[0-9]/.test(value[i]!)) {
+      const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(value.slice(i));
+      if (match) {
+        const token = match[0];
+        result +=
+          !/[.eE]/.test(token) && !Number.isSafeInteger(Number(token))
+            ? JSON.stringify(token)
+            : token;
+        i += token.length;
+        continue;
+      }
+    }
+    result += value[i++];
+  }
+  return JSON.parse(result);
+}
+/** Merge the trace's changed routes, retaining untouched in-flight requests. */
+export function mergeTrace(previous: unknown, incoming: unknown): unknown {
+  const next = record(incoming);
+  if (!Array.isArray(next.ids) || !Array.isArray(next.routes)) throw Error("Magpie trace格式无效");
+  const ids = new Set(next.ids.map(String));
+  const routes = new Map<string, unknown>();
+  if (record(previous).pid === next.pid)
+    for (const row of list(record(previous).routes)) {
+      const id = String(record(row).id);
+      if (ids.has(id)) routes.set(id, row);
+    }
+  for (const row of next.routes) {
+    const id = String(record(row).id);
+    if (ids.has(id)) routes.set(id, row);
+  }
+  return { pid: next.pid, seq: next.seq, routes: [...routes.values()].slice(-60) };
 }
 export function normalizeTotals(value: unknown) {
   const r = record(value),
@@ -36,7 +84,7 @@ export function normalizeTotals(value: unknown) {
     input: num(r.input) ?? 0,
     output: num(r.output) ?? 0,
     cacheRead: num(r.cache_read) ?? 0,
-    cacheWrite: (num(r.cache_write) ?? 0) + (num(r.cache_write_1h) ?? 0),
+    cacheWrite: num(r.cache_write) ?? 0,
     cost: num(r.cost),
     unpriced: num(r.unpriced) ?? 0,
     ttftMs: timed > 0 && num(r.ttft_ms) !== undefined ? Number(r.ttft_ms) / timed : undefined,
@@ -155,7 +203,10 @@ export function normalizeTrace(value: unknown, sessions: ReadonlySet<string>) {
         candidate = list(r.order)
           .map(record)
           .find((c) => c.id === attempt?.id),
-        done = r.done === true;
+        done = r.done === true,
+        account = candidate?.kind === "account" ? text(candidate.who) : undefined,
+        provider = text(candidate?.provider) ?? text(r.provider),
+        accountId = account ? hash(`${provider}:${account}`) : undefined;
       return {
         ...normalizeRequest({
           id: r.id,
@@ -169,9 +220,9 @@ export function normalizeTrace(value: unknown, sessions: ReadonlySet<string>) {
         }),
         id: hash(String(r.id)),
         completed: done,
-        accountLinked: !!candidate,
-        accountId: candidate ? hash(String(candidate.id)) : undefined,
-        accountLabel: candidate ? `账号 ${hash(String(candidate.id)).slice(0, 8)}` : undefined,
+        accountLinked: !!accountId,
+        accountId,
+        accountLabel: accountId ? `账号 ${accountId.slice(0, 8)}` : undefined,
         ttftMs: num(r.ttft),
         firstTextMs: num(r.firstText),
         output: num(r.out),
@@ -318,12 +369,15 @@ export class MagpieUsage {
         this.controller = new AbortController();
         const timeout = setTimeout(() => this.controller?.abort(), 28000);
         try {
-          this.trace = await this.read(
+          const incoming = await this.read(
             `/v1/magpie/trace?after=${encodeURIComponent(this.traceSeq)}&wait=1`,
             this.controller.signal,
           );
+          const restarted =
+            this.trace !== undefined && record(this.trace).pid !== record(incoming).pid;
+          this.trace = mergeTrace(this.trace, incoming);
           this.traceAt = this.now();
-          this.traceSeq = String(record(this.trace).seq ?? "");
+          this.traceSeq = restarted ? "" : String(record(incoming).seq ?? "");
         } catch {
           await new Promise((resolve) => setTimeout(resolve, 1500));
         } finally {

@@ -55,10 +55,12 @@ function RequestRow({
   row,
   theme,
   live = false,
+  compact = true,
 }: {
   row: UsageRequest;
   theme: Props["theme"];
   live?: boolean;
+  compact?: boolean;
 }) {
   const [open, setOpen] = useState(false),
     c = theme.colors;
@@ -78,21 +80,49 @@ function RequestRow({
             justifyContent: "space-between",
           }}
         >
-          <Text selectable style={{ color: c.foreground, fontSize: 12, flexShrink: 1 }}>
+          <Text
+            selectable
+            style={{
+              color: c.foreground,
+              fontSize: 12,
+              flexShrink: 1,
+              flex: compact ? undefined : 1,
+            }}
+          >
             {row.model ?? "模型待确认"} · {row.provider ?? "供应商未知"}
           </Text>
-          <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+          {!compact && (
+            <>
+              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 75 }}>
+                {row.terminal}
+              </Text>
+              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 90 }}>
+                {metricSeconds(row.ttftMs)}
+              </Text>
+              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 80 }}>
+                {n(row.output)}
+              </Text>
+              <Text style={{ color: c.foregroundMuted, fontSize: 11, width: 90 }}>
+                {metricSeconds(row.totalMs)}
+              </Text>
+            </>
+          )}
+          <Text
+            style={{ color: c.foregroundMuted, fontSize: 11, width: compact ? undefined : 140 }}
+          >
             {live && !row.completed ? "进行中" : row.status ? `HTTP ${row.status}` : "状态未知"} ·{" "}
             {new Date(row.at).toLocaleTimeString()}
           </Text>
         </View>
       </Pressable>
-      <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
-        首响应 {metricSeconds(row.ttftMs)} · 输出 {n(row.output)} ·{" "}
-        {live && !row.completed
-          ? `已等待 ${metricSeconds(Math.max(0, Date.now() - row.at))}`
-          : `耗时 ${metricSeconds(row.totalMs)}`}
-      </Text>
+      {compact && (
+        <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>
+          首响应 {metricSeconds(row.ttftMs)} · 输出 {n(row.output)} ·{" "}
+          {live && !row.completed
+            ? `已等待 ${metricSeconds(Math.max(0, Date.now() - row.at))}`
+            : `耗时 ${metricSeconds(row.totalMs)}`}
+        </Text>
+      )}
       {open && (
         <Text selectable style={{ color: c.foregroundMuted, fontSize: 11, lineHeight: 19 }}>
           使用终端 {row.terminal} · {row.accountLinked ? row.accountLabel : "账号未确认"}
@@ -492,8 +522,32 @@ function GlobalUsage(props: Props) {
         点击每条请求展开账号、token、价格与时延。浏览后续页时暂停自动刷新，返回首屏可查看最新记录。
       </Text>
       {page.data?.stale && <Text style={{ color: c.foregroundMuted }}>明细快照已过期</Text>}
+      {!props.layout.compact && (
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          {[
+            ["实际模型 · 供应商", undefined],
+            ["终端", 75],
+            ["首响应", 90],
+            ["输出", 80],
+            ["耗时", 90],
+            ["状态 · 时间", 140],
+          ].map(([label, width]) => (
+            <Text
+              key={label}
+              style={{
+                color: c.foregroundMuted,
+                fontSize: 11,
+                width: typeof width === "number" ? width : undefined,
+                flex: width === undefined ? 1 : undefined,
+              }}
+            >
+              {label}
+            </Text>
+          ))}
+        </View>
+      )}
       {page.data?.rows.map((row) => (
-        <RequestRow key={row.id} row={row} theme={theme} />
+        <RequestRow key={row.id} row={row} theme={theme} compact={props.layout.compact} />
       ))}
       {page.data?.total === 0 && (
         <Text style={{ color: c.foregroundMuted }}>当前筛选没有请求。</Text>

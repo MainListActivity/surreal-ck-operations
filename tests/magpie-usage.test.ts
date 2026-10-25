@@ -55,7 +55,7 @@ test("usage normalization keeps actual routing, missing prices unknown and priva
     ms: 1200,
   });
 });
-import { MagpieUsage, normalizeTrace, usagePath } from "../src/usage/magpie.ts";
+import { MagpieUsage, normalizeTrace, usagePath, mergeTrace } from "../src/usage/magpie.ts";
 const filter = {
   period: "7d" as const,
   provider: "real/provider",
@@ -82,7 +82,7 @@ test("trace associates the actual attempted candidate, never the first eligible 
     done: false,
     order: [
       { id: "wrong", provider: "wrong-provider" },
-      { id: "right", provider: "right-provider", who: "PRIVATE" },
+      { id: "right", provider: "right-provider", kind: "account", who: "PRIVATE" },
     ],
     tries: [{ id: "right", model: "actual-model" }],
     prompt: "PRIVATE",
@@ -164,4 +164,55 @@ test("overview uses filtered native aggregates rather than summing a single page
   expect(view.providers[0]?.requests).toBe(321);
   expect(view.series[0]?.requests).toBe(321);
   source.stop();
+});
+
+test("trace deltas keep waiting requests, evict missing IDs and retain int64 precision", () => {
+  const a = { id: "9007199254740993", session: "s", time: "2026-10-25T12:00:00Z", done: false };
+  const b = { ...a, id: "9007199254740995" };
+  const first = mergeTrace(undefined, { pid: 1, seq: 1, ids: [a.id], routes: [a] });
+  const next = mergeTrace(first, { pid: 1, seq: 2, ids: [a.id, b.id], routes: [b] });
+  expect(normalizeTrace(next, new Set(["s"]))).toHaveLength(2);
+  const evicted = mergeTrace(next, { pid: 1, seq: 3, ids: [b.id], routes: [] });
+  expect(normalizeTrace(evicted, new Set(["s"]))).toHaveLength(1);
+  expect(
+    parseMagpieJson('{"ids":[9007199254740993,9007199254740995],"text":"9007199254740993"}'),
+  ).toEqual({ ids: [a.id, b.id], text: a.id });
+  expect(normalizeTotals({ cache_write: 100, cache_write_1h: 40 }).cacheWrite).toBe(100);
+});
+test("provider and key routing candidates never claim a verified subscription account", () => {
+  for (const kind of ["provider", "key"]) {
+    const rows = normalizeTrace(
+      {
+        routes: [
+          {
+            id: "1",
+            session: "s",
+            tries: [{ id: "candidate" }],
+            order: [{ id: "candidate", provider: "p", kind, who: "mask" }],
+          },
+        ],
+      },
+      new Set(["s"]),
+    );
+    expect(rows[0]?.accountLinked).toBe(false);
+  }
+  const user = "exact-user",
+    provider = "p";
+  const quota = normalizeQuota({ provider, user });
+  const request = normalizeRequest({ provider, providerAccount: user });
+  const trace = normalizeTrace(
+    {
+      routes: [
+        {
+          id: "1",
+          session: "s",
+          tries: [{ id: "c" }],
+          order: [{ id: "c", provider, kind: "account", who: user }],
+        },
+      ],
+    },
+    new Set(["s"]),
+  )[0];
+  expect(trace?.accountId).toBe(quota.id);
+  expect(request.accountId).toBe(quota.id);
 });
