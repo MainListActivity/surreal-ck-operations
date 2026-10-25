@@ -22,6 +22,7 @@ function MetricsCard({view,theme,compact=false}:{view:AgentMetricsView;theme:Plu
    <Text style={value}>最近一次请求 · {latest.model??'实际模型未知'}</Text>
    {!!latest.reported_model&&<Text style={label}>上游报告：{latest.reported_model}</Text>}
    <Text style={label}>首响应 {metricSeconds(latest.ttft_ms)} · 首文字 {metricSeconds(latest.first_text_ms)} · 耗时 {metricSeconds(latest.total_ms)} · HTTP {latest.status}</Text>
+   <Text style={label}>输出 {latest.output_tokens===undefined?'未知':`${metricNumber(latest.output_tokens,0)} tokens`} · 输出吞吐 {latest.completed&&latest.output_tokens!==undefined&&latest.total_ms!==undefined&&latest.total_ms>0?`${metricNumber(latest.output_tokens/(latest.total_ms/1000))} tok/s`:'未知'} · 原生生成速度 {latest.completed&&latest.decodeTokensPerSecond!==undefined?`${metricNumber(latest.decodeTokensPerSecond)} tok/s`:'未知'}</Text>
   </View>}
   <Text style={label}>{view.source==='company-gateway'?'来源：公司模型网关':view.source==='magpie-session'?'来源：Magpie 精确会话匹配':'来源：暂不可用'} · {view.turn?(view.turn.endedAt?'本轮已结束':'本轮进行中'):'尚未记录轮次边界'}</Text>
   {!!view.note&&<Text style={{...label,lineHeight:17}}>{view.note}</Text>}
