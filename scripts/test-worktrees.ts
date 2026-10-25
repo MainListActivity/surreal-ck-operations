@@ -64,6 +64,10 @@ try {
     'tests/input-bounds.integration.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/rollback-isolation-policy.fork.test.ts', 'tests/null-absent.fork.test.ts',
     'tests/disposition.integration.fork.test.ts', 'tests/disposition-channel.fork.test.ts', 'tests/disposition-rollback-isolation.fork.test.ts',
+    // SYS04：新增故障状态（fault_incident / fault_episode / fault_budget / fault_repair）的回滚隔离演练，
+    // 与上面的同形态先例共用 tests/fixtures/rb01-old-runner.ts 的旧版运行时驱动器，同样只在
+    // RUN_SCK_ROLLBACK_FORK_TESTS=1 时运行。
+    'tests/fault-rollback-isolation.fork.test.ts',
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
     'tests/disposition-rehearsal.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',
