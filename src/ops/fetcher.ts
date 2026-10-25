@@ -10,6 +10,19 @@ const { Agent, fetch: undiciFetch } = require('undici/index.js') as UndiciModule
 /** The slice of `fetch` the broker uses; plain functions satisfy it (Bun's `typeof fetch` also demands `preconnect`). */
 export type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/**
+ * A fetcher that can also be asked for a shorter connect limit.
+ *
+ * The production login path needs two connect limits at once: the standing one (20 s) for a normal hop, and a
+ * short one for the first attempts of a hop whose connection never came up. A connect that has not been established
+ * carries no request, so cutting it early costs nothing — while waiting the full 20 s per attempt burns the flow's
+ * whole budget on connections that never existed.
+ */
+export interface ConnectAwareFetcher extends Fetcher {
+  /** A fetcher on the same trust anchors, with the connect limit given here. */
+  withConnectTimeout: (connectTimeoutMs: number) => Fetcher;
+}
+
 /** Secret-free wording for a request that threw, naming the limit when a timeout was the cause. */
 export function describeTransportFailure(error: unknown, timeoutMs: number): { timedOut: boolean; detail: string } {
   const err = error as (Error & { cause?: unknown }) | undefined;
@@ -48,17 +61,43 @@ export interface OpsFetchOptions {
 }
 
 /** A Fetcher on a private undici dispatcher. `close` releases that dispatcher's sockets. */
-export function createOpsFetcher(options: OpsFetchOptions = {}): Fetcher & { close(): Promise<void> } {
-  const dispatcher = new Agent({
-    connect: { timeout: options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS, ...(options.ca ? { ca: options.ca } : {}) },
+export function createOpsFetcher(options: OpsFetchOptions = {}): ConnectAwareFetcher & { close(): Promise<void> } {
+  const connectTimeoutMs = options.connectTimeoutMs ?? OPS_CONNECT_TIMEOUT_MS;
+  const make = (timeoutMs: number) => new Agent({
+    connect: { timeout: timeoutMs, ...(options.ca ? { ca: options.ca } : {}) },
   });
+  const dispatcher = make(connectTimeoutMs);
+  // One dispatcher per connect limit: the short-limit attempts must not wait behind the standing one, and each
+  // dispatcher keeps its own connection pool, so a short attempt really opens a fresh connection.
+  const shortLimit = new Map<number, ReturnType<typeof make>>();
   const fetcher = (input: string | URL | Request, init?: RequestInit) => undiciFetch(input, { ...init, dispatcher });
-  return Object.assign(fetcher, { close: () => dispatcher.close() });
+  const withConnectTimeout = (ms: number): Fetcher => {
+    if (ms === connectTimeoutMs) return fetcher;
+    let agent = shortLimit.get(ms);
+    if (!agent) { agent = make(ms); shortLimit.set(ms, agent); }
+    const short = (input: string | URL | Request, init?: RequestInit) => undiciFetch(input, { ...init, dispatcher: agent });
+    return short;
+  };
+  return Object.assign(fetcher, {
+    withConnectTimeout,
+    close: async () => {
+      await dispatcher.close();
+      for (const agent of shortLimit.values()) await agent.close().catch(() => undefined);
+    },
+  });
 }
 
-let shared: (Fetcher & { close(): Promise<void> }) | undefined;
-/** The transport every ops HTTP call uses unless a caller injects one. Created on first use, so importing an ops module opens no socket. */
-export const opsFetch: Fetcher = (input, init) => (shared ??= createOpsFetcher())(input, init);
+let shared: (ConnectAwareFetcher & { close(): Promise<void> }) | undefined;
+/**
+ * The transport every ops HTTP call uses unless a caller injects one. Created on first use, so importing an ops module
+ * opens no socket.
+ */
+export const opsFetch: ConnectAwareFetcher = Object.assign(
+  (input: string | URL | Request, init?: RequestInit) => (shared ??= createOpsFetcher())(input, init),
+  {
+    withConnectTimeout: (connectTimeoutMs: number): Fetcher => (shared ??= createOpsFetcher()).withConnectTimeout(connectTimeoutMs),
+  },
+);
 
 const TLS_TRUST_CODES = new Set([
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',

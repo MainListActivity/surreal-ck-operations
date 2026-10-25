@@ -480,13 +480,15 @@ export class OpsBroker {
    * works must not eat the recovery budget.
    */
   private async reserveAttempt(ctx: Ctx, tool: string, args: Args): Promise<void> {
-    const reserve = this.deps.core.reserveFault;
-    if (!reserve) return;
+    if (!this.deps.core.reserveFault) return;
     const phase = opsPhaseOf(tool);
     const target = opsTargetOf(tool, args);
-    let result: Awaited<ReturnType<NonNullable<typeof reserve>>>;
+    let result: Awaited<ReturnType<NonNullable<typeof this.deps.core.reserveFault>>>;
     try {
-      result = await reserve({ taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId }, { phase, target });
+      // Called as a method, never pulled off `core` first: reserveFault reads this.faultClock and this.faults, so a
+      // detached reference throws `Cannot read properties of undefined` and the reservation is silently lost — the
+      // budget stops being enforced while the ops tool keeps running. See the `reserve failed` audit line.
+      result = await this.deps.core.reserveFault({ taskId: ctx.scope.taskId, employeeId: ctx.scope.actor.employeeId }, { phase, target });
     } catch (error) {
       // The ledger is unavailable: the call still runs. A broken ledger must not take the ops tools down.
       await this.audit(ctx, 'ops_fault', `reserve failed: ${(error as Error).message}`).catch(() => undefined);
