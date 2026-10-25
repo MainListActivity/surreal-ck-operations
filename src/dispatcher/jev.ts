@@ -53,9 +53,10 @@ export function createJevClient(cfg: JevConfig): JevClient {
         body: JSON.stringify({ model: cfg.model, state, questions }),
         signal: AbortSignal.timeout(cfg.timeoutMs ?? 20_000),
       });
-      const body = await response.json().catch(() => ({})) as { model?: string; answers?: Record<string, JevAnswer>; error?: { message?: string } };
+      const body = await response.json().catch(() => ({})) as { model?: string; answers?: Record<string, JevAnswer>; error?: { message?: string }; detail?: { error_type?: string } };
       if (!response.ok || !body.answers) {
-        throw new Error(`jev request failed (${response.status}): ${body.error?.message ?? 'no answers'}`);
+        const code = typeof body.detail?.error_type === "string" && /^[a-z_]{1,80}$/.test(body.detail.error_type) ? body.detail.error_type : undefined;
+        throw new Error(`jev request failed (${response.status}): ${code ?? body.error?.message ?? 'no answers'}`);
       }
       return { model: body.model ?? cfg.model, answers: body.answers };
     },

@@ -17,3 +17,12 @@
 字段字典、单位、计算口径和可信度说明随每次JEV请求发送。没有明确口径的老板阈值保持原usage平均值口径，不擅自改成P90、最新一次或EWMA。排序输入/输出快照保留趋势数据，Paseo和网页审核台使用同一说明文案。
 
 读取日志失败时，原生API汇总仍可用，趋势标记不可用；采集只保留时间和数值，不持久化账号、会话、请求内容或凭证。
+
+
+## JEV 输入预算与无损列编码
+
+JEV官方文档 https://docs.typesafe.ai/models 规定默认state加任一问题32k token、state加所有问题64k token。逐模型重复完整趋势对象会超过这个限制，真实接口曾返回400 max_tokens_exceeded。
+
+传输时共享一次字段列名、单位和样本单位字典，各指标使用10列数组：current、ewma、slopePerMinute、change、baselineMean、baselineSamples、samples、lastSampleAtMs、ageMs、sufficient。保留全部关键趋势数值；null明确表示未知。窗口分布与完整命名对象保留在成功评分快照和两端UI，首次请求的旧兼容显示可重建关键字段。
+
+本地以state 48000 UTF-8字节、完整请求128000字节进行保守工程预检（不是token计数器），超限不调用JEV、不截断老板规则或丢模型，保留原排序。仍然每组一次调用，不启用实验长上下文。JEV的结构化错误码会进入本地诊断，便于区分输入超限与无答案。

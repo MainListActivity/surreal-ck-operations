@@ -64,7 +64,7 @@ test('controller delivers all key trends and unit dictionary, one quality sample
  expect(f.trends?.performanceScore?.baseline.samples).toBe(1);expect(f.trends?.performanceScore?.current).toBe(4);
  let payload:any;
  await jevOrder({model:'fixture',ask:async(state,q)=>{payload=state;return {model:'fixture',answers:Object.fromEntries(Object.keys(q).map(k=>[k,{type:'score',score:3}]))};}},'haiku','首token超过10秒排最后',facts);
- expect(payload.trendDictionary.slopePerMinute).toContain('最小二乘');expect(payload.models.m0.trends.ttftMs.samples).toBe(10);
+ expect(payload.trendDictionary.slopePerMinute).toContain('最小二乘');expect(payload.trendDictionary.columns[6]).toBe("samples");expect(payload.models.m0.trends.ttftMs[6]).toBe(10);
  expect(JSON.stringify(payload)).not.toContain(home);
 });
 
@@ -96,4 +96,32 @@ test('retry attempts do not become independent requests or failures, including o
 test('daily accepted task scores have meaningful trends at their own cadence rather than a one-hour request window',()=>{
  const scores=[2,2.5,3,3.5,4].map((value,i)=>({at:now-(4-i)*24*60*minute,value}));
  const t=metricTrend(scores,now,'score','task');expect(t.samples).toBe(5);expect(t.sufficient).toBe(true);expect(t.ewma).toBeGreaterThan(3);expect(t.slopePerMinute).toBeGreaterThan(0);
+});
+
+test('compact input preserves every trend field and model, roundtrips legacy cards, and keeps full successful snapshots',async()=>{
+ const {TREND_COLUMNS,rankingTables,RANKING_INPUT_BUDGET}=await import('../src/model-routing/ranking.ts');
+ const units={ttftMs:'ms',tokensPerSecond:'tokens/s',errorRate:'ratio',cacheHitRate:'ratio',ttftOver10sRate:'ratio',performanceScore:'score',aaScore:'score',aaRank:'rank',remainingPct:'percent',inputPrice:'USD/1M',outputPrice:'USD/1M',cacheHitPrice:'USD/1M'};
+ const trends=Object.fromEntries(Object.entries(units).map(([key,unit])=>[key,metricTrend(Array.from({length:10},(_,i)=>({at:now-(9-i)*minute,value:i+1})),now,unit,'request')]));
+ const facts=Array.from({length:35},(_,i)=>({id:`provider/model-${i}:max`,accounts:[{account:'provider #1',remainingPct:80}],price:{free:true,input:0,output:0,cacheHit:0},trends}));
+ let payload:any,snapshot:any,calls=0;
+ await jevOrder({model:'fixture',ask:async(state,q)=>{calls++;return {model:'fixture',answers:Object.fromEntries(Object.keys(q).map(k=>[k,{type:'score',score:3}]))};}},'haiku','首token超过10秒排最后',facts,async p=>{payload=p;},s=>{snapshot=s;});
+ expect(calls).toBe(1);expect(Object.keys(payload.state.models)).toHaveLength(35);
+ expect(Buffer.byteLength(JSON.stringify(payload.state))).toBeLessThan(RANKING_INPUT_BUDGET.stateBytes);
+ expect(payload.state.trendDictionary.columns).toEqual(TREND_COLUMNS);
+ const row=payload.state.models.m0.trends.ttftMs;
+ expect(row).toEqual([10,trends.ttftMs!.ewma,trends.ttftMs!.slopePerMinute,trends.ttftMs!.change.detected?[trends.ttftMs!.change.direction,Date.parse(trends.ttftMs!.change.at!),trends.ttftMs!.change.before,trends.ttftMs!.change.after]:false,trends.ttftMs!.baseline.mean,10,10,now,0,true]);
+ const table=rankingTables({'sck-haiku':[facts[0]!.id]}, {}, [{tier:'haiku',at:new Date(now).toISOString(),payload}]);
+ expect(table[0]?.rows[0]?.trends?.ttftMs).toMatchObject({unit:'ms',sampleUnit:'request',current:10,ewma:trends.ttftMs!.ewma,slopePerMinute:trends.ttftMs!.slopePerMinute,lastSampleAt:new Date(now).toISOString(),sufficient:true});
+ expect(snapshot.rows[0].facts.trends.ttftMs.windows).toEqual(trends.ttftMs!.windows);
+});
+test('oversize groups or rules fail before snapshot publication and Jev calls without dropping models or rules',async()=>{
+ let calls=0,saved=false;const facts=[{id:'p/m',accounts:[],price:{free:false}}];
+ await expect(jevOrder({model:'fixture',ask:async()=>{calls++;throw Error('must not call');}},'haiku','规则'.repeat(20000),facts,async()=>{saved=true;})).rejects.toThrow('safety budget');
+ expect(calls).toBe(0);expect(saved).toBe(false);
+});
+test('Jev context rejections retain their safe structured error code',async()=>{
+ const {createJevClient}=await import('../src/dispatcher/jev.ts');
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch:()=>Response.json({detail:{error_type:'max_tokens_exceeded'}},{status:400})});
+ try{const client=createJevClient({model:'fixture',baseUrl:`http://127.0.0.1:${server.port}`,apiKey:'fixture-only'});await expect(client.ask({},{})).rejects.toThrow('max_tokens_exceeded');}
+ finally{server.stop(true);}
 });
