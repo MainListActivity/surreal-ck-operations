@@ -196,13 +196,14 @@ export class SidecarPool {
   routingLease(ref:string):RoutingLease|undefined {
     const inst=ref.startsWith('employee:')?ref.slice(9):this.instByAgent.get(ref);
     if(!inst||this.quarantined.has(inst)||!this.launched.has(inst)||this.routingUnconfirmed.has(inst))return;
+    const agent=[...this.instByAgent].find(([,id])=>id===inst)?.[0];
     const live=this.claims.get(inst);
-    if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,fence:live.proof.fence};}
+    if(live){if(!live.routing||!(live.routingExpiresAt!>Date.now()))return;return {...live.routing,agent,fence:live.proof.fence};}
     const role=this.routingEmployees.get(inst)?.role;
     // A task lease authorizes task writes, not the employee's ability to speak.
     // submit/review consumes the lease before Claude's next call handles the tool result.
     // Keep authenticated sessions routable without attributing closeout/chat to the finished task.
-    if(role)return {employee:inst,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
+    if(role)return {employee:inst,agent,task:'',fence:0,role,tier:taskTier({executor_role:role}),phase:role==='gm'||role==='eval'?'planning':'idle'};
   }
 
   /** Spawn env for a fresh instance: comm channel only. Minted credential stays in memory. */

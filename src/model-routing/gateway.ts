@@ -1,3 +1,4 @@
+import {StreamMetrics,type RequestMetrics} from "./request-metrics.ts";
 import { createServer, type Server } from "node:http";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -24,6 +25,8 @@ import {
 } from "./policy.ts";
 export interface RoutingLease {
   employee: string;
+  agent?:string;
+  turn_key?:string;
   task: string;
   fence: number;
   role: string;
@@ -37,7 +40,9 @@ export interface GatewayDeps {
   onRequest?: () => void;
   lease(agent: string): Promise<RoutingLease | undefined>;
   record(row: Record<string, unknown>): Promise<void>;
-  complete(id: string, completed: boolean): Promise<void>;
+  complete(id: string, completed: boolean, metrics?:RequestMetrics): Promise<void>;
+  progress?(id:string,metrics:RequestMetrics):void;
+  now?:()=>number;
   upstream?: string;
   fetchImpl?: typeof fetch;
 }
@@ -150,6 +155,7 @@ export async function startModelGateway(
       if (!res.writableEnded) abort.abort();
     });
     let execution: string | undefined;
+    let metrics:StreamMetrics|undefined;
     try {
       if (deps.ready && !deps.ready()) {
         res.writeHead(503,{"content-type":"application/json","retry-after":"1"}).end(JSON.stringify({error:{type:"api_error",message:"公司会话正在恢复，请稍后重试。"}}));
@@ -231,13 +237,38 @@ export async function startModelGateway(
         const v = req.headers[name];
         if (typeof v === "string") headers.set(name, v);
       }
-      const started = Date.now();
+      const now=deps.now??Date.now;
+      const started = now();
+      metrics=new StreamMetrics(started,now);
+      const executionInfo = {
+        agent:lease.agent,
+        turn_key:lease.turn_key,
+        harness: "claude",
+        effort_requested:
+          body.output_config?.effort ?? body.thinking?.type ?? "unspecified",
+        task: lease.task,
+        employee: lease.employee,
+        fence: lease.fence,
+        phase: auxiliary ? "auxiliary" : lease.phase,
+        domain: domainOf(lease.role),
+        tier,
+        requested,
+        completed:false,
+        at:new Date(started),
+      };
       // Stickiness per lease is magpie's (`stays=auto` on x-magpie-session: while the cache is worth it).
       const reply = await (deps.fetchImpl ?? fetch)(new URL(match[2]!, upstream), {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(900000)]),
+      }).catch(async error=>{
+        // Headers are not guaranteed: connection failures are still measured attempts.
+        if(!match[2]!.endsWith("count_tokens")){
+          execution=randomUUID();
+          await deps.record({...executionInfo,id:execution,status:502,model:null,attribution:'unknown'});
+        }
+        throw error;
       });
       const model = modelIdentity(
         reply.headers.get("x-magpie-provider"),
@@ -261,26 +292,13 @@ export async function startModelGateway(
         cooldowns.set(session, Date.now() + retrySeconds * 1000);
       execution = randomUUID();
       await deps.record({
+        ...executionInfo,
         id: execution,
-        harness: "claude",
-        effort_requested:
-          body.output_config?.effort ?? body.thinking?.type ?? "unspecified",
-        task: lease.task,
-        employee: lease.employee,
-        fence: lease.fence,
-        phase: auxiliary ? "auxiliary" : lease.phase,
-        domain: domainOf(lease.role),
-        tier,
-        requested,
         model: model ?? null,
         status: reply.status,
-        completed: false,
-        at: new Date(),
-        header_ms: Date.now() - started,
+        header_ms: now() - started,
         attribution: model ? "gateway-headers" : "unknown",
-        retry_seconds: [402, 429].includes(reply.status)
-          ? retrySeconds
-          : undefined,
+        retry_seconds: [402, 429].includes(reply.status) ? retrySeconds : undefined,
       });
       const outgoing: Record<string, string> = {};
       reply.headers.forEach((v, k) => {
@@ -296,63 +314,27 @@ export async function startModelGateway(
           outgoing[k] = v;
       });
       res.writeHead(reply.status, outgoing);
-      let failed = false,
-        terminal = false,
-        line = "";
-      const decoder = new TextDecoder();
-      const sse = reply.headers
-        .get("content-type")
-        ?.includes("text/event-stream");
-      const observe = (text: string) => {
-        if (text === "data: [DONE]") {
-          terminal = true;
-          return;
-        }
-        if (text === "event: error") {
-          failed = true;
-          return;
-        }
-        if (!text.startsWith("data: ")) return;
-        try {
-          const event = JSON.parse(text.slice(6));
-          if (
-            event.type === "error" ||
-            event.type === "response.failed" ||
-            event.error
-          )
-            failed = true;
-          if (
-            event.type === "message_stop" ||
-            event.type === "response.completed"
-          )
-            terminal = true;
-        } catch {}
-      };
+      const sse=reply.headers.get("content-type")?.includes("text/event-stream");
+      let json="";
       const tap = new Transform({
         transform(chunk, _encoding, callback) {
-          if (sse) {
-            line += decoder.decode(chunk, { stream: true });
-            let pos;
-            while ((pos = line.indexOf("\n")) >= 0) {
-              observe(line.slice(0, pos).trim());
-              line = line.slice(pos + 1);
-            }
-            if (line.length > 1024 * 1024) line = "";
-          }
-          callback(null, chunk);
+          if(sse){metrics!.feed(chunk);try{deps.progress?.(execution!,metrics!.snapshot());}catch{}}
+          else if(json.length<=1024*1024)json+=chunk.toString("utf8");
+          callback(null,chunk);
         },
-        flush(callback) {
-          if (line) observe(line.trim());
+        flush(callback){
+          if(sse)metrics!.end();
+          else if(json.length<=1024*1024){try{metrics!.observe(JSON.parse(json));}catch{}}
           callback();
         },
       });
       if (reply.body)
         await pipeline(Readable.fromWeb(reply.body as never), tap, res);
       else res.end();
-      const completed = !failed && (!sse || terminal);
-      await deps.complete(execution, completed);
+      const completed = reply.ok && !metrics.failed && (!sse || metrics.terminal);
+      await deps.complete(execution, completed,metrics.snapshot());
     } catch {
-      if (execution) await deps.complete(execution, false).catch(() => {});
+      if (execution) await deps.complete(execution, false,metrics?.snapshot()).catch(() => {});
       if (!res.headersSent)
         res
           .writeHead(502, { "content-type": "application/json" })
@@ -441,10 +423,10 @@ export function databaseGateway(db: Surreal): GatewayDeps {
           task: row.task ? new RecordId("task", String(row.task)) : undefined,
         });
     },
-    async complete(id, completed) {
+    async complete(id, completed, metrics) {
       await db.query(
-        "UPDATE $id SET completed=$completed,ended_at=time::now() RETURN NONE;",
-        { id: new RecordId("model_execution", id), completed },
+        "UPDATE $id MERGE $fields RETURN NONE;",
+        { id: new RecordId("model_execution", id), fields:{...metrics,completed,ended_at:new Date()} },
       );
     },
   };
