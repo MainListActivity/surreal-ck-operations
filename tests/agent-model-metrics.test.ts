@@ -79,3 +79,31 @@ test('native retries do not inflate turn requests and stale/completed session bi
  const unknown=state.begin('other','old',now-2000);state.finish('other','old',now);state.begin('other','new',now+1,false,true);
  expect((await readAgentMetrics('other',paseo as any,unknown,true,{state,native})).source).toBe('unavailable');
 });
+
+test('pre-header connection failure is a failed measured attempt and never invents an actual model',async()=>{
+ const rows:any[]=[],completions:any[]=[];let now=100;
+ const gateway=await startModelGateway({now:()=>now,lease:async()=>({agent:'agent',employee:'e',task:'t',fence:1,role:'engineering',tier:'haiku',phase:'execute'}),record:async r=>{rows.push(r);},complete:async(...args)=>{completions.push(args);},fetchImpl:(async()=>{now=900;throw Error('connection closed');}) as any},0);
+ try{const reply=await fetch(`http://127.0.0.1:${gateway.port}/a/agent/v1/messages`,{method:'POST',body:'{"messages":[]}'});expect(reply.status).toBe(502);await reply.text();expect(rows).toHaveLength(1);expect(rows[0]).toMatchObject({agent:'agent',status:502,model:null});expect(completions[0]).toMatchObject([rows[0].id,false,{total_ms:800}]);expect(completions[0][2].ttft_ms).toBeUndefined();}finally{await gateway.stop();}
+});
+
+test('finished summary latest stays in its own turn while panel latest may follow the next turn',async()=>{
+ const {readAgentMetrics}=await import('../plugin/server/agent-metrics.ts');const now=Date.now(),dir=scratch(),state=new AgentTelemetry(join(dir,'state')),file=join(dir,'usage.jsonl'),native=new NativeUsageReader(file);
+ const first=state.begin('agent','a',now-2000);state.record('agent',{id:'old',at:now-1500,model:'p/old',status:200,source:'company-gateway',turnKey:first.key});state.finish('agent','a',now-1000);
+ const second=state.begin('agent','b',now-500);state.record('agent',{id:'new',at:now-100,model:'p/new',status:200,source:'company-gateway',turnKey:second.key});
+ expect(state.view('agent',first,true).latest?.id).toBe('old');expect(state.view('agent',first).latest?.id).toBe('new');
+ const t=state.begin('native','a',now-2000);state.bindSession('native',t.key,'session');state.finish('native','a',now-1000);state.begin('native','b',now-500);
+ writeFileSync(file,[{session:'session',t:new Date(now-1500),provider:'p',model:'old',status:200},{session:'session',t:new Date(now-100),provider:'p',model:'new',status:200}].map(x=>JSON.stringify(x)).join('\n'));
+ const paseo={agents:{ref:()=>({refresh:async()=>({agent:{runtimeInfo:{sessionId:'session'}}})})}};
+ expect((await readAgentMetrics('native',paseo as any,t,true,{state,native})).latest?.model).toBe('p/old');
+});
+
+test('native scan bounds retained records and session cache and marks truncated data partial',async()=>{
+ const file=join(scratch(),'usage.jsonl'),now=Date.now(),row=(session:string,i:number)=>JSON.stringify({session,t:new Date(now-30000+i),provider:'p',model:'m',status:200,ms:1,out:1});
+ writeFileSync(file,Array.from({length:20002},(_,i)=>row(i%2?'a':'b',i)).join('\n'));
+ const reader=new NativeUsageReader(file);await reader.read('a',now);const rows=await reader.read('b',now,true);
+ expect(rows).toHaveLength(5000);expect(rows.partial).toBe(true);
+ expect((reader as any).cached.rows.size).toBe(2);
+ writeFileSync(file,'');for(let i=0;i<66;i++)await reader.read(`session-${i}`,now,true);
+ expect((reader as any).sessions.size).toBe(64);expect((reader as any).cached.sessions.size).toBe(64);
+ const many=summarizeRequests(Array.from({length:51},(_,i)=>({id:String(i),at:i,status:200,source:'company-gateway' as const,model:`p/${i}`})));expect(many.models).toHaveLength(50);expect(many.partial).toBe(true);expect(many.requests).toBe(51);
+});

@@ -14,12 +14,13 @@ interface MetricsRuntime {
 }
 const runtime=():MetricsRuntime=>({state:telemetry(),native});
 export async function readAgentMetrics(agentId:string,paseo:PaseoApi,turn?:AgentTurn,force=false,io:MetricsRuntime=runtime()):Promise<AgentMetricsView>{
+ const turnOnly=turn!==undefined;
  const ref=paseo.agents.ref(agentId),snapshot=await ref.refresh();if(!snapshot)throw Error('agent not found');
  const state=io.state;
  if(!turn){turn=state.lastTurn(agentId);const active=snapshot.agent.activeTurn;
   if(active&&(!turn||turn.endedAt!==undefined||turn.turnId!==active.turnId))turn=state.begin(agentId,active.turnId,active.startedAt?Date.parse(active.startedAt):Date.now(),true);
  }
- const local=state.view(agentId,turn);
+ const local=state.view(agentId,turn,turnOnly);
  if(local.gatewaySeen)return agentMetricsViewSchema.parse({agentId,source:'company-gateway',...local,updatedAt:Date.now(),note:'首响应含思考/工具；首文字单列。输出吞吐=已完成请求输出token总量÷其请求总耗时，含等待；公司网关未取得可靠解码计时时生成速度显示未知。'});
  const runtimeSession=snapshot.agent.runtimeInfo?.sessionId??snapshot.agent.persistence?.sessionId;
  const superseded=turn?.endedAt!==undefined&&state.current(agentId)?.key!==undefined&&state.current(agentId)?.key!==turn.key;
@@ -28,7 +29,7 @@ export async function readAgentMetrics(agentId:string,paseo:PaseoApi,turn?:Agent
  if(!session)return agentMetricsViewSchema.parse({agentId,source:'unavailable',turn,summary:summarizeRequests([],true),updatedAt:Date.now(),note:'此会话未提供原生 sessionId，无法精确匹配；不按目录猜测。'});
  try{
   const rows=await io.native.read(session,Date.now(),force),selected=turn?rows.filter(r=>r.at>=turn.startedAt&&r.at<(turn.endedAt??Infinity)):[];
-  return agentMetricsViewSchema.parse({agentId,source:'magpie-session',turn,latest:rows.at(-1),summary:summarizeRequests(selected,(turn?.partial??true)||(rows.length>=5000&&!!turn&&rows[0]!.at>turn.startedAt)),updatedAt:Date.now(),note:'按原生sessionId精确匹配；首响应含思考/工具，首文字单列。仅包含已落日志的请求，进行中请求未知。输出吞吐含等待；生成速度沿用Magpie原生解码与排除规则。'});
+  return agentMetricsViewSchema.parse({agentId,source:'magpie-session',turn,latest:(turnOnly?selected:rows).at(-1),summary:summarizeRequests(selected,(turn?.partial??true)||rows.partial===true||!!(turn&&turn.startedAt<Date.now()-7*86400000)),updatedAt:Date.now(),note:'按原生sessionId精确匹配；首响应含思考/工具，首文字单列。仅包含已落日志的请求，进行中请求未知。输出吞吐含等待；生成速度沿用Magpie原生解码与排除规则。'});
  }catch{return agentMetricsViewSchema.parse({agentId,source:'unavailable',turn,summary:summarizeRequests([],true),updatedAt:Date.now(),note:'Magpie本机用量日志暂不可读；未知不等于零。'});}
 }
 export function registerAgentMetrics(server:PluginServerContext,io:MetricsRuntime=runtime()){

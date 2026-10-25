@@ -240,12 +240,35 @@ export async function startModelGateway(
       const now=deps.now??Date.now;
       const started = now();
       metrics=new StreamMetrics(started,now);
+      const executionInfo = {
+        agent:lease.agent,
+        turn_key:lease.turn_key,
+        harness: "claude",
+        effort_requested:
+          body.output_config?.effort ?? body.thinking?.type ?? "unspecified",
+        task: lease.task,
+        employee: lease.employee,
+        fence: lease.fence,
+        phase: auxiliary ? "auxiliary" : lease.phase,
+        domain: domainOf(lease.role),
+        tier,
+        requested,
+        completed:false,
+        at:new Date(started),
+      };
       // Stickiness per lease is magpie's (`stays=auto` on x-magpie-session: while the cache is worth it).
       const reply = await (deps.fetchImpl ?? fetch)(new URL(match[2]!, upstream), {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: AbortSignal.any([abort.signal, AbortSignal.timeout(900000)]),
+      }).catch(async error=>{
+        // Headers are not guaranteed: connection failures are still measured attempts.
+        if(!match[2]!.endsWith("count_tokens")){
+          execution=randomUUID();
+          await deps.record({...executionInfo,id:execution,status:502,model:null,attribution:'unknown'});
+        }
+        throw error;
       });
       const model = modelIdentity(
         reply.headers.get("x-magpie-provider"),
@@ -269,28 +292,13 @@ export async function startModelGateway(
         cooldowns.set(session, Date.now() + retrySeconds * 1000);
       execution = randomUUID();
       await deps.record({
+        ...executionInfo,
         id: execution,
-        agent:lease.agent,
-        turn_key:lease.turn_key,
-        harness: "claude",
-        effort_requested:
-          body.output_config?.effort ?? body.thinking?.type ?? "unspecified",
-        task: lease.task,
-        employee: lease.employee,
-        fence: lease.fence,
-        phase: auxiliary ? "auxiliary" : lease.phase,
-        domain: domainOf(lease.role),
-        tier,
-        requested,
         model: model ?? null,
         status: reply.status,
-        completed: false,
-        at: new Date(started),
         header_ms: now() - started,
         attribution: model ? "gateway-headers" : "unknown",
-        retry_seconds: [402, 429].includes(reply.status)
-          ? retrySeconds
-          : undefined,
+        retry_seconds: [402, 429].includes(reply.status) ? retrySeconds : undefined,
       });
       const outgoing: Record<string, string> = {};
       reply.headers.forEach((v, k) => {

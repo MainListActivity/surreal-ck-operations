@@ -22,12 +22,12 @@ export function summarizeRequests(input:AgentRequest[],partial=false):MetricsSum
  const models=new Map<string,number>();for(const r of rows){const id=r.model??'unknown';models.set(id,(models.get(id)??0)+1);}
  const total=measured.reduce((s,r)=>s+r.total_ms!,0),out=measured.reduce((s,r)=>s+r.output_tokens!,0);
  return {requests:rows.length,successful:successful.length,failed:rows.filter(r=>r.completed===false).length,inFlight:rows.filter(r=>r.completed===undefined).length,
- models:[...models].map(([id,requests])=>({id,requests})),firstResponseMs:rows[0]?.ttft_ms,firstTextMs:rows[0]?.first_text_ms,
+ models:[...models].slice(0,50).map(([id,requests])=>({id,requests})),firstResponseMs:rows[0]?.ttft_ms,firstTextMs:rows[0]?.first_text_ms,
  meanResponseMs:timed.length?timed.reduce((s,r)=>s+r.ttft_ms!,0)/timed.length:undefined,
  outputTokens:measured.length?out:undefined,tokensPerSecond:total?out/(total/1000):undefined,
  // Only native measurements with trustworthy decode windows participate. Never average per-request speeds.
  decodeTokensPerSecond:decode.length?decode.reduce((s,r)=>s+r.decodeTokensPerSecond!*r.decodeDurationMs!,0)/decode.reduce((s,r)=>s+r.decodeDurationMs!,0):undefined,
- timedRequests:timed.length,tokenRequests:measured.length,partial};
+ timedRequests:timed.length,tokenRequests:measured.length,partial:partial||models.size>50};
 }
 interface State {turns:AgentTurn[];rows:AgentRequest[];gatewaySeen:boolean;trimmedBefore?:number}
 /** Small durable per-agent numeric ledger; no DB or daemon RPC on the inference path. */
@@ -62,36 +62,49 @@ export class AgentTelemetry {
  }
  progress(agent:string,id:string,metrics:Partial<RequestMetrics>){const r=this.get(agent).rows.find(r=>r.id===id);if(r)Object.assign(r,metrics);}
  complete(agent:string,id:string,done:boolean,metrics:Partial<RequestMetrics>={}){const r=this.get(agent).rows.find(r=>r.id===id);if(r){Object.assign(r,metrics,{completed:done,endedAt:Date.now()});this.save(agent);}}
- view(agent:string,turn=this.lastTurn(agent)){
+ view(agent:string,turn=this.lastTurn(agent),turnOnly=false){
   const s=this.get(agent),rows=turn?s.rows.filter(r=>r.turnKey===turn.key):[];
-  return {turn,latest:s.rows.at(-1),summary:summarizeRequests(rows,turn?.partial||!!(turn&&s.trimmedBefore&&s.trimmedBefore>turn.startedAt)),gatewaySeen:s.gatewaySeen};
+  return {turn,latest:(turnOnly?rows:s.rows).at(-1),summary:summarizeRequests(rows,turn?.partial||!!(turn&&s.trimmedBefore&&s.trimmedBefore>turn.startedAt)),gatewaySeen:s.gatewaySeen};
  }
 }
 /** Session equality only. Cached and single-flight across panels; sanitized rows are all that survive a read. */
 export class NativeUsageReader {
- private cached?:{at:number;rows:Map<string,AgentRequest[]>};private pending?:Promise<Map<string,AgentRequest[]>>;
+ private cached?:{at:number;rows:Map<string,NativeRequests>;sessions:Set<string>};
+ private pending?:Promise<void>;private sessions=new Map<string,true>();
  constructor(private file:string){}
- async read(session:string,now=Date.now(),force=false){
-  if(!force&&this.cached&&now-this.cached.at<5000)return this.cached.rows.get(session)??[];
-  this.pending??=this.load(now).then(rows=>{this.cached={at:now,rows};return rows;}).finally(()=>{this.pending=undefined;});
-  return (await this.pending).get(session)??[];
+ async read(session:string,now=Date.now(),force=false):Promise<NativeRequests>{
+  this.sessions.delete(session);this.sessions.set(session,true);
+  if(this.sessions.size>64)this.sessions.delete(this.sessions.keys().next().value!);
+  if(!force&&this.cached&&now-this.cached.at<5000&&this.cached.sessions.has(session))return this.cached.rows.get(session)??[];
+  if(this.pending){await this.pending;return this.read(session,now,false);}
+  const sessions=new Set(this.sessions.keys());
+  this.pending=this.load(now,sessions).then(rows=>{this.cached={at:now,rows,sessions};}).finally(()=>{this.pending=undefined;});
+  await this.pending;return this.cached!.rows.get(session)??[];
  }
- private async load(now:number){
-  const rows=new Map<string,AgentRequest[]>(),records:Array<{item:AgentRequest;sessions:string[];handedOn:boolean;failed:boolean;rejected:boolean}>=[],routes=new Map<string,number>(),stream=createReadStream(this.file,{encoding:'utf8'}),lines=createInterface({input:stream,crlfDelay:Infinity});
+ private async load(now:number,sessions:Set<string>){
+  type Entry={item:AgentRequest;sessions:string[];handedOn:boolean;failed:boolean;rejected:boolean;route?:string};
+  const rows=new Map<string,NativeRequests>(),records:Entry[]=[],routes=new Map<string,Entry>(),truncated=new Set<string>();let cursor=0;
+  const stream=createReadStream(this.file,{encoding:'utf8'}),lines=createInterface({input:stream,crlfDelay:Infinity});
   try{for await(const line of lines){let r:any;try{r=JSON.parse(line);}catch{continue;}
    if(!r||typeof r!=='object')continue;
+   const matched=[...new Set([r.session,r.native_session].filter(x=>typeof x==='string'&&sessions.has(x)))] as string[];
+   if(!matched.length)continue;
    const at=Date.parse(r.t);if(!Number.isFinite(at)||at<now-7*86400000||at>now)continue;
-   if(typeof r.provider!=='string'||typeof r.model!=='string'||!Number.isFinite(r.status))continue;
+   if(typeof r.provider!=='string'||typeof r.model!=='string'||r.provider.length>300||r.model.length>300||!Number.isFinite(r.status))continue;
    const number=(x:unknown)=>typeof x==='number'&&Number.isFinite(x)&&x>=0?x:undefined;
+   const decode=nativeDecode(r);
    const item:AgentRequest={id:createHash('sha256').update(line).digest('hex').slice(0,32),at,source:'magpie-session',model:r.provider&&r.model?`${r.provider}/${r.model}`:undefined,
     endedAt:typeof r.ms==='number'&&r.ms>=0?at+r.ms:undefined,status:r.status,completed:r.status>=200&&r.status<400&&!r.err,total_ms:number(r.ms),ttft_ms:r.ttft_ms>0?number(r.ttft_ms):undefined,first_text_ms:r.first_text_ms>0?number(r.first_text_ms):undefined,
-    output_tokens:number(r.out),decodeTokensPerSecond:nativeDecode(r),decodeDurationMs:nativeDecode(r)===undefined?undefined:r.ms-(r.reasoning>0?(r.first_text_ms>0?r.first_text_ms:r.first_reasoning_ms):r.ttft_ms),reported_model:typeof r.served==='string'&&r.served.length<=300?r.served:undefined};
-   const route=typeof r.route_id==='number'&&r.route_id!==0?line.match(/\"route_id\"\s*:\s*(\d+)/)?.[1]:undefined;
-   const previous=route===undefined?undefined:records[routes.get(route)??-1];if(previous?.failed&&!previous.rejected)previous.handedOn=true;
-   if(route!==undefined)routes.set(route,records.length);
-   records.push({item,sessions:[...new Set([r.session,r.native_session].filter(x=>typeof x==='string'&&x.length>0))] as string[],handedOn:r.handed_on===true,failed:r.status>=400||!!r.err,rejected:r.rejected===true});
+    output_tokens:number(r.out),decodeTokensPerSecond:decode,decodeDurationMs:decode===undefined?undefined:r.ms-(r.reasoning>0?(r.first_text_ms>0?r.first_text_ms:r.first_reasoning_ms):r.ttft_ms),reported_model:typeof r.served==='string'&&r.served.length<=300?r.served:undefined};
+   const route=typeof r.route_id==='number'&&r.route_id!==0?line.match(/"route_id"\s*:\s*(\d+)/)?.[1]:undefined;
+   const previous=route===undefined?undefined:routes.get(route);if(previous?.failed&&!previous.rejected)previous.handedOn=true;
+   const entry:Entry={item,sessions:matched,handedOn:r.handed_on===true,failed:r.status>=400||!!r.err,rejected:r.rejected===true,route};
+   if(records.length<20000)records.push(entry);
+   else{const old=records[cursor]!;old.sessions.forEach(id=>truncated.add(id));if(old.route&&routes.get(old.route)===old)routes.delete(old.route);records[cursor]=entry;cursor=(cursor+1)%20000;}
+   if(route!==undefined)routes.set(route,entry);
   }}finally{lines.close();stream.destroy();}
   for(const record of records){if(record.handedOn||record.rejected)continue;for(const session of record.sessions){const list=rows.get(session)??[];list.push(record.item);rows.set(session,list);}}
-  for(const [key,list] of rows)rows.set(key,list.sort((a,b)=>a.at-b.at).slice(-5000));return rows;
+  for(const [key,list] of rows)rows.set(key,Object.assign(list.sort((a,b)=>a.at-b.at).slice(-5000),{partial:truncated.has(key)||list.length>5000}));return rows;
  }
 }
+export type NativeRequests=AgentRequest[]&{partial?:boolean};
