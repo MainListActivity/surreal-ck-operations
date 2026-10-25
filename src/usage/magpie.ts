@@ -383,19 +383,21 @@ export class MagpieUsage {
   }
   private async observe() {
     this.observing = true;
+    let firstRead = true;
     try {
       while (!this.stopped && this.now() - this.traceInterest < 30000) {
         this.controller = new AbortController();
         const timeout = setTimeout(() => this.controller?.abort(), 28000);
         try {
           const incoming = await this.read(
-            `/v1/magpie/trace?after=${encodeURIComponent(this.traceSeq)}${this.trace === undefined ? "" : "&wait=1"}`,
+            `/v1/magpie/trace?after=${encodeURIComponent(this.traceSeq)}${firstRead ? "" : "&wait=1"}`,
             this.controller.signal,
           );
           const restarted =
             this.trace !== undefined && record(this.trace).pid !== record(incoming).pid;
           this.trace = mergeTrace(this.trace, incoming);
           this.traceAt = this.now();
+          firstRead = false;
           this.traceSeq = restarted ? "" : String(record(incoming).seq ?? "");
         } catch {
           await new Promise((resolve) => setTimeout(resolve, 1500));
