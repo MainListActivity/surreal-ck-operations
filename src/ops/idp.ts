@@ -44,14 +44,20 @@ export interface LoginOptions {
 }
 
 const MAX_HOPS = 8;
-const MAX_ATTEMPTS = 2;
+const MAX_ATTEMPTS = 3;
 // The IdP and the product are reached over a WAN where a single request of 5-10s happens; a healthy login takes 8-17s in total.
 // Every step's signal caps its connect too (the transport's connect limit, 20s, only ever cuts earlier), so a slow connect spends the step and the budget.
 const STEP_TIMEOUT_MS = 25_000;
 // All attempts together stay well inside the 120s an employee waits for one tool call, which also has to list workspaces afterwards.
 const BUDGET_MS = 75_000;
-// A second attempt starts only with room for a whole flow, so the budget never cuts it short.
+// One full flow's budget envelope: what a retry needs to finish, including a worst-case connect stall on its last hop.
+// Every attempt before the last reserves one envelope for the attempt after it, so a stall at the end of an earlier
+// attempt cannot spend the budget the fresh flow needs. This is what makes a last-hop connect stall recoverable.
 const RETRY_MIN_LEFT_MS = 30_000;
+// The reserve and the retry guard must not meet exactly. An attempt cut by its own deadline always ends a little late —
+// the abort fires after the deadline and the request teardown takes a moment — so without slack the next attempt sees
+// a hair under the guard's threshold and the retry the previous attempt paid for is rejected.
+const RETRY_SLACK_MS = 1_000;
 const MIN_STEP_MS = 2_000;
 
 const fail = (what: string, detail: string | number) => new CompanyError('upstream_error', `${what} failed (${detail})`, true);
@@ -65,8 +71,10 @@ class Unavailable extends CompanyError {
 
 interface Io {
   fetcher: Fetcher;
-  /** A fresh limit for the next request: the per-step limit, cut down to what is left of the budget. */
+  /** A fresh limit for the next request: the per-step limit, cut down to what is left of the attempt and of the budget. */
   step: () => { signal: AbortSignal; ms: number };
+  /** Milliseconds left of the whole-login budget, for the retry decision. */
+  left: () => number;
   /** 1-based attempt currently in flight, stamped onto each trace row. */
   attempt: number;
   /** Sanitized hop records: phase, origin host, HTTP status or safe errno, wall time. */
@@ -83,6 +91,20 @@ const TRACE_TAIL = 10;
 
 function formatTrace(io: Io): string {
   return io.trace.slice(-TRACE_TAIL).map(t => `a${t.attempt}:${t.phase}@${t.host}:${t.result} ${t.ms}ms`).join(' | ');
+}
+
+/** Fixed phase names, so a batch of login failures can be located without another real login. */
+type LoginStage = 'authorize' | 'login' | 'consent' | 'exchange';
+
+/** The last phase the flow reached, mapped onto the fixed stage vocabulary. */
+function lastStage(io: Io): LoginStage | undefined {
+  const phase = io.trace.at(-1)?.phase;
+  if (!phase) return undefined;
+  if (phase.startsWith('authorize')) return 'authorize';
+  if (phase === 'login') return 'login';
+  if (phase === 'consent') return 'consent';
+  if (phase === 'exchange') return 'exchange';
+  return undefined;
 }
 
 /** One request, optionally with its JSON body; a timeout while the body is read counts as a timeout of the request. */
@@ -231,7 +253,7 @@ function channelFor(config: BrokerConfig, kind: LoginChannel = 'customer'): Chan
  * (the customer or ops proxy on the product, or the IdP's own `/token` for `ops`). Failure messages carry
  * status codes and IdP error codes only, so they are safe to relay to employees.
  *
- * A timeout, a dropped connection or a 5xx anywhere in the flow earns one more attempt from a
+ * A timeout, a dropped connection or a 5xx anywhere in the flow earns another attempt from a
  * fresh challenge: the challenge and the code are single-use, so single steps are never replayed.
  * A refusal (wrong password, MFA, bad callback) is final and never retried.
  */
@@ -242,28 +264,40 @@ export async function passwordLogin(
   const started = Date.now();
   const budgetMs = options.budgetMs ?? BUDGET_MS;
   const stepMs = options.stepTimeoutMs ?? STEP_TIMEOUT_MS;
+  const retryMinLeftMs = options.retryMinLeftMs ?? RETRY_MIN_LEFT_MS;
   const left = () => budgetMs - (Date.now() - started);
+  // Each attempt but the last gets a deadline that leaves one whole-flow envelope for the attempt after it: a connect
+  // stall on its last hop then ends that attempt early instead of spending the budget the next fresh flow needs.
+  let attemptDeadline = started + budgetMs;
+  const attemptLeft = () => attemptDeadline - Date.now();
   const io: Io = {
     fetcher: options.fetch ?? opsFetch,
     step: () => {
-      const ms = Math.min(stepMs, Math.max(left(), MIN_STEP_MS));
+      const ms = Math.min(stepMs, Math.max(Math.min(left(), attemptLeft()), MIN_STEP_MS));
       return { signal: AbortSignal.timeout(ms), ms };
     },
+    left,
     attempt: 0,
     trace: [],
   };
+  const giveUp = (failure: Unavailable, attempts: number): CompanyError => {
+    const trace = formatTrace(io);
+    const stage = lastStage(io);
+    const suffix = attempts > 1 ? `; gave up after ${attempts} attempts` : '';
+    return new CompanyError('upstream_error',
+      `${failure.message}${suffix}${trace ? `; trace: ${trace}` : ''}${stage ? `; stage=${stage}` : ''}; runtime ${runtimeVersion()}`, true);
+  };
   for (let attempt = 1; ; attempt++) {
     io.attempt = attempt;
+    // The last attempt runs on the whole remaining budget; every earlier one is capped at (left - one full envelope -
+    // slack), so a connect stall on its last hop ends it with the retry's budget intact. That cap is the fix: the
+    // observed fatality was the one remaining attempt stalling on its final hop with nothing left to run a fresh flow.
+    attemptDeadline = attempt < MAX_ATTEMPTS ? Date.now() + Math.max(left() - retryMinLeftMs - RETRY_SLACK_MS, MIN_STEP_MS) : started + budgetMs;
     try {
       return await signIn(config, username, password, channel, io, options.now ?? Date.now);
     } catch (error) {
       if (!(error instanceof Unavailable)) throw error;
-      if (attempt >= MAX_ATTEMPTS || left() < (options.retryMinLeftMs ?? RETRY_MIN_LEFT_MS)) {
-        const trace = formatTrace(io);
-        const attempts = attempt > 1 ? `; gave up after ${attempt} attempts` : '';
-        throw new CompanyError('upstream_error',
-          `${error.message}${attempts}${trace ? `; trace: ${trace}` : ''}; runtime ${runtimeVersion()}`, true);
-      }
+      if (attempt >= MAX_ATTEMPTS || left() < retryMinLeftMs) throw giveUp(error, attempt);
     }
   }
 }
