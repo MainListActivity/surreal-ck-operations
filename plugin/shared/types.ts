@@ -284,13 +284,19 @@ export interface PermissionRequest {
 }
 
 /** Actual Magpie member order with facts from its latest successful Jev ranking. */
+export interface ModelRankingAttempt {
+  at:string;modelCount:number;encoding:string;stateBytes:number;requestBytes:number;
+  limits:{stateBytes:number;requestBytes:number};status:string;
+}
 export interface ModelRankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: Array<{
-    model: string; pinned?: boolean; aaScore?: number; aaRank?: number; effort?: string;
+    model: string; pinned?: boolean; tailReason?:string; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
     tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
     jevScore?: number; jevConfidence?: number;
+    /** Magpie routing log, every try; `excluded` members were moved last by code and never sent to Jev. */
+    health?: { excluded: boolean; reason?: "unavailable" | "consecutive_errors" | "error_rate"; attempts: number; errors: number; consecutiveErrors: number; lastStatus?: number; lastAttemptAt?: string };
   }>;
 }

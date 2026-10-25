@@ -1,10 +1,12 @@
 import { z } from "zod";
+import type { ModelTrends } from "./trends.ts";
+import type { ModelHealth } from "./health.ts";
 import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
-/** Fable is owner-only and keeps the owner's order; the three staff tiers are ranked by Jev. */
-export const RANKED_TIERS: Tier[] = ["opus", "sonnet", "haiku"];
+/** Opus is maintained entirely in Magpie; only Sonnet and Haiku are ranked by Jev. */
+export const RANKED_TIERS: Tier[] = ["sonnet", "haiku"];
 export const REFRESH_MINUTES = [2, 5, 10] as const;
 export const DEFAULT_REFRESH_MINUTES = 5;
 export const DEFAULT_RANKING_RULES = "智能程度和速度综合优先";
@@ -39,6 +41,8 @@ export interface UsageStat {
   ttftMs?: number;
 }
 export interface ModelFacts {
+  trends?: ModelTrends;
+  trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
   id: string;
   /** Accounts behind this model's provider. Labels only: no e-mail or sign-in leaves the machine. */
   accounts: Array<{ account: string; remainingPct?: number }>;
@@ -48,6 +52,8 @@ export interface ModelFacts {
   price: { free: boolean; input?: number | null; output?: number | null; cacheHit?: number | null };
   usage?: UsageStat;
   performance?: { score: number; samples: number };
+  /** Every try in Magpie's routing log, including refusals handed on to the next member. */
+  health?: ModelHealth;
 }
 
 const usageNumber = z.number().finite().nonnegative().default(0);
@@ -127,45 +133,63 @@ export function modelFacts(
   });
 }
 
-const LEVELS = ["最后考虑", "靠后", "中等", "靠前", "首选"];
+// Each level is evaluated independently. Describe its conditions rather than relying on
+// the model to infer an ordering from generic labels or instructions hidden in state.
+const LEVELS = [
+  "最后考虑：触发老板规则中明确要求排最后或降到末尾的条件，其他能力、绩效、速度或价格优势不能抵消。没有明确末尾条件时，才表示综合优先级最低。",
+  "靠后：未触发老板规则中必须排最后的条件，但按规则综合判断优先级偏低。",
+  "中等：未触发老板规则中必须排最后的条件，按规则综合判断优先级中等。",
+  "靠前：未触发老板规则中必须排最后的条件，按规则综合判断优先级较高。",
+  "首选：未触发老板规则中必须排最后的条件，按规则综合判断属于本组最优先的选择。",
+];
+
+export {TREND_COLUMNS,TREND_DICTIONARY,RANKING_INPUT_BUDGET,rankingInputFact} from "./ranking-input.ts";
+import {buildRankingInput,expandRankingModels,RankingInputBudgetError,type RankingAttempt} from "./ranking-input.ts";
+export type {RankingAttempt} from "./ranking-input.ts";
+
+/** Only a standalone, unambiguous numeric TTFT tail clause is executable; arbitrary prose stays with Jev. */
+export function ttftTailThreshold(rules:string):number|undefined {
+  const values:number[]=[];
+  for(const clause of rules.split(/[，,；;。\n]/).map(s=>s.trim()).filter(Boolean)) {
+    const m=/^(?:平均\s*)?(?:首\s*token|首个\s*token|TTFT)\s*(?:延迟\s*)?(?:超过|大于|>)\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)\s*(?:的(?:模型)?)?\s*(?:排在最后|排最后|放到最后|排在末尾|排末尾)$/i.exec(clause);
+    if(!m) {
+      // Compile only fully understood independent preferences. Unknown clauses may contain an
+      // exception to the tail rule in any language; do not guess from a growing blacklist.
+      if(!/^(?:智能程度和速度综合优先|智能(?:程度)?优先|速度优先|token速率未知的排前面)$/i.test(clause))return undefined;
+      continue;
+    }
+    const n=Number(m[1])*(["ms","毫秒"].includes(m[2]!.toLowerCase())?1:1000);
+    if(!Number.isFinite(n)||n<0)return undefined;values.push(n);
+  }
+  const unique=[...new Set(values)];return unique.length===1?unique[0]:undefined;
+}
+const overTtftLimit=(f:ModelFacts|undefined,limit:number|undefined)=>limit!==undefined&&f?.usage?.ttftMs!==undefined&&f.usage.ttftMs>limit;
 
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
-export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void): Promise<string[]> {
+export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void, onAttempt?: (attempt:RankingAttempt) => Promise<void>): Promise<string[]> {
   const keys = facts.map((_, i) => `m${i}`);
   if (!facts.length) return [];
-  const state = {
-      group: `group/sck-${tier}`,
-      ownerRules: rules.trim() || DEFAULT_RANKING_RULES,
-      models: Object.fromEntries(facts.map((f, i) => [keys[i], f])),
-      notes: [
-        "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
-        "aa.rank：Artificial Analysis 智能指数全榜名次，越小越强；aa.effort 是该成员被固定的思考等级，分数即在该等级下测得。price：每百万 token 美元，free=true 为免费。",
-        "usage：本轮排序前实时读取 Magpie /v1/magpie/usage?period=7d 原生统计；collectedAt 为采集时间，since 为窗口起点。严格按完整供应商/模型路径匹配，含该通道历史各思考等级；缺失表示无该通道数据，不借用其他供应商。",
-        "usage.tokensPerSecond 使用 Magpie decode_out/decode_ms 的原生测速口径，speedSamples 为实测速样本数；ttftMs 为原生平均首 token 延迟，ttftSamples 为样本数；requests 含失败次数 errors，cacheHitRate 为缓存命中占提示 token 比例。",
-        "performance：公司任务验收后的模型绩效（1–5 分）与样本数，样本少时参考价值低。",
-      ],
-    };
-  const questions = Object.fromEntries(facts.map((f, i) => [keys[i], {
-      type: "score" as const,
-      instructions: `按老板规则，并综合能力、额度、价格、缓存命中、速度和绩效，${f.id} 在本组内应排多靠前？`,
-      criteria: LEVELS,
-    }]));
-  // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
-  const payload: RankingRequestPayload = JSON.parse(JSON.stringify({ model: jev.model, state, questions }));
+  const {payload,attempt}=buildRankingInput(jev.model,tier,rules.trim() || DEFAULT_RANKING_RULES,facts,LEVELS);
+  await onAttempt?.(attempt);
+  if(attempt.status==='budget_exceeded')throw new RankingInputBudgetError(attempt);
   await beforeAsk?.(payload);
-  const response = await jev.ask(payload.state, payload.questions);
+  let response:JevResult;
+  try {response=await jev.ask(payload.state,payload.questions);}
+  catch(error){await onAttempt?.({...attempt,status:'upstream_error'});throw error;}
   const { answers } = response;
   // score is the expectation over the five levels, so a mid-ranked model is still placed correctly
   // even though its confidence (mass on the single most likely level) is low. Only gaps are rejected.
   for (const key of keys) {
     const a = answers[key];
-    if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4) throw Error("Jev 排序结果不完整");
+    if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4) {await onAttempt?.({...attempt,status:"invalid_answer"});throw Error("Jev 排序结果不完整");}
   }
+  const tailLimit=ttftTailThreshold(rules);
   const rows = facts
-    .map((f, i) => ({ facts: f, i, score: answers[keys[i]!]!.score!, confidence: answers[keys[i]!]!.confidence }))
-    .sort((a, b) => b.score - a.score || a.i - b.i)
-    .map(({ i, ...row }) => row);
-  afterAnswer?.({ tier, at: new Date().toISOString(), model: response.model, rules: state.ownerRules,
+    .map((f, i) => ({ facts: f, i, tail:overTtftLimit(f,tailLimit), score: answers[keys[i]!]!.score!, confidence: answers[keys[i]!]!.confidence }))
+    .sort((a, b) => Number(a.tail)-Number(b.tail) || b.score - a.score || a.i - b.i)
+    .map(({ i, tail, ...row }) => row);
+  await onAttempt?.({...attempt,status:"success"});
+  afterAnswer?.({ tier, at: new Date().toISOString(), model: response.model, rules: payload.state.ownerRules as string,
     rows: JSON.parse(JSON.stringify(rows)), answers: JSON.parse(JSON.stringify(answers)) });
   return rows.map(row => row.facts.id);
 }
@@ -191,37 +215,48 @@ export interface RankingResultSnapshot {
   answers: JevResult["answers"];
   /** Observations for pinned members, kept outside the Jev request and scored rows. */
   pinnedFacts?: ModelFacts[];
+  /** Members that kept failing: placed last by code, never sent to Jev, never given a score. */
+  excludedFacts?: ModelFacts[];
 }
+/** Latest safety observations are independent of the last successful Jev answer. */
+export interface RankingGateSnapshot {at:string;facts:ModelFacts[]}
+export type RankingGates=Record<string,RankingGateSnapshot>;
 export interface RankingTableRow {
-  model: string; pinned?: boolean;
+  model: string; pinned?: boolean; tailReason?:string;
+  trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
   accounts: ModelFacts["accounts"];
   performanceScore?: number; performanceSamples?: number;
   jevScore?: number; jevConfidence?: number;
+  health?: ModelHealth;
 }
 export interface RankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: RankingTableRow[];
 }
 /** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
-export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}): RankingTable[] {
+export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return RANKED_TIERS.map(tier => {
-    const group = `sck-${tier}`, result = results[group];
+    const group = `sck-${tier}`, result = results[group], gate=gates[group];
+    const tailLimit=ttftTailThreshold(result?.rules??"");
     const request = requests.find(r => r.tier === tier);
-    const legacy = Object.values((request?.payload.state.models ?? {}) as Record<string,ModelFacts>);
+    const legacy = expandRankingModels(request?.payload.state ?? {});
     const rows = (groups[group] ?? []).map(model => {
       const judged = result?.rows.find(row => row.facts.id === model);
       // Once a successful snapshot exists, do not borrow facts from a later failed/pending request.
-      const facts = judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? (!result ? legacy.find(f => f.id === model) : undefined);
-      return { model, pinned: (pins[group] ?? []).includes(model), aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      const current=gate?.facts.find(f=>f.id===model);
+      const excluded = gate ? (current?.health?.excluded ? current : undefined) : result?.excludedFacts?.find(f => f.id === model);
+      const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
+      const pinned = !excluded && (pins[group] ?? []).includes(model);
+      return { model, tailReason:!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined, trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
-        performanceSamples: facts?.performance?.samples, jevScore: (pins[group] ?? []).includes(model) ? undefined : judged?.score, jevConfidence: (pins[group] ?? []).includes(model) ? undefined : judged?.confidence };
+        performanceSamples: facts?.performance?.samples, jevScore: pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
-    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result, rows };
+    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
 }
 
@@ -308,31 +343,47 @@ export class RankingRefresher {
       const orders: Record<string, string[]> = {};
       const errors: string[] = [];
       const results: Record<string,RankingResultSnapshot> = {};
+      const gates:RankingGates={};
       for (const tier of RANKED_TIERS) {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
+        // A member that keeps failing goes last by code, before Jev and over the owner's pins:
+        // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
+        gates[`sck-${tier}`]={at:new Date().toISOString(),facts:members.flatMap(id=>byId.has(id)?[byId.get(id)!]:[])};
+        const excluded = members.filter(id => byId.get(id)?.health?.excluded);
+        const usable = members.filter(id => !excluded.includes(id));
+        const pinned = pinnedOrder(usable, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
+        const excludedFacts = excluded.map(id => byId.get(id)!);
+        const pinnedFacts = pinned.map(id => byId.get(id)!).filter(Boolean);
         try {
-          const pinned = pinnedOrder(members, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
-          const facts = members.filter(id => !pinned.includes(id)).map(id => byId.get(id));
+          const facts = usable.filter(id => !pinned.includes(id)).map(id => byId.get(id));
           if (facts.some(f => !f)) throw Error("missing facts");
           orders[`sck-${tier}`] = [...pinned, ...await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
             await this.deps.db.query(
               "UPSERT type::record('company_meta',$key) SET tier=$tier,at=$at,payload=$payload;",
               { key: `model_ranking_request_${tier}`, tier, at: new Date().toISOString(), payload });
-          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts:pinned.map(id => byId.get(id)!).filter(Boolean)}; })];
+          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts,excludedFacts}; }, async attempt=>{
+            await this.deps.db.query("UPSERT company_meta:model_ranking SET attempts=object::extend(attempts ?? {},$attempts);",{attempts:{[`sck-${tier}`]:attempt}});
+            this.deps.log?.(`模型排序 ${tier} ${attempt.status}：${attempt.encoding}, models=${attempt.modelCount}, state=${attempt.stateBytes}/${attempt.limits.stateBytes}, request=${attempt.requestBytes}/${attempt.limits.requestBytes}`);
+          }), ...excluded];
         } catch (e) {
           // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
           this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
-          errors.push(`${tier} 刷新失败，保留原顺序`);
+          errors.push(`${tier} 刷新失败${e instanceof RankingInputBudgetError ? `（输入超限：共享 ${e.attempt.stateBytes}/${e.attempt.limits.stateBytes} 字节，请求 ${e.attempt.requestBytes}/${e.attempt.limits.requestBytes} 字节）` : ""}，${excluded.length ? "持续报错的成员已移到末尾，其余" : ""}保留原顺序`);
+          // Jev's answer is optional for the tail: failing members still leave the front, unscored.
+          if (excluded.length) {
+            orders[`sck-${tier}`] = [...pinned, ...usable.filter(id => !pinned.includes(id)), ...excluded];
+
+          }
         }
       }
       if (revision !== this.revision || this.stopped) return;
       if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
       if (revision !== this.revision || this.stopped) return;
       await this.deps.db.query(
-        "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results),error=$error,refresh_minutes=$minutes;",
-        { orders, results, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
+        "UPSERT company_meta:model_ranking SET at=time::now(),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results),gates=object::extend(gates ?? {},$gates),error=$error,refresh_minutes=$minutes;",
+        { orders, results, gates, error: errors.length ? errors.join("；") : undefined, minutes: this.minutes });
     } catch (e) {
       this.deps.log?.(`模型排序刷新失败：${(e as Error).message.slice(0, 200)}`);
       if (revision === this.revision && !this.stopped) await this.deps.db.query(

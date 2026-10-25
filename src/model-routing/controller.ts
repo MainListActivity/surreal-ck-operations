@@ -29,6 +29,8 @@ import { employeeTier } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { GROUP_STAYS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
+import { readModelHealth } from "./health.ts";
+import { GaugeHistory, metricTrend, readUsageSamples, type ModelTrends, type Sample } from "./trends.ts";
 import { loadAa, refreshAa } from "./aa.ts";
 import { useBenchmarks } from "./policy.ts";
 import { pinnedOrder, modelFacts, quotaAccounts, usageStats, type ModelFacts } from "./ranking.ts";
@@ -86,6 +88,7 @@ export class ModelRoutingController {
   private catalog: CatalogModel[] = [];
   private updated = 0;
   private sessionsChecked = 0;
+  private readonly gaugeHistory: GaugeHistory;
   private pending?: Promise<void>;
   constructor(
     private readonly db: Surreal,
@@ -98,8 +101,13 @@ export class ModelRoutingController {
       groups?: () => Record<string, string[]>;
       affinity?: () => Record<string, string>;
       jev?: JevClient;
+      usageLog?: string;
+      /** Magpie's per-try routing log; tests point it at a fixture. */
+      routingLogDir?: string;
+      now?: () => number;
     } = {},
   ) {
+    this.gaugeHistory = new GaugeHistory(join(home,"model-routing","trend-gauges.json"));
     try {
       this.enabled =
         JSON.parse(
@@ -201,7 +209,8 @@ export class ModelRoutingController {
 
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
-    const [quota, usage, results] = await Promise.all([
+    const now = this.io.now?.() ?? Date.now();
+    const [quota, usage, results, observations, health] = await Promise.all([
       this.output(["quota", "--json"]).then((t) => quotaAccounts(JSON.parse(t))).catch(() => new Map()),
       (async () => {
         const response = await (this.io.fetch ?? fetch)("http://127.0.0.1:3425/v1/magpie/usage?period=7d", {
@@ -211,6 +220,8 @@ export class ModelRoutingController {
         return usageStats(await response.json());
       })(),
       readModelResults(this.db),
+      readUsageSamples(now, this.io.usageLog).catch(() => undefined),
+      readModelHealth(now, this.io.routingLogDir).catch(() => new Map()),
     ]);
     const known = new Map(classify(this.catalog).map((m) => [m.id, m]));
     const candidates = ids.map((id) => known.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier: "sonnet" as Tier, prior: 2.5, estimated: true, context: 0 });
@@ -220,7 +231,34 @@ export class ModelRoutingController {
       const samples = evidence.reduce((sum,r) => sum + r.weight, 0);
       if (samples > 0) performance.set(candidate.id,{score:Math.round(evidence.reduce((sum,r)=>sum+r.overall*r.weight,0)/samples*100)/100,samples});
     }
-    return modelFacts(ids, { catalog: this.catalog as never, quota, usage, performance });
+    const facts = modelFacts(ids, { catalog: this.catalog as never, quota, usage, performance });
+    const gauges = await this.gaugeHistory.update(Object.fromEntries(facts.map(f => [f.id, {
+      aaScore:f.aa?.score, aaRank:f.aa?.rank,
+      remainingPct:f.accounts.some(a=>a.remainingPct!==undefined)?Math.min(...f.accounts.flatMap(a=>a.remainingPct===undefined?[]:[a.remainingPct])):undefined,
+      inputPrice:f.price.input??undefined, outputPrice:f.price.output??undefined, cacheHitPrice:f.price.cacheHit??undefined,
+    }])),now);
+    for (const f of facts) {
+      const trends: ModelTrends = {};
+      const raw=observations?.rows.get(splitMember(f.id).id)??{};
+      for(const [name,unit] of Object.entries({ttftMs:"ms",tokensPerSecond:"tokens/s",errorRate:"ratio",cacheHitRate:"ratio",ttftOver10sRate:"ratio"}))
+        trends[name]=metricTrend(raw[name]??[],now,unit,"request");
+      // One task is one independent quality observation, even if several employees used this model.
+      const tasks = new Map<string,{at:number;sum:number;weight:number}>();
+      for(const r of results.filter(r=>canonicalModel(r.model)===canonicalModel(f.id))) {
+        if(!r.task)continue;
+        const row=tasks.get(r.task)??{at:Date.parse(r.at),sum:0,weight:0};
+        row.sum+=r.overall*r.weight;row.weight+=r.weight;row.at=Math.max(row.at,Date.parse(r.at));tasks.set(r.task,row);
+      }
+      const scores:Sample[]=[...tasks.values()].filter(r=>r.weight>0).map(r=>({at:r.at,value:r.sum/r.weight}));
+      trends.performanceScore=metricTrend(scores,now,"score","task");
+      for(const [name,unit] of Object.entries({aaScore:"score",aaRank:"rank",remainingPct:"percent",inputPrice:"USD/1M",outputPrice:"USD/1M",cacheHitPrice:"USD/1M"}))
+        trends[name]=metricTrend(gauges[f.id]?.[name]??[],now,unit,"snapshot");
+      f.trends=trends;
+      const h=health.get(splitMember(f.id).id);
+      if(h)f.health=h;
+      f.trendSource={source:"magpie-usage.jsonl",available:!!observations,invalidLines:observations?.invalid??0,collectedAt:new Date(now).toISOString()};
+    }
+    return facts;
   }
   async applyOrders(orders: Record<string, string[]>, isCurrent: () => boolean = () => true): Promise<void> {
     // Serialize behind any periodic sync, then re-read the owner's current membership.
@@ -351,6 +389,9 @@ export class ModelRoutingController {
     const issues: MemberIssue[] = [];
     const tiers = TIERS;
     for (const [level, tier] of tiers.entries()) {
+      // Opus belongs to the owner in Magpie: no creation, membership/effort normalization,
+      // new-model placement, persisted pins, ranking or routing/stickiness writes.
+      if (tier === "opus") continue;
       // An empty staff tier borrows the next stronger one: an upgrade, never a silent downgrade.
       // Fable is owner-only and has nothing stronger; while its models are excluded it serves Opus.
       const pool = (t: Tier) => models.filter((m) => m.tier === tierPool(t));
@@ -426,7 +467,7 @@ export class ModelRoutingController {
     await saveInventory(inventoryFile,inventory);
     const [storyModels] = await this.db.query<[string[]]>("SELECT VALUE model FROM employee_def WHERE role='story-author';");
     for (const id of Object.keys(previous)) {
-      if (!id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
+      if (id === 'sck-opus' || !id.startsWith('sck-') || id in groups || storyModels?.includes(`group/${id}`)) continue;
       if (preparing) groups[id] = previous[id]!; // the previous gateway still owns live leases until release switch
       // Already gone is done: a sync that died after removing groups but before writing groups.json
       // (or a concurrent one) must not fail every later sync.

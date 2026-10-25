@@ -223,16 +223,17 @@ async function startCompanyFork(name: string, tempRoot = tmpdir()) {
   const envs = new Map<string, Record<string, string>>();
   const ops = { tools: ['ops_info'], call: async () => ({ available: true }), release: () => {} };
   let pool: SidecarPool | undefined = new SidecarPool({ core, workforce: wf as unknown as SidecarDeps['workforce'], ops, runDir: join(dir, 'comm'), sweepMs: 5 });
+  const spawnFailures = { remaining: 0 };
   const paseo: PaseoGateway = { list: async () => agentRows, status: async id => agentRows.get(id) ? { status: agentRows.get(id)!.status, pendingPermissions: 0 } : undefined,
     lastError: async id => errors.get(id) ?? '', logsTail: async () => 'isolated synthetic transcript', lastInputTokens: async () => 0,
-    spawn: async b => { const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
+    spawn: async b => { if (spawnFailures.remaining > 0) { spawnFailures.remaining--; throw new Error('fixture launch unavailable'); } const id = `agent-${b.labels.employee_id}`; agentRows.set(id, { id, status: 'running' }); envs.set(id, b.env); return id; },
     send: async id => { agentRows.get(id)!.status = 'running'; }, stop: async id => { agentRows.get(id)!.status = 'idle'; }, reload: async id => { agentRows.get(id)!.status = 'idle'; },
     archive: async id => { agentRows.get(id)!.status = 'archived'; pool?.detachAgent(id); },
     listWorkspaces: async () => [], listProjects: async () => [], archiveWorkspace: async () => {}, deleteProject: async () => {} };
   let last: Dispatcher | undefined;
   const relay = (env: Record<string, string>, tool: string, args: Record<string, unknown> = {}) => relayViaClient(env, tool, args);
   return {
-    core, owner, wf, db, gm, dir, pool: pool!, agentRows, errors, envs, relay,
+    core, owner, wf, db, gm, dir, pool: pool!, agentRows, errors, envs, relay, spawnFailures,
     /** One real tick on a fresh dispatcher, as the existing fork tests run it. */
     tick: async () => {
       last = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool!, rand: () => 0,
@@ -855,3 +856,133 @@ run('company fork: zero dispatch verdicts still report the live review dependenc
     await w.close();
   }
 }, 60000);
+
+run('company fork: an explicit code repo rebind replaces the old-repo implementer and resumes without a manager loop',async()=>{
+ const w=await startCompanyFork('repo-rebind-successor');
+ try{
+  await w.wf.upsertDef('fixture-eng',{role:'engineering',provider:'codex',model:'fixture',maxInstances:1});
+  await w.wf.upsertDef('fixture-eng-new',{role:'engineering',provider:'grok',model:'fixture',maxInstances:1});
+  await w.wf.upsertDef('fixture-qa',{role:'qa',provider:'codex',model:'fixture',maxInstances:1});
+  const task=await w.core.createTask(w.gm,{title:'Cross-repo code binding must not strand the implementer',context:'Synthetic regression only',executorRole:'engineering',reviewerRole:'qa',idempotencyKey:'repo-rebind-create'});
+  expect((await w.tick()).woke.some(r=>r.task===task.id)).toBe(true);
+  const A=(await w.wf.insts()).find(i=>i.role==='engineering')!;
+  expect((await w.relay(w.envs.get(A.paseoAgentId!)!,'report_blocker',{to:'gm',text:'Synthetic code repo mismatch before any delivery',idempotencyKey:'repo-rebind-block'})).ok).toBe(true);
+  w.agentRows.get(A.paseoAgentId!)!.status='idle';
+  const {canonicalRepoPath}=await import('../src/core.ts');
+  const nextRepo=canonicalRepoPath(join(w.dir,'new-code-repo'));
+  await w.db.db.query("CREATE project:rebound_fixture CONTENT {name:'Rebound fixture',repo_path:$repo,created_at:time::now()};",{repo:nextRepo});
+  const blocked=await w.core.getTask(w.gm,task.id);
+  await w.core.bindTaskCodeRepo(w.gm,{taskId:task.id,codeRepoPath:nextRepo,expectedVersion:blocked.version,text:'Manager explicitly corrects the code repository',idempotencyKey:'repo-rebind-bind'});
+  await w.core.resume(w.gm,task.id,{text:'Resume after the explicit repository correction',idempotencyKey:'repo-rebind-resume'});
+  const C=await w.wf.spawnInst((await w.wf.defs()).find(d=>d.id==='fixture-eng-new')!);
+  const envC=w.pool.env(C);
+  const agentId=`agent-${C.id}`;
+  await w.wf.bind(C.id,{agentId,cwd:w.pool.commDirFor(C.id),repoHome:nextRepo,model:'fixture'});
+  w.pool.bindAgent(C.id,agentId);w.agentRows.set(agentId,{id:agentId,status:'idle'});
+  const moved=await w.tick();
+  expect(moved.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
+  expect(await w.core.getTask(w.gm,task.id)).toMatchObject({state:'ready',implementer:C.id,codeRepoPath:nextRepo});
+  expect(moved.woke.some(r=>r.employee.startsWith('gm-'))).toBe(false);
+  const history=await w.core.history(w.gm,task.id);
+  expect(history.find(r=>r.action==='implementer_takeover')).toMatchObject({actor:'system:dispatcher'});
+  expect(history.find(r=>r.action==='implementer_takeover')?.evidence).toContain('代码仓');
+  expect((await w.tick()).woke.find(r=>r.task===task.id)?.employee).toBe(C.id);
+  const claim=readJsonFile<ClaimResult>(join(w.pool.commDirFor(C.id),'claim.json'))!;
+  expect(claim.task.codeRepoPath).toBe(nextRepo);
+  expect((await w.relay(envC,'submit',{text:'Synthetic successor delivery',idempotencyKey:'repo-rebind-submit'})).ok).toBe(true);
+  w.agentRows.get(agentId)!.status='idle';
+  const review=await w.tick();
+  const reviewer=review.woke.find(r=>r.task===task.id)!;
+  expect(reviewer.employee).not.toBe(A.id);expect(reviewer.employee).not.toBe(C.id);
+  expect((await w.relay(w.envs.get((await w.wf.insts()).find(i=>i.id===reviewer.employee)!.paseoAgentId!)!,'review',{decision:'accept',text:'Independent synthetic successor acceptance',idempotencyKey:'repo-rebind-accept'})).ok).toBe(true);
+  expect((await w.core.getTask(w.gm,task.id)).state).toBe('done');
+  const contributions=await w.wf.contributors(task.id);
+  expect(contributions.excluded).toContain(A.id);expect(contributions.excluded).toContain(C.id);
+ }finally{await w.close();}
+},90000);
+
+run('company fork: no reusable successor creates a fresh implementer and retries the same seat after a failed launch and restart', async () => {
+  const w = await startCompanyFork('fresh-successor');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 3 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'closed implementer with only fresh seats available', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fresh-successor-create' });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    // Fail the external launch after the durable takeover and claim. Recovery must reuse that identity.
+    w.spawnFailures.remaining = 3;
+    await w.tick();
+    const pending = await w.core.getTask(w.gm, task.id);
+    expect(pending.implementer).not.toBe(A.id);
+    const C = (await w.wf.insts()).find(i => i.id === pending.implementer)!;
+    expect(C.paseoAgentId).toBeUndefined();
+    expect(C.repoHome).toBe(w.dir);
+    await w.tick();
+    await w.tick();
+    expect((await w.wf.defs()).find(d => d.id === C.def)?.enabled).toBe(true);
+    expect((await w.core.getTask(w.gm, task.id)).implementer).toBe(C.id);
+    await w.reload();
+    const recovered = await w.tick();
+    expect(recovered.woke.find(x => x.task === task.id)).toMatchObject({ employee: C.id, spawned: true });
+    expect((await w.wf.insts()).filter(i => i.role === 'engineering').map(i => i.id)).toEqual([C.id]);
+    const [employees] = await w.db.db.query<[unknown[]]>("SELECT id FROM employee WHERE role = 'engineering';");
+    expect(employees).toHaveLength(2);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'doing', implementer: C.id, currentEmployee: C.id });
+    const running = (await w.wf.insts()).find(i => i.id === C.id)!;
+    expect((await w.relay(w.envs.get(running.paseoAgentId!)!, 'submit', { text: 'Fresh successor delivery', idempotencyKey: 'fresh-successor-submit' })).ok).toBe(true);
+    w.agentRows.get(running.paseoAgentId!)!.status = 'idle';
+    const review = await w.tick();
+    const B = (await w.wf.insts()).find(i => i.role === 'qa')!;
+    expect(review.woke.find(x => x.task === task.id)?.employee).toBe(B.id);
+    expect((await w.relay(w.envs.get(B.paseoAgentId!)!, 'review', { decision: 'accept', text: 'Independent acceptance', idempotencyKey: 'fresh-successor-accept' })).ok).toBe(true);
+    expect(await w.core.getTask(w.gm, task.id)).toMatchObject({ state: 'done', implementer: C.id });
+    expect((await w.wf.contributors(task.id)).authors).toEqual(expect.arrayContaining([A.id, C.id]));
+  } finally { await w.close(); }
+}, 90000);
+
+for (const blocked of ['review', 'quota', 'capacity', 'scope'] as const) run(`company fork: fresh successor preserves ${blocked} gate`, async () => {
+  const w = await startCompanyFork(`fresh-gate-${blocked}`);
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 3 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: `fresh successor ${blocked} refusal`, context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: `fresh-gate-${blocked}` });
+    expect((await w.tick()).woke.find(x => x.task === task.id)?.spawned).toBe(true);
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    if (blocked === 'review') await w.db.db.query('UPDATE employee_def:⟨fixture-qa⟩ SET enabled = false;');
+    if (blocked === 'quota') await w.wf.markExhausted('codex', 'synthetic exhausted subscription');
+    if (blocked === 'capacity') await w.db.db.query('UPDATE company_meta:config SET max_running = 0;');
+    if (blocked === 'scope') w.pool.writeScope = async () => [{ taskId: 'other-writer', employeeId: 'other-engineer' }] as never;
+    const refused = await w.tick();
+    expect(refused.woke.filter(x => x.task === task.id)).toHaveLength(0);
+    expect((await w.core.getTask(w.gm, task.id)).implementer).toBe(A.id);
+    const [employees] = await w.db.db.query<[unknown[]]>("SELECT id FROM employee WHERE role = 'engineering';");
+    expect(employees).toHaveLength(1);
+  } finally { await w.close(); }
+}, 90000);
+
+run('company fork: fresh successor prefers native Factory and a lost CAS leaves no new author', async () => {
+  const w = await startCompanyFork('fresh-factory');
+  try {
+    await w.wf.upsertDef('fixture-eng', { role: 'engineering', provider: 'codex', model: 'fixture', maxInstances: 3 });
+    await w.wf.upsertDef('fixture-qa', { role: 'qa', provider: 'codex', model: 'fixture', maxInstances: 1 });
+    const task = await w.core.createTask(w.gm, { title: 'fresh successor factory priority', context: 'Synthetic regression only', executorRole: 'engineering', reviewerRole: 'qa', idempotencyKey: 'fresh-factory-create' });
+    await w.tick();
+    const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
+    w.agentRows.get(A.paseoAgentId!)!.status = 'archived';
+    await w.wf.upsertDef('fixture-factory', { role: 'engineering', provider: 'factory-droid', model: 'fixture', maxInstances: 2 });
+    const takeover = w.core.systemImplementerTakeover.bind(w.core);
+    w.core.systemImplementerTakeover = async () => { throw new Error('synthetic stale version'); };
+    const refused = await w.tick();
+    expect(refused.woke.filter(x => x.task === task.id)).toHaveLength(0);
+    expect((await w.core.getTask(w.gm, task.id)).implementer).toBe(A.id);
+    expect((await w.wf.contributors(task.id)).authors).toEqual([A.id]);
+    expect((await w.wf.insts()).filter(i => i.role === 'engineering')).toHaveLength(1);
+    w.core.systemImplementerTakeover = takeover;
+    const recovered = await w.tick();
+    const C = (await w.wf.insts()).find(i => i.provider === 'factory-droid')!;
+    expect(recovered.woke.find(x => x.task === task.id)).toMatchObject({ employee: C.id, spawned: true });
+    expect((await w.core.getTask(w.gm, task.id)).implementer).toBe(C.id);
+  } finally { await w.close(); }
+}, 90000);

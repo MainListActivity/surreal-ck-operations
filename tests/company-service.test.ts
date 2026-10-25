@@ -16,6 +16,7 @@ const SHAS = {
   symlink: '2222222222222222222222222222222222222222',
   nondir: '3333333333333333333333333333333333333333',
   incompatible: '4444444444444444444444444444444444444444',
+  nopolicy: '5555555555555555555555555555555555555555',
 } as const;
 
 type Fixture = {
@@ -53,7 +54,22 @@ const ACCEPTANCE_FILES = {
   'schema/026-acceptance.surql': "DEFINE FIELD IF NOT EXISTS acceptance_criteria ON task TYPE option<array<object>>;\nDEFINE TABLE IF NOT EXISTS acceptance_evidence SCHEMAFULL;\n",
 };
 
-function makeRelease(releases: string, sha: string, withGit = false, capable = true) {
+// SYS06 C1: the effective-policy contract the target guard requires (the judgement, the read layer, the plan/isolation
+// seam and the migration). It shares src/core.ts, src/contracts.ts and src/database.ts with the contracts above, so those
+// markers are appended to the same fixture files — in the release and in the plugin vendor alike.
+const POLICY_FILES = {
+  'src/policy.ts': "export function resolveEffective(rows, chain, epoch, now) { return { hash: 'h', domains: [] }; }\nexport function checkWriteAuthority(contract, input) { return { ok: true }; }\nexport function dispatchVerdict(facts, contract) { return { verdict: 'clear' }; }\n",
+  'src/policy-store.ts': "export async function readEffectiveContract(db, chain, now) { return { contract: { hash: 'h' }, rows: [], epoch: 0 }; }\nexport async function readTaskPolicyRow(db, taskId) { return { id: taskId }; }\n",
+  'src/workforce.ts': "export class Workforce {\n  async policyDispatchVerdict(taskId) { return { verdict: 'clear', hash: taskId }; }\n}\n",
+  'schema/035-effective-policy.surql': 'DEFINE TABLE IF NOT EXISTS policy SCHEMALESS PERMISSIONS NONE;\nDEFINE FIELD IF NOT EXISTS policy_hash ON task TYPE option<string>;\nDEFINE FIELD IF NOT EXISTS lease_policy_hash ON task TYPE option<string>;\nDEFINE FIELD IF NOT EXISTS policy_block_reason ON task TYPE option<string>;\n',
+};
+const POLICY_SHARED = {
+  'src/core.ts': "export class PolicyCore {\n  async policyPlan(credential, input) { return input; }\n  async policyEnforce(credential, input) { return `action: 'policy_blocked' ${input} policy_block_reason`; }\n}\n",
+  'src/contracts.ts': 'export interface PolicyPlanInput { policyId: string }\nexport interface PolicyTaskFacts {\n  policyBlockReason?: string;\n}\n',
+  'src/database.ts': "// loadSchema('035-effective-policy.surql')\n",
+};
+
+function makeRelease(releases: string, sha: string, withGit = false, capable = true, policy = capable) {
   const dir = join(releases, sha);
   mkdirSync(join(dir, 'src', 'mcp'), { recursive: true });
   mkdirSync(join(dir, 'src', 'dispatcher'), { recursive: true });
@@ -61,17 +77,19 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES };
+const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}) };
+    const appends: Array<[string, string]> = [['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
+    if (policy) appends.push(...Object.entries(POLICY_SHARED));
     mkdirSync(join(dir, 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
-    appendFileSync(join(dir, 'src', 'core.ts'), "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n");
+    for (const [path, body] of appends) appendFileSync(join(dir, path), body);
     // The plugin surface runs the same core; its generated vendor must carry both contracts too.
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) {
       writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
     }
-    appendFileSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'core.ts'), "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n");
+    for (const [path, body] of appends) appendFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);
   }
   if (withGit) writeFileSync(join(dir, '.git'), 'gitdir: /tmp/company-service-test\n');
   return dir;
@@ -299,6 +317,31 @@ test('install refuses a target whose code lacks the review-wait contract, before
     expect(result.stderr.toString()).toContain('复核等待');
     expect(result.stderr.toString()).toContain(`target=${old}`);
     expect(result.stderr.toString()).toContain('waiting items=unknown');
+    // No side effect: active still points at the previous release, no plist was written, no release pruned, Paseo untouched.
+    expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
+    expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);
+    expect(existsSync(join(f.releases, SHAS.old))).toBe(true);
+    expect(existsSync(f.paseoLog) ? readFileSync(f.paseoLog, 'utf8').trim() : '').toBe('');
+  } finally {
+    cleanup(f);
+  }
+});
+
+test('install refuses a target whose code lacks the effective-policy contract, before any switch side effect', () => {
+  const f = fixture();
+  try {
+    // SYS06 C1: this target satisfies every other guard (RW06 / SYS02 / IR06) and its release record is valid; only the
+    // policy execution layer is missing. Production data may already carry policy rows, task policy_*/lease_policy_*
+    // registrations and tasks quarantined as blocked+blocked_to=gm, so this is exactly the target that must be refused
+    // before the bin copies, the active symlink, the plugin repoint, the MCP restart or pruning.
+    const noPolicy = makeRelease(f.releases, SHAS.nopolicy, false, true, false);
+    writeGateRecord(f.serviceHome, SHAS.nopolicy);
+    const result = runInstall(f, { SCK_RELEASE_KEEP: '1' }, noPolicy);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain('refused:');
+    expect(result.stderr.toString()).toContain('有效策略执行层');
+    expect(result.stderr.toString()).toContain(`target=${noPolicy}`);
+    expect(result.stderr.toString()).toContain('affected tasks=unknown');
     // No side effect: active still points at the previous release, no plist was written, no release pruned, Paseo untouched.
     expect(activeTarget(f)).toBe(join(f.releases, SHAS.previous));
     expect(existsSync(join(f.home, 'Library', 'LaunchAgents', 'org.surrealck.company-mcp.plist'))).toBe(false);

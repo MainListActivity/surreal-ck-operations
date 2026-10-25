@@ -51,6 +51,13 @@ const LOG_TAIL_ENTRIES = 60;
 const CLAIM_DENY_COOLDOWN_MS = 5 * 60_000;
 /** A failed in-place reload is retried on this interval, not on every poll. */
 const RELOAD_RETRY_SECONDS = 300;
+/** A closed session holding work is resumed on this interval; until CLOSED_GRACE_SECONDS it is unknown, never down. */
+const CLOSED_RELOAD_RETRY_SECONDS = 60;
+const CLOSED_GRACE_SECONDS = 600;
+/** A busy holder past stallMinutes keeps its turn while its timeline tail moved within this window. */
+const ACTIVITY_WINDOW_SECONDS = 20 * 60;
+/** Timeline activity extends a stalled busy holder up to this many stallMinutes without a checkpoint. */
+const STALL_ACTIVITY_CAP = 3;
 /** Two or more consecutive quota failures on a bound implementer, or an unknown reset, is persistent: a manager decision. */
 const PERSISTENT_QUOTA_FAILURES = 2;
 /** Pass-wide capacity gates and unknown state are not evidence that a manager todo is resolved. */
@@ -494,7 +501,7 @@ export interface DispatcherDeps {
   /**
    * System-initiated implementer replacement: hands an execute-phase engineering task to a live engineer when the bound
    * implementer's session is gone for good (the employee left, or the session is archived, quarantined, or parked in a
-   * failure that cannot be restarted). Returns true when the binding moved. Undefined disables the automatic successor:
+   * failure that cannot be restarted, or its repo no longer matches an explicit code-repo rebind). Returns true when the binding moved. Undefined disables the automatic successor:
    * the block then names the manager's takeover instead.
    */
   autoTakeover?: (input: { taskId: string; toEmployee: string; expectedVersion: number; reason: string }) => Promise<boolean>;
@@ -547,6 +554,8 @@ export interface SidecarBridge {
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
 /** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
 interface AssignHooks {
+  /** Durable successor CAS before allocating its lease. */
+  beforeClaim?: (inst: EmployeeInst) => Promise<void>;
   beforeExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn') => Promise<void> | void;
   afterExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn', agentId: string) => Promise<void> | void;
 }
@@ -652,6 +661,10 @@ export class Dispatcher {
   private readonly lastStatus = new Map<string, string>();
   /** agentId → when the last in-place reload was attempted; a failing restart is retried, not hammered. */
   private readonly reloadAt = new Map<string, number>();
+  /** agentId → when a closed session holding work was first seen; bounds how long it reads as unknown. */
+  private readonly closedSince = new Map<string, number>();
+  /** agentId → last timeline tail of a stalled busy holder, when it last changed, and the task it was holding. */
+  private readonly activity = new Map<string, { tail: string; at: number; task: string }>();
   /** agentId → the served model already reported as waiting for its provider: one line per episode, not per tick. */
   private readonly driftWaitLogged = new Map<string, string>();
   /** The last quota-floor line written. A subscription can stay below the floor for days; one line per change, not per tick. */
@@ -903,11 +916,20 @@ export class Dispatcher {
       }
     }
 
+    const pendingTasks = this.deps.sidecar && insts.some(i => !i.paseoAgentId) ? await wf.tasks() : [];
     // 1. Session health.
     const states = new Map<string, InstState>();
     const observedStatus = new Map<string, string>();
+    let openTasks: SupervisedTask[] | undefined;
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
+        // A successor CAS can survive a failed launch or a process restart. Keep its identity
+        // and retry that seat through the ordinary pool, quota and review-capacity gates.
+        if (this.deps.sidecar && inst.repoHome && pendingTasks.some(t => t.implementer === inst.id &&
+          t.executorRole === 'engineering' && (t.repoPath ?? this.deps.env.opsRepo) === inst.repoHome)) {
+          states.set(inst.id, 'idle');
+          continue;
+        }
         if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
       }
@@ -1000,6 +1022,15 @@ export class Dispatcher {
         await this.retireBroken(inst, 'Paseo 会话已归档（正常结束）', defs, report, false, 'archive');
         continue;
       }
+      if (status === 'closed') {
+        openTasks ??= await wf.tasks();
+        const resumed = await this.resumeClosed(inst, openTasks, now, report);
+        if (resumed) {
+          states.set(inst.id, resumed);
+          if (resumed !== 'unknown') { observedStatus.set(inst.id, resumed); this.lastStatus.set(inst.paseoAgentId, resumed); }
+          continue;
+        }
+      } else this.closedSince.delete(inst.paseoAgentId);
       states.set(inst.id, 'down');
       await this.retireBroken(inst, `session ${status}`, defs, report, false);
     }
@@ -1017,9 +1048,11 @@ export class Dispatcher {
       const expired = (task.leaseExpiresAt ?? 0) <= now;
       const stale = task.progressAt !== undefined && now - task.progressAt > cfg.stallMinutes * 60;
       if (state === 'busy') {
-        if (stale) {
+        if (stale && !(now - task.progressAt! <= cfg.stallMinutes * 60 * STALL_ACTIVITY_CAP &&
+          await this.stillWorking(inst!.paseoAgentId!, task, cfg.stallMinutes, now))) {
+          this.activity.delete(inst!.paseoAgentId!);
           await paseo.stop(inst!.paseoAgentId!).catch(() => undefined);
-          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，已中止其会话`, inst, report);
+          await this.revoke(task, `员工 ${inst!.id} 超过 ${cfg.stallMinutes} 分钟没有任何 checkpoint，且会话已 ${ACTIVITY_WINDOW_SECONDS / 60} 分钟无动静或超过 ${cfg.stallMinutes * STALL_ACTIVITY_CAP} 分钟上限，已中止其会话`, inst, report);
         } else if ((task.leaseExpiresAt ?? 0) - now < cfg.extendWithinSeconds &&
           await wf.extendLease(task.id, task.currentEmployee, LEASE_SECONDS)) {
           report.extended.push(task.id);
@@ -1270,11 +1303,13 @@ export class Dispatcher {
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
+    const freshTakeovers = new Map<string, { implementer: string; unavailable: string }>();
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned, reserved,
-        implementer: executeGateFor(executeGates, role, task, excludeSubmitter),
-        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined });
+        implementer: task && role === task.executorRole && !excludeSubmitter && freshTakeovers.has(task.id) ? undefined : executeGateFor(executeGates, role, task, excludeSubmitter),
+        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined })
+        .filter(entry => !task || role !== task.executorRole || excludeSubmitter || !freshTakeovers.has(task.id) || entry.kind === 'spawn');
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
       recusal?: ReviewRecusal, reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, excludeSubmitter, recusal, reserved).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
@@ -1285,11 +1320,19 @@ export class Dispatcher {
     /**
      * A bound implementer is struck when its session cannot take the task back: the employee is no longer live, or this
      * pass observed the session as down — archived, quarantined, or parked in a failure that cannot be restarted. Busy,
-     * idle, exhausted and unknown are not struck: those recover on their own.
+     * idle, exhausted and unknown are not struck unless an explicit code-repo rebind has left
+     * that session outside the task's repository: waiting cannot move a repository-bound session.
      */
-    const struckImplementer = (employeeId: string): boolean => {
+    const implementerUnavailableReason = (employeeId: string, task: SupervisedTask, home: string): string | undefined => {
       const inst = insts.find(i => i.id === employeeId);
-      return !inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled));
+      if (!inst || states.get(inst.id) === 'down' || (!!inst.def && !defs.some(d => d.id === inst.def && d.enabled)))
+        return '员工退役/撤凭证，或会话归档、无法就地重启';
+      // A manager's explicit code-repo correction changes the task's dispatch home, not the
+      // existing session's home. That session is permanently outside this task's legal pool.
+      // Do not loosen cross-repo admission or infer a correction from a project change alone.
+      if (task.codeRepoPath === home && (inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo) !== home)
+        return `任务代码仓已显式改绑为 ${home}，原实现人会话仍属于 ${inst.repoHome ?? inst.cwd ?? this.deps.env.opsRepo}`;
+      return undefined;
     };
     /**
      * The binding outlives the employee: a struck implementer can never take its task back, and the execute gate keeps
@@ -1310,7 +1353,8 @@ export class Dispatcher {
     };
     const replaceStruckImplementer = async (task: SupervisedTask, home: string): Promise<boolean> => {
       const implementer = boundImplementer(task);
-      if (!implementer || !struckImplementer(implementer)) return false;
+      const unavailable = implementer && implementerUnavailableReason(implementer, task, home);
+      if (!implementer || !unavailable) return false;
       const takeover = this.deps.autoTakeover;
       if (takeover) {
         let facts;
@@ -1323,12 +1367,13 @@ export class Dispatcher {
         }
         // The successor is a live engineer of the same repo that is neither an author nor the struck implementer.
         const excluded = new Set<string>([...facts.excluded, implementer]);
-        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned })
+        const successor = factoryFirst(staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, implementer: undefined, assigned,
+          independence: independence.get(`execute:${task.id}`) })
           .filter(entry => entry.kind === 'reuse' && entry.eligible && !excluded.has(entry.key))
           .sort((a,b)=>a.key.localeCompare(b.key)))[0]?.key;
         if (successor) {
           const moved = await takeover({ taskId: task.id, toEmployee: successor, expectedVersion: task.version,
-            reason: `自动接替：原实现人 ${implementer} 已不可用（员工退役/撤凭证，或会话归档、无法就地重启），系统把代码交给在岗工程员工` })
+            reason: `自动接替：原实现人 ${implementer} 已不可用（${unavailable}），系统把代码交给同仓在岗工程员工` })
             .catch(error => { this.log(`auto takeover of ${task.id} failed: ${(error as Error).message}`); return false; });
           if (moved) {
             report.decisions.push(`auto-takeover:${task.id}=${successor}`);
@@ -1336,6 +1381,14 @@ export class Dispatcher {
             await this.clearBlocked(task, 'execute');
             return true;
           }
+        }
+        // With no reusable successor, open only the fresh-seat part of the normal execute pool.
+        // Scope, concurrency, independence and future review reservations still run below.
+        const fresh = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, assigned,
+          independence: independence.get(`execute:${task.id}`) });
+        if (this.deps.sidecar && fresh.some(entry => entry.kind === 'spawn' && entry.eligible)) {
+          freshTakeovers.set(task.id, { implementer, unavailable });
+          return false;
         }
       }
       await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
@@ -1491,7 +1544,19 @@ export class Dispatcher {
       this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal, undefined, freshTakeovers.has(item.task.id) ? {
+          beforeClaim: async inst => {
+            const previous = freshTakeovers.get(item.task.id)!;
+            const moved = await this.deps.autoTakeover!({ taskId: item.task.id, toEmployee: inst.id,
+              expectedVersion: item.task.version,
+              reason: `自动接替：原实现人 ${previous.implementer} 已不可用（${previous.unavailable}），创建同仓新工程实例接续` });
+            if (!moved) throw new Error('fresh successor takeover lost its task version');
+            item.task.implementer = inst.id;
+            item.task.version++;
+            executeGates.set(item.task.id, { implementer: inst.id, unresolved: false });
+            report.decisions.push(`auto-takeover:${item.task.id}=${inst.id}`);
+          },
+        } : undefined);
       if (!result) {
         if (this.scopeDenied.delete(item.task.id)) {
           // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
@@ -2251,14 +2316,16 @@ export class Dispatcher {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
     }
-    const defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
+    let defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
     const candidate = pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
     // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
     // reuse or spawn candidate (quota, health, capacity, recusal), ordinary fallback takes over.
     const picked = candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
-    const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
+    const pending = sidecar && picked && !picked.paseoAgentId ? picked : undefined;
+    if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled);
+    const existing = picked?.paseoAgentId && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
     if (existing) {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
@@ -2319,11 +2386,13 @@ export class Dispatcher {
       if (!model) continue;
       // No seat is created for a task whose write scope is held: the preflight comes before the spawn.
       if (sidecar && task && await this.scopeBlocked(task)) { this.scopeDenied.add(task.id); return undefined; }
-      const inst = await wf.spawnInst(def);
-      const spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
+      const inst = pending ?? await wf.spawnInst(def, task?.repoPath ?? anchor?.home ?? env.opsRepo);
+      let spawnEnv: Record<string, string>;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
       try {
+        await hooks?.beforeClaim?.(inst);
+        spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
         claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
@@ -2364,7 +2433,8 @@ export class Dispatcher {
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model };
-        insts.push(bound);
+        const prior = insts.findIndex(row => row.id === inst.id);
+        if (prior >= 0) insts[prior] = bound; else insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
         await wf.touchWake(inst.id);
@@ -2381,9 +2451,14 @@ export class Dispatcher {
         if (EXHAUSTED_PATTERN.test(message)) {
           await wf.markExhausted(def.provider, message);
           if (!report.exhausted.includes(def.provider)) report.exhausted.push(def.provider);
-        } else {
+        } else if (task?.implementer !== inst.id) {
           await this.countDefFailure(def, report);
         }
+        // A bound, unlaunched successor retries through the ordinary tick instead of disabling
+        // its whole definition after repeated infrastructure failures. Quota still cools down above.
+        // The CAS already made this seat the implementer. Retry it next pass rather
+        // than creating more authors or attempting another definition under that binding.
+        if (task?.implementer === inst.id) return undefined;
       }
     }
     return undefined;
@@ -2394,6 +2469,65 @@ export class Dispatcher {
     if (!this.deps.hostResources) return undefined;
     try { return this.deps.hostResources(); }
     catch (error) { this.log(`host resources read failed: ${(error as Error).message}`); return undefined; }
+  }
+
+  /**
+   * A Paseo daemon restart leaves every session `closed`: the process is gone, the conversation is not, and
+   * `agent reload` brings it back from persistence. Read as down, a closed implementer is struck and its code is
+   * handed to another seat that is just as closed. A closed session that holds a lease or is bound to ready/doing
+   * work is resumed in place instead; a lease holder is told to continue, since its interrupted turn will not. A
+   * session with no work keeps the retirement path, so one restart does not relaunch every idle seat at once.
+   * While resuming fails it stays unknown — not struck, not dispatched — for CLOSED_GRACE_SECONDS.
+   */
+  private async resumeClosed(inst: EmployeeInst, tasks: SupervisedTask[], now: number, report: TickReport): Promise<InstState | undefined> {
+    const agent = inst.paseoAgentId!;
+    const holding = tasks.find(t => t.currentEmployee === inst.id);
+    if (!holding && !tasks.some(t => t.implementer === inst.id && (t.state === 'ready' || t.state === 'doing'))) {
+      this.closedSince.delete(agent);
+      return undefined;
+    }
+    const since = this.closedSince.get(agent) ?? now;
+    this.closedSince.set(agent, since);
+    if (now - (this.reloadAt.get(agent) ?? 0) >= CLOSED_RELOAD_RETRY_SECONDS) {
+      this.reloadAt.set(agent, now);
+      try {
+        await this.deps.paseo.reload(agent);
+        this.closedSince.delete(agent);
+        (report.recovered ??= []).push(inst.id);
+        this.log(`recovered ${inst.id}: closed session resumed in place${holding ? ` holding ${holding.id}` : ''}`);
+        if (!holding) return 'idle';
+        try {
+          await this.deps.paseo.send(agent, `【系统】公司服务重启打断了你上一轮的工作。任务 ${holding.id}「${holding.title}」的租约仍在你名下（见 claim.json），从中断处继续执行；收尾规则不变：完成写 report.md，受阻写 blocker.md。`);
+          return 'busy';
+        } catch (error) {
+          this.log(`resume prompt to ${inst.id} failed: ${(error as Error).message}`);
+          return 'idle';
+        }
+      } catch (error) {
+        this.log(`resume closed ${inst.id} failed: ${(error as Error).message}`);
+      }
+    }
+    return now - since < CLOSED_GRACE_SECONDS ? 'unknown' : undefined;
+  }
+
+  /**
+   * progress_at moves only on checkpoint, so a long build or test run looks exactly like a hung turn. A busy holder
+   * past stallMinutes keeps its turn while its timeline tail keeps changing; one whose tail stood still for
+   * ACTIVITY_WINDOW_SECONDS is hung. The first stalled sighting of a task also asks the employee for a checkpoint.
+   */
+  private async stillWorking(agent: string, task: SupervisedTask, stallMinutes: number, now: number): Promise<boolean> {
+    const tail = await this.deps.paseo.logsTail(agent, 20).catch(() => undefined);
+    if (tail === undefined) return false;
+    const seen = this.activity.get(agent);
+    if (!seen || seen.task !== task.id) {
+      this.activity.set(agent, { tail, at: now, task: task.id });
+      await this.deps.paseo.send(agent, `【系统】任务 ${task.id} 已超过 ${stallMinutes} 分钟没有 checkpoint。到下一个可记录的节点就调用 checkpoint 写明进展；会话持续无动静将被中止并收回任务。`)
+        .catch(error => this.log(`checkpoint reminder to ${agent} failed: ${(error as Error).message}`));
+      this.log(`stalled ${task.id}: busy holder still observed, checkpoint requested`);
+      return true;
+    }
+    if (seen.tail !== tail) this.activity.set(agent, { tail, at: now, task: task.id });
+    return now - this.activity.get(agent)!.at < ACTIVITY_WINDOW_SECONDS;
   }
 
   private async revoke(task: SupervisedTask, reason: string, inst: EmployeeInst | undefined, report: TickReport, trigger: 'revoke' | 'expire' = 'revoke') {

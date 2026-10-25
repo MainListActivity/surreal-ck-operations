@@ -97,10 +97,10 @@ function fixture(){
  const deps={db:db as any,jev,groups:()=>groups,facts:async(ids:string[])=>{factsCalls++;return ids.map(fact);},apply:async(x:any)=>{applied.push(x);}};
  return {db,deps,writes,calls,applied,factsCalls:()=>factsCalls};
 }
-test('request refresh is asynchronous, single-flight, interval-controlled and excludes Fable',async()=>{
+test('request refresh is asynchronous, single-flight, interval-controlled and excludes Fable and Opus',async()=>{
  const f=fixture();const r=new RankingRefresher(f.deps);
  r.trigger(0);r.trigger(0);expect(f.calls).toEqual([]);await r.settled();
- expect(f.calls).toEqual(['group/sck-opus','group/sck-sonnet','group/sck-haiku']);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
+ expect(f.calls).toEqual(['group/sck-sonnet','group/sck-haiku']);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
  r.trigger(299999);await r.settled();expect(f.applied).toHaveLength(1);
  r.trigger(300000);await r.settled();expect(f.applied).toHaveLength(2);
  await saveRankingSettings(f.db as any,{rules:'质量优先',refreshMinutes:2},r);
@@ -180,7 +180,8 @@ test('request snapshot exactly matches the serialized body and is available befo
   throw Error('upstream unavailable');
  }},'opus','速度优先',facts,async payload=>{snapshot=structuredClone(payload);})).rejects.toThrow('upstream unavailable');
  expect(snapshot.state.ownerRules).toBe('速度优先');
- expect(snapshot.questions.m0.criteria).toEqual(['最后考虑','靠后','中等','靠前','首选']);
+ expect(snapshot.questions.m0.instructions).toContain('state.ownerRules');
+ expect(snapshot.questions.m0.criteria[0]).toContain('排最后');
 });
 
 test('unavailable live usage cancels the refresh before any Jev call or ranking publication',async()=>{
@@ -211,8 +212,8 @@ test('refresh persists successful snapshots with orders, excludes failed groups 
  f.deps.jev.ask=async(state:any,q:any)=>{if(state.group==='group/sck-sonnet')throw Error('down');return response(q);};
  const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
  const publication=f.writes.find(w=>w?.results);
- expect(Object.keys(publication.results)).toEqual(['sck-opus','sck-haiku']);
- expect(publication.orders['sck-opus']).toEqual(publication.results['sck-opus'].rows.map((row:any)=>row.facts.id));
+ expect(Object.keys(publication.results)).toEqual(['sck-haiku']);
+ expect(publication.orders['sck-haiku']).toEqual(publication.results['sck-haiku'].rows.map((row:any)=>row.facts.id));
  expect(publication.results['sck-haiku'].rows[0].score).toBe(0);
 });
 
@@ -257,8 +258,8 @@ test('pins exclude exact effort IDs from Jev, persist immediately, and serialize
 test('pin invalidates an in-flight Jev result before publishing the manual order',async()=>{
  const f=fixture();let entered!:()=>void,release!:()=>void;const started=new Promise<void>(r=>entered=r),wait=new Promise<void>(r=>release=r);
  const r=new RankingRefresher({...f.deps,jev:{model:'fixture',ask:async(_s:any,q:any)=>{entered();await wait;return response(q);}}});
- r.trigger();await started;const pin=r.setPin('sck-opus','p/a',true);release();await pin;
- expect(f.applied).toEqual([{'sck-opus':['p/a','p/b']}]);
+ r.trigger();await started;const pin=r.setPin('sck-sonnet','p/a',true);release();await pin;
+ expect(f.applied).toEqual([{'sck-sonnet':['p/a']}]);
 });
 
 test('controller refresh enforces persisted pins ahead of cached Jev orders without adding absent members',async()=>{
@@ -274,4 +275,75 @@ test('pinned rows keep observed metrics outside Jev scores and never borrow anot
  const result={tier:'haiku' as const,at:'2026-10-24T12:00:00Z',model:'fixture',rules:'speed',rows:[{facts:fact('p/b'),score:3}],answers:{},pinnedFacts:[{...fact('p/a:max'),aa:{rank:2,score:45},usage:{source:'magpie' as const,period:'7d' as const,collectedAt:'now',scope:'provider-model' as const,requests:10,errors:0,speedSamples:10,ttftSamples:10,tokensPerSecond:100}}]};
  const rows=rankingTables({'sck-haiku':['p/a:max','p/a:high','p/b']},{'sck-haiku':result},[],{'sck-haiku':['p/a:max']})[0]!.rows;
  expect(rows[0]).toMatchObject({pinned:true,aaScore:45,tokensPerSecond:100});expect(rows[0]!.jevScore).toBeUndefined();expect(rows[1]!.aaScore).toBeUndefined();expect(rows[2]!.jevScore).toBe(3);
+});
+
+test('owner rules are explicit in each independent question and concrete priority criteria',async()=>{
+ const rules='智能程度和速度综合优先，首token延迟超过10s的排在最后';
+ await jevOrder({model:'fixture',ask:async(state:any,questions:any)=>{
+  expect(state.ownerRules).toBe(rules);
+  for(const [key,q] of Object.entries(questions) as any){
+   expect(q.instructions).toContain('state.ownerRules');
+   expect(q.instructions).toContain('命中时必须选0级');
+   expect(q.instructions).toContain(`state.models.${key}`);
+   expect(state.rankingPolicy.instructions).toContain('不能抵消');
+   expect(q.criteria[0]).toContain('排最后');
+   for(const level of q.criteria.slice(1))expect(level).toContain('未触发');
+   expect(state.rankingPolicy.levels).toHaveLength(5);
+  }
+  return response(questions);
+ }},'haiku',rules,[fact('p/slow'),fact('p/fast')]);
+});
+
+test('automatic ranking neither reads facts nor sends Jev questions or applies orders for manual Opus',async()=>{
+ const f=fixture();const requested:string[][]=[];
+ f.deps.groups=()=>({'sck-opus':['owner/manual:high'],'sck-sonnet':['p/a'],'sck-haiku':['p/b'],'sck-fable':['owner/z']});
+ f.deps.facts=async ids=>{requested.push(ids);return ids.map(fact);};
+ const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
+ expect(requested).toEqual([['p/a','p/b']]);
+ expect(f.calls).toEqual(['group/sck-sonnet','group/sck-haiku']);
+ expect(f.applied[0]['sck-opus']).toBeUndefined();
+ await expect(r.setPin('sck-opus','owner/manual:high',true)).rejects.toThrow();
+ expect(rankingTables({'sck-opus':['owner/manual:high']},{},[],{'sck-opus':['owner/manual:high']})).toEqual([]);
+});
+
+test('Jev failure preserves successful scores while independent safety observations demote and recover members',async()=>{
+ let results:Record<string,any>={},gates:Record<string,any>={};let fail=false,bad=false;
+ let members=['p/a','p/b'];
+ const db={query:async(sql:string,v?:any)=>{
+  if(sql.startsWith('SELECT pins'))return [{}];if(sql.startsWith('SELECT ranking_rules'))return [{}];
+  if(v?.results){Object.assign(results,v.results);Object.assign(gates,v.gates);}
+  return [undefined];
+ }};
+ const r=new RankingRefresher({db:db as any,groups:()=>({'sck-haiku':members}),facts:async()=>members.map(id=>({...fact(id),...(id==='p/a'&&bad?{health:{source:'magpie-routing' as const,excluded:true,reason:'unavailable' as const,attempts:1,errors:1,consecutiveErrors:1,lastStatus:403}}:{})})),
+  apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
+ r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
+ fail=true;bad=true;r.trigger(300000);await r.settled();
+ expect(results['sck-haiku']).toEqual(success);expect(members.at(-1)).toBe('p/a');
+ let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
+ expect(t.scored).toBe(true);expect(t.at).toBe(success.at);expect(t.rows.find(r=>r.model==='p/b')?.jevScore).toBe(1);
+ expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);
+ bad=false;r.trigger(600000);await r.settled();
+ t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
+ expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).not.toBe(true);expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBe(0);
+});
+
+
+test('compact questions keep the actual average latency directly readable without repeating owner rules',async()=>{
+ const rules='智能程度和速度综合优先，首token延迟超过10s的排在最后';
+ const slow={...fact('p/slow'),usage:usageStats(nativeUsage([{...channel('p','slow',1000,12000),ttft_ms:96000}])).get('p/slow')!};
+ await jevOrder({model:'fixture',ask:async(s:any,q:any)=>{expect(s.ownerRules).toBe(rules);expect(q.m0.instructions).toContain('12秒');expect(q.m0.instructions).toContain('命中时必须选0级');expect(q.m0.instructions).not.toContain(rules);return response(q);}},'haiku',rules,[slow]);
+});
+
+test('explicit numeric TTFT tail constraints beat probabilistic scores without rewriting them or excluding unknowns',async()=>{
+ const {ttftTailThreshold}=await import('../src/model-routing/ranking.ts');
+ expect(ttftTailThreshold('智能优先，首token延迟超过10s的排在最后')).toBe(10000);
+ expect(ttftTailThreshold('TTFT > 1500 ms 排末尾')).toBe(1500);
+ expect(ttftTailThreshold('token速率未知的排前面，智能程度和速度综合优先，首token延迟超过10s的排在最后')).toBe(10000);
+ for(const r of ['速度优先','不要首token延迟超过10s的排在最后','首token延迟超过10s的排在最后，但免费除外','首token延迟超过10s的排在最后，免费模型不受此限制','TTFT > 10s 排末尾; except free models','首token延迟超过10s的排在最后，仅付费模型适用','首token延迟超过10s的排在最后，首token延迟超过20s的排在最后'])expect(ttftTailThreshold(r)).toBeUndefined();
+ const usage=usageStats(nativeUsage([channel('p','slow',100,1000)])).get('p/slow')!;
+ const facts=[{...fact('p/slow'),usage:{...usage,ttftMs:11643}},fact('p/unknown'),{...fact('p/boundary'),usage:{...usage,ttftMs:10000}}];let snapshot:any;
+ const order=await jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{m0:{type:'score',score:4},m1:{type:'score',score:.57},m2:{type:'score',score:.2}}})},'haiku','首token延迟超过10s的排在最后',facts,undefined,s=>{snapshot=s;});
+ expect(order).toEqual(['p/unknown','p/boundary','p/slow']);expect(snapshot.rows.at(-1).score).toBe(4);
+ const t=rankingTables({'sck-haiku':order},{'sck-haiku':snapshot})[0]!;
+ expect(t.rows.at(-1)?.tailReason).toContain('11.643 秒 > 10 秒');expect(t.rows[0]?.tailReason).toBeUndefined();expect(t.rows[1]?.tailReason).toBeUndefined();
 });

@@ -783,7 +783,8 @@ select {
   }
 
   .metrics small {
-    display: none;
+    display: block;
+    overflow-wrap: anywhere;
   }
 }
 

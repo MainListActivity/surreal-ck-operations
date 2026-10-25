@@ -1,3 +1,4 @@
+import { rankingHealthMetric, rankingTrendDetail } from "../shared/ranking-trends.ts";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1178,7 +1179,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
       <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>置顶模型固定在前且不参与 JEV 评分，其余按 JEV 分数排序。</Text>}
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>置顶模型固定在前；其余先执行明确末尾条件，再按 JEV 分数排序。</Text>}
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
@@ -1188,12 +1189,14 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
       const open=expanded===row.model;
       const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
       const metrics=[
-        {label:"AA 智能分",value:number(row.aaScore),detail:row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`},
-        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:"近 7 天实测"},
-        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:"近 7 天平均"},
-        {label:"剩余额度",value:quota,detail:"订阅最紧窗口"},
-        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:row.stabilitySamples===undefined?"暂无样本":`近 7 天 ${row.stabilitySamples} 次请求`},
-        {label:"样本权重",value:number(row.performanceSamples,2),detail:row.performanceScore===undefined?"绩效未知":`历史绩效 ${number(row.performanceScore,2)} / 5`},
+        {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
+        {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
+        {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
+        {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
+        {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
+        {label:"路由尝试",...rankingHealthMetric(row.health)},
+        {label:"缓存命中率",value:row.trends?.cacheHitRate?.current===undefined?"未知":`${number(row.trends.cacheHitRate.current*100)}%`,detail:rankingTrendDetail(row.trends?.cacheHitRate)},
+        {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
       ];
       const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
       return <View key={row.model} style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
@@ -1208,7 +1211,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
           <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>JEV</Text>
-            <Text accessibilityLabel={row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
+            <Text accessibilityLabel={row.health?.excluded?"持续报错，已移到末尾，不参与 JEV 评分":row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.health?.excluded?"持续报错":row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
           onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>
@@ -1218,7 +1221,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           <Text selectable numberOfLines={1} style={{color:c.foregroundMuted,fontSize:mobile?8:9,lineHeight:14,fontFamily:"Menlo",backgroundColor:c.path,borderRadius:8,paddingHorizontal:mobile?7:9,paddingVertical:mobile?5:7,marginVertical:mobile?9:12}}>{row.model}</Text>
           <View style={{flexDirection:"row",flexWrap:"wrap",gap:mobile?7:8}}>{metrics.map(metric=><View key={metric.label} style={{flexBasis:wide?"14%":"28%",flexGrow:1,minWidth:0,gap:2,borderLeftWidth:1,borderColor:c.border,paddingLeft:mobile?8:10}}>
             <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.label}</Text><Text selectable style={[s.text,{fontSize:mobile?11:12,fontWeight:"700"}]}>{metric.value}</Text>
-            {!mobile&&<Text style={[s.muted,{fontSize:9}]}>{metric.detail}</Text>}
+            <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.detail}</Text>
           </View>)}</View>
           {mobile&&row.performanceScore!==undefined&&<Text style={[s.muted,{fontSize:9,marginTop:7}]}>历史绩效 {number(row.performanceScore,2)} / 5</Text>}
         </View>}
@@ -1250,7 +1253,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <View style={[s.row,{justifyContent:"space-between",alignItems:"flex-end"}]}><View style={{flex:1,maxWidth:600}}>
         <Text style={{color:c.accent,fontSize:11,fontWeight:"800",letterSpacing:1.8,marginBottom:12}}>ROUTING CONSOLE</Text>
         <Text style={{color:c.foreground,fontSize:mobile?38:58,lineHeight:mobile?42:62,fontWeight:"700",letterSpacing:-1.8,marginBottom:16}}>模型排序</Text>
-        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>为不同模型组配置路由优先级，系统会综合能力、速度与可用额度自动选择最佳模型。</Text>
+        <Text style={[s.muted,{fontSize:mobile?12:14,lineHeight:24}]}>Haiku、Sonnet 按规则自动排序；Opus 的成员、顺序和组内配置由你在 Magpie 手动维护。</Text>
       </View>{!mobile&&<View style={[s.row,{borderWidth:1,borderColor:c.border,borderRadius:14,paddingVertical:12,paddingHorizontal:15}]}><View style={{width:7,height:7,borderRadius:4,backgroundColor:failed?c.statusWarning:c.statusSuccess}}/><View><Text style={[s.text,{fontSize:12,fontWeight:"700"}]}>{failed?"同步异常":unconfigured?"尚未配置":query.data?"运行正常":"正在加载"}</Text><Text style={s.muted}>{query.data?.at?new Date(query.data.at).toLocaleString():"等待同步"}</Text></View></View>}</View>
     </View>
     <View style={{flexDirection:wide?"row":"column",gap:18,alignItems:"flex-start"}}>
@@ -1270,6 +1273,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <View style={[s.panel,{flex:wide?1:undefined,width:wide?undefined:"100%",minWidth:0}]}>
         <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle="依据当前规则生成的实时排序"/>
         <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
+        {!!selected&&!!query.data?.attempts?.[selected.group]&&<Text style={[s.muted,{marginBottom:10,fontSize:10}]}>{(()=>{const a=query.data!.attempts[selected.group]!;return `最近刷新尝试：${new Date(a.at).toLocaleString()} · ${a.status} · ${a.modelCount} 个评分模型 · ${a.encoding} · 共享 ${a.stateBytes}/${a.limits.stateBytes} 字节 · 请求 ${a.requestBytes}/${a.limits.requestBytes} 字节`;})()}</Text>}
         {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，不再发送给 JEV 排序。":"已取消置顶，下次刷新参与 JEV 排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
         {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
         {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功评分":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}

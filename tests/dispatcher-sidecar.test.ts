@@ -338,14 +338,72 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.retired).not.toContain(inst.id);
     expect(w.events.filter(e => e === `claim:${inst.id}:parked`).length).toBeGreaterThan(1);
   });
-  test('a busy holder past stallMinutes is still stopped and revoked', async () => {
+  test('a busy holder past stallMinutes is asked for a checkpoint, then stopped once its timeline stands still', async () => {
     const w = world(); w.addTask('stuck'); const d = w.dispatcher(); await d.tick();
     const inst = w.instances[0]!;
     w.rows[0]!.progressAt = 1000;
     w.setNow(1000 + 91 * 60);
     await d.tick();
+    expect(w.events).toContain(`send:${inst.paseoAgentId}`);
+    expect(w.events).not.toContain(`stop:${inst.paseoAgentId}`);
+    w.setNow(1000 + 112 * 60);
+    await d.tick();
     expect(w.events).toContain(`stop:${inst.paseoAgentId}`);
     expect(w.events).toContain('revoke:stuck');
+  });
+  test('a busy holder whose timeline keeps moving survives the stall window up to its cap', async () => {
+    const w = world(); w.addTask('long-build'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!;
+    let line = 0;
+    w.paseo.logsTail = async () => `tool call ${++line}`;
+    w.rows[0]!.progressAt = 1000;
+    for (const minute of [91, 120, 180, 260]) {
+      w.setNow(1000 + minute * 60);
+      await d.tick();
+    }
+    expect(w.events).not.toContain(`stop:${inst.paseoAgentId}`);
+    expect(w.views.get('long-build')!.currentEmployee).toBe(inst.id);
+    w.setNow(1000 + 271 * 60);
+    await d.tick();
+    expect(w.events).toContain(`stop:${inst.paseoAgentId}`);
+    expect(w.events).toContain('revoke:long-build');
+  });
+  test('a closed session holding a lease is resumed in place and told to continue', async () => {
+    const w = world(); w.addTask('interrupted'); const d = w.dispatcher(); await d.tick();
+    const inst = w.instances[0]!, agent = inst.paseoAgentId!;
+    w.agents.get(agent)!.status = 'closed';
+    const sends = w.events.filter(e => e === `send:${agent}`).length;
+    const r = await d.tick();
+    expect(w.events).toContain(`reload:${agent}`);
+    expect(w.events.filter(e => e === `send:${agent}`).length).toBe(sends + 1);
+    expect(r.retired).not.toContain(inst.id);
+    expect(r.revoked).toHaveLength(0);
+    expect(w.views.get('interrupted')!.currentEmployee).toBe(inst.id);
+  });
+  test('a closed bound implementer that cannot resume stays unknown through the grace, then reads as down', async () => {
+    const w = world(); w.addTask('bound');
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'closed' });
+    w.rows[0]!.implementer = inst.id;
+    w.paseo.reload = async id => { w.events.push(`reload-failed:${id}`); throw new Error('synthetic resume failure'); };
+    const d = w.dispatcher();
+    await d.tick();
+    expect(w.events).toContain('reload-failed:agent-9');
+    expect(w.events.some(e => e.startsWith('retire:employee-9'))).toBe(false);
+    expect(d.sessionSnapshot().sessions.get('employee-9')?.state).toBe('unknown');
+    w.setNow(1000 + 11 * 60);
+    await d.tick();
+    expect(d.sessionSnapshot().sessions.get('employee-9')?.state).toBe('down');
+  });
+  test('a closed session with no work keeps the retirement path', async () => {
+    const w = world();
+    const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
+    w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
+    w.agents.set('agent-9', { id: 'agent-9', status: 'closed' });
+    const r = await w.dispatcher().tick();
+    expect(w.events).not.toContain('reload:agent-9');
+    expect(r.retired).toContain('employee-9');
   });
   test('host below the free floors pauses all dispatch until water returns', async () => {
     const w = world(); w.addTask('queued');

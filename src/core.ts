@@ -22,7 +22,7 @@ import {
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
-import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
+import type { PolicyEffectiveInput, PolicyEffectiveView, PolicyEnforceInput, PolicyEnforceView, PolicyListInput, PolicyPlanInput, PolicyPlanPage, PolicyPlanView, PolicyRevoke, PolicySet, PolicyView, ReviewerRole as PolicyReviewerRole } from './contracts.ts';
 import type { AdminSummary, CompanyPart, ContextView, HistoryPageView, PageInfo, ReferencesCut, TaskTextSegment, WorktreePageView, WorktreeRefsSegment } from './contracts.ts';
 import type { QaObservationAuth, QaObservationGrant, QaObservationLoginView, QaObservationMeta, QaObservationReadInput, QaObservationReadView, QaObservationRevoke, QaObservationScopeView, QaObservationSessionView, QaObservationTextSegment, QaObservationTimelineView } from './contracts.ts';
 import { CLEANUP_BUDGET_MS, SnapshotStore, type SnapshotBuildStats, type SnapshotHeader, type SnapshotKind, type SnapshotLimits, untilAt } from './snapshot-store.ts';
@@ -35,7 +35,7 @@ import {
   dispatchVerdict, domainOfPayload, domainPayload, normalizePayload, policyActiveAt, policyHash, renderContract, resolveEffective,
   checkToolScope, policyView as policyApiView, type EffectiveContract, type PolicyDomain, type PolicyRow, type PolicyScope, type PolicyScopeLink, type PolicyStatus, type PolicyVerdict,
 } from './policy.ts';
-import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, type PolicyDbRow } from './policy-store.ts';
+import { chainOfTaskRow, policyRowView, policyScopeChain, readEffectiveContract, readPolicyEpoch, readPolicyRows, readTaskPolicyRow, registeredDomainsOf, scanInFlightTasks, type PolicyDbRow } from './policy-store.ts';
 import { FaultStore, type FaultReportResult, type FaultReserveResult } from './fault-store.ts';
 import {
   DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
@@ -460,6 +460,8 @@ interface IndependenceGate {
  */
 const COMPLETE_TASK_ROWS = 500;
 const COMPLETE_HISTORY_ROWS = 1000;
+/** How long a policy_plan cursor stays valid (SYS06 R1(b)): long enough to walk the pages of one plan, short enough that a stale plan is rerun. */
+const POLICY_PLAN_CURSOR_TTL_MS = 30 * 60_000;
 /**
  * A claim reads at most this many of its task's newest protocol entries and newest ops entries for the handover (SYS01 R3).
  * The whole history is counted, so a claim that read less says so: historyComplete is false and historyCount is the total.
@@ -4057,6 +4059,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   /** 变更试算：算出差量与受影响任务，写任何东西之前先给人看（只读）。 */
   async policyPlan(credential: Credential, input: PolicyPlanInput): Promise<PolicyPlanView> {
     const actor = await this.authorized(credential, 'manage');
+    const plan = await this.computePolicyPlan(actor, input);
+    return this.pagePolicyPlan(actor, input, plan);
+  }
+
+  /**
+   * 试算的纯计算部分（只读、无分页）：契约 before/after、候选集扫描、全量受影响清单与 planHash。
+   * policy_plan 的分页只是把这份全量清单裁成一页；planHash 始终覆盖全量，供翻页光标绑定与人工核对。
+   * 它不是执行侧的 CAS：policy_enforce 不读 planHash，而是对每个点名任务按当时的有效契约重新判定。
+   */
+  private async computePolicyPlan(actor: Principal, input: PolicyPlanInput): Promise<Omit<PolicyPlanView, 'affectedTasks' | 'page'> & {
+    affectedTasks: PolicyPlanView['affectedTasks']; scopeChain: PolicyPlanView['scopeChain'];
+  }> {
     const { chain, target } = await this.validatePolicyProposal(actor, input);
     const payload = normalizePayload(input.payload);
     const domain = domainOfPayload(payload);
@@ -4074,12 +4088,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     };
     const projected = rows.map(row => row.id === target?.id ? { ...row, status: 'superseded' as PolicyStatus, supersededBy: synthetic.id } : row);
     const after = resolveEffective([...projected, synthetic], chain, epoch + 1, now);
-    const [candidates] = await this.db.query<[Array<TaskRow & { goal_project?: RecordId }>]>(
-      `SELECT *, goal.project AS goal_project
-       FROM task WHERE state NOT IN ['done', 'void'] AND policy_hash != NONE
-       ORDER BY created_at DESC LIMIT 200;`);
+    // 候选集与派工/领取判定同源（R1）：判定侧对所有在办任务跑 dispatchVerdict，这里就不能按 policy_hash 预筛——
+    // 上线前既存、没有策略登记的任务正是最需要被列出来的那批。分页读到底，读满上限时在视图里显式报告截断。
+    const scan = await scanInFlightTasks<TaskRow & { goal_project?: RecordId }>(this.db);
     const affectedTasks: PolicyPlanView['affectedTasks'] = [];
-    for (const row of candidates ?? []) {
+    for (const row of scan.rows) {
       const task = view(row);
       const taskChain = this.chainOfRow(row);
       const next = resolveEffective([...projected, synthetic], taskChain, epoch + 1, now);
@@ -4097,7 +4110,55 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     const diff = contractDiff(before, after);
     const planHash = HASH(JSON.stringify({ epoch, after: after.hash, affected: affectedTasks.map(t => `${t.id}:${t.toHash}`).sort() }));
-    return { scopeChain: chain, before, after, diff, affectedTasks, planHash };
+    return { scopeChain: chain, before, after, diff, affectedTasks, scanned: scan.scanned, scanLimit: scan.scanLimit,
+      truncated: scan.truncated, planHash };
+  }
+
+  /**
+   * 把全量试算裁成一页（SYS06 R1(b)）：受影响清单永远在 48 KiB 预算内返回，装不下就分页而不是整份拒绝。
+   * 光标绑定调用者与同一份试算（planHash），所以翻页期间提案或 epoch 一旦变化就拒绝，不会把两版清单拼在一起。
+   * 页面按真实序列化大小（answerBytes）裁，不按条数猜。
+   */
+  private async pagePolicyPlan(actor: Principal, input: Pick<PolicyPlanInput, 'pageSize' | 'cursor'>,
+    plan: Awaited<ReturnType<SurrealCompanyCore['computePolicyPlan']>>): Promise<PolicyPlanView> {
+    const all = plan.affectedTasks;
+    const defaultPage = 40;
+    const pageSize = input.pageSize === undefined ? defaultPage : Math.floor(input.pageSize);
+    if (!Number.isFinite(pageSize) || pageSize < 1 || pageSize > 200) {
+      throw new CompanyError('invalid', 'pageSize must be an integer between 1 and 200');
+    }
+    let offset = 0;
+    const key = await this.cursorKey();
+    if (input.cursor !== undefined) {
+      const body = openCursor(input.cursor, key, Date.now());
+      // 分开报：别人的光标是 forbidden；同一个调用者、但试算已经变了是 conflict（从第一页重跑才对——报 forbidden
+      // 会让人以为是自己权限的问题）。判据是 planHash：它只覆盖 epoch、after 契约 hash 与受影响清单，
+      // 所以与受影响清单无关的在办变化（例如某条无关任务新建或完成）不会让光标失效。
+      if (body.k !== 'policy-plan' || body.c !== actor.employeeId) {
+        throw new CompanyError('forbidden', 'cursor belongs to another caller or another listing; run the plan again');
+      }
+      if (body.q !== plan.planHash) {
+        throw new CompanyError('conflict', 'the plan changed since this cursor was issued (the effective epoch or the affected list differ); run the plan again from its first page');
+      }
+      offset = body.seq;
+    }
+    const build = (kept: typeof all, start: number): PolicyPlanView => {
+      const end = start + kept.length;
+      const page: PolicyPlanPage = {
+        pageSize, returned: kept.length, total: all.length, hasMore: end < all.length, budgetBytes: RESPONSE_BUDGET_BYTES,
+        ...(end < all.length ? { nextCursor: sealCursor({ v: 1, k: 'policy-plan', c: actor.employeeId, q: plan.planHash, sid: 'plan', seq: end, exp: Date.now() + POLICY_PLAN_CURSOR_TTL_MS }, key) } : {}),
+      };
+      return { ...plan, affectedTasks: kept, page };
+    };
+    // pageSize 是上限：真正发送的一页还要按字节裁，保证 answerBytes 永远在预算内。
+    const candidates = all.slice(offset, offset + pageSize);
+    const fit = (kept: typeof all): number => fitCount(kept, subset => answerBytes(build([...subset], offset)), RESPONSE_BUDGET_BYTES);
+    const keptCount = fit(candidates);
+    if (keptCount === 0 && candidates.length > 0) {
+      // 单条超预算：受影响清单没有收窄入参，这一条也补不了页——如实报它的字节数，让人知道是"这一条太大"。
+      throw new CompanyError('invalid', `one affected task entry alone is ${answerBytes(build(candidates.slice(0, 1), offset))} bytes, over the ${RESPONSE_BUDGET_BYTES}-byte budget; a single entry cannot be paged, so no page can carry it`);
+    }
+    return build(candidates.slice(0, keptCount), offset);
   }
 
   /**
