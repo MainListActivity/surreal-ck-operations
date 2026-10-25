@@ -64,7 +64,8 @@ test('all unhealthy groups still publish their tail without Jev; Jev failure can
   const bad={...fact('p/bad'),health:{source:'magpie-routing' as const,excluded:true,reason:'consecutive_errors' as const,attempts:3,errors:3,consecutiveErrors:3,lastStatus:503,lastAttemptAt:new Date(now).toISOString()}};
   let members=allBad?['p/bad']:['p/bad','p/good'];let calls=0;const writes:any[]=[];
   const r=new RankingRefresher({db:{query:async(sql:string,v?:any)=>{writes.push(v);return [{}];}} as any,groups:()=>({'sck-haiku':members}),facts:async()=>allBad?[bad]:[bad,fact('p/good')],apply:async orders=>{members=orders['sck-haiku']!;},jev:{model:'fixture',ask:async()=>{calls++;throw Error('Jev down');}}});
-  r.trigger();await r.settled();expect(calls).toBe(allBad?0:1);expect(members.at(-1)).toBe('p/bad');expect(writes.find(w=>w?.results)?.results['sck-haiku'].excludedFacts).toHaveLength(1);
+  r.trigger();await r.settled();expect(calls).toBe(allBad?0:1);expect(members.at(-1)).toBe('p/bad');expect(writes.find(w=>w?.gates)?.gates['sck-haiku'].facts.find((f:any)=>f.id==='p/bad').health.excluded).toBe(true);
+  expect(writes.find(w=>w?.results)?.results).toEqual({});
  }
 });
 test('both owner surfaces explain a demoted member, and the browser copy runs standalone',async()=>{

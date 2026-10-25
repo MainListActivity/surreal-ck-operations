@@ -180,7 +180,7 @@ test('request snapshot exactly matches the serialized body and is available befo
   throw Error('upstream unavailable');
  }},'opus','速度优先',facts,async payload=>{snapshot=structuredClone(payload);})).rejects.toThrow('upstream unavailable');
  expect(snapshot.state.ownerRules).toBe('速度优先');
- expect(snapshot.questions.m0.instructions).toContain('速度优先');
+ expect(snapshot.questions.m0.instructions).toContain('state.ownerRules');
  expect(snapshot.questions.m0.criteria[0]).toContain('排最后');
 });
 
@@ -282,11 +282,12 @@ test('owner rules are explicit in each independent question and concrete priorit
  await jevOrder({model:'fixture',ask:async(state:any,questions:any)=>{
   expect(state.ownerRules).toBe(rules);
   for(const [key,q] of Object.entries(questions) as any){
-   expect(q.instructions).toContain(rules);
+   expect(q.instructions).toContain('state.ownerRules');
    expect(q.instructions).toContain(`state.models.${key}`);
-   expect(q.instructions).toContain('不能抵消');
+   expect(state.rankingPolicy.instructions).toContain('不能抵消');
    expect(q.criteria[0]).toContain('排最后');
    for(const level of q.criteria.slice(1))expect(level).toContain('未触发');
+   expect(state.rankingPolicy.levels).toHaveLength(5);
   }
   return response(questions);
  }},'haiku',rules,[fact('p/slow'),fact('p/fast')]);
@@ -302,4 +303,25 @@ test('automatic ranking neither reads facts nor sends Jev questions or applies o
  expect(f.applied[0]['sck-opus']).toBeUndefined();
  await expect(r.setPin('sck-opus','owner/manual:high',true)).rejects.toThrow();
  expect(rankingTables({'sck-opus':['owner/manual:high']},{},[],{'sck-opus':['owner/manual:high']})).toEqual([]);
+});
+
+test('Jev failure preserves successful scores while independent safety observations demote and recover members',async()=>{
+ let results:Record<string,any>={},gates:Record<string,any>={};let fail=false,bad=false;
+ let members=['p/a','p/b'];
+ const db={query:async(sql:string,v?:any)=>{
+  if(sql.startsWith('SELECT pins'))return [{}];if(sql.startsWith('SELECT ranking_rules'))return [{}];
+  if(v?.results){Object.assign(results,v.results);Object.assign(gates,v.gates);}
+  return [undefined];
+ }};
+ const r=new RankingRefresher({db:db as any,groups:()=>({'sck-haiku':members}),facts:async()=>members.map(id=>({...fact(id),...(id==='p/a'&&bad?{health:{source:'magpie-routing' as const,excluded:true,reason:'unavailable' as const,attempts:1,errors:1,consecutiveErrors:1,lastStatus:403}}:{})})),
+  apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
+ r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
+ fail=true;bad=true;r.trigger(300000);await r.settled();
+ expect(results['sck-haiku']).toEqual(success);expect(members.at(-1)).toBe('p/a');
+ let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
+ expect(t.scored).toBe(true);expect(t.at).toBe(success.at);expect(t.rows.find(r=>r.model==='p/b')?.jevScore).toBe(1);
+ expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);
+ bad=false;r.trigger(600000);await r.settled();
+ t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
+ expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).not.toBe(true);expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBe(0);
 });
