@@ -588,16 +588,14 @@ function GlobalUsage(props: Props) {
     </ScrollView>
   );
 }
-/** Official SDK screen; no reserved native Usage slot or client patch. */
 export function MagpieUsageSurface(props: PluginSurfaceProps) {
   return <GlobalUsage {...props} />;
 }
 
-/** Agent identity comes from the official panel context, never custom screen params. */
 export function AgentUsagePanel(props: PluginAgentPanelProps) {
   return (
     <ScrollView style={{ flex: 1, backgroundColor: props.theme.colors.surface0 }}>
-      <SessionUsage {...props} agentId={props.agentId} />
+      <SessionUsage {...props} />
     </ScrollView>
   );
 }
