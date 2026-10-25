@@ -103,6 +103,8 @@ test('native scan bounds retained records and session cache and marks truncated 
  const reader=new NativeUsageReader(file);await reader.read('a',now);const rows=await reader.read('b',now,true);
  expect(rows).toHaveLength(5000);expect(rows.partial).toBe(true);
  expect((reader as any).cached.rows.size).toBe(2);
+ writeFileSync(file,[row('b',0),...Array.from({length:20000},(_,i)=>row('a',i+1))].join('\n'));
+ const evicted=await reader.read('b',now,true);expect(evicted).toHaveLength(0);expect(evicted.partial).toBe(true);
  writeFileSync(file,'');for(let i=0;i<66;i++)await reader.read(`session-${i}`,now,true);
  expect((reader as any).sessions.size).toBe(64);expect((reader as any).cached.sessions.size).toBe(64);
  const many=summarizeRequests(Array.from({length:51},(_,i)=>({id:String(i),at:i,status:200,source:'company-gateway' as const,model:`p/${i}`})));expect(many.models).toHaveLength(50);expect(many.partial).toBe(true);expect(many.requests).toBe(51);

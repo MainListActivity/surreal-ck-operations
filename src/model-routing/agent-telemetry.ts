@@ -104,7 +104,9 @@ export class NativeUsageReader {
    if(route!==undefined)routes.set(route,entry);
   }}finally{lines.close();stream.destroy();}
   for(const record of records){if(record.handedOn||record.rejected)continue;for(const session of record.sessions){const list=rows.get(session)??[];list.push(record.item);rows.set(session,list);}}
-  for(const [key,list] of rows)rows.set(key,Object.assign(list.sort((a,b)=>a.at-b.at).slice(-5000),{partial:truncated.has(key)||list.length>5000}));return rows;
+  for(const [key,list] of rows)rows.set(key,Object.assign(list.sort((a,b)=>a.at-b.at).slice(-5000),{partial:truncated.has(key)||list.length>5000}));
+  for(const id of truncated)if(!rows.has(id))rows.set(id,Object.assign([],{partial:true}));
+  return rows;
  }
 }
 export type NativeRequests=AgentRequest[]&{partial?:boolean};
