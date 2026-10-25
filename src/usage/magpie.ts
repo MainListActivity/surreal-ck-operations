@@ -158,6 +158,7 @@ function percent(value: unknown) {
   return n !== undefined && n <= 100 ? n : undefined;
 }
 export interface UsageFilter {
+  after?: string;
   period: "today" | "7d" | "30d";
   provider?: string;
   model?: string;
@@ -308,17 +309,29 @@ export class MagpieUsage {
     };
   }
   async page(filter: UsageFilter) {
-    const data = await this.cached(usagePath(filter), 5000),
-      r = record(data.value);
+    // Read the boundary and its following rows in the SAME native snapshot.
+    // A bounded overlap absorbs new insertions without offset-based duplicates.
+    const probeOffset = filter.after ? Math.max(0, filter.offset - 250) : filter.offset;
+    const data = await this.cached(
+      usagePath({ ...filter, offset: probeOffset, limit: filter.after ? 500 : filter.limit }),
+      5000,
+    );
+    const r = record(data.value);
     if (!Array.isArray(r.rows) || num(r.total) === undefined)
       throw Error("Magpie 请求列表格式无效");
+    const normalized = r.rows.map(normalizeRequest);
+    const boundary = filter.after ? normalized.findIndex((row) => row.id === filter.after) : -1;
+    if (filter.after && boundary < 0) throw Error("分页边界已过期，请点击“最新请求”重新开始");
+    const start = filter.after ? boundary + 1 : 0;
+    const rows = normalized.slice(start, start + filter.limit);
     return {
       at: data.at,
       stale: data.stale,
       total: num(r.total)!,
       offset: filter.offset,
       limit: filter.limit,
-      rows: r.rows.slice(0, filter.limit).map(normalizeRequest),
+      rows,
+      hasMore: probeOffset + start + rows.length < Number(r.total),
     };
   }
   async overview(filter: UsageFilter) {

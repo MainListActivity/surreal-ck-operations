@@ -216,3 +216,44 @@ test("provider and key routing candidates never claim a verified subscription ac
   expect(trace?.accountId).toBe(quota.id);
   expect(request.accountId).toBe(quota.id);
 });
+test("a cursor reads its boundary and next page atomically while new rows arrive", async () => {
+  let now = 10000;
+  let rows = Array.from({ length: 120 }, (_, i) => ({
+    t: `2026-10-25T12:00:${String(i % 60).padStart(2, "0")}Z`,
+    response_id: `row-${i}`,
+    provider: "real",
+    model: "actual",
+  }));
+  const source = new MagpieUsage(
+    "http://local",
+    async (url) => {
+      const q = new URL(url).searchParams;
+      const offset = Number(q.get("offset")),
+        limit = Number(q.get("limit"));
+      return Response.json({ rows: rows.slice(offset, offset + limit), total: rows.length });
+    },
+    () => now,
+  );
+  const first = await source.page({ ...filter, offset: 0 });
+  rows = [
+    ...Array.from({ length: 20 }, (_, i) => ({
+      t: "2026-10-25T13:00:00Z",
+      response_id: `new-${i}`,
+      provider: "real",
+      model: "actual",
+    })),
+    ...rows,
+  ];
+  now += 6000;
+  const second = await source.page({ ...filter, after: first.rows.at(-1)!.id });
+  expect(second.rows).toHaveLength(50);
+  expect(second.rows.some((r) => first.rows.some((p) => p.id === r.id))).toBe(false);
+  expect(second.rows[0]?.id).toBe(normalizeRequest(rows[70]).id);
+  expect(second.hasMore).toBe(true);
+  rows = rows.slice(100);
+  now += 6000;
+  await expect(source.page({ ...filter, after: first.rows.at(-1)!.id })).rejects.toThrow(
+    "分页边界已过期",
+  );
+  source.stop();
+});
