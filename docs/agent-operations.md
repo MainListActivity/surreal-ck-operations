@@ -4,14 +4,14 @@
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| 任务服务 | 远端 `data.maplayer.top/sck-mcp`（Caddy→`127.0.0.1:38473`，gate token），本机 launchd `org.surrealck.company-mcp` 兜底并兼跑 GitHub 投影 | 任务、租约、审计、目标、关口；admin/owner 通道 |
+| 任务服务 | 本机 launchd `org.surrealck.company-mcp`（`127.0.0.1:38473`），兼跑 GitHub 投影；129 上的远端入口 `data.maplayer.top/sck-mcp` 已停用 | 任务、租约、审计、目标、关口；admin/owner 通道 |
 | 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
 | 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
 | 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
-| 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
+| 数据 | 本机 SurrealDB（公司 fork，`org.surrealck.company-db`，`127.0.0.1:38480`，数据在 `private/db`）`sck_agent_company/control_plane` | 唯一事实来源；每小时备份到 R2 `sck-company-backup`，每周恢复演练 |
 
-数据位于**产品同一台自托管 SurrealDB**（连接地址与 root 凭证读自 `SCK_PRODUCT_ENV` 指向的产品 `.env`，当前 `wss://data.maplayer.top/rpc`）；公司数据独占 `sck_agent_company` namespace / `control_plane` database，与产品 `main` namespace 隔离。换库或换实例改 `service.env` 的 `SCK_COMPANY_NS` / `SCK_COMPANY_DB` 或 `SCK_PRODUCT_ENV`。
+数据位于**本机 SurrealDB**：连接地址与 root 凭证在 `private/company-db.env`（`scripts/company-db.sh install` 生成，优先于产品 `.env`；测试环境不隐式读取）。产品数据仍在 129，由产品 `.env` 描述。备份由 `scripts/company-backup.ts` 完成：zstd 压缩，单文件超过 20MB 拒传并发老板通知，R2 上保留 2 份小时备份加若干每日备份，总量不超过 40MB；`verify` 把最新备份恢复到临时内存库核对行数。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
 服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认只管理 `mcp`（任务服务 + GitHub 投影）。调度器、员工通道和运维代理都跑在 Paseo 插件 `sck-company` 里，改了 `plugin/` 或 `src/` 后用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；**不要再装 launchd 的 dispatcher**（`SCK_COMPONENTS=dispatcher` 仅为旧部署保留），否则会和插件重复派工。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
