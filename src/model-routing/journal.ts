@@ -1,3 +1,4 @@
+import type {RequestMetrics} from "./request-metrics.ts";
 import {
   mkdirSync,
   readdirSync,
@@ -38,10 +39,10 @@ export class ExecutionJournal {
     this.save(id, row);
     this.active.set(id, row);
   }
-  async complete(id: string, completed: boolean) {
+  async complete(id: string, completed: boolean, metrics?:RequestMetrics) {
     const base = this.active.get(id);
     if (!base) throw Error("execution was not recorded");
-    this.save(id, { ...base, completed, ended_at: new Date() });
+    this.save(id, { ...base,...metrics, completed, ended_at: new Date() });
     this.active.delete(id);
   }
   drain(db: Surreal): Promise<number> {

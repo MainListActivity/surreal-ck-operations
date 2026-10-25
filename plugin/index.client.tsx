@@ -1,7 +1,11 @@
+import {AgentMetricsPanel,AgentMetricsTimeline} from "./client/agent-metrics";
+import {agentMetricsViewSchema} from "./shared/agent-metrics";
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { CompanySurface } from "./client/company";
 
 export default function contribute(client: PluginClientContext) {
+  client.addWorkspacePanel({id:"agent-model-metrics",title:"模型实测",icon:"Gauge",context:"agent",locations:["workspace","explorer"],Component:AgentMetricsPanel});
+  client.addTimelineRenderer({kind:"sck-model-metrics",version:1,schema:agentMetricsViewSchema,Component:AgentMetricsTimeline});
   client.addSurface("company", CompanySurface);
   client.addSidebarItem({
     id: "company",

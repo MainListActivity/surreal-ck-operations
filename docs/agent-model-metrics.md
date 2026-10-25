@@ -1,0 +1,35 @@
+# Agent 模型实测
+
+## 目标与入口
+
+按老板确认的 agent `0093a690-d8b9-4fb7-bd65-9827d7b9b62d` 方案，将实际执行模型和性能展示在 Paseo 当前 agent 的「模型实测」面板，并在每轮结束后追加时间线摘要。面板每 5 秒刷新，区分最近一次请求与本轮多次请求累计。不改变员工编制、派工、分组或 JEV 排序策略，不为生成指标发起模型请求。
+
+本项目锁定的 Paseo 插件 SDK 使用 `addWorkspacePanel(context: agent)` 注册面板，使用 `addTimelineRenderer` 渲染 `sck-model-metrics@1`；服务端监听 `agent.turn_started/ended`，通过 agent ref 的 `timeline.append` 写入。面板适配 Paseo 主题与窄屏。
+
+## 数据归属
+
+- 公司 Claude 员工：沿用公司网关的权威 sidecar 实例映射，在 SSE 透传中收集数字指标；原始字节照常转发。实际模型来自 Magpie 上游路由头，响应内模型单列为「上游报告」，两者不混同。新增字段随原有本地执行 WAL 异步写入 `model_execution`，不等待远端数据库。
+- 普通/老板会话：读取 Paseo `runtimeInfo.sessionId`（缺失时使用 persistence sessionId），仅与 Magpie `usage.jsonl` 的 `session/native_session` 精确匹配。不使用 cwd、时间相近或名字推断归属。原生日志按 route_id 排除已移交的失败尝试与拒绝项，保持与 Magpie 请求口径一致。
+- 无原生 session、日志不可读、缺少模型头或缺少 usage 时显示未知。普通会话日志仅有已落盘请求，进行中数量未知。未观测到轮次开始时可以显示最近一次请求，不伪造本轮累计。
+
+## 指标定义
+
+- 首响应：从请求发送到第一个非空文字、思考或工具内容；不使用 HTTP 头或 message_start 代替。
+- 首文字：从发送到第一个非空文字内容；思考与工具不计入。
+- 本轮首响应/首文字：取本轮第一个请求，缺失时保持未知，不能借后续请求替代。
+- 端到端输出吞吐：成功完成且同时有 output tokens 和正耗时的请求，其输出 token 总和 / 请求耗时总和；包含排队和思考等待，不是各请求速度的算术平均，也不是整轮墙钟速度。失败、中断、缺失数据不参与。显示计量请求数。
+- 原生生成速度：沿用已有 Magpie `nativeDecode` 的解码计时及排除规则，按可靠解码耗时加权。网关未取得可靠推理 token 细分，不估算纯生成速度。
+- usage 累计值取最后值，不累加 message_start/message_delta 的同一计数。非流响应可取 usage 与总耗时，首响应/首文字保持未知。
+- HTTP 非成功、流内 error/incomplete、缺少终止事件、连接中断均不计成功。请求数量仍包含失败与已观测的进行中请求。
+
+## 生命周期、持久化与边界
+
+每次真实 turn_started 创建独立 UUID 轮次，同一 Paseo turnId 后续复用也不合并。部署时正在进行的员工请求可创建「部分观测」轮次，后续结束事件绑定它。面板也可按 SDK 活动轮次接管部分观测。重复 turn_ended 只生成一条摘要，插件卸载会取消待追加摘要，不创建 agent 或定时任务。
+
+每 agent 的数字台账保存在服务目录 `model-routing/agent-metrics`，目录 0700、文件 0600，原子替换。最多缓存 64 个 agent；每个保留 20 轮和 5000 个请求，截断影响本轮时标部分观测。原生日志近 7 天、每 session 最多 5000 个请求，跨面板共享 5 秒缓存与单次读取。台账可跨插件重载读取；时间线条目在 daemon 重启后的持久性由 Paseo 决定，不承诺替代本地台账。
+
+只保存模型、数字、请求/轮次标识及服务端精确匹配必需的 sessionId，不保存提示词、响应正文、思考正文、工具参数、订阅账号或凭证；sessionId 不返回客户端 RPC 或时间线。公司网关观测失败不阻断推理。owner RPC 拒绝 QA 会话，未引入新的公网接口。
+
+## 验证
+
+`tests/agent-model-metrics.test.ts` 覆盖流分块与 UTF-8、思考/文字/工具、累计 usage、加权吞吐、未知值、错误/截断透传、重复 turnId、重载与部分观测、精确 session、原生重试、过期会话隔离、真实生命周期摘要与卸载取消。现有网关回归及公司 fork 的 model-routing 集成测试共同验证原有鉴权/分组/执行记录行为。
