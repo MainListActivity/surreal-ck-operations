@@ -547,6 +547,8 @@ export interface SidecarBridge {
 interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
 /** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
 interface AssignHooks {
+  /** Durable successor CAS before allocating its lease. */
+  beforeClaim?: (inst: EmployeeInst) => Promise<void>;
   beforeExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn') => Promise<void> | void;
   afterExternal?: (inst: EmployeeInst, kind: 'send' | 'spawn', agentId: string) => Promise<void> | void;
 }
@@ -903,11 +905,19 @@ export class Dispatcher {
       }
     }
 
+    const pendingTasks = this.deps.sidecar && insts.some(i => !i.paseoAgentId) ? await wf.tasks() : [];
     // 1. Session health.
     const states = new Map<string, InstState>();
     const observedStatus = new Map<string, string>();
     for (const inst of insts) {
       if (!inst.paseoAgentId) {
+        // A successor CAS can survive a failed launch or a process restart. Keep its identity
+        // and retry that seat through the ordinary pool, quota and review-capacity gates.
+        if (this.deps.sidecar && inst.repoHome && pendingTasks.some(t => t.implementer === inst.id &&
+          t.executorRole === 'engineering' && (t.repoPath ?? this.deps.env.opsRepo) === inst.repoHome)) {
+          states.set(inst.id, 'idle');
+          continue;
+        }
         if (await this.retireGated(inst, 'spawn did not bind a Paseo agent', 'failure', report)) report.retired.push(inst.id);
         continue;
       }
@@ -1270,11 +1280,13 @@ export class Dispatcher {
     const poolBase = { defs, states, holding, health, quotaBlocked, busyBy, policyBlocks,
       providerMax: cfg.providerMax, slots: slotMap, runtimeModels, opsRepo: this.deps.env.opsRepo,
       sidecar: !!this.deps.sidecar, now };
+    const freshTakeovers = new Map<string, { implementer: string; unavailable: string }>();
     const poolFor = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false, recusal?: ReviewRecusal,
       reserved?: ReadonlySet<string>) =>
       staffingPool({ ...poolBase, insts, role, home, task, excludeSubmitter, recusal, assigned, reserved,
-        implementer: executeGateFor(executeGates, role, task, excludeSubmitter),
-        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined });
+        implementer: task && role === task.executorRole && !excludeSubmitter && freshTakeovers.has(task.id) ? undefined : executeGateFor(executeGates, role, task, excludeSubmitter),
+        independence: task ? independence.get(`${excludeSubmitter ? 'review' : 'execute'}:${task.id}`) : undefined })
+        .filter(entry => !task || role !== task.executorRole || excludeSubmitter || !freshTakeovers.has(task.id) || entry.kind === 'spawn');
     const eligibleInsts = (role: string, home: string, task?: SupervisedTask, excludeSubmitter = false,
       recusal?: ReviewRecusal, reserved?: ReadonlySet<string>) =>
       poolFor(role, home, task, excludeSubmitter, recusal, reserved).flatMap(e => e.kind === 'reuse' && e.eligible ? [e.inst!] : []);
@@ -1346,6 +1358,14 @@ export class Dispatcher {
             await this.clearBlocked(task, 'execute');
             return true;
           }
+        }
+        // With no reusable successor, open only the fresh-seat part of the normal execute pool.
+        // Scope, concurrency, independence and future review reservations still run below.
+        const fresh = staffingPool({ ...poolBase, insts, role: task.executorRole, home, task, assigned,
+          independence: independence.get(`execute:${task.id}`) });
+        if (this.deps.sidecar && fresh.some(entry => entry.kind === 'spawn' && entry.eligible)) {
+          freshTakeovers.set(task.id, { implementer, unavailable });
+          return false;
         }
       }
       await this.settleBlocked(task, 'execute', home, [{ key: '*', eligible: false, code: 'implementer_unavailable' }], now, report);
@@ -1501,7 +1521,19 @@ export class Dispatcher {
       this.scopeDenied.delete(item.task.id);
       const result = await this.assign(item.role, item.task, last?.employee, pickItem, spawnItem,
         (inst, first, claim) => wake(inst, item.task, this.deps.env, first,
-          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal);
+          { comm: !!this.deps.sidecar, claim, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, item.purpose === 'review', slotMap, recusal, undefined, freshTakeovers.has(item.task.id) ? {
+          beforeClaim: async inst => {
+            const previous = freshTakeovers.get(item.task.id)!;
+            const moved = await this.deps.autoTakeover!({ taskId: item.task.id, toEmployee: inst.id,
+              expectedVersion: item.task.version,
+              reason: `自动接替：原实现人 ${previous.implementer} 已不可用（${previous.unavailable}），创建同仓新工程实例接续` });
+            if (!moved) throw new Error('fresh successor takeover lost its task version');
+            item.task.implementer = inst.id;
+            item.task.version++;
+            executeGates.set(item.task.id, { implementer: inst.id, unresolved: false });
+            report.decisions.push(`auto-takeover:${item.task.id}=${inst.id}`);
+          },
+        } : undefined);
       if (!result) {
         if (this.scopeDenied.delete(item.task.id)) {
           // The claim lost the write scope: the same reason the preflight gives, never a wake failure.
@@ -2222,14 +2254,16 @@ export class Dispatcher {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
     }
-    const defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
+    let defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
     const candidate = pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
     // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
     // reuse or spawn candidate (quota, health, capacity, recusal), ordinary fallback takes over.
     const picked = candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
     // A legacy credential-file session can't be sidecar-claimed for new work; let
     // it finish what it holds and fall through to spawning a comm-mode instance.
-    const existing = picked && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
+    const pending = sidecar && picked && !picked.paseoAgentId ? picked : undefined;
+    if (pending) defsOrdered = (await wf.defs()).filter(d => d.id === pending.def && d.enabled);
+    const existing = picked?.paseoAgentId && !(sidecar && task && picked.credentialFile) && (!sidecar || sidecar.canReuse(picked)) ? picked : undefined;
     if (existing) {
       const first = !this.onboarded.has(existing.id) && !existing.onboarded;
       let claim: ClaimResult | undefined;
@@ -2290,11 +2324,13 @@ export class Dispatcher {
       if (!model) continue;
       // No seat is created for a task whose write scope is held: the preflight comes before the spawn.
       if (sidecar && task && await this.scopeBlocked(task)) { this.scopeDenied.add(task.id); return undefined; }
-      const inst = await wf.spawnInst(def);
-      const spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
+      const inst = pending ?? await wf.spawnInst(def, task?.repoPath ?? anchor?.home ?? env.opsRepo);
+      let spawnEnv: Record<string, string>;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
       try {
+        await hooks?.beforeClaim?.(inst);
+        spawnEnv = sidecar ? sidecar.env(inst) : { SCK_EMPLOYEE_CREDENTIAL_FILE: wf.writeCredentialFile(inst, inst.credential!) };
         claim = sidecar && task ? await sidecar.claim(inst, task) : undefined;
         if (sidecar && !task) workspace = await sidecar.readWorkspace?.(inst, anchor?.task?.id, anchor?.project);
       }
@@ -2335,7 +2371,8 @@ export class Dispatcher {
         await wf.bind(inst.id, { agentId, cwd, repoHome, model });
         sidecar?.bindAgent(inst.id, agentId);
         const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model };
-        insts.push(bound);
+        const prior = insts.findIndex(row => row.id === inst.id);
+        if (prior >= 0) insts[prior] = bound; else insts.push(bound);
         this.onboarded.add(inst.id);
         this.lastStatus.set(agentId, 'running');
         await wf.touchWake(inst.id);
@@ -2355,6 +2392,9 @@ export class Dispatcher {
         } else {
           await this.countDefFailure(def, report);
         }
+        // The CAS already made this seat the implementer. Retry it next pass rather
+        // than creating more authors or attempting another definition under that binding.
+        if (task?.implementer === inst.id) return undefined;
       }
     }
     return undefined;

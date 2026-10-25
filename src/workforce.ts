@@ -465,15 +465,15 @@ export class Workforce {
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
    *  The credential is returned in memory only — file delivery is the caller's choice
    *  (writeCredentialFile for the legacy standalone dispatcher; plugin sidecar keeps it in RAM). */
-  async spawnInst(def: EmployeeDef): Promise<EmployeeInst> {
+  async spawnInst(def: EmployeeDef, repoHome?: string): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
     await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      retired: false, created_at: time::now() };`, {
+      retired: false, workspace_repo: $repo_home, created_at: time::now() };`, {
       e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
-      thinking: def.thinking,
+      thinking: def.thinking, repo_home: repoHome,
     });
-    return { id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
+    return { repoHome, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
   }
 
   /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
