@@ -29,6 +29,7 @@ import { employeeTier } from "./policy.ts";
 import { createPaseoCli } from "../dispatcher/paseo.ts";
 import { GROUP_STAYS, saveMagpieGroups, magpieEnvironment } from "./magpie-admin.ts";
 import { readModelResults } from "./store.ts";
+import { readModelHealth } from "./health.ts";
 import { GaugeHistory, metricTrend, readUsageSamples, type ModelTrends, type Sample } from "./trends.ts";
 import { loadAa, refreshAa } from "./aa.ts";
 import { useBenchmarks } from "./policy.ts";
@@ -101,6 +102,8 @@ export class ModelRoutingController {
       affinity?: () => Record<string, string>;
       jev?: JevClient;
       usageLog?: string;
+      /** Magpie's per-try routing log; tests point it at a fixture. */
+      routingLogDir?: string;
       now?: () => number;
     } = {},
   ) {
@@ -207,7 +210,7 @@ export class ModelRoutingController {
   /** Jev's input for one group: accounts and quota, AA rank and price, 7-day usage, task performance. */
   async rankingFacts(ids: string[]): Promise<ModelFacts[]> {
     const now = this.io.now?.() ?? Date.now();
-    const [quota, usage, results, observations] = await Promise.all([
+    const [quota, usage, results, observations, health] = await Promise.all([
       this.output(["quota", "--json"]).then((t) => quotaAccounts(JSON.parse(t))).catch(() => new Map()),
       (async () => {
         const response = await (this.io.fetch ?? fetch)("http://127.0.0.1:3425/v1/magpie/usage?period=7d", {
@@ -218,6 +221,7 @@ export class ModelRoutingController {
       })(),
       readModelResults(this.db),
       readUsageSamples(now, this.io.usageLog).catch(() => undefined),
+      readModelHealth(now, this.io.routingLogDir).catch(() => new Map()),
     ]);
     const known = new Map(classify(this.catalog).map((m) => [m.id, m]));
     const candidates = ids.map((id) => known.get(id) ?? { id, model: id.slice(id.lastIndexOf("/") + 1), tier: "sonnet" as Tier, prior: 2.5, estimated: true, context: 0 });
@@ -250,6 +254,8 @@ export class ModelRoutingController {
       for(const [name,unit] of Object.entries({aaScore:"score",aaRank:"rank",remainingPct:"percent",inputPrice:"USD/1M",outputPrice:"USD/1M",cacheHitPrice:"USD/1M"}))
         trends[name]=metricTrend(gauges[f.id]?.[name]??[],now,unit,"snapshot");
       f.trends=trends;
+      const h=health.get(splitMember(f.id).id);
+      if(h)f.health=h;
       f.trendSource={source:"magpie-usage.jsonl",available:!!observations,invalidLines:observations?.invalid??0,collectedAt:new Date(now).toISOString()};
     }
     return facts;
