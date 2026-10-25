@@ -1,4 +1,4 @@
-import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type { PluginSurfaceProps, PluginAgentPanelProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
@@ -16,7 +16,7 @@ import { agentMetrics, metricNumber, metricSeconds } from "../shared/agent-metri
 const n = (value: number | undefined) => (value === undefined ? "未知" : metricNumber(value, 0));
 const speed = (value: number | undefined) =>
   value === undefined ? "未知" : `${metricNumber(value)} tok/s`;
-type Props = PluginSurfaceProps & { params?: Readonly<Record<string, string | undefined>> };
+type Props = PluginSurfaceProps;
 function Action({
   label,
   onPress,
@@ -588,11 +588,14 @@ function GlobalUsage(props: Props) {
     </ScrollView>
   );
 }
-export function UnifiedUsage(props: Props) {
-  const agentId = props.params?.agentId;
-  return typeof agentId === "string" ? (
-    <SessionUsage {...props} agentId={agentId} />
-  ) : (
-    <GlobalUsage {...props} />
+export function MagpieUsageSurface(props: PluginSurfaceProps) {
+  return <GlobalUsage {...props} />;
+}
+
+export function AgentUsagePanel(props: PluginAgentPanelProps) {
+  return (
+    <ScrollView style={{ flex: 1, backgroundColor: props.theme.colors.surface0 }}>
+      <SessionUsage {...props} />
+    </ScrollView>
   );
 }

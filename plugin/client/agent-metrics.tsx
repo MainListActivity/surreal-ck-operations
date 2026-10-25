@@ -1,8 +1,6 @@
 import type {PluginAgentPanelProps,PluginTimelineItemProps} from '@getpaseo/plugin/client';
-import {useRpc} from '@getpaseo/plugin/client';
-import {useQuery} from '@tanstack/react-query';
-import {ScrollView,Text,View} from 'react-native';
-import {agentMetrics,metricNumber,metricSeconds,type AgentMetricsView} from '../shared/agent-metrics';
+import {Text,View} from 'react-native';
+import {metricNumber,metricSeconds,type AgentMetricsView} from '../shared/agent-metrics';
 
 function MetricsCard({view,theme,compact=false}:{view:AgentMetricsView;theme:PluginAgentPanelProps['theme'];compact?:boolean}){
  const c=theme.colors,s=view.summary,latest=view.latest;
@@ -27,14 +25,5 @@ function MetricsCard({view,theme,compact=false}:{view:AgentMetricsView;theme:Plu
   <Text style={label}>{view.source==='company-gateway'?'来源：公司模型网关':view.source==='magpie-session'?'来源：Magpie 精确会话匹配':'来源：暂不可用'} · {view.turn?(view.turn.endedAt?'本轮已结束':'本轮进行中'):'尚未记录轮次边界'}</Text>
   {!!view.note&&<Text style={{...label,lineHeight:17}}>{view.note}</Text>}
  </View>;
-}
-export function AgentMetricsPanel(props:PluginAgentPanelProps){
- const read=useRpc(agentMetrics);const query=useQuery({queryKey:['agent-model-metrics',props.agentId],queryFn:()=>read({agentId:props.agentId}),refetchInterval:5000});
- const c=props.theme.colors;
- return <ScrollView style={{flex:1,backgroundColor:c.surface0}} contentContainerStyle={{padding:props.layout.compact?12:18,gap:12}}>
-  <Text style={{color:c.foreground,fontSize:18,fontWeight:'700'}}>模型实测</Text>
-  <Text style={{color:c.foregroundMuted,fontSize:12}}>按当前 agent 精确归属，每 5 秒刷新。最近请求与本轮累计分别展示。</Text>
-  {query.isError?<Text style={{color:c.foregroundMuted}}>读取失败，下一次刷新会重试；未显示的数据不会当成零。</Text>:query.data?<MetricsCard view={query.data} theme={props.theme} compact={props.layout.compact}/>:<Text style={{color:c.foregroundMuted}}>正在读取…</Text>}
- </ScrollView>;
 }
 export function AgentMetricsTimeline({item,theme,layout}:PluginTimelineItemProps<AgentMetricsView>){return <MetricsCard view={item.data} theme={theme} compact={layout.compact}/>;}
