@@ -333,3 +333,17 @@ test('compact questions keep the actual average latency directly readable withou
  const slow={...fact('p/slow'),usage:usageStats(nativeUsage([{...channel('p','slow',1000,12000),ttft_ms:96000}])).get('p/slow')!};
  await jevOrder({model:'fixture',ask:async(s:any,q:any)=>{expect(s.ownerRules).toBe(rules);expect(q.m0.instructions).toContain('12秒');expect(q.m0.instructions).toContain('命中时必须选0级');expect(q.m0.instructions).not.toContain(rules);return response(q);}},'haiku',rules,[slow]);
 });
+
+test('explicit numeric TTFT tail constraints beat probabilistic scores without rewriting them or excluding unknowns',async()=>{
+ const {ttftTailThreshold}=await import('../src/model-routing/ranking.ts');
+ expect(ttftTailThreshold('智能优先，首token延迟超过10s的排在最后')).toBe(10000);
+ expect(ttftTailThreshold('TTFT > 1500 ms 排末尾')).toBe(1500);
+ expect(ttftTailThreshold('token速率未知的排前面，智能程度和速度综合优先，首token延迟超过10s的排在最后')).toBe(10000);
+ for(const r of ['速度优先','不要首token延迟超过10s的排在最后','首token延迟超过10s的排在最后，但免费除外','首token延迟超过10s的排在最后，免费模型不受此限制','TTFT > 10s 排末尾; except free models','首token延迟超过10s的排在最后，仅付费模型适用','首token延迟超过10s的排在最后，首token延迟超过20s的排在最后'])expect(ttftTailThreshold(r)).toBeUndefined();
+ const usage=usageStats(nativeUsage([channel('p','slow',100,1000)])).get('p/slow')!;
+ const facts=[{...fact('p/slow'),usage:{...usage,ttftMs:11643}},fact('p/unknown'),{...fact('p/boundary'),usage:{...usage,ttftMs:10000}}];let snapshot:any;
+ const order=await jevOrder({model:'fixture',ask:async()=>({model:'fixture',answers:{m0:{type:'score',score:4},m1:{type:'score',score:.57},m2:{type:'score',score:.2}}})},'haiku','首token延迟超过10s的排在最后',facts,undefined,s=>{snapshot=s;});
+ expect(order).toEqual(['p/unknown','p/boundary','p/slow']);expect(snapshot.rows.at(-1).score).toBe(4);
+ const t=rankingTables({'sck-haiku':order},{'sck-haiku':snapshot})[0]!;
+ expect(t.rows.at(-1)?.tailReason).toContain('11.643 秒 > 10 秒');expect(t.rows[0]?.tailReason).toBeUndefined();expect(t.rows[1]?.tailReason).toBeUndefined();
+});

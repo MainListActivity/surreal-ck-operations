@@ -147,6 +147,24 @@ export {TREND_COLUMNS,TREND_DICTIONARY,RANKING_INPUT_BUDGET,rankingInputFact} fr
 import {buildRankingInput,expandRankingModels,RankingInputBudgetError,type RankingAttempt} from "./ranking-input.ts";
 export type {RankingAttempt} from "./ranking-input.ts";
 
+/** Only a standalone, unambiguous numeric TTFT tail clause is executable; arbitrary prose stays with Jev. */
+export function ttftTailThreshold(rules:string):number|undefined {
+  const values:number[]=[];
+  for(const clause of rules.split(/[，,；;。\n]/).map(s=>s.trim()).filter(Boolean)) {
+    const m=/^(?:平均\s*)?(?:首\s*token|首个\s*token|TTFT)\s*(?:延迟\s*)?(?:超过|大于|>)\s*(\d+(?:\.\d+)?)\s*(毫秒|ms|秒|s)\s*(?:的(?:模型)?)?\s*(?:排在最后|排最后|放到最后|排在末尾|排末尾)$/i.exec(clause);
+    if(!m) {
+      // Compile only fully understood independent preferences. Unknown clauses may contain an
+      // exception to the tail rule in any language; do not guess from a growing blacklist.
+      if(!/^(?:智能程度和速度综合优先|智能(?:程度)?优先|速度优先|token速率未知的排前面)$/i.test(clause))return undefined;
+      continue;
+    }
+    const n=Number(m[1])*(["ms","毫秒"].includes(m[2]!.toLowerCase())?1:1000);
+    if(!Number.isFinite(n)||n<0)return undefined;values.push(n);
+  }
+  const unique=[...new Set(values)];return unique.length===1?unique[0]:undefined;
+}
+const overTtftLimit=(f:ModelFacts|undefined,limit:number|undefined)=>limit!==undefined&&f?.usage?.ttftMs!==undefined&&f.usage.ttftMs>limit;
+
 /** One Jev call per group: a priority score per member, highest first; ties keep the current order. */
 export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts: ModelFacts[], beforeAsk?: (payload: RankingRequestPayload) => Promise<void>, afterAnswer?: (result: RankingResultSnapshot) => void, onAttempt?: (attempt:RankingAttempt) => Promise<void>): Promise<string[]> {
   const keys = facts.map((_, i) => `m${i}`);
@@ -165,10 +183,11 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
     const a = answers[key];
     if (a?.type !== "score" || !Number.isFinite(a.score) || a.score! < 0 || a.score! > 4) {await onAttempt?.({...attempt,status:"invalid_answer"});throw Error("Jev 排序结果不完整");}
   }
+  const tailLimit=ttftTailThreshold(rules);
   const rows = facts
-    .map((f, i) => ({ facts: f, i, score: answers[keys[i]!]!.score!, confidence: answers[keys[i]!]!.confidence }))
-    .sort((a, b) => b.score - a.score || a.i - b.i)
-    .map(({ i, ...row }) => row);
+    .map((f, i) => ({ facts: f, i, tail:overTtftLimit(f,tailLimit), score: answers[keys[i]!]!.score!, confidence: answers[keys[i]!]!.confidence }))
+    .sort((a, b) => Number(a.tail)-Number(b.tail) || b.score - a.score || a.i - b.i)
+    .map(({ i, tail, ...row }) => row);
   await onAttempt?.({...attempt,status:"success"});
   afterAnswer?.({ tier, at: new Date().toISOString(), model: response.model, rules: payload.state.ownerRules as string,
     rows: JSON.parse(JSON.stringify(rows)), answers: JSON.parse(JSON.stringify(answers)) });
@@ -203,7 +222,7 @@ export interface RankingResultSnapshot {
 export interface RankingGateSnapshot {at:string;facts:ModelFacts[]}
 export type RankingGates=Record<string,RankingGateSnapshot>;
 export interface RankingTableRow {
-  model: string; pinned?: boolean;
+  model: string; pinned?: boolean; tailReason?:string;
   trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
@@ -220,6 +239,7 @@ export interface RankingTable {
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return RANKED_TIERS.map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
+    const tailLimit=ttftTailThreshold(result?.rules??"");
     const request = requests.find(r => r.tier === tier);
     const legacy = expandRankingModels(request?.payload.state ?? {});
     const rows = (groups[group] ?? []).map(model => {
@@ -229,7 +249,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const excluded = gate ? (current?.health?.excluded ? current : undefined) : result?.excludedFacts?.find(f => f.id === model);
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
       const pinned = !excluded && (pins[group] ?? []).includes(model);
-      return { model, trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, tailReason:!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined, trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
