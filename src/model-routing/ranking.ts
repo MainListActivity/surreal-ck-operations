@@ -140,8 +140,42 @@ const LEVELS = [
   "首选：未触发老板规则中必须排最后的条件，按规则综合判断属于本组最优先的选择。",
 ];
 
+/** Compact wire columns keep the shared state within Jev's per-question context. */
+export const TREND_COLUMNS = ["current","ewma","slopePerMinute","change","baselineMean","baselineSamples","samples","lastSampleAtMs","ageMs","sufficient"] as const;
+const METRIC_UNITS:Record<string,string> = {ttftMs:"ms",tokensPerSecond:"tokens/s",errorRate:"ratio",cacheHitRate:"ratio",ttftOver10sRate:"ratio",performanceScore:"score",aaScore:"score",aaRank:"rank",remainingPct:"percent",inputPrice:"USD/1M",outputPrice:"USD/1M",cacheHitPrice:"USD/1M"};
+const sampleUnitOf = (key:string) => key === "performanceScore" ? "task" as const : ["aaScore","aaRank","remainingPct","inputPrice","outputPrice","cacheHitPrice"].includes(key) ? "snapshot" as const : "request" as const;
+/** Full facts remain in successful UI snapshots; only the transport uses shared columns. */
+export function rankingInputFact(f:ModelFacts) {
+  if(!f.trends)return f;
+  return {...f,trends:Object.fromEntries(Object.entries(f.trends).map(([key,t])=>[key,t.baseline.samples ? [
+    t.current??null,t.ewma??null,t.slopePerMinute??null,t.change.detected?[t.change.direction,t.change.at?Date.parse(t.change.at):null,t.change.before??null,t.change.after??null]:false,
+    t.baseline.mean??null,t.baseline.samples,t.samples,t.lastSampleAt?Date.parse(t.lastSampleAt):null,t.ageMs??null,t.sufficient,
+  ] : null]))};
+}
+/** Legacy/first-attempt cards can read the exact compact request even before any successful score. */
+function expandRankingInput(f:ModelFacts):ModelFacts {
+  if(!f.trends)return f;
+  const trends:ModelTrends={};
+  for(const [key,input] of Object.entries(f.trends)) {
+    if(input && !Array.isArray(input)){trends[key]=input;continue;}
+    const row=input as unknown[]|null;
+    const value=(i:number)=>typeof row?.[i]==='number'&&Number.isFinite(row[i])?row[i] as number:undefined;
+    const at=value(7);
+    trends[key]={unit:METRIC_UNITS[key]??"unknown",sampleUnit:sampleUnitOf(key),current:value(0),ewma:value(1),slopePerMinute:value(2),
+      change:Array.isArray(row?.[3])?{detected:true,direction:row[3][0] as 'up'|'down',at:typeof row[3][1]==='number'?new Date(row[3][1]).toISOString():undefined,before:row[3][2]??undefined,after:row[3][3]??undefined}:{detected:false},
+      baseline:{mean:value(4),samples:value(5)??0},samples:value(6)??0,lastSampleAt:at===undefined?undefined:new Date(at).toISOString(),ageMs:value(8),sufficient:row?.[9]===true,windows:{}};
+  }
+  return {...f,trends};
+}
+// Conservative UTF-8 engineering budgets, not a tokenizer. Upstream rejections still retain the previous order.
+// https://docs.typesafe.ai/models: 32k state+one question; 64k state+all questions.
+export const RANKING_INPUT_BUDGET = {stateBytes:48_000,requestBytes:128_000};
+
 /** Explicit units/estimators travel with every request, rather than relying on field names. */
 export const TREND_DICTIONARY = {
+  columns:TREND_COLUMNS,
+  encoding:"trends每项是按columns列名对应的数组；整个指标null表示无有效历史，数组里的null表示该字段未知。规则引用指标.current等字段时按相应列读取。change=false表示未检出突变；突变数组为[direction,atMs,before,after]（direction=up或down，atMs为Unix毫秒）。lastSampleAtMs为Unix毫秒。详细窗口保留在公司页面成功快照，本次输入只传当前、趋势与基线摘要。",
+  metricInfo:Object.fromEntries(Object.entries(METRIC_UNITS).map(([key,unit])=>[key,{unit,sampleUnit:sampleUnitOf(key)}])),
   scope:"每个完整供应商/模型通道独立统计，沿用 usage 的跨历史思考等级口径，不混用其他供应商。绩效按现有 canonical model 映射归并。",
   metrics:{ttftMs:"首个内容（含思考或工具调用）的延迟，毫秒；仅成功且有计时的请求",tokensPerSecond:"Magpie DecodeOf 原生生成速度（token/s），排除未计时、隐式思考和突发释放等不可测速请求",errorRate:"失败请求占比0–1，含没有首token的失败",cacheHitRate:"每次成功请求的缓存token/全部提示token，窗口为请求比例的均值；与usage的token加权命中率区分",ttftOver10sRate:"成功且有首token计时的请求中超过10000ms的比例",performanceScore:"最终验收任务的1–5分绩效，同一任务多名员工按原评分权重归并成一个样本",aaScore:"AA智能分",aaRank:"AA全榜名次，越小越好",remainingPct:"各订阅最紧窗口剩余比例的最小值，0–100",inputPrice:"输入价格USD/百万token",outputPrice:"输出价格USD/百万token",cacheHitPrice:"缓存命中价格USD/百万token"},
   current:"最新一次有效实测值，不是均值；lastSampleAt与ageMs标明它是否过期；没有数据是未知，不是0。",
@@ -149,7 +183,7 @@ export const TREND_DICTIONARY = {
   slopePerMinute:"同EWMA的近期窗口最多20个样本对实际时间做最小二乘回归；单位=该指标unit/分钟。至少5样本且覆盖1秒才提供。正负只代表上升下降，延迟/错误率/排名上升通常变差，速度/绩效/命中率上升通常变好。",
   change:"启发式突变信号而非统计显著性概率：最近10样本前后各5个均值相差超过25%、前5样本3倍标准差与单位最小变化量（ms为500、ratio为0.05、score为0.25、percent为5、USD/1M为0.001、其他为1），且后5中至少4个同方向；最新请求须在15分钟内，任务/变动快照须在7天内。detected=false不证明没有变化。",
   confidence:"samples是相应近期窗口最多20样本数；sufficient要求至少5样本、覆盖至少1秒，请求最新不超过15分钟，稀疏任务/变动快照不超过7天。false时降低采信，不据此断言趋势；快照是变动记录，重复读取相同值不增加样本，不能冒充独立请求或任务。",
-  baseline:"最近7天有效样本的均值与样本数，只作长期参照。windows给出15m/1h/24h/7d各自的样本数、均值、P50、P90（最近秩法）；不重叠前后5样本用于突变检测。",
+  baseline:"最近7天有效样本的均值与样本数，只作长期参照。公司页面的完整快照windows给出15m/1h/24h/7d分布，本次请求不重复发送这些窗口；不重叠前后5样本用于突变检测。",
   rules:"老板明确的优先级和排最后条件优先；缺失、样本不足或过期数据不代表优秀或满足限制。趋势辅助排序，不自行修改老板阈值或统计口径。AA与价格等稀疏指标没有变动历史时趋势未知。",
 };
 
@@ -161,7 +195,7 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
       group: `group/sck-${tier}`,
       ownerRules: rules.trim() || DEFAULT_RANKING_RULES,
       trendDictionary: TREND_DICTIONARY,
-      models: Object.fromEntries(facts.map((f, i) => [keys[i], f])),
+      models: Object.fromEntries(facts.map((f, i) => [keys[i], rankingInputFact(f)])),
       notes: [
         "accounts.remainingPct：该订阅账号最紧的额度窗口剩余百分比；额度少的账号应靠后，避免撞上限。",
         "aa.rank：Artificial Analysis 智能指数全榜名次，越小越强；aa.effort 是该成员被固定的思考等级，分数即在该等级下测得。price：每百万 token 美元，free=true 为免费。",
@@ -177,6 +211,8 @@ export async function jevOrder(jev: JevClient, tier: Tier, rules: string, facts:
     }]));
   // Normalize exactly as the HTTP client does, so the persisted snapshot has no undefined fields.
   const payload: RankingRequestPayload = JSON.parse(JSON.stringify({ model: jev.model, state, questions }));
+  if(Buffer.byteLength(JSON.stringify(payload.state),"utf8") > RANKING_INPUT_BUDGET.stateBytes || Buffer.byteLength(JSON.stringify(payload),"utf8") > RANKING_INPUT_BUDGET.requestBytes)
+    throw Error("ranking input exceeds Jev safety budget; preserve the previous order");
   await beforeAsk?.(payload);
   const response = await jev.ask(payload.state, payload.questions);
   const { answers } = response;
@@ -235,7 +271,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
   return RANKED_TIERS.map(tier => {
     const group = `sck-${tier}`, result = results[group];
     const request = requests.find(r => r.tier === tier);
-    const legacy = Object.values((request?.payload.state.models ?? {}) as Record<string,ModelFacts>);
+    const legacy = Object.values((request?.payload.state.models ?? {}) as Record<string,ModelFacts>).map(expandRankingInput);
     const rows = (groups[group] ?? []).map(model => {
       const judged = result?.rows.find(row => row.facts.id === model);
       // Once a successful snapshot exists, do not borrow facts from a later failed/pending request.
