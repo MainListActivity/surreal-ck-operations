@@ -1,4 +1,4 @@
-import type { MetricTrend } from '../../src/model-routing/trends.ts';
+import type { MetricTrend } from './model-trends.ts';
 /** Same wording on the Paseo card and the browser card. No runtime imports from the server. */
 export function rankingTrendDetail(t?: MetricTrend): string {
   if(!t || !t.baseline.samples)return '趋势未知：暂无有效历史';

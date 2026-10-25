@@ -84,3 +84,11 @@ test('both owner surfaces share readable current, decay, slope, change and confi
  for(const word of ['当前','EWMA','斜率','百分点','突升','7天基线','10个请求','样本充分'])expect(text).toContain(word);
  expect(rankingTrendDetail()).toContain('未知');
 });
+
+test('retry attempts do not become independent requests or failures, including older logs with large route IDs',async()=>{
+ const file=join(scratch(),'usage.jsonl'), t=new Date(now).toISOString();
+ const row=(route:string,extras:object)=>JSON.stringify({t,provider:'p',model:'m',status:200,route_id:'PLACEHOLDER',...extras}).replace('"PLACEHOLDER"',route);
+ writeFileSync(file,[row('9007199254740992',{status:503,handed_on:true}),row('9007199254740992',{}),row('9007199254740993',{status:503}),row('9007199254740993',{}),row('9007199254740994',{status:500,rejected:true}),row('9007199254740994',{})].join('\n'));
+ const data=await readUsageSamples(now,file);
+ expect(data.rows.get('p/m')?.errorRate?.map(r=>r.value)).toEqual([0,0,1,0]);
+});

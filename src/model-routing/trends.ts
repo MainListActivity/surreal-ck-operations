@@ -81,6 +81,8 @@ export interface UsageSamples { rows: Map<string, Record<string,Sample[]>>; inva
 /** Stream only numeric observations into memory. Accounts, request bodies and session IDs never enter the trend store. */
 export async function readUsageSamples(now: number, file = join(homedir(),'.config/magpie/usage.jsonl')): Promise<UsageSamples> {
   const rows = new Map<string,Record<string,Sample[]>>(); let invalid=0;
+  const records:Array<{key:string;at:number;metrics:Record<string,number>;failed:boolean;rejected:boolean;handedOn:boolean}>=[];
+  const routes=new Map<string,number>();
   const stream=createReadStream(file,{encoding:'utf8'});
   const lines=createInterface({input:stream,crlfDelay:Infinity});
   try {
@@ -89,9 +91,10 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
       if(!r||typeof r!=='object'||Array.isArray(r)){invalid++;continue;}
       const at=typeof r.t==='string'?Date.parse(r.t):NaN;
       if(!finite(at)||at>now||at<now-7*DAY||typeof r.provider!=='string'||typeof r.model!=='string')continue;
-      const key=`${r.provider}/${r.model}`, metrics=rows.get(key)??{};
-      const put=(name:string,value:unknown)=>{if(finite(value))(metrics[name]??=[]).push({at,value});};
-      const failed=typeof r.err==='string'&&r.err.length>0 || !finite(r.status) || r.status<200 || r.status>=400;
+      if(!finite(r.status)||r.status<0){invalid++;continue;}
+      const metrics:Record<string,number>={};
+      const put=(name:string,value:unknown)=>{if(finite(value))metrics[name]=value;};
+      const failed=(typeof r.err==='string'&&r.err.length>0)||r.status>=400;
       put('errorRate',failed?1:0);
       if(!failed) {
         if(finite(r.ttft_ms)&&r.ttft_ms>0) {put('ttftMs',r.ttft_ms);put('ttftOver10sRate',r.ttft_ms>10000?1:0);}
@@ -101,9 +104,21 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
           if(prompt>0)put('cacheHitRate',Number(r.cache_read??0)/prompt);
         }
       }
-      rows.set(key,metrics);
+      // Older Magpie logs infer handed-on attempts from a later row of the same route.
+      // Keep the integer text: route IDs can exceed JavaScript's safe integer range.
+      const route=finite(r.route_id)&&r.route_id!==0?line.match(/"route_id"\s*:\s*(\d+)/)?.[1]:undefined;
+      const previous=route===undefined?undefined:records[routes.get(route)??-1];
+      if(previous?.failed&&!previous.rejected)previous.handedOn=true;
+      if(route!==undefined)routes.set(route,records.length);
+      records.push({key:`${r.provider}/${r.model}`,at,metrics,failed,rejected:r.rejected===true,handedOn:r.handed_on===true});
     }
   } finally {lines.close();stream.destroy();}
+  for(const r of records) {
+    if(r.handedOn)continue;
+    const metrics=rows.get(r.key)??{};
+    for(const [name,value] of Object.entries(r.metrics))(metrics[name]??=[]).push({at:r.at,value});
+    rows.set(r.key,metrics);
+  }
   return {rows,invalid};
 }
 

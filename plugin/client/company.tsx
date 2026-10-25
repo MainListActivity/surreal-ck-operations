@@ -1220,7 +1220,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           <Text selectable numberOfLines={1} style={{color:c.foregroundMuted,fontSize:mobile?8:9,lineHeight:14,fontFamily:"Menlo",backgroundColor:c.path,borderRadius:8,paddingHorizontal:mobile?7:9,paddingVertical:mobile?5:7,marginVertical:mobile?9:12}}>{row.model}</Text>
           <View style={{flexDirection:"row",flexWrap:"wrap",gap:mobile?7:8}}>{metrics.map(metric=><View key={metric.label} style={{flexBasis:wide?"14%":"28%",flexGrow:1,minWidth:0,gap:2,borderLeftWidth:1,borderColor:c.border,paddingLeft:mobile?8:10}}>
             <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.label}</Text><Text selectable style={[s.text,{fontSize:mobile?11:12,fontWeight:"700"}]}>{metric.value}</Text>
-            {!mobile&&<Text style={[s.muted,{fontSize:9}]}>{metric.detail}</Text>}
+            <Text style={[s.muted,{fontSize:mobile?8:9}]}>{metric.detail}</Text>
           </View>)}</View>
           {mobile&&row.performanceScore!==undefined&&<Text style={[s.muted,{fontSize:9,marginTop:7}]}>历史绩效 {number(row.performanceScore,2)} / 5</Text>}
         </View>}

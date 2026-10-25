@@ -91,3 +91,12 @@ test('ranking row has an independent pin action and clearly labels a pinned mode
  expect(h.text()).toContain('已置顶');
  const button=nodes.find(n=>n.props.accessibilityLabel==='取消置顶 p/a:max');expect(button).toBeDefined();await button.props.onPress();expect(calls).toEqual([['p/a:max',false]]);
 });
+
+test('mobile expanded model cards expose trend explanations and freshness',()=>{
+ const h=harness(undefined);
+ const trend={unit:'ms',sampleUnit:'request',current:12000,ewma:11000,slopePerMinute:6000,samples:10,sufficient:true,ageMs:60000,change:{detected:true,direction:'up'},baseline:{samples:5000,mean:2000},windows:{}};
+ const props={ctx:{...rankingCtx,compact:true},width:390,table:{group:'sck-haiku',scored:true,rows:[{model:'p/mobile',accounts:[],trends:{ttftMs:trend}}]}};
+ const nodes=h.render('ModelRankingList',props);nodes.find(n=>n.props.accessibilityLabel==='第 1 名 p/mobile').props.onPress();
+ h.render('ModelRankingList',props);
+ for(const word of ['EWMA','斜率','突升','7天基线','10个请求','距最新样本1分钟'])expect(h.text()).toContain(word);
+});
