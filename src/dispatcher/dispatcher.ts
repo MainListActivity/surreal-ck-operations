@@ -2389,9 +2389,11 @@ export class Dispatcher {
         if (EXHAUSTED_PATTERN.test(message)) {
           await wf.markExhausted(def.provider, message);
           if (!report.exhausted.includes(def.provider)) report.exhausted.push(def.provider);
-        } else {
+        } else if (task?.implementer !== inst.id) {
           await this.countDefFailure(def, report);
         }
+        // A bound, unlaunched successor retries through the ordinary tick instead of disabling
+        // its whole definition after repeated infrastructure failures. Quota still cools down above.
         // The CAS already made this seat the implementer. Retry it next pass rather
         // than creating more authors or attempting another definition under that binding.
         if (task?.implementer === inst.id) return undefined;

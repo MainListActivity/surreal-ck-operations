@@ -911,13 +911,17 @@ run('company fork: no reusable successor creates a fresh implementer and retries
     const A = (await w.wf.insts()).find(i => i.role === 'engineering')!;
     w.agentRows.get(A.paseoAgentId!)!.status = 'closed';
     // Fail the external launch after the durable takeover and claim. Recovery must reuse that identity.
-    w.spawnFailures.remaining = 1;
+    w.spawnFailures.remaining = 3;
     await w.tick();
     const pending = await w.core.getTask(w.gm, task.id);
     expect(pending.implementer).not.toBe(A.id);
     const C = (await w.wf.insts()).find(i => i.id === pending.implementer)!;
     expect(C.paseoAgentId).toBeUndefined();
     expect(C.repoHome).toBe(w.dir);
+    await w.tick();
+    await w.tick();
+    expect((await w.wf.defs()).find(d => d.id === C.def)?.enabled).toBe(true);
+    expect((await w.core.getTask(w.gm, task.id)).implementer).toBe(C.id);
     await w.reload();
     const recovered = await w.tick();
     expect(recovered.woke.find(x => x.task === task.id)).toMatchObject({ employee: C.id, spawned: true });
