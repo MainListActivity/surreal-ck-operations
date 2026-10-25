@@ -370,7 +370,7 @@ export class MagpieUsage {
         const timeout = setTimeout(() => this.controller?.abort(), 28000);
         try {
           const incoming = await this.read(
-            `/v1/magpie/trace?after=${encodeURIComponent(this.traceSeq)}&wait=1`,
+            `/v1/magpie/trace?after=${encodeURIComponent(this.traceSeq)}${this.trace === undefined ? "" : "&wait=1"}`,
             this.controller.signal,
           );
           const restarted =
