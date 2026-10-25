@@ -1183,7 +1183,8 @@ export interface CompanyCore {
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
-  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>>;
+  /** eval/gm only: each participant's actual models (executions, fences, phases, first/last) for modelScores. */
+  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;models:Array<{model:string;executions:number;fences:number[];phases:string[];first:string;last:string}>}>>;
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
 }
 

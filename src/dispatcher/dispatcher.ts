@@ -1110,7 +1110,8 @@ export class Dispatcher {
         // refuses to claim for it), so an idle one only wastes a provider seat and
         // misleads Jev's staffing picks. Retire it on sight.
         const legacyEol = Boolean(this.deps.sidecar && inst.credentialFile);
-        const overWakes = cfg.sessionMaxWakes > 0 && (inst.wakeCount ?? 0) >= cfg.sessionMaxWakes;
+        const maxWakes = cfg.sessionMaxWakesByRole?.[inst.role] ?? cfg.sessionMaxWakes;
+        const overWakes = maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
         let inputK = 0;
         if (!legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
           inspected++;
