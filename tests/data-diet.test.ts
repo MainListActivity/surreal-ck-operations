@@ -62,3 +62,9 @@ test('the company database file wins over the product env, and tests never read 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('backup keys sort by time and give each UTC day its own daily copy', async () => {
+  const { backupKeys } = await import('../scripts/company-backup.ts');
+  expect(backupKeys(new Date('2026-10-25T13:51:07.123Z'))).toEqual({ hourly: 'hourly/20261025T1351Z.surql.zst', daily: 'daily/20261025.surql.zst' });
+  expect(backupKeys(new Date('2026-10-26T00:05:00Z')).daily).toBe('daily/20261026.surql.zst');
+});
