@@ -640,21 +640,28 @@ describe('managed-local-test acceptance adapter', () => {
     expect(MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID).toBe('25ec8d1a-6bbf-4bee-abaf-74998adeb5af');
   });
 
-  test('D2 producer isolation: real script writes sha.suite artifacts that the reader loads without clobber', async () => {
+  test('D2 producer isolation: real script dual-suite write/read + attestation (same fixture SHA)', async () => {
     const {
-      defaultManagedLocalTestReader, managedLocalTestRecordFileName, MANAGED_LOCAL_TEST_GATE,
+      defaultManagedLocalTestReader, managedLocalTestRecordFileName, managedLocalTestLogFileName,
+      MANAGED_LOCAL_TEST_GATE, createHmacManagedLocalTestAgent, verifyManagedLocalTestAttestation,
+      verifyManagedLocalTest,
     } = await import('../src/acceptance.ts');
-    // Minimal fake target with the two unit files named by sys02-local-evidence allowlist.
-    const target = mkdtempSync(join(tmpdir(), 'sck-mlt-prod-'));
+    // Fixture stubs satisfy allowlisted paths only — not real SYS04 role-gate business content.
+    const target = mkdtempSync(join(tmpdir(), 'sck-mlt-dual-'));
     const home = mkdtempSync(join(tmpdir(), 'sck-mlt-home-'));
-    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-    // Name the target dir as the sha so the script accepts a non-git path… but unbound release is refused.
-    // Use a git worktree instead: init, commit placeholder tests.
+    const keyFile = join(home, 'test-signing.key');
     mkdirSync(join(target, 'tests'), { recursive: true });
     mkdirSync(join(target, 'scripts'), { recursive: true });
-    writeFileSync(join(target, 'tests/acceptance.test.ts'), "import { test, expect } from 'bun:test'; test('x', () => expect(1).toBe(1));\n");
-    writeFileSync(join(target, 'tests/pr-gate.test.ts'), "import { test, expect } from 'bun:test'; test('y', () => expect(1).toBe(1));\n");
-    writeFileSync(join(target, 'scripts/test-worktrees.ts'), 'console.log("noop");\n');
+    const stub = (name: string) =>
+      writeFileSync(join(target, name), "import { test, expect } from 'bun:test'; test('stub', () => expect(1).toBe(1));\n");
+    stub('tests/acceptance.test.ts');
+    stub('tests/pr-gate.test.ts');
+    stub('tests/plugin-runtime-diagnostics.test.ts');
+    stub('tests/sidecar-runtime-diagnostics.test.ts');
+    stub('tests/plugin-runtime-role-gate.fork.test.ts');
+    writeFileSync(join(target, 'scripts/test-worktrees.ts'), '// fixture harness stub — not the company fork\nprocess.exit(0);\n');
+    writeFileSync(keyFile, agentSecret, { mode: 0o600 });
+
     const git = async (...args: string[]) => {
       const p = Bun.spawn(['git', ...args], { cwd: target, stdout: 'pipe', stderr: 'pipe' });
       await p.exited;
@@ -663,7 +670,7 @@ describe('managed-local-test acceptance adapter', () => {
     await git('config', 'user.email', 't@example.com');
     await git('config', 'user.name', 't');
     await git('add', '.');
-    await git('commit', '-m', 't');
+    await git('commit', '-m', 'fixture');
     const headProc = Bun.spawn(['git', 'rev-parse', 'HEAD'], { cwd: target, stdout: 'pipe' });
     const head = (await new Response(headProc.stdout).text()).trim();
     await headProc.exited;
@@ -671,27 +678,67 @@ describe('managed-local-test acceptance adapter', () => {
 
     const prevHome = process.env.SCK_SERVICE_HOME;
     process.env.SCK_SERVICE_HOME = home;
-    try {
-      const script = join(ROOT, 'scripts/managed-local-test.sh');
-      const run = Bun.spawn(['/bin/sh', script, 'sys02-local-evidence', target], {
+    const script = join(ROOT, 'scripts/managed-local-test.sh');
+    const runSuite = async (suite: string) => {
+      const run = Bun.spawn(['/bin/sh', script, suite, target], {
         cwd: ROOT,
-        env: { ...process.env, SCK_SERVICE_HOME: home, PATH: process.env.PATH },
+        env: {
+          ...process.env,
+          SCK_SERVICE_HOME: home,
+          PATH: process.env.PATH,
+          SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE: keyFile,
+          SCK_MANAGED_LOCAL_TEST_TASK_ID: authorizedTask,
+          SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID: ownerAudit,
+          SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID: ownerTask,
+        },
         stdout: 'pipe', stderr: 'pipe',
       });
       const out = await new Response(run.stdout).text();
       const err = await new Response(run.stderr).text();
       const code = await run.exited;
-      expect(code).toBe(0);
-      expect(out + err).toContain('hostMode=dry-run');
-      const name = managedLocalTestRecordFileName(head, 'sys02-local-evidence');
-      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name))).toBe(true);
+      return { code, text: out + err };
+    };
+    try {
+      const a = await runSuite('sys02-local-evidence');
+      expect(a.code).toBe(0);
+      expect(a.text).toContain('hostMode=managed');
+      const b = await runSuite('sys04-runtime-diagnostics');
+      expect(b.code).toBe(0);
+      expect(b.text).toContain('hostMode=managed');
+
+      const name02 = managedLocalTestRecordFileName(head, 'sys02-local-evidence');
+      const name04 = managedLocalTestRecordFileName(head, 'sys04-runtime-diagnostics');
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name02))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name04))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, managedLocalTestLogFileName(head, 'sys02-local-evidence')))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, managedLocalTestLogFileName(head, 'sys04-runtime-diagnostics')))).toBe(true);
       expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, `${head}.json`))).toBe(false);
-      const rec = await defaultManagedLocalTestReader({ sha: head, suite: 'sys02-local-evidence' });
-      expect(rec?.suite).toBe('sys02-local-evidence');
-      expect(rec?.sha).toBe(head);
-      expect(rec?.hostMode).toBe('dry-run');
-      // Second suite path must not be overwritten by the first (file simply absent until written).
-      expect(await defaultManagedLocalTestReader({ sha: head, suite: 'sys04-runtime-diagnostics' })).toBeNull();
+
+      const rec02 = await defaultManagedLocalTestReader({ sha: head, suite: 'sys02-local-evidence' });
+      const rec04 = await defaultManagedLocalTestReader({ sha: head, suite: 'sys04-runtime-diagnostics' });
+      expect(rec02?.suite).toBe('sys02-local-evidence');
+      expect(rec04?.suite).toBe('sys04-runtime-diagnostics');
+      expect(rec02?.sha).toBe(head);
+      expect(rec04?.sha).toBe(head);
+      expect(rec02?.command).not.toBe(rec04?.command);
+      expect(rec02?.hostMode).toBe('managed');
+      expect(rec04?.hostMode).toBe('managed');
+
+      const agent = createHmacManagedLocalTestAgent(agentSecret, 'dual-suite-verify');
+      const scope = { requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask };
+      expect(verifyManagedLocalTestAttestation(rec02!, agent, scope).ok).toBe(true);
+      expect(verifyManagedLocalTestAttestation(rec04!, agent, scope).ok).toBe(true);
+      expect(verifyManagedLocalTestAttestation(rec02!, agent, { ...scope, requestingTaskId: '00000000-0000-0000-0000-000000000000' }).ok).toBe(false);
+      expect(verifyManagedLocalTestAttestation({ ...rec02!, suite: 'sys04-runtime-diagnostics' }, agent, scope).ok).toBe(false);
+
+      const verified = await verifyManagedLocalTest({
+        sha: head, suite: 'sys02-local-evidence', ...scope,
+        readRecord: async () => rec02!,
+        readOwnerReply: async () => ownerReply,
+        readLogHash: () => rec02!.logHash,
+        attestationAgent: agent,
+      });
+      expect(verified).toMatchObject({ ok: true, source: { provider: 'managed-local-test' } });
     } finally {
       if (prevHome === undefined) delete process.env.SCK_SERVICE_HOME;
       else process.env.SCK_SERVICE_HOME = prevHome;
