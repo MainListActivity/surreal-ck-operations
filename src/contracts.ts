@@ -804,6 +804,44 @@ export interface OutboxEvent {
 }
 
 /**
+ * SYS04: what the plugin process is actually running. Read-only, and read by gm/product/qa only: it names the
+ * release the company service is loaded from, so it is an operator fact rather than a general employee read.
+ *
+ * The view is produced in the plugin host's own execution context (the face every employee channel reaches),
+ * never from the MCP face's tree and never from the `active` symlink — a symlink names what the service
+ * points at, which is the claim needing evidence rather than the evidence.
+ */
+export interface PluginRuntimeView {
+  /** Which execution context produced this answer. `plugin-host` is the only accepted value. */
+  context: 'plugin-host';
+  /** When the sample was taken, ISO 8601 with a timezone offset. */
+  collectedAt: string;
+  process: { pid: number; nodeVersion: string; execPath: string; bunShim: boolean };
+  loaded: {
+    selfPath: string | null;
+    serverDir: string | null;
+    vendorDir: string | null;
+    vendorResolvedBy: 'vendor-child-of-server-dir' | 'unavailable';
+  };
+  /** The release proven from the loaded code's own path; `unavailable` when it could not be proven. */
+  binding: { kind: 'plugin-server-dir' | 'unavailable'; path: string | null; reason?: string };
+  /** The files whose content binds the answer. A file that could not be read is present with a null digest. */
+  modules: Array<{ name: string; path: string | null; sha256: string | null; bytes: number | null }>;
+  /** Paths the diagnostic deliberately did not read, so a reader can see the boundary. */
+  notRead: string[];
+}
+
+/**
+ * SYS04: the roles allowed to read the plugin runtime diagnostics.
+ *
+ * The role check is a core concern because that is where the authoritative identity lives; the sample itself
+ * is taken by the plugin host, the only process that can state what it loaded. An unauthorized read must
+ * produce no diagnostic at all — not a refused one that still touched the filesystem — so the check runs
+ * before any sampling.
+ */
+export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['gm', 'product', 'qa'];
+
+/**
  * gm dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
  * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
  */
@@ -1092,6 +1130,15 @@ export interface CompanyCore {
    */
   systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
+  /**
+   * SYS04: authorize a read of the plugin runtime diagnostics (gm/product/qa only) and answer it from the
+   * caller's own execution context.
+   *
+   * `sample` is invoked only after the caller is known to be allowed, so an unauthorized read produces no
+   * diagnostic at all rather than a refused one that still touched the filesystem. The core cannot take the
+   * sample itself: only the plugin host can state what it loaded.
+   */
+  pluginRuntimeDiagnostics?(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView>;
   /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
   qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
   qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;

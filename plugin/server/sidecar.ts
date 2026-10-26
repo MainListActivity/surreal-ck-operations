@@ -1084,17 +1084,25 @@ export class SidecarPool {
           files: Array.isArray(args.files) ? args.files.map(String) : [],
         });
       }
-      // SYS04: a read-only sample of what THIS process is running. It is answered here, in the plugin host,
-      // rather than through core: core also runs in the MCP face, and a path read there would describe a
-      // different execution context than the one the employee's `sck call` actually reaches. No credential,
-      // private path, environment value or arbitrary file is involved; the answer is a bounded set of paths,
-      // digests and the collection instant.
+      // SYS04: a read-only sample of what THIS process is running.
+      //
+      // The sample is taken here, in the plugin host, because core also runs in the MCP face and a path read
+      // there would describe a different execution context than the one the employee's `sck call` reaches. The
+      // authorization is core's: it decides whether this caller may read the diagnostics at all, and it does so
+      // BEFORE the sample is taken, so an unauthorized read produces no diagnostic at all rather than a refused
+      // one that still touched the filesystem. The role set is gm/product/qa — the operators who act on a
+      // deployment; a general employee has no business collecting the service's runtime fingerprint.
       case "plugin_runtime_diagnostics": return withinReplyCeiling(async () => {
-        const { collectPluginRuntimeDiagnostics } = await import("./runtime-diagnostics.ts");
-        const sample = collectPluginRuntimeDiagnostics();
-        // The stamp that proves this answer came from the plugin face rather than the MCP one: the MCP process
-        // has no plugin server directory, so its own attempt to answer would report the binding unavailable.
-        return { ...sample, channel: "plugin-sidecar", instanceId: instId };
+        if (!core.pluginRuntimeDiagnostics) {
+          throw Object.assign(new Error("core does not expose plugin_runtime_diagnostics"), { code: "temporarily_unavailable" });
+        }
+        return core.pluginRuntimeDiagnostics(cred, async () => {
+          const { collectPluginRuntimeDiagnostics } = await import("./runtime-diagnostics.ts");
+          const sample = collectPluginRuntimeDiagnostics();
+          // The stamp that proves this answer came from the plugin face rather than the MCP one: the MCP process
+          // has no plugin server directory, so its own attempt to answer would report the binding unavailable.
+          return { ...sample, channel: "plugin-sidecar", instanceId: instId };
+        });
       });
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`

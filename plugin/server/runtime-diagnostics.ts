@@ -19,13 +19,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
-
-/** How the reported release binding was established. A value of `unavailable` is a fact, not a failure. */
-export type RuntimeBindingKind =
-  /** The plugin server directory resolves inside a release snapshot; the binding is the resolved path. */
-  | "plugin-server-dir"
-  /** The release could not be established from this context; nothing was guessed. */
-  | "unavailable";
+import type { PluginRuntimeView } from "./vendor/src/contracts.ts";
 
 /** One file the diagnostic read, with the digest that binds its content. */
 export interface RuntimeModule {
@@ -39,47 +33,8 @@ export interface RuntimeModule {
   readonly bytes: number | null;
 }
 
-/** The release/source binding the diagnostic could prove from the plugin's own execution context. */
-export interface RuntimeBinding {
-  readonly kind: RuntimeBindingKind;
-  /** The resolved absolute path the binding was taken from; null when unavailable. */
-  readonly path: string | null;
-  /** Why the binding is unavailable, when it is. */
-  readonly reason?: string;
-}
-
-export interface PluginRuntimeDiagnostics {
-  /** Which execution context produced this answer. `plugin-host` is the only accepted value. */
-  readonly context: "plugin-host";
-  /** When the sample was taken, ISO 8601 with a timezone offset. */
-  readonly collectedAt: string;
-  /** Process facts that identify the running program. */
-  readonly process: {
-    readonly pid: number;
-    readonly nodeVersion: string;
-    /** The executable actually running, from process.execPath. */
-    readonly execPath: string;
-    /** Whether the Bun shim is installed in this process (the plugin runs on Node). */
-    readonly bunShim: boolean;
-  };
-  /** The loaded entry point and module paths, as this process resolves them. */
-  readonly loaded: {
-    /** Absolute path of this diagnostic module inside the running program. */
-    readonly selfPath: string | null;
-    /** Absolute path of the plugin server directory that holds the company code. */
-    readonly serverDir: string | null;
-    /** Absolute path of the vendored company source the plugin imports. */
-    readonly vendorDir: string | null;
-    /** How the vendored directory was resolved, or why it was not. */
-    readonly vendorResolvedBy: "vendor-child-of-server-dir" | "unavailable";
-  };
-  /** The release/source binding proven from this context; never the `active` symlink. */
-  readonly binding: RuntimeBinding;
-  /** The files whose content binds the answer. */
-  readonly modules: readonly RuntimeModule[];
-  /** Paths the diagnostic deliberately did NOT read, so a reader can see the boundary. */
-  readonly notRead: readonly string[];
-}
+/** The answer shape is the shared contract, so core and the plugin agree on it exactly. */
+export type PluginRuntimeDiagnostics = PluginRuntimeView;
 
 /** Read one file's content and digest it; an unreadable file is reported as a gap, never omitted. */
 function readModule(name: string, path: string | null): RuntimeModule {
@@ -133,7 +88,7 @@ function resolveVendorDir(serverDir: string | null): { vendorDir: string | null;
  * `active` symlink: a symlink names what the service points at, which is exactly the claim that needs
  * independent evidence rather than restatement.
  */
-function bindRelease(serverDir: string | null): RuntimeBinding {
+function bindRelease(serverDir: string | null): PluginRuntimeView["binding"] {
   if (!serverDir) return { kind: "unavailable", path: null, reason: "plugin server directory could not be resolved in this context" };
   // <release>/plugin/server -> <release>
   const candidate = resolve(serverDir, "..", "..");

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,13 +19,56 @@ const claimResult = (taskId: string): ClaimResult => ({
   task: taskView(taskId), deliveryId: `d-${taskId}`, fence: 7, leaseExpiresAt: new Date().toISOString(), history: [],
 });
 
+/**
+ * The core the sidecar talks to. It mirrors core's own rule (SYS04: gm/product/qa may read the plugin runtime
+ * diagnostics) and — the part this file is about — it refuses BEFORE calling the sampler, exactly as the real
+ * core does, so an unauthorized read produces no diagnostic at all.
+ */
+let actorRole = 'gm';
+let samplerCalls = 0;
+/**
+ * The plugin host's real collector, replaced by a counting stand-in.
+ *
+ * The sidecar's own contract is that it hands core a *callback* and lets core decide whether to run it. A
+ * counter on the real collector is what makes that observable: if the sidecar sampled before asking core, the
+ * count would rise for a refused call, and this file's "no diagnostic is produced" case would fail.
+ */
+let collectorCalls = 0;
+mock.module('../plugin/server/runtime-diagnostics.ts', () => ({
+  collectPluginRuntimeDiagnostics: () => {
+    collectorCalls++;
+    return {
+      context: 'plugin-host' as const,
+      collectedAt: new Date().toISOString(),
+      process: { pid: 1, nodeVersion: 'v0.0.0', execPath: '/test/node', bunShim: false },
+      loaded: { selfPath: '/test/plugin/server/runtime-diagnostics.ts', serverDir: '/test/plugin/server', vendorDir: '/test/plugin/server/vendor', vendorResolvedBy: 'vendor-child-of-server-dir' as const },
+      binding: { kind: 'plugin-server-dir' as const, path: '/test' },
+      modules: [{ name: 'core', path: '/test/plugin/server/vendor/src/core.ts', sha256: 'a'.repeat(64), bytes: 1 }],
+      notRead: [
+        'private/ (service credentials)',
+        'active symlink (names a target, not a loaded module)',
+        'MCP face tree (release/src, a different execution context)',
+        'process environment values',
+      ],
+    };
+  },
+}));
+
 const core = {
-  authenticate: async () => ({ employeeId: 'eng-x', role: 'engineering' }),
+  authenticate: async () => ({ employeeId: 'eng-x', role: actorRole }),
   listTasks: async () => [], getTask: async () => taskView('task-x'),
   heartbeat: async () => ({}), claim: async () => claimResult('task-x'), checkpoint: async () => ({}),
   submit: async () => ({}), review: async () => ({}), block: async () => ({}), history: async () => [],
   worktreeList: async () => [], worktreePage: async () => ({ worktrees: [], page: {} }),
   contextView: async () => ({ principal: { employeeId: 'eng-x' }, tasks: [] }),
+  pluginRuntimeDiagnostics: async (_credential: string, sample: () => unknown) => {
+    if (!['gm', 'product', 'qa'].includes(actorRole)) {
+      // Shaped like the real CompanyError: the code is separate from the message, and the relay prefixes it.
+      throw Object.assign(new Error('Only gm, product or qa may read the plugin runtime diagnostics'), { code: 'forbidden' });
+    }
+    samplerCalls++;
+    return sample();
+  },
 };
 const workforce = { rotate: async () => ({}), list: async () => [], heartbeat: async () => ({}) };
 const ops = { tools: ['ops_info'] as const, call: async () => ({ ok: true }), release: () => undefined };
@@ -46,6 +89,9 @@ const relay = async (envDir: string, key: string, name: string, tool: string, ar
 let runDir: string;
 let pool: SidecarPool;
 beforeEach(() => {
+  actorRole = 'gm';
+  samplerCalls = 0;
+  collectorCalls = 0;
   runDir = mkdtempSync(join(tmpdir(), 'sck-rt-diag-sidecar-'));
   pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20 });
 });
@@ -147,6 +193,42 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       expect(binding.path).not.toBe(elsewhere);
       expect(String(JSON.stringify(answer.data))).not.toContain(elsewhere);
     } finally { process.env.SCK_SERVICE_HOME = prev; }
+  });
+
+  test('an unauthorized role is refused through the channel and no diagnostic is produced', async () => {
+    // SYS04 review R1: the diagnostic names the release the service is loaded from, so it is an operator fact.
+    // A role that may not read it gets a refusal — and the plugin host is never asked to sample, so no
+    // diagnostic is produced at all (not a refused one that still touched the filesystem).
+    for (const role of ['engineering', 'cs', 'eval']) {
+      actorRole = role;
+      const i = inst(`e-${role}`);
+      const env = pool.env(i);
+      await pool.claim(i, task(`task-${role}`));
+      const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `r-${role}`, 'plugin_runtime_diagnostics', {});
+      expect([role, answer.ok]).toEqual([role, false]);
+      expect(String(answer.error)).toContain('forbidden');
+      expect(String(answer.error)).toContain('gm, product or qa');
+      // No sample was taken for a refused call: neither core's callback nor the plugin host's collector ran.
+      expect([role, samplerCalls]).toEqual([role, 0]);
+      expect([role, collectorCalls]).toEqual([role, 0]);
+    }
+  });
+
+  test('gm, product and qa are answered with the plugin execution context', async () => {
+    for (const role of ['gm', 'product', 'qa']) {
+      actorRole = role;
+      const before = samplerCalls;
+      const beforeCollector = collectorCalls;
+      const i = inst(`e-ok-${role}`);
+      const env = pool.env(i);
+      await pool.claim(i, task(`task-ok-${role}`));
+      const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, `o-${role}`, 'plugin_runtime_diagnostics', {});
+      expect([role, answer.ok]).toEqual([role, true]);
+      expect([role, (answer.data as { context: string }).context]).toEqual([role, 'plugin-host']);
+      // Exactly one sample per authorized call: the host is asked once, not twice.
+      expect([role, samplerCalls - before]).toEqual([role, 1]);
+      expect([role, collectorCalls - beforeCollector]).toEqual([role, 1]);
+    }
   });
 
   test('a null argument object is accepted for this read, and the answer still arrives', async () => {
