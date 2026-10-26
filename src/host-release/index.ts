@@ -1,0 +1,13 @@
+export type {
+  HostReleaseCheck, HostReleaseOp, HostReleaseOperation, HostReleasePrepareResult, HostReleaseReceipt,
+  HostReleaseRequest, HostReleaseRoots, HostReleaseState, HostReleaseStatusResult,
+} from './types.ts';
+export {
+  HOST_RELEASE_LOCK_FILE, HOST_RELEASE_OPERATION_FILE, HOST_RELEASE_PREPARE_FILE, HOST_RELEASE_RECEIPT_FILE,
+  hostReleaseEnvelopeDir, isCommitSha, isSafeAbsolutePath,
+} from './types.ts';
+export { snapshotInventoryHash, verifyRelease, resolveServiceBunVersion, type VerifyInput, type VerifyResult } from './verify.ts';
+export {
+  HostReleaseError, acquireHostReleaseLock, opIdFor, prepareHostRelease, readHostReleaseReceipt,
+  readHostReleaseStatus, releaseHostReleaseLock, validateRequest, writeHostReceipt,
+} from './store.ts';

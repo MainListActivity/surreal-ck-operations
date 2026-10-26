@@ -4,7 +4,10 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView, HostReleasePrepareInput, HostReleasePrepareView, HostReleaseStatusView, HostReleaseReceiptView } from './contracts.ts';
+import {
+  HostReleaseError, prepareHostRelease, readHostReleaseReceipt, readHostReleaseStatus,
+} from './host-release/index.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -2912,6 +2915,111 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or gm');
     }
     return this.faultStatusOf(input.taskId);
+  }
+
+  /**
+   * FV06/SYS04: prepare a verified host-release envelope. Apply is deliberately not exposed — the employee
+   * sandbox cannot write releases/ or exec paseo/launchctl. The fixed apply entry is scripts/host-release/apply.sh
+   * on a trusted host; this method only records the prepare half and returns apply.available=false.
+   */
+  async hostReleasePrepare(credential: Credential, input: HostReleasePrepareInput): Promise<HostReleasePrepareView> {
+    const actor = await this.authenticate(credential);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const holds = row.current_employee === actor.employeeId && ['doing', 'review', 'blocked'].includes(row.state ?? '') &&
+      (row.lease_expires_at ?? 0) > Date.now() / 1000;
+    if (actor.role !== 'gm' && actor.role !== 'engineering' && !holds) {
+      throw new CompanyError('forbidden', 'host_release_prepare is called by the task holder, engineering, or gm');
+    }
+    const serviceHome = process.env.SCK_SERVICE_HOME
+      || `${process.env.HOME ?? ''}/Library/Application Support/SurrealCKCompany`;
+    const opsRepo = process.env.SCK_OPS_REPO || process.env.SCK_AGENT_CWD
+      || '/Users/y/IdeaProjects/surreal-ck-operations';
+    try {
+      const prepared = prepareHostRelease({
+        roots: { serviceHome, opsRepo, releasesDir: `${serviceHome}/releases` },
+        request: {
+          taskId: input.taskId,
+          targetSha: input.targetSha,
+          expectedActive: input.expectedActive,
+          snapshotHash: input.snapshotHash,
+          rollbackSha: input.rollbackSha,
+          idempotencyKey: input.idempotencyKey,
+        },
+        snapshotPath: input.snapshotPath,
+      });
+      await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'host_release_prepare', evidence: $evidence, at: time::now() };`,
+        { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
+          evidence: JSON.stringify({ opId: prepared.opId, targetSha: prepared.targetSha, state: prepared.state, snapshotHash: prepared.snapshotHash }).slice(0, 30000) });
+      return {
+        ...prepared,
+        apply: {
+          available: false,
+          reason: 'apply runs only on a trusted host via scripts/host-release/apply.sh (needs releases/, private/, paseo, launchctl); the employee channel cannot execute it',
+        },
+      };
+    } catch (error) {
+      if (error instanceof HostReleaseError) {
+        throw new CompanyError(error.code === 'refused' ? 'invalid' : error.code === 'conflict' ? 'conflict' : error.code === 'not_found' ? 'not_found' : 'invalid', error.message);
+      }
+      throw error;
+    }
+  }
+
+  async hostReleaseStatus(credential: Credential, input: { opId: string }): Promise<HostReleaseStatusView> {
+    await this.authenticate(credential);
+    const serviceHome = process.env.SCK_SERVICE_HOME
+      || `${process.env.HOME ?? ''}/Library/Application Support/SurrealCKCompany`;
+    try {
+      const status = readHostReleaseStatus(serviceHome, input.opId);
+      return {
+        ...status,
+        apply: {
+          available: false,
+          reason: 'apply runs only on a trusted host via scripts/host-release/apply.sh; use host_release_receipt after the host writes one',
+        },
+      };
+    } catch (error) {
+      if (error instanceof HostReleaseError) {
+        throw new CompanyError(error.code === 'not_found' ? 'not_found' : 'invalid', error.message);
+      }
+      throw error;
+    }
+  }
+
+  async hostReleaseReceipt(credential: Credential, input: { opId: string }): Promise<HostReleaseReceiptView> {
+    await this.authenticate(credential);
+    const serviceHome = process.env.SCK_SERVICE_HOME
+      || `${process.env.HOME ?? ''}/Library/Application Support/SurrealCKCompany`;
+    try {
+      const receipt = readHostReleaseReceipt(serviceHome, input.opId);
+      return {
+        schema: receipt.schema,
+        opId: receipt.opId,
+        taskId: receipt.taskId,
+        targetSha: receipt.targetSha,
+        state: receipt.state,
+        executor: receipt.executor,
+        startedAt: receipt.startedAt,
+        finishedAt: receipt.finishedAt,
+        exitCode: receipt.exitCode,
+        binding: {
+          releasePath: receipt.binding.releasePath,
+          contentMatchesCommit: receipt.binding.contentMatchesCommit,
+          vendorSchemaDiff: receipt.binding.vendorSchemaDiff,
+        },
+        mcp: receipt.mcp,
+        plugin: receipt.plugin,
+        channelRecovery: receipt.channelRecovery,
+        lockReleased: receipt.lockReleased,
+        ...(receipt.reason ? { reason: receipt.reason } : {}),
+      };
+    } catch (error) {
+      if (error instanceof HostReleaseError) {
+        throw new CompanyError(error.code === 'not_found' ? 'not_found' : 'invalid', error.message);
+      }
+      throw error;
+    }
   }
 
   /**
