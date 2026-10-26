@@ -832,6 +832,29 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.faultStatus
     ? core.faultStatus(token(ctx), { taskId: input.taskId }) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('host_release_prepare', {
+    description: 'FV06/SYS04 managed host-release prepare (employee-safe): verify a pre-built snapshot against main ancestry, content bind, RW06/SYS02/IR06/SYS06, dual gates and expectedActive CAS; write the envelope under maintenance/host-release/<opId>/. Returns apply.available=false — apply runs only on a trusted host via scripts/host-release/apply.sh (needs releases/, private/, paseo, launchctl). Does not switch active. Does not accept arbitrary commands or paths.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      targetSha: z.string().regex(/^[0-9a-f]{40}$/),
+      expectedActive: z.string().min(1).max(1024),
+      snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
+      rollbackSha: z.string().regex(/^[0-9a-f]{40}$/),
+      snapshotPath: z.string().min(1).max(1024),
+      idempotencyKey: z.string().min(1).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.hostReleasePrepare
+    ? core.hostReleasePrepare(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('host_release_status', {
+    description: 'Read the state of a managed host-release operation envelope. Secret-free. Apply is never available on this channel.',
+    inputSchema: z.object({ opId: z.string().regex(/^[0-9a-f]{16,64}$/) }),
+  }, async (input, ctx) => run(token(ctx), () => core.hostReleaseStatus
+    ? core.hostReleaseStatus(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('host_release_receipt', {
+    description: 'Read a host-written release receipt (schema host-release-receipt/1 with executor identity). Employee-uploaded JSON without a trusted executor is refused. Use after the trusted host has run scripts/host-release/apply.sh.',
+    inputSchema: z.object({ opId: z.string().regex(/^[0-9a-f]{16,64}$/) }),
+  }, async (input, ctx) => run(token(ctx), () => core.hostReleaseReceipt
+    ? core.hostReleaseReceipt(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('fault_lift', {
     description: 'gm only: lift a spent (or stopped) recovery budget for one incident of a task after the cause is fixed or a diagnosis has been recorded. Resets the existing scope so the next attempt starts a fresh recovery window. Creates no new budget and never invents an incident. Audited. Pass the incident from fault_status.',
     inputSchema: z.object({

@@ -1136,6 +1136,14 @@ export interface CompanyCore {
    */
   faultLift?(credential: Credential, input: { taskId: TaskId; incident: string; reason: string; idempotencyKey: string }): Promise<FaultStatusView>;
   /**
+   * FV06/SYS04 managed host-release seam (employee-safe half): prepare a verified snapshot envelope, read status,
+   * read a host-written receipt. Apply is NOT exposed here — it requires a trusted host outside the employee
+   * sandbox (releases/ + private/ + paseo + launchctl). An employee-uploaded JSON is never accepted as a receipt.
+   */
+  hostReleasePrepare?(credential: Credential, input: HostReleasePrepareInput): Promise<HostReleasePrepareView>;
+  hostReleaseStatus?(credential: Credential, input: { opId: string }): Promise<HostReleaseStatusView>;
+  hostReleaseReceipt?(credential: Credential, input: { opId: string }): Promise<HostReleaseReceiptView>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
@@ -1409,6 +1417,74 @@ export interface FaultStatusView {
   budgets: FaultBudgetView[];
   episodes: FaultEpisodeView[];
   repairs: FaultRepairView[];
+}
+
+/** FV06/SYS04: employee-safe prepare input for the managed host-release seam. */
+export interface HostReleasePrepareInput {
+  taskId: TaskId;
+  /** Full 40-char main commit SHA. */
+  targetSha: string;
+  /** Absolute path active must currently equal (CAS). */
+  expectedActive: string;
+  /** Inventory hash of the prepared snapshot. */
+  snapshotHash: string;
+  /** Full 40-char rollback candidate SHA. */
+  rollbackSha: string;
+  /** Absolute path of the prepared snapshot directory (name = targetSha). */
+  snapshotPath: string;
+  idempotencyKey: string;
+}
+
+export interface HostReleaseCheckView { name: string; ok: boolean; detail?: string }
+
+export interface HostReleasePrepareView {
+  opId: string;
+  state: string;
+  targetSha: string;
+  expectedActive: string;
+  snapshotHash: string;
+  rollbackSha: string;
+  snapshotPath: string;
+  envelopePath: string;
+  checks: HostReleaseCheckView[];
+  /** Explicit: apply is not available on the employee channel. */
+  apply: { available: false; reason: string };
+}
+
+export interface HostReleaseStatusView {
+  opId: string;
+  state: string;
+  targetSha: string;
+  expectedActive: string;
+  snapshotHash: string;
+  rollbackSha: string;
+  updatedAt: string;
+  reason?: string;
+  receiptPath?: string;
+  activeNow?: string;
+  apply: { available: false; reason: string };
+}
+
+/** Host-written receipt view (schema-validated). */
+export interface HostReleaseReceiptView {
+  schema: 'host-release-receipt/1';
+  opId: string;
+  taskId: string;
+  targetSha: string;
+  state: string;
+  executor: { host: string; uid: number; user: string };
+  startedAt: string;
+  finishedAt: string;
+  exitCode: number;
+  installerExitCode: number;
+  binding: { releasePath: string | null; contentMatchesCommit: boolean; vendorSchemaDiff: string; schemaHash: string | null; vendorSchemaHash: string | null };
+  mcp: { health: number | null; ready: number | null; cwd: string | null; pid: number | null; sha: string | null };
+  plugin: { status: string | null; enabled: boolean | null; source: string | null; directory: string | null; sourceKnown: boolean; modules: Array<{ path: string; sha256: string; bytes: number }> | null };
+  channelRecovery: string;
+  lockReleased: boolean;
+  /** Structured post-check results (install / active / mcp health+ready / plugin source / rollback). */
+  checks: Array<{ name: string; ok: boolean; detail?: string }>;
+  reason?: string;
 }
 
 /** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */

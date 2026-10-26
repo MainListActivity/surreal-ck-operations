@@ -36,6 +36,10 @@
   (under service "/sandbox")
   (under service "/zdot")
   (under service "/vault")
+  ;; F4 / AC04: employees must not mint host-release receipts or hold the apply lock.
+  ;; prepare still writes envelopes under maintenance/host-release/<opId>/ via the
+  ;; company service process (outside this profile); the agent session itself cannot.
+  (under service "/maintenance/host-release")
   (under home "/Library/LaunchAgents")
   (under home "/.local/bin")
   (under home "/.local/share/claude")

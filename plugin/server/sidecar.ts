@@ -72,6 +72,8 @@ const BASE_TOOLS = [
   "plugin_runtime_diagnostics",
   // SYS04 故障诊断：任务持有人 / 验收人 / gm 只读预算状态；gm 解封已耗尽的恢复预算（core 判定）。
   "fault_status", "fault_lift",
+  // FV06/SYS04 受管宿主发布接缝（员工通道半边）：prepare/status/receipt。apply 不在此暴露。
+  "host_release_prepare", "host_release_status", "host_release_receipt",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -1117,6 +1119,23 @@ export class SidecarPool {
             idempotencyKey: String(args.idempotencyKey ?? ""),
           })
         : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
+      case "host_release_prepare": return core.hostReleasePrepare
+        ? core.hostReleasePrepare(cred, {
+            taskId: String(args.taskId ?? live().taskId),
+            targetSha: String(args.targetSha ?? ""),
+            expectedActive: String(args.expectedActive ?? ""),
+            snapshotHash: String(args.snapshotHash ?? ""),
+            rollbackSha: String(args.rollbackSha ?? ""),
+            snapshotPath: String(args.snapshotPath ?? ""),
+            idempotencyKey: String(args.idempotencyKey ?? ""),
+          })
+        : Promise.reject(Object.assign(new Error("core does not expose host_release_prepare"), { code: "temporarily_unavailable" }));
+      case "host_release_status": return core.hostReleaseStatus
+        ? core.hostReleaseStatus(cred, { opId: String(args.opId ?? "") })
+        : Promise.reject(Object.assign(new Error("core does not expose host_release_status"), { code: "temporarily_unavailable" }));
+      case "host_release_receipt": return core.hostReleaseReceipt
+        ? core.hostReleaseReceipt(cred, { opId: String(args.opId ?? "") })
+        : Promise.reject(Object.assign(new Error("core does not expose host_release_receipt"), { code: "temporarily_unavailable" }));
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });
