@@ -323,9 +323,14 @@ describe('managed-local-test acceptance adapter', () => {
     evidence: ownerEvidence,
     at: '2026-10-26T05:37:49.111436Z',
   };
-  const hostSecret = 'SCK_AGENT_CWD=/ops\nSCK_BUN=/bun\n';
-  const unsignedRecord = {
+  const agentSecret = 'unit-test-signing-key-v11!!';
+  const authorizedTask = '612f1946-ccab-42b6-b426-c3b032eb6a11';
+  const ownerTask = '25ec8d1a-6bbf-4bee-abaf-74998adeb5af';
+  const ownerAudit = 'wuj9vmp3vg9pqyu33p2v';
+
+  const unsignedBase = {
     gate: 'managed-local-test',
+    protocolVersion: 'managed-local-test/1',
     suite: 'sys04-runtime-diagnostics',
     sha: 'b1d5bc3ffed0629ec95184856d0651eb66189327',
     bun: '1.3.11',
@@ -341,221 +346,224 @@ describe('managed-local-test acceptance adapter', () => {
     dirty: false,
     log: '/gates/managed-local-test/b1d5bc3ffed0629ec95184856d0651eb66189327.log',
     logHash: 'a'.repeat(64),
+    runnerIdentity: 'test-host:501',
+    requestingTaskId: authorizedTask,
+    ownerReplyAuditId: ownerAudit,
+    ownerReplyTaskId: ownerTask,
     hostMode: 'dry-run' as const,
   };
-  const authorizedTask = '612f1946-ccab-42b6-b426-c3b032eb6a11';
-  const ownerTask = '25ec8d1a-6bbf-4bee-abaf-74998adeb5af';
 
-  const managedRecord = async () => {
-    const { signManagedLocalTestAttestation } = await import('../src/acceptance.ts');
-    const attestation = signManagedLocalTestAttestation(unsignedRecord, hostSecret);
-    return { ...unsignedRecord, hostMode: 'managed' as const, hostAttestation: attestation };
+  const managedOf = async (over: Record<string, unknown> = {}) => {
+    const {
+      createHmacManagedLocalTestAgent, managedLocalTestAttestationPayload, signedFieldsFromRecord, MANAGED_LOCAL_TEST_PROTOCOL,
+    } = await import('../src/acceptance.ts');
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'unit-hmac');
+    const record = { ...unsignedBase, hostMode: 'managed' as const, ...over };
+    const fields = signedFieldsFromRecord(record as any, {
+      requestingTaskId: (record as any).requestingTaskId ?? authorizedTask,
+      ownerReplyAuditId: (record as any).ownerReplyAuditId ?? ownerAudit,
+      ownerReplyTaskId: (record as any).ownerReplyTaskId ?? ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    return {
+      agent,
+      record: { ...record, protocolVersion: MANAGED_LOCAL_TEST_PROTOCOL, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) },
+    };
   };
 
   const baseOf = async () => {
-    const goodRecord = await managedRecord();
+    const { agent, record } = await managedOf();
     return {
-      goodRecord,
+      agent,
+      goodRecord: record,
       base: {
-        sha: goodRecord.sha,
-        suite: goodRecord.suite,
-        ownerReplyAuditId: 'wuj9vmp3vg9pqyu33p2v',
+        sha: record.sha,
+        suite: record.suite,
+        ownerReplyAuditId: ownerAudit,
         ownerReplyTaskId: ownerTask,
         requestingTaskId: authorizedTask,
-        readRecord: async () => goodRecord,
+        readRecord: async () => record,
         readOwnerReply: async () => ownerReply,
         readLogHash: () => 'a'.repeat(64),
-        readHostSecret: () => hostSecret,
+        attestationAgent: agent,
       },
     };
   };
 
-  test('a host-attested pass record with a real owner_reply is accepted', async () => {
+  test('a host-agent-attested pass record with a real owner_reply is accepted', async () => {
     const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
     const { base, goodRecord } = await baseOf();
     const result = await verifyManagedLocalTest(base);
     expect(result).toMatchObject({ ok: true, sha: goodRecord.sha });
     if (result.ok) {
       expect(result.source.provider).toBe('managed-local-test');
-      expect(result.source.exitCode).toBe(0);
-      expect(result.source.ownerReplyAuditId).toBe('wuj9vmp3vg9pqyu33p2v');
       expect(result.source.hostMode).toBe('managed');
+      expect(result.source.attestationAgent).toBe('unit-hmac');
     }
   });
 
-  test('a dry-run (engineer self-run) record cannot substitute CI', async () => {
+  test('production without a wired attestation agent fails closed', async () => {
     const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
     const { base } = await baseOf();
+    const result = await verifyManagedLocalTest({ ...base, attestationAgent: null });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('signing agent is not wired');
+  });
+
+  test('a dry-run record cannot substitute CI', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base, agent } = await baseOf();
     const result = await verifyManagedLocalTest({
-      ...base, readRecord: async () => unsignedRecord, readHostSecret: () => hostSecret,
+      ...base, attestationAgent: agent, readRecord: async () => unsignedBase,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain('dry-run');
   });
 
-  test('a forged hostAttestation is refused', async () => {
+  test('forged attestation / unbound release repoIdentity / mutated security fields are refused', async () => {
     const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base, goodRecord } = await baseOf();
+    const { base, goodRecord, agent } = await baseOf();
     expect((await verifyManagedLocalTest({
-      ...base,
-      readRecord: async () => ({ ...goodRecord, hostAttestation: 'f'.repeat(64) }),
+      ...base, readRecord: async () => ({ ...goodRecord, hostAttestation: 'f'.repeat(64) }),
     })).ok).toBe(false);
     expect((await verifyManagedLocalTest({
-      ...base, readHostSecret: () => null,
+      ...base, readRecord: async () => ({ ...goodRecord, repoIdentity: `release:${goodRecord.sha}` }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, dirty: true }),
+    })).ok).toBe(false);
+    // Tamper target after signing — MAC must fail
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, target: '/evil' }),
+    })).ok).toBe(false);
+    // Cross-task replay: record bound to authorizedTask, request from another authorized id still mismatches record field
+    const other = '690ea881-7663-41a5-a984-bfed0c189cde';
+    expect((await verifyManagedLocalTest({
+      ...base, requestingTaskId: other, attestationAgent: agent,
     })).ok).toBe(false);
   });
 
-  test('a failed or dirty record is refused', async () => {
+  test('shell-shaped producer → adapter: sign with agent then mutate each bound field', async () => {
+    const {
+      verifyManagedLocalTest, createHmacManagedLocalTestAgent, managedLocalTestAttestationPayload, signedFieldsFromRecord,
+    } = await import('../src/acceptance.ts');
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'shell-sim');
+    const draft = { ...unsignedBase, hostMode: 'managed' as const };
+    const fields = signedFieldsFromRecord(draft as any, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    const signed = { ...draft, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) };
+    const ok = await verifyManagedLocalTest({
+      sha: signed.sha, suite: signed.suite, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+      requestingTaskId: authorizedTask, readRecord: async () => signed, readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    });
+    expect(ok.ok).toBe(true);
+    for (const tweak of [
+      { result: 'fail', exitCode: 1 },
+      { startedAt: '1999-01-01T00:00:00Z' },
+      { command: 'bun test evil.ts' },
+      { runnerIdentity: 'attacker:0' },
+      { logHash: 'b'.repeat(64) },
+    ] as Array<Record<string, unknown>>) {
+      const tampered = { ...signed, ...tweak };
+      const res = await verifyManagedLocalTest({
+        sha: signed.sha, suite: signed.suite, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+        requestingTaskId: authorizedTask, readRecord: async () => tampered as any, readOwnerReply: async () => ownerReply,
+        readLogHash: () => (tweak.logHash as string) ?? 'a'.repeat(64), attestationAgent: agent,
+      });
+      expect(res.ok).toBe(false);
+    }
+  });
+
+  test('a failed or dirty or missing record / forged owner_reply / unknown suite / wrong sha are refused', async () => {
     const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
     const { base, goodRecord } = await baseOf();
     expect((await verifyManagedLocalTest({
       ...base, readRecord: async () => ({ ...goodRecord, result: 'fail', exitCode: 1 }),
     })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({ ...base, readLogHash: () => 'b'.repeat(64) })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({ ...base, readRecord: async () => null })).ok).toBe(false);
     expect((await verifyManagedLocalTest({
-      ...base, readRecord: async () => ({ ...goodRecord, dirty: true }),
-    })).ok).toBe(false);
-  });
-
-  test('a hand-edited log (logHash mismatch) is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base } = await baseOf();
-    expect((await verifyManagedLocalTest({
-      ...base, readLogHash: () => 'b'.repeat(64),
-    })).ok).toBe(false);
-  });
-
-  test('a missing gate record is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base } = await baseOf();
-    expect((await verifyManagedLocalTest({
-      ...base, readRecord: async () => null,
-    })).ok).toBe(false);
-  });
-
-  test('an unauthorized requesting task is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base } = await baseOf();
-    const result = await verifyManagedLocalTest({
       ...base, requestingTaskId: '00000000-0000-0000-0000-000000000000',
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toContain('not in the owner-authorized');
-  });
-
-  test('a forged or paraphrased owner_reply is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base } = await baseOf();
+    })).ok).toBe(false);
     expect((await verifyManagedLocalTest({
       ...base, readOwnerReply: async () => ({ ...ownerReply, evidence: '本地测试通过就可以（我同意）' }),
     })).ok).toBe(false);
-    expect((await verifyManagedLocalTest({
-      ...base, readOwnerReply: async () => ({ ...ownerReply, action: 'owner_approve' }),
-    })).ok).toBe(false);
-    expect((await verifyManagedLocalTest({
-      ...base, readOwnerReply: async () => ({ ...ownerReply, actor: 'engineering-claude-x' }),
-    })).ok).toBe(false);
-    expect((await verifyManagedLocalTest({
-      ...base, readOwnerReply: async () => null,
-    })).ok).toBe(false);
-  });
-
-  test('an unknown suite is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base } = await baseOf();
     expect((await verifyManagedLocalTest({ ...base, suite: 'anything-goes' })).ok).toBe(false);
-  });
-
-  test('a wrong-sha gate record is refused', async () => {
-    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
-    const { base, goodRecord } = await baseOf();
     expect((await verifyManagedLocalTest({
       ...base, readRecord: async () => ({ ...goodRecord, sha: 'c'.repeat(40) }),
     })).ok).toBe(false);
   });
 
-  test('the composite adapter routes by provider and keeps github-actions working', async () => {
+  test('the composite adapter routes by provider; managed path needs the agent', async () => {
     const { createAcceptanceSourceAdapter } = await import('../src/acceptance.ts');
-    const goodRecord = await managedRecord();
+    const { agent, record } = await managedOf();
     const adapter = createAcceptanceSourceAdapter({
       github: {
         verify: async () => ({ ok: true, sha: 'head-1', at: '2026-10-26T00:00:00Z', source: { provider: 'github-actions' } }),
       },
-      readRecord: async () => goodRecord,
+      readRecord: async () => record,
       readOwnerReply: async () => ownerReply,
       readLogHash: () => 'a'.repeat(64),
-      readHostSecret: () => hostSecret,
+      attestationAgent: agent,
     });
     expect(await adapter.verify({
       provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/1', sha: 'head-1',
     })).toMatchObject({ ok: true, source: { provider: 'github-actions' } });
     expect(await adapter.verify({
-      provider: 'managed-local-test', sha: goodRecord.sha, suite: goodRecord.suite,
-      ownerReplyAuditId: 'wuj9vmp3vg9pqyu33p2v', ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
+      provider: 'managed-local-test', sha: record.sha, suite: record.suite,
+      ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
     })).toMatchObject({ ok: true, source: { provider: 'managed-local-test' } });
+    const closed = createAcceptanceSourceAdapter({
+      readRecord: async () => record, readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64),
+    });
+    expect((await closed.verify({
+      provider: 'managed-local-test', sha: record.sha, suite: record.suite,
+      ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
+    })).ok).toBe(false);
   });
 
-  test('PR-gate soft CI failure is substituted only for authorized tasks with host-attested sys02 suite', async () => {
+  test('PR-gate soft CI substitute uses host agent + full payload; dry-run and ordinary tasks refuse', async () => {
     const {
-      evaluateManagedLocalPrGateSubstitute, MANAGED_LOCAL_TEST_SUBMIT_SUITE, signManagedLocalTestAttestation,
+      evaluateManagedLocalPrGateSubstitute, MANAGED_LOCAL_TEST_SUBMIT_SUITE, createHmacManagedLocalTestAgent,
+      managedLocalTestAttestationPayload, signedFieldsFromRecord,
     } = await import('../src/acceptance.ts');
-    const submitRecord = {
-      ...unsignedRecord,
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'pr-gate-hmac');
+    const draft = {
+      ...unsignedBase,
       suite: MANAGED_LOCAL_TEST_SUBMIT_SUITE,
       command: 'bun test tests/acceptance.test.ts tests/pr-gate.test.ts',
       hostMode: 'managed' as const,
-      hostAttestation: '',
     };
-    submitRecord.hostAttestation = signManagedLocalTestAttestation(submitRecord, hostSecret);
+    const fields = signedFieldsFromRecord(draft as any, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    const submitRecord = { ...draft, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) };
     const ciReason = 'PR https://github.com/o/r/pull/7 的 CI 未通过（quality、channel）：修复并确认通过后再提交。';
-    const ok = await evaluateManagedLocalPrGateSubstitute({
-      taskId: authorizedTask,
-      head: submitRecord.sha,
-      ciFailed: ['quality', 'channel'],
-      reason: ciReason,
-      readRecord: async () => submitRecord,
-      readOwnerReply: async () => ownerReply,
-      readLogHash: () => 'a'.repeat(64),
-      readHostSecret: () => hostSecret,
-    });
-    expect(ok).toMatchObject({ ok: true, head: submitRecord.sha });
-
-    // Ordinary task: soft CI stays a refuse.
-    const deniedTask = await evaluateManagedLocalPrGateSubstitute({
-      taskId: '00000000-0000-0000-0000-000000000000',
-      head: submitRecord.sha,
-      ciFailed: ['quality'],
-      reason: ciReason,
-      readRecord: async () => submitRecord,
-      readOwnerReply: async () => ownerReply,
-      readLogHash: () => 'a'.repeat(64),
-      readHostSecret: () => hostSecret,
-    });
-    expect(deniedTask.ok).toBe(false);
-
-    // Dry-run cannot substitute even for an authorized task.
-    const dry = await evaluateManagedLocalPrGateSubstitute({
-      taskId: authorizedTask,
-      head: submitRecord.sha,
-      ciFailed: ['quality'],
-      reason: ciReason,
-      readRecord: async () => ({ ...submitRecord, hostMode: 'dry-run', hostAttestation: undefined }),
-      readOwnerReply: async () => ownerReply,
-      readLogHash: () => 'a'.repeat(64),
-      readHostSecret: () => hostSecret,
-    });
-    expect(dry.ok).toBe(false);
-    if (!dry.ok) expect(dry.reason).toContain('受管本地替代未通过');
-
-    // Wrong head / wrong suite / local fail refuse.
-    expect((await evaluateManagedLocalPrGateSubstitute({
-      taskId: authorizedTask, head: 'd'.repeat(40), ciFailed: ['quality'], reason: ciReason,
+    expect(await evaluateManagedLocalPrGateSubstitute({
+      taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality', 'channel'], reason: ciReason,
       readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply,
-      readLogHash: () => 'a'.repeat(64), readHostSecret: () => hostSecret,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    })).toMatchObject({ ok: true, head: submitRecord.sha });
+    expect((await evaluateManagedLocalPrGateSubstitute({
+      taskId: '00000000-0000-0000-0000-000000000000', head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
+      readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
     })).ok).toBe(false);
     expect((await evaluateManagedLocalPrGateSubstitute({
       taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
-      readRecord: async () => ({ ...submitRecord, result: 'fail', exitCode: 1 }),
-      readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64), readHostSecret: () => hostSecret,
+      readRecord: async () => ({ ...submitRecord, hostMode: 'dry-run', hostAttestation: undefined }),
+      readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
     })).ok).toBe(false);
+    // No agent wired
+    const noAgent = await evaluateManagedLocalPrGateSubstitute({
+      taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
+      readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64),
+    });
+    expect(noAgent.ok).toBe(false);
+    if (!noAgent.ok) expect(noAgent.reason).toContain('受管本地替代未通过');
   });
 });

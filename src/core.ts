@@ -18,8 +18,9 @@ import {
   acceptanceLegForSubject, acceptanceTargetAttempt, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
   isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
-  MANAGED_LOCAL_TEST_AUTHORIZED_TASKS, evaluateManagedLocalPrGateSubstitute,
+  evaluateManagedLocalPrGateSubstitute,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
+  type ManagedLocalTestAttestationAgent,
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
@@ -564,12 +565,18 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  /** Host-wired managed-local-test signing agent; unset ⇒ substitute/evidence path fail-closed. */
+  private readonly managedLocalAttestationAgent: ManagedLocalTestAttestationAgent | null;
+
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; attestationAgent?: ManagedLocalTestAttestationAgent | null };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number } }) {
     this.submitCheck = options?.submitCheck;
     // Default: github-actions plus the owner-authorized managed-local-test path. The owner_reply reader is bound
     // to this core's database so the adapter can verify a real audit row; tests inject a whole adapter instead.
+    // Attestation agent is host-injected only — never derived from private/service.env (SYS02 v11).
+    this.managedLocalAttestationAgent = options?.acceptance?.attestationAgent ?? null;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createAcceptanceSourceAdapter({
+      attestationAgent: this.managedLocalAttestationAgent,
       readOwnerReply: async ({ taskId, auditId }) => {
         const [rows] = await this.database.db.query<[Array<{ action?: string; actor?: unknown; evidence?: string | null; at?: string }>]>(
           "SELECT action, actor, evidence, at FROM audit WHERE id = $aid AND action = 'owner_reply';",
@@ -2526,6 +2533,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
             ciFailed: checked.ciFailed!,
             reason: checked.reason,
             prUrl: checked.prUrl,
+            attestationAgent: this.managedLocalAttestationAgent,
             readOwnerReply: async ({ taskId, auditId }) => {
               const [rows] = await this.db.query<[Array<{ action: string; actor: string; evidence: string; at: string }>]>(
                 'SELECT action, type::string(actor) AS actor, evidence, type::string(at) AS at FROM type::thing("audit", $audit) WHERE task = $task LIMIT 1;',

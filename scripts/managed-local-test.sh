@@ -71,10 +71,8 @@ if [ -d "$target/.git" ] || [ -f "$target/.git" ]; then
   fi
 else
   # Release snapshot: content must match the commit when an ops checkout is available (same rule as release-gate).
+  # Do not read private/service.env here (SYS02 v11). Host sets SCK_OPS_REPO explicitly.
   ops_repo=${SCK_OPS_REPO:-}
-  if [ -z "$ops_repo" ] && [ -f "$service_home/private/service.env" ]; then
-    ops_repo=$(/usr/bin/sed -n 's/^SCK_AGENT_CWD=//p' "$service_home/private/service.env" 2>/dev/null | /usr/bin/tr -d "\"'" || true)
-  fi
   if [ -n "$ops_repo" ] && [ -d "$ops_repo/.git" ]; then
     release_matches_commit "$target" "$sha" "$ops_repo" || {
       echo "refused: $target does not match commit $sha" >&2; exit 2
@@ -82,7 +80,10 @@ else
     repo_identity=$(git -C "$ops_repo" rev-parse --git-common-dir)
     case "$repo_identity" in /*) ;; *) repo_identity=$(CDPATH= cd -- "$ops_repo/$repo_identity" && pwd);; esac
   else
-    repo_identity="release:$sha"
+    # SYS02 v11: a directory named as a 40-char sha is NOT proof the content matches that commit.
+    # Without an ops checkout that can release_matches_commit, refuse rather than mint an unbound label.
+    echo "refused: release snapshot has no ops checkout to prove content matches commit $sha (set SCK_OPS_REPO)" >&2
+    exit 2
   fi
 fi
 
@@ -96,14 +97,29 @@ resolve_bun "$service_home"
 [ -x "$BUN" ] || { echo "refused: the service Bun runtime is not executable: $BUN" >&2; exit 2; }
 bun_version=$("$BUN" --version) || { echo "refused: $BUN did not report a version" >&2; exit 2; }
 
-# Host vs dry-run: only a process that can read private/service.env may mint a managed attestation.
-# Engineer sandboxes that cannot open that file still produce a dry-run record for local verification,
-# but the acceptance adapter / PR-gate substitute refuse dry-run as a CI substitute.
+# Host vs dry-run (SYS02 v11): managed attestation requires a host-injected signing key that is NOT
+# derived from private/service.env (employees must never mint production attestations from readable config).
+# The trusted execution agent sets SCK_MANAGED_LOCAL_TEST_SIGNING_KEY (or a file via SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE).
+# Without it, the script still runs tests and writes a dry-run record for local verification only.
 host_mode=dry-run
-service_env="$service_home/private/service.env"
-if [ -f "$service_env" ] && [ -r "$service_env" ]; then
+signing_key=""
+if [ -n "${SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE:-}" ] && [ -r "${SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE}" ]; then
+  signing_key=$(cat "${SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE}")
+elif [ -n "${SCK_MANAGED_LOCAL_TEST_SIGNING_KEY:-}" ]; then
+  signing_key=$SCK_MANAGED_LOCAL_TEST_SIGNING_KEY
+fi
+# Refuse keys that look like they were copied from private/service.env (common misconfig).
+case "$signing_key" in
+  *SCK_AGENT_CWD=*|*SURREAL_*|*TYPESAFE_*|*JEV_API*) signing_key="";;
+esac
+if [ ${#signing_key} -ge 16 ]; then
   host_mode=managed
 fi
+runner_identity="$(/usr/bin/uname -n):$(/usr/bin/id -u 2>/dev/null || echo unknown)"
+# Optional scope bindings (host agent sets these when minting a substitutable record).
+req_task=${SCK_MANAGED_LOCAL_TEST_TASK_ID:-}
+owner_audit=${SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID:-wuj9vmp3vg9pqyu33p2v}
+owner_task=${SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID:-25ec8d1a-6bbf-4bee-abaf-74998adeb5af}
 
 out_dir="$service_home/gates/managed-local-test"
 mkdir -p "$out_dir"
@@ -160,11 +176,14 @@ GATE_SHA="$sha" GATE_SUITE="$suite" GATE_BUN="$bun_version" GATE_BUN_PATH="$BUN"
   GATE_RESULT="$result" GATE_RC="$rc" GATE_STARTED="$started" GATE_FINISHED="$finished" \
   GATE_LOG="$log" GATE_LOG_HASH="$log_hash" GATE_RECORD="$record" GATE_COMMAND="$command_line" \
   GATE_TARGET="$target" GATE_REPO="$repo_identity" GATE_DIRTY="$dirty" GATE_ARCH="$(uname -m)" \
-  GATE_WHY="$gate_why" GATE_HOST_MODE="$host_mode" GATE_SERVICE_ENV="$service_env" \
+  GATE_WHY="$gate_why" GATE_HOST_MODE="$host_mode" GATE_SIGNING_KEY="$signing_key" \
+  GATE_RUNNER="$runner_identity" GATE_REQ_TASK="$req_task" GATE_OWNER_AUDIT="$owner_audit" \
+  GATE_OWNER_TASK="$owner_task" \
   /usr/bin/python3 - <<'PY'
 import hashlib, hmac, json, os
 record = {
     'gate': 'managed-local-test',
+    'protocolVersion': 'managed-local-test/1',
     'suite': os.environ['GATE_SUITE'],
     'sha': os.environ['GATE_SHA'],
     'bun': os.environ['GATE_BUN'],
@@ -183,23 +202,42 @@ record = {
     'logHash': os.environ['GATE_LOG_HASH'],
     'why': os.environ['GATE_WHY'],
     'hostMode': os.environ['GATE_HOST_MODE'],
+    'runnerIdentity': os.environ['GATE_RUNNER'],
 }
-# Managed attestation: HMAC-SHA256 over the canonical payload with private/service.env as the secret.
-# Dry-run deliberately omits hostAttestation so the adapter cannot mistake it for a host-signed pass.
+req = os.environ.get('GATE_REQ_TASK') or ''
+if req:
+    record['requestingTaskId'] = req
+owner_audit = os.environ.get('GATE_OWNER_AUDIT') or ''
+owner_task = os.environ.get('GATE_OWNER_TASK') or ''
+if owner_audit:
+    record['ownerReplyAuditId'] = owner_audit
+if owner_task:
+    record['ownerReplyTaskId'] = owner_task
+# Managed attestation: HMAC over the FULL canonical payload with a host-injected signing key.
+# Never private/service.env. Dry-run omits hostAttestation.
 if record['hostMode'] == 'managed':
-    secret_path = os.environ['GATE_SERVICE_ENV']
-    # Match Node createHmac('sha256', utf8String): secret is the utf-8 bytes of private/service.env.
-    with open(secret_path, 'r', encoding='utf-8') as handle:
-        secret = handle.read().encode('utf-8')
+    secret = os.environ['GATE_SIGNING_KEY'].encode('utf-8')
     payload = '\n'.join([
+        f"protocolVersion={record['protocolVersion']}",
         f"gate={record['gate']}",
         f"sha={record['sha']}",
         f"suite={record['suite']}",
+        f"result={record['result']}",
         f"exitCode={record['exitCode']}",
-        f"logHash={record['logHash']}",
+        f"startedAt={record['startedAt']}",
         f"finishedAt={record['finishedAt']}",
         f"command={record['command']}",
+        f"target={record['target']}",
+        f"repoIdentity={record['repoIdentity']}",
+        f"dirty={'true' if record['dirty'] else 'false'}",
+        f"logHash={record['logHash']}",
+        f"runnerIdentity={record['runnerIdentity']}",
+        f"requestingTaskId={record.get('requestingTaskId') or req}",
+        f"ownerReplyAuditId={record.get('ownerReplyAuditId') or owner_audit}",
+        f"ownerReplyTaskId={record.get('ownerReplyTaskId') or owner_task}",
     ]).encode('utf-8')
+    if not record.get('requestingTaskId'):
+        raise SystemExit('managed mode requires SCK_MANAGED_LOCAL_TEST_TASK_ID (requesting task bound into attestation)')
     record['hostAttestation'] = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 path = os.environ['GATE_RECORD']
 with open(path, 'w', encoding='utf-8') as handle:
