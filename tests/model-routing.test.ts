@@ -670,3 +670,87 @@ test('Opus is never created, rebuilt, reordered, appended to or removed by contr
   expect(calls.filter(args=>args[0]==='group'&&args[2]==='sck-opus')).toEqual([]);
  }
 });
+
+// Claude's transcript id is independent of the lease-scoped Magpie affinity id.
+// Exercise the real HTTP gateway boundary so native identity cannot be lost by its header/body reconstruction.
+test("gateway preserves Claude native identity and metadata while owning lease affinity", async () => {
+  const forwarded: { headers: Headers; body: any }[] = [];
+  let fence = 4;
+  const g = await startModelGateway({
+    lease: async () => ({ employee: "engineer", task: "identity-task", fence, role: "engineering", tier: "haiku", phase: "execute" }),
+    record: async () => {}, complete: async () => {},
+    fetchImpl: (async (_url: any, init: any) => {
+      forwarded.push({ headers: new Headers(init.headers), body: JSON.parse(init.body) });
+      return Response.json({ id: "message-test", model: "test-model" });
+    }) as typeof fetch,
+  }, 0);
+  const native = "840a4970-2281-48c8-8c3b-f1b72bf4fe8b";
+  const metadata = { user_id: JSON.stringify({ device_id: "test-device", account_uuid: "", session_id: native }), extra: "preserve" };
+  try {
+    const send = async (session: string, path = "messages", withMetadata = true) => {
+      const r = await fetch(`http://127.0.0.1:${g.port}/a/employee%3Aengineer/v1/${path}`, {
+        method: "POST",
+        headers: { "x-claude-code-session-id": session, "x-claude-code-agent-id": "child-test",
+          "x-magpie-session": "caller-must-not-control-affinity", authorization: "private-client-key",
+          "x-api-key": "private-client-key", cookie: "private-cookie", "x-unrelated": "private" },
+        body: JSON.stringify({ model: "haiku", messages: [], ...(withMetadata ? { metadata } : {}) }),
+      });
+      expect(r.status).toBe(200);
+      await r.text();
+    };
+    await send(native);
+    await send("34487b88-73ec-48d0-b955-b2844cdacf1e", "messages/count_tokens", false);
+    fence++;
+    await send(native);
+    expect(forwarded[0]!.body.metadata).toEqual(metadata);
+    expect(forwarded[1]!.body.metadata).toBeUndefined();
+    expect(forwarded[0]!.headers.get("x-claude-code-session-id")).toBe(native);
+    expect(forwarded[1]!.headers.get("x-claude-code-session-id")).toBe("34487b88-73ec-48d0-b955-b2844cdacf1e");
+    expect(forwarded[0]!.headers.get("x-claude-code-agent-id")).toBe("child-test");
+    const affinity = forwarded.map(r => r.headers.get("x-magpie-session"));
+    expect(affinity[0]).toMatch(/^sck-/);
+    expect(affinity[0]).toBe(affinity[1]);
+    expect(affinity[2]).not.toBe(affinity[0]);
+    for (const { headers } of forwarded) {
+      expect(headers.get("authorization")).toBe("Bearer magpie-claude");
+      for (const name of ["x-api-key", "cookie", "x-unrelated"]) expect(headers.has(name)).toBe(false);
+    }
+  } finally { await g.stop(); }
+});
+
+test("gateway bridges only recognized Claude metadata sessions, with explicit headers taking precedence", async () => {
+  const native = "840a4970-2281-48c8-8c3b-f1b72bf4fe8b";
+  const other = "34487b88-73ec-48d0-b955-b2844cdacf1e";
+  let seen: { headers: Headers; body: any };
+  const g = await startModelGateway({
+    lease: async () => ({ employee: "engineer", task: "metadata-task", fence: 1, role: "engineering", tier: "haiku", phase: "execute" }),
+    record: async () => {}, complete: async () => {},
+    fetchImpl: (async (_url: any, init: any) => {
+      seen = { headers: new Headers(init.headers), body: JSON.parse(init.body) };
+      return Response.json({ id: "test" });
+    }) as typeof fetch,
+  }, 0);
+  const jsonUser = JSON.stringify({ device_id: "test", session_id: native });
+  const legacyUser = `user_test_account__session_${native}`;
+  try {
+    for (const [user_id, header, expected] of [
+      [jsonUser, undefined, native], [legacyUser, undefined, native],
+      [jsonUser, other, other],
+      ["sck-company-affinity", undefined, null], ["{broken", undefined, null],
+      [JSON.stringify({ session_id: "not-a-session" }), undefined, null],
+      [JSON.stringify({ session_id: { id: native } }), undefined, null],
+      [`random_session_${native}`, undefined, null], [undefined, undefined, null],
+      ["x".repeat(4097), undefined, null],
+    ] as const) {
+      const r = await fetch(`http://127.0.0.1:${g.port}/a/employee%3Aengineer/v1/messages`, {
+        method: "POST", headers: header ? { "x-claude-code-session-id": header } : {},
+        body: JSON.stringify({ model: "haiku", messages: [], metadata: { user_id } }),
+      });
+      await r.text();
+      expect(r.status).toBe(200);
+      expect(seen!.headers.get("x-claude-code-session-id")).toBe(expected);
+      expect(seen!.body.metadata).toEqual(user_id === undefined ? {} : { user_id });
+      expect(seen!.headers.get("x-magpie-session")).toMatch(/^sck-/);
+    }
+  } finally { await g.stop(); }
+});
