@@ -1,18 +1,20 @@
 import {join} from 'node:path';import {homedir} from 'node:os';
-import type {PluginServerContext,PluginLifecycleEvents} from '@getpaseo/plugin/server';
+import type {PluginServerContext} from '@getpaseo/plugin/server';
 import type {PaseoApi} from '@getpaseo/client';
 import {AgentTelemetry,NativeUsageReader,summarizeRequests,type AgentTurn} from './vendor/src/model-routing/agent-telemetry.ts';
 import {agentMetrics,agentMetricsViewSchema,type AgentMetricsView} from '../shared/agent-metrics';
+import {observeModelSwitches} from './model-switch-observer';
 import {serviceHome} from './env';import {isQaContext} from './owner-context';
 let store:AgentTelemetry|undefined;
 const native=new NativeUsageReader(join(homedir(),'.config/magpie/usage.jsonl'));
 export const telemetry=()=>store??=new AgentTelemetry(join(serviceHome(),'model-routing','agent-metrics'));
 
 interface MetricsRuntime {
- state:Pick<AgentTelemetry,'lastTurn'|'begin'|'view'|'current'|'bindSession'|'finish'>;
+ state:Pick<AgentTelemetry,'lastTurn'|'begin'|'view'|'current'|'bindSession'|'finish'|'requests'|'subscribe'>;
  native:Pick<NativeUsageReader,'read'>;
+ switches?:{dir:string;file:string;intervalMs?:number};
 }
-const runtime=():MetricsRuntime=>({state:telemetry(),native});
+const runtime=():MetricsRuntime=>({state:telemetry(),native,switches:{dir:join(serviceHome(),'model-routing','model-switches'),file:join(homedir(),'.config/magpie/usage.jsonl')}});
 export async function readAgentMetrics(agentId:string,paseo:PaseoApi,turn?:AgentTurn,force=false,io:MetricsRuntime=runtime()):Promise<AgentMetricsView>{
  const turnOnly=turn!==undefined;
  const ref=paseo.agents.ref(agentId),snapshot=await ref.refresh();if(!snapshot)throw Error('agent not found');
@@ -33,22 +35,16 @@ export async function readAgentMetrics(agentId:string,paseo:PaseoApi,turn?:Agent
  }catch{return agentMetricsViewSchema.parse({agentId,source:'unavailable',turn,summary:summarizeRequests([],true),updatedAt:Date.now(),note:'Magpie本机用量日志暂不可读；未知不等于零。'});}
 }
 export function registerAgentMetrics(server:PluginServerContext,io:MetricsRuntime=runtime()){
- const state=io.state;let active=true;
- server.handle(agentMetrics,async({agentId},context)=>{if(isQaContext(context))throw Error('owner metrics are not available to QA sessions');return readAgentMetrics(agentId,context.paseo,undefined,false,io);});
+ const state=io.state;
+ const switches=io.switches?observeModelSwitches({...io.switches,state,native:io.native}):undefined;
+ server.handle(agentMetrics,async({agentId},context)=>{if(isQaContext(context))throw Error('owner metrics are not available to QA sessions');switches?.connect(agentId,context.paseo);return readAgentMetrics(agentId,context.paseo,undefined,false,io);});
  const offs=[server.on('agent.turn_started',(event,{paseo})=>{
+  switches?.connect(event.agent.id,paseo);
   let turn:AgentTurn;try{turn=state.begin(event.agent.id,event.turnId,Date.now(),false,true);}catch{console.warn("agent model metrics: start observation unavailable");return;}
   void paseo.agents.ref(event.agent.id).refresh().then(s=>{const id=s?.agent.runtimeInfo?.sessionId??s?.agent.persistence?.sessionId;if(id&&state.current(event.agent.id)?.key===turn.key)state.bindSession(event.agent.id,turn.key,id);}).catch(()=>{});
  }),server.on('agent.turn_ended',(event,{paseo})=>{
-  let turn:AgentTurn|undefined;try{turn=state.finish(event.agent.id,event.turnId);}catch{console.warn("agent model metrics: end observation unavailable");return;}if(!turn)return;
-  void publishTurnMetrics(event,turn,paseo,()=>active,io).catch(()=>console.warn('agent model metrics: turn summary unavailable'));
- })];
- return ()=>{active=false;offs.forEach(off=>off());};
-}
-async function publishTurnMetrics(event:PluginLifecycleEvents['agent.turn_ended'],turn:AgentTurn,paseo:PaseoApi,isActive:()=>boolean,io:MetricsRuntime){
- // Let the final stream completion/usage append land before reading the exact turn window.
- await new Promise(resolve=>setTimeout(resolve,250));
- if(!isActive())return;
- const view=await readAgentMetrics(event.agent.id,paseo,turn,true,io);
- if(!isActive())return;
- await paseo.agents.ref(event.agent.id).timeline.append({type:'plugin',id:`model-metrics-${turn.key}`,kind:'sck-model-metrics',version:1,data:view});
+  try{state.finish(event.agent.id,event.turnId);}catch{console.warn("agent model metrics: end observation unavailable");}
+  switches?.connect(event.agent.id,paseo);
+ }),server.on('agent.archived',event=>switches?.forget(event.agent.id))];
+ return ()=>{switches?.stop();offs.forEach(off=>off());};
 }

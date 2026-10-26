@@ -33,6 +33,10 @@ interface State {turns:AgentTurn[];rows:AgentRequest[];gatewaySeen:boolean;trimm
 /** Small durable per-agent numeric ledger; no DB or daemon RPC on the inference path. */
 export class AgentTelemetry {
  private cache=new Map<string,State>();
+ private listeners=new Set<(agent:string)=>void>();
+ subscribe(listener:(agent:string)=>void){this.listeners.add(listener);return ()=>{this.listeners.delete(listener);};}
+ private changed(agent:string){for(const listener of this.listeners){try{listener(agent);}catch{}}}
+ requests(agent:string){return this.get(agent).rows;}
  constructor(private dir:string){mkdirSync(dir,{recursive:true,mode:0o700});}
  private path(agent:string){return join(this.dir,createHash('sha256').update(agent).digest('hex')+'.json');}
  private get(agent:string):State{
@@ -64,9 +68,10 @@ export class AgentTelemetry {
   const i=s.rows.findIndex(r=>r.id===row.id);if(i<0)s.rows.push(row);else s.rows[i]=row;
   if(s.rows.length>5000){s.trimmedBefore=s.rows[s.rows.length-5000]!.at;s.rows=s.rows.slice(-5000);}
   this.save(agent);
+  this.changed(agent);
  }
- progress(agent:string,id:string,metrics:Partial<RequestMetrics>){const r=this.get(agent).rows.find(r=>r.id===id);if(r)Object.assign(r,metrics);}
- complete(agent:string,id:string,done:boolean,metrics:Partial<RequestMetrics>={}){const r=this.get(agent).rows.find(r=>r.id===id);if(r){Object.assign(r,metrics,{completed:done,endedAt:Date.now()});this.save(agent);}}
+ progress(agent:string,id:string,metrics:Partial<RequestMetrics>){const r=this.get(agent).rows.find(r=>r.id===id);if(r){const first=r.ttft_ms===undefined&&metrics.ttft_ms!==undefined;Object.assign(r,metrics);if(first)this.changed(agent);}}
+ complete(agent:string,id:string,done:boolean,metrics:Partial<RequestMetrics>={}){const r=this.get(agent).rows.find(r=>r.id===id);if(r){Object.assign(r,metrics,{completed:done,endedAt:Date.now()});this.save(agent);this.changed(agent);}}
  view(agent:string,turn=this.lastTurn(agent),turnOnly=false){
   const s=this.get(agent),rows=turn?s.rows.filter(r=>r.turnKey===turn.key):[];
   return {turn,latest:(turnOnly?rows:s.rows).at(-1),summary:summarizeRequests(rows,turn?.partial||!!(turn&&s.trimmedBefore&&s.trimmedBefore>turn.startedAt)),gatewaySeen:s.gatewaySeen};
