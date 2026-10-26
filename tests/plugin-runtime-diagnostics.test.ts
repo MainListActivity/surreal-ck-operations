@@ -1,11 +1,23 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   collectPluginRuntimeDiagnostics, releaseRootOf,
   type PluginRuntimeDiagnostics,
 } from '../plugin/server/runtime-diagnostics.ts';
+
+const modulePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'server', 'runtime-diagnostics.ts');
+const repoRoot = resolve(dirname(modulePath), '..', '..');
+
+/**
+ * Whether this machine's node can run the module the way the Paseo plugin host does: as ESM, where
+ * `__dirname` is undefined. Bun supplies `__dirname` even in ESM, so it cannot stand in for that context.
+ */
+const nodeEsmProbe = spawnSync('node', ['--experimental-strip-types', '-e', 'console.log(process.versions.node)'], { encoding: 'utf8' });
+const nodeEsmAvailable = nodeEsmProbe.status === 0;
 
 /** A release-shaped tree: <root>/plugin/server with a vendor/src beside it, as a real snapshot has. */
 function makeRelease(): { root: string; serverDir: string } {
@@ -51,7 +63,7 @@ describe('plugin runtime diagnostics', () => {
   });
 
   test('a bundled plugin reports the bundle path, and its own modules are still bound', () => {
-    // Paseo bundles the plugin server with esbuild, where import.meta.url does not survive and every inlined
+    // If the host instead runs bundled CJS output, import.meta.url does not survive and every inlined
     // module collapses onto the bundle. The answer then names the bundle, and the plugin's own files are read
     // from their .cjs form. Reporting .ts here would make two entries permanent gaps in every real release.
     const { serverDir } = makeRelease();
@@ -135,6 +147,46 @@ describe('plugin runtime diagnostics', () => {
     expect(text).not.toContain('SCK_EMPLOYEE_CREDENTIAL');
     // The declared boundary is part of the answer, so a reader can check it without reading the source.
     expect(sample(serverDir).notRead).toContain('process environment values');
+  });
+
+  test.skipIf(!nodeEsmAvailable)('the module locates itself in a real ESM context, with no moduleDir injected', () => {
+    // The plugin host loads this module as ESM, where `__dirname` is undefined — and production cannot inject
+    // `moduleDir`, since that is the very thing the host does not hand the code. So the real file is run
+    // under node with no injection: the answer must still name absolute paths, the release binding and real
+    // content digests. Bun supplies `__dirname` even in ESM, which is why this cannot be a Bun-side test.
+    const dir = mkdtempSync(join(tmpdir(), 'sck-rt-esm-'));
+    const probe = join(dir, 'probe.mjs');
+    writeFileSync(probe, [
+      "import { pathToFileURL } from 'node:url';",
+      'const mod = await import(pathToFileURL(process.argv[2]).href);',
+      'const answer = mod.collectPluginRuntimeDiagnostics();',
+      "console.log(JSON.stringify({ dirnameType: typeof __dirname, answer }));",
+      '',
+    ].join('\n'));
+    try {
+      const run = spawnSync('node', ['--experimental-strip-types', probe, modulePath], { encoding: 'utf8' });
+      expect(run.status, run.stderr).toBe(0);
+      const { dirnameType, answer } = JSON.parse(run.stdout) as {
+        dirnameType: string;
+        answer: PluginRuntimeDiagnostics;
+      };
+      // If __dirname existed here the test would prove nothing about the context that failed in production.
+      expect(dirnameType).toBe('undefined');
+      expect(answer.loaded.serverDir).toBe(dirname(modulePath));
+      expect(answer.loaded.selfPath).toBe(modulePath);
+      // Where the vendored tree is present it must be the real sibling, never a guessed path.
+      if (answer.loaded.vendorDir !== null) {
+        expect(answer.loaded.vendorDir).toBe(join(dirname(modulePath), 'vendor'));
+      }
+      expect(answer.binding).toEqual({ kind: 'plugin-server-dir', path: repoRoot });
+      // The module that produced this answer is bound by the bytes actually loaded, not by a version claim.
+      const own = answer.modules.find(m => m.name === 'plugin-runtime-diagnostics');
+      expect(own?.path).toBe(modulePath);
+      expect(own?.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(own?.bytes).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('the answer is bounded, so it fits the channel reply budget', () => {
