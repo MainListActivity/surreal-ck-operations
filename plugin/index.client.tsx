@@ -1,3 +1,5 @@
+import { ModelSwitchTimeline } from './client/model-switch';
+import { modelSwitchSchema } from './shared/model-switch';
 import { MagpieUsageSurface, AgentUsagePanel } from "./client/usage";
 import { AgentMetricsTimeline } from "./client/agent-metrics";
 import { agentMetricsViewSchema } from "./shared/agent-metrics";
@@ -22,6 +24,7 @@ export default function contribute(client: PluginClientContext) {
       openPanel("agent-model-metrics", { location: "explorer" });
     },
   });
+  client.addTimelineRenderer({kind: "sck-model-switch", version: 1, schema: modelSwitchSchema, Component: ModelSwitchTimeline});
   client.addTimelineRenderer({
     kind: "sck-model-metrics",
     version: 1,

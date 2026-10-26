@@ -54,7 +54,7 @@ test('real gateway records numeric metrics through journal, preserves response b
  }
 });
 
-test('lifecycle appends one real turn summary, duplicate events are idempotent and teardown cancels queued appends',async()=>{
+test('lifecycle keeps turn measurements without appending verbose turn-end cards',async()=>{
  const {registerAgentMetrics}=await import('../plugin/server/agent-metrics.ts');
  const state=new AgentTelemetry(scratch()),native=new NativeUsageReader(join(scratch(),'missing'));
  const handlers=new Map<string,any>(),rpcs=new Map<string,any>();const appended:any[]=[];
@@ -65,10 +65,10 @@ test('lifecycle appends one real turn summary, duplicate events are idempotent a
  state.record('agent',{id:'req',at:Date.now(),turnKey:t.key,model:'p/actual',status:200,source:'company-gateway'});state.complete('agent','req',true,{ttft_ms:1200,total_ms:2000,output_tokens:100});
  const get=rpcs.get('company.agent-model-metrics.get');await expect(get({agentId:'agent'},{paseo,qaSession:true})).rejects.toThrow('QA');
  handlers.get('agent.turn_ended')(event,{paseo});handlers.get('agent.turn_ended')(event,{paseo});
- for(let n=0;n<100&&!appended.length;n++)await Bun.sleep(10);
- expect(appended).toHaveLength(1);expect(appended[0]).toMatchObject({kind:'sck-model-metrics',version:1,data:{source:'company-gateway',summary:{requests:1,outputTokens:100,tokensPerSecond:50},latest:{model:'p/actual'}}});
- expect(JSON.stringify(appended[0])).not.toContain('sessionId');
- handlers.get('agent.turn_started')({...event,turnId:'next'},{paseo});handlers.get('agent.turn_ended')({...event,turnId:'next'},{paseo});stop();await Bun.sleep(300);expect(appended).toHaveLength(1);
+ expect(state.lastTurn('agent')?.endedAt).toBeDefined();
+ expect(state.view('agent').summary.tokensPerSecond).toBe(50);
+ expect(appended).toHaveLength(0);
+ handlers.get('agent.turn_started')({...event,turnId:'next'},{paseo});handlers.get('agent.turn_ended')({...event,turnId:'next'},{paseo});stop();await Bun.sleep(20);expect(appended).toHaveLength(0);
 });
 
 test('native retries do not inflate turn requests and stale/completed session bindings do not borrow a newly opened session',async()=>{
