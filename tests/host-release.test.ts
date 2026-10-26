@@ -172,7 +172,7 @@ describe('host-release envelope', () => {
       schema: 'host-release-receipt/1', opId, taskId: 't', targetSha: sha(11),
       previousActive: '/x', expectedActive: '/x', snapshotHash: 'd'.repeat(64), rollbackSha: sha(12),
       // missing executor
-      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
       plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
@@ -201,7 +201,7 @@ describe('host-release envelope', () => {
       opId, taskId: 't', targetSha: sha(13), previousActive: '/a', expectedActive: '/a',
       snapshotHash: 'e'.repeat(64), rollbackSha: sha(14),
       executor: { host: 'testhost', uid: 501, user: 'y' },
-      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
+      startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [{ name: 'content-bind', ok: true }],
       binding: { releasePath: '/svc/releases/' + sha(13), contentMatchesCommit: true, vendorSchemaDiff: 'none' },
       mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(13), pid: 1 },
@@ -239,7 +239,7 @@ describe('host-release envelope', () => {
       previousActive: '/real', expectedActive: '/real', snapshotHash: 'd'.repeat(64), rollbackSha: sha(21),
       executor: { host: 'forged-host', uid: 1, user: 'forger' },
       hostTag: 'a'.repeat(64),
-      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
       plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
@@ -270,7 +270,7 @@ describe('host-release envelope', () => {
       executor: { host: 'employee-laptop', uid: 501, user: 'forger' },
       // missing / fake tag
       hostTag: 'c'.repeat(64),
-      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
       plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
@@ -291,7 +291,7 @@ describe('host-release envelope', () => {
       opId: '2'.repeat(32), taskId: 't', targetSha: sha(50), previousActive: '/a', expectedActive: '/a',
       snapshotHash: 'd'.repeat(64), rollbackSha: sha(51),
       executor: { host: 'h', uid: 1, user: 'u' },
-      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
+      startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: null, contentMatchesCommit: false, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
       plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
@@ -466,7 +466,7 @@ describe('host-release apply.sh syntax + first-mint', () => {
       opId: '3'.repeat(32), taskId: 't', targetSha: sha(60), previousActive: '/a', expectedActive: '/a',
       snapshotHash: 'e'.repeat(64), rollbackSha: sha(61),
       executor: { host: 'h', uid: 1, user: 'u' },
-      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
+      startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
       plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
@@ -489,6 +489,33 @@ describe('host-release apply.sh syntax + first-mint', () => {
     expect(enabled('true')).toBe(true);
     expect(enabled('True')).toBe(false);
     expect(enabled('false')).toBe(false);
+  });
+
+  test('exitCode semantics: installerExitCode is signed and diverges from apply exit on warning', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-exit-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
+    const base: Omit<HostReleaseReceipt, 'hostTag'> = {
+      schema: 'host-release-receipt/1',
+      opId: '4'.repeat(32), taskId: 't', targetSha: sha(70), previousActive: '/a', expectedActive: '/a',
+      snapshotHash: 'f'.repeat(64), rollbackSha: sha(71),
+      executor: { host: 'h', uid: 1, user: 'u' },
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
+      exitCode: 1, installerExitCode: 0, state: 'rolled_back',
+      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      channelRecovery: 'unknown', lockReleased: true,
+      rollback: { attempted: true, to: '/r2', ok: true },
+    };
+    // Warn-mode shape: installer rc=0 while apply exit=1 — distinct fields must coexist.
+    expect(base.exitCode).toBe(1);
+    expect(base.installerExitCode).toBe(0);
+    const tag = mintHostTag(serviceHome, base);
+    expect(verifyHostTag(serviceHome, { ...base, hostTag: tag })).toBe(true);
+    // installerExitCode is part of the signed payload — tampering breaks verification.
+    expect(verifyHostTag(serviceHome, { ...base, hostTag: tag, installerExitCode: 1 })).toBe(false);
   });
 
   test('B3: set -e lock failure still prints refused (set +e capture)', () => {

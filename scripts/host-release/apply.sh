@@ -350,7 +350,8 @@ fi
 OP_ID="$op_id" TASK_ID="$taskId" TARGET_SHA="$targetSha" PREV_ACTIVE="$expectedActive" \
 EXPECTED_ACTIVE="$expectedActive" SNAP_HASH="$snapshotHash" ROLLBACK_SHA="$rollbackSha" \
 HOST="$host" UID_N="$uid" USER_N="$user" STARTED="$started" FINISHED="$finished" \
-EXIT_CODE="$install_rc" STATE="$final_state" REASON="$reason" RELEASE_DIR="$release_dir" \
+EXIT_CODE="$install_rc" APPLY_EXIT="$([ "$final_state" = succeeded ] && echo 0 || echo 1)" \
+STATE="$final_state" REASON="$reason" RELEASE_DIR="$release_dir" \
 HEALTH="$health_code" READY="$ready_code" PLUGIN_STATUS="$plugin_status" PLUGIN_ENABLED="$plugin_enabled" \
 PLUGIN_SOURCE="$plugin_source" PLUGIN_DIRECTORY="$plugin_directory" PLUGIN_KNOWN="$plugin_source_known" \
 RB_ATTEMPTED="$rollback_attempted" RB_OK="$rollback_ok" RB_TO="$rollback_to" \
@@ -374,7 +375,8 @@ receipt = {
   "executor": executor,
   "startedAt": os.environ["STARTED"],
   "finishedAt": os.environ["FINISHED"],
-  "exitCode": int(os.environ["EXIT_CODE"]),
+  "exitCode": int(os.environ["APPLY_EXIT"]),
+  "installerExitCode": int(os.environ["EXIT_CODE"]),
   "state": state,
   "checks": [],
   "binding": {
@@ -419,6 +421,7 @@ tag_obj = {
   "startedAt": receipt["startedAt"],
   "finishedAt": receipt["finishedAt"],
   "exitCode": receipt["exitCode"],
+  "installerExitCode": receipt["installerExitCode"],
   "state": receipt["state"],
   "checks": receipt["checks"],
   "binding": receipt["binding"],
@@ -491,6 +494,7 @@ tag_obj = {
   "startedAt": receipt["startedAt"],
   "finishedAt": receipt["finishedAt"],
   "exitCode": receipt["exitCode"],
+  "installerExitCode": receipt["installerExitCode"],
   "state": receipt["state"],
   "checks": receipt["checks"],
   "binding": receipt["binding"],

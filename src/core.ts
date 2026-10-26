@@ -3003,6 +3003,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         startedAt: receipt.startedAt,
         finishedAt: receipt.finishedAt,
         exitCode: receipt.exitCode,
+        installerExitCode: receipt.installerExitCode,
         binding: {
           releasePath: receipt.binding.releasePath,
           contentMatchesCommit: receipt.binding.contentMatchesCommit,

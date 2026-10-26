@@ -40,6 +40,7 @@ export function receiptTagPayload(receipt: Omit<HostReleaseReceipt, 'hostTag'>):
     startedAt: receipt.startedAt,
     finishedAt: receipt.finishedAt,
     exitCode: receipt.exitCode,
+    installerExitCode: receipt.installerExitCode,
     state: receipt.state,
     checks: receipt.checks.map(check => ({
       name: check.name,

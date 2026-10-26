@@ -123,7 +123,14 @@ export interface HostReleaseReceipt {
   hostTag: string;
   startedAt: string;
   finishedAt: string;
+  /** apply.sh's own exit status: 0 only when state=succeeded, 1 otherwise. */
   exitCode: number;
+  /**
+   * Exit status of the installer (company-service.sh install) alone. A plugin-repoint
+   * warning leaves this 0 while apply still fails and rolls back, so `exitCode` and
+   * `installerExitCode` must be read together, never as synonyms.
+   */
+  installerExitCode: number;
   state: HostReleaseState;
   checks: HostReleaseCheck[];
   /** Content / vendor / schema binding digests. */

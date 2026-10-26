@@ -1476,6 +1476,7 @@ export interface HostReleaseReceiptView {
   startedAt: string;
   finishedAt: string;
   exitCode: number;
+  installerExitCode: number;
   binding: { releasePath: string | null; contentMatchesCommit: boolean; vendorSchemaDiff: string };
   mcp: { health: number | null; ready: number | null; cwd: string | null; pid: number | null };
   plugin: { status: string | null; enabled: boolean | null; source: string | null; directory: string | null; sourceKnown: boolean };
