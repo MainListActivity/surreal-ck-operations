@@ -29,7 +29,7 @@ export function deliveryChain(title: string, spec: string): Spec[] {
 你是工程。按 claim.json.worktree 的登记路径、分支与写权实现：树和分支由调度按任务或所属线（worktree.lane）分配，同一线的任务共用一棵树和一个分支，接手时在现有提交上继续，不另开分支；已有未合入 PR 就追加提交。仅在 intent=code 的登记分支提交，不自行新建/checkout/reset/pull，遵守该仓库 AGENTS 与技能；附件写 evidenceDir。
 完成标准：测试通过，推送分支并创建 PR（不要合入）。
 submit 证据：PR 链接、分支、提交 SHA、测试命令与结果、数据库迁移类型（无 / 只新增结构 / 改写或删除已有数据）、需要的新环境变量或主机准备。
-验收者是另一位工程师：读 diff、跑测试、确认 PR 的 CI 通过；不通过就 return 并写明问题。`,
+验收者是另一位工程师：读 diff、跑测试；不通过就 return 并写明问题。`,
     },
     {
       title: `${title} · 上线申请`, kind: 'release', executorRole: 'engineering', reviewerRole: 'product',
@@ -44,7 +44,7 @@ ${AUTHORITY}`,
       title: `${title} · 合入部署与生产实测`, kind: 'deploy', executorRole: 'engineering', reviewerRole: 'qa',
       acceptanceCriteria: defaultAcceptanceCriteria('deploy'),
       context: `${head}
-你是工程。上线申请已批准。按 project.release 发布：合入 PR、等待 CI 发布完成、确认生产运行的就是该提交（health、版本或页面）。
+你是工程。上线申请已批准。按 project.release 发布：合入 PR、确认发布完成、并核对生产运行的就是该提交（health、版本或页面）。
 发布失败或自动回滚：先按 project.rollback 恢复生产，再修复后重新发布；修不好就 report_blocker to=gm。
 submit 证据：合入提交、CI 运行链接与结论、生产健康检查结果。
 验收者 qa：在生产环境按上面的验收标准逐条实测。测试账号、workspace、登录用运维工具（ops_login、ops_workspace_ensure、ops_browser_login 等）；你拿不到也不需要密码或 token，证据里只写账号别名和 workspace slug。
@@ -70,7 +70,7 @@ export function quickChain(title: string, spec: string): Spec[] {
 完成标准：测试通过，推送分支并创建 PR（不要合入）。
 本任务是实现与上线申请合一，submit 证据要同时包含：PR 链接、分支、提交 SHA、测试命令与结果、改动摘要、影响面、数据库迁移类型（无 / 只新增结构 / 改写或删除已有数据）、需要的新环境变量或主机准备、回滚方式、生产验证要点。
 验收者是运营，由运营决定是否上线（调度器可能先用 Jev 判断，高置信安全时自动批准）。accept = 同意上线；return = 需要补什么写明。
-运营：复核证据与 PR、CI 是否通过、迁移类型与红线；只在触碰 project.redLines 或需要花钱、对外联系时 report_blocker to=gm，其余自己决定。
+运营：复核证据与 PR、迁移类型与红线；只在触碰 project.redLines 或需要花钱、对外联系时 report_blocker to=gm，其余自己决定。
 ${AUTHORITY}`,
     },
     deliveryChain(title, spec)[2],
