@@ -336,6 +336,10 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;
     if ((inst.repoHome ?? inst.cwd ?? p.opsRepo) !== p.home) continue;
+    if (p.task && inst.workspaceScope && inst.workspaceScope !== p.task.goalId) continue;
+    // Legacy sessions may finish/rework their existing task, but never acquire a new goal's work.
+    if (p.sidecar && p.task?.goalId && !inst.workspaceScope &&
+      ![p.task.currentEmployee, p.task.previousEmployee, p.task.implementer, p.implementer?.implementer].includes(inst.id)) continue;
     const def = p.defs.find(d => d.id === inst.def);
     // Recusal and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
@@ -365,7 +369,8 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   for (const def of p.defs) {
     if (def.role !== p.role) continue;
     const resolved = resolveSlot(def);
-    const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home && !(p.sidecar && i.credentialFile)).length;
+    const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
+      (!p.task || i.workspaceScope === p.task.goalId) && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
       policyBlock ??
       gate(undefined) ??
@@ -551,7 +556,7 @@ export interface SidecarBridge {
  * when no task exists yet (triage): `home` is the resolved repo the candidate pool,
  * spawn cwd and repoHome bind to, `project` is the project id readWorkspace resolves.
  */
-interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string }
+interface DispatchAnchor { task?: SupervisedTask; home?: string; project?: string; goalId?: string; goalTitle?: string }
 /** Optional hooks around the only external Paseo actions (send/spawn), used by the manager-wake CAS. */
 interface AssignHooks {
   /** Durable successor CAS before allocating its lease. */
@@ -942,7 +947,7 @@ export class Dispatcher {
         const archived = (await paseo.status(inst.paseoAgentId).catch(() => undefined))?.status === 'archived';
         if (!await this.retireBroken(inst, archived ? '会话已归档（正常结束），通道绑定随之失效' : '通道隔离：会话启动绑定已失效，禁止复用旧会话', defs, report, false, archived ? 'archive' : 'failure')) continue;
         await paseo.stop(inst.paseoAgentId).catch(() => undefined);
-        await paseo.archive(inst.paseoAgentId).catch(() => undefined);
+        if (!inst.workspaceScope) await paseo.archive(inst.paseoAgentId).catch(() => undefined);
         continue;
       }
       const status = agents.get(inst.paseoAgentId)?.status ?? (await paseo.status(inst.paseoAgentId))?.status ?? 'missing';
@@ -1075,7 +1080,7 @@ export class Dispatcher {
       if (states.get(inst.id)!=='idle' || (!inst.def || defs.some(d=>d.id===inst.def && d.enabled))) continue;
       if (await this.retireGated(inst, '编制已停用或删除，旧会话完成后正常退出', 'rotation', report)) {
         report.retired.push(inst.id);
-        if(inst.paseoAgentId) await paseo.archive(inst.paseoAgentId).catch(()=>undefined);
+        if(inst.paseoAgentId && !inst.workspaceScope) await paseo.archive(inst.paseoAgentId).catch(()=>undefined);
       }
     }
     insts = insts.filter(i => !report.retired.includes(i.id));
@@ -1111,9 +1116,9 @@ export class Dispatcher {
         // misleads Jev's staffing picks. Retire it on sight.
         const legacyEol = Boolean(this.deps.sidecar && inst.credentialFile);
         const maxWakes = cfg.sessionMaxWakesByRole?.[inst.role] ?? cfg.sessionMaxWakes;
-        const overWakes = maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
+        const overWakes = !inst.workspaceScope && maxWakes > 0 && (inst.wakeCount ?? 0) >= maxWakes;
         let inputK = 0;
-        if (!legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
+        if (!inst.workspaceScope && !legacyEol && !overWakes && cfg.sessionMaxInputK > 0 && (inst.wakeCount ?? 0) >= 3 && inspected < 8) {
           inspected++;
           inputK = ((await paseo.lastInputTokens(inst.paseoAgentId!).catch(() => undefined)) ?? 0) / 1000;
         }
@@ -1822,7 +1827,7 @@ export class Dispatcher {
       const noticeKey = `gm-unavailable:${home}`;
       // Use the exact same pools as assign, without acquiring a wake only to
       // immediately release it. This remains quiet across dispatcher restarts.
-      if (!eligibleInsts('gm', home, undefined, false).length && !eligibleDefs('gm', home).length) {
+      if (!eligibleInsts('gm', home, todo.task, false).length && !eligibleDefs('gm', home, todo.task).length) {
         await this.notice(noticeKey, `项目 ${repoName(home)} 暂无可用经理；待办保留，检查经理编制、额度和容量。候选恢复后自动唤醒。`, report);
         continue;
       }
@@ -1854,8 +1859,9 @@ export class Dispatcher {
     const gmGroups = new Map<string, Array<{ todo: PendingGm; claim: ManagerWakeClaim }>>();
     for (const item of granted) {
       const home = item.todo.task.repoPath ?? this.deps.env.opsRepo;
-      const group = gmGroups.get(home);
-      if (group) group.push(item); else gmGroups.set(home, [item]);
+      const key = `${home}\0${item.todo.task.goalId ?? ''}`;
+      const group = gmGroups.get(key);
+      if (group) group.push(item); else gmGroups.set(key, [item]);
     }
     for (const group of gmGroups.values()) {
       if (running >= cfg.maxRunning) {
@@ -1973,13 +1979,15 @@ export class Dispatcher {
       const triageGroups = new Map<string, typeof due>();
       for (const goal of due) {
         const home = goal.repoPath ?? this.deps.env.opsRepo;
-        const group = triageGroups.get(home);
-        if (group) group.push(goal); else triageGroups.set(home, [goal]);
+        const key = `${home}\0${goal.id}`;
+        const group = triageGroups.get(key);
+        if (group) group.push(goal); else triageGroups.set(key, [goal]);
       }
-      for (const [home, group] of triageGroups) {
+      for (const group of triageGroups.values()) {
+        const home = group[0].repoPath ?? this.deps.env.opsRepo;
         if (running >= cfg.maxRunning) break;
         const result = await this.assign('gm', undefined, undefined, pick, spawnable,
-          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { home, project: group[0].project });
+          (inst, first, claim, worktree) => gmTriage(inst, group, this.deps.env, first, { comm: !!this.deps.sidecar, worktree, commDir: this.deps.sidecar?.commDirFor(inst.id), scratchDir: this.deps.sidecar?.scratchDirFor(inst.id) }), report, insts, false, slotMap, undefined, { home, project: group[0].project, goalId: group[0].id, goalTitle: group[0].title });
         if (!result) continue;
         for (const goal of group) await wf.recordDispatch(`goal:${goal.id}`, 0, 'triage', result.id);
         running++;
@@ -2318,8 +2326,12 @@ export class Dispatcher {
       const deny = this.taskDeny.get(task.id);
       if (deny && deny.version === task.version && Date.now() - deny.at < CLAIM_DENY_COOLDOWN_MS) return undefined;
     }
-    let defsOrdered = factoryFirst(spawnable(role, task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo, task, forReview));
-    const candidate = pick(role, task ?? anchor?.task, avoid, forReview, recusal, anchor?.home);
+    const scopeTask = task ?? anchor?.task ?? (anchor?.goalId
+      ? { goalId: anchor.goalId, goalTitle: anchor.goalTitle, repoPath: anchor.home } as SupervisedTask : undefined);
+    const workspaceScope = sidecar ? scopeTask?.goalId : undefined;
+    const repoHome = scopeTask?.repoPath ?? anchor?.home ?? env.opsRepo;
+    let defsOrdered = factoryFirst(spawnable(role, repoHome, scopeTask, forReview));
+    const candidate = pick(role, scopeTask, avoid, forReview, recusal, anchor?.home);
     // A free Factory seat is used before an idle Claude session. Once Factory has no admitted
     // reuse or spawn candidate (quota, health, capacity, recusal), ordinary fallback takes over.
     const picked = candidate?.provider !== FACTORY_PROVIDER && defsOrdered.some(d=>d.provider===FACTORY_PROVIDER) ? undefined : candidate;
@@ -2351,7 +2363,7 @@ export class Dispatcher {
         // retire. The retire+respawn below only applies to legacy tree-bound
         // insts whose cwd still IS a worktree path.
         const instHome = sidecar?.commDirFor(existing.id);
-        const sceneBound = !instHome || existing.cwd !== instHome;
+        const sceneBound = !existing.workspaceScope && (!instHome || existing.cwd !== instHome);
         if ((claim?.worktree ?? workspace) && sceneBound && existing.cwd !== (claim?.worktree ?? workspace)!.worktreePath) {
           if (task) await sidecar!.releaseClaim(existing.id, task.id, '工作区路径变化，换新会话接管登记现场');
           else await sidecar?.releaseWorkspace?.(existing);
@@ -2388,7 +2400,7 @@ export class Dispatcher {
       if (!model) continue;
       // No seat is created for a task whose write scope is held: the preflight comes before the spawn.
       if (sidecar && task && await this.scopeBlocked(task)) { this.scopeDenied.add(task.id); return undefined; }
-      const inst = pending ?? await wf.spawnInst(def, task?.repoPath ?? anchor?.home ?? env.opsRepo);
+      const inst = pending ?? await wf.spawnInst(def, repoHome, workspaceScope);
       let spawnEnv: Record<string, string>;
       let claim: ClaimResult | undefined;
       let workspace: WorktreeAssignment | undefined;
@@ -2414,27 +2426,26 @@ export class Dispatcher {
         return undefined;
       }
       try {
-        // Employee sessions must outlive their task scene: the agent cwd is the
-        // instance's private comm dir, never a worktree path, so scene reclaim
-        // archives only task workspaces. The task's registered tree is carried
-        // in claim.json + the prompt instead. Legacy no-sidecar mode keeps the
-        // tree-bound cwd it always had.
+        // Goal conversations live at the repository root; private comm remains per employee.
+        // Worktree allocation stays in claim.json and never changes the Paseo workspace.
+        // Legacy instances keep their existing launch directory until normal retirement.
         const instHome = sidecar?.commDirFor(inst.id);
-        const spawnCwd = instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
+        const spawnCwd = workspaceScope ? repoHome : instHome ?? (claim?.worktree ?? workspace)?.worktreePath ?? repoHome;
         await hooks?.beforeExternal?.(inst, 'spawn');
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
-          mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd, workspaceTitle: instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
-          labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id },
+          mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
+          workspaceTitle: workspaceScope ? `${scopeTask?.goalTitle ?? '公司目标'} [${workspaceScope}]` : instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
+          workspaceScope, repoHome,
+          labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id, ...(workspaceScope ? { goal_id: workspaceScope } : {}) },
           env: spawnEnv,
           prompt: prompt(inst, true, claim, workspace),
         });
         await hooks?.afterExternal?.(inst, 'spawn', agentId);
         const cwd = spawnCwd;
-        const repoHome = task?.repoPath ?? anchor?.task?.repoPath ?? anchor?.home ?? env.opsRepo;
-        await wf.bind(inst.id, { agentId, cwd, repoHome, model });
+        await wf.bind(inst.id, { agentId, cwd, repoHome, model, workspaceScope });
         sidecar?.bindAgent(inst.id, agentId);
-        const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model };
+        const bound = { ...inst, paseoAgentId: agentId, cwd, repoHome, model, workspaceScope };
         const prior = insts.findIndex(row => row.id === inst.id);
         if (prior >= 0) insts[prior] = bound; else insts.push(bound);
         this.onboarded.add(inst.id);

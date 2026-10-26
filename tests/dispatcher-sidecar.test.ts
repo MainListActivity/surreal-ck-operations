@@ -16,7 +16,7 @@ import type { HostResources } from '../src/dispatcher/host.ts';
 import type { ArtifactTrigger } from '../src/dispatcher/artifact-reclaim.ts';
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
-function world(role: EmployeeDef['role'] = 'engineering') {
+export function world(role: EmployeeDef['role'] = 'engineering') {
   const root = mkdtempSync(join(tmpdir(), 'dispatch-comm-'));
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string; model?: string }>();

@@ -23,6 +23,7 @@ interface TaskSpec {
   implementer?: string;
   version?: number;
   facts?: Record<string, unknown>;
+  goalId?: string;
 }
 
 interface ActionInput {
@@ -67,7 +68,7 @@ export function fixture(specs: TaskSpec[]) {
     const state = spec.state ?? 'blocked';
     const task = {
       id: spec.id, title: spec.id, state, blockedTo: spec.blockedTo, executorRole: 'engineering', reviewerRole: 'qa',
-      kind: 'task', version: spec.version ?? 1, implementer: spec.implementer, repoPath: spec.repoPath,
+      kind: 'task', goalId: spec.goalId, version: spec.version ?? 1, implementer: spec.implementer, repoPath: spec.repoPath,
       evalAttempts: 0, ownerRerouted: false,
       row: { id: spec.id, title: spec.id, state, blocked_to: spec.blockedTo, version: spec.version ?? 1,
         implementer: spec.implementer, repo_path: spec.repoPath } as never,
@@ -220,7 +221,7 @@ export function fixture(specs: TaskSpec[]) {
     },
     bind: async (id: string, binding: { agentId: string; cwd: string; repoHome?: string; model?: string }) => {
       Object.assign(instances.find(i => i.id === id)!, { paseoAgentId: binding.agentId, cwd: binding.cwd,
-        repoHome: binding.repoHome ?? binding.cwd, model: binding.model });
+        repoHome: binding.repoHome ?? binding.cwd, model: binding.model, workspaceScope: (binding as { workspaceScope?: string }).workspaceScope });
       agents.set(binding.agentId, { id: binding.agentId, status: 'running' });
     },
     retire: async () => {},
@@ -755,4 +756,13 @@ test('same-repo bound implementer stays assigned after an explicit code repo bin
  const report=await f.tick({autoTakeover:async input=>{calls.push(input);return true;}});
  expect(calls).toEqual([]);
  expect(report.woke.find(w=>w.task==='same-repo')?.employee).toBe('eng-1');
+});
+
+
+test('same repository manager work is separated by goal, not batched into one conversation', async () => {
+  const f = fixture([{ id: 'goal-a-task', goalId: 'goal-a', repoPath: PROJ_A, blockedTo: 'gm' },
+    { id: 'goal-b-task', goalId: 'goal-b', repoPath: PROJ_A, blockedTo: 'gm' }]);
+  await f.tick();
+  const managers = f.instances.filter(i => i.role === 'gm');
+  expect(managers.map(i => i.workspaceScope).sort()).toEqual(['goal-a', 'goal-b']);
 });

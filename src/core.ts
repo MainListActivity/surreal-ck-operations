@@ -264,6 +264,7 @@ interface TaskRow {
   worktree?: WorktreeAssignment;
   repo_path?: string;
   goal_tier?: string;
+  goal_title?: string;
   /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
   revises?: RecordId;
   superseded_by?: RecordId;
