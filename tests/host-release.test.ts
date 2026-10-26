@@ -3,7 +3,7 @@
  * No company DB, no real paseo/launchctl, no writes under releases/.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, unlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -12,6 +12,8 @@ import {
 } from '../src/host-release/store.ts';
 import { snapshotInventoryHash, verifyRelease } from '../src/host-release/verify.ts';
 import { isCommitSha, isSafeAbsolutePath, type HostReleaseReceipt } from '../src/host-release/types.ts';
+import { parsePaseoPluginJson } from '../src/host-release/plugin-parse.ts';
+import { checkActivityBarrier } from '../src/host-release/barrier.ts';
 
 const clean: string[] = [];
 afterEach(() => {
@@ -159,6 +161,11 @@ describe('host-release envelope', () => {
     const opId = 'a'.repeat(32);
     const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
     mkdirSync(envelope, { recursive: true });
+    writeFileSync(join(envelope, 'operation.json'), JSON.stringify({
+      opId, taskId: 't', targetSha: sha(11), expectedActive: '/x', snapshotHash: 'd'.repeat(64),
+      rollbackSha: sha(12), idempotencyKey: 'k', state: 'prepared', createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }));
     writeFileSync(join(envelope, 'receipt.json'), JSON.stringify({
       schema: 'host-release-receipt/1', opId, taskId: 't', targetSha: sha(11),
       previousActive: '/x', expectedActive: '/x', snapshotHash: 'd'.repeat(64), rollbackSha: sha(12),
@@ -204,7 +211,32 @@ describe('host-release envelope', () => {
     expect(readHostReleaseStatus(serviceHome, opId).state).toBe('succeeded');
   });
 
-  test('lock is exclusive and released by the same opId', () => {
+  test('F4′: receipt with executor but mismatched taskId/targetSha/snapshotHash is refused', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-forge-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    const opId = 'f'.repeat(32);
+    const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
+    mkdirSync(envelope, { recursive: true });
+    writeFileSync(join(envelope, 'operation.json'), JSON.stringify({
+      opId, taskId: 'task-REAL', targetSha: sha(20), expectedActive: '/real', snapshotHash: 'a'.repeat(64),
+      rollbackSha: sha(21), idempotencyKey: 'k', state: 'prepared', createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }));
+    writeFileSync(join(envelope, 'receipt.json'), JSON.stringify({
+      schema: 'host-release-receipt/1', opId, taskId: 'task-FORGED', targetSha: 'f'.repeat(40),
+      previousActive: '/real', expectedActive: '/real', snapshotHash: 'd'.repeat(64), rollbackSha: sha(21),
+      executor: { host: 'forged-host', uid: 1, user: 'forger' },
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null },
+      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
+      channelRecovery: 'unknown', lockReleased: true,
+    }));
+    expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/taskId|targetSha|snapshotHash/);
+  });
+
+  test('lock is exclusive (O_EXCL) and released by the same opId', () => {
     const root = mkdtempSync(join(tmpdir(), 'sck-hr-lock-'));
     clean.push(root);
     const serviceHome = join(root, 'svc');
@@ -214,6 +246,79 @@ describe('host-release envelope', () => {
     releaseHostReleaseLock(serviceHome, 'c'.repeat(32));
     acquireHostReleaseLock(serviceHome, 'd'.repeat(32));
     releaseHostReleaseLock(serviceHome, 'd'.repeat(32));
+  });
+
+  test('F3′: prepare refuses snapshotPath whose basename is not targetSha', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-base-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    const opsRepo = join(root, 'ops');
+    mkdirSync(join(opsRepo, '.git'), { recursive: true });
+    mkdirSync(join(serviceHome, 'maintenance'), { recursive: true });
+    mkdirSync(join(serviceHome, 'releases', sha(22)), { recursive: true });
+    symlinkSync(join(serviceHome, 'releases', sha(22)), join(serviceHome, 'active'));
+    const snap = makeSnapshot(root, sha(23));
+    const hash = snapshotInventoryHash(snap);
+    // Rename so basename ≠ targetSha.
+    const renamed = join(root, 'not-a-sha');
+    renameSync(snap, renamed);
+    expect(() => prepareHostRelease({
+      roots: { serviceHome, opsRepo, releasesDir: join(serviceHome, 'releases') },
+      request: {
+        taskId: 'task-z', targetSha: sha(23), expectedActive: join(serviceHome, 'releases', sha(22)),
+        snapshotHash: hash, rollbackSha: sha(22), idempotencyKey: 'k3',
+      },
+      snapshotPath: renamed,
+    })).toThrow(/basename/);
+  });
+});
+
+describe('host-release plugin parse (F0 fixture)', () => {
+  test('parsePaseoPluginJson reads SOURCE/DIRECTORY from a successful paseo fixture', () => {
+    const raw = JSON.stringify([{
+      path: '/svc/releases/' + sha(30) + '/plugin',
+      status: 'running',
+      enabled: true,
+      installation: { identity: { path: '/svc/releases/' + sha(30) + '/plugin' } },
+    }]);
+    const binding = parsePaseoPluginJson(raw);
+    expect(binding.sourceKnown).toBe(true);
+    expect(binding.source).toBe('/svc/releases/' + sha(30) + '/plugin');
+    expect(binding.directory).toBe('/svc/releases/' + sha(30) + '/plugin');
+    expect(binding.status).toBe('running');
+    expect(binding.enabled).toBe(true);
+  });
+
+  test('parsePaseoPluginJson refuses non-array JSON', () => {
+    expect(() => parsePaseoPluginJson('{"path":"/x"}')).toThrow(/array/);
+  });
+});
+
+describe('host-release activity barrier (AC03)', () => {
+  test('barrier refuses when dispatch-paused or qa-observation-active mirrors are set', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-bar-'));
+    clean.push(root);
+    mkdirSync(join(root, 'maintenance'), { recursive: true });
+    writeFileSync(join(root, 'maintenance', 'dispatch-paused.json'), JSON.stringify({ paused: true }));
+    const paused = checkActivityBarrier({ serviceHome: root });
+    expect(paused.ok).toBe(false);
+    expect(paused.checks.some(check => check.name === 'dispatch-paused' && !check.ok)).toBe(true);
+
+    unlinkSync(join(root, 'maintenance', 'dispatch-paused.json'));
+    writeFileSync(join(root, 'maintenance', 'qa-observation-active.json'), JSON.stringify({
+      active: true, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    const obs = checkActivityBarrier({ serviceHome: root });
+    expect(obs.ok).toBe(false);
+    expect(obs.checks.some(check => check.name === 'qa-observation-window' && !check.ok)).toBe(true);
+  });
+
+  test('barrier passes when no file signals are present', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-barok-'));
+    clean.push(root);
+    mkdirSync(join(root, 'maintenance'), { recursive: true });
+    const result = checkActivityBarrier({ serviceHome: root });
+    expect(result.ok).toBe(true);
   });
 });
 

@@ -90,9 +90,42 @@ active_now=$(readlink "$service_home/active" 2>/dev/null || true)
   exit 1
 }
 
-# --- copy snapshot into releases/ (idempotent if identical) ---
+# --- copy snapshot into releases/ (idempotent only when inventory matches envelope) ---
+# Reuse must re-bind envelope.snapshotHash: installer content-bind ≠ inventory hash (F1′).
 if [ -d "$release_dir" ]; then
-  echo "release dir exists: $release_dir (reusing after content check)"
+  existing_hash=$(TARGET="$release_dir" /usr/bin/python3 - <<'PY'
+import hashlib, os
+root = os.environ["TARGET"]
+skip_prefixes = ("node_modules/", "plugin/server/vendor/", ".runtime/", ".git/", "vault/build/")
+files = []
+for dirpath, dirnames, filenames in os.walk(root):
+    rel_dir = os.path.relpath(dirpath, root)
+    if rel_dir == ".": rel_dir = ""
+    kept = []
+    for name in dirnames:
+        rel = f"{rel_dir}/{name}" if rel_dir else name
+        if any(rel == p[:-1] or rel.startswith(p) for p in skip_prefixes):
+            continue
+        kept.append(name)
+    dirnames[:] = kept
+    for name in filenames:
+        rel = f"{rel_dir}/{name}" if rel_dir else name
+        if any(rel.startswith(p) for p in skip_prefixes):
+            continue
+        files.append(rel)
+files.sort()
+lines = []
+for rel in files:
+    digest = hashlib.sha256(open(os.path.join(root, rel), "rb").read()).hexdigest()
+    lines.append(f"{rel}\0{digest}\n")
+print(hashlib.sha256("".join(lines).encode()).hexdigest())
+PY
+)
+  [ "$existing_hash" = "$snapshotHash" ] || {
+    echo "refused: existing $release_dir inventory $existing_hash != envelope snapshotHash $snapshotHash" >&2
+    exit 1
+  }
+  echo "release dir exists: $release_dir (reusing; inventory matches envelope.snapshotHash)"
 else
   mkdir -p "$release_dir"
   cp -R "$snapshot/." "$release_dir/"
@@ -113,9 +146,14 @@ plugin_enabled="unknown"
 plugin_source_known=false
 if [ -x "$paseo_cli" ]; then
   if plugin_json=$("$paseo_cli" plugin ls sck-company --json 2>/dev/null); then
-    eval "$(printf '%s\n' "$plugin_json" | /usr/bin/python3 - <<'PY'
-import json, sys
-rows = json.load(sys.stdin) or []
+    # F0: never pipe into `python - <<'PY'` — the heredoc steals stdin from the pipe.
+    # Same algorithm as src/host-release/plugin-parse.ts (unit-tested); kept inline so apply.sh
+    # has no bun dependency on the trusted host.
+    eval "$(PLUGIN_JSON="$plugin_json" /usr/bin/python3 -c '
+import json, os
+rows = json.loads(os.environ["PLUGIN_JSON"]) or []
+if not isinstance(rows, list):
+    raise SystemExit("paseo plugin ls JSON must be an array")
 row = rows[0] if rows else {}
 ident = (row.get("installation") or {}).get("identity") or {}
 print("plugin_source=%s" % json.dumps(ident.get("path") or ""))
@@ -123,8 +161,7 @@ print("plugin_directory=%s" % json.dumps(row.get("path") or ""))
 print("plugin_status=%s" % json.dumps(row.get("status") or ""))
 print("plugin_enabled=%s" % json.dumps(bool(row.get("enabled"))))
 print("plugin_source_known=true")
-PY
-)"
+')"
   fi
 fi
 
@@ -177,6 +214,25 @@ if [ "$final_state" != succeeded ]; then
 fi
 
 finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# F2′: contentMatchesCommit is observed, never hard-coded. Prefer install log markers;
+# fall back to whether install exited 0 (installer refuses content mismatch before switch).
+content_matches=false
+if grep -Eqi 'does not match commit|content.?bind|release_matches_commit' "$install_log" 2>/dev/null; then
+  content_matches=false
+elif [ "$install_rc" -eq 0 ]; then
+  content_matches=true
+fi
+
+# channelRecovery: only claim adopt-expected when plugin SOURCE actually points at this release.
+channel_recovery=unknown
+if [ "$final_state" = succeeded ] && [ "$plugin_ok" = true ]; then
+  channel_recovery=adopt-expected
+fi
+
+# lockReleased: observed — true only after we successfully unlink our lock file below.
+lock_released=false
+
 # --- receipt (trusted host) ---
 OP_ID="$op_id" TASK_ID="$taskId" TARGET_SHA="$targetSha" PREV_ACTIVE="$expectedActive" \
 EXPECTED_ACTIVE="$expectedActive" SNAP_HASH="$snapshotHash" ROLLBACK_SHA="$rollbackSha" \
@@ -185,8 +241,11 @@ EXIT_CODE="$install_rc" STATE="$final_state" REASON="$reason" RELEASE_DIR="$rele
 HEALTH="$health_code" READY="$ready_code" PLUGIN_STATUS="$plugin_status" PLUGIN_ENABLED="$plugin_enabled" \
 PLUGIN_SOURCE="$plugin_source" PLUGIN_DIRECTORY="$plugin_directory" PLUGIN_KNOWN="$plugin_source_known" \
 RB_ATTEMPTED="$rollback_attempted" RB_OK="$rollback_ok" RB_TO="$rollback_to" \
+CONTENT_MATCHES="$content_matches" CHANNEL_RECOVERY="$channel_recovery" LOCK_RELEASED="$lock_released" \
 RECEIPT="$receipt" /usr/bin/python3 - <<'PY'
 import json, os
+state = os.environ["STATE"]
+content_matches = os.environ["CONTENT_MATCHES"] == "true"
 receipt = {
   "schema": "host-release-receipt/1",
   "opId": os.environ["OP_ID"],
@@ -200,11 +259,11 @@ receipt = {
   "startedAt": os.environ["STARTED"],
   "finishedAt": os.environ["FINISHED"],
   "exitCode": int(os.environ["EXIT_CODE"]),
-  "state": os.environ["STATE"],
+  "state": state,
   "checks": [],
   "binding": {
-    "releasePath": os.environ["RELEASE_DIR"] if os.environ["STATE"] in ("succeeded", "rolled_back", "failed") else None,
-    "contentMatchesCommit": True,
+    "releasePath": os.environ["RELEASE_DIR"] if state in ("succeeded", "rolled_back", "failed") else None,
+    "contentMatchesCommit": content_matches,
     "vendorSchemaDiff": "unavailable",
   },
   "mcp": {
@@ -220,13 +279,14 @@ receipt = {
     "directory": os.environ["PLUGIN_DIRECTORY"] if os.environ["PLUGIN_DIRECTORY"] not in ("", "unknown") else None,
     "sourceKnown": os.environ["PLUGIN_KNOWN"] == "true",
   },
-  "channelRecovery": "adopt-expected" if os.environ["STATE"] == "succeeded" else "unknown",
+  "channelRecovery": os.environ["CHANNEL_RECOVERY"],
   "rollback": {
     "attempted": os.environ["RB_ATTEMPTED"] == "true",
     "to": os.environ["RB_TO"] or None,
     "ok": os.environ["RB_OK"] == "true",
   },
-  "lockReleased": True,
+  # Written false first; flipped to true below only after the lock file is actually removed.
+  "lockReleased": False,
 }
 if os.environ["REASON"]:
   receipt["reason"] = os.environ["REASON"]
@@ -256,6 +316,23 @@ if os.environ["OP_RELEASE"]:
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
   json.dump(op, handle, ensure_ascii=False, indent=2)
+  handle.write("\n")
+os.replace(tmp, path)
+PY
+
+# Release the lock, then flip receipt.lockReleased to the observed result (F2′).
+trap - EXIT
+if rm -f "$lock"; then
+  lock_released=true
+fi
+RECEIPT="$receipt" LOCK_RELEASED="$lock_released" /usr/bin/python3 - <<'PY'
+import json, os
+path = os.environ["RECEIPT"]
+receipt = json.load(open(path, encoding="utf-8"))
+receipt["lockReleased"] = os.environ["LOCK_RELEASED"] == "true"
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as handle:
+  json.dump(receipt, handle, ensure_ascii=False, indent=2)
   handle.write("\n")
 os.replace(tmp, path)
 PY

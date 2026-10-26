@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { HostReleaseCheck, HostReleaseRoots } from './types.ts';
 import { isCommitSha, isSafeAbsolutePath } from './types.ts';
+import { checkActivityBarrier } from './barrier.ts';
 
 export interface VerifyInput {
   roots: HostReleaseRoots;
@@ -177,6 +178,10 @@ export function verifyRelease(input: VerifyInput): VerifyResult {
     && existsSync(join(input.releasePath, 'src/dispatcher/run.ts'))
     && existsSync(join(input.releasePath, 'plugin'));
   push('release-shape', shaped, shaped ? undefined : 'release missing src/mcp/run.ts, src/dispatcher/run.ts or plugin/');
+
+  // 7) AC03 activity barrier (file-backed signals; host re-checks before side effects)
+  const barrier = checkActivityBarrier({ serviceHome: input.roots.serviceHome });
+  for (const check of barrier.checks) checks.push(check);
 
   return { ok: checks.every(check => check.ok), checks };
 }

@@ -11,3 +11,5 @@ export {
   HostReleaseError, acquireHostReleaseLock, opIdFor, prepareHostRelease, readHostReleaseReceipt,
   readHostReleaseStatus, releaseHostReleaseLock, validateRequest, writeHostReceipt,
 } from './store.ts';
+export { checkActivityBarrier, type BarrierInput, type BarrierResult } from './barrier.ts';
+export { parsePaseoPluginJson, type PaseoPluginBinding } from './plugin-parse.ts';

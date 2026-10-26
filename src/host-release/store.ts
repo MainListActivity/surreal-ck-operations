@@ -4,8 +4,8 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, closeSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type {
   HostReleaseOperation, HostReleasePrepareResult, HostReleaseReceipt, HostReleaseRequest, HostReleaseRoots,
@@ -68,6 +68,10 @@ export function prepareHostRelease(input: PrepareInput): HostReleasePrepareResul
   validateRequest(input.request);
   if (!isSafeAbsolutePath(input.snapshotPath) || !existsSync(input.snapshotPath)) {
     throw new HostReleaseError('invalid', 'snapshotPath must be an existing absolute path');
+  }
+  // F3′: store-level basename == targetSha (CLI already checks; MCP must too).
+  if (basename(input.snapshotPath) !== input.request.targetSha) {
+    throw new HostReleaseError('invalid', `snapshotPath basename must equal targetSha (${input.request.targetSha})`);
   }
   const inventory = snapshotInventoryHash(input.snapshotPath);
   if (inventory !== input.request.snapshotHash) {
@@ -148,12 +152,17 @@ export function readHostReleaseStatus(serviceHome: string, opId: string): HostRe
 }
 
 /**
- * Read a host-written receipt. Refuses employee-shaped forgeries: schema must match, executor must be present,
- * and the file must live under the operation envelope (not an arbitrary upload path).
+ * Read a host-written receipt. Refuses employee-shaped forgeries (F4′):
+ * - schema + executor identity required
+ * - file must live under the operation envelope
+ * - receipt.taskId / targetSha / snapshotHash / rollbackSha / expectedActive must match operation.json
+ * Presence of an executor field alone is never enough.
  */
 export function readHostReleaseReceipt(serviceHome: string, opId: string): HostReleaseReceipt {
   if (!/^[0-9a-f]{16,64}$/.test(opId)) throw new HostReleaseError('invalid', 'opId malformed');
   const envelopePath = hostReleaseEnvelopeDir(serviceHome, opId);
+  const operation = readJson<HostReleaseOperation>(join(envelopePath, HOST_RELEASE_OPERATION_FILE));
+  if (!operation) throw new HostReleaseError('not_found', `operation ${opId} not found`);
   const receiptPath = join(envelopePath, HOST_RELEASE_RECEIPT_FILE);
   const receipt = readJson<HostReleaseReceipt>(receiptPath);
   if (!receipt) throw new HostReleaseError('not_found', `receipt for ${opId} not found`);
@@ -162,18 +171,33 @@ export function readHostReleaseReceipt(serviceHome: string, opId: string): HostR
     throw new HostReleaseError('invalid', 'receipt missing trusted executor identity');
   }
   if (receipt.opId !== opId) throw new HostReleaseError('invalid', 'receipt opId mismatch');
+  if (receipt.taskId !== operation.taskId) throw new HostReleaseError('invalid', 'receipt.taskId does not match operation');
+  if (receipt.targetSha !== operation.targetSha) throw new HostReleaseError('invalid', 'receipt.targetSha does not match operation');
+  if (receipt.snapshotHash !== operation.snapshotHash) throw new HostReleaseError('invalid', 'receipt.snapshotHash does not match operation');
+  if (receipt.rollbackSha !== operation.rollbackSha) throw new HostReleaseError('invalid', 'receipt.rollbackSha does not match operation');
+  if (receipt.expectedActive !== operation.expectedActive) throw new HostReleaseError('invalid', 'receipt.expectedActive does not match operation');
   return receipt;
 }
 
-/** Acquire the global host-release lock. Host-only; employees can see it but cannot run apply. */
+/**
+ * Acquire the global host-release lock (F5). Uses O_EXCL so two concurrent creators cannot both win
+ * the existsSync→write race. Host-only; employees can see it but cannot run apply.
+ */
 export function acquireHostReleaseLock(serviceHome: string, opId: string): string {
   const lockPath = join(serviceHome, 'maintenance', HOST_RELEASE_LOCK_FILE);
   mkdirSync(join(serviceHome, 'maintenance'), { recursive: true, mode: 0o700 });
-  if (existsSync(lockPath)) {
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
     const prior = readJson<{ opId?: string; at?: string }>(lockPath);
-    throw new HostReleaseError('conflict', `host-release lock held by ${prior?.opId ?? 'unknown'} since ${prior?.at ?? 'unknown'}`);
+    throw new HostReleaseError('conflict', `host-release lock held by ${prior?.opId ?? 'unknown'} since ${prior?.at ?? 'unknown'}: ${(error as Error).message}`);
   }
-  writeJsonAtomic(lockPath, { opId, at: nowIso() });
+  try {
+    writeFileSync(fd, `${JSON.stringify({ opId, at: nowIso() }, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
   return lockPath;
 }
 
