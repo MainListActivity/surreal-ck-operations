@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>模型排序 · UI 审核原型</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main id="app" class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#"><span class="brand-mark">M</span><span>Model Relay</span></a>
+      <span class="live"><i></i>静态审核原型</span>
+    </header>
+    <div class="page">
+      <section class="page-heading">
+        <div><p class="eyebrow">ROUTING CONSOLE</p><h1>模型排序</h1><p>配置 Haiku、Sonnet 的自动排序规则与模型优先级。</p></div>
+        <div class="health"><i></i><span><strong>运行正常</strong><small>模拟数据</small></span></div>
+      </section>
+      <div class="workspace">
+        <aside class="settings panel">
+          <div class="panel-title"><b>01</b><span><strong>排序规则</strong><small>描述你的分组策略</small></span></div>
+          <label for="rule">自定义规则</label>
+          <textarea id="rule">额度按余量分层：80%以上、30–80%、30%以下；层内结合 AA 智能分、错误率、首 token 响应时间综合排序。</textarea>
+          <p class="hint">留空时采用默认规则：智能程度和速度综合优先。</p>
+          <label for="refresh">刷新间隔</label>
+          <select id="refresh"><option>2 分钟</option><option selected>5 分钟（默认）</option><option>10 分钟</option></select>
+          <button class="primary" id="save">保存排序规则 <span>→</span></button>
+          <div class="meta"><small>最近刷新</small><strong>2026/10/26 09:45:14</strong><p>到期后由下一次员工请求触发后台刷新。</p></div>
+        </aside>
+        <section class="results panel">
+          <div class="panel-title"><b>02</b><span><strong>模型优先级</strong><small>依据当前规则生成的实时排序</small></span><em>最近更新 09:45</em></div>
+          <div class="tabs" id="tabs"></div>
+          <div class="list-heading"><span><strong id="group-title">Haiku 模型</strong><small>置顶模型固定在前，其余按 JEV 分数排序</small></span><b id="count">40 个成员</b></div>
+          <div class="column-head"><span>排名 / 模型</span><span>智能分</span><span>速度</span><span>额度</span><span>JEV</span><span></span></div>
+          <div class="model-list" id="models"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
