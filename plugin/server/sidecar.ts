@@ -70,6 +70,8 @@ const BASE_TOOLS = [
   // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
   // the MCP face's tree or the `active` symlink, so it can serve as evidence of the loaded version.
   "plugin_runtime_diagnostics",
+  // SYS04 故障诊断：任务持有人 / 验收人 / gm 只读预算状态；gm 解封已耗尽的恢复预算（core 判定）。
+  "fault_status", "fault_lift",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -1104,6 +1106,17 @@ export class SidecarPool {
           return { ...sample, channel: "plugin-sidecar", instanceId: instId };
         });
       });
+      case "fault_status": return core.faultStatus
+        ? core.faultStatus(cred, { taskId: String(args.taskId ?? live().taskId) })
+        : Promise.reject(Object.assign(new Error("core does not expose fault_status"), { code: "temporarily_unavailable" }));
+      case "fault_lift": return core.faultLift
+        ? core.faultLift(cred, {
+            taskId: String(args.taskId ?? live().taskId),
+            incident: String(args.incident ?? ""),
+            reason: String(args.reason ?? ""),
+            idempotencyKey: String(args.idempotencyKey ?? ""),
+          })
+        : Promise.reject(Object.assign(new Error("core does not expose fault_lift"), { code: "temporarily_unavailable" }));
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });

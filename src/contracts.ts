@@ -1124,6 +1124,18 @@ export interface CompanyCore {
    */
   settleFault?(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void>;
   /**
+   * Read-only fault diagnosis for one task: budget scopes, episodes, and any open repair chain. Secret-free.
+   * Readable by the task holder, its reviewer, or gm — so a QA acceptance that hits a spent budget can see
+   * nextAllowedAt / attempts / repairTaskId without guessing.
+   */
+  faultStatus?(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView>;
+  /**
+   * gm only: lift a spent (or stopped) recovery budget for one incident of a task, after the cause is fixed
+   * or a diagnosis has been recorded. Creates no new budget; resets the existing scope so the next attempt
+   * starts a fresh recovery window. Audited.
+   */
+  faultLift?(credential: Credential, input: { taskId: TaskId; incident: string; reason: string; idempotencyKey: string }): Promise<FaultStatusView>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
@@ -1346,8 +1358,58 @@ export interface EnrollmentAdmin {
 // ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
 // 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
 import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
-import type { FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
+import type { FaultDiagnostic, FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
 export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
+
+/** One budget scope of a task, as shown to a holder / reviewer / gm. Secret-free. */
+export interface FaultBudgetView {
+  key: string;
+  target: string;
+  phase: string;
+  attempts: number;
+  maxAttempts: number;
+  totalAttempts: number;
+  deadline: number;
+  nextAllowedAt: number;
+  failed: boolean;
+  stopped: boolean;
+  lastErrno?: string;
+  lastHop?: string;
+  lastIncident?: string;
+  stopReason?: string;
+  stopDiagnostic?: FaultDiagnostic;
+}
+
+/** One episode of a cause on a task. */
+export interface FaultEpisodeView {
+  episode: string;
+  incident: string;
+  fingerprint: string;
+  phase: string;
+  state: string;
+  openedAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+/** The open repair chain of an incident, when one exists. */
+export interface FaultRepairView {
+  incident: string;
+  fingerprint: string;
+  taskId?: string;
+  sourceTaskId?: string;
+  state: string;
+  diagnostic?: FaultDiagnostic;
+}
+
+/** Read-only diagnosis of a task's recovery budget. Never carries credentials or upstream bodies. */
+export interface FaultStatusView {
+  taskId: TaskId;
+  now: number;
+  budgets: FaultBudgetView[];
+  episodes: FaultEpisodeView[];
+  repairs: FaultRepairView[];
+}
 
 /** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */
 export interface PolicyView {

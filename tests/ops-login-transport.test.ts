@@ -273,8 +273,11 @@ describe('same-hop connect recovery', () => {
   test('a hop whose connections all fail hands the failure back with the stage and the cause', async () => {
     // Every connection of the authorize hop is broken, in every flow attempt: the login fails with the real cause and
     // the stage, not with a bare timeout, and the error carries no secret.
+    // stepTimeoutMs tracks the short connect limit so a same-hop retry is still affordable under the budget gate.
     const target = await idp({ holdHop: (hop, connection) => (hop === 'authorize' ? 13_000 : 0) });
-    const { error } = await failure(login(target, { fetch: transport(1_000), budgetMs: 40_000, retryMinLeftMs: 20_000 }));
+    const { error } = await failure(login(target, {
+      fetch: transport(1_000), budgetMs: 40_000, retryMinLeftMs: 20_000, stepTimeoutMs: 3_000,
+    }));
     expect(error.code).toBe('upstream_error');
     // The cause is the connection that never came up, and the stage says where.
     expect(error.message).toContain('UND_ERR_CONNECT_TIMEOUT');
@@ -283,6 +286,24 @@ describe('same-hop connect recovery', () => {
     // The hop never reached the server, so no challenge was ever issued.
     expect(target.counts.authorize).toBe(0);
   }, 120_000);
+
+  test('a same-hop retry that would leave the next flow short of its reserve is refused', async () => {
+    // QA 2026-10-26 production shape: first connect burns ~20s, same-hop retry then burns the rest, and the flow
+    // retry is left with ~2s. The gate must refuse that second connection so the failure returns with budget left
+    // for a fresh authorize→exchange (or so the recovery budget is not spent on a path that stays broken).
+    const target = await idp({ holdHop: (hop) => (hop === 'authorize' ? 13_000 : 0) });
+    const { error, ms } = await failure(login(target, {
+      fetch: transport(8_000), budgetMs: 30_000, retryMinLeftMs: 15_000, stepTimeoutMs: 10_000,
+    }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('UND_ERR_CONNECT_TIMEOUT');
+    expect(error.message).toContain('stage=authorize');
+    // After one connect stall (~8s) the remaining budget cannot fund another full connect window AND the
+    // 15s flow reserve, so no same-hop retry is recorded. The outer flow may still start a fresh attempt.
+    expect(error.message).not.toContain('connect retry');
+    // Bounded by the budget, not by a second same-hop connect window stacked on the first.
+    expect(ms).toBeLessThan(30_000);
+  }, 60_000);
 
   test('a request that may have been written is never sent twice, even when the connection failed', async () => {
     // The login POST is consumed by the IdP and the connection breaks on the way back: the password was sent, so the

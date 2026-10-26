@@ -827,6 +827,21 @@ function registerTools(server: McpServer, core: CompanyCore) {
       reason: z.string().min(8).max(2000), idempotencyKey: z.string().min(8).max(200) }),
   }, async (input, ctx) => run(token(ctx), () => core.qaObservationRevoke
     ? core.qaObservationRevoke(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('fault_status', {
+    description: 'Read-only diagnosis of a task\'s recovery budget: scopes (attempts/deadline/nextAllowedAt/lastErrno), episodes, and any open repair chain. Readable by the task holder, its reviewer, or gm. Secret-free: never returns credentials, upstream bodies, or aliases beyond what the ledger already stored. Use this when ops_login (or another ops tool) is refused with recovery budget spent / deadline passed, so the next attempt is planned against real counters instead of guessed.',
+    inputSchema: z.object({ taskId: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.faultStatus
+    ? core.faultStatus(token(ctx), { taskId: input.taskId }) : Promise.reject({ code: 'temporarily_unavailable' })));
+  server.registerTool('fault_lift', {
+    description: 'gm only: lift a spent (or stopped) recovery budget for one incident of a task after the cause is fixed or a diagnosis has been recorded. Resets the existing scope so the next attempt starts a fresh recovery window. Creates no new budget and never invents an incident. Audited. Pass the incident from fault_status.',
+    inputSchema: z.object({
+      taskId: z.string().min(1).max(200),
+      incident: z.string().min(1).max(500),
+      reason: z.string().min(4).max(2000),
+      idempotencyKey: z.string().min(1).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.faultLift
+    ? core.faultLift(token(ctx), input) : Promise.reject({ code: 'temporarily_unavailable' })));
   server.registerTool('qa_observation_status', {
     description: 'gm sees every QA observation scope; a qa employee sees its own. Never returns a code, token or session hash. Read-only.',
     inputSchema: z.object({}),

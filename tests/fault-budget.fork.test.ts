@@ -490,6 +490,44 @@ describe('the exhausted budget', () => {
     expect(episodes?.[0]?.evidence_revision).toBe(2);
   });
 
+  test('fault_status is readable by the holder and reports spent budgets; fault_lift resets them for gm', async () => {
+    const taskId = await makeTask('诊断：fault_status 与 fault_lift');
+    const claimResult = await claim(taskId, 'eng');
+    const scope = { taskId, employeeId: 't-eng' };
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    for (let n = 0; n < 2; n++) {
+      clock += 10_000;
+      await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    }
+    clock += 10_000;
+    await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    // The holder (and the reviewer / gm) can read the diagnosis without guessing.
+    const status = await core.faultStatus!(tokens.eng, { taskId });
+    expect(status.taskId).toBe(taskId);
+    expect(status.budgets.length).toBeGreaterThanOrEqual(1);
+    expect(status.budgets[0]?.attempts).toBe(3);
+    expect(status.budgets[0]?.lastErrno).toBe('UND_ERR_CONNECT_TIMEOUT');
+    expect(status.episodes.some(episode => episode.state === 'exhausted')).toBe(true);
+    const incident = status.budgets[0]?.lastIncident ?? status.episodes[0]?.incident;
+    expect(incident).toBeTruthy();
+    // A non-gm cannot lift.
+    await expect(core.faultLift!(tokens.eng, {
+      taskId, incident: incident!, reason: '验收期间解封', idempotencyKey: `lift-eng-${clock}`,
+    })).rejects.toMatchObject({ code: 'forbidden' });
+    // gm lifts with a reason: the next attempt starts a fresh recovery window.
+    const after = await core.faultLift!(tokens.gm, {
+      taskId, incident: incident!, reason: 'TLS 长尾已诊断，验收需要解封继续测', idempotencyKey: `lift-gm-${clock}`,
+    });
+    expect(after.budgets[0]?.attempts).toBe(0);
+    expect(after.budgets[0]?.stopped).toBe(false);
+    expect(after.episodes.every(episode => episode.state === 'resolved' || episode.incident !== incident)).toBe(true);
+    clock += 10_000;
+    const recovered = await attempt(scope, { errno: 'UND_ERR_CONNECT_TIMEOUT' });
+    expect(recovered.reserved?.allowed).toBe(true);
+    // The claim is kept alive so the holder path stays valid for the duration of the test.
+    expect(claimResult.task.id).toBe(taskId);
+  });
+
   test('a repair that is done lifts the fault: the source task may recover with a fresh budget', async () => {
     const taskId = await makeTask('耗尽：修复完成后可恢复');
     const scope = { taskId, employeeId: 't-eng' };

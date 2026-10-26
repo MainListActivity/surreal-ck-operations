@@ -726,6 +726,22 @@ export class FaultStore {
   async budgetTrail(key: string): Promise<FaultScopeRow | undefined> {
     return this.scope(key);
   }
+
+  /** Every budget scope of a task, newest first. The diagnostic face reads this; it never invents a row. */
+  async scopesOfTask(taskId: string): Promise<FaultScopeRow[]> {
+    // SurrealDB requires every ORDER BY field to appear in the selection.
+    const [rows] = await this.db.query<[Array<{ key?: string; updated_at?: unknown }>]>(
+      'SELECT key, updated_at FROM fault_budget WHERE task = $task ORDER BY updated_at DESC;',
+      { task: new RecordId('task', taskId) },
+    );
+    const scopes: FaultScopeRow[] = [];
+    for (const row of rows ?? []) {
+      if (!row.key) continue;
+      const scope = await this.scope(row.key);
+      if (scope) scopes.push(scope);
+    }
+    return scopes;
+  }
 }
 
 /** The empty state of a scope that was never charged. */
