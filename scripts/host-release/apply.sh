@@ -75,6 +75,8 @@ lock="$service_home/maintenance/host-release.lock"
 # --- mutual exclusion (R1): O_EXCL create, not check-then-mv ---
 # Two concurrent apply.sh must not both win. Python os.open(O_CREAT|O_EXCL) is the portable atomic create.
 # Heredoc MUST complete before we inspect $?; `cmd <<'PY' || { … }` is a syntax error (sh -n EOF).
+# B3: under `set -e`, a non-zero python exit aborts BEFORE `lock_rc=$?` — capture with set +e.
+set +e
 LOCK_PATH="$lock" LOCK_OP="$op_id" /usr/bin/python3 - <<'PY'
 import json, os, time
 path = os.environ["LOCK_PATH"]
@@ -91,6 +93,7 @@ finally:
     os.close(fd)
 PY
 lock_rc=$?
+set -e
 [ "$lock_rc" -eq 0 ] || {
   echo "refused: host-release lock held or uncreatable: $lock" >&2
   exit 1
@@ -102,6 +105,8 @@ trap cleanup_lock EXIT
 # --- AC03 activity barrier BEFORE side effects (F6/R2) ---
 # Fail closed when mirrors declare pause/observation; ignore OUR own lock (we just took it).
 # Missing / unreadable / non-boolean mirrors are refused for apply.
+# B3: same set +e capture as the lock block — non-zero python must not abort before barrier_rc.
+set +e
 BARRIER_HOME="$service_home" BARRIER_OP="$op_id" /usr/bin/python3 - <<'PY'
 import json, os, sys, time
 home = os.environ["BARRIER_HOME"]
@@ -177,6 +182,7 @@ if errors:
     raise SystemExit(1)
 PY
 barrier_rc=$?
+set -e
 [ "$barrier_rc" -eq 0 ] || {
   echo "refused: activity barrier blocked apply (see above)" >&2
   exit 1
@@ -384,7 +390,8 @@ receipt = {
   },
   "plugin": {
     "status": os.environ["PLUGIN_STATUS"] if os.environ["PLUGIN_STATUS"] != "unknown" else None,
-    "enabled": (os.environ["PLUGIN_ENABLED"] == "True") if os.environ["PLUGIN_KNOWN"] == "true" else None,
+    # B2: json.dumps(bool) prints "true"/"false"; compare lowercase, not Python True.
+    "enabled": (os.environ["PLUGIN_ENABLED"] == "true") if os.environ["PLUGIN_KNOWN"] == "true" else None,
     "source": os.environ["PLUGIN_SOURCE"] if os.environ["PLUGIN_SOURCE"] not in ("", "unknown") else None,
     "directory": os.environ["PLUGIN_DIRECTORY"] if os.environ["PLUGIN_DIRECTORY"] not in ("", "unknown") else None,
     "sourceKnown": os.environ["PLUGIN_KNOWN"] == "true",
@@ -456,16 +463,48 @@ with open(tmp, "w", encoding="utf-8") as handle:
 os.replace(tmp, path)
 PY
 
-# Release the lock, then flip receipt.lockReleased to the observed result (F2′).
+# Release the lock, then flip receipt.lockReleased and RE-SIGN hostTag (B1).
+# Signing with lockReleased=false then flipping without resign makes verifyHostTag fail.
 trap - EXIT
 if rm -f "$lock"; then
   lock_released=true
 fi
-RECEIPT="$receipt" LOCK_RELEASED="$lock_released" /usr/bin/python3 - <<'PY'
-import json, os
+RECEIPT="$receipt" LOCK_RELEASED="$lock_released" HMAC_KEY="$hmac_key" /usr/bin/python3 - <<'PY'
+import hashlib, hmac, json, os
 path = os.environ["RECEIPT"]
 receipt = json.load(open(path, encoding="utf-8"))
 receipt["lockReleased"] = os.environ["LOCK_RELEASED"] == "true"
+# Canonical payload MUST match the mint block / src/host-release/provenance.ts receiptTagPayload.
+tag_obj = {
+  "opId": receipt["opId"],
+  "taskId": receipt["taskId"],
+  "targetSha": receipt["targetSha"],
+  "previousActive": receipt["previousActive"],
+  "expectedActive": receipt["expectedActive"],
+  "snapshotHash": receipt["snapshotHash"],
+  "rollbackSha": receipt["rollbackSha"],
+  "executor": {
+    "host": receipt["executor"]["host"],
+    "uid": receipt["executor"]["uid"],
+    "user": receipt["executor"]["user"],
+  },
+  "startedAt": receipt["startedAt"],
+  "finishedAt": receipt["finishedAt"],
+  "exitCode": receipt["exitCode"],
+  "state": receipt["state"],
+  "checks": receipt["checks"],
+  "binding": receipt["binding"],
+  "mcp": receipt["mcp"],
+  "plugin": receipt["plugin"],
+  "channelRecovery": receipt["channelRecovery"],
+  "rollback": receipt["rollback"],
+  "lockReleased": receipt["lockReleased"],
+}
+if "reason" in receipt:
+  tag_obj["reason"] = receipt["reason"]
+tag_payload = json.dumps(tag_obj, separators=(",", ":"))
+key = open(os.environ["HMAC_KEY"], "rb").read()
+receipt["hostTag"] = hmac.new(key, tag_payload.encode(), hashlib.sha256).hexdigest()
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
   json.dump(receipt, handle, ensure_ascii=False, indent=2)

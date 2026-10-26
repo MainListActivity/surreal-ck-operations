@@ -40,12 +40,13 @@ const readJson = <T>(path: string): T | undefined => {
 
 /**
  * File-backed signals the host / prepare path can see without opening SurrealDB.
- * - maintenance/dispatch-paused.json { paused: true } — optional mirror written by owner tooling
- * - maintenance/qa-observation-active.json { active: true, expiresAt?: ISO } — optional mirror
+ * - maintenance/dispatch-paused.json { paused: true|false } — host-published mirror
+ * - maintenance/qa-observation-active.json { active: true|false, expiresAt?: ISO } — host-published mirror
  * - maintenance/host-release.lock — live apply lock
  *
- * When the mirror files are absent the check reports ok=true with detail "no file signal"
- * (DB-side paused/observation is re-checked by apply on the host, which can read the DB).
+ * prepare: missing mirrors report ok with detail "no file signal".
+ * apply: missing / unreadable / non-boolean mirrors are refused (fail-closed). There is no
+ * automatic DB→file sync; the trusted host must publish an explicit clear signal before apply.
  */
 export function checkActivityBarrier(input: BarrierInput): BarrierResult {
   const checks: HostReleaseCheck[] = [];

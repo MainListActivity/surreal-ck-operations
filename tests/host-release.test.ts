@@ -453,6 +453,58 @@ describe('host-release apply.sh syntax + first-mint', () => {
     expect(good.status).toBe(0);
     expect(existsSync(keyPath)).toBe(true);
   });
+
+  test('B1: flipping lockReleased without resign fails; resigning verifies', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-b1-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
+    const startedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+    const body: Omit<HostReleaseReceipt, 'hostTag'> = {
+      schema: 'host-release-receipt/1',
+      opId: '3'.repeat(32), taskId: 't', targetSha: sha(60), previousActive: '/a', expectedActive: '/a',
+      snapshotHash: 'e'.repeat(64), rollbackSha: sha(61),
+      executor: { host: 'h', uid: 1, user: 'u' },
+      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
+      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      channelRecovery: 'adopt-expected', lockReleased: false,
+      rollback: { attempted: false, to: null, ok: false },
+    };
+    const tag = mintHostTag(serviceHome, body);
+    expect(verifyHostTag(serviceHome, { ...body, hostTag: tag })).toBe(true);
+    // Flip without resign — reader must reject (historical bug).
+    expect(verifyHostTag(serviceHome, { ...body, hostTag: tag, lockReleased: true })).toBe(false);
+    // Resign after flip — must verify.
+    const resigned = { ...body, lockReleased: true };
+    const newTag = mintHostTag(serviceHome, resigned);
+    expect(verifyHostTag(serviceHome, { ...resigned, hostTag: newTag })).toBe(true);
+  });
+
+  test('B2: plugin.enabled compare accepts json.dumps lowercase true', () => {
+    // Mirrors apply.sh receipt mint: PLUGIN_ENABLED from json.dumps(bool) is "true"/"false".
+    const enabled = (value: string) => value === 'true';
+    expect(enabled('true')).toBe(true);
+    expect(enabled('True')).toBe(false);
+    expect(enabled('false')).toBe(false);
+  });
+
+  test('B3: set -e lock failure still prints refused (set +e capture)', () => {
+    // Micro-repro of apply.sh lock capture pattern — non-zero child must not abort before echo.
+    const script = [
+      'set -eu',
+      'set +e',
+      '/usr/bin/python3 -c "raise SystemExit(1)"',
+      'lock_rc=$?',
+      'set -e',
+      '[ "$lock_rc" -eq 0 ] || { echo "refused: host-release lock held or uncreatable: /x" >&2; exit 1; }',
+    ].join('\n');
+    const result = spawnSync('/bin/sh', ['-c', script], { encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/refused: host-release lock held or uncreatable/);
+  });
 });
 
 describe('host-release verifyRefuseOrder', () => {
