@@ -13,6 +13,14 @@ import { CompanyError } from '../core-errors.ts';
 export interface AgentInfo { id: string; status: string; model?: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
+/** One row of `paseo plugin ls --json`: the host's own record of where a plugin is registered from. */
+export interface PaseoPluginInfo {
+  id?: string;
+  path?: string;
+  enabled?: boolean;
+  status?: string;
+  installation?: { identity?: { kind?: string; path?: string } };
+}
 export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number; employeesRetired?: number }
 
 /** The dispatcher-facing fields of an employee instance that scene cleanup needs. */
@@ -69,6 +77,9 @@ export interface PaseoGateway {
   listWorkspaces(): Promise<PaseoWorkspaceInfo[]>;
   /** Registered projects; each maps a directory to the workspaces under it. */
   listProjects(): Promise<PaseoProjectInfo[]>;
+  /** Registered plugins as the host records them (id, status and the installation source). Optional so a
+   *  focused dispatcher test double need not stub a host query the dispatcher itself never makes. */
+  plugins?(): Promise<PaseoPluginInfo[]>;
   /** Archive a workspace and everything it owns; the transcript stays in history. */
   archiveWorkspace(workspaceId: string): Promise<void>;
   /** Delete a project and its workspaces. */
@@ -220,6 +231,9 @@ export function createPaseoCli(
     },
     async listProjects() {
       return json<PaseoProjectInfo[]>(['project', 'ls']);
+    },
+    async plugins() {
+      return json<PaseoPluginInfo[]>(['plugin', 'ls']);
     },
     async archiveWorkspace(workspaceId) {
       await run(['workspace', 'archive', workspaceId]);

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,14 +10,15 @@ import {
 } from '../plugin/server/runtime-diagnostics.ts';
 
 const modulePath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'plugin', 'server', 'runtime-diagnostics.ts');
-const repoRoot = resolve(dirname(modulePath), '..', '..');
 
 /**
- * Whether this machine's node can run the module the way the Paseo plugin host does: as ESM, where
- * `__dirname` is undefined. Bun supplies `__dirname` even in ESM, so it cannot stand in for that context.
+ * The esbuild the Paseo application itself bundles plugins with. The host loads plugin server code as esbuild
+ * CJS inside `(function(require){…})` via `globalThis.eval`, where neither `__dirname` nor `import.meta.url`
+ * exists — the context this diagnostic must survive. The application ships its own esbuild; without it the
+ * exact loader cannot be reproduced and the case is skipped rather than approximated.
  */
-const nodeEsmProbe = spawnSync('node', ['--experimental-strip-types', '-e', 'console.log(process.versions.node)'], { encoding: 'utf8' });
-const nodeEsmAvailable = nodeEsmProbe.status === 0;
+const PASEO_ESBUILD = '/Applications/Paseo.app/Contents/Resources/app.asar.unpacked/node_modules/esbuild/bin/esbuild';
+const hostLoaderAvailable = existsSync(PASEO_ESBUILD);
 
 /** A release-shaped tree: <root>/plugin/server with a vendor/src beside it, as a real snapshot has. */
 function makeRelease(): { root: string; serverDir: string } {
@@ -55,6 +56,7 @@ describe('plugin runtime diagnostics', () => {
     // company code, so the answer must show which one was actually loaded.
     const { serverDir, root } = makeRelease();
     const answer = sample(serverDir);
+    expect(answer.loaded.basis).toBe('module-dir');
     expect(answer.loaded.serverDir).toBe(serverDir);
     expect(answer.loaded.vendorDir).toBe(join(serverDir, 'vendor'));
     // The vendored source is the plugin's own; the MCP face's tree is never reported as the loaded one.
@@ -149,41 +151,89 @@ describe('plugin runtime diagnostics', () => {
     expect(sample(serverDir).notRead).toContain('process environment values');
   });
 
-  test.skipIf(!nodeEsmAvailable)('the module locates itself in a real ESM context, with no moduleDir injected', () => {
-    // The plugin host loads this module as ESM, where `__dirname` is undefined — and production cannot inject
-    // `moduleDir`, since that is the very thing the host does not hand the code. So the real file is run
-    // under node with no injection: the answer must still name absolute paths, the release binding and real
-    // content digests. Bun supplies `__dirname` even in ESM, which is why this cannot be a Bun-side test.
-    const dir = mkdtempSync(join(tmpdir(), 'sck-rt-esm-'));
-    const probe = join(dir, 'probe.mjs');
-    writeFileSync(probe, [
-      "import { pathToFileURL } from 'node:url';",
-      'const mod = await import(pathToFileURL(process.argv[2]).href);',
-      'const answer = mod.collectPluginRuntimeDiagnostics();',
-      "console.log(JSON.stringify({ dirnameType: typeof __dirname, answer }));",
+  test('the host-registered plugin source is the directory, so no module global is consulted', () => {
+    // The Paseo host evaluates a CJS bundle where `__dirname` and `import.meta.url` are both absent. The
+    // sidecar resolves the host's own registry entry (`paseo plugin ls --json`) and passes it in; the
+    // diagnostic binds that registered tree and says so, instead of deriving anything from the module.
+    const { root, serverDir } = makeRelease();
+    const answer = collectPluginRuntimeDiagnostics({
+      clock: () => AT,
+      pluginSourceDir: join(root, 'plugin'),
+    });
+    expect(answer.loaded.basis).toBe('registered-plugin-source');
+    expect(answer.loaded.serverDir).toBe(serverDir);
+    expect(answer.loaded.vendorDir).toBe(join(serverDir, 'vendor'));
+    expect(answer.loaded.selfPath).toBe(join(serverDir, 'runtime-diagnostics.ts'));
+    expect(answer.binding).toEqual({ kind: 'plugin-server-dir', path: root });
+    expect(answer.modules.every(m => m.sha256 !== null)).toBe(true);
+  });
+
+  test('without a host-supplied directory the answer is unavailable, never guessed', () => {
+    // No module globals, no registry entry: the honest answer is unavailable with null paths, not a path
+    // derived from a process that happens to be nearby.
+    const answer = collectPluginRuntimeDiagnostics({ clock: () => AT });
+    expect(answer.loaded.basis).toBe('unavailable');
+    expect(answer.loaded.serverDir).toBeNull();
+    expect(answer.loaded.selfPath).toBeNull();
+    expect(answer.binding.kind).toBe('unavailable');
+    expect(answer.modules.every(m => m.path === null)).toBe(true);
+  });
+
+  test.skipIf(!hostLoaderAvailable)('under the real Paseo loader (esbuild CJS + eval) the registered source is bound with no module globals', () => {
+    // Mirrors the host exactly: esbuild to CJS, wrap in `(function(require){…})`, evaluate with
+    // `globalThis.eval`, then call the factory with a runtime require. If the diagnostic still depended on
+    // `__dirname` or `import.meta`, this case would report unavailable — it is the context production failed in.
+    const { root, serverDir } = makeRelease();
+    const dir = mkdtempSync(join(tmpdir(), 'sck-rt-host-'));
+    const entry = join(dir, 'entry.ts');
+    writeFileSync(entry, [
+      `import { collectPluginRuntimeDiagnostics } from ${JSON.stringify(modulePath)};`,
+      'export default function run(pluginDir: string) {',
+      '  return {',
+      '    dirnameType: typeof __dirname,',
+      '    metaUrl: (import.meta as { url?: string }).url ?? null,',
+      '    withSource: collectPluginRuntimeDiagnostics({ pluginSourceDir: pluginDir }),',
+      '    without: collectPluginRuntimeDiagnostics(),',
+      '  };',
+      '}',
+      '',
+    ].join('\n'));
+    const bundle = join(dir, 'bundle.cjs');
+    const build = spawnSync(PASEO_ESBUILD, [
+      entry, '--bundle', '--format=cjs', '--platform=node', '--target=node20', `--outfile=${bundle}`,
+    ], { encoding: 'utf8' });
+    expect(build.status, build.stderr).toBe(0);
+    const runner = join(dir, 'runner.mjs');
+    writeFileSync(runner, [
+      "import { readFileSync } from 'node:fs';",
+      "import { createRequire } from 'node:module';",
+      'const code = readFileSync(process.argv[2], "utf8");',
+      'const factory = globalThis.eval("(function(require) {\\nconst module = { exports: {} };\\nconst exports = module.exports;\\n" + code + "\\nreturn module.exports;\\n})");',
+      'const mod = factory(createRequire(import.meta.url));',
+      'const result = mod.default(process.argv[3]);',
+      'console.log(JSON.stringify(result));',
       '',
     ].join('\n'));
     try {
-      const run = spawnSync('node', ['--experimental-strip-types', probe, modulePath], { encoding: 'utf8' });
+      const run = spawnSync('node', [runner, bundle, join(root, 'plugin')], { encoding: 'utf8' });
       expect(run.status, run.stderr).toBe(0);
-      const { dirnameType, answer } = JSON.parse(run.stdout) as {
+      const { dirnameType, metaUrl, withSource, without } = JSON.parse(run.stdout) as {
         dirnameType: string;
-        answer: PluginRuntimeDiagnostics;
+        metaUrl: string | null;
+        withSource: PluginRuntimeDiagnostics;
+        without: PluginRuntimeDiagnostics;
       };
-      // If __dirname existed here the test would prove nothing about the context that failed in production.
+      // The loader context really is the one production failed in: no globals to read a directory from.
       expect(dirnameType).toBe('undefined');
-      expect(answer.loaded.serverDir).toBe(dirname(modulePath));
-      expect(answer.loaded.selfPath).toBe(modulePath);
-      // Where the vendored tree is present it must be the real sibling, never a guessed path.
-      if (answer.loaded.vendorDir !== null) {
-        expect(answer.loaded.vendorDir).toBe(join(dirname(modulePath), 'vendor'));
-      }
-      expect(answer.binding).toEqual({ kind: 'plugin-server-dir', path: repoRoot });
-      // The module that produced this answer is bound by the bytes actually loaded, not by a version claim.
-      const own = answer.modules.find(m => m.name === 'plugin-runtime-diagnostics');
-      expect(own?.path).toBe(modulePath);
-      expect(own?.sha256).toMatch(/^[0-9a-f]{64}$/);
-      expect(own?.bytes).toBeGreaterThan(0);
+      expect(metaUrl).toBeNull();
+      expect(withSource.loaded.basis).toBe('registered-plugin-source');
+      expect(withSource.loaded.serverDir).toBe(serverDir);
+      expect(withSource.loaded.selfPath).toBe(join(serverDir, 'runtime-diagnostics.ts'));
+      expect(withSource.binding).toEqual({ kind: 'plugin-server-dir', path: root });
+      expect(withSource.modules.filter(m => m.sha256 !== null).length).toBe(7);
+      // With no host-supplied directory the same loader reports unavailable rather than inventing a path.
+      expect(without.loaded.basis).toBe('unavailable');
+      expect(without.loaded.serverDir).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

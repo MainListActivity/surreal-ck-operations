@@ -135,6 +135,13 @@ export interface SidecarDeps {
   sync?: OpsGateway;
   /** Root under which per-instance comm dirs live. */
   runDir: string;
+  /**
+   * The registered source directory of this plugin, from the trusted host's own plugin registry
+   * (`paseo plugin ls --json`). The Paseo host evaluates a CJS bundle with no module loader, so the
+   * diagnostic cannot derive its own directory; it binds this registered tree instead. Resolved only
+   * after core authorises the read.
+   */
+  pluginSource?: () => Promise<string | null>;
   log?: (message: string) => void;
   /** Injectable for tests. */
   heartbeatMs?: number;
@@ -1100,7 +1107,16 @@ export class SidecarPool {
         }
         return core.pluginRuntimeDiagnostics(cred, async () => {
           const { collectPluginRuntimeDiagnostics } = await import("./runtime-diagnostics.ts");
-          const sample = collectPluginRuntimeDiagnostics();
+          // Resolved inside the sample callback so an unauthorised caller (core refuses before sampling)
+          // never triggers a host query. The host evaluates a CJS bundle with no module loader, so the
+          // registered plugin source is the only legitimate directory this context can supply.
+          let pluginSourceDir: string | null = null;
+          try {
+            pluginSourceDir = (await this.deps.pluginSource?.()) ?? null;
+          } catch (error) {
+            this.log(`plugin source lookup failed: ${(error as Error).message}`);
+          }
+          const sample = collectPluginRuntimeDiagnostics(pluginSourceDir ? { pluginSourceDir } : {});
           // The stamp that proves this answer came from the plugin face rather than the MCP one: the MCP process
           // has no plugin server directory, so its own attempt to answer would report the binding unavailable.
           return { ...sample, channel: "plugin-sidecar", instanceId: instId };

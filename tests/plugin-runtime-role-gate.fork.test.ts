@@ -32,7 +32,7 @@ const sampler = (calls: string[]) => (): PluginRuntimeView => {
     context: 'plugin-host',
     collectedAt: new Date().toISOString(),
     process: { pid: 1, nodeVersion: 'v0.0.0', execPath: '/test/node', bunShim: false },
-    loaded: { selfPath: '/test/plugin/server/runtime-diagnostics.ts', serverDir: '/test/plugin/server', vendorDir: '/test/plugin/server/vendor', vendorResolvedBy: 'vendor-child-of-server-dir' },
+    loaded: { basis: 'registered-plugin-source', selfPath: '/test/plugin/server/runtime-diagnostics.ts', serverDir: '/test/plugin/server', vendorDir: '/test/plugin/server/vendor', vendorResolvedBy: 'vendor-child-of-server-dir' },
     binding: { kind: 'plugin-server-dir', path: '/test' },
     modules: [{ name: 'core', path: '/test/plugin/server/vendor/src/core.ts', sha256: 'a'.repeat(64), bytes: 1 }],
     notRead: ['private/ (service credentials)'],

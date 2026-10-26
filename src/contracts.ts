@@ -818,6 +818,12 @@ export interface PluginRuntimeView {
   collectedAt: string;
   process: { pid: number; nodeVersion: string; execPath: string; bunShim: boolean };
   loaded: {
+    /**
+     * How the directory was obtained. `registered-plugin-source` is the Paseo host's own plugin registry entry
+     * (`paseo plugin ls --json`): the host bundles the server code and evaluates it without a module loader, so
+     * there is no loaded file path to read; the registered source tree is content-bound instead.
+     */
+    basis: 'module-dir' | 'registered-plugin-source' | 'unavailable';
     selfPath: string | null;
     serverDir: string | null;
     vendorDir: string | null;
