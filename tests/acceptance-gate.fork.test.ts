@@ -41,7 +41,7 @@ class FakeAcceptanceAdapter implements AcceptanceSourceAdapter {
     });
   }
   async verify(input: AcceptanceSourceInput): Promise<AcceptanceVerifyResult> {
-    const runId = /\/actions\/runs\/(\d+)\/?$/.exec(input.runUrl)?.[1];
+    const runId = typeof input.runUrl === 'string' ? /\/actions\/runs\/(\d+)\/?$/.exec(input.runUrl)?.[1] : undefined;
     const run = runId ? this.runs.get(runId) : undefined;
     if (!run) return { ok: false, reason: 'run not found' };
     if (run.headSha !== input.sha) return { ok: false, reason: 'head mismatch' };

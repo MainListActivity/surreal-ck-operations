@@ -14,11 +14,13 @@ import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecar
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
-  ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createGithubActionsAdapter, criteriaForLeg,
+  ACCEPTANCE_CRITERIA_VERSION, acceptanceError, acceptanceSubject, createAcceptanceSourceAdapter, createGithubActionsAdapter, criteriaForLeg,
   acceptanceLegForSubject, acceptanceTargetAttempt, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
   isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
+  evaluateManagedLocalPrGateSubstitute,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
+  type ManagedLocalTestAttestationAgent,
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
 import { companyBlock, companyParts } from './company-context.ts';
@@ -563,10 +565,29 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  /** Host-wired managed-local-test signing agent; unset ⇒ substitute/evidence path fail-closed. */
+  private readonly managedLocalAttestationAgent: ManagedLocalTestAttestationAgent | null;
+
+  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter; attestationAgent?: ManagedLocalTestAttestationAgent | null };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number } }) {
     this.submitCheck = options?.submitCheck;
-    this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
+    // Default: github-actions plus the owner-authorized managed-local-test path. The owner_reply reader is bound
+    // to this core's database so the adapter can verify a real audit row; tests inject a whole adapter instead.
+    // Attestation agent is host-injected only — never derived from private/service.env (SYS02 v11).
+    this.managedLocalAttestationAgent = options?.acceptance?.attestationAgent ?? null;
+    this.acceptanceAdapter = options?.acceptance?.adapter ?? createAcceptanceSourceAdapter({
+      attestationAgent: this.managedLocalAttestationAgent,
+      readOwnerReply: async ({ taskId, auditId }) => {
+        const [rows] = await this.database.db.query<[Array<{ action?: string; actor?: unknown; evidence?: string | null; at?: string }>]>(
+          "SELECT action, actor, evidence, at FROM audit WHERE id = $aid AND action = 'owner_reply';",
+          { aid: id('audit', auditId) },
+        );
+        const row = rows?.[0];
+        if (!row || typeof row.action !== 'string') return null;
+        const actor = row.actor instanceof RecordId ? asId(row.actor) : String(row.actor ?? '');
+        return { action: row.action, actor, evidence: row.evidence ?? '', at: row.at ?? new Date().toISOString() };
+      },
+    });
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
     // endpoint instead of the network, while production always gets the company's authenticated gh CLI.
     this.externalActionsGateway = options?.externalActions?.gateway;
@@ -2299,7 +2320,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authenticate(credential);
     const row = await this.db.select<TaskRow>(id('task', input.taskId));
     if (!row) throw new CompanyError('not_found', 'Task not found');
-    if (input.source?.provider !== 'github-actions') throw new CompanyError('invalid', 'acceptance evidence source must be github-actions');
+    const provider = input.source?.provider;
+    if (provider !== 'github-actions' && provider !== 'managed-local-test') {
+      throw new CompanyError('invalid', 'acceptance evidence source must be github-actions or managed-local-test');
+    }
     const holds = row.current_employee === actor.employeeId && ['doing', 'review'].includes(row.state) &&
       (row.lease_expires_at ?? 0) > Date.now() / 1000;
     if (actor.role !== 'gm' && !holds) throw new CompanyError('forbidden', 'Acceptance evidence is recorded by the task holder or gm');
@@ -2307,8 +2331,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const criterion = criteria.find(item => item.id === input.acId);
     if (!criterion) throw new CompanyError('not_found', `acceptance criterion ${input.acId} not found on this task`);
     if (criterion.kind !== 'machine') throw new CompanyError('invalid', `${input.acId} is a human criterion; it is signed at independent review`);
-    if (criterion.evidence === 'probe' && (!input.source.probe || !input.source.artifactId)) throw new CompanyError('invalid', `${input.acId}: a probe requires the CI artifact that carries its record and the record itself`);
-    if (criterion.evidence === 'artifact' && !input.source.artifactId) throw new CompanyError('invalid', `${input.acId} requires an artifactId`);
+    if (provider === 'github-actions') {
+      if (criterion.evidence === 'probe' && (!input.source.probe || !input.source.artifactId)) throw new CompanyError('invalid', `${input.acId}: a probe requires the CI artifact that carries its record and the record itself`);
+      if (criterion.evidence === 'artifact' && !input.source.artifactId) throw new CompanyError('invalid', `${input.acId} requires an artifactId`);
+    }
+    if (provider === 'managed-local-test') {
+      // Managed local tests satisfy the machine ci-run criterion under an owner-authorized exception; probe/artifact
+      // criteria still require their own GitHub artifacts.
+      if (criterion.evidence !== 'ci-run') throw new CompanyError('invalid', `${input.acId}: managed-local-test only satisfies ci-run machine criteria`);
+      if (typeof input.source.suite !== 'string' || typeof input.source.ownerReplyAuditId !== 'string' || typeof input.source.ownerReplyTaskId !== 'string') {
+        throw new CompanyError('invalid', 'managed-local-test requires suite, ownerReplyAuditId and ownerReplyTaskId');
+      }
+    }
     const gate = await loadAcceptanceGate(this.db);
     // N1: the expected environment comes from the controlled task/AC declaration, never from the caller's label. The
     // adapter must return that same verified environment (GitHub deployments for the run/head) or the row is refused.
@@ -2323,9 +2357,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     // submitted one afterwards. The status read and the evaluator use the same rule.
     const targetAttempt = acceptanceTargetAttempt(row);
     const verified = await this.acceptanceAdapter.verify({
-      provider: input.source.provider, runUrl: input.source.runUrl, artifactId: input.source.artifactId,
-      sha: input.sha, environment: declaredEnvironment, probe: input.source.probe,
-      verify: criterion.verify, risk: criterion.risk,
+      provider,
+      runUrl: input.source.runUrl,
+      artifactId: input.source.artifactId,
+      sha: input.sha,
+      environment: declaredEnvironment,
+      probe: input.source.probe,
+      verify: criterion.verify,
+      risk: criterion.risk,
+      suite: input.source.suite,
+      ownerReplyAuditId: input.source.ownerReplyAuditId,
+      ownerReplyTaskId: input.source.ownerReplyTaskId,
+      requestingTaskId: input.taskId,
     });
     if (!verified.ok) {
       await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence_rejected', evidence: $evidence, at: time::now() };`,
@@ -2338,12 +2381,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
     const evidence = await recordAcceptanceEvidenceRow(this.db, {
       taskId: input.taskId, acId: input.acId, kind: 'machine', sha: input.sha, environment: verified.environment,
-      evidenceType: criterion.evidence, source: verified.source, verifier: 'github-actions', actor: actor.employeeId,
+      evidenceType: criterion.evidence, source: verified.source, verifier: provider, actor: actor.employeeId,
       at: verified.at, criteriaVersion: gate.criteriaVersion, taskVersion: row.version, attempt: targetAttempt,
     });
     await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'acceptance_evidence', evidence: $evidence, at: time::now() };`,
       { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
-        evidence: JSON.stringify({ acId: input.acId, sha: input.sha, evidenceType: criterion.evidence, environment: verified.environment, attempt: targetAttempt, digest: evidence.digest }) });
+        evidence: JSON.stringify({ acId: input.acId, sha: input.sha, evidenceType: criterion.evidence, environment: verified.environment, attempt: targetAttempt, digest: evidence.digest, provider }) });
     return evidence;
   }
 
@@ -2476,7 +2519,46 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
         const checked = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
-        if (checked?.reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+        if (checked?.reason) {
+          // Soft CI failure may be substituted by a host-attested managed-local-test record for owner-authorized
+          // tasks only. Closed / conflicting PRs stay hard refuses. Ordinary tasks never get the exception.
+          const substituteHead = typeof checked.head === 'string' ? checked.head : undefined;
+          const softCi = Array.isArray(checked.ciFailed) && checked.ciFailed.length > 0 && !!substituteHead;
+          if (!softCi || !substituteHead) {
+            throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+          }
+          const substitute = await evaluateManagedLocalPrGateSubstitute({
+            taskId: proof.taskId,
+            head: substituteHead,
+            ciFailed: checked.ciFailed!,
+            reason: checked.reason,
+            prUrl: checked.prUrl,
+            attestationAgent: this.managedLocalAttestationAgent,
+            readOwnerReply: async ({ taskId, auditId }) => {
+              const [rows] = await this.db.query<[Array<{ action: string; actor: string; evidence: string; at: string }>]>(
+                'SELECT action, type::string(actor) AS actor, evidence, type::string(at) AS at FROM type::thing("audit", $audit) WHERE task = $task LIMIT 1;',
+                { audit: auditId, task: id('task', taskId) });
+              return rows[0] ?? null;
+            },
+          });
+          if (!substitute.ok) {
+            throw new CompanyError('invalid', `提交被退回（未进入验收）：${substitute.reason}`);
+          }
+          await this.db.query(
+            `CREATE audit CONTENT { task: $task, actor: $actor, action: 'pr_gate_managed_local_substitute', evidence: $evidence, at: time::now() };`,
+            {
+              task: id('task', proof.taskId),
+              actor: id('employee', actor.employeeId),
+              evidence: JSON.stringify({
+                prUrl: checked.prUrl ?? null,
+                head: substituteHead,
+                ciFailed: checked.ciFailed,
+                suite: 'sys02-local-evidence',
+                source: substitute.source,
+              }).slice(0, 30000),
+            },
+          );
+        }
         // The PR gate's actual head is authoritative: a declared acceptance head cannot outlive a moved PR head (B2).
         prHead = checked?.head;
       }

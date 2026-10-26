@@ -339,3 +339,436 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('managed-local-test acceptance adapter', () => {
+  const ownerEvidence = `来源：owner:paseo-plugin\n决定：reply\n无法取得就在本地运行单元测试，通过就可以`;
+  const ownerReply = {
+    action: 'owner_reply',
+    actor: 'owner:paseo-plugin',
+    evidence: ownerEvidence,
+    at: '2026-10-26T05:37:49.111436Z',
+  };
+  const agentSecret = 'unit-test-signing-key-v11!!';
+  const authorizedTask = '612f1946-ccab-42b6-b426-c3b032eb6a11';
+  const ownerTask = '25ec8d1a-6bbf-4bee-abaf-74998adeb5af';
+  const ownerAudit = 'wuj9vmp3vg9pqyu33p2v';
+
+  const unsignedBase = {
+    gate: 'managed-local-test',
+    protocolVersion: 'managed-local-test/1',
+    suite: 'sys04-runtime-diagnostics',
+    sha: 'b1d5bc3ffed0629ec95184856d0651eb66189327',
+    bun: '1.3.11',
+    bunPath: '/bun',
+    platform: 'darwin',
+    result: 'pass',
+    exitCode: 0,
+    startedAt: '2026-10-26T05:50:00Z',
+    finishedAt: '2026-10-26T05:50:30Z',
+    command: 'bun test tests/plugin-runtime-diagnostics.test.ts tests/sidecar-runtime-diagnostics.test.ts && bun scripts/test-worktrees.ts tests/plugin-runtime-role-gate.fork.test.ts',
+    target: '/release/b1d5bc3ffed0629ec95184856d0651eb66189327',
+    repoIdentity: '/ops/.git',
+    dirty: false,
+    log: '/gates/managed-local-test/b1d5bc3ffed0629ec95184856d0651eb66189327.log',
+    logHash: 'a'.repeat(64),
+    runnerIdentity: 'test-host:501',
+    requestingTaskId: authorizedTask,
+    ownerReplyAuditId: ownerAudit,
+    ownerReplyTaskId: ownerTask,
+    hostMode: 'dry-run' as const,
+  };
+
+  const managedOf = async (over: Record<string, unknown> = {}) => {
+    const {
+      createHmacManagedLocalTestAgent, managedLocalTestAttestationPayload, signedFieldsFromRecord, MANAGED_LOCAL_TEST_PROTOCOL,
+    } = await import('../src/acceptance.ts');
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'unit-hmac');
+    const record = { ...unsignedBase, hostMode: 'managed' as const, ...over };
+    const fields = signedFieldsFromRecord(record as any, {
+      requestingTaskId: (record as any).requestingTaskId ?? authorizedTask,
+      ownerReplyAuditId: (record as any).ownerReplyAuditId ?? ownerAudit,
+      ownerReplyTaskId: (record as any).ownerReplyTaskId ?? ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    return {
+      agent,
+      record: { ...record, protocolVersion: MANAGED_LOCAL_TEST_PROTOCOL, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) },
+    };
+  };
+
+  const baseOf = async () => {
+    const { agent, record } = await managedOf();
+    return {
+      agent,
+      goodRecord: record,
+      base: {
+        sha: record.sha,
+        suite: record.suite,
+        ownerReplyAuditId: ownerAudit,
+        ownerReplyTaskId: ownerTask,
+        requestingTaskId: authorizedTask,
+        readRecord: async () => record,
+        readOwnerReply: async () => ownerReply,
+        readLogHash: () => 'a'.repeat(64),
+        attestationAgent: agent,
+      },
+    };
+  };
+
+  test('a host-agent-attested pass record with a real owner_reply is accepted', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base, goodRecord } = await baseOf();
+    const result = await verifyManagedLocalTest(base);
+    expect(result).toMatchObject({ ok: true, sha: goodRecord.sha });
+    if (result.ok) {
+      expect(result.source.provider).toBe('managed-local-test');
+      expect(result.source.hostMode).toBe('managed');
+      expect(result.source.attestationAgent).toBe('unit-hmac');
+    }
+  });
+
+  test('production without a wired attestation agent fails closed', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base } = await baseOf();
+    const result = await verifyManagedLocalTest({ ...base, attestationAgent: null });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('signing agent is not wired');
+  });
+
+  test('a dry-run record cannot substitute CI', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base, agent } = await baseOf();
+    const result = await verifyManagedLocalTest({
+      ...base, attestationAgent: agent, readRecord: async () => unsignedBase,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('dry-run');
+  });
+
+  test('forged attestation / unbound release repoIdentity / mutated security fields are refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base, goodRecord, agent } = await baseOf();
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, hostAttestation: 'f'.repeat(64) }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, repoIdentity: `release:${goodRecord.sha}` }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, dirty: true }),
+    })).ok).toBe(false);
+    // Tamper target after signing — MAC must fail
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, target: '/evil' }),
+    })).ok).toBe(false);
+    // Cross-task replay: record bound to authorizedTask, request from another authorized id still mismatches record field
+    const other = '690ea881-7663-41a5-a984-bfed0c189cde';
+    expect((await verifyManagedLocalTest({
+      ...base, requestingTaskId: other, attestationAgent: agent,
+    })).ok).toBe(false);
+  });
+
+  test('shell-shaped producer → adapter: sign with agent then mutate each bound field', async () => {
+    const {
+      verifyManagedLocalTest, createHmacManagedLocalTestAgent, managedLocalTestAttestationPayload, signedFieldsFromRecord,
+    } = await import('../src/acceptance.ts');
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'shell-sim');
+    const draft = { ...unsignedBase, hostMode: 'managed' as const };
+    const fields = signedFieldsFromRecord(draft as any, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    const signed = { ...draft, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) };
+    const ok = await verifyManagedLocalTest({
+      sha: signed.sha, suite: signed.suite, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+      requestingTaskId: authorizedTask, readRecord: async () => signed, readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    });
+    expect(ok.ok).toBe(true);
+    for (const tweak of [
+      { result: 'fail', exitCode: 1 },
+      { startedAt: '1999-01-01T00:00:00Z' },
+      { command: 'bun test evil.ts' },
+      { runnerIdentity: 'attacker:0' },
+      { logHash: 'b'.repeat(64) },
+    ] as Array<Record<string, unknown>>) {
+      const tampered = { ...signed, ...tweak };
+      const res = await verifyManagedLocalTest({
+        sha: signed.sha, suite: signed.suite, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+        requestingTaskId: authorizedTask, readRecord: async () => tampered as any, readOwnerReply: async () => ownerReply,
+        readLogHash: () => (tweak.logHash as string) ?? 'a'.repeat(64), attestationAgent: agent,
+      });
+      expect(res.ok).toBe(false);
+    }
+  });
+
+  test('a failed or dirty or missing record / forged owner_reply / unknown suite / wrong sha are refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const { base, goodRecord } = await baseOf();
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, result: 'fail', exitCode: 1 }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({ ...base, readLogHash: () => 'b'.repeat(64) })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({ ...base, readRecord: async () => null })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, requestingTaskId: '00000000-0000-0000-0000-000000000000',
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readOwnerReply: async () => ({ ...ownerReply, evidence: '本地测试通过就可以（我同意）' }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({ ...base, suite: 'anything-goes' })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, sha: 'c'.repeat(40) }),
+    })).ok).toBe(false);
+  });
+
+  test('the composite adapter routes by provider; managed path needs the agent', async () => {
+    const { createAcceptanceSourceAdapter } = await import('../src/acceptance.ts');
+    const { agent, record } = await managedOf();
+    const adapter = createAcceptanceSourceAdapter({
+      github: {
+        verify: async () => ({ ok: true, sha: 'head-1', at: '2026-10-26T00:00:00Z', source: { provider: 'github-actions' } }),
+      },
+      readRecord: async () => record,
+      readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64),
+      attestationAgent: agent,
+    });
+    expect(await adapter.verify({
+      provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/1', sha: 'head-1',
+    })).toMatchObject({ ok: true, source: { provider: 'github-actions' } });
+    expect(await adapter.verify({
+      provider: 'managed-local-test', sha: record.sha, suite: record.suite,
+      ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
+    })).toMatchObject({ ok: true, source: { provider: 'managed-local-test' } });
+    const closed = createAcceptanceSourceAdapter({
+      readRecord: async () => record, readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64),
+    });
+    expect((await closed.verify({
+      provider: 'managed-local-test', sha: record.sha, suite: record.suite,
+      ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
+    })).ok).toBe(false);
+  });
+
+  test('PR-gate soft CI substitute uses host agent + full payload; dry-run and ordinary tasks refuse', async () => {
+    const {
+      evaluateManagedLocalPrGateSubstitute, MANAGED_LOCAL_TEST_SUBMIT_SUITE, createHmacManagedLocalTestAgent,
+      managedLocalTestAttestationPayload, signedFieldsFromRecord,
+    } = await import('../src/acceptance.ts');
+    const agent = createHmacManagedLocalTestAgent(agentSecret, 'pr-gate-hmac');
+    const draft = {
+      ...unsignedBase,
+      suite: MANAGED_LOCAL_TEST_SUBMIT_SUITE,
+      command: 'bun test tests/acceptance.test.ts tests/pr-gate.test.ts',
+      hostMode: 'managed' as const,
+    };
+    const fields = signedFieldsFromRecord(draft as any, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    if ('error' in fields) throw new Error(fields.error);
+    const submitRecord = { ...draft, hostAttestation: agent.sign(managedLocalTestAttestationPayload(fields)) };
+    const ciReason = 'PR https://github.com/o/r/pull/7 的 CI 未通过（quality、channel）：修复并确认通过后再提交。';
+    expect(await evaluateManagedLocalPrGateSubstitute({
+      taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality', 'channel'], reason: ciReason,
+      readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    })).toMatchObject({ ok: true, head: submitRecord.sha });
+    expect((await evaluateManagedLocalPrGateSubstitute({
+      taskId: '00000000-0000-0000-0000-000000000000', head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
+      readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    })).ok).toBe(false);
+    expect((await evaluateManagedLocalPrGateSubstitute({
+      taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
+      readRecord: async () => ({ ...submitRecord, hostMode: 'dry-run', hostAttestation: undefined }),
+      readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64), attestationAgent: agent,
+    })).ok).toBe(false);
+    // No agent wired
+    const noAgent = await evaluateManagedLocalPrGateSubstitute({
+      taskId: authorizedTask, head: submitRecord.sha, ciFailed: ['quality'], reason: ciReason,
+      readRecord: async () => submitRecord, readOwnerReply: async () => ownerReply, readLogHash: () => 'a'.repeat(64),
+    });
+    expect(noAgent.ok).toBe(false);
+    if (!noAgent.ok) expect(noAgent.reason).toContain('受管本地替代未通过');
+  });
+
+  test('D1: env resolver enables agent only for a dedicated key; refuse service.env-shaped secrets', async () => {
+    const { resolveManagedLocalTestAttestationAgentFromEnv } = await import('../src/acceptance.ts');
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({})).toBeNull();
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({ SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: 'short' })).toBeNull();
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({
+      SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: 'SCK_AGENT_CWD=/ops\nSCK_BUN=/bun\n',
+    })).toBeNull();
+    const agent = resolveManagedLocalTestAttestationAgentFromEnv({
+      SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: agentSecret,
+    });
+    expect(agent?.name).toBe('env-hmac/1');
+  });
+
+  test('D2: gate json/log paths isolate by full sha + suite; dual-suite write/read does not clobber', async () => {
+    const {
+      defaultManagedLocalTestReader, managedLocalTestRecordFileName, managedLocalTestLogFileName,
+      managedLocalTestServiceHome, MANAGED_LOCAL_TEST_GATE,
+    } = await import('../src/acceptance.ts');
+    const sha = 'b1d5bc3ffed0629ec95184856d0651eb66189327';
+    expect(managedLocalTestRecordFileName(sha, 'sys04-runtime-diagnostics')).toBe(`${sha}.sys04-runtime-diagnostics.json`);
+    expect(managedLocalTestRecordFileName(sha, 'sys02-local-evidence')).toBe(`${sha}.sys02-local-evidence.json`);
+    expect(managedLocalTestLogFileName(sha, 'sys02-local-evidence')).toBe(`${sha}.sys02-local-evidence.log`);
+    expect(() => managedLocalTestRecordFileName('deadbeef', 'sys02-local-evidence')).toThrow();
+
+    const home = mkdtempSync(join(tmpdir(), 'sck-mlt-d2-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    try {
+      const dir = join(home, 'gates', MANAGED_LOCAL_TEST_GATE);
+      mkdirSync(dir, { recursive: true });
+      const a = { ...unsignedBase, suite: 'sys04-runtime-diagnostics', why: 'suite-a' };
+      const b = { ...unsignedBase, suite: 'sys02-local-evidence', why: 'suite-b', command: 'bun test tests/acceptance.test.ts tests/pr-gate.test.ts' };
+      writeFileSync(join(dir, managedLocalTestRecordFileName(sha, a.suite)), JSON.stringify(a));
+      writeFileSync(join(dir, managedLocalTestRecordFileName(sha, b.suite)), JSON.stringify(b));
+      writeFileSync(join(dir, managedLocalTestLogFileName(sha, a.suite)), 'log-a');
+      writeFileSync(join(dir, managedLocalTestLogFileName(sha, b.suite)), 'log-b');
+      const readA = await defaultManagedLocalTestReader({ sha, suite: a.suite });
+      const readB = await defaultManagedLocalTestReader({ sha, suite: b.suite });
+      expect(readA?.why).toBe('suite-a');
+      expect(readB?.why).toBe('suite-b');
+      expect(readA?.suite).not.toBe(readB?.suite);
+      // Legacy <sha>.json alone is not found
+      writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ ...a, why: 'legacy' }));
+      expect((await defaultManagedLocalTestReader({ sha, suite: a.suite }))?.why).toBe('suite-a');
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME;
+      else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
+    expect(managedLocalTestServiceHome()).toBeTruthy();
+  });
+
+  test('D3: deprecated sign helper refuses missing scope (no default task ids)', async () => {
+    const { signManagedLocalTestAttestation } = await import('../src/acceptance.ts');
+    expect(() => (signManagedLocalTestAttestation as any)(unsignedBase, agentSecret)).toThrow(/requires explicit scope/);
+    expect(() => (signManagedLocalTestAttestation as any)(unsignedBase, agentSecret, {})).toThrow(/requires explicit scope/);
+    const mac = signManagedLocalTestAttestation(unsignedBase, agentSecret, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    expect(mac).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('D4: shell script owner-reply defaults match TypeScript constants', async () => {
+    const {
+      MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID, MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID,
+    } = await import('../src/acceptance.ts');
+    const script = await Bun.file(join(ROOT, 'scripts/managed-local-test.sh')).text();
+    expect(script).toContain(`OWNER_REPLY_AUDIT_ID:-${MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID}`);
+    expect(script).toContain(`OWNER_REPLY_TASK_ID:-${MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID}`);
+    expect(MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID).toBe('wuj9vmp3vg9pqyu33p2v');
+    expect(MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID).toBe('25ec8d1a-6bbf-4bee-abaf-74998adeb5af');
+  });
+
+  test('D2 producer isolation: real script dual-suite write/read + attestation (same fixture SHA)', async () => {
+    const {
+      defaultManagedLocalTestReader, managedLocalTestRecordFileName, managedLocalTestLogFileName,
+      MANAGED_LOCAL_TEST_GATE, createHmacManagedLocalTestAgent, verifyManagedLocalTestAttestation,
+      verifyManagedLocalTest,
+    } = await import('../src/acceptance.ts');
+    // Fixture stubs satisfy allowlisted paths only — not real SYS04 role-gate business content.
+    const target = mkdtempSync(join(tmpdir(), 'sck-mlt-dual-'));
+    const home = mkdtempSync(join(tmpdir(), 'sck-mlt-home-'));
+    const keyFile = join(home, 'test-signing.key');
+    mkdirSync(join(target, 'tests'), { recursive: true });
+    mkdirSync(join(target, 'scripts'), { recursive: true });
+    const stub = (name: string) =>
+      writeFileSync(join(target, name), "import { test, expect } from 'bun:test'; test('stub', () => expect(1).toBe(1));\n");
+    stub('tests/acceptance.test.ts');
+    stub('tests/pr-gate.test.ts');
+    stub('tests/plugin-runtime-diagnostics.test.ts');
+    stub('tests/sidecar-runtime-diagnostics.test.ts');
+    stub('tests/plugin-runtime-role-gate.fork.test.ts');
+    writeFileSync(join(target, 'scripts/test-worktrees.ts'), '// fixture harness stub — not the company fork\nprocess.exit(0);\n');
+    writeFileSync(keyFile, agentSecret, { mode: 0o600 });
+
+    const git = async (...args: string[]) => {
+      const p = Bun.spawn(['git', ...args], { cwd: target, stdout: 'pipe', stderr: 'pipe' });
+      await p.exited;
+    };
+    await git('init');
+    await git('config', 'user.email', 't@example.com');
+    await git('config', 'user.name', 't');
+    await git('add', '.');
+    await git('commit', '-m', 'fixture');
+    const headProc = Bun.spawn(['git', 'rev-parse', 'HEAD'], { cwd: target, stdout: 'pipe' });
+    const head = (await new Response(headProc.stdout).text()).trim();
+    await headProc.exited;
+    expect(head).toMatch(/^[0-9a-f]{40}$/);
+
+    const prevHome = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    const script = join(ROOT, 'scripts/managed-local-test.sh');
+    const runSuite = async (suite: string) => {
+      const run = Bun.spawn(['/bin/sh', script, suite, target], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          SCK_SERVICE_HOME: home,
+          PATH: process.env.PATH,
+          SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE: keyFile,
+          SCK_MANAGED_LOCAL_TEST_TASK_ID: authorizedTask,
+          SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID: ownerAudit,
+          SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID: ownerTask,
+        },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const out = await new Response(run.stdout).text();
+      const err = await new Response(run.stderr).text();
+      const code = await run.exited;
+      return { code, text: out + err };
+    };
+    try {
+      const a = await runSuite('sys02-local-evidence');
+      expect(a.code).toBe(0);
+      expect(a.text).toContain('hostMode=managed');
+      const b = await runSuite('sys04-runtime-diagnostics');
+      expect(b.code).toBe(0);
+      expect(b.text).toContain('hostMode=managed');
+
+      const name02 = managedLocalTestRecordFileName(head, 'sys02-local-evidence');
+      const name04 = managedLocalTestRecordFileName(head, 'sys04-runtime-diagnostics');
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name02))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name04))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, managedLocalTestLogFileName(head, 'sys02-local-evidence')))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, managedLocalTestLogFileName(head, 'sys04-runtime-diagnostics')))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, `${head}.json`))).toBe(false);
+
+      const rec02 = await defaultManagedLocalTestReader({ sha: head, suite: 'sys02-local-evidence' });
+      const rec04 = await defaultManagedLocalTestReader({ sha: head, suite: 'sys04-runtime-diagnostics' });
+      expect(rec02?.suite).toBe('sys02-local-evidence');
+      expect(rec04?.suite).toBe('sys04-runtime-diagnostics');
+      expect(rec02?.sha).toBe(head);
+      expect(rec04?.sha).toBe(head);
+      expect(rec02?.command).not.toBe(rec04?.command);
+      expect(rec02?.hostMode).toBe('managed');
+      expect(rec04?.hostMode).toBe('managed');
+
+      const agent = createHmacManagedLocalTestAgent(agentSecret, 'dual-suite-verify');
+      const scope = { requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask };
+      expect(verifyManagedLocalTestAttestation(rec02!, agent, scope).ok).toBe(true);
+      expect(verifyManagedLocalTestAttestation(rec04!, agent, scope).ok).toBe(true);
+      expect(verifyManagedLocalTestAttestation(rec02!, agent, { ...scope, requestingTaskId: '00000000-0000-0000-0000-000000000000' }).ok).toBe(false);
+      expect(verifyManagedLocalTestAttestation({ ...rec02!, suite: 'sys04-runtime-diagnostics' }, agent, scope).ok).toBe(false);
+
+      const verified = await verifyManagedLocalTest({
+        sha: head, suite: 'sys02-local-evidence', ...scope,
+        readRecord: async () => rec02!,
+        readOwnerReply: async () => ownerReply,
+        readLogHash: () => rec02!.logHash,
+        attestationAgent: agent,
+      });
+      expect(verified).toMatchObject({ ok: true, source: { provider: 'managed-local-test' } });
+    } finally {
+      if (prevHome === undefined) delete process.env.SCK_SERVICE_HOME;
+      else process.env.SCK_SERVICE_HOME = prevHome;
+      rmSync(target, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
