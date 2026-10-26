@@ -44,7 +44,8 @@ import {
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
 type FaultReportOutcome = FaultReportResult;
-import type { ContributorDryRunView } from './contracts.ts';
+import type { ContributorDryRunView, PluginRuntimeView } from './contracts.ts';
+import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -2033,6 +2034,23 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
       },
     };
+  }
+
+  /**
+   * gm/product/qa only, read-only (SYS04): what the plugin process is actually running.
+   *
+   * The core cannot take the sample itself — only the plugin host can state which release it loaded, and the
+   * plugin host is the face every employee channel reaches. So the core owns the authorization and the caller
+   * owns the sampling, in that order: `sample` runs only after the caller is known to be allowed, so an
+   * unauthorized read produces no diagnostic at all rather than a refused one that still touched the
+   * filesystem.
+   */
+  async pluginRuntimeDiagnostics(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView> {
+    const actor = await this.authorized(credential);
+    if (!PLUGIN_RUNTIME_ROLES.includes(actor.role)) {
+      throw new CompanyError('forbidden', 'Only gm, product or qa may read the plugin runtime diagnostics');
+    }
+    return await sample();
   }
 
   /**
