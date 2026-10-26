@@ -697,12 +697,18 @@ export function createHmacManagedLocalTestAgent(secret: string, name = 'hmac-age
   };
 }
 
-/** @deprecated Use createHmacManagedLocalTestAgent + managedLocalTestAttestationPayload(signedFields). */
+/**
+ * @deprecated Prefer createHmacManagedLocalTestAgent + managedLocalTestAttestationPayload(signedFields).
+ * Scope is required: never defaults a task/audit id (D3).
+ */
 export function signManagedLocalTestAttestation(
   record: Pick<ManagedLocalTestRecord, 'sha' | 'suite' | 'exitCode' | 'logHash' | 'finishedAt' | 'command'> & Partial<ManagedLocalTestRecord>,
   secret: string,
-  scope?: { requestingTaskId: string; ownerReplyAuditId: string; ownerReplyTaskId: string },
+  scope: { requestingTaskId: string; ownerReplyAuditId: string; ownerReplyTaskId: string },
 ): string {
+  if (!scope?.requestingTaskId || !scope?.ownerReplyAuditId || !scope?.ownerReplyTaskId) {
+    throw new Error('signManagedLocalTestAttestation requires explicit scope (no default task/audit ids)');
+  }
   const agent = createHmacManagedLocalTestAgent(secret, 'legacy-test-hmac');
   const full: ManagedLocalTestRecord = {
     gate: MANAGED_LOCAL_TEST_GATE,
@@ -723,14 +729,55 @@ export function signManagedLocalTestAttestation(
     finishedAt: record.finishedAt,
     command: record.command,
     logHash: record.logHash,
+    requestingTaskId: scope.requestingTaskId,
+    ownerReplyAuditId: scope.ownerReplyAuditId,
+    ownerReplyTaskId: scope.ownerReplyTaskId,
   };
-  const fields = signedFieldsFromRecord(full, scope ?? {
-    requestingTaskId: record.requestingTaskId ?? '612f1946-ccab-42b6-b426-c3b032eb6a11',
-    ownerReplyAuditId: record.ownerReplyAuditId ?? MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID,
-    ownerReplyTaskId: record.ownerReplyTaskId ?? MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID,
-  });
+  const fields = signedFieldsFromRecord(full, scope);
   if ('error' in fields) throw new Error(fields.error);
   return agent.sign(managedLocalTestAttestationPayload(fields));
+}
+
+/**
+ * Host wiring (D1): enable a verification agent only when a dedicated signing key is configured.
+ * Never reads private/service.env; never invents a key. Missing/short/misconfigured → null (fail-closed).
+ */
+export function resolveManagedLocalTestAttestationAgentFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): ManagedLocalTestAttestationAgent | null {
+  let key = '';
+  const file = env.SCK_MANAGED_LOCAL_TEST_SIGNING_KEY_FILE?.trim();
+  if (file) {
+    try {
+      key = readFileSync(file, 'utf8');
+    } catch {
+      return null;
+    }
+  } else if (typeof env.SCK_MANAGED_LOCAL_TEST_SIGNING_KEY === 'string') {
+    key = env.SCK_MANAGED_LOCAL_TEST_SIGNING_KEY;
+  }
+  key = key.trim();
+  if (key.length < 16) return null;
+  // Refuse keys that look like copied service.env / product credentials.
+  if (/SCK_AGENT_CWD=|SURREAL_|TYPESAFE_|JEV_API|API_KEY|BEGIN [A-Z ]*PRIVATE KEY/.test(key)) return null;
+  return createHmacManagedLocalTestAgent(key, 'env-hmac/1');
+}
+
+/** Gate artifact names: full sha + suite so two suites never clobber (D2). */
+export function managedLocalTestRecordFileName(sha: string, suite: string): string {
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('managed-local-test record sha must be 40 hex chars');
+  if (!MANAGED_LOCAL_TEST_SUITES.includes(suite as ManagedLocalTestSuite)) {
+    throw new Error(`managed-local-test suite must be one of ${MANAGED_LOCAL_TEST_SUITES.join(', ')}`);
+  }
+  return `${sha}.${suite}.json`;
+}
+
+export function managedLocalTestLogFileName(sha: string, suite: string): string {
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('managed-local-test log sha must be 40 hex chars');
+  if (!MANAGED_LOCAL_TEST_SUITES.includes(suite as ManagedLocalTestSuite)) {
+    throw new Error(`managed-local-test suite must be one of ${MANAGED_LOCAL_TEST_SUITES.join(', ')}`);
+  }
+  return `${sha}.${suite}.log`;
 }
 
 export function verifyManagedLocalTestAttestation(
@@ -759,9 +806,15 @@ export function verifyManagedLocalTestAttestation(
   return { ok: true, payload };
 }
 
-/** Default reader: the host-written gate record under SCK_SERVICE_HOME/gates/managed-local-test/<sha>.json. */
-export const defaultManagedLocalTestReader: ManagedLocalTestRecordReader = async ({ sha }) => {
-  const path = join(managedLocalTestServiceHome(), 'gates', MANAGED_LOCAL_TEST_GATE, `${sha}.json`);
+/** Default reader: host-written gate under …/gates/managed-local-test/<sha>.<suite>.json (D2). */
+export const defaultManagedLocalTestReader: ManagedLocalTestRecordReader = async ({ sha, suite }) => {
+  let name: string;
+  try {
+    name = managedLocalTestRecordFileName(sha, suite);
+  } catch {
+    return null;
+  }
+  const path = join(managedLocalTestServiceHome(), 'gates', MANAGED_LOCAL_TEST_GATE, name);
   try {
     return JSON.parse(readFileSync(path, 'utf8')) as ManagedLocalTestRecord;
   } catch {

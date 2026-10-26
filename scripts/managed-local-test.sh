@@ -117,6 +117,7 @@ if [ ${#signing_key} -ge 16 ]; then
 fi
 runner_identity="$(/usr/bin/uname -n):$(/usr/bin/id -u 2>/dev/null || echo unknown)"
 # Optional scope bindings (host agent sets these when minting a substitutable record).
+# D4: defaults MUST match src/acceptance.ts MANAGED_LOCAL_TEST_OWNER_REPLY_* (asserted in unit tests).
 req_task=${SCK_MANAGED_LOCAL_TEST_TASK_ID:-}
 owner_audit=${SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID:-wuj9vmp3vg9pqyu33p2v}
 owner_task=${SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID:-25ec8d1a-6bbf-4bee-abaf-74998adeb5af}
@@ -124,7 +125,8 @@ owner_task=${SCK_MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID:-25ec8d1a-6bbf-4bee-abaf
 out_dir="$service_home/gates/managed-local-test"
 mkdir -p "$out_dir"
 chmod 700 "$service_home/gates" "$out_dir" 2>/dev/null || true
-log="$out_dir/$sha.log"
+# D2: isolate by full sha + suite so two suites never clobber each other's json/log.
+log="$out_dir/$sha.$suite.log"
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # The command string recorded is the allowlisted suite expansion, never a free-form caller command.
 if [ -n "$fork_test" ]; then
@@ -171,7 +173,7 @@ else
   log_hash=$(shasum -a 256 "$log" | cut -d' ' -f1)
 fi
 
-record="$out_dir/$sha.json"
+record="$out_dir/$sha.$suite.json"
 GATE_SHA="$sha" GATE_SUITE="$suite" GATE_BUN="$bun_version" GATE_BUN_PATH="$BUN" \
   GATE_RESULT="$result" GATE_RC="$rc" GATE_STARTED="$started" GATE_FINISHED="$finished" \
   GATE_LOG="$log" GATE_LOG_HASH="$log_hash" GATE_RECORD="$record" GATE_COMMAND="$command_line" \

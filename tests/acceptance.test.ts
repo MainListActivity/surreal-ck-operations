@@ -566,4 +566,137 @@ describe('managed-local-test acceptance adapter', () => {
     expect(noAgent.ok).toBe(false);
     if (!noAgent.ok) expect(noAgent.reason).toContain('受管本地替代未通过');
   });
+
+  test('D1: env resolver enables agent only for a dedicated key; refuse service.env-shaped secrets', async () => {
+    const { resolveManagedLocalTestAttestationAgentFromEnv } = await import('../src/acceptance.ts');
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({})).toBeNull();
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({ SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: 'short' })).toBeNull();
+    expect(resolveManagedLocalTestAttestationAgentFromEnv({
+      SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: 'SCK_AGENT_CWD=/ops\nSCK_BUN=/bun\n',
+    })).toBeNull();
+    const agent = resolveManagedLocalTestAttestationAgentFromEnv({
+      SCK_MANAGED_LOCAL_TEST_SIGNING_KEY: agentSecret,
+    });
+    expect(agent?.name).toBe('env-hmac/1');
+  });
+
+  test('D2: gate json/log paths isolate by full sha + suite; dual-suite write/read does not clobber', async () => {
+    const {
+      defaultManagedLocalTestReader, managedLocalTestRecordFileName, managedLocalTestLogFileName,
+      managedLocalTestServiceHome, MANAGED_LOCAL_TEST_GATE,
+    } = await import('../src/acceptance.ts');
+    const sha = 'b1d5bc3ffed0629ec95184856d0651eb66189327';
+    expect(managedLocalTestRecordFileName(sha, 'sys04-runtime-diagnostics')).toBe(`${sha}.sys04-runtime-diagnostics.json`);
+    expect(managedLocalTestRecordFileName(sha, 'sys02-local-evidence')).toBe(`${sha}.sys02-local-evidence.json`);
+    expect(managedLocalTestLogFileName(sha, 'sys02-local-evidence')).toBe(`${sha}.sys02-local-evidence.log`);
+    expect(() => managedLocalTestRecordFileName('deadbeef', 'sys02-local-evidence')).toThrow();
+
+    const home = mkdtempSync(join(tmpdir(), 'sck-mlt-d2-'));
+    const prev = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    try {
+      const dir = join(home, 'gates', MANAGED_LOCAL_TEST_GATE);
+      mkdirSync(dir, { recursive: true });
+      const a = { ...unsignedBase, suite: 'sys04-runtime-diagnostics', why: 'suite-a' };
+      const b = { ...unsignedBase, suite: 'sys02-local-evidence', why: 'suite-b', command: 'bun test tests/acceptance.test.ts tests/pr-gate.test.ts' };
+      writeFileSync(join(dir, managedLocalTestRecordFileName(sha, a.suite)), JSON.stringify(a));
+      writeFileSync(join(dir, managedLocalTestRecordFileName(sha, b.suite)), JSON.stringify(b));
+      writeFileSync(join(dir, managedLocalTestLogFileName(sha, a.suite)), 'log-a');
+      writeFileSync(join(dir, managedLocalTestLogFileName(sha, b.suite)), 'log-b');
+      const readA = await defaultManagedLocalTestReader({ sha, suite: a.suite });
+      const readB = await defaultManagedLocalTestReader({ sha, suite: b.suite });
+      expect(readA?.why).toBe('suite-a');
+      expect(readB?.why).toBe('suite-b');
+      expect(readA?.suite).not.toBe(readB?.suite);
+      // Legacy <sha>.json alone is not found
+      writeFileSync(join(dir, `${sha}.json`), JSON.stringify({ ...a, why: 'legacy' }));
+      expect((await defaultManagedLocalTestReader({ sha, suite: a.suite }))?.why).toBe('suite-a');
+    } finally {
+      if (prev === undefined) delete process.env.SCK_SERVICE_HOME;
+      else process.env.SCK_SERVICE_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
+    expect(managedLocalTestServiceHome()).toBeTruthy();
+  });
+
+  test('D3: deprecated sign helper refuses missing scope (no default task ids)', async () => {
+    const { signManagedLocalTestAttestation } = await import('../src/acceptance.ts');
+    expect(() => (signManagedLocalTestAttestation as any)(unsignedBase, agentSecret)).toThrow(/requires explicit scope/);
+    expect(() => (signManagedLocalTestAttestation as any)(unsignedBase, agentSecret, {})).toThrow(/requires explicit scope/);
+    const mac = signManagedLocalTestAttestation(unsignedBase, agentSecret, {
+      requestingTaskId: authorizedTask, ownerReplyAuditId: ownerAudit, ownerReplyTaskId: ownerTask,
+    });
+    expect(mac).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('D4: shell script owner-reply defaults match TypeScript constants', async () => {
+    const {
+      MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID, MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID,
+    } = await import('../src/acceptance.ts');
+    const script = await Bun.file(join(ROOT, 'scripts/managed-local-test.sh')).text();
+    expect(script).toContain(`OWNER_REPLY_AUDIT_ID:-${MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID}`);
+    expect(script).toContain(`OWNER_REPLY_TASK_ID:-${MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID}`);
+    expect(MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID).toBe('wuj9vmp3vg9pqyu33p2v');
+    expect(MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID).toBe('25ec8d1a-6bbf-4bee-abaf-74998adeb5af');
+  });
+
+  test('D2 producer isolation: real script writes sha.suite artifacts that the reader loads without clobber', async () => {
+    const {
+      defaultManagedLocalTestReader, managedLocalTestRecordFileName, MANAGED_LOCAL_TEST_GATE,
+    } = await import('../src/acceptance.ts');
+    // Minimal fake target with the two unit files named by sys02-local-evidence allowlist.
+    const target = mkdtempSync(join(tmpdir(), 'sck-mlt-prod-'));
+    const home = mkdtempSync(join(tmpdir(), 'sck-mlt-home-'));
+    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    // Name the target dir as the sha so the script accepts a non-git path… but unbound release is refused.
+    // Use a git worktree instead: init, commit placeholder tests.
+    mkdirSync(join(target, 'tests'), { recursive: true });
+    mkdirSync(join(target, 'scripts'), { recursive: true });
+    writeFileSync(join(target, 'tests/acceptance.test.ts'), "import { test, expect } from 'bun:test'; test('x', () => expect(1).toBe(1));\n");
+    writeFileSync(join(target, 'tests/pr-gate.test.ts'), "import { test, expect } from 'bun:test'; test('y', () => expect(1).toBe(1));\n");
+    writeFileSync(join(target, 'scripts/test-worktrees.ts'), 'console.log("noop");\n');
+    const git = async (...args: string[]) => {
+      const p = Bun.spawn(['git', ...args], { cwd: target, stdout: 'pipe', stderr: 'pipe' });
+      await p.exited;
+    };
+    await git('init');
+    await git('config', 'user.email', 't@example.com');
+    await git('config', 'user.name', 't');
+    await git('add', '.');
+    await git('commit', '-m', 't');
+    const headProc = Bun.spawn(['git', 'rev-parse', 'HEAD'], { cwd: target, stdout: 'pipe' });
+    const head = (await new Response(headProc.stdout).text()).trim();
+    await headProc.exited;
+    expect(head).toMatch(/^[0-9a-f]{40}$/);
+
+    const prevHome = process.env.SCK_SERVICE_HOME;
+    process.env.SCK_SERVICE_HOME = home;
+    try {
+      const script = join(ROOT, 'scripts/managed-local-test.sh');
+      const run = Bun.spawn(['/bin/sh', script, 'sys02-local-evidence', target], {
+        cwd: ROOT,
+        env: { ...process.env, SCK_SERVICE_HOME: home, PATH: process.env.PATH },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const out = await new Response(run.stdout).text();
+      const err = await new Response(run.stderr).text();
+      const code = await run.exited;
+      expect(code).toBe(0);
+      expect(out + err).toContain('hostMode=dry-run');
+      const name = managedLocalTestRecordFileName(head, 'sys02-local-evidence');
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, name))).toBe(true);
+      expect(existsSync(join(home, 'gates', MANAGED_LOCAL_TEST_GATE, `${head}.json`))).toBe(false);
+      const rec = await defaultManagedLocalTestReader({ sha: head, suite: 'sys02-local-evidence' });
+      expect(rec?.suite).toBe('sys02-local-evidence');
+      expect(rec?.sha).toBe(head);
+      expect(rec?.hostMode).toBe('dry-run');
+      // Second suite path must not be overwritten by the first (file simply absent until written).
+      expect(await defaultManagedLocalTestReader({ sha: head, suite: 'sys04-runtime-diagnostics' })).toBeNull();
+    } finally {
+      if (prevHome === undefined) delete process.env.SCK_SERVICE_HOME;
+      else process.env.SCK_SERVICE_HOME = prevHome;
+      rmSync(target, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
