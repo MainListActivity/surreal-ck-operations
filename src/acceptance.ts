@@ -15,7 +15,7 @@ import { CompanyError } from './core-errors.ts';
 import {
   associateDeploymentSource, type DeploymentRecord, type DeploymentStatusRecord,
 } from './deployment-source.ts';
-import { ghCli, type GhRunner } from './pr-gate.ts';
+import { ghCli, runInfrastructureRefusal, type GhRunner } from './pr-gate.ts';
 
 export const ACCEPTANCE_CRITERIA_VERSION = 1;
 export const ACCEPTANCE_MAX_CRITERIA = 20;
@@ -1004,9 +1004,12 @@ interface ProbeArtifactRecord extends ProbeRecord { probe?: string; target?: str
 
 /**
  * Read-only GitHub Actions adapter (SYS02 AC02/AC04). It reads the run through gh and requires the run's head to equal the
- * submitted sha and the conclusion to be success. A probe is the artifact's record, not a caller claim: the artifact must
- * come from the same run and head, and its JSON record must match the caller's attested fields. An artifact-only criterion
- * still requires an unexpired artifact of the same head. The adapter never reads product credentials.
+ * submitted sha and the conclusion to be success — except when GitHub refused to start the run's jobs at all (failed
+ * account payments or a reached spending limit): such a run executed no step, so it judged no code, and a generic CI
+ * criterion is satisfied by the refusal itself. An environment-bound criterion is never satisfied that way. A probe is
+ * the artifact's record, not a caller claim: the artifact must come from the same run and head, and its JSON record must
+ * match the caller's attested fields. An artifact-only criterion still requires an unexpired artifact of the same head.
+ * The adapter never reads product credentials.
  */
 export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: ArtifactReader = ghArtifactReader(run)): AcceptanceSourceAdapter {
   return {
@@ -1028,7 +1031,20 @@ export function createGithubActionsAdapter(run: GhRunner = ghCli, readArtifact: 
         return { ok: false, reason: `the CI run could not be read: ${(error as Error).message.slice(0, 160)}` };
       }
       if (info.headSha !== input.sha) return { ok: false, reason: `the CI run head ${info.headSha ?? '?'} is not the submitted sha ${input.sha}` };
-      if (info.conclusion !== 'success') return { ok: false, reason: `the CI run is not successful (conclusion ${info.conclusion ?? 'unknown'})` };
+      if (info.conclusion !== 'success') {
+        // GitHub refusing to start the jobs is infrastructure, not a result of the code under test: not one step ran. The
+        // waiver is read from GitHub itself and only for a criterion that names no environment — an environment is a
+        // deployment fact, and no deployment can be proven by a run that never started.
+        const refusal = input.environment === undefined ? await runInfrastructureRefusal(run, owner, repo, runId) : undefined;
+        if (refusal === undefined) return { ok: false, reason: `the CI run is not successful (conclusion ${info.conclusion ?? 'unknown'})` };
+        return {
+          ok: true, sha: input.sha, at: info.updatedAt ?? new Date().toISOString(),
+          source: {
+            provider: 'github-actions', runUrl: input.runUrl, runId, workflowName: info.workflowName ?? null,
+            conclusion: info.conclusion, infrastructure: { reason: 'billing', message: refusal.message, jobs: refusal.jobs },
+          },
+        };
+      }
       let at = info.updatedAt ?? new Date().toISOString();
       let verifiedProbe: Record<string, unknown> | undefined;
       let probeEnvironment: string | undefined;

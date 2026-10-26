@@ -80,3 +80,33 @@ test('no branch, no link, or any gh trouble lets the submission through', async 
   expect(await broken({ text: 'https://github.com/o/r/pull/7' })).toBeUndefined();
   expect(await broken({ branch: 'task/abcd1234', text: '没有链接' })).toBeUndefined(); expect(calls).toBe(1);
 });
+
+test('a check GitHub refused to start is infrastructure, not a failed test', () => {
+  const refused = { name: 'quality', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/9/job/5', infrastructureBlocked: 'The job was not started because recent account payments have failed' };
+  expect(judgePr(pr({ checks: [refused, { name: 'channel', conclusion: 'SUCCESS' }] }), 'task/abcd1234')).toBeUndefined();
+  // A real failure beside it still refuses, and the same check without the refusal is a failure.
+  expect(judgePr(pr({ checks: [refused, { name: 'lint', conclusion: 'FAILURE' }] }), 'task/abcd1234')).toContain('lint');
+  expect(judgePr(pr({ checks: [{ ...refused, infrastructureBlocked: undefined }] }), 'task/abcd1234')).toContain('quality');
+});
+
+const billingMessage = "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings";
+const billingGh = (steps: unknown[], message = billingMessage) => async (args: string[]) => {
+  if (args[0] === 'pr') {
+    return payload({ statusCheckRollup: [{ name: 'quality', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/9/job/5' }] });
+  }
+  if (args[0] === 'api' && String(args[1]).includes('/check-runs/5/annotations')) return JSON.stringify([{ message }]);
+  if (args[0] === 'api' && String(args[1]).includes('/actions/jobs/5')) return JSON.stringify({ id: 5, name: 'quality', steps });
+  throw new Error(`unexpected gh ${args.join(' ')}`);
+};
+
+test('the submit check reads the refusal from GitHub and still names the PR head', async () => {
+  expect(await createSubmitCheck(billingGh([]))({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' })).toEqual({ head: 'head-1' });
+  // A job that executed a step is a real failure; so is an annotation that names no billing or spending limit.
+  expect((await createSubmitCheck(billingGh([{ name: 'checkout', conclusion: 'failure' }]))({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' }))?.reason).toContain('quality');
+  expect((await createSubmitCheck(billingGh([], 'tests failed'))({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' }))?.reason).toContain('quality');
+  // A check with no job link cannot be waived: the refusal is never inferred.
+  const noLink = async (args: string[]) => args[0] === 'pr'
+    ? payload({ statusCheckRollup: [{ name: 'quality', conclusion: 'FAILURE' }] })
+    : (() => { throw new Error(`unexpected gh ${args.join(' ')}`); })();
+  expect((await createSubmitCheck(noLink)({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' }))?.reason).toContain('quality');
+});

@@ -236,6 +236,31 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     expect((await noVersionAdapter.verify({ ...nodeBase, probe: nodeProbe })).ok).toBe(false);
   });
 
+  test('R3: a run GitHub refused to start satisfies a generic CI criterion, but never an environment one', async () => {
+    const billing = "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings";
+    const refused = (steps: unknown[], message = billing) => async (args: string[]) => {
+      if (args[0] === 'run' && args[1] === 'view') {
+        return JSON.stringify({ headSha: 'head-1', status: 'completed', conclusion: 'failure', workflowName: 'Quality gate',
+          createdAt: '2026-10-26T09:06:51.000Z', updatedAt: '2026-10-26T09:06:55.000Z' });
+      }
+      if (args[0] === 'api' && String(args[1]).includes('/actions/runs/42/jobs')) return JSON.stringify({ jobs: [{ id: 5, name: 'quality', steps }] });
+      if (args[0] === 'api' && String(args[1]).includes('/check-runs/5/annotations')) return JSON.stringify([{ message }]);
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    };
+    const generic = { provider: 'github-actions' as const, runUrl: 'https://github.com/o/r/actions/runs/42', sha: 'head-1' };
+    const verdict = await createGithubActionsAdapter(refused([]), readArtifact).verify(generic);
+    expect(verdict).toMatchObject({ ok: true, sha: 'head-1' });
+    expect((verdict as { source: Record<string, unknown> }).source).toMatchObject({ conclusion: 'failure', infrastructure: { reason: 'billing', jobs: ['quality'] } });
+    // A job that ran any step, and an annotation naming no billing or spending limit, are real failures.
+    expect((await createGithubActionsAdapter(refused([{ name: 'checkout', conclusion: 'failure' }]), readArtifact).verify(generic)).ok).toBe(false);
+    expect((await createGithubActionsAdapter(refused([], 'the tests failed'), readArtifact).verify(generic)).ok).toBe(false);
+    // A read that cannot answer is not a waiver: an unreadable run stays refused.
+    const unreadable = async () => { throw new Error('gh: not logged in'); };
+    expect((await createGithubActionsAdapter(unreadable, readArtifact).verify(generic)).ok).toBe(false);
+    // An environment names a deployment fact, and no deployment can be proven by a run that never started.
+    expect((await createGithubActionsAdapter(refused([]), readArtifact).verify({ ...generic, environment: 'production' })).ok).toBe(false);
+  });
+
   test('N1: an environment-bound probe is only accepted with a deployment record for this run and head', async () => {
     // N1-R: the deployment must be produced by THIS run and its success state must be read. The run link is the fact
     // that cannot be borrowed: a same-head, same-environment, in-window deployment of another run is refused.
