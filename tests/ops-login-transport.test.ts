@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { createOpsFetcher, opsFetch, OPS_CONNECT_TIMEOUT_MS, type Fetcher } from '../src/ops/fetcher.ts';
-import { LoginError, passwordLogin, type LoginOptions, type LoginTokens } from '../src/ops/idp.ts';
+import { LoginError, LoginFailure, passwordLogin, type LoginOptions, type LoginTokens } from '../src/ops/idp.ts';
 import { loginBrokerConfig, makeTestPki, startLoginIdp, type LoginIdp, type LoginIdpOptions, type TestPki } from './support/ops-login-transport.ts';
 
 // Real sockets and real TLS against a loopback IdP. Only the stall, delay and drop points are scripted.
@@ -50,6 +50,27 @@ async function failure(run: Promise<unknown>): Promise<{ error: CompanyError; ms
   const error = await run.then(() => { throw new Error('expected the login to fail'); }, (reason: unknown) => reason);
   if (!(error instanceof CompanyError)) throw new Error(`expected a CompanyError, got ${String(error)}`);
   return { error, ms: performance.now() - started };
+}
+
+/**
+ * Injects `cause.code = 'ECONNRESET'` into the requests whose URL contains `pathname`, leaving every other hop to the
+ * real transport.
+ *
+ * - `afterServer`: the request is first carried to the IdP — the single-use material is really consumed — and only then
+ *   is the answer lost to the reset. That is the dangerous shape the retry policy must refuse to replay.
+ * - `all`: every such request fails, so no connection of the hop ever gets through.
+ */
+function withEconnReset(real: Fetcher, pathname: string, afterServer = false, all = false): Fetcher {
+  let fired = false;
+  return async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes(pathname) && (all || !fired)) {
+      fired = true;
+      if (afterServer) await real(input, init);
+      throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+    }
+    return real(input, init);
+  };
 }
 
 describe('explicit connect limit', () => {
@@ -372,6 +393,73 @@ describe('slow but healthy handshakes', () => {
     expect(ms).toBeLessThan(75_000);
     expect(tokens.trace).toContain('connect retry');
   }, 120_000);
+});
+
+describe('ECONNRESET on the login hops', () => {
+  // `mayRepeatOnFreshConnection` decides the same-hop retry on two facts: the errno and whether the request may be
+  // repeated at all. ECONNRESET says the connection broke — unlike a connect timeout it does NOT prove the request was
+  // never written — so it only justifies a fresh-connection retry for a request that is safe to repeat. The authorize
+  // hop is an idempotent GET: repeating it cannot use anything twice. The three POSTs each carry single-use material
+  // (login_challenge, authorization_code, consent_challenge); sending one twice is not a retry but a second use, so
+  // those failures go back to the flow, which authorizes again and consumes a fresh challenge. This block pins both
+  // sides of that rule; if someone changes the predicate in src/ops/idp.ts, one of these cases fails.
+  test('an ECONNRESET on the authorize GET is retried on the same hop: no new challenge, one attempt', async () => {
+    const target = await idp();
+    const real = transport();
+    const { tokens } = await success(login(target, { fetch: withEconnReset(real, '/t/ck/authorize') }));
+    // The retry happened inside the first flow attempt: the hop was repeated, the flow was not.
+    expect(tokens.attempts).toBe(1);
+    // The challenge was fetched exactly once and nothing was replayed: the reset hop never delivered an answer, and
+    // re-asking an idempotent GET costs the server nothing it cannot redo.
+    expect(target.counts).toEqual({ authorize: 1, login: 1, exchange: 1, replays: 0 });
+    expect(tokens.trace).toContain('ECONNRESET');
+    expect(tokens.trace).toContain('connect retry');
+    expect(tokens.trace).toContain('HTTP 200');
+    for (const secret of [PASSWORD, 'login_challenge', 'code-', 'code_verifier', '/api/', '/t/ck']) expect(tokens.trace).not.toContain(secret);
+  }, SLOW);
+
+  test('an ECONNRESET on the login POST is not retried on the same hop: a fresh flow carries a fresh challenge', async () => {
+    // The dangerous shape: the reset arrives after the IdP really consumed the login challenge, so the client cannot
+    // know whether its POST landed. Retrying on a new connection would use the single-use challenge a second time;
+    // the flow must start over instead, and the second authorize issues a new challenge.
+    const target = await idp();
+    const real = transport();
+    const { tokens } = await success(login(target, { fetch: withEconnReset(real, '/api/login/ck/password', true) }));
+    expect(tokens.attempts).toBe(2);
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 1, replays: 0 });
+    // No same-hop retry fired on the login hop: the failure may have followed a written request.
+    expect(tokens.trace).not.toContain('a1:login@127.0.0.1:connect retry');
+    expect(tokens.trace).toContain('ECONNRESET');
+  }, SLOW);
+
+  test('an ECONNRESET on the exchange POST is not retried on the same hop: a fresh flow redeems a fresh code', async () => {
+    // Same rule one hop later: the reset lands after the IdP already redeemed the authorization code. The client only
+    // knows the answer never arrived, so the code may or may not be spent — sending the same POST again could redeem
+    // it twice. The flow starts over and redeems a fresh code exactly once.
+    const target = await idp();
+    const real = transport();
+    const { tokens } = await success(login(target, { fetch: withEconnReset(real, '/api/auth/token', true) }));
+    expect(tokens.attempts).toBe(2);
+    // The first code was redeemed by the discarded answer, the second by the fresh flow: the IdP never saw a replay.
+    expect(target.counts).toEqual({ authorize: 2, login: 2, exchange: 2, replays: 0 });
+    expect(tokens.trace).not.toContain('a1:exchange@127.0.0.1:connect retry');
+    expect(tokens.trace).toContain('ECONNRESET');
+  }, SLOW);
+
+  test('authorize resetting on every connection hands the failure back with stage and errno, secret-free', async () => {
+    // With no healthy connection left, the hop exhausts its same-hop retries and every flow attempt fails: the login
+    // ends with the real cause and the stage, and the diagnostic carries no password.
+    const target = await idp();
+    const real = transport();
+    const { error } = await failure(login(target, { fetch: withEconnReset(real, '/t/ck/authorize', false, true) }));
+    expect(error).toBeInstanceOf(LoginFailure);
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('ECONNRESET');
+    expect(error.message).toContain('stage=authorize');
+    expect(error.message).not.toContain(PASSWORD);
+    // No GET ever reached the server: no challenge was ever issued.
+    expect(target.counts).toEqual({ authorize: 0, login: 0, exchange: 0, replays: 0 });
+  }, SLOW);
 });
 
 describe('production connect limit', () => {
