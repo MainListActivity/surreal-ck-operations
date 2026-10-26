@@ -67,6 +67,9 @@ const BASE_TOOLS = [
   "claim_disposition", "release_disposition", "disposition_status", "decide_disposition", "holder_notices",
   // SYS03 受控外部动作：取消 CI 运行走这个入口（core 判定经理/任务当事人），只读对账标 unknown_actor，归因只由 gm 带证据做。
   "cancel_ci_run", "reconcile_ci_runs", "attribute_ci_run", "list_external_actions",
+  // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
+  // the MCP face's tree or the `active` symlink, so it can serve as evidence of the loaded version.
+  "plugin_runtime_diagnostics",
 ];
 
 /** Still named by tasks written before credentials left the agent; answer with where to go instead of a bare "unknown tool". */
@@ -1081,6 +1084,18 @@ export class SidecarPool {
           files: Array.isArray(args.files) ? args.files.map(String) : [],
         });
       }
+      // SYS04: a read-only sample of what THIS process is running. It is answered here, in the plugin host,
+      // rather than through core: core also runs in the MCP face, and a path read there would describe a
+      // different execution context than the one the employee's `sck call` actually reaches. No credential,
+      // private path, environment value or arbitrary file is involved; the answer is a bounded set of paths,
+      // digests and the collection instant.
+      case "plugin_runtime_diagnostics": return withinReplyCeiling(async () => {
+        const { collectPluginRuntimeDiagnostics } = await import("./runtime-diagnostics.ts");
+        const sample = collectPluginRuntimeDiagnostics();
+        // The stamp that proves this answer came from the plugin face rather than the MCP one: the MCP process
+        // has no plugin server directory, so its own attempt to answer would report the binding unavailable.
+        return { ...sample, channel: "plugin-sidecar", instanceId: instId };
+      });
       default: throw Object.assign(new Error(RETIRED_TOOLS.has(tool)
         ? `${tool} 已下线：凭证不再交给员工，需要账号、workspace、登录请用运维工具（sck call ops_info '{}' 查看）`
         : `unknown tool: ${tool}`), { code: "unknown_tool" });
