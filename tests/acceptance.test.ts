@@ -314,3 +314,135 @@ describe('SYS02 GitHub Actions adapter (AC02/AC04)', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('managed-local-test acceptance adapter', () => {
+  const ownerEvidence = `来源：owner:paseo-plugin\n决定：reply\n无法取得就在本地运行单元测试，通过就可以`;
+  const ownerReply = {
+    action: 'owner_reply',
+    actor: 'owner:paseo-plugin',
+    evidence: ownerEvidence,
+    at: '2026-10-26T05:37:49.111436Z',
+  };
+  const goodRecord = {
+    gate: 'managed-local-test',
+    suite: 'sys04-runtime-diagnostics',
+    sha: 'b1d5bc3ffed0629ec95184856d0651eb66189327',
+    bun: '1.3.11',
+    bunPath: '/bun',
+    platform: 'darwin',
+    result: 'pass',
+    exitCode: 0,
+    startedAt: '2026-10-26T05:50:00Z',
+    finishedAt: '2026-10-26T05:50:30Z',
+    command: 'bun test tests/plugin-runtime-diagnostics.test.ts tests/sidecar-runtime-diagnostics.test.ts && bun scripts/test-worktrees.ts tests/plugin-runtime-role-gate.fork.test.ts',
+    target: '/release/b1d5bc3ffed0629ec95184856d0651eb66189327',
+    repoIdentity: '/ops/.git',
+    dirty: false,
+    log: '/gates/managed-local-test/b1d5bc3ffed0629ec95184856d0651eb66189327.log',
+    logHash: 'a'.repeat(64),
+  };
+  const authorizedTask = '612f1946-ccab-42b6-b426-c3b032eb6a11';
+  const ownerTask = '25ec8d1a-6bbf-4bee-abaf-74998adeb5af';
+
+  const base = {
+    sha: goodRecord.sha,
+    suite: goodRecord.suite,
+    ownerReplyAuditId: 'wuj9vmp3vg9pqyu33p2v',
+    ownerReplyTaskId: ownerTask,
+    requestingTaskId: authorizedTask,
+    readRecord: async () => goodRecord,
+    readOwnerReply: async () => ownerReply,
+    readLogHash: () => 'a'.repeat(64),
+  };
+
+  test('a host-written pass record with a real owner_reply is accepted', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const result = await verifyManagedLocalTest(base);
+    expect(result).toMatchObject({ ok: true, sha: goodRecord.sha });
+    if (result.ok) {
+      expect(result.source.provider).toBe('managed-local-test');
+      expect(result.source.exitCode).toBe(0);
+      expect(result.source.ownerReplyAuditId).toBe('wuj9vmp3vg9pqyu33p2v');
+    }
+  });
+
+  test('a failed or dirty record is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, result: 'fail', exitCode: 1 }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, dirty: true }),
+    })).ok).toBe(false);
+  });
+
+  test('a hand-edited log (logHash mismatch) is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({
+      ...base, readLogHash: () => 'b'.repeat(64),
+    })).ok).toBe(false);
+  });
+
+  test('a missing gate record is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => null,
+    })).ok).toBe(false);
+  });
+
+  test('an unauthorized requesting task is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    const result = await verifyManagedLocalTest({
+      ...base, requestingTaskId: '00000000-0000-0000-0000-000000000000',
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('not in the owner-authorized');
+  });
+
+  test('a forged or paraphrased owner_reply is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({
+      ...base, readOwnerReply: async () => ({ ...ownerReply, evidence: '本地测试通过就可以（我同意）' }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readOwnerReply: async () => ({ ...ownerReply, action: 'owner_approve' }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readOwnerReply: async () => ({ ...ownerReply, actor: 'engineering-claude-x' }),
+    })).ok).toBe(false);
+    expect((await verifyManagedLocalTest({
+      ...base, readOwnerReply: async () => null,
+    })).ok).toBe(false);
+  });
+
+  test('an unknown suite is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({ ...base, suite: 'anything-goes' })).ok).toBe(false);
+  });
+
+  test('a wrong-sha gate record is refused', async () => {
+    const { verifyManagedLocalTest } = await import('../src/acceptance.ts');
+    expect((await verifyManagedLocalTest({
+      ...base, readRecord: async () => ({ ...goodRecord, sha: 'c'.repeat(40) }),
+    })).ok).toBe(false);
+  });
+
+  test('the composite adapter routes by provider and keeps github-actions working', async () => {
+    const { createAcceptanceSourceAdapter } = await import('../src/acceptance.ts');
+    const adapter = createAcceptanceSourceAdapter({
+      github: {
+        verify: async () => ({ ok: true, sha: 'head-1', at: '2026-10-26T00:00:00Z', source: { provider: 'github-actions' } }),
+      },
+      readRecord: async () => goodRecord,
+      readOwnerReply: async () => ownerReply,
+      readLogHash: () => 'a'.repeat(64),
+    });
+    expect(await adapter.verify({
+      provider: 'github-actions', runUrl: 'https://github.com/o/r/actions/runs/1', sha: 'head-1',
+    })).toMatchObject({ ok: true, source: { provider: 'github-actions' } });
+    expect(await adapter.verify({
+      provider: 'managed-local-test', sha: goodRecord.sha, suite: goodRecord.suite,
+      ownerReplyAuditId: 'wuj9vmp3vg9pqyu33p2v', ownerReplyTaskId: ownerTask, requestingTaskId: authorizedTask,
+    })).toMatchObject({ ok: true, source: { provider: 'managed-local-test' } });
+  });
+});

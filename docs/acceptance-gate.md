@@ -16,6 +16,7 @@
 - **环境绑定（N1）**：所需环境只来自建单/AC 的受控声明，并且只挂在**部署腿**（`kind=deploy`）；实现腿与上线申请腿在合入前不存在 deployment，带环境要求会被建单拒绝（`acceptance environment requirements apply to the deploy leg only`）。submit 使用本次提交的目标环境（不是旧任务行）与受控声明严格比较，accept 使用持久化的同一值；缺失、未知、错误环境一律拒绝。机器证据的 `environment` 必须与目标环境精确相等，`undefined` 只表示「通用 CI」，不能通配 `production`。适配器必须返回核验过的环境。**N1-R 来源关联**：`src/deployment-source.ts` 判定，规则是两道独立的门，缺一不可。①**授权**：只有受信的部署 workflow（`TRUSTED_DEPLOYMENT_WORKFLOWS`：`Deploy production` / `Deploy origin` / `Deploy origin (manual)`，可用 `SCK_TRUSTED_DEPLOYMENT_WORKFLOWS` 追加，**只增不减**）能证明环境；通用 CI（quality gate、channel build）只能证明「这次提交能构建」，永远不能升级为 production 事实，它没有环境事实。②**因果**：deployment 记录或其状态必须**指名本次证据 run** —— 真实 GitHub 形状里 deployment 记录本身不带 run 引用（`payload` 为空），链接在状态的 `log_url`/`target_url`（`…/actions/runs/<runId>/job/<jobId>`）里；同 SHA、同环境名、时间接近**都不是**证明，因为一次成功的通用 CI 与另一 run 的同提交失败 deployment 这三样全都一样。同时 deployment 必须与 run 同 head（**缺 sha 是未知不是通配**）、同环境、创建在 run 时间窗内，并且其状态里必须读到**成功终态**（`success`/`active`）且该状态也指向本次 run；状态缺失/未知/失败/未完成/指向别的 run 一律失败关闭。`source` 不再只写 environment 字符串，而是保留 `deployment{id,status,runId,jobId}`、workflowName 与 sha，可追溯。
 - **attempt 绑定（N2）**：机器证据在记录时绑定目标 attempt（`doing` 时为当前 attempt+1，`review` 时为当前 attempt）和当时的 gate criteria 版本。submit/accept 只接受 attempt 与 criteria 版本都匹配的证据；退回后的新 attempt 必须重新记录，旧 attempt 记录被拒绝并返回对应 AC。heartbeat/checkpoint 只推进任务版本、不推进 attempt，因此不会让已有证据失效；`task_version` 仅作审计。
 - 机器证据只由服务端适配器写入：`record_acceptance_evidence` 让适配器只读调用 `gh run view`、`gh api .../artifacts/<id>`、`gh api .../deployments` 与 target run/job/status API，要求 run 的 `headSha` 等于提交 SHA、`conclusion=success`。probe 必须是受信版本 `acceptance-probe/2` 的 CI artifact 记录：运行中通道由 target 作业开始即创建的 commit status 承载，适配器核验 producer run、target run/job 的 in-progress 窗口（`started_at <= readAt <= completed_at`）与 status 创建时刻/哈希；Node 打包模板由 Node 实际执行构建 bundle 的 default 请求路径并记录 Node 版本/bundle hash；`criterion.verify`（如 `probe:running-channel`/`probe:node-packed`）与 `risk` 绑定 probe kind/target。任意 2xx URL、Fake adapter、自传 `RUN_ID`、作业完成后读取或记录不符一律拒绝；artifact 类证据要求未过期且属于同一 head。模型文本或自写 `passed` 不会进入 `verified=true`。
+- **受管本地单测例外（SYS02，老板授权）**：当 GitHub Actions 账单不可用且存在真实 `owner_reply`（原文含「无法取得就在本地运行单元测试，通过就可以」）时，`provider=managed-local-test` 可代替 `github-actions` 满足 **ci-run** 机器 AC。受信宿主先跑 `scripts/managed-local-test.sh <suite> /absolute/path`（固定允许名单，禁止任意命令），把记录写到 `SCK_SERVICE_HOME/gates/managed-local-test/<sha>.json`（含 UTC 起止、command、exitCode、logHash、repoIdentity、dirty=false）。`record_acceptance_evidence` 核验：① 宿主写出的记录（不是员工上传的 JSON）；② logHash 与磁盘日志一致；③ 真实 `owner_reply` 审计；④ 请求任务与 owner_reply 任务都在代码内授权名单（本次：`25ec8d1a` 与本修复链 `612f1946`/`690ea881`/`231e786b`）。未授权任务、脏树、失败退出、改过的日志、错误 head、伪造 owner 原文一律拒绝。**本例外不关闭 gate、不删 required AC、不伪造 GitHub success。** 本修复链自身的实现腿 AC 仍优先走 GitHub；若账单仍断，由经理协调宿主发布接力，不得用尚未上线的本工具给自己出成功证明。
 - 人工证据由获授权的独立签署写入：实现腿由另一位工程师在 `accept` 时签署，上线申请由运营，部署由 QA，老板关口由 `owner.decide`。Jev 是机器 actor，永远不能签署人工 AC。
 
 ## 3. 统一评估器（AC03）
@@ -54,7 +55,7 @@
 
 | 工具 | 参数 | 作用 |
 | --- | --- | --- |
-| `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`（只用于与受控声明比对，不能新增要求）、`source{provider,runUrl,artifactId,probe?}`、`idempotencyKey` | probe 必须带 artifactId；声明的环境由 Deployments API 核验；服务端写入本次 attempt 与 criteria 版本 |
+| `record_acceptance_evidence` | `taskId`、`acId`、`sha`、`environment?`（只用于与受控声明比对，不能新增要求）、`source{provider,runUrl?,suite?,ownerReplyAuditId?,ownerReplyTaskId?,artifactId?,probe?}`、`idempotencyKey` | `provider=github-actions` 时 probe 必须带 artifactId，声明环境由 Deployments API 核验；`provider=managed-local-test` 时需 suite + ownerReply*，核验宿主 `gates/managed-local-test/<sha>.json` 与授权 `owner_reply`；服务端写入本次 attempt 与 criteria 版本 |
 | `acceptance_status` | `taskId` | 读 gate、criteria、证据与当前未满足清单 |
 | `acceptance_gate` | — | gm 读 gate 记录 |
 | `set_acceptance_gate` | `enabled`、`reason`、`expectedVersion`、`idempotencyKey` | gm 版本化启停，审计理由 |
@@ -65,7 +66,8 @@
 
 ## 8. 回归
 
-- `tests/acceptance.test.ts`：criteria 校验、三腿默认、机器/人工判定、Jev 不能签人工、拒绝清单、签署摘要唯一性；GitHub adapter 的 artifact 记录核验。
+- `tests/acceptance.test.ts`：criteria 校验、三腿默认、机器/人工判定、Jev 不能签人工、拒绝清单、签署摘要唯一性；GitHub adapter 的 artifact 记录核验；`managed-local-test` 适配器正负例（pass/fail/dirty/logHash/缺记录/未授权任务/伪造 owner_reply/未知 suite/错误 sha/composite 路由）。
+- `scripts/managed-local-test.sh`：固定 suite 允许名单；宿主写出 `gates/managed-local-test/<sha>.{json,log}`；脏树/未知 suite/非 40-char 路径拒绝。
 - `tests/acceptance-gate.fork.test.ts`：隔离 fork 上的建单/提交/复核/owner/Jev/证据适配器/真实 sck 拒绝→补证据→独立 accept。
 - `tests/acceptance.test.ts` 的 adapter 负例：不受信 probeVersion、target workflow 不符、缺 `commit-status` 通道均拒绝；`Node` 执行失败时 `acceptance-node-probe` 不写记录。服务端核验 artifact 与 producer/target run/job/status 的绑定；`nodeVersion`/`bundleHash` 是受信探针自报，Node 执行保证来自 CI 作业退出码，信任锚是受信 `acceptance-probe/2` 与 run/artifact provenance。
 - `tests/acceptance-gate.fork.test.ts`：RB01 旧版读取与回滚边界，以及 probe artifact 伪造与 PR head 绑定的负例。

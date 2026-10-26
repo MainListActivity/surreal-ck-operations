@@ -113,10 +113,22 @@ export interface AcceptanceEvidenceInput {
   sha: string;
   environment?: string;
   source: {
-    provider: 'github-actions';
-    runUrl: string;
+    /**
+     * `github-actions` is the default CI path.
+     * `managed-local-test` is the owner-authorized exception (SYS02): a trusted host ran a fixed allowlisted
+     * suite and wrote a gate record under the service home; the server verifies that record and a real
+     * `owner_reply` audit, never an employee-uploaded JSON as the execution proof.
+     */
+    provider: 'github-actions' | 'managed-local-test';
+    runUrl?: string;
     artifactId?: string;
     probe?: { runId: string; jobId?: string; readAt: string; inProgress: boolean; observationHash: string; probeVersion?: string; producerRunId?: string; targetRunId?: string; targetJobId?: string; targetWorkflow?: string; targetStatus?: string; kind?: string; nodeVersion?: string; bundleHash?: string; annotationHash?: string; channel?: string; statusCreatedAt?: string };
+    /** Allowlisted suite name recorded by scripts/managed-local-test.sh (required for managed-local-test). */
+    suite?: string;
+    /** Real owner_reply audit id whose evidence authorizes this exception (required for managed-local-test). */
+    ownerReplyAuditId?: string;
+    /** Task that received the owner_reply (required for managed-local-test). */
+    ownerReplyTaskId?: string;
   };
   idempotencyKey: string;
 }

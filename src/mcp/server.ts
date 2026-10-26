@@ -368,13 +368,13 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.createDelivery(token(ctx), input)));
   server.registerTool('record_acceptance_evidence', {
-    description: 'SYS02: record verified machine evidence for one acceptance criterion. The server reads the GitHub Actions run (or its artifact/probe) and refuses a run from another head, a non-successful run, an expired artifact, an out-of-window probe, or a source the caller may not read. Model text never becomes a pass fact.',
+    description: 'SYS02: record verified machine evidence for one acceptance criterion. Default provider github-actions: the server reads the GitHub Actions run (or its artifact/probe) and refuses a run from another head, a non-successful run, an expired artifact, an out-of-window probe, or a source the caller may not read. Provider managed-local-test (owner-authorized exception): the server verifies a host-written gate record under the service home (scripts/managed-local-test.sh) plus a real owner_reply audit; employee-uploaded JSON is never the execution proof. Model text never becomes a pass fact.',
     inputSchema: z.object({
       taskId: z.string().min(1).max(200), acId: z.string().min(1).max(50), sha: z.string().min(1).max(200),
       environment: z.string().min(1).max(100).optional(),
       source: z.object({
-        provider: z.literal('github-actions'),
-        runUrl: z.string().min(1).max(500),
+        provider: z.enum(['github-actions', 'managed-local-test']),
+        runUrl: z.string().min(1).max(500).optional(),
         artifactId: z.string().min(1).max(100).optional(),
         probe: z.object({
           runId: z.string().min(1).max(100), jobId: z.string().min(1).max(100).optional(),
@@ -388,6 +388,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
           channel: z.string().min(1).max(40).optional(), statusCreatedAt: z.string().min(1).max(40).optional(),
           environment: z.string().regex(/^[a-z][a-z0-9._-]{0,49}$/).optional(),
         }).optional(),
+        suite: z.string().min(1).max(80).optional(),
+        ownerReplyAuditId: z.string().min(1).max(200).optional(),
+        ownerReplyTaskId: z.string().min(1).max(200).optional(),
       }),
       idempotencyKey: z.string().min(1),
     }),
