@@ -158,6 +158,8 @@ export class CompanyDatabase {
     // 进入既有依赖等待语义（defer/waits），那由新版写入 task 的既有字段，不改旧字段（RB01）。
     await this.db.query(loadSchema('037-fault-budget.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
+    await this.db.query(loadSchema('038-goal-workspaces.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 38 WHERE schema_version < 38;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

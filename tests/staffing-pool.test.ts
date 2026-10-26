@@ -14,7 +14,7 @@ const def = (id: string, over: Partial<EmployeeDef> = {}): EmployeeDef =>
     priority: 100, weight: 10, scored: 0, errorStreak: 0, ...over });
 
 const inst = (id: string, over: Partial<EmployeeInst> = {}): EmployeeInst =>
-  ({ id, role: 'engineering', def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: `ag-${id}`, ...over });
+  ({ id, role: 'engineering', def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: `ag-${id}`, workspaceScope: 'maintenance', ...over });
 
 const base = (over: Partial<StaffingInput> = {}): StaffingInput => ({
   role: 'engineering', home: OPS,

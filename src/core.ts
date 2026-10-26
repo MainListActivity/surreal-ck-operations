@@ -1,3 +1,4 @@
+import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
@@ -264,6 +265,7 @@ interface TaskRow {
   worktree?: WorktreeAssignment;
   repo_path?: string;
   goal_tier?: string;
+  goal_title?: string;
   /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
   revises?: RecordId;
   superseded_by?: RecordId;
@@ -1110,6 +1112,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authorized(credential);
     if (!this.worktrees) return this.claimLease(actor, taskId);
     const task = await this.getTask(credential, taskId);
+    const employee = await this.db.select<{ workspace_scope?: string }>(id('employee', actor.employeeId));
+    if (employee?.workspace_scope && employee.workspace_scope !== workspaceScopeFor(task.goalId)) {
+      throw new CompanyError('forbidden', 'Task claim denied: conversation belongs to another goal');
+    }
     const reviewing = task.state === 'review';
     if (!['ready', 'doing', 'review'].includes(task.state) ||
         !actor.capabilities.includes(reviewing ? 'review' : 'execute') ||
@@ -1286,6 +1292,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
+      IF $who.workspace_scope != NONE AND $who.workspace_scope != IF $t.goal = NONE THEN 'maintenance' ELSE <string>record::id($t.goal) END { THROW 'workspace goal denied' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };

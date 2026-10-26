@@ -77,8 +77,9 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}) };
-    const appends: Array<[string, string]> = [['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
+const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}),
+  'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
+    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
     if (policy) appends.push(...Object.entries(POLICY_SHARED));
     mkdirSync(join(dir, 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);

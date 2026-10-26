@@ -14,6 +14,7 @@ components=${SCK_COMPONENTS:-mcp}
 . "$(dirname "$0")/review-wait-guard.sh"
 . "$(dirname "$0")/independence-guard.sh"
 . "$(dirname "$0")/policy-guard.sh"
+. "$(dirname "$0")/goal-workspace-guard.sh"
 
 label() { echo "org.surrealck.company-$1"; }
 
@@ -121,6 +122,7 @@ case "$action" in
     # copies, the active symlink, the plugin repoint, the MCP restart or release pruning. No zero-row exception either:
     # "no policy today" would race a policy write, and would miss the data that already holds one.
     policy_target_supported "$release" || { policy_refuse "$release"; exit 1; }
+    goal_workspace_target_supported "$release" || { goal_workspace_refuse "$release"; exit 1; }
     check_gate comm-slow-pipe "$sha" || {
       echo "refused: no passing comm-slow-pipe gate for $sha on bun $(runtime_version) — run 'sh $(dirname "$0")/release-gate.sh slow-pipe $release' on this Mac, then install again" >&2; exit 1; }
     check_gate sidecar-review "$sha" || {

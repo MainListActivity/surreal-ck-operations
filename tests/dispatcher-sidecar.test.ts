@@ -16,7 +16,7 @@ import type { HostResources } from '../src/dispatcher/host.ts';
 import type { ArtifactTrigger } from '../src/dispatcher/artifact-reclaim.ts';
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
-function world(role: EmployeeDef['role'] = 'engineering') {
+export function world(role: EmployeeDef['role'] = 'engineering') {
   const root = mkdtempSync(join(tmpdir(), 'dispatch-comm-'));
   const instances: EmployeeInst[] = [], rows: SupervisedTask[] = [];
   const views = new Map<string, TaskView>(), agents = new Map<string, { id: string; status: string; model?: string }>();
@@ -226,6 +226,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
     // A review task whose registered scene is the task's exclusive worktree.
     w.addTask('t1', { state: 'review', submittedBy: 'employee-77', worktreePath: '/repo-task-t1' });
+    w.rows[0].previousEmployee = stale.id;
     const r = await w.dispatcher().tick();
     // Channel rollback is not a reviewer verdict: a release, never a return.
     expect(w.events).toContain('claim:employee-9:t1');
@@ -237,7 +238,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(w.events).toContain(`claim:${inst.id}:t1`);
     // Home-bound spawn: the session parks on the instance's private comm dir so
     // scene reclaim can never cascade-kill it; the worktree arrives via claim.json.
-    expect(w.cwds.get(inst.paseoAgentId!)).toBe(w.pool.commDirFor(inst.id));
+    expect(w.cwds.get(inst.paseoAgentId!)).toBe('/repo');
     // The task stayed in review and is now held by the spawned reviewer.
     expect(w.views.get('t1')!.state).toBe('review');
     expect(w.views.get('t1')!.currentEmployee).toBe(inst.id);
@@ -253,6 +254,7 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
     // Its new task lives on a tree the session has never seen — that is the normal case.
     w.addTask('t1', { state: 'ready', worktreePath: '/repo-task-t1' });
+    w.rows[0].previousEmployee = home.id;
     const r = await w.dispatcher().tick();
     expect(w.events).toContain('claim:employee-9:t1');
     expect(w.events).toContain('send:agent-9');
@@ -260,12 +262,13 @@ describe('dispatcher + sidecar launch/reuse/restart', () => {
     expect(r.woke.map(x => x.employee)).toContain('employee-9');
     expect(w.views.get('t1')!.currentEmployee).toBe('employee-9');
   });
-  test('a spawned instance binds its private comm dir as cwd, never the task worktree', async () => {
+  test('a spawned instance binds the repository root as cwd and keeps private comm separately', async () => {
     const w = world();
     w.addTask('t1', { state: 'ready', worktreePath: '/repo-task-t1' });
     await w.dispatcher().tick();
     const inst = w.instances[0];
-    expect(inst.cwd).toBe(w.pool.commDirFor(inst.id));
+    expect(inst.cwd).toBe('/repo');
+    expect(inst.workspaceScope).toBe('maintenance');
     expect(inst.repoHome).toBe('/repo');
     // Scene reclaim only ever archives workspaces under the tree — never this one.
     expect(inst.cwd!.startsWith('/repo-task-t1')).toBe(false);
@@ -524,7 +527,7 @@ describe('R1: review capacity before an engineering execute claim', () => {
   // Two idle engineers fill both seats of the fixture def.
   const twoEngineers = (w: ReturnType<typeof world>) => {
     for (const [id, agent] of [['employee-8', 'agent-8'], ['employee-9', 'agent-9']] as const) {
-      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}` } as EmployeeInst;
+      const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, workspaceScope: 'maintenance' } as EmployeeInst;
       w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
       w.agents.set(agent, { id: agent, status: 'idle' });
     }
@@ -607,6 +610,7 @@ describe('R1: a write scope held by another writer is a verdict, never a spawn c
   test('a refused claim on a reused seat keeps the seat: nothing is spawned or retired', async () => {
     const w = world(); w.addTask('reused'); w.denied.set('reused', 'worktree_busy');
     const inst = { id: 'employee-9', def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: 'fixture-9' } as EmployeeInst;
+    inst.workspaceScope = 'maintenance';
     w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(inst.id, 'agent-9'); inst.paseoAgentId = 'agent-9';
     w.agents.set('agent-9', { id: 'agent-9', status: 'idle' });
     const r = await w.dispatcher().tick();
@@ -664,6 +668,7 @@ describe('R3: repeated ticks, replay, bound repo and recusal capacity', () => {
     for (const id of ids) {
       const agent = `agent-${id}`;
       const inst = { id, def: 'test', role: 'engineering', provider: 'codex', model: 'fixture', credential: `fixture-${id}`, repoHome } as EmployeeInst;
+      inst.workspaceScope = 'maintenance';
       w.instances.push(inst); w.pool.env(inst); w.pool.bindAgent(id, agent); inst.paseoAgentId = agent;
       w.agents.set(agent, { id: agent, status: 'idle' });
     }

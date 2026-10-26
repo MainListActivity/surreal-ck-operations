@@ -91,6 +91,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
 
+目标会话布局的切换还执行 `goal-workspace-guard.sh`：核心与插件 vendor 必须同时携带目标绑定领取检查。旧版会忽略员工 `workspace_scope`，因此被拒绝；上线后发生问题保留健康版本并前向修复，不能用旧调度器接管已绑定目标的会话。布局与迁移边界见 [工程、目标与会话](./goal-workspaces.md)。
+
 ### 5. 双面回滚
 
 **兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
