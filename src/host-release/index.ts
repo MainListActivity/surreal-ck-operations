@@ -13,3 +13,7 @@ export {
 } from './store.ts';
 export { checkActivityBarrier, type BarrierInput, type BarrierResult } from './barrier.ts';
 export { parsePaseoPluginJson, type PaseoPluginBinding } from './plugin-parse.ts';
+export {
+  ensureHostHmacKey, hostReleaseHmacPath, mintHostTag, readHostHmacKey, receiptTagPayload, verifyHostTag,
+  HOST_RELEASE_HMAC_FILE,
+} from './provenance.ts';

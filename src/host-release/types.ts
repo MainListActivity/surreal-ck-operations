@@ -114,6 +114,13 @@ export interface HostReleaseReceipt {
   rollbackSha: string;
   /** Host identity that ran apply (hostname + uid), never a credential. */
   executor: { host: string; uid: number; user: string };
+  /**
+   * Host provenance (F4 / AC04). HMAC-SHA256 over the canonical receipt fields, keyed by the
+   * host-only secret at `$SCK_SERVICE_HOME/private/host-release.hmac` (mode 0600, outside the
+   * employee sandbox). An employee-written JSON that merely copies operation fields and invents
+   * an executor cannot produce a valid tag. Absent/invalid tag ⇒ reader refuses.
+   */
+  hostTag: string;
   startedAt: string;
   finishedAt: string;
   exitCode: number;

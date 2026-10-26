@@ -62,18 +62,25 @@ sh scripts/host-release/apply.sh \
 
 ## AC03 活动屏障
 
-prepare / verify 读取文件信号（无 DB 依赖）：
+文件信号（无 DB 依赖）：
 
-- `maintenance/host-release.lock` — 进行中的 apply
-- `maintenance/dispatch-paused.json` `{paused:true}` — 全局暂停镜像
-- `maintenance/qa-observation-active.json` `{active:true, expiresAt?}` — 采样/观察窗镜像
-- 其它 envelope `state=applying`
+- `maintenance/host-release.lock` — 进行中的 apply（O_EXCL 创建；自持锁在 apply 核验时豁免）
+- `maintenance/dispatch-paused.json` `{paused:true|false}` — 全局暂停权威镜像
+- `maintenance/qa-observation-active.json` `{active:true|false, expiresAt?}` — 采样/观察窗权威镜像
+- 其它 envelope `state=applying`（忽略自身 opId）
 
-宿主 apply 在副作用前再次检查同一组信号。镜像文件由宿主/经理工具维护；缺失时 prepare 记 `no file signal`（不假装 DB 侧已查）。
+**prepare**（`mode=prepare`）：缺失镜像记 `no file signal` 并放行（只做预检）。  
+**apply**（`mode=apply`，副作用前）：缺失镜像 **拒绝**（fail closed）。宿主须显式写入 `{paused:false}` / `{active:false}` 才算放行。
+
+## AC04 回执来源
+
+- receipt 必须带 `hostTag`：HMAC-SHA256，密钥 `$SCK_SERVICE_HOME/private/host-release.hmac`（0600）。
+- 员工沙箱 deny 读 `private/`、deny 写 `maintenance/host-release/`（`employee.sb`）。
+- reader 校验：operation 五字段绑定 **且** `hostTag` 通过；照抄 operation + 自填 executor **不能**通过。
 
 ## 明确未解决
 
 - 现役公司任务通道**没有**可投递的 apply 能力 ID；本 PR 不假装有。
 - 回滚候选 `05ac7593…` 的兼容守卫**本链未重验**；apply 前宿主须用当前受审 installer 验证。
 - 本链不跑真实登录、不改 fault budget、不切 active。
-- `maintenance/` 对员工沙箱可写：receipt 可信性靠 **reader 绑定 operation 字段**（taskId/targetSha/snapshotHash/rollbackSha/expectedActive），不只靠 executor 字段存在。
+- DB 侧 `company_meta:config.paused` / QA observation 与文件镜像的自动同步：由宿主/经理工具维护镜像；本缝不直接开 DB。

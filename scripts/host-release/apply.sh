@@ -72,16 +72,110 @@ user=$(/usr/bin/id -un)
 receipt="$envelope/receipt.json"
 lock="$service_home/maintenance/host-release.lock"
 
-# --- mutual exclusion ---
-if [ -f "$lock" ]; then
-  echo "refused: host-release lock held: $(cat "$lock")" >&2
+# --- mutual exclusion (R1): O_EXCL create, not check-then-mv ---
+# Two concurrent apply.sh must not both win. Python os.open(O_CREAT|O_EXCL) is the portable atomic create.
+LOCK_PATH="$lock" LOCK_OP="$op_id" /usr/bin/python3 - <<'PY' || {
+  echo "refused: host-release lock held or uncreatable: $lock" >&2
   exit 1
-fi
-printf '{"opId":"%s","at":"%s"}\n' "$op_id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lock.tmp"
-mv "$lock.tmp" "$lock"
+}
+import json, os, time
+path = os.environ["LOCK_PATH"]
+os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+try:
+    fd = os.open(path, flags, 0o600)
+except FileExistsError:
+    raise SystemExit(1)
+try:
+    payload = json.dumps({"opId": os.environ["LOCK_OP"], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2) + "\n"
+    os.write(fd, payload.encode())
+finally:
+    os.close(fd)
+PY
 
 cleanup_lock() { rm -f "$lock"; }
 trap cleanup_lock EXIT
+
+# --- AC03 activity barrier BEFORE side effects (F6/R2) ---
+# Fail closed when mirrors declare pause/observation; ignore OUR own lock (we just took it).
+# Missing mirrors are refused for apply (authoritative path); prepare may still report "no file signal".
+BARRIER_HOME="$service_home" BARRIER_OP="$op_id" /usr/bin/python3 - <<'PY' || {
+  echo "refused: activity barrier blocked apply (see above)" >&2
+  exit 1
+}
+import json, os, sys, time
+home = os.environ["BARRIER_HOME"]
+op = os.environ["BARRIER_OP"]
+now = time.time()
+maint = os.path.join(home, "maintenance")
+errors = []
+
+paused = os.path.join(maint, "dispatch-paused.json")
+if os.path.exists(paused):
+    try:
+        data = json.load(open(paused, encoding="utf-8"))
+        if data.get("paused") is True:
+            errors.append("dispatch-paused: company dispatch is paused")
+    except Exception as e:
+        errors.append("dispatch-paused: unreadable (%s)" % e)
+else:
+    # Apply fail-closed: without an authoritative signal we refuse rather than guess clear.
+    # Hosts that do not yet publish the mirror must write {"paused":false} explicitly.
+    errors.append("dispatch-paused: missing authoritative mirror (apply fail-closed)")
+
+obs = os.path.join(maint, "qa-observation-active.json")
+if os.path.exists(obs):
+    try:
+        data = json.load(open(obs, encoding="utf-8"))
+        active = data.get("active") is True
+        exp = data.get("expiresAt")
+        if active and exp:
+            try:
+                # accept Z or offset; fall back to active if unparsable
+                from datetime import datetime
+                exp_ts = datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp()
+                if exp_ts <= now:
+                    active = False
+            except Exception:
+                pass
+        if active:
+            errors.append("qa-observation-window: active sampling/observation window")
+    except Exception as e:
+        errors.append("qa-observation-window: unreadable (%s)" % e)
+else:
+    errors.append("qa-observation-window: missing authoritative mirror (apply fail-closed)")
+
+# Foreign applying envelopes (ignore our own opId).
+hr = os.path.join(maint, "host-release")
+if os.path.isdir(hr):
+    for name in os.listdir(hr):
+        if name == op:
+            continue
+        op_path = os.path.join(hr, name, "operation.json")
+        if not os.path.isfile(op_path):
+            continue
+        try:
+            state = json.load(open(op_path, encoding="utf-8")).get("state")
+        except Exception:
+            continue
+        if state == "applying":
+            errors.append("concurrent-apply: envelope %s still applying" % name)
+
+# Lock file: only refuse if held by a DIFFERENT opId (we hold it ourselves).
+lock_path = os.path.join(maint, "host-release.lock")
+if os.path.exists(lock_path):
+    try:
+        holder = json.load(open(lock_path, encoding="utf-8")).get("opId")
+        if holder and holder != op:
+            errors.append("host-release-lock: held by %s" % holder)
+    except Exception as e:
+        errors.append("host-release-lock: unreadable (%s)" % e)
+
+if errors:
+    for e in errors:
+        print(e, file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 # --- expectedActive CAS ---
 active_now=$(readlink "$service_home/active" 2>/dev/null || true)
@@ -234,6 +328,13 @@ fi
 lock_released=false
 
 # --- receipt (trusted host) ---
+# F4: mint hostTag with private/host-release.hmac (employee sandbox cannot read private/).
+hmac_key="$service_home/private/host-release.hmac"
+if [ ! -f "$hmac_key" ]; then
+  mkdir -p "$service_home/private"
+  /usr/bin/python3 -c 'import os; open(os.environ["P"],"wb").write(os.urandom(32))' P="$hmac_key"
+  chmod 600 "$hmac_key"
+fi
 OP_ID="$op_id" TASK_ID="$taskId" TARGET_SHA="$targetSha" PREV_ACTIVE="$expectedActive" \
 EXPECTED_ACTIVE="$expectedActive" SNAP_HASH="$snapshotHash" ROLLBACK_SHA="$rollbackSha" \
 HOST="$host" UID_N="$uid" USER_N="$user" STARTED="$started" FINISHED="$finished" \
@@ -242,10 +343,42 @@ HEALTH="$health_code" READY="$ready_code" PLUGIN_STATUS="$plugin_status" PLUGIN_
 PLUGIN_SOURCE="$plugin_source" PLUGIN_DIRECTORY="$plugin_directory" PLUGIN_KNOWN="$plugin_source_known" \
 RB_ATTEMPTED="$rollback_attempted" RB_OK="$rollback_ok" RB_TO="$rollback_to" \
 CONTENT_MATCHES="$content_matches" CHANNEL_RECOVERY="$channel_recovery" LOCK_RELEASED="$lock_released" \
-RECEIPT="$receipt" /usr/bin/python3 - <<'PY'
-import json, os
+HMAC_KEY="$hmac_key" RECEIPT="$receipt" /usr/bin/python3 - <<'PY'
+import hashlib, hmac, json, os
 state = os.environ["STATE"]
 content_matches = os.environ["CONTENT_MATCHES"] == "true"
+executor = {"host": os.environ["HOST"], "uid": int(os.environ["UID_N"]), "user": os.environ["USER_N"]}
+# Canonical payload must match src/host-release/provenance.ts receiptTagPayload.
+tag_payload = json.dumps({
+  "opId": os.environ["OP_ID"],
+  "taskId": os.environ["TASK_ID"],
+  "targetSha": os.environ["TARGET_SHA"],
+  "snapshotHash": os.environ["SNAP_HASH"],
+  "rollbackSha": os.environ["ROLLBACK_SHA"],
+  "expectedActive": os.environ["EXPECTED_ACTIVE"],
+  "state": state,
+  "exitCode": int(os.environ["EXIT_CODE"]),
+  "executor": executor,
+  "startedAt": os.environ["STARTED"],
+  "finishedAt": os.environ["FINISHED"],
+}, separators=(",", ":"))
+# provenance.ts uses JSON.stringify (no separators tweak for nested — Node keeps default spacing for objects
+# but key order is fixed above; match Node's JSON.stringify default (no space) for the whole object.
+tag_payload = json.dumps({
+  "opId": os.environ["OP_ID"],
+  "taskId": os.environ["TASK_ID"],
+  "targetSha": os.environ["TARGET_SHA"],
+  "snapshotHash": os.environ["SNAP_HASH"],
+  "rollbackSha": os.environ["ROLLBACK_SHA"],
+  "expectedActive": os.environ["EXPECTED_ACTIVE"],
+  "state": state,
+  "exitCode": int(os.environ["EXIT_CODE"]),
+  "executor": {"host": executor["host"], "uid": executor["uid"], "user": executor["user"]},
+  "startedAt": os.environ["STARTED"],
+  "finishedAt": os.environ["FINISHED"],
+}, separators=(",", ":"))
+key = open(os.environ["HMAC_KEY"], "rb").read()
+host_tag = hmac.new(key, tag_payload.encode(), hashlib.sha256).hexdigest()
 receipt = {
   "schema": "host-release-receipt/1",
   "opId": os.environ["OP_ID"],
@@ -255,7 +388,8 @@ receipt = {
   "expectedActive": os.environ["EXPECTED_ACTIVE"],
   "snapshotHash": os.environ["SNAP_HASH"],
   "rollbackSha": os.environ["ROLLBACK_SHA"],
-  "executor": {"host": os.environ["HOST"], "uid": int(os.environ["UID_N"]), "user": os.environ["USER_N"]},
+  "executor": executor,
+  "hostTag": host_tag,
   "startedAt": os.environ["STARTED"],
   "finishedAt": os.environ["FINISHED"],
   "exitCode": int(os.environ["EXIT_CODE"]),
@@ -285,7 +419,6 @@ receipt = {
     "to": os.environ["RB_TO"] or None,
     "ok": os.environ["RB_OK"] == "true",
   },
-  # Written false first; flipped to true below only after the lock file is actually removed.
   "lockReleased": False,
 }
 if os.environ["REASON"]:

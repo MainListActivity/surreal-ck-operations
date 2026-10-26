@@ -16,6 +16,7 @@ import {
   hostReleaseEnvelopeDir, isCommitSha, isSafeAbsolutePath,
 } from './types.ts';
 import { snapshotInventoryHash, verifyRelease, type VerifyResult } from './verify.ts';
+import { verifyHostTag } from './provenance.ts';
 
 export class HostReleaseError extends Error {
   constructor(readonly code: 'invalid' | 'conflict' | 'not_found' | 'forbidden' | 'refused', message: string) {
@@ -176,6 +177,10 @@ export function readHostReleaseReceipt(serviceHome: string, opId: string): HostR
   if (receipt.snapshotHash !== operation.snapshotHash) throw new HostReleaseError('invalid', 'receipt.snapshotHash does not match operation');
   if (receipt.rollbackSha !== operation.rollbackSha) throw new HostReleaseError('invalid', 'receipt.rollbackSha does not match operation');
   if (receipt.expectedActive !== operation.expectedActive) throw new HostReleaseError('invalid', 'receipt.expectedActive does not match operation');
+  // F4 / AC04: field binding alone is not provenance — require a valid host HMAC tag.
+  if (!verifyHostTag(serviceHome, receipt)) {
+    throw new HostReleaseError('invalid', 'receipt.hostTag missing or not minted by the trusted host (private/host-release.hmac)');
+  }
   return receipt;
 }
 

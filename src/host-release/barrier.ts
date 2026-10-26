@@ -19,6 +19,13 @@ export interface BarrierInput {
   serviceHome: string;
   /** ISO now; used to expire observation windows when expiresAt is present. */
   nowIso?: string;
+  /**
+   * `prepare` (default): missing mirrors report ok with detail "no file signal".
+   * `apply`: missing mirrors are refused (fail closed) — host must publish an explicit clear signal.
+   */
+  mode?: 'prepare' | 'apply';
+  /** When set, a lock held by this opId is ignored (self-lock exemption for apply). */
+  selfOpId?: string;
 }
 
 export interface BarrierResult {
@@ -43,15 +50,20 @@ const readJson = <T>(path: string): T | undefined => {
 export function checkActivityBarrier(input: BarrierInput): BarrierResult {
   const checks: HostReleaseCheck[] = [];
   const now = Date.parse(input.nowIso ?? new Date().toISOString());
+  const mode = input.mode ?? 'prepare';
+  const failClosed = mode === 'apply';
 
   const lockPath = join(input.serviceHome, 'maintenance', HOST_RELEASE_LOCK_FILE);
   if (existsSync(lockPath)) {
     const prior = readJson<{ opId?: string; at?: string }>(lockPath);
-    checks.push({
-      name: 'host-release-lock',
-      ok: false,
-      detail: `lock held by ${prior?.opId ?? 'unknown'} since ${prior?.at ?? 'unknown'}`,
-    });
+    const self = input.selfOpId !== undefined && prior?.opId === input.selfOpId;
+    checks.push(self
+      ? { name: 'host-release-lock', ok: true, detail: `self-lock ${input.selfOpId}` }
+      : {
+          name: 'host-release-lock',
+          ok: false,
+          detail: `lock held by ${prior?.opId ?? 'unknown'} since ${prior?.at ?? 'unknown'}`,
+        });
   } else {
     checks.push({ name: 'host-release-lock', ok: true });
   }
@@ -66,7 +78,11 @@ export function checkActivityBarrier(input: BarrierInput): BarrierResult {
       detail: paused ? 'company dispatch is paused (maintenance/dispatch-paused.json)' : undefined,
     });
   } else {
-    checks.push({ name: 'dispatch-paused', ok: true, detail: 'no file signal' });
+    checks.push({
+      name: 'dispatch-paused',
+      ok: !failClosed,
+      detail: failClosed ? 'missing authoritative mirror (apply fail-closed)' : 'no file signal',
+    });
   }
 
   const observationMirror = join(input.serviceHome, 'maintenance', 'qa-observation-active.json');
@@ -83,14 +99,19 @@ export function checkActivityBarrier(input: BarrierInput): BarrierResult {
       detail: active ? 'active QA observation / sampling window is open' : undefined,
     });
   } else {
-    checks.push({ name: 'qa-observation-window', ok: true, detail: 'no file signal' });
+    checks.push({
+      name: 'qa-observation-window',
+      ok: !failClosed,
+      detail: failClosed ? 'missing authoritative mirror (apply fail-closed)' : 'no file signal',
+    });
   }
 
-  // Presence of other host-release envelopes in 'applying' state is a soft barrier.
+  // Presence of OTHER host-release envelopes in 'applying' state (ignore self).
   const root = join(input.serviceHome, 'maintenance', 'host-release');
   if (existsSync(root)) {
     let applying = 0;
     for (const name of readdirSync(root)) {
+      if (input.selfOpId && name === input.selfOpId) continue;
       const op = readJson<{ state?: string }>(join(root, name, 'operation.json'));
       if (op?.state === 'applying') applying += 1;
     }

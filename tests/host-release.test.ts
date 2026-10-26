@@ -14,6 +14,7 @@ import { snapshotInventoryHash, verifyRelease } from '../src/host-release/verify
 import { isCommitSha, isSafeAbsolutePath, type HostReleaseReceipt } from '../src/host-release/types.ts';
 import { parsePaseoPluginJson } from '../src/host-release/plugin-parse.ts';
 import { checkActivityBarrier } from '../src/host-release/barrier.ts';
+import { ensureHostHmacKey, mintHostTag } from '../src/host-release/provenance.ts';
 
 const clean: string[] = [];
 afterEach(() => {
@@ -179,10 +180,11 @@ describe('host-release envelope', () => {
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/executor/);
   });
 
-  test('writeHostReceipt + readHostReleaseReceipt round-trip with executor identity', () => {
+  test('writeHostReceipt + readHostReleaseReceipt round-trip with hostTag provenance', () => {
     const root = mkdtempSync(join(tmpdir(), 'sck-hr-ok-'));
     clean.push(root);
     const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
     const opId = 'b'.repeat(32);
     const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
     mkdirSync(envelope, { recursive: true });
@@ -191,12 +193,18 @@ describe('host-release envelope', () => {
       rollbackSha: sha(14), idempotencyKey: 'k', state: 'prepared', createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     }));
-    const receipt: HostReleaseReceipt = {
-      schema: 'host-release-receipt/1',
+    const startedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+    const base = {
       opId, taskId: 't', targetSha: sha(13), previousActive: '/a', expectedActive: '/a',
       snapshotHash: 'e'.repeat(64), rollbackSha: sha(14),
       executor: { host: 'testhost', uid: 501, user: 'y' },
-      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      startedAt, finishedAt, exitCode: 0 as const, state: 'succeeded' as const,
+    };
+    const receipt: HostReleaseReceipt = {
+      schema: 'host-release-receipt/1',
+      ...base,
+      hostTag: mintHostTag(serviceHome, base),
       checks: [{ name: 'content-bind', ok: true }],
       binding: { releasePath: '/svc/releases/' + sha(13), contentMatchesCommit: true, vendorSchemaDiff: 'none' },
       mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(13), pid: 1 },
@@ -207,6 +215,7 @@ describe('host-release envelope', () => {
     expect(existsSync(path)).toBe(true);
     const read = readHostReleaseReceipt(serviceHome, opId);
     expect(read.executor.host).toBe('testhost');
+    expect(read.hostTag).toMatch(/^[0-9a-f]{64}$/);
     expect(read.state).toBe('succeeded');
     expect(readHostReleaseStatus(serviceHome, opId).state).toBe('succeeded');
   });
@@ -215,6 +224,7 @@ describe('host-release envelope', () => {
     const root = mkdtempSync(join(tmpdir(), 'sck-hr-forge-'));
     clean.push(root);
     const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
     const opId = 'f'.repeat(32);
     const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
     mkdirSync(envelope, { recursive: true });
@@ -227,6 +237,7 @@ describe('host-release envelope', () => {
       schema: 'host-release-receipt/1', opId, taskId: 'task-FORGED', targetSha: 'f'.repeat(40),
       previousActive: '/real', expectedActive: '/real', snapshotHash: 'd'.repeat(64), rollbackSha: sha(21),
       executor: { host: 'forged-host', uid: 1, user: 'forger' },
+      hostTag: 'a'.repeat(64),
       startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
       checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
       mcp: { health: 200, ready: 200, cwd: null, pid: null },
@@ -234,6 +245,37 @@ describe('host-release envelope', () => {
       channelRecovery: 'unknown', lockReleased: true,
     }));
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/taskId|targetSha|snapshotHash/);
+  });
+
+  test('F4 / AC04: same-field forge (copy operation + invent executor, no valid hostTag) is refused', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-samefield-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
+    const opId = '1'.repeat(32);
+    const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
+    mkdirSync(envelope, { recursive: true });
+    const op = {
+      opId, taskId: 'task-REAL', targetSha: sha(40), expectedActive: '/real', snapshotHash: 'b'.repeat(64),
+      rollbackSha: sha(41), idempotencyKey: 'k', state: 'prepared', createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(envelope, 'operation.json'), JSON.stringify(op));
+    // Employee forges by copying operation fields and inventing executor — no access to private/ HMAC key.
+    writeFileSync(join(envelope, 'receipt.json'), JSON.stringify({
+      schema: 'host-release-receipt/1',
+      opId: op.opId, taskId: op.taskId, targetSha: op.targetSha, previousActive: op.expectedActive,
+      expectedActive: op.expectedActive, snapshotHash: op.snapshotHash, rollbackSha: op.rollbackSha,
+      executor: { host: 'employee-laptop', uid: 501, user: 'forger' },
+      // missing / fake tag
+      hostTag: 'c'.repeat(64),
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, state: 'succeeded',
+      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null },
+      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
+      channelRecovery: 'unknown', lockReleased: true,
+    }));
+    expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/hostTag/);
   });
 
   test('lock is exclusive (O_EXCL) and released by the same opId', () => {
@@ -313,12 +355,27 @@ describe('host-release activity barrier (AC03)', () => {
     expect(obs.checks.some(check => check.name === 'qa-observation-window' && !check.ok)).toBe(true);
   });
 
-  test('barrier passes when no file signals are present', () => {
+  test('prepare mode passes when no file signals are present; apply mode refuses missing mirrors', () => {
     const root = mkdtempSync(join(tmpdir(), 'sck-hr-barok-'));
     clean.push(root);
     mkdirSync(join(root, 'maintenance'), { recursive: true });
-    const result = checkActivityBarrier({ serviceHome: root });
+    expect(checkActivityBarrier({ serviceHome: root, mode: 'prepare' }).ok).toBe(true);
+    const apply = checkActivityBarrier({ serviceHome: root, mode: 'apply' });
+    expect(apply.ok).toBe(false);
+    expect(apply.checks.some(check => check.name === 'dispatch-paused' && !check.ok)).toBe(true);
+  });
+
+  test('apply mode ignores self-lock and accepts explicit clear mirrors', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-selflock-'));
+    clean.push(root);
+    mkdirSync(join(root, 'maintenance'), { recursive: true });
+    const opId = 's'.repeat(32);
+    writeFileSync(join(root, 'maintenance', 'host-release.lock'), JSON.stringify({ opId, at: new Date().toISOString() }));
+    writeFileSync(join(root, 'maintenance', 'dispatch-paused.json'), JSON.stringify({ paused: false }));
+    writeFileSync(join(root, 'maintenance', 'qa-observation-active.json'), JSON.stringify({ active: false }));
+    const result = checkActivityBarrier({ serviceHome: root, mode: 'apply', selfOpId: opId });
     expect(result.ok).toBe(true);
+    expect(result.checks.some(check => check.name === 'host-release-lock' && check.ok)).toBe(true);
   });
 });
 
