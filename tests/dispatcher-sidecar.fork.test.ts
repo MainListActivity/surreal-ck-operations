@@ -874,10 +874,10 @@ run('company fork: an explicit code repo rebind replaces the old-repo implemente
   const blocked=await w.core.getTask(w.gm,task.id);
   await w.core.bindTaskCodeRepo(w.gm,{taskId:task.id,codeRepoPath:nextRepo,expectedVersion:blocked.version,text:'Manager explicitly corrects the code repository',idempotencyKey:'repo-rebind-bind'});
   await w.core.resume(w.gm,task.id,{text:'Resume after the explicit repository correction',idempotencyKey:'repo-rebind-resume'});
-  const C=await w.wf.spawnInst((await w.wf.defs()).find(d=>d.id==='fixture-eng-new')!);
+  const C=await w.wf.spawnInst((await w.wf.defs()).find(d=>d.id==='fixture-eng-new')!,nextRepo,'maintenance');
   const envC=w.pool.env(C);
   const agentId=`agent-${C.id}`;
-  await w.wf.bind(C.id,{agentId,cwd:w.pool.commDirFor(C.id),repoHome:nextRepo,model:'fixture'});
+  await w.wf.bind(C.id,{agentId,cwd:nextRepo,repoHome:nextRepo,model:'fixture',workspaceScope:'maintenance'});
   w.pool.bindAgent(C.id,agentId);w.agentRows.set(agentId,{id:agentId,status:'idle'});
   const moved=await w.tick();
   expect(moved.decisions).toContain(`auto-takeover:${task.id}=${C.id}`);
