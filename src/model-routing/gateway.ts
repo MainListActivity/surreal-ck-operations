@@ -49,6 +49,21 @@ export interface GatewayDeps {
 export const ROUTING_PORT = 18779;
 /** What magpie's /v1/models declares for every sck-* group. */
 export const GROUP_CONTEXT_TOKENS = 1048576;
+
+/** Claude versions send either JSON user metadata or the older user_..._session_UUID form. */
+function claudeMetadataSession(metadata: unknown): string | undefined {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return;
+  const user = (metadata as { user_id?: unknown }).user_id;
+  if (typeof user !== "string" || user.length > 4096) return;
+  let session: unknown;
+  if (user.trimStart().startsWith("{")) {
+    try { session = JSON.parse(user)?.session_id; } catch { return; }
+  } else if (user.startsWith("user_")) {
+    session = /_session_([0-9a-f-]+)$/i.exec(user)?.[1];
+  }
+  return typeof session === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(session)
+    ? session : undefined;
+}
 /** Project-local settings override a user's global settings.env without changing their personal sessions. */
 export function installRoutingSettings(
   comm: string,
@@ -225,17 +240,27 @@ export async function startModelGateway(
       if (cooldowns.size > 4096)
         for (const [key, until] of cooldowns)
           if (until <= Date.now()) cooldowns.delete(key);
-      if (match[2]!.includes("/messages"))
-        body.metadata = { ...body.metadata, user_id: session };
-      else body.prompt_cache_key = session;
+      // Claude metadata.user_id carries its native transcript identity. Keep it intact:
+      // Magpie records native_session separately from our lease-scoped routing affinity,
+      // and needs that native identity to deduplicate gateway usage against local logs.
+      if (!match[2]!.includes("/messages")) body.prompt_cache_key = session;
       const headers = new Headers({
         "content-type": "application/json",
         authorization: "Bearer magpie-claude",
         "x-magpie-session": session,
       });
-      for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
+      for (const name of [
+        "anthropic-version", "anthropic-beta", "accept",
+        "x-claude-code-session-id", "x-claude-code-agent-id",
+      ]) {
         const v = req.headers[name];
         if (typeof v === "string") headers.set(name, v);
+      }
+      // Magpie's native identity reader uses the Claude header, not metadata.user_id.
+      // Bridge older Claude clients without replacing an explicit native session header.
+      if (match[2]!.includes("/messages") && !headers.has("x-claude-code-session-id")) {
+        const nativeSession = claudeMetadataSession(body.metadata);
+        if (nativeSession) headers.set("x-claude-code-session-id", nativeSession);
       }
       const now=deps.now??Date.now;
       const started = now();
