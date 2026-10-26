@@ -68,42 +68,58 @@ export function checkActivityBarrier(input: BarrierInput): BarrierResult {
     checks.push({ name: 'host-release-lock', ok: true });
   }
 
+  const readStrictBool = (
+    path: string, field: 'paused' | 'active', label: string,
+  ): { ok: boolean; detail?: string; value?: boolean } => {
+    if (!existsSync(path)) {
+      return failClosed
+        ? { ok: false, detail: 'missing authoritative mirror (apply fail-closed)' }
+        : { ok: true, detail: 'no file signal' };
+    }
+    const data = readJson<Record<string, unknown>>(path);
+    if (data === undefined) {
+      return { ok: false, detail: `${label}: unreadable or invalid JSON` };
+    }
+    if (typeof data !== 'object' || data === null || !(field in data)) {
+      return { ok: false, detail: `${label}: missing boolean field ${field}` };
+    }
+    const value = data[field];
+    if (value !== true && value !== false) {
+      return { ok: false, detail: `${label}: ${field} must be JSON boolean true|false, got ${JSON.stringify(value)}` };
+    }
+    return { ok: true, value };
+  };
+
   const pausedMirror = join(input.serviceHome, 'maintenance', 'dispatch-paused.json');
-  if (existsSync(pausedMirror)) {
-    const data = readJson<{ paused?: boolean }>(pausedMirror);
-    const paused = data?.paused === true;
-    checks.push({
-      name: 'dispatch-paused',
-      ok: !paused,
-      detail: paused ? 'company dispatch is paused (maintenance/dispatch-paused.json)' : undefined,
-    });
+  const paused = readStrictBool(pausedMirror, 'paused', 'dispatch-paused');
+  if (!paused.ok) {
+    checks.push({ name: 'dispatch-paused', ok: false, detail: paused.detail });
+  } else if (paused.value === true) {
+    checks.push({ name: 'dispatch-paused', ok: false, detail: 'company dispatch is paused (maintenance/dispatch-paused.json)' });
   } else {
-    checks.push({
-      name: 'dispatch-paused',
-      ok: !failClosed,
-      detail: failClosed ? 'missing authoritative mirror (apply fail-closed)' : 'no file signal',
-    });
+    checks.push({ name: 'dispatch-paused', ok: true, detail: paused.detail });
   }
 
   const observationMirror = join(input.serviceHome, 'maintenance', 'qa-observation-active.json');
-  if (existsSync(observationMirror)) {
-    const data = readJson<{ active?: boolean; expiresAt?: string }>(observationMirror);
-    let active = data?.active === true;
-    if (active && data?.expiresAt) {
+  const observation = readStrictBool(observationMirror, 'active', 'qa-observation-window');
+  if (!observation.ok) {
+    checks.push({ name: 'qa-observation-window', ok: false, detail: observation.detail });
+  } else if (observation.value === true) {
+    const data = readJson<{ expiresAt?: string }>(observationMirror);
+    if (data?.expiresAt) {
       const exp = Date.parse(data.expiresAt);
-      if (Number.isFinite(exp) && exp <= now) active = false;
+      if (!Number.isFinite(exp)) {
+        checks.push({ name: 'qa-observation-window', ok: false, detail: 'expiresAt unparsable while active=true' });
+      } else if (exp <= now) {
+        checks.push({ name: 'qa-observation-window', ok: true, detail: 'observation window expired' });
+      } else {
+        checks.push({ name: 'qa-observation-window', ok: false, detail: 'active QA observation / sampling window is open' });
+      }
+    } else {
+      checks.push({ name: 'qa-observation-window', ok: false, detail: 'active QA observation / sampling window is open' });
     }
-    checks.push({
-      name: 'qa-observation-window',
-      ok: !active,
-      detail: active ? 'active QA observation / sampling window is open' : undefined,
-    });
   } else {
-    checks.push({
-      name: 'qa-observation-window',
-      ok: !failClosed,
-      detail: failClosed ? 'missing authoritative mirror (apply fail-closed)' : 'no file signal',
-    });
+    checks.push({ name: 'qa-observation-window', ok: true, detail: observation.detail });
   }
 
   // Presence of OTHER host-release envelopes in 'applying' state (ignore self).

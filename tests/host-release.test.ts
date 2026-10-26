@@ -14,7 +14,8 @@ import { snapshotInventoryHash, verifyRelease } from '../src/host-release/verify
 import { isCommitSha, isSafeAbsolutePath, type HostReleaseReceipt } from '../src/host-release/types.ts';
 import { parsePaseoPluginJson } from '../src/host-release/plugin-parse.ts';
 import { checkActivityBarrier } from '../src/host-release/barrier.ts';
-import { ensureHostHmacKey, mintHostTag } from '../src/host-release/provenance.ts';
+import { ensureHostHmacKey, mintHostTag, verifyHostTag } from '../src/host-release/provenance.ts';
+import { spawnSync } from 'node:child_process';
 
 const clean: string[] = [];
 afterEach(() => {
@@ -195,21 +196,21 @@ describe('host-release envelope', () => {
     }));
     const startedAt = new Date().toISOString();
     const finishedAt = new Date().toISOString();
-    const base = {
+    const body: Omit<HostReleaseReceipt, 'hostTag'> = {
+      schema: 'host-release-receipt/1',
       opId, taskId: 't', targetSha: sha(13), previousActive: '/a', expectedActive: '/a',
       snapshotHash: 'e'.repeat(64), rollbackSha: sha(14),
       executor: { host: 'testhost', uid: 501, user: 'y' },
-      startedAt, finishedAt, exitCode: 0 as const, state: 'succeeded' as const,
-    };
-    const receipt: HostReleaseReceipt = {
-      schema: 'host-release-receipt/1',
-      ...base,
-      hostTag: mintHostTag(serviceHome, base),
+      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
       checks: [{ name: 'content-bind', ok: true }],
       binding: { releasePath: '/svc/releases/' + sha(13), contentMatchesCommit: true, vendorSchemaDiff: 'none' },
       mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(13), pid: 1 },
       plugin: { status: 'running', enabled: true, source: '/svc/releases/' + sha(13) + '/plugin', directory: '/svc/releases/' + sha(13) + '/plugin', sourceKnown: true },
       channelRecovery: 'adopt-expected', lockReleased: true,
+    };
+    const receipt: HostReleaseReceipt = {
+      ...body,
+      hostTag: mintHostTag(serviceHome, body),
     };
     const path = writeHostReceipt(serviceHome, receipt);
     expect(existsSync(path)).toBe(true);
@@ -276,6 +277,44 @@ describe('host-release envelope', () => {
       channelRecovery: 'unknown', lockReleased: true,
     }));
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/hostTag/);
+  });
+
+  test('F4 full-field: tampering unsigned evidence fields after mint fails verifyHostTag', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-tamper-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
+    const startedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+    const body: Omit<HostReleaseReceipt, 'hostTag'> = {
+      schema: 'host-release-receipt/1',
+      opId: '2'.repeat(32), taskId: 't', targetSha: sha(50), previousActive: '/a', expectedActive: '/a',
+      snapshotHash: 'd'.repeat(64), rollbackSha: sha(51),
+      executor: { host: 'h', uid: 1, user: 'u' },
+      startedAt, finishedAt, exitCode: 0, state: 'succeeded',
+      checks: [], binding: { releasePath: null, contentMatchesCommit: false, vendorSchemaDiff: 'unavailable' },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      channelRecovery: 'unknown', lockReleased: false,
+      rollback: { attempted: false, to: null, ok: false },
+    };
+    const tag = mintHostTag(serviceHome, body);
+    expect(verifyHostTag(serviceHome, { ...body, hostTag: tag })).toBe(true);
+    // Tamper each previously-unsigned field — tag must no longer verify.
+    expect(verifyHostTag(serviceHome, {
+      ...body, hostTag: tag,
+      binding: { ...body.binding, contentMatchesCommit: true },
+    })).toBe(false);
+    expect(verifyHostTag(serviceHome, {
+      ...body, hostTag: tag,
+      plugin: { ...body.plugin, source: '/forged' },
+    })).toBe(false);
+    expect(verifyHostTag(serviceHome, {
+      ...body, hostTag: tag, channelRecovery: 'adopt-expected',
+    })).toBe(false);
+    expect(verifyHostTag(serviceHome, {
+      ...body, hostTag: tag, lockReleased: true,
+    })).toBe(false);
   });
 
   test('lock is exclusive (O_EXCL) and released by the same opId', () => {
@@ -376,6 +415,43 @@ describe('host-release activity barrier (AC03)', () => {
     const result = checkActivityBarrier({ serviceHome: root, mode: 'apply', selfOpId: opId });
     expect(result.ok).toBe(true);
     expect(result.checks.some(check => check.name === 'host-release-lock' && check.ok)).toBe(true);
+  });
+
+  test('apply mode refuses {}, string booleans, and invalid JSON mirrors', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-schema-'));
+    clean.push(root);
+    mkdirSync(join(root, 'maintenance'), { recursive: true });
+    writeFileSync(join(root, 'maintenance', 'dispatch-paused.json'), '{}');
+    writeFileSync(join(root, 'maintenance', 'qa-observation-active.json'), JSON.stringify({ active: false }));
+    expect(checkActivityBarrier({ serviceHome: root, mode: 'apply' }).ok).toBe(false);
+
+    writeFileSync(join(root, 'maintenance', 'dispatch-paused.json'), JSON.stringify({ paused: 'false' }));
+    expect(checkActivityBarrier({ serviceHome: root, mode: 'apply' }).ok).toBe(false);
+
+    writeFileSync(join(root, 'maintenance', 'dispatch-paused.json'), '{not-json');
+    expect(checkActivityBarrier({ serviceHome: root, mode: 'apply' }).ok).toBe(false);
+  });
+});
+
+describe('host-release apply.sh syntax + first-mint', () => {
+  test('apply.sh passes sh -n', () => {
+    const script = join(import.meta.dir, '..', 'scripts', 'host-release', 'apply.sh');
+    const result = spawnSync('/bin/sh', ['-n', script], { encoding: 'utf8' });
+    expect(result.status).toBe(0);
+  });
+
+  test('first-mint: env assignment before -c creates the hmac key', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-mint-'));
+    clean.push(root);
+    const keyPath = join(root, 'host-release.hmac');
+    // Wrong form (argv after -c) must fail.
+    const bad = spawnSync('/usr/bin/python3', ['-c', 'import os; open(os.environ["P"],"wb").write(os.urandom(32))', `P=${keyPath}`], { encoding: 'utf8' });
+    expect(bad.status).not.toBe(0);
+    expect(existsSync(keyPath)).toBe(false);
+    // Correct form (env before command) must succeed.
+    const good = spawnSync('/bin/sh', ['-c', 'P="$1" /usr/bin/python3 -c \'import os; open(os.environ["P"],"wb").write(os.urandom(32))\'', 'mint', keyPath], { encoding: 'utf8' });
+    expect(good.status).toBe(0);
+    expect(existsSync(keyPath)).toBe(true);
   });
 });
 

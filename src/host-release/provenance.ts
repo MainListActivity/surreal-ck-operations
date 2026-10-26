@@ -3,8 +3,9 @@
  *
  * The HMAC key lives at `$SCK_SERVICE_HOME/private/host-release.hmac` — the employee sandbox
  * denies read of `private/`, so only a trusted host can mint a valid `hostTag`. The tag covers
- * the binding fields (opId/taskId/targetSha/snapshotHash/rollbackSha/expectedActive/state/
- * exitCode/executor), so copying those fields from operation.json is not enough.
+ * EVERY evidence field on the receipt (binding/mcp/plugin/channelRecovery/lockReleased/rollback/
+ * checks/reason included), so copying operation.json fields and inventing an executor is not enough,
+ * and tampering with any unsigned evidence field after mint also fails verification.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -18,20 +19,19 @@ export const HOST_RELEASE_HMAC_FILE = 'host-release.hmac';
 export const hostReleaseHmacPath = (serviceHome: string): string =>
   join(serviceHome, 'private', HOST_RELEASE_HMAC_FILE);
 
-/** Canonical bytes covered by hostTag (stable key order, no whitespace variance). */
-export function receiptTagPayload(receipt: Pick<HostReleaseReceipt,
-  'opId' | 'taskId' | 'targetSha' | 'snapshotHash' | 'rollbackSha' | 'expectedActive' |
-  'state' | 'exitCode' | 'executor' | 'startedAt' | 'finishedAt'
->): string {
+/**
+ * Canonical bytes covered by hostTag. Stable key order; JSON.stringify default (no spaces).
+ * `hostTag` itself is excluded. Every other receipt evidence field is included.
+ */
+export function receiptTagPayload(receipt: Omit<HostReleaseReceipt, 'hostTag'>): string {
   return JSON.stringify({
     opId: receipt.opId,
     taskId: receipt.taskId,
     targetSha: receipt.targetSha,
+    previousActive: receipt.previousActive,
+    expectedActive: receipt.expectedActive,
     snapshotHash: receipt.snapshotHash,
     rollbackSha: receipt.rollbackSha,
-    expectedActive: receipt.expectedActive,
-    state: receipt.state,
-    exitCode: receipt.exitCode,
     executor: {
       host: receipt.executor.host,
       uid: receipt.executor.uid,
@@ -39,6 +39,47 @@ export function receiptTagPayload(receipt: Pick<HostReleaseReceipt,
     },
     startedAt: receipt.startedAt,
     finishedAt: receipt.finishedAt,
+    exitCode: receipt.exitCode,
+    state: receipt.state,
+    checks: receipt.checks.map(check => ({
+      name: check.name,
+      ok: check.ok,
+      ...(check.detail !== undefined ? { detail: check.detail } : {}),
+    })),
+    binding: {
+      releasePath: receipt.binding.releasePath,
+      contentMatchesCommit: receipt.binding.contentMatchesCommit,
+      vendorSchemaDiff: receipt.binding.vendorSchemaDiff,
+      ...(receipt.binding.vendorSchemaDetail !== undefined
+        ? { vendorSchemaDetail: receipt.binding.vendorSchemaDetail }
+        : {}),
+    },
+    mcp: {
+      health: receipt.mcp.health,
+      ready: receipt.mcp.ready,
+      cwd: receipt.mcp.cwd,
+      pid: receipt.mcp.pid,
+    },
+    plugin: {
+      status: receipt.plugin.status,
+      enabled: receipt.plugin.enabled,
+      source: receipt.plugin.source,
+      directory: receipt.plugin.directory,
+      sourceKnown: receipt.plugin.sourceKnown,
+    },
+    channelRecovery: receipt.channelRecovery,
+    ...(receipt.rollback
+      ? {
+          rollback: {
+            attempted: receipt.rollback.attempted,
+            to: receipt.rollback.to,
+            ok: receipt.rollback.ok,
+            ...(receipt.rollback.detail !== undefined ? { detail: receipt.rollback.detail } : {}),
+          },
+        }
+      : {}),
+    lockReleased: receipt.lockReleased,
+    ...(receipt.reason !== undefined ? { reason: receipt.reason } : {}),
   });
 }
 
@@ -61,7 +102,7 @@ export function ensureHostHmacKey(serviceHome: string): string {
   return path;
 }
 
-export function mintHostTag(serviceHome: string, receipt: Parameters<typeof receiptTagPayload>[0]): string {
+export function mintHostTag(serviceHome: string, receipt: Omit<HostReleaseReceipt, 'hostTag'>): string {
   const key = readHostHmacKey(serviceHome);
   return createHmac('sha256', key).update(receiptTagPayload(receipt)).digest('hex');
 }
@@ -70,7 +111,8 @@ export function verifyHostTag(serviceHome: string, receipt: HostReleaseReceipt):
   if (typeof receipt.hostTag !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.hostTag)) return false;
   let key: Buffer;
   try { key = readHostHmacKey(serviceHome); } catch { return false; }
-  const expected = createHmac('sha256', key).update(receiptTagPayload(receipt)).digest();
+  const { hostTag: _tag, ...rest } = receipt;
+  const expected = createHmac('sha256', key).update(receiptTagPayload(rest)).digest();
   const actual = Buffer.from(receipt.hostTag, 'hex');
   if (actual.length !== expected.length) return false;
   return timingSafeEqual(actual, expected);
