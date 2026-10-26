@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { CompanyError } from '../core-errors.ts';
 import { isProvablyUnsentFailure, type FlowStage } from '../faults.ts';
 import type { BrokerConfig } from './config.ts';
-import { describeTransportFailure, isTlsTrustFailure, opsFetch, transportErrno, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
+import { describeTransportFailure, isTlsTrustFailure, OPS_CONNECT_TIMEOUT_MS, opsFetch, transportErrno, type ConnectAwareFetcher, type Fetcher } from './fetcher.ts';
 
 /**
  * The machine facts of the hop that failed. The fault classifier reads them; no message is ever parsed for them,
@@ -84,11 +84,18 @@ const MIN_STEP_MS = 2_000;
  * How many times one hop may open a fresh connection before the failure is handed back to the flow.
  *
  * The observed production shape is a bimodal WAN path: a healthy connection comes up in well under two seconds, and a
- * broken one never comes up at all — the transport's 20 s connect limit is what ends it. Three attempts on the same
- * hop therefore cost at most one broken window's worth of time, and they turn "the first connection of this hop was
- * unlucky" into a success without replaying a single request (a connect failure writes nothing).
+ * broken one never comes up at all — the transport's connect limit is what ends it. A same-hop retry is worth it only
+ * while the login still has room for that full connect window AND for a fresh flow afterwards: burning another connect
+ * stall on a path that stays broken must not spend the budget the next authorize→exchange needs (QA 2026-10-26:
+ * CONNECT_TIMEOUT 20s → same-hop retry → step cut at 23s → flow retry left with 2s).
  */
 const CONNECT_ATTEMPTS = 3;
+
+/**
+ * Worst-case wall time one same-hop connect retry may spend: the tighter of the standing connect limit and the
+ * current step limit, plus the minimum step floor (so a refused retry still leaves a usable step).
+ */
+const connectRetryNeedMs = (stepMs: number): number => Math.min(OPS_CONNECT_TIMEOUT_MS, stepMs) + MIN_STEP_MS;
 
 const fail = (what: string, detail: string | number, facts: LoginFacts) => new LoginFailure(`${what} failed (${detail})`, facts);
 
@@ -378,9 +385,13 @@ export async function passwordLogin(
     left,
     attempt: 0,
     trace: [],
-    // A same-hop retry only runs while the flow still has room for it: the retry is bounded by the same budget as
-    // everything else, so a broken path cannot spend more than the login is allowed to take.
-    connectRetryAllowed: () => left() >= MIN_STEP_MS && attemptLeft() >= MIN_STEP_MS,
+    // A same-hop retry only runs while the login still has room for a full connect window AND for a fresh flow
+    // afterwards. Burning another connect stall on a path that stays broken must not spend the budget the next
+    // authorize→exchange needs (QA 2026-10-26: CONNECT_TIMEOUT → same-hop retry → step cut → flow retry left with 2s).
+    connectRetryAllowed: () => {
+      const need = connectRetryNeedMs(stepMs);
+      return left() >= need + retryMinLeftMs && attemptLeft() >= need;
+    },
     connectFetcher: () => {
       const fetcher = options.fetch ?? opsFetch;
       const aware = fetcher as Partial<ConnectAwareFetcher>;

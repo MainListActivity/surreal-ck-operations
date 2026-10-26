@@ -4,7 +4,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
@@ -2895,6 +2895,86 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       message: this.faultRefusalMessage(fault.phase, result.decision.reason, result.decision.nextAllowedAt, result.diagnostic),
       evidence: { ...faultEvidence(fault), decision: result.decision.reason ?? 'not_retryable' },
     };
+  }
+
+  /**
+   * Read-only diagnosis of a task's recovery budget. Readable by the task holder, its reviewer, or gm.
+   * Secret-free: no upstream bodies, no credentials, no aliases beyond what the ledger already stored.
+   */
+  async faultStatus(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView> {
+    const actor = await this.authenticate(credential);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const holds = row.current_employee === actor.employeeId && ['doing', 'review', 'blocked'].includes(row.state ?? '') &&
+      (row.lease_expires_at ?? 0) > Date.now() / 1000;
+    const reviews = actor.role === row.reviewer_role;
+    if (actor.role !== 'gm' && !holds && !reviews) {
+      throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or gm');
+    }
+    return this.faultStatusOf(input.taskId);
+  }
+
+  /**
+   * gm only: lift a spent (or stopped) recovery budget for one incident of a task. Resets the existing scope so
+   * the next attempt starts a fresh recovery window. Audited. Creates no new budget and never invents an incident.
+   */
+  async faultLift(credential: Credential, input: {
+    taskId: TaskId; incident: string; reason: string; idempotencyKey: string;
+  }): Promise<FaultStatusView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may lift a spent recovery budget');
+    requireText(input.reason, 'reason', 4, 2000);
+    requireText(input.incident, 'incident', 1, 500);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const episodes = await this.faults.episodesOfTask(input.taskId);
+    const matching = episodes.filter(episode => episode.incident === input.incident);
+    if (matching.length === 0) throw new CompanyError('not_found', `no fault episode for incident ${input.incident} on this task`);
+    const liftable = matching.some(episode => episode.state === 'exhausted' || episode.state === 'stopped' || episode.state === 'opened' || episode.state === 'converged');
+    if (!liftable) throw new CompanyError('conflict', `incident ${input.incident} is already resolved on this task`);
+    const now = this.faultClock();
+    await this.faults.liftRepair({ taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits });
+    await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'fault_lift', evidence: $evidence, at: time::now() };`,
+      { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ incident: input.incident, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 30000) });
+    return this.faultStatusOf(input.taskId);
+  }
+
+  /** Assemble the secret-free diagnosis view of a task. */
+  private async faultStatusOf(taskId: TaskId): Promise<FaultStatusView> {
+    const now = this.faultClock();
+    const budgets: FaultBudgetView[] = (await this.faults.scopesOfTask(taskId)).map(scope => ({
+      key: scope.key, target: scope.target, phase: scope.phase,
+      attempts: scope.attempts, maxAttempts: scope.maxAttempts, totalAttempts: scope.totalAttempts,
+      deadline: scope.deadline, nextAllowedAt: scope.nextAllowedAt,
+      failed: scope.failed, stopped: scope.stopped,
+      ...(scope.lastErrno === undefined ? {} : { lastErrno: scope.lastErrno }),
+      ...(scope.lastHop === undefined ? {} : { lastHop: scope.lastHop }),
+      ...(scope.lastIncident === undefined ? {} : { lastIncident: scope.lastIncident }),
+      ...(scope.stopReason === undefined ? {} : { stopReason: scope.stopReason }),
+      ...(scope.stopDiagnostic === undefined ? {} : { stopDiagnostic: scope.stopDiagnostic }),
+    }));
+    const episodes: FaultEpisodeView[] = (await this.faults.episodesOfTask(taskId)).map(episode => ({
+      episode: episode.episode, incident: episode.incident, fingerprint: episode.fingerprint,
+      phase: episode.phase, state: episode.state, openedAt: episode.openedAt, updatedAt: episode.updatedAt,
+      ...(episode.resolvedAt === undefined ? {} : { resolvedAt: episode.resolvedAt }),
+    }));
+    const seen = new Set<string>();
+    const repairs: FaultRepairView[] = [];
+    for (const episode of episodes) {
+      if (seen.has(episode.incident)) continue;
+      seen.add(episode.incident);
+      const repair = await this.faults.repair(episode.incident);
+      if (!repair) continue;
+      repairs.push({
+        incident: repair.incident, fingerprint: repair.fingerprint, state: repair.state,
+        ...(repair.taskId === undefined ? {} : { taskId: repair.taskId }),
+        ...(repair.sourceTaskId === undefined ? {} : { sourceTaskId: repair.sourceTaskId }),
+        ...(repair.diagnostic === undefined ? {} : { diagnostic: repair.diagnostic }),
+      });
+    }
+    return { taskId, now, budgets, episodes, repairs };
   }
 
   /**
