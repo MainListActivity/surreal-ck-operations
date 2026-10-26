@@ -27,7 +27,13 @@ case "$suite" in
     fork_test='tests/plugin-runtime-role-gate.fork.test.ts'
     gate_why='SYS04 plugin runtime diagnostics (unit + role-gate fork)'
     ;;
-  *) echo "unknown suite: $suite (known: sys04-runtime-diagnostics)" >&2; exit 2;;
+  sys02-local-evidence)
+    # SYS02 acceptance seam + PR-gate substitute suite (unit only; no fork DB required for the gate record).
+    unit_test='tests/acceptance.test.ts tests/pr-gate.test.ts'
+    fork_test=''
+    gate_why='SYS02 managed-local-test acceptance + PR-gate substitute (unit)'
+    ;;
+  *) echo "unknown suite: $suite (known: sys04-runtime-diagnostics, sys02-local-evidence)" >&2; exit 2;;
 esac
 
 # Resolve the sha being attested: release dir name, or git HEAD of a worktree.
@@ -82,6 +88,7 @@ fi
 
 # Every named test file must exist in the target.
 for one in $unit_test $fork_test; do
+  [ -n "$one" ] || continue
   [ -f "$target/$one" ] || { echo "refused: the target has no $one" >&2; exit 2; }
 done
 
@@ -89,17 +96,30 @@ resolve_bun "$service_home"
 [ -x "$BUN" ] || { echo "refused: the service Bun runtime is not executable: $BUN" >&2; exit 2; }
 bun_version=$("$BUN" --version) || { echo "refused: $BUN did not report a version" >&2; exit 2; }
 
+# Host vs dry-run: only a process that can read private/service.env may mint a managed attestation.
+# Engineer sandboxes that cannot open that file still produce a dry-run record for local verification,
+# but the acceptance adapter / PR-gate substitute refuse dry-run as a CI substitute.
+host_mode=dry-run
+service_env="$service_home/private/service.env"
+if [ -f "$service_env" ] && [ -r "$service_env" ]; then
+  host_mode=managed
+fi
+
 out_dir="$service_home/gates/managed-local-test"
 mkdir -p "$out_dir"
 chmod 700 "$service_home/gates" "$out_dir" 2>/dev/null || true
 log="$out_dir/$sha.log"
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # The command string recorded is the allowlisted suite expansion, never a free-form caller command.
-command_line="bun test $unit_test && bun scripts/test-worktrees.ts $fork_test"
+if [ -n "$fork_test" ]; then
+  command_line="bun test $unit_test && bun scripts/test-worktrees.ts $fork_test"
+else
+  command_line="bun test $unit_test"
+fi
 
 set +e
 {
-  echo "=== managed-local-test suite=$suite sha=$sha started=$started ==="
+  echo "=== managed-local-test suite=$suite sha=$sha started=$started hostMode=$host_mode ==="
   echo "target=$target"
   echo "bun=$BUN ($bun_version)"
   echo "command=$command_line"
@@ -107,13 +127,17 @@ set +e
   (cd "$target" && "$BUN" test $unit_test)
   unit_rc=$?
   echo "unit_exit=$unit_rc"
-  if [ "$unit_rc" -eq 0 ]; then
-    echo "--- fork ---"
-    (cd "$target" && "$BUN" scripts/test-worktrees.ts $fork_test)
-    fork_rc=$?
-    echo "fork_exit=$fork_rc"
+  if [ -n "$fork_test" ]; then
+    if [ "$unit_rc" -eq 0 ]; then
+      echo "--- fork ---"
+      (cd "$target" && "$BUN" scripts/test-worktrees.ts $fork_test)
+      fork_rc=$?
+      echo "fork_exit=$fork_rc"
+    else
+      fork_rc=1
+    fi
   else
-    fork_rc=1
+    fork_rc=0
   fi
   if [ "$unit_rc" -eq 0 ] && [ "$fork_rc" -eq 0 ]; then rc=0; else rc=1; fi
   echo "=== finished rc=$rc ==="
@@ -136,8 +160,9 @@ GATE_SHA="$sha" GATE_SUITE="$suite" GATE_BUN="$bun_version" GATE_BUN_PATH="$BUN"
   GATE_RESULT="$result" GATE_RC="$rc" GATE_STARTED="$started" GATE_FINISHED="$finished" \
   GATE_LOG="$log" GATE_LOG_HASH="$log_hash" GATE_RECORD="$record" GATE_COMMAND="$command_line" \
   GATE_TARGET="$target" GATE_REPO="$repo_identity" GATE_DIRTY="$dirty" GATE_ARCH="$(uname -m)" \
-  GATE_WHY="$gate_why" /usr/bin/python3 - <<'PY'
-import json, os
+  GATE_WHY="$gate_why" GATE_HOST_MODE="$host_mode" GATE_SERVICE_ENV="$service_env" \
+  /usr/bin/python3 - <<'PY'
+import hashlib, hmac, json, os
 record = {
     'gate': 'managed-local-test',
     'suite': os.environ['GATE_SUITE'],
@@ -157,7 +182,25 @@ record = {
     'log': os.environ['GATE_LOG'],
     'logHash': os.environ['GATE_LOG_HASH'],
     'why': os.environ['GATE_WHY'],
+    'hostMode': os.environ['GATE_HOST_MODE'],
 }
+# Managed attestation: HMAC-SHA256 over the canonical payload with private/service.env as the secret.
+# Dry-run deliberately omits hostAttestation so the adapter cannot mistake it for a host-signed pass.
+if record['hostMode'] == 'managed':
+    secret_path = os.environ['GATE_SERVICE_ENV']
+    # Match Node createHmac('sha256', utf8String): secret is the utf-8 bytes of private/service.env.
+    with open(secret_path, 'r', encoding='utf-8') as handle:
+        secret = handle.read().encode('utf-8')
+    payload = '\n'.join([
+        f"gate={record['gate']}",
+        f"sha={record['sha']}",
+        f"suite={record['suite']}",
+        f"exitCode={record['exitCode']}",
+        f"logHash={record['logHash']}",
+        f"finishedAt={record['finishedAt']}",
+        f"command={record['command']}",
+    ]).encode('utf-8')
+    record['hostAttestation'] = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 path = os.environ['GATE_RECORD']
 with open(path, 'w', encoding='utf-8') as handle:
     json.dump(record, handle, ensure_ascii=False, indent=2)
@@ -165,5 +208,5 @@ with open(path, 'w', encoding='utf-8') as handle:
 os.chmod(path, 0o600)
 PY
 
-echo "managed-local-test $result for $sha suite=$suite (record: $record)"
+echo "managed-local-test $result for $sha suite=$suite hostMode=$host_mode (record: $record)"
 exit "$rc"

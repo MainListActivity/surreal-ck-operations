@@ -2,8 +2,8 @@
 // the submitted head; the evaluator is pure, so submit / review accept / release approval / deploy / owner gate all judge
 // the same facts the same way. Self-written text or an arbitrary URL never becomes a machine pass fact: only the source
 // adapter can set verified=true.
-import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
@@ -489,7 +489,7 @@ export interface AcceptanceSourceAdapter { verify(input: AcceptanceSourceInput):
  * record must already exist on the host at the path the host script writes.
  */
 export const MANAGED_LOCAL_TEST_GATE = 'managed-local-test';
-export const MANAGED_LOCAL_TEST_SUITES = ['sys04-runtime-diagnostics'] as const;
+export const MANAGED_LOCAL_TEST_SUITES = ['sys04-runtime-diagnostics', 'sys02-local-evidence'] as const;
 export type ManagedLocalTestSuite = (typeof MANAGED_LOCAL_TEST_SUITES)[number];
 
 /**
@@ -506,6 +506,16 @@ export const MANAGED_LOCAL_TEST_AUTHORIZED_TASKS: readonly string[] = [
 
 /** Exact owner wording that authorizes the exception; a paraphrase is not accepted. */
 export const MANAGED_LOCAL_TEST_OWNER_PHRASE = '无法取得就在本地运行单元测试，通过就可以';
+
+/** Fixed owner_reply that authorizes PR-gate CI substitution for the tasks above (code-bound, not free-form). */
+export const MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID = 'wuj9vmp3vg9pqyu33p2v';
+export const MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID = '25ec8d1a-6bbf-4bee-abaf-74998adeb5af';
+
+/**
+ * Suite required when substituting a red GitHub check-run at submit time.
+ * Distinct from sys04-runtime-diagnostics (content-bound SYS04 suite).
+ */
+export const MANAGED_LOCAL_TEST_SUBMIT_SUITE: ManagedLocalTestSuite = 'sys02-local-evidence';
 
 export interface ManagedLocalTestRecord {
   gate: string;
@@ -526,15 +536,84 @@ export interface ManagedLocalTestRecord {
   log: string;
   logHash: string;
   why?: string;
+  /**
+   * `managed` = host could read private/service.env and signed the record.
+   * `dry-run` = engineer/sandbox self-run without host private material — never substitutes CI.
+   */
+  hostMode?: 'managed' | 'dry-run';
+  /** HMAC-SHA256 (hex) over the canonical attestation payload; required when hostMode=managed. */
+  hostAttestation?: string;
 }
 
 export type ManagedLocalTestRecordReader = (input: { sha: string; suite: string }) => Promise<ManagedLocalTestRecord | null>;
 export type OwnerReplyReader = (input: { taskId: string; auditId: string }) => Promise<{ action: string; actor: string; evidence: string; at: string } | null>;
+export type HostAttestationSecretReader = () => string | null;
+
+/** Default service-home resolution (same as the host script). */
+export function managedLocalTestServiceHome(): string {
+  return process.env.SCK_SERVICE_HOME ?? join(process.env.HOME ?? '', 'Library/Application Support/SurrealCKCompany');
+}
+
+/**
+ * Host attestation secret: the bytes of private/service.env (readable only by the service host).
+ * An engineer sandbox that cannot open that file cannot mint a managed attestation.
+ * Returns null when private/service.env is missing or unreadable — never invents a fallback secret.
+ */
+export const defaultHostAttestationSecretReader: HostAttestationSecretReader = () => {
+  const path = join(managedLocalTestServiceHome(), 'private', 'service.env');
+  try {
+    if (!existsSync(path)) return null;
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/** Canonical payload the host HMAC signs; field order is fixed so dry-run and managed agree on the string. */
+export function managedLocalTestAttestationPayload(record: Pick<ManagedLocalTestRecord, 'sha' | 'suite' | 'exitCode' | 'logHash' | 'finishedAt' | 'command'>): string {
+  return [
+    `gate=${MANAGED_LOCAL_TEST_GATE}`,
+    `sha=${record.sha}`,
+    `suite=${record.suite}`,
+    `exitCode=${record.exitCode}`,
+    `logHash=${record.logHash}`,
+    `finishedAt=${record.finishedAt}`,
+    `command=${record.command}`,
+  ].join('\n');
+}
+
+export function signManagedLocalTestAttestation(
+  record: Pick<ManagedLocalTestRecord, 'sha' | 'suite' | 'exitCode' | 'logHash' | 'finishedAt' | 'command'>,
+  secret: string,
+): string {
+  return createHmac('sha256', secret).update(managedLocalTestAttestationPayload(record), 'utf8').digest('hex');
+}
+
+export function verifyManagedLocalTestAttestation(
+  record: ManagedLocalTestRecord,
+  secret: string | null | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (record.hostMode !== 'managed') {
+    return { ok: false, reason: 'gate record hostMode is not managed (engineer dry-run cannot substitute CI)' };
+  }
+  if (typeof record.hostAttestation !== 'string' || !/^[0-9a-f]{64}$/.test(record.hostAttestation)) {
+    return { ok: false, reason: 'gate record is missing a hostAttestation HMAC' };
+  }
+  if (!secret) {
+    return { ok: false, reason: 'host attestation secret (private/service.env) is not readable on this process' };
+  }
+  const expected = signManagedLocalTestAttestation(record, secret);
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(record.hostAttestation, 'utf8');
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    return { ok: false, reason: 'gate record hostAttestation does not match the host secret' };
+  }
+  return { ok: true };
+}
 
 /** Default reader: the host-written gate record under SCK_SERVICE_HOME/gates/managed-local-test/<sha>.json. */
 export const defaultManagedLocalTestReader: ManagedLocalTestRecordReader = async ({ sha }) => {
-  const home = process.env.SCK_SERVICE_HOME ?? join(process.env.HOME ?? '', 'Library/Application Support/SurrealCKCompany');
-  const path = join(home, 'gates', MANAGED_LOCAL_TEST_GATE, `${sha}.json`);
+  const path = join(managedLocalTestServiceHome(), 'gates', MANAGED_LOCAL_TEST_GATE, `${sha}.json`);
   try {
     return JSON.parse(readFileSync(path, 'utf8')) as ManagedLocalTestRecord;
   } catch {
@@ -545,6 +624,7 @@ export const defaultManagedLocalTestReader: ManagedLocalTestRecordReader = async
 /**
  * Verify a host-written managed-local-test record against the submitted sha and an owner_reply authorization.
  * Pure enough for unit tests when `readRecord` and `readOwnerReply` are injected.
+ * When `requireHostAttestation` is true (PR-gate CI substitute), dry-run / unsigned records are refused.
  */
 export async function verifyManagedLocalTest(input: {
   sha: string;
@@ -555,6 +635,9 @@ export async function verifyManagedLocalTest(input: {
   readRecord?: ManagedLocalTestRecordReader;
   readOwnerReply?: OwnerReplyReader;
   readLogHash?: (logPath: string) => string;
+  readHostSecret?: HostAttestationSecretReader;
+  /** When true, hostMode must be managed and hostAttestation must verify (CI substitute path). */
+  requireHostAttestation?: boolean;
 }): Promise<AcceptanceVerifyResult> {
   if (!MANAGED_LOCAL_TEST_SUITES.includes(input.suite as ManagedLocalTestSuite)) {
     return { ok: false, reason: `suite must be one of ${MANAGED_LOCAL_TEST_SUITES.join(', ')}` };
@@ -608,6 +691,18 @@ export async function verifyManagedLocalTest(input: {
   if (typeof record.command !== 'string' || !record.command.includes('bun test')) {
     return { ok: false, reason: 'gate record command is not an allowlisted bun test invocation' };
   }
+
+  // CI substitute / record_acceptance_evidence for this exception always requires a host-signed record.
+  // Engineer dry-run (no private/service.env) stays a local verification artifact only.
+  const needAttestation = input.requireHostAttestation !== false;
+  if (needAttestation) {
+    const secret = (input.readHostSecret ?? defaultHostAttestationSecretReader)();
+    const attested = verifyManagedLocalTestAttestation(record, secret);
+    if (!attested.ok) return attested;
+  } else if (record.hostMode === 'dry-run') {
+    // Explicit opt-out is only for unit tests of the non-attested fields; production callers never pass false.
+  }
+
   return {
     ok: true,
     sha: input.sha,
@@ -625,12 +720,56 @@ export async function verifyManagedLocalTest(input: {
       repoIdentity: record.repoIdentity,
       dirty: false,
       bun: record.bun,
+      hostMode: record.hostMode ?? 'unknown',
+      hostAttestation: record.hostAttestation ?? null,
       ownerReplyAuditId: input.ownerReplyAuditId,
       ownerReplyTaskId: input.ownerReplyTaskId,
       ownerReplyAt: reply.at,
       ownerReplyActor: reply.actor,
     },
   };
+}
+
+/**
+ * Decide whether a soft PR-gate CI failure may be substituted by a host-attested managed-local-test record.
+ * Closed/conflicting PRs never reach here (pr-gate marks them hard). Ordinary tasks are refused.
+ */
+export async function evaluateManagedLocalPrGateSubstitute(input: {
+  taskId: string;
+  head: string;
+  ciFailed: string[];
+  reason: string;
+  prUrl?: string;
+  readOwnerReply?: OwnerReplyReader;
+  readRecord?: ManagedLocalTestRecordReader;
+  readLogHash?: (logPath: string) => string;
+  readHostSecret?: HostAttestationSecretReader;
+}): Promise<
+  | { ok: true; head: string; source: Record<string, unknown> }
+  | { ok: false; reason: string }
+> {
+  if (!MANAGED_LOCAL_TEST_AUTHORIZED_TASKS.includes(input.taskId)) {
+    return { ok: false, reason: input.reason };
+  }
+  if (!input.ciFailed.length || !/^[0-9a-f]{7,40}$/i.test(input.head)) {
+    return { ok: false, reason: input.reason };
+  }
+  const result = await verifyManagedLocalTest({
+    sha: input.head,
+    suite: MANAGED_LOCAL_TEST_SUBMIT_SUITE,
+    ownerReplyAuditId: MANAGED_LOCAL_TEST_OWNER_REPLY_AUDIT_ID,
+    ownerReplyTaskId: MANAGED_LOCAL_TEST_OWNER_REPLY_TASK_ID,
+    requestingTaskId: input.taskId,
+    requireHostAttestation: true,
+    readOwnerReply: input.readOwnerReply,
+    readRecord: input.readRecord,
+    readLogHash: input.readLogHash,
+    readHostSecret: input.readHostSecret,
+  });
+  if (!result.ok) {
+    return { ok: false, reason: `${input.reason}；受管本地替代未通过：${result.reason}` };
+  }
+  return { ok: true, head: input.head, source: result.source };
 }
 
 const RUN_URL = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/actions\/runs\/(\d+)\/?$/;
@@ -903,6 +1042,7 @@ export function createAcceptanceSourceAdapter(options?: {
   readRecord?: ManagedLocalTestRecordReader;
   readOwnerReply?: OwnerReplyReader;
   readLogHash?: (logPath: string) => string;
+  readHostSecret?: HostAttestationSecretReader;
 }): AcceptanceSourceAdapter {
   const github = options?.github ?? createGithubActionsAdapter();
   return {
@@ -921,6 +1061,8 @@ export function createAcceptanceSourceAdapter(options?: {
           ownerReplyTaskId: input.ownerReplyTaskId,
           requestingTaskId: input.requestingTaskId,
           readRecord: options?.readRecord,
+          readHostSecret: options?.readHostSecret,
+          requireHostAttestation: true,
           readOwnerReply: options?.readOwnerReply,
           readLogHash: options?.readLogHash,
         });

@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { createSubmitCheck, extractPrUrls, judgePr, type PrInfo } from '../src/pr-gate.ts';
+import { createSubmitCheck, extractPrUrls, judgePr, judgePrDetailed, type PrInfo } from '../src/pr-gate.ts';
 
-const pr = (over: Partial<PrInfo> = {}): PrInfo => ({ url: 'https://github.com/o/r/pull/7', state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', checks: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
+const pr = (over: Partial<PrInfo> = {}): PrInfo => ({ url: 'https://github.com/o/r/pull/7', state: 'OPEN', mergeable: 'MERGEABLE', headRefName: 'task/abcd1234', headRefOid: 'head-1', checks: [{ name: 'quality', conclusion: 'SUCCESS' }], ...over });
 
 test('PR links are found once each in free text', () => {
   expect(extractPrUrls('见 https://github.com/o/r/pull/7 和 https://github.com/o/r/pull/7，另一个 https://github.com/o/r/pull/9。')).toEqual(['https://github.com/o/r/pull/7', 'https://github.com/o/r/pull/9']);
@@ -13,6 +13,14 @@ test('a conflicting, closed or red PR on the task branch cannot go to review', (
   expect(judgePr(pr({ mergeable: 'CONFLICTING' }), 'task/abcd1234')).toContain('与主干有冲突');
   expect(judgePr(pr({ state: 'CLOSED' }), 'task/abcd1234')).toContain('已关闭且未合并');
   expect(judgePr(pr({ checks: [{ name: 'quality', conclusion: 'FAILURE' }, { name: 'channel', conclusion: 'SUCCESS' }, { name: 'lint', state: 'ERROR' }] }), 'task/abcd1234')).toContain('quality、lint');
+});
+
+test('CI failures are soft; closed/conflicting are hard', () => {
+  expect(judgePrDetailed(pr({ checks: [{ name: 'quality', conclusion: 'FAILURE' }] }), 'task/abcd1234')).toMatchObject({
+    ok: false, hard: false, failedChecks: ['quality'],
+  });
+  expect(judgePrDetailed(pr({ state: 'CLOSED' }), 'task/abcd1234')).toMatchObject({ ok: false, hard: true });
+  expect(judgePrDetailed(pr({ mergeable: 'CONFLICTING' }), 'task/abcd1234')).toMatchObject({ ok: false, hard: true });
 });
 
 test('pending checks, merged PRs and unknown mergeability are not failures', () => {
@@ -31,9 +39,28 @@ const payload = (over: Record<string, unknown> = {}) => JSON.stringify({ state: 
 test('the submit check reads linked PRs through gh and names the first problem', async () => {
   const seen: string[][] = [];
   const check = createSubmitCheck(async args => { seen.push(args); return args[2]!.endsWith('/9') ? payload({ statusCheckRollup: [{ context: 'ci/legacy', state: 'FAILURE' }] }) : payload(); });
-  expect((await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7 以及 https://github.com/o/r/pull/9' }))?.reason).toContain('ci/legacy');
+  const soft = await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7 以及 https://github.com/o/r/pull/9' });
+  expect(soft?.reason).toContain('ci/legacy');
+  expect(soft?.ciFailed).toEqual(['ci/legacy']);
+  expect(soft?.head).toBe('head-1');
   expect(seen.map(a => a[2])).toEqual(['https://github.com/o/r/pull/7', 'https://github.com/o/r/pull/9']);
   expect(await check({ branch: 'task/abcd1234', text: 'PR https://github.com/o/r/pull/7' })).toEqual({ head: 'head-1' });
+});
+
+test('a soft CI failure still names the PR head for managed-local substitute', async () => {
+  const check = createSubmitCheck(async () => payload({ statusCheckRollup: [{ name: 'quality', conclusion: 'FAILURE' }, { name: 'channel', conclusion: 'FAILURE' }] }));
+  await expect(check({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' })).resolves.toMatchObject({
+    head: 'head-1',
+    ciFailed: ['quality', 'channel'],
+    prUrl: 'https://github.com/o/r/pull/7',
+  });
+});
+
+test('a closed PR is a hard refuse without ciFailed', async () => {
+  const check = createSubmitCheck(async () => payload({ state: 'CLOSED', statusCheckRollup: [{ name: 'quality', conclusion: 'FAILURE' }] }));
+  const verdict = await check({ branch: 'task/abcd1234', text: 'https://github.com/o/r/pull/7' });
+  expect(verdict?.reason).toContain('已关闭');
+  expect(verdict?.ciFailed).toBeUndefined();
 });
 
 test('the submit check returns the own PR head and ignores another branch head', async () => {

@@ -18,6 +18,7 @@ import {
   acceptanceLegForSubject, acceptanceTargetAttempt, defaultAcceptanceCriteria, effectiveEnvironment, evaluateAcceptance, humanSignoffs, isLegacyAcceptance,
   isTrustedCodeDeliverable, loadAcceptanceEvidence, mergeAcceptanceCriteria,
   loadAcceptanceGate, recordAcceptanceEvidenceRow, validateAcceptanceCriteria,
+  MANAGED_LOCAL_TEST_AUTHORIZED_TASKS, evaluateManagedLocalPrGateSubstitute,
   type AcceptanceActor, type AcceptanceSourceAdapter, type AcceptanceTaskRow, type HumanSignoff,
 } from './acceptance.ts';
 import type { AcceptanceCriterion, AcceptanceEvidenceInput, AcceptanceEvidenceRecord, AcceptanceGateInput, AcceptanceGateView, AcceptanceLeg, AcceptancePhase, AcceptanceStatusView } from './contracts.ts';
@@ -2511,7 +2512,45 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const row = await this.db.select<TaskRow>(id('task', proof.taskId));
       if (row?.executor_role === 'engineering' && row.kind === 'task') {
         const checked = await this.submitCheck({ branch: row.worktree?.branch, text: evidence.text }).catch(() => undefined);
-        if (checked?.reason) throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+        if (checked?.reason) {
+          // Soft CI failure may be substituted by a host-attested managed-local-test record for owner-authorized
+          // tasks only. Closed / conflicting PRs stay hard refuses. Ordinary tasks never get the exception.
+          const substituteHead = typeof checked.head === 'string' ? checked.head : undefined;
+          const softCi = Array.isArray(checked.ciFailed) && checked.ciFailed.length > 0 && !!substituteHead;
+          if (!softCi || !substituteHead) {
+            throw new CompanyError('invalid', `提交被退回（未进入验收）：${checked.reason}`);
+          }
+          const substitute = await evaluateManagedLocalPrGateSubstitute({
+            taskId: proof.taskId,
+            head: substituteHead,
+            ciFailed: checked.ciFailed!,
+            reason: checked.reason,
+            prUrl: checked.prUrl,
+            readOwnerReply: async ({ taskId, auditId }) => {
+              const [rows] = await this.db.query<[Array<{ action: string; actor: string; evidence: string; at: string }>]>(
+                'SELECT action, type::string(actor) AS actor, evidence, type::string(at) AS at FROM type::thing("audit", $audit) WHERE task = $task LIMIT 1;',
+                { audit: auditId, task: id('task', taskId) });
+              return rows[0] ?? null;
+            },
+          });
+          if (!substitute.ok) {
+            throw new CompanyError('invalid', `提交被退回（未进入验收）：${substitute.reason}`);
+          }
+          await this.db.query(
+            `CREATE audit CONTENT { task: $task, actor: $actor, action: 'pr_gate_managed_local_substitute', evidence: $evidence, at: time::now() };`,
+            {
+              task: id('task', proof.taskId),
+              actor: id('employee', actor.employeeId),
+              evidence: JSON.stringify({
+                prUrl: checked.prUrl ?? null,
+                head: substituteHead,
+                ciFailed: checked.ciFailed,
+                suite: 'sys02-local-evidence',
+                source: substitute.source,
+              }).slice(0, 30000),
+            },
+          );
+        }
         // The PR gate's actual head is authoritative: a declared acceptance head cannot outlive a moved PR head (B2).
         prHead = checked?.head;
       }
