@@ -34,14 +34,17 @@ let samplerCalls = 0;
  * count would rise for a refused call, and this file's "no diagnostic is produced" case would fail.
  */
 let collectorCalls = 0;
+/** The options the sidecar handed the collector on the last authorized sample. */
+let lastCollectorOptions: unknown;
 mock.module('../plugin/server/runtime-diagnostics.ts', () => ({
-  collectPluginRuntimeDiagnostics: () => {
+  collectPluginRuntimeDiagnostics: (options: unknown) => {
     collectorCalls++;
+    lastCollectorOptions = options;
     return {
       context: 'plugin-host' as const,
       collectedAt: new Date().toISOString(),
       process: { pid: 1, nodeVersion: 'v0.0.0', execPath: '/test/node', bunShim: false },
-      loaded: { selfPath: '/test/plugin/server/runtime-diagnostics.ts', serverDir: '/test/plugin/server', vendorDir: '/test/plugin/server/vendor', vendorResolvedBy: 'vendor-child-of-server-dir' as const },
+      loaded: { basis: 'registered-plugin-source' as const, selfPath: '/test/plugin/server/runtime-diagnostics.ts', serverDir: '/test/plugin/server', vendorDir: '/test/plugin/server/vendor', vendorResolvedBy: 'vendor-child-of-server-dir' as const },
       binding: { kind: 'plugin-server-dir' as const, path: '/test' },
       modules: [{ name: 'core', path: '/test/plugin/server/vendor/src/core.ts', sha256: 'a'.repeat(64), bytes: 1 }],
       notRead: [
@@ -88,12 +91,26 @@ const relay = async (envDir: string, key: string, name: string, tool: string, ar
 
 let runDir: string;
 let pool: SidecarPool;
+/** What the host's plugin registry reports for this plugin; the sidecar resolves it only after authorization. */
+let pluginSourceDir: string | null;
+let pluginSourceCalls = 0;
+let pluginSourceThrows = false;
 beforeEach(() => {
   actorRole = 'gm';
   samplerCalls = 0;
   collectorCalls = 0;
+  pluginSourceDir = '/test/registered/plugin';
+  pluginSourceCalls = 0;
+  pluginSourceThrows = false;
   runDir = mkdtempSync(join(tmpdir(), 'sck-rt-diag-sidecar-'));
-  pool = new SidecarPool({ core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20 });
+  pool = new SidecarPool({
+    core: core as never, workforce: workforce as never, ops, runDir, heartbeatMs: 10_000, sweepMs: 20,
+    pluginSource: async () => {
+      pluginSourceCalls++;
+      if (pluginSourceThrows) throw new Error('host registry unavailable');
+      return pluginSourceDir;
+    },
+  });
 });
 afterEach(() => { pool.close(); rmSync(runDir, { recursive: true, force: true }); });
 
@@ -112,6 +129,9 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
     expect(String(data.collectedAt)).toMatch(/Z$/);
     // Loaded paths and a content binding, from this process.
     expect((data.loaded as { serverDir: string | null }).serverDir).toContain('plugin/server');
+    // The directory came from the host's own plugin registry, not from a module global.
+    expect((data.loaded as { basis: string }).basis).toBe('registered-plugin-source');
+    expect(lastCollectorOptions).toEqual({ pluginSourceDir: '/test/registered/plugin' });
     const modules = data.modules as Array<{ name: string; sha256: string | null }>;
     expect(modules.length).toBeGreaterThan(0);
     expect(modules.some(m => m.sha256 !== null)).toBe(true);
@@ -208,9 +228,11 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       expect([role, answer.ok]).toEqual([role, false]);
       expect(String(answer.error)).toContain('forbidden');
       expect(String(answer.error)).toContain('gm, product or qa');
-      // No sample was taken for a refused call: neither core's callback nor the plugin host's collector ran.
+      // No sample was taken for a refused call: neither core's callback nor the plugin host's collector ran,
+      // and the host registry was not queried either.
       expect([role, samplerCalls]).toEqual([role, 0]);
       expect([role, collectorCalls]).toEqual([role, 0]);
+      expect([role, pluginSourceCalls]).toEqual([role, 0]);
     }
   });
 
@@ -229,6 +251,30 @@ describe('plugin_runtime_diagnostics through the employee channel', () => {
       expect([role, samplerCalls - before]).toEqual([role, 1]);
       expect([role, collectorCalls - beforeCollector]).toEqual([role, 1]);
     }
+  });
+
+  test('an unavailable host registry is reported as no directory, not guessed at', async () => {
+    // The host cannot name its plugin source (CLI failure or no row): the sidecar still answers, but it hands
+    // the collector nothing rather than falling back to a module global or another process's path.
+    pluginSourceThrows = true;
+    const i = inst('e-host-fail');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-host-fail'));
+    const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'hf1', 'plugin_runtime_diagnostics', {});
+    expect(answer.ok).toBe(true);
+    expect(pluginSourceCalls).toBe(1);
+    expect(lastCollectorOptions).toEqual({});
+  });
+
+  test('a host registry that reports no path leaves the collector without a directory', async () => {
+    pluginSourceDir = null;
+    const i = inst('e-host-null');
+    const env = pool.env(i);
+    await pool.claim(i, task('task-host-null'));
+    const answer = await relay(env.SCK_COMM_DIR, env.SCK_COMM_KEY!, 'hn1', 'plugin_runtime_diagnostics', {});
+    expect(answer.ok).toBe(true);
+    expect(pluginSourceCalls).toBe(1);
+    expect(lastCollectorOptions).toEqual({});
   });
 
   test('a null argument object is accepted for this read, and the answer still arrives', async () => {

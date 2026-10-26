@@ -6,20 +6,21 @@
 // context looks authoritative and is worthless, which is why this module never reads the MCP face's path,
 // the `active` symlink, or a client-side directory: it reports what this process loaded.
 //
-// The module's own directory is resolved from what the running program actually offers: the Paseo plugin
-// host loads the server entry as ESM, where `__dirname` is undefined, so the location comes from
-// `import.meta.url`. A host that instead runs bundled CJS output offers `__dirname` and no usable
-// `import.meta.url`. Both answers name the directory the loaded code occupies — a bundle collapses inlined
-// modules onto itself, which is still the honest answer about what was loaded. What cannot be proven is
-// reported as unavailable: nothing here is inferred, and nothing is echoed from a sibling context.
+// The Paseo host does not run the plugin module through a module loader at all: it bundles the server entry
+// with esbuild to CJS, wraps that output in `(function(require){…})` and evaluates it with `globalThis.eval`.
+// In that context both `__dirname` and `import.meta.url` are absent (esbuild empties `import.meta` for CJS),
+// so a module's own directory cannot be derived from module globals. The directory therefore comes from the
+// one place the host does publish — its own plugin registry entry (`paseo plugin ls --json`), which the
+// sidecar resolves through the trusted host and passes in. That registered source tree is then content-bound
+// by digest. When the host cannot supply it, the answer is `unavailable`; nothing is inferred, and nothing is
+// echoed from a sibling context.
 //
 // Read-only by construction: it opens no socket, writes nothing, reads no private/ or credential file, and
 // exposes no arbitrary file or command capability.
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, resolve, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve, join } from "node:path";
 import type { PluginRuntimeView } from "./vendor/src/contracts.ts";
 
 /** One file the diagnostic read, with the digest that binds its content. */
@@ -49,34 +50,29 @@ function readModule(name: string, path: string | null): RuntimeModule {
 }
 
 /**
- * The directory this module's code occupies in the running program.
+ * The server directory inside a registered plugin source, or null when that tree has none.
  *
- * ESM is checked first because the Paseo plugin host loads the server entry as ESM (there `__dirname` is
- * undefined). A CJS build has no usable `import.meta.url` and falls back to `__dirname`. `typeof` on an
- * undeclared identifier is safe in ESM, so neither branch can throw; a context that offers neither reports
- * unavailable rather than guessing.
+ * The host registers the plugin package directory (`<release>/plugin`); the server code lives in its
+ * `server` child. A path that does not carry one is not a plugin source this diagnostic can bind, so it is
+ * reported as unresolved instead of being guessed at.
  */
-export function moduleDirOfThisFile(): string | null {
-  const meta = import.meta as { url?: string } | undefined;
-  const metaUrl = typeof meta?.url === "string" ? meta.url : undefined;
-  if (metaUrl) {
-    try {
-      return dirname(fileURLToPath(metaUrl));
-    } catch {
-      // fall through to the CJS global
-    }
+export function serverDirOfPluginSource(pluginSourceDir: string | null): string | null {
+  if (!pluginSourceDir) return null;
+  const candidate = join(resolve(pluginSourceDir), "server");
+  try {
+    if (existsSync(candidate) && statSync(candidate).isDirectory()) return candidate;
+  } catch {
+    // fall through to unresolved
   }
-  if (typeof __dirname === "string" && __dirname.length > 0) return resolve(__dirname);
   return null;
 }
 
 /**
- * The path this diagnostic's own code occupies inside the running program.
+ * The path this diagnostic's source occupies in the registered plugin tree.
  *
- * In an esbuild CJS bundle every inlined module collapses onto the bundle, so this is the bundle's own
- * location rather than a per-module one — which is still the honest answer about what was loaded. The
- * extension follows whichever file is actually present: a release snapshot ships `.ts`, a bundle leaves
- * `.cjs`. When neither is there the answer is null rather than a guess.
+ * A release snapshot ships `.ts`; a tree prepared by a bundler may leave `.cjs`. Whichever file is present is
+ * reported, so a real tree never reads as a permanent gap. When neither is there the answer is null rather
+ * than a guess.
  */
 function selfPath(serverDir: string | null): string | null {
   if (!serverDir) return null;
@@ -161,16 +157,22 @@ function bindModules(vendorDir: string | null, serverDir: string | null): Runtim
 /**
  * Sample what this plugin process is actually running.
  *
- * `clock` is injectable so a test can pin the timestamp without touching the real process. Everything else is
- * read from the live program.
+ * `clock` is injectable so a test can pin the timestamp. The directories are supplied rather than derived
+ * from module globals: the Paseo host evaluates a CJS bundle, where neither `__dirname` nor `import.meta.url`
+ * exists, so the sidecar resolves the host's registered plugin source and passes it in. `moduleDir` remains
+ * for tests and for a host that already resolved the server directory.
  */
 export function collectPluginRuntimeDiagnostics(options: {
   clock?: () => Date;
   moduleDir?: string;
+  pluginSourceDir?: string;
 } = {}): PluginRuntimeDiagnostics {
   const clock = options.clock ?? (() => new Date());
-  // A test may name the directory this module would occupy; otherwise the module's own location is used.
-  const serverDir = options.moduleDir ?? moduleDirOfThisFile();
+  const explicitServerDir = options.moduleDir ? resolve(options.moduleDir) : null;
+  const registeredServerDir = serverDirOfPluginSource(options.pluginSourceDir ?? null);
+  const serverDir = explicitServerDir ?? registeredServerDir;
+  const basis: PluginRuntimeDiagnostics["loaded"]["basis"] =
+    explicitServerDir ? "module-dir" : registeredServerDir ? "registered-plugin-source" : "unavailable";
   const { vendorDir, by } = resolveVendorDir(serverDir);
   return {
     context: "plugin-host",
@@ -182,6 +184,7 @@ export function collectPluginRuntimeDiagnostics(options: {
       bunShim: typeof (globalThis as { Bun?: unknown }).Bun !== "undefined",
     },
     loaded: {
+      basis,
       selfPath: selfPath(serverDir),
       serverDir,
       vendorDir,
@@ -195,6 +198,7 @@ export function collectPluginRuntimeDiagnostics(options: {
       "active symlink (names a target, not a loaded module)",
       "MCP face tree (release/src, a different execution context)",
       "process environment values",
+      "in-memory bundle (the host evaluates generated CJS; only the registered source tree is read)",
     ],
   };
 }
