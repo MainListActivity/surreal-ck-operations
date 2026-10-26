@@ -173,9 +173,9 @@ describe('host-release envelope', () => {
       previousActive: '/x', expectedActive: '/x', snapshotHash: 'd'.repeat(64), rollbackSha: sha(12),
       // missing executor
       startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
-      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
+      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false, modules: null },
       channelRecovery: 'unknown', lockReleased: true,
     }));
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/executor/);
@@ -203,9 +203,9 @@ describe('host-release envelope', () => {
       executor: { host: 'testhost', uid: 501, user: 'y' },
       startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
       checks: [{ name: 'content-bind', ok: true }],
-      binding: { releasePath: '/svc/releases/' + sha(13), contentMatchesCommit: true, vendorSchemaDiff: 'none' },
-      mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(13), pid: 1 },
-      plugin: { status: 'running', enabled: true, source: '/svc/releases/' + sha(13) + '/plugin', directory: '/svc/releases/' + sha(13) + '/plugin', sourceKnown: true },
+      binding: { releasePath: '/svc/releases/' + sha(13), contentMatchesCommit: true, vendorSchemaDiff: 'none', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(13), pid: 1, sha: 'f'.repeat(64) },
+      plugin: { status: 'running', enabled: true, source: '/svc/releases/' + sha(13) + '/plugin', directory: '/svc/releases/' + sha(13) + '/plugin', sourceKnown: true, modules: [{ path: 'index.server.ts', sha256: 'b'.repeat(64), bytes: 3 }] },
       channelRecovery: 'adopt-expected', lockReleased: true,
     };
     const receipt: HostReleaseReceipt = {
@@ -240,9 +240,9 @@ describe('host-release envelope', () => {
       executor: { host: 'forged-host', uid: 1, user: 'forger' },
       hostTag: 'a'.repeat(64),
       startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
-      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
+      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false, modules: null },
       channelRecovery: 'unknown', lockReleased: true,
     }));
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/taskId|targetSha|snapshotHash/);
@@ -271,9 +271,9 @@ describe('host-release envelope', () => {
       // missing / fake tag
       hostTag: 'c'.repeat(64),
       startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, installerExitCode: 0, state: 'succeeded',
-      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false },
+      checks: [], binding: { releasePath: null, contentMatchesCommit: true, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: null, enabled: null, source: null, directory: null, sourceKnown: false, modules: null },
       channelRecovery: 'unknown', lockReleased: true,
     }));
     expect(() => readHostReleaseReceipt(serviceHome, opId)).toThrow(/hostTag/);
@@ -292,9 +292,9 @@ describe('host-release envelope', () => {
       snapshotHash: 'd'.repeat(64), rollbackSha: sha(51),
       executor: { host: 'h', uid: 1, user: 'u' },
       startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
-      checks: [], binding: { releasePath: null, contentMatchesCommit: false, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      checks: [], binding: { releasePath: null, contentMatchesCommit: false, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true, modules: [{ path: 'index.server.ts', sha256: 'a'.repeat(64), bytes: 3 }] },
       channelRecovery: 'unknown', lockReleased: false,
       rollback: { attempted: false, to: null, ok: false },
     };
@@ -467,9 +467,9 @@ describe('host-release apply.sh syntax + first-mint', () => {
       snapshotHash: 'e'.repeat(64), rollbackSha: sha(61),
       executor: { host: 'h', uid: 1, user: 'u' },
       startedAt, finishedAt, exitCode: 0, installerExitCode: 0, state: 'succeeded',
-      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true, modules: [{ path: 'index.server.ts', sha256: 'a'.repeat(64), bytes: 3 }] },
       channelRecovery: 'adopt-expected', lockReleased: false,
       rollback: { attempted: false, to: null, ok: false },
     };
@@ -503,9 +503,9 @@ describe('host-release apply.sh syntax + first-mint', () => {
       executor: { host: 'h', uid: 1, user: 'u' },
       startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
       exitCode: 1, installerExitCode: 0, state: 'rolled_back',
-      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable' },
-      mcp: { health: 200, ready: 200, cwd: null, pid: null },
-      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true },
+      checks: [], binding: { releasePath: '/r', contentMatchesCommit: true, vendorSchemaDiff: 'unavailable', schemaHash: null, vendorSchemaHash: null },
+      mcp: { health: 200, ready: 200, cwd: null, pid: null, sha: null },
+      plugin: { status: 'running', enabled: true, source: '/p', directory: '/p', sourceKnown: true, modules: [{ path: 'index.server.ts', sha256: 'a'.repeat(64), bytes: 3 }] },
       channelRecovery: 'unknown', lockReleased: true,
       rollback: { attempted: true, to: '/r2', ok: true },
     };
@@ -545,5 +545,128 @@ describe('host-release verifyRefuseOrder', () => {
     });
     expect(result.ok).toBe(false);
     expect(result.checks.some(check => check.name === 'targetSha' && !check.ok)).toBe(true);
+  });
+});
+
+describe('AC04 receipt evidence: hashes, mcp runtime, plugin modules', () => {
+  const receiptBody = (over: Partial<Omit<HostReleaseReceipt, 'hostTag'>> = {}): Omit<HostReleaseReceipt, 'hostTag'> => ({
+    schema: 'host-release-receipt/1',
+    opId: 'a'.repeat(32), taskId: 't', targetSha: sha(80), previousActive: '/a', expectedActive: '/a',
+    snapshotHash: 'c'.repeat(64), rollbackSha: sha(81),
+    executor: { host: 'h', uid: 1, user: 'u' },
+    startedAt: '2026-10-26T00:00:00Z', finishedAt: '2026-10-26T00:01:00Z',
+    exitCode: 0, installerExitCode: 0, state: 'succeeded',
+    checks: [{ name: 'install', ok: true }, { name: 'mcp-health', ok: true }],
+    binding: {
+      releasePath: '/svc/releases/' + sha(80), contentMatchesCommit: true, vendorSchemaDiff: 'none',
+      schemaHash: '1'.repeat(64), vendorSchemaHash: '1'.repeat(64),
+    },
+    mcp: { health: 200, ready: 200, cwd: '/svc/releases/' + sha(80), pid: 4321, sha: '2'.repeat(64) },
+    plugin: {
+      status: 'running', enabled: true, source: '/svc/releases/' + sha(80) + '/plugin',
+      directory: '/svc/releases/' + sha(80) + '/plugin', sourceKnown: true,
+      modules: [{ path: 'index.server.ts', sha256: '3'.repeat(64), bytes: 300 }],
+    },
+    channelRecovery: 'adopt-expected', lockReleased: true,
+    rollback: { attempted: false, to: null, ok: false },
+    ...over,
+  });
+
+  test('the new AC04 fields are signed: mint then tamper each one fails verification', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-ac04-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    ensureHostHmacKey(serviceHome);
+    const body = receiptBody();
+    const tag = mintHostTag(serviceHome, body);
+    expect(verifyHostTag(serviceHome, { ...body, hostTag: tag })).toBe(true);
+
+    const tampers: Array<[string, Omit<HostReleaseReceipt, 'hostTag'>]> = [
+      ['schemaHash', { ...body, binding: { ...body.binding, schemaHash: '9'.repeat(64) } }],
+      ['vendorSchemaHash', { ...body, binding: { ...body.binding, vendorSchemaHash: '9'.repeat(64) } }],
+      ['vendorSchemaDiff', { ...body, binding: { ...body.binding, vendorSchemaDiff: 'differ' } }],
+      ['mcp.sha', { ...body, mcp: { ...body.mcp, sha: '9'.repeat(64) } }],
+      ['mcp.cwd', { ...body, mcp: { ...body.mcp, cwd: '/elsewhere' } }],
+      ['mcp.pid', { ...body, mcp: { ...body.mcp, pid: 1 } }],
+      ['plugin.modules[0].sha256', { ...body, plugin: { ...body.plugin, modules: [{ path: 'index.server.ts', sha256: '9'.repeat(64), bytes: 300 }] } }],
+      ['plugin.modules removed', { ...body, plugin: { ...body.plugin, modules: null } }],
+      ['checks', { ...body, checks: [{ name: 'install', ok: false }] }],
+    ];
+    for (const [label, tampered] of tampers) {
+      expect({ label, ok: verifyHostTag(serviceHome, { ...tampered, hostTag: tag }) }).toEqual({ label, ok: false });
+    }
+  });
+
+  test('apply.sh run against stub host tools mints a receipt the reader accepts, with real samples', () => {
+    const root = mkdtempSync(join(tmpdir(), 'sck-hr-apply-'));
+    clean.push(root);
+    const serviceHome = join(root, 'svc');
+    const releaseSha = sha(90);
+    const previousSha = sha(91);
+    const opId = 'f'.repeat(32);
+    const envelope = join(serviceHome, 'maintenance', 'host-release', opId);
+    mkdirSync(envelope, { recursive: true });
+    // Apply's barrier is fail-closed: the host must publish both authoritative mirrors first.
+    writeFileSync(join(serviceHome, 'maintenance', 'dispatch-paused.json'), '{"paused":false}\n');
+    writeFileSync(join(serviceHome, 'maintenance', 'qa-observation-active.json'), '{"active":false}\n');
+    // Previous active release (the rollback target) so expectedActive CAS resolves.
+    mkdirSync(join(serviceHome, 'releases', previousSha), { recursive: true });
+    symlinkSync(join(serviceHome, 'releases', previousSha), join(serviceHome, 'active'));
+    ensureHostHmacKey(serviceHome);
+
+    // Snapshot whose inventory digest becomes envelope.snapshotHash.
+    const snapshot = join(root, 'snapshot');
+    mkdirSync(join(snapshot, 'scripts'), { recursive: true });
+    mkdirSync(join(snapshot, 'schema'), { recursive: true });
+    mkdirSync(join(snapshot, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
+    mkdirSync(join(snapshot, 'plugin', 'shared'), { recursive: true });
+    writeFileSync(join(snapshot, 'schema', '001-control.surql'), 'DEFINE TABLE x;\n');
+    writeFileSync(join(snapshot, 'plugin', 'server', 'vendor', 'schema', '001-control.surql'), 'DEFINE TABLE x;\n');
+    writeFileSync(join(snapshot, 'plugin', 'shared', 'types.ts'), 'export type T = 1;\n');
+    // Stub installer: only switches active, like the fixture harness the earlier reviews used.
+    writeFileSync(join(snapshot, 'scripts', 'company-service.sh'),
+      '#!/bin/sh\ncase "$1" in install) ln -sfn "$2" "${SCK_SERVICE_HOME}/active"; exit 0;; esac\nexit 0\n');
+    const snapshotHash = snapshotInventoryHash(snapshot);
+
+    writeFileSync(join(envelope, 'operation.json'), JSON.stringify({
+      opId, taskId: 'task-ac04', targetSha: releaseSha, expectedActive: join(serviceHome, 'releases', previousSha),
+      snapshotHash, rollbackSha: previousSha, idempotencyKey: 'k', state: 'prepared',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }, null, 2));
+
+    // Stub host tools on PATH: curl reports 200; paseo reports the plugin bound to the target release.
+    const bin = join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'curl'), '#!/bin/sh\necho 200\n');
+    writeFileSync(join(bin, 'paseo'),
+      `#!/bin/sh\nif [ "$1" = plugin ]; then\n  printf '[{"installation":{"identity":{"path":"%s"}},"path":"%s","status":"running","enabled":true}]\\n' "${join(serviceHome, 'releases', releaseSha, 'plugin')}" "${join(serviceHome, 'releases', releaseSha, 'plugin')}"\n  exit 0\nfi\nexit 0\n`);
+    chmodSync(join(bin, 'curl'), 0o755);
+    chmodSync(join(bin, 'paseo'), 0o755);
+
+    const script = join(import.meta.dir, '..', 'scripts', 'host-release', 'apply.sh');
+    const result = spawnSync('/bin/sh', [script,
+      '--service-home', serviceHome, '--ops-repo', root, '--op-id', opId,
+      '--snapshot', snapshot, '--paseo', join(bin, 'paseo'),
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SCK_SERVICE_HOME: serviceHome, SCK_MCP_PORT: '1' },
+    });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+
+    const receipt = readHostReleaseReceipt(serviceHome, opId);
+    expect(receipt.state).toBe('succeeded');
+    expect(receipt.exitCode).toBe(0);
+    // Real samples, not placeholders:
+    expect(receipt.binding.schemaHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(receipt.binding.vendorSchemaHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(receipt.binding.vendorSchemaDiff).toBe('none');
+    expect(receipt.plugin.sourceKnown).toBe(true);
+    expect(receipt.plugin.modules?.some(module => module.path === 'shared/types.ts')).toBe(true);
+    expect(receipt.checks.length).toBeGreaterThan(0);
+    expect(receipt.checks.every(check => typeof check.name === 'string' && typeof check.ok === 'boolean')).toBe(true);
+    // MCP pid/cwd come from a real lsof probe: with no listener in this fixture they stay null, never invented.
+    expect(receipt.mcp.pid).toBeNull();
+    expect(receipt.mcp.sha).toBeNull();
   });
 });

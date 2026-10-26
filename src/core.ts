@@ -3008,11 +3008,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           releasePath: receipt.binding.releasePath,
           contentMatchesCommit: receipt.binding.contentMatchesCommit,
           vendorSchemaDiff: receipt.binding.vendorSchemaDiff,
+          schemaHash: receipt.binding.schemaHash,
+          vendorSchemaHash: receipt.binding.vendorSchemaHash,
         },
         mcp: receipt.mcp,
         plugin: receipt.plugin,
         channelRecovery: receipt.channelRecovery,
         lockReleased: receipt.lockReleased,
+        checks: receipt.checks,
         ...(receipt.reason ? { reason: receipt.reason } : {}),
       };
     } catch (error) {

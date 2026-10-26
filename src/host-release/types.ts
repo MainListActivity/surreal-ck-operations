@@ -138,14 +138,20 @@ export interface HostReleaseReceipt {
     releasePath: string | null;
     contentMatchesCommit: boolean;
     vendorSchemaDiff: 'none' | 'differ' | 'unavailable';
+    /** Inventory digest of the release's own schema directory (null when absent). */
+    schemaHash: string | null;
+    /** Inventory digest of the schema copy the plugin actually ships under plugin/server/vendor. */
+    vendorSchemaHash: string | null;
     vendorSchemaDetail?: string;
   };
-  /** MCP face: cwd of the process listening on the service port, when observable. */
+  /** MCP face: the process actually listening on the service port, and the code it runs. */
   mcp: {
     health: number | null;
     ready: number | null;
     cwd: string | null;
     pid: number | null;
+    /** Inventory digest of `cwd` when it is a release dir; null otherwise. */
+    sha: string | null;
   };
   /** Plugin face: SOURCE/DIRECTORY from paseo, or explicit unknown. */
   plugin: {
@@ -154,9 +160,13 @@ export interface HostReleaseReceipt {
     source: string | null;
     directory: string | null;
     sourceKnown: boolean;
+    /**
+     * AC04: sha256 of the files the plugin loads from the bound SOURCE (manifest + sources,
+     * node_modules excluded). Signed, so a tampered list fails verification. null when SOURCE
+     * is unknown — the receipt then says so rather than inventing a binding.
+     */
+    modules: Array<{ path: string; sha256: string; bytes: number }> | null;
   };
-  /** Optional plugin-host module sample (paths + sha256), when collectable. */
-  pluginModules?: Array<{ name: string; path: string | null; sha256: string | null; bytes: number | null }>;
   /** Live channel recovery note after plugin repoint. */
   channelRecovery: 'adopt-expected' | 'unchanged' | 'unknown';
   /** Rollback outcome when apply failed mid-way. */

@@ -1477,11 +1477,13 @@ export interface HostReleaseReceiptView {
   finishedAt: string;
   exitCode: number;
   installerExitCode: number;
-  binding: { releasePath: string | null; contentMatchesCommit: boolean; vendorSchemaDiff: string };
-  mcp: { health: number | null; ready: number | null; cwd: string | null; pid: number | null };
-  plugin: { status: string | null; enabled: boolean | null; source: string | null; directory: string | null; sourceKnown: boolean };
+  binding: { releasePath: string | null; contentMatchesCommit: boolean; vendorSchemaDiff: string; schemaHash: string | null; vendorSchemaHash: string | null };
+  mcp: { health: number | null; ready: number | null; cwd: string | null; pid: number | null; sha: string | null };
+  plugin: { status: string | null; enabled: boolean | null; source: string | null; directory: string | null; sourceKnown: boolean; modules: Array<{ path: string; sha256: string; bytes: number }> | null };
   channelRecovery: string;
   lockReleased: boolean;
+  /** Structured post-check results (install / active / mcp health+ready / plugin source / rollback). */
+  checks: Array<{ name: string; ok: boolean; detail?: string }>;
   reason?: string;
 }
 

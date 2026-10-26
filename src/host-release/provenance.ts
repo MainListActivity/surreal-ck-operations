@@ -51,6 +51,8 @@ export function receiptTagPayload(receipt: Omit<HostReleaseReceipt, 'hostTag'>):
       releasePath: receipt.binding.releasePath,
       contentMatchesCommit: receipt.binding.contentMatchesCommit,
       vendorSchemaDiff: receipt.binding.vendorSchemaDiff,
+      schemaHash: receipt.binding.schemaHash,
+      vendorSchemaHash: receipt.binding.vendorSchemaHash,
       ...(receipt.binding.vendorSchemaDetail !== undefined
         ? { vendorSchemaDetail: receipt.binding.vendorSchemaDetail }
         : {}),
@@ -60,6 +62,7 @@ export function receiptTagPayload(receipt: Omit<HostReleaseReceipt, 'hostTag'>):
       ready: receipt.mcp.ready,
       cwd: receipt.mcp.cwd,
       pid: receipt.mcp.pid,
+      sha: receipt.mcp.sha,
     },
     plugin: {
       status: receipt.plugin.status,
@@ -67,6 +70,10 @@ export function receiptTagPayload(receipt: Omit<HostReleaseReceipt, 'hostTag'>):
       source: receipt.plugin.source,
       directory: receipt.plugin.directory,
       sourceKnown: receipt.plugin.sourceKnown,
+      // AC04: the modules the plugin actually loads are signed, so a tampered module list fails verify.
+      modules: receipt.plugin.modules
+        ? receipt.plugin.modules.map(module => ({ path: module.path, sha256: module.sha256, bytes: module.bytes }))
+        : null,
     },
     channelRecovery: receipt.channelRecovery,
     ...(receipt.rollback

@@ -195,10 +195,11 @@ active_now=$(readlink "$service_home/active" 2>/dev/null || true)
   exit 1
 }
 
-# --- copy snapshot into releases/ (idempotent only when inventory matches envelope) ---
-# Reuse must re-bind envelope.snapshotHash: installer content-bind ≠ inventory hash (F1′).
-if [ -d "$release_dir" ]; then
-  existing_hash=$(TARGET="$release_dir" /usr/bin/python3 - <<'PY'
+# --- shared inventory digest (one implementation for reuse, source and receipt binding) ---
+# Same algorithm as src/host-release/store.ts snapshotInventoryHash: sorted rel paths + sha256 of each
+# file, skipping generated/heavy trees. Prints the digest to stdout.
+inventory_hash() {
+  TARGET="$1" /usr/bin/python3 - <<'PY'
 import hashlib, os
 root = os.environ["TARGET"]
 skip_prefixes = ("node_modules/", "plugin/server/vendor/", ".runtime/", ".git/", "vault/build/")
@@ -225,13 +226,25 @@ for rel in files:
     lines.append(f"{rel}\0{digest}\n")
 print(hashlib.sha256("".join(lines).encode()).hexdigest())
 PY
-)
+}
+
+# --- copy snapshot into releases/ (idempotent only when inventory matches envelope) ---
+# Reuse must re-bind envelope.snapshotHash: installer content-bind ≠ inventory hash (F1′).
+if [ -d "$release_dir" ]; then
+  existing_hash=$(inventory_hash "$release_dir")
   [ "$existing_hash" = "$snapshotHash" ] || {
     echo "refused: existing $release_dir inventory $existing_hash != envelope snapshotHash $snapshotHash" >&2
     exit 1
   }
   echo "release dir exists: $release_dir (reusing; inventory matches envelope.snapshotHash)"
 else
+  # A fresh copy must also bind the source snapshot to the envelope hash: the installer's
+  # release_matches_commit only proves commit-level content, not that this is the prepared tree.
+  source_hash=$(inventory_hash "$snapshot")
+  [ "$source_hash" = "$snapshotHash" ] || {
+    echo "refused: snapshot $snapshot inventory $source_hash != envelope snapshotHash $snapshotHash" >&2
+    exit 1
+  }
   mkdir -p "$release_dir"
   cp -R "$snapshot/." "$release_dir/"
 fi
@@ -330,10 +343,108 @@ elif [ "$install_rc" -eq 0 ]; then
 fi
 
 # channelRecovery: only claim adopt-expected when plugin SOURCE actually points at this release.
+# This is an EXPECTATION derived from the plugin binding, not an observed live-channel probe; a real
+# lease/channel observation is still out of reach for this script (documented as unresolved).
 channel_recovery=unknown
 if [ "$final_state" = succeeded ] && [ "$plugin_ok" = true ]; then
   channel_recovery=adopt-expected
 fi
+
+# --- AC04 evidence sampling (post-install, before mint): real values, never constant placeholders ---
+# MCP runtime: the process actually listening on the service port, its cwd, and — when that cwd is a
+# release dir — the inventory digest of the code it is running.
+mcp_pid=""
+mcp_cwd=""
+mcp_sha=""
+if [ -x /usr/sbin/lsof ]; then
+  set +e
+  listening_pid=$(/usr/sbin/lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+  set -e
+  if [ -n "$listening_pid" ]; then
+    mcp_pid=$listening_pid
+    set +e
+    cwd_out=$(/usr/sbin/lsof -a -p "$mcp_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    set -e
+    if [ -n "$cwd_out" ]; then
+      mcp_cwd=$cwd_out
+      case "$mcp_cwd" in
+        "$service_home"/releases/*) mcp_sha=$(inventory_hash "$mcp_cwd") ;;
+      esac
+    fi
+  fi
+fi
+
+# vendor/schema binding: digest the release schema and the vendored schema copy the plugin actually ships.
+schema_hash=""
+vendor_schema_hash=""
+vendor_schema_diff=unavailable
+if [ -d "$release_dir/schema" ]; then
+  schema_hash=$(inventory_hash "$release_dir/schema")
+fi
+if [ -d "$release_dir/plugin/server/vendor/schema" ]; then
+  vendor_schema_hash=$(inventory_hash "$release_dir/plugin/server/vendor/schema")
+fi
+if [ -n "$schema_hash" ] && [ -n "$vendor_schema_hash" ]; then
+  if [ "$schema_hash" = "$vendor_schema_hash" ]; then
+    vendor_schema_diff=none
+  else
+    vendor_schema_diff=differ
+  fi
+fi
+
+# Plugin modules: sha256 of the files the plugin loads from the bound SOURCE (manifest + server/shared
+# sources, excluding node_modules). Empty when SOURCE is unknown — the receipt then says so honestly.
+plugin_modules_json=""
+if [ "$plugin_source_known" = true ] && [ -d "$plugin_source" ]; then
+  set +e
+  plugin_modules_json=$(PLUGIN_DIR="$plugin_source" /usr/bin/python3 - <<'PY'
+import hashlib, json, os
+root = os.environ["PLUGIN_DIR"]
+exts = (".ts", ".tsx", ".js", ".mjs", ".cjs", ".json")
+modules = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
+    for name in filenames:
+        if not name.endswith(exts):
+            continue
+        path = os.path.join(dirpath, name)
+        rel = os.path.relpath(path, root)
+        try:
+            data = open(path, "rb").read()
+        except OSError:
+            continue
+        modules.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
+modules.sort(key=lambda m: m["path"])
+print(json.dumps(modules[:400], separators=(",", ":")))
+PY
+)
+  set -e
+fi
+
+# Structured post-check results: readers should not have to parse the aggregate reason string.
+CHECKS="$(
+  INSTALL_RC="$install_rc" ACTIVE_OK="$([ "$active_after" = "$release_dir" ] && echo true || echo false)" \
+  HEALTH="$health_code" READY="$ready_code" PLUGIN_OK="$plugin_ok" \
+  ROLLBACK_OK="$rollback_ok" ROLLBACK_ATTEMPTED="$rollback_attempted" \
+  SNAPSHOT_BOUND="$([ "$final_state" = succeeded ] || [ "$rollback_ok" = true ] && echo true || echo false)" \
+  /usr/bin/python3 -c '
+import json, os
+def ok(v): return v == "true"
+checks = [
+  {"name": "install", "ok": os.environ["INSTALL_RC"] == "0",
+   "detail": None if os.environ["INSTALL_RC"] == "0" else "install exit %s" % os.environ["INSTALL_RC"]},
+  {"name": "active", "ok": ok(os.environ["ACTIVE_OK"])},
+  {"name": "mcp-health", "ok": os.environ["HEALTH"] == "200",
+   "detail": None if os.environ["HEALTH"] == "200" else "health=%s" % os.environ["HEALTH"]},
+  {"name": "mcp-ready", "ok": os.environ["READY"] == "200",
+   "detail": None if os.environ["READY"] == "200" else "ready=%s" % os.environ["READY"]},
+  {"name": "plugin-source", "ok": ok(os.environ["PLUGIN_OK"])},
+]
+if ok(os.environ["ROLLBACK_ATTEMPTED"]):
+  checks.append({"name": "rollback", "ok": ok(os.environ["ROLLBACK_OK"])})
+print(json.dumps([{k: v for k, v in c.items() if v is not None} for c in checks], separators=(",", ":")))
+'
+)"
 
 # lockReleased: observed — true only after we successfully unlink our lock file below.
 lock_released=false
@@ -356,6 +467,9 @@ HEALTH="$health_code" READY="$ready_code" PLUGIN_STATUS="$plugin_status" PLUGIN_
 PLUGIN_SOURCE="$plugin_source" PLUGIN_DIRECTORY="$plugin_directory" PLUGIN_KNOWN="$plugin_source_known" \
 RB_ATTEMPTED="$rollback_attempted" RB_OK="$rollback_ok" RB_TO="$rollback_to" \
 CONTENT_MATCHES="$content_matches" CHANNEL_RECOVERY="$channel_recovery" LOCK_RELEASED="$lock_released" \
+MCP_PID="$mcp_pid" MCP_CWD="$mcp_cwd" MCP_SHA="$mcp_sha" \
+SCHEMA_HASH="$schema_hash" VENDOR_SCHEMA_HASH="$vendor_schema_hash" VENDOR_SCHEMA_DIFF="$vendor_schema_diff" \
+PLUGIN_MODULES="$plugin_modules_json" CHECKS_JSON="$CHECKS" \
 HMAC_KEY="$hmac_key" RECEIPT="$receipt" /usr/bin/python3 - <<'PY'
 import hashlib, hmac, json, os
 state = os.environ["STATE"]
@@ -378,17 +492,20 @@ receipt = {
   "exitCode": int(os.environ["APPLY_EXIT"]),
   "installerExitCode": int(os.environ["EXIT_CODE"]),
   "state": state,
-  "checks": [],
+  "checks": json.loads(os.environ["CHECKS_JSON"] or "[]"),
   "binding": {
     "releasePath": os.environ["RELEASE_DIR"] if state in ("succeeded", "rolled_back", "failed") else None,
     "contentMatchesCommit": content_matches,
-    "vendorSchemaDiff": "unavailable",
+    "vendorSchemaDiff": os.environ["VENDOR_SCHEMA_DIFF"],
+    "schemaHash": os.environ["SCHEMA_HASH"] or None,
+    "vendorSchemaHash": os.environ["VENDOR_SCHEMA_HASH"] or None,
   },
   "mcp": {
     "health": int(os.environ["HEALTH"]) if os.environ["HEALTH"].isdigit() else None,
     "ready": int(os.environ["READY"]) if os.environ["READY"].isdigit() else None,
-    "cwd": None,
-    "pid": None,
+    "cwd": os.environ["MCP_CWD"] or None,
+    "pid": int(os.environ["MCP_PID"]) if os.environ["MCP_PID"].isdigit() else None,
+    "sha": os.environ["MCP_SHA"] or None,
   },
   "plugin": {
     "status": os.environ["PLUGIN_STATUS"] if os.environ["PLUGIN_STATUS"] != "unknown" else None,
@@ -397,6 +514,7 @@ receipt = {
     "source": os.environ["PLUGIN_SOURCE"] if os.environ["PLUGIN_SOURCE"] not in ("", "unknown") else None,
     "directory": os.environ["PLUGIN_DIRECTORY"] if os.environ["PLUGIN_DIRECTORY"] not in ("", "unknown") else None,
     "sourceKnown": os.environ["PLUGIN_KNOWN"] == "true",
+    "modules": json.loads(os.environ["PLUGIN_MODULES"]) if os.environ["PLUGIN_MODULES"] else None,
   },
   "channelRecovery": os.environ["CHANNEL_RECOVERY"],
   "rollback": {

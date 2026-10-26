@@ -77,6 +77,12 @@ sh scripts/host-release/apply.sh \
 - receipt 必须带 `hostTag`：HMAC-SHA256，密钥 `$SCK_SERVICE_HOME/private/host-release.hmac`（0600）。
 - 员工沙箱 deny 读 `private/`、deny 写 `maintenance/host-release/`（`employee.sb`）。
 - reader 校验：operation 五字段绑定 **且** `hostTag` 通过；照抄 operation + 自填 executor **不能**通过。
+- 回执证据字段（全部纳入三处 canonical payload：mint / 释锁后重签 / `receiptTagPayload`）：
+  - `binding.schemaHash` / `binding.vendorSchemaHash` / `binding.vendorSchemaDiff`：install 后分别对 `releases/<sha>/schema` 与 `plugin/server/vendor/schema` 算目录清单摘要；两者都在时才判 `none`/`differ`，否则 `unavailable` + `null`。
+  - `mcp.{pid,cwd,sha}`：用 `lsof` 取**实际监听服务端口**的进程与其 cwd；cwd 落在 `releases/` 时再算该目录清单摘要。没有监听者时如实为 `null`（不臆造）。
+  - `plugin.modules`：对 paseo 报告的 SOURCE 目录内实际加载的清单与源码文件算 sha256（排除 `node_modules`）；SOURCE 未知时为 `null`。
+  - `checks`：install / active / mcp-health / mcp-ready / plugin-source /（发生回滚时）rollback 的结构化结果。
+- `channelRecovery` 仍是**推断值**（`succeeded && plugin_ok → adopt-expected`），不是观测到的活通道恢复。
 
 ## 明确未解决
 
@@ -84,3 +90,5 @@ sh scripts/host-release/apply.sh \
 - 回滚候选 `05ac7593…` 的兼容守卫**本链未重验**；apply 前宿主须用当前受审 installer 验证。
 - 本链不跑真实登录、不改 fault budget、不切 active。
 - DB 侧 `company_meta:config.paused` / QA observation 与文件镜像的自动同步：由宿主/经理工具维护镜像；本缝不直接开 DB。
+- `host-release.hmac` 由 apply 首跑自行生成（自举）；密钥的生成/保管/轮换/吊销主体仍未指定（属宿主接入协调）。
+- `channelRecovery` 为推断，非活通道探针；`employee.sb` 的实际加载、真实 install/Paseo/launchctl 仍未在本链验证。
