@@ -80,8 +80,9 @@ sh scripts/host-release/apply.sh \
 - 回执证据字段（全部纳入三处 canonical payload：mint / 释锁后重签 / `receiptTagPayload`）：
   - `binding.schemaHash` / `binding.vendorSchemaHash` / `binding.vendorSchemaDiff`：install 后分别对 `releases/<sha>/schema` 与 `plugin/server/vendor/schema` 算目录清单摘要；两者都在时才判 `none`/`differ`，否则 `unavailable` + `null`。
   - `mcp.{pid,cwd,sha}`：用 `lsof` 取**实际监听服务端口**的进程与其 cwd；cwd 落在 `releases/` 时再算该目录清单摘要。没有监听者时如实为 `null`（不臆造）。
-  - `plugin.modules`：对 paseo 报告的 SOURCE 目录内实际加载的清单与源码文件算 sha256（排除 `node_modules`）；SOURCE 未知时为 `null`。
+  - `plugin.modules`：对 paseo 报告的 SOURCE 目录内清单与源码文件（`.ts/.tsx/.js/.mjs/.cjs/.json`，排除任意层级 `node_modules`，最多 2000 项）算 sha256；SOURCE 未知时为 `null`。这是 SOURCE 目录的快照清单，不是运行时逐模块加载观测。
   - `checks`：install / active / mcp-health / mcp-ready / plugin-source /（发生回滚时）rollback 的结构化结果。
+- 目录清单摘要（`snapshotHash`、`schemaHash`、`vendorSchemaHash`、`mcp.sha`）一律使用与 `src/host-release/verify.ts` `snapshotInventoryHash` **完全一致**的剪枝规则：任意路径段为 `node_modules`，以及 `plugin/server/vendor/`、`.runtime/`、`.git/`、`vault/build/` 前缀。两侧不一致会让 apply 拒绝它自己被交付的快照。
 - `channelRecovery` 仍是**推断值**（`succeeded && plugin_ok → adopt-expected`），不是观测到的活通道恢复。
 
 ## 明确未解决

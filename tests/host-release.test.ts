@@ -597,7 +597,17 @@ describe('AC04 receipt evidence: hashes, mcp runtime, plugin modules', () => {
     }
   });
 
-  test('apply.sh run against stub host tools mints a receipt the reader accepts, with real samples', () => {
+
+  /**
+   * Real apply.sh run against stub host tools. Mirrors the prepared-snapshot shape the release pipeline
+   * produces: the snapshot carries plugin/node_modules (and a nested one), which the inventory digest must
+   * prune exactly like TS snapshotInventoryHash — otherwise apply refuses its own snapshot (ef9523 R2).
+   */
+  function runApply(opts: {
+    withMcpListener?: boolean;
+    preCreateRelease?: boolean;
+    tamperSnapshot?: boolean;
+  } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'sck-hr-apply-'));
     clean.push(root);
     const serviceHome = join(root, 'svc');
@@ -609,39 +619,57 @@ describe('AC04 receipt evidence: hashes, mcp runtime, plugin modules', () => {
     // Apply's barrier is fail-closed: the host must publish both authoritative mirrors first.
     writeFileSync(join(serviceHome, 'maintenance', 'dispatch-paused.json'), '{"paused":false}\n');
     writeFileSync(join(serviceHome, 'maintenance', 'qa-observation-active.json'), '{"active":false}\n');
-    // Previous active release (the rollback target) so expectedActive CAS resolves.
     mkdirSync(join(serviceHome, 'releases', previousSha), { recursive: true });
     symlinkSync(join(serviceHome, 'releases', previousSha), join(serviceHome, 'active'));
     ensureHostHmacKey(serviceHome);
 
-    // Snapshot whose inventory digest becomes envelope.snapshotHash.
     const snapshot = join(root, 'snapshot');
     mkdirSync(join(snapshot, 'scripts'), { recursive: true });
     mkdirSync(join(snapshot, 'schema'), { recursive: true });
     mkdirSync(join(snapshot, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     mkdirSync(join(snapshot, 'plugin', 'shared'), { recursive: true });
+    // Real prepared snapshots carry installed dependencies; the digest must prune them at any depth.
+    mkdirSync(join(snapshot, 'node_modules', 'pkg'), { recursive: true });
+    mkdirSync(join(snapshot, 'plugin', 'node_modules', 'dep'), { recursive: true });
+    writeFileSync(join(snapshot, 'node_modules', 'pkg', 'index.js'), 'module.exports = 1;\n');
+    writeFileSync(join(snapshot, 'plugin', 'node_modules', 'dep', 'index.js'), 'module.exports = 2;\n');
     writeFileSync(join(snapshot, 'schema', '001-control.surql'), 'DEFINE TABLE x;\n');
     writeFileSync(join(snapshot, 'plugin', 'server', 'vendor', 'schema', '001-control.surql'), 'DEFINE TABLE x;\n');
     writeFileSync(join(snapshot, 'plugin', 'shared', 'types.ts'), 'export type T = 1;\n');
-    // Stub installer: only switches active, like the fixture harness the earlier reviews used.
     writeFileSync(join(snapshot, 'scripts', 'company-service.sh'),
       '#!/bin/sh\ncase "$1" in install) ln -sfn "$2" "${SCK_SERVICE_HOME}/active"; exit 0;; esac\nexit 0\n');
     const snapshotHash = snapshotInventoryHash(snapshot);
+    if (opts.tamperSnapshot) writeFileSync(join(snapshot, 'plugin', 'shared', 'types.ts'), 'export type T = 2;\n');
 
     writeFileSync(join(envelope, 'operation.json'), JSON.stringify({
       opId, taskId: 'task-ac04', targetSha: releaseSha, expectedActive: join(serviceHome, 'releases', previousSha),
       snapshotHash, rollbackSha: previousSha, idempotencyKey: 'k', state: 'prepared',
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     }, null, 2));
+    if (opts.preCreateRelease) {
+      // Reuse branch: the release dir already holds the prepared tree.
+      const releaseDir = join(serviceHome, 'releases', releaseSha);
+      mkdirSync(releaseDir, { recursive: true });
+      spawnSync('cp', ['-R', `${snapshot}/.`, `${releaseDir}/`]);
+    }
 
-    // Stub host tools on PATH: curl reports 200; paseo reports the plugin bound to the target release.
     const bin = join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeFileSync(join(bin, 'curl'), '#!/bin/sh\necho 200\n');
+    const pluginPath = join(serviceHome, 'releases', releaseSha, 'plugin');
     writeFileSync(join(bin, 'paseo'),
-      `#!/bin/sh\nif [ "$1" = plugin ]; then\n  printf '[{"installation":{"identity":{"path":"%s"}},"path":"%s","status":"running","enabled":true}]\\n' "${join(serviceHome, 'releases', releaseSha, 'plugin')}" "${join(serviceHome, 'releases', releaseSha, 'plugin')}"\n  exit 0\nfi\nexit 0\n`);
+      `#!/bin/sh\nif [ "$1" = plugin ]; then\n  printf '[{"installation":{"identity":{"path":"%s"}},"path":"%s","status":"running","enabled":true}]\\n' "${pluginPath}" "${pluginPath}"\n  exit 0\nfi\nexit 0\n`);
     chmodSync(join(bin, 'curl'), 0o755);
     chmodSync(join(bin, 'paseo'), 0o755);
+
+    // Stub lsof only when a listener is simulated; otherwise the real probe runs and reports nothing.
+    let lsofPath = '/usr/sbin/lsof';
+    if (opts.withMcpListener) {
+      lsofPath = join(bin, 'lsof');
+      writeFileSync(lsofPath,
+        `#!/bin/sh\ncase "$*" in\n  *-iTCP:*) echo 4321;;\n  *-Fn*) echo "n${join(serviceHome, 'releases', releaseSha)}";;\n  *) exit 0;;\nesac\n`);
+      chmodSync(lsofPath, 0o755);
+    }
 
     const script = join(import.meta.dir, '..', 'scripts', 'host-release', 'apply.sh');
     const result = spawnSync('/bin/sh', [script,
@@ -649,24 +677,51 @@ describe('AC04 receipt evidence: hashes, mcp runtime, plugin modules', () => {
       '--snapshot', snapshot, '--paseo', join(bin, 'paseo'),
     ], {
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, SCK_SERVICE_HOME: serviceHome, SCK_MCP_PORT: '1' },
+      env: {
+        ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`,
+        SCK_SERVICE_HOME: serviceHome, SCK_MCP_PORT: '1', SCK_LSOF: lsofPath,
+      },
     });
+    return { root, serviceHome, snapshot, releaseSha, opId, result };
+  }
+
+  test('apply.sh accepts a snapshot that carries nested node_modules (digest parity with TS)', () => {
+    const { serviceHome, opId, result } = runApply();
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
-
     const receipt = readHostReleaseReceipt(serviceHome, opId);
     expect(receipt.state).toBe('succeeded');
-    expect(receipt.exitCode).toBe(0);
-    // Real samples, not placeholders:
     expect(receipt.binding.schemaHash).toMatch(/^[0-9a-f]{64}$/);
     expect(receipt.binding.vendorSchemaHash).toMatch(/^[0-9a-f]{64}$/);
     expect(receipt.binding.vendorSchemaDiff).toBe('none');
     expect(receipt.plugin.sourceKnown).toBe(true);
     expect(receipt.plugin.modules?.some(module => module.path === 'shared/types.ts')).toBe(true);
+    // node_modules is pruned from the module list too.
+    expect(receipt.plugin.modules?.some(module => module.path.includes('node_modules'))).toBe(false);
     expect(receipt.checks.length).toBeGreaterThan(0);
     expect(receipt.checks.every(check => typeof check.name === 'string' && typeof check.ok === 'boolean')).toBe(true);
-    // MCP pid/cwd come from a real lsof probe: with no listener in this fixture they stay null, never invented.
-    expect(receipt.mcp.pid).toBeNull();
-    expect(receipt.mcp.sha).toBeNull();
+  });
+
+  test('the reuse branch accepts an existing release dir with the same inventory', () => {
+    const { serviceHome, opId, result } = runApply({ preCreateRelease: true });
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(readHostReleaseReceipt(serviceHome, opId).state).toBe('succeeded');
+  });
+
+  test('a snapshot whose inventory does not match envelope.snapshotHash is refused before side effects', () => {
+    const { serviceHome, releaseSha, result } = runApply({ tamperSnapshot: true });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/snapshot .* inventory .* != envelope snapshotHash/);
+    expect(existsSync(join(serviceHome, 'releases', releaseSha))).toBe(false);
+  });
+
+  test('a simulated listening MCP process is sampled into mcp pid/cwd/sha', () => {
+    const { serviceHome, releaseSha, opId, result } = runApply({ withMcpListener: true });
+    expect(result.status).toBe(0);
+    const receipt = readHostReleaseReceipt(serviceHome, opId);
+    expect(receipt.mcp.pid).toBe(4321);
+    expect(receipt.mcp.cwd).toBe(join(serviceHome, 'releases', releaseSha));
+    expect(receipt.mcp.sha).toMatch(/^[0-9a-f]{64}$/);
   });
 });

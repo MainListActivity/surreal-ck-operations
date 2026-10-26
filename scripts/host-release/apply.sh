@@ -196,34 +196,43 @@ active_now=$(readlink "$service_home/active" 2>/dev/null || true)
 }
 
 # --- shared inventory digest (one implementation for reuse, source and receipt binding) ---
-# Same algorithm as src/host-release/store.ts snapshotInventoryHash: sorted rel paths + sha256 of each
-# file, skipping generated/heavy trees. Prints the digest to stdout.
+# Mirrors src/host-release/verify.ts snapshotInventoryHash EXACTLY: same skip predicate (any path
+# segment `node_modules`, plus vendor/.runtime/.git/vault-build prefixes), same sorted
+# `rel\0sha256\n` lines. Divergence here would make apply refuse the snapshot it was handed.
 inventory_hash() {
   TARGET="$1" /usr/bin/python3 - <<'PY'
 import hashlib, os
 root = os.environ["TARGET"]
-skip_prefixes = ("node_modules/", "plugin/server/vendor/", ".runtime/", ".git/", "vault/build/")
+
+def skip(rel):
+    return (rel.startswith("node_modules/") or "/node_modules/" in rel
+            or rel.startswith("plugin/server/vendor/")
+            or rel.startswith(".runtime/") or rel.startswith(".git/")
+            or rel.startswith("vault/build/"))
+
 files = []
-for dirpath, dirnames, filenames in os.walk(root):
-    rel_dir = os.path.relpath(dirpath, root)
-    if rel_dir == ".": rel_dir = ""
-    kept = []
-    for name in dirnames:
-        rel = f"{rel_dir}/{name}" if rel_dir else name
-        if any(rel == p[:-1] or rel.startswith(p) for p in skip_prefixes):
+
+def walk(abs_dir, rel):
+    try:
+        entries = sorted(os.listdir(abs_dir))
+    except OSError:
+        return
+    for name in entries:
+        child = rel + "/" + name if rel else name
+        if skip(child):
             continue
-        kept.append(name)
-    dirnames[:] = kept
-    for name in filenames:
-        rel = f"{rel_dir}/{name}" if rel_dir else name
-        if any(rel.startswith(p) for p in skip_prefixes):
-            continue
-        files.append(rel)
+        path = os.path.join(abs_dir, name)
+        if os.path.isdir(path):
+            walk(path, child)
+        elif os.path.isfile(path):
+            files.append(child)
+
+walk(root, "")
 files.sort()
 lines = []
 for rel in files:
-    digest = hashlib.sha256(open(os.path.join(root, rel), "rb").read()).hexdigest()
-    lines.append(f"{rel}\0{digest}\n")
+    with open(os.path.join(root, rel), "rb") as handle:
+        lines.append("%s\0%s\n" % (rel, hashlib.sha256(handle.read()).hexdigest()))
 print(hashlib.sha256("".join(lines).encode()).hexdigest())
 PY
 }
@@ -356,14 +365,15 @@ fi
 mcp_pid=""
 mcp_cwd=""
 mcp_sha=""
-if [ -x /usr/sbin/lsof ]; then
+lsof_bin="${SCK_LSOF:-/usr/sbin/lsof}"
+if [ -x "$lsof_bin" ]; then
   set +e
-  listening_pid=$(/usr/sbin/lsof -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+  listening_pid=$("$lsof_bin" -nP -iTCP:"$mcp_port" -sTCP:LISTEN -t 2>/dev/null | head -1)
   set -e
   if [ -n "$listening_pid" ]; then
     mcp_pid=$listening_pid
     set +e
-    cwd_out=$(/usr/sbin/lsof -a -p "$mcp_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    cwd_out=$("$lsof_bin" -a -p "$mcp_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     set -e
     if [ -n "$cwd_out" ]; then
       mcp_cwd=$cwd_out
@@ -415,7 +425,7 @@ for dirpath, dirnames, filenames in os.walk(root):
             continue
         modules.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
 modules.sort(key=lambda m: m["path"])
-print(json.dumps(modules[:400], separators=(",", ":")))
+print(json.dumps(modules[:2000], separators=(",", ":")))
 PY
 )
   set -e
@@ -426,7 +436,6 @@ CHECKS="$(
   INSTALL_RC="$install_rc" ACTIVE_OK="$([ "$active_after" = "$release_dir" ] && echo true || echo false)" \
   HEALTH="$health_code" READY="$ready_code" PLUGIN_OK="$plugin_ok" \
   ROLLBACK_OK="$rollback_ok" ROLLBACK_ATTEMPTED="$rollback_attempted" \
-  SNAPSHOT_BOUND="$([ "$final_state" = succeeded ] || [ "$rollback_ok" = true ] && echo true || echo false)" \
   /usr/bin/python3 -c '
 import json, os
 def ok(v): return v == "true"
