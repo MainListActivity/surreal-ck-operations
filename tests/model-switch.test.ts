@@ -26,7 +26,7 @@ test('failures, unknown/group labels and response-less candidates never become s
  expect(tracker.observe('agent','session',[a,...ignored])).toEqual([]);
  const b=row('b',300,'p/b');const [change]=tracker.observe('agent','session',[a,...ignored,b]);tracker.acknowledge('agent',change!.id);
  expect(tracker.observe('agent','session',[a,row('late',250),b])).toEqual([]);
- expect(tracker.observe('agent','other-native-session',[row('new',400,'p/c')])).toEqual([]);
+ expect(tracker.observe('agent','other-native-session',[row('new',400,'p/c')])[0]!.data).toMatchObject({from:'p/b',to:'p/c'});
 });
 test('historical adoption is quiet, append retries retain the same ID and restart does not duplicate acknowledged switches',()=>{
  const dir=scratch(),a=row('a',100),b=row('b',200,'p/b'),c=row('c',300,'p/c');
@@ -87,4 +87,16 @@ test('concurrent calls follow first-response order rather than request start ord
  const [first]=tracker.observe('agent','session',[baseline,quick]);tracker.acknowledge('agent',first!.id);
  const [second]=tracker.observe('agent','session',[baseline,quick,slow]);
  expect(second!.data).toMatchObject({from:'p/b',to:'p/a',at:1100});
+});
+
+
+test('a native session reset preserves the previous model speed within the same Paseo conversation',()=>{
+ const dir=scratch(),tracker=new ModelSwitchTracker(dir),old=[row('a',100,'p/a',{output_tokens:120,total_ms:2000})];
+ tracker.observe('agent','old-native',old,false,[row('native-a',101,'p/a',{output_tokens:120,decodeTokensPerSecond:80,decodeDurationMs:1500})]);
+ const restored=new ModelSwitchTracker(dir);
+ expect(restored.observe('agent','new-native',[])).toEqual([]);
+ const [event]=restored.observe('agent','new-native',[row('b',3000,'p/b')]);
+ expect(event!.data).toMatchObject({from:'p/a',to:'p/b',previous:{successful:1,tokensPerSecond:60,decodeTokensPerSecond:80}});
+ restored.acknowledge('agent',event!.id);
+ expect(restored.observe('agent','new-native',[row('b',3000,'p/b')])).toEqual([]);
 });
