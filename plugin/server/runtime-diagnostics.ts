@@ -96,12 +96,15 @@ function readModule(name: string, path: string | null): RuntimeModule {
  * The path this diagnostic's own code occupies inside the running program.
  *
  * In an esbuild CJS bundle every inlined module collapses onto the bundle, so this is the bundle's own
- * location rather than a per-module one — which is still the honest answer about what was loaded. When the
- * module was inlined into a string with no file behind it, the answer is null rather than a guess.
+ * location rather than a per-module one — which is still the honest answer about what was loaded. The
+ * extension follows whichever file is actually present: a release snapshot ships `.ts`, a bundle leaves
+ * `.cjs`. When neither is there the answer is null rather than a guess.
  */
 function selfPath(serverDir: string | null): string | null {
   const here = serverDir ?? (typeof __dirname === "string" ? resolve(__dirname) : null);
-  return here ? resolve(here, "runtime-diagnostics.cjs") : null;
+  if (!here) return null;
+  const [found] = [join(here, "runtime-diagnostics.ts"), join(here, "runtime-diagnostics.cjs")].filter(path => existsSync(path));
+  return found ? resolve(found) : null;
 }
 
 /**
@@ -157,6 +160,10 @@ function bindRelease(serverDir: string | null): RuntimeBinding {
  *
  * The list is the same whatever the context: a file that cannot be read is reported as a gap. Dropping it
  * instead would let a reader take a short list for agreement, when it may only mean the tree was not there.
+ *
+ * The plugin's own files are looked up as `.ts` (what a release snapshot ships) and as `.cjs` (what an
+ * esbuild bundle would leave beside itself), and the one that exists is reported. Guessing a single
+ * extension would make two entries permanent gaps in every release, which reads as a broken sample.
  */
 function bindModules(vendorDir: string | null, serverDir: string | null): RuntimeModule[] {
   const vendored: readonly (readonly [string, string | null])[] = [
@@ -166,11 +173,12 @@ function bindModules(vendorDir: string | null, serverDir: string | null): Runtim
     ["ops-broker", vendorDir ? join(vendorDir, "src", "ops", "broker.ts") : null],
     ["ops-idp", vendorDir ? join(vendorDir, "src", "ops", "idp.ts") : null],
   ];
-  const pluginOwned: readonly (readonly [string, string | null])[] = [
-    ["plugin-sidecar", serverDir ? join(serverDir, "sidecar.cjs") : null],
-    ["plugin-runtime-diagnostics", serverDir ? join(serverDir, "runtime-diagnostics.cjs") : null],
+  const pluginOwned: readonly (readonly [string, readonly string[]])[] = [
+    ["plugin-sidecar", serverDir ? [join(serverDir, "sidecar.ts"), join(serverDir, "sidecar.cjs")] : []],
+    ["plugin-runtime-diagnostics", serverDir ? [join(serverDir, "runtime-diagnostics.ts"), join(serverDir, "runtime-diagnostics.cjs")] : []],
   ];
-  return [...vendored, ...pluginOwned].map(([name, path]) => readModule(name, path && existsSync(path) ? path : null));
+  const owned = pluginOwned.map(([name, candidates]) => [name, candidates.find(path => existsSync(path)) ?? null] as const);
+  return [...vendored, ...owned].map(([name, path]) => readModule(name, path));
 }
 
 /**

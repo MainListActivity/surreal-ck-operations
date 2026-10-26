@@ -21,8 +21,9 @@ function makeRelease(): { root: string; serverDir: string } {
   writeFileSync(join(vendor, 'faults.ts'), 'faults\n');
   writeFileSync(join(vendor, 'ops', 'broker.ts'), 'broker\n');
   writeFileSync(join(vendor, 'ops', 'idp.ts'), 'idp\n');
-  writeFileSync(join(serverDir, 'sidecar.cjs'), 'sidecar\n');
-  writeFileSync(join(serverDir, 'runtime-diagnostics.cjs'), 'diag\n');
+  // A release snapshot ships the plugin's own sources as .ts; that is what the fixture mirrors.
+  writeFileSync(join(serverDir, 'sidecar.ts'), 'sidecar\n');
+  writeFileSync(join(serverDir, 'runtime-diagnostics.ts'), 'diag\n');
   return { root, serverDir };
 }
 
@@ -46,7 +47,24 @@ describe('plugin runtime diagnostics', () => {
     expect(answer.loaded.vendorDir).toBe(join(serverDir, 'vendor'));
     // The vendored source is the plugin's own; the MCP face's tree is never reported as the loaded one.
     expect(answer.loaded.vendorDir).not.toBe(join(root, 'src'));
+    expect(answer.loaded.selfPath).toBe(join(serverDir, 'runtime-diagnostics.ts'));
+  });
+
+  test('a bundled plugin reports the bundle path, and its own modules are still bound', () => {
+    // Paseo bundles the plugin server with esbuild, where import.meta.url does not survive and every inlined
+    // module collapses onto the bundle. The answer then names the bundle, and the plugin's own files are read
+    // from their .cjs form. Reporting .ts here would make two entries permanent gaps in every real release.
+    const { serverDir } = makeRelease();
+    rmSync(join(serverDir, 'sidecar.ts'));
+    rmSync(join(serverDir, 'runtime-diagnostics.ts'));
+    writeFileSync(join(serverDir, 'sidecar.cjs'), 'bundled-sidecar\n');
+    writeFileSync(join(serverDir, 'runtime-diagnostics.cjs'), 'bundled-diag\n');
+    const answer = sample(serverDir);
     expect(answer.loaded.selfPath).toBe(join(serverDir, 'runtime-diagnostics.cjs'));
+    const own = answer.modules.filter(m => m.name.startsWith('plugin-'));
+    expect(own.map(m => m.name)).toEqual(['plugin-sidecar', 'plugin-runtime-diagnostics']);
+    // Both are read from the bundle, so neither is a gap.
+    expect(own.every(m => m.sha256 !== null)).toBe(true);
   });
 
   test('a module read from the MCP face tree cannot be mistaken for the plugin path', () => {
