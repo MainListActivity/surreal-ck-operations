@@ -97,7 +97,7 @@ export function fixture(specs: TaskSpec[]) {
 
   const addInstance = (def: EmployeeDef, id: string, status = 'idle') => {
     const inst: EmployeeInst = { id, role: def.role, def: def.id, provider: def.provider, model: def.model,
-      paseoAgentId: `agent-${id}`, cwd: OPS, repoHome: OPS, credential: `cred-${id}` };
+      paseoAgentId: `agent-${id}`, cwd: OPS, repoHome: OPS, workspaceScope: 'maintenance', credential: `cred-${id}` };
     instances.push(inst);
     agents.set(inst.paseoAgentId!, { id: inst.paseoAgentId!, status });
     return inst;
@@ -704,7 +704,7 @@ function factoryWorld() {
   const factory:EmployeeDef={...claude,id:'engineering-factory',provider:'factory-droid',model:'native-factory-model',quotaLimited:true,maxInstances:1};
   f.defs.push(factory);
   const addFactory=(status:string)=>{
-    const inst:EmployeeInst={id:'factory-1',def:factory.id,provider:factory.provider,model:factory.model,role:factory.role,paseoAgentId:'agent-factory',cwd:OPS,repoHome:OPS};
+    const inst:EmployeeInst={id:'factory-1',def:factory.id,provider:factory.provider,model:factory.model,role:factory.role,paseoAgentId:'agent-factory',cwd:OPS,repoHome:OPS,workspaceScope:'maintenance'};
     f.instances.push(inst);f.agents.set('agent-factory',{id:'agent-factory',status});return inst;
   };
   return {...f,factory,addFactory};

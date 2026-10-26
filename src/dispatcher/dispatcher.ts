@@ -1,3 +1,4 @@
+import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
 import { managedModel } from "../model-routing/policy.ts";
 import type { OwnerDesk } from '../owner.ts';
@@ -332,14 +333,17 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
   // Track gating: a task with discipline X only routes to defs whose tracks list covers X.
   const trackOk = (task: SupervisedTask | undefined, tracks: string[] | undefined) =>
     trackOkFor(p.role as Role, task, tracks);
+  const inWorkspace = (inst: EmployeeInst): boolean => {
+    if (!p.task) return true; // Repository-wide preview, not a dispatch decision.
+    if (inst.workspaceScope) return inst.workspaceScope === workspaceScopeFor(p.task.goalId);
+    // Legacy sessions only continue already assigned/bound work; never move them mid-flight.
+    return !p.sidecar || [p.task.currentEmployee, p.task.previousEmployee, p.task.implementer, p.implementer?.implementer].includes(inst.id);
+  };
   const entries: StaffingEntry[] = [];
   for (const inst of p.insts) {
     if (inst.role !== p.role) continue;
     if ((inst.repoHome ?? inst.cwd ?? p.opsRepo) !== p.home) continue;
-    if (p.task && inst.workspaceScope && inst.workspaceScope !== p.task.goalId) continue;
-    // Legacy sessions may finish/rework their existing task, but never acquire a new goal's work.
-    if (p.sidecar && p.task?.goalId && !inst.workspaceScope &&
-      ![p.task.currentEmployee, p.task.previousEmployee, p.task.implementer, p.implementer?.implementer].includes(inst.id)) continue;
+    if (!inWorkspace(inst)) continue;
     const def = p.defs.find(d => d.id === inst.def);
     // Recusal and the execute gate come first: a candidate that can never take the task must not be reported as merely busy.
     const hit: Block | undefined =
@@ -370,7 +374,7 @@ export function staffingPool(p: StaffingInput): StaffingEntry[] {
     if (def.role !== p.role) continue;
     const resolved = resolveSlot(def);
     const seats = p.insts.filter(i => i.def === def.id && (i.repoHome ?? i.cwd ?? p.opsRepo) === p.home &&
-      (!p.task || i.workspaceScope === p.task.goalId) && !(p.sidecar && i.credentialFile)).length;
+      inWorkspace(i) && !(p.sidecar && i.credentialFile)).length;
     const hit: Block | undefined =
       policyBlock ??
       gate(undefined) ??
@@ -1527,7 +1531,7 @@ export class Dispatcher {
         for (const entry of poolFor(item.role, home, item.task)) {
           if (entry.kind !== 'spawn' || !entry.eligible) continue;
           const seat = { id: `pending:${entry.key}`, def: entry.ref, role: item.role, provider: entry.provider,
-            model: entry.model, repoHome: home, cwd: home } as EmployeeInst;
+            model: entry.model, repoHome: home, cwd: home, workspaceScope: this.deps.sidecar ? workspaceScopeFor(item.task.goalId) : undefined } as EmployeeInst;
           if (!reviewPlan({ authors: new Set([...authors.authors, seat.id]), hands: new Set() }, [...insts, seat]).feasible) held.add(entry.key);
         }
         if (held.size) {
@@ -1824,7 +1828,7 @@ export class Dispatcher {
     const granted: Array<{ todo: PendingGm; claim: ManagerWakeClaim }> = [];
     for (const todo of pendingGm) {
       const home = todo.task.repoPath ?? this.deps.env.opsRepo;
-      const noticeKey = `gm-unavailable:${home}`;
+      const noticeKey = `gm-unavailable:${home}:${workspaceScopeFor(todo.task.goalId)}`;
       // Use the exact same pools as assign, without acquiring a wake only to
       // immediately release it. This remains quiet across dispatcher restarts.
       if (!eligibleInsts('gm', home, todo.task, false).length && !eligibleDefs('gm', home, todo.task).length) {
@@ -2328,7 +2332,7 @@ export class Dispatcher {
     }
     const scopeTask = task ?? anchor?.task ?? (anchor?.goalId
       ? { goalId: anchor.goalId, goalTitle: anchor.goalTitle, repoPath: anchor.home } as SupervisedTask : undefined);
-    const workspaceScope = sidecar ? scopeTask?.goalId : undefined;
+    const workspaceScope = sidecar ? workspaceScopeFor(scopeTask?.goalId) : undefined;
     const repoHome = scopeTask?.repoPath ?? anchor?.home ?? env.opsRepo;
     let defsOrdered = factoryFirst(spawnable(role, repoHome, scopeTask, forReview));
     const candidate = pick(role, scopeTask, avoid, forReview, recusal, anchor?.home);
@@ -2435,7 +2439,7 @@ export class Dispatcher {
         const agentId = await paseo.spawn({
           title: `SCK · ${def.role} · ${inst.id}`, provider: def.provider, model, thinking: def.thinking,
           mode: UNATTENDED_MODE[def.provider], cwd: spawnCwd,
-          workspaceTitle: workspaceScope ? `${scopeTask?.goalTitle ?? '公司目标'} [${workspaceScope}]` : instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
+          workspaceTitle: workspaceScope ? `${workspaceScope === 'maintenance' ? '日常维护' : scopeTask?.goalTitle ?? '公司目标'} [${workspaceScope}]` : instHome ? `SCK · ${inst.id}` : `SCK · ${def.id}`,
           workspaceScope, repoHome,
           labels: { company: 'surreal-ck', employee_id: inst.id, role: def.role, def: def.id, ...(workspaceScope ? { goal_id: workspaceScope } : {}) },
           env: spawnEnv,
@@ -2586,9 +2590,9 @@ export class Dispatcher {
   private async retireBroken(inst: EmployeeInst, reason: string, defs: EmployeeDef[], report: TickReport, countFailure = true, kind: RetirementKind = 'failure'): Promise<boolean> {
     if (!await this.retireGated(inst, reason, kind, report)) return false;
     if (inst.paseoAgentId) this.deps.sidecar?.detachAgent(inst.paseoAgentId);
-    // The dead session is useless and its red "error" entry confuses the roster —
-    // archive it (soft-delete, timeline kept) like session rotation already does.
-    if (inst.paseoAgentId) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
+    // Revoke the identity and stop its process, keeping goal conversation history visible.
+    if (inst.paseoAgentId && inst.workspaceScope && kind !== 'archive') await this.deps.paseo.stop(inst.paseoAgentId).catch(() => undefined);
+    if (inst.paseoAgentId && !inst.workspaceScope) await this.deps.paseo.archive(inst.paseoAgentId).catch(() => undefined);
     await this.archiveInstScene(inst);
     report.retired.push(inst.id);
     this.log(`retired ${inst.id}: ${reason}`);

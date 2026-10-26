@@ -18,8 +18,10 @@ test('different goals in one repository get independent seats, never reuse each 
   w.def.maxInstances = 1;
   w.addTask('a', { worktreePath: '/repo-task-a' });
   w.addTask('b', { worktreePath: '/repo-task-b' });
-  Object.assign(w.rows[0], { goalId: 'goal-a' });
-  Object.assign(w.rows[1], { goalId: 'goal-b' });
+  Object.assign(w.rows[0], { goalId: 'goal-a', reviewerRole: 'owner' });
+  Object.assign(w.rows[1], { goalId: 'goal-b', reviewerRole: 'owner' });
+  w.views.get('a')!.reviewerRole = 'owner';
+  w.views.get('b')!.reviewerRole = 'owner';
   await w.dispatcher().tick();
   expect(w.instances.map(i => i.workspaceScope).sort()).toEqual(['goal-a', 'goal-b']);
   expect(w.views.get('a')!.currentEmployee).not.toBe(w.views.get('b')!.currentEmployee);
@@ -58,4 +60,37 @@ test('plugin adoption keeps a goal agent and its in-flight lease in place', asyn
   expect(result.retired).not.toContain(before.id);
   expect(w.views.get('a')!.currentEmployee).toBe(before.id);
   expect(w.instances[0]).toMatchObject({ paseoAgentId: before.paseoAgentId, cwd: '/repo', workspaceScope: 'goal-a' });
+});
+
+for (const failure of ['error', 'lost-channel'] as const) {
+  test(`a ${failure} revokes a goal employee without archiving its conversation or workspace`, async () => {
+    const w = world();
+    w.addTask('a', { worktreePath: '/repo-task-a' });
+    Object.assign(w.rows[0], { goalId: 'goal-a' });
+    await w.dispatcher().tick();
+    const inst = w.instances[0];
+    await w.pool.releaseClaim(inst.id, 'a', 'fixture handoff');
+    w.rows.splice(0, 1);
+    w.agents.set(inst.paseoAgentId!, { id: inst.paseoAgentId!, status: failure === 'error' ? 'error' : 'idle' });
+    if (failure === 'lost-channel') w.pool.detachAgent(inst.paseoAgentId!);
+    w.setLastError('fixture internal fault');
+    const result = await w.dispatcher().tick();
+    expect(result.retired).toContain(inst.id);
+    expect(w.events.some(e => e.startsWith('archive:'))).toBe(false);
+    expect(w.pool.canReuse(inst)).toBe(false);
+  });
+}
+
+test('a new maintenance task cannot borrow a legacy employee workspace', async () => {
+  const w = world();
+  const old = { id: 'legacy-seat', def: w.def.id, role: w.def.role, provider: w.def.provider, model: w.def.model,
+    credential: 'legacy-fixture', paseoAgentId: 'legacy-agent', repoHome: '/repo' };
+  w.instances.push(old);
+  w.pool.env({ ...old, paseoAgentId: undefined }); w.pool.bindAgent(old.id, old.paseoAgentId);
+  w.agents.set(old.paseoAgentId, { id: old.paseoAgentId, status: 'idle' });
+  w.addTask('new-maintenance', { worktreePath: '/repo-task-new' });
+  w.rows[0].reviewerRole = 'owner';
+  await w.dispatcher().tick();
+  expect(w.views.get('new-maintenance')!.currentEmployee).not.toBe(old.id);
+  expect(w.instances.find(i => i.id !== old.id)!.workspaceScope).toBe('maintenance');
 });
