@@ -1,3 +1,4 @@
+import {rankingLayers} from "../shared/ranking-layers.ts";
 import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../shared/ranking-trends.ts";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
@@ -1230,6 +1231,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
   const s=relayStyles(ctx),c=relayColors(ctx);
   const [expanded,setExpanded]=useState<string|null>(null);
   const mobile=width<=600,wide=width>900;
+  const layers=rankingLayers(table),starts=new Map(layers.map(layer=>[layer.start,layer]));
   const number=(value:number|undefined,digits=1)=>value===undefined?"未知":value.toFixed(digits);
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
@@ -1238,13 +1240,14 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
+    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①安全状态 → ②新模型试用 → ③AA能力档 → ④计费类型 → ⑤本层置顶 → ⑥层内分降序</Text><Text style={s.muted}>安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
     {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
     {table.rows.map((row,index)=>{
       const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
-      const open=expanded===row.model;
+      const open=expanded===row.model,layer=starts.get(index);
       const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
       const metrics=[
-        {label:"综合分",value:row.decision?.score?.toFixed(2)??"未知",detail:row.previousRank?`线上第 ${row.previousRank} 名 → 预览第 ${index+1} 名`:"固定分层内比较，不跨能力档或计费层"},
+        {label:"层内分",value:row.decision?.score?.toFixed(2)??"未知",detail:row.previousRank?`线上第 ${row.previousRank} 名 → 预览第 ${index+1} 名`:"固定分层内比较，不跨能力档或计费层"},
         {label:"排序依据",value:row.decision?.reason??"等待规则排序",detail:"不调用 JEV；首 token 置后阈值为20秒"},
         {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
         {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
@@ -1256,7 +1259,9 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
         {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
       ];
       const stat=(label:string,value:string,width:number)=><View style={{width,gap:2}}><Text style={[s.muted,{fontSize:9}]}>{label}</Text><Text style={[s.text,{fontSize:11,fontWeight:"600"}]}>{value}</Text></View>;
-      return <View key={row.model} style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
+      return <View key={row.model} style={{gap:mobile?5:8}}>
+        {layer&&<View accessibilityLabel={layer.title} style={{borderTopWidth:2,borderColor:c.accent,backgroundColor:c.surface2,borderRadius:8,padding:12,marginTop:index?16:4,gap:5}}><Text style={[s.text,{fontWeight:"700",fontSize:12}]}>{layer.title}</Text><Text style={[s.muted,{color:c.accent}]}>第{layer.start+1}–{layer.end+1}名 · 本段{layer.count}个模型{layer.total!==layer.count?` / 本层共${layer.total}个`:""}</Text><Text style={s.muted}>{layer.abilitySummary}</Text><Collapsible title="这一层如何形成" ctx={ctx}><Text style={s.muted}>{layer.ability}</Text><Text style={s.muted}>{layer.explanation}</Text><Text style={[s.muted,{fontWeight:"600"}]}>{layer.comparison}</Text></Collapsible></View>}
+        <View style={{borderWidth:1,borderColor:open?c.accent:c.border,borderRadius:mobile?10:12,backgroundColor:c.row,overflow:"hidden"}}>
         <View style={{flexDirection:"row",alignItems:"center"}}><Pressable accessibilityRole="button" accessibilityLabel={`第 ${index+1} 名 ${row.model}`} accessibilityState={{expanded:open}}
           onPress={()=>setExpanded(open?null:row.model)} style={[s.row,{flex:1,minWidth:0,minHeight:mobile?52:62,paddingVertical:mobile?7:10,paddingHorizontal:mobile?8:12,gap:mobile?7:12}]}>
           <View style={{width:mobile?28:34,height:mobile?28:34,borderRadius:mobile?8:12,backgroundColor:c.surface2,alignItems:"center",justifyContent:"center"}}><Text style={[s.muted,{fontSize:mobile?9:11,fontWeight:"700"}]}>#{index+1}</Text></View>
@@ -1267,7 +1272,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.decision?.tail?"置后":row.decision?.coldStart?"试用":row.pinned?"置顶":"综合分"}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.decision?.tail?"置后":row.decision?.coldStart?"试用":row.pinned?"置顶":"层内分"}</Text>
             <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
@@ -1284,7 +1289,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {!!onBilling&&<View style={{marginTop:12,gap:6}}><Text style={s.muted}>计费分类（新数据仍由 Magpie 提供；此处仅修正分类）</Text><View style={[s.row,{flexWrap:"wrap"}]}>{Object.entries({auto:"自动",free:"免费",included:"套餐/积分",unknown:"未知",paid:"额外付费"}).map(([kind,label])=><Pressable accessibilityRole="button" accessibilityState={{selected:(billingOverrides?.[row.model]??"auto")===kind}} key={kind} onPress={()=>onBilling(row.model,kind)} style={{padding:8,borderWidth:1,borderColor:(billingOverrides?.[row.model]??"auto")===kind?c.accent:c.border,borderRadius:8}}><Text style={s.text}>{label}</Text></Pressable>)}</View></View>}
           {mobile&&row.performanceScore!==undefined&&<Text style={[s.muted,{fontSize:9,marginTop:7}]}>历史绩效 {number(row.performanceScore,2)} / 5</Text>}
         </View>}
-      </View>;
+      </View></View>;
     })}
   </View>;
 }

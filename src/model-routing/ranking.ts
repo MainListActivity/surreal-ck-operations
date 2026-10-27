@@ -238,13 +238,20 @@ export interface RankingTableRow {
   health?: ModelHealth;
 }
 export interface RankingTable {
-  group: string; at?: string; rules?: string; scored: boolean;
+  group: string; at?: string; rules?: string; bandWidth?:number; bandRanges?:Record<string,{top:number;bottom:number}>; scored: boolean;
   rows: RankingTableRow[];
 }
 /** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return RANKED_TIERS.map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
+    const bandWidth=result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandRanges:Record<string,{top:number;bottom:number}>={};
+    if(bandWidth!==undefined)for(const r of result?.rows??[]){
+      if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;
+      const key=JSON.stringify([r.decision.tail??'',r.decision.band]),top=Math.max(bandRanges[key]?.top??-Infinity,r.facts.aa.score);
+      bandRanges[key]={top,bottom:top-bandWidth};
+    }
     const tailLimit=ttftTailThreshold(result?.rules??"");
     const request = requests.find(r => r.tier === tier);
     const legacy = expandRankingModels(request?.payload.state ?? {});
@@ -263,7 +270,7 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
         performanceSamples: facts?.performance?.samples, jevScore: result?.engine?.startsWith('quality-pace-') || pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
-    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
+    return { group, bandWidth,bandRanges, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
 }
 

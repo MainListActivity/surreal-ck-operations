@@ -1,3 +1,4 @@
+import {rankingLayers} from "../plugin/shared/ranking-layers.ts";
 import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../plugin/shared/ranking-trends.ts";
 import {expect,test} from 'bun:test';
 const page=await Bun.file(new URL('../plugin/client/company.tsx',import.meta.url)).text();
@@ -7,8 +8,8 @@ function harness(data:any) {
  const elements:any[]=[];let states:any[]=[];let cursor=0;
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):{type,props:props??{},children}};
  const useState=(initial:any)=>{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],(next:any)=>{states[i]=typeof next==='function'?next(states[i]):next;}];};
- const components=new Function('rankingRuleLabel','rankingTrendDetail','rankingHealthMetric','React','useState','useEffect','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
-  rankingRuleLabel,rankingTrendDetail,rankingHealthMetric,React,useState,()=>{},()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
+ const components=new Function('rankingLayers','rankingRuleLabel','rankingTrendDetail','rankingHealthMetric','React','useState','useEffect','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
+  rankingLayers,rankingRuleLabel,rankingTrendDetail,rankingHealthMetric,React,useState,()=>{},()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
  const render=(name:string,props:any)=>{cursor=0;elements.length=0;const root=components[name]({...props,ctx:{theme:{colors:{surface0:"#ffffff"}},compact:false,...props.ctx}});const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}elements.push(node);node.children?.forEach(walk);};walk(root);return elements;};
  const text=()=>elements.filter(n=>n.type==='Text').map(n=>n.children.flat(Infinity).filter((v:any)=>typeof v==='string'||typeof v==='number').join('')).join('\n');
  return {render,text,colors:(ctx:any)=>components.relayColors(ctx)};
@@ -82,7 +83,7 @@ test('ranking group selector defaults to Haiku and switches lists without showin
 test('Figma palette follows Paseo light/dark appearance including RGB surfaces',()=>{
  const h=harness(undefined);
  const light=h.colors({theme:{colors:{surface0:'#fafafa'}}}),dark=h.colors({theme:{colors:{surface0:'#0b0d10'}}});
- expect(light.surface1).toBe('#ffffff');expect(dark.surface1).toBe('#15171c');expect(light.foreground).not.toBe(dark.foreground);
+ expect(light.surface1).toBe('#ffffff');expect(dark.surface1).toBe('#17181d');expect(light.foreground).not.toBe(dark.foreground);
  expect(h.colors({theme:{colors:{surface0:'rgb(12, 14, 18)'}}}).surface1).toBe(dark.surface1);
  expect(h.colors({theme:{colors:{surface0:'hsl(240 6% 7%)'}}}).surface1).toBe(dark.surface1);
 });
@@ -101,4 +102,19 @@ test('mobile expanded model cards expose trend explanations and freshness',()=>{
  const nodes=h.render('ModelRankingList',props);nodes.find(n=>n.props.accessibilityLabel==='第 1 名 p/mobile').props.onPress();
  h.render('ModelRankingList',props);
  for(const word of ['EWMA','斜率','突升','7天基线','10个请求','距最新样本1分钟'])expect(h.text()).toContain(word);
+});
+test('ranking list visibly separates billing layers and explains why the lower score stays first',()=>{
+ const decision={band:0,coldStart:false,latencySource:'unknown',billing:'subscription',quota:'available',reason:'fixed'};
+ const h=harness(undefined);const nodes=h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,bandWidth:2,bandRanges:{'["",0]':{top:45.1,bottom:43.1}},rows:[
+  {model:'p/free',accounts:[],aaScore:43.7,decision:{...decision,score:16.2,costClass:'free'}},
+  {model:'p/included',accounts:[],aaScore:43.7,decision:{...decision,score:52.4,costClass:'included'}},
+ ]}});
+ expect(nodes.filter(n=>n.props.accessibilityLabel?.startsWith('第')&&n.props.accessibilityLabel.includes('层')).map(n=>n.props.accessibilityLabel)).toEqual(['第1层 · 正常可用 · 常规候选 · 能力档1 · 免费','第2层 · 正常可用 · 常规候选 · 能力档1 · 套餐/积分覆盖']);
+ expect(h.text()).toContain('AA 43.1–45.1');expect(h.text()).toContain('跨层不比较分数');expect(h.text()).toContain('层内分');
+ expect(nodes.filter(n=>n.props.accessibilityLabel?.startsWith('第 ')&&n.props.accessibilityLabel.includes('名')).map(n=>n.props.accessibilityLabel)).toEqual(['第 1 名 p/free','第 2 名 p/included']);
+});
+
+test('preview layers are explicitly distinguished from the published snapshot',()=>{
+ const h=harness(undefined);h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/preview',accounts:[],previousRank:3}]}});
+ expect(h.text()).toContain('以下分层来自当前预览');expect(h.text()).not.toContain('以下分层来自最近成功排序快照');
 });
