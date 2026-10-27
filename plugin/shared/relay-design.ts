@@ -796,4 +796,10 @@ select {
 .pin-button[aria-pressed="true"]{color:var(--relay-accent)}
 .pin-button:disabled{opacity:.5;cursor:wait}
 @media(max-width:600px){.pin-button{margin-right:5px;padding:6px 3px;font-size:10px}}
+
+.ranking-layer-guide,.ranking-layer{background:var(--relay-control);color:var(--relay-text);border-radius:10px;padding:14px;margin:12px 0;line-height:1.7;font-size:12px;overflow-wrap:anywhere}
+.ranking-layer-guide p,.ranking-layer p{margin:5px 0;color:var(--relay-muted)}
+.ranking-layer{border-top:2px solid var(--relay-accent);margin-top:20px}
+.ranking-layer h3{margin:0;font-size:13px}
+.ranking-layer .layer-range{color:var(--relay-accent);font-weight:600}
 `;
