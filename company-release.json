@@ -1,18 +1,19 @@
 {
-  "version": "0.2.0",
-  "title": "老板收件箱一键升级",
-  "changes": [
-    "公司系统上线任务可直接点击“升级至版本”，后台完成发布前检查、安装和服务验证",
-    "升级验证成功后自动回复通过，失败保留待办并显示失败阶段",
-    "升级卡片列出上线内容、影响范围、数据变化和回退说明",
-    "公司版本使用语义版本号展示，同时保留完整提交 SHA",
-    "公司升级待办保留给老板点击，不由 JEV 分流或自动批准"
-  ],
-  "impact": [
-    "Paseo 公司插件和老板网页审核台使用同一升级流程",
-    "切换期间短暂停止新增派工，原有员工会话和租约保留",
-    "仅公司系统上线任务提供升级按钮，其他产品上线流程保持原样"
-  ],
-  "migration": "新增升级作业及审计记录，不改写既有业务任务或预算。",
-  "rollback": "安装或验证失败时尝试恢复升级前的固定发布；无法恢复时保持暂停派工并显示失败。"
+    "version": "0.3.0",
+    "title": "目标终验图与结构化成果契约",
+    "changes": [
+        "引入显式最终验收机制，目标完成由有效关口、老板真实批准与客户证据共同决定",
+        "新增 goal_console/goal_governance_scan/goal_metrics 三个管理看板与经营指标",
+        "final_gate void/被替代/缺客户回执时自动标记 needs_repair，不再静默关闭目标",
+        "升级回滚兼容性验证：旧版无法读取新表状态，不会误派或误关闭待修复目标"
+    ],
+    "impact": [
+        "现有无 outcome 契约的目标将在终验时先进入 needs_repair，需 gm 登记后重算",
+        "owner_final 必须由 owner 终验关口且 accepted_by=owner 满足，经理终验不能替代",
+        "void 实现任务若无已完成继任修订会阻断完成；授权 outcome 变更可清除该缺口",
+        "expired SYS05 等待在目标卡显示为已过期并给出取消/延期后的下一动作",
+        "跨窗客户证据按 cutoff 前已存在证据统计，不重复报 missing"
+    ],
+    "migration": "新增 schema/042-goal-governance.surql（goal_outcome/goal_evidence 表与 goal 可选字段），schema_version 42；无历史改写。",
+    "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至 c68d1d4，守卫 RW06/SYS02/IR06/SYS06 校验兼容后再切。"
 }
