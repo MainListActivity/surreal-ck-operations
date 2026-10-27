@@ -50,7 +50,7 @@ export type FaultRetryability =
   | 'unclassified';
 
 /** The controlled target of the operation. Only these kinds are recorded; a raw URL never is. */
-export type FaultTargetKind = 'idp_authorize' | 'idp_login' | 'idp_token' | 'product_api' | 'product_token' | 'workspace' | 'member' | 'account' | 'internal' | 'none';
+export type FaultTargetKind = 'idp_authorize' | 'idp_login' | 'idp_token' | 'product_api' | 'product_token' | 'workspace' | 'member' | 'account' | 'internal' | 'browser' | 'logout' | 'none';
 
 /** One sanitized fault. Every field is a machine fact; none of them is a credential, a path or a free-text reason. */
 export interface FaultRecord {

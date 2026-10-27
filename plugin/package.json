@@ -1,7 +1,7 @@
 {
   "name": "sck-company",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.2",
   "files": [
     "paseo-plugin.json",
     "index.client.ts",

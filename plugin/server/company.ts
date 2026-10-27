@@ -58,6 +58,7 @@ export function company(): Promise<Company> {
     const { ProjectStore, loadSecretKey } = await import("./vendor/src/projects.ts");
     const { CompanyProofStore } = await import("./vendor/src/ops/proof-store.ts");
     const { OpsBroker } = await import("./vendor/src/ops/broker.ts");
+    const { egoBrowserSpaceCloser } = await import("./vendor/src/ops/browser.ts");
     const { SidecarPool } = await import("./sidecar.ts");
     const { MediaStudio } = await import("./vendor/src/media/elevenlabs.ts");
     const { SyncStudio } = await import("./vendor/src/media/sync.ts");
@@ -74,7 +75,7 @@ export function company(): Promise<Company> {
     const modelRouting = new ModelRoutingController(db.db, serviceHome(), undefined, { jev: jevFromEnv() });
     const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
     const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
-    const modelRanking = new RankingRefresher({db:db.db, jev:jevFromEnv(), groups:readMagpieGroups,
+    const modelRanking = new RankingRefresher({db:db.db, groups:readMagpieGroups,
       facts:async ids => { await modelRouting.refresh(); return modelRouting.rankingFacts(ids); },
       apply:(orders,isCurrent)=>modelRouting.applyOrders(orders,isCurrent),log:message=>console.warn(message)});
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));
@@ -109,6 +110,9 @@ export function company(): Promise<Company> {
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
       core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db),
+      // SYS05: lease-end cleanup bounded-closes the spaces this broker injected, and never a
+      // user-owned space. Without this wiring every space was only counted as pending.
+      closeBrowserSpace: egoBrowserSpaceCloser,
       log: message => console.log(message),
     });
     const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;

@@ -1,3 +1,4 @@
+import { RULE_ENGINE, RULE_DESCRIPTION, ruleOrder, type RuleDecision } from './rules.ts';
 import { z } from "zod";
 import type { ModelTrends } from "./trends.ts";
 import type { ModelHealth } from "./health.ts";
@@ -5,11 +6,11 @@ import type { Surreal } from "surrealdb";
 import type { JevClient, JevResult } from "../dispatcher/jev.ts";
 import { aaRankOfScore, resolveBenchmark, splitMember, type Effort, type Tier } from "./policy.ts";
 
-/** Opus is maintained entirely in Magpie; only Sonnet and Haiku are ranked by Jev. */
+/** Opus is maintained entirely in Magpie; only Sonnet and Haiku use deterministic ranking. */
 export const RANKED_TIERS: Tier[] = ["sonnet", "haiku"];
 export const REFRESH_MINUTES = [2, 5, 10] as const;
 export const DEFAULT_REFRESH_MINUTES = 5;
-export const DEFAULT_RANKING_RULES = "智能程度和速度综合优先";
+export const DEFAULT_RANKING_RULES = RULE_DESCRIPTION;
 
 export interface RankingSettings {
   rules: string;
@@ -45,7 +46,7 @@ export interface ModelFacts {
   trendSource?: { source: string; available: boolean; invalidLines: number; collectedAt: string };
   id: string;
   /** Accounts behind this model's provider. Labels only: no e-mail or sign-in leaves the machine. */
-  accounts: Array<{ account: string; remainingPct?: number }>;
+  accounts: Array<{ account: string; kind?:'subscription'|'plan'|'api'|'unknown'; remainingPct?: number; windows?:Array<{remainingPct:number;resetsAt?:string}> }>;
   /** The score at the level the member is pinned to (effort), not the model's best. */
   aa?: { rank: number; score: number; effort?: Effort };
   /** USD per 1M tokens; 0 when magpie serves it free. */
@@ -93,12 +94,13 @@ export function usageStats(snapshot: unknown, collectedAt = new Date().toISOStri
 }
 
 /** `magpie quota --json`: per provider, each account's tightest window. */
-export function quotaAccounts(rows: Array<{ provider: string; name?: string; windows?: Array<{ remaining?: number }> }>): Map<string, ModelFacts["accounts"]> {
+export function quotaAccounts(rows: Array<{ provider: string; name?: string; kind?:string; error?:string; readAt?:string; windows?: Array<{ remaining?: number; resetsAt?:string }> }>): Map<string, ModelFacts["accounts"]> {
   const out = new Map<string, ModelFacts["accounts"]>();
   for (const q of rows) {
     const list = out.get(q.provider) ?? [];
-    const left = (q.windows ?? []).map((w) => w.remaining).filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100);
-    list.push({ account: `${q.provider} #${list.length + 1}`, remainingPct: left.length ? Math.min(...left) : undefined });
+    const windows=q.error?[]:(q.windows??[]).filter(w=>!w.resetsAt||Date.parse(w.resetsAt)>Date.now());
+    const left = windows.map((w) => w.remaining).filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100);
+    list.push({kind:q.kind==='subscription'||q.kind==='plan'||q.kind==='api'?q.kind:'unknown',windows:windows.flatMap(w=>typeof w.remaining==='number'&&Number.isFinite(w.remaining)&&w.remaining>=0&&w.remaining<=100?[{remainingPct:w.remaining,...(w.resetsAt?{resetsAt:w.resetsAt}:{})}]:[]), account: `${q.provider} #${list.length + 1}`, remainingPct: left.length ? Math.min(...left) : undefined });
     out.set(q.provider, list);
   }
   return out;
@@ -207,11 +209,12 @@ export interface RankingRequestSnapshot {
 
 /** Last successfully applied response and the exact facts used to judge it; never mixed with later attempts. */
 export interface RankingResultSnapshot {
+  engine?:typeof RULE_ENGINE;
   tier: Tier;
   at: string;
   model: string;
   rules: string;
-  rows: Array<{ facts: ModelFacts; score: number; confidence?: number }>;
+  rows: Array<{ facts: ModelFacts; score?: number; confidence?: number; decision?:RuleDecision }>;
   answers: JevResult["answers"];
   /** Observations for pinned members, kept outside the Jev request and scored rows. */
   pinnedFacts?: ModelFacts[];
@@ -222,7 +225,7 @@ export interface RankingResultSnapshot {
 export interface RankingGateSnapshot {at:string;facts:ModelFacts[]}
 export type RankingGates=Record<string,RankingGateSnapshot>;
 export interface RankingTableRow {
-  model: string; pinned?: boolean; tailReason?:string;
+  model: string; pinned?: boolean; tailReason?:string; decision?:RuleDecision;
   trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
@@ -249,12 +252,13 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const excluded = gate ? (current?.health?.excluded ? current : undefined) : result?.excludedFacts?.find(f => f.id === model);
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
       const pinned = !excluded && (pins[group] ?? []).includes(model);
-      return { model, tailReason:!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined, trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
-        tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: facts?.usage?.ttftMs,
+      const decision=judged?.decision;
+      return { model, decision, tailReason:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+        tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
-        performanceSamples: facts?.performance?.samples, jevScore: pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
+        performanceSamples: facts?.performance?.samples, jevScore: result?.engine===RULE_ENGINE || pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
     return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
@@ -296,7 +300,7 @@ export class RankingRefresher {
   stop(): void { this.stopped = true; this.revision++; }
   settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   trigger(now = Date.now()): void {
-    if (this.stopped || !this.deps.jev || this.running || this.pinning || (this.last !== undefined && now - this.last < this.minutes * 60000)) return;
+    if (this.stopped || this.running || this.pinning || (this.last !== undefined && now - this.last < this.minutes * 60000)) return;
     this.last = now;
     const revision = this.revision;
     this.running = Promise.resolve().then(() => this.run(revision)).catch(() => this.deps.log?.("模型排序刷新失败，保留现有顺序"))
@@ -321,10 +325,14 @@ export class RankingRefresher {
         if (pins[group]?.includes(model)) next.splice(pins[group].indexOf(model), 0, model);
         else next.push(model);
       }
-      const orders = {[group]: pinnedOrder(members, next)};
+      const facts=await this.deps.facts(members);
+      if(members.some(id=>!facts.some(f=>f.id===id)))throw Error('排序观测缺失，置顶尚未生效');
+      const rows=ruleOrder(members.map(id=>facts.find(f=>f.id===id)!),next);
+      const orders = {[group]:rows.map(r=>r.facts.id)};
+      const results={[group]:{engine:RULE_ENGINE,tier:group.slice(4),at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,rows,answers:{}}};
       await this.deps.db.query(
-        "UPSERT company_meta:model_ranking SET pins=object::extend(pins ?? {},$pins),orders=object::extend(orders ?? {},$orders);",
-        {pins:{[group]:next},orders});
+        "UPSERT company_meta:model_ranking SET pins=object::extend(pins ?? {},$pins),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results);",
+        {pins:{[group]:next},orders,results});
       await this.deps.apply(orders, () => !this.stopped);
     })();
     const tracked = operation.finally(() => { if (this.pinning === tracked) this.pinning = undefined; });
@@ -351,31 +359,15 @@ export class RankingRefresher {
         // A member that keeps failing goes last by code, before Jev and over the owner's pins:
         // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
         gates[`sck-${tier}`]={at:new Date().toISOString(),facts:members.flatMap(id=>byId.has(id)?[byId.get(id)!]:[])};
-        const excluded = members.filter(id => byId.get(id)?.health?.excluded);
-        const usable = members.filter(id => !excluded.includes(id));
-        const pinned = pinnedOrder(usable, pins[`sck-${tier}`]).filter(id => (pins[`sck-${tier}`] ?? []).includes(id));
-        const excludedFacts = excluded.map(id => byId.get(id)!);
-        const pinnedFacts = pinned.map(id => byId.get(id)!).filter(Boolean);
         try {
-          const facts = usable.filter(id => !pinned.includes(id)).map(id => byId.get(id));
-          if (facts.some(f => !f)) throw Error("missing facts");
-          orders[`sck-${tier}`] = [...pinned, ...await jevOrder(this.deps.jev!, tier, settings.rules, facts as ModelFacts[], async payload => {
-            await this.deps.db.query(
-              "UPSERT type::record('company_meta',$key) SET tier=$tier,at=$at,payload=$payload;",
-              { key: `model_ranking_request_${tier}`, tier, at: new Date().toISOString(), payload });
-          }, result => { results[`sck-${tier}`] = {...result,pinnedFacts,excludedFacts}; }, async attempt=>{
-            await this.deps.db.query("UPSERT company_meta:model_ranking SET attempts=object::extend(attempts ?? {},$attempts);",{attempts:{[`sck-${tier}`]:attempt}});
-            this.deps.log?.(`模型排序 ${tier} ${attempt.status}：${attempt.encoding}, models=${attempt.modelCount}, state=${attempt.stateBytes}/${attempt.limits.stateBytes}, request=${attempt.requestBytes}/${attempt.limits.requestBytes}`);
-          }), ...excluded];
-        } catch (e) {
-          // Upstream text stays in the local plugin log; the shared record only says which group kept its order.
-          this.deps.log?.(`模型排序 ${tier} 失败：${(e as Error).message.slice(0, 200)}`);
-          errors.push(`${tier} 刷新失败${e instanceof RankingInputBudgetError ? `（输入超限：共享 ${e.attempt.stateBytes}/${e.attempt.limits.stateBytes} 字节，请求 ${e.attempt.requestBytes}/${e.attempt.limits.requestBytes} 字节）` : ""}，${excluded.length ? "持续报错的成员已移到末尾，其余" : ""}保留原顺序`);
-          // Jev's answer is optional for the tail: failing members still leave the front, unscored.
-          if (excluded.length) {
-            orders[`sck-${tier}`] = [...pinned, ...usable.filter(id => !pinned.includes(id)), ...excluded];
-
-          }
+          const facts=members.map(id=>byId.get(id));
+          if(facts.some(f=>!f))throw Error('missing facts');
+          const rows=ruleOrder(facts as ModelFacts[],pins[`sck-${tier}`]);
+          orders[`sck-${tier}`]=rows.map(r=>r.facts.id);
+          results[`sck-${tier}`]={engine:RULE_ENGINE,tier,at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,
+            rows,answers:{}};
+        } catch {
+          errors.push(`${tier} 数据不完整，保留现有顺序`);
         }
       }
       if (revision !== this.revision || this.stopped) return;
@@ -395,10 +387,10 @@ export class RankingRefresher {
 export async function rankingSettings(db: Surreal): Promise<RankingSettings> {
   const [row] = await db.query<[{ ranking_rules?: string; ranking_refresh_minutes?: number } | undefined]>(
     "SELECT ranking_rules, ranking_refresh_minutes FROM ONLY company_meta:model_routing;");
-  return { rules: row?.ranking_rules?.trim() || DEFAULT_RANKING_RULES, refreshMinutes: REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never) ? row!.ranking_refresh_minutes! : DEFAULT_REFRESH_MINUTES };
+  return { rules:DEFAULT_RANKING_RULES, refreshMinutes: REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never) ? row!.ranking_refresh_minutes! : DEFAULT_REFRESH_MINUTES };
 }
 export async function saveRankingSettings(db: Surreal, settings: RankingSettings, refresher: RankingRefresher): Promise<void> {
   if (!REFRESH_MINUTES.includes(settings.refreshMinutes as never) || typeof settings.rules !== 'string' || settings.rules.length > 8000) throw Error('排序规则或刷新间隔无效');
-  await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes};", {rules:settings.rules.trim() || DEFAULT_RANKING_RULES,minutes:settings.refreshMinutes});
+  await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes};", {rules:DEFAULT_RANKING_RULES,minutes:settings.refreshMinutes});
   refresher.reset(settings.refreshMinutes);
 }

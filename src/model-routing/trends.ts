@@ -102,7 +102,7 @@ export async function readUsageSamples(now: number, file = join(homedir(),'.conf
       const failed=(typeof r.err==='string'&&r.err.length>0)||r.status>=400;
       put('errorRate',failed?1:0);
       if(!failed) {
-        if(finite(r.ttft_ms)&&r.ttft_ms>0) {put('ttftMs',r.ttft_ms);put('ttftOver10sRate',r.ttft_ms>10000?1:0);}
+        if(finite(r.ttft_ms)&&r.ttft_ms>0) {put('ttftMs',r.ttft_ms);put('ttftOver10sRate',r.ttft_ms>10000?1:0);put('ttftOver20sRate',r.ttft_ms>20000?1:0);}
         put('tokensPerSecond',nativeDecode(r));
         if([r.in,r.cache_read??0,r.cache_write??0].every(v=>finite(v)&&v>=0)) {
           const prompt=Number(r.in)+Number(r.cache_read??0)+Number(r.cache_write??0);

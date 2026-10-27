@@ -1,4 +1,4 @@
-import { rankingHealthMetric, rankingTrendDetail } from "../plugin/shared/ranking-trends.ts";
+import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../plugin/shared/ranking-trends.ts";
 import {expect,test} from 'bun:test';
 const page=await Bun.file(new URL('../plugin/client/company.tsx',import.meta.url)).text();
 const source=page.slice(page.indexOf('function RankingJson('),page.indexOf('function RosterTab('));
@@ -7,8 +7,8 @@ function harness(data:any) {
  const elements:any[]=[];let states:any[]=[];let cursor=0;
  const React={createElement:(type:any,props:any,...children:any[]):any=>typeof type==='function'?type({...props,children}):{type,props:props??{},children}};
  const useState=(initial:any)=>{const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],(next:any)=>{states[i]=typeof next==='function'?next(states[i]):next;}];};
- const components=new Function('rankingTrendDetail','rankingHealthMetric','React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
-  rankingTrendDetail,rankingHealthMetric,React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
+ const components=new Function('rankingRuleLabel','rankingTrendDetail','rankingHealthMetric','React','useState','useRpc','useQuery','makeStyles','rpc','Section','View','Text','TextInput','Pressable','ExpandableText','Collapsible',compiled)(
+  rankingRuleLabel,rankingTrendDetail,rankingHealthMetric,React,useState,()=>()=>{},()=>({data,isError:false}),()=>({}),{},'Section','View','Text','TextInput','Pressable',({text}:any)=>React.createElement('Text',{},text),'Collapsible');
  const render=(name:string,props:any)=>{cursor=0;elements.length=0;const root=components[name]({...props,ctx:{theme:{colors:{surface0:"#ffffff"}},compact:false,...props.ctx}});const walk=(node:any)=>{if(!node||typeof node!=='object')return;if(Array.isArray(node)){node.forEach(walk);return;}elements.push(node);node.children?.forEach(walk);};walk(root);return elements;};
  const text=()=>elements.filter(n=>n.type==='Text').map(n=>n.children.flat(Infinity).filter((v:any)=>typeof v==='string'||typeof v==='number').join('')).join('\n');
  return {render,text,colors:(ctx:any)=>components.relayColors(ctx)};
@@ -16,15 +16,16 @@ function harness(data:any) {
 test('ranking UI shows default rules and an honest empty state before the first recorded attempt',()=>{
  const h=harness({rules:'智能程度和速度综合优先',refreshMinutes:5,configured:true,orders:{},requests:[]});
  const nodes=h.render('ModelRankingCard',{ctx:{}});
- expect(nodes.find(n=>n.type==='TextInput').props.value).toBe('智能程度和速度综合优先');
- expect(h.text()).toContain('尚无请求快照');
+ expect(nodes.filter(n=>n.type==='TextInput')).toHaveLength(0);
+ expect(h.text()).toContain('智能程度和速度综合优先');
+ expect(h.text()).toContain('没有历史请求');
 });
 test('ranking UI exposes each request timestamp and exact JSON, and JSON sections expand on press',()=>{
  const payload={model:'jev-fixture',state:{ownerRules:'旧规则',models:{m0:{id:'p/a'}}},questions:{m0:{instructions:'排序问题'}}};
  const h=harness({rules:'新规则',refreshMinutes:5,configured:true,orders:{},requests:[{tier:'opus',at:'2026-10-24T02:45:13Z',payload}]});
  h.render('ModelRankingCard',{ctx:{}});
  expect(h.text()).toContain('OPUS');expect(h.text()).toContain('调用开始');
- expect(h.text()).toContain(JSON.stringify(payload,null,2));expect(h.text()).not.toContain('尚无请求快照');
+ expect(h.text()).toContain(JSON.stringify(payload,null,2));expect(h.text()).not.toContain('没有历史请求');
  const tree=harness(undefined);
  let nodes=tree.render('RankingJson',{ctx:{},label:'state',value:payload.state});
  expect(tree.text()).toContain('旧规则');expect(tree.text()).not.toContain('p/a');
@@ -58,14 +59,14 @@ test('compact model rows expand on demand and preserve real scores, zero quotas 
   {model:'p/new',accounts:[]},
  ]}};
  let nodes=h.render('ModelRankingList',props);
- expect(h.text()).toContain('3.7123');expect(h.text()).toContain('0.0000');expect(h.text()).not.toContain('15.21 秒');
+ expect(h.text()).toContain('待测');expect(h.text()).not.toContain('3.7123');expect(h.text()).not.toContain('15.21 秒');
  nodes.find(n=>n.props.accessibilityLabel==='第 1 名 remote-magpie/codearts/deepseek:max').props.onPress();
  h.render('ModelRankingList',props);
  for(const value of ['45.1','164 tok/s','15.21 秒','0.0%','4.72 / 5','99.8%','2.50'])expect(h.text()).toContain(value);
  nodes=h.render('ModelRankingList',props);nodes.find(n=>n.props.accessibilityLabel==='第 2 名 p/zero').props.onPress();h.render('ModelRankingList',props);
- expect(h.text()).toContain('0 tok/s');expect(h.text()).not.toContain('15.21 秒');expect(h.text()).toContain('未评分');
+ expect(h.text()).toContain('0 tok/s');expect(h.text()).not.toContain('15.21 秒');expect(h.text()).toContain('待测');
  h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:false,rows:[{model:'p/old',accounts:[]}]}});
- expect(h.text()).toContain('未记录');expect(h.text()).toContain('历史排序未记录');
+ expect(h.text()).toContain('待测');expect(h.text()).toContain('等待下一次请求');
 });
 test('ranking group selector defaults to Haiku and switches lists without showing another group scores',()=>{
  const data={rules:'默认规则',refreshMinutes:5,configured:true,orders:{},requests:[],tables:[
@@ -88,7 +89,7 @@ test('Figma palette follows Paseo light/dark appearance including RGB surfaces',
 test('ranking row has an independent pin action and clearly labels a pinned model',async()=>{
  const h=harness(undefined),calls:unknown[]=[];
  const nodes=h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/a:max',pinned:true,accounts:[]}]},onPin:async(...args:unknown[])=>{calls.push(args);}});
- expect(h.text()).toContain('已置顶');
+ expect(h.text()).toContain('置顶');
  const button=nodes.find(n=>n.props.accessibilityLabel==='取消置顶 p/a:max');expect(button).toBeDefined();await button.props.onPress();expect(calls).toEqual([['p/a:max',false]]);
 });
 

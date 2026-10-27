@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createConsoleFetch,consoleUrl} from '../plugin/server/console.ts';
 import {startPreview} from '../plugin/server/preview.ts';
+import {DEFAULT_RANKING_RULES} from '../src/model-routing/ranking.ts';
 import {rankingPage} from '../plugin/server/ranking-page.ts';
 import {relayDesignCss} from '../plugin/shared/relay-design.ts';
 const homes:string[]=[];
@@ -31,15 +32,19 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  expect(()=>new Function(script)).not.toThrow();
  expect(html).not.toMatch(/\.metrics small\s*\{\s*display:\s*none/);
  expect(script).toContain('EWMA');
+ expect(html).not.toContain('<textarea');
+ expect(script).toContain("$('rule').textContent=state.rules");
+ expect(script).not.toContain("$('rule').value");
+ expect(script).toContain('rules:state.rules,refreshMinutes:Number');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
  expect(relayDesignCss).toContain('grid-template-columns: 340px minmax(0, 1fr)');
 });
 test('owner ranking GET shares settings without triggering a refresh; saves validate and reset the existing refresher',async()=>{
- const f=fixture();const get=await f.request('api/model-ranking');expect(get.status).toBe(200);expect(await get.json()).toMatchObject({rules:'原规则',refreshMinutes:5});expect(f.resets).toEqual([]);
+ const f=fixture();const get=await f.request('api/model-ranking');expect(get.status).toBe(200);expect(await get.json()).toMatchObject({rules:DEFAULT_RANKING_RULES,refreshMinutes:5});expect(f.resets).toEqual([]);
  expect((await f.request('api/model-ranking',{rules:'速度优先',refreshMinutes:2},'https://other.example')).status).toBe(403);
  for(const body of [{rules:'x',refreshMinutes:15},{rules:5,refreshMinutes:5},{rules:'x'.repeat(8001),refreshMinutes:5}])expect((await f.request('api/model-ranking',body)).status).toBe(400);
  expect(f.resets).toEqual([]);expect((await f.request('api/model-ranking',{rules:'速度优先',refreshMinutes:2},'http://localhost')).status).toBe(200);
- expect(f.resets).toEqual([2]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({rules:'速度优先',refreshMinutes:2});
+ expect(f.resets).toEqual([2]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({rules:DEFAULT_RANKING_RULES,refreshMinutes:2});
 });
 
 test('owner pin endpoint validates membership arguments and origin independently of rule saves',async()=>{
