@@ -839,7 +839,7 @@ export class Workforce {
     }
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE OR $t.state != 'review' OR $t.current_employee != NONE OR $t.version != $version { THROW 'task changed' };
+      IF $t = NONE OR $t.state != 'review' OR $t.current_employee != NONE OR $t.version != $version OR $t.company_upgrade != NONE { THROW 'task changed' };
       LET $next = UPDATE ONLY $task SET state = 'done', accepted_by = 'jev', jev_release_version = $version,
         delivery_id = NONE, lease_expires_at = NONE, version = $t.version + 1 RETURN AFTER;
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'accept', evidence: $evidence, version: $next.version, at: time::now() };
@@ -854,7 +854,7 @@ export class Workforce {
   async rerouteToGm(taskId: TaskId, version: number, evidence: string): Promise<boolean> {
     const responses = await this.db.query<unknown[]>(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
-      IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $version { THROW 'task changed' };
+      IF $t = NONE OR $t.state != 'blocked' OR $t.blocked_to != 'owner' OR $t.version != $version OR $t.company_upgrade != NONE { THROW 'task changed' };
       LET $next = UPDATE ONLY $task SET blocked_to = 'gm', owner_rerouted = true, jev_route_version = $version,
         version = $t.version + 1 RETURN AFTER;
       CREATE audit CONTENT { task: $task, actor: 'jev', action: 'jev_reroute', evidence: $evidence, version: $next.version, at: time::now() };
