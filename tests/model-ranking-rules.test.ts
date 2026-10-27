@@ -4,11 +4,11 @@ import {quotaAccounts,rankingTables,RankingRefresher,type ModelFacts} from '../s
 const now=Date.parse('2026-10-27T12:00:00Z');
 const fact=(id:string,score?:number,ttft?:number):ModelFacts=>({id,accounts:[{account:'anonymous',kind:'subscription',remainingPct:80}],price:{free:false},...(score===undefined?{}:{aa:{score,rank:1}}),...(ttft===undefined?{}:{usage:{source:'magpie',period:'7d',scope:'provider-model',collectedAt:new Date(now).toISOString(),requests:10,errors:0,ttftSamples:10,speedSamples:0,ttftMs:ttft}})});
 const order=(f:ModelFacts[],pins:string[]=[])=>ruleOrder(f,pins,now).map(r=>r.facts.id);
-test('the exact 20 second boundary remains eligible; greater latency cannot buy priority with AA or a pin',()=>{
+test('the exact 20 second boundary stays eligible; manual pins override the automatic latency tier',()=>{
  expect(TTFT_LIMIT_MS).toBe(20000);
  const f=[fact('slow',99,20001),fact('boundary',50,20000),fact('fast',49,500)];
- expect(order(f,['slow'])).toEqual(['fast','boundary','slow']);
- expect(ruleOrder(f,['slow'],now).at(-1)?.decision.tail).toBe('首 token 超过20秒');
+ expect(order(f)).toEqual(['fast','boundary','slow']);expect(order(f,['slow'])).toEqual(['slow','fast','boundary']);
+ expect(ruleOrder(f,['slow'],now)[0]?.decision.tail).toBe('首 token 超过20秒');
 });
 test('equally capable and within 20 seconds: TTFT wins even against a slightly higher AA score or much faster decode',()=>{
  const a=fact('AA60',60,18000),b=fact('AA59',59,700);a.usage!.tokensPerSecond=500;a.usage!.speedSamples=10;b.usage!.tokensPerSecond=10;b.usage!.speedSamples=10;
@@ -42,9 +42,10 @@ test('unknown TTFT is never encoded as zero and loses to measured latency within
  const rows=ruleOrder([{...fact('unknown',60),health:{source:'magpie-routing',attempts:1,errors:0,consecutiveErrors:0,excluded:false}},fact('measured',60,19000)],[],now);
  expect(rows.map(r=>r.facts.id)).toEqual(['measured','unknown']);expect(rows[1]!.decision).toMatchObject({latencySource:'unknown'});expect(rows[1]!.decision.ttftMs).toBeUndefined();
 });
-test('error gates and exhausted budgets cannot be overridden by pinning',()=>{
+test('automatic error and quota gates remain; manual pins form the independent first tier',()=>{
  const bad=fact('bad',99,50);bad.health={source:'magpie-routing',excluded:true,attempts:3,errors:3,consecutiveErrors:3};const spent=fact('spent',99,50);spent.accounts[0]!.remainingPct=0;
- expect(order([bad,spent,fact('healthy',50,100)],['bad','spent'])).toEqual(['healthy','spent','bad']);
+ expect(order([bad,spent,fact('healthy',50,100)])).toEqual(['healthy','spent','bad']);
+ expect(order([bad,spent,fact('healthy',50,100)],['bad','spent'])).toEqual(['bad','spent','healthy']);
 });
 test('quota parsing retains reset windows and billing kinds but anonymizes account labels',()=>{
  const rows=quotaAccounts([{provider:'p',kind:'plan',name:'private@example.com',windows:[{remaining:60,resetsAt:'2026-11-28T12:00:00Z'}]}]);
@@ -60,7 +61,7 @@ test('rule snapshots expose actual latency and reasons, never a fabricated Jev s
  expect(table.rows[0]!.decision?.ttftMs).toBe(21000);expect(table.rows[0]!.tailReason).toContain('20秒');expect(table.rows[0]!.jevScore).toBeUndefined();
 });
 
-test('first rule publication beats legacy pins, uses native PACE only for involved providers and records original settings',async()=>{
+test('controller preserves published orders, uses native PACE only for involved providers and records original settings',async()=>{
  const {ModelRoutingController}=await import('../src/model-routing/controller.ts');
  const {mkdtempSync,rmSync,readFileSync,writeFileSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
  const home=mkdtempSync(join(tmpdir(),'sck-native-pace-'));const groups:Record<string,string[]>={'sck-haiku':['p/gpt-6.1-sol','p/kimi-k3'],'sck-opus':['manual/opus'],'sck-fable':['manual/fable']};const commands:string[][]=[];

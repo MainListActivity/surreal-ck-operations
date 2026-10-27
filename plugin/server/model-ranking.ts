@@ -9,6 +9,6 @@ export async function modelRankingView(db: Surreal) {
   const [status]=await db.query<[{at?:Date;error?:string;results?:Record<string,RankingResultSnapshot>;orders?:Record<string,string[]>;pins?:Record<string,string[]>;gates?:RankingGates;attempts?:Record<string,RankingAttempt>}|undefined]>(
     'SELECT at,error,orders,results,pins,gates,attempts FROM ONLY company_meta:model_ranking;');
   const requests=await rankingRequests(db);
-  return {...settings,requests,attempts:{},tables:rankingTables(readMagpieGroups(),status?.results,requests,status?.pins,status?.gates),configured:true,engine:'quality-pace-v2',
+  return {...settings,requests,attempts:{},tables:rankingTables(readMagpieGroups(),status?.results,requests,status?.pins,status?.gates),configured:true,engine:'quality-pace-v3',
     at:status?.at?String(status.at):undefined,error:status?.error,orders:status?.orders??{}};
 }
