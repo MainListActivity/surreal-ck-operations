@@ -423,8 +423,15 @@ test('v3 promotional/account-bound evidence parses and its eligibility gate re-d
     { accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_PRO' }, { accountBound: false }, { promotional: false },
     { autoTopupDisabled: false }, { revalidateBeforeUse: false }, { evidenceClass: 'official-stable-free' },
     { terminationRisk: 'permanent' },
+    { terminationRisk: 'promotional-end-recorded' },
+    { promotionalEndsAt: new Date(now + 2 * 3_600_000).toISOString(), terminationRisk: 'unknown-promotional-end' },
     { planSource: { ...doc.planSource, httpDate: undefined } },
     { planSource: { ...doc.planSource, clockSkewMs: 300_001 } },
+    { planSource: { ...doc.planSource, clockSkewMs: 60_000 } },
+    { planSource: { ...doc.planSource, httpDate: new Date(now - 365 * 86_400_000).toISOString() } },
+    { governingPool: { poolType: 'dedicated', basis: 'single-pool' } },
+    { governingPool: { poolType: 'dedicated', basis: 'default-pool' } },
+    { governingPool: { poolType: 'default', basis: 'dedicated-pool-for-bound-model' } },
     { normalization: { ...doc.normalization, algorithm: 'raw' } },
     { pools: [{ ...doc.pools[0]!, window7d: undefined }] },
     { pools: [{ ...doc.pools[0]!, window7d: { ...doc.pools[0]!.window7d, remaining: null } }] },
@@ -442,6 +449,29 @@ test('v3 promotional/account-bound evidence parses and its eligibility gate re-d
   expect(tokenPlanV3Eligible({ ...doc, expiresAt: new Date(now + 5 * 3_600_000).toISOString() } as never, now)).toBe(false);
   expect(tokenPlanV3Eligible({ ...doc, quotaRemaining: 10 } as never, now)).toBe(false);
   expect(tokenPlanV3Eligible({ ...doc, serviceApproved: false } as never, now)).toBe(false);
+
+  // R1: the usable quota is bound to the pool itself, not to the self-reported quota fields.
+  const drainedPools = doc.pools.map(pool => ({
+    ...pool,
+    window5h: { ...pool.window5h, used: pool.window5h.limit - 100, remaining: 100 },
+    window7d: { ...pool.window7d, used: pool.window7d.limit - 100, remaining: 100 },
+  }));
+  const drained = { ...doc, quotaAmount: 60_000, quotaRemaining: 60_000, pools: drainedPools };
+  expect(tokenPlanEvidenceV3Schema.safeParse(drained).success).toBe(false);
+  expect(tokenPlanV3Eligible(drained as never, now)).toBe(false);
+  expect(evidenceChecks(drained as never, manifest, now).serviceEvidenceEligible).toBe(false);
+  // A conservative lower number is still a false record: quotaRemaining must be the actual minimum.
+  expect(tokenPlanEvidenceV3Schema.safeParse({ ...doc, quotaRemaining: 118_499 }).success).toBe(false);
+  expect(tokenPlanEvidenceV3Schema.safeParse({ ...doc, quotaRemaining: 119_400 }).success).toBe(false);
+
+  // R2: the declared skew must be the real difference, so a stale HTTP Date cannot look fresh.
+  const stale = { ...doc, planSource: { ...doc.planSource, httpDate: new Date(now - 365 * 86_400_000).toISOString() } };
+  expect(tokenPlanEvidenceV3Schema.safeParse(stale).success).toBe(false);
+  expect(tokenPlanV3Eligible(stale as never, now)).toBe(false);
+  const fakeSkew = { ...doc, planSource: { ...doc.planSource, clockSkewMs: 0 } };
+  fakeSkew.planSource.httpDate = new Date(now - 60_000).toISOString();
+  expect(tokenPlanEvidenceV3Schema.safeParse(fakeSkew).success).toBe(false);
+  expect(tokenPlanV3Eligible(fakeSkew as never, now)).toBe(false);
 });
 
 test('v3 documentHash covers every new field and loadProofFiles round-trips it', async () => {
@@ -474,7 +504,10 @@ test('v3 documentHash covers every new field and loadProofFiles round-trips it',
 
 test('the v3 synthetic example is contract-valid (shape only, not real evidence)', async () => {
   const text = await readFile(new URL('../docs/examples/internal-ai-token-plan-v3.synthetic.json', import.meta.url), 'utf8');
-  expect(tokenPlanEvidenceV3Schema.safeParse(JSON.parse(text)).success).toBe(true);
+  const example = JSON.parse(text);
+  expect(tokenPlanEvidenceV3Schema.safeParse(example).success).toBe(true);
+  // Its self-reported quota fields equal the pool minimum and its HTTP Date skew is the real difference.
+  expect(tokenPlanV3Eligible(example, Date.parse('2026-10-27T10:30:00.000Z'))).toBe(true);
   // The v2 example is untouched and still follows the frozen v2 path.
   const v2 = await readFile(new URL('../docs/examples/internal-ai-token-plan-v2.synthetic.json', import.meta.url), 'utf8');
   expect(evidenceSchema.safeParse(JSON.parse(v2)).success).toBe(true);

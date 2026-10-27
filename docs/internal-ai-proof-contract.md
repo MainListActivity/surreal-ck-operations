@@ -42,18 +42,20 @@ GM 技术裁定：官方页仍写公测免费、限时放量，但**不再给配
 
 v3 文档（`schemaVersion=3`，`type=reviewed-token-plan`，`evidenceClass=promotional-account-bound`）在 v2 基础上强制并记录：
 
-- `planSource { url, fetchedAt, httpDate, clockSkewMs, status, etag, rawSha256 }`：官方 URL、本机 UTC 抓取时刻、来源 HTTP Date 与偏差（±5 分钟）、HTTP 状态、ETag、原始页面字节 SHA256；
+- `planSource { url, fetchedAt, httpDate, clockSkewMs, status, etag, rawSha256 }`：官方 URL、本机 UTC 抓取时刻、来源 HTTP Date 与偏差（±5 分钟）、HTTP 状态、ETag、原始页面字节 SHA256；`clockSkewMs` 必须精确等于 `fetchedAt - httpDate` 且实际差值在 ±5 分钟内，签名后的自报字段不能伪造新鲜度；
 - `normalization { algorithm:"html-text-flat/1", flatSha256, flatChars }`：固定归一化算法（去 script/style、标签换空格、空白折叠）及归一化文本 hash；
 - `accountPlanType=FREE`、`accountBound=true`、`accountBoundSource`：仅认证 console 的 pool-usage + 同一密封 API key 精确交叉绑定可证明；
 - `pools[]` 每个池必须同时有 `window5h`/`window7d` 的 `limit/used/remaining/resetAt`（`used` 可标 `reported`/`derived`），`used+remaining=limit`；重复池类型、缺任一窗口、已重置或事实不一致一律 blocked；**缺 7d 不得当作无限**；
-- `governingPool { poolType, basis }`：绑定模型优先 dedicated，其次 default，单池则 single-pool；重复 dedicated 视为歧义；
-- `quotaAmount`：本次**准用上界** = min(核定 60000 points / 18000s, 所有适用池 5h/7d 的可信 remaining)，`quotaRemaining` 记录最小可信剩余；观察到的 120000/1200000 只进 `pools`/回执，永不抬高准用上界；余额 0 时 blocked，不生成文档；
-- `promotional=true`、`revalidateBeforeUse=true`、`terminationRisk`、`promotionalEndsAt`：官方页若给出可解析的活动截止日，`expiresAt` 不得晚于它；提到截止但无法解析时 blocked；未提及时明示 `unknown-promotional-end`，不得声称永久有效；
+- `governingPool { poolType, basis }`：绑定模型优先 dedicated，其次 default，单池则 single-pool；重复 dedicated 视为歧义；`basis` 必须与所选池一致（dedicated/default 对应同名池类型，single-pool 仅限单池文档）；
+- `quotaAmount`：本次**准用上界** = min(核定 60000 points / 18000s, 所有适用池 5h/7d 的可信 remaining)，`quotaRemaining` 必须精确等于所有池窗口 remaining 的最小值（自报更大值或保守小值都不能通过），`quotaAmount` 同时不得大于该最小值；观察到的 120000/1200000 只进 `pools`/回执，永不抬高准用上界；余额 0 时 blocked，不生成文档；
+- `promotional=true`、`revalidateBeforeUse=true`、`terminationRisk`、`promotionalEndsAt`：官方页若给出可解析的活动截止日，按站点时区 Asia/Shanghai（UTC+8）的当日 23:59:59.999 理解，`expiresAt` 不得晚于该时刻；`terminationRisk=promotional-end-recorded` 必须同时给出 `promotionalEndsAt`，`unknown-promotional-end` 必须为 null；提到截止但无法解析时 blocked；未提及时明示 `unknown-promotional-end`，不得声称永久有效；
 - `autoTopupDisabled=true` 仍是我方计量配置断言；支付面 404 仍只是回执观测，不证明没有支付能力，也绝不参与判定；
 - `expiresAt` ≤ `sampledAt+24h`，且 ≤ 所有适用池 5h/7d reset 的最早者；到期不续旧件，必须真实重采样。
 
-`tokenPlanV3Eligible` 在 prepare/prove/deliver/diagnose 共用的 `evidenceChecks` 中重新推导上述边界（额度上限、每个池保持一致、expires 不越过 reset/24h/活动截止、FREE/accountBound/promotional/revalidate/autoTopup 全为真），因此手写或篡改的文档不能靠自报字段通过。`documentHash` 覆盖完整 v3 JSON，任何新语义字段变化都会使候选/证明失配。官方页 marker 由 v2 的 `quota5h` 换成 v3 的 `freeBetaOpen + paidTiersUpcoming + limitedTimePromotion + freeTierNamed`；配额数字改为 `officialQuotaNumberObserved` 观测项，不是放行条件——这不是删除失败项，而是官方文案已无数字，新增的限时 marker 与账号绑定池约束更严。
+`tokenPlanV3Eligible` 在 prepare/prove/deliver/diagnose 共用的 `evidenceChecks` 中重新推导上述边界（额度上限与各池最小 remaining 交叉核对、HTTP Date 偏差与 `clockSkewMs` 一致、terminationRisk/promotionalEndsAt 一致、governingPool basis 与池类型一致、每个池保持一致、expires 不越过 reset/24h/活动截止、FREE/accountBound/promotional/revalidate/autoTopup 全为真），因此手写或篡改的文档不能靠自报字段通过。`documentHash` 覆盖完整 v3 JSON，任何新语义字段变化都会使候选/证明失配。官方页 marker 由 v2 的 `quota5h` 换成 v3 的 `freeBetaOpen + paidTiersUpcoming + limitedTimePromotion + freeTierNamed`；配额数字改为 `officialQuotaNumberObserved` 观测项，不是放行条件——这不是删除失败项，而是官方文案已无数字，新增的限时 marker 与账号绑定池约束更严。
 
 产品消费端不变：投递的 JWT 仍 `contractVersion=1`，manifest 仍 schemaVersion=1，v3 文档不进入 JWT（产品只校验签名、manifest 与 documentHash）。若未来产品需要解析 evidence 文档，v3 必须另拆独立产品交付链与部署依赖，不能把不兼容版本直接发布为可用。
+
+`revalidateBeforeUse=true` 是文档的持续义务声明，不是“已核实”的证明：每次模型调用前由源业务（33dc）重新采样官方 FREE/限时状态与池剩余，文档到期即作废、不续旧件；公司证明链只在签发时校验该文档。
 
 评审人生命周期（FV06）：批准以审计行的 accept 评审人为准，其撤权状态按结构化字段判定，诊断、授权与密钥轮换共用同一规则。调度器正常轮换或归档（员工退役类型 `rotation` / `archive`）只使凭证失效，不撤销已形成的独立批准；显式安全撤权（管理员 revoke，写入不可回退的 `security_revoked`）、失败或人工退役、改动前写入的无类型退役（旧记录）一律拒绝。旧记录不自动追认，需要新的独立批准。

@@ -267,10 +267,13 @@ export function promotionalDeadline(flat: string): { at: string; text: string } 
   const match = /(?:活动)?(?:截止|截至)(?:日期|时间)?[:：]?\s*(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/.exec(flat);
   if (!match) return null;
   const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
-  const at = Date.UTC(year, month - 1, day, 23, 59, 59, 999);
-  const date = new Date(at);
-  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
-  return { at: date.toISOString(), text: match[0].slice(0, 80) };
+  // The plan page is a Chinese site and states a bare calendar date; interpret its end of day in
+  // Asia/Shanghai (UTC+8), not UTC, so an evidence document never outlives the real campaign by
+  // the eight-hour offset. The date itself is validated against the same UTC+8 calendar.
+  const at = Date.UTC(year, month - 1, day, 15, 59, 59, 999);
+  const local = new Date(at + 8 * 3_600_000);
+  if (local.getUTCFullYear() !== year || local.getUTCMonth() !== month - 1 || local.getUTCDate() !== day) return null;
+  return { at: new Date(at).toISOString(), text: match[0].slice(0, 80) };
 }
 
 /** Parses the console pool-usage payload; null when the shape drifted beyond recognition. */

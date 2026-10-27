@@ -81,7 +81,7 @@ test('v2 official-copy markers and semantics are preserved; v3 adds limited-time
   expect(planPageMarkersV2(v2Page)).toEqual({ freeBetaOpen: true, paidTiersUpcoming: true, quota5h: true, freeTierNamed: true });
   const v3Page = '<html><body>公测期完全免费开放 付费档位即将上线 Free · 公测 限时放量 ¥0/月</body></html>';
   expect(planPageMarkersV3(flattenPlanHtml(v3Page))).toMatchObject({ limitedTimePromotion: true, officialQuotaNumberObserved: false });
-  expect(promotionalDeadline('活动截止 2026-11-30')).toMatchObject({ at: '2026-11-30T23:59:59.999Z' });
+  expect(promotionalDeadline('活动截止 2026-11-30')).toMatchObject({ at: '2026-11-30T15:59:59.999Z' });
   expect(promotionalDeadline('活动截止 另行通知')).toBeNull();
 });
 
@@ -505,7 +505,7 @@ describe('ops_supplier_plan_sample', () => {
     expect(result.status).toBe('sampled');
     const doc = result.document as Record<string, any>;
     expect(doc.terminationRisk).toBe('promotional-end-recorded');
-    expect(doc.promotionalEndsAt).toBe(new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999)).toISOString());
+    expect(doc.promotionalEndsAt).toBe(new Date(Date.UTC(y, m - 1, d, 15, 59, 59, 999)).toISOString());
     expect(Date.parse(doc.expiresAt)).toBeLessThanOrEqual(Date.parse(doc.promotionalEndsAt));
     expectNoSupplierLeaks(r);
   });
