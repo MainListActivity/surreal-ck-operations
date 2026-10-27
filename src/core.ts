@@ -43,6 +43,15 @@ import {
   DEFAULT_FAULT_BUDGET, budgetKey, classifyFault, faultEvidence, jitterFactorOf, type FaultBudgetLimits,
   type FaultDiagnostic, type FaultInput, type FaultPhase, type FaultRecord, type FaultTargetKind, type FlowStage,
 } from './faults.ts';
+import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
+import {
+  assertNonSensitive, migrationPreview, normalizeWait, parseInstant, validateEvent, verifyWaitWebhook, waitEventKey, waitKeyOf,
+  webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
+} from './waits.ts';
+import type {
+  TaskWaitView, WaitActionInput, WaitActionView, WaitEntryInput, WaitListView, WaitMigrationApplyInput,
+  WaitMigrationPreviewView, WaitResolveInput, WaitResolveView,
+} from './contracts.ts';
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
 type FaultReportOutcome = FaultReportResult;
@@ -148,7 +157,7 @@ export const RESOLVE_DEP_SQL = (deps: string, p: string) => `
 export const UNLOCK_CHILDREN_SQL = `
   LET $done_row = SELECT * FROM ONLY $task;
   LET $task_chain = IF ($done_row.lineage ?? NONE) = NONE THEN [$task] ELSE (SELECT VALUE id FROM task WHERE lineage = $done_row.lineage) END;
-  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
+  LET $children = SELECT * FROM task WHERE state = 'blocked' AND blocked_to = NONE AND wait_state != 'waiting' AND array::len(array::filter(dependencies ?? [], |$d| $d IN $task_chain)) > 0;
   FOR $child IN $children {
     ${RESOLVE_DEP_SQL('$child.dependencies', '$c_dep')}
     LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
@@ -215,7 +224,7 @@ interface EmployeeRow {
   tracks?: string[];
 }
 
-interface TaskRow {
+export interface TaskRow {
   recovery_stopped?: boolean;
   dependency_continuation?: 'execute' | 'manager';
   execution_window?: import('./task-recovery.ts').ExecutionWindow;
@@ -254,6 +263,17 @@ interface TaskRow {
   progress_at?: number;
   /** Unix seconds: a quota-caused block may not be re-announced to gm before this instant. */
   quota_resets_at?: number | null;
+  /** SYS05: the open typed wait (schemaless task fields, written only by WaitStore.enter). */
+  wait_state?: 'waiting' | null;
+  wait_kind?: string | null;
+  wait_episode?: string | null;
+  wait_not_before?: number | null;
+  wait_expires_at?: number | null;
+  wait_next_check_at?: number | null;
+  wait_owner_role?: string | null;
+  wait_source?: string | null;
+  wait_version?: number | null;
+  wait_entered_at?: unknown;
   evaluated_at?: string;
   model_eval_full_history?: boolean;
   eval_via?: string;
@@ -315,7 +335,6 @@ interface ActiveLeaseRow {
   version: number;
 }
 export interface IdempotencyRow { payload_digest: string; result: TaskRow }
-export type { TaskRow };
 
 /** The policy as the API states it: `setAt` as an ISO timestamp, whatever the driver returned. */
 function policyView(policy: IndependenceRow): IndependencePolicy {
@@ -365,6 +384,18 @@ export function view(row: TaskRow): TaskView {
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     waiting: waitingOf(row),
+    wait: row.wait_state === 'waiting' && row.wait_episode ? {
+      waitKey: row.wait_episode,
+      kind: (row.wait_kind ?? 'time') as NonNullable<TaskView['wait']>['kind'],
+      state: 'waiting',
+      ownerRole: row.wait_owner_role ?? 'unknown',
+      source: (row.wait_source ?? 'time') as NonNullable<TaskView['wait']>['source'],
+      ...(row.wait_not_before === undefined || row.wait_not_before === null ? {} : { notBefore: new Date(row.wait_not_before).toISOString() }),
+      ...(row.wait_expires_at === undefined || row.wait_expires_at === null ? {} : { expiresAt: new Date(row.wait_expires_at).toISOString() }),
+      expiresSource: row.wait_expires_at === undefined || row.wait_expires_at === null ? 'unknown' : 'exact',
+      ...(row.wait_next_check_at === undefined || row.wait_next_check_at === null ? {} : { nextCheckAt: new Date(row.wait_next_check_at).toISOString() }),
+      version: row.wait_version ?? 1,
+    } : undefined,
     handover: row.handover || undefined,
     previousEmployee: row.previous_employee,
     implementer: row.implementer ?? undefined,
@@ -576,7 +607,8 @@ export class SurrealCompanyCore implements CompanyCore {
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
-    externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number } }) {
+    externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
+    waits?: { clock?: () => number; webhookSecret?: string } }) {
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
@@ -601,6 +633,10 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
     this.faults = new FaultStore(database.db);
     this.faultLimits = options?.faults?.limits ?? DEFAULT_FAULT_BUDGET;
     this.faultClock = options?.faults?.clock ?? Date.now;
+    // SYS05: typed waits on time and trusted external events.
+    this.waits = new WaitStore(database.db);
+    this.waitClock = options?.waits?.clock ?? Date.now;
+    this.waitWebhookSecret = options?.waits?.webhookSecret ?? process.env.SCK_WAIT_WEBHOOK_SECRET;
   }
   readonly worktrees?: WorktreeRegistry;
   private readonly owner: OwnerDesk;
@@ -614,6 +650,12 @@ private readonly independenceReadHook?: (taskId: string) => Promise<void>;
   private readonly faultLimits: FaultBudgetLimits;
   /** SYS04: the clock the budget is measured against (tests inject a controlled one). */
   private readonly faultClock: () => number;
+  /** SYS05: the wait ledger. */
+  private readonly waits: WaitStore;
+  /** SYS05: the clock waits are measured against (tests inject a controlled one). */
+  private readonly waitClock: () => number;
+  /** SYS05: the HMAC secret a webhook must sign with; absent means webhook events are refused, never trusted by default. */
+  private readonly waitWebhookSecret?: string;
   private readonly projects: ProjectStore;
   /** Stored listings behind the paged reads (C4). */
   private readonly snapshots: SnapshotStore;
@@ -1311,6 +1353,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $who.workspace_scope != NONE AND $who.workspace_scope != IF $t.goal = NONE THEN 'maintenance' ELSE <string>record::id($t.goal) END { THROW 'workspace goal denied' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
+      // SYS05：等待中的任务不占租约、不派工；到点前直接 claim 也拒绝（releaseDue 落库后才回到 ready/review）。
+      IF $t.wait_state = 'waiting' { THROW 'task is waiting' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
       LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
       IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the claim was read' };
@@ -2466,8 +2510,27 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
 
   async relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView> {
     const source = await this.relayActor(credential, input.ownerQuote);
-    return echoTask(await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
-      note: `${input.note}\n老板原话：${input.ownerQuote}` }));
+    // SYS05: an owner handoff wait parks the task outside the owner-gate fields (blocked_to = NONE), so the
+    // ordinary owner.decide path cannot reach it. The boss's reply through this same relay is the typed event
+    // that releases it, carrying the owner's own words; a model saying "the boss agreed" has no quote to pass.
+    if (input.taskId && input.decision === 'reply') {
+      const waiting = await this.waits.openOfTask(input.taskId).catch(() => undefined);
+      if (waiting?.kind === 'owner_handoff') {
+        await this.resolveOwnerWait(input.taskId, input.ownerQuote, input.idempotencyKey);
+        const row = await this.db.select<TaskRow>(id('task', input.taskId));
+        if (!row) throw new CompanyError('not_found', 'Task not found');
+        return echoTask(view(row));
+      }
+    }
+    const decided = await this.owner.decide({ ...input, source, key: `${source}:${input.idempotencyKey}`,
+      note: `${input.note}\n老板原话：${input.ownerQuote}` });
+    // SYS05: if a task is both an owner gate and an owner handoff, the same decision resolves the wait too.
+    if (input.taskId) {
+      await this.resolveOwnerWait(input.taskId, input.ownerQuote, input.idempotencyKey)
+        .catch(error => { /* the decision itself must not be lost to a wait ledger error; the next tick can retry */
+          void error; });
+    }
+    return echoTask(decided);
   }
 
   async relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void> {
@@ -2788,6 +2851,359 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const view = await this.transition(credential, proof, 'block', evidence, to);
     await this.recordQuotaGate(credential, proof.taskId, until);
     return view;
+  }
+
+  // ---------------------------------------------------------------- SYS05: typed waits
+
+  /**
+   * Enter a typed wait. The lease is released and the progress snapshot is stored in the same transaction; the task
+   * leaves the dispatch queue with no employee or provider seat attached. Nothing about the condition is released
+   * here, and the time condition replaces neither a dependency nor an owner approval.
+   */
+  async wait(credential: Credential, proof: LeaseProof, evidence: Evidence, input: WaitEntryInput): Promise<TaskView> {
+    const actor = await this.authorized(credential);
+    if (!Number.isSafeInteger(proof.expectedVersion) || !Number.isSafeInteger(proof.fence) || proof.fence < 1) {
+      throw new CompanyError('invalid', 'Invalid lease proof');
+    }
+    requireText(evidence.text, 'evidence', 20, 30000);
+    // SYS05 AC04: invitation material and credentials stay in the controlled handoff file, never in task evidence.
+    assertNonSensitive(evidence.text, 'evidence');
+    const row = await this.db.select<TaskRow>(id('task', proof.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.state === 'void') throw new CompanyError('conflict', 'Task retired');
+    if (!['doing', 'review'].includes(row.state)) throw new CompanyError('forbidden', 'Task not held');
+    const idem = this.idemId(actor.employeeId, 'wait', evidence.idempotencyKey);
+    const digest = HASH(JSON.stringify({ proof, evidence, input }));
+    const replay = await this.replay(idem, digest);
+    if (replay) return replay;
+    const now = this.waitClock();
+    const defaultOwner = input.kind === 'owner_handoff' ? 'owner'
+      : (input.kind === 'dependency' || input.kind === 'upstream_repair') ? row.executor_role : 'gm';
+    const normalized = normalizeWait({ ...input, ownerRole: input.ownerRole ?? defaultOwner } as WaitInput, {
+      now, ownerRole: defaultOwner,
+    });
+    let releaseGraph: (() => Promise<void>) | undefined;
+    try {
+      if (normalized.referenceTaskId) {
+        const reference = await this.db.select<TaskRow>(id('task', normalized.referenceTaskId));
+        if (!reference) throw new CompanyError('not_found', 'referenceTaskId 指向的任务不存在');
+        if (normalized.referenceTaskId === proof.taskId) throw new CompanyError('invalid', '任务不能等待自己');
+        // The cycle check and the wait insert must be one critical section. A pre-check alone is a TOCTOU race:
+        // two holders entering A->B and B->A at the same time each miss the other's uncommitted edge.
+        releaseGraph = await this.waits.lockGraph(`employee:${actor.employeeId}:${randomUUID()}`);
+        if (await this.waitWouldCycle(proof.taskId, normalized.referenceTaskId)) {
+          throw new CompanyError('conflict', '等待引用会形成依赖环，已拒绝');
+        }
+        if (['done', 'void'].includes(reference.state)) {
+          throw new CompanyError('conflict', 'referenceTaskId 指向的任务已经终态；不需要进入等待');
+        }
+      }
+      // The progress snapshot is the last resumable thing the holder did, not a claim about the outside world.
+      let summary = normalized.summary;
+      if (!summary) {
+        const [latest] = await this.db.query<[Array<{ evidence?: string }>]>(
+          `SELECT evidence FROM audit WHERE task = $task AND action IN ['checkpoint', 'submit', 'wait']
+           ORDER BY at DESC LIMIT 1;`, { task: id('task', proof.taskId) }).catch(() => [[]] as [Array<{ evidence?: string }>]);
+        const text = latest?.[0]?.evidence ?? '';
+        summary = text ? assertNonSensitive(text.slice(0, 800), 'progress summary') : undefined;
+      }
+      const waitKey = waitKeyOf(proof.taskId, randomUUID());
+      const createdAt = this.waitClock();
+      try {
+        const updated = await this.waits.enter({
+          taskId: proof.taskId, waitKey, normalized: {
+            kind: normalized.kind, source: normalized.source, ownerRole: normalized.ownerRole,
+            ...(normalized.reference === undefined ? {} : { reference: normalized.reference }),
+            ...(normalized.referenceTaskId === undefined ? {} : { referenceTaskId: normalized.referenceTaskId }),
+            ...(normalized.notBefore === undefined ? {} : { notBefore: normalized.notBefore }),
+            ...(normalized.expiresAt === undefined ? {} : { expiresAt: normalized.expiresAt }),
+            expiresSource: normalized.expiresSource,
+            ...(normalized.nextCheckAt === undefined ? {} : { nextCheckAt: normalized.nextCheckAt }),
+            ...(normalized.timezone === undefined ? {} : { timezone: normalized.timezone }),
+            completed: normalized.completed,
+            ...(normalized.pendingAction === undefined ? {} : { pendingAction: normalized.pendingAction }),
+            ...(normalized.handoffFile === undefined ? {} : { handoffFile: normalized.handoffFile }),
+            reason: normalized.reason,
+          },
+          progress: {
+            employee: actor.employeeId, taskVersion: proof.expectedVersion, at: createdAt,
+            ...(summary === undefined ? {} : { summary }),
+          },
+          resumeState: row.state === 'review' ? 'review' : 'ready',
+          resumeRole: row.state === 'review' ? row.reviewer_role : row.executor_role,
+          actor: actor.employeeId, employee: actor.employeeId,
+          proof: { deliveryId: proof.deliveryId, fence: proof.fence, expectedVersion: proof.expectedVersion },
+          now, evidence: evidence.text, idem: String(idem.id), digest,
+          auditId: randomUUID(), outboxId: randomUUID(),
+        });
+        if (!updated) throw new CompanyError('temporarily_unavailable', '等待未落地，请重试', true);
+        return view(updated);
+      } catch (error) {
+        const prior = await this.replay(idem, digest);
+        if (prior) return prior;
+        throw this.waitError(error);
+      }
+    } finally {
+      await releaseGraph?.();
+    }
+  }
+
+  /**
+   * Resolve a wait from a trusted event. The public entry accepts an authorized manager or a signed webhook; the
+   * owner path is not reachable here (only the owner relay calls `resolveOwnerWait`), so an employee saying it heard
+   * back from the customer cannot release a real-person acknowledgement.
+   */
+  async resolveWait(credential: Credential, input: WaitResolveInput): Promise<WaitResolveView> {
+    const actor = await this.authorized(credential);
+    if (!input || typeof input.source !== 'string') throw new CompanyError('invalid', 'source is required');
+    if (input.source === 'owner') {
+      throw new CompanyError('forbidden', '老板决定只能由 owner relay 记录（record_owner_decision），员工不能自称收到老板回执');
+    }
+    requireText(input.text, 'evidence', 20, 30000);
+    assertNonSensitive(input.text, 'evidence');
+    const wait = await this.waitOfInput(input);
+    if (!wait) throw new CompanyError('not_found', '没有找到这个等待（waitKey 或 taskId）');
+    const now = this.waitClock();
+    const verified = input.source === 'webhook' ? this.verifyWebhook(input, now) : false;
+    if (input.source === 'authorized_person' || input.source === 'dependency') {
+      if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以以授权人身份确认等待事件');
+    }
+    if (input.source === 'webhook' && !verified) {
+      if (!this.waitWebhookSecret) throw new CompanyError('not_configured', 'webhook 签名密钥未配置；未验证的事件不能解除等待');
+      throw new CompanyError('forbidden', 'webhook 签名无效；事件未被接受');
+    }
+    const event = validateEvent(waitRecordOf(wait), input as never, now, { verified });
+    const outcome = await this.waits.resolve({
+      wait, event: event as WaitEvent, expectedVersion: wait.version, actor: `employee:${actor.employeeId}`,
+      ownerApproved: false, now,
+    });
+    return {
+      released: outcome.released, code: outcome.code, message: outcome.message,
+      taskId: outcome.taskId, waitKey: wait.waitKey,
+      ...(event.eventId ? { eventKey: waitEventKey(wait.waitKey, event) ?? '' } : {}),
+    };
+  }
+
+  /**
+   * The owner relay's resolution. It is deliberately not exposed as a tool: only `record_owner_decision` (which
+   * carries the owner's own words and is audited as a relay) reaches it. It releases every open owner handoff of
+   * that task, and nothing else.
+   */
+  private async resolveOwnerWait(taskId: TaskId, ownerQuote: string, idempotencyKey: string): Promise<void> {
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (!row) return;
+    const waits = await this.waits.waitsOfTask(taskId);
+    for (const wait of waits) {
+      if (wait.kind !== 'owner_handoff' || wait.state !== 'waiting') continue;
+      const now = this.waitClock();
+      const event: WaitEvent = {
+        source: 'owner', at: now, verified: true, objectWaitId: wait.waitKey, objectTaskId: taskId,
+        eventId: `owner:${idempotencyKey}:${wait.waitKey}`,
+        ownerQuote: assertNonSensitive(ownerQuote.slice(0, 2000), 'ownerQuote'),
+      };
+      await this.waits.resolve({
+        wait, event, expectedVersion: wait.version, actor: 'owner-relay', ownerApproved: true, now,
+      });
+    }
+  }
+
+  /** Manager cancel: version-locked. Without `resume` the task stays blocked for a human, never silently schedulable. */
+  async cancelWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以取消等待');
+    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '取消理由需为 10-2000 字');
+    assertNonSensitive(reason, 'reason');
+    const result = await this.waits.cancel({
+      waitKey: String(input.waitKey ?? ''), expectedVersion: input.expectedVersion, reason,
+      actor: `employee:${actor.employeeId}`, resume: input.resume === true, now: this.waitClock(),
+    });
+    return { ok: result.cancelled, message: result.message, waitKey: String(input.waitKey ?? ''),
+      ...(result.taskId === undefined ? {} : { taskId: result.taskId }) };
+  }
+
+  /** Manager extend/re-arm: version-locked and reasoned. A stale version cannot overwrite another manager's change. */
+  async extendWait(credential: Credential, input: WaitActionInput): Promise<WaitActionView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以延期等待');
+    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '延期理由需为 10-2000 字');
+    assertNonSensitive(reason, 'reason');
+    const now = this.waitClock();
+    const notBefore = input.notBefore === undefined ? undefined : parseInstant(input.notBefore, 'notBefore');
+    const expiresAt = input.expiresAt === undefined ? undefined : parseInstant(input.expiresAt, 'expiresAt');
+    const nextCheckAt = input.nextCheckAt === undefined ? undefined : parseInstant(input.nextCheckAt, 'nextCheckAt');
+    if (notBefore !== undefined && notBefore < now) throw new CompanyError('invalid', '新的 notBefore 不能早于现在；取消请用 cancel_wait');
+    if (expiresAt !== undefined && expiresAt <= now) throw new CompanyError('invalid', '新的 expiresAt 必须晚于现在');
+    if (nextCheckAt !== undefined && nextCheckAt <= now) throw new CompanyError('invalid', '新的 nextCheckAt 必须晚于现在');
+    const result = await this.waits.extend({
+      waitKey: String(input.waitKey ?? ''), expectedVersion: input.expectedVersion, reason,
+      actor: `employee:${actor.employeeId}`, now,
+      ...(notBefore === undefined ? {} : { notBefore }),
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(nextCheckAt === undefined ? {} : { nextCheckAt }),
+    });
+    return { ok: result.extended, message: result.message, waitKey: String(input.waitKey ?? ''),
+      ...(result.version === undefined ? {} : { version: result.version }) };
+  }
+
+  /** Read waits. Every authenticated employee may read the internal wait facts; they carry no credentials. */
+  async listWaits(credential: Credential, input: { taskId?: string; state?: string; limit?: number } = {}): Promise<WaitListView> {
+    await this.authorized(credential);
+    const waits = await this.waits.list({
+      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+      ...(input.state === undefined ? {} : { state: input.state as never }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+    return { waits: waits.map(wait => this.waitViewOf(wait)), total: waits.length };
+  }
+
+  /** The owner handoff cards. Owner/gm only; a card never contains the handoff file's content. */
+  async waitHandoffCards(credential: Credential): Promise<WaitHandoffCard[]> {
+    const actor = await this.authorized(credential);
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', '只有经理/运营可以读取老板交接卡');
+    return this.waits.handoffCards(this.waitClock());
+  }
+
+  /** Read-only legacy migration preview. It never releases anything, and an owner gate is never a time wait. */
+  async waitMigrationPreview(credential: Credential): Promise<WaitMigrationPreviewView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (!['gm', 'product'].includes(actor.role)) throw new CompanyError('forbidden', '只有经理/运营可以做旧任务迁移预演');
+    const [rows] = await this.db.query<[Array<{ id: unknown; state: string; blocked_to?: string; quota_resets_at?: number; wait_state?: string }>]>(
+      `SELECT id, state, blocked_to, quota_resets_at, wait_state, created_at FROM task
+       WHERE state IN ['blocked', 'ready', 'doing'] ORDER BY created_at LIMIT 200;`);
+    const candidates = migrationPreview((rows ?? []).map(row => ({
+      id: asId(row.id), state: row.state,
+      ...(row.blocked_to === undefined ? {} : { blocked_to: row.blocked_to }),
+      ...(row.quota_resets_at === undefined || row.quota_resets_at === null ? {} : { quota_resets_at: row.quota_resets_at }),
+      ...(row.wait_state === undefined || row.wait_state === null ? {} : { wait_state: row.wait_state }),
+    })), this.waitClock());
+    return {
+      candidates,
+      ownerGatesBlocked: candidates.filter(candidate => candidate.reason === 'owner_gate').length,
+      generatedAt: new Date(this.waitClock()).toISOString(),
+    };
+  }
+
+  /**
+   * Migrate exactly one legacy time-bounded task, after the dry run. The caller must name the task and the version
+   * it read; an owner gate is refused, a task with no future time bound is refused, and the conversion is audited.
+   * There is no batch entry point: a bulk release could walk past a gate whose real blocker is not time.
+   */
+  async waitMigrationApply(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以迁移旧任务到等待');
+    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '迁移理由需为 10-2000 字');
+    assertNonSensitive(reason, 'reason');
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
+    if (row.reviewer_role === 'owner' || row.blocked_to === 'owner') {
+      throw new CompanyError('forbidden', '老板关口不能批量迁移为时间等待；必须由老板本人决定');
+    }
+    const waitKey = waitKeyOf(input.taskId, randomUUID());
+    try {
+      const updated = await this.waits.migrateLegacy({
+        taskId: input.taskId, waitKey, expectedVersion: input.expectedVersion, reason,
+        actor: `employee:${actor.employeeId}`, now: this.waitClock(),
+        auditId: randomUUID(), outboxId: randomUUID(),
+      });
+      if (!updated) throw new CompanyError('temporarily_unavailable', '迁移未落地，请重试', true);
+      return view(updated);
+    } catch (error) {
+      throw this.waitError(error);
+    }
+  }
+
+  /** The wait a resolve call names, by its waitKey or its task's open wait. */
+  private async waitOfInput(input: WaitResolveInput): Promise<WaitRow | undefined> {
+    // The event's own object id is a valid locator: a webhook that names the wait it is about has already said
+    // which waiting object it addresses, so requiring a second copy of the same key would only cause omissions.
+    const key = typeof input.waitKey === 'string' ? input.waitKey.trim()
+      : typeof input.objectWaitId === 'string' ? input.objectWaitId.trim() : '';
+    if (key) return this.waits.wait(key);
+    const taskId = typeof input.taskId === 'string' ? input.taskId.trim() : '';
+    if (taskId) return this.waits.openOfTask(taskId);
+    return undefined;
+  }
+
+  /** Verify a webhook signature over the canonical typed payload. An absent secret is a refusal, never a pass. */
+  private verifyWebhook(input: WaitResolveInput, now: number): boolean {
+    if (!input.eventId || !input.provider) return false;
+    const at = input.at === undefined ? now : parseInstant(input.at, 'at');
+    const payload = webhookPayload({
+      eventId: String(input.eventId), provider: String(input.provider), at,
+      ...(input.objectWaitId === undefined ? {} : { objectWaitId: String(input.objectWaitId) }),
+      ...(input.objectTaskId === undefined ? {} : { objectTaskId: String(input.objectTaskId) }),
+    });
+    return verifyWaitWebhook(this.waitWebhookSecret, payload, input.signature);
+  }
+
+  /** True when waiting on `reference` would close a cycle: the reference already (transitively) waits on this task. */
+  private async waitWouldCycle(taskId: string, reference: string): Promise<boolean> {
+    if (taskId === reference) return true;
+    const seen = new Set<string>();
+    const queue = [reference];
+    while (queue.length && seen.size < 50) {
+      const current = queue.shift()!;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      const [rows] = await this.db.query<[Array<{ dependencies?: unknown[] }>]>(
+        'SELECT dependencies FROM $task;', { task: id('task', current) });
+      const edges = new Set<string>();
+      for (const dep of rows?.[0]?.dependencies ?? []) edges.add(asId(dep as never));
+      // A task can wait through its own open wait row as well as through task.dependencies. Both are real edges:
+      // otherwise A->B and B->A both look acyclic and neither can ever be released.
+      const [waits] = await this.db.query<[Array<{ reference_task?: unknown }>]>(
+        `SELECT reference_task FROM task_wait
+         WHERE task = $task AND state IN ['waiting', 'held'] AND reference_task != NONE;`,
+        { task: id('task', current) });
+      for (const wait of waits ?? []) {
+        const ref = wait.reference_task === undefined ? undefined : asId(wait.reference_task as never);
+        if (ref) edges.add(ref);
+      }
+      for (const depId of edges) {
+        if (depId === taskId) return true;
+        if (!seen.has(depId)) queue.push(depId);
+      }
+    }
+    return false;
+  }
+
+  private waitViewOf(wait: WaitRow): TaskWaitView {
+    return {
+      waitKey: wait.waitKey, kind: wait.kind, state: wait.state, ownerRole: wait.ownerRole,
+      source: wait.source.kind,
+      ...(wait.notBefore === undefined ? {} : { notBefore: new Date(wait.notBefore).toISOString() }),
+      ...(wait.expiresAt === undefined ? {} : { expiresAt: new Date(wait.expiresAt).toISOString() }),
+      expiresSource: wait.expiresSource,
+      ...(wait.nextCheckAt === undefined ? {} : { nextCheckAt: new Date(wait.nextCheckAt).toISOString() }),
+      ...(wait.timezone === undefined ? {} : { timezone: wait.timezone }),
+      version: wait.version,
+    };
+  }
+
+  /** The raw wait transaction errors, mapped onto the API's stable codes. */
+  private waitError(error: unknown): CompanyError {
+    if (error instanceof CompanyError) return error;
+    const message = ((error as Error)?.message ?? '').trim();
+    if (/wait graph lock busy/i.test(message)) return new CompanyError('conflict', '另一个等待正在写入，等待图锁未取得；请重试');
+    if (/lease expired/i.test(message)) return new CompanyError('lease_expired', '租约已过期；重新领取后再进入等待');
+    if (/stale lease or version/i.test(message)) return new CompanyError('conflict', '租约或任务版本已移动；旧 fence 的写入被拒绝');
+    if (/already waiting/i.test(message)) return new CompanyError('conflict', '该任务已有进行中的等待');
+    if (/owner gate cannot be migrated/i.test(message)) return new CompanyError('forbidden', '老板关口不能迁移为时间等待；必须由老板本人决定');
+    if (/no future time bound/i.test(message)) return new CompanyError('invalid', '任务没有未来的时间边界（quota_resets_at 为空或已过去），不能迁移为时间等待');
+    if (/not blocked for migration/i.test(message)) return new CompanyError('invalid', '任务不在 blocked 阶段；与迁移预演一致，只有 blocked 任务可以迁移');
+    if (/still leased/i.test(message)) return new CompanyError('conflict', '任务仍被有效租约持有，不能迁移；先释放或等到租约结束');
+    if (/version moved/i.test(message)) return new CompanyError('conflict', '任务版本已移动；重新读取后再迁移');
+    if (/task not held/i.test(message)) return new CompanyError('forbidden', '任务不在执行/复核持有阶段，不能进入等待');
+    if (/not found/i.test(message)) return new CompanyError('not_found', 'Task not found');
+    if (/conflict/i.test(message)) return new CompanyError('conflict', message.slice(0, 300));
+    return new CompanyError('temporarily_unavailable', `等待写入失败：${message.slice(0, 200)}`, true);
   }
 
   /**
@@ -3163,6 +3579,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (replay) return replay;
     const before = await this.db.select<TaskRow>(id('task', taskId));
     if (!before) throw new CompanyError('not_found', 'Task not found');
+    if (before.state === 'blocked' && before.wait_state === 'waiting') {
+      throw new CompanyError('conflict', '任务在等待中；请先 cancel_wait（授权取消）或由受信事件解除，不能用 resume 跳过等待条件');
+    }
     const executionWindow = evidence.executionWindow === undefined ? before.execution_window : await this.validateExecutionWindow(taskId, evidence.executionWindow);
     if (windowExpired(executionWindow)) throw new CompanyError('invalid', 'Execution window expired; defer for a fresh approval instead of resuming');
     if (before.state === 'blocked') {
@@ -3200,6 +3619,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         IF $t.version != $expected_version { THROW 'task version moved' };
         IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
+        IF $t.wait_state = 'waiting' { THROW 'task is waiting: cancel or resolve the wait first' };
         IF $execution_window != NONE {
           IF <datetime>$execution_window.notAfter <= time::now() { THROW 'execution window expired' };
           LET $approval = type::record('task', $execution_window.approvalTask);
@@ -3576,7 +3996,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $task SET
         state = 'void', blocked_to = NONE, resume_role = NONE, resume_state = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        wait_state = NONE, wait_kind = NONE, wait_episode = NONE, wait_not_before = NONE,
+        wait_expires_at = NONE, wait_next_check_at = NONE, wait_owner_role = NONE,
+        wait_source = NONE, wait_version = NONE, wait_entered_at = NONE,
         version = $t.version + 1 RETURN AFTER;
+      UPDATE task_wait SET state = 'cancelled', cancelled_reason = 'task retired', updated_at = time::now()
+        WHERE task = $task AND state IN ['waiting', 'held', 'expired'];
       UPDATE employee SET active_task = NONE WHERE active_task = $task;
       ${UNLOCK_CHILDREN_SQL}
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };

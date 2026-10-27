@@ -890,6 +890,19 @@ export class Dispatcher {
     let health = await wf.providerHealth();
     const quotaByProvider = new Map<string, ProviderQuota>();
     for (const q of quotaRows) quotaByProvider.set(q.provider, q);
+    // SYS05: release due waits before the queue is read. A time wait releases once (the store's CAS); a wait whose
+    // precise expiry passed is marked expired and is not auto-released. If this read fails the pass still filters
+    // every waiting task out of the queue below, so a failed sweep can delay a wake but never fire one early.
+    if (typeof wf.releaseDueWaits === 'function') {
+      try {
+        const sweep = await wf.releaseDueWaits(now * 1000);
+        for (const item of sweep.released) report.decisions.push(`wait-released:${item.taskId}`);
+        for (const item of sweep.expired) report.decisions.push(`wait-expired:${item.taskId}`);
+        for (const item of sweep.held) report.decisions.push(`wait-held:${item.taskId}`);
+      } catch (error) {
+        this.log(`wait sweep failed (sentinel: waiting tasks stay parked): ${(error as Error).message}`);
+      }
+    }
     // Quota circuit breaker: separate floors for short windows (session/5h + balances)
     // and long windows (week/month). Stale snapshots (>15min) fail open rather than
     // keeping a provider blocked forever.
@@ -1182,15 +1195,15 @@ export class Dispatcher {
     this.passInputs = { now, cfg, defs, insts, states, health, quotaBlocked, tasks, slots: slotMap, runtimeModels };
 
     // 3. Owner inbox notices (gates, questions) and staffing gaps.
-    await this.ownerNotices(tasks, report);
+    await this.ownerNotices(tasks, report, now);
     await this.ownerAging(now, report).catch(error => this.log(`owner aging failed: ${(error as Error).message}`));
 
     // 4. Work that needs an employee.
     const holding = new Set(tasks.filter(t => t.currentEmployee).map(t => t.currentEmployee!));
     const work = [
-      ...tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee)
+      ...tasks.filter(t => t.state === 'review' && t.reviewerRole !== 'owner' && !t.currentEmployee && !t.waitState)
         .map(t => ({ task: t, role: t.reviewerRole, purpose: 'review' as const })),
-      ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee)
+      ...tasks.filter(t => (t.state === 'ready' || t.state === 'doing') && !t.currentEmployee && !t.waitState)
         .map(t => ({ task: t, role: t.executorRole as string, purpose: 'execute' as const })),
     ];
     // Independence scopes (SYS-DISP IR02): each work item whose policy names its stage reads its exclusion once per pass, from the same
@@ -2627,7 +2640,7 @@ export class Dispatcher {
     }
   }
 
-  private async ownerNotices(tasks: SupervisedTask[], report: TickReport) {
+  private async ownerNotices(tasks: SupervisedTask[], report: TickReport, nowSec: number = Date.now() / 1000) {
     const { owner } = this.deps;
     const live = new Set<string>();
     for (const task of tasks) {
@@ -2643,6 +2656,56 @@ export class Dispatcher {
     }
     for (const notice of await owner.openNotices()) {
       if (/^(gate|question):/.test(notice.key) && !live.has(notice.key)) await owner.resolveNotice(notice.key);
+    }
+    // SYS05: owner handoff cards. One reminder per wait and risk bucket, so a wait that is still unknown-expiry is
+    // not re-announced every tick while a change to overdue (or a new wait) is. This never releases anything.
+    const wf = this.deps.workforce;
+    const handoffLive = new Set<string>();
+    if (typeof wf.waitHandoffCards === 'function') {
+      try {
+        for (const card of await wf.waitHandoffCards(nowSec * 1000)) {
+          const key = `wait-handoff:${card.waitKey}:${card.risk}`;
+          handoffLive.add(key);
+          const expires = card.expiresAt.source === 'exact' && card.expiresAt.value
+            ? `精确到期 ${card.expiresAt.value}` : '到期时间 unknown（工具未给出精确值，系统不自行推算）';
+          await this.notice(key,
+            `老板交接待办：${card.taskTitle}（任务 ${card.taskId}）。已完成 ${card.completed.length} 项；` +
+            `待你执行：${card.pendingAction ?? '（未写明）'}；${card.waitingOn} 在等 ${card.waitingBy}；${expires}；` +
+            `下一触发：${card.nextTrigger.join(' / ')}；风险 ${card.risk}。查看：company owner inbox`,
+            report);
+        }
+      } catch (error) {
+        this.log(`wait handoff read failed: ${(error as Error).message}`);
+      }
+    }
+    if (typeof wf.dueWaitChecks === 'function') {
+      try {
+        for (const wait of await wf.dueWaitChecks(nowSec * 1000)) {
+          const key = `wait-check:${wait.waitKey}:${wait.nextCheckAt ?? 0}`;
+          handoffLive.add(key);
+          await this.notice(key,
+            `等待复查到期：任务 ${wait.taskId} 的 ${wait.kind} 等待已到下次检查时间（${wait.nextCheckAt ? new Date(wait.nextCheckAt).toISOString() : '未知'}）。` +
+            `请确认是继续等待、延期还是取消；系统不会自动放行或代发客户消息。`, report);
+        }
+      } catch (error) {
+        this.log(`wait check read failed: ${(error as Error).message}`);
+      }
+    }
+    if (typeof wf.expiredWaitChecks === 'function') {
+      try {
+        for (const wait of await wf.expiredWaitChecks()) {
+          const key = `wait-expired:${wait.waitKey}`;
+          handoffLive.add(key);
+          await this.notice(key,
+            `等待已过期：任务 ${wait.taskId} 的 ${wait.kind} 等待已过期，任务仍被冻结。` +
+            `请确认取消、延期还是先延期再补受信事件；过期状态不能直接确认，系统不会自动放行，也不会代发客户消息。`, report);
+        }
+      } catch (error) {
+        this.log(`wait expiry read failed: ${(error as Error).message}`);
+      }
+    }
+    for (const notice of await owner.openNotices()) {
+      if (/^wait-(handoff|check|expired):/.test(notice.key) && !handoffLive.has(notice.key)) await owner.resolveNotice(notice.key);
     }
   }
 

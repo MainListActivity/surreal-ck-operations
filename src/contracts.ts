@@ -1,4 +1,5 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
+import type { WaitHandoffCard, WaitMigrationCandidate } from './waits.ts';
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
@@ -176,6 +177,27 @@ export interface TaskWaiting {
   dependenciesCount: number;
 }
 
+/**
+ * SYS05: a task's open typed wait. It is separate from `TaskWaiting` (which describes any blocked row): a wait
+ * names its own condition, the role that owns it, the absolute instant it becomes due and the trusted source that
+ * may release it. `expiresAt` is present only when a tool named a precise instant; `expiresSource=unknown` is not
+ * a placeholder to be filled in by arithmetic.
+ */
+export interface TaskWaitView {
+  waitKey: string;
+  kind: 'time' | 'dependency' | 'upstream_repair' | 'customer_activation' | 'owner_handoff' | 'feedback';
+  state: 'waiting' | 'released' | 'held' | 'expired' | 'cancelled' | 'superseded';
+  ownerRole: string;
+  source: 'time' | 'dependency' | 'webhook' | 'authorized_person' | 'owner';
+  notBefore?: string;
+  expiresAt?: string;
+  expiresSource: 'exact' | 'unknown';
+  nextCheckAt?: string;
+  timezone?: string;
+  version: number;
+}
+
+
 export interface TaskView {
   executionWindow?: import('./task-recovery.ts').ExecutionWindow;
   dependencyContinuation?: 'execute' | 'manager';
@@ -222,6 +244,8 @@ export interface TaskView {
   resumeRole?: string;
   /** Blocked rows: why the task waits, in the same authoritative terms for every view (RW06 C3). */
   waiting?: TaskWaiting;
+  /** SYS05: the open typed wait (time or trusted external event), when the task is waiting on one. */
+  wait?: TaskWaitView;
   /** Set when the previous holder's lease was revoked; the next holder must read the handover history. */
   handover?: boolean;
   previousEmployee?: EmployeeId;
@@ -1023,6 +1047,88 @@ import type {
   HolderNoticeView,
 } from './disposition.ts';
 
+/**
+ * SYS05: typed wait entry. The employee hands over why it stops; the core normalizes, stores the progress and
+ * releases the lease in one transaction. Times must carry an explicit offset.
+ */
+export interface WaitEntryInput {
+  kind: string;
+  ownerRole?: string;
+  reference?: string;
+  referenceTaskId?: string;
+  notBefore?: string;
+  expiresAt?: string;
+  nextCheckAt?: string;
+  timezone?: string;
+  completed?: string[];
+  pendingAction?: string;
+  handoffFile?: string;
+  reason: string;
+  summary?: string;
+}
+/** A trusted external event that would release a wait. `signature` is verified only for webhook sources. */
+export interface WaitResolveInput {
+  waitKey?: string;
+  taskId?: string;
+  source: string;
+  provider?: string;
+  account?: string;
+  eventId?: string;
+  at?: string | number;
+  objectWaitId?: string;
+  objectTaskId?: string;
+  ownerQuote?: string;
+  payloadDigest?: string;
+  signature?: string;
+  text: string;
+  idempotencyKey: string;
+}
+export interface WaitResolveView {
+  released: boolean;
+  code: string;
+  message: string;
+  taskId?: string;
+  waitKey?: string;
+  /** The dedupe key the source event landed on, when it had one. */
+  eventKey?: string;
+}
+export interface WaitActionInput {
+  waitKey: string;
+  expectedVersion: number;
+  reason: string;
+  idempotencyKey: string;
+  /** Cancel: true only when the authorized caller states the blocker is gone. */
+  resume?: boolean;
+  /** Extend: the new absolute instants. */
+  notBefore?: string;
+  expiresAt?: string;
+  nextCheckAt?: string;
+}
+export interface WaitActionView {
+  ok: boolean;
+  message: string;
+  waitKey: string;
+  taskId?: string;
+  version?: number;
+}
+export interface WaitListView {
+  waits: TaskWaitView[];
+  total: number;
+}
+export interface WaitMigrationPreviewView {
+  candidates: WaitMigrationCandidate[];
+  /** Owner gates are never migrated automatically; the count says how many were held back. */
+  ownerGatesBlocked: number;
+  generatedAt: string;
+}
+/** SYS05: migrate exactly one legacy time-bounded task, under its version, after the dry-run. */
+export interface WaitMigrationApplyInput {
+  taskId: TaskId;
+  expectedVersion: number;
+  reason: string;
+  idempotencyKey: string;
+}
+
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
   writeScopeOf(taskId: TaskId, employeeId?: string): Promise<WriteScopeHolder[]>;
@@ -1060,6 +1166,25 @@ export interface CompanyCore {
    */
   release?(credential: Credential, proof: LeaseProof, evidence: Evidence): Promise<TaskView>;
   block(credential: Credential, proof: LeaseProof, to: 'gm' | 'owner', evidence: Evidence, quotaResetsAt?: string): Promise<TaskView>;
+  /**
+   * SYS05: enter a typed wait. Atomically stores the progress, releases the execution lease and takes the task out
+   * of the dispatch queue until the condition is released. Optional for old adapters.
+   */
+  wait?(credential: Credential, proof: LeaseProof, evidence: Evidence, input: WaitEntryInput): Promise<TaskView>;
+  /** SYS05: resolve a wait from a trust-checked external event (signed webhook, authorized manager, owner relay). */
+  resolveWait?(credential: Credential, input: WaitResolveInput): Promise<WaitResolveView>;
+  /** SYS05: cancel a wait under its version. Without `resume` the task stays blocked for the manager. */
+  cancelWait?(credential: Credential, input: WaitActionInput): Promise<WaitActionView>;
+  /** SYS05: extend/re-arm a wait under its version, with a reason. */
+  extendWait?(credential: Credential, input: WaitActionInput): Promise<WaitActionView>;
+  /** SYS05: read the waits of one task (or the open ones), gm/owner-side. */
+  listWaits?(credential: Credential, input?: { taskId?: string; state?: string; limit?: number }): Promise<WaitListView>;
+  /** SYS05: the owner handoff cards; unknown expiry stays unknown. */
+  waitHandoffCards?(credential: Credential): Promise<WaitHandoffCard[]>;
+  /** SYS05: read-only dry run for legacy tasks; never releases an owner gate. */
+  waitMigrationPreview?(credential: Credential): Promise<WaitMigrationPreviewView>;
+  /** SYS05: migrate one named legacy task into a wait; owner gates refused, version-locked, audited. */
+  waitMigrationApply?(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;

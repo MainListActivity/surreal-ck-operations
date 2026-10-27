@@ -283,6 +283,83 @@ function registerTools(server: McpServer, core: CompanyCore) {
       quotaResetsAt: z.string().min(1).optional() }),
   }, async (input, ctx) => run(token(ctx), () => core.block(token(ctx), proof(input), input.to, evidence(input), input.quotaResetsAt)));
 
+  // SYS05: typed waits. Time and external-event conditions are stored and scheduled by the server; the employee
+  // never sleeps in the foreground and the task takes no lease or provider seat while it waits.
+  const waitInstants = {
+    notBefore: z.string().min(1).optional(),
+    expiresAt: z.string().min(1).optional(),
+    nextCheckAt: z.string().min(1).optional(),
+    timezone: z.string().min(1).max(80).optional(),
+  };
+  server.registerTool('wait_task', {
+    description: 'Enter a typed wait and release the current lease: kind=time needs notBefore (ISO 8601 with an explicit offset); dependency/upstream_repair need referenceTaskId; owner_handoff needs completed and pendingAction. The server stores progress and schedules the release; do not sleep in the foreground.',
+    inputSchema: z.object({ ...proofShape, ...evidenceShape,
+      kind: z.enum(['time', 'dependency', 'upstream_repair', 'customer_activation', 'owner_handoff', 'feedback']),
+      ownerRole: z.string().min(1).max(60).optional(),
+      reference: z.string().max(240).optional(),
+      referenceTaskId: z.string().min(1).max(200).optional(),
+      ...waitInstants,
+      completed: z.array(z.string().min(1).max(240)).max(10).optional(),
+      pendingAction: z.string().max(600).optional(),
+      handoffFile: z.string().max(300).optional(),
+      reason: z.string().min(10).max(2000),
+      summary: z.string().max(1000).optional(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => {
+    if (!core.wait) return Promise.reject({ code: 'temporarily_unavailable' });
+    const { taskId: _taskId, deliveryId: _deliveryId, fence: _fence, expectedVersion: _expectedVersion, ...spec } = input;
+    return core.wait(token(ctx), proof(input), evidence(input), spec as never);
+  }));
+
+  server.registerTool('resolve_wait', {
+    description: 'Resolve a wait from a trust-checked event: an authorized manager (source=authorized_person) or a signed webhook (source=webhook with provider/eventId/signature). The owner path is not callable here; owner decisions resolve owner handoffs through record_owner_decision only. Duplicate, expired and wrong-object events are refused.',
+    inputSchema: z.object({
+      waitKey: z.string().optional(), taskId: z.string().optional(),
+      source: z.enum(['authorized_person', 'webhook', 'dependency']),
+      provider: z.string().min(1).max(80).optional(), account: z.string().max(120).optional(),
+      eventId: z.string().min(1).max(200).optional(), at: z.union([z.string(), z.number()]).optional(),
+      objectWaitId: z.string().max(300).optional(), objectTaskId: z.string().max(200).optional(),
+      ownerQuote: z.string().max(2000).optional(), payloadDigest: z.string().max(200).optional(),
+      signature: z.string().max(200).optional(), text: z.string().min(20).max(30000),
+      idempotencyKey: z.string().min(1).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.resolveWait ? core.resolveWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('cancel_wait', {
+    description: 'Manager (gm): cancel a wait under its version with a reason. Without resume=true the task stays blocked for a human; cancelling is not the same as resolving the condition.',
+    inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
+      resume: z.boolean().optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.cancelWait ? core.cancelWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('extend_wait', {
+    description: 'Manager (gm): extend or re-arm a wait under its version with a reason. A stale version is refused; a re-armed wait keeps its task parked.',
+    inputSchema: z.object({ waitKey: z.string().min(1), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200),
+      ...waitInstants }),
+  }, async (input, ctx) => run(token(ctx), () => core.extendWait ? core.extendWait(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('list_task_waits', {
+    description: 'Read waits (internal facts, no credentials): by task, by state, or the newest open ones. GM/QA use this to audit concurrency and release once-ness.',
+    inputSchema: z.object({ taskId: z.string().optional(), state: z.enum(['waiting', 'released', 'held', 'expired', 'cancelled', 'superseded']).optional(), limit: z.number().int().min(1).max(100).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.listWaits ? core.listWaits(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('wait_handoff_cards', {
+    description: 'Owner/manager: handoff cards for waits owned by the boss. Each names completed items, the pending action, who waits for whom, the exact expiry or unknown, and the allowed next triggers.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.waitHandoffCards ? core.waitHandoffCards(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('wait_migration_preview', {
+    description: 'Manager: read-only dry-run for legacy tasks. It never releases an owner gate and writes nothing; migration is confirmed one task at a time.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.waitMigrationPreview ? core.waitMigrationPreview(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('wait_migration_apply', {
+    description: 'Manager (gm): migrate exactly one legacy time-bounded task (future quota_resets_at) into a wait, under the version read. Owner gates, leased tasks and tasks without a future time bound are refused; audited.',
+    inputSchema: z.object({ taskId: z.string().min(1), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.waitMigrationApply ? core.waitMigrationApply(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('review', {
     description: 'Independently accept or return the current review delivery.',
     inputSchema: z.object({ ...proofShape, ...evidenceShape, decision: z.enum(['accept', 'return']) }),
