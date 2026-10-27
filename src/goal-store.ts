@@ -7,12 +7,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { RecordId } from 'surrealdb';
 import {
-  assessGoal, cardSort, finalGateId, normalizeEvidence, normalizeOutcome,
+  assessGoal, blockerSeverity, cardSort, finalGateId, normalizeEvidence, normalizeOutcome,
   type GoalAssessment, type GoalCard, type GoalEvidenceFact, type GoalEvidenceInput, type GoalEvidenceKind,
   type GoalFact, type GoalFaultFact, type GoalOutcomeFact, type GoalOutcomeInput, type GoalStage, type GoalTaskFact,
   type GoalWaitFact,
 } from './goal-governance.ts';
 import { isTimeZone } from './waits.ts';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from './response-budget.ts';
 import { computeGoalMetrics, type GoalMetricsView, type GoalMetricsWindow, type MetricAuditRow, type MetricEvidenceRow,
   type MetricGoalRow, type MetricTaskRow, type MetricUsageRow, type MetricWakeRow } from './goal-metrics.ts';
 
@@ -190,14 +191,23 @@ export interface GoalPageView {
   guidance: string;
 }
 
+export interface GoalScanQuery {
+  pageSize?: number;
+  cursor?: string;
+}
+
 export interface GoalScanView {
   dryRun: true;
+  /** Total goals in the scan (active, needs_repair and done), not just this page. */
   scanned: number;
   goals: GoalCard[];
-  /** Cards omitted from this response for size; counts and scanned still cover every goal. Use goal_console to page. */
-  truncated?: number;
+  /** Global counts over every scanned goal; they do not change between pages of one listing. */
   counts: { needsRepair: number; missingOutcome: number; finalGateGap: number; graphIssues: number; unknownDeadline: number };
   dataCutoff: string;
+  /** Every page is deterministic and fits the 48 KiB response budget; follow nextCursor until hasMore is false. */
+  page: { pageSize: number; returned: number; hasMore: boolean; nextCursor?: string; total: number; snapshotAt: string; budgetBytes: number };
+  /** Cards not on this page (including cards reduced to fit); the cursor reaches them. */
+  truncated?: number;
   guidance: string;
 }
 
@@ -230,6 +240,13 @@ export interface GoalFinalGateRepairInput {
 
 export interface GoalFinalGateRepairResult {
   goalId: string; oldTaskId?: string; newTaskId: string; goalVersion: number; snapshotHash: string; repairedAt: string;
+}
+
+/** Activity first for the owner surfaces: repair, then the most severe blocker, then blocker count, then cardSort. */
+function activityCardSort(a: GoalCard, b: GoalCard): number {
+  const rank = (card: GoalCard) => card.needsRepair ? 0 : card.blockers.length ? 1 : card.outcome.missing.length ? 2 : 3;
+  const severity = (card: GoalCard) => card.blockers.reduce((max, blocker) => Math.max(max, blockerSeverity(blocker)), 0);
+  return rank(a) - rank(b) || severity(b) - severity(a) || b.blockers.length - a.blockers.length || cardSort(a, b);
 }
 
 export class GoalGovernanceStore {
@@ -265,6 +282,28 @@ export class GoalGovernanceStore {
       return { offset: body.o!, asOf: body.t! };
     } catch {
       throw new Error('goal console cursor is invalid or belongs to another query');
+    }
+  }
+
+  /** The scan has one fixed query shape; its cursor pins only the offset and listing instant. */
+  private scanCursorDigest(): string {
+    return HASH('goal-governance-scan');
+  }
+
+  private sealScanCursor(offset: number, asOf: number): string {
+    return Buffer.from(JSON.stringify({ v: 1, q: this.scanCursorDigest(), o: offset, t: asOf })).toString('base64url');
+  }
+
+  private openScanCursor(cursor: string): { offset: number; asOf: number } {
+    try {
+      const body = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { v?: number; q?: string; o?: number; t?: number };
+      if (body.v !== 1 || body.q !== this.scanCursorDigest() || !Number.isSafeInteger(body.o) || (body.o ?? -1) < 0 ||
+        !Number.isSafeInteger(body.t) || (body.t ?? -1) <= 0) {
+        throw new Error('bad cursor');
+      }
+      return { offset: body.o!, asOf: body.t! };
+    } catch {
+      throw new Error('goal governance scan cursor is invalid or belongs to another query');
     }
   }
 
@@ -397,6 +436,7 @@ export class GoalGovernanceStore {
         needsRepair: assessment.needsRepair || goal.state === 'needs_repair',
         blockers: assessment.blockers.slice(0, blockerCap).map(blocker => ({
           ...blocker, dependencyPath: blocker.dependencyPath.slice(0, 8),
+          ...(blocker.dependencyPath.length > 8 ? { dependencyPathTruncated: true } : {}),
         })),
         ...(assessment.blockers.length > blockerCap ? { blockersOmitted: assessment.blockers.length - blockerCap } : {}),
         repairReasons: assessment.repairReasons.slice(0, reasonCap),
@@ -461,13 +501,36 @@ export class GoalGovernanceStore {
     };
   }
 
+  /**
+   * One consistent snapshot of every goal card, ordered by active-blocker priority. The owner console and the
+   * daily brief read this instead of taking the first console page: a goal behind the first page still appears
+   * when it has a blocker or needs repair. The caller decides its display cap and must disclose it.
+   */
+  async cardsSnapshot(input: { asOf?: number; states?: string[] } = {}): Promise<{ cards: GoalCard[]; snapshotAt: string }> {
+    const asOf = input.asOf ?? await this.now();
+    const states = new Set(input.states ?? ['active', 'triage', 'needs_repair']);
+    let rows = (await this.goalRows()).filter(row => states.has(row.state));
+    rows = rows.filter(row => {
+      const createdAt = ms(row.created_at);
+      return createdAt === undefined || createdAt <= asOf;
+    });
+    const cards = (await this.cardsFor(rows, asOf)).sort(activityCardSort);
+    return { cards, snapshotAt: new Date(asOf).toISOString() };
+  }
+
   /** Read-only dry-run over active, needs_repair and done goals; writes nothing and never closes/voids/approves anything. */
-  async scan(limit = 20): Promise<GoalScanView> {
+  async scan(input: GoalScanQuery = {}): Promise<GoalScanView> {
+    const pageSize = Math.max(1, Math.min(25, Math.trunc(input.pageSize ?? 10)));
     const now = await this.now();
-    // Done goals are read too: a historical goal whose gate was voided or whose customer receipt never existed is
-    // surfaced as goal_done_without_evidence, never silently treated as complete. The scan still writes nothing.
-    const rows = (await this.goalRows()).filter(row => row.state === 'active' || row.state === 'needs_repair' || row.state === 'done');
-    const cards = (await this.cardsFor(rows, now)).sort(cardSort);
+    const cursor = input.cursor ? this.openScanCursor(input.cursor) : undefined;
+    const asOf = cursor?.asOf ?? now;
+    let rows = (await this.goalRows()).filter(row => row.state === 'active' || row.state === 'needs_repair' || row.state === 'done');
+    rows = rows.filter(row => {
+      const createdAt = ms(row.created_at);
+      return createdAt === undefined || createdAt <= asOf;
+    });
+    // One snapshot for the whole traversal: cards are assessed at the listing instant, not at each page's clock.
+    const cards = (await this.cardsFor(rows, asOf)).sort(cardSort);
     const counts = {
       needsRepair: cards.filter(card => card.needsRepair).length,
       missingOutcome: cards.filter(card => !card.outcome.registered).length,
@@ -476,11 +539,56 @@ export class GoalGovernanceStore {
       graphIssues: cards.filter(card => card.graph.cycle || card.graph.dangling.length > 0 || card.graph.crossGoal.length > 0).length,
       unknownDeadline: cards.filter(card => card.deadline.status === 'unknown').length,
     };
-    const shown = cards.slice(0, Math.max(1, Math.min(50, limit)));
-    return { dryRun: true, scanned: cards.length, goals: shown, counts, dataCutoff: new Date(now).toISOString(),
-      ...(shown.length < cards.length ? { truncated: cards.length - shown.length } : {}),
-      guidance: '只读扫描：不会撤销、关闭或批准任何历史任务；counts 覆盖全部目标，未展示的卡片用 goal_console 分页；修复需按目标显式预览并 CAS 提交。' };
+    const offset = cursor?.offset ?? 0;
+    const selected = cards.slice(offset, offset + pageSize);
+    const build = (kept: GoalCard[]): GoalScanView => {
+      const end = offset + kept.length;
+      const hasMore = end < cards.length;
+      return {
+        dryRun: true, scanned: cards.length, goals: kept, counts, dataCutoff: new Date(now).toISOString(),
+        page: { pageSize, returned: kept.length, hasMore, ...(hasMore ? { nextCursor: this.sealScanCursor(end, asOf) } : {}),
+          total: cards.length, snapshotAt: new Date(asOf).toISOString(), budgetBytes: RESPONSE_BUDGET_BYTES },
+        ...(cards.length > kept.length ? { truncated: cards.length - kept.length } : {}),
+        guidance: '只读扫描：不会撤销、关闭或批准任何历史任务；counts 与 scanned 覆盖全部目标。按 page.nextCursor 翻页直到 page.hasMore=false；每页在 48 KiB 预算内，未展示的卡片由 truncated 与 cursor 显式给出，单卡压缩时标 detailsOmitted。',
+      };
+    };
+    // Greedy prefix: build each candidate page as it is sent. A page never carries a card that would break the budget.
+    const kept: GoalCard[] = [];
+    for (const card of selected) {
+      const next = [...kept, card];
+      if (answerBytes(build(next)) > RESPONSE_BUDGET_BYTES) break;
+      kept.push(card);
+    }
+    if (!kept.length && selected.length) {
+      // Even one normal card did not fit: keep the goal visible with a reduced card and disclose the reduction.
+      const answer = build([this.shrinkCard(selected[0]!)]);
+      if (answerBytes(answer) > RESPONSE_BUDGET_BYTES) {
+        throw new Error('a single goal card alone exceeds the response budget; use goal_console with a goalId and pageSize to read one goal');
+      }
+      return answer;
+    }
+    return build(kept);
   }
+
+  /** Last-resort reduction for one card that cannot fit a page whole. Never silent: detailsOmitted marks it. */
+  private shrinkCard(card: GoalCard): GoalCard {
+    return {
+      ...card,
+      detailsOmitted: true,
+      blockers: card.blockers.slice(0, 1).map(blocker => ({
+        ...blocker, dependencyPath: blocker.dependencyPath.slice(0, 2),
+        ...(blocker.dependencyPath.length > 2 ? { dependencyPathTruncated: true } : {}),
+      })),
+      ...((card.blockers.length > 1 || card.blockersOmitted) ? {
+        blockersOmitted: (card.blockersOmitted ?? 0) + Math.max(0, card.blockers.length - 1),
+      } : {}),
+      repairReasons: card.repairReasons.slice(0, 4),
+      sourceTaskIds: card.sourceTaskIds.slice(0, 5),
+      ...((card.sourceTaskIds.length > 5 || card.sourceTaskIdsTruncated) ? { sourceTaskIdsTruncated: true } : {}),
+      brief: card.brief.slice(0, 200),
+    };
+  }
+
 
   async card(goalId: string): Promise<GoalCard | undefined> {
     const rows = await this.goalRows([goalId]);

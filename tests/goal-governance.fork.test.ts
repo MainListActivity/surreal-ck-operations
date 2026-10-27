@@ -18,6 +18,11 @@ import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { OwnerDesk } from '../src/owner.ts';
+import { renderBrief } from '../src/owner-brief.ts';
+import { isGoalMetricsSegment, type GoalMetricsSection, type GoalMetricsSegmentView, type GoalMetricsView } from '../src/goal-metrics.ts';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
+import type { GoalCard } from '../src/goal-governance.ts';
+import type { GoalScanView } from '../src/goal-store.ts';
 
 const NS = 'sck_agent_company_test_goal_sys07';
 const database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
@@ -151,6 +156,177 @@ describe('goal console, scan and permissions (AC01/AC03/AC05)', () => {
     const [auditsAfter] = await database.db.query<[Array<{ n: number }>]>('SELECT count() AS n FROM audit GROUP ALL;');
     expect(after[0]).toEqual(before[0]);
     expect(auditsAfter?.[0]?.n ?? 0).toBe(auditsBefore?.[0]?.n ?? 0);
+  });
+});
+
+describe('SYS07 follow-up: scan paging, owner surfaces and metrics sections', () => {
+  /** 27 active goals: one repair gap, 25 quiet goals, and the SYS07 goal last with two parallel blockers. */
+  async function seedCrowdedGoals(): Promise<{ lateGoalId: string; bulkGoalIds: string[]; waitTask: string; managerTask: string }> {
+    // beforeEach deletes goals but keeps tasks (deleting them fires the model-evaluation reopen event), so a
+    // fixed goal id would inherit an earlier test's orphan tasks. Each call gets fresh goal ids.
+    const tag = randomUUID().slice(0, 8);
+    const bulkGoalIds: string[] = [];
+    for (let index = 0; index < 26; index++) {
+      const id = `scan-bulk-${tag}-${String(index).padStart(2, '0')}`;
+      bulkGoalIds.push(id);
+      await seedGoal({
+        id,
+        createdAt: new Date(Date.now() - 10 * 86_400_000).toISOString(),
+        ...(index === 0
+          ? { finalState: 'done', acceptedBy: 'owner', outcomeRequired: ['customer_activation'] }
+          : { finalState: 'review' }),
+      });
+    }
+    const late = await seedGoal({
+      id: `sys07-late-${tag}`,
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+      finalState: 'review',
+    });
+    const waitTask = await makeTask(late.goalId, '客户激活等待', {
+      state: 'blocked', executor_role: 'engineering', reviewer_role: 'qa',
+      current_employee: 'eng-holder', created_at: new Date(Date.now() - 2 * 3_600_000),
+    });
+    await database.db.query(`CREATE task_wait CONTENT {
+      wait_key: $key, task: $task, kind: 'customer_activation', state: 'waiting',
+      source: { kind: 'authorized_person', by: 'fixture' }, owner_role: 'customer', expires_source: 'unknown',
+      progress: { employee: 'eng-holder' }, completed: ['内部验收完成'], pending_action: '请客户确认激活',
+      next_check_at: $next, reason: '等待客户激活回执并确认采纳结果', version: 1, entered_by: 'fixture', entered_version: 1,
+      entered_at: $entered, updated_at: time::now()
+    };`, { key: `wait-${waitTask}`, task: new RecordId('task', waitTask), next: Date.now() + 86_400_000,
+      entered: new Date(Date.now() - 3_600_000) });
+    const managerTask = await makeTask(late.goalId, '经理决策任务', {
+      state: 'blocked', blocked_to: 'gm', executor_role: 'product', reviewer_role: 'gm',
+      dispatch_blocked_since: Math.floor((Date.now() - 7_200_000) / 1000),
+      created_at: new Date(Date.now() - 2 * 3_600_000),
+    });
+    await database.db.query('UPDATE $gate SET dependencies = [$wait, $manager];', {
+      gate: new RecordId('task', late.gateId), wait: new RecordId('task', waitTask), manager: new RecordId('task', managerTask),
+    });
+    return { lateGoalId: late.goalId, bulkGoalIds, waitTask, managerTask };
+  }
+
+  test('the scan pages deterministically within the budget and reaches a goal behind the first page', async () => {
+    const { lateGoalId, waitTask, managerTask } = await seedCrowdedGoals();
+    const pages: GoalScanView[] = [];
+    let cursor: string | undefined;
+    for (let index = 0; index < 20; index++) {
+      const page = await core.goalGovernanceScan(tokens.gm!, { pageSize: 5, ...(cursor ? { cursor } : {}) });
+      pages.push(page);
+      expect(answerBytes(page)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      if (!page.page.hasMore) break;
+      expect(page.page.nextCursor).toBeTruthy();
+      cursor = page.page.nextCursor;
+    }
+    const all = pages.flatMap(page => page.goals);
+    const ids = all.map(card => card.goalId);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(pages[0]!.page.total).toBe(27);
+    expect(pages.every(page => page.scanned === 27)).toBe(true);
+    expect(new Set(pages.map(page => page.page.snapshotAt)).size).toBe(1);
+    expect(pages.at(-1)!.page.hasMore).toBe(false);
+    expect(pages.every(page => JSON.stringify(page.counts) === JSON.stringify(pages[0]!.counts))).toBe(true);
+    expect(pages[0]!.counts.needsRepair).toBeGreaterThanOrEqual(1);
+    expect(ids.indexOf(lateGoalId)).toBeGreaterThan(20);
+
+    const late = all.find(card => card.goalId === lateGoalId)!;
+    expect(late).toBeTruthy();
+    expect(late.blockers.map(blocker => blocker.taskId).sort()).toEqual([waitTask, managerTask, late.finalGate.taskId ?? ''].sort());
+    const wait = late.blockers.find(blocker => blocker.taskId === waitTask)!;
+    expect(wait.kind).toBe('wait');
+    expect(wait.responsibleRole).toBe('engineering');
+    expect(wait.holder).toBe('eng-holder');
+    expect(wait.waitedMinutes).toBeGreaterThanOrEqual(59);
+    expect(wait.nextTrigger).toBeTruthy();
+    expect(wait.dependencyPath.map(item => item.taskId)).toContain(late.finalGate.taskId ?? '');
+    expect(wait.handoff?.pendingAction ?? '').toContain('请客户确认');
+    const manager = late.blockers.find(blocker => blocker.taskId === managerTask)!;
+    expect(manager.kind).toBe('manager');
+    expect(manager.responsibleRole).toBe('gm');
+    expect(manager.waitedMinutes).toBeGreaterThanOrEqual(119);
+  });
+
+  test('the console and daily brief reach the last goal and render every blocker field and the final gate', async () => {
+    const { lateGoalId, bulkGoalIds, waitTask, managerTask } = await seedCrowdedGoals();
+    const lateTitle = `目标 ${lateGoalId}`;
+    const desk = new OwnerDesk(database);
+    const brief = await desk.brief();
+    expect(brief.goalCardCoverage).toMatchObject({ total: 27, prioritized: true });
+    const briefCard = brief.goalCards!.find(card => card.goalId === lateGoalId)!;
+    expect(briefCard).toBeTruthy();
+    expect(briefCard.blockers.map(blocker => blocker.taskId).sort()).toEqual([waitTask, managerTask, briefCard.finalGate.taskId ?? ''].sort());
+
+    const apiCards: GoalCard[] = [];
+    let cursor: string | undefined;
+    for (let index = 0; index < 10; index++) {
+      const page = await core.goalConsole(tokens.gm!, { pageSize: 10, ...(cursor ? { cursor } : {}) });
+      apiCards.push(...page.goals);
+      if (!page.page.hasMore) break;
+      cursor = page.page.nextCursor;
+    }
+    expect(apiCards.length).toBe(27);
+    const apiCard = apiCards.find(card => card.goalId === lateGoalId)!;
+    expect(apiCard).toBeTruthy();
+    expect(briefCard.blockers.map(blocker => blocker.taskId)).toEqual(apiCard.blockers.map(blocker => blocker.taskId));
+    expect(briefCard.finalGate).toEqual(apiCard.finalGate);
+    expect(briefCard.needsRepair).toBe(apiCard.needsRepair);
+    expect(briefCard.stages.map(stage => `${stage.key}:${stage.status}`)).toEqual(apiCard.stages.map(stage => `${stage.key}:${stage.status}`));
+
+    const data = await desk.briefData(Date.now(), '2026-10-27');
+    const { text } = renderBrief(data);
+    for (const part of [lateTitle, '责任：engineering', '持有人：eng-holder', '依赖路径：', '下一触发：', '交接：待办：请客户确认激活', '终验：', '证据任务：']) {
+      expect(text).toContain(part);
+    }
+    // Severe blockers outrank quiet goals in the brief's 8-line cap, so the last-created SYS07 goal is named first.
+    const lateIndex = text.indexOf(lateTitle);
+    expect(lateIndex).toBeGreaterThanOrEqual(0);
+    const firstQuiet = bulkGoalIds.slice(1).map(id => text.indexOf(`目标 ${id}`))
+      .filter(index => index >= 0).sort((a, b) => a - b)[0];
+    expect(firstQuiet).toBeDefined();
+    expect(lateIndex).toBeLessThan(firstQuiet!);
+    expect(text).toContain('待修复');
+  });
+
+  test('metrics sections page a real window and keep the window/denominator/coverage口径', async () => {
+    const now = Date.now();
+    const from = iso(now - 7 * 86_400_000), to = iso(now);
+    for (let index = 0; index < 6; index++) {
+      await seedGoal({ id: `metric-page-${index}`, doneAt: new Date(now - (index + 1) * 3_600_000).toISOString(),
+        createdAt: new Date(now - 2 * 86_400_000).toISOString(), outcomeRequired: [] });
+      const task = await makeTask(`metric-page-${index}`, `指标任务 ${index}`, { state: 'done', acceptance_attempt: 1,
+        created_at: new Date(now - 3 * 3_600_000) });
+      await database.db.query(`CREATE audit CONTENT { task: $task, actor: 'qa-1', action: 'accept', evidence: '通过', at: $at };`,
+        { task: new RecordId('task', task), at: new Date(now - (index + 1) * 3_600_000) });
+      await database.db.query(`CREATE model_execution CONTENT { task: $task, model: 'fixture', completed: true,
+        input_tokens: $tokens, at: $at };`, { task: new RecordId('task', task), tokens: 100 + index, at: new Date(now - (index + 1) * 3_600_000) });
+    }
+    const full = await core.goalMetrics(tokens.gm!, { from, to, timezone: 'UTC' }) as GoalMetricsView;
+    expect(isGoalMetricsSegment(full)).toBe(false);
+    const collect = async <T>(section: GoalMetricsSection, pick: (segment: GoalMetricsSegmentView) => T[]): Promise<T[]> => {
+      const out: T[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 20; page++) {
+        const segment = await core.goalMetrics(tokens.gm!, { from, to, timezone: 'UTC', section, pageSize: 2, ...(cursor ? { cursor } : {}) });
+        expect(isGoalMetricsSegment(segment)).toBe(true);
+        if (!isGoalMetricsSegment(segment)) throw new Error('expected a metrics section');
+        expect(segment.section).toBe(section);
+        expect(answerBytes(segment)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+        expect(segment.window).toMatchObject({ from: full.window.from, to: full.window.to, timezone: 'UTC', explicit: true });
+        expect(Number.isFinite(Date.parse(segment.window.cutoffAt))).toBe(true);
+        expect(segment.denominators).toEqual(full.denominators);
+        expect(segment.coverage).toEqual(full.coverage);
+        expect(segment.exclusions).toEqual(full.exclusions);
+        out.push(...pick(segment));
+        if (!segment.page?.hasMore) return out;
+        cursor = segment.page.nextCursor;
+      }
+      throw new Error(`metrics section ${section} did not finish`);
+    };
+    expect(await collect('usage_by_goal', segment => (segment.data!.usage as { byGoal: Array<{ goalId: string }> }).byGoal.map(row => row.goalId)))
+      .toEqual(full.usage.byGoal.map(row => row.goalId));
+    expect(await collect('customer_evidence_missing_activation', segment => (segment.data!.customerEvidence as { missingActivation: string[] }).missingActivation))
+      .toEqual(full.customerEvidence.missingActivation);
+    expect(await collect('day_series', segment => (segment.data!.daySeries as Array<{ day: string }>).map(row => row.day)))
+      .toEqual(full.daySeries.map(row => row.day));
   });
 });
 
@@ -445,7 +621,7 @@ describe('business metrics (AC04/AC05)', () => {
       { task: new RecordId('task', rework), at: done });
     const metrics = await core.goalMetrics(tokens.gm!, {
       from: iso(now - 86_400_000), to: iso(now), timezone: 'UTC', goalId: 'metric-1',
-    });
+    }) as GoalMetricsView;
     expect(metrics.denominators).toMatchObject({ goalsDone: 1, tasksAccepted: 2, firstPassKnown: 2 });
     expect(metrics.acceptance.firstPass).toMatchObject({ passed: 1, known: 2, rate: 0.5 });
     expect(metrics.usage).toMatchObject({ tasksAccepted: 2, tasksWithUsage: 1,
@@ -471,7 +647,7 @@ describe('business metrics (AC04/AC05)', () => {
     };`, { goal: new RecordId('goal', 'metric-cross-window'), at: new Date(from - 86_400_000) });
     const metrics = await core.goalMetrics(tokens.gm!, {
       from: iso(from), to: iso(now), timezone: 'UTC', goalId: 'metric-cross-window',
-    });
+    }) as GoalMetricsView;
     expect(metrics.customerEvidence).toMatchObject({ goalsDone: 1, goalsWithActivation: 1, missingActivation: [] });
   });
 

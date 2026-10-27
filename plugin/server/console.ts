@@ -395,6 +395,20 @@ async function openGoal(gid){
   await reloadGoalTasks(gid);
 }
 function stageChip(x){const tone={done:'done',active:'active',waiting:'waiting',missing:'missing'}[x.status]||'';const label={done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知';return '<span class="stage '+tone+'">'+esc(x.label)+' '+label+'</span>'}
+function goalBlockerHtml(b){
+  var parts=['<b>'+esc(b.kind)+'</b> · '+esc(b.summary)];
+  if(b.responsibleRole)parts.push('责任：'+esc(b.responsibleRole));
+  if(b.holder)parts.push('持有人：'+esc(b.holder));
+  if(b.waitedMinutes!==undefined)parts.push('已等 '+b.waitedMinutes+' 分钟');
+  if(b.nextTrigger)parts.push('下一触发：'+esc(b.nextTrigger));
+  if(b.dependencyPath&&b.dependencyPath.length)parts.push('依赖路径：'+b.dependencyPath.map(function(p){return esc(p.title)}).join(' → ')+(b.dependencyPathTruncated?' …':''));
+  if(b.handoff){var h=b.handoff.pendingAction?('待办：'+esc(b.handoff.pendingAction)):((b.handoff.completed&&b.handoff.completed.length)?('已完成 '+b.handoff.completed.length+' 项'):esc(b.handoff.kind));parts.push('交接：'+h)}
+  return parts.join('；');
+}
+function goalFinalGateHtml(fg){
+  if(!fg||!fg.taskId)return '终验：缺失';
+  return '终验：《'+esc(fg.title||fg.taskId)+'》（'+esc(fg.state||'未知')+(fg.reviewerRole?'，复核 '+esc(fg.reviewerRole):'')+(fg.ownerGate?'，老板关口':'')+(fg.effective?'':'，已被替代')+'）；证据任务：'+esc((fg.evidenceTaskIds||[]).join(', ')||'无');
+}
 function render(){
   const m=$('m');
   if(T==='todo'){
@@ -426,20 +440,27 @@ function render(){
     [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=$('at-'+x.task.id);if(e)atts(e,x.task.id)});
   }else if(T==='goals'){
     var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});
-    m.innerHTML=((BRIEF&&BRIEF.goals)||[]).map(function(g,i){
-      var c=cards[g.id]||{};
+    var coverage=BRIEF&&BRIEF.goalCardCoverage;
+    var rows=((BRIEF&&BRIEF.goals)||[]);
+    var cover=(coverage&&coverage.omitted>0)?('<p class="meta">目标详情已展示 '+coverage.shown+'/'+coverage.total+'（按活动阻点优先；未展开的目标只显示标题）</p>'):'';
+    m.innerHTML=cover+(rows.map(function(g,i){
+      var c=cards[g.id];
+      if(!c){return '<article class="goal-card" id="gt-'+g.id+'"><div class="goal-main"><span class="goal-index">'+(i+1)+'</span>'
+        +'<div class="goal-name"><h3>'+esc(g.title)+'</h3><p class="meta">详情未展开（已展示 '+(coverage?coverage.shown:0)+'/'+(coverage?coverage.total:rows.length)+'）</p></div></div></article>'}
       var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString().slice(0,10)):'截止未知';
       var stages=(c.stages||[]).map(stageChip).join('')||'<span class="stage">阶段未知</span>';
       var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<p class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</p>'):'';
       var repair=c.needsRepair?('<p class="meta bad">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</p>'):'';
-      var blockers=(c.blockers&&c.blockers.length)?('<p class="meta">当前阻点：'+c.blockers.map(function(b){return esc(b.kind)+' · '+esc(b.summary)+(b.waitedMinutes!==undefined?('（已等 '+b.waitedMinutes+' 分钟）'):'')}).join('；')+'</p>'):'';
+      var blockers=(c.blockers&&c.blockers.length)?('<p class="meta">当前阻点：</p>'+c.blockers.map(function(b){return '<p class="meta">'+goalBlockerHtml(b)+'</p>'}).join('')+(c.blockersOmitted?('<p class="meta">另有 '+c.blockersOmitted+' 个阻点未展示（卡片上限）</p>'):'')):'';
+      var finalLine='<p class="meta">'+goalFinalGateHtml(c.finalGate)+'</p>';
+      var total='<p class="meta">任务 '+(c.taskTotal||0)+' 个</p>';
       return '<article class="goal-card" id="gt-'+g.id+'"><button class="goal-main" onclick="openGoal(\\''+g.id+'\\')">'
         +'<span class="goal-index">'+(i+1)+'</span>'
         +'<div class="goal-name"><span><span class="tier">'+esc(g.tier)+'</span> '+esc(g.state)+(g.project?' · '+esc(g.project):'')+' · '+esc(deadline)+'</span>'
         +'<h3>'+esc(g.title)+'</h3><p>'+esc((g.brief||'').slice(0,140))+'</p></div>'
         +'<div class="goal-stages">'+stages+'</div>'+icon('chevron','goal-arrow')+'</button>'
-        +'<div class="goal-extra">'+missing+repair+blockers+'</div></article>';
-    }).join('')||'<div class="empty">无在办目标</div>';
+        +'<div class="goal-extra">'+missing+repair+finalLine+total+blockers+'</div></article>';
+    }).join('')||'<div class="empty">无在办目标</div>');
   }else if(T==='docs'){
     if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
     const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));

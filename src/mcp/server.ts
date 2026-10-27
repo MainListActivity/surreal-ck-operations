@@ -713,19 +713,23 @@ function registerTools(server: McpServer, core: CompanyCore) {
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_governance_scan', {
-    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles or dangling edges, missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision.',
-    inputSchema: z.object({}),
-  }, async (_input, ctx) => run(token(ctx), () => core.goalGovernanceScan
-    ? core.goalGovernanceScan(token(ctx))
+    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles or dangling edges, missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision. The scan is deterministically paged: each page fits the 48 KiB response budget and carries page.nextCursor/hasMore/total/snapshotAt plus global counts; follow nextCursor until hasMore is false to cover every goal. Cards omitted from a page are counted in truncated (and a reduced card is marked detailsOmitted); nothing is silently dropped.',
+    inputSchema: z.object({ ...pageArgs }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalGovernanceScan
+    ? core.goalGovernanceScan(token(ctx), withoutNull(input))
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('goal_metrics', {
-    description: 'gm only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit.',
+    description: 'gm only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit. A window whose full answer fits the budget returns it whole; otherwise the answer is a section index (sections, window, denominators, exclusions, cutoff, coverage) and each section is read with section plus pageSize/cursor, where list-shaped sections paginate until page.hasMore is false.',
     inputSchema: z.object({
       from: z.string().min(1).max(40).nullish(),
       to: z.string().min(1).max(40).nullish(),
       timezone: z.string().min(1).max(80).nullish(),
       goalId: z.string().min(1).max(100).nullish(),
+      section: z.enum(['cycle', 'acceptance', 'blocks', 'blocks_by_actor', 'wakes', 'usage', 'usage_by_goal',
+        'events', 'customer_evidence', 'customer_evidence_missing_activation', 'customer_evidence_missing_adoption',
+        'day_series']).nullish(),
+      ...pageArgs,
     }),
   }, async (input, ctx) => run(token(ctx), () => core.goalMetrics
     ? core.goalMetrics(token(ctx), withoutNull(input))
