@@ -6,6 +6,9 @@ goal_workspace_probe_root() {
   grep -Eq "^export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1'" "$root/src/goal-workspace-capability.ts" || return 1
   grep -qF 'workspace goal denied' "$root/src/core.ts" 2>/dev/null || return 1
   grep -qF 'workspace_scope' "$root/src/workforce.ts" 2>/dev/null || return 1
+  [ -f "$root/src/task-recovery.ts" ] || return 1
+  grep -qF 'dependency_continuation' "$root/src/core.ts" || return 1
+  grep -qF 'assertExecutionWindow' "$root/src/ops/proof-store.ts" || return 1
 }
 goal_workspace_target_supported() {
   release=$1

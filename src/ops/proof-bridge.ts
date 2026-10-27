@@ -115,6 +115,7 @@ export class InternalAiProofBridge {
       const files = await loadProofFiles(this.deps.home, approvalTask ?? scope.taskId, args.manifestPath, args.documentPath);
       if (args.activityId !== files.manifest.activityId) throw new CompanyError('forbidden', 'activity scope mismatch');
       this.assertFiles(files, args.mode);
+      if (args.mode === 'enable') await this.deps.store.assertExecutionWindow(lease.taskId, approvalTask, files);
       const approval = approvalTask ? await this.deps.store.approval(approvalTask, env, files) : null;
       const identities = await this.deps.identities(scope, env, files);
       const identitiesDigest = sha256(canonical(identities));
@@ -168,6 +169,7 @@ export class InternalAiProofBridge {
     const files = await loadProofFiles(this.deps.home, row.approval?.taskId ?? row.lease.taskId, row.files.manifestPath, row.files.documentPath);
     if (files.manifestHash !== row.files.manifestHash || files.documentHash !== row.files.documentHash) throw new CompanyError('forbidden', 'proof evidence changed');
     this.assertFiles(files, this.content(row).mode);
+    if (this.content(row).mode === 'enable') await this.deps.store.assertExecutionWindow(row.lease.taskId, row.approval?.taskId, files);
     if (row.approval && canonical(await this.deps.store.approval(row.approval.taskId, files.manifest.env, files)) !== canonical(row.approval)) throw new CompanyError('forbidden', 'proof approval changed');
     // The digest is always supplied by the caller and always compared: prove and deliver pass this
     // request's live resolution (their identity-drift check, kept outside the freshness window);

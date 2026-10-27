@@ -159,7 +159,8 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('037-fault-budget.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
     await this.db.query(loadSchema('038-goal-workspaces.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 38 WHERE schema_version < 38;');
+    await this.db.query(loadSchema('039-task-recovery.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 39 WHERE schema_version < 39;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

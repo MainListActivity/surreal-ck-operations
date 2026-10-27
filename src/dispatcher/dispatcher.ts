@@ -1,3 +1,4 @@
+import { faultBelongsToWait } from '../task-recovery.ts';
 import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
 import { managedModel } from "../model-routing/policy.ts";
@@ -1783,7 +1784,8 @@ export class Dispatcher {
         const kept: PendingGm[] = [];
         for (const todo of pendingGm) {
           const episodes = facts.byTask.get(todo.task.id) ?? [];
-          const open = episodes.filter(episode => episode.state !== 'resolved');
+          const open = episodes.filter(episode => episode.state !== 'resolved' &&
+            faultBelongsToWait(episode.updatedAt, facts.blockedAt?.get(todo.task.id)));
           const pending = open.filter(episode => !episode.notified);
           if (open.length && !pending.length) {
             // The manager already has every open cause of this task on their desk.
@@ -2650,7 +2652,7 @@ export class Dispatcher {
     const { loops, reasons } = prefetched ?? await owner.blockLoops(task.id);
     if (loops < cfg.blockLoopLimit || !(await owner.escalateLooping(task, loops, reasons))) return false;
     report.decisions.push(`escalate-loop:${task.id}`);
-    this.log(`task ${task.id} blocked on manager ${loops} times; escalated to owner`);
+    this.log(`task ${task.id} blocked on manager ${loops} times; loop recovery handled`);
     return true;
   }
 

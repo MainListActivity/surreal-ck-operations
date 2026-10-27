@@ -349,6 +349,7 @@ export interface DispositionEpisodeFacts {
  * already been told about this cause.
  */
 export interface FaultEpisodeFacts {
+  updatedAt?: string;
   episode: string;
   fingerprint: string;
   incident: string;
@@ -952,7 +953,7 @@ export class Workforce {
    * whose budget is spent) does not produce a second wake. The read is a single query: an unreadable ledger is
    * reported as undefined, and the caller then fails closed for the pass.
    */
-  async faultEpisodes(input: { tasks: readonly string[] }): Promise<{ byTask: Map<string, FaultEpisodeFacts[]> } | undefined> {
+  async faultEpisodes(input: { tasks: readonly string[] }): Promise<{ byTask: Map<string, FaultEpisodeFacts[]>; blockedAt?: Map<string, number> } | undefined> {
     const byTask = new Map<string, FaultEpisodeFacts[]>();
     const tasks = [...new Set(input.tasks.filter(taskId => taskId.length > 0))];
     if (!tasks.length) return { byTask };
@@ -974,12 +975,18 @@ export class Workforce {
         state: (row.state === 'converged' || row.state === 'exhausted' || row.state === 'stopped' || row.state === 'resolved'
           ? row.state : 'opened'),
         evidenceRevision: row.evidence_revision ?? 0,
+        updatedAt: row.updated_at ? String(row.updated_at) : undefined,
         notified: row.notified ?? false,
       };
       const list = byTask.get(taskId);
       if (list) list.push(facts); else byTask.set(taskId, [facts]);
     }
-    return { byTask };
+    const [boundaries] = await this.db.query<[Array<{ task: unknown; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $tasks AND action IN ['resume', 'deferred', 'dependency_unlocked', 'manager_recovery'] ORDER BY at DESC;`,
+      { tasks: tasks.map(taskId => id('task', taskId)) });
+    const blockedAt = new Map<string, number>();
+    for (const b of boundaries ?? []) if (!blockedAt.has(asId(b.task))) blockedAt.set(asId(b.task), Date.parse(String(b.at)));
+    return { byTask, blockedAt };
   }
 
   /**
