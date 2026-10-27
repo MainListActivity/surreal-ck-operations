@@ -2694,7 +2694,7 @@ export class Dispatcher {
           handoffLive.add(key);
           await this.notice(key,
             `等待已过期：任务 ${wait.taskId} 的 ${wait.kind} 等待已过期，任务仍被冻结。` +
-            `请确认取消、延期还是补齐受信事件；系统不会自动放行，也不会代发客户消息。`, report);
+            `请确认取消、延期还是先延期再补受信事件；过期状态不能直接确认，系统不会自动放行，也不会代发客户消息。`, report);
         }
       } catch (error) {
         this.log(`wait expiry read failed: ${(error as Error).message}`);

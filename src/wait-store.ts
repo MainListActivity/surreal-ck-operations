@@ -708,6 +708,7 @@ export class WaitStore {
       IF $t = NONE { THROW 'task not found' };
       IF $t.version != $expected { THROW 'task version moved' };
       IF $t.state IN ['done', 'void'] { THROW 'task terminal' };
+      IF $t.state != 'blocked' { THROW 'task not blocked for migration' };
       IF $t.wait_state = 'waiting' { THROW 'task already waiting' };
       IF $t.reviewer_role = 'owner' OR $t.blocked_to = 'owner' { THROW 'owner gate cannot be migrated' };
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task still leased' };

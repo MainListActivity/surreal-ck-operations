@@ -3117,8 +3117,19 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       seen.add(current);
       const [rows] = await this.db.query<[Array<{ dependencies?: unknown[] }>]>(
         'SELECT dependencies FROM $task;', { task: id('task', current) });
-      for (const dep of rows?.[0]?.dependencies ?? []) {
-        const depId = asId(dep as never);
+      const edges = new Set<string>();
+      for (const dep of rows?.[0]?.dependencies ?? []) edges.add(asId(dep as never));
+      // A task can wait through its own open wait row as well as through task.dependencies. Both are real edges:
+      // otherwise A->B and B->A both look acyclic and neither can ever be released.
+      const [waits] = await this.db.query<[Array<{ reference_task?: unknown }>]>(
+        `SELECT reference_task FROM task_wait
+         WHERE task = $task AND state IN ['waiting', 'held'] AND reference_task != NONE;`,
+        { task: id('task', current) });
+      for (const wait of waits ?? []) {
+        const ref = wait.reference_task === undefined ? undefined : asId(wait.reference_task as never);
+        if (ref) edges.add(ref);
+      }
+      for (const depId of edges) {
         if (depId === taskId) return true;
         if (!seen.has(depId)) queue.push(depId);
       }
@@ -3148,6 +3159,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (/already waiting/i.test(message)) return new CompanyError('conflict', '该任务已有进行中的等待');
     if (/owner gate cannot be migrated/i.test(message)) return new CompanyError('forbidden', '老板关口不能迁移为时间等待；必须由老板本人决定');
     if (/no future time bound/i.test(message)) return new CompanyError('invalid', '任务没有未来的时间边界（quota_resets_at 为空或已过去），不能迁移为时间等待');
+    if (/not blocked for migration/i.test(message)) return new CompanyError('invalid', '任务不在 blocked 阶段；与迁移预演一致，只有 blocked 任务可以迁移');
     if (/still leased/i.test(message)) return new CompanyError('conflict', '任务仍被有效租约持有，不能迁移；先释放或等到租约结束');
     if (/version moved/i.test(message)) return new CompanyError('conflict', '任务版本已移动；重新读取后再迁移');
     if (/task not held/i.test(message)) return new CompanyError('forbidden', '任务不在执行/复核持有阶段，不能进入等待');

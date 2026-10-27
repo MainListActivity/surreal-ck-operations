@@ -372,6 +372,25 @@ describe('safe release and version locks (AC05)', () => {
     expect((await rowOf(taskId)).state).toBe('blocked');
   });
 
+  test('two tasks cannot wait on each other through their open reference waits', async () => {
+    const a = await makeTask('互相等待 A');
+    const b = await makeTask('互相等待 B');
+    const heldA = await claim(a, 'eng');
+    const heldB = await claim(b, 'eng2');
+    const first = await core.wait(tokens.eng!, heldA.proof, evidence(`cycle-a-${a}`), {
+      kind: 'dependency', referenceTaskId: b,
+      reason: 'SYS05 回归：A 先等待 B，随后 B 再等待 A 时必须被环检测拒绝',
+    } as never);
+    expect(first.wait!.kind).toBe('dependency');
+    await expectRefused(core.wait(tokens.eng2!, heldB.proof, evidence(`cycle-b-${b}`), {
+      kind: 'dependency', referenceTaskId: a,
+      reason: 'SYS05 回归：等待引用会形成依赖环，第二次进入必须被拒绝而不是永久 blocked',
+    } as never), 'conflict', /依赖环/);
+    const rowB = await rowOf(b);
+    expect(rowB.wait_state).toBeUndefined();
+    expect(rowB.state).toBe('doing');
+  });
+
   test('a held wait recovers automatically once its dependency finishes', async () => {
     const dependency = await makeTask('迟到的依赖');
     const taskId = await makeTask('到点后被依赖挂住');
@@ -395,7 +414,10 @@ describe('safe release and version locks (AC05)', () => {
   test('migration applies to one named task, refuses owner gates, and is version-locked', async () => {
     const legacy = await makeTask('旧时间阻塞');
     const until = Math.floor(Date.now() / 1000) + 3600;
-    await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until;', { task: new RecordId('task', legacy), until });
+    await database.db.query(
+      'UPDATE ONLY $task SET state = "blocked", blocked_to = "gm", resume_state = "ready", quota_resets_at = $until;',
+      { task: new RecordId('task', legacy), until },
+    );
     const before = await rowOf(legacy);
     const migrated = await core.waitMigrationApply(tokens.gm!, {
       taskId: legacy, expectedVersion: before.version as number,
@@ -410,6 +432,14 @@ describe('safe release and version locks (AC05)', () => {
       taskId: legacy, expectedVersion: before.version as number,
       reason: 'SYS05 回归：旧版本再次迁移必须被拒绝，避免覆盖新状态', idempotencyKey: 'migrate-stale',
     }), 'conflict', /version moved|版本/);
+
+    const ready = await makeTask('ready 残留额度边界');
+    await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until;', { task: new RecordId('task', ready), until });
+    const readyRow = await rowOf(ready);
+    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+      taskId: ready, expectedVersion: readyRow.version as number,
+      reason: 'SYS05 回归：ready 任务不在迁移预演的 eligible 条件内，apply 必须拒绝', idempotencyKey: 'migrate-ready',
+    }), 'invalid', /blocked/);
 
     const owned = await makeTask('老板关口不迁移', 'owner');
     await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until, state = "blocked", blocked_to = "owner";', {
