@@ -5,7 +5,7 @@ import { relayDesignCss } from "../shared/relay-design.ts";
 export const rankingPage = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>模型排序 · 公司审核台</title><style>${relayDesignCss}</style></head><body><main class="app-shell">
 <header class="topbar"><a class="brand" href="./" title="返回公司审核台"><span class="brand-mark">M</span><span>Model Relay</span></a><div class="preview-badge"><span class="pulse"></span>实时数据</div></header>
 <div class="page"><section class="hero"><div><p class="eyebrow">ROUTING CONSOLE</p><h1>模型排序</h1><p class="hero-copy">Haiku、Sonnet 按规则自动排序；Opus 的成员、顺序和组内配置由你在 Magpie 手动维护。</p></div><div class="sync-state"><span class="sync-dot"></span><div><strong id="sync-title">正在加载</strong><span id="sync-time">等待同步</span></div></div></section>
-<div class="workspace"><aside class="settings-panel"><div class="section-heading"><span class="step">01</span><div><h2>排序规则</h2><p>固定规则，无模型调用费用</p></div></div><label class="field-label" for="rule">当前生效规则</label><textarea readonly id="rule" maxlength="8000" placeholder="例如：智能程度和速度综合优先"></textarea><p class="field-help">规则由代码执行；这里只设置刷新间隔。旧自然语言规则已停用。</p><label class="field-label" for="refresh">刷新间隔</label><div class="select-wrap"><select id="refresh"><option value="2">2 分钟</option><option value="5" selected>5 分钟（默认）</option><option value="10">10 分钟</option></select></div><button id="save-rule" class="save-button" disabled><span id="save-label" style="font-size:13px">保存刷新间隔</span><span id="save-arrow">→</span></button><p id="save-message" class="field-help" role="status"></p><div class="last-refresh"><span>最近刷新</span><time id="last-refresh">尚未刷新</time><p>到期后由下一次员工请求触发后台刷新。</p></div><p id="error" class="error-message" role="alert"></p></aside>
+<div class="workspace"><aside class="settings-panel"><div class="section-heading"><span class="step">01</span><div><h2>排序规则</h2><p>固定规则，无模型调用费用</p></div></div><div class="field-label">当前生效规则</div><p id="rule" style="font-size:12px;line-height:1.8;white-space:pre-wrap;margin:0"></p><p class="field-help">规则由代码执行；这里只设置刷新间隔。旧自然语言规则已停用。</p><label class="field-label" for="refresh">刷新间隔</label><div class="select-wrap"><select id="refresh"><option value="2">2 分钟</option><option value="5" selected>5 分钟（默认）</option><option value="10">10 分钟</option></select></div><button id="save-rule" class="save-button" disabled><span id="save-label" style="font-size:13px">保存刷新间隔</span><span id="save-arrow">→</span></button><p id="save-message" class="field-help" role="status"></p><div class="last-refresh"><span>最近刷新</span><time id="last-refresh">尚未刷新</time><p>到期后由下一次员工请求触发后台刷新。</p></div><p id="error" class="error-message" role="alert"></p></aside>
 <section class="results-panel"><div class="section-heading results-heading"><span class="step">02</span><div><h2>模型优先级</h2><p>依据当前规则生成的实时排序</p></div><span id="updated" class="updated"></span></div><div class="tabs" id="group-tabs" role="tablist" aria-label="模型组"></div><div class="group-summary"><div><h2 id="models-heading">Haiku 模型</h2><p>先执行故障、额度和20秒限制，再按订阅、能力档、首 token 延迟排序；置顶不能越过限制。</p></div><span id="model-count" class="model-count">加载中</span></div><p id="legacy" class="field-help"></p><p id="pin-message" class="field-help" role="status"></p><div id="model-list" class="model-list"></div><p id="attempt-budget" class="field-help"></p><p id="snapshot" class="field-help"></p><details class="request-details"><summary>历史 JEV 请求（已停用）</summary><pre id="request-json"></pre></details></section></div></div></main><script>const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const num=(v,n=1)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(n):'未知';
@@ -55,7 +55,7 @@ function draw(){
 }
 async function load(){
  const sequence=++readSequence;
- try{const next=await api();if(sequence!==readSequence)return;state=next;if(!dirty){$('rule').value=state.rules;$('refresh').value=state.refreshMinutes;}
+ try{const next=await api();if(sequence!==readSequence)return;state=next;$('rule').textContent=state.rules;if(!dirty){$('refresh').value=state.refreshMinutes;}
   $('last-refresh').textContent=state.at?new Date(state.at).toLocaleString():'尚未刷新';
   $('sync-title').textContent=state.error?'同步异常':!state.configured?'尚未配置':'运行正常';
   $('sync-time').textContent=state.at?new Date(state.at).toLocaleString():'等待首次刷新';
@@ -63,13 +63,13 @@ async function load(){
   $('request-json').textContent=JSON.stringify(state.requests||[],null,2);$('save-rule').disabled=saving;draw();
  }catch(e){if(sequence===readSequence){$('sync-title').textContent='读取失败';$('error').textContent=e.message;}}
 }
-$('rule').oninput=()=>{dirty=true;};$('refresh').onchange=()=>{dirty=true;};
+$('refresh').onchange=()=>{dirty=true;};
 $('save-rule').onclick=async()=>{
  if(saving)return;saving=true;++readSequence;
- const body={rules:$('rule').value,refreshMinutes:Number($('refresh').value)};
+ const body={rules:state.rules,refreshMinutes:Number($('refresh').value)};
  clearTimeout(saveTimer);$('save-rule').classList.remove('saved');$('save-arrow').textContent='→';
  $('save-rule').disabled=true;$('save-label').textContent='保存中…';$('save-message').textContent='';
- try{await api(body);if($('rule').value===body.rules&&Number($('refresh').value)===body.refreshMinutes)dirty=false;
+ try{await api(body);if(Number($('refresh').value)===body.refreshMinutes)dirty=false;
   $('save-message').textContent='已保存，下次员工请求到达时刷新排序。';$('save-rule').classList.add('saved');$('save-label').textContent='已保存设置';$('save-arrow').textContent='✓';saveTimer=setTimeout(()=>{$('save-rule').classList.remove('saved');$('save-label').textContent='保存刷新间隔';$('save-arrow').textContent='→';},2200);await load();
  }catch(e){$('save-message').textContent='保存失败：'+e.message;}
  finally{saving=false;$('save-rule').disabled=false;if(!$('save-rule').classList.contains('saved'))$('save-label').textContent='保存刷新间隔';}

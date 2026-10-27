@@ -16,7 +16,8 @@ function harness(data:any) {
 test('ranking UI shows default rules and an honest empty state before the first recorded attempt',()=>{
  const h=harness({rules:'智能程度和速度综合优先',refreshMinutes:5,configured:true,orders:{},requests:[]});
  const nodes=h.render('ModelRankingCard',{ctx:{}});
- expect(nodes.find(n=>n.type==='TextInput').props.value).toBe('智能程度和速度综合优先');
+ expect(nodes.filter(n=>n.type==='TextInput')).toHaveLength(0);
+ expect(h.text()).toContain('智能程度和速度综合优先');
  expect(h.text()).toContain('没有历史请求');
 });
 test('ranking UI exposes each request timestamp and exact JSON, and JSON sections expand on press',()=>{
