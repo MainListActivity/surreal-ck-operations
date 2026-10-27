@@ -395,8 +395,8 @@ export class RankingRefresher {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
-        // A member that keeps failing goes last by code, before Jev and over the owner's pins:
-        // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
+        // Keep model-specific safety observations for automatic ranking and risk display.
+        // Explicit owner pins remain in their independent first tier even when these observations flag a risk.
         gates[`sck-${tier}`]={at:new Date().toISOString(),facts:members.flatMap(id=>byId.has(id)?[byId.get(id)!]:[])};
         try {
           const facts=members.map(id=>byId.get(id));
