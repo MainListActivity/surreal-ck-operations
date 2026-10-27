@@ -1,4 +1,4 @@
-import { rankingHealthMetric, rankingTrendDetail } from "../shared/ranking-trends.ts";
+import { rankingHealthMetric, rankingTrendDetail, rankingRuleLabel } from "../shared/ranking-trends.ts";
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1198,16 +1198,17 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
       <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>置顶模型固定在前；其余先执行明确末尾条件，再按 JEV 分数排序。</Text>}
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>先执行故障、额度和20秒限制，再按订阅、能力档、首 token 延迟排序；置顶不能越过限制。</Text>}
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
-    {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>历史排序未记录 JEV 分数，下一轮成功刷新后显示。</Text>}
+    {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
     {table.rows.map((row,index)=>{
       const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
       const open=expanded===row.model;
       const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
       const metrics=[
+        {label:"排序依据",value:row.decision?.reason??"等待规则排序",detail:"不调用 JEV；首 token 置后阈值为20秒"},
         {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
         {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
         {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
@@ -1224,13 +1225,13 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           <View style={{width:mobile?28:34,height:mobile?28:34,borderRadius:mobile?8:12,backgroundColor:c.surface2,alignItems:"center",justifyContent:"center"}}><Text style={[s.muted,{fontSize:mobile?9:11,fontWeight:"700"}]}>#{index+1}</Text></View>
           <View style={{flex:1,minWidth:0}}><View style={[s.row,{gap:8}]}>
             <Text numberOfLines={1} style={[s.text,{flexShrink:1,fontSize:mobile?12:13,fontWeight:"700"}]}>{short.slice(slash+1)}</Text>
-            {!mobile&&index===0&&row.jevScore!==undefined&&<View style={{backgroundColor:c.surface2,paddingHorizontal:6,paddingVertical:3,borderRadius:5}}><Text style={{color:c.statusSuccess,fontSize:9}}>推荐</Text></View>}
-          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)}</Text></View>
+            {!mobile&&index===0&&!!row.decision&&!row.decision.tail&&<View style={{backgroundColor:c.surface2,paddingHorizontal:6,paddingVertical:3,borderRadius:5}}><Text style={{color:c.statusSuccess,fontSize:9}}>推荐</Text></View>}
+          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)} · {row.ttftMs===undefined?"TTFT ?":`${number(row.ttftMs/1000,2)}s`}</Text></View>
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>JEV</Text>
-            <Text accessibilityLabel={row.health?.excluded?"持续报错，已移到末尾，不参与 JEV 评分":row.pinned?"已置顶，不参与 JEV 评分":row.jevScore===undefined?"JEV 分数未记录":`JEV 原始分数 ${row.jevScore}`} style={{color:c.score,fontSize:mobile?14:19,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.health?.excluded?"持续报错":row.pinned?"已置顶":row.jevScore===undefined?(table.scored?"未评分":"未记录"):row.jevScore.toFixed(4)}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>规则</Text>
+            <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{rankingRuleLabel(row)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
           onPress={()=>void onPin?.(row.model,!row.pinned)} style={{paddingHorizontal:mobile?7:10,minHeight:44,justifyContent:"center",opacity:pinBusy?0.5:1}}>
@@ -1277,30 +1278,30 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
     </View>
     <View style={{flexDirection:wide?"row":"column",gap:18,alignItems:"flex-start"}}>
       <View style={[s.panel,{width:wide?340:"100%"}]}>
-        <RelayHeading ctx={ctx} step="01" title="排序规则" subtitle="用自然语言描述你的分组策略"/>
-        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginBottom:9}]}>自定义规则</Text>
-        <TextInput accessibilityLabel="模型排序规则" multiline maxLength={8000} style={[s.input,{minHeight:118,textAlignVertical:"top"}]} value={current.rules} onChangeText={rules=>setDraft({...current,rules})} placeholder="例如：智能程度和速度综合优先" placeholderTextColor={c.foregroundMuted}/>
-        <Text style={[s.muted,{marginTop:8,fontSize:11}]}>留空时采用默认规则：智能程度和速度综合优先。</Text>
+        <RelayHeading ctx={ctx} step="01" title="排序规则" subtitle="固定规则，无模型调用费用"/>
+        <Text style={[s.text,{fontSize:12,fontWeight:"600",marginBottom:9}]}>当前生效规则</Text>
+        <TextInput accessibilityLabel="模型排序规则" editable={false} multiline maxLength={8000} style={[s.input,{minHeight:118,textAlignVertical:"top"}]} value={current.rules} onChangeText={rules=>setDraft({...current,rules})} placeholder="例如：智能程度和速度综合优先" placeholderTextColor={c.foregroundMuted}/>
+        <Text style={[s.muted,{marginTop:8,fontSize:11}]}>规则由代码执行；这里只设置刷新间隔。旧自然语言规则已停用。</Text>
         <Text style={[s.text,{fontSize:12,fontWeight:"600",marginTop:20,marginBottom:9}]}>刷新间隔</Text>
         <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={[s.input,s.row,{height:45,justifyContent:"space-between",paddingVertical:0}]} onPress={()=>setSelectOpen(!selectOpen)}><Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""}</Text><Text style={s.muted}>⌄</Text></Pressable>
         {selectOpen&&<View style={[s.input,{marginTop:6,gap:12}]}>{([2,5,10] as const).map(minutes=><Pressable key={minutes} accessibilityRole="button" accessibilityState={{selected:current.refreshMinutes===minutes}} onPress={()=>{setDraft({...current,refreshMinutes:minutes});setSelectOpen(false);}}><Text style={s.text}>{minutes} 分钟{minutes===5?"（默认）":""}</Text></Pressable>)}</View>}
-        <Pressable accessibilityRole="button" disabled={busy||!query.data} style={[s.row,{height:47,borderRadius:13,backgroundColor:savedAt?"#2ea77e":c.accent,paddingHorizontal:16,justifyContent:"space-between",marginTop:22,opacity:busy?0.6:1}]} onPress={async()=>{setBusy(true);setSavedAt(undefined);setMessage("");try{await save(current);await query.refetch();setDraft(previous=>previous&&(previous.rules!==current.rules||previous.refreshMinutes!==current.refreshMinutes)?previous:undefined);setMessage("已保存，下次员工请求到达时刷新排序。");const at=Date.now();setSavedAt(at);setTimeout(()=>setSavedAt(previous=>previous===at?undefined:previous),2200);}catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}}}><Text style={{color:c.accentForeground,fontSize:13,fontWeight:"700"}}>{busy?"保存中…":savedAt?"已保存规则":"保存排序规则"}</Text><Text style={{color:c.accentForeground,fontSize:18}}>{savedAt?"✓":"→"}</Text></Pressable>
+        <Pressable accessibilityRole="button" disabled={busy||!query.data} style={[s.row,{height:47,borderRadius:13,backgroundColor:savedAt?"#2ea77e":c.accent,paddingHorizontal:16,justifyContent:"space-between",marginTop:22,opacity:busy?0.6:1}]} onPress={async()=>{setBusy(true);setSavedAt(undefined);setMessage("");try{await save(current);await query.refetch();setDraft(previous=>previous&&(previous.rules!==current.rules||previous.refreshMinutes!==current.refreshMinutes)?previous:undefined);setMessage("已保存，下次员工请求到达时刷新排序。");const at=Date.now();setSavedAt(at);setTimeout(()=>setSavedAt(previous=>previous===at?undefined:previous),2200);}catch{setMessage("保存失败，请重试。");}finally{setBusy(false);}}}><Text style={{color:c.accentForeground,fontSize:13,fontWeight:"700"}}>{busy?"保存中…":savedAt?"已保存设置":"保存刷新间隔"}</Text><Text style={{color:c.accentForeground,fontSize:18}}>{savedAt?"✓":"→"}</Text></Pressable>
         {!!message&&<Text style={[s.muted,{marginTop:8}]}>{message}</Text>}
         <View style={{borderTopWidth:1,borderColor:c.border,marginTop:24,paddingTop:19,gap:5}}><Text style={[s.muted,{fontSize:10}]}>最近刷新</Text><Text style={[s.text,{fontSize:11,fontFamily:"Menlo"}]}>{query.data?.at?new Date(query.data.at).toLocaleString():"尚未刷新"}</Text><Text style={[s.muted,{fontSize:10}]}>到期后由下一次员工请求触发后台刷新。</Text></View>
-        {unconfigured&&<Text style={[s.muted,{marginTop:8}]}>Jev 尚未配置，暂时保留现有顺序。</Text>}{failed&&<Text style={{color:c.statusWarning,fontSize:12,marginTop:8}}>{query.data?.error??"设置读取失败，请稍后重试。"}</Text>}
+        {unconfigured&&<Text style={[s.muted,{marginTop:8}]}>规则排序尚未初始化。</Text>}{failed&&<Text style={{color:c.statusWarning,fontSize:12,marginTop:8}}>{query.data?.error??"设置读取失败，请稍后重试。"}</Text>}
       </View>
       <View style={[s.panel,{flex:wide?1:undefined,width:wide?undefined:"100%",minWidth:0}]}>
         <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle="依据当前规则生成的实时排序"/>
         <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
         {!!selected&&!!query.data?.attempts?.[selected.group]&&<Text style={[s.muted,{marginBottom:10,fontSize:10}]}>{(()=>{const a=query.data!.attempts[selected.group]!;return `最近刷新尝试：${new Date(a.at).toLocaleString()} · ${a.status} · ${a.modelCount} 个评分模型 · ${a.encoding} · 共享 ${a.stateBytes}/${a.limits.stateBytes} 字节 · 请求 ${a.requestBytes}/${a.limits.requestBytes} 字节`;})()}</Text>}
-        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，不再发送给 JEV 排序。":"已取消置顶，下次刷新参与 JEV 排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
+        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，仍受20秒和可用性限制。":"已取消置顶，下次刷新按规则排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
         {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
-        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功评分":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
+        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功排序":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
       </View>
     </View>
-    <View style={{marginTop:18}}><Collapsible title="最近发送给 Jev 的内容" ctx={ctx}>
-      <Text style={s.muted}>每组保留最近一次调用前的实际请求快照，调用失败时仍保留。</Text>
-      {!query.data?.requests.length&&<Text style={s.muted}>尚无请求快照，下一次排序调用后显示；历史调用无法补回。</Text>}
+    <View style={{marginTop:18}}><Collapsible title="历史 JEV 请求（已停用）" ctx={ctx}>
+      <Text style={s.muted}>仅保留切换前的历史快照；现在按固定规则排序，不再调用 JEV。</Text>
+      {!query.data?.requests.length&&<Text style={s.muted}>没有历史请求。</Text>}
       {query.data?.requests.map(request=><View key={request.tier} style={{gap:8,marginTop:12}}><Text style={s.text}>{request.tier.toUpperCase()} · 调用开始：{new Date(request.at).toLocaleString()}</Text><RankingJson ctx={ctx} label="请求内容" value={request.payload}/><ExpandableText ctx={ctx} text={JSON.stringify(request.payload,null,2)} lines={3} style={{color:c.foregroundMuted,fontSize:11,fontFamily:"Menlo"}}/></View>)}
     </Collapsible></View>
   </View>;

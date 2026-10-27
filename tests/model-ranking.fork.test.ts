@@ -1,58 +1,35 @@
 import {expect,test} from 'bun:test';
-import {expandRankingModels} from '../src/model-routing/ranking-input.ts';
 import {CompanyDatabase} from '../src/database.ts';
 import {loadDatabaseConfig} from '../src/config.ts';
 import {RankingRefresher,rankingSettings,saveRankingSettings,rankingRequests,DEFAULT_RANKING_RULES,rankingTables,rankingPins} from '../src/model-routing/ranking.ts';
 const run=process.env.RUN_SCK_CHANNEL_FORK_TESTS==='1'?test:test.skip;
-run('fork: ranking settings preserve routing config; request-triggered two-group results persist',async()=>{
- const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
+run('fork: deterministic ranking persists across reconnect without Jev or overwriting other routing config',async()=>{
+ const config={...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'};
+ const db=new CompanyDatabase(config);
  try{
   await db.connect();await db.bootstrap();
-  await db.db.query("UPSERT company_meta:model_routing CONTENT {enabled:true,disabledModels:['keep/excluded']};");
+  await db.db.query("UPSERT company_meta:model_routing CONTENT {enabled:true,disabledModels:['keep/excluded'],ranking_rules:'old prose'};");
   expect(await rankingRequests(db.db)).toEqual([]);
-  const sent:any[]=[];const applied:unknown[]=[];let calls=0;
-  const refresher=new RankingRefresher({db:db.db,groups:()=>({'sck-opus':['a/x','a/y'],'sck-sonnet':['a/x'],'sck-haiku':['a/y'],'sck-fable':['owner/z']}),facts:async ids=>ids.map(id=>({id,accounts:[],price:{free:true,input:0,output:0,cacheHit:0}})),apply:async orders=>{applied.push(orders);},jev:{model:'fixture',ask:async(state,questions)=>{calls++;
-    const snapshots=await rankingRequests(db.db);
-    const snapshot=snapshots.find(s=>`group/sck-${s.tier}`===(state as any).group)!;
-    expect(snapshot.payload).toEqual(JSON.parse(JSON.stringify({model:'fixture',state,questions})));
-    sent.push(snapshot);return {model:'fixture',answers:Object.fromEntries(Object.keys(questions).map((k,i)=>[k,{type:'score' as const,score:i,confidence:0.99}]))};}}});
-  expect(await rankingSettings(db.db)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:5});
-  await saveRankingSettings(db.db,{rules:'免费优先',refreshMinutes:2},refresher);
-  const [config]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_routing;');
-  expect(config).toMatchObject({enabled:true,disabledModels:['keep/excluded'],ranking_rules:'免费优先',ranking_refresh_minutes:2});
-  await db.db.query("UPSERT company_meta:model_ranking CONTENT {orders:{kept:['old/model']}};");
-  refresher.trigger(0);await refresher.settled();expect(calls).toBe(2);expect(applied).toHaveLength(1);
+  const applied:Record<string,string[]>[]=[];let calls=0;
+  const facts=async(ids:string[])=>ids.map(id=>({id,accounts:[{account:'anonymous',kind:'subscription' as const,remainingPct:80}],aa:{score:60,rank:1},price:{free:false},usage:{source:'magpie' as const,period:'7d' as const,scope:'provider-model' as const,collectedAt:new Date().toISOString(),requests:10,errors:0,speedSamples:0,ttftSamples:10,ttftMs:id==='a/slow'?20001:500}}));
+  const refresher=new RankingRefresher({db:db.db,groups:()=>({'sck-opus':['manual/a'],'sck-sonnet':['a/slow','a/fast'],'sck-haiku':['a/slow','a/fast'],'sck-fable':['manual/b']}),facts,apply:async orders=>{applied.push(orders);},jev:{model:'must-not-call',ask:async()=>{calls++;throw Error('must never call Jev');}}});
+  await saveRankingSettings(db.db,{rules:'ignored legacy prose',refreshMinutes:2},refresher);
+  expect(await rankingSettings(db.db)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2});
+  const [c]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_routing;');expect(c).toMatchObject({enabled:true,disabledModels:['keep/excluded'],ranking_rules:DEFAULT_RANKING_RULES});
+  await db.db.query("UPSERT company_meta:model_ranking CONTENT {orders:{kept:['old/model']},pins:{'sck-haiku':['a/slow']}};");
+  refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/fast','a/slow']}]);
+  expect(await rankingRequests(db.db)).toEqual([]);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
-  expect(status.orders).toEqual({kept:['old/model'],'sck-sonnet':['a/x'],'sck-haiku':['a/y']});expect(status.refresh_minutes).toBe(2);expect(status.at).toBeDefined();
-  expect(status.results['sck-sonnet']).toMatchObject({tier:'sonnet',rules:'免费优先',model:'fixture'});
-  expect(status.results['sck-sonnet'].rows.map((r:any)=>[r.facts.id,r.score])).toEqual([['a/x',0]]);
-  expect(status.results['sck-sonnet'].answers.m0.score).toBe(0);
-  expect((await rankingRequests(db.db)).map(s=>s.tier)).toEqual(['sonnet','haiku']);
-  await saveRankingSettings(db.db,{rules:'质量优先',refreshMinutes:2},refresher);
-  expect(await rankingRequests(db.db)).toEqual(sent); // editing rules cannot rewrite historical input
-  refresher.trigger(1);await refresher.settled();
-  expect(await rankingRequests(db.db)).toHaveLength(2); // bounded even after another refresh
-  expect((await rankingRequests(db.db))[0]!.payload.state.ownerRules).toBe('质量优先');
-  const failed=new RankingRefresher({db:db.db,groups:()=>({'sck-haiku':['p/failed']}),facts:async ids=>ids.map(id=>({id,accounts:[],price:{free:false}})),apply:async()=>{throw Error('must retain prior orders');},jev:{model:'failed-fixture',ask:async()=>{throw Error('private upstream text');}}});
-  failed.trigger();await failed.settled();
-  const afterFailure=await rankingRequests(db.db);
-  expect(afterFailure).toHaveLength(2);
-  expect(afterFailure.find(s=>s.tier==='haiku')!.payload.model).toBe('failed-fixture');
-  const [kept]=await db.db.query<[any]>('SELECT orders,error,results FROM ONLY company_meta:model_ranking;');
-  expect(kept.orders).toEqual(status.orders);expect(kept.error).toBe('haiku 刷新失败，保留原顺序');
-  expect(kept.results['sck-haiku'].rules).toBe('质量优先');
-  await expect(refresher.setPin('sck-opus','a/x',true)).rejects.toThrow();
-  await refresher.setPin('sck-sonnet','a/x',true);
-  expect(await rankingPins(db.db)).toEqual({'sck-sonnet':['a/x']});
-  refresher.trigger(5);await refresher.settled();
-  expect(expandRankingModels((await rankingRequests(db.db)).find(s=>s.tier==='haiku')!.payload.state)).toEqual([{id:'a/y',accounts:[],price:{free:true,input:0,output:0,cacheHit:0}}]);
-  const reconnected=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_fixture',database:'control_plane'});
-  try {
-    await reconnected.connect();await reconnected.useDatabase();
-    const [persisted]=await reconnected.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
-    const tables=rankingTables({'sck-haiku':['a/y']},persisted.results,await rankingRequests(reconnected.db));
-    expect((await rankingPins(reconnected.db))['sck-opus']).toBeUndefined();
-    expect(tables[0]).toMatchObject({scored:true,rules:'质量优先',rows:[{model:'a/y',jevScore:0}]});
-  } finally {await reconnected.close();}
+  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v1',answers:{}});
+  expect(status.results['sck-haiku'].rows[0].score).toBeUndefined();expect(status.results['sck-haiku'].rows[1].decision.tail).toContain('20秒');
+  const reconnected=new CompanyDatabase(config);try{
+   await reconnected.connect();await reconnected.useDatabase();
+   const [stored]=await reconnected.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
+   const table=rankingTables({'sck-haiku':['a/fast','a/slow']},stored.results,[],await rankingPins(reconnected.db))[0]!;
+   expect(table.rows[0]!.decision?.ttftMs).toBe(500);expect(table.rows[1]!.tailReason).toContain('20秒');expect(table.rows[1]!.jevScore).toBeUndefined();
+  }finally{await reconnected.close();}
+  const failed=new RankingRefresher({db:db.db,groups:()=>({'sck-haiku':['changed']}),facts,apply:async()=>{throw Error('apply failed');}});
+  failed.trigger(0);await failed.settled();
+  const [after]=await db.db.query<[any]>('SELECT orders,error FROM ONLY company_meta:model_ranking;');expect(after.orders).toEqual(status.orders);expect(after.error).toBeDefined();
  }finally{await db.close();}
 });
