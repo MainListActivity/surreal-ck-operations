@@ -99,6 +99,14 @@ describe('time releases time only (AC01/AC05)', () => {
     expect(decision.code).toBe('owner_gate');
   });
 
+  test('a held wait is re-checked, not lost: it releases when its gates clear and stays held otherwise', () => {
+    const row = wait({ state: 'held', notBefore: NOW });
+    expect(decideRelease(row, NOW, { dependenciesSatisfied: true, ownerApproved: false, taskBlockedToOwner: false }))
+      .toMatchObject({ release: true, code: 'released' });
+    expect(decideRelease(row, NOW, { dependenciesSatisfied: false, ownerApproved: false, taskBlockedToOwner: false }))
+      .toMatchObject({ release: false, code: 'dependency' });
+  });
+
   test('a due time releases once the gates are clear, and the same facts answer the same way', () => {
     const row = wait({ notBefore: NOW });
     const gates = { dependenciesSatisfied: true, ownerApproved: false, taskBlockedToOwner: false };

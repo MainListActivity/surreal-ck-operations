@@ -36,7 +36,7 @@ const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
   // SYS05 typed waits: enter (consumes the lease), trusted-event resolve, manager cancel/extend, read-only audit/cards.
-  "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview",
+  "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview", "wait_migration_apply",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
   "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
@@ -989,6 +989,9 @@ export class SidecarPool {
       case "wait_migration_preview": return core.waitMigrationPreview
         ? core.waitMigrationPreview(cred)
         : Promise.reject(Object.assign(new Error("core does not expose wait_migration_preview"), { code: "temporarily_unavailable" }));
+      case "wait_migration_apply": return core.waitMigrationApply
+        ? core.waitMigrationApply(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose wait_migration_apply"), { code: "temporarily_unavailable" }));
       case "create_task": return core.createTask(cred, args as never);
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);

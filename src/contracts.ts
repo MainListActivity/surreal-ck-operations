@@ -1115,6 +1115,13 @@ export interface WaitMigrationPreviewView {
   ownerGatesBlocked: number;
   generatedAt: string;
 }
+/** SYS05: migrate exactly one legacy time-bounded task, under its version, after the dry-run. */
+export interface WaitMigrationApplyInput {
+  taskId: TaskId;
+  expectedVersion: number;
+  reason: string;
+  idempotencyKey: string;
+}
 
 export interface CompanyCore {
   /** Read-only write-scope preflight for the dispatcher: the holders that would refuse an execute claim now (SYS-DISP R1). */
@@ -1170,6 +1177,8 @@ export interface CompanyCore {
   waitHandoffCards?(credential: Credential): Promise<WaitHandoffCard[]>;
   /** SYS05: read-only dry run for legacy tasks; never releases an owner gate. */
   waitMigrationPreview?(credential: Credential): Promise<WaitMigrationPreviewView>;
+  /** SYS05: migrate one named legacy task into a wait; owner gates refused, version-locked, audited. */
+  waitMigrationApply?(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView>;
   resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView>;
   /** gm only: a gm block becomes a dependency wait — stays blocked for the dispatcher; the last dependency restores ready (execute) or review (provable non-owner review block). */
   deferTaskUntil(credential: Credential, input: DeferTaskUntil): Promise<TaskView>;

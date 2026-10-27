@@ -416,7 +416,9 @@ export function validateEvent(wait: WaitRecord, input: WaitEventInput, now: numb
  * walk past: an owner gate, an unfinished dependency, or an owner handoff without the owner's real decision.
  */
 export function decideRelease(wait: WaitRecord, now: number, gates: WaitGates, event?: WaitEvent): WaitDecision {
-  if (wait.state !== 'waiting') {
+  // `held` is a parked wait that the scheduler re-checks: its condition fired earlier but a dependency or an
+  // owner gate was not clear. Re-evaluating it is not a new release; the same gates decide it below.
+  if (wait.state !== 'waiting' && wait.state !== 'held') {
     return { release: false, code: 'not_waiting', message: `等待已处于 ${wait.state}，不能再解除` };
   }
   if (wait.expiresAt !== undefined) {

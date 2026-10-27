@@ -48,8 +48,8 @@ import {
   webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
 } from './waits.ts';
 import type {
-  TaskWaitView, WaitActionInput, WaitActionView, WaitEntryInput, WaitListView, WaitMigrationPreviewView,
-  WaitResolveInput, WaitResolveView,
+  TaskWaitView, WaitActionInput, WaitActionView, WaitEntryInput, WaitListView, WaitMigrationApplyInput,
+  WaitMigrationPreviewView, WaitResolveInput, WaitResolveView,
 } from './contracts.ts';
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
@@ -3050,6 +3050,38 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     };
   }
 
+  /**
+   * Migrate exactly one legacy time-bounded task, after the dry run. The caller must name the task and the version
+   * it read; an owner gate is refused, a task with no future time bound is refused, and the conversion is audited.
+   * There is no batch entry point: a bulk release could walk past a gate whose real blocker is not time.
+   */
+  async waitMigrationApply(credential: Credential, input: WaitMigrationApplyInput): Promise<TaskView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', '只有经理（gm）可以迁移旧任务到等待');
+    if (!Number.isSafeInteger(input.expectedVersion)) throw new CompanyError('invalid', 'expectedVersion 必须是整数');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length < 10 || reason.length > 2000) throw new CompanyError('invalid', '迁移理由需为 10-2000 字');
+    assertNonSensitive(reason, 'reason');
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    if (row.version !== input.expectedVersion) throw new CompanyError('conflict', 'Task version moved');
+    if (row.reviewer_role === 'owner' || row.blocked_to === 'owner') {
+      throw new CompanyError('forbidden', '老板关口不能批量迁移为时间等待；必须由老板本人决定');
+    }
+    const waitKey = waitKeyOf(input.taskId, randomUUID());
+    try {
+      const updated = await this.waits.migrateLegacy({
+        taskId: input.taskId, waitKey, expectedVersion: input.expectedVersion, reason,
+        actor: `employee:${actor.employeeId}`, now: this.waitClock(),
+        auditId: randomUUID(), outboxId: randomUUID(),
+      });
+      if (!updated) throw new CompanyError('temporarily_unavailable', '迁移未落地，请重试', true);
+      return view(updated);
+    } catch (error) {
+      throw this.waitError(error);
+    }
+  }
+
   /** The wait a resolve call names, by its waitKey or its task's open wait. */
   private async waitOfInput(input: WaitResolveInput): Promise<WaitRow | undefined> {
     // The event's own object id is a valid locator: a webhook that names the wait it is about has already said
@@ -3114,6 +3146,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (/lease expired/i.test(message)) return new CompanyError('lease_expired', '租约已过期；重新领取后再进入等待');
     if (/stale lease or version/i.test(message)) return new CompanyError('conflict', '租约或任务版本已移动；旧 fence 的写入被拒绝');
     if (/already waiting/i.test(message)) return new CompanyError('conflict', '该任务已有进行中的等待');
+    if (/owner gate cannot be migrated/i.test(message)) return new CompanyError('forbidden', '老板关口不能迁移为时间等待；必须由老板本人决定');
+    if (/no future time bound/i.test(message)) return new CompanyError('invalid', '任务没有未来的时间边界（quota_resets_at 为空或已过去），不能迁移为时间等待');
+    if (/still leased/i.test(message)) return new CompanyError('conflict', '任务仍被有效租约持有，不能迁移；先释放或等到租约结束');
+    if (/version moved/i.test(message)) return new CompanyError('conflict', '任务版本已移动；重新读取后再迁移');
     if (/task not held/i.test(message)) return new CompanyError('forbidden', '任务不在执行/复核持有阶段，不能进入等待');
     if (/not found/i.test(message)) return new CompanyError('not_found', 'Task not found');
     if (/conflict/i.test(message)) return new CompanyError('conflict', message.slice(0, 300));

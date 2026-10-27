@@ -268,12 +268,21 @@ export class WaitStore {
 
   /** The owner handoff cards, newest first. Read-only and bounded. */
   async handoffCards(now: number, limit = 20): Promise<WaitHandoffCard[]> {
-    const [rows] = await this.db.query<[Array<RawWait & { task_title?: string; executor_role?: string }>]>(
+    const [rows] = await this.db.query<[RawWait[]]>(
       `SELECT * FROM task_wait WHERE kind = 'owner_handoff' AND state IN ['waiting', 'expired', 'held']
        ORDER BY entered_at DESC LIMIT $limit;`, { limit });
-    return (rows ?? []).map(raw => {
-      const row = rowOf(raw);
-      return handoffCard(waitRecordOf(row), raw.task_title ?? '', raw.executor_role ?? row.ownerRole, now);
+    const waits = (rows ?? []).map(rowOf);
+    if (!waits.length) return [];
+    // The card is read by the boss: it must name the real task and the party that waits, not a placeholder. One
+    // batched task read keeps the card off the per-row round-trip path the WSS channel cannot afford.
+    const ids = [...new Set(waits.map(wait => wait.taskId))].map(taskId => new RecordId('task', taskId));
+    const [tasks] = await this.db.query<[Array<{ id?: unknown; title?: string; executor_role?: string }>]>(
+      'SELECT id, title, executor_role FROM task WHERE id IN $ids;', { ids });
+    const byId = new Map((tasks ?? []).map(task => [asText(task.id), task]));
+    return waits.map(wait => {
+      const task = byId.get(wait.taskId);
+      const waitingBy = task?.executor_role ?? wait.progress?.employee ?? wait.ownerRole;
+      return handoffCard(waitRecordOf(wait), task?.title ?? wait.taskId, waitingBy, now);
     });
   }
 
@@ -375,21 +384,29 @@ export class WaitStore {
    */
   async releaseDue(now: number): Promise<ReleaseDueResult> {
     const [rows] = await this.db.query<[RawWait[]]>(
-      `SELECT * FROM task_wait WHERE state = 'waiting' AND (
+      `SELECT * FROM task_wait WHERE (state = 'waiting' AND (
          (kind = 'time' AND not_before != NONE AND not_before <= $now)
          OR (kind IN ['dependency', 'upstream_repair'] AND reference_task != NONE)
-       ) ORDER BY not_before, entered_at LIMIT 200;`, { now });
+       )) OR state = 'held'
+       ORDER BY not_before, entered_at LIMIT 200;`, { now });
     const result: ReleaseDueResult = { released: [], held: [], expired: [], skipped: [] };
     for (const raw of rows ?? []) {
       const row = rowOf(raw);
       if (!row.waitKey) continue;
-      let referenceComplete = false;
-      if ((row.kind === 'dependency' || row.kind === 'upstream_repair') && row.referenceTaskId) {
+      const dependency = row.kind === 'dependency' || row.kind === 'upstream_repair';
+      let referenceComplete = true;
+      if (dependency && row.referenceTaskId) {
         const [ref] = await this.db.query<[Array<{ state?: string }>]>(
           'SELECT state FROM $ref;', { ref: new RecordId('task', row.referenceTaskId) });
         referenceComplete = ref?.[0]?.state === 'done' || ref?.[0]?.state === 'void';
-        if (!referenceComplete) continue;
       }
+      // A held row is re-checked every tick: once its dependencies/reference finish, it returns to the queue
+      // without a manager having to remember it. The release transaction re-reads the reference state, so this
+      // pre-check cannot release a task that moved in between. External-event waits are never released by a tick:
+      // they need their own trusted event, so a held one waits for resolve/extend/cancel.
+      if (dependency && !referenceComplete) continue;
+      if (row.state === 'held' && !dependency && row.kind !== 'time') continue;
+      if (row.state === 'held' && row.kind === 'time' && (row.notBefore === undefined || now < row.notBefore)) continue;
       const event: WaitEvent = {
         source: row.kind === 'time' ? 'time' : 'dependency', at: now, verified: true,
         ...(row.kind === 'time' ? {} : { eventId: `dependency:${row.referenceTaskId ?? '-'}:done` }),
@@ -398,10 +415,14 @@ export class WaitStore {
       const outcome = await this.releaseOne(row, event, now, {
         source: row.kind === 'time' ? 'time' : 'dependency', actor: 'system:dispatcher',
         ownerApproved: false, referenceComplete,
+        requireReferenceTerminal: dependency,
       });
       if (outcome.released) result.released.push({ waitKey: row.waitKey, taskId: row.taskId });
       else if (outcome.code === 'expired') result.expired.push({ waitKey: row.waitKey, taskId: row.taskId });
-      else if (outcome.code === 'owner_gate' || outcome.code === 'dependency') {
+      else if (row.state === 'held') {
+        // Already held and still not releasable: leave it parked (no repeated held notice every tick).
+        result.skipped!.push({ waitKey: row.waitKey, taskId: row.taskId, code: outcome.code, message: outcome.message });
+      } else if (outcome.code === 'owner_gate' || outcome.code === 'dependency') {
         result.held.push({ waitKey: row.waitKey, taskId: row.taskId, reason: outcome.message });
         // Mark held so the tick does not retry the same row forever; the card and the owner show why.
         await this.db.query(`UPDATE $wait SET state = 'held', held_reason = $reason, updated_at = time::now()
@@ -418,6 +439,8 @@ export class WaitStore {
   /** One compare-and-set release. The first caller wins; every other caller sees `version_moved`. */
   async releaseOne(row: WaitRow, event: WaitEvent, now: number, options: {
     source: string; actor: string; ownerApproved: boolean; referenceComplete: boolean;
+    /** True for a system dependency event: the reference task must be done/void inside this transaction too. */
+    requireReferenceTerminal?: boolean;
   }): Promise<ResolveWaitResult> {
     const gates = {
       dependenciesSatisfied: false, ownerApproved: options.ownerApproved, taskBlockedToOwner: false,
@@ -434,7 +457,11 @@ export class WaitStore {
     try {
       const next = await this.tx<{ id?: unknown }>(`BEGIN;
         LET $w = SELECT * FROM ONLY $wait;
-        IF $w = NONE OR $w.state != 'waiting' OR $w.version != $expected { THROW 'wait version moved' };
+        IF $w = NONE OR $w.state NOT IN ['waiting', 'held'] OR $w.version != $expected { THROW 'wait version moved' };
+        IF $require_reference AND $w.reference_task != NONE {
+          LET $ref = SELECT state FROM ONLY $w.reference_task;
+          IF $ref = NONE OR $ref.state NOT IN ['done', 'void'] { THROW 'reference task not terminal' };
+        };
         LET $t = SELECT * FROM ONLY $w.task;
         IF $t = NONE { THROW 'task not found' };
         IF $t.wait_episode != $w.wait_key { THROW 'wait superseded' };
@@ -452,7 +479,7 @@ export class WaitStore {
           version = $t.version + 1 RETURN AFTER;
         LET $released = UPDATE ONLY $wait SET state = 'released', released_at = time::now(),
           release_source = $source, released_by = $actor, version = $w.version + 1
-          WHERE state = 'waiting' AND version = $expected RETURN AFTER;
+          WHERE state IN ['waiting', 'held'] AND version = $expected RETURN AFTER;
         IF $released = NONE { THROW 'wait version moved' };
         ${key ? `CREATE ONLY $event CONTENT { event_key: $event_key, wait_key: $w.wait_key, task: $w.task,
           kind: $event_kind, provider: $provider, external_id: $external_id, at_ms: $at, accepted: true,
@@ -467,6 +494,7 @@ export class WaitStore {
         COMMIT;`, {
         wait: waitId(row.waitKey), expected: row.version,
         source: options.source, actor: options.actor,
+        require_reference: options.requireReferenceTerminal === true,
         ...(key ? {
           event: eventId(key), event_key: key, event_kind: event.source,
           provider: event.provider ?? undefined, external_id: event.eventId ?? undefined,
@@ -491,6 +519,9 @@ export class WaitStore {
       if (/dependencies incomplete/i.test(message)) {
         return { released: false, code: 'dependency', message: '任务依赖尚未完成，到点只释放时间条件', taskId: row.taskId };
       }
+      if (/reference task not terminal/i.test(message)) {
+        return { released: false, code: 'dependency', message: '引用的修复/上游任务尚未完成或作废', taskId: row.taskId };
+      }
       return { released: false, code: 'version_moved', message: `释放未落地：${message.slice(0, 160)}`, taskId: row.taskId };
     }
   }
@@ -503,9 +534,20 @@ export class WaitStore {
     const row = input.wait;
     const event = input.event;
     const key = waitEventKey(row.waitKey, event);
+    // A system dependency event is only valid when the reference task really is terminal. The state is read here
+    // for the readable pre-check and re-read inside the release transaction, so a task that moves between the two
+    // cannot be released. An authorized person is the explicit human exemption and is audited as such.
+    let referenceComplete = true;
+    if ((row.kind === 'dependency' || row.kind === 'upstream_repair') && row.referenceTaskId) {
+      const [refs] = await this.db.query<[Array<{ state?: string }>]>(
+        'SELECT state FROM $ref;', { ref: new RecordId('task', row.referenceTaskId) });
+      referenceComplete = refs?.[0]?.state === 'done' || refs?.[0]?.state === 'void';
+    }
+    const systemDependency = event.source === 'dependency';
+    const gateReference = systemDependency ? referenceComplete : true;
     const decision = decideRelease(waitRecordOf(row), input.now, {
       dependenciesSatisfied: true, ownerApproved: input.ownerApproved, taskBlockedToOwner: false,
-      referenceComplete: row.kind === 'dependency' || row.kind === 'upstream_repair',
+      referenceComplete: gateReference,
     }, event);
     if (!decision.release) {
       // Record the refused event for the audit, without making it count. A refused event must not be replayed.
@@ -525,7 +567,7 @@ export class WaitStore {
     }
     const outcome = await this.releaseOne(row, event, input.now, {
       source: event.source, actor: input.actor, ownerApproved: input.ownerApproved,
-      referenceComplete: row.kind === 'dependency' || row.kind === 'upstream_repair',
+      referenceComplete: gateReference, requireReferenceTerminal: systemDependency,
     });
     if (outcome.released && event.ownerQuote) {
       await this.db.query(
@@ -636,7 +678,58 @@ export class WaitStore {
   async markExpired(now: number): Promise<Array<{ waitKey: string; taskId: string }>> {
     const [rows] = await this.db.query<[RawWait[]]>(
       `UPDATE task_wait SET state = 'expired', updated_at = time::now()
-       WHERE state = 'waiting' AND expires_at != NONE AND expires_at < $now RETURN AFTER;`, { now });
+       WHERE state IN ['waiting', 'held'] AND expires_at != NONE AND expires_at < $now RETURN AFTER;`, { now });
     return (rows ?? []).map(row => ({ waitKey: row.wait_key ?? '', taskId: asText(row.task) }));
   }
+
+  /**
+   * Migrate one legacy time-bounded task into a wait. This is deliberately per task: a batch run could release an
+   * owner gate or a gate whose real blocker is not time, so the caller must name the task and its version. Owner
+   * gates are refused outright; the legacy `quota_resets_at` is the only time bound this accepts.
+   */
+  async migrateLegacy(input: {
+    taskId: string; waitKey: string; expectedVersion: number; reason: string; actor: string; now: number;
+    auditId: string; outboxId: string;
+  }): Promise<TaskRow | undefined> {
+    return this.tx<TaskRow>(`BEGIN;
+      LET $t = SELECT * FROM ONLY $task;
+      IF $t = NONE { THROW 'task not found' };
+      IF $t.version != $expected { THROW 'task version moved' };
+      IF $t.state IN ['done', 'void'] { THROW 'task terminal' };
+      IF $t.wait_state = 'waiting' { THROW 'task already waiting' };
+      IF $t.reviewer_role = 'owner' OR $t.blocked_to = 'owner' { THROW 'owner gate cannot be migrated' };
+      IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task still leased' };
+      IF $t.quota_resets_at = NONE OR ($t.quota_resets_at * 1000) <= $now { THROW 'task has no future time bound' };
+      LET $not_before = $t.quota_resets_at * 1000;
+      LET $resume = IF $t.state = 'review' THEN 'review' ELSE 'ready' END;
+      LET $role = IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END;
+      UPDATE task_wait SET state = 'superseded', updated_at = time::now() WHERE task = $task AND state IN ['waiting', 'held'];
+      CREATE ONLY $wait CONTENT {
+        wait_key: $key, task: $task, kind: 'time', state: 'waiting', source: { kind: 'time' },
+        owner_role: $role, not_before: $not_before, expires_source: 'unknown',
+        progress: { employee: 'system:migration', taskVersion: $t.version, at: $now },
+        completed: [], reason: $reason, version: 1, entered_by: 'system:migration',
+        entered_version: $t.version, entered_at: time::now(), updated_at: time::now()
+      };
+      LET $next = UPDATE ONLY $t.id SET
+        state = 'blocked', blocked_to = NONE, resume_state = $resume, resume_role = $role,
+        current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+        wait_state = 'waiting', wait_kind = 'time', wait_episode = $key, wait_not_before = $not_before,
+        wait_expires_at = NONE, wait_next_check_at = NONE, wait_owner_role = $role,
+        wait_source = 'time', wait_version = 1, wait_entered_at = time::now(), quota_resets_at = NONE,
+        version = $t.version + 1 RETURN AFTER;
+      UPDATE employee SET active_task = NONE WHERE active_task = $task;
+      CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'wait_migrated', evidence: $reason,
+        version: $next.version, at: time::now() };
+      LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+      CREATE ONLY $outbox CONTENT { task: $task, kind: 'wait_migrated', sequence: $sequence.value,
+        payload: { version: $next.version, state: $next.state, wait_key: $key }, at: time::now() };
+      RETURN $next;
+      COMMIT;`, {
+      task: new RecordId('task', input.taskId), wait: waitId(input.waitKey), key: input.waitKey,
+      expected: input.expectedVersion, reason: input.reason, actor: input.actor, now: input.now,
+      audit: new RecordId('audit', input.auditId), outbox: new RecordId('outbox', input.outboxId),
+    });
+  }
+
 }

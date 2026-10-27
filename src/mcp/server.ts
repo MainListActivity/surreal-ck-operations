@@ -351,6 +351,12 @@ function registerTools(server: McpServer, core: CompanyCore) {
     inputSchema: z.object({}),
   }, async (_input, ctx) => run(token(ctx), () => core.waitMigrationPreview ? core.waitMigrationPreview(token(ctx)) : Promise.reject({ code: 'temporarily_unavailable' })));
 
+  server.registerTool('wait_migration_apply', {
+    description: 'Manager (gm): migrate exactly one legacy time-bounded task (future quota_resets_at) into a wait, under the version read. Owner gates, leased tasks and tasks without a future time bound are refused; audited.',
+    inputSchema: z.object({ taskId: z.string().min(1), expectedVersion: z.number().int().positive(),
+      reason: z.string().min(10).max(2000), idempotencyKey: z.string().min(1).max(200) }),
+  }, async (input, ctx) => run(token(ctx), () => core.waitMigrationApply ? core.waitMigrationApply(token(ctx), input as never) : Promise.reject({ code: 'temporarily_unavailable' })));
+
   server.registerTool('review', {
     description: 'Independently accept or return the current review delivery.',
     inputSchema: z.object({ ...proofShape, ...evidenceShape, decision: z.enum(['accept', 'return']) }),

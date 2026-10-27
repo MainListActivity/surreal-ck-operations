@@ -281,6 +281,9 @@ describe('owner handoff (AC04/AC06)', () => {
     const card = cards.find(item => item.waitKey === entered.wait!.waitKey);
     expect(card).toBeDefined();
     expect(card!.expiresAt).toEqual({ source: 'unknown' });
+    expect(card!.taskTitle).toBe((await core.getTask(tokens.gm!, taskId)).title);
+    expect(card!.waitingOn).toBe('owner');
+    expect(card!.waitingBy).toBe('engineering');
     expect(card!.handoffFileName).toBeUndefined();
     expect(JSON.stringify(card)).not.toMatch(/https?:\/\//);
   });
@@ -326,6 +329,78 @@ describe('safe release and version locks (AC05)', () => {
     expect(sweep.released.map(item => item.taskId)).toContain(taskId);
     expect((await rowOf(taskId)).state).toBe('ready');
     expect(entered.wait!.kind).toBe('upstream_repair');
+  });
+
+  test('a source=dependency event cannot release while the reference task is still ready', async () => {
+    const dependency = await makeTask('未完成的上游修复');
+    const taskId = await makeTask('等待未完成修复');
+    const entered = await enter(taskId, 'eng', { kind: 'upstream_repair', referenceTaskId: dependency });
+    const refused = await core.resolveWait(tokens.gm!, {
+      source: 'dependency', objectWaitId: entered.wait!.waitKey, at: Date.now(),
+      text: 'SYS05 回归：引用任务仍为 ready，系统依赖事件不能解除上游修复等待',
+      idempotencyKey: 'dependency-not-terminal',
+    } as never);
+    expect(refused.released).toBe(false);
+    expect(refused.code).toBe('dependency');
+    expect((await rowOf(taskId)).state).toBe('blocked');
+    // A named manager may attest explicitly (and is audited as authorized_person) rather than pretending the task finished.
+    const attested = await core.resolveWait(tokens.gm!, {
+      source: 'authorized_person', objectWaitId: entered.wait!.waitKey, at: Date.now(),
+      text: 'SYS05 回归：授权人显式确认上游已修复并留审计，属于人工豁免而非系统依赖事件',
+      idempotencyKey: 'dependency-human-exemption',
+    } as never);
+    expect(attested.released).toBe(true);
+    expect((await rowOf(taskId)).state).toBe('ready');
+  });
+
+  test('a held wait recovers automatically once its dependency finishes', async () => {
+    const dependency = await makeTask('迟到的依赖');
+    const taskId = await makeTask('到点后被依赖挂住');
+    await enter(taskId, 'eng', { kind: 'time', notBefore: iso(Date.now()) });
+    // A dependency added after the wait was entered is exactly the case that produces `held`.
+    await database.db.query('UPDATE $task SET dependencies += $dep;', {
+      task: new RecordId('task', taskId), dep: new RecordId('task', dependency),
+    });
+    const store = new WaitStore(database.db);
+    const first = await store.releaseDue(Date.now());
+    expect(first.held.map(item => item.taskId)).toContain(taskId);
+    expect((await store.waitsOfTask(taskId))[0]!.state).toBe('held');
+    expect((await rowOf(taskId)).state).toBe('blocked');
+    await core.retireTask(tokens.gm!, { taskId: dependency, text: 'SYS05 回归：依赖完成后 held 等待应自动恢复', idempotencyKey: `retire-held-${dependency}` } as never);
+    const recovered = await store.releaseDue(Date.now());
+    expect(recovered.released.map(item => item.taskId)).toContain(taskId);
+    expect((await rowOf(taskId)).state).toBe('ready');
+    expect((await store.waitsOfTask(taskId))[0]!.state).toBe('released');
+  });
+
+  test('migration applies to one named task, refuses owner gates, and is version-locked', async () => {
+    const legacy = await makeTask('旧时间阻塞');
+    const until = Math.floor(Date.now() / 1000) + 3600;
+    await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until;', { task: new RecordId('task', legacy), until });
+    const before = await rowOf(legacy);
+    const migrated = await core.waitMigrationApply(tokens.gm!, {
+      taskId: legacy, expectedVersion: before.version as number,
+      reason: 'SYS05 回归：把一条旧的时间阻塞按任务迁移为时间等待，不批量放行', idempotencyKey: 'migrate-one',
+    });
+    expect(migrated.state).toBe('blocked');
+    expect(migrated.wait).toMatchObject({ kind: 'time', state: 'waiting' });
+    expect((await rowOf(legacy)).quota_resets_at).toBeUndefined();
+    const wait = (await new WaitStore(database.db).waitsOfTask(legacy))[0]!;
+    expect(wait.notBefore).toBe(until * 1000);
+    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+      taskId: legacy, expectedVersion: before.version as number,
+      reason: 'SYS05 回归：旧版本再次迁移必须被拒绝，避免覆盖新状态', idempotencyKey: 'migrate-stale',
+    }), 'conflict', /version moved|版本/);
+
+    const owned = await makeTask('老板关口不迁移', 'owner');
+    await database.db.query('UPDATE ONLY $task SET quota_resets_at = $until, state = "blocked", blocked_to = "owner";', {
+      task: new RecordId('task', owned), until,
+    });
+    const ownedRow = await rowOf(owned);
+    await expectRefused(core.waitMigrationApply(tokens.gm!, {
+      taskId: owned, expectedVersion: ownedRow.version as number,
+      reason: 'SYS05 回归：老板关口不能被批量迁移为时间等待', idempotencyKey: 'migrate-owner',
+    }), 'forbidden', /老板关口/);
   });
 
   test('the migration preview is read-only and never marks an owner gate eligible', async () => {
