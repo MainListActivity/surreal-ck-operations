@@ -1,3 +1,4 @@
+import {rankingPolicy,DEFAULT_POLICY,type RankingPolicy} from './weights.ts';
 import { RULE_ENGINE, RULE_DESCRIPTION, ruleOrder, type RuleDecision } from './rules.ts';
 import { z } from "zod";
 import type { ModelTrends } from "./trends.ts";
@@ -15,6 +16,7 @@ export const DEFAULT_RANKING_RULES = RULE_DESCRIPTION;
 export interface RankingSettings {
   rules: string;
   refreshMinutes: number;
+  policy?: RankingPolicy;
 }
 /** Exact member IDs, including effort; each group's array is the owner's pin order. */
 export type RankingPins = Record<string, string[]>;
@@ -209,7 +211,8 @@ export interface RankingRequestSnapshot {
 
 /** Last successfully applied response and the exact facts used to judge it; never mixed with later attempts. */
 export interface RankingResultSnapshot {
-  engine?:typeof RULE_ENGINE;
+  engine?:string;
+  policy?:RankingPolicy;
   tier: Tier;
   at: string;
   model: string;
@@ -225,7 +228,7 @@ export interface RankingResultSnapshot {
 export interface RankingGateSnapshot {at:string;facts:ModelFacts[]}
 export type RankingGates=Record<string,RankingGateSnapshot>;
 export interface RankingTableRow {
-  model: string; pinned?: boolean; tailReason?:string; decision?:RuleDecision;
+  model: string; previousRank?:number; price?:ModelFacts["price"]; pinned?: boolean; tailReason?:string; decision?:RuleDecision;
   trends?: ModelTrends; trendSource?: ModelFacts["trendSource"];
   aaScore?: number; aaRank?: number; effort?: string;
   tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
@@ -253,12 +256,12 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
       const pinned = !excluded && (pins[group] ?? []).includes(model);
       const decision=judged?.decision;
-      return { model, decision, tailReason:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, price:facts?.price, decision, tailReason:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
-        performanceSamples: facts?.performance?.samples, jevScore: result?.engine===RULE_ENGINE || pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
+        performanceSamples: facts?.performance?.samples, jevScore: result?.engine?.startsWith('quality-pace-') || pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
     return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
@@ -291,6 +294,9 @@ export class RankingRefresher {
   private revision = 0;
   private stopped = false;
   private pinning?: Promise<void>;
+  private warming=false;
+  private configuring?:Promise<void>;
+  private previewSnapshot?:{at:string;groups:Record<string,string[]>;facts:ModelFacts[]};
   constructor(private readonly deps: RefresherDeps) {}
   reset(minutes = DEFAULT_REFRESH_MINUTES): void {
     this.last = undefined;
@@ -300,14 +306,39 @@ export class RankingRefresher {
   stop(): void { this.stopped = true; this.revision++; }
   settled(): Promise<void> { return this.running ?? Promise.resolve(); }
   trigger(now = Date.now()): void {
-    if (this.stopped || this.running || this.pinning || (this.last !== undefined && now - this.last < this.minutes * 60000)) return;
+    if (this.stopped || this.running || this.pinning || this.configuring || (this.last !== undefined && now - this.last < (this.warming?30000:this.minutes * 60000))) return;
     this.last = now;
     const revision = this.revision;
     this.running = Promise.resolve().then(() => this.run(revision)).catch(() => this.deps.log?.("模型排序刷新失败，保留现有顺序"))
       .finally(() => { this.running = undefined; });
   }
+  async configure(write:()=>Promise<void>,minutes:number):Promise<void>{
+    const previous=this.configuring;
+    const job=(async()=>{await previous?.catch(()=>undefined);this.reset(minutes);await this.pinning;await write();this.reset(minutes);})();
+    this.configuring=job;
+    try{await job;}finally{if(this.configuring===job)this.configuring=undefined;}
+  }
+  /** Read/collect only: never writes settings, orders or Magpie configuration. Frozen observations across slider edits. */
+  async preview(input:unknown,refresh=false){
+    const policy=rankingPolicy(input),groups=this.deps.groups(),ids=[...new Set(RANKED_TIERS.flatMap(t=>groups[`sck-${t}`]??[]))];
+    if(refresh){const facts=await this.deps.facts(ids);this.previewSnapshot={at:new Date().toISOString(),groups,facts};}
+    if(!this.previewSnapshot){
+      const [status]=await this.deps.db.query<[{at?:string;results?:Record<string,RankingResultSnapshot>}|undefined]>('SELECT at,results FROM ONLY company_meta:model_ranking;');
+      this.previewSnapshot={at:status?.at?String(status.at):new Date().toISOString(),groups,facts:Object.values(status?.results??{}).flatMap(r=>r.rows.map(row=>row.facts))};
+    }
+    const snapshot=this.previewSnapshot,pins=await rankingPins(this.deps.db),orders:Record<string,string[]>={},results:Record<string,RankingResultSnapshot>={};
+    for(const tier of RANKED_TIERS){const group=`sck-${tier}`,members=groups[group]??[];
+      const facts=members.map(id=>snapshot.facts.find(f=>f.id===id));
+      if(facts.some(f=>!f))throw Error('预览观测不完整，请点击更新观测');
+      const rows=ruleOrder(facts as ModelFacts[],pins[group],Date.parse(snapshot.at),policy);
+      orders[group]=rows.map(r=>r.facts.id);results[group]={engine:RULE_ENGINE,policy,tier,at:snapshot.at,model:RULE_ENGINE,rules:RULE_DESCRIPTION,rows,answers:{}};
+    }
+    const tables=rankingTables(orders,results,[],pins).map(t=>({...t,rows:t.rows.map(r=>({...r,previousRank:(groups[t.group]??[]).indexOf(r.model)+1}))}));
+    return {tables,at:snapshot.at,policy};
+  }
   /** Invalidate in-flight Jev results before waiting; serialize edits from both owner surfaces. */
   setPin(group: string, model: string, pinned: boolean): Promise<void> {
+    if (this.configuring)return Promise.reject(Error('配置保存中，请稍后重试'));
     if (!RANKED_TIERS.some(t => group === `sck-${t}`) || !model || model.length > 300 || typeof pinned !== 'boolean')
       return Promise.reject(Error('置顶参数无效'));
     this.reset(this.minutes);
@@ -327,9 +358,10 @@ export class RankingRefresher {
       }
       const facts=await this.deps.facts(members);
       if(members.some(id=>!facts.some(f=>f.id===id)))throw Error('排序观测缺失，置顶尚未生效');
-      const rows=ruleOrder(members.map(id=>facts.find(f=>f.id===id)!),next);
+      const settings=await rankingSettings(this.deps.db);
+      const rows=ruleOrder(members.map(id=>facts.find(f=>f.id===id)!),next,Date.now(),settings.policy);
       const orders = {[group]:rows.map(r=>r.facts.id)};
-      const results={[group]:{engine:RULE_ENGINE,tier:group.slice(4),at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,rows,answers:{}}};
+      const results={[group]:{engine:RULE_ENGINE,policy:settings.policy,tier:group.slice(4),at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,rows,answers:{}}};
       await this.deps.db.query(
         "UPSERT company_meta:model_ranking SET pins=object::extend(pins ?? {},$pins),orders=object::extend(orders ?? {},$orders),results=object::extend(results ?? {},$results);",
         {pins:{[group]:next},orders,results});
@@ -362,15 +394,16 @@ export class RankingRefresher {
         try {
           const facts=members.map(id=>byId.get(id));
           if(facts.some(f=>!f))throw Error('missing facts');
-          const rows=ruleOrder(facts as ModelFacts[],pins[`sck-${tier}`]);
+          const rows=ruleOrder(facts as ModelFacts[],pins[`sck-${tier}`],Date.now(),settings.policy);
           orders[`sck-${tier}`]=rows.map(r=>r.facts.id);
-          results[`sck-${tier}`]={engine:RULE_ENGINE,tier,at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,
+          results[`sck-${tier}`]={engine:RULE_ENGINE,policy:settings.policy,tier,at:new Date().toISOString(),model:RULE_ENGINE,rules:RULE_DESCRIPTION,
             rows,answers:{}};
         } catch {
           errors.push(`${tier} 数据不完整，保留现有顺序`);
         }
       }
       if (revision !== this.revision || this.stopped) return;
+      this.warming=Object.values(results).some(r=>r.rows.some(row=>row.decision?.coldStart));
       if (Object.keys(orders).length) await this.deps.apply(orders, () => revision === this.revision && !this.stopped);
       if (revision !== this.revision || this.stopped) return;
       await this.deps.db.query(
@@ -385,12 +418,15 @@ export class RankingRefresher {
 }
 
 export async function rankingSettings(db: Surreal): Promise<RankingSettings> {
-  const [row] = await db.query<[{ ranking_rules?: string; ranking_refresh_minutes?: number } | undefined]>(
-    "SELECT ranking_rules, ranking_refresh_minutes FROM ONLY company_meta:model_routing;");
-  return { rules:DEFAULT_RANKING_RULES, refreshMinutes: REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never) ? row!.ranking_refresh_minutes! : DEFAULT_REFRESH_MINUTES };
+  const [row] = await db.query<[{ranking_policy?:RankingPolicy;ranking_refresh_minutes?:number}|undefined]>(
+    "SELECT ranking_rules, ranking_refresh_minutes, ranking_policy FROM ONLY company_meta:model_routing;");
+  return {rules:DEFAULT_RANKING_RULES,policy:rankingPolicy(row?.ranking_policy??DEFAULT_POLICY),refreshMinutes:REFRESH_MINUTES.includes(row?.ranking_refresh_minutes as never)?row!.ranking_refresh_minutes!:DEFAULT_REFRESH_MINUTES};
 }
 export async function saveRankingSettings(db: Surreal, settings: RankingSettings, refresher: RankingRefresher): Promise<void> {
   if (!REFRESH_MINUTES.includes(settings.refreshMinutes as never) || typeof settings.rules !== 'string' || settings.rules.length > 8000) throw Error('排序规则或刷新间隔无效');
-  await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes};", {rules:DEFAULT_RANKING_RULES,minutes:settings.refreshMinutes});
-  refresher.reset(settings.refreshMinutes);
+  // Older clients changing only the interval must not reset weights or billing decisions.
+  const policy=rankingPolicy(settings.policy??(await rankingSettings(db)).policy);
+  const write=async()=>{await db.query("UPSERT company_meta:model_routing MERGE {ranking_rules:$rules,ranking_refresh_minutes:$minutes,ranking_policy:$policy};",{rules:DEFAULT_RANKING_RULES,minutes:settings.refreshMinutes,policy});};
+  if(typeof refresher.configure==='function')await refresher.configure(write,settings.refreshMinutes);
+  else {await write();refresher.reset(settings.refreshMinutes);}
 }

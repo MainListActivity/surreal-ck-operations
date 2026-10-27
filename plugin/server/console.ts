@@ -110,6 +110,12 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const { modelRankingView }=await import("./model-ranking.ts");
         return json(await modelRankingView((await opts.company()).db.db));
       }
+      if(req.method==='POST'&&sub==='/api/model-ranking/preview'){
+        if(req.headers.get('origin')&&req.headers.get('origin')!==url.origin)return json({error:'origin mismatch'},403);
+        try{const b=await req.json() as {policy:unknown;refresh?:boolean};if(b.refresh!==undefined&&typeof b.refresh!=='boolean')throw Error('refresh');
+          return json(await (await opts.company()).modelRanking.preview(b.policy,b.refresh));
+        }catch{return json({error:'预览失败：请检查权重或点击更新观测'},400);}
+      }
       if (req.method === "POST" && sub === "/api/model-ranking/pin") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
         const b=await req.json() as {group?:unknown;model?:unknown;pinned?:unknown};
@@ -121,11 +127,15 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
       }
       if (req.method === "POST" && sub === "/api/model-ranking") {
         if(req.headers.get("origin")&&req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
-        const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown};
+        const b=await req.json() as {rules?:unknown;refreshMinutes?:unknown;policy?:unknown};
         if(typeof b.rules!=="string"||b.rules.length>8000||![2,5,10].includes(b.refreshMinutes as number))return json({error:"排序规则或刷新间隔无效"},400);
         const { saveRankingSettings }=await import("./vendor/src/model-routing/ranking.ts");
         const ctx=await opts.company();
-        await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:b.refreshMinutes as number},ctx.modelRanking);
+        try{
+          const {rankingPolicy}=await import('./vendor/src/model-routing/weights.ts');
+          const policy=b.policy===undefined?undefined:rankingPolicy(b.policy);
+          await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:b.refreshMinutes as number,policy},ctx.modelRanking);
+        }catch{return json({error:'排序设置无效或保存失败'},400);}
         return json({ok:true});
       }
       if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
