@@ -177,6 +177,8 @@ export interface TaskWaiting {
 }
 
 export interface TaskView {
+  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
+  dependencyContinuation?: 'execute' | 'manager';
   id: TaskId;
   title: string;
   context: string;
@@ -566,6 +568,8 @@ export interface CreateDelivery {
 
 /** gm only: re-point a gm block — execute, or a provable normal non-owner review block — at unmet dependencies instead of the manager. */
 export interface DeferTaskUntil {
+  /** manager: dependencies finish into a fresh GM wait; no employee is dispatched automatically. */
+  continuation?: 'execute' | 'manager';
   taskId: TaskId;
   /** Dependencies to merge into the task's existing set (union, same goal, acyclic after resolution). */
   dependencies: TaskId[];
@@ -788,6 +792,8 @@ export interface LeaseProof {
 }
 
 export interface Evidence {
+  executionWindow?: import('./task-recovery.ts').ExecutionWindow;
+  recoveryReason?: import('./task-recovery.ts').RecoveryReason;
   text: string;
   idempotencyKey: string;
   /** SYS02: the head this submission is bound to; machine evidence must match it. */

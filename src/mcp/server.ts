@@ -1,3 +1,4 @@
+import { executionWindowSchema, recoveryReasonSchema } from '../task-recovery.ts';
 import { basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -24,6 +25,8 @@ const proofShape = {
   expectedVersion: z.number().int().nonnegative(),
 };
 const evidenceShape = {
+  executionWindow: executionWindowSchema.optional(),
+  recoveryReason: recoveryReasonSchema.optional(),
   text: z.string().min(1),
   idempotencyKey: z.string().min(1),
   // SYS02: the head a submission is bound to; machine evidence must match it.
@@ -427,15 +430,16 @@ function registerTools(server: McpServer, core: CompanyCore) {
   }, async (input, ctx) => run(token(ctx), async () => { await core.relayDirection(token(ctx), input); return { recorded: true }; }));
 
   server.registerTool('resume_task', {
-    description: 'Resume a blocked task; requires core manage capability.',
+    description: 'gm only: resume a blocked task. For windowed operations pass executionWindow bound to a completed independent approval dependency and its immutable candidate expiry/digest. Expired windows require resampling and new approval; plain resume cannot extend them.',
     inputSchema: z.object({ taskId: z.string().min(1), ...evidenceShape }),
   }, async (input, ctx) => run(token(ctx), () => core.resume(token(ctx), input.taskId, evidence(input))));
 
   server.registerTool('defer_task_until', {
-    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with all dependencies already done it restores immediately. Owner gates and unprovable review history are refused.',
+    description: 'gm only: turn a gm-blocked execute task, or a normal non-owner review block with a provable original submit and reviewer block, into a dependency wait — it stays blocked (the manager is no longer woken for it), the gm flag clears, and it restores ready (execute) or review (review) when every dependency is done; with continuation=manager it returns to GM instead, including when dependencies are already done. Use manager for further sampling, approval or scheduling decisions. Every prerequisite must be a real dependency task. Owner gates and unprovable review history are refused.',
     inputSchema: z.object({
       taskId: z.string().min(1),
       dependencies: z.array(z.string().min(1)).min(1).max(20),
+      continuation: z.enum(['execute', 'manager']).optional(),
       text: z.string().min(20).max(8000),
       idempotencyKey: z.string().min(1),
       expectedVersion: z.number().int().positive().optional(),

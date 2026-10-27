@@ -69,7 +69,7 @@ try {
     // RUN_SCK_ROLLBACK_FORK_TESTS=1 时运行。
     'tests/fault-rollback-isolation.fork.test.ts',
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
-    'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
+    'tests/task-recovery.test.ts', 'tests/task-recovery.fork.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
     'tests/disposition-rehearsal.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',

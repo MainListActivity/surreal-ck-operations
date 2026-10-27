@@ -77,15 +77,16 @@ function makeRelease(releases: string, sha: string, withGit = false, capable = t
   writeFileSync(join(dir, 'src', 'mcp', 'run.ts'), 'export {};\n');
   writeFileSync(join(dir, 'src', 'dispatcher', 'run.ts'), 'export {};\n');
   if (capable) {
-const files = { ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}),
+const files = { 'src/task-recovery.ts': 'export {};', 'src/ops/proof-store.ts': 'export const assertExecutionWindow = true;', ...CAPABILITY_FILES, ...ACCEPTANCE_FILES, ...(policy ? POLICY_FILES : {}),
   'src/goal-workspace-capability.ts': "export const GOAL_WORKSPACE_CONTRACT = 'sck-goal-workspace/v1';\n" };
-    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
+    const appends: Array<[string, string]> = [['src/core.ts', "// workspace goal denied dependency_continuation\n"], ['src/workforce.ts', "// workspace_scope\n"], ['src/core.ts', "export const ACCEPTANCE_CORE = 'mergeAcceptanceCriteria(leg, criteria); isTrustedCodeDeliverable(subject);';\n"]];
     if (policy) appends.push(...Object.entries(POLICY_SHARED));
     mkdirSync(join(dir, 'schema'), { recursive: true });
+    mkdirSync(join(dir, 'src', 'ops'), { recursive: true });
     for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
     for (const [path, body] of appends) appendFileSync(join(dir, path), body);
     // The plugin surface runs the same core; its generated vendor must carry both contracts too.
-    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src'), { recursive: true });
+    mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'src', 'ops'), { recursive: true });
     mkdirSync(join(dir, 'plugin', 'server', 'vendor', 'schema'), { recursive: true });
     for (const [path, body] of Object.entries(files)) {
       writeFileSync(join(dir, 'plugin', 'server', 'vendor', path), body);

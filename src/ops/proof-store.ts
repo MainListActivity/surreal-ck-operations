@@ -1,3 +1,4 @@
+import { windowExpired, type ExecutionWindow } from '../task-recovery.ts';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
@@ -6,7 +7,7 @@ import { emptyChecks, mark, normalRetirement, type DiagnosticCheck, type CheckRe
 import type { ProofFiles } from './proof-files.ts';
 export type LeaseStamp = { taskId: string; employee: string; delivery: string; fence: number; goal: string; project: string; role: Role };
 export type ApprovalReceipt = { taskId: string; version: number; action: 'accept' | 'owner_approve'; auditId: string; reviewer: string; digest: string };
-export type Candidate = { task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string };
+export type Candidate = { evidence_expires_at?: string; task: RecordId; digest: string; manifest_hash: string; document_hash: string; manifest_path: string; document_path: string; author: string; env: string };
 export type ProofRow = { id: RecordId; task: RecordId; delivery: string; fence: number; request_key: string; request_digest: string; lease: LeaseStamp; approval: ApprovalReceipt | null; files: ProofFiles; identities_digest: string; status_hash: string; expires_at: number; revoked: boolean; version: number; sealed: { ciphertext: string; iv: string; tag: string }; kid: string };
 type ApprovalTaskRow = { state: string; kind: string; version: number; submitted_by: string; accepted_by: string; reviewer_role: string; goal: RecordId; project: RecordId };
 type ApprovalAuditRow = { id: RecordId; actor: RecordId | string; action: 'accept' | 'owner_approve'; evidence: string; version: number; at: unknown };
@@ -21,6 +22,15 @@ export class CompanyProofStore {
     if (!r || r.current_employee !== scope.actor.employeeId || !['doing', 'review'].includes(r.state) || r.lease_expires_at <= this.now() / 1000 || r.revoked || r.retired || !['engineering', 'product', 'qa'].includes(r.role) || String(r.goal?.id) !== PROOF_GOAL || String(r.project?.id) !== scope.project || scope.project !== 'surreal_ck') throw denied();
     return { taskId: scope.taskId, employee: r.current_employee, delivery: r.delivery_id, fence: r.fence, goal: PROOF_GOAL, project: scope.project, role: r.role as Role };
   }
+  async assertExecutionWindow(taskId: string, approvalTask?: string, files?: ProofFiles): Promise<void> {
+    const [row] = await this.db.query<[{ execution_window?: ExecutionWindow } | undefined]>(
+      'SELECT execution_window FROM ONLY $task;', { task: new RecordId('task', taskId) });
+    const window = row?.execution_window;
+    if (!window) return; // Legacy tasks retain the existing proof and evidence checks.
+    if (windowExpired(window, this.now())) throw new CompanyError('forbidden', 'execution window expired');
+    if (files && (window.approvalTask !== approvalTask || window.configurationDigest !== files.manifest.configurationDigest ||
+        window.evidenceExpiresAt !== files.evidence.expiresAt)) throw new CompanyError('forbidden', 'execution window candidate mismatch');
+  }
   async leaseValid(stamp: LeaseStamp): Promise<boolean> {
     try {
       const current = await this.lease({ taskId: stamp.taskId, project: stamp.project, actor: { employeeId: stamp.employee, role: stamp.role, capabilities: [] } });
@@ -28,7 +38,7 @@ export class CompanyProofStore {
     } catch { return false; }
   }
   async prepare(lease: LeaseStamp, env: string, files: ProofFiles): Promise<void> {
-    const row: Candidate = { task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env };
+    const row: Candidate = { evidence_expires_at: files.evidence.expiresAt, task: new RecordId('task', lease.taskId), digest: files.manifest.configurationDigest, manifest_hash: files.manifestHash, document_hash: files.documentHash, manifest_path: files.manifestPath, document_path: files.documentPath, author: lease.employee, env };
     await this.db.query('INSERT INTO internal_ai_candidate $row ON DUPLICATE KEY UPDATE digest = $input.digest;', { row });
     const found = await this.candidate(lease.taskId);
     if (!found || found.manifest_hash !== row.manifest_hash || found.document_hash !== row.document_hash || found.author !== row.author || found.env !== env || found.manifest_path !== row.manifest_path || found.document_path !== row.document_path) throw new CompanyError('conflict', 'immutable approval candidate differs');
