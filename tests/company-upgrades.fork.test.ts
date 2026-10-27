@@ -8,6 +8,8 @@ import {CompanyDatabase} from '../src/database.ts';
 import {OwnerDesk} from '../src/owner.ts';
 import {SurrealCompanyCore} from '../src/core.ts';
 import {LocalEnrollmentAdmin} from '../src/enrollment.ts';
+import {Workforce} from '../src/workforce.ts';
+import {Dispatcher} from '../src/dispatcher/dispatcher.ts';
 import {CompanyUpgrades} from '../src/company-upgrades.ts';
 import {runCompanyUpgrade,type UpgradeCommand} from '../src/company-upgrade-runner.ts';
 import {readCompanyRelease,compareRelease,releaseNotesSchema} from '../src/company-release.ts';
@@ -122,4 +124,16 @@ run('stale reaping cannot overwrite a worker that progressed after the inbox sna
  try{await service.state();}finally{db.db.query=original;}
  expect((await service.job(j.jobId))!.status).toBe('checking');
  await service.update(j.jobId,'failed','fixture cleanup');
+});
+
+run('company version actions bypass Jev routing and approval, including stale dispatcher snapshots',async()=>{
+ const t=await task(),wf=new Workforce(db,join(dir,'credentials')),before=t.version;
+ expect(await wf.rerouteToGm(t.id,before,'Jev proposes GM')).toBe(false);
+ expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
+ await db.db.query("UPDATE $task SET state='review',reviewer_role='owner',acceptance_legacy=true;",{task:new RecordId('task',t.id)});
+ expect(await wf.jevAccept(t.id,before,'Jev proposes automatic acceptance')).toBe(false);
+ expect((await core.getTask(eng,t.id)).state).toBe('review');
+ let calls=0;
+ const dispatcher=new Dispatcher({workforce:{tasks:async()=>[{kind:'release',state:'review',version:before,row:{company_upgrade:t.companyUpgrade}},{kind:'deploy',state:'blocked',blockedTo:'owner',version:before,row:{company_upgrade:t.companyUpgrade}}],judgeInput:async()=>{calls++;throw Error('must not ask Jev');}},owner:{triagePending:async()=>[]},jev:{model:'fixture',ask:async()=>{calls++;throw Error('must not call Jev');}}} as never);
+ await (dispatcher as any).jevDecisions({jevDecisions:true},{decisions:[],errors:[]});expect(calls).toBe(0);
 });
