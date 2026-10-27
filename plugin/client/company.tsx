@@ -1296,7 +1296,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
         {!!selected&&!!query.data?.attempts?.[selected.group]&&<Text style={[s.muted,{marginBottom:10,fontSize:10}]}>{(()=>{const a=query.data!.attempts[selected.group]!;return `最近刷新尝试：${new Date(a.at).toLocaleString()} · ${a.status} · ${a.modelCount} 个评分模型 · ${a.encoding} · 共享 ${a.stateBytes}/${a.limits.stateBytes} 字节 · 请求 ${a.requestBytes}/${a.limits.requestBytes} 字节`;})()}</Text>}
         {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，仍受20秒和可用性限制。":"已取消置顶，下次刷新按规则排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
         {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
-        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功评分":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
+        {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功排序":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
       </View>
     </View>
     <View style={{marginTop:18}}><Collapsible title="历史 JEV 请求（已停用）" ctx={ctx}>

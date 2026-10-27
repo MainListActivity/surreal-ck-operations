@@ -62,6 +62,6 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now()):Ar
  return rows.map(({facts,decision,pin})=>({facts,decision:{...decision,reason:decision.tail??[
   pin!==Infinity?'人工置顶':undefined,decision.billing==='subscription'?'订阅覆盖':decision.billing==='metered'?'按量计费后备':'计费类型未知',
   decision.band===undefined?'AA未知':`能力档${decision.band+1}（AA ${facts.aa!.score}）`,
-  decision.ttftMs===undefined?'首 token 未测得':`首 token ${(decision.ttftMs/1000).toFixed(2)}秒（${decision.latencySource}）`,
+  decision.ttftMs===undefined?'首 token 未测得':`首 token ${(decision.ttftMs/1000).toFixed(2)}秒（${({'recent-ewma':'近期EWMA','recent-last':'近期单次','historical-average':'近7天均值','unknown':'未知'})[decision.latencySource]}）`,
  ].filter(Boolean).join('；')}}));
 }

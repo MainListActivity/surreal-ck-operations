@@ -36,7 +36,7 @@ function draw(){
  $('updated').textContent=table?.at?'更新于 '+new Date(table.at).toLocaleTimeString():'';
  const attempt=state?.attempts?.[table?.group];
  $('attempt-budget').textContent=attempt?'最近刷新尝试：'+new Date(attempt.at).toLocaleString()+' · '+attempt.status+' · '+attempt.modelCount+' 个评分模型 · '+attempt.encoding+' · 共享 '+attempt.stateBytes+'/'+attempt.limits.stateBytes+' 字节 · 请求 '+attempt.requestBytes+'/'+attempt.limits.requestBytes+' 字节':'';
- $('snapshot').textContent=table?.at?(table.scored?'最近成功评分：':'历史请求数据：')+new Date(table.at).toLocaleString()+' · 本轮规则：'+(table.rules||'未记录'):'';
+ $('snapshot').textContent=table?.at?(table.scored?'最近成功排序：':'历史请求数据：')+new Date(table.at).toLocaleString()+' · 本轮规则：'+(table.rules||'未记录'):'';
  $('legacy').textContent=table&&!table.scored?'等待下一次请求触发规则排序。':'';
  $('model-list').innerHTML=table?.rows.map((r,i)=>{
   const short=r.model.replace(/^remote-magpie\\//,''),slash=short.lastIndexOf('/'),open=expanded===r.model;
