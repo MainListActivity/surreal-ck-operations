@@ -33,7 +33,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
 
 const ROOT = join(import.meta.dir, '..');
-/** The release the rollback would land on: the SYS05 release this lane branched from. The deploy leg may
+/** The release the rollback would land on: main at the SYS07 merge base. The deploy leg may
  * override it with whatever `active` points at when SYS07 lands. Read-only extraction, never a checkout. */
 const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? 'c68d1d4d88a40422df24c7fb717d2760314607ca';
 const TICKS = 3;
