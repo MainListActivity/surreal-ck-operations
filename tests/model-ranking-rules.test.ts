@@ -61,7 +61,7 @@ test('rule snapshots expose actual latency and reasons, never a fabricated Jev s
 
 test('first rule publication beats legacy pins, uses native PACE only for involved providers and records original settings',async()=>{
  const {ModelRoutingController}=await import('../src/model-routing/controller.ts');
- const {mkdtempSync,rmSync,readFileSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const {mkdtempSync,rmSync,readFileSync,writeFileSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
  const home=mkdtempSync(join(tmpdir(),'sck-native-pace-'));const groups:Record<string,string[]>={'sck-haiku':['p/gpt-6.1-sol','p/kimi-k3'],'sck-opus':['manual/opus'],'sck-fable':['manual/fable']};const commands:string[][]=[];
  const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:sql.includes('SELECT orders')?[{orders:{},pins:{'sck-haiku':['p/gpt-6.1-sol']}}]:[[]]};
  const controller=new ModelRoutingController(db as any,home,'unused',{providerRouting:()=>({p:'smart',manual:'order'}),groups:()=>groups,fetch:(async()=>Response.json({data:[{id:'p/gpt-6.1-sol'},{id:'p/kimi-k3'}]})) as unknown as typeof fetch,command:async a=>{commands.push(a);if(a[0]==='group'&&a[1]==='add')groups[a[2]!]=a[3]!.slice(7).split(',');}});
@@ -71,5 +71,22 @@ test('first rule publication beats legacy pins, uses native PACE only for involv
   expect(groups['sck-haiku']).toEqual(['p/kimi-k3','p/gpt-6.1-sol']);expect(groups['sck-opus']).toEqual(['manual/opus']);expect(groups['sck-fable']).toEqual(['manual/fable']);
   expect(commands.filter(a=>a[0]==='provider')).toEqual([['provider','set','p','routing=pace']]);
   expect(JSON.parse(readFileSync(join(home,'model-routing/account-routing.json'),'utf8'))).toEqual({original:{p:'smart'}});
+  const backup=join(home,'model-routing/account-routing.json');writeFileSync(backup,'broken backup');commands.length=0;
+  await expect(controller.applyOrders({'sck-haiku':['p/gpt-6.1-sol','p/kimi-k3']})).rejects.toThrow();
+  expect(readFileSync(backup,'utf8')).toBe('broken backup');expect(commands.filter(a=>a[0]==='provider')).toEqual([]);
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
+test('cancelled two-group publication cannot leak its other group through a later pin or refresh',async()=>{
+ const {ModelRoutingController}=await import('../src/model-routing/controller.ts');const {mkdtempSync,rmSync}=await import('node:fs');const {tmpdir}=await import('node:os');const {join}=await import('node:path');
+ const home=mkdtempSync(join(tmpdir(),'sck-cancelled-ranking-'));const groups:Record<string,string[]>={};let hold=false,valid=true,entered!:()=>void,release!:()=>void;
+ const started=new Promise<void>(r=>entered=r),wait=new Promise<void>(r=>release=r);
+ const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:[[]]};
+ const c=new ModelRoutingController(db as any,home,'unused',{providerRouting:()=>({}),groups:()=>groups,fetch:(async()=>{if(hold){entered();await wait;}return Response.json({data:[{id:'p/gpt-6.1-sol'},{id:'p/kimi-k3'}]});}) as unknown as typeof fetch,command:async a=>{if(a[0]==='group'&&a[1]==='add')groups[a[2]!]=a[3]!.slice(7).split(',');}});
+ try{
+  await c.refresh(true);groups['sck-sonnet']=['p/owner-b','p/owner-a'];groups['sck-haiku']=['p/h2','p/h1'];
+  await c.applyOrders({'sck-sonnet':['p/owner-b','p/owner-a']});
+  hold=true;const stale=c.applyOrders({'sck-sonnet':['p/owner-a','p/owner-b'],'sck-haiku':['p/h1','p/h2']},()=>valid);await started;valid=false;release();await stale;
+  hold=false;await c.applyOrders({'sck-haiku':['p/h2','p/h1']});expect(groups['sck-sonnet']).toEqual(['p/owner-b','p/owner-a']);
  }finally{rmSync(home,{recursive:true,force:true});}
 });

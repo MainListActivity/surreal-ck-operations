@@ -1226,7 +1226,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy}: 
           <View style={{flex:1,minWidth:0}}><View style={[s.row,{gap:8}]}>
             <Text numberOfLines={1} style={[s.text,{flexShrink:1,fontSize:mobile?12:13,fontWeight:"700"}]}>{short.slice(slash+1)}</Text>
             {!mobile&&index===0&&!!row.decision&&!row.decision.tail&&<View style={{backgroundColor:c.surface2,paddingHorizontal:6,paddingVertical:3,borderRadius:5}}><Text style={{color:c.statusSuccess,fontSize:9}}>推荐</Text></View>}
-          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)}</Text></View>
+          </View><Text style={[s.muted,{fontSize:mobile?9:10}]}>{short.slice(0,slash)} · {row.ttftMs===undefined?"TTFT ?":`${number(row.ttftMs/1000,2)}s`}</Text></View>
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}

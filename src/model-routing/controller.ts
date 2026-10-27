@@ -279,7 +279,13 @@ export class ModelRoutingController {
         if(providers[id]===undefined||providers[id]==='pace')continue;
         const dir=join(this.home,'model-routing'),file=join(dir,'account-routing.json');
         let original:Record<string,string>={};
-        try{original=JSON.parse(await readFile(file,'utf8')).original??{};}catch{}
+        try{
+          const saved=JSON.parse(await readFile(file,'utf8'));
+          if(!saved?.original||typeof saved.original!=='object'||Array.isArray(saved.original)||Object.values(saved.original).some(v=>typeof v!=='string'))throw Error('invalid backup');
+          original=saved.original;
+        }catch(error){
+          if((error as NodeJS.ErrnoException).code!=='ENOENT')throw Error('账号路由恢复记录不可读，未修改供应商策略');
+        }
         if(original[id]===undefined)original[id]=providers[id]!;
         await mkdir(dir,{recursive:true,mode:0o700});
         await writeFile(file+'.tmp',JSON.stringify({original}),{mode:0o600});
@@ -288,9 +294,17 @@ export class ModelRoutingController {
         await this.command(['provider','set',id,'routing=pace']);
       }
       if(!isCurrent())return;
+      const previousOrders=this.orders,previousRules=new Set(this.ruleOrders);
       this.orders = { ...this.orders, ...orders };
       for(const group of Object.keys(orders))if(group==='sck-haiku'||group==='sck-sonnet')this.ruleOrders.add(group);
-      await this.sync(false,isCurrent);
+      let completed=false;
+      try{await this.sync(false,isCurrent);completed=isCurrent();}
+      finally{
+        if(!completed){
+          this.orders=previousOrders;
+          this.ruleOrders.clear();for(const group of previousRules)this.ruleOrders.add(group);
+        }
+      }
     };
     this.pending = operation().finally(() => {this.pending=undefined;});
     await this.pending;
