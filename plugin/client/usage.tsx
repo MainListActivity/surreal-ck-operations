@@ -12,6 +12,7 @@ import {
   type UsageQuota,
 } from "../shared/usage";
 import { agentMetrics, metricNumber, metricSeconds } from "../shared/agent-metrics";
+import { relayTheme } from "./relay-theme";
 
 const n = (value: number | undefined) => (value === undefined ? "未知" : metricNumber(value, 0));
 const speed = (value: number | undefined) =>
@@ -589,13 +590,14 @@ function GlobalUsage(props: Props) {
   );
 }
 export function MagpieUsageSurface(props: PluginSurfaceProps) {
-  return <GlobalUsage {...props} />;
+  return <GlobalUsage {...props} theme={relayTheme(props.theme)} />;
 }
 
 export function AgentUsagePanel(props: PluginAgentPanelProps) {
+  const theme = relayTheme(props.theme);
   return (
-    <ScrollView style={{ flex: 1, backgroundColor: props.theme.colors.surface0 }}>
-      <SessionUsage {...props} />
+    <ScrollView style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
+      <SessionUsage {...props} theme={theme} />
     </ScrollView>
   );
 }
