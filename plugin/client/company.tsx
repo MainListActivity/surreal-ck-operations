@@ -1280,7 +1280,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
       <View style={[s.panel,{width:wide?340:"100%"}]}>
         <RelayHeading ctx={ctx} step="01" title="排序规则" subtitle="固定规则，无模型调用费用"/>
         <Text style={[s.text,{fontSize:12,fontWeight:"600",marginBottom:9}]}>当前生效规则</Text>
-        <TextInput accessibilityLabel="模型排序规则" editable={false} multiline maxLength={8000} style={[s.input,{minHeight:118,textAlignVertical:"top"}]} value={current.rules} onChangeText={rules=>setDraft({...current,rules})} placeholder="例如：智能程度和速度综合优先" placeholderTextColor={c.foregroundMuted}/>
+        <Text selectable style={[s.text,{fontSize:12,lineHeight:21}]}>{query.data?.rules??current.rules}</Text>
         <Text style={[s.muted,{marginTop:8,fontSize:11}]}>规则由代码执行；这里只设置刷新间隔。旧自然语言规则已停用。</Text>
         <Text style={[s.text,{fontSize:12,fontWeight:"600",marginTop:20,marginBottom:9}]}>刷新间隔</Text>
         <Pressable accessibilityRole="button" accessibilityLabel="选择模型排序刷新间隔" accessibilityState={{expanded:selectOpen}} style={[s.input,s.row,{height:45,justifyContent:"space-between",paddingVertical:0}]} onPress={()=>setSelectOpen(!selectOpen)}><Text style={s.text}>{current.refreshMinutes} 分钟{current.refreshMinutes===5?"（默认）":""}</Text><Text style={s.muted}>⌄</Text></Pressable>

@@ -32,6 +32,10 @@ test('owner ranking page uses supplied Figma layout, real API, light/dark tokens
  expect(()=>new Function(script)).not.toThrow();
  expect(html).not.toMatch(/\.metrics small\s*\{\s*display:\s*none/);
  expect(script).toContain('EWMA');
+ expect(html).not.toContain('<textarea');
+ expect(script).toContain("$('rule').textContent=state.rules");
+ expect(script).not.toContain("$('rule').value");
+ expect(script).toContain('rules:state.rules,refreshMinutes:Number');
  expect((await (await f.request('')).text())).toContain("location.href='ranking'");
  expect(relayDesignCss).toContain('grid-template-columns: 340px minmax(0, 1fr)');
 });
