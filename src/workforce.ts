@@ -681,6 +681,11 @@ export class Workforce {
     return this.waits.dueChecks(nowMs);
   }
 
+  /** SYS05: expired waits that still need an explicit cancel/extend decision. */
+  async expiredWaitChecks(): Promise<WaitRow[]> {
+    return this.waits.expiredChecks();
+  }
+
   /** SYS05: the waits of one task, newest first (used by the owner relay and by tests). */
   async taskWaits(taskId: string): Promise<WaitRow[]> {
     return this.waits.waitsOfTask(taskId);

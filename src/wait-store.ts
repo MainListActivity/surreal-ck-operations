@@ -294,6 +294,16 @@ export class WaitStore {
     return (rows ?? []).map(rowOf);
   }
 
+  /**
+   * Expired waits stay on the task until someone cancels or extends them; the row itself is no longer scanned by
+   * `releaseDue`. Keep a stable reminder so an expired wait cannot silently disappear from the queue.
+   */
+  async expiredChecks(limit = 50): Promise<WaitRow[]> {
+    const [rows] = await this.db.query<[RawWait[]]>(
+      `SELECT * FROM task_wait WHERE state = 'expired' ORDER BY updated_at DESC LIMIT $limit;`, { limit });
+    return (rows ?? []).map(rowOf);
+  }
+
   // ------------------------------------------------------------------ enter
 
   /**
@@ -534,17 +544,19 @@ export class WaitStore {
     const row = input.wait;
     const event = input.event;
     const key = waitEventKey(row.waitKey, event);
-    // A system dependency event is only valid when the reference task really is terminal. The state is read here
-    // for the readable pre-check and re-read inside the release transaction, so a task that moves between the two
-    // cannot be released. An authorized person is the explicit human exemption and is audited as such.
+    // A dependency wait is valid only when the reference task really is terminal. This applies to both the
+    // system dependency event and a signed webhook: a provider's signature proves the event is authentic, not that
+    // the referenced repair finished. An authorized person is the explicit human exemption and is audited as such.
+    const referenceKinds = row.kind === 'dependency' || row.kind === 'upstream_repair';
+    const authorizedExemption = event.source === 'authorized_person';
     let referenceComplete = true;
-    if ((row.kind === 'dependency' || row.kind === 'upstream_repair') && row.referenceTaskId) {
+    if (referenceKinds && row.referenceTaskId) {
       const [refs] = await this.db.query<[Array<{ state?: string }>]>(
         'SELECT state FROM $ref;', { ref: new RecordId('task', row.referenceTaskId) });
       referenceComplete = refs?.[0]?.state === 'done' || refs?.[0]?.state === 'void';
     }
-    const systemDependency = event.source === 'dependency';
-    const gateReference = systemDependency ? referenceComplete : true;
+    const gateReference = referenceKinds && !authorizedExemption ? referenceComplete : true;
+    const requireReferenceTerminal = referenceKinds && !authorizedExemption;
     const decision = decideRelease(waitRecordOf(row), input.now, {
       dependenciesSatisfied: true, ownerApproved: input.ownerApproved, taskBlockedToOwner: false,
       referenceComplete: gateReference,
@@ -567,7 +579,7 @@ export class WaitStore {
     }
     const outcome = await this.releaseOne(row, event, input.now, {
       source: event.source, actor: input.actor, ownerApproved: input.ownerApproved,
-      referenceComplete: gateReference, requireReferenceTerminal: systemDependency,
+      referenceComplete: gateReference, requireReferenceTerminal,
     });
     if (outcome.released && event.ownerQuote) {
       await this.db.query(
@@ -701,8 +713,8 @@ export class WaitStore {
       IF $t.current_employee != NONE AND $t.lease_expires_at > time::unix(time::now()) { THROW 'task still leased' };
       IF $t.quota_resets_at = NONE OR ($t.quota_resets_at * 1000) <= $now { THROW 'task has no future time bound' };
       LET $not_before = $t.quota_resets_at * 1000;
-      LET $resume = IF $t.state = 'review' THEN 'review' ELSE 'ready' END;
-      LET $role = IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END;
+      LET $resume = $t.resume_state ?? (IF $t.state = 'review' THEN 'review' ELSE 'ready' END);
+      LET $role = $t.resume_role ?? (IF $t.state = 'review' THEN $t.reviewer_role ELSE $t.executor_role END);
       UPDATE task_wait SET state = 'superseded', updated_at = time::now() WHERE task = $task AND state IN ['waiting', 'held'];
       CREATE ONLY $wait CONTENT {
         wait_key: $key, task: $task, kind: 'time', state: 'waiting', source: { kind: 'time' },

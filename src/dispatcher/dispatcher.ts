@@ -2687,8 +2687,21 @@ export class Dispatcher {
         this.log(`wait check read failed: ${(error as Error).message}`);
       }
     }
+    if (typeof wf.expiredWaitChecks === 'function') {
+      try {
+        for (const wait of await wf.expiredWaitChecks()) {
+          const key = `wait-expired:${wait.waitKey}`;
+          handoffLive.add(key);
+          await this.notice(key,
+            `等待已过期：任务 ${wait.taskId} 的 ${wait.kind} 等待已过期，任务仍被冻结。` +
+            `请确认取消、延期还是补齐受信事件；系统不会自动放行，也不会代发客户消息。`, report);
+        }
+      } catch (error) {
+        this.log(`wait expiry read failed: ${(error as Error).message}`);
+      }
+    }
     for (const notice of await owner.openNotices()) {
-      if (/^wait-(handoff|check):/.test(notice.key) && !handoffLive.has(notice.key)) await owner.resolveNotice(notice.key);
+      if (/^wait-(handoff|check|expired):/.test(notice.key) && !handoffLive.has(notice.key)) await owner.resolveNotice(notice.key);
     }
   }
 

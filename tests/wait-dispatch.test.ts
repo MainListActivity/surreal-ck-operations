@@ -32,6 +32,8 @@ function fixture(initial: SupervisedTask[]) {
   let next = 0;
   let releaseCalls = 0;
   let dueOnFirstSweep: ((task: SupervisedTask) => boolean) | undefined;
+  let expiredRows: Array<{ waitKey: string; taskId: string; kind: string }> = [];
+  const notices: string[] = [];
 
   const wf = {
     config: async () => ({
@@ -76,6 +78,7 @@ function fixture(initial: SupervisedTask[]) {
     },
     waitHandoffCards: async () => [],
     dueWaitChecks: async () => [],
+    expiredWaitChecks: async () => expiredRows,
     spawnInst: async () => {
       const inst: EmployeeInst = { id: `inst-${++next}`, def: def.id, role: def.role, provider: def.provider, model: def.model, credential: `cred-${next}` };
       instances.push(inst);
@@ -90,7 +93,8 @@ function fixture(initial: SupervisedTask[]) {
 
   const owner = {
     applyPending: async () => [], resolveNotice: async () => {}, openNotices: async () => [],
-    triagePending: async () => [], raiseNotice: async () => false,
+    triagePending: async () => [],
+    raiseNotice: async (key: string) => { notices.push(key); return true; },
   };
 
   const paseo: PaseoGateway = {
@@ -126,8 +130,9 @@ function fixture(initial: SupervisedTask[]) {
     env: { opsRepo: OPS, sckBin: '/bin/sck', paseoBin: '/bin/paseo' }, rand: () => 0,
   });
   return {
-    dispatcher, claimed, instances,
+    dispatcher, claimed, instances, notices,
     dueWhen: (predicate: (task: SupervisedTask) => boolean) => { dueOnFirstSweep = predicate; },
+    expire: (rows: Array<{ waitKey: string; taskId: string; kind: string }>) => { expiredRows = rows; },
     releaseCalls: () => releaseCalls,
   };
 }
@@ -172,4 +177,16 @@ test('a due condition is released once: the first tick wakes, the next tick has 
   expect(second.woke).toHaveLength(0);
   expect(f.releaseCalls()).toBe(2);
   expect(f.claimed).toEqual(['due-1']);
+});
+
+test('an expired wait stays visible as a stable reminder and is never auto-dispatched', async () => {
+  const expired = task('expired-1', {
+    waitState: 'waiting', waitKind: 'feedback', waitKey: 'expired-1:k',
+  });
+  const f = fixture([expired]);
+  f.expire([{ waitKey: 'expired-1:k', taskId: 'expired-1', kind: 'feedback' }]);
+  const report = await f.dispatcher.tick();
+  expect(report.woke).toHaveLength(0);
+  expect(f.claimed).toHaveLength(0);
+  expect(f.notices).toContain('wait-expired:expired-1:k');
 });

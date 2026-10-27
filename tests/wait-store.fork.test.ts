@@ -240,6 +240,8 @@ describe('external events (AC02/AC06)', () => {
     } as never);
     expect(late.released).toBe(false);
     expect(['expired', 'not_waiting']).toContain(late.code);
+    // The expired row stays visible to the reminder path, so it cannot silently disappear from the queue.
+    expect((await store.expiredChecks()).map(item => item.waitKey)).toContain(entered.wait!.waitKey);
   });
 });
 
@@ -353,6 +355,23 @@ describe('safe release and version locks (AC05)', () => {
     expect((await rowOf(taskId)).state).toBe('ready');
   });
 
+  test('a signed webhook cannot release a dependency wait before the reference is terminal either', async () => {
+    const dependency = await makeTask('webhook 也不能绕过的上游修复');
+    const taskId = await makeTask('等待上游修复（webhook）');
+    const entered = await enter(taskId, 'eng', { kind: 'upstream_repair', referenceTaskId: dependency });
+    const at = Date.now();
+    const payload = webhookPayload({ eventId: 'evt-repair-ready', provider: 'ops-provider', at, objectWaitId: entered.wait!.waitKey });
+    const refused = await core.resolveWait(tokens.gm!, {
+      source: 'webhook', provider: 'ops-provider', eventId: 'evt-repair-ready', at,
+      objectWaitId: entered.wait!.waitKey, signature: signWaitWebhook(WEBHOOK_SECRET, payload),
+      text: 'SYS05 回归：签名证明事件真实，不证明上游修复完成；引用仍 ready 时必须拒绝',
+      idempotencyKey: 'webhook-not-terminal',
+    } as never);
+    expect(refused.released).toBe(false);
+    expect(refused.code).toBe('dependency');
+    expect((await rowOf(taskId)).state).toBe('blocked');
+  });
+
   test('a held wait recovers automatically once its dependency finishes', async () => {
     const dependency = await makeTask('迟到的依赖');
     const taskId = await makeTask('到点后被依赖挂住');
@@ -401,6 +420,27 @@ describe('safe release and version locks (AC05)', () => {
       taskId: owned, expectedVersion: ownedRow.version as number,
       reason: 'SYS05 回归：老板关口不能被批量迁移为时间等待', idempotencyKey: 'migrate-owner',
     }), 'forbidden', /老板关口/);
+  });
+
+  test('migration keeps a review-phase block in review instead of turning it into executable work', async () => {
+    const legacy = await makeTask('复核期额度阻塞');
+    const until = Math.floor(Date.now() / 1000) + 3600;
+    await database.db.query(
+      'UPDATE ONLY $task SET state = "blocked", blocked_to = "gm", resume_state = "review", resume_role = "qa", quota_resets_at = $until;',
+      { task: new RecordId('task', legacy), until },
+    );
+    const before = await rowOf(legacy);
+    const migrated = await core.waitMigrationApply(tokens.gm!, {
+      taskId: legacy, expectedVersion: before.version as number,
+      reason: 'SYS05 回归：复核期旧阻塞迁移后必须回到复核，而不是变成可执行任务', idempotencyKey: 'migrate-review',
+    });
+    expect(migrated.wait).toMatchObject({ kind: 'time', state: 'waiting', ownerRole: 'qa' });
+    expect((await rowOf(legacy)).resume_state).toBe('review');
+    const store = new WaitStore(database.db);
+    await store.releaseDue(until * 1000 + 1);
+    const released = await rowOf(legacy);
+    expect(released.state).toBe('review');
+    expect(released.reviewer_role).toBe('qa');
   });
 
   test('the migration preview is read-only and never marks an owner gate eligible', async () => {
