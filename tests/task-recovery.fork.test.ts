@@ -113,6 +113,14 @@ run('old fault notices do not hide a new post-dependency manager stage; same-sta
   const notified=await new Workforce(db,dir).faultEpisodes({tasks:[t.id]});
   expect(faultNeedsNotice(notified!.byTask.get(t.id)![0]!,notified!.blockedAt?.get(t.id))).toBe(false);
   expect(await new Workforce(db,dir).markFaultEpisodeNotified(episode.episode, fresh!.blockedAt?.get(t.id))).toBe(false);
+  const nextStage=Date.parse('2026-01-04T00:00:00Z');
+  // Even when an S1 notification lands after wall clock has passed S2, it only acknowledges S1.
+  expect(faultNeedsNotice(notified!.byTask.get(t.id)![0]!,nextStage)).toBe(true);
+  expect(await new Workforce(db,dir).markFaultEpisodeNotified(episode.episode,nextStage)).toBe(true);
+  expect(await new Workforce(db,dir).markFaultEpisodeNotified(episode.episode,fresh!.blockedAt?.get(t.id))).toBe(false);
+  const nextNotified=await new Workforce(db,dir).faultEpisodes({tasks:[t.id]});
+  expect(faultNeedsNotice(nextNotified!.byTask.get(t.id)![0]!,nextStage)).toBe(false);
+
 });
 
 run('classified loops get one owned recovery task and a second exhausted cycle stops automatically', async () => {
@@ -163,6 +171,7 @@ run('adding completed prerequisites does not reset a stopped recovery while an o
   const source=await newTask(),oldDep=await newTask(),finished=await newTask(),newDep=await newTask();
   await db.db.query("UPDATE $task SET state='blocked',blocked_to='gm',resume_state='doing',dependencies=[$old],recovery_stopped=true; UPDATE $finished SET state='done';",
     {task:new RecordId('task',source.id),old:new RecordId('task',oldDep.id),finished:new RecordId('task',finished.id)});
+  expect(await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[finished.id],continuation:'execute',...text('已完成依赖不能解除停止并直接派工')}).catch(e=>e.code)).toBe('conflict');
   await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[finished.id],continuation:'manager',...text('新增一个已完成依赖不能伪装实际恢复进展')});
   const [still]=await db.db.query<[Array<{recovery_stopped:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',source.id)});
   expect(still[0]!.recovery_stopped).toBe(true);

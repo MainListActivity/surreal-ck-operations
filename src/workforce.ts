@@ -352,6 +352,7 @@ export interface DispositionEpisodeFacts {
 export interface FaultEpisodeFacts {
   updatedAt?: string;
   notifiedAt?: string;
+  notifiedStageAt?: string;
   episode: string;
   fingerprint: string;
   incident: string;
@@ -960,7 +961,7 @@ export class Workforce {
     const tasks = [...new Set(input.tasks.filter(taskId => taskId.length > 0))];
     if (!tasks.length) return { byTask };
     type Row = { episode?: string; fingerprint?: string; incident?: string; task?: unknown; phase?: string;
-      state?: string; evidence_revision?: number; notified?: boolean; updated_at?: unknown; notified_at?: unknown };
+      state?: string; evidence_revision?: number; notified?: boolean; updated_at?: unknown; notified_at?: unknown; notified_stage_at?: unknown };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM fault_episode WHERE task IN $tasks ORDER BY updated_at DESC;',
       { tasks: tasks.map(taskId => id('task', taskId)) });
@@ -979,6 +980,7 @@ export class Workforce {
         evidenceRevision: row.evidence_revision ?? 0,
         updatedAt: row.updated_at ? String(row.updated_at) : undefined,
         notifiedAt: row.notified_at ? String(row.notified_at) : undefined,
+        notifiedStageAt: row.notified_stage_at ? String(row.notified_stage_at) : undefined,
         notified: row.notified ?? false,
       };
       const list = byTask.get(taskId);

@@ -28,6 +28,6 @@ export function faultBelongsToWait(updatedAt: string | undefined, blockedSinceMs
   return blockedSinceMs === undefined || (updatedAt !== undefined && Date.parse(updatedAt) >= blockedSinceMs);
 }
 
-export function faultNeedsNotice(episode: { notified: boolean; notifiedAt?: string }, stageStartedAt?: number): boolean {
-  return !episode.notified || (stageStartedAt !== undefined && (!episode.notifiedAt || Date.parse(episode.notifiedAt) < stageStartedAt));
+export function faultNeedsNotice(episode: { notified: boolean; notifiedStageAt?: string }, stageStartedAt?: number): boolean {
+  return !episode.notified || (stageStartedAt !== undefined && (!episode.notifiedStageAt || Date.parse(episode.notifiedStageAt) < stageStartedAt));
 }

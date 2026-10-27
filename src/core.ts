@@ -1345,6 +1345,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
       } ELSE {
+      IF $t.state != 'review' AND $t.recovery_stopped = true { THROW 'automatic recovery stopped' };
       LET $same = $t.current_employee = $employee AND $t.lease_expires_at > $now;
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
@@ -3463,6 +3464,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $new_deps = array::complement($dependencies, $t.dependencies ?? []);
       ${RESOLVE_DEP_SQL('$new_deps', '$new_dep')}
       LET $new_unmet = SELECT VALUE id FROM task WHERE id IN $new_dep_resolved AND ${depUnsatisfiedFor('$t')};
+      IF $t.recovery_stopped = true AND array::len($new_unmet) = 0 AND $continuation != 'manager' { THROW 'automatic recovery stopped: no new unmet prerequisite' };
       LET $m_phase = $t.resume_state ?? 'ready';
       LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
       LET $manager = $continuation = 'manager';

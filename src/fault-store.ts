@@ -653,8 +653,8 @@ export class FaultStore {
    */
   async markNotified(episodeKey: string, stageStartedAt?: number): Promise<boolean> {
     const [updated] = await this.db.query<[Array<{ notified?: boolean }>]>(
-      `UPDATE $episode SET notified = true, notified_at = time::now(), updated_at = time::now()
-       WHERE notified = false OR ($stage != NONE AND (notified_at = NONE OR notified_at < <datetime>$stage)) RETURN AFTER;`,
+      `UPDATE $episode SET notified = true, notified_at = time::now(), notified_stage_at = IF $stage = NONE THEN NONE ELSE <datetime>$stage END, updated_at = time::now()
+       WHERE notified = false OR ($stage != NONE AND (notified_stage_at = NONE OR notified_stage_at < <datetime>$stage)) RETURN AFTER;`,
       { episode: episodeId(episodeKey), stage: stageStartedAt === undefined ? undefined : new Date(stageStartedAt).toISOString() });
     return (updated?.length ?? 0) > 0;
   }
