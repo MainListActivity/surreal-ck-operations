@@ -148,6 +148,11 @@ const opsTargetOf = (tool: string, args: Args = {}): FaultTargetKind => {
     case 'ops_account_ensure': return 'account';
     case 'ops_workspace_ensure': return 'workspace';
     case 'ops_member_list': case 'ops_member_add': case 'ops_member_remove': return 'member';
+    // SYS04/SYS05 isolation: a browser injection failure stops only the injection scope, and a
+    // logout/cleanup is never refused because an injection failed. Sharing the `internal` target
+    // with ops_request is what made one unclassified injection block both.
+    case 'ops_browser_login': return 'browser';
+    case 'ops_logout': return 'logout';
     default: return 'internal';
   }
 };
@@ -180,6 +185,13 @@ interface WorkspaceItem { slug: string; name: string; dbName: string; role?: str
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const DAY_SECONDS = 86_400;
 const REFRESH_MARGIN_MS = 60_000;
+/**
+ * One bounded retry inside a single tool call, only for a transient injection failure (a navigation
+ * timeout or a connection reset). It never applies to a deterministic refusal and never grows into
+ * an unbounded loop: the fault budget still caps the operation at its configured maxAttempts.
+ */
+const BROWSER_INJECT_ATTEMPTS = 2;
+const BROWSER_RETRY_BACKOFF_MS = 1_000;
 const DEFAULT_TOKEN_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 100_000;
 
@@ -1682,10 +1694,26 @@ export class OpsBroker {
       });
     }
 
-    const landed = await (this.deps.browser ?? egoBrowserInjector)({
+    const inject = this.deps.browser ?? egoBrowserInjector;
+    const injection = {
       bin: ctx.cfg.browser?.bin, spaceId, page, probeUrl, landingUrl,
       token: session.token, expiresAt: session.expiresAt, oidcUser,
-    });
+    };
+    // SYS04: only a genuinely transient failure is retried, and only once. A deterministic
+    // refusal (a missing space, a bad page, a revoked operator) is reported on the first attempt.
+    let landed: { url: string; title: string } | undefined;
+    for (let attempt = 1; attempt <= BROWSER_INJECT_ATTEMPTS; attempt++) {
+      try {
+        landed = await inject(injection);
+        break;
+      } catch (error) {
+        const transient = error instanceof CompanyError && error.retryable
+          && (error.code === 'upstream_error' || error.code === 'login_failed');
+        if (!transient || attempt === BROWSER_INJECT_ATTEMPTS) throw error;
+        await this.sleep(BROWSER_RETRY_BACKOFF_MS);
+      }
+    }
+    if (!landed) throw new CompanyError('upstream_error', 'browser login produced no result', true);
     // SYS05: remember the space so the lease-end cleanup can bound it. The space id is not a secret.
     const employee = ctx.scope.actor.employeeId;
     const spaces = this.browserSpaces.get(employee) ?? new Set<number>();
