@@ -21,7 +21,9 @@ case "$gate" in
     gate_name=sidecar-review
     # SYS02 N1-R: the deployment-source association (a borrowed deployment must not certify an environment) is
     # part of the same local-fork gate, so a regression of the source association blocks the release too.
-    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts"
+    # SYS06: the effective-policy contract regression rides this gate as well — it needs the company fork
+    # SurrealDB (official upstream is not compatible), so it can never run on hosted CI.
+    gate_test="tests/dispatcher-sidecar.fork.test.ts tests/deployment-source.test.ts tests/deployment-source.fork.test.ts tests/effective-policy.fork.test.ts"
     gate_why='the sidecar-review gate runs on macOS only; it uses the local company fork'
     ;;
   *) echo "unknown gate: $gate (known: slow-pipe, sidecar-review)" >&2; exit 2;;

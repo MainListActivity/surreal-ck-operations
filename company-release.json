@@ -1,19 +1,18 @@
 {
-  "version": "0.3.9",
-  "title": "供应商时间来源诊断与配额原始精度校验",
+  "version": "0.3.10",
+  "title": "SYS06 工作区夹具修复与策略回归接入发布门禁",
   "changes": [
-    "每个外部探测（models/官方页/条件GET/apiKeys/池用量/支付面）记录请求起止、响应头与读完 body 的本机时刻、单调耗时，以及原始 HTTP Date/Age/cache-control/ETag/缓存状态/重定向/响应主机与脱敏 body hash，标明字段来源",
-    "同一轮分别观察官方页、console 池与供应商 API 三域时钟，分类 missing-date/invalid-date/redirect-date/code-error/stale-cache-date/cacheAgeUnknown/source-clock-skew/host-clock-skew/ok，并单列 ageAdjustedSkewMs 与 probed",
-    "官方页证据要求页面 Date 被同一供应商 API 域 Date 在 ±5 分钟内 corroborate；跨域矛盾或 API Date 缺失均 blocked，API Date 不替代页面时钟",
-    "console 时钟偏差超过 ±5 分钟或时间域不可用时不再生成文档，不把来源域绝对 resetAt 当作可信时间；expiry 始终由同域相对差扣除全程耗时与 60s margin 推导",
-    "池 limit/used/remaining/reset 保留脱敏 {type,value} 原值；一致性检查前不取整，小数或小数字符串按 poolPrecision blocked；used 必须 provider 报告，禁止用 limit−remaining 派生",
-    "条件 GET 记录请求头与 304/200、ETag、body hash、x-nextjs-cache，明确只证明 body 身份，不证明 origin 重新校验或内容新鲜，也不绕过时钟门"
+    "effective-policy.fork 真实 QA 复现的 1 例失败修正：静置实例按真实 spawn 形态补 workspaceScope，策略池恢复 reuse+spawn 两条路径，19/19 通过",
+    "保持 dispatcher 工作区隔离语义不变：无 scope 的旧会话只允许续做在手任务，不放宽旧员工跨目标复用",
+    "该策略回归接入发布门禁 sidecar-review：install 缺通过记录即拒绝切换；明确依赖公司 fork SurrealDB，官方 surrealdb 不兼容、不上 hosted CI",
+    "对照组（无 policyBlocks）reuse 与 spawn 均存在且合格、策略组两者均 policy_blocked 的断言全部保留，未删断言、无空集 every 伪绿",
+    "本版本同时包含已合入 main 的 v0.3.9 供应商时间来源诊断与配额原始精度校验；现役 v0.3.8 d8f882d9 为本候选祖先"
   ],
   "impact": [
-    "v2/v3 证据文档形状与既有限值不变：60,000 points / 18,000s 准用上限、30 次/美元预算、FREE/account-bound/每次使用前复核、支付面 404 仅观测",
-    "真实采样仍可能 blocked：官方页与 console Date 约 +779s、页面可共享缓存无 Age、default 7d used+remaining=limit−1；本次只纠正分类/采集与假保证，不保证供应商条件自动恢复",
-    "v3 新增行为仅为收紧：usedSource 必须 reported 才能进入 prepare/prove/deliver/diagnose 的 eligibility；新增诊断字段只进回执与推导，不写入文档"
+    "策略收权隔离的池子清点恢复完整：reuse 与 spawn 都会以 policy_blocked 出现，不再漏报静置实例路径",
+    "此后每次双面安装都会在门禁里重跑 effective-policy.fork，策略契约回归回归即阻断发布",
+    "无数据库迁移、无历史改写；回滚到部署前现役安全，旧版忽略本次仅测试与门禁脚本的改动"
   ],
-  "migration": "无数据库迁移；未改写或删除已有数据。",
-  "rollback": "通过标准安装器恢复上一固定发布；旧回执与已签发证据不受影响，重采样按旧分类逻辑运行。"
+  "migration": "无数据库迁移、无历史改写；改动仅测试夹具与 scripts/release-gate.sh 门禁清单。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.8 d8f882d90e10bd7745760e447aa83bb952cf0187，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }
