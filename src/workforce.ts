@@ -1,3 +1,4 @@
+import { FaultStore } from './fault-store.ts';
 import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -371,6 +372,9 @@ export interface DispositionEpisodeFacts {
  * already been told about this cause.
  */
 export interface FaultEpisodeFacts {
+  updatedAt?: string;
+  notifiedAt?: string;
+  notifiedStageAt?: string;
   episode: string;
   fingerprint: string;
   incident: string;
@@ -1012,12 +1016,12 @@ export class Workforce {
    * whose budget is spent) does not produce a second wake. The read is a single query: an unreadable ledger is
    * reported as undefined, and the caller then fails closed for the pass.
    */
-  async faultEpisodes(input: { tasks: readonly string[] }): Promise<{ byTask: Map<string, FaultEpisodeFacts[]> } | undefined> {
+  async faultEpisodes(input: { tasks: readonly string[] }): Promise<{ byTask: Map<string, FaultEpisodeFacts[]>; blockedAt?: Map<string, number> } | undefined> {
     const byTask = new Map<string, FaultEpisodeFacts[]>();
     const tasks = [...new Set(input.tasks.filter(taskId => taskId.length > 0))];
     if (!tasks.length) return { byTask };
     type Row = { episode?: string; fingerprint?: string; incident?: string; task?: unknown; phase?: string;
-      state?: string; evidence_revision?: number; notified?: boolean; updated_at?: unknown };
+      state?: string; evidence_revision?: number; notified?: boolean; updated_at?: unknown; notified_at?: unknown; notified_stage_at?: unknown };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM fault_episode WHERE task IN $tasks ORDER BY updated_at DESC;',
       { tasks: tasks.map(taskId => id('task', taskId)) });
@@ -1034,12 +1038,20 @@ export class Workforce {
         state: (row.state === 'converged' || row.state === 'exhausted' || row.state === 'stopped' || row.state === 'resolved'
           ? row.state : 'opened'),
         evidenceRevision: row.evidence_revision ?? 0,
+        updatedAt: row.updated_at ? String(row.updated_at) : undefined,
+        notifiedAt: row.notified_at ? String(row.notified_at) : undefined,
+        notifiedStageAt: row.notified_stage_at ? String(row.notified_stage_at) : undefined,
         notified: row.notified ?? false,
       };
       const list = byTask.get(taskId);
       if (list) list.push(facts); else byTask.set(taskId, [facts]);
     }
-    return { byTask };
+    const [boundaries] = await this.db.query<[Array<{ task: unknown; at: unknown }>]>(
+      `SELECT task, at FROM audit WHERE task IN $tasks AND action IN ['resume', 'deferred', 'dependency_unlocked', 'manager_recovery'] ORDER BY at DESC;`,
+      { tasks: tasks.map(taskId => id('task', taskId)) });
+    const blockedAt = new Map<string, number>();
+    for (const b of boundaries ?? []) if (!blockedAt.has(asId(b.task))) blockedAt.set(asId(b.task), Date.parse(String(b.at)));
+    return { byTask, blockedAt };
   }
 
   /**
@@ -1048,11 +1060,8 @@ export class Workforce {
    * One episode, one notice: the flag is set when the wake goes out, so ten identical reports of the same cause
    * leave the manager with one episode to act on. A second call is a no-op.
    */
-  async markFaultEpisodeNotified(episode: string): Promise<boolean> {
-    const [rows] = await this.db.query<[Array<{ notified?: boolean }>]>(
-      'UPDATE $episode SET notified = true, updated_at = time::now() WHERE notified = false RETURN AFTER;',
-      { episode: id('fault_episode', episode) });
-    return (rows?.length ?? 0) > 0;
+  async markFaultEpisodeNotified(episode: string, stageStartedAt?: number): Promise<boolean> {
+    return new FaultStore(this.db).markNotified(episode, stageStartedAt);
   }
 
   private dispositionFactsOf(row: { episode?: string; task?: unknown; phase?: string; episode_since?: number; status?: string;

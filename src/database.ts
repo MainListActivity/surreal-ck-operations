@@ -159,12 +159,13 @@ export class CompanyDatabase {
     await this.db.query(loadSchema('037-fault-budget.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
     await this.db.query(loadSchema('038-goal-workspaces.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 38 WHERE schema_version < 38;');
-    // SYS05 P1：时间与外部事件等待状态机（编号 039；038 已被 goal-workspaces 占用）。只新增 task_wait /
+    await this.db.query(loadSchema('039-task-recovery.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 39 WHERE schema_version < 39;');
+    // SYS05 P1：时间与外部事件等待状态机（编号 040；039 已由 main 的 task-recovery 占用）。只新增 task_wait /
     // wait_event 两张表与索引；任务上的 wait_* 是 schemaless 新字段。进入等待时任务置为 blocked（旧版派工
     // 队列不收），旧版读不到新表即忽略，因此回滚后不会认领或拉起等待中的任务（RB01）。
-    await this.db.query(loadSchema('039-waits.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 39 WHERE schema_version < 39;');
+    await this.db.query(loadSchema('040-waits.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 40 WHERE schema_version < 40;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {

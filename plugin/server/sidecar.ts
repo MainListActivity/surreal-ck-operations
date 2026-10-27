@@ -498,7 +498,8 @@ export class SidecarPool {
     instId: string, live: LiveClaim, to: "gm" | undefined,
     text: string, path: string,
   ): Promise<void> {
-    const evidence: Evidence = { text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
+    const recovery = /^\s*recoveryReason:\s*(\S+)\s*$/m.exec(text)?.[1];
+    const evidence: Evidence = { ...(to && recovery ? { recoveryReason: recovery as Evidence["recoveryReason"] } : {}), text, idempotencyKey: `sidecar-file:${instId}:${live.proof.deliveryId}:${hash(text)}` };
     try {
       const cred = await this.credentialFor(instId);
       if (to) {
@@ -863,6 +864,8 @@ export class SidecarPool {
       return raw;
     };
     const evidence = (): Evidence => ({
+      ...(args.executionWindow === undefined ? {} : { executionWindow: args.executionWindow as Evidence["executionWindow"] }),
+      ...(args.recoveryReason === undefined ? {} : { recoveryReason: args.recoveryReason as Evidence["recoveryReason"] }),
       text: String(args.text ?? ""),
       idempotencyKey: String(args.idempotencyKey ?? `sidecar-relay:${instId}:${randomBytes(6).toString("hex")}`),
       ...(declared ? { acceptance: declared } : {}),

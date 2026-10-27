@@ -460,7 +460,7 @@ export class OwnerDesk {
   async blockLoops(taskId: TaskId): Promise<{ loops: number; reasons: string[] }> {
     const task = id('task', taskId);
     const [touched] = await this.db.query<[Array<{ at: unknown }>]>(
-      "SELECT at FROM audit WHERE task = $task AND action IN ['owner_reply', 'escalate'] ORDER BY at DESC LIMIT 1;", { task });
+      "SELECT at FROM audit WHERE task = $task AND action IN ['owner_reply', 'escalate', 'manager_recovery', 'recovery_progress'] ORDER BY at DESC LIMIT 1;", { task });
     const [blocks] = await this.db.query<[Array<{ evidence?: string }>]>(
       "SELECT evidence, at FROM audit WHERE task = $task AND action = 'block' AND at > <datetime>$since ORDER BY at DESC;",
       { task, since: touched[0] ? String(touched[0].at) : '1970-01-01T00:00:00Z' });
@@ -473,7 +473,7 @@ export class OwnerDesk {
     const stats = new Map<string, { loops: number; reasons: string[] }>();
     if (!ids.length) return stats;
     const [touched, blocks] = await this.db.query<[Array<{ task: RecordId; at: unknown }>, Array<{ task: RecordId; evidence?: string; at: unknown }>]>(
-      `SELECT task, at FROM audit WHERE task IN $ids AND action IN ['owner_reply', 'escalate'] ORDER BY at DESC;
+      `SELECT task, at FROM audit WHERE task IN $ids AND action IN ['owner_reply', 'escalate', 'manager_recovery', 'recovery_progress'] ORDER BY at DESC;
        SELECT task, evidence, at FROM audit WHERE task IN $ids AND action = 'block' ORDER BY at DESC;`,
       { ids });
     const touchedAt = new Map<string, string>();
@@ -492,6 +492,11 @@ export class OwnerDesk {
 
   /** Stops a task that keeps bouncing between employee and manager: it becomes an owner question with the recent reasons. */
   async escalateLooping(task: { id: TaskId; version: number }, loops: number, reasons: string[]): Promise<boolean> {
+    const [lastBlock] = await this.db.query<[Array<{ recovery_reason?: string }>]>(
+      "SELECT recovery_reason, at FROM audit WHERE task = $task AND action = 'block' ORDER BY at DESC LIMIT 1;", { task: id('task', task.id) });
+    if (['stale_window', 'missing_prerequisite', 'infrastructure'].includes(lastBlock?.[0]?.recovery_reason ?? '')) {
+      return this.recoverLooping(task, loops, reasons);
+    }
     const evidence = `这个任务已在员工与经理之间往返 ${loops} 次（阻塞→经理处理→再阻塞）仍没有完成，系统不再自动循环。最近的阻塞原因：\n${reasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n请给方向后回复（任务按你的回复继续），或让经理把它拆小/作废。`;
     try {
       await this.run(`BEGIN;
@@ -502,6 +507,40 @@ export class OwnerDesk {
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE outbox CONTENT { task: $task, kind: 'escalated', sequence: $sequence.value, payload: { loops: $loops }, at: time::now() };
         COMMIT;`, { task: id('task', task.id), expected: task.version, evidence, loops });
+      return true;
+    } catch { return false; }
+  }
+
+  /** One bounded recovery handoff per source task. Classification changes routing, never the failure budget. */
+  private async recoverLooping(task: { id: TaskId; version: number }, loops: number, reasons: string[]): Promise<boolean> {
+    const recovery = id('task', `recovery-${HASH(task.id).slice(0, 24)}`);
+    try {
+      await this.run(`BEGIN;
+        LET $t = SELECT * FROM ONLY $task;
+        IF $t.state != 'blocked' OR $t.blocked_to != 'gm' OR $t.version != $expected { THROW 'task moved' };
+        LET $existing = SELECT * FROM ONLY $recovery;
+        IF $existing = NONE {
+          CREATE ONLY $recovery CONTENT { title: '恢复任务：' + $t.title,
+            context: $context, executor_role: 'gm', reviewer_role: 'product', kind: 'task',
+            goal: $t.goal, project: $t.project, code_repo_path: $t.code_repo_path,
+            state: 'ready', version: 1, fence: 0, dependencies: [], work_intent: { kind: 'read' },
+            recovery_source: $task, created_at: time::now() };
+          UPDATE ONLY $task SET dependencies = array::distinct(array::append(dependencies ?? [], $recovery)),
+            blocked_to = NONE, dependency_continuation = 'manager', version += 1;
+          CREATE audit CONTENT { task: $recovery, actor: 'system:loop-breaker', action: 'create', evidence: $context, version: 1, at: time::now() };
+          CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'manager_recovery',
+            evidence: '系统阻塞已交经理恢复任务；完成后先交经理接续，不直接派员工', recovery_task: $recovery, at: time::now() };
+          LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+          CREATE outbox CONTENT { task: $recovery, kind: 'created', sequence: $seq.value, payload: {}, at: time::now() };
+        } ELSE {
+          IF $t.recovery_stopped != true {
+            UPDATE ONLY $task SET recovery_stopped = true, version += 1;
+            CREATE audit CONTENT { task: $task, actor: 'system:loop-breaker', action: 'recovery_stopped',
+              evidence: '同一任务的恢复交付后再次达到循环上限；停止自动重派，由经理检查恢复方案；不重建恢复链、不自动升级老板', at: time::now() };
+          };
+        };
+        COMMIT;`, { task: id('task', task.id), recovery, expected: task.version,
+          context: `源任务 ${task.id} 已阻塞 ${loops} 次。请补齐结构化前置依赖；必要时真实重采样并交不同员工独立批准，再恢复源任务。不得续期旧证据、放宽目标红线、增加预算或绕过独立验收。恢复任务完成仅表示处置安排已落实，不代表源业务完成。最近原因：${reasons.join(' / ')}` });
       return true;
     } catch { return false; }
   }

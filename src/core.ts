@@ -1,3 +1,4 @@
+import { parseExecutionWindow, windowExpired, recoveryReasonSchema } from './task-recovery.ts';
 import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -162,9 +163,14 @@ export const UNLOCK_CHILDREN_SQL = `
     LET $remaining = SELECT * FROM task WHERE id IN $c_dep_resolved AND ${depUnsatisfiedFor('$child')};
     IF array::len($remaining) = 0 {
       LET $source_phase = $child.resume_state ?? 'ready';
+      LET $manager = $child.dependency_continuation = 'manager';
       LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
       LET $unlocked = UPDATE ONLY $child.id SET
-        state = $restore_phase, version += 1, resume_state = NONE, resume_role = NONE,
+        state = IF $manager THEN 'blocked' ELSE $restore_phase END, version += 1,
+        blocked_to = IF $manager THEN 'gm' ELSE NONE END,
+        resume_state = IF $manager THEN $source_phase ELSE NONE END,
+        resume_role = IF $manager THEN $child.resume_role ELSE NONE END,
+        dependency_continuation = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE;
       CREATE audit CONTENT { task: $child.id, actor: $actor, action: 'dependency_unlocked',
         evidence: '依赖全部完成，按原阻塞阶段恢复', version: $unlocked.version, at: time::now(),
@@ -172,7 +178,7 @@ export const UNLOCK_CHILDREN_SQL = `
         dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
-        payload: { state: $restore_phase, source_phase: $source_phase, restore_phase: $restore_phase,
+        payload: { state: $unlocked.state, source_phase: $source_phase, restore_phase: $restore_phase,
           dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
     };
   };
@@ -219,6 +225,9 @@ interface EmployeeRow {
 }
 
 export interface TaskRow {
+  recovery_stopped?: boolean;
+  dependency_continuation?: 'execute' | 'manager';
+  execution_window?: import('./task-recovery.ts').ExecutionWindow;
   id: RecordId;
   title: string;
   context: string;
@@ -360,6 +369,7 @@ export function waitingOf(row: Pick<TaskRow, 'state' | 'blocked_to' | 'resume_st
 export function view(row: TaskRow): TaskView {
   return {
     id: asId(row.id), title: row.title, context: row.context, state: row.state,
+    executionWindow: row.execution_window ?? undefined, dependencyContinuation: row.dependency_continuation ?? undefined,
     executorRole: row.executor_role, reviewerRole: row.reviewer_role,
     discipline: row.discipline ?? undefined,
     kind: row.kind ?? 'task', goalId: row.goal ? asId(row.goal) : undefined,
@@ -1150,6 +1160,12 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
   }
 
+  private async checkExecutionWindow(taskId: string): Promise<void> {
+    const row = await this.db.select<TaskRow>(id('task', taskId));
+    if (row && row.state !== 'review' && windowExpired(row.execution_window))
+      throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
+  }
+
   async claim(credential: Credential, taskId: TaskId): Promise<ClaimResult> {
     const actor = await this.authorized(credential);
     if (!this.worktrees) return this.claimLease(actor, taskId);
@@ -1364,6 +1380,16 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $active = SELECT * FROM ONLY $who.active_task;
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
       };
+      LET $expired = $t.state != 'review' AND $t.execution_window != NONE AND <datetime>$t.execution_window.notAfter <= time::now();
+      IF $expired {
+        IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'execution window expired under active lease' };
+        LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'gm', resume_state = $t.state, version += 1 RETURN AFTER;
+        CREATE audit CONTENT { task: $task, actor: 'system:execution-window', action: 'block', version: $n.version,
+          recovery_reason: 'stale_window', evidence: '执行窗口已过期；需经理安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
+        LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
+      } ELSE {
+      IF $t.state != 'review' AND $t.recovery_stopped = true { THROW 'automatic recovery stopped' };
       LET $same = $t.current_employee = $employee AND $t.lease_expires_at > $now;
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
@@ -1397,7 +1423,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
-      RETURN $next;
+      };
+      RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
@@ -1413,6 +1440,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const taskView = view(row);
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
+    if (row.state === 'blocked') throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
@@ -2527,6 +2555,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       throw new CompanyError('invalid', 'Invalid lease proof');
     }
     if (evidence) requireText(evidence.text, 'evidence', 20, 30000);
+    if (evidence?.recoveryReason !== undefined && !recoveryReasonSchema.safeParse(evidence.recoveryReason).success) throw new CompanyError('invalid', 'Invalid recoveryReason');
     const idem = evidence ? this.idemId(actor.employeeId, action, evidence.idempotencyKey) : undefined;
     const digest = evidence ? HASH(JSON.stringify({ proof, evidence, to })) : undefined;
     if (idem && digest) {
@@ -2686,7 +2715,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         ${UNLOCK_SQL}
       };
       IF !$heartbeat {
-        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
+        CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: $action, evidence: $evidence, version: $next.version, at: time::now(), recovery_reason: $recovery_reason, phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: $action, sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       };
@@ -2700,7 +2729,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, recovery_reason: action === 'block' ? evidence?.recoveryReason : undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],
@@ -3215,6 +3244,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }): Promise<{ allowed: boolean; attempt: number; charged: boolean; reason?: string; message: string; evidence: Record<string, unknown> } | undefined> {
     const controlledTarget = input.target ?? 'none';
     const now = this.faultClock();
+    await this.checkExecutionWindow(scope.taskId);
     await this.liftRepairedFaults(scope.taskId, now);
     // SYS04 AC02: the attempt runs inside the lease, so it may not outlive the lock. The lease window caps the
     // recovery deadline; the budget itself stays persisted, so a re-claimed lease keeps the same counters.
@@ -3516,6 +3546,20 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     return this.worktrees?.listAudits(limit) ?? [];
   }
 
+  private async validateExecutionWindow(taskId: string, raw: unknown) {
+    const window = parseExecutionWindow(raw);
+    if (windowExpired(window)) throw new CompanyError('invalid', 'Execution window expired; resample and independently approve a fresh candidate');
+    const [facts] = await this.db.query<[Array<{ state: string; goal?: RecordId; digest?: string; expiry?: string }>]>(
+      `SELECT state, goal, (SELECT VALUE digest FROM internal_ai_candidate WHERE task = $approval)[0] AS digest, (SELECT VALUE evidence_expires_at FROM internal_ai_candidate WHERE task = $approval)[0] AS expiry FROM $approval;`,
+      { approval: id('task', window.approvalTask) });
+    const task = await this.db.select<TaskRow>(id('task', taskId));
+    const approved = facts?.[0];
+    if (!task || !approved || approved.state !== 'done' || normalizedId(approved.goal) !== normalizedId(task.goal) ||
+        approved.digest !== window.configurationDigest || approved.expiry !== window.evidenceExpiresAt || !(task.dependencies ?? []).some(d => asId(d) === window.approvalTask))
+      throw new CompanyError('invalid', 'Execution window requires a completed independent approval dependency and matching candidate digest');
+    return window;
+  }
+
   async resume(credential: Credential, taskId: TaskId, evidence: Evidence): Promise<TaskView> {
     return echoTask(await this.resumeRecord(credential, taskId, evidence));
   }
@@ -3538,6 +3582,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (before.state === 'blocked' && before.wait_state === 'waiting') {
       throw new CompanyError('conflict', '任务在等待中；请先 cancel_wait（授权取消）或由受信事件解除，不能用 resume 跳过等待条件');
     }
+    const executionWindow = evidence.executionWindow === undefined ? before.execution_window : await this.validateExecutionWindow(taskId, evidence.executionWindow);
+    if (windowExpired(executionWindow)) throw new CompanyError('invalid', 'Execution window expired; defer for a fresh approval instead of resuming');
     if (before.state === 'blocked') {
       const target = before.resume_state ?? 'ready';
       if (!['ready', 'doing', 'review'].includes(target)) {
@@ -3545,6 +3591,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       }
       if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
     }
+    if (before.recovery_stopped && !(evidence.executionWindow && before.execution_window?.approvalTask !== executionWindow?.approvalTask)) throw new CompanyError('invalid', 'Automatic recovery stopped; add real prerequisites or a new independent approval before resuming');
     // SYS04 AC04: a resume may not walk past a fault whose recovery stopped — the budget is spent, or the cause
     // cannot be recovered at all. The task waits for the one repair chain of that incident instead; the manager is
     // not asked to approve the same failure again.
@@ -3570,7 +3617,19 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $who = SELECT * FROM ONLY $actor;
         LET $t = SELECT * FROM ONLY $task;
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
+        IF $t.version != $expected_version { THROW 'task version moved' };
+        IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
         IF $t.wait_state = 'waiting' { THROW 'task is waiting: cancel or resolve the wait first' };
+        IF $execution_window != NONE {
+          IF <datetime>$execution_window.notAfter <= time::now() { THROW 'execution window expired' };
+          LET $approval = type::record('task', $execution_window.approvalTask);
+          LET $approved = SELECT * FROM ONLY $approval;
+          LET $candidate = SELECT * FROM internal_ai_candidate WHERE task = $approval;
+          IF $approved.state != 'done' OR $approval NOT IN $t.dependencies OR array::len($candidate) != 1 OR
+            $candidate[0].digest != $execution_window.configurationDigest OR $candidate[0].evidence_expires_at != $execution_window.evidenceExpiresAt {
+            THROW 'execution approval moved';
+          };
+        };
         ${RESOLVE_DEP_SQL('$t.dependencies', '$r_dep')}
         LET $remaining = SELECT * FROM task WHERE id IN $r_dep_resolved AND ${depUnsatisfiedFor('$t')};
         LET $source_phase = $t.resume_state ?? 'ready';
@@ -3579,8 +3638,13 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
           state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
           resume_role = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_role END,
           resume_state = IF array::len($remaining) = 0 THEN NONE ELSE $t.resume_state END,
-          blocked_to = NONE, current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
+          blocked_to = NONE, dependency_continuation = NONE, execution_window = $execution_window,
+          recovery_stopped = IF $new_window THEN NONE ELSE $t.recovery_stopped END,
+          current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
           version = $t.version + 1 RETURN AFTER;
+        IF $new_window {
+          CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '绑定新独立批准及有效执行窗口', at: time::now() };
+        };
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'resume', evidence: $evidence, version: $next.version, at: time::now(),
           source_phase: $source_phase, restore_phase: $restore_phase, result: $next.state };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
@@ -3589,7 +3653,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
-        actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text,
+        actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text, execution_window: executionWindow, expected_version: before.version, new_window: evidence.executionWindow !== undefined && before.execution_window?.approvalTask !== executionWindow?.approvalTask,
         idem, digest, audit: id('audit', randomUUID()), outbox: id('outbox', randomUUID()),
       });
       return view(row);
@@ -3705,6 +3769,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     if (input.expectedVersion !== undefined && !Number.isSafeInteger(input.expectedVersion)) {
       throw new CompanyError('invalid', 'Invalid expectedVersion');
     }
+    if (input.continuation !== undefined && !['execute', 'manager'].includes(input.continuation)) throw new CompanyError('invalid', 'Invalid dependency continuation');
     const dependencies = [...new Set(input.dependencies ?? [])];
     if (!dependencies.length || dependencies.length > 20) {
       throw new CompanyError('invalid', 'defer requires 1-20 dependencies');
@@ -3715,7 +3780,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const idem = options.businessScope
       ? this.businessIdemId('defer', input.idempotencyKey)
       : this.idemId(actor.employeeId, 'defer', input.idempotencyKey);
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion }));
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, dependencies, text: input.text, expectedVersion: input.expectedVersion, continuation: input.continuation }));
     const replayed = await this.replay(idem, digest);
     if (replayed) return replayed;
 
@@ -3733,11 +3798,11 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     type DeferredRow = {
       state: TaskState; blocked_to?: 'gm' | 'owner'; resume_state?: TaskState; resume_role?: string;
       submitted_by?: string; reviewer_role: ReviewerRole; current_employee?: string;
-      lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string;
+      lease_expires_at?: number; version: number; dependencies?: RecordId[]; goal?: RecordId; goal_state?: string; execution_window?: unknown;
     };
     // `FROM ONLY` yields the record itself (or NONE), not a list.
     const [before] = await this.db.query<[DeferredRow | undefined]>(
-      'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state FROM ONLY $task;',
+      'SELECT state, blocked_to, resume_state, resume_role, submitted_by, reviewer_role, current_employee, lease_expires_at, version, dependencies, goal, goal.state AS goal_state, execution_window FROM ONLY $task;',
       { task: taskRef });
     if (!before) throw new CompanyError('not_found', 'Task not found');
     if (before.state !== 'blocked' || before.blocked_to !== 'gm' || !['doing', 'ready', 'review'].includes(before.resume_state ?? '')) {
@@ -3816,17 +3881,27 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       } ELSE {
         UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
       };
+      LET $new_deps = array::complement($dependencies, $t.dependencies ?? []);
+      ${RESOLVE_DEP_SQL('$new_deps', '$new_dep')}
+      LET $new_unmet = SELECT VALUE id FROM task WHERE id IN $new_dep_resolved AND ${depUnsatisfiedFor('$t')};
+      IF $t.recovery_stopped = true AND array::len($new_unmet) = 0 AND $continuation != 'manager' { THROW 'automatic recovery stopped: no new unmet prerequisite' };
       LET $m_phase = $t.resume_state ?? 'ready';
       LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
-      LET $next_resume_state = IF array::len($remaining) > 0 AND $m_phase = 'review' THEN 'review' ELSE NONE END;
+      LET $manager = $continuation = 'manager';
+      LET $next_resume_state = IF $manager OR (array::len($remaining) > 0 AND $m_phase = 'review') THEN $m_phase ELSE NONE END;
       LET $next = UPDATE ONLY $task SET
         dependencies = $merged,
-        state = IF array::len($remaining) = 0 THEN $restore_phase ELSE 'blocked' END,
-        blocked_to = NONE,
+        state = IF array::len($remaining) = 0 AND !$manager THEN $restore_phase ELSE 'blocked' END,
+        blocked_to = IF array::len($remaining) = 0 AND $manager THEN 'gm' ELSE NONE END,
+        dependency_continuation = IF array::len($remaining) > 0 THEN $continuation ELSE NONE END,
         resume_state = $next_resume_state,
         resume_role = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         version = $t.version + 1 RETURN AFTER;
+      IF array::len($new_unmet) > 0 {
+        CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '新增真实未完成前置，进入新恢复阶段', at: time::now() };
+        UPDATE ONLY $task SET recovery_stopped = NONE;
+      };
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'deferred', evidence: $evidence, version: $next.version, at: time::now(),
         source_phase: $m_phase, restore_phase: $restore_phase, dependencies_before: $before_refs,
         dependencies_after: $merged, result: $next.state, operator: $employee };
@@ -3838,7 +3913,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       RETURN $next;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
-      dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
+      continuation: input.continuation ?? (before.execution_window ? 'manager' : 'execute'), dependencies: depIds, evidence, added: dependencies.filter(dep => !beforeDeps.includes(dep)).length,
       before_refs: (before.dependencies ?? []).map(dep => id('task', normalizedId(dep))),
       submitted_ref: before.submitted_by ? id('employee', before.submitted_by) : undefined,
       submitted_by: before.submitted_by, epoch_seen: epochSeen,

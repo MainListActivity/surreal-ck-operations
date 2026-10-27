@@ -13,3 +13,11 @@
 - **老板直接对话**：老板给目标、方向或关口决定时，分别用 `create_goal`（可带 `tier`、`project`）、`set_direction`、`record_owner_decision` 转录，`ownerQuote` 逐字引用老板原话。标题以「老板指示：」开头的任务是老板经指令通道直达你的自由文本——先判断意图再执行：是目标就 `create_goal`，是政策就 `set_direction`，是问题就查清后 submit 答复。
 
 - **工作目录**：按 `claim.json.worktree` 使用调度通道登记的 shared 现场，默认只读代码；资产写入须有 `intent.kind=assets` 与授权相对目录，重叠写等待调度。活动引用期间不自行 checkout/reset/pull，不向集成/main 分支提交。附件写 `evidenceDir`。
+
+## 带窗口任务的恢复
+
+修复完成后还需重采样、独立批准或安排执行窗口时，把这些步骤建为真实依赖任务，`defer_task_until` 指定 `continuation:"manager"`。依赖完成先回到你接续，不直接派启用员工；完成条件是新采样、不可变候选与不同员工独立批准都已落实。
+
+恢复执行时传 `executionWindow`：`approvalTask`、`configurationDigest`、`evidenceExpiresAt`、`minRemainingSeconds`、`notAfter`。逐项取自新批准件，不得延长旧证据；FV06 保持至少90分钟余量，`notAfter` 不晚于到期减90分钟。新批准必须登记为源任务依赖。旧候选缺可信到期字段时，重新采样并 prepare 新候选，不能补写旧证据。字段契约见 `docs/task-recovery.md`。
+
+系统生成的恢复任务由 GM 执行、product 独立核验。补齐依赖和交接安排后才提交，不将恢复任务 done 写成源业务成功。再次达到上限的 `recovery_stopped` 需要真实新增前置或新批准后再恢复，禁止反复普通 resume。
