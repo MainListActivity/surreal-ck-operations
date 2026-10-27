@@ -18,6 +18,7 @@ import { OwnerDesk } from '../src/owner.ts';
 import { ProjectStore } from '../src/projects.ts';
 import { Workforce, type EmployeeDef, type EmployeeInst, type ProviderHealth, type SupervisedTask } from '../src/workforce.ts';
 import { staffingPool, type InstState } from '../src/dispatcher/dispatcher.ts';
+import { workspaceScopeFor } from '../src/goal-workspace-capability.ts';
 import { OpsBroker } from '../src/ops/broker.ts';
 import { connectCompanyClient } from '../src/mcp/client.ts';
 import { createMcpHttpService } from '../src/mcp/server.ts';
@@ -568,7 +569,10 @@ test('AC03/RB01 isolation: policy_plan shows the affected tasks, policy_enforce 
   if (!task) throw new Error('isolated task is not in the dispatcher task list');
   const poolDef: EmployeeDef = { id: 'pool-def', role: 'engineering', provider: 'codex', model: 'm1', enabled: true,
     maxInstances: 2, priority: 100, weight: 10, scored: 0, errorStreak: 0 };
-  const poolInst: EmployeeInst = { id: 'pool-inst', role: 'engineering', def: 'pool-def', provider: 'codex', model: 'm1', paseoAgentId: 'ag-pool' };
+  // 静置实例按真实 spawn 形态带 workspaceScope（dispatcher 1548）：没有 scope 的旧会话只允许续做在手任务，
+  // 会被工作区过滤排除（dispatcher 337-341），夹具缺它会让池子少掉 reuse 路径，而不是策略判定把人拦下。
+  const poolInst: EmployeeInst = { id: 'pool-inst', role: 'engineering', def: 'pool-def', provider: 'codex', model: 'm1', paseoAgentId: 'ag-pool',
+    workspaceScope: workspaceScopeFor(task.goalId) };
   const poolInput = { role: 'engineering' as const, home: '/fixture/policy', task, defs: [poolDef], insts: [poolInst],
     states: new Map<string, InstState>([['pool-inst', 'idle']]), holding: new Set<string>(), health: new Map<string, ProviderHealth>(),
     quotaBlocked: new Map<string, string>(), busyBy: new Map<string, number>(), providerMax: { codex: 3 }, slots: new Map<string, string>(),
