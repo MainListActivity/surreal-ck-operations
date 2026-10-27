@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { agingLevel, agingText, formatAge, localDate, renderBrief, type BriefData, type WaitingItem } from '../src/owner-brief.ts';
+import type { GoalBlocker, GoalFinalGateView } from '../src/goal-governance.ts';
 import { evaluateDispatch, globalBlock } from '../src/dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList, dispatchBlockedRows } from '../src/dispatcher/dispatch-list.ts';
 
@@ -88,4 +89,27 @@ test('brief names every blocked item of the pass row by row, and says how many i
   expect(short).toContain('【无法派工】共 4 项');
   expect(short).toContain('- 另有 2 项未逐条列出，见岗位页面');
   expect(short).toContain('独立验收'); expect(short).not.toContain('就绪实现');
+});
+
+// SYS07 follow-up: the active SYS07 goal sat on card 27 behind the old first-page read. The brief now carries
+// every parallel blocker with responsibility/holder/path/wait/trigger and the effective final gate with its evidence.
+test('the brief names every blocker with responsibility, holder, path, wait, trigger and the final gate', () => {
+  const blockers: GoalBlocker[] = [
+    { taskId: 't1', title: '客户激活', kind: 'wait', summary: '等待客户激活：客户回执', responsibleRole: 'engineering',
+      holder: 'eng-holder', waitedMinutes: 90, nextTrigger: '2026-10-28T00:00:00.000Z',
+      dependencyPath: [{ taskId: 'gate', title: '终验' }, { taskId: 't1', title: '客户激活' }],
+      handoff: { kind: 'customer_activation', ownerRole: 'customer', pendingAction: '请客户确认激活', completed: ['内部验收'] } },
+    { taskId: 't2', title: '经理决策', kind: 'manager', summary: '等待经理动作', responsibleRole: 'gm',
+      dependencyPath: [{ taskId: 't2', title: '经理决策' }] },
+  ];
+  const finalGate: GoalFinalGateView = { taskId: 'gate', title: '终验', state: 'review', reviewerRole: 'owner',
+    ownerGate: true, effective: true, superseded: false, evidenceTaskIds: ['e1'] };
+  const { text } = renderBrief({ ...data, waiting: [], stuck: [], resources: [], capacity: [],
+    dispatchBlocked: { total: 0, rows: [] },
+    goals: [{ title: 'SYS07 目标', days: 12, needsRepair: true, blockers, finalGate }] });
+  for (const part of [
+    'SYS07 目标（已 12 天，待修复）', '责任：engineering', '持有人：eng-holder', '已等 90 分钟',
+    '下一触发：2026-10-28T00:00:00.000Z', '依赖路径：终验 → 客户激活', '交接：待办：请客户确认激活',
+    '阻点[manager] 等待经理动作；责任：gm', '终验：《终验》（review，复核 owner，老板关口）；证据任务：e1',
+  ]) expect(text).toContain(part);
 });

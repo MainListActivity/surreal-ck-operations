@@ -1,8 +1,8 @@
 /** v1 core/adapter boundary. The MCP adapter supplies an opaque credential on every call. */
 import type { WaitHandoffCard, WaitMigrationCandidate } from './waits.ts';
 import type { GoalCard, GoalEvidenceFact, GoalEvidenceInput, GoalOutcomeFact, RequiredEvidenceKind } from './goal-governance.ts';
-import type { GoalMetricsView } from './goal-metrics.ts';
-import type { GoalFinalGatePreview, GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanView } from './goal-store.ts';
+import type { GoalMetricsAnswer, GoalMetricsSection, GoalMetricsView } from './goal-metrics.ts';
+import type { GoalFinalGatePreview, GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView } from './goal-store.ts';
 /** 'eval' is a workforce-only judge role: it reads task history and writes scorecards, never claims tasks. */
 export type Role = 'gm' | 'product' | 'engineering' | 'ai-content' | 'concept-design' | 'asset-production' | 'screenwriter' | 'story-author' | 'cinematography' | 'qa' | 'cs' | 'eval';
 export const ROLES: readonly Role[] = ['gm', 'product', 'engineering', 'ai-content', 'concept-design', 'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs', 'eval'];
@@ -874,6 +874,11 @@ export interface GoalMetricsQuery {
   to?: string;
   timezone?: string;
   goalId?: string;
+  /** A full answer over the response budget is served as sections; ask for one section at a time. */
+  section?: GoalMetricsSection;
+  /** Page size for list-shaped sections (usage_by_goal, missing evidence, day_series, blocks_by_actor). */
+  pageSize?: number;
+  cursor?: string;
 }
 
 /** deliveryId + fence are mandatory for every write after claim. */
@@ -1268,9 +1273,9 @@ export interface CompanyCore {
   /** SYS07: one paged, read-only goal console (deadline, outcome stages, blockers, gate, evidence). */
   goalConsole?(credential: Credential, input: GoalConsoleQuery): Promise<GoalPageView>;
   /** SYS07: read-only dry-run over active goals; never closes, voids or approves anything. */
-  goalGovernanceScan?(credential: Credential): Promise<GoalScanView>;
-  /** SYS07: windowed business metrics with denominators, coverage and unknowns. */
-  goalMetrics?(credential: Credential, input: GoalMetricsQuery): Promise<GoalMetricsView>;
+  goalGovernanceScan?(credential: Credential, input?: GoalScanQuery): Promise<GoalScanView>;
+  /** SYS07: read-only goal governance metrics; a full answer over budget is segmented by section. */
+  goalMetrics?(credential: Credential, input?: GoalMetricsQuery): Promise<GoalMetricsAnswer>;
   /** SYS07: register/replace a goal's structured outcome under a version CAS. */
   goalOutcomeRegister?(credential: Credential, input: GoalOutcomeRegisterInput): Promise<GoalOutcomeView>;
   /** SYS07: record one immutable outcome receipt (customer activation/adoption or QA/release record). */
@@ -1570,8 +1575,10 @@ export interface CompanyBrief {
   directions: { text: string; source: string; at: string }[];
   goals: GoalView[];
   /** SYS07: the same goal cards the console/daily brief use; the MCP company block strips them to keep its
-   * bounded response, and callers read them through goal_console instead. */
+   * bounded response, and callers read them through goal_console instead. The console caps the list for display;
+   * goalCardCoverage says how many of the total were shown and that the order is active-blocker priority. */
   goalCards?: GoalCard[];
+  goalCardCoverage?: { shown: number; total: number; omitted: number; snapshotAt: string; prioritized: true };
   projects: ProjectView[];
   paused: boolean;
 }

@@ -394,10 +394,21 @@ export class OwnerDesk {
     ]>(`SELECT text, source, at FROM direction ORDER BY at DESC LIMIT 10;
       SELECT * FROM goal WHERE state IN ['triage', 'active', 'needs_repair'] ORDER BY created_at;
       SELECT paused FROM company_meta:config;`);
-    const goalCards = await this.goals.page({ pageSize: 20 }).then(page => page.goals).catch(() => []);
+    const snapshot = await this.goals.cardsSnapshot({ states: ['triage', 'active', 'needs_repair'] })
+      .catch(() => ({ cards: [] as GoalCard[], snapshotAt: new Date().toISOString() }));
+    // The console shows every goal with an active blocker or repair gap (never hidden behind a quiet first page),
+    // then fills to a display cap. goalCardCoverage states shown/total instead of pretending the list is complete.
+    const active = snapshot.cards.filter(card => card.needsRepair || card.blockers.length > 0 || card.outcome.missing.length > 0);
+    const goalCards = snapshot.cards.slice(0, Math.max(30, active.length));
+    const goalCardCoverage = snapshot.cards.length ? {
+      shown: goalCards.length, total: snapshot.cards.length, omitted: snapshot.cards.length - goalCards.length,
+      snapshotAt: snapshot.snapshotAt, prioritized: true as const,
+    } : undefined;
     return {
       directions: directions.map(d => ({ text: d.text, source: d.source, at: String(d.at) })),
-      goals: goals.map(goalView), goalCards, projects: await new ProjectStore(this.db).list(), paused: Boolean(config[0]?.paused),
+      goals: goals.map(goalView), goalCards,
+      ...(goalCardCoverage ? { goalCardCoverage } : {}),
+      projects: await new ProjectStore(this.db).list(), paused: Boolean(config[0]?.paused),
     };
   }
 
@@ -655,15 +666,18 @@ export class OwnerDesk {
       ...health.filter(h => h.state !== 'healthy').map(h => `${asId(h.id)} ${h.state}${h.last_error ? `：${h.last_error.slice(0, 60)}` : ''}`),
       ...quotas.filter(q => (q.lowest_pct ?? 100) <= 2).map(q => `${asId(q.id).replace('quota_', '')} 额度剩余 ${q.lowest_pct}%`),
     ];
-    const goalCards = await this.goals.page({ pageSize: 20 }).then(page => page.goals).catch(() => []);
-    const cardsById = new Map(goalCards.map(card => [card.goalId, card]));
+    // The daily brief reads one activity-ordered snapshot, not the first console page: a goal behind page one
+    // (the active SYS07 goal was card 27) is still named when it has a blocker or needs repair.
+    const snapshot = await this.goals.cardsSnapshot({ states: ['active', 'needs_repair'] })
+      .catch(() => ({ cards: [] as GoalCard[], snapshotAt: new Date().toISOString() }));
+    const cardsById = new Map(snapshot.cards.map(card => [card.goalId, card]));
     return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rolledBack, rejected: n('owner_reject'), retired: n('retire') },
       goals: goals.map(g => {
         const card = cardsById.get(asId(g.id));
         return { title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)),
           ...(card ? { id: card.goalId, needsRepair: card.needsRepair, deadline: card.deadline,
-            blocker: card.blockers[0]?.summary, nextTrigger: card.blockers[0]?.nextTrigger,
-            missingEvidence: card.outcome.missing } : {}) };
+            blockers: card.blockers, ...(card.blockersOmitted ? { blockersOmitted: card.blockersOmitted } : {}),
+            finalGate: card.finalGate, missingEvidence: card.outcome.missing, taskTotal: card.taskTotal } : {}) };
       }),
       resources, capacity, dispatchBlocked: briefDispatch(dispatch),
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };

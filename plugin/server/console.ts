@@ -393,6 +393,20 @@ async function openGoal(gid){
   el.dataset.open='1';const d=document.createElement('div');d.className='docbody';d.textContent='加载中…';el.appendChild(d);
   await reloadGoalTasks(gid);
 }
+function goalBlockerHtml(b){
+  var parts=['<b>'+esc(b.kind)+'</b> · '+esc(b.summary)];
+  if(b.responsibleRole)parts.push('责任：'+esc(b.responsibleRole));
+  if(b.holder)parts.push('持有人：'+esc(b.holder));
+  if(b.waitedMinutes!==undefined)parts.push('已等 '+b.waitedMinutes+' 分钟');
+  if(b.nextTrigger)parts.push('下一触发：'+esc(b.nextTrigger));
+  if(b.dependencyPath&&b.dependencyPath.length)parts.push('依赖路径：'+b.dependencyPath.map(function(p){return esc(p.title)}).join(' → ')+(b.dependencyPathTruncated?' …':''));
+  if(b.handoff){var h=b.handoff.pendingAction?('待办：'+esc(b.handoff.pendingAction)):((b.handoff.completed&&b.handoff.completed.length)?('已完成 '+b.handoff.completed.length+' 项'):esc(b.handoff.kind));parts.push('交接：'+h)}
+  return parts.join('；');
+}
+function goalFinalGateHtml(fg){
+  if(!fg||!fg.taskId)return '终验：缺失';
+  return '终验：《'+esc(fg.title||fg.taskId)+'》（'+esc(fg.state||'未知')+(fg.reviewerRole?'，复核 '+esc(fg.reviewerRole):'')+(fg.ownerGate?'，老板关口':'')+(fg.effective?'':'，已被替代')+'）；证据任务：'+esc((fg.evidenceTaskIds||[]).join(', ')||'无');
+}
 function render(){
   const m=document.getElementById('m');
   if(T==='todo'){
@@ -418,15 +432,21 @@ function render(){
     [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=document.getElementById('at-'+x.task.id);if(e)atts(e,x.task.id)});
   }else if(T==='goals'){
     var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});
-    m.innerHTML=((BRIEF&&BRIEF.goals)||[]).map(function(g){
-      var c=cards[g.id]||{};
+    var coverage=BRIEF&&BRIEF.goalCardCoverage;
+    var rows=((BRIEF&&BRIEF.goals)||[]);
+    var cover=(coverage&&coverage.omitted>0)?('<div class="meta">目标详情已展示 '+coverage.shown+'/'+coverage.total+'（按活动阻点优先；未展开的目标只显示标题）</div>'):'';
+    m.innerHTML=cover+(rows.map(function(g){
+      var c=cards[g.id];
+      if(!c){return '<div class="card glist" id="gt-'+g.id+'"><h3>'+esc(g.title)+'</h3><div class="meta">详情未展开（已展示 '+(coverage?coverage.shown:0)+'/'+(coverage?coverage.total:rows.length)+'）</div><div class="row"><button class="act no" onclick="cancelGoal(\\''+g.id+'\\')">取消目标</button></div></div>'}
       var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString()):'截止未知';
       var stages=(c.stages||[]).map(function(x){return esc(x.label)+'='+({done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知')}).join(' · ');
       var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<div class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</div>'):'';
       var repair=c.needsRepair?('<div class="meta" style="color:#b00">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</div>'):'';
-      var blockers=(c.blockers&&c.blockers.length)?('<div class="body" style="max-height:160px"><b>当前阻点</b><br>'+c.blockers.map(function(b){return esc(b.kind)+' · '+esc(b.summary)+(b.nextTrigger?(' · 下一触发 '+esc(b.nextTrigger)):'')+(b.waitedMinutes!==undefined?(' · 已等 '+b.waitedMinutes+' 分钟'):'')}).join('<br>')+'</div>'):'';
-      return '<div class="card glist" id="gt-'+g.id+'"><h3>'+esc(g.title)+'</h3><div class="meta"><span class="tier">'+esc(g.tier)+'</span> <span class="st">'+esc(g.state)+'</span> '+(g.project?esc(g.project):'')+' · '+esc(deadline)+'</div><div class="meta">阶段：'+stages+'</div>'+missing+repair+blockers+'<div class="body" style="max-height:120px">'+esc(g.brief||'')+'</div><div class="row"><button class="act mid" onclick="openGoal(\\''+g.id+'\\')">查看任务</button><button class="act no" onclick="cancelGoal(\\''+g.id+'\\')">取消目标</button></div></div>';
-    }).join('')||'<div class="empty">无在办目标</div>';
+      var blockers=(c.blockers&&c.blockers.length)?('<div class="body" style="max-height:260px"><b>当前阻点</b><br>'+c.blockers.map(function(b){return goalBlockerHtml(b)}).join('<br>')+(c.blockersOmitted?('<br>另有 '+c.blockersOmitted+' 个阻点未展示（卡片上限）'):'')+'</div>'):'';
+      var finalLine='<div class="meta">'+goalFinalGateHtml(c.finalGate)+'</div>';
+      var total='<div class="meta">任务 '+(c.taskTotal||0)+' 个</div>';
+      return '<div class="card glist" id="gt-'+g.id+'"><h3>'+esc(g.title)+'</h3><div class="meta"><span class="tier">'+esc(g.tier)+'</span> <span class="st">'+esc(g.state)+'</span> '+(g.project?esc(g.project):'')+' · '+esc(deadline)+'</div><div class="meta">阶段：'+stages+'</div>'+finalLine+missing+repair+total+blockers+'<div class="body" style="max-height:120px">'+esc(g.brief||'')+'</div><div class="row"><button class="act mid" onclick="openGoal(\\''+g.id+'\\')">查看任务</button><button class="act no" onclick="cancelGoal(\\''+g.id+'\\')">取消目标</button></div></div>';
+    }).join('')||'<div class="empty">无在办目标</div>');
   }else if(T==='docs'){
     if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
     const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));

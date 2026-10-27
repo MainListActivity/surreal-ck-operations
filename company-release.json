@@ -1,26 +1,19 @@
 {
-  "version": "0.3.4",
-  "title": "模型排序权重、预览与新模型试用（含目标终验治理）",
+  "version": "0.3.5",
+  "title": "治理看板分页与全量呈现修复",
   "changes": [
-    "Haiku、Sonnet 按能力档、免费/套餐积分/额外付费分层，并使用可配置权重评分；不调用JEV",
-    "Paseo与网页支持六项权重、能力档宽度、逐模型计费分类、排名预览和各项分数贡献",
-    "无请求记录的新模型优先试用，试用期间请求触发的观测检查缩短至30秒；失败按模型ID隔离",
-    "引入显式最终验收机制：目标完成由有效终验关口、老板真实批准与已登记的必需（required）客户证据共同决定，不再静默关闭",
-    "新增 goal_console / goal_governance_scan / goal_metrics 管理看板与经营指标（周期、一次通过率、阻塞、唤醒、成本与客户证据覆盖）",
-    "终验关口作废或被替代时目标进入 needs_repair，由 gm 用 goal_final_gate_repair 按版本 CAS 替换关口引用",
-    "缺必需客户回执时目标同样进入 needs_repair，由 gm 用 goal_evidence_record 登记真实回执后 goal_finalize 重算；两条修复路径互不替代",
-    "本版本同时包含此前已合入 main 的 v0.3.1 浏览器注入故障隔离与 v0.3.2 排序设置文本化修复"
+    "goal_governance_scan 增加确定性分页：pageSize/cursor、snapshotAt、总数与稳定排序，每页在 48 KiB 预算内；按 nextCursor 可翻完，未展示或压缩的卡片显式标注",
+    "goal_metrics 超预算时按 section 分段（周期、验收、阻塞、唤醒、用量、事件、客户证据、日序列），列表分段可翻页；窗口、IANA 时区、分母、排除项、截止、coverage 与未知成本口径保持",
+    "老板网页控制台与每日简报改用服务端活动阻点优先快照：后页目标（如 SYS07 第 27 卡）不再丢失，超过展示上限时显示已展示 X/Y",
+    "逐项呈现每个并行阻点的责任岗位、持有人、依赖路径、已等时长、下一触发条件，以及有效终验关口与证据；卡片上限与截断显式披露",
+    "保留 needs_repair/终验 CAS、只读 dry-run 语义与 SYS05 交接脱敏；本版本同时包含此前已合入 main 的 v0.3.4 排序权重与目标终验治理"
   ],
   "impact": [
-    "默认模型顺序改为能力相近时免费和套餐积分优先；六项权重只在同一能力档与计费层内生效",
-    "预览不发布顺序且不调用模型；保存保留现有刷新间隔，Opus/Fable继续手动维护",
-    "现有无 outcome 契约的目标首次终验会进入 needs_repair，需 gm 登记成果契约后重算",
-    "owner_final 必须由 owner 终验关口且 accepted_by=owner 满足，经理终验不能替代",
-    "void 实现任务若无已完成继任修订会阻断完成；授权 outcome 变更可清除该缺口",
-    "expired SYS05 等待在目标卡显示为已过期并给出取消/延期后的下一动作",
-    "跨窗客户证据按 cutoff 前已存在证据统计，不重复报 missing；成本缺供应商账单时保持 unknown",
+    "大扫描与大窗口不再因单次响应超过 49152 字节被拒绝；调用方按 page.nextCursor 或 section 取完整数据",
+    "控制台/简报有展示上限时明确显示已展示 X/Y 并按活动阻点优先，不再静默丢掉有阻点或需修复的后页目标",
+    "无 schema 变更、无历史改写；回滚到 v0.3.4 安全，旧版忽略新增的分页/分段响应字段",
     "真实 GM 通道同快照对账、客户线下回执与发布后生产 QA 由上线验证腿完成；客户回执不得由 AI 代填"
   ],
-  "migration": "新增可选ranking_policy配置，旧配置使用默认权重；同时包含前版schema/042-goal-governance.surql（goal_outcome、goal_evidence表与goal可选字段），schema_version 42；只新增、无历史改写。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.2 0af914e；若尚未切换则为 v0.3.1 0dbe6b5）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；仅 goal_governance_scan/goal_metrics 响应增加分页/分段字段，console/brief 改为读取全量快照。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.4 2734012）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }

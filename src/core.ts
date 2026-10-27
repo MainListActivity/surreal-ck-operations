@@ -46,9 +46,9 @@ import {
 } from './faults.ts';
 import { WaitStore, waitRecordOf, type WaitRow } from './wait-store.ts';
 import { GoalGovernanceStore } from './goal-store.ts';
-import type { GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanView, GoalFinalGatePreview } from './goal-store.ts';
+import type { GoalFinalGateRepairResult, GoalOutcomeView, GoalPageView, GoalScanQuery, GoalScanView, GoalFinalGatePreview } from './goal-store.ts';
 import type { GoalCard, GoalEvidenceFact } from './goal-governance.ts';
-import type { GoalMetricsView } from './goal-metrics.ts';
+import { segmentGoalMetrics, type GoalMetricsAnswer, type GoalMetricsView } from './goal-metrics.ts';
 import {
   assertNonSensitive, isTimeZone, migrationPreview, normalizeWait, parseInstant, validateEvent, verifyWaitWebhook,
   waitEventKey, waitKeyOf, webhookPayload, type WaitEvent, type WaitHandoffCard, type WaitInput,
@@ -4433,13 +4433,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /** SYS07: read-only dry-run over active, needs_repair and done goals; never changes a goal, task or owner decision. */
-  async goalGovernanceScan(credential: Credential): Promise<GoalScanView> {
+  async goalGovernanceScan(credential: Credential, input: GoalScanQuery = {}): Promise<GoalScanView> {
     await this.requireGoalManager(credential);
-    return this.goals.scan();
+    try {
+      return await this.goals.scan(input);
+    } catch (error) {
+      throw new CompanyError('invalid', (error as Error).message);
+    }
   }
 
   /** SYS07: windowed metrics with explicit denominators, coverage and unknown cost. */
-  async goalMetrics(credential: Credential, input: GoalMetricsQuery = {}): Promise<GoalMetricsView> {
+  async goalMetrics(credential: Credential, input: GoalMetricsQuery = {}): Promise<GoalMetricsAnswer> {
     await this.requireGoalManager(credential);
     const now = Date.now();
     const to = input.to ?? new Date(now).toISOString();
@@ -4452,8 +4456,17 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const timezone = input.timezone ?? 'UTC';
     if (!isTimeZone(timezone)) throw new CompanyError('invalid', 'timezone 必须是 IANA 时区');
     try {
-      return await this.goals.metrics({ from, to, timezone, explicit: input.from !== undefined || input.to !== undefined,
+      const view = await this.goals.metrics({ from, to, timezone, explicit: input.from !== undefined || input.to !== undefined,
         ...(input.goalId ? { goalId: input.goalId } : {}) });
+      // Small windows keep the existing whole view. A full answer over the response budget is never cut: the caller
+      // gets a section index and reads each section (paging its lists) until it has the whole window.
+      if (!input.section && answerBytes(view) <= RESPONSE_BUDGET_BYTES) return view;
+      return segmentGoalMetrics(view, {
+        ...(input.section ? { section: input.section } : {}),
+        ...(input.pageSize !== undefined ? { pageSize: input.pageSize } : {}),
+        ...(input.cursor ? { cursor: input.cursor } : {}),
+        scope: `${from}\0${to}\0${timezone}\0${input.goalId ?? ''}`,
+      });
     } catch (error) {
       throw new CompanyError('invalid', (error as Error).message);
     }

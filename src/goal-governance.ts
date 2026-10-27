@@ -139,6 +139,8 @@ export interface GoalBlocker {
   waitedMinutes?: number;
   nextTrigger?: string;
   dependencyPath: Array<{ taskId: string; title: string }>;
+  /** The card capped the path; the omitted tail is disclosed instead of silently dropped. */
+  dependencyPathTruncated?: boolean;
   handoff?: {
     kind: string;
     ownerRole: string;
@@ -199,6 +201,8 @@ export interface GoalCard extends GoalAssessment {
   project?: string;
   createdAt?: number;
   needsRepairStored?: boolean;
+  /** A single card was reduced to fit one response page; the reader is told the detail was omitted. */
+  detailsOmitted?: boolean;
 }
 
 const STAGE_LABELS: Record<GoalStageKey, string> = {
@@ -355,7 +359,9 @@ function blockerFor(
         waitedMinutes: Math.max(0, Math.floor((now - task.dispatchBlockedSince * 1000) / 60_000)) } : {}) };
   }
   if (task.blockedTo === 'gm') {
-    return { ...base, kind: 'manager', summary: '等待经理动作', responsibleRole: 'gm' };
+    return { ...base, kind: 'manager', summary: '等待经理动作', responsibleRole: 'gm',
+      ...(task.dispatchBlockedSince ? { waitedSince: task.dispatchBlockedSince * 1000,
+        waitedMinutes: Math.max(0, Math.floor((now - task.dispatchBlockedSince * 1000) / 60_000)) } : {}) };
   }
   const openDeps = task.dependencies.filter(dep => unresolved.has(dep));
   if (task.state === 'blocked' && openDeps.length) {
@@ -513,7 +519,7 @@ export function assessGoal(input: {
   const blockers = tasks
     .filter(task => !TERMINAL.has(task.state))
     .map(task => blockerFor(task, waitByTask.get(task.id), faultByTask.get(task.id), byId, finalId, now, unresolved))
-    .sort((a, b) => severity(b) - severity(a) || (b.waitedMinutes ?? 0) - (a.waitedMinutes ?? 0) || a.taskId.localeCompare(b.taskId));
+    .sort((a, b) => blockerSeverity(b) - blockerSeverity(a) || (b.waitedMinutes ?? 0) - (a.waitedMinutes ?? 0) || a.taskId.localeCompare(b.taskId));
 
   const effectiveFinalView = final ? !superseded : false;
   const deadline = goal.deadline !== undefined
@@ -552,7 +558,7 @@ export function assessGoal(input: {
   };
 }
 
-function severity(blocker: GoalBlocker): number {
+export function blockerSeverity(blocker: GoalBlocker): number {
   switch (blocker.kind) {
     case 'fault': return 7;
     case 'owner': return 6;

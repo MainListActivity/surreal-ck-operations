@@ -5,6 +5,8 @@
  * tokens, weights or durations. Actual cost is `unknown` unless every contributing usage row carries a provider
  * billed amount, and the denominator/coverage that produced that answer is part of the result.
  */
+import { createHash } from 'node:crypto';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from './response-budget.ts';
 import type { GoalEvidenceKind } from './goal-governance.ts';
 
 export interface GoalMetricsWindow {
@@ -440,4 +442,194 @@ export function computeGoalMetrics(source: GoalMetricsSource): GoalMetricsView {
     coverage: { goals: source.goals.length, tasks: source.tasks.length, audits: source.audits.length,
       wakes: source.wakes.length, usage: source.usage.length, evidence: source.evidence.length },
   };
+}
+
+// ---- SYS07 follow-up: deterministic metrics segmentation ----
+//
+// A window that fits one answer still returns the full GoalMetricsView. A larger window is served as sections;
+// every section repeats the window/timezone/denominators/exclusions/cutoff/coverage so the reader can reconcile
+// it with the full口径, and list-shaped sections page with a cursor. Token counts are never turned into cost.
+
+export type GoalMetricsSection =
+  | 'cycle' | 'acceptance' | 'blocks' | 'blocks_by_actor' | 'wakes'
+  | 'usage' | 'usage_by_goal' | 'events'
+  | 'customer_evidence' | 'customer_evidence_missing_activation' | 'customer_evidence_missing_adoption'
+  | 'day_series';
+
+export interface GoalMetricsSectionInfo {
+  key: GoalMetricsSection;
+  /** Rows the section covers; 1 for a scalar section. */
+  total: number;
+  /** True when the section takes pageSize/cursor. */
+  pageable: boolean;
+}
+
+export interface GoalMetricsPageInfo {
+  pageSize: number; returned: number; hasMore: boolean; nextCursor?: string; total: number; budgetBytes: number;
+}
+
+/** One section (or the compact index when `section` is null) of a metrics answer over the response budget. */
+export interface GoalMetricsSegmentView {
+  segmented: true;
+  section: GoalMetricsSection | null;
+  window: GoalMetricsView['window'];
+  definitions: Record<string, string>;
+  denominators: GoalMetricsView['denominators'];
+  exclusions: string[];
+  coverage: GoalMetricsView['coverage'];
+  sections: GoalMetricsSectionInfo[];
+  page?: GoalMetricsPageInfo;
+  data?: Record<string, unknown>;
+  guidance: string;
+}
+
+export type GoalMetricsAnswer = GoalMetricsView | GoalMetricsSegmentView;
+
+export const isGoalMetricsSegment = (value: GoalMetricsAnswer): value is GoalMetricsSegmentView =>
+  'segmented' in value && value.segmented === true;
+
+const METRICS_SECTIONS: GoalMetricsSection[] = [
+  'cycle', 'acceptance', 'blocks', 'blocks_by_actor', 'wakes',
+  'usage', 'usage_by_goal', 'events',
+  'customer_evidence', 'customer_evidence_missing_activation', 'customer_evidence_missing_adoption',
+  'day_series',
+];
+
+const PAGED_SECTIONS: ReadonlySet<GoalMetricsSection> = new Set([
+  'blocks_by_actor', 'usage_by_goal', 'customer_evidence_missing_activation',
+  'customer_evidence_missing_adoption', 'day_series',
+]);
+
+function sectionTotal(view: GoalMetricsView, section: GoalMetricsSection): number {
+  switch (section) {
+    case 'cycle':
+    case 'acceptance':
+    case 'blocks':
+    case 'usage':
+    case 'events':
+    case 'customer_evidence':
+      return 1;
+    case 'blocks_by_actor': return Object.keys(view.blocks.byActor).length;
+    case 'wakes': return view.wakes.byTask.length;
+    case 'usage_by_goal': return view.usage.byGoal.length;
+    case 'customer_evidence_missing_activation': return view.customerEvidence.missingActivation.length;
+    case 'customer_evidence_missing_adoption': return view.customerEvidence.missingAdoption.length;
+    case 'day_series': return view.daySeries.length;
+  }
+}
+
+const metricsCursorDigest = (scope: string, section: GoalMetricsSection): string =>
+  createHash('sha256').update(`${scope}\0${section}`).digest('hex');
+
+function sealMetricsCursor(scope: string, section: GoalMetricsSection, offset: number): string {
+  return Buffer.from(JSON.stringify({ v: 1, q: metricsCursorDigest(scope, section), s: section, o: offset })).toString('base64url');
+}
+
+function openMetricsCursor(scope: string, section: GoalMetricsSection, cursor: string | undefined): number {
+  if (!cursor) return 0;
+  try {
+    const body = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { v?: number; q?: string; s?: string; o?: number };
+    if (body.v !== 1 || body.q !== metricsCursorDigest(scope, section) || body.s !== section ||
+      !Number.isSafeInteger(body.o) || (body.o ?? -1) < 0) throw new Error('bad cursor');
+    return body.o!;
+  } catch {
+    throw new Error('goal metrics cursor is invalid or belongs to another section or window');
+  }
+}
+
+/**
+ * Segment one full metrics view. With no section it returns the compact index; with a section it returns that
+ * section, paging any list so every answer stays inside RESPONSE_BUDGET_BYTES. The window, IANA timezone,
+ * denominators, exclusions, cutoff and coverage travel with every segment.
+ */
+export function segmentGoalMetrics(view: GoalMetricsView, input: {
+  section?: GoalMetricsSection;
+  pageSize?: number;
+  cursor?: string;
+  /** Stable window/goal scope the cursor is bound to. */
+  scope: string;
+}): GoalMetricsSegmentView {
+  const sections = METRICS_SECTIONS.map(key => ({ key, total: sectionTotal(view, key), pageable: PAGED_SECTIONS.has(key) }));
+  const base = (section: GoalMetricsSection | null, page?: GoalMetricsPageInfo, data?: Record<string, unknown>): GoalMetricsSegmentView => ({
+    segmented: true, section, window: view.window, definitions: view.definitions,
+    denominators: view.denominators, exclusions: view.exclusions, coverage: view.coverage, sections,
+    ...(page ? { page } : {}), ...(data ? { data } : {}),
+    guidance: 'gm 只读指标分段：每个分段都带窗口、IANA 时区、分母、排除项、数据截止与 coverage；token 与成本不互算，缺 provider 账单为 unknown。列表分段用 page.nextCursor 翻页直到 page.hasMore=false；全部 section 可从本响应的 sections 索引取得。',
+  });
+  if (!input.section) return base(null);
+  const section = input.section;
+  const pageSize = Math.max(1, Math.min(100, Math.trunc(input.pageSize ?? 20)));
+  const offset = openMetricsCursor(input.scope, section, input.cursor);
+
+  const single = (data: Record<string, unknown>): GoalMetricsSegmentView => {
+    const answer = base(section, undefined, data);
+    if (answerBytes(answer) > RESPONSE_BUDGET_BYTES) {
+      throw new Error(`metrics section ${section} exceeds the response budget; narrow the window or goalId`);
+    }
+    return answer;
+  };
+  const paged = <T>(items: T[], buildData: (kept: T[]) => Record<string, unknown>): GoalMetricsSegmentView => {
+    const remaining = items.slice(offset);
+    const built = (kept: T[]): GoalMetricsSegmentView => {
+      const end = offset + kept.length;
+      const hasMore = end < items.length;
+      return base(section, {
+        pageSize, returned: kept.length, hasMore,
+        ...(hasMore ? { nextCursor: sealMetricsCursor(input.scope, section, end) } : {}),
+        total: items.length, budgetBytes: RESPONSE_BUDGET_BYTES,
+      }, buildData(kept));
+    };
+    // Greedy, measured as it is sent; one entry that cannot fit is an explicit refusal, never a silent cut.
+    const kept: T[] = [];
+    for (const item of remaining) {
+      const next = [...kept, item];
+      if (answerBytes(built(next)) > RESPONSE_BUDGET_BYTES) break;
+      kept.push(item);
+    }
+    if (!kept.length && remaining.length) {
+      throw new Error(`one entry in metrics section ${section} exceeds the response budget; narrow the window or goalId`);
+    }
+    return built(kept);
+  };
+
+  switch (section) {
+    case 'cycle': return single({ cycleTime: view.cycleTime });
+    case 'acceptance': return single({ acceptance: view.acceptance });
+    case 'blocks':
+      return single({ blocks: {
+        repeatedEpisodes: view.blocks.repeatedEpisodes, episodes: view.blocks.episodes,
+        extraBlocks: view.blocks.extraBlocks, samples: view.blocks.samples,
+      } });
+    case 'blocks_by_actor':
+      return paged(Object.entries(view.blocks.byActor).sort(([a, av], [b, bv]) => bv - av || a.localeCompare(b)),
+        entries => ({ blocks: { byActor: Object.fromEntries(entries) } }));
+    case 'wakes': return single({ wakes: view.wakes });
+    case 'usage':
+      return single({ usage: {
+        tasksAccepted: view.usage.tasksAccepted, tasksWithUsage: view.usage.tasksWithUsage,
+        tokens: view.usage.tokens, cost: view.usage.cost,
+      } });
+    case 'usage_by_goal':
+      return paged(view.usage.byGoal, rows => ({ usage: {
+        tasksAccepted: view.usage.tasksAccepted, tasksWithUsage: view.usage.tasksWithUsage,
+        tokens: view.usage.tokens, cost: view.usage.cost, byGoal: rows,
+      } }));
+    case 'events': return single({ events: view.events });
+    case 'customer_evidence':
+      return single({ customerEvidence: {
+        goalsDone: view.customerEvidence.goalsDone, goalsWithActivation: view.customerEvidence.goalsWithActivation,
+        goalsWithAdoption: view.customerEvidence.goalsWithAdoption,
+      } });
+    case 'customer_evidence_missing_activation':
+      return paged(view.customerEvidence.missingActivation, rows => ({ customerEvidence: {
+        goalsDone: view.customerEvidence.goalsDone, goalsWithActivation: view.customerEvidence.goalsWithActivation,
+        goalsWithAdoption: view.customerEvidence.goalsWithAdoption, missingActivation: rows,
+      } }));
+    case 'customer_evidence_missing_adoption':
+      return paged(view.customerEvidence.missingAdoption, rows => ({ customerEvidence: {
+        goalsDone: view.customerEvidence.goalsDone, goalsWithActivation: view.customerEvidence.goalsWithActivation,
+        goalsWithAdoption: view.customerEvidence.goalsWithAdoption, missingAdoption: rows,
+      } }));
+    case 'day_series': return paged(view.daySeries, rows => ({ daySeries: rows }));
+  }
 }

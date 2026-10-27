@@ -4,7 +4,8 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { assessGoal, normalizeEvidence, normalizeOutcome, type GoalFact, type GoalTaskFact } from '../src/goal-governance.ts';
-import { computeGoalMetrics, dayKey, type GoalMetricsSource } from '../src/goal-metrics.ts';
+import { computeGoalMetrics, dayKey, isGoalMetricsSegment, segmentGoalMetrics, type GoalMetricsSection, type GoalMetricsSegmentView, type GoalMetricsSource, type GoalMetricsView } from '../src/goal-metrics.ts';
+import { answerBytes, RESPONSE_BUDGET_BYTES } from '../src/response-budget.ts';
 
 const NOW = Date.UTC(2026, 9, 26, 12, 0);
 
@@ -290,5 +291,98 @@ describe('business metrics (AC04/AC05)', () => {
     // One continuous task+phase segment has two blocks even though a resume happened: the episode key resets only
     // the segment counter, so this is reported as repeated work rather than hidden.
     expect(metrics.blocks.repeatedEpisodes).toBe(1);
+  });
+});
+
+describe('metrics segmentation keeps a large window complete and inside the response budget', () => {
+  const window = { from: '2026-03-08T00:00:00-05:00', to: '2026-03-10T00:00:00-04:00',
+    fromMs: Date.parse('2026-03-08T00:00:00-05:00'), toMs: Date.parse('2026-03-10T00:00:00-04:00'),
+    timezone: 'America/New_York', cutoffAt: '2026-03-10T04:00:00.000Z', explicit: true };
+  const baseSource = (): GoalMetricsSource => ({ window, goals: [], tasks: [], audits: [], wakes: [], usage: [], evidence: [] });
+  const largeView = (): GoalMetricsView => {
+    const base = computeGoalMetrics(baseSource());
+    return {
+      ...base,
+      usage: { ...base.usage, byGoal: Array.from({ length: 240 }, (_, index) => ({
+        goalId: `goal-${index}`, tasks: 1, usageRows: 1, tokens: { input: 100 + index },
+        cost: { status: 'unknown' as const, reason: 'no provider bill' },
+      })) },
+      customerEvidence: {
+        goalsDone: 240, goalsWithActivation: 0, goalsWithAdoption: 0,
+        missingActivation: Array.from({ length: 240 }, (_, index) => `目标 ${index}`),
+        missingAdoption: Array.from({ length: 240 }, (_, index) => `目标 ${index}`),
+      },
+      blocks: { ...base.blocks, byActor: Object.fromEntries(Array.from({ length: 120 }, (_, index) => [`employee-${index}`, 120 - index])) },
+      daySeries: Array.from({ length: 200 }, (_, index) => ({ day: `day-${String(index).padStart(3, '0')}`, tasksAccepted: 1, goalsDone: 0, blockEvents: 0 })),
+    };
+  };
+
+  const collect = <T>(view: GoalMetricsView, section: GoalMetricsSection, pick: (segment: GoalMetricsSegmentView) => T[]): T[] => {
+    const out: T[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 200; page++) {
+      const segment = segmentGoalMetrics(view, { section, pageSize: 7, ...(cursor ? { cursor } : {}), scope: 'fixture-window' });
+      expect(segment.section).toBe(section);
+      expect(answerBytes(segment)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      out.push(...pick(segment));
+      if (!segment.page?.hasMore) {
+        expect(segment.page?.nextCursor).toBeUndefined();
+        return out;
+      }
+      expect(segment.page?.nextCursor).toBeTruthy();
+      cursor = segment.page!.nextCursor;
+    }
+    throw new Error(`section ${section} did not finish`);
+  };
+
+  test('the index names every section and fits the budget', () => {
+    const view = largeView();
+    const index = segmentGoalMetrics(view, { scope: 'fixture-window' });
+    expect(index.section).toBeNull();
+    expect(index.sections.map(section => section.key)).toEqual([
+      'cycle', 'acceptance', 'blocks', 'blocks_by_actor', 'wakes', 'usage', 'usage_by_goal', 'events',
+      'customer_evidence', 'customer_evidence_missing_activation', 'customer_evidence_missing_adoption', 'day_series',
+    ]);
+    expect(index.sections.find(section => section.key === 'usage_by_goal')).toMatchObject({ total: 240, pageable: true });
+    expect(index.sections.find(section => section.key === 'customer_evidence_missing_activation')).toMatchObject({ total: 240, pageable: true });
+    expect(answerBytes(index)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+    // Every section is reachable and carries the same window/denominator/exclusion/cutoff/coverage口径.
+    for (const section of index.sections) {
+      const segment = segmentGoalMetrics(view, { section: section.key, pageSize: 7, scope: 'fixture-window' });
+      expect(answerBytes(segment)).toBeLessThanOrEqual(RESPONSE_BUDGET_BYTES);
+      expect(segment.window).toEqual(view.window);
+      expect(segment.denominators).toEqual(view.denominators);
+      expect(segment.exclusions).toEqual(view.exclusions);
+      expect(segment.coverage).toEqual(view.coverage);
+      expect(segment.definitions).toEqual(view.definitions);
+    }
+  });
+
+  test('paged sections concatenate to the full lists without duplicates or omissions', () => {
+    const view = largeView();
+    expect(collect(view, 'usage_by_goal', segment => (segment.data!.usage as { byGoal: Array<{ goalId: string }> }).byGoal.map(row => row.goalId)))
+      .toEqual(view.usage.byGoal.map(row => row.goalId));
+    expect(collect(view, 'customer_evidence_missing_activation', segment => (segment.data!.customerEvidence as { missingActivation: string[] }).missingActivation))
+      .toEqual(view.customerEvidence.missingActivation);
+    expect(collect(view, 'customer_evidence_missing_adoption', segment => (segment.data!.customerEvidence as { missingAdoption: string[] }).missingAdoption))
+      .toEqual(view.customerEvidence.missingAdoption);
+    expect(collect(view, 'day_series', segment => (segment.data!.daySeries as Array<{ day: string }>).map(row => row.day)))
+      .toEqual(view.daySeries.map(row => row.day));
+    expect([...collect(view, 'blocks_by_actor', segment => Object.keys((segment.data!.blocks as { byActor: Record<string, number> }).byActor))].sort())
+      .toEqual(Object.keys(view.blocks.byActor).sort());
+  });
+
+  test('a cursor is bound to its section and cannot be replayed on another', () => {
+    const view = largeView();
+    const first = segmentGoalMetrics(view, { section: 'usage_by_goal', pageSize: 3, scope: 'fixture-window' });
+    expect(first.page?.hasMore).toBe(true);
+    expect(() => segmentGoalMetrics(view, { section: 'day_series', pageSize: 3, cursor: first.page!.nextCursor, scope: 'fixture-window' }))
+      .toThrow(/cursor/);
+  });
+
+  test('a small window stays a full view; the index is only for an over-budget answer', () => {
+    const view = computeGoalMetrics(baseSource());
+    expect(isGoalMetricsSegment(view)).toBe(false);
+    expect(segmentGoalMetrics(view, { scope: 'fixture-window' }).section).toBeNull();
   });
 });

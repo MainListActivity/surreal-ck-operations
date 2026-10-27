@@ -1065,7 +1065,7 @@ export class SidecarPool {
         ? core.goalConsole(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_console"), { code: "temporarily_unavailable" }));
       case "goal_governance_scan": return core.goalGovernanceScan
-        ? core.goalGovernanceScan(cred)
+        ? core.goalGovernanceScan(cred, args as never)
         : Promise.reject(Object.assign(new Error("core does not expose goal_governance_scan"), { code: "temporarily_unavailable" }));
       case "goal_metrics": return core.goalMetrics
         ? core.goalMetrics(cred, args as never)
