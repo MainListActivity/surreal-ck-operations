@@ -7,9 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, test } from 'bun:test';
 import { sha256, evidenceSchema } from '../src/ops/proof-contract.ts';
-import { reviewedEvidenceSchema as productSchema } from './fixtures/product-1adf73ae-internal-ai-proof.ts';
 import { OPS_TOOLS, OpsBroker } from '../src/ops/broker.ts';
-import { ACCOUNT_PAYMENT_SOURCES } from '../src/ops/supplier.ts';
+import { ACCOUNT_PAYMENT_SOURCES, flattenPlanHtml, planPageMarkersV2, planPageMarkersV3, promotionalDeadline } from '../src/ops/supplier.ts';
 import { FakeCompany, FakeWorld, brokerConfig } from './support/ops-world.ts';
 
 interface Rig { world: FakeWorld; company: FakeCompany; broker: OpsBroker; home: string; qa: string; outputs: unknown[] }
@@ -77,6 +76,15 @@ const onlyAllowedRequests = (r: Rig) => r.world.requests.filter(q =>
   && !q.url.startsWith('https://iam.sensecoreapi.cn/iam/authn/v1/')
   && !q.url.startsWith('https://www.sensenova.cn/token-plan'));
 
+test('v2 official-copy markers and semantics are preserved; v3 adds limited-time and records the number as observation', () => {
+  const v2Page = '<html><body>公测期完全免费开放 付费档位即将上线 Free · 公测 60,000 积分 / 5 小时</body></html>';
+  expect(planPageMarkersV2(v2Page)).toEqual({ freeBetaOpen: true, paidTiersUpcoming: true, quota5h: true, freeTierNamed: true });
+  const v3Page = '<html><body>公测期完全免费开放 付费档位即将上线 Free · 公测 限时放量 ¥0/月</body></html>';
+  expect(planPageMarkersV3(flattenPlanHtml(v3Page))).toMatchObject({ limitedTimePromotion: true, officialQuotaNumberObserved: false });
+  expect(promotionalDeadline('活动截止 2026-11-30')).toMatchObject({ at: '2026-11-30T23:59:59.999Z' });
+  expect(promotionalDeadline('活动截止 另行通知')).toBeNull();
+});
+
 describe('ops_supplier_plan_sample', () => {
   test('tool is enumerated and surfaced with its fixed service binding in ops_info', async () => {
     expect(OPS_TOOLS).toContain('ops_supplier_plan_sample');
@@ -84,7 +92,7 @@ describe('ops_supplier_plan_sample', () => {
     seal(r);
     const info = await call(r, 'ops_info');
     expect(info.supplierPlanSampling).toMatchObject({
-      provider: 'sensenova', adapter: 'sensenova-token-plan/2',
+      provider: 'sensenova', adapter: 'sensenova-token-plan/3',
       service: {
         endpoint: 'https://token.sensenova.cn/v1',
         model: 'sensenova-6.8-flash-lite',
@@ -96,28 +104,61 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('FREE console plan + bound API key + official applicability → v2 document, payment state unverified', async () => {
+  test('FREE console plan + bound API key + official limited-time copy → v3 promotional/account-bound document', async () => {
     const r = rig();
     seal(r);
     const result = await sample(r);
     expect(result.status).toBe('sampled');
-    expect(result.document).toMatchObject({ schemaVersion: 2, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE', quotaAmount: 60000 });
+    expect(result.document).toMatchObject({
+      schemaVersion: 3, type: 'reviewed-token-plan', evidenceClass: 'promotional-account-bound',
+      accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE', accountBound: true, promotional: true,
+      revalidateBeforeUse: true, autoTopupDisabled: true, terminationRisk: 'unknown-promotional-end',
+      // The pool observes 120000/5h, but the allowed cap stays the reviewed 60000.
+      quotaAmount: 60000, quotaWindowSeconds: 18000, quotaRemaining: 118500,
+      quotaSource: 'account-bound-observation',
+      governingPool: { poolType: 'dedicated', basis: 'dedicated-pool-for-bound-model' },
+    });
+    const doc = result.document as Record<string, any>;
+    expect(doc.planSource).toMatchObject({
+      url: 'https://www.sensenova.cn/token-plan', status: 200, etag: '"plan-fixture-v3"', clockSkewMs: 0,
+    });
+    expect(doc.planSource.httpDate).toBe(new Date(r.world.clock).toISOString());
+    expect(doc.planSource.rawSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(doc.normalization).toMatchObject({ algorithm: 'html-text-flat/1' });
+    expect(doc.normalization.flatSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(doc.normalization.flatChars).toBeGreaterThan(0);
+    expect(doc.pools).toHaveLength(2);
+    expect(doc.pools[0]).toMatchObject({
+      poolType: 'dedicated', accountBound: true,
+      window5h: { limit: 120000, used: 600, remaining: 119400 }, window7d: { limit: 1200000, used: 2000, remaining: 1198000 },
+      usedSource5h: 'reported', usedSource7d: 'reported',
+    });
+    // The observed 120k pool limit is recorded but never raises the allowed cap.
+    expect(doc.quotaAmount).toBeLessThan(doc.pools[0].window5h.limit);
+    expect(doc.quotaAmount).toBeLessThanOrEqual(doc.quotaRemaining);
     expect(result.document).not.toHaveProperty('noPaymentInstrument');
-    expect(result.document).not.toHaveProperty('autoTopupDisabled');
+    expect(result.document).not.toHaveProperty('balanceNanoUsd');
     expect(result.documentSha256).toMatch(/^[a-f0-9]{64}$/);
     const bytes = readFileSync(result.documentFile);
     expect(sha256(bytes)).toBe(result.documentSha256);
-    expect(evidenceSchema.parse(JSON.parse(bytes.toString('utf8')))).toEqual(productSchema.parse(result.document));
+    expect(evidenceSchema.safeParse(JSON.parse(bytes.toString('utf8'))).success).toBe(true);
     expect(Date.parse(result.expiresAt) - Date.parse(result.sampledAt)).toBeLessThanOrEqual(86400000);
+    // The earliest applicable reset is the default pool's 5h window (4h), which caps expiry first.
+    expect(Date.parse(result.expiresAt)).toBeLessThanOrEqual(r.world.clock + 4 * 3600 * 1000);
     expect(result.accountRef).toMatch(/^snv[a-f0-9]{24}$/);
     expect(result.receipt.derivations).toMatchObject({
       accountBound: true,
       applicabilityOk: true,
       accountPlan: { id: 'free', name: 'Free Plan', type: 'TOKEN_PLAN_PLAN_TYPE_FREE' },
       accountPlanFree: true,
+      officialQuotaNumberObserved: false,
       consolePaymentSurfaceAbsent: true,
       paymentStateSources: 0,
-      removedAccountAssertions: ['noPaymentInstrument', 'autoTopupDisabled'],
+      removedAccountAssertions: ['noPaymentInstrument'],
+      quotaAllowedAmount: 60000,
+      quotaRemaining: 118500,
+      poolsOk: true,
+      governingPool: { poolType: 'dedicated', basis: 'dedicated-pool-for-bound-model' },
     });
     expect(result.gaps).toEqual([]);
     // The receipt is still written: sources, observations and gaps are the evidence.
@@ -127,6 +168,9 @@ describe('ops_supplier_plan_sample', () => {
     expect(receipt.pools).toHaveLength(2); // dual pools preserved as side evidence
     const names = receipt.sources.map((s: { name: string }) => s.name).sort();
     expect(names).toEqual(['apiKeys', 'models', 'planPage', ...Array(11).fill('paymentSurface'), 'poolUsage'].sort());
+    const planSource = receipt.sources.find((s: { name: string }) => s.name === 'planPage');
+    expect(planSource).toMatchObject({ fetchedAt: result.sampledAt, httpDate: new Date(r.world.clock).toUTCString(), etag: '"plan-fixture-v3"' });
+    expect(planSource.rawSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(statSync(receiptFile).mode & 0o777).toBe(0o600);
     const dir = join(r.home, 'evidence', 'task-1');
     expect(readdirSync(dir).some(f => /supplier-plan-sensenova-\d+\.json$/.test(f))).toBe(true);
@@ -154,7 +198,7 @@ describe('ops_supplier_plan_sample', () => {
     seal(r, { consoleToken: false, consoleCreds: true });
     const result = await sample(r);
     expect(result.status).toBe('sampled');
-    expect(result.document.schemaVersion).toBe(2);
+    expect(result.document.schemaVersion).toBe(3);
     const receipt = JSON.parse(readFileSync(String(result.receiptFile), 'utf8'));
     expect(receipt.derivations.consoleSession.tokenSource).toBe('issued');
     expect(receipt.derivations.consoleSession.sessionExpiresAt).toMatch(/^\d{4}-/);
@@ -296,7 +340,7 @@ describe('ops_supplier_plan_sample', () => {
     r.world.supplier.billingPathLive = true;
     const result = await sample(r);
     expect(result.status).toBe('sampled');
-    expect(result.document).toMatchObject({ schemaVersion: 2, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE' });
+    expect(result.document).toMatchObject({ schemaVersion: 3, accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_FREE', evidenceClass: 'promotional-account-bound' });
     expect(result.receipt.derivations.consolePaymentSurfaceAbsent).toBe(false);
     expect(result.receipt.derivations.paymentSurface).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: '/billing', status: 200 })]),
@@ -332,16 +376,76 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('quota hard cap drift or absence fails closed', async () => {
-    for (const limit of [0, 60001, null]) {
+  test('inconsistent pool facts fail closed instead of guessing the allowed cap', async () => {
+    for (const mutate of [
+      (pool: any) => { pool.window_5h.limit = 0; },
+      (pool: any) => { pool.window_5h.remaining = pool.window_5h.limit + 1; },
+      (pool: any) => { pool.window_5h.used = pool.window_5h.limit + 1; },
+      (pool: any) => { pool.window_5h.used = 1; /* used + remaining no longer equals limit */ },
+    ]) {
       const r = rig(); seal(r);
-      r.world.supplier.pools[0]!.window_5h.limit = limit as never;
+      mutate(r.world.supplier.pools[0]!);
       const result = await sample(r);
       expect(result.status).toBe('blocked');
       expect(result.document).toBeUndefined();
-      expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'quota', source: 'poolUsage' })]));
+      expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'poolConsistency', source: 'poolUsage' })]));
       expectNoSupplierLeaks(r);
     }
+  });
+
+  test('missing 5h/7d facts and resets block; a missing window is never treated as unlimited', async () => {
+    const mutations = [
+      (pool: any) => { delete pool.window_7d; },
+      (pool: any) => { pool.window_7d.remaining = null; },
+      (pool: any) => { pool.window_7d.reset_at = null; },
+      (pool: any) => { delete pool.window_5h; },
+      (pool: any) => { pool.window_5h.reset_at = null; },
+    ];
+    for (const mutate of mutations) {
+      const r = rig(); seal(r);
+      mutate(r.world.supplier.pools[0]!);
+      const result = await sample(r);
+      expect(result.status).toBe('blocked');
+      expect(result.document).toBeUndefined();
+      expect(result.gaps.some((g: { field: string }) => g.field === 'quota5h' || g.field === 'quota7d')).toBe(true);
+      expectNoSupplierLeaks(r);
+    }
+  });
+
+  test('the allowed cap is the smaller of 60000 and every applicable pool remaining', async () => {
+    const r = rig(); seal(r);
+    // Make the dedicated 5h window the trusted minimum (50000), with consistent used facts.
+    r.world.supplier.pools[0]!.window_5h.used = 70_000;
+    r.world.supplier.pools[0]!.window_5h.remaining = 50_000;
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    expect(result.document).toMatchObject({ quotaAmount: 50_000, quotaRemaining: 50_000 });
+    expect(result.receipt.derivations.quotaAllowedAmount).toBe(50_000);
+    expectNoSupplierLeaks(r);
+  });
+
+  test('an exhausted applicable pool blocks rather than producing a zero-cap document', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.pools[0]!.window_5h.used = 120_000;
+    r.world.supplier.pools[0]!.window_5h.remaining = 0;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'quota', source: 'poolUsage' })]));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('a missing remaining figure blocks: a null remaining is not a fabricated number', async () => {
+    const r = rig();
+    seal(r);
+    // Null remaining with used still present also breaks used+remaining=limit, so consistency or
+    // the missing-window gap must fire; either way no document is produced.
+    (r.world.supplier.pools[0]!.window_5h as { remaining: number | null }).remaining = null as never;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps.some((g: { field: string }) => ['quota5h', 'quota7d', 'poolConsistency'].includes(g.field))).toBe(true);
+    expectNoSupplierLeaks(r);
   });
 
   test('a drifted pool-usage schema blocks rather than guessing quota', async () => {
@@ -354,17 +458,6 @@ describe('ops_supplier_plan_sample', () => {
     expectNoSupplierLeaks(r);
   });
 
-  test('a missing remaining figure is a quotaRemaining gap, never a fabricated number', async () => {
-    const r = rig();
-    seal(r);
-    (r.world.supplier.pools[0]!.window_5h as { remaining: number | null }).remaining = null as never;
-    const result = await sample(r);
-    expect(result.status).toBe('sampled');
-    expect(result.document.quotaRemaining).toBeNull();
-    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'quotaRemaining' })]));
-    expectNoSupplierLeaks(r);
-  });
-
   test('a pool window already reset makes the sample born-expired → blocked', async () => {
     const r = rig();
     seal(r);
@@ -374,6 +467,55 @@ describe('ops_supplier_plan_sample', () => {
     const result = await sample(r);
     expect(result.status).toBe('blocked');
     expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'expiresAt' })]));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('v3 requires the official HTTP Date; a missing source date blocks', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.planDate = false;
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'sourceDate', source: 'planPage' })]));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('the official copy must still say paid tiers are upcoming and the release is limited-time', async () => {
+    for (const html of [
+      '<html><body>公测期完全免费开放 Free · 公测 ¥0/月</body></html>', // paid tiers / limited-time missing
+      '<html><body>公测期完全免费开放，付费档位即将上线 Free · 公测 ¥0/月</body></html>', // limited-time missing
+      '<html><body>公测期完全免费开放，付费档位即将上线 限时放量 ¥0/月</body></html>', // Free tier missing
+    ]) {
+      const r = rig(); seal(r);
+      r.world.supplier.planHtml = html;
+      const result = await sample(r);
+      expect(result.status).toBe('blocked');
+      expect(result.document).toBeUndefined();
+      expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'planApplicability', source: 'planPage' })]));
+      expectNoSupplierLeaks(r);
+    }
+  });
+
+  test('an explicit promotional deadline caps expiry and is recorded; unknown risk is explicit otherwise', async () => {
+    const r = rig(); seal(r);
+    const deadline = new Date(r.world.clock + 2 * 3600 * 1000);
+    const y = deadline.getUTCFullYear(), m = deadline.getUTCMonth() + 1, d = deadline.getUTCDate();
+    r.world.supplier.planHtml = `<html><body>公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 活动截止 ${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}</body></html>`;
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    const doc = result.document as Record<string, any>;
+    expect(doc.terminationRisk).toBe('promotional-end-recorded');
+    expect(doc.promotionalEndsAt).toBe(new Date(Date.UTC(y, m - 1, d, 23, 59, 59, 999)).toISOString());
+    expect(Date.parse(doc.expiresAt)).toBeLessThanOrEqual(Date.parse(doc.promotionalEndsAt));
+    expectNoSupplierLeaks(r);
+  });
+
+  test('a promotional page that mentions a deadline we cannot parse blocks instead of assuming permanence', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.planHtml = '<html><body>公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 活动截止 另行通知</body></html>';
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.gaps).toEqual(expect.arrayContaining([expect.objectContaining({ field: 'promotionalEnd', source: 'planPage' })]));
     expectNoSupplierLeaks(r);
   });
 

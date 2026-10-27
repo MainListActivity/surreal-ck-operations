@@ -73,8 +73,119 @@ export const reviewedEvidenceSchema = z.discriminatedUnion("type", [
   }).strict(),
 ]);
 export type ReviewedEvidence = z.infer<typeof reviewedEvidenceSchema>;
-export const evidenceSchema = reviewedEvidenceSchema;
-export type ServiceEvidence = ReviewedEvidence;
+/**
+ * FV06 v3：限时账号绑定 FREE 公测观测。官方页只写「公测免费、限时放量」，不再给配额数字；
+ * 配额数字仅来自已认证 console 的 account-bound 池观测，且只作为本次证据上界，不成为官方规则。
+ * v2 的冻结 schema 保持逐字不变（见 proof-mirror 测试），v3 在其外独立定义。
+ */
+export const TOKEN_PLAN_EVIDENCE_CLASS = 'promotional-account-bound';
+export const PLAN_HTML_FLAT_ALGORITHM = 'html-text-flat/1';
+export const REVIEWED_QUOTA_AMOUNT = 60_000;
+export const REVIEWED_QUOTA_WINDOW_SECONDS = 18_000;
+const v3PoolWindow = z.object({
+  limit: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  used: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  remaining: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  resetAt: z.string().datetime(),
+}).strict().refine(w => w.used + w.remaining === w.limit, { message: 'used + remaining must equal limit' });
+const v3Pool = z.object({
+  poolType: z.string().min(1).max(40),
+  name: controlFreeText(80),
+  accountBound: z.literal(true),
+  window5h: v3PoolWindow,
+  window7d: v3PoolWindow,
+  /** Whether `used` came from the provider payload or was derived as limit-remaining. */
+  usedSource5h: z.enum(['reported', 'derived']),
+  usedSource7d: z.enum(['reported', 'derived']),
+}).strict();
+export const tokenPlanEvidenceV3Schema = z.object({
+  ...evidenceBase,
+  schemaVersion: z.literal(3),
+  type: z.literal("reviewed-token-plan"),
+  evidenceClass: z.literal(TOKEN_PLAN_EVIDENCE_CLASS),
+  planName: controlFreeText(200),
+  planSourceUrl: httpsSource,
+  planSource: z.object({
+    url: httpsSource,
+    /** Local UTC instant the official page response was received. */
+    fetchedAt: z.string().datetime(),
+    /** The origin's own Date header; required so freshness is not only our clock. */
+    httpDate: z.string().datetime(),
+    /** fetchedAt - httpDate in ms; bounded to ±5 minutes. */
+    clockSkewMs: z.number().int().min(-300_000).max(300_000),
+    status: z.number().int().min(200).max(299),
+    etag: z.string().min(1).max(200).nullable(),
+    rawSha256: hash,
+  }).strict(),
+  normalization: z.object({
+    algorithm: z.literal(PLAN_HTML_FLAT_ALGORITHM),
+    flatSha256: hash,
+    flatChars: z.number().int().positive().max(1_000_000),
+  }).strict(),
+  accountPlanType: z.literal(TOKEN_PLAN_PLAN_TYPE_FREE),
+  accountBound: z.literal(true),
+  accountBoundSource: z.literal('console-pool-usage-cross-bound-to-sealed-api-key'),
+  quotaUnit: z.enum(["points", "requests"]),
+  /** The allowed upper bound for this evidence: <= the reviewed 60k/5h cap and <= every applicable pool's remaining. */
+  quotaAmount: z.number().int().positive().max(REVIEWED_QUOTA_AMOUNT),
+  quotaWindowSeconds: z.number().int().positive().max(REVIEWED_QUOTA_WINDOW_SECONDS),
+  quotaRemaining: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  quotaSource: z.literal('account-bound-observation'),
+  governingPool: z.object({
+    poolType: z.string().min(1).max(40),
+    basis: z.enum(['dedicated-pool-for-bound-model', 'default-pool', 'single-pool']),
+  }).strict(),
+  pools: z.array(v3Pool).min(1).max(8),
+  /** Our measurement configuration asserts auto-recharge is disabled; not a provider read-back. */
+  autoTopupDisabled: z.literal(true),
+  /** Explicitly a limited-time promotional, account-bound observation — never a permanent official rule. */
+  promotional: z.literal(true),
+  revalidateBeforeUse: z.literal(true),
+  terminationRisk: z.enum(['unknown-promotional-end', 'promotional-end-recorded']),
+  promotionalEndsAt: z.string().datetime().nullable(),
+  serviceApproved: z.boolean(),
+}).strict().superRefine((v, ctx) => {
+  const sampled = Date.parse(v.sampledAt), expires = Date.parse(v.expiresAt);
+  const fail = (path: string, message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path: path.split('.'), message });
+  if (expires - sampled > 86_400_000) fail('expiresAt', 'evidence validity may not exceed 24 hours');
+  if (v.planSource.url !== v.planSourceUrl) fail('planSource.url', 'planSource.url must equal planSourceUrl');
+  if (v.quotaAmount > v.quotaRemaining) fail('quotaAmount', 'allowed quota exceeds trusted remaining quota');
+  const resets = v.pools.flatMap(pool => [Date.parse(pool.window5h.resetAt), Date.parse(pool.window7d.resetAt)]);
+  if (resets.some(reset => !Number.isFinite(reset) || reset <= sampled)) fail('pools', 'a pool window already reset at sampling time');
+  if (resets.length && expires > Math.min(...resets)) fail('expiresAt', 'evidence outlives the earliest pool window reset');
+  if (!v.pools.some(pool => pool.poolType === v.governingPool.poolType)) fail('governingPool.poolType', 'governing pool is not listed');
+  if (new Set(v.pools.map(pool => pool.poolType)).size !== v.pools.length) fail('pools', 'duplicate pool types are ambiguous');
+  if (v.promotionalEndsAt !== null) {
+    const end = Date.parse(v.promotionalEndsAt);
+    if (end <= sampled) fail('promotionalEndsAt', 'promotional activity already ended at sampling time');
+    if (expires > end) fail('expiresAt', 'evidence outlives the recorded promotional deadline');
+  }
+});
+export type TokenPlanEvidenceV3 = z.infer<typeof tokenPlanEvidenceV3Schema>;
+/**
+ * The v3 eligibility gate reused by prepare/prove/deliver/diagnose. It re-derives the bounds from the
+ * document itself, so a hand-written or tampered document cannot pass by claiming a larger cap.
+ */
+export function tokenPlanV3Eligible(e: TokenPlanEvidenceV3, now: number): boolean {
+  if (e.evidenceClass !== TOKEN_PLAN_EVIDENCE_CLASS || !e.serviceApproved || e.accountPlanType !== TOKEN_PLAN_PLAN_TYPE_FREE) return false;
+  if (!e.accountBound || !e.promotional || !e.revalidateBeforeUse || !e.autoTopupDisabled) return false;
+  if (e.quotaUnit !== 'points' && e.quotaUnit !== 'requests') return false;
+  if (e.quotaAmount <= 0 || e.quotaAmount > REVIEWED_QUOTA_AMOUNT || e.quotaWindowSeconds > REVIEWED_QUOTA_WINDOW_SECONDS) return false;
+  if (e.quotaRemaining < e.quotaAmount) return false;
+  const sampled = Date.parse(e.sampledAt), expires = Date.parse(e.expiresAt);
+  if (!Number.isFinite(sampled) || !Number.isFinite(expires)) return false;
+  if (now - sampled > 86_400_000 || expires <= now || expires - sampled > 86_400_000) return false;
+  const resets = e.pools.flatMap(pool => [Date.parse(pool.window5h.resetAt), Date.parse(pool.window7d.resetAt)]);
+  if (!resets.length || resets.some(reset => !Number.isFinite(reset) || reset <= now || expires > reset)) return false;
+  if (!e.pools.some(pool => pool.poolType === e.governingPool.poolType)) return false;
+  const poolWindows = e.pools.flatMap(pool => [pool.window5h, pool.window7d]);
+  if (poolWindows.some(window => window.used + window.remaining !== window.limit)) return false;
+  if (e.pools.some(pool => pool.accountBound !== true)) return false;
+  if (e.promotionalEndsAt !== null && (Date.parse(e.promotionalEndsAt) <= now || expires > Date.parse(e.promotionalEndsAt))) return false;
+  return true;
+}
+export const evidenceSchema = z.union([...reviewedEvidenceSchema.options, tokenPlanEvidenceV3Schema]);
+export type ServiceEvidence = z.infer<typeof evidenceSchema>;
 export const sha256 = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';

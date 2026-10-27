@@ -32,8 +32,28 @@ evidenceSchema 是按 `type` 判别的冻结联合。公司保留产品 PR175 �
 
 `ops_internal_ai_prove(mode=enable)` 的 USD 分支不变：serviceApproved 且 balanceNanoUsd 覆盖 manifest.budget.totalNanoUsd。token-plan 查真实受审 v2 FREE 文档、serviceApproved、quotaAmount>0、quotaRemaining 为 null 或 >0、sampledAt 不晚于签发且年龄≤24h、expiresAt 未过。独立审批、身份、文件原始 hash、租约、status 和签名检查不变。prepare / register-disabled 可以接受契约合法的 v2，但仅登记 disabled、paidCallsAllowed=0，不授予调用权限；enable 才检查服务可用窗口。
 
-采样器 `sensenova-token-plan/2` 使用账户 console 的 `/tokenplan/pool-usage` 计划读回；以同一 console `/metered/api-keys` 对密封 API key 精确交叉绑定。`/v1/models` 只验证 key 活性与模型列表，不证明账户 FREE。官方计划页面须同时包含免费公测、付费档位即将上线、60,000积分/5小时、Free 公测正面标记；console governing pool 的硬顶须与核定配额一致，否则 blocked。猜测支付 URI 枚举纯为回执观测（paymentSurface 不作证明、不阻塞文档）：存活面漂移记 note 提请人工复核，付费档上线跳闸仍由官方页 marker 承担；枚举绝不证明支付绑定为空或账户自动充值已禁用。`ACCOUNT_PAYMENT_SOURCES` 注册表机制保留、维持空表，供应商出现官方账户级支付来源时再注册。回执 `accountPlanSource` 标来源与绑定，`removedAccountAssertions` 标明 noPaymentInstrument/autoTopupDisabled 系契约修订移除而非探测不足；缺计划/非 FREE/未绑定列 `accountPlanType` gap（对应产品 enable 缺口名 `account-plan-free`）。剩余额度未读回可 null 并记录 gap，不臆造数值。过期重置窗口闭锁，文档 expiresAt 取重置时刻与24小时上限的较早者。
+采样器 `sensenova-token-plan/3` 使用账户 console 的 `/tokenplan/pool-usage` 计划读回；以同一 console `/metered/api-keys` 对密封 API key 精确交叉绑定。`/v1/models` 只验证 key 活性与模型列表，不证明账户 FREE。官方计划页面须同时包含免费公测、付费档位即将上线、限时放量、Free 公测正面标记；配额数字只作为 `officialQuotaNumberObserved` 记录，不再要求官方页给出数字。两个池的 5h/7d limit/used/remaining/reset 全部读回并校验一致；准用上界取核定 60000/18000s 与所有池可信剩余的较小者，观察到的 120000 不抬高上界。支付 URI 枚举纯为回执观测（paymentSurface 不作证明、不阻塞文档）：存活面漂移记 note 提请人工复核，付费档上线跳闸由官方页 marker 承担；枚举绝不证明支付绑定为空或账户自动充值已禁用。`ACCOUNT_PAYMENT_SOURCES` 注册表机制保留、维持空表。回执同时记录 `planSource`（HTTP Date/ETag/raw hash）、`normalization`（flat 算法/hash）、池分析、governingPool/依据与 observed limits；`accountPlanSource` 标来源与绑定。缺计划/非 FREE/未绑定列 `accountPlanType` gap（对应产品 enable 缺口名 `account-plan-free`）；缺任一池窗口、剩余或 reset 均 blocked，不臆造数值。过期重置窗口闭锁，文档 expiresAt 取所有池 reset、活动截止与24小时上限的最早者。
 
 manifest.budget.autoTopupDisabled=true 和我方计量配置自动充值禁用保持；measurementCycle≤30、worstCost=0、原30台账和消费者预算门不在本次变更中放宽。JWT contractVersion=1、issuer/audience/alg/kid 和信任锚不变。
+
+### FV06 v3：限时账号绑定 FREE 观测（promotional/account-bound）
+
+GM 技术裁定：官方页仍写公测免费、限时放量，但**不再给配额数字**；授权账号 default/dedicated 池的 120000/5h、1200000/7d 只是 account-bound 观测，不是官方稳定免费配额，更不是 QUOTA 常量。v3 是独立的新证据版本，v2 schema 与判定逐字保留（见 `tests/proof-mirror.test.ts` 与 v2 回归）；v3 仅在 `proof-contract.ts` 冻结镜像区之外新增。
+
+v3 文档（`schemaVersion=3`，`type=reviewed-token-plan`，`evidenceClass=promotional-account-bound`）在 v2 基础上强制并记录：
+
+- `planSource { url, fetchedAt, httpDate, clockSkewMs, status, etag, rawSha256 }`：官方 URL、本机 UTC 抓取时刻、来源 HTTP Date 与偏差（±5 分钟）、HTTP 状态、ETag、原始页面字节 SHA256；
+- `normalization { algorithm:"html-text-flat/1", flatSha256, flatChars }`：固定归一化算法（去 script/style、标签换空格、空白折叠）及归一化文本 hash；
+- `accountPlanType=FREE`、`accountBound=true`、`accountBoundSource`：仅认证 console 的 pool-usage + 同一密封 API key 精确交叉绑定可证明；
+- `pools[]` 每个池必须同时有 `window5h`/`window7d` 的 `limit/used/remaining/resetAt`（`used` 可标 `reported`/`derived`），`used+remaining=limit`；重复池类型、缺任一窗口、已重置或事实不一致一律 blocked；**缺 7d 不得当作无限**；
+- `governingPool { poolType, basis }`：绑定模型优先 dedicated，其次 default，单池则 single-pool；重复 dedicated 视为歧义；
+- `quotaAmount`：本次**准用上界** = min(核定 60000 points / 18000s, 所有适用池 5h/7d 的可信 remaining)，`quotaRemaining` 记录最小可信剩余；观察到的 120000/1200000 只进 `pools`/回执，永不抬高准用上界；余额 0 时 blocked，不生成文档；
+- `promotional=true`、`revalidateBeforeUse=true`、`terminationRisk`、`promotionalEndsAt`：官方页若给出可解析的活动截止日，`expiresAt` 不得晚于它；提到截止但无法解析时 blocked；未提及时明示 `unknown-promotional-end`，不得声称永久有效；
+- `autoTopupDisabled=true` 仍是我方计量配置断言；支付面 404 仍只是回执观测，不证明没有支付能力，也绝不参与判定；
+- `expiresAt` ≤ `sampledAt+24h`，且 ≤ 所有适用池 5h/7d reset 的最早者；到期不续旧件，必须真实重采样。
+
+`tokenPlanV3Eligible` 在 prepare/prove/deliver/diagnose 共用的 `evidenceChecks` 中重新推导上述边界（额度上限、每个池保持一致、expires 不越过 reset/24h/活动截止、FREE/accountBound/promotional/revalidate/autoTopup 全为真），因此手写或篡改的文档不能靠自报字段通过。`documentHash` 覆盖完整 v3 JSON，任何新语义字段变化都会使候选/证明失配。官方页 marker 由 v2 的 `quota5h` 换成 v3 的 `freeBetaOpen + paidTiersUpcoming + limitedTimePromotion + freeTierNamed`；配额数字改为 `officialQuotaNumberObserved` 观测项，不是放行条件——这不是删除失败项，而是官方文案已无数字，新增的限时 marker 与账号绑定池约束更严。
+
+产品消费端不变：投递的 JWT 仍 `contractVersion=1`，manifest 仍 schemaVersion=1，v3 文档不进入 JWT（产品只校验签名、manifest 与 documentHash）。若未来产品需要解析 evidence 文档，v3 必须另拆独立产品交付链与部署依赖，不能把不兼容版本直接发布为可用。
 
 评审人生命周期（FV06）：批准以审计行的 accept 评审人为准，其撤权状态按结构化字段判定，诊断、授权与密钥轮换共用同一规则。调度器正常轮换或归档（员工退役类型 `rotation` / `archive`）只使凭证失效，不撤销已形成的独立批准；显式安全撤权（管理员 revoke，写入不可回退的 `security_revoked`）、失败或人工退役、改动前写入的无类型退役（旧记录）一律拒绝。旧记录不自动追认，需要新的独立批准。

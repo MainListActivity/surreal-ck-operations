@@ -3,9 +3,9 @@ import { mkdtemp, mkdir, writeFile, readFile, stat, symlink, rm, realpath } from
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { readProofFile, loadProofFiles } from '../src/ops/proof-files.ts';
+import { readProofFile, loadProofFiles, evidenceChecks } from '../src/ops/proof-files.ts';
 import { ProofSigner, verifyCompanyProof } from '../src/ops/proof-signer.ts';
-import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, type ProofIdentity } from '../src/ops/proof-contract.ts';
+import { TOKEN_PLAN_PLAN_TYPE_FREE, proofToolSchemas, PROOF_AUDIENCE, manifestSchema, evidenceSchema, configurationDigest, tokenPlanEvidenceV3Schema, tokenPlanV3Eligible, sha256, type ProofIdentity } from '../src/ops/proof-contract.ts';
 import { InternalAiProofBridge } from '../src/ops/proof-bridge.ts';
 import { CompanyProofStore, type ProofRow } from '../src/ops/proof-store.ts';
 import { RecordId, type Surreal } from 'surrealdb';
@@ -369,4 +369,113 @@ test('approval diagnostics use production predicates, strict authorization and n
     role='engineering';authorize=false;expect(await diagnose() as unknown).toEqual({outcome:'denied',failure:'scope-denied'});
     await expect(bridge.call(scope,'production','ops_internal_ai_approval_diagnose',{...args,sql:'SELECT * FROM employee'})).rejects.toMatchObject({code:'invalid'});
   } finally {await rm(home,{recursive:true,force:true});}
+});
+
+// ---- FV06 v3: promotional/account-bound evidence ----
+
+const HASH = 'a'.repeat(64);
+function tokenPlanV3(nowMs = Date.now()) {
+  const sampledAt = new Date(nowMs).toISOString();
+  const reset5h = new Date(nowMs + 4 * 3_600_000).toISOString();
+  const reset7d = new Date(nowMs + 5 * 86_400_000).toISOString();
+  return {
+    schemaVersion: 3 as const, type: 'reviewed-token-plan' as const, evidenceClass: 'promotional-account-bound' as const,
+    accountRef: 'synthetic-v3-account', endpoint: 'https://token.sensenova.cn/v1',
+    model: 'sensenova-6.8-flash-lite', priceRevision: 'sensenova-token-plan-2026-10-10',
+    sampledAt, expiresAt: new Date(nowMs + 3 * 3_600_000).toISOString(), serviceApproved: true,
+    planName: 'SenseNova Token Plan Free · 公测 · 限时账号绑定', planSourceUrl: 'https://www.sensenova.cn/token-plan',
+    planSource: {
+      url: 'https://www.sensenova.cn/token-plan', fetchedAt: sampledAt, httpDate: sampledAt, clockSkewMs: 0,
+      status: 200, etag: '"plan-fixture-v3"', rawSha256: HASH,
+    },
+    normalization: { algorithm: 'html-text-flat/1' as const, flatSha256: HASH, flatChars: 120 },
+    accountPlanType: TOKEN_PLAN_PLAN_TYPE_FREE, accountBound: true as const,
+    accountBoundSource: 'console-pool-usage-cross-bound-to-sealed-api-key' as const,
+    quotaUnit: 'points' as const, quotaAmount: 60_000, quotaWindowSeconds: 18_000, quotaRemaining: 118_500,
+    quotaSource: 'account-bound-observation' as const,
+    governingPool: { poolType: 'dedicated', basis: 'dedicated-pool-for-bound-model' as const },
+    pools: [
+      { poolType: 'dedicated', name: 'Flash-Lite', accountBound: true as const,
+        window5h: { limit: 120_000, used: 600, remaining: 119_400, resetAt: reset5h },
+        window7d: { limit: 1_200_000, used: 2_000, remaining: 1_198_000, resetAt: reset7d },
+        usedSource5h: 'reported' as const, usedSource7d: 'reported' as const },
+      { poolType: 'default', name: '通用', accountBound: true as const,
+        window5h: { limit: 120_000, used: 1_500, remaining: 118_500, resetAt: new Date(nowMs + 3 * 3_600_000).toISOString() },
+        window7d: { limit: 1_200_000, used: 10_000, remaining: 1_190_000, resetAt: new Date(nowMs + 5 * 86_400_000).toISOString() },
+        usedSource5h: 'reported' as const, usedSource7d: 'derived' as const },
+    ],
+    autoTopupDisabled: true as const, promotional: true as const, revalidateBeforeUse: true as const,
+    terminationRisk: 'unknown-promotional-end' as const, promotionalEndsAt: null,
+  };
+}
+
+test('v3 promotional/account-bound evidence parses and its eligibility gate re-derives every bound', () => {
+  const now = Date.now();
+  const doc = tokenPlanV3(now);
+  expect(tokenPlanEvidenceV3Schema.safeParse(doc).success).toBe(true);
+  expect(evidenceSchema.safeParse(doc).success).toBe(true);
+  expect(tokenPlanV3Eligible(doc as never, now)).toBe(true);
+  const manifest = { ...disabledSenseNovaFixture().manifest };
+  expect(evidenceChecks(doc as never, manifest, now)).toMatchObject({ sampleNotFuture: true, evidenceUnexpired: true, serviceEvidenceEligible: true });
+
+  const reject = [
+    { quotaAmount: 60_001 }, { quotaWindowSeconds: 18_001 }, { quotaRemaining: 59_999 },
+    { accountPlanType: 'TOKEN_PLAN_PLAN_TYPE_PRO' }, { accountBound: false }, { promotional: false },
+    { autoTopupDisabled: false }, { revalidateBeforeUse: false }, { evidenceClass: 'official-stable-free' },
+    { terminationRisk: 'permanent' },
+    { planSource: { ...doc.planSource, httpDate: undefined } },
+    { planSource: { ...doc.planSource, clockSkewMs: 300_001 } },
+    { normalization: { ...doc.normalization, algorithm: 'raw' } },
+    { pools: [{ ...doc.pools[0]!, window7d: undefined }] },
+    { pools: [{ ...doc.pools[0]!, window7d: { ...doc.pools[0]!.window7d, remaining: null } }] },
+    { pools: [{ ...doc.pools[0]!, window5h: { ...doc.pools[0]!.window5h, used: 1 } }] },
+    { pools: [...doc.pools, { ...doc.pools[0]! }] },
+    { governingPool: { poolType: 'missing', basis: 'default-pool' } },
+    { expiresAt: new Date(now + 25 * 3_600_000).toISOString() },
+    { expiresAt: new Date(now + 5 * 3_600_000).toISOString() }, // beyond the default pool's 3h 5h reset
+    { promotionalEndsAt: new Date(now + 2 * 3_600_000).toISOString(), terminationRisk: 'promotional-end-recorded' },
+    { unknownField: 1 },
+  ];
+  for (const patch of reject) expect(tokenPlanEvidenceV3Schema.safeParse({ ...doc, ...patch }).success).toBe(false);
+  // A tampered cap is rejected by the gate even if a caller only carries the parsed shape.
+  expect(tokenPlanV3Eligible({ ...doc, quotaAmount: 60_001 } as never, now)).toBe(false);
+  expect(tokenPlanV3Eligible({ ...doc, expiresAt: new Date(now + 5 * 3_600_000).toISOString() } as never, now)).toBe(false);
+  expect(tokenPlanV3Eligible({ ...doc, quotaRemaining: 10 } as never, now)).toBe(false);
+  expect(tokenPlanV3Eligible({ ...doc, serviceApproved: false } as never, now)).toBe(false);
+});
+
+test('v3 documentHash covers every new field and loadProofFiles round-trips it', async () => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'proof-v3-unit-')));
+  const task = 'synthetic-v3-task';
+  const root = join(home, 'evidence', task); await mkdir(root, { recursive: true });
+  const manifestPath = join(root, 'manifest.json'), documentPath = join(root, 'evidence.json');
+  const now = Date.now();
+  const document = tokenPlanV3(now);
+  const bytes = JSON.stringify(document);
+  const { configurationDigest: _priorDigest, ...base } = disabledSenseNovaFixture().manifest;
+  const rest = { ...base, documentHash: sha256(bytes), service: { ...base.service, accountRef: document.accountRef, priceRevision: document.priceRevision } };
+  const manifest = { ...rest, configurationDigest: configurationDigest(rest) };
+  try {
+    await writeFile(documentPath, bytes);
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const files = await loadProofFiles(home, task, manifestPath, documentPath);
+    expect(files.evidence).toMatchObject({ schemaVersion: 3, evidenceClass: 'promotional-account-bound', quotaAmount: 60_000 });
+    expect(files.documentHash).toBe(sha256(bytes));
+    // Any v3 semantic field changes the document hash, so prepare/prove bind to the new bytes.
+    const changed = JSON.stringify({ ...document, quotaAmount: 59_999 });
+    await writeFile(documentPath, changed);
+    await expect(loadProofFiles(home, task, manifestPath, documentPath)).rejects.toMatchObject({ code: 'invalid' });
+    // A v2 document still follows the old strict path unchanged.
+    const v2 = { ...document, schemaVersion: 2, quotaAmount: 100_000, quotaRemaining: 90_000 } as Record<string, unknown>;
+    for (const key of ['evidenceClass', 'planSource', 'normalization', 'accountBound', 'accountBoundSource', 'quotaSource', 'governingPool', 'pools', 'autoTopupDisabled', 'promotional', 'revalidateBeforeUse', 'terminationRisk', 'promotionalEndsAt']) delete v2[key];
+    expect(evidenceSchema.safeParse(v2).success).toBe(true);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('the v3 synthetic example is contract-valid (shape only, not real evidence)', async () => {
+  const text = await readFile(new URL('../docs/examples/internal-ai-token-plan-v3.synthetic.json', import.meta.url), 'utf8');
+  expect(tokenPlanEvidenceV3Schema.safeParse(JSON.parse(text)).success).toBe(true);
+  // The v2 example is untouched and still follows the frozen v2 path.
+  const v2 = await readFile(new URL('../docs/examples/internal-ai-token-plan-v2.synthetic.json', import.meta.url), 'utf8');
+  expect(evidenceSchema.safeParse(JSON.parse(v2)).success).toBe(true);
 });

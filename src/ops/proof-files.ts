@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { resolve, relative, sep, join } from 'node:path';
 import { CompanyError } from '../core-errors.ts';
-import { manifestSchema, evidenceSchema, configurationDigest, sha256, TOKEN_PLAN_PLAN_TYPE_FREE, type ServiceEvidence, type ProofManifest } from './proof-contract.ts';
+import { manifestSchema, evidenceSchema, configurationDigest, sha256, tokenPlanV3Eligible, TOKEN_PLAN_PLAN_TYPE_FREE, type ServiceEvidence, type ProofManifest } from './proof-contract.ts';
 const denied = () => new CompanyError('forbidden', 'approval file unavailable or unsafe');
 /** No symlink components; hash the same bounded fd that was opened and recheck metadata after reading. */
 export async function readProofFile(home: string, task: string, path: string): Promise<Buffer> {
@@ -48,7 +48,9 @@ export function evidenceChecks(e: ServiceEvidence, manifest: ProofManifest, now:
     serviceEvidenceEligible: e.type === 'reviewed-service'
       ? e.serviceApproved && e.balanceNanoUsd >= manifest.budget.totalNanoUsd
       : e.type === 'reviewed-token-plan'
-        ? e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && now - Date.parse(e.sampledAt) <= 86_400_000
+        ? e.schemaVersion === 3
+          ? tokenPlanV3Eligible(e, now)
+          : e.serviceApproved && e.quotaAmount > 0 && (e.quotaRemaining == null || e.quotaRemaining > 0) && e.accountPlanType === TOKEN_PLAN_PLAN_TYPE_FREE && now - Date.parse(e.sampledAt) <= 86_400_000
         : false };
 }
 export async function loadProofFiles(home: string, task: string, manifestPath: string, documentPath: string) {

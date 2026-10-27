@@ -9,23 +9,32 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { describeTransportFailure, opsFetch, type Fetcher } from './fetcher.ts';
-import { evidenceSchema, sha256, TOKEN_PLAN_PLAN_TYPE_FREE } from './proof-contract.ts';
+import {
+  evidenceSchema, sha256, PLAN_HTML_FLAT_ALGORITHM, REVIEWED_QUOTA_AMOUNT, REVIEWED_QUOTA_WINDOW_SECONDS,
+  TOKEN_PLAN_PLAN_TYPE_FREE, type TokenPlanEvidenceV3,
+} from './proof-contract.ts';
 import { clip, redactJson } from './redact.ts';
 
 /**
- * The fixed SenseNova adapter (v2). Every endpoint, method and field below was reviewed
- * against the provider's public pages and console surface; callers can never steer the
- * sampler to another host, path, method or body.
+ * The fixed SenseNova adapter (v3). v3 records the official page as a promotional, account-bound
+ * observation only: the page no longer states a quota number, so the quota facts come from the
+ * authenticated console pools and the allowed cap stays at the reviewed 60k points / 5h bound.
+ * Callers can never steer the sampler to another host, path, method or body.
  */
-export const SUPPLIER_ADAPTER = 'sensenova-token-plan/2';
+export const SUPPLIER_ADAPTER = 'sensenova-token-plan/3';
 export const SUPPLIER_PROVIDER = 'sensenova';
 const API_BASE = 'https://token.sensenova.cn/v1';
 const CONSOLE_API = 'https://platform.sensenova.cn/lite/console/v1';
 const PLAN_PAGE = 'https://www.sensenova.cn/token-plan';
 const BOUND_MODEL = 'sensenova-6.8-flash-lite';
 const BOUND_PRICE_REVISION = 'sensenova-token-plan-2026-10-10';
-const PLAN_NAME = 'SenseNova Token Plan Free · 公测';
-const QUOTA = { unit: 'points', amount: 60_000, windowSeconds: 18_000 } as const;
+const PLAN_NAME = 'SenseNova Token Plan Free · 公测 · 限时账号绑定';
+/**
+ * The reviewed cap. GM FV06 ruling: the authenticated account pools observe 120000/5h and
+ * 1200000/7d, but those are observations only — the allowed upper bound never rises above this
+ * reviewed 60k points / 5h constant.
+ */
+const QUOTA = { unit: 'points', amount: REVIEWED_QUOTA_AMOUNT, windowSeconds: REVIEWED_QUOTA_WINDOW_SECONDS } as const;
 /** The reviewed service binding every generated document asserts. */
 export const SUPPLIER_SERVICE = {
   endpoint: API_BASE, model: BOUND_MODEL, priceRevision: BOUND_PRICE_REVISION, planSourceUrl: PLAN_PAGE,
@@ -103,13 +112,21 @@ interface SourceRecord {
   name: string; url: string; method: 'GET';
   status: number | null; ms: number | null;
   ok: boolean; detail?: string;
+  /** Local UTC instant the response was received (v3 source freshness). */
+  fetchedAt?: string;
+  /** The origin's Date header, verbatim; v3 requires it for the official page. */
+  httpDate?: string | null;
+  etag?: string | null;
+  rawSha256?: string;
+  flatSha256?: string;
 }
 interface PoolFacts {
   poolType: string; name: string;
-  limit5h: number | null; remaining5h: number | null; reset5h: number | null;
-  limit7d: number | null; remaining7d: number | null; reset7d: number | null;
+  limit5h: number | null; used5h: number | null; remaining5h: number | null; reset5h: number | null;
+  limit7d: number | null; used7d: number | null; remaining7d: number | null; reset7d: number | null;
+  used5hDerived: boolean; used7dDerived: boolean;
 }
-interface ProbeBody { status: number; ms: number; body: unknown; text: string }
+interface ProbeBody { status: number; ms: number; body: unknown; text: string; at: number; date: string | null; etag: string | null; truncated: boolean }
 
 export interface SupplierSampleInput {
   project: string;
@@ -171,7 +188,7 @@ const secondsOrNull = (value: unknown): number | null => {
  */
 async function probe(
   name: string, url: string, init: RequestInit,
-  io: { fetcher: Fetcher; left: () => number }, record: SourceRecord,
+  io: { fetcher: Fetcher; left: () => number; now: () => number }, record: SourceRecord,
 ): Promise<ProbeBody | null> {
   const started = Date.now();
   const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
@@ -180,14 +197,18 @@ async function probe(
     const response = await io.fetcher(url, { ...init, signal: AbortSignal.timeout(ms) });
     record.status = response.status;
     record.ms = Date.now() - started;
+    const at = io.now();
+    const date = response.headers.get('date');
+    const etag = response.headers.get('etag');
     if (response.status >= 300 && response.status <= 399) {
       record.detail = 'redirect rejected by policy';
-      return { status: response.status, ms: record.ms, body: null, text: '' };
+      return { status: response.status, ms: record.ms, body: null, text: '', at, date, etag, truncated: false };
     }
-    const text = clip(await response.text().catch(() => ''), MAX_BODY_BYTES);
+    const rawText = await response.text().catch(() => '');
+    const text = clip(rawText, MAX_BODY_BYTES);
     let body: unknown = null;
     try { body = JSON.parse(text); } catch { /* non-JSON is recorded by status only */ }
-    return { status: response.status, ms: record.ms, body, text };
+    return { status: response.status, ms: record.ms, body, text, at, date, etag, truncated: text.includes('[truncated ') };
   } catch (error) {
     record.ms = Date.now() - started;
     record.detail = describeTransportFailure(error, ms).detail;
@@ -196,19 +217,60 @@ async function probe(
 }
 
 /**
- * Official plan-page applicability markers (zh page, reviewed 2026-10): the free beta is
- * fully open, paid tiers are only announced, and the 60k-points / 5-hour fact is stated.
- * If the copy changes (e.g. paid tiers launch) a marker disappears and the sampler blocks
- * for re-review instead of reusing stale applicability.
+ * The documented v3 normalization: script/style bodies are dropped, every remaining tag becomes one
+ * space, and all whitespace runs collapse. The exact flat text and its SHA256 are recorded in the
+ * evidence document, so two verifiers can re-derive the same bytes from the captured raw page.
  */
-function planPageMarkers(text: string): Record<string, boolean> {
-  const flat = text.replace(/<script[^>]*>[\s\S]*?<\/script>|<style[^>]*>[\s\S]*?<\/style>|<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+export function flattenPlanHtml(text: string): string {
+  return text
+    .replace(/<script[^>]*>[\s\S]*?<\/script>|<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Official plan-page applicability markers for v3 (reviewed 2026-10-27): the page says the public
+ * beta is free and time-limited, paid tiers are only announced, and it carries no quota number.
+ * The quota number is deliberately an observation (`officialQuotaNumberObserved`), never a required
+ * marker: the account-bound pool figures are the only quota evidence. This replaces the v2
+ * `quota5h` marker (still kept in planPageMarkersV2 for old-document regression) instead of deleting
+ * a failing check: the new copy has no number to match, and a missing limited-time marker blocks.
+ */
+export function planPageMarkersV3(flat: string): Record<string, boolean> {
+  return {
+    freeBetaOpen: flat.includes('公测期完全免费开放'),
+    paidTiersUpcoming: flat.includes('付费档位即将上线'),
+    limitedTimePromotion: /限时(?:放量|免费|开放|活动)/.test(flat),
+    freeTierNamed: flat.includes('Free') && flat.includes('公测'),
+    officialQuotaNumberObserved: /\d[\d,]{2,}\s*(?:积分|points?)/i.test(flat),
+  };
+}
+
+/** v2's official-copy markers, retained so old sampled documents keep their original semantics. */
+export function planPageMarkersV2(text: string): Record<string, boolean> {
+  const flat = flattenPlanHtml(text);
   return {
     freeBetaOpen: flat.includes('公测期完全免费开放'),
     paidTiersUpcoming: flat.includes('付费档位即将上线'),
     quota5h: flat.includes('60,000') && flat.includes('5 小时'),
     freeTierNamed: flat.includes('Free') && flat.includes('公测'),
   };
+}
+
+/**
+ * A promotional end date the page states explicitly, if any. When present it caps the evidence
+ * lifetime; when absent the document records `unknown-promotional-end` instead of claiming the
+ * activity is permanent.
+ */
+export function promotionalDeadline(flat: string): { at: string; text: string } | null {
+  const match = /(?:活动)?(?:截止|截至)(?:日期|时间)?[:：]?\s*(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/.exec(flat);
+  if (!match) return null;
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+  const at = Date.UTC(year, month - 1, day, 23, 59, 59, 999);
+  const date = new Date(at);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return { at: date.toISOString(), text: match[0].slice(0, 80) };
 }
 
 /** Parses the console pool-usage payload; null when the shape drifted beyond recognition. */
@@ -219,11 +281,19 @@ function parsePools(body: unknown): PoolFacts[] | null {
   return pools.filter((p): p is Record<string, unknown> => !!p && typeof p === 'object').map(p => {
     const w5 = (p.window_5h ?? {}) as Record<string, unknown>;
     const w7 = (p.window_7d ?? {}) as Record<string, unknown>;
+    const limit5h = numberOrNull(w5.limit), remaining5h = numberOrNull(w5.remaining);
+    const limit7d = numberOrNull(w7.limit), remaining7d = numberOrNull(w7.remaining);
+    const reported5h = numberOrNull(w5.used);
+    const reported7d = numberOrNull(w7.used);
+    const derived = (limit: number | null, remaining: number | null) =>
+      limit !== null && remaining !== null && remaining <= limit ? limit - remaining : null;
     return {
       poolType: typeof p.pool_type === 'string' ? p.pool_type : 'unknown',
       name: typeof p.name === 'string' ? p.name.slice(0, 80) : '',
-      limit5h: numberOrNull(w5.limit), remaining5h: numberOrNull(w5.remaining), reset5h: secondsOrNull(w5.reset_at),
-      limit7d: numberOrNull(w7.limit), remaining7d: numberOrNull(w7.remaining), reset7d: secondsOrNull(w7.reset_at),
+      limit5h, used5h: reported5h ?? derived(limit5h, remaining5h), remaining5h, reset5h: secondsOrNull(w5.reset_at),
+      used5hDerived: reported5h === null,
+      limit7d, used7d: reported7d ?? derived(limit7d, remaining7d), remaining7d, reset7d: secondsOrNull(w7.reset_at),
+      used7dDerived: reported7d === null,
     };
   });
 }
@@ -240,6 +310,84 @@ function parseAccountPlan(body: unknown): { id: string; name: string; type: stri
 /** The pool that governs the bound model: Flash-Lite dedicated first, the general pool otherwise. */
 function governingPool(pools: PoolFacts[]): PoolFacts | undefined {
   return pools.find(p => p.poolType === 'dedicated') ?? pools.find(p => p.poolType === 'default') ?? pools[0];
+}
+
+type PoolWindowDocument = { limit: number; used: number; remaining: number; resetAt: string };
+type PoolDocument = {
+  poolType: string; name: string; accountBound: true;
+  window5h: PoolWindowDocument; window7d: PoolWindowDocument;
+  usedSource5h: 'reported' | 'derived'; usedSource7d: 'reported' | 'derived';
+};
+interface PoolAnalysis {
+  ok: boolean;
+  governing?: PoolFacts;
+  basis?: 'dedicated-pool-for-bound-model' | 'default-pool' | 'single-pool';
+  minRemaining: number | null;
+  minResetMs: number | null;
+  observedLimits: Array<{ poolType: string; limit5h: number | null; limit7d: number | null }>;
+  documentPools: PoolDocument[];
+  gaps: Gap[];
+}
+
+/**
+ * The v3 pool contract. Both windows are mandatory for every pool; `used + remaining` must equal
+ * the reported limit; duplicate pool types are ambiguous; a window already reset is stale. The
+ * trusted remaining is the minimum across both windows of every applicable pool, so a large 7d
+ * figure can never hide a nearly spent 5h window (or vice versa). Missing 7d facts never become
+ * "unlimited": they block.
+ */
+function analyzePools(pools: PoolFacts[], sampledMs: number): PoolAnalysis {
+  const gaps: Gap[] = [];
+  const fail = (field: string, detail: string) => gaps.push({ field, source: 'poolUsage', detail });
+  if (pools.length === 0) fail('quota', 'account shows no token-plan pools');
+  if (new Set(pools.map(pool => pool.poolType)).size !== pools.length) fail('poolConsistency', 'duplicate pool types make the governing pool ambiguous');
+  const documentPools: PoolDocument[] = [];
+  let minRemaining: number | null = null;
+  let minResetMs: number | null = null;
+  for (const pool of pools) {
+    const window = (label: '5h' | '7d', limit: number | null, used: number | null, remaining: number | null, reset: number | null, derived: boolean) => {
+      if (limit === null || used === null || remaining === null || reset === null) {
+        fail(label === '5h' ? 'quota5h' : 'quota7d', `pool ${pool.poolType} is missing a ${label} limit/used/remaining/reset fact; a missing window is never treated as unlimited`);
+        return undefined;
+      }
+      if (limit <= 0 || remaining > limit || used > limit || used + remaining !== limit) {
+        fail('poolConsistency', `pool ${pool.poolType} ${label} facts are inconsistent (limit=${limit}, used=${used}, remaining=${remaining})`);
+        return undefined;
+      }
+      const resetMs = reset * 1000;
+      if (resetMs <= sampledMs) {
+        fail('poolWindow', `pool ${pool.poolType} ${label} window already reset at ${new Date(resetMs).toISOString()}`);
+        return undefined;
+      }
+      minRemaining = minRemaining === null ? remaining : Math.min(minRemaining, remaining);
+      minResetMs = minResetMs === null ? resetMs : Math.min(minResetMs, resetMs);
+      return { limit, used, remaining, resetAt: new Date(resetMs).toISOString(), derived };
+    };
+    const w5 = window('5h', pool.limit5h, pool.used5h, pool.remaining5h, pool.reset5h, pool.used5hDerived);
+    const w7 = window('7d', pool.limit7d, pool.used7d, pool.remaining7d, pool.reset7d, pool.used7dDerived);
+    if (w5 && w7) {
+      documentPools.push({
+        poolType: pool.poolType, name: pool.name || pool.poolType, accountBound: true,
+        window5h: { limit: w5.limit, used: w5.used, remaining: w5.remaining, resetAt: w5.resetAt },
+        window7d: { limit: w7.limit, used: w7.used, remaining: w7.remaining, resetAt: w7.resetAt },
+        usedSource5h: w5.derived ? 'derived' : 'reported', usedSource7d: w7.derived ? 'derived' : 'reported',
+      });
+    } else {
+      // Keep the receipt's observed limits even when the document cannot be produced.
+      documentPools.length = 0;
+    }
+  }
+  const governing = governingPool(pools);
+  if (!governing) fail('governingPool', 'no pool can govern the bound model');
+  const basis = pools.length === 1 ? 'single-pool'
+    : pools.some(pool => pool.poolType === 'dedicated') ? 'dedicated-pool-for-bound-model' : 'default-pool';
+  const observedLimits = pools.map(pool => ({ poolType: pool.poolType, limit5h: pool.limit5h, limit7d: pool.limit7d }));
+  return {
+    ok: gaps.length === 0 && documentPools.length > 0 && governing !== undefined,
+    ...(governing === undefined ? {} : { governing }),
+    basis,
+    minRemaining, minResetMs, observedLimits, documentPools, gaps,
+  };
 }
 
 export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<SupplierSampleResult> {
@@ -298,7 +446,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let modelListed = false;
   if (apiKey) {
     const record = source('models', `${API_BASE}/models`);
-    const res = await probe('models', `${API_BASE}/models`, bearer(apiKey), { fetcher, left }, record);
+    const res = await probe('models', `${API_BASE}/models`, bearer(apiKey), { fetcher, left, now }, record);
     if (res && res.status === 200) {
       const ids = Array.isArray((res.body as { data?: unknown })?.data)
         ? ((res.body as { data: unknown[] }).data.map(row => (row as { id?: unknown })?.id).filter((v): v is string => typeof v === 'string'))
@@ -314,15 +462,45 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     }
   }
 
-  // ---- source: official plan page (applicability of plan facts) ----
+  // ---- source: official plan page (promotional applicability + source freshness) ----
   const pageRecord = source('planPage', PLAN_PAGE);
-  const page = await probe('planPage', PLAN_PAGE, { method: 'GET', redirect: 'manual', headers: { accept: 'text/html' } }, { fetcher, left }, pageRecord);
-  const markers = page && page.status === 200 ? planPageMarkers(page.text) : null;
-  if (page && page.status === 200 && markers) {
+  const page = await probe('planPage', PLAN_PAGE, { method: 'GET', redirect: 'manual', headers: { accept: 'text/html' } }, { fetcher, left, now }, pageRecord);
+  const flat = page && page.status === 200 ? flattenPlanHtml(page.text) : '';
+  const markers = page && page.status === 200 && flat ? planPageMarkersV3(flat) : null;
+  const promotionalEnd = markers ? promotionalDeadline(flat) : null;
+  const claimsPromotionalEnd = /(?:截止|截至)/.test(flat);
+  let planSource: TokenPlanEvidenceV3['planSource'] | undefined;
+  let normalization: TokenPlanEvidenceV3['normalization'] | undefined;
+  if (page && page.status === 200 && markers && flat) {
     pageRecord.ok = true;
+    pageRecord.fetchedAt = new Date(page.at).toISOString();
+    pageRecord.httpDate = page.date;
+    pageRecord.etag = page.etag;
+    pageRecord.rawSha256 = sha256(page.text);
+    pageRecord.flatSha256 = sha256(flat);
     derivations.planPageMarkers = markers;
-    for (const [key, hit] of Object.entries(markers)) {
-      if (!hit) gaps.push({ field: 'planApplicability', source: 'planPage', detail: `official plan page marker ${key} no longer holds` });
+    derivations.planPagePromotionalEnd = promotionalEnd;
+    derivations.planPageRawSha256 = pageRecord.rawSha256;
+    derivations.planPageFlatSha256 = pageRecord.flatSha256;
+    derivations.planPageFlatAlgorithm = PLAN_HTML_FLAT_ALGORITHM;
+    for (const key of ['freeBetaOpen', 'paidTiersUpcoming', 'limitedTimePromotion', 'freeTierNamed']) {
+      if (!markers[key]) gaps.push({ field: 'planApplicability', source: 'planPage', detail: `official plan page marker ${key} no longer holds` });
+    }
+    if (page.truncated) gaps.push({ field: 'planSource', source: 'planPage', detail: 'official page exceeded the bounded body size; raw/flat hash would cover only a prefix' });
+    if (!page.date) gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page sent no HTTP Date header; source freshness cannot be corroborated' });
+    else if (!Number.isFinite(Date.parse(page.date))) gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page HTTP Date header is not a valid HTTP date' });
+    else {
+      const skew = page.at - Date.parse(page.date);
+      derivations.planPageClockSkewMs = skew;
+      if (Math.abs(skew) > 300_000) gaps.push({ field: 'sourceDate', source: 'planPage', detail: `local clock differs from HTTP Date by ${skew}ms (beyond the 5 minute bound)` });
+      else planSource = {
+        url: PLAN_PAGE, fetchedAt: new Date(page.at).toISOString(), httpDate: new Date(Date.parse(page.date)).toISOString(),
+        clockSkewMs: skew, status: page.status, etag: page.etag, rawSha256: sha256(page.text),
+      };
+    }
+    normalization = { algorithm: PLAN_HTML_FLAT_ALGORITHM, flatSha256: sha256(flat), flatChars: flat.length };
+    if (promotionalEnd === null && claimsPromotionalEnd) {
+      gaps.push({ field: 'promotionalEnd', source: 'planPage', detail: 'official page mentions a deadline that could not be parsed; refusing to assume an unbounded activity' });
     }
   } else {
     gaps.push({ field: 'planApplicability', source: 'planPage', detail: pageRecord.detail ?? `official plan page unreadable (HTTP ${page?.status ?? 'n/a'})` });
@@ -340,8 +518,8 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     const keysRecord = source('apiKeys', `${CONSOLE_API}/metered/api-keys`);
     const poolRecord = source('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`);
     const [keysFirst, poolRes] = await Promise.all([
-      probe('apiKeys', `${CONSOLE_API}/metered/api-keys?page_size=${API_KEY_PAGE_SIZE}`, bearer(consoleToken), { fetcher, left }, keysRecord),
-      probe('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`, bearer(consoleToken), { fetcher, left }, poolRecord),
+      probe('apiKeys', `${CONSOLE_API}/metered/api-keys?page_size=${API_KEY_PAGE_SIZE}`, bearer(consoleToken), { fetcher, left, now }, keysRecord),
+      probe('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`, bearer(consoleToken), { fetcher, left, now }, poolRecord),
     ]);
 
     if (poolRes && poolRes.status === 200) {
@@ -372,7 +550,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
         const body = page === 0 ? keysFirst.body : null;
         const res = page === 0 ? keysFirst : await probe(
           'apiKeys', `${CONSOLE_API}/metered/api-keys?page_size=${API_KEY_PAGE_SIZE}&page_token=${encodeURIComponent(nextToken)}`,
-          bearer(consoleToken), { fetcher, left }, keysRecord);
+          bearer(consoleToken), { fetcher, left, now }, keysRecord);
         const payload = page === 0 ? body : res?.body;
         if (!payload || typeof payload !== 'object' || !Array.isArray((payload as { api_keys?: unknown }).api_keys)) { malformed = true; break; }
         const rows = (payload as { api_keys: Array<Record<string, unknown>> }).api_keys;
@@ -416,7 +594,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     const surfaceChecks: Array<{ path: string; status: number | null }> = [];
     const surfaceRecords = PAYMENT_SURFACE_PATHS.map(path => source('paymentSurface', `${CONSOLE_API}${path}`));
     const surfaceResults = await Promise.all(
-      PAYMENT_SURFACE_PATHS.map((path, i) => probe('paymentSurface', `${CONSOLE_API}${path}`, bearer(consoleToken), { fetcher, left }, surfaceRecords[i]!)),
+      PAYMENT_SURFACE_PATHS.map((path, i) => probe('paymentSurface', `${CONSOLE_API}${path}`, bearer(consoleToken), { fetcher, left, now }, surfaceRecords[i]!)),
     );
     let surfaceDrift = false;
     for (let i = 0; i < PAYMENT_SURFACE_PATHS.length; i += 1) {
@@ -434,10 +612,16 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   }
 
   // ---- derivations ----
-  const applicabilityOk = markers !== null && Object.values(markers).every(Boolean);
+  // The v3 official-copy gate: free beta + paid tiers still upcoming + a limited-time promotion +
+  // the Free 公测 tier. The quota number is recorded as an observation and is never a required
+  // marker, because the official copy no longer states one; the account-bound pools are the only
+  // quota evidence.
+  const requiredMarkers = ['freeBetaOpen', 'paidTiersUpcoming', 'limitedTimePromotion', 'freeTierNamed'] as const;
+  const applicabilityOk = markers !== null && requiredMarkers.every(key => markers[key] === true);
   const accountBound = poolsOk && crossBound;
   derivations.accountBound = accountBound;
   derivations.applicabilityOk = applicabilityOk;
+  derivations.officialQuotaNumberObserved = markers?.officialQuotaNumberObserved ?? false;
   // Only the authenticated console plan record, cross-bound to the sealed API key,
   // establishes FREE. Public copy, model liveness and HTTP 404s are not account facts.
   const accountPlanFree = accountBound && accountPlan?.type === TOKEN_PLAN_PLAN_TYPE_FREE;
@@ -446,8 +630,8 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   derivations.accountPlanSource = { source: 'poolUsage', accountBound, verified: accountPlanFree };
   derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
   derivations.paymentStateSources = ACCOUNT_PAYMENT_SOURCES.length;
-  derivations.removedAccountAssertions = ['noPaymentInstrument', 'autoTopupDisabled'];
-  notes.push('the revised contract dropped the account-level payment assertions noPaymentInstrument/autoTopupDisabled; their absence is contractual, not a gap more probing could close');
+  derivations.removedAccountAssertions = ['noPaymentInstrument'];
+  notes.push('v3 keeps autoTopupDisabled as our measurement-configuration assertion; payment-surface 404s remain observations and never prove the absence of payment capability');
   if (!accountPlanFree) {
     gaps.push({ field: 'accountPlanType', source: 'poolUsage', detail: accountPlan
       ? 'authenticated account plan is not verified FREE for the bound API key (product gap: account-plan-free)'
@@ -459,40 +643,53 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     gaps.push({ field: 'apiKey', source: 'models', detail: 'chat credential liveness unverified' });
   }
 
-  const governing = pools.length ? governingPool(pools) : undefined;
-  let quotaRemaining: number | null = null;
-  const quotaVerified = !!governing && governing.limit5h === QUOTA.amount;
-  derivations.quotaHardCapVerified = quotaVerified;
-  if (!quotaVerified) gaps.push({ field: 'quota', source: 'poolUsage', detail: 'governing pool hard cap missing or differs from reviewed official quota' });
-  if (governing) {
-    quotaRemaining = governing.remaining5h;
-    if (quotaRemaining === null) {
-      gaps.push({ field: 'quotaRemaining', source: 'poolUsage', detail: `governing pool ${governing.poolType} exposes no 5h remaining figure` });
-    }
-    if (governing.limit5h !== null && governing.limit5h !== QUOTA.amount) {
-      notes.push(`governing pool 5h limit ${governing.limit5h} differs from certified ${QUOTA.amount}; document blocked for quota re-review`);
-    }
+  const poolAnalysis = analyzePools(pools, sampledMs);
+  gaps.push(...poolAnalysis.gaps);
+  const quotaRemaining = poolAnalysis.minRemaining;
+  // The allowed bound is the smaller of the reviewed 60k cap and every applicable pool's trusted
+  // remaining. The observed 120k pool limit is recorded in pools/governing facts and never raises it.
+  const quotaAmount = quotaRemaining === null ? null : Math.min(QUOTA.amount, quotaRemaining);
+  derivations.poolsOk = poolAnalysis.ok;
+  derivations.governingPool = poolAnalysis.governing ? { poolType: poolAnalysis.governing.poolType, basis: poolAnalysis.basis ?? null } : null;
+  derivations.observedPoolLimits = poolAnalysis.observedLimits;
+  derivations.quotaAllowedAmount = quotaAmount;
+  derivations.quotaRemaining = quotaRemaining;
+  derivations.quotaCapSource = 'min(reviewed 60000 points / 18000s, every applicable pool remaining)';
+  if (quotaAmount === null || quotaAmount <= 0) {
+    gaps.push({ field: 'quota', source: 'poolUsage', detail: 'no trusted remaining quota in every applicable pool; allowed upper bound cannot be established' });
   }
 
-  let canDocument = !!accountRef && keyLive && modelListed && accountBound && accountPlanFree && applicabilityOk && quotaVerified;
-  let document: Record<string, unknown> | undefined;
-  let documentSha256: string | undefined;
-  let documentFile: string | undefined;
-  let expiresAt: string | undefined;
-
-  const resets = [governing?.reset5h, governing?.reset7d].filter((v): v is number => typeof v === 'number');
-  const expiryMs = Math.min(sampledMs + MAX_DOC_AGE_MS, ...(resets.length ? resets.map(s => s * 1000) : [sampledMs + MAX_DOC_AGE_MS]));
+  const promotionalEndMs = promotionalEnd ? Date.parse(promotionalEnd.at) : null;
+  // A page that mentions a deadline we could not parse is not treated as open-ended.
+  const promotionalEndOk = !(claimsPromotionalEnd && promotionalEnd === null);
+  const terminationRisk = promotionalEndMs === null ? 'unknown-promotional-end' : 'promotional-end-recorded';
+  const resetsMs = pools.flatMap(pool => [pool.reset5h, pool.reset7d])
+    .filter((value): value is number => typeof value === 'number').map(value => value * 1000);
+  const expiryCandidates = [sampledMs + MAX_DOC_AGE_MS, ...resetsMs, ...(promotionalEndMs === null ? [] : [promotionalEndMs])];
+  const expiryMs = Math.min(...expiryCandidates);
+  if (promotionalEndMs !== null && promotionalEndMs <= sampledMs) {
+    gaps.push({ field: 'promotionalEnd', source: 'planPage', detail: 'the recorded promotional activity already ended at sampling time' });
+  }
   if (expiryMs <= sampledMs) {
     // A window boundary the provider already passed would make any document born-expired;
     // report the stale facts even when the call is already blocked for other reasons.
     gaps.push({ field: 'expiresAt', source: 'poolUsage', detail: 'pool window reset already elapsed; sampled facts are stale on arrival' });
-    canDocument = false;
   }
+
+  let expiresAt: string | undefined;
+  let document: Record<string, unknown> | undefined;
+  let documentSha256: string | undefined;
+  let documentFile: string | undefined;
+  const canDocument = !!accountRef && keyLive && modelListed && applicabilityOk && accountBound && accountPlanFree
+    && poolAnalysis.ok && quotaAmount !== null && quotaAmount > 0 && quotaRemaining !== null
+    && planSource !== undefined && normalization !== undefined && promotionalEndOk
+    && expiryMs > sampledMs && !(promotionalEndMs !== null && promotionalEndMs <= sampledMs);
   if (canDocument) {
     expiresAt = new Date(expiryMs).toISOString();
     document = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       type: 'reviewed-token-plan',
+      evidenceClass: 'promotional-account-bound',
       accountRef: accountRef!,
       endpoint: API_BASE,
       model: BOUND_MODEL,
@@ -501,18 +698,30 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       expiresAt,
       planName: PLAN_NAME,
       planSourceUrl: PLAN_PAGE,
-      quotaUnit: QUOTA.unit,
-      quotaAmount: QUOTA.amount,
-      quotaWindowSeconds: QUOTA.windowSeconds,
-      quotaRemaining,
+      planSource: planSource!,
+      normalization: normalization!,
       accountPlanType: accountPlan!.type,
+      accountBound: true,
+      accountBoundSource: 'console-pool-usage-cross-bound-to-sealed-api-key',
+      quotaUnit: QUOTA.unit,
+      quotaAmount: quotaAmount!,
+      quotaWindowSeconds: QUOTA.windowSeconds,
+      quotaRemaining: quotaRemaining!,
+      quotaSource: 'account-bound-observation',
+      governingPool: { poolType: poolAnalysis.governing!.poolType, basis: poolAnalysis.basis! },
+      pools: poolAnalysis.documentPools,
+      autoTopupDisabled: true,
+      promotional: true,
+      revalidateBeforeUse: true,
+      terminationRisk,
+      promotionalEndsAt: promotionalEnd?.at ?? null,
       // The document's approval claim: it takes effect only through ops_internal_ai_prove's
       // independent task-service approval receipt, never on this field alone.
       serviceApproved: true,
     };
     const parsed = evidenceSchema.safeParse(document);
     if (!parsed.success) {
-      gaps.push({ field: 'document', source: 'sampler', detail: 'generated document failed the reviewed-token-plan schema' });
+      gaps.push({ field: 'document', source: 'sampler', detail: 'generated document failed the reviewed-token-plan v3 schema' });
       document = undefined;
     } else {
       const bytes = Buffer.from(JSON.stringify(document, null, 2) + '\n', 'utf8');
