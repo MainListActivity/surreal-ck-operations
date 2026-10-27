@@ -108,23 +108,79 @@ export const supplierAliasFromSecretName = (name: string): { alias: string; kind
 
 /** One fact the sampler could not establish; why the call ended `blocked` or a field stayed null. */
 interface Gap { field: string; source: string; detail: string }
+/**
+ * Per-source provenance. Every probe records its own raw time/cache/redirect metadata so a
+ * reviewer can re-derive freshness verdicts without trusting the sampler's classification:
+ * three wall-clock timestamps plus a monotonic duration (wall clocks can be skewed — the
+ * monotonic pair cannot go backwards), the verbatim HTTP Date/Age/cache headers, redirect
+ * policy outcome, and the body hash/size. Field provenance is in the names: `httpDate*`
+ * come from response headers, `*At` are local wall clock, `monotonic*` is measured.
+ */
 interface SourceRecord {
   name: string; url: string; method: 'GET';
   status: number | null; ms: number | null;
   ok: boolean; detail?: string;
-  /** Local UTC instant the response was received (v3 source freshness). */
+  /** Local wall clock: request sent, response headers arrived, body fully read. */
+  requestStartedAt?: string | null;
+  headersAt?: string | null;
+  bodyCompletedAt?: string | null;
+  /** Monotonic (performance.now) ms at headers and at body completion; immune to clock steps. */
+  monotonicMs?: number | null;
+  monotonicBodyMs?: number | null;
+  /** Local UTC instant the response headers arrived (v3 planSource field); equals headersAt. */
   fetchedAt?: string;
-  /** The origin's Date header, verbatim; v3 requires it for the official page. */
+  /** The origin's Date header, verbatim, plus its parsed epoch; null when absent/invalid. */
   httpDate?: string | null;
+  httpDateEpochMs?: number | null;
+  /** Age header seconds; null when absent (cacheAgeUnknown flags the cacheable-without-Age case). */
+  ageSeconds?: number | null;
+  cacheAgeUnknown?: boolean;
+  cacheControl?: string | null;
   etag?: string | null;
-  rawSha256?: string;
+  cfCacheStatus?: string | null;
+  xNextjsCache?: string | null;
+  server?: string | null;
+  via?: string | null;
+  /** 3xx Location; the sampler never follows redirects (redirect: manual). */
+  location?: string | null;
+  redirectRejected?: boolean;
+  redirectChain?: string[];
+  responseHost?: string;
+  rawSha256?: string | null;
+  bodyBytes?: number | null;
+  /** Console-issued request id, when the surface sends one; ties the pool snapshot together. */
+  requestId?: string | null;
   flatSha256?: string;
 }
+/** A pool field exactly as the provider sent it, before any numeric conversion. */
+interface RawValue { type: 'number' | 'string' | 'null' | 'other'; value: string }
+const rawOf = (value: unknown): RawValue =>
+  typeof value === 'number' ? { type: 'number', value: String(value) }
+  : typeof value === 'string' ? { type: 'string', value }
+  : value === null || value === undefined ? { type: 'null', value: 'null' }
+  : { type: 'other', value: typeof value };
+/**
+ * Exact numeric value of a JSON number or a plain decimal string, with no floor, no
+ * parseFloat drift and no silent coercion: a string must be a plain decimal literal.
+ * Non-finite, negative or malformed input yields null (reported as a missing fact).
+ */
+const exactNumber = (value: unknown): number | null => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(value.trim())) return null;
+    const n = Number(value.trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+};
 interface PoolFacts {
   poolType: string; name: string;
   limit5h: number | null; used5h: number | null; remaining5h: number | null; reset5h: number | null;
   limit7d: number | null; used7d: number | null; remaining7d: number | null; reset7d: number | null;
   used5hDerived: boolean; used7dDerived: boolean;
+  /** Receipt-only raw fields: the provider values before any conversion, for precision audits. */
+  rawLimit5h: RawValue; rawUsed5h: RawValue; rawRemaining5h: RawValue; rawReset5h: RawValue;
+  rawLimit7d: RawValue; rawUsed7d: RawValue; rawRemaining7d: RawValue; rawReset7d: RawValue;
 }
 interface ProbeBody { status: number; ms: number; body: unknown; text: string; at: number; date: string | null; etag: string | null; truncated: boolean }
 
@@ -170,27 +226,52 @@ const bearer = (token: string): RequestInit => ({
   headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
 });
 
-const numberOrNull = (value: unknown): number | null => {
-  const n = typeof value === 'string' ? Number(value) : value;
-  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+const headerOrNull = (headers: Headers, name: string): string | null => headers.get(name);
+const intHeaderOrNull = (headers: Headers, name: string): number | null => {
+  const raw = headers.get(name);
+  if (raw === null || !/^-?\d+$/.test(raw.trim())) return null;
+  return Number.parseInt(raw.trim(), 10);
 };
-
-/** reset_at fields are unix seconds on the console surface. */
-const secondsOrNull = (value: unknown): number | null => {
-  const n = typeof value === 'string' ? Number(value) : value;
-  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+/**
+ * True when the cache headers allow shared caching without forced revalidation — the case
+ * where a missing Age leaves the body's age unknown. `no-cache`/`no-store`/`private`
+ * responses are not shared-cache material, so their Date is the generation time.
+ */
+const cacheableWithoutRevalidation = (cacheControl: string | null): boolean => {
+  if (!cacheControl) return false;
+  const lower = cacheControl.toLowerCase();
+  if (/(?:^|,)\s*(?:no-store|no-cache|private)\b/.test(lower)) return false;
+  return /(?:^|,)\s*(?:public|max-age|s-maxage)\b/.test(lower);
 };
 
 /**
  * One bounded GET: no redirects followed, one per-source timeout inside a shared budget,
  * the body read is clipped so a hostile or drifting payload can never blow up memory or
- * echo large content. The record keeps status/timing only — bodies never leave the sampler.
+ * echo large content. The record keeps status/timing plus the raw time/cache/redirect
+ * metadata; bodies never leave the sampler.
  */
 async function probe(
   name: string, url: string, init: RequestInit,
   io: { fetcher: Fetcher; left: () => number; now: () => number }, record: SourceRecord,
 ): Promise<ProbeBody | null> {
   const started = Date.now();
+  const monoStart = performance.now();
+  record.responseHost = new URL(url).host;
+  record.requestStartedAt = new Date(io.now()).toISOString();
+  record.headersAt = null;
+  record.bodyCompletedAt = null;
+  record.monotonicMs = null;
+  record.monotonicBodyMs = null;
+  record.httpDate = null;
+  record.httpDateEpochMs = null;
+  record.ageSeconds = null;
+  record.cacheAgeUnknown = false;
+  record.location = null;
+  record.redirectRejected = false;
+  record.redirectChain = [];
+  record.rawSha256 = null;
+  record.bodyBytes = null;
+  record.requestId = null;
   const ms = Math.min(STEP_TIMEOUT_MS, Math.max(io.left(), MIN_STEP_MS));
   record.ms = 0;
   try {
@@ -198,17 +279,41 @@ async function probe(
     record.status = response.status;
     record.ms = Date.now() - started;
     const at = io.now();
-    const date = response.headers.get('date');
-    const etag = response.headers.get('etag');
-    if (response.status >= 300 && response.status <= 399) {
+    record.headersAt = new Date(at).toISOString();
+    record.fetchedAt = record.headersAt;
+    record.monotonicMs = performance.now() - monoStart;
+    const headers = response.headers;
+    record.httpDate = headers.get('date');
+    const dateEpoch = record.httpDate !== null && Number.isFinite(Date.parse(record.httpDate)) ? Date.parse(record.httpDate) : null;
+    record.httpDateEpochMs = dateEpoch;
+    const ageSeconds = intHeaderOrNull(headers, 'age');
+    record.ageSeconds = ageSeconds !== null && ageSeconds >= 0 ? ageSeconds : null;
+    record.cacheControl = headerOrNull(headers, 'cache-control');
+    record.etag = headers.get('etag');
+    record.cfCacheStatus = headerOrNull(headers, 'cf-cache-status');
+    record.xNextjsCache = headerOrNull(headers, 'x-nextjs-cache');
+    record.server = headerOrNull(headers, 'server');
+    record.via = headerOrNull(headers, 'via');
+    record.requestId = headerOrNull(headers, 'x-request-id');
+    // A shared-cacheable response with no Age header leaves the body's age unknown: the
+    // absolute time of the content (and of any absolute timestamp inside it) is unproven.
+    record.cacheAgeUnknown = record.ageSeconds === null && cacheableWithoutRevalidation(record.cacheControl);
+    if (response.status >= 300 && response.status <= 399 && response.status !== 304) {
       record.detail = 'redirect rejected by policy';
-      return { status: response.status, ms: record.ms, body: null, text: '', at, date, etag, truncated: false };
+      record.redirectRejected = true;
+      record.location = headers.get('location');
+      record.redirectChain = record.location ? [record.location] : [];
+      return { status: response.status, ms: record.ms, body: null, text: '', at, date: record.httpDate, etag: record.etag, truncated: false };
     }
     const rawText = await response.text().catch(() => '');
+    record.bodyCompletedAt = new Date(io.now()).toISOString();
+    record.monotonicBodyMs = performance.now() - monoStart;
     const text = clip(rawText, MAX_BODY_BYTES);
+    record.bodyBytes = Buffer.byteLength(rawText, 'utf8');
+    record.rawSha256 = response.status === 304 ? null : sha256(rawText);
     let body: unknown = null;
     try { body = JSON.parse(text); } catch { /* non-JSON is recorded by status only */ }
-    return { status: response.status, ms: record.ms, body, text, at, date, etag, truncated: text.includes('[truncated ') };
+    return { status: response.status, ms: record.ms, body, text, at, date: record.httpDate, etag: record.etag, truncated: text.includes('[truncated ') };
   } catch (error) {
     record.ms = Date.now() - started;
     record.detail = describeTransportFailure(error, ms).detail;
@@ -276,7 +381,14 @@ export function promotionalDeadline(flat: string): { at: string; text: string } 
   return { at: new Date(at).toISOString(), text: match[0].slice(0, 80) };
 }
 
-/** Parses the console pool-usage payload; null when the shape drifted beyond recognition. */
+/**
+ * Parses the console pool-usage payload; null when the shape drifted beyond recognition.
+ * Every field keeps its raw `{type, value}` form in the receipt, and arithmetic uses the
+ * exact numeric value with no floor: a later consistency/precision gate decides, never a
+ * silent conversion. `used` is only ever the provider-reported value — a missing used is
+ * a missing fact, never derived from limit-remaining (that circular "consistency" is the
+ * false guarantee this adapter removes).
+ */
 function parsePools(body: unknown): PoolFacts[] | null {
   if (!body || typeof body !== 'object') return null;
   const pools = (body as { pools?: unknown }).pools;
@@ -284,19 +396,19 @@ function parsePools(body: unknown): PoolFacts[] | null {
   return pools.filter((p): p is Record<string, unknown> => !!p && typeof p === 'object').map(p => {
     const w5 = (p.window_5h ?? {}) as Record<string, unknown>;
     const w7 = (p.window_7d ?? {}) as Record<string, unknown>;
-    const limit5h = numberOrNull(w5.limit), remaining5h = numberOrNull(w5.remaining);
-    const limit7d = numberOrNull(w7.limit), remaining7d = numberOrNull(w7.remaining);
-    const reported5h = numberOrNull(w5.used);
-    const reported7d = numberOrNull(w7.used);
-    const derived = (limit: number | null, remaining: number | null) =>
-      limit !== null && remaining !== null && remaining <= limit ? limit - remaining : null;
+    const limit5h = exactNumber(w5.limit), remaining5h = exactNumber(w5.remaining);
+    const limit7d = exactNumber(w7.limit), remaining7d = exactNumber(w7.remaining);
+    const reported5h = exactNumber(w5.used);
+    const reported7d = exactNumber(w7.used);
     return {
       poolType: typeof p.pool_type === 'string' ? p.pool_type : 'unknown',
       name: typeof p.name === 'string' ? p.name.slice(0, 80) : '',
-      limit5h, used5h: reported5h ?? derived(limit5h, remaining5h), remaining5h, reset5h: secondsOrNull(w5.reset_at),
+      limit5h, used5h: reported5h, remaining5h, reset5h: exactNumber(w5.reset_at),
       used5hDerived: reported5h === null,
-      limit7d, used7d: reported7d ?? derived(limit7d, remaining7d), remaining7d, reset7d: secondsOrNull(w7.reset_at),
+      limit7d, used7d: reported7d, remaining7d, reset7d: exactNumber(w7.reset_at),
       used7dDerived: reported7d === null,
+      rawLimit5h: rawOf(w5.limit), rawUsed5h: rawOf(w5.used), rawRemaining5h: rawOf(w5.remaining), rawReset5h: rawOf(w5.reset_at),
+      rawLimit7d: rawOf(w7.limit), rawUsed7d: rawOf(w7.used), rawRemaining7d: rawOf(w7.remaining), rawReset7d: rawOf(w7.reset_at),
     };
   });
 }
@@ -327,19 +439,25 @@ interface PoolAnalysis {
   basis?: 'dedicated-pool-for-bound-model' | 'default-pool' | 'single-pool';
   minRemaining: number | null;
   minResetMs: number | null;
+  /** Smallest same-domain distance to a reset: min(reset_at − consoleNow), in ms. */
+  minResetInMs: number | null;
   observedLimits: Array<{ poolType: string; limit5h: number | null; limit7d: number | null }>;
   documentPools: PoolDocument[];
   gaps: Gap[];
 }
 
 /**
- * The v3 pool contract. Both windows are mandatory for every pool; `used + remaining` must equal
- * the reported limit; duplicate pool types are ambiguous; a window already reset is stale. The
- * trusted remaining is the minimum across both windows of every applicable pool, so a large 7d
- * figure can never hide a nearly spent 5h window (or vice versa). Missing 7d facts never become
- * "unlimited": they block.
+ * The v3 pool contract. Both windows are mandatory for every pool; `used` must be
+ * provider-reported (a derived used would make `used + remaining = limit` circular), every
+ * quota figure must be an exact non-negative integer (raw values are preserved in the
+ * receipt; no rounding rule is accepted without a written provider rule), and
+ * `used + remaining` must equal the reported limit exactly — off by one is still blocked.
+ * Duplicate pool types are ambiguous; windows are judged against the console clock domain
+ * relatively (`reset_at − consoleNow`), never against the host wall clock, so a fast or
+ * slow source clock cannot extend or fake a window. The trusted remaining is the minimum
+ * across both windows of every applicable pool.
  */
-function analyzePools(pools: PoolFacts[], sampledMs: number): PoolAnalysis {
+function analyzePools(pools: PoolFacts[], consoleNowMs: number | null): PoolAnalysis {
   const gaps: Gap[] = [];
   const fail = (field: string, detail: string) => gaps.push({ field, source: 'poolUsage', detail });
   if (pools.length === 0) fail('quota', 'account shows no token-plan pools');
@@ -347,24 +465,46 @@ function analyzePools(pools: PoolFacts[], sampledMs: number): PoolAnalysis {
   const documentPools: PoolDocument[] = [];
   let minRemaining: number | null = null;
   let minResetMs: number | null = null;
+  let minResetInMs: number | null = null;
   for (const pool of pools) {
     const window = (label: '5h' | '7d', limit: number | null, used: number | null, remaining: number | null, reset: number | null, derived: boolean) => {
       if (limit === null || used === null || remaining === null || reset === null) {
-        fail(label === '5h' ? 'quota5h' : 'quota7d', `pool ${pool.poolType} is missing a ${label} limit/used/remaining/reset fact; a missing window is never treated as unlimited`);
+        const missing = [
+          limit === null ? 'limit' : null, used === null ? (derived ? 'used (not provider-reported)' : 'used') : null,
+          remaining === null ? 'remaining' : null, reset === null ? 'reset' : null,
+        ].filter(Boolean).join('/');
+        fail(label === '5h' ? 'quota5h' : 'quota7d', `pool ${pool.poolType} is missing a ${label} ${missing} fact; a missing window is never treated as unlimited and used is never derived from limit-remaining`);
+        return undefined;
+      }
+      if (derived) {
+        fail('poolConsistency', `pool ${pool.poolType} ${label} used is not provider-reported; a derived used never passes the consistency gate`);
+        return undefined;
+      }
+      if (![limit, used, remaining].every(v => Number.isInteger(v) && v >= 0)) {
+        fail('poolPrecision', `pool ${pool.poolType} ${label} quota fields must be exact non-negative integers (raw values preserved in the receipt); no rounding rule is accepted without a written provider rule`);
         return undefined;
       }
       if (limit <= 0 || remaining > limit || used > limit || used + remaining !== limit) {
-        fail('poolConsistency', `pool ${pool.poolType} ${label} facts are inconsistent (limit=${limit}, used=${used}, remaining=${remaining})`);
+        fail('poolConsistency', `pool ${pool.poolType} ${label} facts are inconsistent (limit=${limit}, used=${used}, remaining=${remaining}); off-by-one is still inconsistent`);
         return undefined;
       }
+      if (consoleNowMs === null) {
+        // The console clock for this snapshot is unusable (missing/invalid Date, or a
+        // cacheable response without Age): reset_at cannot be placed in a trusted domain.
+        fail('poolWindow', `pool ${pool.poolType} ${label} reset cannot be judged: the console clock for this snapshot is unusable (see the poolWindow/sourceDate gaps)`);
+        return undefined;
+      }
+      const resetInMs = reset * 1000 - consoleNowMs;
+      if (resetInMs <= 0) {
+        fail('poolWindow', `pool ${pool.poolType} ${label} window already reset ${Math.round(-resetInMs / 1000)}s before the console snapshot time`);
+        fail('expiresAt', `pool ${pool.poolType} ${label} reset already elapsed; sampled facts are stale on arrival and cannot bound a document`);
+        return undefined;
+      }
+      if (minResetInMs === null || resetInMs < minResetInMs) minResetInMs = resetInMs;
       const resetMs = reset * 1000;
-      if (resetMs <= sampledMs) {
-        fail('poolWindow', `pool ${pool.poolType} ${label} window already reset at ${new Date(resetMs).toISOString()}`);
-        return undefined;
-      }
+      if (minResetMs === null || resetMs < minResetMs) minResetMs = resetMs;
       minRemaining = minRemaining === null ? remaining : Math.min(minRemaining, remaining);
-      minResetMs = minResetMs === null ? resetMs : Math.min(minResetMs, resetMs);
-      return { limit, used, remaining, resetAt: new Date(resetMs).toISOString(), derived };
+      return { limit, used, remaining, resetAt: new Date(resetMs).toISOString() };
     };
     const w5 = window('5h', pool.limit5h, pool.used5h, pool.remaining5h, pool.reset5h, pool.used5hDerived);
     const w7 = window('7d', pool.limit7d, pool.used7d, pool.remaining7d, pool.reset7d, pool.used7dDerived);
@@ -373,7 +513,7 @@ function analyzePools(pools: PoolFacts[], sampledMs: number): PoolAnalysis {
         poolType: pool.poolType, name: pool.name || pool.poolType, accountBound: true,
         window5h: { limit: w5.limit, used: w5.used, remaining: w5.remaining, resetAt: w5.resetAt },
         window7d: { limit: w7.limit, used: w7.used, remaining: w7.remaining, resetAt: w7.resetAt },
-        usedSource5h: w5.derived ? 'derived' : 'reported', usedSource7d: w7.derived ? 'derived' : 'reported',
+        usedSource5h: 'reported', usedSource7d: 'reported',
       });
     } else {
       // Keep the receipt's observed limits even when the document cannot be produced.
@@ -389,12 +529,95 @@ function analyzePools(pools: PoolFacts[], sampledMs: number): PoolAnalysis {
     ok: gaps.length === 0 && documentPools.length > 0 && governing !== undefined,
     ...(governing === undefined ? {} : { governing }),
     basis,
-    minRemaining, minResetMs, observedLimits, documentPools, gaps,
+    minRemaining, minResetMs, minResetInMs, observedLimits, documentPools, gaps,
   };
 }
 
-export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<SupplierSampleResult> {
-  const fetcher = input.fetch ?? opsFetch;
+/**
+ * The ±5 minute bound every source clock is judged against (GM FV06 ruling: never widened,
+ * no off-by-one tolerance). `RESET_MARGIN_MS` is a safety margin subtracted from a
+ * same-domain reset distance — it is not a tolerance for any gate.
+ */
+const CLOCK_BOUND_MS = 300_000;
+const RESET_MARGIN_MS = 60_000;
+/** A cached body older than this is stale no matter what its Date header says. */
+const STALE_AGE_SECONDS = 300;
+
+type ClockClass =
+  | 'missing-date' | 'invalid-date' | 'redirect-date' | 'code-error'
+  | 'stale-cache-date' | 'cacheAgeUnknown'
+  | 'source-clock-skew' | 'host-clock-skew' | 'ok';
+
+interface ClockView {
+  httpDate: string | null;
+  httpDateEpochMs: number | null;
+  headersAt: string | null;
+  skewMs: number | null;
+  ageSeconds: number | null;
+  cacheControl: string | null;
+  cacheable: boolean;
+  cacheAgeUnknown: boolean;
+  staleCache: boolean;
+  sourceNowMs: number | null;
+  /** Clock-skew verdict independent of cache-age gating; both can apply at once. */
+  skewClass: 'source-clock-skew' | 'host-clock-skew' | 'ok' | null;
+  /** Age-adjusted view of the source's current clock; informational, not the v3 clockSkewMs. */
+  ageAdjustedSkewMs: number | null;
+  /** False when this domain was never probed (e.g. no console session) — not the same as a failed probe. */
+  probed: boolean;
+  fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skewMs = headersAt − Date (v3 clockSkewMs semantics); ageAdjustedSkewMs = headersAt − (Date + Age)';
+  class: ClockClass;
+}
+
+/**
+ * Classifies one source's clock facts. The provider API domain's skew is passed in as the
+ * host-health reference used only to label which side is wrong — it is never a substitute
+ * anchor for a web/console clock (GM ruling), so a skewed source stays blocked either way.
+ */
+function clockView(record: SourceRecord | undefined, referenceSkewMs: number | null): ClockView {
+  const base = {
+    httpDate: record?.httpDate ?? null,
+    httpDateEpochMs: record?.httpDateEpochMs ?? null,
+    headersAt: record?.headersAt ?? null,
+    skewMs: null as number | null,
+    ageSeconds: record?.ageSeconds ?? null,
+    cacheControl: record?.cacheControl ?? null,
+    cacheable: cacheableWithoutRevalidation(record?.cacheControl ?? null),
+    cacheAgeUnknown: record?.cacheAgeUnknown ?? false,
+    staleCache: false,
+    sourceNowMs: null as number | null,
+    skewClass: null as 'source-clock-skew' | 'host-clock-skew' | 'ok' | null,
+    ageAdjustedSkewMs: null as number | null,
+    probed: record !== undefined,
+    fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skewMs = headersAt − Date (v3 clockSkewMs semantics); ageAdjustedSkewMs = headersAt − (Date + Age)' as const,
+  };
+  let klass: ClockClass;
+  if (record?.redirectRejected) klass = 'redirect-date';
+  else if (base.httpDateEpochMs === null) klass = base.httpDate === null ? 'missing-date' : 'invalid-date';
+  else {
+    const headersMs = base.headersAt !== null ? Date.parse(base.headersAt) : Number.NaN;
+    const skew = Number.isFinite(headersMs) ? headersMs - base.httpDateEpochMs! : null;
+    base.skewMs = skew;
+    base.staleCache = (base.ageSeconds ?? 0) > STALE_AGE_SECONDS;
+    base.sourceNowMs = base.httpDateEpochMs + (base.ageSeconds ?? 0) * 1000;
+    base.ageAdjustedSkewMs = skew === null || base.ageSeconds === null ? null : skew - base.ageSeconds * 1000;
+    base.skewClass = skew !== null && Math.abs(skew) > CLOCK_BOUND_MS
+      ? (referenceSkewMs !== null && Math.abs(referenceSkewMs) > CLOCK_BOUND_MS ? 'host-clock-skew' : 'source-clock-skew')
+      : 'ok';
+    // A wall-clock step inside the request makes skew and the monotonic duration disagree;
+    // that is a sampler/host inconsistency (code-error), never a source fact to be trusted.
+    const startedMs = record?.requestStartedAt ? Date.parse(record.requestStartedAt) : Number.NaN;
+    const monotonic = record?.monotonicMs ?? null;
+    const wallDuration = Number.isFinite(startedMs) && Number.isFinite(headersMs) ? headersMs - startedMs : null;
+    if (wallDuration !== null && monotonic !== null && Math.abs(wallDuration - monotonic) > CLOCK_BOUND_MS) klass = 'code-error';
+    else if (base.staleCache) klass = 'stale-cache-date';
+    else if (base.cacheAgeUnknown) klass = 'cacheAgeUnknown';
+    else klass = base.skewClass;
+  }
+  return { ...base, class: klass };
+}
+
+export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<SupplierSampleResult> {  const fetcher = input.fetch ?? opsFetch;
   const now = input.now ?? Date.now;
   const sampledMs = now();
   const sampledAt = new Date(sampledMs).toISOString();
@@ -447,21 +670,22 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   // ---- source: chat-surface models list (credential liveness + bound model availability) ----
   let keyLive = false;
   let modelListed = false;
+  let modelsRecord: SourceRecord | undefined;
   if (apiKey) {
-    const record = source('models', `${API_BASE}/models`);
-    const res = await probe('models', `${API_BASE}/models`, bearer(apiKey), { fetcher, left, now }, record);
+    modelsRecord = source('models', `${API_BASE}/models`);
+    const res = await probe('models', `${API_BASE}/models`, bearer(apiKey), { fetcher, left, now }, modelsRecord);
     if (res && res.status === 200) {
       const ids = Array.isArray((res.body as { data?: unknown })?.data)
         ? ((res.body as { data: unknown[] }).data.map(row => (row as { id?: unknown })?.id).filter((v): v is string => typeof v === 'string'))
         : [];
       keyLive = true;
       modelListed = ids.includes(BOUND_MODEL);
-      record.ok = true;
+      modelsRecord!.ok = true;
       if (!modelListed) gaps.push({ field: 'model', source: 'models', detail: `bound model ${BOUND_MODEL} is not in the account model list` });
     } else if (res && (res.status === 401 || res.status === 403)) {
       gaps.push({ field: 'apiKey', source: 'models', detail: `chat credential rejected (HTTP ${res.status})` });
     } else {
-      gaps.push({ field: 'apiKey', source: 'models', detail: record.detail ?? `models probe unavailable (HTTP ${res?.status ?? 'n/a'})` });
+      gaps.push({ field: 'apiKey', source: 'models', detail: modelsRecord!.detail ?? `models probe unavailable (HTTP ${res?.status ?? 'n/a'})` });
     }
   }
 
@@ -474,12 +698,15 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   const claimsPromotionalEnd = /(?:截止|截至)/.test(flat);
   let planSource: TokenPlanEvidenceV3['planSource'] | undefined;
   let normalization: TokenPlanEvidenceV3['normalization'] | undefined;
+  // The provider API domain's clock, used only to label which side is skewed — never as a
+  // substitute anchor for the web/console clock (GM ruling: API-domain Date cannot stand
+  // in for the plan/console surface, and the host clock is never corrected).
+  const apiClock = clockView(modelsRecord, null);
+  // The API domain is the host-health reference itself: its own skew is host-side by definition.
+  if (apiClock.class === 'source-clock-skew') apiClock.class = 'host-clock-skew';
+  const apiSkewMs = apiClock.skewMs;
   if (page && page.status === 200 && markers && flat) {
     pageRecord.ok = true;
-    pageRecord.fetchedAt = new Date(page.at).toISOString();
-    pageRecord.httpDate = page.date;
-    pageRecord.etag = page.etag;
-    pageRecord.rawSha256 = sha256(page.text);
     pageRecord.flatSha256 = sha256(flat);
     derivations.planPageMarkers = markers;
     derivations.planPagePromotionalEnd = promotionalEnd;
@@ -490,16 +717,59 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       if (!markers[key]) gaps.push({ field: 'planApplicability', source: 'planPage', detail: `official plan page marker ${key} no longer holds` });
     }
     if (page.truncated) gaps.push({ field: 'planSource', source: 'planPage', detail: 'official page exceeded the bounded body size; raw/flat hash would cover only a prefix' });
-    if (!page.date) gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page sent no HTTP Date header; source freshness cannot be corroborated' });
-    else if (!Number.isFinite(Date.parse(page.date))) gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page HTTP Date header is not a valid HTTP date' });
-    else {
-      const skew = page.at - Date.parse(page.date);
-      derivations.planPageClockSkewMs = skew;
-      if (Math.abs(skew) > 300_000) gaps.push({ field: 'sourceDate', source: 'planPage', detail: `local clock differs from HTTP Date by ${skew}ms (beyond the 5 minute bound)` });
-      else planSource = {
-        url: PLAN_PAGE, fetchedAt: new Date(page.at).toISOString(), httpDate: new Date(Date.parse(page.date)).toISOString(),
-        clockSkewMs: skew, status: page.status, etag: page.etag, rawSha256: sha256(page.text),
-      };
+    const pageClock = clockView(pageRecord, apiSkewMs);
+    derivations.planPageClockSkewMs = pageClock.skewMs;
+    switch (pageClock.class) {
+      case 'missing-date':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page sent no HTTP Date header; source freshness cannot be corroborated (missing-date)' });
+        break;
+      case 'invalid-date':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page HTTP Date header is not a valid HTTP date (invalid-date)' });
+        break;
+      case 'stale-cache-date':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: `official page cache Age ${pageClock.ageSeconds}s exceeds the ${STALE_AGE_SECONDS}s bound; the cached body is stale (stale-cache-date)` });
+        if (pageClock.skewClass === 'source-clock-skew' || pageClock.skewClass === 'host-clock-skew') {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: `official page HTTP Date differs from the local clock by ${pageClock.skewMs}ms (beyond the 5 minute bound; ${pageClock.skewClass}); the provider API Date is recorded for classification only and can never substitute for the web/console clock` });
+        }
+        break;
+      case 'cacheAgeUnknown':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official page is shared-cacheable but sent no Age header; the body age and every absolute time it carries are unproven (cacheAgeUnknown)' });
+        if (pageClock.skewClass === 'source-clock-skew' || pageClock.skewClass === 'host-clock-skew') {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: `official page HTTP Date differs from the local clock by ${pageClock.skewMs}ms (beyond the 5 minute bound; ${pageClock.skewClass}); the provider API Date is recorded for classification only and can never substitute for the web/console clock` });
+        }
+        break;
+      case 'source-clock-skew':
+      case 'host-clock-skew':
+        gaps.push({
+          field: 'sourceDate', source: 'planPage',
+          detail: `official page HTTP Date differs from the local clock by ${pageClock.skewMs}ms (beyond the 5 minute bound; ${pageClock.class}: ${pageClock.class === 'source-clock-skew' ? 'the provider web/console clock is the deviating domain' : 'the host clock is the deviating domain'}); the provider API Date is recorded for classification only and can never substitute for the web/console clock`,
+        });
+        break;
+      case 'redirect-date':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'official plan page answered with a redirect; the sampler never follows redirects (redirect-date)' });
+        break;
+      case 'code-error':
+        gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'wall-clock duration and monotonic duration disagree by more than the bound; the source time cannot be trusted (code-error)' });
+        break;
+      case 'ok': {
+        // 42 spec B.3: the page clock must also be corroborated by the same provider's API
+        // Date. The API Date never replaces the web/console clock; it only detects a
+        // cross-domain contradiction, which is insufficient evidence and blocks.
+        const apiDate = apiClock.httpDateEpochMs;
+        const pageDate = pageClock.httpDateEpochMs;
+        const crossDelta = apiDate === null || pageDate === null ? null : pageDate - apiDate;
+        if (apiDate === null) {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'provider API Date is missing or invalid; the page clock cannot be corroborated across domains (cross-domain corroboration unavailable)' });
+        } else if (crossDelta === null || Math.abs(crossDelta) > CLOCK_BOUND_MS) {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: `plan page Date and provider API Date differ by ${crossDelta}ms (beyond the 5 minute bound; cross-domain clock contradiction); evidence is insufficient and the API Date cannot substitute for the web/console clock` });
+        } else {
+          planSource = {
+            url: PLAN_PAGE, fetchedAt: pageRecord.headersAt!, httpDate: new Date(pageDate!).toISOString(),
+            clockSkewMs: pageClock.skewMs!, status: page.status, etag: page.etag, rawSha256: pageRecord.rawSha256!,
+          };
+        }
+        break;
+      }
     }
     normalization = { algorithm: PLAN_HTML_FLAT_ALGORITHM, flatSha256: sha256(flat), flatChars: flat.length };
     if (promotionalEnd === null && claimsPromotionalEnd) {
@@ -507,6 +777,35 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     }
   } else {
     gaps.push({ field: 'planApplicability', source: 'planPage', detail: pageRecord.detail ?? `official plan page unreadable (HTTP ${page?.status ?? 'n/a'})` });
+    if (page && pageRecord.redirectRejected) {
+      gaps.push({ field: 'sourceDate', source: 'planPage', detail: `official plan page answered with HTTP ${page.status} and a Location; its Date is a redirect-date and the sampler never follows redirects (redirect-date)` });
+    }
+  }
+
+  // ---- source: conditional re-validation of the official page (body identity only) ----
+  // A 304 (which itself may come from a cache) or a 200 with the same ETag/body hash proves
+  // at most that the body identity is stable. It never proves that origin re-validated the
+  // content or that the content is fresh, and it never bypasses the source clock gates.
+  if (page && page.status === 200 && page.etag) {
+    const conditionalRecord = source('planPageConditional', PLAN_PAGE);
+    const conditional = await probe('planPageConditional', PLAN_PAGE, {
+      method: 'GET', redirect: 'manual',
+      headers: { accept: 'text/html', 'cache-control': 'no-cache', pragma: 'no-cache', 'if-none-match': page.etag },
+    }, { fetcher, left, now }, conditionalRecord);
+    derivations.planPageConditional = {
+      request: { method: 'GET', headers: { 'if-none-match': page.etag, 'cache-control': 'no-cache', pragma: 'no-cache' } },
+      status: conditional?.status ?? null,
+      etag: conditionalRecord.etag ?? null,
+      httpDate: conditionalRecord.httpDate ?? null,
+      ageSeconds: conditionalRecord.ageSeconds ?? null,
+      cacheControl: conditionalRecord.cacheControl ?? null,
+      xNextjsCache: conditionalRecord.xNextjsCache ?? null,
+      bodySha256: conditional && conditional.status === 200 ? conditionalRecord.rawSha256 : null,
+      sameEtag: conditional?.status === 304 || (conditional?.status === 200 && conditionalRecord.etag !== null && conditionalRecord.etag === page.etag),
+      sameBodySha256: conditional?.status === 200 && conditionalRecord.rawSha256 !== null && conditionalRecord.rawSha256 === pageRecord.rawSha256,
+      proves: 'body identity at most; never origin revalidation or content freshness (a 304 can itself come from a cache)',
+      transport: conditional ? null : conditionalRecord.detail ?? 'unavailable',
+    };
   }
 
   // ---- sources on the console session (account-bound) ----
@@ -515,17 +814,39 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   let apiKeysComplete = false;
   let accountPlan: { id: string; name: string; type: string } | null = null;
   let paymentSurfaceAbsent = false;
+  let poolRecord: SourceRecord | undefined;
+  let consoleClock: ClockView | null = null;
+  let consoleNowMs: number | null = null;
   if (!consoleToken) {
     gaps.push({ field: 'consoleToken', source: 'sealed-store', detail: `no sealed ${supplierConsoleSecretName(input.alias)} and no sealed ${supplierUsernameSecretName(input.alias)}/${supplierPasswordSecretName(input.alias)}; account-bound quota and plan type are unverifiable` });
   } else {
     const keysRecord = source('apiKeys', `${CONSOLE_API}/metered/api-keys`);
-    const poolRecord = source('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`);
+    poolRecord = source('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`);
     const [keysFirst, poolRes] = await Promise.all([
       probe('apiKeys', `${CONSOLE_API}/metered/api-keys?page_size=${API_KEY_PAGE_SIZE}`, bearer(consoleToken), { fetcher, left, now }, keysRecord),
       probe('poolUsage', `${CONSOLE_API}/tokenplan/pool-usage`, bearer(consoleToken), { fetcher, left, now }, poolRecord),
     ]);
 
     if (poolRes && poolRes.status === 200) {
+      consoleClock = clockView(poolRecord, apiSkewMs);
+      // reset_at is a console-domain epoch: it is only usable as a relative distance from
+      // the same domain's snapshot time. A missing/invalid Date, a stale cached body or a
+      // cacheable body without Age makes that domain unusable for expiry — never patched
+      // with the host wall clock.
+      if (consoleClock.class === 'missing-date' || consoleClock.class === 'invalid-date' || consoleClock.class === 'code-error') {
+        gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console response has ${consoleClock.class}; reset_at absolute times cannot be placed in a trusted console clock domain` });
+      } else if (consoleClock.class === 'source-clock-skew' || consoleClock.class === 'host-clock-skew') {
+        // The relative distance would still be usable, but the document's pools[].resetAt is an
+        // absolute console-domain epoch. GM ruling: an untrusted source clock keeps the sample
+        // blocked instead of publishing a source-domain absolute as if it were trusted time.
+        gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console clock is beyond the 5 minute bound (${consoleClock.class}: ${consoleClock.skewMs}ms); reset_at absolute times cannot be converted into a trusted domain, so no document is produced` });
+      } else if (consoleClock.class === 'stale-cache-date') {
+        gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console response cache Age ${consoleClock.ageSeconds}s exceeds the ${STALE_AGE_SECONDS}s bound; the pool snapshot is stale (stale-cache-date)` });
+      } else if (consoleClock.class === 'cacheAgeUnknown') {
+        gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: 'console response is shared-cacheable but sent no Age header; the pool snapshot time is unknown (cacheAgeUnknown)' });
+      } else {
+        consoleNowMs = consoleClock.sourceNowMs;
+      }
       accountPlan = parseAccountPlan(poolRes.body);
       const parsed = parsePools(poolRes.body);
       if (parsed) {
@@ -536,6 +857,12 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       } else {
         gaps.push({ field: 'quota', source: 'poolUsage', detail: 'pool-usage response shape drifted (pools list missing)' });
       }
+      derivations.poolUsageSnapshot = {
+        date: poolRecord.httpDate, dateEpochMs: poolRecord.httpDateEpochMs, ageSeconds: poolRecord.ageSeconds,
+        cacheControl: poolRecord.cacheControl, etag: poolRecord.etag, requestId: poolRecord.requestId,
+        rawSha256: poolRecord.rawSha256, bodyBytes: poolRecord.bodyBytes, sourceNowMs: consoleNowMs,
+        clockClass: consoleClock.class,
+      };
     } else if (poolRes && (poolRes.status === 401 || poolRes.status === 403)) {
       gaps.push({ field: 'consoleToken', source: 'poolUsage', detail: `console session rejected (HTTP ${poolRes.status})` });
     } else {
@@ -634,6 +961,26 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   derivations.consolePaymentSurfaceAbsent = paymentSurfaceAbsent;
   derivations.paymentStateSources = ACCOUNT_PAYMENT_SOURCES.length;
   derivations.removedAccountAssertions = ['noPaymentInstrument'];
+  // Same-round clock observation per domain (plan www / console platform / API token) and
+  // the classification. Only classification lives here; the v3 document shape is unchanged.
+  const pageClockView = clockView(pageRecord, apiSkewMs);
+  const pageApiDeltaMs = pageClockView.httpDateEpochMs !== null && apiClock.httpDateEpochMs !== null
+    ? pageClockView.httpDateEpochMs - apiClock.httpDateEpochMs : null;
+  derivations.clockDomains = {
+    api: apiClock,
+    console: consoleClock ?? clockView(poolRecord, apiSkewMs),
+    planPage: pageClockView,
+    crossDomain: {
+      reference: 'provider API Date (token.sensenova.cn), used only to corroborate the page clock — never as a substitute for it',
+      pageDateEpochMs: pageClockView.httpDateEpochMs,
+      apiDateEpochMs: apiClock.httpDateEpochMs,
+      deltaMs: pageApiDeltaMs,
+      boundMs: CLOCK_BOUND_MS,
+      ok: pageApiDeltaMs !== null && Math.abs(pageApiDeltaMs) <= CLOCK_BOUND_MS,
+    },
+    reference: 'classification uses the provider API domain only to label which side deviates; it is never a substitute clock for the web/console surfaces',
+    boundMs: CLOCK_BOUND_MS,
+  };
   notes.push('v3 keeps autoTopupDisabled as our measurement-configuration assertion; payment-surface 404s remain observations and never prove the absence of payment capability');
   if (!accountPlanFree) {
     gaps.push({ field: 'accountPlanType', source: 'poolUsage', detail: accountPlan
@@ -646,7 +993,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
     gaps.push({ field: 'apiKey', source: 'models', detail: 'chat credential liveness unverified' });
   }
 
-  const poolAnalysis = analyzePools(pools, sampledMs);
+  const poolAnalysis = analyzePools(pools, consoleNowMs);
   gaps.push(...poolAnalysis.gaps);
   const quotaRemaining = poolAnalysis.minRemaining;
   // The allowed bound is the smaller of the reviewed 60k cap and every applicable pool's trusted
@@ -666,9 +1013,24 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   // A page that mentions a deadline we could not parse is not treated as open-ended.
   const promotionalEndOk = !(claimsPromotionalEnd && promotionalEnd === null);
   const terminationRisk = promotionalEndMs === null ? 'unknown-promotional-end' : 'promotional-end-recorded';
-  const resetsMs = pools.flatMap(pool => [pool.reset5h, pool.reset7d])
-    .filter((value): value is number => typeof value === 'number').map(value => value * 1000);
-  const expiryCandidates = [sampledMs + MAX_DOC_AGE_MS, ...resetsMs, ...(promotionalEndMs === null ? [] : [promotionalEndMs])];
+  // Expiry is derived from the console-domain relative reset distance, never from an absolute
+  // source timestamp: a source clock running fast cancels out of (reset_at − consoleNow), and
+  // the full sampling duration plus an explicit margin is subtracted before it can extend the
+  // evidence. If the console clock is unusable there is no reset-based bound, so no document.
+  const elapsedMs = now() - sampledMs;
+  const resetCapMs = poolAnalysis.minResetInMs === null
+    ? null
+    : sampledMs + poolAnalysis.minResetInMs - elapsedMs - RESET_MARGIN_MS;
+  derivations.expiryDerivation = {
+    maxAgeMs: MAX_DOC_AGE_MS,
+    minResetInMs: poolAnalysis.minResetInMs,
+    elapsedMs,
+    marginMs: RESET_MARGIN_MS,
+    resetCapMs,
+    promotionalEndMs,
+    basis: 'sampledAt + min(same-domain reset_in) − full request duration − margin; absolute source times never extend expiry',
+  };
+  const expiryCandidates = [sampledMs + MAX_DOC_AGE_MS, ...(resetCapMs === null ? [] : [resetCapMs]), ...(promotionalEndMs === null ? [] : [promotionalEndMs])];
   const expiryMs = Math.min(...expiryCandidates);
   if (promotionalEndMs !== null && promotionalEndMs <= sampledMs) {
     gaps.push({ field: 'promotionalEnd', source: 'planPage', detail: 'the recorded promotional activity already ended at sampling time' });
@@ -686,6 +1048,7 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   const canDocument = !!accountRef && keyLive && modelListed && applicabilityOk && accountBound && accountPlanFree
     && poolAnalysis.ok && quotaAmount !== null && quotaAmount > 0 && quotaRemaining !== null
     && planSource !== undefined && normalization !== undefined && promotionalEndOk
+    && resetCapMs !== null
     && expiryMs > sampledMs && !(promotionalEndMs !== null && promotionalEndMs <= sampledMs);
   if (canDocument) {
     expiresAt = new Date(expiryMs).toISOString();

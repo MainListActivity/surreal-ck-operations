@@ -45,14 +45,30 @@ v3 文档（`schemaVersion=3`，`type=reviewed-token-plan`，`evidenceClass=prom
 - `planSource { url, fetchedAt, httpDate, clockSkewMs, status, etag, rawSha256 }`：官方 URL、本机 UTC 抓取时刻、来源 HTTP Date 与偏差（±5 分钟）、HTTP 状态、ETag、原始页面字节 SHA256；`clockSkewMs` 必须精确等于 `fetchedAt - httpDate` 且实际差值在 ±5 分钟内，签名后的自报字段不能伪造新鲜度；
 - `normalization { algorithm:"html-text-flat/1", flatSha256, flatChars }`：固定归一化算法（去 script/style、标签换空格、空白折叠）及归一化文本 hash；
 - `accountPlanType=FREE`、`accountBound=true`、`accountBoundSource`：仅认证 console 的 pool-usage + 同一密封 API key 精确交叉绑定可证明；
-- `pools[]` 每个池必须同时有 `window5h`/`window7d` 的 `limit/used/remaining/resetAt`（`used` 可标 `reported`/`derived`），`used+remaining=limit`；重复池类型、缺任一窗口、已重置或事实不一致一律 blocked；**缺 7d 不得当作无限**；
+- `pools[]` 每个池必须同时有 `window5h`/`window7d` 的 `limit/used/remaining/resetAt`，`used` **必须由 provider 报告**（`usedSource=reported`；缺失即 blocked，禁止用 `limit−remaining` 派生后冒充一致，`tokenPlanV3Eligible` 也拒绝 `derived`），`used+remaining=limit` 严格成立；重复池类型、缺任一窗口、已重置或事实不一致（含差 1/差 2）一律 blocked；**缺 7d 不得当作无限**；
 - `governingPool { poolType, basis }`：绑定模型优先 dedicated，其次 default，单池则 single-pool；重复 dedicated 视为歧义；`basis` 必须与所选池一致（dedicated/default 对应同名池类型，single-pool 仅限单池文档）；
 - `quotaAmount`：本次**准用上界** = min(核定 60000 points / 18000s, 所有适用池 5h/7d 的可信 remaining)，`quotaRemaining` 必须精确等于所有池窗口 remaining 的最小值（自报更大值或保守小值都不能通过），`quotaAmount` 同时不得大于该最小值；观察到的 120000/1200000 只进 `pools`/回执，永不抬高准用上界；余额 0 时 blocked，不生成文档；
 - `promotional=true`、`revalidateBeforeUse=true`、`terminationRisk`、`promotionalEndsAt`：官方页若给出可解析的活动截止日，按站点时区 Asia/Shanghai（UTC+8）的当日 23:59:59.999 理解，`expiresAt` 不得晚于该时刻；`terminationRisk=promotional-end-recorded` 必须同时给出 `promotionalEndsAt`，`unknown-promotional-end` 必须为 null；提到截止但无法解析时 blocked；未提及时明示 `unknown-promotional-end`，不得声称永久有效；
 - `autoTopupDisabled=true` 仍是我方计量配置断言；支付面 404 仍只是回执观测，不证明没有支付能力，也绝不参与判定；
-- `expiresAt` ≤ `sampledAt+24h`，且 ≤ 所有适用池 5h/7d reset 的最早者；到期不续旧件，必须真实重采样。
+- `expiresAt` ≤ `sampledAt+24h`，且由**同域相对时间**推导：`sampledAt + min(reset_at − consoleNow) − 完整请求耗时 − 60s margin`，不晚于活动截止；`consoleNow` = console HTTP Date + Age。来源时钟快不会延长证据（偏差在相对差中抵消），但 console 偏差超过 ±5 分钟或时间域不可用时仍 blocked，不发布来源域绝对 resetAt；到期不续旧件，必须真实重采样。
 
 `tokenPlanV3Eligible` 在 prepare/prove/deliver/diagnose 共用的 `evidenceChecks` 中重新推导上述边界（额度上限与各池最小 remaining 交叉核对、HTTP Date 偏差与 `clockSkewMs` 一致、terminationRisk/promotionalEndsAt 一致、governingPool basis 与池类型一致、每个池保持一致、expires 不越过 reset/24h/活动截止、FREE/accountBound/promotional/revalidate/autoTopup 全为真），因此手写或篡改的文档不能靠自报字段通过。`documentHash` 覆盖完整 v3 JSON，任何新语义字段变化都会使候选/证明失配。官方页 marker 由 v2 的 `quota5h` 换成 v3 的 `freeBetaOpen + paidTiersUpcoming + limitedTimePromotion + freeTierNamed`；配额数字改为 `officialQuotaNumberObserved` 观测项，不是放行条件——这不是删除失败项，而是官方文案已无数字，新增的限时 marker 与账号绑定池约束更严。
+
+### 来源时间诊断、条件 GET 与池原始精度（15d775ea 修复）
+
+**每个 source 的原始时间/缓存元数据**（receipt/derivation-only，不进入 v3 文档）：所有 probe（models/planPage/planPageConditional/apiKeys/poolUsage/paymentSurface）记录 `requestStartedAt`、`headersAt`、`bodyCompletedAt`（本地 UTC ISO；亚毫秒精度由单调时钟承担）、`monotonicMs`/`monotonicBodyMs`（`performance.now`，不受墙钟回拨影响）、原始 `httpDate` 及解析 epoch、`ageSeconds`（缺失为 null）、`cacheControl`、`etag`、`cfCacheStatus`、`xNextjsCache`、`server`、`via`、`location`、`redirectRejected`、`redirectChain`、`responseHost`、`rawSha256`、`bodyBytes`；console 另记 `x-request-id`。字段来源由命名标明：`httpDate*` 来自响应头，`*At` 是本机墙钟，`monotonic*` 是实测。
+
+**时钟分类**（`derivations.clockDomains.{planPage,console,api,crossDomain}`）：同一轮分别观察 `www.sensenova.cn`、`platform.sensenova.cn`、`token.sensenova.cn` 的 Date 与本机时点，输出 `missing-date` / `invalid-date` / `redirect-date` / `code-error`（墙钟与单调耗时不自洽） / `stale-cache-date`（Age > 5 分钟） / `cacheAgeUnknown`（可共享缓存但无 Age） / `source-clock-skew` / `host-clock-skew` / `ok`，并单独给出不受缓存门影响的 `skewClass`、`ageAdjustedSkewMs` 与 `probed`（未探测 ≠ 探测失败）。`skewMs = headersAt − Date`（即 v3 `clockSkewMs` 语义）；`ageAdjustedSkewMs = headersAt − (Date + Age)` 仅用于观察来源当前时钟，二者必须可复算且不得混用。**provider API 域 Date 只用于标注偏差在哪一侧和跨域核对，不能替代 web/console 时钟，也不得据多数域推翻目标域**；本机在 ±5 分钟内也不能单独证明来源时间可信。`sourceDate` gap 的文案必须写清来源侧/本机侧与分类，不再写成笼统的“local clock differs”。
+
+**跨域核对（R2）**：生成 `planSource` 前，官方页 Date 必须被同一 provider 的 API 域 Date 在 5 分钟内 corroborate；API Date 缺失/非法或两域相差 >5 分钟即视为跨域矛盾、证据不足 → blocked（`clockDomains.crossDomain` 记录两域 epoch、delta、bound 与 ok）。API Date 只作矛盾检测，不能替代页面时钟。
+
+**console 时钟不可信即 blocked（R1）**：`reset_at` 是 console 域绝对 epoch。若 console 的 Date 缺失/非法/code-error/陈旧/年龄未知，或**偏差超过 ±5 分钟**（`source-clock-skew`/`host-clock-skew`），则该绝对时间无法换算到可信域，`pools[].resetAt` 不写入证据、document 不生成；不因为相对差本身可计算就发布来源域绝对时刻。仅当 console 时钟在 ±5 分钟内时，`pools[].resetAt` 才以 console 域绝对 epoch 记录，且 `expiresAt` 始终由同域相对差保守推导、不依赖该绝对值。
+
+**门（只收紧）**：官方页 `planSource` 只在 Date 有效、Age 缺失但不可共享缓存（或 Age ≤ 5 分钟）、且 `|skew| ≤ 5 分钟` 时生成；缺失/非法/3xx/陈旧缓存/缓存年龄未知/超界一律 blocked，±5 分钟与差 1 均无容差，也不改宿主机时钟。console 的 `reset_at` 用同域相对差 `reset_at − (Date + Age)` 判定；console Date 缺失/非法、缓存陈旧或年龄未知时，reset 相对时间不可建立，直接 blocked。
+
+**条件 GET**：主页面 200 且带 ETag 时追加一次 `If-None-Match` + `Cache-Control: no-cache` + `Pragma: no-cache` 请求，receipt 记录请求头、304/200、Date、Age、ETag、body hash、`x-nextjs-cache`。**304（本身也可能来自缓存）或 200+同 ETag/同 body hash 最多证明 body 身份，永不证明 origin 重新校验或内容新鲜，也永不绕过时钟门**。
+
+**池原始精度**：`PoolFacts` 每项保留脱敏 `{type:'number'|'string'|'null', value}` 的 raw 值（`limit/used/remaining/reset_at` 的 5h/7d 全部），`derivations.poolUsageSnapshot` 记录同一快照的 Date/Age/cache-control/ETag/requestId/raw SHA256/bodyBytes。算术前不 `Math.floor`、不静默字符串强转：值必须是有限、非负、精确整数，否则 `poolPrecision` gap；小数或小数字符串默认 blocked，除非 provider 给出书面取整规则（当前没有）。`used` 缺失记 missing，禁止派生。`quotaAmount` 仍 `min(60000, 所有窗口最小 remaining)`，不因 120k/1.2M 或差 1 扩大。`pools[].resetAt` 写入文档时是 console 时钟域的绝对 epoch；`expiresAt` 由同域相对差推导并在 receipt 的 `expiryDerivation` 中可复算，绝对来源时间不得延长证据。
 
 产品消费端不变：投递的 JWT 仍 `contractVersion=1`，manifest 仍 schemaVersion=1，v3 文档不进入 JWT（产品只校验签名、manifest 与 documentHash）。若未来产品需要解析 evidence 文档，v3 必须另拆独立产品交付链与部署依赖，不能把不兼容版本直接发布为可用。
 

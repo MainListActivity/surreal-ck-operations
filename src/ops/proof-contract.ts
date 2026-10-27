@@ -199,6 +199,9 @@ export function tokenPlanV3Eligible(e: TokenPlanEvidenceV3, now: number): boolea
   if (e.terminationRisk === 'unknown-promotional-end' && e.promotionalEndsAt !== null) return false;
   const poolWindows = e.pools.flatMap(pool => [pool.window5h, pool.window7d]);
   if (poolWindows.some(window => window.used + window.remaining !== window.limit)) return false;
+  // A derived `used` (limit − remaining) would make the consistency equation circular; only
+  // provider-reported values may establish the pool facts (schema shape unchanged).
+  if (e.pools.some(pool => pool.usedSource5h !== 'reported' || pool.usedSource7d !== 'reported')) return false;
   const trustedRemaining = Math.min(...poolWindows.map(window => window.remaining));
   if (e.quotaRemaining !== trustedRemaining || e.quotaAmount > trustedRemaining) return false;
   if (e.pools.some(pool => pool.accountBound !== true)) return false;

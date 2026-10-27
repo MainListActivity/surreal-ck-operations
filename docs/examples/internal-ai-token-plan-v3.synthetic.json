@@ -51,7 +51,7 @@
       "window5h": { "limit": 120000, "used": 1500, "remaining": 118500, "resetAt": "2026-10-27T13:00:00.000Z" },
       "window7d": { "limit": 1200000, "used": 10000, "remaining": 1190000, "resetAt": "2026-11-01T10:00:00.000Z" },
       "usedSource5h": "reported",
-      "usedSource7d": "derived"
+      "usedSource7d": "reported"
     }
   ],
   "autoTopupDisabled": true,
