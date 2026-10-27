@@ -9,6 +9,7 @@ import { readProviderQuotas } from "./dispatch";
 import { setAgentModel } from "./vendor/src/dispatcher/agent-model.ts";
 
 export interface Company {
+  upgrades: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
   db: import("./vendor/src/database").CompanyDatabase;
   owner: import("./vendor/src/owner").OwnerDesk;
   workforce: import("./vendor/src/workforce").Workforce;
@@ -233,7 +234,9 @@ export function company(): Promise<Company> {
     try { await sidecar.adopt(await workforce.insts()); }
     catch(error) { await modelGateway.stop(); throw error; }
     routingReady=true;
-    return readyCompany={ modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    const {CompanyUpgrades}=await import("./vendor/src/company-upgrades.ts");
+    const upgrades=new CompanyUpgrades(db,owner,{home:serviceHome(),repo:opsRepo});
+    return readyCompany={ upgrades, modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;
