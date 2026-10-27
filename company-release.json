@@ -1,16 +1,19 @@
 {
-  "version": "0.3.8",
-  "title": "手动置顶模型独立第一层",
+  "version": "0.3.9",
+  "title": "供应商时间来源诊断与配额原始精度校验",
   "changes": [
-    "手动置顶优先于所有自动分层，多个置顶按置顶先后排列，不再按能力、计费、额度或错误状态拆分",
-    "Paseo与网页明确展示第一层手动置顶、状态异常提示及取消后恢复自动分层的规则",
-    "置顶模型排除出自动AA分档，避免影响其余模型的能力档边界"
+    "每个外部探测（models/官方页/条件GET/apiKeys/池用量/支付面）记录请求起止、响应头与读完 body 的本机时刻、单调耗时，以及原始 HTTP Date/Age/cache-control/ETag/缓存状态/重定向/响应主机与脱敏 body hash，标明字段来源",
+    "同一轮分别观察官方页、console 池与供应商 API 三域时钟，分类 missing-date/invalid-date/redirect-date/code-error/stale-cache-date/cacheAgeUnknown/source-clock-skew/host-clock-skew/ok，并单列 ageAdjustedSkewMs 与 probed",
+    "官方页证据要求页面 Date 被同一供应商 API 域 Date 在 ±5 分钟内 corroborate；跨域矛盾或 API Date 缺失均 blocked，API Date 不替代页面时钟",
+    "console 时钟偏差超过 ±5 分钟或时间域不可用时不再生成文档，不把来源域绝对 resetAt 当作可信时间；expiry 始终由同域相对差扣除全程耗时与 60s margin 推导",
+    "池 limit/used/remaining/reset 保留脱敏 {type,value} 原值；一致性检查前不取整，小数或小数字符串按 poolPrecision blocked；used 必须 provider 报告，禁止用 limit−remaining 派生",
+    "条件 GET 记录请求头与 304/200、ETag、body hash、x-nextjs-cache，明确只证明 body 身份，不证明 origin 重新校验或内容新鲜，也不绕过时钟门"
   ],
   "impact": [
-    "现有置顶将按新规则重新发布到Magpie；其他模型继续执行现有自动排序与权重",
-    "额度和报错观测仍保留；不修改Magpie底层账号余额、可用性判断或失败回退",
-    "Opus/Fable继续手动维护，刷新间隔及权重不变"
+    "v2/v3 证据文档形状与既有限值不变：60,000 points / 18,000s 准用上限、30 次/美元预算、FREE/account-bound/每次使用前复核、支付面 404 仅观测",
+    "真实采样仍可能 blocked：官方页与 console Date 约 +779s、页面可共享缓存无 Age、default 7d used+remaining=limit−1；本次只纠正分类/采集与假保证，不保证供应商条件自动恢复",
+    "v3 新增行为仅为收紧：usedSource 必须 reported 才能进入 prepare/prove/deliver/diagnose 的 eligibility；新增诊断字段只进回执与推导，不写入文档"
   ],
-  "migration": "无数据库迁移；沿用现有pins列表并发布quality-pace-v3快照。",
-  "rollback": "通过标准安装器恢复上一固定发布，并重新计算排序；旧版置顶会恢复为自动层内优先。"
+  "migration": "无数据库迁移；未改写或删除已有数据。",
+  "rollback": "通过标准安装器恢复上一固定发布；旧回执与已签发证据不受影响，重采样按旧分类逻辑运行。"
 }
