@@ -307,6 +307,41 @@ export class WaitStore {
   // ------------------------------------------------------------------ enter
 
   /**
+   * A short DB-backed advisory lock that makes "read the wait graph, then insert an edge" one critical section.
+   * A unique record create is the acquisition primitive: two callers cannot both create it, and a crashed holder
+   * is recoverable because the record carries an expiry. It serializes only reference-bearing wait entries.
+   */
+  async lockGraph(owner: string, waitMs = 5000, ttlMs = 15_000): Promise<() => Promise<void>> {
+    const lock = new RecordId('company_meta', 'wait_enter_lock');
+    const deadline = Date.now() + waitMs;
+    while (true) {
+      try {
+        await this.db.query(
+          'CREATE ONLY $lock CONTENT { owner: $owner, expires_at: $expires, at: time::now() };',
+          { lock, owner, expires: Date.now() + ttlMs });
+        let released = false;
+        return async () => {
+          if (released) return;
+          released = true;
+          await this.db.query('DELETE $lock WHERE owner = $owner;', { lock, owner }).catch(() => undefined);
+        };
+      } catch (error) {
+        const message = (error as Error)?.message ?? '';
+        if (!/already exists|Database record|record.*exists/i.test(message)) throw error;
+        const [rows] = await this.db.query<[Array<{ expires_at?: number }>]>(
+          'SELECT expires_at FROM $lock;', { lock });
+        const expires = Number(rows?.[0]?.expires_at ?? 0);
+        if (expires <= Date.now()) {
+          await this.db.query('DELETE $lock WHERE expires_at <= $now;', { lock, now: Date.now() }).catch(() => undefined);
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error('wait graph lock busy');
+        await Bun.sleep(10 + Math.floor(Math.random() * 15));
+      }
+    }
+  }
+
+  /**
    * Enter a wait: one transaction creates the wait row, clears the lease and moves the task out of the dispatch
    * queue. The task becomes a dependency-shaped blocked task (`blocked_to = NONE`) so an older release does not
    * dispatch it either; `wait_state` is the new code's marker.

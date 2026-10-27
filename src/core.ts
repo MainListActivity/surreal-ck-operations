@@ -2853,61 +2853,69 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const normalized = normalizeWait({ ...input, ownerRole: input.ownerRole ?? defaultOwner } as WaitInput, {
       now, ownerRole: defaultOwner,
     });
-    if (normalized.referenceTaskId) {
-      const reference = await this.db.select<TaskRow>(id('task', normalized.referenceTaskId));
-      if (!reference) throw new CompanyError('not_found', 'referenceTaskId 指向的任务不存在');
-      if (normalized.referenceTaskId === proof.taskId) throw new CompanyError('invalid', '任务不能等待自己');
-      if (await this.waitWouldCycle(proof.taskId, normalized.referenceTaskId)) {
-        throw new CompanyError('conflict', '等待引用会形成依赖环，已拒绝');
-      }
-      if (['done', 'void'].includes(reference.state)) {
-        throw new CompanyError('conflict', 'referenceTaskId 指向的任务已经终态；不需要进入等待');
-      }
-    }
-    // The progress snapshot is the last resumable thing the holder did, not a claim about the outside world.
-    let summary = normalized.summary;
-    if (!summary) {
-      const [latest] = await this.db.query<[Array<{ evidence?: string }>]>(
-        `SELECT evidence FROM audit WHERE task = $task AND action IN ['checkpoint', 'submit', 'wait']
-         ORDER BY at DESC LIMIT 1;`, { task: id('task', proof.taskId) }).catch(() => [[]] as [Array<{ evidence?: string }>]);
-      const text = latest?.[0]?.evidence ?? '';
-      summary = text ? assertNonSensitive(text.slice(0, 800), 'progress summary') : undefined;
-    }
-    const waitKey = waitKeyOf(proof.taskId, randomUUID());
-    const createdAt = this.waitClock();
+    let releaseGraph: (() => Promise<void>) | undefined;
     try {
-      const updated = await this.waits.enter({
-        taskId: proof.taskId, waitKey, normalized: {
-          kind: normalized.kind, source: normalized.source, ownerRole: normalized.ownerRole,
-          ...(normalized.reference === undefined ? {} : { reference: normalized.reference }),
-          ...(normalized.referenceTaskId === undefined ? {} : { referenceTaskId: normalized.referenceTaskId }),
-          ...(normalized.notBefore === undefined ? {} : { notBefore: normalized.notBefore }),
-          ...(normalized.expiresAt === undefined ? {} : { expiresAt: normalized.expiresAt }),
-          expiresSource: normalized.expiresSource,
-          ...(normalized.nextCheckAt === undefined ? {} : { nextCheckAt: normalized.nextCheckAt }),
-          ...(normalized.timezone === undefined ? {} : { timezone: normalized.timezone }),
-          completed: normalized.completed,
-          ...(normalized.pendingAction === undefined ? {} : { pendingAction: normalized.pendingAction }),
-          ...(normalized.handoffFile === undefined ? {} : { handoffFile: normalized.handoffFile }),
-          reason: normalized.reason,
-        },
-        progress: {
-          employee: actor.employeeId, taskVersion: proof.expectedVersion, at: createdAt,
-          ...(summary === undefined ? {} : { summary }),
-        },
-        resumeState: row.state === 'review' ? 'review' : 'ready',
-        resumeRole: row.state === 'review' ? row.reviewer_role : row.executor_role,
-        actor: actor.employeeId, employee: actor.employeeId,
-        proof: { deliveryId: proof.deliveryId, fence: proof.fence, expectedVersion: proof.expectedVersion },
-        now, evidence: evidence.text, idem: String(idem.id), digest,
-        auditId: randomUUID(), outboxId: randomUUID(),
-      });
-      if (!updated) throw new CompanyError('temporarily_unavailable', '等待未落地，请重试', true);
-      return view(updated);
-    } catch (error) {
-      const prior = await this.replay(idem, digest);
-      if (prior) return prior;
-      throw this.waitError(error);
+      if (normalized.referenceTaskId) {
+        const reference = await this.db.select<TaskRow>(id('task', normalized.referenceTaskId));
+        if (!reference) throw new CompanyError('not_found', 'referenceTaskId 指向的任务不存在');
+        if (normalized.referenceTaskId === proof.taskId) throw new CompanyError('invalid', '任务不能等待自己');
+        // The cycle check and the wait insert must be one critical section. A pre-check alone is a TOCTOU race:
+        // two holders entering A->B and B->A at the same time each miss the other's uncommitted edge.
+        releaseGraph = await this.waits.lockGraph(`employee:${actor.employeeId}:${randomUUID()}`);
+        if (await this.waitWouldCycle(proof.taskId, normalized.referenceTaskId)) {
+          throw new CompanyError('conflict', '等待引用会形成依赖环，已拒绝');
+        }
+        if (['done', 'void'].includes(reference.state)) {
+          throw new CompanyError('conflict', 'referenceTaskId 指向的任务已经终态；不需要进入等待');
+        }
+      }
+      // The progress snapshot is the last resumable thing the holder did, not a claim about the outside world.
+      let summary = normalized.summary;
+      if (!summary) {
+        const [latest] = await this.db.query<[Array<{ evidence?: string }>]>(
+          `SELECT evidence FROM audit WHERE task = $task AND action IN ['checkpoint', 'submit', 'wait']
+           ORDER BY at DESC LIMIT 1;`, { task: id('task', proof.taskId) }).catch(() => [[]] as [Array<{ evidence?: string }>]);
+        const text = latest?.[0]?.evidence ?? '';
+        summary = text ? assertNonSensitive(text.slice(0, 800), 'progress summary') : undefined;
+      }
+      const waitKey = waitKeyOf(proof.taskId, randomUUID());
+      const createdAt = this.waitClock();
+      try {
+        const updated = await this.waits.enter({
+          taskId: proof.taskId, waitKey, normalized: {
+            kind: normalized.kind, source: normalized.source, ownerRole: normalized.ownerRole,
+            ...(normalized.reference === undefined ? {} : { reference: normalized.reference }),
+            ...(normalized.referenceTaskId === undefined ? {} : { referenceTaskId: normalized.referenceTaskId }),
+            ...(normalized.notBefore === undefined ? {} : { notBefore: normalized.notBefore }),
+            ...(normalized.expiresAt === undefined ? {} : { expiresAt: normalized.expiresAt }),
+            expiresSource: normalized.expiresSource,
+            ...(normalized.nextCheckAt === undefined ? {} : { nextCheckAt: normalized.nextCheckAt }),
+            ...(normalized.timezone === undefined ? {} : { timezone: normalized.timezone }),
+            completed: normalized.completed,
+            ...(normalized.pendingAction === undefined ? {} : { pendingAction: normalized.pendingAction }),
+            ...(normalized.handoffFile === undefined ? {} : { handoffFile: normalized.handoffFile }),
+            reason: normalized.reason,
+          },
+          progress: {
+            employee: actor.employeeId, taskVersion: proof.expectedVersion, at: createdAt,
+            ...(summary === undefined ? {} : { summary }),
+          },
+          resumeState: row.state === 'review' ? 'review' : 'ready',
+          resumeRole: row.state === 'review' ? row.reviewer_role : row.executor_role,
+          actor: actor.employeeId, employee: actor.employeeId,
+          proof: { deliveryId: proof.deliveryId, fence: proof.fence, expectedVersion: proof.expectedVersion },
+          now, evidence: evidence.text, idem: String(idem.id), digest,
+          auditId: randomUUID(), outboxId: randomUUID(),
+        });
+        if (!updated) throw new CompanyError('temporarily_unavailable', '等待未落地，请重试', true);
+        return view(updated);
+      } catch (error) {
+        const prior = await this.replay(idem, digest);
+        if (prior) return prior;
+        throw this.waitError(error);
+      }
+    } finally {
+      await releaseGraph?.();
     }
   }
 
@@ -3154,6 +3162,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   private waitError(error: unknown): CompanyError {
     if (error instanceof CompanyError) return error;
     const message = ((error as Error)?.message ?? '').trim();
+    if (/wait graph lock busy/i.test(message)) return new CompanyError('conflict', '另一个等待正在写入，等待图锁未取得；请重试');
     if (/lease expired/i.test(message)) return new CompanyError('lease_expired', '租约已过期；重新领取后再进入等待');
     if (/stale lease or version/i.test(message)) return new CompanyError('conflict', '租约或任务版本已移动；旧 fence 的写入被拒绝');
     if (/already waiting/i.test(message)) return new CompanyError('conflict', '该任务已有进行中的等待');

@@ -391,6 +391,32 @@ describe('safe release and version locks (AC05)', () => {
     expect(rowB.state).toBe('doing');
   });
 
+  test('concurrent mutual waits cannot both commit a cycle', async () => {
+    const a = await makeTask('并发互相等待 A');
+    const b = await makeTask('并发互相等待 B');
+    const heldA = await claim(a, 'eng');
+    const heldB = await claim(b, 'eng2');
+    const results = await Promise.allSettled([
+      core.wait(tokens.eng!, heldA.proof, evidence(`race-a-${a}`), {
+        kind: 'dependency', referenceTaskId: b,
+        reason: 'SYS05 回归：并发进入 A 等 B，环检测与写入必须在同一临界区',
+      } as never),
+      core.wait(tokens.eng2!, heldB.proof, evidence(`race-b-${b}`), {
+        kind: 'dependency', referenceTaskId: a,
+        reason: 'SYS05 回归：并发进入 B 等 A，最多一条可成功，另一条必须被环检测拒绝',
+      } as never),
+    ]);
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    const error = rejected[0]!.reason;
+    expect(error).toBeInstanceOf(CompanyError);
+    expect((error as CompanyError).code).toBe('conflict');
+    expect((error as CompanyError).message).toMatch(/依赖环/);
+    const [open] = await database.db.query<[Array<{ count?: number }>]>(
+      `SELECT count() FROM task_wait WHERE state IN ['waiting', 'held'] GROUP ALL;`);
+    expect(open?.[0]?.count).toBe(1);
+  });
+
   test('a held wait recovers automatically once its dependency finishes', async () => {
     const dependency = await makeTask('迟到的依赖');
     const taskId = await makeTask('到点后被依赖挂住');
