@@ -9,7 +9,7 @@
 - `resume_task.executionWindow` 包含 approvalTask、configurationDigest、evidenceExpiresAt、minRemainingSeconds、notAfter。批准必须是本任务同目标、已完成的直接依赖，摘要和截止时间须匹配 prepare 登记的候选。notAfter 不得超过证据到期减去最小执行余量。
 - 首次部署前的候选没有可信到期元数据，不能据文字补填；须真实重采样后 prepare 新候选并独立批准。证明工具继续核验不可变文件、身份和独立批准。
 - 恢复、领取和实际证明/交付都校验窗口；过期领取在无活租约时转经理，绝不续期旧证据、放宽90分钟要求、增加次数或预算。统计领取 p95 不作为硬门禁。
-- 新经理阶段以 resume/defer/dependency_unlocked 的审计边界识别。旧阶段故障不能吞掉新待办；当前阶段相同故障仍去重，故障预算与非重试拒绝不变。
+- 新经理阶段以 resume/defer/dependency_unlocked 的审计边界识别。旧阶段故障不能吞掉新待办；每个阶段单独登记 notified_at；当前阶段相同故障仍去重，故障预算与非重试拒绝不变。
 - `report_blocker.recoveryReason` 为 stale_window / missing_prerequisite / infrastructure。文件入口可写独立一行 `recoveryReason: missing_prerequisite`，非法值拒收；正文不推断类别。
 - 所有 block 仍计数。新增真实未完成依赖或绑定新有效批准写 recovery_progress，开始新阶段；仅改文字/换员工/普通 resume 不清零。
 - 已分类系统阻塞达到上限：原子建立唯一 GM 执行、product 独立复核的恢复任务，原任务等待它并以 manager 接续；完成恢复交付不等于业务验收。再次达到上限停止自动重派，留 recovery_stopped 审计，不无限建链或自动转老板。真正老板事项仍走 owner；没有结构化类别的旧入口保留原保护行为。

@@ -1,3 +1,4 @@
+import { faultNeedsNotice } from '../src/task-recovery.ts';
 import { RecordId } from 'surrealdb';
 import { Workforce } from '../src/workforce.ts';
 import { faultBelongsToWait, parseExecutionWindow, windowExpired } from '../src/task-recovery.ts';
@@ -97,9 +98,9 @@ run('expired and altered windows are refused; queue expiry becomes one manager w
 
 run('old fault notices do not hide a new post-dependency manager stage; same-stage dedup remains', async () => {
   const t = await newTask();
-  await db.db.query(`CREATE fault_episode CONTENT {episode:$episode,fingerprint:'fixture',incident:'fixture',phase:'request',task:$task,state:'stopped',notified:true,evidence_revision:1,opened_at:d'2026-01-01T00:00:00Z',updated_at:d'2026-01-01T00:00:00Z'};
+  await db.db.query(`CREATE $episode_row CONTENT {episode:$episode,fingerprint:'fixture',incident:'fixture',phase:'request',task:$task,state:'stopped',notified:true,evidence_revision:1,opened_at:d'2026-01-01T00:00:00Z',updated_at:d'2026-01-01T00:00:00Z'};
     CREATE audit CONTENT {task:$task,action:'dependency_unlocked',at:d'2026-01-02T00:00:00Z'};`,
-    {task:new RecordId('task',t.id),episode:'same-cause#'+t.id});
+    {task:new RecordId('task',t.id),episode:'same-cause#'+t.id,episode_row:new RecordId('fault_episode','same-cause#'+t.id)});
   const facts = await new Workforce(db, dir).faultEpisodes({tasks:[t.id]});
   const episode = facts!.byTask.get(t.id)![0]!;
   expect(faultBelongsToWait(episode.updatedAt,facts!.blockedAt?.get(t.id))).toBe(false);
@@ -107,6 +108,11 @@ run('old fault notices do not hide a new post-dependency manager stage; same-sta
   const fresh=await new Workforce(db, dir).faultEpisodes({tasks:[t.id]});
   expect(faultBelongsToWait(fresh!.byTask.get(t.id)![0]!.updatedAt,fresh!.blockedAt?.get(t.id))).toBe(true);
   expect(fresh!.byTask.get(t.id)![0]!.notified).toBe(true);
+  expect(faultNeedsNotice(fresh!.byTask.get(t.id)![0]!, fresh!.blockedAt?.get(t.id))).toBe(true);
+  expect(await new Workforce(db,dir).markFaultEpisodeNotified(episode.episode, fresh!.blockedAt?.get(t.id))).toBe(true);
+  const notified=await new Workforce(db,dir).faultEpisodes({tasks:[t.id]});
+  expect(faultNeedsNotice(notified!.byTask.get(t.id)![0]!,notified!.blockedAt?.get(t.id))).toBe(false);
+  expect(await new Workforce(db,dir).markFaultEpisodeNotified(episode.episode, fresh!.blockedAt?.get(t.id))).toBe(false);
 });
 
 run('classified loops get one owned recovery task and a second exhausted cycle stops automatically', async () => {
@@ -134,4 +140,34 @@ run('classified loops get one owned recovery task and a second exhausted cycle s
   const [stopped]=await db.db.query<[Array<{recovery_stopped:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',t.id)});
   expect(stopped[0]!.recovery_stopped).toBe(true);
   expect((await core.getTask(gm,t.id)).blockedTo).toBe('gm');
+  expect(await core.resume(gm,t.id,text('普通恢复不能绕过第二轮自动停止')).catch(e=>e.code)).toBe('invalid');
+});
+
+run('an expired execute window cannot mutate a foreign workspace or block same-role independent review', async()=>{
+  const t=await newTask();
+  const foreign=await new LocalEnrollmentAdmin(db).enroll('foreign-eng','engineering',['execute','review']);
+  await db.db.query("UPDATE $employee SET workspace_scope='foreign-goal'; UPDATE $task SET execution_window={notAfter:$past};",
+    {employee:new RecordId('employee','foreign-eng'),task:new RecordId('task',t.id),past:new Date(Date.now()-1000).toISOString()});
+  const before=await core.getTask(gm,t.id);
+  expect(await core.claim(foreign,t.id).catch(e=>e.code)).toBe('forbidden');
+  expect((await core.getTask(gm,t.id)).version).toBe(before.version);
+  expect((await core.getTask(gm,t.id)).state).toBe('ready');
+  // Execute already complete: only the ordinary independence and review lease checks apply.
+  const qa=await new LocalEnrollmentAdmin(db).enroll('same-role-reviewer','engineering',['execute','review']);
+  await db.db.query("UPDATE $task SET state='review', reviewer_role='engineering', submitted_by='other-author';",{task:new RecordId('task',t.id)});
+  const review=await core.claim(qa,t.id);
+  expect(review.task.state).toBe('review');
+});
+
+run('adding completed prerequisites does not reset a stopped recovery while an older dependency waits',async()=>{
+  const source=await newTask(),oldDep=await newTask(),finished=await newTask(),newDep=await newTask();
+  await db.db.query("UPDATE $task SET state='blocked',blocked_to='gm',resume_state='doing',dependencies=[$old],recovery_stopped=true; UPDATE $finished SET state='done';",
+    {task:new RecordId('task',source.id),old:new RecordId('task',oldDep.id),finished:new RecordId('task',finished.id)});
+  await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[finished.id],continuation:'manager',...text('新增一个已完成依赖不能伪装实际恢复进展')});
+  const [still]=await db.db.query<[Array<{recovery_stopped:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',source.id)});
+  expect(still[0]!.recovery_stopped).toBe(true);
+  await db.db.query("UPDATE $task SET blocked_to='gm';",{task:new RecordId('task',source.id)});
+  await core.deferTaskUntil(gm,{taskId:source.id,dependencies:[newDep.id],continuation:'manager',...text('新增真实尚未完成的前置才进入新恢复阶段')});
+  const [after]=await db.db.query<[Array<{recovery_stopped?:boolean}>]>('SELECT recovery_stopped FROM $task;',{task:new RecordId('task',source.id)});
+  expect(after[0]!.recovery_stopped).not.toBe(true);
 });

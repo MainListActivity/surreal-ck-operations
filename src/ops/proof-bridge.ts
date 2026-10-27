@@ -144,6 +144,7 @@ export class InternalAiProofBridge {
     const row = await this.deps.store.get(sha256(args.proofHandle));
     if (!row || row.lease.employee !== lease.employee || row.lease.taskId !== lease.taskId || row.lease.delivery !== lease.delivery || row.lease.fence !== lease.fence || row.files.manifest.env !== env) throw new CompanyError('not_found', 'unknown task-bound proof handle');
     if (tool === 'ops_internal_ai_revoke') { await this.deps.store.revoke(row); return { revoked: true, version: row.revoked ? row.version : row.version + 1 }; }
+    if (this.content(row).mode === 'enable') await this.deps.store.assertExecutionWindow(row.lease.taskId, row.approval?.taskId, row.files);
     await this.valid(row, signer, await this.liveIdentitiesDigest(row));
     const content = this.content(row);
     const response = await this.deps.deliver(content.jwt, scope, env, proofToolSchemas.ops_internal_ai_deliver.parse(raw).session);

@@ -33,7 +33,6 @@ export class CompanyProofStore {
   }
   async leaseValid(stamp: LeaseStamp): Promise<boolean> {
     try {
-      await this.assertExecutionWindow(stamp.taskId);
       const current = await this.lease({ taskId: stamp.taskId, project: stamp.project, actor: { employeeId: stamp.employee, role: stamp.role, capabilities: [] } });
       return current.delivery === stamp.delivery && current.fence === stamp.fence && current.role === stamp.role;
     } catch { return false; }

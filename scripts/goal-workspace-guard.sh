@@ -20,6 +20,6 @@ goal_workspace_target_supported() {
   fi
 }
 goal_workspace_refuse() {
-  echo "refused: target=$1 lacks the goal conversation contract on one or both surfaces" >&2
+  echo "refused: target=$1 lacks the goal conversation / recovery stage contract on one or both surfaces" >&2
   echo 'refused: scoped conversations=unknown; preserve the healthy release and use an audited forward fix' >&2
 }

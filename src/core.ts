@@ -216,6 +216,7 @@ interface EmployeeRow {
 }
 
 interface TaskRow {
+  recovery_stopped?: boolean;
   dependency_continuation?: 'execute' | 'manager';
   execution_window?: import('./task-recovery.ts').ExecutionWindow;
   id: RecordId;
@@ -1117,28 +1118,14 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     }
   }
 
-  private async checkExecutionWindow(taskId: string, moveToManager = false): Promise<void> {
+  private async checkExecutionWindow(taskId: string): Promise<void> {
     const row = await this.db.select<TaskRow>(id('task', taskId));
-    if (!row || !windowExpired(row.execution_window)) return;
-    if (moveToManager && row.state === 'ready' && !(row.current_employee && (row.lease_expires_at ?? 0) > Date.now() / 1000)) {
-      await this.db.query(`BEGIN;
-        LET $t = SELECT * FROM ONLY $task;
-        IF $t.version = $version AND $t.state = 'ready' AND ($t.current_employee = NONE OR $t.lease_expires_at <= time::unix(time::now())) {
-          LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'gm', resume_state = 'ready', version += 1 RETURN AFTER;
-          CREATE audit CONTENT { task: $task, actor: 'system:execution-window', action: 'block', version: $n.version,
-            recovery_reason: 'stale_window', evidence: '执行窗口已过期；需经理安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
-          LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
-          CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
-        };
-        COMMIT;`, { task: id('task', taskId), version: row.version });
-    }
-    throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
+    if (row && row.state !== 'review' && windowExpired(row.execution_window))
+      throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
   }
 
   async claim(credential: Credential, taskId: TaskId): Promise<ClaimResult> {
     const actor = await this.authorized(credential);
-    const claimTask = await this.db.select<TaskRow>(id('task', taskId));
-    if (claimTask && actor.role === claimTask.executor_role && actor.capabilities.includes('execute')) await this.checkExecutionWindow(taskId, true);
     if (!this.worktrees) return this.claimLease(actor, taskId);
     const task = await this.getTask(credential, taskId);
     const employee = await this.db.select<{ workspace_scope?: string }>(id('employee', actor.employeeId));
@@ -1324,7 +1311,6 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       IF $who.workspace_scope != NONE AND $who.workspace_scope != IF $t.goal = NONE THEN 'maintenance' ELSE <string>record::id($t.goal) END { THROW 'workspace goal denied' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
-      IF $t.state != 'review' AND $t.execution_window != NONE AND <datetime>$t.execution_window.notAfter <= time::now() { THROW 'execution window expired' };
       IF $t != NONE AND $t.version != $seen { THROW 'contribution history moved: retry' };
       LET $epoch = (SELECT VALUE value FROM ONLY company_meta:policy_epoch) ?? 0;
       IF $epoch != $expected_policy_epoch { THROW 'policy moved: the effective contract moved since the claim was read' };
@@ -1350,6 +1336,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $active = SELECT * FROM ONLY $who.active_task;
         IF $active != NONE AND $active.lease_expires_at > $now AND $active.current_employee = $employee { THROW 'employee already has active task' };
       };
+      LET $expired = $t.state != 'review' AND $t.execution_window != NONE AND <datetime>$t.execution_window.notAfter <= time::now();
+      IF $expired {
+        IF $t.current_employee != NONE AND $t.lease_expires_at > $now { THROW 'execution window expired under active lease' };
+        LET $n = UPDATE ONLY $task SET state = 'blocked', blocked_to = 'gm', resume_state = $t.state, version += 1 RETURN AFTER;
+        CREATE audit CONTENT { task: $task, actor: 'system:execution-window', action: 'block', version: $n.version,
+          recovery_reason: 'stale_window', evidence: '执行窗口已过期；需经理安排真实重采样和独立批准，禁止延长旧证据', at: time::now() };
+        LET $seq = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
+        CREATE outbox CONTENT { task: $task, kind: 'block', sequence: $seq.value, payload: { version: $n.version }, at: time::now() };
+      } ELSE {
       LET $same = $t.current_employee = $employee AND $t.lease_expires_at > $now;
       LET $next = UPDATE ONLY $task SET
         state = IF $t.state = 'review' THEN 'review' ELSE 'doing' END,
@@ -1383,7 +1378,8 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'claimed', sequence: $sequence.value, payload: { employee: $employee, fence: $next.fence }, at: time::now() };
       };
-      RETURN $next;
+      };
+      RETURN SELECT * FROM ONLY $task;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task,
       delivery: randomUUID(), lease_seconds: this.leaseSeconds,
@@ -1399,6 +1395,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const taskView = view(row);
     const project = await this.taskProject(taskId);
     const handover = await this.handoverHistory(taskId);
+    if (row.state === 'blocked') throw new CompanyError('invalid', 'Execution window expired; manager recovery required');
     return { task: taskView, deliveryId: taskView.deliveryId!, fence: taskView.fence,
       leaseExpiresAt: taskView.leaseExpiresAt!, history: handover.history, historyComplete: handover.historyComplete, historyCount: handover.historyCount,
       predecessors: await this.predecessors(taskId, actor.employeeId),
@@ -3174,6 +3171,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       }
       if (target === 'review') await this.requireProvableReviewWait(id('task', taskId), before);
     }
+    if (before.recovery_stopped && !(evidence.executionWindow && before.execution_window?.approvalTask !== executionWindow?.approvalTask)) throw new CompanyError('invalid', 'Automatic recovery stopped; add real prerequisites or a new independent approval before resuming');
     // SYS04 AC04: a resume may not walk past a fault whose recovery stopped — the budget is spent, or the cause
     // cannot be recovered at all. The task waits for the one repair chain of that incident instead; the manager is
     // not asked to approve the same failure again.
@@ -3200,6 +3198,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $t = SELECT * FROM ONLY $task;
         IF $who.revoked = true OR $who.role != 'gm' OR $t = NONE OR $t.state != 'blocked' { THROW 'resume denied' };
         IF $t.version != $expected_version { THROW 'task version moved' };
+        IF $t.recovery_stopped = true AND !$new_window { THROW 'automatic recovery stopped' };
         IF $execution_window != NONE {
           IF <datetime>$execution_window.notAfter <= time::now() { THROW 'execution window expired' };
           LET $approval = type::record('task', $execution_window.approvalTask);
@@ -3461,6 +3460,9 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       } ELSE {
         UPDATE ONLY company_meta:defer_epoch SET value = $epoch_value + 1;
       };
+      LET $new_deps = array::complement($dependencies, $t.dependencies ?? []);
+      ${RESOLVE_DEP_SQL('$new_deps', '$new_dep')}
+      LET $new_unmet = SELECT VALUE id FROM task WHERE id IN $new_dep_resolved AND ${depUnsatisfiedFor('$t')};
       LET $m_phase = $t.resume_state ?? 'ready';
       LET $restore_phase = IF $m_phase = 'review' THEN 'review' ELSE 'ready' END;
       LET $manager = $continuation = 'manager';
@@ -3474,7 +3476,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         resume_role = NONE,
         current_employee = NONE, delivery_id = NONE, lease_expires_at = NONE,
         version = $t.version + 1 RETURN AFTER;
-      IF $added > 0 AND array::len($remaining) > 0 {
+      IF array::len($new_unmet) > 0 {
         CREATE audit CONTENT { task: $task, actor: $actor, action: 'recovery_progress', evidence: '新增真实未完成前置，进入新恢复阶段', at: time::now() };
         UPDATE ONLY $task SET recovery_stopped = NONE;
       };

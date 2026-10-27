@@ -1,4 +1,4 @@
-import { faultBelongsToWait } from '../task-recovery.ts';
+import { faultBelongsToWait, faultNeedsNotice } from '../task-recovery.ts';
 import { workspaceScopeFor } from '../goal-workspace-capability.ts';
 import { FACTORY_PROVIDER, factoryFirst } from './provider-order.ts';
 import { managedModel } from "../model-routing/policy.ts";
@@ -1689,7 +1689,7 @@ export class Dispatcher {
       /** True when `wakeEpisode` is only a stand-in (the task version), not an episode start: see the SYS03 guard. */
       episodeUnknown?: boolean;
       /** The fault episodes this wake tells the manager about (SYS04: one episode, one notice). */
-      faultEpisodes?: string[] };
+      faultEpisodes?: string[]; faultStageStartedAt?: number };
     const pendingGm: PendingGm[] = [];
     // Batch audit reads up front: per-task blockLoops() would cost two round trips per
     // blocked task, and on the ~50KB/s WSS channel hundreds of sequential lookups keep
@@ -1786,7 +1786,9 @@ export class Dispatcher {
           const episodes = facts.byTask.get(todo.task.id) ?? [];
           const open = episodes.filter(episode => episode.state !== 'resolved' &&
             faultBelongsToWait(episode.updatedAt, facts.blockedAt?.get(todo.task.id)));
-          const pending = open.filter(episode => !episode.notified);
+          const stageStartedAt = facts.blockedAt?.get(todo.task.id);
+          const pending = open.filter(episode => faultNeedsNotice(episode, stageStartedAt));
+          todo.faultStageStartedAt = stageStartedAt;
           if (open.length && !pending.length) {
             // The manager already has every open cause of this task on their desk.
             report.decisions.push(`gm-fault-converged:${todo.task.id}`);
@@ -1927,7 +1929,7 @@ export class Dispatcher {
         else if (item.todo.purpose) await wf.recordDispatch(item.todo.task.id, 0, item.todo.purpose, result.id);
         // SYS04: the wake went out, so this cause is on the manager's desk: the episode is notified once.
         for (const episode of item.todo.faultEpisodes ?? []) {
-          await wf.markFaultEpisodeNotified?.(episode).catch(error =>
+          await wf.markFaultEpisodeNotified?.(episode, item.todo.faultStageStartedAt).catch(error =>
             this.log(`fault episode notify failed for ${episode}: ${(error as Error).message}`));
         }
       }

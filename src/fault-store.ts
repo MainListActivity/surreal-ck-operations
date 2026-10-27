@@ -651,13 +651,11 @@ export class FaultStore {
    * Record that the episode reached the manager: exactly one notification per episode. A second call is a no-op,
    * so ten identical reports still produce one notice.
    */
-  async markNotified(episodeKey: string): Promise<boolean> {
-    const row = await this.db.select<{ notified?: boolean }>(episodeId(episodeKey));
-    if (!row) return false;
-    if (row.notified) return false;
+  async markNotified(episodeKey: string, stageStartedAt?: number): Promise<boolean> {
     const [updated] = await this.db.query<[Array<{ notified?: boolean }>]>(
-      'UPDATE $episode SET notified = true, updated_at = time::now() WHERE notified = false RETURN AFTER;',
-      { episode: episodeId(episodeKey) });
+      `UPDATE $episode SET notified = true, notified_at = time::now(), updated_at = time::now()
+       WHERE notified = false OR ($stage != NONE AND (notified_at = NONE OR notified_at < <datetime>$stage)) RETURN AFTER;`,
+      { episode: episodeId(episodeKey), stage: stageStartedAt === undefined ? undefined : new Date(stageStartedAt).toISOString() });
     return (updated?.length ?? 0) > 0;
   }
 
