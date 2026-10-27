@@ -295,7 +295,7 @@ export interface ModelRankingAttempt {
 export interface ModelRankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: Array<{
-    model: string; pinned?: boolean; tailReason?:string; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
+    model: string; pinned?: boolean; tailReason?:string; decision?:{band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
     tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;

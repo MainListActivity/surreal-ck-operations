@@ -74,7 +74,7 @@ export function company(): Promise<Company> {
     const modelRouting = new ModelRoutingController(db.db, serviceHome(), undefined, { jev: jevFromEnv() });
     const { readMagpieGroups } = await import("./vendor/src/model-routing/controller.ts");
     const { RankingRefresher } = await import("./vendor/src/model-routing/ranking.ts");
-    const modelRanking = new RankingRefresher({db:db.db, jev:jevFromEnv(), groups:readMagpieGroups,
+    const modelRanking = new RankingRefresher({db:db.db, groups:readMagpieGroups,
       facts:async ids => { await modelRouting.refresh(); return modelRouting.rankingFacts(ids); },
       apply:(orders,isCurrent)=>modelRouting.applyOrders(orders,isCurrent),log:message=>console.warn(message)});
     void modelRouting.refresh().catch(error=>console.warn(`model routing startup: ${(error as Error).message}`));

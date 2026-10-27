@@ -81,10 +81,14 @@ export interface RoutingConfig {
   disabledModels?: string[];
   tierOverrides?: Record<string, Tier>;
 }
+export function readMagpieProviderRouting(file=join(homedir(),'.config/magpie/providers.json')):Record<string,string>{
+ try{const data=JSON.parse(readFileSync(file,'utf8'));return Object.fromEntries((data.providers??[]).map((p:{id:string;routing?:string})=>[p.id,p.routing??'smart']));}catch{return {};}
+}
 export class ModelRoutingController {
   enabled = false;
-  /** Latest Jev order per group; members it has not seen yet follow in performance order. */
+  /** Latest rule order per group; members it has not seen yet follow in performance order. */
   private orders: Record<string, string[]> = {};
+  private readonly ruleOrders=new Set<string>();
   private catalog: CatalogModel[] = [];
   private updated = 0;
   private sessionsChecked = 0;
@@ -100,6 +104,7 @@ export class ModelRoutingController {
       output?: (args: string[]) => Promise<string>;
       groups?: () => Record<string, string[]>;
       affinity?: () => Record<string, string>;
+      providerRouting?: () => Record<string,string>;
       jev?: JevClient;
       usageLog?: string;
       /** Magpie's per-try routing log; tests point it at a fixture. */
@@ -240,7 +245,7 @@ export class ModelRoutingController {
     for (const f of facts) {
       const trends: ModelTrends = {};
       const raw=observations?.rows.get(splitMember(f.id).id)??{};
-      for(const [name,unit] of Object.entries({ttftMs:"ms",tokensPerSecond:"tokens/s",errorRate:"ratio",cacheHitRate:"ratio",ttftOver10sRate:"ratio"}))
+      for(const [name,unit] of Object.entries({ttftMs:"ms",tokensPerSecond:"tokens/s",errorRate:"ratio",cacheHitRate:"ratio",ttftOver10sRate:"ratio",ttftOver20sRate:"ratio"}))
         trends[name]=metricTrend(raw[name]??[],now,unit,"request");
       // One task is one independent quality observation, even if several employees used this model.
       const tasks = new Map<string,{at:number;sum:number;weight:number}>();
@@ -264,8 +269,44 @@ export class ModelRoutingController {
     // Serialize behind any periodic sync, then re-read the owner's current membership.
     while (this.pending) await this.pending;
     if (!isCurrent()) return;
-    this.orders = { ...this.orders, ...orders };
-    this.pending = this.sync(false,isCurrent).finally(() => {this.pending=undefined;});
+    // Provider account selection is native PACE; model order remains group-local.
+    // A remote Magpie's inner providers remain owned by that remote instance.
+    const operation=async()=>{
+      const providers=this.io.providerRouting?.()??readMagpieProviderRouting();
+      const used=new Set(Object.keys(orders).filter(g=>g==='sck-haiku'||g==='sck-sonnet').flatMap(g=>(this.io.groups?.()??readMagpieGroups())[g]??[]).map(id=>id.split('/')[0]!));
+      for(const id of used){
+        if(!isCurrent())return;
+        if(providers[id]===undefined||providers[id]==='pace')continue;
+        const dir=join(this.home,'model-routing'),file=join(dir,'account-routing.json');
+        let original:Record<string,string>={};
+        try{
+          const saved=JSON.parse(await readFile(file,'utf8'));
+          if(!saved?.original||typeof saved.original!=='object'||Array.isArray(saved.original)||Object.values(saved.original).some(v=>typeof v!=='string'))throw Error('invalid backup');
+          original=saved.original;
+        }catch(error){
+          if((error as NodeJS.ErrnoException).code!=='ENOENT')throw Error('账号路由恢复记录不可读，未修改供应商策略');
+        }
+        if(original[id]===undefined)original[id]=providers[id]!;
+        await mkdir(dir,{recursive:true,mode:0o700});
+        await writeFile(file+'.tmp',JSON.stringify({original}),{mode:0o600});
+        await rename(file+'.tmp',file);
+        if(!isCurrent())return;
+        await this.command(['provider','set',id,'routing=pace']);
+      }
+      if(!isCurrent())return;
+      const previousOrders=this.orders,previousRules=new Set(this.ruleOrders);
+      this.orders = { ...this.orders, ...orders };
+      for(const group of Object.keys(orders))if(group==='sck-haiku'||group==='sck-sonnet')this.ruleOrders.add(group);
+      let completed=false;
+      try{await this.sync(false,isCurrent);completed=isCurrent();}
+      finally{
+        if(!completed){
+          this.orders=previousOrders;
+          this.ruleOrders.clear();for(const group of previousRules)this.ruleOrders.add(group);
+        }
+      }
+    };
+    this.pending = operation().finally(() => {this.pending=undefined;});
     await this.pending;
   }
   refresh(force = false): Promise<void> {
@@ -355,7 +396,7 @@ export class ModelRoutingController {
       }
       useAliases(aliasMap(aliases));
     }
-    const [ranking] = await this.db.query<[{ orders?: Record<string, string[]>; pins?: Record<string, string[]> } | undefined]>("SELECT orders,pins FROM ONLY company_meta:model_ranking;");
+    const [ranking] = await this.db.query<[{ orders?: Record<string, string[]>; pins?: Record<string, string[]>; results?:Record<string,{engine?:string}> } | undefined]>("SELECT orders,pins,results FROM ONLY company_meta:model_ranking;");
     this.orders = { ...ranking?.orders, ...this.orders };
     const models = classify(catalog.data).filter(
       (m) => !config?.disabledModels?.includes(m.id),
@@ -425,7 +466,8 @@ export class ModelRoutingController {
       };
       const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
       const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
-      const members = tier === "fable" ? ordered.map(m => m.id) : pinnedOrder(ordered.map(m => m.id), ranking?.pins?.[`sck-${tier}`]);
+      const members = tier==='fable'||this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine==='quality-pace-v1'
+        ?ordered.map(m=>m.id):pinnedOrder(ordered.map(m=>m.id),ranking?.pins?.[`sck-${tier}`]);
       const positions = new Map(members.map((id, i) => [id, i]));
       ordered.sort((a,b) => positions.get(a.id)! - positions.get(b.id)!);
       for (const member of members) {

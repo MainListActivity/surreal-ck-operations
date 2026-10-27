@@ -100,11 +100,11 @@ function fixture(){
 test('request refresh is asynchronous, single-flight, interval-controlled and excludes Fable and Opus',async()=>{
  const f=fixture();const r=new RankingRefresher(f.deps);
  r.trigger(0);r.trigger(0);expect(f.calls).toEqual([]);await r.settled();
- expect(f.calls).toEqual(['group/sck-sonnet','group/sck-haiku']);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
+ expect(f.calls).toEqual([]);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
  r.trigger(299999);await r.settled();expect(f.applied).toHaveLength(1);
  r.trigger(300000);await r.settled();expect(f.applied).toHaveLength(2);
  await saveRankingSettings(f.db as any,{rules:'质量优先',refreshMinutes:2},r);
- expect(await rankingSettings(f.db as any)).toEqual({rules:'质量优先',refreshMinutes:2});
+ expect(await rankingSettings(f.db as any)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2});
  r.trigger(300001);await r.settled();expect(f.applied).toHaveLength(3);
  r.trigger(420000);await r.settled();expect(f.applied).toHaveLength(3);
  r.trigger(420001);await r.settled();expect(f.applied).toHaveLength(4);
@@ -118,10 +118,11 @@ test('saving during a refresh invalidates old rules, stopped refresher cannot pu
  r.stop();r.reset();r.trigger();await r.settled();expect(f.applied).toHaveLength(1);
  await expect(saveRankingSettings(f.db as any,{rules:'',refreshMinutes:3},r)).rejects.toThrow();
 });
-test('Jev failure retains group order and records a safe error, retry waits for interval',async()=>{
- const f=fixture();f.deps.jev.ask=async()=>{throw Error('private upstream error');};
- const r=new RankingRefresher(f.deps);r.trigger(0);await r.settled();expect(f.applied).toHaveLength(0);expect(f.writes.find(w=>w?.error)?.error).not.toContain('private');
+test('facts failure retains group order and records a safe error without invoking Jev',async()=>{
+ const f=fixture();f.deps.facts=async()=>{throw Error('private upstream error');};
+ const r=new RankingRefresher(f.deps);r.trigger(0);await r.settled();expect(f.applied).toHaveLength(0);expect(f.calls).toEqual([]);expect(JSON.stringify(f.writes)).not.toContain('private upstream');
 });
+
 test('controller applies persisted group-local orders but preserves manual membership and Fable ordering',async()=>{
  const home=scratch();const store:Record<string,string[]>={};let orders:Record<string,string[]>={};
  const db={query:async(sql:string)=>sql.includes('SELECT enabled')?[{enabled:true}]:sql.includes('SELECT orders')?[{orders}]:[[]]};
@@ -167,7 +168,7 @@ test('empty and whitespace rules use the default in settings, saved values and t
   await saveRankingSettings(f.db as any,{rules,refreshMinutes:5},r);
   expect((await rankingSettings(f.db as any)).rules).toBe(DEFAULT_RANKING_RULES);
   await jevOrder({model:'fixture',ask:async(state:any,q:any)=>{
-   expect(state.ownerRules).toBe('智能程度和速度综合优先');return response(q);
+   expect(state.ownerRules).toBe(DEFAULT_RANKING_RULES);return response(q);
   }},'haiku',rules,[fact('p/a')]);
  }
 });
@@ -207,14 +208,13 @@ test('successful Jev snapshots retain exact decimal scores, raw answers, facts, 
  expect(published).toBe(false);
 });
 
-test('refresh persists successful snapshots with orders, excludes failed groups and invalidated results',async()=>{
- const f=fixture();
- f.deps.jev.ask=async(state:any,q:any)=>{if(state.group==='group/sck-sonnet')throw Error('down');return response(q);};
- const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
+test('refresh records immutable rule decisions, requires no Jev client and skips incomplete groups',async()=>{
+ const f=fixture();f.deps.facts=async()=>[fact('p/b')];
+ const r=new RankingRefresher({...f.deps,jev:undefined});r.trigger();await r.settled();
  const publication=f.writes.find(w=>w?.results);
- expect(Object.keys(publication.results)).toEqual(['sck-haiku']);
- expect(publication.orders['sck-haiku']).toEqual(publication.results['sck-haiku'].rows.map((row:any)=>row.facts.id));
- expect(publication.results['sck-haiku'].rows[0].score).toBe(0);
+ expect(Object.keys(publication.results)).toEqual(['sck-haiku']);expect(f.calls).toEqual([]);
+ expect(publication.orders['sck-haiku']).toEqual(['p/b']);
+ expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v1',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
 });
 
 test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
@@ -232,7 +232,7 @@ test('ranking list joins current members to one successful snapshot, never a new
  const legacy=rankingTables(groups,{},requests)[0]!;expect(legacy.scored).toBe(false);expect(legacy.at).toBe('new-at');expect(legacy.rows[1]?.aaScore).toBe(99);expect(legacy.rows.every(r=>r.jevScore===undefined)).toBe(true);
 });
 
-test('pins exclude exact effort IDs from Jev, persist immediately, and serialize across owner surfaces',async()=>{
+test('pins persist exact effort IDs and serialize without calling Jev',async()=>{
  let pins:Record<string,string[]>={};let stored:Record<string,string[]>={};let fail=false;
  const members:Record<string,string[]>={'sck-haiku':['p/a:max','p/b:max','p/a:high']};
  const sent:any[]=[];const published:any[]=[];
@@ -247,19 +247,19 @@ test('pins exclude exact effort IDs from Jev, persist immediately, and serialize
  await Promise.all([r.setPin('sck-haiku','p/b:max',true),r.setPin('sck-haiku','p/a:max',true)]);
  expect(pins).toEqual({'sck-haiku':['p/b:max','p/a:max']});expect(stored['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);expect(sent).toHaveLength(0);
  await r.setPin('sck-haiku','p/b:max',true);expect(pins['sck-haiku']).toEqual(['p/b:max','p/a:max']);
- r.trigger(1);await r.settled();expect(Object.values(sent[0].models).map((f:any)=>f.id)).toEqual(['p/a:high']);expect(members['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);
+ r.trigger(1);await r.settled();expect(sent).toHaveLength(0);expect(members['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);
  await r.setPin('sck-haiku','p/a:high',true);const before=sent.length;
  const restarted=new RankingRefresher(deps);restarted.trigger(2);await restarted.settled();expect(sent).toHaveLength(before);expect(members['sck-haiku']).toEqual(['p/b:max','p/a:max','p/a:high']);
- await restarted.setPin('sck-haiku','p/b:max',false);restarted.trigger(3);await restarted.settled();expect(Object.values(sent.at(-1).models).map((f:any)=>f.id)).toEqual(['p/b:max']);expect(members['sck-haiku']).toEqual(['p/a:max','p/a:high','p/b:max']);
+ await restarted.setPin('sck-haiku','p/b:max',false);restarted.trigger(3);await restarted.settled();expect(sent).toHaveLength(0);expect(members['sck-haiku']).toEqual(['p/a:max','p/a:high','p/b:max']);
  fail=true;await restarted.setPin('sck-haiku','p/a:high',false);restarted.trigger(4);await restarted.settled();expect(members['sck-haiku'][0]).toBe('p/a:max');
  await expect(r.setPin('sck-fable','p/a:max',true)).rejects.toThrow();await expect(r.setPin('sck-haiku','p/missing',true)).rejects.toThrow();
 });
 
-test('pin invalidates an in-flight Jev result before publishing the manual order',async()=>{
- const f=fixture();let entered!:()=>void,release!:()=>void;const started=new Promise<void>(r=>entered=r),wait=new Promise<void>(r=>release=r);
- const r=new RankingRefresher({...f.deps,jev:{model:'fixture',ask:async(_s:any,q:any)=>{entered();await wait;return response(q);}}});
+test('pin invalidates an in-flight facts snapshot before publishing the manual order',async()=>{
+ const f=fixture();let entered!:()=>void,release!:()=>void,reads=0;const started=new Promise<void>(r=>entered=r),wait=new Promise<void>(r=>release=r);
+ const r=new RankingRefresher({...f.deps,facts:async(ids:string[])=>{if(reads++===0){entered();await wait;}return ids.map(fact);}});
  r.trigger();await started;const pin=r.setPin('sck-sonnet','p/a',true);release();await pin;
- expect(f.applied).toEqual([{'sck-sonnet':['p/a']}]);
+ expect(f.calls).toEqual([]);expect(f.applied).toHaveLength(1);expect(f.applied[0]['sck-sonnet']).toEqual(['p/a']);
 });
 
 test('controller refresh enforces persisted pins ahead of cached Jev orders without adding absent members',async()=>{
@@ -300,7 +300,7 @@ test('automatic ranking neither reads facts nor sends Jev questions or applies o
  f.deps.facts=async ids=>{requested.push(ids);return ids.map(fact);};
  const r=new RankingRefresher(f.deps);r.trigger();await r.settled();
  expect(requested).toEqual([['p/a','p/b']]);
- expect(f.calls).toEqual(['group/sck-sonnet','group/sck-haiku']);
+ expect(f.calls).toEqual([]);
  expect(f.applied[0]['sck-opus']).toBeUndefined();
  await expect(r.setPin('sck-opus','owner/manual:high',true)).rejects.toThrow();
  expect(rankingTables({'sck-opus':['owner/manual:high']},{},[],{'sck-opus':['owner/manual:high']})).toEqual([]);
@@ -318,13 +318,13 @@ test('Jev failure preserves successful scores while independent safety observati
   apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
  r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
  fail=true;bad=true;r.trigger(300000);await r.settled();
- expect(results['sck-haiku']).toEqual(success);expect(members.at(-1)).toBe('p/a');
+ expect(results['sck-haiku'].engine).toBe('quality-pace-v1');expect(members.at(-1)).toBe('p/a');
  let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
- expect(t.scored).toBe(true);expect(t.at).toBe(success.at);expect(t.rows.find(r=>r.model==='p/b')?.jevScore).toBe(1);
+ expect(t.scored).toBe(true);expect(t.at).toBe(results['sck-haiku'].at);expect(t.rows.find(r=>r.model==='p/b')?.decision).toBeDefined();
  expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);
  bad=false;r.trigger(600000);await r.settled();
  t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
- expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).not.toBe(true);expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBe(0);
+ expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).not.toBe(true);expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();
 });
 
 
