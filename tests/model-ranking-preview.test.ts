@@ -118,3 +118,10 @@ test('preview layers are explicitly distinguished from the published snapshot',(
  const h=harness(undefined);h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/preview',accounts:[],previousRank:3}]}});
  expect(h.text()).toContain('以下分层来自当前预览');expect(h.text()).not.toContain('以下分层来自最近成功排序快照');
 });
+test('an unhealthy pin is labelled first-tier pinned while preserving its real health warning',()=>{
+ const h=harness(undefined),health={excluded:true,attempts:3,errors:3,consecutiveErrors:3};
+ h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/bad',pinned:true,accounts:[],health,decision:{tail:'该模型持续报错',score:5,reason:'手动置顶第1位'}}]}});
+ expect(h.text()).toContain('第1层 · 手动置顶');expect(h.text()).toContain('状态异常');
+ expect(rankingRuleLabel({pinned:true,health})).toBe('置顶');
+ const warning=rankingHealthMetric(health,true).detail;expect(warning).toContain('手动置顶仍在第一层');expect(warning).not.toContain('已移到组末尾');
+});

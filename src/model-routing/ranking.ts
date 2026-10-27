@@ -261,9 +261,9 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const current=gate?.facts.find(f=>f.id===model);
       const excluded = gate ? (current?.health?.excluded ? current : undefined) : result?.excludedFacts?.find(f => f.id === model);
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
-      const pinned = !excluded && (pins[group] ?? []).includes(model);
+      const pinned = (pins[group] ?? []).includes(model);
       const decision=judged?.decision;
-      return { model, price:facts?.price, decision, tailReason:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, price:facts?.price, decision, tailReason:pinned?undefined:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
@@ -395,8 +395,8 @@ export class RankingRefresher {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
-        // A member that keeps failing goes last by code, before Jev and over the owner's pins:
-        // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
+        // Keep model-specific safety observations for automatic ranking and risk display.
+        // Explicit owner pins remain in their independent first tier even when these observations flag a risk.
         gates[`sck-${tier}`]={at:new Date().toISOString(),facts:members.flatMap(id=>byId.has(id)?[byId.get(id)!]:[])};
         try {
           const facts=members.map(id=>byId.get(id));

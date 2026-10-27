@@ -1,3 +1,4 @@
+import {relayPalette} from '../plugin/client/relay-theme.ts';
 import { expect, test } from 'bun:test';
 import type { Pulse } from '../plugin/shared/types.ts';
 
@@ -98,7 +99,7 @@ const compiled = new Bun.Transpiler({ loader: 'tsx', tsconfig: {
   compilerOptions: { jsx: 'react', jsxFactory: 'React.createElement' },
 } }).transformSync(`return (${jsx});`);
 const render = new Function(
-  'React', 's', 'ctx', 'p', 'loaded', 'data', 'attention',
+  'React', 's', 'ctx', 'pal', 'MetricCard', 'p', 'loaded', 'data', 'attention',
   'Section', 'Collapsible', 'View', 'Text', 'fmtAge', 'ROLE_LABEL', 'WORKFLOW_LABEL', 'WAIT_KIND_LABEL', 'WAIT_STATE_LABEL', 'clockOf',
   compiled,
 );
@@ -109,10 +110,17 @@ const el = (type: unknown, props: Record<string, unknown> | null, ...children: u
   const walk = (c: unknown) => Array.isArray(c) ? c.forEach(walk) : flat.push(c);
   children.forEach(walk);
   const pr = (props ?? {}) as Record<string, unknown>;
-  return { type, props: { ...pr, children: flat.length <= 1 ? flat[0] : flat } };
+  const resolved={ ...pr, children: flat.length <= 1 ? flat[0] : flat };
+  if(typeof type==='function')return type(resolved);
+  return { type, props: resolved };
 };
 const React = { createElement: el };
 const View = 'View', Text = 'Text';
+// The host page now uses a shared metric card and palette; render the real card, not a missing global.
+const metricStart=page.indexOf('function MetricCard('),metricEnd=page.indexOf('\n}\n',metricStart)+3;
+if(metricStart<0||metricEnd<3)throw Error('MetricCard missing');
+const metricSource=new Bun.Transpiler({loader:'tsx',tsconfig:{compilerOptions:{jsx:'react',jsxFactory:'React.createElement'}}}).transformSync(page.slice(metricStart,metricEnd));
+const MetricCard=new Function('React','View','Text',metricSource+';return MetricCard;')(React,View,Text);
 const Section = ({ title, children }: { title: string; children: unknown }) =>
   el('section', { title }, children);
 const Collapsible = ({ title, children }: { title: string; children: unknown }) =>
@@ -132,7 +140,7 @@ const collectText = (node: unknown): string => {
 const attentionOf = (p: Pulse) =>
   p.waiting.length + p.stuck.length + p.resources.length + p.bounds.dispatchBlocked.total;
 const renderPulse = (raw: unknown, q: { isLoading?: boolean; isError?: boolean; error?: Error } = {}) =>
-  render(React, s, ctx, normalizePulse(raw), raw != null,
+  render(React, s, ctx, relayPalette({ colors: {} } as never), MetricCard, normalizePulse(raw), raw != null,
     { data: raw, isLoading: false, isError: false, error: undefined, ...q },
     attentionOf(normalizePulse(raw)), Section, Collapsible, View, Text, fmtAge, ROLE_LABEL, WORKFLOW_LABEL, WAIT_KIND_LABEL, WAIT_STATE_LABEL, clockOf);
 

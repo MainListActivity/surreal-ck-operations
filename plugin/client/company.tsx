@@ -1236,25 +1236,25 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
   return <View style={{gap:mobile?5:8}}>
     <View style={[s.row,{alignItems:"flex-start",justifyContent:"space-between",marginBottom:mobile?7:10}]}>
       <View style={{flex:1}}><Text style={[s.text,{fontSize:mobile?15:17,fontWeight:"700"}]}>{table.group.replace("sck-","").replace(/^./,x=>x.toUpperCase())} 模型</Text>
-        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>新模型优先试用；其余按能力档和计费层分组，再比较综合分。故障、额度和20秒限制始终生效。</Text>}
+        {!mobile&&<Text style={[s.muted,{marginTop:6}]}>手动置顶独立第一层；其余模型中，新模型优先试用，再按能力档和计费层分组，再比较综合分。未置顶模型继续执行故障、额度和20秒置后规则。</Text>}
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
-    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①安全状态 → ②新模型试用 → ③AA能力档 → ④计费类型 → ⑤本层置顶 → ⑥层内分降序</Text><Text style={s.muted}>安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
+    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①手动置顶独立第一层 → ②其余模型按安全状态 → 新模型试用 → AA能力档 → 计费类型 → 层内分降序</Text><Text style={s.muted}>手动置顶不再细分层，按置顶先后排列；其余模型的安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
     {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
     {table.rows.map((row,index)=>{
       const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
       const open=expanded===row.model,layer=starts.get(index);
       const quota=row.accounts.length?row.accounts.map((a,i)=>`${row.accounts.length>1?`#${i+1} `:""}${a.remainingPct===undefined?"未知":`${number(a.remainingPct)}%`}`).join(" · "):"未知";
       const metrics=[
-        {label:"层内分",value:row.decision?.score?.toFixed(2)??"未知",detail:row.previousRank?`线上第 ${row.previousRank} 名 → 预览第 ${index+1} 名`:"固定分层内比较，不跨能力档或计费层"},
+        {label:"层内分",value:row.decision?.score?.toFixed(2)??"未知",detail:row.pinned?"手动置顶按先后排列，分数仅供参考":row.previousRank?`线上第 ${row.previousRank} 名 → 预览第 ${index+1} 名`:"固定分层内比较，不跨能力档或计费层"},
         {label:"排序依据",value:row.decision?.reason??"等待规则排序",detail:"不调用 JEV；首 token 置后阈值为20秒"},
         {label:"AA 智能分",value:number(row.aaScore),detail:(row.aaRank===undefined?"暂无排名":`全榜第 ${row.aaRank} 名`)+" · "+rankingTrendDetail(row.trends?.aaScore)},
         {label:"生成速度",value:row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,detail:rankingTrendDetail(row.trends?.tokensPerSecond)},
         {label:"首 token 延迟",value:row.ttftMs===undefined?"未知":`${number(row.ttftMs/1000,2)} 秒`,detail:(row.tailReason?row.tailReason+" · ":"")+rankingTrendDetail(row.trends?.ttftMs)},
         {label:"剩余额度",value:quota,detail:rankingTrendDetail(row.trends?.remainingPct)},
         {label:"请求稳定性",value:row.stabilityPct===undefined?"未知":`${number(row.stabilityPct)}%`,detail:"错误率趋势："+rankingTrendDetail(row.trends?.errorRate)},
-        {label:"路由尝试",...rankingHealthMetric(row.health)},
+        {label:"路由尝试",...rankingHealthMetric(row.health,row.pinned)},
         {label:"缓存命中率",value:row.trends?.cacheHitRate?.current===undefined?"未知":`${number(row.trends.cacheHitRate.current*100)}%`,detail:rankingTrendDetail(row.trends?.cacheHitRate)},
         {label:"样本权重",value:number(row.performanceSamples,2),detail:rankingTrendDetail(row.trends?.performanceScore)},
       ];
@@ -1272,7 +1272,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
           {wide&&stat("智能分",number(row.aaScore),72)}
           {!mobile&&stat("速度",row.tokensPerSecond===undefined?"未知":`${number(row.tokensPerSecond,0)} tok/s`,96)}
           {wide&&stat("额度",quota,64)}
-          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.decision?.tail?"置后":row.decision?.coldStart?"试用":row.pinned?"置顶":"层内分"}</Text>
+          <View style={{width:mobile?66:76,alignItems:"flex-end"}}><Text style={[s.muted,{fontSize:9}]}>{row.pinned?"置顶":row.decision?.tail?"置后":row.decision?.coldStart?"试用":"层内分"}</Text>
             <Text accessibilityLabel={row.decision?.reason??"等待规则排序"} style={{color:c.score,fontSize:mobile?13:17,lineHeight:mobile?18:23,fontWeight:"700"}}>{row.decision?.score===undefined?rankingRuleLabel(row):row.decision.score.toFixed(1)}</Text>
           </View><Text style={[s.muted,{width:mobile?18:22,textAlign:"center",fontSize:17}]}>{open?"−":"+"}</Text>
         </Pressable><Pressable accessibilityRole="button" accessibilityLabel={`${row.pinned?"取消置顶":"置顶"} ${row.model}`} disabled={pinBusy||!onPin}
@@ -1355,7 +1355,7 @@ function ModelRankingCard({ctx}: {ctx:Ctx}) {
         <RelayHeading ctx={ctx} step="02" title="模型优先级" subtitle={changed?"配置预览 · 尚未应用线上":"依据当前规则生成的实时排序"}/>
         <View style={{flexDirection:"row",gap:7,padding:5,borderRadius:13,backgroundColor:c.input,marginBottom:mobile?16:25}}>{[...tables].sort((a,b)=>['sck-haiku','sck-sonnet','sck-opus'].indexOf(a.group)-['sck-haiku','sck-sonnet','sck-opus'].indexOf(b.group)).map(table=><Pressable key={table.group} accessibilityRole="tab" accessibilityLabel={`查看 ${table.group} 模型排序`} accessibilityState={{selected:selected?.group===table.group}} onPress={()=>setGroup(table.group)} style={{flex:1,minHeight:39,borderRadius:9,backgroundColor:selected?.group===table.group?c.tab:"transparent",alignItems:"center",justifyContent:"center"}}><Text style={{color:selected?.group===table.group?c.foreground:c.foregroundMuted,fontSize:12,fontWeight:"600"}}>{table.group.replace('sck-','').replace(/^./,x=>x.toUpperCase())} <Text style={{color:selected?.group===table.group?c.accent:c.foregroundMuted,fontSize:10}}> {table.rows.length}</Text></Text></Pressable>)}</View>
         {!!selected&&!!query.data?.attempts?.[selected.group]&&<Text style={[s.muted,{marginBottom:10,fontSize:10}]}>{(()=>{const a=query.data!.attempts[selected.group]!;return `最近刷新尝试：${new Date(a.at).toLocaleString()} · ${a.status} · ${a.modelCount} 个评分模型 · ${a.encoding} · 共享 ${a.stateBytes}/${a.limits.stateBytes} 字节 · 请求 ${a.requestBytes}/${a.limits.requestBytes} 字节`;})()}</Text>}
-        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy||changed} billingOverrides={policy.billingOverrides} onBilling={(model,kind)=>{const next={...policy.billingOverrides};if(kind==="auto")delete next[model];else next[model]=kind as "free"|"included"|"unknown"|"paid";editPolicy({...policy,billingOverrides:next});}} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶，仍受20秒和可用性限制。":"已取消置顶，下次刷新按规则排序。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
+        {selected?<ModelRankingList key={selected.group} ctx={ctx} table={selected} width={width} pinBusy={pinBusy||changed} billingOverrides={policy.billingOverrides} onBilling={(model,kind)=>{const next={...policy.billingOverrides};if(kind==="auto")delete next[model];else next[model]=kind as "free"|"included"|"unknown"|"paid";editPolicy({...policy,billingOverrides:next});}} onPin={async(model,pinned)=>{setPinBusy(true);setPinMessage("");try{await pin({group:selected.group as "sck-haiku"|"sck-sonnet"|"sck-opus",model,pinned});await query.refetch();setPinMessage(pinned?"已置顶到独立第一层，状态异常仍保留提示。":"已取消置顶，恢复自动分层。");}catch{await query.refetch();setPinMessage("置顶更新未完成，请刷新后重试。");}finally{setPinBusy(false);}}}/>:<Text style={s.muted}>尚无分组成员。</Text>}
         {!!pinMessage&&<Text accessibilityRole="alert" style={[s.muted,{marginTop:10}]}>{pinMessage}</Text> }
         {!!selected?.at&&<Text style={[s.muted,{marginTop:14,fontSize:10}]}>{selected.scored?"最近成功排序":"历史请求数据"}：{new Date(selected.at).toLocaleString()} · 本轮规则：{selected.rules??"未记录"}</Text>}
       </View>

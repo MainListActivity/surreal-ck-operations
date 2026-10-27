@@ -15,18 +15,18 @@ export function rankingTrendDetail(t?: MetricTrend): string {
 }
 
 /** Shared by the Paseo page and the web review console (embedded there by toString, so self-contained). */
-export function rankingHealthMetric(health: ModelRankingTable["rows"][number]["health"]): { value: string; detail: string } {
+export function rankingHealthMetric(health: ModelRankingTable["rows"][number]["health"], pinned=false): { value: string; detail: string } {
   const reasons = { unavailable: "被拒绝（无权限，或订阅不提供）", consecutive_errors: "连续报错", error_rate: "报错率过高" };
   if (!health) return { value: "未知", detail: "近 24 小时没有路由尝试记录" };
   const last = health.lastStatus === undefined ? "" : `，最近一次 HTTP ${health.lastStatus}`;
   return { value: `${health.errors}/${health.attempts} 失败`,
-    detail: health.excluded ? `${reasons[health.reason ?? "consecutive_errors"]}${last}：已移到组末尾，不参与正常优先排序，恢复成功后自动回到排序` : `近 24 小时含被转给下一个成员的尝试${last}` };
+    detail: health.excluded&&pinned?`自动排序应置后${last}；当前手动置顶仍在第一层，实际可用性由Magpie判断`:health.excluded ? `${reasons[health.reason ?? "consecutive_errors"]}${last}：已移到组末尾，不参与正常优先排序，恢复成功后自动回到排序` : `近 24 小时含被转给下一个成员的尝试${last}` };
 }
 
 /** A rule label, never presented as a probabilistic model score. */
 export function rankingRuleLabel(row:{pinned?:boolean;health?:{excluded:boolean};decision?:{tail?:string;band?:number;coldStart?:boolean}}):string {
+ if(row.pinned)return '置顶';
  if(row.health?.excluded||row.decision?.tail)return '置后';
  if(row.decision?.coldStart)return '新模型试用';
- if(row.pinned)return '置顶';
  return row.decision?.band===undefined?'待测':`能力档 ${row.decision.band+1}`;
 }

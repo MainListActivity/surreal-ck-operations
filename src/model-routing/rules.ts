@@ -1,9 +1,9 @@
 import type { ModelFacts } from './ranking.ts';
 import {DEFAULT_POLICY,rankingPolicy,BILLING_LABELS,type RankingPolicy,type BillingClass} from './weights.ts';
-export const RULE_ENGINE='quality-pace-v2';
+export const RULE_ENGINE='quality-pace-v3';
 export const TTFT_LIMIT_MS=20_000;
 export const AA_BAND_WIDTH=2;
-export const RULE_DESCRIPTION='模型持续报错、额度耗尽、首 token 超过20秒置后；无请求记录的新模型优先试用；按AA能力分档，再按免费、套餐/积分覆盖、未知、额外付费分层；层内使用可配置权重评分，不调用JEV。';
+export const RULE_DESCRIPTION='手动置顶独立第一层，按置顶先后排列；其余模型持续报错、额度耗尽、首 token 超过20秒置后；无请求记录的新模型优先试用；按AA能力分档，再按免费、套餐/积分覆盖、未知、额外付费分层；层内使用可配置权重评分，不调用JEV。';
 export interface RuleDecision {
  band?:number; ttftMs?:number; latencySource:'recent-ewma'|'recent-last'|'historical-average'|'unknown';
  billing:'subscription'|'metered'|'unknown'; quota:'available'|'low'|'exhausted'|'unknown';
@@ -36,8 +36,9 @@ export function accountFacts(f:ModelFacts,now:number){
  return {billing,quota,remainingPct:remaining,pace:paces.length?Math.max(...paces):undefined};
 }
 const clamp=(n:number)=>Math.max(0,Math.min(1,n));
-/** Same engine for preview and publication. Safety, exploration and ability never become purchasable weights. */
+/** Manual pins are an explicit first tier; automatic candidates retain their existing gates and weights. */
 export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),input:RankingPolicy=DEFAULT_POLICY):Array<{facts:ModelFacts;decision:RuleDecision}> {
+ pins=[...new Set(pins)].filter(id=>facts.some(f=>f.id===id));
  const policy=rankingPolicy(input),total=Object.values(policy.weights).reduce((a,b)=>a+b,0);
  const rows=facts.map((facts,i)=>{
   const latency=recentMetric(facts,'ttftMs',now),account=accountFacts(facts,now);
@@ -54,18 +55,18 @@ export function ruleOrder(facts:ModelFacts[],pins:string[]=[],now=Date.now(),inp
   return {facts,i,decision,gate:facts.health?.excluded?3:tail==='供应商已知账号额度耗尽'?2:tail?1:0,pin:pins.includes(facts.id)?pins.indexOf(facts.id):Infinity};
  });
  const partitions=new Map<number,typeof rows>();
- for(const row of rows)(partitions.get(row.gate)??partitions.set(row.gate,[]).get(row.gate)!).push(row);
+ for(const row of rows.filter(r=>r.pin===Infinity))(partitions.get(row.gate)??partitions.set(row.gate,[]).get(row.gate)!).push(row);
  for(const group of partitions.values()){
   const measured=group.filter(r=>finite(r.facts.aa?.score)).sort((a,b)=>b.facts.aa!.score-a.facts.aa!.score);
   let top=Infinity,band=-1;
   for(const r of measured){if(top-r.facts.aa!.score>policy.bandWidth){top=r.facts.aa!.score;band++;}r.decision.band=band;}
  }
  const costs:Record<BillingClass,number>={free:0,included:1,unknown:2,paid:3};
- rows.sort((a,b)=>a.gate-b.gate||Number(!!b.decision.coldStart)-Number(!!a.decision.coldStart)||
-  (a.decision.band??Infinity)-(b.decision.band??Infinity)||costs[a.decision.costClass!]-costs[b.decision.costClass!]||a.pin-b.pin||
+ rows.sort((a,b)=>a.pin-b.pin||a.gate-b.gate||Number(!!b.decision.coldStart)-Number(!!a.decision.coldStart)||
+  (a.decision.band??Infinity)-(b.decision.band??Infinity)||costs[a.decision.costClass!]-costs[b.decision.costClass!]||
   b.decision.score!-a.decision.score!||a.i-b.i);
- return rows.map(({facts,decision,pin})=>({facts,decision:{...decision,reason:decision.tail??[
-  decision.coldStart?'新模型优先试用':undefined,pin!==Infinity?'本层人工置顶':undefined,BILLING_LABELS[decision.costClass!],
+ return rows.map(({facts,decision,pin})=>({facts,decision:{...decision,reason:pin!==Infinity?`手动置顶第${pin+1}位；独立第一层；${decision.tail?'自动排序风险：'+decision.tail:'不按能力档、计费层或分数重排'}`:decision.tail??[
+  decision.coldStart?'新模型优先试用':undefined,BILLING_LABELS[decision.costClass!],
   decision.band===undefined?'AA未知':`能力档${decision.band+1}（AA ${facts.aa!.score}）`,
   `综合分 ${decision.score!.toFixed(2)}`,decision.ttftMs===undefined?'首 token 未测得':`首 token ${(decision.ttftMs/1000).toFixed(2)}秒`,
  ].filter(Boolean).join('；')}}));

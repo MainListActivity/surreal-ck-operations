@@ -11,11 +11,12 @@ test('weights change the within-layer winner and each component sums exactly to 
  expect(latency[0]!.facts.id).toBe('p/fast');expect(pace[0]!.facts.id).toBe('p/urgent');
  for(const r of [...pace,...latency])expect(r.decision.score).toBeCloseTo(Object.values(r.decision.contributions!).reduce((s,v)=>s+v.points,0),10);
 });
-test('ability and cost layers cannot be bought with weights or pins; manual classification is explicit',()=>{
+test('automatic ability and cost layers hold; explicit manual pins take precedence',()=>{
  const free=fact('p/free',19000),included=fact('p/included',100),paid=fact('p/paid',1),strong=fact('p/strong',19000);
  free.price.free=true;paid.accounts[0]!.kind='api';strong.aa!.score=65;strong.accounts[0]!.kind='api';
  const rows=ruleOrder([paid,included,free,strong],['p/paid'],now,policy('latency'));
- expect(rows.map(r=>r.facts.id)).toEqual(['p/strong','p/free','p/included','p/paid']);
+ expect(rows.map(r=>r.facts.id)).toEqual(['p/paid','p/strong','p/free','p/included']);
+ expect(ruleOrder([paid,included,free,strong],[],now,policy('latency')).map(r=>r.facts.id)).toEqual(['p/strong','p/free','p/included','p/paid']);
  const p=policy('latency');p.billingOverrides['p/included']='paid';
  expect(ruleOrder([paid,included],[],now,p)[0]!.facts.id).toBe('p/paid');
 });
@@ -24,11 +25,11 @@ test('truly untried models get exploration priority; any error attempt prevents 
  expect(ruleOrder([known,fresh],[],now)[0]!.decision.coldStart).toBe(true);
  fresh.health={source:'magpie-routing',attempts:1,errors:1,consecutiveErrors:1,excluded:false};
  expect(ruleOrder([fresh,known],[],now)[0]!.facts.id).toBe('p/known');
- fresh.health.excluded=true;expect(ruleOrder([fresh,known],['p/new'],now)[1]!.decision.tail).toContain('模型持续报错');
+ fresh.health.excluded=true;expect(ruleOrder([fresh,known],['p/new'],now)[0]!.decision.tail).toContain('模型持续报错');
 });
 test('failing one model never demotes a healthy sibling on the same provider',()=>{
  const bad=fact('p/bad'),good=fact('p/good');bad.health={source:'magpie-routing',attempts:3,errors:3,consecutiveErrors:3,excluded:true};
- expect(ruleOrder([bad,good],['p/bad'],now).map(r=>r.facts.id)).toEqual(['p/good','p/bad']);
+ expect(ruleOrder([bad,good],[],now).map(r=>r.facts.id)).toEqual(['p/good','p/bad']);
 });
 test('unknown metrics get no fabricated values; invalid policies fail closed',()=>{
  const missing=fact('p/missing');delete missing.usage;missing.health={source:'magpie-routing',attempts:1,errors:0,consecutiveErrors:0,excluded:false};
