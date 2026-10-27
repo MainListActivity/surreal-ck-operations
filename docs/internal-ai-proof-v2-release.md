@@ -34,3 +34,4 @@
 - **官方 2026-10-27 console 公告**：5h 上限 60k→120k、7d 600k→1.2M、统一重置。公告只作为窗口上限与重置的事实来源，**不是** `used`/`remaining` 的取整规则；不得据此把 60,000 points / 18,000s 准用上限抬高，也不得据此生成候选。
 - **已观测仍 blocked**：官方页与 console 的 Date 比本机/供应商 API 快约 779 s（source-clock-skew），且真实页 `s-maxage` 无 Age（cacheAgeUnknown）；default 7d `used+remaining = limit − 1`。修复只保证分类/采集正确、原始值可审计；在上述来源事实未恢复前，真实采样继续 blocked，不保证自动恢复。
 - **不使用**：供应商 API 域 Date 替代 web/console 时钟、放宽 ±5 分钟、对差 1 容差、改宿主机时钟、以 304/同 ETag 声称内容新鲜。`usedSource=reported` 现在是 eligibility 硬门（形状不变），派生 `used` 一律不可用。
+- **复核收紧（R1/R2/R3）**：console 时钟偏差 >5 分钟时不再生成文档（不把来源域绝对 `resetAt` 当可信时间）；官方页 Date 必须被同一 provider 的 API 域 Date 在 5 分钟内 corroborate，跨域矛盾即 blocked（API Date 仍不能替代页面时钟）；`clockDomains.fieldSource` 的公式改为与实际计算一致：`skewMs = headersAt − Date`，另列 `ageAdjustedSkewMs = headersAt − (Date + Age)`。

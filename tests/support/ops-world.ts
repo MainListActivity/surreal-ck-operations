@@ -144,6 +144,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     poolCacheControl: null as string | null,
     poolRequestId: 'req-fixture-0001',
     /** Provider API domain Date shift; the API clock is the host-health reference. */
+    modelsDate: true,
     modelsDateSkewMs: 0,
     // when true, one fixed billing path answers 200 instead of the absent-surface 404
     billingPathLive: false,
@@ -562,7 +563,7 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (method !== 'GET') return json(405, { code: 12, message: 'Method Not Allowed' });
     if (url.host === 'token.sensenova.cn') {
       if (url.pathname !== '/v1/models') return json(404, { error: { code: 5, message: 'NOT_FOUND' } });
-      const headers = { date: new Date(this.clock + s.modelsDateSkewMs).toUTCString() };
+      const headers: Record<string, string> = s.modelsDate ? { date: new Date(this.clock + s.modelsDateSkewMs).toUTCString() } : {};
       if (token !== s.apiKey) return new Response(JSON.stringify({ error: { code: 16, message: 'Forbidden' } }), { status: 401, headers: { 'content-type': 'application/json', ...headers } });
       if (s.modelsStatus !== 200) return new Response('', { status: s.modelsStatus, headers });
       return new Response(JSON.stringify({ object: 'list', data: [{ id: 'sensenova-6.8-flash-lite', object: 'model' }, { id: 'deepseek-v4-flash', object: 'model' }] }), { status: 200, headers: { 'content-type': 'application/json', ...headers } });

@@ -723,17 +723,72 @@ describe('supplier time-source diagnostics and raw quota precision (15d775ea spe
     expect(Date.parse(normal.expiresAt)).toBeLessThanOrEqual(r.world.clock + 1_800_000 - 60_000);
     expect(normal.receipt.derivations.expiryDerivation).toMatchObject({ minResetInMs: 1_800_000, marginMs: 60_000 });
 
-    // Same reset distances, but the console clock runs 779s fast: reset_at shifts with it.
+    // Same reset distances, console clock +120s (inside the 5 minute bound): reset_at shifts
+    // with the clock and the bias cancels, so expiry does not move.
     const fast = rig(); seal(fast);
-    fast.world.supplier.poolDateSkewMs = 779_000;
+    fast.world.supplier.poolDateSkewMs = 120_000;
     for (const pool of fast.world.supplier.pools as Array<any>) {
-      for (const window of [pool.window_5h, pool.window_7d]) window.reset_at = Math.floor((fast.world.clock + 779_000) / 1000) + 1_800;
+      for (const window of [pool.window_5h, pool.window_7d]) window.reset_at = Math.floor((fast.world.clock + 120_000) / 1000) + 1_800;
     }
     const skewed = await sample(fast);
     expect(skewed.status).toBe('sampled');
     expect(Math.abs(Date.parse(skewed.expiresAt) - Date.parse(normal.expiresAt))).toBeLessThanOrEqual(2_000);
     expect(Date.parse(skewed.expiresAt)).toBeLessThanOrEqual(fast.world.clock + 1_800_000 - 60_000);
     expectNoSupplierLeaks(fast);
+  });
+
+  test('console clock beyond 5 minutes blocks instead of publishing a source-domain absolute resetAt', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.poolDateSkewMs = 779_000;
+    for (const pool of r.world.supplier.pools as Array<any>) {
+      for (const window of [pool.window_5h, pool.window_7d]) window.reset_at = Math.floor((r.world.clock + 779_000) / 1000) + 1_800;
+    }
+    const result = await sample(r);
+    expect(result.status).toBe('blocked');
+    expect(result.document).toBeUndefined();
+    expect(result.documentSha256).toBeUndefined();
+    expect(result).not.toHaveProperty('expiresAt');
+    expect(poolGap(result)?.detail).toContain('source-clock-skew');
+    expect(poolGap(result)?.detail).toContain('cannot be converted into a trusted domain');
+    expect(result.receipt.derivations.poolUsageSnapshot.clockClass).toBe('source-clock-skew');
+    expectNoSupplierLeaks(r);
+  });
+
+  test('plan page Date must be corroborated by the provider API Date across domains', async () => {
+    // The API clock alone deviates: page/local agree, but the two provider domains contradict.
+    const apiSkew = rig(); seal(apiSkew);
+    apiSkew.world.supplier.modelsDateSkewMs = 779_000;
+    const contradiction = await sample(apiSkew);
+    expect(contradiction.status).toBe('blocked');
+    expect(contradiction.document).toBeUndefined();
+    expect(planPageGap(contradiction)?.detail).toContain('cross-domain clock contradiction');
+    expect(contradiction.receipt.derivations.clockDomains.crossDomain).toMatchObject({ ok: false, deltaMs: -779_000 });
+    expect(contradiction.receipt.derivations.clockDomains.api.class).toBe('host-clock-skew');
+    expectNoSupplierLeaks(apiSkew);
+
+    // No API Date at all: cross-domain corroboration is unavailable, so the page cannot pass.
+    const noApiDate = rig(); seal(noApiDate);
+    noApiDate.world.supplier.modelsDate = false;
+    const unavailable = await sample(noApiDate);
+    expect(unavailable.status).toBe('blocked');
+    expect(unavailable.document).toBeUndefined();
+    expect(planPageGap(unavailable)?.detail).toContain('cross-domain corroboration unavailable');
+    expect(unavailable.receipt.derivations.clockDomains.crossDomain.ok).toBe(false);
+    expectNoSupplierLeaks(noApiDate);
+  });
+
+  test('receipt skew formula matches the stored value and separates the Age-adjusted view', async () => {
+    const r = rig(); seal(r);
+    r.world.supplier.planAgeSeconds = 200;
+    r.world.supplier.planCacheControl = 'public, max-age=600';
+    const result = await sample(r);
+    expect(result.status).toBe('sampled');
+    const pageClock = result.receipt.derivations.clockDomains.planPage;
+    expect(pageClock).toMatchObject({ class: 'ok', skewMs: 0, ageSeconds: 200, ageAdjustedSkewMs: -200_000, probed: true });
+    expect(pageClock.fieldSource).toContain('skewMs = headersAt − Date');
+    expect(pageClock.fieldSource).toContain('ageAdjustedSkewMs = headersAt − (Date + Age)');
+    expect(result.receipt.derivations.planPageClockSkewMs).toBe(pageClock.skewMs);
+    expectNoSupplierLeaks(r);
   });
 
   test('an unusable console clock (missing Date / stale / cacheable without Age) blocks reset-based expiry', async () => {

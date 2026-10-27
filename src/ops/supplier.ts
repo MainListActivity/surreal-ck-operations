@@ -561,7 +561,11 @@ interface ClockView {
   sourceNowMs: number | null;
   /** Clock-skew verdict independent of cache-age gating; both can apply at once. */
   skewClass: 'source-clock-skew' | 'host-clock-skew' | 'ok' | null;
-  fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skew = headersAt − (Date + Age)';
+  /** Age-adjusted view of the source's current clock; informational, not the v3 clockSkewMs. */
+  ageAdjustedSkewMs: number | null;
+  /** False when this domain was never probed (e.g. no console session) — not the same as a failed probe. */
+  probed: boolean;
+  fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skewMs = headersAt − Date (v3 clockSkewMs semantics); ageAdjustedSkewMs = headersAt − (Date + Age)';
   class: ClockClass;
 }
 
@@ -583,7 +587,9 @@ function clockView(record: SourceRecord | undefined, referenceSkewMs: number | n
     staleCache: false,
     sourceNowMs: null as number | null,
     skewClass: null as 'source-clock-skew' | 'host-clock-skew' | 'ok' | null,
-    fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skew = headersAt − (Date + Age)' as const,
+    ageAdjustedSkewMs: null as number | null,
+    probed: record !== undefined,
+    fieldSource: 'httpDate/Age/cache-control from response headers; headersAt local wall clock; skewMs = headersAt − Date (v3 clockSkewMs semantics); ageAdjustedSkewMs = headersAt − (Date + Age)' as const,
   };
   let klass: ClockClass;
   if (record?.redirectRejected) klass = 'redirect-date';
@@ -594,6 +600,7 @@ function clockView(record: SourceRecord | undefined, referenceSkewMs: number | n
     base.skewMs = skew;
     base.staleCache = (base.ageSeconds ?? 0) > STALE_AGE_SECONDS;
     base.sourceNowMs = base.httpDateEpochMs + (base.ageSeconds ?? 0) * 1000;
+    base.ageAdjustedSkewMs = skew === null || base.ageSeconds === null ? null : skew - base.ageSeconds * 1000;
     base.skewClass = skew !== null && Math.abs(skew) > CLOCK_BOUND_MS
       ? (referenceSkewMs !== null && Math.abs(referenceSkewMs) > CLOCK_BOUND_MS ? 'host-clock-skew' : 'source-clock-skew')
       : 'ok';
@@ -744,12 +751,25 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       case 'code-error':
         gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'wall-clock duration and monotonic duration disagree by more than the bound; the source time cannot be trusted (code-error)' });
         break;
-      case 'ok':
-        planSource = {
-          url: PLAN_PAGE, fetchedAt: pageRecord.headersAt!, httpDate: new Date(pageClock.httpDateEpochMs!).toISOString(),
-          clockSkewMs: pageClock.skewMs!, status: page.status, etag: page.etag, rawSha256: pageRecord.rawSha256!,
-        };
+      case 'ok': {
+        // 42 spec B.3: the page clock must also be corroborated by the same provider's API
+        // Date. The API Date never replaces the web/console clock; it only detects a
+        // cross-domain contradiction, which is insufficient evidence and blocks.
+        const apiDate = apiClock.httpDateEpochMs;
+        const pageDate = pageClock.httpDateEpochMs;
+        const crossDelta = apiDate === null || pageDate === null ? null : pageDate - apiDate;
+        if (apiDate === null) {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: 'provider API Date is missing or invalid; the page clock cannot be corroborated across domains (cross-domain corroboration unavailable)' });
+        } else if (crossDelta === null || Math.abs(crossDelta) > CLOCK_BOUND_MS) {
+          gaps.push({ field: 'sourceDate', source: 'planPage', detail: `plan page Date and provider API Date differ by ${crossDelta}ms (beyond the 5 minute bound; cross-domain clock contradiction); evidence is insufficient and the API Date cannot substitute for the web/console clock` });
+        } else {
+          planSource = {
+            url: PLAN_PAGE, fetchedAt: pageRecord.headersAt!, httpDate: new Date(pageDate!).toISOString(),
+            clockSkewMs: pageClock.skewMs!, status: page.status, etag: page.etag, rawSha256: pageRecord.rawSha256!,
+          };
+        }
         break;
+      }
     }
     normalization = { algorithm: PLAN_HTML_FLAT_ALGORITHM, flatSha256: sha256(flat), flatChars: flat.length };
     if (promotionalEnd === null && claimsPromotionalEnd) {
@@ -815,6 +835,11 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
       // with the host wall clock.
       if (consoleClock.class === 'missing-date' || consoleClock.class === 'invalid-date' || consoleClock.class === 'code-error') {
         gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console response has ${consoleClock.class}; reset_at absolute times cannot be placed in a trusted console clock domain` });
+      } else if (consoleClock.class === 'source-clock-skew' || consoleClock.class === 'host-clock-skew') {
+        // The relative distance would still be usable, but the document's pools[].resetAt is an
+        // absolute console-domain epoch. GM ruling: an untrusted source clock keeps the sample
+        // blocked instead of publishing a source-domain absolute as if it were trusted time.
+        gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console clock is beyond the 5 minute bound (${consoleClock.class}: ${consoleClock.skewMs}ms); reset_at absolute times cannot be converted into a trusted domain, so no document is produced` });
       } else if (consoleClock.class === 'stale-cache-date') {
         gaps.push({ field: 'poolWindow', source: 'poolUsage', detail: `console response cache Age ${consoleClock.ageSeconds}s exceeds the ${STALE_AGE_SECONDS}s bound; the pool snapshot is stale (stale-cache-date)` });
       } else if (consoleClock.class === 'cacheAgeUnknown') {
@@ -938,10 +963,21 @@ export async function sampleSupplierPlan(input: SupplierSampleInput): Promise<Su
   derivations.removedAccountAssertions = ['noPaymentInstrument'];
   // Same-round clock observation per domain (plan www / console platform / API token) and
   // the classification. Only classification lives here; the v3 document shape is unchanged.
+  const pageClockView = clockView(pageRecord, apiSkewMs);
+  const pageApiDeltaMs = pageClockView.httpDateEpochMs !== null && apiClock.httpDateEpochMs !== null
+    ? pageClockView.httpDateEpochMs - apiClock.httpDateEpochMs : null;
   derivations.clockDomains = {
     api: apiClock,
     console: consoleClock ?? clockView(poolRecord, apiSkewMs),
-    planPage: clockView(pageRecord, apiSkewMs),
+    planPage: pageClockView,
+    crossDomain: {
+      reference: 'provider API Date (token.sensenova.cn), used only to corroborate the page clock — never as a substitute for it',
+      pageDateEpochMs: pageClockView.httpDateEpochMs,
+      apiDateEpochMs: apiClock.httpDateEpochMs,
+      deltaMs: pageApiDeltaMs,
+      boundMs: CLOCK_BOUND_MS,
+      ok: pageApiDeltaMs !== null && Math.abs(pageApiDeltaMs) <= CLOCK_BOUND_MS,
+    },
     reference: 'classification uses the provider API domain only to label which side deviates; it is never a substitute clock for the web/console surfaces',
     boundMs: CLOCK_BOUND_MS,
   };
