@@ -69,7 +69,7 @@ try {
     // RUN_SCK_ROLLBACK_FORK_TESTS=1 时运行。
     'tests/fault-rollback-isolation.fork.test.ts',
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
-    'tests/task-recovery.test.ts', 'tests/task-recovery.fork.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
+    'tests/company-upgrades.fork.test.ts', 'tests/company-upgrade-console.test.ts', 'tests/task-recovery.test.ts', 'tests/task-recovery.fork.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
     // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
     'tests/waits.test.ts', 'tests/wait-dispatch.test.ts', 'tests/wait-cleanup.test.ts', 'tests/wait-store.fork.test.ts',
     // SYS07：目标终验图、成果证据、只读看板/指标与最终验收阻断；隔离库验证 CAS、分页、权限与历史不回写。
@@ -84,7 +84,7 @@ try {
     'tests/independence.test.ts', 'tests/independence-policy.fork.test.ts', 'tests/independence-check.fork.test.ts',  ];
   const test = Bun.spawn([process.execPath, 'test', ...targets], { detached: true, stdout: 'inherit', stderr: 'inherit', env: {
     ...process.env, SCK_PRODUCT_ENV: '/dev/null', SURREAL_URL: `ws://127.0.0.1:${port}/rpc`, SURREAL_ROOT_USER: 'root', SURREAL_ROOT_PASS: rootPassword,
-    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1',
+    RUN_SCK_WORKTREE_FORK_TESTS: '1', RUN_SCK_CHANNEL_FORK_TESTS: '1', RUN_SCK_OWNER_AGING_TESTS: '1', RUN_SCK_PIPELINE_TESTS: '1', RUN_SCK_STORY_AUTHOR_TESTS: '1', RUN_SCK_CINEMATOGRAPHY_TESTS: '1', RUN_SCK_REASSIGN_TESTS: '1', RUN_SCK_PR_GATE_TESTS: '1', RUN_SCK_UPGRADE_FORK_TESTS: '1', RUN_SCK_LOOP_BREAKER_TESTS: '1', RUN_SCK_OWNER_COMMANDS_TESTS: '1', RUN_SCK_ARTIFACT_FORK_TESTS: '1', RUN_SCK_ROLLBACK_FORK_TESTS: '1',
   } });
   groups.push(test.pid); save();
   exit = await test.exited;

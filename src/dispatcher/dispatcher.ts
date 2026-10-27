@@ -2198,6 +2198,8 @@ export class Dispatcher {
       });
     }
     for (const task of await wf.tasks()) {
+      // Host upgrades require the owner's explicit version action, never Jev routing or approval.
+      if (task.row.company_upgrade) continue;
       if (task.kind === 'release' && task.state === 'review' && !task.currentEmployee && task.jevReleaseVersion !== task.version) {
         await attempt(`release ${task.id}`, async () => {
           const input = await wf.judgeInput(task.id);

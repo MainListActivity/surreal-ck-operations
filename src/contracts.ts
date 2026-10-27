@@ -202,6 +202,7 @@ export interface TaskWaitView {
 
 
 export interface TaskView {
+  companyUpgrade?: import('./company-release.ts').CompanyRelease;
   executionWindow?: import('./task-recovery.ts').ExecutionWindow;
   dependencyContinuation?: 'execute' | 'manager';
   id: TaskId;
@@ -884,6 +885,8 @@ export interface LeaseProof {
 }
 
 export interface Evidence {
+  /** Engineering company-system release/deploy only. Bound to this lease write and a reviewed main commit. */
+  companyUpgrade?: { sha: string };
   executionWindow?: import('./task-recovery.ts').ExecutionWindow;
   recoveryReason?: import('./task-recovery.ts').RecoveryReason;
   text: string;

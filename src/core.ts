@@ -1,3 +1,4 @@
+import { readCompanyRelease, type CompanyRelease } from './company-release.ts';
 import { parseExecutionWindow, windowExpired, recoveryReasonSchema } from './task-recovery.ts';
 import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
@@ -231,6 +232,7 @@ interface EmployeeRow {
 }
 
 export interface TaskRow {
+  company_upgrade?: CompanyRelease;
   recovery_stopped?: boolean;
   dependency_continuation?: 'execute' | 'manager';
   execution_window?: import('./task-recovery.ts').ExecutionWindow;
@@ -387,6 +389,7 @@ export function view(row: TaskRow): TaskView {
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at * 1000).toISOString() : undefined,
     fence: row.fence,
     blockedTo: row.blocked_to,
+    companyUpgrade: row.company_upgrade ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined,
     resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     waiting: waitingOf(row),
@@ -612,9 +615,11 @@ export class SurrealCompanyCore implements CompanyCore {
   /** Test seam (SYS-DISP AC06): runs after a contribution view is read and before the lease transaction that checks it. */
   private readonly contributionReadHook?: (taskId: string) => Promise<void>;
 private readonly independenceReadHook?: (taskId: string) => Promise<void>;
-  constructor(readonly database: CompanyDatabase, options?: { leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
+  private readonly companyReleaseRepo?:string;
+  constructor(readonly database: CompanyDatabase, options?: { companyReleaseRepo?:string; leaseSeconds?: number; checkpointLimit?: number; workforce?: Workforce; worktrees?: RegistryOptions; submitCheck?: SubmitCheck; snapshots?: Partial<SnapshotLimits>; snapshotObserve?: (stats: SnapshotBuildStats) => void; contributionReadHook?: (taskId: string) => Promise<void>; independenceReadHook?: (taskId: string) => Promise<void>; acceptance?: { adapter?: AcceptanceSourceAdapter };
     externalActions?: { gateway?: ExternalActionGateway }; faults?: { limits?: FaultBudgetLimits; clock?: () => number };
     waits?: { clock?: () => number; webhookSecret?: string } }) {
+    this.companyReleaseRepo=options?.companyReleaseRepo;
     this.submitCheck = options?.submitCheck;
     this.acceptanceAdapter = options?.acceptance?.adapter ?? createGithubActionsAdapter();
     // Same seam as the acceptance adapter: the controlled external exit is injectable so a test drives an isolated fake
@@ -2575,6 +2580,18 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       const prior = await this.replay(idem, digest);
       if (prior) return prior;
     }
+    let companyUpgrade: CompanyRelease | undefined;
+    if (evidence?.companyUpgrade !== undefined) {
+      const row = await this.db.select<TaskRow>(id('task', proof.taskId));
+      if (!row || actor.role !== 'engineering' || row.state !== 'doing' || !['release','deploy'].includes(row.kind ?? '') ||
+          !['submit','block'].includes(action) || row.current_employee !== actor.employeeId || row.delivery_id !== proof.deliveryId ||
+          row.fence !== proof.fence || row.version !== proof.expectedVersion || (row.lease_expires_at ?? 0) <= Date.now()/1000)
+        throw new CompanyError('forbidden','只有当前工程租约可以登记公司系统上线版本');
+      const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
+      const project = await this.taskProject(proof.taskId);
+      if (!(row.code_repo_path ?? project?.repoPath) || realpathSync((row.code_repo_path ?? project?.repoPath)!) !== realpathSync(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
+      companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
+    }
     let prHead: string | undefined;
     // SYS06 AC03: 下一次相关动作前核版本。租约登记的契约 hash 与当前有效契约不一致时，这笔写被拒——
     // 旧 claim 与旧提示都不能授权继续写（心跳不算写动作，只续租约）。
@@ -2698,6 +2715,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         IF ($cpn[0] ?? 0) >= $checkpoint_limit { THROW 'checkpoint limit reached' };
       };
       LET $next = UPDATE ONLY $task SET
+        company_upgrade = IF $has_company_upgrade THEN $company_upgrade ELSE $t.company_upgrade END,
         state = IF $submit { 'review' } ELSE IF $accept { 'done' } ELSE IF $returning { 'ready' } ELSE IF $block { 'blocked' } ELSE { $t.state },
         submitted_by = IF $submit THEN $employee ELSE $t.submitted_by END,
         current_employee = IF $heartbeat OR $checkpoint THEN $employee ELSE NONE END,
@@ -2742,7 +2760,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         actor: id('employee', actor.employeeId), employee: actor.employeeId,
         task: id('task', proof.taskId), delivery: proof.deliveryId,
         fence: proof.fence, expected: proof.expectedVersion, lease_seconds: this.leaseSeconds,
-        ...flags, action, recovery_reason: action === 'block' ? evidence?.recoveryReason : undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
+        ...flags, action, has_company_upgrade: companyUpgrade !== undefined, company_upgrade: companyUpgrade, recovery_reason: action === 'block' ? evidence?.recoveryReason : undefined, evidence: evidence?.text ?? '', to: to ?? '', checkpoint_limit: this.checkpointLimit,
         acceptance_head: acceptance?.head ?? null, acceptance_environment: acceptance?.environment ?? null,
         has_head: acceptance?.head !== undefined, has_environment: acceptance?.environment !== undefined,
         human_evidence: acceptance?.human ?? [],

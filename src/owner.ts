@@ -186,11 +186,11 @@ export class OwnerDesk {
   }
 
   /** approve/reject an owner-reviewed gate, or reply to a task blocked to the owner. */
-  async decide(input: { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string }): Promise<TaskView> {
+  async decide(input: { taskId: TaskId; decision: OwnerDecision; note: string; source: string; key: string; expectedVersion?:number }): Promise<TaskView> {
     if (!['approve', 'reject', 'reply'].includes(input.decision)) throw new CompanyError('invalid', 'Invalid decision');
     requireText(input.note ?? '', 'note', input.decision === 'approve' ? 0 : 2, 20000);
     const idem = id('idempotency', HASH(`owner\0decide\0${input.key}`));
-    const digest = HASH(JSON.stringify({ taskId: input.taskId, decision: input.decision, note: input.note }));
+    const digest = HASH(JSON.stringify({ taskId: input.taskId, decision: input.decision, note: input.note, expectedVersion:input.expectedVersion }));
     const prior = await this.db.select<IdempotencyRow>(idem);
     if (prior) {
       if (prior.payload_digest !== digest) throw new CompanyError('conflict', 'Idempotency key reused with different input');
@@ -214,6 +214,7 @@ export class OwnerDesk {
     const rows = await this.run(`BEGIN;
       LET $t = SELECT * FROM ONLY $task;
       IF $t = NONE { THROW 'task not found' };
+      IF $expected_version != NONE AND $t.version != $expected_version { THROW 'task version moved' };
       IF $decision IN ['approve', 'reject'] AND ($t.state != 'review' OR $t.reviewer_role != 'owner') { THROW 'task is not awaiting owner review' };
       IF $decision = 'reply' AND ($t.state != 'blocked' OR $t.blocked_to != 'owner') { THROW 'task is not waiting for an owner answer' };
       ${RESOLVE_DEP_SQL('$t.dependencies', '$od')}
@@ -243,7 +244,7 @@ export class OwnerDesk {
       CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
-      task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest, human_evidence: humanEvidence,
+      task: id('task', input.taskId), expected_version:input.expectedVersion, decision: input.decision, evidence, actor: input.source, idem, digest, human_evidence: humanEvidence,
     });
     const decided = rows.at(-2) as TaskRow;
     if (input.decision === 'approve' && decided.goal) {
@@ -384,7 +385,7 @@ export class OwnerDesk {
   }
 
   async setPaused(paused: boolean): Promise<void> {
-    await this.db.query('UPSERT company_meta:config MERGE { paused: $paused };', { paused });
+    await this.db.query('UPSERT company_meta:config SET paused=$paused, pause_version=(pause_version??0)+1;', { paused });
   }
 
   async brief(): Promise<CompanyBrief> {

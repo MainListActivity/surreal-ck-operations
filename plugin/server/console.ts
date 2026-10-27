@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { relayWebTheme } from "../shared/relay-design.ts";
 
 type CompanyApi = {
+  upgrades?: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
   owner: {
     inbox(): Promise<unknown>;
     brief(): Promise<unknown>;
@@ -127,7 +128,7 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         await saveRankingSettings(ctx.db.db,{rules:b.rules,refreshMinutes:b.refreshMinutes as number},ctx.modelRanking);
         return json({ok:true});
       }
-      if (req.method === "GET" && sub === "/api/inbox") return json(await (await opts.company()).owner.inbox());
+      if (req.method === "GET" && sub === "/api/inbox") return json(await (async()=>{const c=await opts.company();return c.upgrades?c.upgrades.inbox():c.owner.inbox();})());
       if (req.method === "GET" && sub === "/api/brief") return json(await (await opts.company()).owner.brief());
       if (req.method === "GET" && sub === "/api/tasks") {
         const goalId = url.searchParams.get("goalId") ?? "";
@@ -164,6 +165,12 @@ export function createConsoleFetch(opts: ConsoleOptions): (req: Request) => Prom
         const { opsRepo } = await opts.company();
         const body = readDoc(opsRepo, url.searchParams.get("name") ?? "");
         return body === undefined ? json({ error: "not found" }, 404) : json({ name: url.searchParams.get("name"), text: body });
+      }
+      if (req.method === "POST" && sub === "/api/upgrade") {
+        if(req.headers.get("origin") && req.headers.get("origin")!==url.origin)return json({error:"origin mismatch"},403);
+        const b=await req.json() as {taskId:string;taskVersion:number;digest:string};
+        const c=await opts.company();if(!c.upgrades)return json({error:"升级服务尚未就绪"},409);
+        return json(await c.upgrades.start(b,SOURCE));
       }
       if (req.method === "POST" && sub === "/api/decide") {
         const b = await req.json() as { taskId?: string; decision?: string; note?: string; key?: string };
@@ -315,6 +322,18 @@ async function decide(tid,dec){
     await api('decide',{taskId:tid,decision:dec,note,key:newKey()});await load();
   }catch(e){alert(e.message)}
 }
+async function upgrade(tid,version,digest){
+ const el=document.getElementById('upgrade-'+tid);if(el){el.disabled=true;el.textContent='正在启动升级…'}
+ try{await api('upgrade',{taskId:tid,taskVersion:version,digest});await load()}catch(e){alert(e.message);if(el){el.disabled=false;el.textContent='重新升级'}}
+}
+function upgradeCard(x){
+ const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded';
+ const list=a=>'<ul>'+a.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul>';
+ return '<div class="card"><div class="meta">公司系统升级 · '+esc(x.phase)+'</div><h3>v'+esc(p.version)+' · '+esc(p.title)+'</h3>'+
+ '<h4>上线内容</h4>'+list(p.changes)+'<h4>影响范围</h4>'+list(p.impact)+'<h4>数据变化</h4><p>'+esc(p.migration)+'</p><h4>回退方式</h4><p>'+esc(p.rollback)+'</p>'+
+ '<details><summary>提交详情</summary><code>'+esc(p.sha)+'</code></details>'+(x.error?'<p role="alert">'+esc(x.error)+'</p>':'')+
+ (!done?'<button id="upgrade-'+esc(x.taskId)+'" class="act ok" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button>':'<p class="okm">升级完成，已自动回复通过</p>')+'</div>';
+}
 async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
 async function voidTask(tid,gid){
   const note=prompt('作废原因（必填，会进任务审计）')||'';
@@ -367,7 +386,7 @@ async function openGoal(gid){
 function render(){
   const m=document.getElementById('m');
   if(T==='todo'){
-    const g=(INBOX?.gates||[]).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
+    const g=(INBOX?.gates||[]).filter(x=>!x.task.companyUpgrade).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
       <div class="meta">\${KIND[x.task.kind]||x.task.kind} · 执行 \${esc(x.task.executor_role)} · 提交人 \${esc(x.task.current_employee||'—')}</div>
       <div class="body">\${linkify(x.submission||'（无提交说明）')}</div>
       <div class="atts" id="at-\${x.task.id}"></div>
@@ -375,14 +394,17 @@ function render(){
       <div class="row"><button class="act ok" onclick="decide('\${x.task.id}','approve')">批准</button>
       <button class="act no" onclick="decide('\${x.task.id}','reject')">退回</button>
       <button class="act no" onclick="voidTask('\${x.task.id}')">作废</button></div></div>\`).join('');
-    const q=(INBOX?.questions||[]).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
+    const q=(INBOX?.questions||[]).filter(x=>!x.task.companyUpgrade).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
       <div class="meta">来自 \${esc(x.task.executor_role)} 的问题</div>
       <div class="body">\${linkify(x.question||'（无问题文本）')}</div>
       <div class="atts" id="at-\${x.task.id}"></div>
       <textarea id="n-\${x.task.id}" placeholder="答复"></textarea>
       <div class="row"><button class="act mid" onclick="decide('\${x.task.id}','reply')">回复</button></div></div>\`).join('');
     const n=(INBOX?.notices||[]).map(x=>\`<div class="card notice"><span>\${linkify(x.text)}</span><button onclick="notice('\${x.key}')">已阅</button></div>\`).join('');
-    m.innerHTML=(g||q||n)?(g+q+n):'<div class="empty">没有待办事项</div>';
+    const u=(INBOX?.upgrades?.items||[]).map(upgradeCard).join('');
+    const v=INBOX?.upgrades?.current;
+    const head=v?'<div class="card"><strong>当前版本 v'+esc(v.version)+'</strong><details><summary>提交详情</summary><code>'+esc(v.sha)+'</code></details></div>':'';
+    m.innerHTML=head+((u||g||q||n)?(u+g+q+n):'<div class="empty">没有待办事项</div>');
     [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=document.getElementById('at-'+x.task.id);if(e)atts(e,x.task.id)});
   }else if(T==='goals'){
     var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});

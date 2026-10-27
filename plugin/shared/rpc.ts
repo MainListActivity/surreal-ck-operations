@@ -225,3 +225,9 @@ export const answerPermission = defineRpc({
   }),
   output: z.object({ ok: z.boolean() }),
 });
+
+export const upgrade = defineRpc({
+  name:"company.upgrade",
+  input:z.object({taskId:key,taskVersion:z.number().int().positive(),digest:z.string().regex(/^[a-f0-9]{64}$/)}),
+  output:z.object({jobId:z.string(),status:z.string()}),
+});

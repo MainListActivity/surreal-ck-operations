@@ -8,3 +8,7 @@
 - **合入部署**：按 `project.release` 合入 PR，确认发布完成，并核对生产运行的就是该提交。需要新环境变量或冻结写入的数据迁移时，先按 runbook 在主机上准备好再合入，否则发布会失败并自动回滚。发布失败先恢复生产，再修复重发。
 - **不要 SSH 主机发布**：新增服务端环境变量用 `gh secret set ORIGIN_ENV_<NAME> --env production`，冻结写入的迁移放进仓库 `scripts/deploy/origin-pre-start.sh`，都随 Deploy origin 由 CI 执行。
 - 不安装全局工具，不重置他人工作树，不读取或输出密钥。
+
+## 公司系统的一键升级交付
+
+公司运营仓库上线时提高 package.json 版本号，同一提交维护 company-release.json 的上线内容、影响范围、数据变化和回退说明。合入 main 后向老板提交完整 SHA：`report_blocker to=owner` 或交 owner 关口的 `submit` 增加 `companyUpgrade:{sha:"<完整main SHA>"}`；文件入口用独立一行 `companyUpgradeSha: <SHA>`。老板直接点版本升级，系统验证成功后自动回复，不再要求老板复制运行临时安装脚本。没有说明、版本未提高或未合 main，先由工程补齐。细则见 docs/company-upgrades.md。

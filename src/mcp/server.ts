@@ -25,6 +25,7 @@ const proofShape = {
   expectedVersion: z.number().int().nonnegative(),
 };
 const evidenceShape = {
+  companyUpgrade: z.object({ sha:z.string().regex(/^[a-f0-9]{40}$/) }).strict().optional(),
   executionWindow: executionWindowSchema.optional(),
   recoveryReason: recoveryReasonSchema.optional(),
   text: z.string().min(1),

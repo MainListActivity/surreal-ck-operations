@@ -224,7 +224,7 @@ run('RB01 rollback isolation: SYS07 goal states against the previous release', (
 
   test('the oracle is the previous release tree, not this worktree', () => {
     expect(existsSync(join(oldRoot, 'src/goal-store.ts'))).toBe(false);
-    expect(existsSync(join(oldRoot, 'schema/041-goal-governance.surql'))).toBe(false);
+    expect(existsSync(join(oldRoot, 'schema/042-goal-governance.surql'))).toBe(false);
     expect(readFileSync(join(oldRoot, 'src/mcp/server.ts'), 'utf8')).not.toContain('goal_outcome');
   });
 
@@ -286,8 +286,8 @@ run('RB01 rollback isolation: SYS07 goal states against the previous release', (
     }
     expect(named).toEqual([]);
     for (const table of NEW_TABLES) expect(digestsAfter[table]).toBe(digestsBefore[table]);
-    // The old release knows schema 040, the new one 041; it only bumps the marker upward.
-    expect(schemaVersion.before).toBeGreaterThanOrEqual(41);
+    // The old release knows schema 040, the new one 042; it only bumps the marker upward.
+    expect(schemaVersion.before).toBeGreaterThanOrEqual(42);
     expect(schemaVersion.after).toBe(schemaVersion.before);
   });
 });
