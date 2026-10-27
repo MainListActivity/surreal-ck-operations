@@ -181,6 +181,12 @@ function writeScopeClash(intent: WorkIntent, task: Pick<TaskView, 'id' | 'curren
 const holderOf = (r: Ref): WriteScopeHolder => ({ taskId: r.task ? String(r.task.id) : undefined, employee: r.employee, intent: r.intent.kind });
 
 export class WorktreeRegistry {
+  /**
+   * tree id → reason of its last recorded routine retention. A sweep runs every few minutes and keeps the same trees
+   * for the same reasons; recording each unchanged retention filled worktree_audit with ~95% identical skip rows.
+   * A routine sweep records a retention only when its reason changes; event and manual reclaims record every one.
+   */
+  private readonly retained = new Map<string, string>();
   constructor(private readonly db: Surreal, readonly options: RegistryOptions) {}
   async identity(repoPath: string) {
     const path = realpathSync(repoPath);
@@ -480,12 +486,14 @@ export class WorktreeRegistry {
     const policy = await this.policy();
     const known = await this.rows();
     const repos = [...new Set(input.repos ?? [this.options.opsRepo, ...known.map(r => r.repo)])];
-    await this.audit({
+    const routine = input.trigger === 'sweep' && !input.dryRun;
+    const header = () => this.audit({
       scanId, repo: '*', path: '*', event: 'orphan_scan', trigger: input.trigger,
       decision: input.dryRun ? 'dry-run' : (policy.enabled ? 'scan' : 'disabled'),
       result: 'success', reason: `repos=${repos.length};graceMs=${policy.orphanGraceMs}`,
     });
-    result.audited++;
+    // A routine sweep that changes nothing leaves no trace; its header is written once it records something.
+    if (!routine) { await header(); result.audited++; }
 
     for (const repoPath of repos) {
       try {
@@ -566,6 +574,9 @@ export class WorktreeRegistry {
                   row.cleanup_todo = todo;
                 }
               }
+              const key = String(row.id.id);
+              if (routine && this.retained.get(key) === reason) continue;
+              if (routine) this.retained.set(key, reason);
               await this.audit({
                 scanId, repo, path: row.path, tree: row.id, event: input.dryRun ? 'dry_run' : 'skip',
                 trigger: input.trigger, ownership: { mode: row.mode, refs: freshRefs.length },
@@ -678,6 +689,7 @@ export class WorktreeRegistry {
         result.audited++;
       }
     }
+    if (routine && result.audited) await header().catch(() => undefined);
     return result;
   }
 

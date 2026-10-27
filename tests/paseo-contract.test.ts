@@ -227,3 +227,37 @@ test('a failed reload surfaces instead of passing for a restart', async () => {
   const bin = fakeCli({}, undefined, undefined, `echo '{"error":{"code":"RELOAD_FAILED"}}' >&2; exit 1`);
   await expect(createPaseoCli(bin).reload(AGENT)).rejects.toThrow();
 });
+
+test('goal workspace provisioning coalesces concurrent agents and survives a dispatcher restart or title change', async () => {
+  const state = join(dir, `workspace-state-${++seq}.json`);
+  const script = join(dir, `workspace-cli-${seq}.ts`);
+  writeFileSync(state, JSON.stringify({ projects: [], workspaces: [], calls: [], agents: 0 }));
+  writeFileSync(script, `#!/usr/bin/env bun
+import {readFileSync,writeFileSync,appendFileSync} from 'node:fs';
+const file=${JSON.stringify(state)};
+const s=JSON.parse(readFileSync(file,'utf8'));const a=process.argv.slice(2);
+const value=k=>a[a.indexOf(k)+1];
+appendFileSync(file+'.calls',JSON.stringify(a)+'\\n');let out;
+if(a[0]==='project'&&a[1]==='ls')out=s.projects;
+else if(a[0]==='project'&&a[1]==='create'){out={projectId:'project-'+s.projects.length,name:'repo',path:a[2]};s.projects.push(out);}
+else if(a[0]==='workspace'&&a[1]==='ls')out=s.workspaces;
+else if(a[0]==='workspace'&&a[1]==='create'){out={workspaceId:'workspace-'+s.workspaces.length,name:value('--title'),cwd:value('--path'),project:value('--project')};s.workspaces.push(out);}
+else if(a[0]==='run')out={agentId:'agent-'+(++s.agents)};
+else throw Error('unexpected CLI '+a.join(' '));
+writeFileSync(file,JSON.stringify(s));console.log(JSON.stringify(out));
+`);
+  chmodSync(script, 0o755);
+  const input = { title: '工程', provider: 'claude', model: 'haiku', cwd: '/fixture/repo', repoHome: '/fixture/repo',
+    workspaceScope: 'goal-a', workspaceTitle: '优化 [goal-a]', labels: {}, env: {}, prompt: 'fixture' };
+  const paseo = createPaseoCli(script);
+  // Provision concurrently without racing our deliberately simple fake run counter.
+  await Promise.all([paseo.spawn(input), paseo.spawn(input)]);
+  await createPaseoCli(script).spawn({ ...input, workspaceTitle: '改名 [goal-a]' });
+  await paseo.spawn({ ...input, workspaceScope: 'goal-b', workspaceTitle: '目标 B [goal-b]' });
+  const stored = JSON.parse(readFileSync(state, 'utf8'));
+  expect(stored.projects).toHaveLength(1);
+  expect(stored.workspaces).toHaveLength(2);
+  expect(stored.workspaces.every((w: { project: string }) => w.project === 'project-0')).toBe(true);
+  const runs = readFileSync(state + '.calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)).filter((a: string[]) => a[0] === 'run');
+  expect(runs.slice(0, 3).map((a: string[]) => a[a.indexOf('--workspace') + 1])).toEqual(['workspace-0', 'workspace-0', 'workspace-0']);
+});

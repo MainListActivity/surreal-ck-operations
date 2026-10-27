@@ -4,14 +4,14 @@
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| 任务服务 | 远端 `data.maplayer.top/sck-mcp`（Caddy→`127.0.0.1:38473`，gate token），本机 launchd `org.surrealck.company-mcp` 兜底并兼跑 GitHub 投影 | 任务、租约、审计、目标、关口；admin/owner 通道 |
+| 任务服务 | 本机 launchd `org.surrealck.company-mcp`（`127.0.0.1:38473`），兼跑 GitHub 投影；129 上的远端入口 `data.maplayer.top/sck-mcp` 已停用 | 任务、租约、审计、目标、关口；admin/owner 通道 |
 | 调度器 | Paseo 插件内（`plugin/server/dispatch.ts` tick 循环） | 不消耗模型 token：读队列、叫醒/新开员工、收回并改派、订阅健康、老板通知 |
 | 员工通道 | Paseo 插件内 `plugin/server/sidecar.ts`（每实例一个） | 代持实例凭证、代领任务、自动续租、relay `sck call`、回收 `report.md`/`blocker.md` 为提交/阻塞；把 `ops_*` 转给运维代理。架构与排障详见 [sidecar 通道](sidecar-channel.md) |
 | 运维代理 | Paseo 插件内 `src/ops/`（`OpsBroker`，由通道调用） | 持有密封凭证与 Cloudflare/IdP 权限，替员工建账号、建 workspace、管成员、登录、调产品接口、查 workspace 数据、给浏览器登录；员工只拿会话句柄，见下文「运维代理」 |
 | 员工 | Paseo 会话 | 按 [协议](../agents/PROTOCOL.md) 执行、写 `.sck` 交付物；进程内无任何凭证，环境里的凭证变量在 spawn 前被清空 |
-| 数据 | SurrealDB `sck_agent_company/control_plane` | 唯一事实来源 |
+| 数据 | 本机 SurrealDB（公司 fork，`org.surrealck.company-db`，`127.0.0.1:38480`，数据在 `private/db`）`sck_agent_company/control_plane` | 唯一事实来源；每小时备份到 R2 `sck-company-backup`，每周恢复演练 |
 
-数据位于**产品同一台自托管 SurrealDB**（连接地址与 root 凭证读自 `SCK_PRODUCT_ENV` 指向的产品 `.env`，当前 `wss://data.maplayer.top/rpc`）；公司数据独占 `sck_agent_company` namespace / `control_plane` database，与产品 `main` namespace 隔离。换库或换实例改 `service.env` 的 `SCK_COMPANY_NS` / `SCK_COMPANY_DB` 或 `SCK_PRODUCT_ENV`。
+数据位于**本机 SurrealDB**：连接地址与 root 凭证在 `private/company-db.env`（`scripts/company-db.sh install` 生成，优先于产品 `.env`；测试环境不隐式读取）。产品数据仍在 129，由产品 `.env` 描述。备份由 `scripts/company-backup.ts` 完成：zstd 压缩，单文件超过 20MB 拒传并发老板通知，R2 上保留 2 份小时备份加若干每日备份，总量不超过 40MB；`verify` 把最新备份恢复到临时内存库核对行数。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
 服务目录：`~/Library/Application Support/SurrealCKCompany/`（`active` 指向固定发布目录；`private/` 为配置与凭证，0700；`logs/` 为日志）。安装、启停：发布目录内 `sh scripts/company-service.sh install|status|restart|stop|uninstall`，默认只管理 `mcp`（任务服务 + GitHub 投影）。调度器、员工通道和运维代理都跑在 Paseo 插件 `sck-company` 里，改了 `plugin/` 或 `src/` 后用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；**不要再装 launchd 的 dispatcher**（`SCK_COMPONENTS=dispatcher` 仅为旧部署保留），否则会和插件重复派工。服务依赖本机 Paseo、SurrealDB、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
@@ -231,3 +231,4 @@ gm 与 product 岗位（`capabilities` 含 `manage`）除常规任务工具外�
 - 演练 A（GitHub #34）：调度器派 qa-01 执行 → checkpoint → submit → 自动派 eng-01 独立验收 → done。
 - 演练 B（GitHub #35）：codex 并发临时设为 0，调度器按定义新开 `cs-grok-9d59da`；它存下 ALPHA 进度后会话被强制归档。约 25 秒内调度器退役该实例并撤销凭证、收回租约并附交接包、新开 `cs-grok-580043` 接手；接手者读到 ALPHA 与交接包，跳过已完成步骤存下 BETA 并提交；`qa-grok-5dfd5a` 独立验收通过。旧凭证调用返回 401。
 - 未在真实环境演练的路径：真实订阅额度耗尽（错误文本分类、冷却与探测恢复由集成测试用模拟网关覆盖），所有订阅耗尽时的充值提醒。
+- 2026-10-26：GitHub 计费拒绝不再算 CI 失败（来源 PR #1713 → main `fcbc828`，发布 `releases/fcbc828…`，active 与插件来源同为该 SHA）。GitHub 因账户付款失败或触及支出上限而拒绝启动作业时，检查以 `failure` 结束但**一个步骤都没跑**，两道门禁此前只看结论，于是交付被一个与代码无关的原因永久卡住。现在 `pr-gate` 判定前先向 GitHub 问该检查是不是它自己拒绝启动的：只有同时满足「检查带 job 链接」「该 job `steps` 为空」「注解确为 GitHub 的拒绝文案（account payments / spending limit / Billing & plans）」才豁免；没有 job 链接、跑过任何步骤、注解或作业读不到一律照旧按失败处理（工作流无法伪造：打印注解必须跑步骤）。验收适配器对「全部作业都没启动」的 run 放行通用 CI criteria，并把拒绝事实写进证据 `source.infrastructure{reason,message,jobs}`；**声明 environment 的 criteria 永不豁免**——环境是部署事实，从未启动的 run 证明不了任何部署。同时按老板指示简化员工提示词：`src/flows.ts` 与 `agents/engineering.md` 不再要求员工确认 PR 的 CI 通过、等 CI 发布完成或复核 CI，门禁只保留在公司系统里。CI 两个工作流因计费仍未启动，如实记录，未改账单、未动检查状态。`fcbc828` 验收：根/插件 typecheck 退出 0；test:comm 19 通过/1 跳过；test:service 53 通过/0 失败；test:bridge 1079 通过/58 跳过/0 失败；新增用例覆盖豁免与三个负例（跑过步骤的作业、不含计费文案的注解、声明 environment 的 criteria 均仍拒绝）；两道本机发布门禁 comm-slow-pipe 与 sidecar-review 在 bun 1.4.2 下 pass。上线后用**生产代码**对 PR #1713 的真实计费拒绝数据实测：插件面 `createSubmitCheck` 返回 head 而非拒收；核心适配器对通用 CI criteria 返回 `ok` 并记 `source.infrastructure{reason:billing}`；对声明 `production` 的同一 run 仍拒绝；对照（不向 GitHub 询问）仍以「CI 未通过（channel、quality）」拒收——豁免只在真的读不到拒绝时失效，方向安全。上线后 MCP 进程 `state = running`，插件已重指到新 release，派工 tick 持续（10:05:37Z 仍有 owner notice 落库）。

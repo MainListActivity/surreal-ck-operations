@@ -68,6 +68,8 @@ export interface EmployeeInst {
   /** Directory of the Paseo workspace this instance runs in (project repo, or the ops repo when undefined). */
   cwd?: string;
   repoHome?: string;
+  /** Goal-scoped Paseo workspace; absent on legacy employee workspaces. */
+  workspaceScope?: string;
   /** Registered identity principal (schema 029), when one is registered: the only cross-employee identity link (SYS-DISP Q3). */
   principal?: string;
   /** How many times the dispatcher woke this session; used to rotate it before the context grows too large. */
@@ -115,6 +117,8 @@ export interface CompanyConfig {
   quotaWarnPct: number;
   /** 实例派工达到该次数即退休换新会话，避免上下文无限膨胀；0 = 不按次数轮换。 */
   sessionMaxWakes: number;
+  /** 按岗位覆盖 sessionMaxWakes（如 { engineering: 4 }）：会话少带几轮旧任务历史，换来更小的请求上下文。 */
+  sessionMaxWakesByRole: Record<string, number>;
   /** 实例上一轮 input token 超过该值（千）即退休换新会话；0 = 不按上下文大小轮换。 */
   sessionMaxInputK: number;
   /** 连续观测为空闲的会话在此分钟数后回收；0 = 关闭。 */
@@ -150,7 +154,7 @@ export const DEFAULT_CONFIG: CompanyConfig = {
   pollSeconds: 20, stallMinutes: 90, redispatchMinutes: 15, extendWithinSeconds: 300, handoverChars: 12000,
   evalEnabled: true, evalEngine: 'auto', jevMinConfidence: 0.7, jevFlagThreshold: 0.65, jevNotifyTriage: true,
   jevDecisions: true, jevReleaseThreshold: 0.8, jevOwnerThreshold: 0.3, jevPickConfidence: 0.5,
-  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
+  quotaFloorPct: 8, quotaWeeklyFloorPct: 6, quotaWarnPct: 20, sessionMaxWakes: 12, sessionMaxWakesByRole: {}, sessionMaxInputK: 200, sessionIdleMinutes: 120, evalQuickLlm: false, ownerBriefHour: 9, blockLoopLimit: 5,
   minFreeMemMb: 2048, minFreeDiskMb: 10240,
   artifactReclaimEnabled: true, artifactEvidenceGraceDays: 3, artifactDeliverableGraceDays: 7, artifactHeadroomMb: 10240,
   archiveRetentionDays: 7, commDirGraceHours: 48, scratchGraceHours: 24,
@@ -236,6 +240,7 @@ export interface SupervisedTask {
   codeRepoPath?: string;
   /** Tier of the goal this task belongs to (quick/standard/program); undefined for standalone tasks. */
   goalTier?: string;
+  goalTitle?: string;
 }
 
 /** What Jev reads for a release or escalation decision. */
@@ -271,7 +276,7 @@ const supervised = (row: TaskRow): SupervisedTask => {
     } : {}),
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
-    codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };
+    codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined, goalTitle: row.goal_title ?? undefined };
 };
 
 const COOLDOWN_BASE = 30 * 60;
@@ -424,6 +429,8 @@ export class Workforce {
       quotaWeeklyFloorPct: typeof row?.quota_weekly_floor_pct === 'number' ? row.quota_weekly_floor_pct : DEFAULT_CONFIG.quotaWeeklyFloorPct,
       quotaWarnPct: typeof row?.quota_warn_pct === 'number' ? row.quota_warn_pct : DEFAULT_CONFIG.quotaWarnPct,
       sessionMaxWakes: typeof row?.session_max_wakes === 'number' ? row.session_max_wakes : 8,
+      sessionMaxWakesByRole: Object.fromEntries(Object.entries(row?.session_max_wakes_by_role && typeof row.session_max_wakes_by_role === 'object' ? row.session_max_wakes_by_role : {})
+        .filter((e): e is [string, number] => typeof e[1] === 'number' && Number.isInteger(e[1]) && e[1] >= 0)),
       sessionIdleMinutes: typeof row?.session_idle_minutes === 'number' && Number.isFinite(row.session_idle_minutes) && row.session_idle_minutes >= 0 ? row.session_idle_minutes : DEFAULT_CONFIG.sessionIdleMinutes,
       sessionMaxInputK: typeof row?.session_max_input_k === 'number' ? row.session_max_input_k : DEFAULT_CONFIG.sessionMaxInputK,
       evalQuickLlm: row?.eval_quick_llm === true,
@@ -496,28 +503,28 @@ export class Workforce {
   async insts(): Promise<EmployeeInst[]> {
     type Row = { id: RecordId; role: Role; def?: RecordId; principal?: RecordId; provider?: string; model?: string; thinking?: string;
       paseo_agent_id?: string; active_task?: RecordId; credential_file?: string; last_wake_at?: number; idle_since?: number;
-      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; wake_count?: number };
+      v3_onboarded?: boolean; workspace_cwd?: string; workspace_repo?: string; workspace_scope?: string; wake_count?: number };
     const [rows] = await this.db.query<[Row[]]>(
       'SELECT * FROM employee WHERE revoked != true AND retired != true AND (def != NONE OR paseo_agent_id != NONE) ORDER BY id;');
     return rows.map(r => ({ id: asId(r.id), role: r.role, def: r.def ? asId(r.def) : undefined, provider: r.provider,
       model: r.model, thinking: r.thinking, paseoAgentId: r.paseo_agent_id ?? undefined,
       activeTask: r.active_task ? asId(r.active_task) : undefined, credentialFile: r.credential_file, lastWakeAt: r.last_wake_at, idleSince: r.idle_since,
-      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, wakeCount: r.wake_count ?? 0,
+      onboarded: Boolean(r.v3_onboarded), cwd: r.workspace_cwd ?? undefined, repoHome: r.workspace_repo ?? undefined, workspaceScope: r.workspace_scope ?? undefined, wakeCount: r.wake_count ?? 0,
       principal: r.principal ? asId(r.principal) : undefined }));
   }
 
   /** Creates an employee identity for a definition; the caller binds the Paseo agent once spawned.
    *  The credential is returned in memory only — file delivery is the caller's choice
    *  (writeCredentialFile for the legacy standalone dispatcher; plugin sidecar keeps it in RAM). */
-  async spawnInst(def: EmployeeDef, repoHome?: string): Promise<EmployeeInst> {
+  async spawnInst(def: EmployeeDef, repoHome?: string, workspaceScope?: string): Promise<EmployeeInst> {
     const employeeId = `${def.id}-${randomBytes(3).toString('hex')}`;
     const credential = await this.enrollment.enroll(employeeId, def.role, capabilitiesFor(def.role));
     await this.db.query(`UPDATE $e MERGE { def: $def, provider: $provider, model: $model, thinking: $thinking,
-      retired: false, workspace_repo: $repo_home, created_at: time::now() };`, {
+      retired: false, workspace_repo: $repo_home, workspace_scope: $scope, created_at: time::now() };`, {
       e: id('employee', employeeId), def: id('employee_def', def.id), provider: def.provider, model: def.model,
-      thinking: def.thinking, repo_home: repoHome,
+      thinking: def.thinking, repo_home: repoHome, scope: workspaceScope,
     });
-    return { repoHome, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
+    return { repoHome, workspaceScope, id: employeeId, role: def.role, def: def.id, provider: def.provider, model: def.model, thinking: def.thinking, credential };
   }
 
   /** Legacy agent delivery: write the credential to a 600 file the agent's env can point at. */
@@ -541,12 +548,12 @@ export class Workforce {
     return token;
   }
 
-  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string }): Promise<void> {
+  async bind(employeeId: string, input: { agentId: string; def?: string; provider?: string; model?: string; thinking?: string; credentialFile?: string; cwd?: string; repoHome?: string; workspaceScope?: string }): Promise<void> {
     const [rows] = await this.db.query<[unknown[]]>(`UPDATE $e MERGE {
       paseo_agent_id: $agent, def: $def ?? def, provider: $provider ?? provider, model: $model ?? model,
-      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, retired: false } RETURN AFTER;`, {
+      thinking: $thinking ?? thinking, credential_file: $file ?? credential_file, workspace_cwd: $cwd ?? workspace_cwd, workspace_repo: $repo_home ?? workspace_repo, workspace_scope: $scope ?? workspace_scope, retired: false } RETURN AFTER;`, {
       e: id('employee', employeeId), agent: input.agentId, def: input.def ? id('employee_def', input.def) : undefined,
-      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome,
+      provider: input.provider, model: input.model, thinking: input.thinking, file: input.credentialFile, cwd: input.cwd, repo_home: input.repoHome, scope: input.workspaceScope,
     });
     if (!rows?.length) throw new CompanyError('not_found', 'Employee not found');
   }
@@ -643,7 +650,7 @@ export class Workforce {
     // context is ~77% of table bytes and dispatch never reads it; over a ~50KB/s WSS
     // channel carrying it would stall every other query behind megabytes of backlog.
     const [rows] = await this.db.query<[TaskRow[]]>(
-      `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier
+      `SELECT *, NONE AS context, code_repo_path ?? project.repo_path ?? goal.project.repo_path AS repo_path, goal.tier AS goal_tier, goal.title AS goal_title
        FROM task WHERE state IN ['ready', 'doing', 'review', 'blocked'] ORDER BY created_at, id;`);
     return rows.map(supervised);
   }

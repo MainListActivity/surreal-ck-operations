@@ -212,7 +212,7 @@ export class OwnerDesk {
         };
         ${UNLOCK_SQL}
       };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
       task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest, human_evidence: humanEvidence,
@@ -256,7 +256,7 @@ export class OwnerDesk {
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'reassign', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $task, kind: 'reassigned', sequence: $sequence.value, payload: { executor: $executor, reviewer: $reviewer }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, { task: id('task', input.taskId), expected: before.version, executor, reviewer, evidence, actor: input.source, idem, digest });
     return view(rows.at(-2) as TaskRow);
@@ -296,7 +296,7 @@ export class OwnerDesk {
       CREATE audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, { task: id('task', input.taskId), actor: input.source, evidence, holder: before.current_employee, idem, digest });
     return view(rows.at(-2) as TaskRow);

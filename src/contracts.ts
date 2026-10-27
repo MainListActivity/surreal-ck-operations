@@ -828,6 +828,50 @@ export interface OutboxEvent {
 }
 
 /**
+ * SYS04: what the plugin process is actually running. Read-only, and read by gm/product/qa only: it names the
+ * release the company service is loaded from, so it is an operator fact rather than a general employee read.
+ *
+ * The view is produced in the plugin host's own execution context (the face every employee channel reaches),
+ * never from the MCP face's tree and never from the `active` symlink — a symlink names what the service
+ * points at, which is the claim needing evidence rather than the evidence.
+ */
+export interface PluginRuntimeView {
+  /** Which execution context produced this answer. `plugin-host` is the only accepted value. */
+  context: 'plugin-host';
+  /** When the sample was taken, ISO 8601 with a timezone offset. */
+  collectedAt: string;
+  process: { pid: number; nodeVersion: string; execPath: string; bunShim: boolean };
+  loaded: {
+    /**
+     * How the directory was obtained. `registered-plugin-source` is the Paseo host's own plugin registry entry
+     * (`paseo plugin ls --json`): the host bundles the server code and evaluates it without a module loader, so
+     * there is no loaded file path to read; the registered source tree is content-bound instead.
+     */
+    basis: 'module-dir' | 'registered-plugin-source' | 'unavailable';
+    selfPath: string | null;
+    serverDir: string | null;
+    vendorDir: string | null;
+    vendorResolvedBy: 'vendor-child-of-server-dir' | 'unavailable';
+  };
+  /** The release proven from the loaded code's own path; `unavailable` when it could not be proven. */
+  binding: { kind: 'plugin-server-dir' | 'unavailable'; path: string | null; reason?: string };
+  /** The files whose content binds the answer. A file that could not be read is present with a null digest. */
+  modules: Array<{ name: string; path: string | null; sha256: string | null; bytes: number | null }>;
+  /** Paths the diagnostic deliberately did not read, so a reader can see the boundary. */
+  notRead: string[];
+}
+
+/**
+ * SYS04: the roles allowed to read the plugin runtime diagnostics.
+ *
+ * The role check is a core concern because that is where the authoritative identity lives; the sample itself
+ * is taken by the plugin host, the only process that can state what it loaded. An unauthorized read must
+ * produce no diagnostic at all — not a refused one that still touched the filesystem — so the check runs
+ * before any sampling.
+ */
+export const PLUGIN_RUNTIME_ROLES: readonly Role[] = ['gm', 'product', 'qa'];
+
+/**
  * gm dry-run of the contributor derivation (SYS-DISP AC05): read-only. `timeline` is the task's audit stream, oldest first,
  * with the role each row plays. `status` and `suggestedImplementer` are advice; nothing here writes an implementer.
  */
@@ -1202,12 +1246,33 @@ export interface CompanyCore {
    */
   settleFault?(scope: { taskId: TaskId; employeeId?: string }, input: { phase: FaultPhase; target?: FaultTargetKind }): Promise<void>;
   /**
+   * Read-only fault diagnosis for one task: budget scopes, episodes, and any open repair chain. Secret-free.
+   * Readable by the task holder, its reviewer, or gm — so a QA acceptance that hits a spent budget can see
+   * nextAllowedAt / attempts / repairTaskId without guessing.
+   */
+  faultStatus?(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView>;
+  /**
+   * gm only: lift a spent (or stopped) recovery budget for one incident of a task, after the cause is fixed
+   * or a diagnosis has been recorded. Creates no new budget; resets the existing scope so the next attempt
+   * starts a fresh recovery window. Audited.
+   */
+  faultLift?(credential: Credential, input: { taskId: TaskId; incident: string; reason: string; idempotencyKey: string }): Promise<FaultStatusView>;
+  /**
    * Dispatcher-only: hand an execute-phase engineering task to a live engineer when the bound implementer's session is
    * gone for good (archived, missing, or a failure that cannot be restarted). Same compare-and-set write as the
    * manager's takeover, audited as `system:dispatcher`. Takes no credential and is never exposed as an agent tool.
    */
   systemImplementerTakeover?(input: { taskId: TaskId; toEmployee: EmployeeId; expectedVersion: number; reason: string }): Promise<TaskView>;  /** gm dry-run of the contributor derivation for up to 20 tasks; read-only (SYS-DISP AC05). */
   contributorDryRun?(credential: Credential, input: { taskIds: string[] }): Promise<ContributorDryRunView>;
+  /**
+   * SYS04: authorize a read of the plugin runtime diagnostics (gm/product/qa only) and answer it from the
+   * caller's own execution context.
+   *
+   * `sample` is invoked only after the caller is known to be allowed, so an unauthorized read produces no
+   * diagnostic at all rather than a refused one that still touched the filesystem. The core cannot take the
+   * sample itself: only the plugin host can state what it loaded.
+   */
+  pluginRuntimeDiagnostics?(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView>;
   /** QA 受限只读取证（SYS-DISP 7454fc89）：GM 登记/撤销/查看范围；QA 换取一次性登录码与受限会话；只读读取。 */
   qaObservationGrant?(credential: Credential, input: QaObservationGrant): Promise<QaObservationScopeView>;
   qaObservationRevoke?(credential: Credential, input: QaObservationRevoke): Promise<QaObservationScopeView>;
@@ -1299,7 +1364,8 @@ export interface CompanyCore {
   relayOwnerDecision(credential: Credential, input: OwnerDecisionInput & { ownerQuote: string }): Promise<TaskView>;
   relayDirection(credential: Credential, input: { text: string; ownerQuote: string; idempotencyKey: string }): Promise<void>;
   /** eval role only: score every employee who participated in a finished task. Marks the task evaluated. */
-  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;model?:string;fence:number;phase:string;at:string;ended_at?:string}>>;
+  /** eval/gm only: each participant's actual models (executions, fences, phases, first/last) for modelScores. */
+  modelEvidence?(credential: Credential, taskId: TaskId): Promise<Array<{employee:string;models:Array<{model:string;executions:number;fences:number[];phases:string[];first:string;last:string}>}>>;
   recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }>;
 }
 
@@ -1414,8 +1480,58 @@ export interface EnrollmentAdmin {
 // ---- 有效策略层（SYS06 P1）：版本化的机器策略、显式替代关系、当前有效契约 ----
 // 类型定义在 src/policy.ts（受限 schema 与判定逻辑同处一文件，避免判定与字段漂移）；这里只做类型引用。
 import type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict } from './policy.ts';
-import type { FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
+import type { FaultDiagnostic, FaultPhase, FaultTargetKind, FlowStage } from './faults.ts';
 export type { EffectiveContract, EffectiveDomain, PolicyAuthorization, PolicyDomain, PolicyPayload, PolicyScope, PolicySource, PolicyStatus, PolicyVerdict };
+
+/** One budget scope of a task, as shown to a holder / reviewer / gm. Secret-free. */
+export interface FaultBudgetView {
+  key: string;
+  target: string;
+  phase: string;
+  attempts: number;
+  maxAttempts: number;
+  totalAttempts: number;
+  deadline: number;
+  nextAllowedAt: number;
+  failed: boolean;
+  stopped: boolean;
+  lastErrno?: string;
+  lastHop?: string;
+  lastIncident?: string;
+  stopReason?: string;
+  stopDiagnostic?: FaultDiagnostic;
+}
+
+/** One episode of a cause on a task. */
+export interface FaultEpisodeView {
+  episode: string;
+  incident: string;
+  fingerprint: string;
+  phase: string;
+  state: string;
+  openedAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+/** The open repair chain of an incident, when one exists. */
+export interface FaultRepairView {
+  incident: string;
+  fingerprint: string;
+  taskId?: string;
+  sourceTaskId?: string;
+  state: string;
+  diagnostic?: FaultDiagnostic;
+}
+
+/** Read-only diagnosis of a task's recovery budget. Never carries credentials or upstream bodies. */
+export interface FaultStatusView {
+  taskId: TaskId;
+  now: number;
+  budgets: FaultBudgetView[];
+  episodes: FaultEpisodeView[];
+  repairs: FaultRepairView[];
+}
 
 /** 一版机器策略的登记内容（历史不可变：payload/hash 一版写定）。 */
 export interface PolicyView {

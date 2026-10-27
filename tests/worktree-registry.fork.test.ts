@@ -216,9 +216,9 @@ run('actual dispatcher and sidecar stage one registry source in claim.json, prom
     const dispatcher = new Dispatcher({ workforce: wf, owner, paseo, sidecar: pool, env: { opsRepo: path, sckBin: '/fixture/sck', paseoBin: '/fixture/paseo' } });
     const result = await dispatcher.tick(); expect(result.woke).toHaveLength(1); expect(seen).toBeDefined();
     const claim = readJsonFile<ClaimResult>(join(seen!.env.SCK_COMM_DIR!, 'claim.json'))!;
-    // Sessions park on the private comm dir so scene reclaim can never kill them;
-    // the registered worktree reaches the agent through claim.json and the prompt.
-    expect(seen!.cwd).toBe(seen!.env.SCK_COMM_DIR);
+    // Logical workspace stays on the repository root; comm and task scene remain separate.
+    expect(seen!.cwd).toBe(path);
+    expect(seen!.env.SCK_COMM_DIR).not.toBe(path);
     expect(seen!.prompt).toContain(claim.worktree!.worktreePath); expect(seen!.cwd).not.toBe(claim.worktree!.worktreePath);
     expect(claim.worktree!.discipline).toContain('只读代码');
     expect(JSON.stringify(claim)).not.toContain('sck_'); expect(JSON.stringify(claim)).not.toContain(password);
@@ -772,3 +772,50 @@ run('WT02: a tree holding only dependency output is reclaimed, and a row for a v
     "SELECT reason FROM worktree_audit WHERE event = 'fail' AND repo = $repo;", { repo: path });
   expect(ghostFails ?? []).toEqual([]);
 }, 60000);
+
+run('a routine sweep records a retention once per reason, never the same skip every pass', async () => {
+  const path = repo(), core = coreFor(path);
+  const eng = await employee('engineering');
+  const held = await core.claim(eng, (await task(core, 'engineering')).id);
+  const audits = async () => ((await db.db.query<[Array<{ event: string }>]>(
+    'SELECT event FROM worktree_audit WHERE repo = $repo OR (repo = "*" AND trigger = "sweep");', { repo: path }))[0] ?? []);
+  const before = (await audits()).length;
+  const first = await core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  expect(first.kept.some(k => k.path === held.worktree!.worktreePath)).toBe(true);
+  const recorded = (await audits()).length;
+  expect(recorded).toBeGreaterThan(before);
+  for (let n = 0; n < 3; n++) await core.worktrees!.reclaimAll({ trigger: 'sweep', repos: [path] });
+  expect((await audits()).length).toBe(recorded);
+  // A manual reclaim still records every retention it decides.
+  await core.reclaimWorktrees(gm, { repos: [path] });
+  expect((await audits()).length).toBeGreaterThan(recorded);
+}, 60000);
+
+run('goal workspace metadata survives database reconnect while its task lease and worktree stay unchanged', async () => {
+  const path = repo(), core = coreFor(path), wf = new Workforce(db, join(dir, 'unused-goal-credentials'));
+  const name = `goal-seat-${++count}`;
+  await wf.upsertDef(name, { role: 'engineering', provider: 'claude', model: 'haiku', maxInstances: 2 });
+  const def = (await wf.defs()).find(d => d.id === name)!;
+  const inst = await wf.spawnInst(def, path, 'fixture-goal');
+  const agentId = `goal-agent-${count}`;
+  await wf.bind(inst.id, { agentId, cwd: path, repoHome: path, workspaceScope: 'fixture-goal' });
+  const goal = await new OwnerDesk(db).createGoal({ text: 'Isolated goal workspace fixture', source: 'fixture', key: name, tier: 'standard' });
+  // Rebind the fixture before it takes a lease; real dispatch stores this at spawn.
+  await wf.bind(inst.id, { agentId, workspaceScope: goal.id });
+  const ownTask = await core.createTask(gm, { title: name, context: 'Isolated goal claim', executorRole: 'engineering', reviewerRole: 'qa',
+    goalId: goal.id, workIntent: { kind: 'code' }, idempotencyKey: name });
+  const otherTask = await task(core, 'engineering', { kind: 'code' });
+  await expect(core.claim(inst.credential!, otherTask.id)).rejects.toThrow('another goal');
+  await expect(new SurrealCompanyCore(db).claim(inst.credential!, otherTask.id)).rejects.toThrow('forbidden');
+  const allocated = await core.claim(inst.credential!, ownTask.id);
+  const before = await core.getTask(gm, allocated.task.id);
+  await db.close();
+  db = new CompanyDatabase(config()); await db.connect(); await db.useDatabase();
+  const restored = (await new Workforce(db, join(dir, 'unused-goal-credentials')).insts()).find(i => i.id === inst.id)!;
+  expect(restored).toMatchObject({ cwd: path, repoHome: path, workspaceScope: goal.id, paseoAgentId: agentId });
+  const after = await coreFor(path).getTask(gm, allocated.task.id);
+  expect(after.currentEmployee).toBe(before.currentEmployee);
+  expect(after.fence).toBe(before.fence);
+  expect(after.worktree).toEqual(before.worktree);
+  expect(after.version).toBe(before.version);
+});

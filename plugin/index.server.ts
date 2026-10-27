@@ -1,3 +1,4 @@
+import {registerUsage} from './server/usage';
 import {registerAgentMetrics} from "./server/agent-metrics";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -28,6 +29,7 @@ export default function contribute(server: PluginServerContext) {
   loadServiceEnv(); // SCK_SCRUB_ENV lives there, and the zsh shim is written below, before the company stack boots
   registerHandlers(server);
   const stopMetrics=registerAgentMetrics(server);
+  const stopUsage=registerUsage(server);
   const paseoConfig = join(process.env.PASEO_HOME ?? join(homedir(), ".paseo"), "config.json");
   const stopScrub = registerScrub(server, process.env, { zdotdir: join(serviceHome(), "zdot"),
     sandbox: provider => sandboxGap(provider, paseoConfig, join(serviceHome(), "sandbox", "bin")), modelEnv: async request => {
@@ -50,6 +52,7 @@ export default function contribute(server: PluginServerContext) {
   return () => {
     stopDispatch();
     stopMetrics();
+    stopUsage();
     void company().then(ctx=>ctx.stopModelGateway());
     void preview.stop();
     stopScrub();

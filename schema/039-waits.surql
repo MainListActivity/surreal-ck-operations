@@ -1,4 +1,4 @@
--- SYS05 P1 时间与外部事件等待状态机（本 lane 取号 038）。
+-- SYS05 P1 时间与外部事件等待状态机（本 lane 取号 039；038 已由主干 goal-workspaces 使用）。
 --
 -- 只新增表与索引：不新增、不改写 task / audit / outbox / dispatch / disposition_* / fault_* 的任何既有字段，
 -- 也不改任何已有行的类型。新代码在 task 上写入的是 schemaless 的新字段（wait_* 与 users 既有字段的清除），

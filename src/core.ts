@@ -1,16 +1,17 @@
+import { workspaceScopeFor } from './goal-workspace-capability.ts';
 import { authenticationLookup } from './diagnostics.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { RecordId, type Surreal } from 'surrealdb';
 import type { CompanyDatabase } from './database.ts';
-import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView } from './contracts.ts';
+import type { ActiveLease, ClaimResult, CompanyBrief, CompanyCore, CreateDelivery, CreateTask, Credential, DefView, DeferTaskUntil, TaskWaiting, EnsureDef, GoalAcceptancePreview, GoalAcceptanceRepair, GoalAcceptanceResult, GoalAcceptanceTask, GoalAcceptanceView, GoalTier, ProjectView, EmployeeScore, Evidence, GoalView, HistoryEntry, LeaseProof, OpsScope, OutboxEvent, ImplementerTakeover, IndependencePolicy, IndependenceStage, IndependenceCheckInput, IndependenceCheckView, IndependenceCheckPolicyView, OwnerDecisionInput, Principal, RetireTask, ReviewerRole, Role, SessionRef, TaskId, TaskKind, TaskState, TaskView, SetIndependence, SetIdentityPrincipal, IdentityPrincipalView, FaultStatusView, FaultBudgetView, FaultEpisodeView, FaultRepairView } from './contracts.ts';
 import { OwnerDesk } from './owner.ts';
 import { deliveryChain } from './flows.ts';
 import { assertRoleContract, loadContract, type DisciplineContract } from './role-contract.ts';
 import type { SubmitCheck } from './pr-gate.ts';
 import { ProjectStore } from './projects.ts';
-import { collectEvalState, validateScores, writeScorecards } from './scoring.ts';
+import { collectEvalState, summarizeModelEvidence, validateScores, writeScorecards, type ModelEvidence } from './scoring.ts';
 import { ITEM_BUDGET_BYTES, RESPONSE_BUDGET_BYTES, SEGMENT_DEFAULT_BYTES, SEGMENT_MAX_BYTES, answerBytes, dualBytes, echoTask, fitCount, longestFittingPrefix, openCursor, sealCursor, textSegment, textSegmentAnswer, utf8Bytes, worktreeRefsSegment, worktreeRefsSegmentAnswer, type TaskTextHead } from './response-budget.ts';
 import { DEFAULT_PAGE_SIZE, TASK_STATES, parseContextInput, parseHistoryInput, parseReclaimInput, parseSummaryInput, parseTextInput, parseWorktreeInput, parseWorktreeRefsInput, queryDigest, type ContextParams } from './query-input.ts';
 import {
@@ -53,7 +54,8 @@ import type {
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
 type FaultReportOutcome = FaultReportResult;
-import type { ContributorDryRunView } from './contracts.ts';
+import type { ContributorDryRunView, PluginRuntimeView } from './contracts.ts';
+import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 import { QA_OBSERVATION_CODE_TTL_MS, QA_OBSERVATION_CONTEXT_INLINE_BYTES, QA_OBSERVATION_MAX_SUBJECTS, QA_OBSERVATION_MAX_TTL_MS, QA_OBSERVATION_MIN_TTL_MS, QA_OBSERVATION_TOKEN_TTL_MS, QA_OBSERVATION_WAIT_RELEASE_RESERVE_BYTES, QA_OBSERVATION_WAIT_ROOTS_LIMIT, fitGoalWaitSummary, qaDispatchFor, qaDispatchState, qaHash, qaId, qaScopeView, type QaObservationScopeRow, type QaObservationSessionRow } from './qa-observation.ts';
 
 import { CompanyError } from './core-errors.ts';
@@ -283,6 +285,7 @@ export interface TaskRow {
   worktree?: WorktreeAssignment;
   repo_path?: string;
   goal_tier?: string;
+  goal_title?: string;
   /** Screenplay-revision edge fields (schema 015): see RESOLVE_DEP_SQL. */
   revises?: RecordId;
   superseded_by?: RecordId;
@@ -973,7 +976,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $policy_evidence, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $sequence.value, payload: { state: $created.state }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $created };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
       return view(row);
@@ -1136,7 +1139,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'create', version: 1, evidence: $create_evidence, at: time::now() };
         LET $seq_new = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'created', sequence: $seq_new.value, payload: { state: $created.state, revises: $revises, lineage: $lineage, revision_no: $revision_no }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $created };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $created };
         RETURN $created;
         COMMIT;`, vars);
       return view(row);
@@ -1151,6 +1154,10 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
     const actor = await this.authorized(credential);
     if (!this.worktrees) return this.claimLease(actor, taskId);
     const task = await this.getTask(credential, taskId);
+    const employee = await this.db.select<{ workspace_scope?: string }>(id('employee', actor.employeeId));
+    if (employee?.workspace_scope && employee.workspace_scope !== workspaceScopeFor(task.goalId)) {
+      throw new CompanyError('forbidden', 'Task claim denied: conversation belongs to another goal');
+    }
     const reviewing = task.state === 'review';
     if (!['ready', 'doing', 'review'].includes(task.state) ||
         !actor.capabilities.includes(reviewing ? 'review' : 'execute') ||
@@ -1327,6 +1334,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $who = SELECT * FROM ONLY $actor;
       LET $t = SELECT * FROM ONLY $task;
       IF $who = NONE OR $who.revoked = true OR $t = NONE { THROW 'not found or revoked' };
+      IF $who.workspace_scope != NONE AND $who.workspace_scope != IF $t.goal = NONE THEN 'maintenance' ELSE <string>record::id($t.goal) END { THROW 'workspace goal denied' };
       IF $t.state = 'void' { THROW 'task retired' };
       IF $t.state NOT IN ['ready', 'review', 'doing'] { THROW 'task not claimable' };
       // SYS05：等待中的任务不占租约、不派工；到点前直接 claim 也拒绝（releaseDue 落库后才回到 ready/review）。
@@ -2080,6 +2088,23 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
+   * gm/product/qa only, read-only (SYS04): what the plugin process is actually running.
+   *
+   * The core cannot take the sample itself — only the plugin host can state which release it loaded, and the
+   * plugin host is the face every employee channel reaches. So the core owns the authorization and the caller
+   * owns the sampling, in that order: `sample` runs only after the caller is known to be allowed, so an
+   * unauthorized read produces no diagnostic at all rather than a refused one that still touched the
+   * filesystem.
+   */
+  async pluginRuntimeDiagnostics(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView> {
+    const actor = await this.authorized(credential);
+    if (!PLUGIN_RUNTIME_ROLES.includes(actor.role)) {
+      throw new CompanyError('forbidden', 'Only gm, product or qa may read the plugin runtime diagnostics');
+    }
+    return await sample();
+  }
+
+  /**
    * gm only, read-only (SYS-DISP AC05): what the audit-derived contributors say about the given tasks, the implementer status
    * each one would have, and its timeline. Nothing is written: no lease, submitter, owner gate, history or implementer changes
    * here. Recording a suggested implementer is a separate step that needs owner authorization.
@@ -2665,7 +2690,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: $action, sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
       };
-      ${idem ? 'CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };' : ''}
+      ${idem ? 'CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };' : ''}
       RETURN $next;
       COMMIT;`;
     // Gated stages (SYS-DISP IR03): submit is an execute write; accept and return are review decisions. Other actions take no gate.
@@ -2755,7 +2780,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'released', evidence: $evidence, version: $next.version, at: time::now(), phase: IF $t.state = 'review' THEN 'review' ELSE 'execute' END };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'released', sequence: $sequence.value, payload: { version: $next.version, state: $next.state }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
     try {
@@ -3239,6 +3264,86 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
   }
 
   /**
+   * Read-only diagnosis of a task's recovery budget. Readable by the task holder, its reviewer, or gm.
+   * Secret-free: no upstream bodies, no credentials, no aliases beyond what the ledger already stored.
+   */
+  async faultStatus(credential: Credential, input: { taskId: TaskId }): Promise<FaultStatusView> {
+    const actor = await this.authenticate(credential);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const holds = row.current_employee === actor.employeeId && ['doing', 'review', 'blocked'].includes(row.state ?? '') &&
+      (row.lease_expires_at ?? 0) > Date.now() / 1000;
+    const reviews = actor.role === row.reviewer_role;
+    if (actor.role !== 'gm' && !holds && !reviews) {
+      throw new CompanyError('forbidden', 'Fault status is read by the task holder, its reviewer, or gm');
+    }
+    return this.faultStatusOf(input.taskId);
+  }
+
+  /**
+   * gm only: lift a spent (or stopped) recovery budget for one incident of a task. Resets the existing scope so
+   * the next attempt starts a fresh recovery window. Audited. Creates no new budget and never invents an incident.
+   */
+  async faultLift(credential: Credential, input: {
+    taskId: TaskId; incident: string; reason: string; idempotencyKey: string;
+  }): Promise<FaultStatusView> {
+    const actor = await this.authorized(credential, 'manage');
+    if (actor.role !== 'gm') throw new CompanyError('forbidden', 'Only gm may lift a spent recovery budget');
+    requireText(input.reason, 'reason', 4, 2000);
+    requireText(input.incident, 'incident', 1, 500);
+    requireText(input.idempotencyKey, 'idempotencyKey', 1, 200);
+    const row = await this.db.select<TaskRow>(id('task', input.taskId));
+    if (!row) throw new CompanyError('not_found', 'Task not found');
+    const episodes = await this.faults.episodesOfTask(input.taskId);
+    const matching = episodes.filter(episode => episode.incident === input.incident);
+    if (matching.length === 0) throw new CompanyError('not_found', `no fault episode for incident ${input.incident} on this task`);
+    const liftable = matching.some(episode => episode.state === 'exhausted' || episode.state === 'stopped' || episode.state === 'opened' || episode.state === 'converged');
+    if (!liftable) throw new CompanyError('conflict', `incident ${input.incident} is already resolved on this task`);
+    const now = this.faultClock();
+    await this.faults.liftRepair({ taskId: input.taskId, incident: input.incident, now, limits: this.faultLimits });
+    await this.db.query(`CREATE audit CONTENT { task: $task, actor: $actor, action: 'fault_lift', evidence: $evidence, at: time::now() };`,
+      { task: id('task', input.taskId), actor: id('employee', actor.employeeId),
+        evidence: JSON.stringify({ incident: input.incident, reason: input.reason, idempotencyKey: input.idempotencyKey }).slice(0, 30000) });
+    return this.faultStatusOf(input.taskId);
+  }
+
+  /** Assemble the secret-free diagnosis view of a task. */
+  private async faultStatusOf(taskId: TaskId): Promise<FaultStatusView> {
+    const now = this.faultClock();
+    const budgets: FaultBudgetView[] = (await this.faults.scopesOfTask(taskId)).map(scope => ({
+      key: scope.key, target: scope.target, phase: scope.phase,
+      attempts: scope.attempts, maxAttempts: scope.maxAttempts, totalAttempts: scope.totalAttempts,
+      deadline: scope.deadline, nextAllowedAt: scope.nextAllowedAt,
+      failed: scope.failed, stopped: scope.stopped,
+      ...(scope.lastErrno === undefined ? {} : { lastErrno: scope.lastErrno }),
+      ...(scope.lastHop === undefined ? {} : { lastHop: scope.lastHop }),
+      ...(scope.lastIncident === undefined ? {} : { lastIncident: scope.lastIncident }),
+      ...(scope.stopReason === undefined ? {} : { stopReason: scope.stopReason }),
+      ...(scope.stopDiagnostic === undefined ? {} : { stopDiagnostic: scope.stopDiagnostic }),
+    }));
+    const episodes: FaultEpisodeView[] = (await this.faults.episodesOfTask(taskId)).map(episode => ({
+      episode: episode.episode, incident: episode.incident, fingerprint: episode.fingerprint,
+      phase: episode.phase, state: episode.state, openedAt: episode.openedAt, updatedAt: episode.updatedAt,
+      ...(episode.resolvedAt === undefined ? {} : { resolvedAt: episode.resolvedAt }),
+    }));
+    const seen = new Set<string>();
+    const repairs: FaultRepairView[] = [];
+    for (const episode of episodes) {
+      if (seen.has(episode.incident)) continue;
+      seen.add(episode.incident);
+      const repair = await this.faults.repair(episode.incident);
+      if (!repair) continue;
+      repairs.push({
+        incident: repair.incident, fingerprint: repair.fingerprint, state: repair.state,
+        ...(repair.taskId === undefined ? {} : { taskId: repair.taskId }),
+        ...(repair.sourceTaskId === undefined ? {} : { sourceTaskId: repair.sourceTaskId }),
+        ...(repair.diagnostic === undefined ? {} : { diagnostic: repair.diagnostic }),
+      });
+    }
+    return { taskId, now, budgets, episodes, repairs };
+  }
+
+  /**
    * A repair that is done lifts the fault it was made for (AC04): the source task may recover again, with a fresh
    * budget and a new stage. The repair task is the one the manager created for the incident.
    */
@@ -3424,7 +3529,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'resumed', sequence: $sequence.value,
           payload: { state: $next.state, source_phase: $source_phase, restore_phase: $restore_phase }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', taskId), evidence: evidence.text,
@@ -3672,7 +3777,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'deferred', sequence: $sequence.value,
         payload: { state: $next.state, source_phase: $m_phase, restore_phase: $restore_phase,
           dependencies_before: $before_refs, dependencies_after: $merged, operator: $employee, added: $added }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
       actor: id('employee', actor.employeeId), employee: actor.employeeId, task: taskRef, expected: input.expectedVersion,
@@ -3770,7 +3875,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'retire', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'retired', sequence: $sequence.value, payload: { state: 'void', retired_holder: $holder }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
@@ -4114,7 +4219,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         CREATE ONLY $audit_old CONTENT { task: $old, actor: $actor, action: 'goal_acceptance_replaced', evidence: $evidence_old, version: $o.version, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $candidate, kind: 'goal_acceptance_repaired', sequence: $sequence.value, payload: { goal: $goal_key, replaced: $old_key, candidate: $candidate_key }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $result };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $result };
         RETURN $result;
         COMMIT;`, vars);
       return result;
@@ -4325,7 +4430,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         ${closeOutTarget}
         UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
         CREATE audit CONTENT { actor: $actor, action: 'policy_set', evidence: $evidence, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $policy, version: $version } };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $policy, version: $version } };
         RETURN $created;
         COMMIT;`, vars);
       return policyApiView(policyRowView(row));
@@ -4364,7 +4469,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $revoked = UPDATE ONLY $policy SET status = 'revoked', revoked_by = $actor, revoke_reason = $reason RETURN AFTER;
         UPDATE ONLY company_meta:policy_epoch SET value = $epoch + 1;
         CREATE audit CONTENT { actor: $actor, action: 'policy_revoke', evidence: $evidence, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $policy, version: $t.version } };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $policy, version: $t.version } };
         RETURN $revoked;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), policy: id('policy', input.policyId), reason: input.reason,
@@ -4665,7 +4770,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         version = $t.version + 1
         RETURN AFTER;
       CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'independence_set', evidence: $evidence, version: $next.version, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
     const vars = {
@@ -4742,7 +4847,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       FOR $e IN $employees { UPDATE ONLY $e SET principal = $principal; };
       CREATE ONLY $audit CONTENT { actor: $actor, action: 'identity_principal_set', evidence: $evidence, version: $version, at: time::now() };
       // The idempotent result stores the very timestamp the write returns, so a replay is byte-identical to the first call.
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: { id: $principal, employees: $employees, reason: $reason, set_by: $employee, set_at: $next.created_at } };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: { id: $principal, employees: $employees, reason: $reason, set_by: $employee, set_at: $next.created_at } };
       RETURN { created_at: $next.created_at, set_by: $employee };
       COMMIT;`;
     const vars = {
@@ -4857,7 +4962,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
     const vars = {
@@ -4936,7 +5041,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       CREATE ONLY $bound CONTENT { task: $task, actor: $target, action: 'implementer_bound', phase: 'execute', evidence: $evidence, version: $next.version, at: time::now() };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE ONLY $outbox CONTENT { task: $task, kind: 'implementer_takeover', sequence: $sequence.value, payload: { version: $next.version, implementer: $target_key, automatic: true }, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
     const vars = {
@@ -5126,7 +5231,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         CREATE ONLY $audit CONTENT { task: $task, actor: $actor, action: 'task_project_update', evidence: $evidence, version: $next.version, at: time::now() };
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'task_project_updated', sequence: $sequence.value, payload: { project: $project_id, version: $next.version }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
@@ -5202,7 +5307,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
         CREATE ONLY $outbox CONTENT { task: $task, kind: 'code_repo_bound', sequence: $sequence.value,
           payload: { old_repo: $old_repo, new_repo: $repo, version: $next.version }, at: time::now() };
-        CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+        CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
         RETURN $next;
         COMMIT;`, {
         actor: id('employee', actor.employeeId), task: id('task', input.taskId),
@@ -5223,11 +5328,15 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
    * Scorecards are idempotent per (task, employee); writing marks task.evaluated_at so the
    * dispatcher stops dispatching judges, and rolls the average into employee and employee_def.
    */
-  async modelEvidence(credential: Credential, taskId: TaskId) {
+  async modelEvidence(credential: Credential, taskId: TaskId): Promise<ModelEvidence[]> {
     const actor = await this.authorized(credential);
     if (!['eval','gm'].includes(actor.role)) throw new CompanyError('forbidden','Only eval or gm may read model evaluation evidence');
-    const state = await collectEvalState(this.db,taskId,actor.employeeId);
-    return state.modelExecutions ?? [];
+    if (!await this.db.select(id('task', taskId))) throw new CompanyError('not_found', 'Task not found');
+    // The same rows collectEvalState validates against, read alone: the full eval state rebuilt the whole timeline per call.
+    const [rows] = await this.db.query<[NonNullable<Parameters<typeof summarizeModelEvidence>[0]>]>(
+      "SELECT employee,model,fence,phase,<string>at AS at FROM model_execution WHERE task=$task AND completed=true AND status>=200 AND status<300 AND phase!='auxiliary' AND employee!=$actor;",
+      { task: id('task', taskId), actor: actor.employeeId });
+    return summarizeModelEvidence(rows ?? []);
   }
 
   async recordScore(credential: Credential, input: { taskId: TaskId; summary: string; scores: EmployeeScore[] }): Promise<{ recorded: number; participants: string[] }> {
@@ -5390,7 +5499,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         lease_fence: $fence, subjects: $subjects, status: 'active', expires_at: $expires, version: 1, reason: $reason,
         created_by: $actor, created_at: time::now() };
       CREATE ONLY $audit CONTENT { task: $deploy, actor: $actor, action: 'qa_observation_grant', evidence: $evidence, version: 1, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $scope };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $scope };
       RETURN $scope;
       COMMIT;`;
     const vars = {
@@ -5431,7 +5540,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
       LET $next = UPDATE ONLY $scope SET status = 'revoked', revoked_at = time::now(), revoked_by = $actor,
         revoked_reason = $reason, version = $s.version + 1 RETURN AFTER;
       CREATE ONLY $audit CONTENT { task: $s.deployment_task, actor: $actor, action: 'qa_observation_revoke', evidence: $evidence, version: $next.version, at: time::now() };
-      CREATE ONLY $idem CONTENT { payload_digest: $digest, result: $next };
+      CREATE ONLY $idem CONTENT { at: time::now(), payload_digest: $digest, result: $next };
       RETURN $next;
       COMMIT;`;
     const vars = { actor: id('employee', actor.employeeId), scope: id('qa_observation_scope', input.scopeId),

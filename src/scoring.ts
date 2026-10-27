@@ -114,6 +114,35 @@ export async function collectEvalState(db: Surreal, taskId: TaskId, excludeEmplo
   };
 }
 
+/** One employee's actual models on a task: what modelScores must cover, without the per-request rows. */
+export interface ModelEvidence {
+  employee: string;
+  models: Array<{ model: string; executions: number; fences: number[]; phases: string[]; first: string; last: string }>;
+}
+
+/**
+ * Per (employee, model) rollup of successful executions. A long task has hundreds of rows that exceed the reply
+ * budget; the rollup is a few lines per participant and is exactly the set validateScores enforces.
+ */
+export function summarizeModelEvidence(rows: NonNullable<EvalState['modelExecutions']>): ModelEvidence[] {
+  const by = new Map<string, Map<string, ModelEvidence['models'][number]>>();
+  for (const r of rows) {
+    if (!r.model) continue;
+    const models = by.get(r.employee) ?? new Map();
+    by.set(r.employee, models);
+    const m = models.get(r.model) ?? { model: r.model, executions: 0, fences: [], phases: [], first: r.at, last: r.at };
+    models.set(r.model, m);
+    m.executions++;
+    if (!m.fences.includes(r.fence)) m.fences.push(r.fence);
+    if (!m.phases.includes(r.phase)) m.phases.push(r.phase);
+    if (r.at < m.first) m.first = r.at;
+    if (r.at > m.last) m.last = r.at;
+  }
+  return [...by].sort(([a], [b]) => a.localeCompare(b)).map(([employee, models]) => ({
+    employee, models: [...models.values()].sort((a, b) => a.model.localeCompare(b.model)).map(m => ({ ...m, fences: m.fences.sort((a, b) => a - b) })),
+  }));
+}
+
 export interface ScoredEmployee extends EmployeeScore {
   confidence?: number;
   probabilities?: Record<string, Record<string, number>>;
@@ -126,12 +155,17 @@ export function validateScores(state: EvalState, scores: EmployeeScore[]): strin
   for (const s of scores) {
     if (!state.participants.includes(s.employee)) return `Not a participant: ${s.employee}`;
     const required = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
-    if (required.size>1 && [...required].some(m=>!s.modelScores?.some(a=>a.model===m))) return `Missing model assessments: ${s.employee}`;
+    // Name the gap: an eval employee is entitled to these models, and a bare refusal turned scoring into guessing.
+    const missing = [...required].filter(m=>!s.modelScores?.some(a=>a.model===m)).sort();
+    if (required.size>1 && missing.length) return `Missing model assessments: ${s.employee} needs ${missing.join(', ')}`;
     const models = s.modelScores;
     if (models) {
       const actual = new Set(state.modelExecutions?.filter(r=>r.employee===s.employee && r.model).map(r=>r.model));
       if (new Set(models.map(m=>m.model)).size !== models.length) return `Duplicate model assessment: ${s.employee}`;
-      for (const m of models) if (!actual.has(m.model) || !Number.isFinite(m.overall) || m.overall<1 || m.overall>5) return `Invalid model assessment: ${m.model}`;
+      for (const m of models) {
+        if (!actual.has(m.model)) return `Invalid model assessment: ${m.model} is not a model of ${s.employee} (actual: ${[...actual].sort().join(', ') || 'none'})`;
+        if (!Number.isFinite(m.overall) || m.overall<1 || m.overall>5) return `Invalid model assessment: ${m.model}`;
+      }
     }
     for (const d of dims) {
       if (typeof s[d] !== 'number' || !Number.isFinite(s[d]) || s[d] < 1 || s[d] > 5) return `Invalid ${d} score`;

@@ -1,5 +1,6 @@
 import { DispatchTimings } from "./vendor/src/diagnostics.ts";
 import { openUserPaths, scratchKeepReason } from "./vendor/src/dispatcher/scratch-gc.ts";
+import { pruneOperationalData } from "./vendor/src/data-retention.ts";
 import { settleCompanyTurn, TurnInterruptions } from "./turn-closeout";
 // Runs the company dispatcher tick loop inside the plugin subprocess and wakes it early on
 // Paseo lifecycle events, replacing the org.surrealck.company-dispatcher launchd service.
@@ -337,6 +338,11 @@ async function runLifecycleGc(ctx: Company): Promise<void> {
       if (scratch.removed.length || scratch.failed?.length) console.log(`lifecycle gc scratch: removed ${scratch.removed.length}, failed ${scratch.failed?.length ?? 0}, kept ${scratch.skipped} (${(scratch.bytes / 1048576).toFixed(1)} MB)`);
     } catch { console.warn("lifecycle gc scratch retained: reference/process inspection unavailable"); }
   }
+
+  try {
+    const pruned = await pruneOperationalData(ctx.db.db);
+    if (Object.keys(pruned).length) console.log(`lifecycle gc data: ${JSON.stringify(pruned)}`);
+  } catch (error) { console.warn(`lifecycle gc data failed: ${(error as Error).message}`); }
 
   if (cfg.archiveRetentionDays > 0) {
     const arch = await sweepArchiveBatches({

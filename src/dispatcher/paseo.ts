@@ -13,6 +13,14 @@ import { CompanyError } from '../core-errors.ts';
 export interface AgentInfo { id: string; status: string; model?: string }
 export interface PaseoWorkspaceInfo { workspaceId: string; name: string; cwd: string; project?: string }
 export interface PaseoProjectInfo { projectId: string; name: string; path: string; kind?: string }
+/** One row of `paseo plugin ls --json`: the host's own record of where a plugin is registered from. */
+export interface PaseoPluginInfo {
+  id?: string;
+  path?: string;
+  enabled?: boolean;
+  status?: string;
+  installation?: { identity?: { kind?: string; path?: string } };
+}
 export interface SceneCleanupResult { workspacesArchived: number; projectsDeleted: number; employeesRetired?: number }
 
 /** The dispatcher-facing fields of an employee instance that scene cleanup needs. */
@@ -31,8 +39,10 @@ export interface SpawnInput {
   thinking?: string;
   mode?: string;
   cwd: string;
-  /** One Paseo workspace per employee definition; every instance of the definition runs as an agent inside it. */
+  /** Legacy title, or a goal title within the explicitly registered repository project. */
   workspaceTitle: string;
+  workspaceScope?: string;
+  repoHome?: string;
   labels: Record<string, string>;
   env: Record<string, string>;
   prompt: string;
@@ -67,6 +77,9 @@ export interface PaseoGateway {
   listWorkspaces(): Promise<PaseoWorkspaceInfo[]>;
   /** Registered projects; each maps a directory to the workspaces under it. */
   listProjects(): Promise<PaseoProjectInfo[]>;
+  /** Registered plugins as the host records them (id, status and the installation source). Optional so a
+   *  focused dispatcher test double need not stub a host query the dispatcher itself never makes. */
+  plugins?(): Promise<PaseoPluginInfo[]>;
   /** Archive a workspace and everything it owns; the transcript stays in history. */
   archiveWorkspace(workspaceId: string): Promise<void>;
   /** Delete a project and its workspaces. */
@@ -123,16 +136,35 @@ export function createPaseoCli(
     }
   };
   const json = async <T>(args: string[]): Promise<T> => JSON.parse(await run([...args, '--json'])) as T;
+  const projects = new Map<string, Promise<string>>();
+  const ensureProject = (path: string): Promise<string> => {
+    const root = canonicalPath(path);
+    const known = projects.get(root);
+    if (known) return known;
+    const found = (async () => {
+      const rows = await json<PaseoProjectInfo[]>(['project', 'ls']);
+      const existing = rows.find(p => canonicalPath(p.path) === root);
+      if (existing) return existing.projectId;
+      const created = await json<{ projectId?: string; id?: string }>(['project', 'create', root]);
+      const id = created.projectId ?? created.id;
+      if (!id) throw new Error('paseo project create did not return a project ID');
+      return id;
+    })();
+    projects.set(root, found);
+    found.catch(() => projects.delete(root));
+    return found;
+  };
   const workspaces = new Map<string, Promise<string>>();
-  const ensureWorkspace = (title: string, cwd: string): Promise<string> => {
-    const key = `${title}\0${cwd}`;
+  const ensureWorkspace = (title: string, cwd: string, project?: string, scope?: string): Promise<string> => {
+    const key = `${project ?? ''}\0${scope ?? title}\0${cwd}`;
     const known = workspaces.get(key);
     if (known) return known;
     const found = (async () => {
-      const rows = await json<Array<{ workspaceId: string; name: string; cwd: string }>>(['workspace', 'ls']);
-      const existing = rows.find(w => w.name === title && w.cwd === cwd);
+      const rows = await json<PaseoWorkspaceInfo[]>(['workspace', 'ls']);
+      const existing = rows.find(w => canonicalPath(w.cwd) === canonicalPath(cwd) &&
+        (scope ? w.name.endsWith(`[${scope}]`) : w.name === title));
       if (existing) return existing.workspaceId;
-      const created = await json<{ workspaceId?: string; id?: string }>(['workspace', 'create', '--isolation', 'local', '--path', cwd, '--title', title]);
+      const created = await json<{ workspaceId?: string; id?: string }>(['workspace', 'create', '--isolation', 'local', '--path', cwd, '--title', title, ...(project ? ['--project', project] : [])]);
       const id = created.workspaceId ?? created.id;
       if (!id) throw new Error('paseo workspace create did not return a workspace ID');
       return id;
@@ -200,6 +232,9 @@ export function createPaseoCli(
     async listProjects() {
       return json<PaseoProjectInfo[]>(['project', 'ls']);
     },
+    async plugins() {
+      return json<PaseoPluginInfo[]>(['plugin', 'ls']);
+    },
     async archiveWorkspace(workspaceId) {
       await run(['workspace', 'archive', workspaceId]);
     },
@@ -207,7 +242,8 @@ export function createPaseoCli(
       await run(['project', 'delete', projectId]);
     },
     async spawn(input) {
-      const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd);
+      const project = input.workspaceScope && input.repoHome ? await ensureProject(input.repoHome) : undefined;
+      const workspace = await ensureWorkspace(input.workspaceTitle, input.cwd, project, input.workspaceScope);
       const args = ['run', '-d', '--json', '--provider', `${input.provider}/${input.model}`, '--title', input.title, '--workspace', workspace];
       if (input.thinking) args.push('--thinking', input.thinking);
       if (input.mode) args.push('--mode', input.mode);

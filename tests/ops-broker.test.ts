@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode, type OpsDeps } from '../src/ops/broker.ts';
+import type { OpsScope } from '../src/contracts.ts';
 import type { OriginRequest } from '../src/ops/origin.ts';
 import { parseBrokerConfig } from '../src/ops/config.ts';
 import { verifyPassword } from '../src/ops/password.ts';
@@ -306,6 +307,46 @@ describe('ops login and sessions', () => {
     expect(r.company.faults.reported[0]!.stage).toBe('login');
   });
 
+  test('the reservation is reached through a bound core, so the budget is never lost to an unbound call', async () => {
+    // The broker used to pull `reserveFault` off `core` and call it detached, so `this` inside core was undefined and
+    // `this.faultClock()` threw. The call was then swallowed as `reserve failed` and the tool ran without a reservation:
+    // the budget silently stopped being enforced on every ops tool. A fake whose reserve is a property arrow hides it,
+    // because it never reads `this` — so this test binds a real object, the shape production has.
+    const r = rig({ d1: undefined });
+    const objectCore = {
+      // The state the method reads through `this`, exactly like CompanyCore.faultClock: detached, `this` is undefined
+      // and reading it throws — which is how the real reservation was lost.
+      faultClock: () => 1_700_000_000_000,
+      reserved: [] as Array<{ taskId: string; phase: string; target: string }>,
+      opsScope: async (credential: string, taskId: string): Promise<OpsScope> => r.company.core.opsScope(credential, taskId),
+      auditOps: async (scope: OpsScope, action: string, evidence: string) => {
+        r.company.audits.push({ employeeId: scope.actor.employeeId, taskId: scope.taskId, project: scope.project, action, evidence });
+      },
+      opsCount: async () => 0,
+      async reserveFault(this: { faultClock: () => number; reserved: Array<{ taskId: string; phase: string; target: string }> },
+        scope: { taskId: string }, input: { phase: string; target?: string }) {
+        this.faultClock();                               // throws when the call is detached
+        this.reserved.push({ taskId: scope.taskId, phase: input.phase, target: input.target ?? 'none' });
+        r.company.faults.reserved.push({ taskId: scope.taskId, phase: input.phase, target: input.target ?? 'none' });
+        return { allowed: true, attempt: 0, charged: false, message: '', evidence: {} };
+      },
+    };
+    const broker = new OpsBroker({
+      core: objectCore as never, projects: r.company.projects as never, secretKey: () => Buffer.alloc(32),
+      controlEnv: () => ({ cloudflareToken: 'cf-token-value', cloudflareAccountId: 'acct' }),
+      fetch: r.world.fetch, now: r.world.now, d1: () => r.world.d1, queryAsUser: r.world.queryAsUser, browser: r.world.browser,
+      sleep: async (ms) => { r.world.clock += ms; },
+    });
+    const r2: Rig = { world: r.world, company: r.company, broker, qa: r.qa, outputs: r.outputs };
+    r.company.sealed.set('demo/production/GHOST_PASSWORD', 'wrong-password-123');
+    await failure(call(r2, 'ops_login', { alias: 'ghost' }));
+    // The reservation landed: the bound call returned instead of throwing `Cannot read properties of undefined`.
+    expect(objectCore.reserved.at(-1)).toMatchObject({ phase: 'login', target: 'idp_login' });
+    expect(r.company.faults.reserved.at(-1)).toMatchObject({ phase: 'login', target: 'idp_login' });
+    // And no reservation was lost to the swallowed `reserve failed` path.
+    expect(r.company.audits.filter(a => a.action === 'ops_fault' && a.evidence.includes('reserve failed'))).toHaveLength(0);
+  });
+
   test('a refused reservation never reaches the tool and is not charged as a failure', async () => {
     const r = rig();
     r.company.faults.refuse = { reason: 'attempts_exhausted', message: 'operation refused (login): the recovery budget for this operation is spent.' };
@@ -328,6 +369,17 @@ describe('ops login and sessions', () => {
     // And the diagnosis says what to do about it.
     expect(error.message).toContain('not retryable');
     expect(error.message).not.toContain('wrong-password-123');
+  });
+
+  test('a successful ops_login can be released with ops_logout, and the session stops working', async () => {
+    // The login path changed (same-hop connect retry). What a successful login means to the caller must not: the
+    // broker still mints a session that ops_logout closes, and the same session handle is dead afterwards.
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_logout', { session })).toEqual({ closed: true });
+    expect((await failure(call(r, 'ops_request', { session, method: 'GET', path: '/api/session/workspaces' }))).code).toBe('not_found');
+    // A second logout of the same handle is refused, not silently accepted.
+    expect((await failure(call(r, 'ops_logout', { session }))).code).toBe('not_found');
   });
 
   test('sessions belong to one employee; release and logout kill them', async () => {

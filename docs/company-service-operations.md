@@ -91,6 +91,8 @@ rtk proxy "$PASEO_CLI" plugin ls sck-company
 
 证据分别记录两面路径、SHA、进程状态、探针与真实派工结果/时间；若真实派工尚未验证须明确标注，不能宣布部署完成。
 
+目标会话布局的切换还执行 `goal-workspace-guard.sh`：核心与插件 vendor 必须同时携带目标绑定领取检查。旧版会忽略员工 `workspace_scope`，因此被拒绝；上线后发生问题保留健康版本并前向修复，不能用旧调度器接管已绑定目标的会话。布局与迁移边界见 [工程、目标与会话](./goal-workspaces.md)。
+
 ### 5. 双面回滚
 
 **兼容目标是回滚的前提（RW06）**：切换（install 与远端 deploy）在内容绑定之后、任何副作用（bin 复制、`active` 链接、插件重指、MCP 重启、快照清理、远端上传）之前，用 `scripts/review-wait-guard.sh` 读取**目标自身的代码**判定兼容性：目标必须带 `src/review-wait-capability.ts` 的协议标记、`src/core.ts` 中的“按原阶段解锁”语句（`$restore_phase`）与 `src/contracts.ts` 的 resume 视图字段；本地 install 还要求插件 vendor 同源，远端 deploy 只查核心。不兼容、不可读或无法证明的目标一律拒绝，**没有“当前没有等待项所以放行”的例外**（检查之后并发产生的等待会绕过这种检查）；拒绝发生在任何切换副作用之前，并输出目标、原因与 `waiting items=unknown`（切换脚本没有受权的公司数据读取接缝，不能据此声称没有等待项）。
@@ -244,7 +246,7 @@ pnpm run company reassign <任务ID> [--executor <岗位>] [--reviewer <岗位|o
 
 ## 提交前检查（PR 门）
 
-工程的实现任务（kind=task）提交时，系统会读 submit 证据里链接的 GitHub PR（`gh pr view`），只检查**头分支就是本任务登记分支**的那个 PR：与主干冲突、已关闭未合并、或有失败的 CI 检查，提交会被直接拒收（`invalid`，任务仍是 doing），员工修好后重新提交，不再占用一次验收。CI 还在跑不算失败；证据里没有 PR 链接、链接的是别的分支、或 `gh` 查询出任何问题时一律放行，由验收人照常检查。上线申请、合入部署和其他岗位不受影响。`SCK_PR_GATE=0` 关闭（MCP 与插件两面都要设）。
+工程的实现任务（kind=task）提交时，系统会读 submit 证据里链接的 GitHub PR（`gh pr view`），只检查**头分支就是本任务登记分支**的那个 PR：与主干冲突、已关闭未合并、或有失败的 CI 检查，提交会被直接拒收（`invalid`，任务仍是 doing），员工修好后重新提交，不再占用一次验收。CI 还在跑不算失败；GitHub 因账户付款失败或触及支出上限而未启动作业的检查也不算失败——判定前会读该检查的注解（含 account payments / spending limit / Billing & plans 文案）与其作业，只有**一步都没执行**的作业才算基础设施拒绝，跑过步骤的失败、没有 job 链接的检查、读不到注解或作业一律照旧视为失败。证据里没有 PR 链接、链接的是别的分支、或 `gh` 查询出任何问题时一律放行，由验收人照常检查。上线申请、合入部署和其他岗位不受影响。`SCK_PR_GATE=0` 关闭（MCP 与插件两面都要设）。
 
 简报里的"退回"只统计真正的验收退回；系统因工作区路径变化换会话产生的"通道回滚"单列。
 

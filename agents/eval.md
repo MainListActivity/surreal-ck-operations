@@ -5,7 +5,7 @@
 ## 做法
 
 1. 派工消息里给出目标任务 ID。用 `get_task_history` 读完整审计历史（claim / checkpoint / submit / review / revoked），需要时用 `get_context {"taskId": "<id>"}` 读任务正文。
-2. 用 `get_model_evidence {"taskId":"<id>"}` 读取实际模型、fence、阶段与时间，结合完整提交、退回、修复及最终验收记录，为每位员工的各实际模型补充 `modelScores:[{model,overall,notes}]`。多模型分别说明返工责任和修复贡献，不能按请求数量分配质量；基础设施故障不扣模型质量。最终验收前不结算。
+2. 用 `get_model_evidence {"taskId":"<id>"}` 读取每位员工实际用过的模型集合（调用次数、fence、阶段与首末时间），结合完整提交、退回、修复及最终验收记录，为每位员工的各实际模型补充 `modelScores:[{model,overall,notes}]`。多模型分别说明返工责任和修复贡献，不能按请求数量分配质量；基础设施故障不扣模型质量。`record_score` 报错会写明缺失或多余的模型，照改一次即可；不要拿 `record_score` 反复试探模型名，证据读不到就 `report_blocker`。最终验收前不结算。
 3. **参与者** = history 里出现过的员工编号；`dispatcher`、`owner:*`、`gm-relay:*` 不是员工，不评分。被收回租约（`revoked`）的前任也是参与者，按其中断前的实际表现打分。
 3. 每位参与者打 5 个分（1–5，可 0.5 步进）加一句评语：
    - `quality`：交付/验收内容是否达成任务目标；

@@ -11,7 +11,7 @@ import { ROSTER_BUDGET_BYTES, ROSTER_LIST_CAPS, rosterAnswer as boundRosterAnswe
 const defs: StaffingInput['defs'] = [{ id: 'd1', role: 'engineering', provider: 'codex', model: 'm1',
   enabled: true, maxInstances: 3, priority: 100, weight: 10, scored: 0, errorStreak: 0 }];
 const insts: StaffingInput['insts'] = ['author', 'fresh', 'rework-submitter'].map(id => ({ id, role: 'engineering',
-  def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: id, cwd: '/ops' }));
+  def: 'd1', provider: 'codex', model: 'm1', paseoAgentId: id, cwd: '/ops', workspaceScope: 'maintenance' }));
 const task = { id: 'review-task', title: '独立验收', state: 'review', reviewerRole: 'engineering',
   submittedBy: 'rework-submitter', repoPath: '/ops' } as SupervisedTask;
 const readyTask = { id: 'ready-task', title: '就绪实现', state: 'ready', executorRole: 'engineering',

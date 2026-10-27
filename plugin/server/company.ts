@@ -25,6 +25,9 @@ export interface Company {
 }
 
 let boot: Promise<Company> | undefined;
+let readyCompany:Company|undefined;
+/** Local read only; never starts bootstrap or waits on the company database. */
+export function currentCompany(){return readyCompany;}
 
 const notify = async (title: string, text: string) => {
   const esc = (v: string) => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').slice(0, 240);
@@ -151,6 +154,16 @@ export function company(): Promise<Company> {
     const sidecar = new SidecarPool({
       core, workforce, ops, media, browser, sync,
       runDir,
+      // SYS04: the plugin host bundles the server code and evaluates it without a module loader, so the
+      // diagnostic cannot read its own directory from `__dirname`/`import.meta`. The host's own registry
+      // (`paseo plugin ls --json`, the same query the release receipt uses) names the registered source
+      // tree, which the diagnostic then binds by content hash. Read-only; resolved only after core
+      // authorises the caller.
+      pluginSource: async () => {
+        const rows = (await paseo.plugins?.()) ?? [];
+        const row = rows.find(item => item.id === "sck-company");
+        return row?.installation?.identity?.path ?? row?.path ?? null;
+      },
       log: message => console.log(message),
     });
     const { ExecutionJournal } = await import("./vendor/src/model-routing/journal.ts");
@@ -220,7 +233,7 @@ export function company(): Promise<Company> {
     try { await sidecar.adopt(await workforce.insts()); }
     catch(error) { await modelGateway.stop(); throw error; }
     routingReady=true;
-    return { modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
+    return readyCompany={ modelJournal, modelRouting, modelRanking, stopModelGateway:async()=>{modelRanking.stop();await modelGateway.stop();}, db, owner, workforce, dispatcher, core, sidecar, opsRepo, ops };
   })();
   boot.catch(() => { boot = undefined; }); // a failed boot must not poison later calls
   return boot;

@@ -14,6 +14,7 @@ set -eu
 . "$(dirname "$0")/review-wait-guard.sh"
 . "$(dirname "$0")/independence-guard.sh"
 . "$(dirname "$0")/policy-guard.sh"
+. "$(dirname "$0")/goal-workspace-guard.sh"
 
 host=${SCK_REMOTE_HOST:-ubuntu@129.146.179.37}
 # Deploys authenticate with a dedicated, passphrase-protected key that is never
@@ -74,6 +75,7 @@ independence_target_supported "$staging/probe" core || { independence_refuse "$s
 # SYS06 C1: the same contract on the same payload (core scope: the remote runs the MCP service, not the plugin).
 # Refused before any step reaches the host.
 policy_target_supported "$staging/probe" core || { policy_refuse "$staging/probe" core; exit 1; }
+goal_workspace_target_supported "$staging/probe" core || { goal_workspace_refuse "$staging/probe" core; exit 1; }
 
 sed -n \
   -e 's/^SURREAL_ROOT_USER=/SURREAL_ROOT_USER=/p' \

@@ -12,6 +12,8 @@ export async function reclaimIdleSessions(input: {
   const updates: Array<{ inst: EmployeeInst; since?: number }> = [];
   const candidates: EmployeeInst[] = [];
   for (const inst of input.instances) {
+    // Goal agents are durable conversations, independent of transient worktree resources.
+    if (inst.workspaceScope) continue;
     const eligible = input.states.get(inst.id) === 'idle' && !inst.activeTask && !input.held.has(inst.id) && !input.bound.has(inst.id) && !!inst.paseoAgentId;
     const freshWake = inst.idleSince !== undefined && (inst.lastWakeAt ?? 0) >= inst.idleSince;
     const since = eligible ? freshWake ? now : inst.idleSince ?? now : undefined;
