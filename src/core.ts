@@ -155,9 +155,9 @@ export const UNLOCK_CHILDREN_SQL = `
     IF array::len($remaining) = 0 {
       LET $source_phase = $child.resume_state ?? 'ready';
       LET $manager = $child.dependency_continuation = 'manager';
-      LET $restore_phase = IF $manager THEN 'blocked' ELSE (IF $source_phase = 'review' THEN 'review' ELSE 'ready' END) END;
+      LET $restore_phase = IF $source_phase = 'review' THEN 'review' ELSE 'ready' END;
       LET $unlocked = UPDATE ONLY $child.id SET
-        state = $restore_phase, version += 1,
+        state = IF $manager THEN 'blocked' ELSE $restore_phase END, version += 1,
         blocked_to = IF $manager THEN 'gm' ELSE NONE END,
         resume_state = IF $manager THEN $source_phase ELSE NONE END,
         resume_role = IF $manager THEN $child.resume_role ELSE NONE END,
@@ -169,7 +169,7 @@ export const UNLOCK_CHILDREN_SQL = `
         dependencies_before: $child.dependencies ?? [], dependencies_after: $child.dependencies ?? [] };
       LET $sequence = UPDATE ONLY company_meta:outbox_counter SET value += 1 RETURN AFTER;
       CREATE outbox CONTENT { task: $child.id, kind: 'dependency_unlocked', sequence: $sequence.value,
-        payload: { state: $restore_phase, source_phase: $source_phase, restore_phase: $restore_phase,
+        payload: { state: $unlocked.state, source_phase: $source_phase, restore_phase: $restore_phase,
           dependencies: $child.dependencies ?? [], version: $unlocked.version }, at: time::now() };
     };
   };
