@@ -1,3 +1,4 @@
+import {DEFAULT_POLICY} from '../src/model-routing/weights.ts';
 import {afterEach,expect,test} from 'bun:test';
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -101,13 +102,13 @@ test('request refresh is asynchronous, single-flight, interval-controlled and ex
  const f=fixture();const r=new RankingRefresher(f.deps);
  r.trigger(0);r.trigger(0);expect(f.calls).toEqual([]);await r.settled();
  expect(f.calls).toEqual([]);expect(f.factsCalls()).toBe(1);expect(f.applied).toHaveLength(1);
- r.trigger(299999);await r.settled();expect(f.applied).toHaveLength(1);
- r.trigger(300000);await r.settled();expect(f.applied).toHaveLength(2);
+ r.trigger(29999);await r.settled();expect(f.applied).toHaveLength(1);
+ r.trigger(30000);await r.settled();expect(f.applied).toHaveLength(2);
  await saveRankingSettings(f.db as any,{rules:'质量优先',refreshMinutes:2},r);
- expect(await rankingSettings(f.db as any)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2});
+ expect(await rankingSettings(f.db as any)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2,policy:DEFAULT_POLICY});
  r.trigger(300001);await r.settled();expect(f.applied).toHaveLength(3);
- r.trigger(420000);await r.settled();expect(f.applied).toHaveLength(3);
- r.trigger(420001);await r.settled();expect(f.applied).toHaveLength(4);
+ r.trigger(330000);await r.settled();expect(f.applied).toHaveLength(3);
+ r.trigger(330001);await r.settled();expect(f.applied).toHaveLength(4);
 });
 test('saving during a refresh invalidates old rules, stopped refresher cannot publish',async()=>{
  const f=fixture();let release!:()=>void;const wait=new Promise<void>(resolve=>release=resolve);
@@ -214,7 +215,7 @@ test('refresh records immutable rule decisions, requires no Jev client and skips
  const publication=f.writes.find(w=>w?.results);
  expect(Object.keys(publication.results)).toEqual(['sck-haiku']);expect(f.calls).toEqual([]);
  expect(publication.orders['sck-haiku']).toEqual(['p/b']);
- expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v1',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
+ expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v2',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
 });
 
 test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
@@ -318,7 +319,7 @@ test('Jev failure preserves successful scores while independent safety observati
   apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
  r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
  fail=true;bad=true;r.trigger(300000);await r.settled();
- expect(results['sck-haiku'].engine).toBe('quality-pace-v1');expect(members.at(-1)).toBe('p/a');
+ expect(results['sck-haiku'].engine).toBe('quality-pace-v2');expect(members.at(-1)).toBe('p/a');
  let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
  expect(t.scored).toBe(true);expect(t.at).toBe(results['sck-haiku'].at);expect(t.rows.find(r=>r.model==='p/b')?.decision).toBeDefined();
  expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);

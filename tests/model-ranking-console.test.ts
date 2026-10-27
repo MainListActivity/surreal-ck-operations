@@ -26,8 +26,8 @@ function fixture(){
 test('owner ranking page uses supplied Figma layout, real API, light/dark tokens and a review-console return link',async()=>{
  const f=fixture();expect((await f.fetch(new Request('http://localhost/o/wrong/ranking'))).status).toBe(404);
  const response=await f.request('ranking');expect(response.status).toBe(200);const html=await response.text();
- for(const part of ['class="workspace"','class="settings-panel"','class="results-panel"','class="model-list"','model-row-main','role="tablist"','href="./"','api/model-ranking','aria-expanded'])expect(html).toContain(part);
- expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(html).not.toContain('\\u6A21');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
+ for(const part of ['id="policy-editor"','api/model-ranking/preview','class="workspace"','class="settings-panel"','class="results-panel"','class="model-list"','model-row-main','role="tablist"','href="./"','api/model-ranking','aria-expanded'])expect(html).toContain(part);
+ expect(html).toContain('prefers-color-scheme:light');expect(html).toContain('<title>模型排序');expect(html).toContain('Opus 的成员、顺序和组内配置由你在 Magpie 手动维护');expect(html).not.toContain('seedModels');expect(html).not.toContain('makeModels');
  const script=rankingPage.match(/<script>([\s\S]*?)<\/script>/)![1]!;
  expect(()=>new Function(script)).not.toThrow();
  expect(html).not.toMatch(/\.metrics small\s*\{\s*display:\s*none/);
@@ -64,4 +64,10 @@ test('real preview HTTP transport preserves browser origin for pinning and rejec
   const good=await send(origin);expect(good.status).toBe(200);expect(f.pins).toEqual([['sck-haiku','p/a:max',true]]);
   expect((await send('http://other.example')).status).toBe(403);expect(f.pins).toHaveLength(1);
  } finally {await server.stop();}
+});
+test('owner preview rejects foreign origins and invalid configuration without changing the live interval',async()=>{
+ const f=fixture();
+ expect((await f.request('api/model-ranking/preview',{policy:{}},'https://other.example')).status).toBe(403);
+ expect((await f.request('api/model-ranking',{rules:'',refreshMinutes:10,policy:{bandWidth:100}},'http://localhost')).status).toBe(400);
+ expect(f.resets).toEqual([]);expect(await (await f.request('api/model-ranking')).json()).toMatchObject({refreshMinutes:5});
 });

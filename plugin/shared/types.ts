@@ -295,7 +295,7 @@ export interface ModelRankingAttempt {
 export interface ModelRankingTable {
   group: string; at?: string; rules?: string; scored: boolean;
   rows: Array<{
-    model: string; pinned?: boolean; tailReason?:string; decision?:{band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
+    model: string; previousRank?:number; price?:{free:boolean;input?:number|null;output?:number|null;cacheHit?:number|null}; pinned?: boolean; tailReason?:string; decision?:{score?:number;coldStart?:boolean;costClass?:string;contributions?:Record<string,{value?:number;weight:number;points:number}>;band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
     tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
@@ -304,3 +304,5 @@ export interface ModelRankingTable {
     health?: { excluded: boolean; reason?: "unavailable" | "consecutive_errors" | "error_rate"; attempts: number; errors: number; consecutiveErrors: number; lastStatus?: number; lastAttemptAt?: string };
   }>;
 }
+
+export interface ModelRankingPolicy {bandWidth:number;weights:Record<'pace'|'latency'|'intelligence'|'speed'|'performance'|'price',number>;billingOverrides:Record<string,'free'|'included'|'unknown'|'paid'>}

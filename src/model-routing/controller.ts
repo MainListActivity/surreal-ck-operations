@@ -466,7 +466,7 @@ export class ModelRoutingController {
       };
       const baseOrder = tier === "fable" && !initializing ? candidates.map(m => byRank.find(r => r.id === m.id)!) : byRank;
       const ordered = baseOrder.map((m, i) => ({ m, i })).sort((a, b) => at(a.m.id) - at(b.m.id) || a.i - b.i).map((x) => x.m);
-      const members = tier==='fable'||this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine==='quality-pace-v1'
+      const members = tier==='fable'||this.ruleOrders.has(`sck-${tier}`)||ranking?.results?.[`sck-${tier}`]?.engine?.startsWith('quality-pace-')
         ?ordered.map(m=>m.id):pinnedOrder(ordered.map(m=>m.id),ranking?.pins?.[`sck-${tier}`]);
       const positions = new Map(members.map((id, i) => [id, i]));
       ordered.sort((a,b) => positions.get(a.id)! - positions.get(b.id)!);

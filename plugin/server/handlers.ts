@@ -185,6 +185,7 @@ export function registerHandlers(server: PluginServerContext): void {
     await ctx.modelRanking.setPin(input.group,input.model,input.pinned);
     return {ok:true};
   });
+  ownerHandle(rpc.previewModelRanking,async(input:RpcInput<typeof rpc.previewModelRanking>)=>(await company()).modelRanking.preview(input.policy,input.refresh));
   ownerHandle(rpc.modelRanking, async () => {
     const ctx = await company();
     const { modelRankingView } = await import("./model-ranking.ts");

@@ -20,10 +20,11 @@ test('AA bands are anchored partitions, not a non-transitive pairwise tolerance'
  for(const list of [facts,[...facts].reverse(),[facts[1]!,facts[2]!,facts[0]!]])expect(order(list)).toEqual(['b','a','c']);
  expect(ruleOrder(facts,[],now).map(r=>[r.facts.id,r.decision.band])).toEqual([['b',0],['a',0],['c',1]]);
 });
-test('native subscription identity takes priority over metered models; zero price is not subscription evidence',()=>{
- const sub=fact('sub',50,1000),api=fact('api',70,100),unknown=fact('unknown',90,50);
- api.accounts=[{account:'api',kind:'api',remainingPct:100}];api.price={free:true};unknown.accounts=[];
- expect(order([api,unknown,sub])).toEqual(['sub','unknown','api']);
+test('ability precedes billing; within the same band free beats subscription, then unknown and metered',()=>{
+ const sub=fact('sub',60,1000),api=fact('api',60,100),unknown=fact('unknown',60,50);
+ api.accounts=[{account:'api',kind:'api',remainingPct:100}];api.price={free:true};unknown.accounts=[];unknown.usage={...sub.usage!};
+ expect(order([api,unknown,sub])).toEqual(['api','sub','unknown']);
+ api.price.free=false;expect(order([api,unknown,sub])).toEqual(['sub','unknown','api']);
  expect(accountFacts(unknown,now)).toMatchObject({billing:'unknown',quota:'unknown'});
 });
 test('a model with any unmeasured account is not reported as definitively exhausted; best available account wins',()=>{
@@ -38,7 +39,7 @@ test('latest sufficient EWMA supersedes a huge historical average; stale trends 
  f.trends.ttftMs!.lastSampleAt=new Date(now-3600000).toISOString();expect(recentMetric(f,'ttftMs',now)).toEqual({value:4000,source:'historical-average'});
 });
 test('unknown TTFT is never encoded as zero and loses to measured latency within the same capability band',()=>{
- const rows=ruleOrder([fact('unknown',60),fact('measured',60,19000)],[],now);
+ const rows=ruleOrder([{...fact('unknown',60),health:{source:'magpie-routing',attempts:1,errors:0,consecutiveErrors:0,excluded:false}},fact('measured',60,19000)],[],now);
  expect(rows.map(r=>r.facts.id)).toEqual(['measured','unknown']);expect(rows[1]!.decision).toMatchObject({latencySource:'unknown'});expect(rows[1]!.decision.ttftMs).toBeUndefined();
 });
 test('error gates and exhausted budgets cannot be overridden by pinning',()=>{
@@ -55,7 +56,7 @@ test('same capability/latency/decode: final accepted task performance breaks tie
 });
 test('rule snapshots expose actual latency and reasons, never a fabricated Jev score',()=>{
  const rows=ruleOrder([fact('p/a',50,21000)],[],now);
- const table=rankingTables({'sck-haiku':['p/a']},{'sck-haiku':{engine:'quality-pace-v1',tier:'haiku',at:new Date(now).toISOString(),model:'quality-pace-v1',rules:'fixed',answers:{},rows:rows.map(r=>({...r,score:0}))}})[0]!;
+ const table=rankingTables({'sck-haiku':['p/a']},{'sck-haiku':{engine:'quality-pace-v2',tier:'haiku',at:new Date(now).toISOString(),model:'quality-pace-v1',rules:'fixed',answers:{},rows:rows.map(r=>({...r,score:0}))}})[0]!;
  expect(table.rows[0]!.decision?.ttftMs).toBe(21000);expect(table.rows[0]!.tailReason).toContain('20秒');expect(table.rows[0]!.jevScore).toBeUndefined();
 });
 
