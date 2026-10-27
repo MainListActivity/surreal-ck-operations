@@ -25,3 +25,12 @@
 实读 active、插件版本及 vendor 对齐；ops_info adapter 应为 sensenova-token-plan/2。由 ops_* 受控真实账户采样，脱敏文档/回执以 deliverable_publish 发布。核验 FREE 的 poolUsage 来源和 API key/console 账户交叉绑定、官方正面出处、配额硬顶、UTF-8 原文 hash、≤24h窗口。用自身租约 prepare / 必要 register-disabled 验 v2接受、v1/非FREE拒绝；真实身份资料缺口需列明，synthetic不能补位。记录固定 release、插件版本、真实回滚基线和镜像空 diff，发布链接交原 a75520d3。
 
 公司 QA 可按“签发端可产v2且失败闭锁”完成，不等待产品 PR175 上线。真实 consumer 投递、新预算和 UI 验收交后续产品链；不宣称跨端v2完整链路已通，不恢复9a90fe76/022a8ebc指标。
+
+## v3 采样诊断与原始精度（15d775ea 修复，不改 v2/v3 形状）
+
+本次只收紧公司端采样与校验，v2 schema/marker 与 v3 文档形状均不变，产品 consumer 不变。
+
+- **receipt-only 新字段**：`derivations.clockDomains`（planPage/console/api 的 Date、偏差、Age/缓存、分类）、`derivations.planPageConditional`（条件 GET 的 304/200、ETag、body 身份）、`derivations.poolUsageSnapshot`（同一快照 Date/requestId/raw hash）、`derivations.expiryDerivation`（可复算的相对 reset 推导）、`pools[].raw*`（`{type,value}` 原始值）。这些都不写入 v3 文档，`documentHash`/产品 schema 不受影响。
+- **官方 2026-10-27 console 公告**：5h 上限 60k→120k、7d 600k→1.2M、统一重置。公告只作为窗口上限与重置的事实来源，**不是** `used`/`remaining` 的取整规则；不得据此把 60,000 points / 18,000s 准用上限抬高，也不得据此生成候选。
+- **已观测仍 blocked**：官方页与 console 的 Date 比本机/供应商 API 快约 779 s（source-clock-skew），且真实页 `s-maxage` 无 Age（cacheAgeUnknown）；default 7d `used+remaining = limit − 1`。修复只保证分类/采集正确、原始值可审计；在上述来源事实未恢复前，真实采样继续 blocked，不保证自动恢复。
+- **不使用**：供应商 API 域 Date 替代 web/console 时钟、放宽 ±5 分钟、对差 1 容差、改宿主机时钟、以 304/同 ETag 声称内容新鲜。`usedSource=reported` 现在是 eligibility 硬门（形状不变），派生 `used` 一律不可用。

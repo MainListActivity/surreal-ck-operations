@@ -48,8 +48,10 @@ interface FaultRule { match: RequestMatcher; how: Fault; times: number; afterEff
 
 export class FakeWorld {
   clock = Date.UTC(2026, 0, 1);
+  /** Host wall-clock shift for host-clock-skew fixtures; server Dates stay at `clock`. */
+  hostSkewMs = 0;
   canCreate = true;
-  readonly now = () => this.clock;
+  readonly now = () => this.clock + this.hostSkewMs;
   readonly sqlite = new Database(':memory:');
   readonly sql: Array<{ sql: string; params: unknown[] }> = [];
   readonly requests: Array<{ method: string; url: string }> = [];
@@ -125,7 +127,24 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     planType: 'TOKEN_PLAN_PLAN_TYPE_FREE',
     /** v3 source-freshness fixtures: drop the HTTP Date / ETag header to exercise the strict gates. */
     planDate: true,
+    planDateInvalid: false,
     planEtag: true,
+    /** Shift the plan-page Date relative to the local wall clock (source-clock-skew fixtures). */
+    planDateSkewMs: 0,
+    /** Emit an Age header; null means no Age (paired with planCacheControl for cacheAgeUnknown). */
+    planAgeSeconds: null as number | null,
+    planCacheControl: null as string | null,
+    /** Conditional re-validation answer: 200 with the same ETag, a 304, a different 200, or none. */
+    planConditional: '200-same' as '200-same' | '304' | '200-diff' | 'none',
+    planRedirectLocation: 'https://www.sensenova.cn/token-plan?redirected=1',
+    /** Console pool-usage response time metadata (reset_at is judged relative to this Date). */
+    poolDate: true,
+    poolDateSkewMs: 0,
+    poolAgeSeconds: null as number | null,
+    poolCacheControl: null as string | null,
+    poolRequestId: 'req-fixture-0001',
+    /** Provider API domain Date shift; the API clock is the host-health reference. */
+    modelsDateSkewMs: 0,
     // when true, one fixed billing path answers 200 instead of the absent-surface 404
     billingPathLive: false,
     pools: [
@@ -543,9 +562,10 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (method !== 'GET') return json(405, { code: 12, message: 'Method Not Allowed' });
     if (url.host === 'token.sensenova.cn') {
       if (url.pathname !== '/v1/models') return json(404, { error: { code: 5, message: 'NOT_FOUND' } });
-      if (token !== s.apiKey) return json(401, { error: { code: 16, message: 'Forbidden' } });
-      if (s.modelsStatus !== 200) return new Response('', { status: s.modelsStatus });
-      return json(200, { object: 'list', data: [{ id: 'sensenova-6.8-flash-lite', object: 'model' }, { id: 'deepseek-v4-flash', object: 'model' }] });
+      const headers = { date: new Date(this.clock + s.modelsDateSkewMs).toUTCString() };
+      if (token !== s.apiKey) return new Response(JSON.stringify({ error: { code: 16, message: 'Forbidden' } }), { status: 401, headers: { 'content-type': 'application/json', ...headers } });
+      if (s.modelsStatus !== 200) return new Response('', { status: s.modelsStatus, headers });
+      return new Response(JSON.stringify({ object: 'list', data: [{ id: 'sensenova-6.8-flash-lite', object: 'model' }, { id: 'deepseek-v4-flash', object: 'model' }] }), { status: 200, headers: { 'content-type': 'application/json', ...headers } });
     }
     if (url.host === 'platform.sensenova.cn') {
       const unauth = (reason: string) => json(401, { code: 16, details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', domain: 'global', reason }], message: 'Unauthenticated' });
@@ -553,7 +573,14 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
         if (!token) return unauth('Authorization header is required');
         if (token !== s.consoleToken && token !== s.issuedToken) return unauth("Authentication type 'apikey' is not enabled");
         if (s.poolStatus !== 200) return new Response('', { status: s.poolStatus });
-        return json(200, { plan: { id: 'free', name: 'Free Plan', type: s.planType }, pools: s.pools });
+        const headers: Record<string, string> = {
+          'content-type': 'application/json',
+          ...(s.poolDate ? { date: new Date(this.clock + s.poolDateSkewMs).toUTCString() } : {}),
+          ...(s.poolAgeSeconds === null ? {} : { age: String(s.poolAgeSeconds) }),
+          ...(s.poolCacheControl === null ? {} : { 'cache-control': s.poolCacheControl }),
+          ...(s.poolRequestId === null ? {} : { 'x-request-id': s.poolRequestId }),
+        };
+        return new Response(JSON.stringify({ plan: { id: 'free', name: 'Free Plan', type: s.planType }, pools: s.pools }), { status: 200, headers });
       }
       if (url.pathname === '/lite/console/v1/billing' && s.billingPathLive) {
         if (!token || (token !== s.consoleToken && token !== s.issuedToken)) return unauth('Authorization header is required');
@@ -570,12 +597,27 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     }
     if (url.host === 'www.sensenova.cn') {
       if (url.pathname !== '/token-plan') return new Response('404', { status: 404 });
-      if (s.planStatus !== 200) return new Response('', { status: s.planStatus });
-      return new Response(s.planHtml, { status: 200, headers: {
+      if (s.planStatus !== 200) {
+        const headers: Record<string, string> = {
+          ...(s.planStatus >= 300 && s.planStatus <= 399 ? { location: s.planRedirectLocation } : {}),
+          ...(s.planDate ? { date: new Date(this.clock + s.planDateSkewMs).toUTCString() } : {}),
+        };
+        return new Response('', { status: s.planStatus, headers });
+      }
+      const headers: Record<string, string> = {
         'content-type': 'text/html; charset=utf-8',
-        ...(s.planDate ? { date: new Date(this.clock).toUTCString() } : {}),
+        ...(s.planDate ? { date: s.planDateInvalid ? 'not-a-date' : new Date(this.clock + s.planDateSkewMs).toUTCString() } : {}),
         ...(s.planEtag ? { etag: '"plan-fixture-v3"' } : {}),
-      } });
+        ...(s.planAgeSeconds === null ? {} : { age: String(s.planAgeSeconds) }),
+        ...(s.planCacheControl === null ? {} : { 'cache-control': s.planCacheControl }),
+      };
+      const ifNoneMatch = new Headers(init?.headers).get('if-none-match');
+      if (ifNoneMatch !== null && s.planConditional !== 'none') {
+        if (s.planConditional === '304') return new Response('', { status: 304, headers });
+        if (s.planConditional === '200-diff')
+          return new Response('<html><body>different copy</body></html>', { status: 200, headers: { ...headers, etag: '"plan-fixture-other"' } });
+      }
+      return new Response(s.planHtml, { status: 200, headers });
     }
     return new Response('unreachable host', { status: 502 });
   }

@@ -402,7 +402,7 @@ function tokenPlanV3(nowMs = Date.now()) {
       { poolType: 'default', name: '通用', accountBound: true as const,
         window5h: { limit: 120_000, used: 1_500, remaining: 118_500, resetAt: new Date(nowMs + 3 * 3_600_000).toISOString() },
         window7d: { limit: 1_200_000, used: 10_000, remaining: 1_190_000, resetAt: new Date(nowMs + 5 * 86_400_000).toISOString() },
-        usedSource5h: 'reported' as const, usedSource7d: 'derived' as const },
+        usedSource5h: 'reported' as const, usedSource7d: 'reported' as const },
     ],
     autoTopupDisabled: true as const, promotional: true as const, revalidateBeforeUse: true as const,
     terminationRisk: 'unknown-promotional-end' as const, promotionalEndsAt: null,
@@ -449,6 +449,15 @@ test('v3 promotional/account-bound evidence parses and its eligibility gate re-d
   expect(tokenPlanV3Eligible({ ...doc, expiresAt: new Date(now + 5 * 3_600_000).toISOString() } as never, now)).toBe(false);
   expect(tokenPlanV3Eligible({ ...doc, quotaRemaining: 10 } as never, now)).toBe(false);
   expect(tokenPlanV3Eligible({ ...doc, serviceApproved: false } as never, now)).toBe(false);
+
+  // C.4: a derived used (limit − remaining) is circular and can never satisfy eligibility.
+  const derivedUsed = {
+    ...doc,
+    pools: doc.pools.map(pool => ({ ...pool, usedSource7d: 'derived' as const })),
+  };
+  expect(tokenPlanEvidenceV3Schema.safeParse(derivedUsed).success).toBe(true);
+  expect(tokenPlanV3Eligible(derivedUsed as never, now)).toBe(false);
+  expect(evidenceChecks(derivedUsed as never, manifest, now).serviceEvidenceEligible).toBe(false);
 
   // R1: the usable quota is bound to the pool itself, not to the self-reported quota fields.
   const drainedPools = doc.pools.map(pool => ({
