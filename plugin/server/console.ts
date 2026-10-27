@@ -8,7 +8,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import { relayWebTheme } from "../shared/relay-design.ts";
+import { relayShellCss, relayIcon } from "../shared/relay-shell.ts";
 
 type CompanyApi = {
   upgrades?: import("./vendor/src/company-upgrades.ts").CompanyUpgrades;
@@ -252,188 +252,210 @@ const PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>公司审核台</title>
 <style>
-${relayWebTheme}*{box-sizing:border-box}
-body{margin:0;font:15px/1.55 -apple-system,system-ui,sans-serif;background:var(--relay-bg);color:var(--relay-text)}
-header{position:sticky;top:0;background:var(--relay-panel);border-bottom:1px solid var(--relay-border);padding:12px 16px;display:flex;gap:12px;align-items:center;z-index:9}
-header b{font-size:16px}header span{color:var(--relay-muted);font-size:12px}
-nav{display:flex;gap:4px;padding:8px 12px;background:var(--relay-input);border-bottom:1px solid var(--relay-border);position:sticky;top:49px;z-index:8;overflow-x:auto}
-nav button{background:none;border:1px solid var(--relay-border);border-radius:8px;color:var(--relay-muted);padding:6px 12px;font-size:13px;white-space:nowrap}
-nav button.on{color:#fff;border-color:var(--relay-accent);background:var(--relay-control)}
-main{padding:12px;max-width:760px;margin:0 auto}
-.card{background:var(--relay-panel);border:1px solid var(--relay-border);border-radius:12px;padding:14px;margin-bottom:12px}
-.card h3{margin:0 0 4px;font-size:15px}
-.meta{color:var(--relay-muted);font-size:12px;margin-bottom:8px;word-break:break-all}
-.body{white-space:pre-wrap;word-break:break-word;font-size:14px;color:var(--relay-text);max-height:300px;overflow:auto;background:var(--relay-input);border-radius:8px;padding:10px;margin:8px 0}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-button.act{border:none;border-radius:8px;padding:9px 16px;font-size:14px;font-weight:600}
-.ok{background:#2f7d4f;color:#fff}.no{background:#8a3a3a;color:#fff}.mid{background:var(--relay-accent);color:#fff}
-button:disabled{opacity:.5}
-textarea{width:100%;background:var(--relay-input);border:1px solid var(--relay-border);border-radius:8px;color:var(--relay-text);padding:8px;font:14px/1.5 inherit;min-height:60px;margin-top:8px}
-a{color:var(--relay-score);word-break:break-all}
-.att{display:block;padding:8px 10px;background:var(--relay-input);border-radius:8px;margin-top:6px;font-size:13px}
-.empty{color:var(--relay-faint);text-align:center;padding:30px 0}
-.notice{display:flex;justify-content:space-between;gap:10px;align-items:center}
-.notice button{background:var(--relay-border);color:var(--relay-text);border:none;border-radius:8px;padding:6px 12px;font-size:13px}
-.doc{cursor:pointer;padding:9px 10px;background:var(--relay-input);border-radius:8px;margin-top:6px;font-size:14px}
-.trow{padding:10px 0;border-top:1px solid var(--relay-border)}
-.trow:first-child{border-top:none}
-.trow .row{margin-top:6px}
-.trow .act{padding:6px 12px;font-size:13px}
-.docbody{white-space:pre-wrap;font:13px/1.6 ui-monospace,Menlo,monospace;background:var(--relay-input);border-radius:8px;padding:12px;margin-top:8px;max-height:60vh;overflow:auto}
-.tier{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--relay-border);color:var(--relay-muted)}
-.st{font-size:11px;color:var(--relay-muted)}
-.glist .card{cursor:default}
-.err{color:var(--relay-danger);font-size:13px;margin-top:8px;white-space:pre-wrap}
-.okm{color:var(--relay-success);font-size:13px;margin-top:8px}
-h4.sec{color:var(--relay-muted);font-size:12px;letter-spacing:.08em;margin:20px 0 8px}
-
-header{height:68px;padding:0 4vw;background:var(--relay-bg)}header .brand-mark{width:30px;height:30px;display:grid;place-items:center;border-radius:9px;background:var(--relay-accent);color:white;font-size:14px;font-weight:700}
-nav{top:68px;background:var(--relay-bg);padding:10px 4vw;gap:7px}nav button{border-color:transparent;border-radius:9px}nav button.on{background:var(--relay-tab);color:var(--relay-score);border-color:var(--relay-border)}
-main{max-width:1240px;width:92vw;padding:30px 0 60px}.card{border-radius:16px;padding:22px;box-shadow:var(--relay-shadow)}textarea{border-radius:13px;padding:14px}.refresh-button{margin-left:auto;background:var(--relay-control);color:var(--relay-text);border:1px solid var(--relay-border);border-radius:9px;padding:7px 12px}
-@media(max-width:600px){header{height:60px;padding:0 18px}nav{top:60px;padding:8px 12px}main{width:auto;padding:20px 12px 40px}.card{padding:16px}}
+${relayShellCss}
 </style></head><body>
-<header><span class="brand-mark">M</span><b>公司审核台</b><span id="stat"></span><button onclick="load()" class="refresh-button">刷新</button></header>
-<nav>
-<button data-t="todo" class="on" onclick="tab('todo')">待办</button>
-<button data-t="goals" onclick="tab('goals')">目标</button>
-<button data-t="docs" onclick="tab('docs')">手册</button>
-<button onclick="location.href='ranking'">模型排序</button>
-<button data-t="gm" onclick="tab('gm')">给经理留言</button>
+<div class="shell">
+<aside class="sidebar">
+<div class="brand"><span class="brand-mark"><i></i><i></i></span><span><strong>Relay</strong><small>Operations</small></span></div>
+<p class="nav-label">管理工作区</p>
+<nav class="main-nav">
+<button data-t="todo" class="on" onclick="tab('todo')">${relayIcon("inbox")}<span>待办</span><b id="nav-count" hidden></b></button>
+<button data-t="goals" onclick="tab('goals')">${relayIcon("target")}<span>目标</span></button>
+<button data-t="docs" onclick="tab('docs')">${relayIcon("book")}<span>手册</span></button>
+<button onclick="location.href='ranking'">${relayIcon("layers")}<span>模型排序</span></button>
+<button data-t="gm" onclick="tab('gm')">${relayIcon("send")}<span>给经理留言</span></button>
 </nav>
-<main id="m"></main>
+<div class="sidebar-footer"><div class="operator"><span class="avatar">ML</span><span><strong>老板</strong><small>公司审核台</small></span></div></div>
+</aside>
+<div class="main-area">
+<header class="topbar">
+<div class="breadcrumb"><span>公司审核台</span><b>/</b><strong id="crumb">待办</strong></div>
+<div class="top-actions"><span class="status" id="stat">加载中…</span><button class="icon-button" id="theme-btn" onclick="toggleTheme()" aria-label="切换主题"></button><button class="refresh" onclick="load()">${relayIcon("refresh")}<span>刷新</span></button></div>
+</header>
+<main class="content" id="m"></main>
+</div>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
+const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const linkify=s=>esc(s).replace(/https?:\\/\\/[^\\s"'<>）)】\\]，。；、]+/g,u=>'<a href="'+u+'" target="_blank" rel="noopener">'+u+'</a>');
 const KIND={goal:'范围',task:'任务',gate:'关口',release:'上线申请',deploy:'部署实测'};
+const CRUMB={todo:'待办',goals:'目标',docs:'手册',gm:'给经理留言'};
+const STATE_TONE={doing:['进行中','blue'],ready:['待领取',''],blocked:['被阻塞','danger'],review:['待验收','violet'],done:['已完成','success'],void:['已作废','']};
+const ICONS={check:'<path d="M5 12l4 4L19 6"/>',x:'<path d="M6 6l12 12M18 6L6 18"/>',send:'<path d="M21 3L9 15M21 3l-7 18-5-6-6-5 18-7z"/>',file:'<path d="M6 2h8l4 4v16H6z"/><path d="M14 2v5h5M9 12h6M9 16h6"/>',activity:'<path d="M3 12h4l2-7 4 14 2-7h6"/>',moon:'<path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/>',sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>'};
+const icon=n=>'<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">'+(ICONS[n]||'')+'</svg>';
+const badge=(text,tone)=>'<span class="status '+(tone||'')+'"><i></i>'+esc(text)+'</span>';
+function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(function(){el.classList.remove('show')},2200)}
+const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+function prefTheme(){try{return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}catch(e){return 'light'}}
+function renderThemeBtn(){$('theme-btn').innerHTML=icon((store.get('relay-theme')||prefTheme())==='light'?'moon':'sun')}
+function toggleTheme(){const next=(store.get('relay-theme')||prefTheme())==='light'?'dark':'light';store.set('relay-theme',next);document.documentElement.dataset.theme=next;renderThemeBtn()}
+const savedTheme=store.get('relay-theme');if(savedTheme)document.documentElement.dataset.theme=savedTheme;
 const api=async(p,o)=>{const r=await fetch('api/'+p,o?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}:undefined);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j};
 let INBOX=null,BRIEF=null,DOCS=null,T='todo';
-function tab(t){T=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));render()}
+function tab(t){T=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));$('crumb').textContent=CRUMB[t]||t;render()}
 async function load(){
-  document.getElementById('stat').textContent='加载中…';
+  $('stat').textContent='加载中…';
   // brief is only rendered on the goals tab; polling it every 20s on todo used to
   // run the heaviest aggregate query in a loop and starve the shared DB channel.
   try{
     INBOX=await api('inbox');
     if(T!=='todo'||!BRIEF)BRIEF=await api('brief');
-    const n=(INBOX.gates?.length||0)+(INBOX.questions?.length||0);
-    document.getElementById('stat').textContent=n?('待办 '+n):'无待办';
-    render();}catch(e){document.getElementById('stat').textContent='加载失败';}
+    const g=(INBOX.gates||[]).filter(x=>!x.task.companyUpgrade).length,q=(INBOX.questions||[]).filter(x=>!x.task.companyUpgrade).length,n=g+q;
+    const navBadge=$('nav-count');navBadge.textContent=n;navBadge.hidden=!n;
+    const stat=$('stat');stat.textContent=n?('待办 '+n):'无待办';stat.className='status'+(n?' violet':'');
+    render();}catch(e){$('stat').textContent='加载失败';}
 }
 async function atts(el,tid){
   try{const r=await api('attachments?taskId='+encodeURIComponent(tid));
-    el.innerHTML=(r.attachments||[]).map(a=>'<a class="att" target="_blank" href="'+a.url+'">'+esc(a.name)+' · '+((a.sizeBytes/1024).toFixed(1))+'KB · '+esc(a.kind)+'</a>').join('')||'';
+    el.innerHTML=(r.attachments||[]).map(a=>'<a class="attachment" target="_blank" href="'+a.url+'">'+icon('file')+'<span><strong>'+esc(a.name)+'</strong><small>'+((a.sizeBytes/1024).toFixed(1))+'KB · '+esc(a.kind)+'</small></span></a>').join('')||'';
   }catch(e){}
 }
 const newKey=()=>'k'+Date.now().toString(36)+Math.random().toString(36).slice(2,14);
 async function decide(tid,dec){
   try{
-    const noteEl=document.getElementById('n-'+tid),note=noteEl?noteEl.value:'';
+    const noteEl=$('n-'+tid),note=noteEl?noteEl.value:'';
     if(dec!=='approve'&&note.trim().length<2){alert('退回/回复需要写明说明');return}
-    await api('decide',{taskId:tid,decision:dec,note,key:newKey()});await load();
+    await api('decide',{taskId:tid,decision:dec,note,key:newKey()});
+    toast(dec==='approve'?'已批准，任务继续推进':dec==='reject'?'已退回并通知提交人':'回复已发送');await load();
   }catch(e){alert(e.message)}
 }
 async function upgrade(tid,version,digest){
- const el=document.getElementById('upgrade-'+tid);if(el){el.disabled=true;el.textContent='正在启动升级…'}
+ const el=$('upgrade-'+tid);if(el){el.disabled=true;el.textContent='正在启动升级…'}
  try{await api('upgrade',{taskId:tid,taskVersion:version,digest});await load()}catch(e){alert(e.message);if(el){el.disabled=false;el.textContent='重新升级'}}
 }
 function upgradeCard(x){
  const p=x.plan,busy=['queued','preparing','checking','installing','verifying'].includes(x.status),done=x.status==='succeeded';
  const list=a=>'<ul>'+a.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul>';
- return '<div class="card"><div class="meta">公司系统升级 · '+esc(x.phase)+'</div><h3>v'+esc(p.version)+' · '+esc(p.title)+'</h3>'+
- '<h4>上线内容</h4>'+list(p.changes)+'<h4>影响范围</h4>'+list(p.impact)+'<h4>数据变化</h4><p>'+esc(p.migration)+'</p><h4>回退方式</h4><p>'+esc(p.rollback)+'</p>'+
- '<details><summary>提交详情</summary><code>'+esc(p.sha)+'</code></details>'+(x.error?'<p role="alert">'+esc(x.error)+'</p>':'')+
- (!done?'<button id="upgrade-'+esc(x.taskId)+'" class="act ok" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button>':'<p class="okm">升级完成，已自动回复通过</p>')+'</div>';
+ return '<article class="decision-card upgrade-card"><div class="card-top"><span class="type-label">公司系统升级 · '+esc(x.phase)+'</span>'+badge(done?'已完成':busy?'进行中':'待执行',done?'success':busy?'blue':'warning')+'</div>'
+ +'<h3>v'+esc(p.version)+' · '+esc(p.title)+'</h3>'
+ +'<div class="upgrade-cols"><div><h4>上线内容</h4>'+list(p.changes)+'<h4>影响范围</h4>'+list(p.impact)+'</div>'
+ +'<div><h4>数据变化</h4><p class="upgrade-p">'+esc(p.migration)+'</p><h4>回退方式</h4><p class="upgrade-p">'+esc(p.rollback)+'</p></div></div>'
+ +'<details class="sha"><summary>提交详情</summary><code>'+esc(p.sha)+'</code></details>'+(x.error?'<p class="err" role="alert">'+esc(x.error)+'</p>':'')
+ +(done?'<p class="okm">升级完成，已自动回复通过</p>':'<div class="decision-actions"><button id="upgrade-'+esc(x.taskId)+'" class="approve" '+(busy?'disabled':'')+' onclick="upgrade(\\''+x.taskId+'\\','+x.taskVersion+',\\''+p.digest+'\\')">'+(busy?esc(x.phase):'升级至 v'+esc(p.version))+'</button></div>')+'</article>';
 }
 async function notice(key){try{await api('notice',{key});await load()}catch(e){alert(e.message)}}
 async function voidTask(tid,gid){
   const note=prompt('作废原因（必填，会进任务审计）')||'';
   if(note.trim().length<2)return;
-  try{await api('void',{taskId:tid,note,key:newKey()});if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+  try{await api('void',{taskId:tid,note,key:newKey()});toast('任务已作废');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
 }
 async function revokeTask(tid,gid){
   const note=prompt('终止原因（可留空），只撤当前在途执行，任务回 ready 等下一位员工','');
   if(note===null)return;
-  try{const r=await api('revoke',{taskId:tid,note});alert(r.ok?('已撤销 '+(r.employee||'')+' 的租约'):'该任务没有在途租约');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+  try{const r=await api('revoke',{taskId:tid,note});toast(r.ok?('已撤销 '+(r.employee||'')+' 的租约'):'该任务没有在途租约');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
 }
 async function unlockTask(tid,gid){
-  try{const r=await api('unlock',{taskId:tid});alert(r.unlocked&&r.unlocked.length?('已解锁：'+r.unlocked.join('、')):'没有需要解锁的任务');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
+  try{const r=await api('unlock',{taskId:tid});toast(r.unlocked&&r.unlocked.length?('已解锁：'+r.unlocked.join('、')):'没有需要解锁的任务');if(gid)reloadGoalTasks(gid);else await load()}catch(e){alert(e.message)}
 }
 async function cancelGoal(gid){
   const note=prompt('取消目标原因（必填），会作废其全部未完成任务并关闭目标')||'';
   if(note.trim().length<2)return;
   if(!confirm('确认取消这个目标？未完成任务将全部作废。'))return;
-  try{const r=await api('cancel-goal',{goalId:gid,note,key:newKey()});alert('已作废 '+r.retired+' 个任务'+(r.remaining?('；仍有 '+r.remaining+' 个未能作废，目标保持原状'):'，目标已关闭'));await load()}catch(e){alert(e.message)}
+  try{const r=await api('cancel-goal',{goalId:gid,note,key:newKey()});toast('已作废 '+r.retired+' 个任务'+(r.remaining?('；仍有 '+r.remaining+' 个未能作废'):''));await load()}catch(e){alert(e.message)}
 }
 const TERMINAL=['done','void'];
+function stateBadge(s){const d=STATE_TONE[s]||[s,''];return badge(d[0],d[1])}
 function taskActions(t,gid){
   let h='';
-  if(t.state==='doing'&&t.currentEmployee)h+='<button class="act mid" onclick="revokeTask(\\''+t.id+'\\',\\''+gid+'\\')">终止在途</button>';
-  if(t.state==='blocked')h+='<button class="act mid" onclick="unlockTask(\\''+t.id+'\\',\\''+gid+'\\')">解锁</button>';
-  if(!TERMINAL.includes(t.state))h+='<button class="act no" onclick="voidTask(\\''+t.id+'\\',\\''+gid+'\\')">作废</button>';
+  if(t.state==='doing'&&t.currentEmployee)h+='<button class="mid" onclick="revokeTask(\\''+t.id+'\\',\\''+gid+'\\')">终止在途</button>';
+  if(t.state==='blocked')h+='<button class="mid" onclick="unlockTask(\\''+t.id+'\\',\\''+gid+'\\')">解锁</button>';
+  if(!TERMINAL.includes(t.state))h+='<button class="no" onclick="voidTask(\\''+t.id+'\\',\\''+gid+'\\')">作废</button>';
   return h;
 }
 async function reloadGoalTasks(gid){
-  const d=document.getElementById('gt-'+gid)?.querySelector('.docbody');if(!d)return;
+  const d=document.querySelector('#gt-'+CSS.escape(gid)+' .task-list');if(!d)return;
   try{const r=await api('tasks?goalId='+encodeURIComponent(gid));
-    d.innerHTML=(r.tasks||[]).map(t=>'<div class="trow"><div class="meta">['+esc(t.state)+'] '+esc(t.executorRole)+'→'+esc(t.reviewerRole)+(t.currentEmployee?' · '+esc(t.currentEmployee):'')+'</div><div>'+esc(t.title)+'</div><div class="row">'+taskActions(t,gid)+'</div></div>').join('')||'（无任务）';
+    d.innerHTML=(r.tasks||[]).map(t=>'<div class="task-row"><strong>'+esc(t.title)+'</strong><span class="task-people">'+esc(t.executorRole)+' → '+esc(t.reviewerRole)+(t.currentEmployee?' · '+esc(t.currentEmployee):'')+'</span>'+stateBadge(t.state)+'<div class="task-acts">'+taskActions(t,gid)+'</div></div>').join('')||'<div class="task-row"><strong>（无任务）</strong></div>';
   }catch(e){d.textContent=e.message}
 }
 async function instruct(){
-  const t=document.getElementById('gm-text');if(!t.value.trim())return;
-  try{await api('instruct',{text:t.value,key:newKey()});t.value='';document.getElementById('gm-ok').textContent='已下达，经理稍后处理';await load()}catch(e){alert(e.message)}
+  const t=$('gm-text');if(!t.value.trim())return;
+  try{await api('instruct',{text:t.value,key:newKey()});t.value='';$('gm-ok').textContent='已下达，经理稍后处理';toast('已下达给经理');await load()}catch(e){alert(e.message)}
 }
 async function openDoc(name,el){
-  if(el.dataset.open){el.dataset.open='';el.nextSibling.remove();return}
-  el.dataset.open='1';const d=document.createElement('div');d.className='docbody';d.textContent='加载中…';el.after(d);
-  try{const r=await api('doc?name='+encodeURIComponent(name));d.textContent=r.text}catch(e){d.textContent=e.message}
+  document.querySelectorAll('.docs-nav button').forEach(b=>b.classList.toggle('active',b===el));
+  const view=$('doc-view');
+  const slash=name.lastIndexOf('/'),base=name.slice(slash+1);
+  view.innerHTML='<div class="doc-meta"><span class="doc-icon">'+icon('file')+'</span><div><p>'+esc(name)+'</p><h2>'+esc(base)+'</h2></div></div><div class="doc-info"><span>岗位手册与运行文档 · ops 仓库只读</span></div><div class="docbody">加载中…</div>';
+  try{const r=await api('doc?name='+encodeURIComponent(name));view.querySelector('.docbody').textContent=r.text}catch(e){view.querySelector('.docbody').textContent=e.message}
+}
+function filterDocs(){
+  const q=($('doc-q').value||'').toLowerCase();
+  document.querySelectorAll('.docs-nav button').forEach(b=>{b.style.display=b.dataset.doc.toLowerCase().includes(q)?'':'none'});
 }
 async function openGoal(gid){
-  const el=document.getElementById('gt-'+gid);
-  if(el.dataset.open){el.dataset.open='';el.querySelector('.docbody')?.remove();return}
-  el.dataset.open='1';const d=document.createElement('div');d.className='docbody';d.textContent='加载中…';el.appendChild(d);
+  const el=document.querySelector('#gt-'+CSS.escape(gid));
+  if(el.dataset.open){el.dataset.open='';el.querySelector('.task-drawer')?.remove();el.classList.remove('open');return}
+  el.dataset.open='1';el.classList.add('open');
+  const d=document.createElement('div');d.className='task-drawer';
+  d.innerHTML='<div class="task-head"><span>任务</span><span>执行 → 审核</span><span>状态</span><span></span></div><div class="task-list">加载中…</div><button class="text-button danger" onclick="cancelGoal(\\''+gid+'\\')">取消这个目标</button>';
+  el.appendChild(d);
   await reloadGoalTasks(gid);
 }
+function stageChip(x){const tone={done:'done',active:'active',waiting:'waiting',missing:'missing'}[x.status]||'';const label={done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知';return '<span class="stage '+tone+'">'+esc(x.label)+' '+label+'</span>'}
 function render(){
-  const m=document.getElementById('m');
+  const m=$('m');
   if(T==='todo'){
-    const g=(INBOX?.gates||[]).filter(x=>!x.task.companyUpgrade).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
-      <div class="meta">\${KIND[x.task.kind]||x.task.kind} · 执行 \${esc(x.task.executor_role)} · 提交人 \${esc(x.task.current_employee||'—')}</div>
-      <div class="body">\${linkify(x.submission||'（无提交说明）')}</div>
-      <div class="atts" id="at-\${x.task.id}"></div>
-      <textarea id="n-\${x.task.id}" placeholder="说明（批准可留空，退回必填）"></textarea>
-      <div class="row"><button class="act ok" onclick="decide('\${x.task.id}','approve')">批准</button>
-      <button class="act no" onclick="decide('\${x.task.id}','reject')">退回</button>
-      <button class="act no" onclick="voidTask('\${x.task.id}')">作废</button></div></div>\`).join('');
-    const q=(INBOX?.questions||[]).filter(x=>!x.task.companyUpgrade).map(x=>\`<div class="card"><h3>\${esc(x.task.title)}</h3>
-      <div class="meta">来自 \${esc(x.task.executor_role)} 的问题</div>
-      <div class="body">\${linkify(x.question||'（无问题文本）')}</div>
-      <div class="atts" id="at-\${x.task.id}"></div>
-      <textarea id="n-\${x.task.id}" placeholder="答复"></textarea>
-      <div class="row"><button class="act mid" onclick="decide('\${x.task.id}','reply')">回复</button></div></div>\`).join('');
-    const n=(INBOX?.notices||[]).map(x=>\`<div class="card notice"><span>\${linkify(x.text)}</span><button onclick="notice('\${x.key}')">已阅</button></div>\`).join('');
-    const u=(INBOX?.upgrades?.items||[]).map(upgradeCard).join('');
+    const gates=(INBOX?.gates||[]).filter(x=>!x.task.companyUpgrade);
+    const asks=(INBOX?.questions||[]).filter(x=>!x.task.companyUpgrade);
+    const notices=INBOX?.notices||[];
+    const items=INBOX?.upgrades?.items||[];
     const v=INBOX?.upgrades?.current;
-    const head=v?'<div class="card"><strong>当前版本 v'+esc(v.version)+'</strong><details><summary>提交详情</summary><code>'+esc(v.sha)+'</code></details></div>':'';
-    m.innerHTML=head+((u||g||q||n)?(u+g+q+n):'<div class="empty">没有待办事项</div>');
-    [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=document.getElementById('at-'+x.task.id);if(e)atts(e,x.task.id)});
+    const stats=[['待审批',gates.length,'验收提交等待你的决定','violet'],['待回复',asks.length,'来自执行员工的问题','amber'],['升级流程',items.filter(x=>x.status!=='succeeded').length,'公司系统版本升级','blue'],['系统通知',notices.length,'运行提醒与简报','green']];
+    const statHtml='<section class="stat-grid">'+stats.map(s=>'<article class="metric-card '+s[3]+'"><span>'+s[0]+'</span><strong>'+s[1]+'</strong><small>'+s[2]+'</small><i></i></article>').join('')+'</section>';
+    const head=v?'<section class="panel version-panel"><span class="type-label">当前生产版本</span><div class="version-row"><strong>v'+esc(v.version)+'</strong><code>'+esc(v.sha)+'</code></div></section>':'';
+    const g=gates.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">'+esc(KIND[x.task.kind]||x.task.kind)+'</span>'+badge('待验收','violet')+'</div>'
+      +'<h3>'+esc(x.task.title)+'</h3><p class="byline">执行 '+esc(x.task.executor_role)+' · 提交人 '+esc(x.task.current_employee||'—')+'</p>'
+      +'<div class="submission">'+linkify(x.submission||'（无提交说明）')+'</div>'
+      +'<div class="atts" id="at-'+x.task.id+'"></div>'
+      +'<label class="comment-field"><span>决策说明（批准可留空，退回必填）</span><textarea id="n-'+x.task.id+'" placeholder="补充约束、提醒或后续要求…"></textarea></label>'
+      +'<div class="decision-actions"><button class="approve" onclick="decide(\\''+x.task.id+'\\',\\'approve\\')">'+icon('check')+'批准</button>'
+      +'<button class="reject" onclick="decide(\\''+x.task.id+'\\',\\'reject\\')">'+icon('x')+'退回</button>'
+      +'<button class="quiet" onclick="voidTask(\\''+x.task.id+'\\')">作废</button></div></article>').join('');
+    const q=asks.map(x=>'<article class="decision-card"><div class="card-top"><span class="type-label">提问</span>'+badge('待回复','warning')+'</div>'
+      +'<h3>'+esc(x.task.title)+'</h3><p class="byline">来自 '+esc(x.task.executor_role)+' 的问题</p>'
+      +'<div class="submission">'+linkify(x.question||'（无问题文本）')+'</div>'
+      +'<div class="atts" id="at-'+x.task.id+'"></div>'
+      +'<label class="comment-field"><span>答复</span><textarea id="n-'+x.task.id+'" placeholder="写下清晰的口径和下一步…"></textarea></label>'
+      +'<div class="decision-actions"><button class="approve" onclick="decide(\\''+x.task.id+'\\',\\'reply\\')">'+icon('send')+'回复</button></div></article>').join('');
+    const n=notices.map(x=>'<div class="notice"><span>'+icon('activity')+'</span><div>'+linkify(x.text)+'</div><button onclick="notice(\\''+x.key+'\\')">已阅</button></div>').join('');
+    const u=items.map(upgradeCard).join('');
+    m.innerHTML=head+statHtml+((u||g||q||n)?(u+'<section class="section-bar"><div><h2>需要你的决定</h2><p>按到达时间排序，处理完会自动离开列表</p></div></section><div class="decision-grid">'+g+q+'</div>'+n):'<div class="empty">没有待办事项</div>');
+    [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=$('at-'+x.task.id);if(e)atts(e,x.task.id)});
   }else if(T==='goals'){
     var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});
-    m.innerHTML=((BRIEF&&BRIEF.goals)||[]).map(function(g){
+    m.innerHTML=((BRIEF&&BRIEF.goals)||[]).map(function(g,i){
       var c=cards[g.id]||{};
-      var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString()):'截止未知';
-      var stages=(c.stages||[]).map(function(x){return esc(x.label)+'='+({done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知')}).join(' · ');
-      var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<div class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</div>'):'';
-      var repair=c.needsRepair?('<div class="meta" style="color:#b00">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</div>'):'';
-      var blockers=(c.blockers&&c.blockers.length)?('<div class="body" style="max-height:160px"><b>当前阻点</b><br>'+c.blockers.map(function(b){return esc(b.kind)+' · '+esc(b.summary)+(b.nextTrigger?(' · 下一触发 '+esc(b.nextTrigger)):'')+(b.waitedMinutes!==undefined?(' · 已等 '+b.waitedMinutes+' 分钟'):'')}).join('<br>')+'</div>'):'';
-      return '<div class="card glist" id="gt-'+g.id+'"><h3>'+esc(g.title)+'</h3><div class="meta"><span class="tier">'+esc(g.tier)+'</span> <span class="st">'+esc(g.state)+'</span> '+(g.project?esc(g.project):'')+' · '+esc(deadline)+'</div><div class="meta">阶段：'+stages+'</div>'+missing+repair+blockers+'<div class="body" style="max-height:120px">'+esc(g.brief||'')+'</div><div class="row"><button class="act mid" onclick="openGoal(\\''+g.id+'\\')">查看任务</button><button class="act no" onclick="cancelGoal(\\''+g.id+'\\')">取消目标</button></div></div>';
+      var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString().slice(0,10)):'截止未知';
+      var stages=(c.stages||[]).map(stageChip).join('')||'<span class="stage">阶段未知</span>';
+      var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<p class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</p>'):'';
+      var repair=c.needsRepair?('<p class="meta bad">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</p>'):'';
+      var blockers=(c.blockers&&c.blockers.length)?('<p class="meta">当前阻点：'+c.blockers.map(function(b){return esc(b.kind)+' · '+esc(b.summary)+(b.waitedMinutes!==undefined?('（已等 '+b.waitedMinutes+' 分钟）'):'')}).join('；')+'</p>'):'';
+      return '<article class="goal-card" id="gt-'+g.id+'"><button class="goal-main" onclick="openGoal(\\''+g.id+'\\')">'
+        +'<span class="goal-index">'+(i+1)+'</span>'
+        +'<div class="goal-name"><span><span class="tier">'+esc(g.tier)+'</span> '+esc(g.state)+(g.project?' · '+esc(g.project):'')+' · '+esc(deadline)+'</span>'
+        +'<h3>'+esc(g.title)+'</h3><p>'+esc((g.brief||'').slice(0,140))+'</p></div>'
+        +'<div class="goal-stages">'+stages+'</div>'+icon('chevron','goal-arrow')+'</button>'
+        +'<div class="goal-extra">'+missing+repair+blockers+'</div></article>';
     }).join('')||'<div class="empty">无在办目标</div>';
   }else if(T==='docs'){
     if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
     const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));
-    m.innerHTML=Object.keys(groups).map(g=>'<h4 class="sec">'+esc(g)+'</h4>'+groups[g].map(d=>'<div class="doc" onclick="openDoc(\\''+d.name+'\\',this)">'+esc(d.name)+'</div>').join('')).join('')||'<div class="empty">加载中…</div>';
+    m.innerHTML='<div class="docs-shell"><aside class="docs-nav"><label class="docs-search">'+icon('file')+'<input id="doc-q" placeholder="搜索文档" oninput="filterDocs()"></label>'
+      +Object.keys(groups).map(g=>'<p>'+esc(g)+'</p>'+groups[g].map(d=>'<button data-doc="'+esc(d.name)+'" onclick="openDoc(\\''+d.name+'\\',this)">'+icon('file')+'<span>'+esc(d.name)+'</span></button>').join('')).join('')
+      +(DOCS?'':'<p>加载中…</p>')+'</aside><article class="doc-view" id="doc-view"><p class="empty">从左侧选择一篇手册查看</p></article></div>';
   }else{
-    m.innerHTML='<div class="card"><h3>给经理留言</h3><div class="meta">写成任务派给经理，回复在收件箱里看</div><textarea id="gm-text" style="min-height:120px" placeholder="比如：盘一下 G1 的进度给我个简报"></textarea><div class="row"><button class="act mid" onclick="instruct()">下达</button></div><div class="okm" id="gm-ok"></div></div>';
+    m.innerHTML='<div class="message-layout"><section class="compose-card"><div class="compose-head"><span class="avatar large">经</span><div><h2>发给值班经理</h2><p>写成任务派给经理，回复会出现在待办里</p></div>'+badge('在线','success')+'</div>'
+      +'<label class="compose"><span>你希望经理做什么？</span><textarea id="gm-text" style="min-height:150px" placeholder="比如：盘一下 G1 的进度给我个简报"></textarea><small>写清“为什么”和“结果长什么样”，经理会自行拆解执行步骤。</small></label>'
+      +'<div class="send-row"><button class="primary" onclick="instruct()">'+icon('send')+'下达给经理</button></div><p class="okm" id="gm-ok"></p></section></div>';
   }
 }
+const startTab=location.hash.slice(1);
+if(CRUMB[startTab])T=startTab;
+document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===T));
+$('crumb').textContent=CRUMB[T]||T;
+renderThemeBtn();render();
 load();setInterval(()=>{if(T==='todo')load()},20000);
 </script></body></html>`;
