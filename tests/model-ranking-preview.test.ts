@@ -113,3 +113,8 @@ test('ranking list visibly separates billing layers and explains why the lower s
  expect(h.text()).toContain('AA 43.1–45.1');expect(h.text()).toContain('跨层不比较分数');expect(h.text()).toContain('层内分');
  expect(nodes.filter(n=>n.props.accessibilityLabel?.startsWith('第 ')&&n.props.accessibilityLabel.includes('名')).map(n=>n.props.accessibilityLabel)).toEqual(['第 1 名 p/free','第 2 名 p/included']);
 });
+
+test('preview layers are explicitly distinguished from the published snapshot',()=>{
+ const h=harness(undefined);h.render('ModelRankingList',{ctx:rankingCtx,table:{group:'sck-haiku',scored:true,rows:[{model:'p/preview',accounts:[],previousRank:3}]}});
+ expect(h.text()).toContain('以下分层来自当前预览');expect(h.text()).not.toContain('以下分层来自最近成功排序快照');
+});

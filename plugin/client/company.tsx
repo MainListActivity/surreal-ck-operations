@@ -1240,7 +1240,7 @@ function ModelRankingList({ctx,table,width=ctx.compact?390:1100,onPin,pinBusy,on
       </View>
       <View style={{backgroundColor:c.surface2,borderColor:c.border,borderWidth:1,borderRadius:999,paddingHorizontal:9,paddingVertical:6}}><Text style={[s.muted,s.accent,{fontSize:10,fontWeight:"700"}]}>{table.rows.length} 个成员</Text></View>
     </View>
-    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①安全状态 → ②新模型试用 → ③AA能力档 → ④计费类型 → ⑤本层置顶 → ⑥层内分降序</Text><Text style={s.muted}>安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。</Text></View>
+    <View style={{backgroundColor:c.surface2,borderRadius:10,padding:12,gap:5,marginBottom:8}}><Text style={[s.text,{fontWeight:"700"}]}>先比较分层，再比较层内分</Text><Text style={s.muted}>①安全状态 → ②新模型试用 → ③AA能力档 → ④计费类型 → ⑤本层置顶 → ⑥层内分降序</Text><Text style={s.muted}>安全状态、试用状态、能力档、计费类型都相同，才是同一层。AA档在同一安全状态内，从最高分开始逐档划分。每层下方列出实际范围和依据。</Text><Text style={s.muted}>{table.rows.some(r=>r.previousRank!==undefined)?"以下分层来自当前预览；保存前不影响线上。":"以下分层来自最近成功排序快照；跨层即使分数更高，也不会提前。"}</Text></View>
     {!table.scored&&<Text style={[s.muted,{marginBottom:8}]}>等待下一次请求触发规则排序。</Text>}
     {table.rows.map((row,index)=>{
       const short=row.model.replace(/^remote-magpie\//,"");const slash=short.lastIndexOf("/");
