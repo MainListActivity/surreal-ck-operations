@@ -1,6 +1,7 @@
 import type {PluginAgentPanelProps,PluginTimelineItemProps} from '@getpaseo/plugin/client';
 import {Text,View} from 'react-native';
 import {metricNumber,metricSeconds,type AgentMetricsView} from '../shared/agent-metrics';
+import {relayTheme} from './relay-theme';
 
 function MetricsCard({view,theme,compact=false}:{view:AgentMetricsView;theme:PluginAgentPanelProps['theme'];compact?:boolean}){
  const c=theme.colors,s=view.summary,latest=view.latest;
@@ -26,4 +27,4 @@ function MetricsCard({view,theme,compact=false}:{view:AgentMetricsView;theme:Plu
   {!!view.note&&<Text style={{...label,lineHeight:17}}>{view.note}</Text>}
  </View>;
 }
-export function AgentMetricsTimeline({item,theme,layout}:PluginTimelineItemProps<AgentMetricsView>){return <MetricsCard view={item.data} theme={theme} compact={layout.compact}/>;}
+export function AgentMetricsTimeline({item,theme,layout}:PluginTimelineItemProps<AgentMetricsView>){return <MetricsCard view={item.data} theme={relayTheme(theme)} compact={layout.compact}/>;}
