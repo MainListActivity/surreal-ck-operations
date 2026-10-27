@@ -286,7 +286,7 @@ run('RB01 rollback isolation: SYS07 goal states against the previous release', (
     }
     expect(named).toEqual([]);
     for (const table of NEW_TABLES) expect(digestsAfter[table]).toBe(digestsBefore[table]);
-    // The old release knows schema 040, the new one 042; it only bumps the marker upward.
+    // The old release knows schema 041 (company upgrades), the new one 042; it only bumps the marker upward.
     expect(schemaVersion.before).toBeGreaterThanOrEqual(42);
     expect(schemaVersion.after).toBe(schemaVersion.before);
   });
