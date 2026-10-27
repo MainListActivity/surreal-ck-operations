@@ -1,18 +1,19 @@
 {
-  "version": "0.3.10",
-  "title": "SYS06 工作区夹具修复与策略回归接入发布门禁",
+  "version": "0.3.11",
+  "title": "版本化验收映射预览与授权导入",
   "changes": [
-    "effective-policy.fork 真实 QA 复现的 1 例失败修正：静置实例按真实 spawn 形态补 workspaceScope，策略池恢复 reuse+spawn 两条路径，19/19 通过",
-    "保持 dispatcher 工作区隔离语义不变：无 scope 的旧会话只允许续做在手任务，不放宽旧员工跨目标复用",
-    "该策略回归接入发布门禁 sidecar-review：install 缺通过记录即拒绝切换；明确依赖公司 fork SurrealDB，官方 surrealdb 不兼容、不上 hosted CI",
-    "对照组（无 policyBlocks）reuse 与 spawn 均存在且合格、策略组两者均 policy_blocked 的断言全部保留，未删断言、无空集 every 伪绿",
-    "本版本同时包含已合入 main 的 v0.3.9 供应商时间来源诊断与配额原始精度校验；现役 v0.3.8 d8f882d9 为本候选祖先"
+    "新增 acceptance_mapping_preview 只读预览：旧新 criteria、required、逐 SYS 机器源/人工签核与 RB01 覆盖、目标任务版本与冲突",
+    "新增 acceptance_mapping_import：仅 gm，携带预览 digest 与任务 expectedVersion CAS、理由与审计；幂等重放先于守卫",
+    "拒绝陈旧 digest、降级或删除 required 基线、活动租约、done/void 历史改写与已带版本化 criteria 的二次覆盖",
+    "INT01–INT08 全部为人工独立复核项，机器源仅真实 CI 基线，叙述文字不伪装 machine verified",
+    "isLegacyAcceptance 认可显式导入标记：预门禁行经授权导入后受门禁约束，其余 createdAt 截止规则不变"
   ],
   "impact": [
-    "策略收权隔离的池子清点恢复完整：reuse 与 spawn 都会以 policy_blocked 出现，不再漏报静置实例路径",
-    "此后每次双面安装都会在门禁里重跑 effective-policy.fork，策略契约回归回归即阻断发布",
-    "无数据库迁移、无历史改写；回滚到部署前现役安全，旧版忽略本次仅测试与门禁脚本的改动"
+    "legacy:true criteria:[] 的在办任务可经授权导入进入版本化门禁；QA 与执行者不能自批",
+    "submit/review/Jev/owner 与 MCP/sck 同源使用同一评估器；导入后提交必须先取得真实机器证据",
+    "schema 043 只新增 task 可选字段 acceptance_mapping_at/digest；旧版读不到即按 legacy 处理，不误派（RB01）",
+    "真实 GM 通道同快照对账、生产实测与客户回执由上线验证腿完成；客户回执不得由 AI 代填"
   ],
-  "migration": "无数据库迁移、无历史改写；改动仅测试夹具与 scripts/release-gate.sh 门禁清单。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前现役（现为 v0.3.8 d8f882d90e10bd7745760e447aa83bb952cf0187，以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
+  "migration": "新增 schema/043-acceptance-mapping.surql：task 可选字段 acceptance_mapping_at、acceptance_mapping_digest，schema_version 43；只新增、无历史改写。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前 active 所指固定 release（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；已导入映射的行在旧版回退为 legacy 路径，不误派；无数据回滚。"
 }
