@@ -51,6 +51,32 @@ describe('goal final-gate invariants (AC01)', () => {
     expect(result.goalComplete).toBe(false);
   });
 
+  test('required owner_final cannot be satisfied by a manager final gate', () => {
+    const gmGate = task('gate', { kind: 'gate', executorRole: 'gm', reviewerRole: 'gm', acceptedBy: 'gm' });
+    const result = assessGoal({ goal: goal(), tasks: [task('manual'), gmGate],
+      outcome: outcome(['implementation', 'owner_final']), now: NOW });
+    expect(result.outcome.missing).toContain('owner_final');
+    expect(result.stages.find(stage => stage.key === 'owner_final')).toMatchObject({ status: 'missing' });
+    expect(result.repairReasons.map(reason => reason.code)).toContain('final_evidence_incomplete');
+    expect(result.readyToComplete).toBe(false);
+  });
+
+  test('a void implementation task without a completed successor is a gap, not completion', () => {
+    const retired = task('impl', { state: 'void' });
+    const first = assessGoal({ goal: goal(), tasks: [task('manual'), retired, ownerGate()],
+      outcome: outcome(['implementation', 'owner_final']), now: NOW });
+    expect(first.outcome.missing).toContain('implementation');
+    expect(first.repairReasons.map(reason => reason.code)).toContain('implementation_void');
+    expect(first.stages.find(stage => stage.key === 'implementation')?.status).not.toBe('done');
+    expect(first.readyToComplete).toBe(false);
+    const successor = task('impl-2', { state: 'done' });
+    const superseded = task('impl', { state: 'void', supersededBy: 'impl-2' });
+    const second = assessGoal({ goal: goal(), tasks: [task('manual'), superseded, successor, ownerGate()],
+      outcome: outcome(['implementation', 'owner_final']), now: NOW });
+    expect(second.outcome.missing).toEqual([]);
+    expect(second.readyToComplete).toBe(true);
+  });
+
   test('all required evidence and a real owner approval make the final gate completable', () => {
     const result = assessGoal({ goal: goal(), tasks: [task('manual'), ownerGate()],
       outcome: outcome(['implementation', 'owner_final']), now: NOW });
@@ -126,6 +152,22 @@ describe('actionable blockers (AC03)', () => {
     expect(own.handoff).not.toHaveProperty('handoffFile');
     expect(result.blockers.find(item => item.taskId === 'dep')!.dependencyPath.map(item => item.taskId))
       .toEqual(['gate', 'dep']);
+  });
+});
+
+describe('expired waits and cross-window evidence (AC03/AC04)', () => {
+  test('an expired SYS05 wait stays visible with a next action and cannot look like a healthy wait', () => {
+    const waiting = task('expired', { state: 'blocked', dependencies: [] });
+    const result = assessGoal({ goal: goal(), tasks: [task('manual'), waiting, ownerGate()],
+      waits: [{ taskId: 'expired', waitKey: 'wait:expired', kind: 'customer_activation', state: 'expired',
+        ownerRole: 'owner', enteredAt: NOW - 120 * 60_000, expiresAt: NOW - 60 * 60_000,
+        reason: '等待客户激活回执', completed: [] }],
+      outcome: outcome(['implementation', 'customer_activation', 'owner_final']), now: NOW });
+    expect(result.blockers.find(item => item.taskId === 'expired')).toMatchObject({
+      kind: 'wait', summary: expect.stringContaining('已过期'), nextTrigger: expect.any(String),
+    });
+    expect(result.stages.find(stage => stage.key === 'customer_activation')).toMatchObject({ status: 'missing' });
+    expect(result.stages.find(stage => stage.key === 'customer_activation')?.note).toContain('已过期');
   });
 });
 
@@ -211,6 +253,15 @@ describe('business metrics (AC04/AC05)', () => {
       leaseEnds: { released: 1, revoked: 1, total: 2 }, systemEvents: 2 });
     expect(metrics.cycleTime.goal.known).toBe(2);
     expect(metrics.cycleTime.task.known).toBe(3);
+  });
+
+  test('customer evidence from before the window still covers a goal completed inside it', () => {
+    const data = source();
+    data.evidence = [{ goalId: 'g1', kind: 'customer_activation', at: window.fromMs - 86_400_000 }];
+    const metrics = computeGoalMetrics(data);
+    expect(metrics.customerEvidence).toMatchObject({ goalsDone: 2, goalsWithActivation: 1 });
+    expect(metrics.customerEvidence.missingActivation).not.toContain('目标一');
+    expect(metrics.customerEvidence.missingActivation).toContain('目标二');
   });
 
   test('DST day bucketing keeps each local day separate without inventing an hour', () => {

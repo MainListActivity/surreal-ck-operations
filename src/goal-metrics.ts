@@ -348,8 +348,10 @@ export function computeGoalMetrics(source: GoalMetricsSource): GoalMetricsView {
   };
 
   const doneGoalIds = goals.map(goal => goal.id);
-  const activation = new Set(source.evidence.filter(row => inWindow(row.at) && row.kind === 'customer_activation').map(row => row.goalId));
-  const adoption = new Set(source.evidence.filter(row => inWindow(row.at) && row.kind === 'customer_adoption').map(row => row.goalId));
+  // Evidence coverage follows the goal completed in this window, not the evidence timestamp: a receipt recorded
+  // before the window still proves the result of a goal that completed inside it.
+  const activation = new Set(source.evidence.filter(row => row.kind === 'customer_activation').map(row => row.goalId));
+  const adoption = new Set(source.evidence.filter(row => row.kind === 'customer_adoption').map(row => row.goalId));
 
   const dayMap = new Map<string, { tasksAccepted: number; goalsDone: number; blockEvents: number }>();
   const addDay = (ms: number, field: 'tasksAccepted' | 'goalsDone' | 'blockEvents') => {
@@ -380,6 +382,7 @@ export function computeGoalMetrics(source: GoalMetricsSource): GoalMetricsView {
       repeatedWake: '同一 task+phase+episode 的第 2 次及以后 manager_wake_acquired；区间内无 checkpoint/submit/accept 记为无新增可验证进展',
       usage: 'model_execution 的可归因 token；只有每行都带 provider 实际计费才给实际成本，否则 unknown',
       window: '左闭右开 [from,to)，按 timezone 分日；cutoffAt 是数据库读取时刻',
+      customerEvidence: '按窗口内完成的目标统计 cutoff 前已存在的 activation/adoption 证据；不因回执早于窗口而误报缺失',
     },
     denominators: {
       goalsDone: goals.length, tasksAccepted: tasks.length,

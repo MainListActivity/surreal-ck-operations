@@ -347,6 +347,10 @@ export class GoalGovernanceStore {
     ]);
     const taskIds = tasks.map(task => text(task.id));
     const taskIdSet = new Set(taskIds);
+    const [replacementRows] = taskIds.length ? await this.db.query<[Array<{ task: unknown }>]>(
+      "SELECT task FROM audit WHERE task IN $tasks AND action = 'goal_acceptance_replaced';",
+      { tasks: taskIds.map(id => new RecordId('task', id)) }) : [[] as Array<{ task: unknown }>];
+    const replacedAcceptanceTaskIds = [...new Set((replacementRows ?? []).map(row => text(row.task)))];
     const missingDeps = [...new Set(tasks.flatMap(task => taskFact(task).dependencies).filter(dep => !taskIdSet.has(dep)))];
     const [externalRows] = missingDeps.length ? await this.db.query<[Array<{ id: unknown; goal?: unknown }>]>(
       'SELECT id, goal FROM task WHERE id IN $deps;', { deps: missingDeps.map(dep => new RecordId('task', dep)) }) : [[] as Array<{ id: unknown; goal?: unknown }>];
@@ -384,6 +388,7 @@ export class GoalGovernanceStore {
         goal, tasks: goalTasks, waits: goalWaits, faults: goalFaults,
         ...(outcomes.get(goal.id) ? { outcome: outcomes.get(goal.id)! } : {}),
         evidence: evidence.get(goal.id) ?? [], ...(externalByGoal.get(goal.id) ? { externalDependencies: externalByGoal.get(goal.id)! } : {}),
+        ...(replacedAcceptanceTaskIds.length ? { replacedAcceptanceTaskIds } : {}),
         now,
       });
       const blockerCap = 8, taskCap = 20, reasonCap = 12;
@@ -831,8 +836,9 @@ export class GoalGovernanceStore {
       ...(num(row.cost_usd) !== undefined ? { costUsd: num(row.cost_usd) } : {}),
     }));
     const [evidenceRows] = goalRows.length ? await this.db.query<[Array<Record<string, unknown>>]>(
-      `SELECT goal, kind, at FROM goal_evidence WHERE goal IN $goals AND at >= <datetime>$from AND at < <datetime>$to ORDER BY at;`,
-      { goals: goalRows.map(row => new RecordId('goal', text(row.id))), from: input.from, to: input.to }) : [[] as Array<Record<string, unknown>>];
+      // No lower bound: a goal completed in the window may rely on a customer receipt recorded earlier.
+      `SELECT goal, kind, at FROM goal_evidence WHERE goal IN $goals AND at < <datetime>$to ORDER BY at;`,
+      { goals: goalRows.map(row => new RecordId('goal', text(row.id))), to: input.to }) : [[] as Array<Record<string, unknown>>];
     const evidence: MetricEvidenceRow[] = (evidenceRows ?? []).map(row => ({
       goalId: text(row.goal), kind: String(row.kind ?? '') as GoalEvidenceKind, at: ms(row.at) ?? 0,
     }));

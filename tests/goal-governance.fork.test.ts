@@ -211,8 +211,8 @@ describe('RB01 rollback isolation drill (new writes -> previous release)', () =>
     expect(tasksAfter).toEqual(tasksBefore);
 
     // Forward release then observes the same goal; the open task was not consumed by the old scans, so the
-    // fixture retires it before completion. Completion itself still needs the recorded receipt.
-    await database.db.query("UPDATE ONLY $task SET state = 'void', version += 1;", { task: new RecordId('task', readyId) });
+    // fixture closes it as done before completion. Completion itself still needs the recorded receipt.
+    await database.db.query("UPDATE ONLY $task SET state = 'done', version += 1;", { task: new RecordId('task', readyId) });
     const done = await core.goalFinalize(tokens.gm!, { goalId });
     expect(done.state).toBe('done');
     expect(done.goalComplete).toBe(true);
@@ -281,6 +281,26 @@ describe('final-gate completion and evidence (AC01/AC02/AC05)', () => {
     expect(ownerAuditsAfter?.[0]?.n).toBe(ownerAuditsBefore?.[0]?.n);
     const gate = await database.db.select<Record<string, unknown>>(new RecordId('task', gateId));
     expect(gate?.accepted_by).toBe('owner');
+  });
+
+  test('a manager final gate cannot satisfy a required owner_final', async () => {
+    const { goalId } = await seedGoal({ id: 'owner-required-gm', reviewerRole: 'gm', acceptedBy: 'gm',
+      outcomeRequired: ['implementation', 'owner_final'] });
+    const card = await core.goalFinalize(tokens.gm!, { goalId });
+    expect(card.state).toBe('needs_repair');
+    expect(card.outcome.missing).toContain('owner_final');
+    expect(card.stages.find(stage => stage.key === 'owner_final')).toMatchObject({ status: 'missing' });
+  });
+
+  test('a void implementation task without a completed successor leaves an implementation gap', async () => {
+    const { goalId } = await seedGoal({ id: 'void-implementation', acceptedBy: 'owner',
+      outcomeRequired: ['implementation', 'owner_final'] });
+    const retired = await makeTask(goalId, '被作废的实现', { state: 'void', kind: 'task' });
+    const card = await core.goalFinalize(tokens.gm!, { goalId });
+    expect(card.state).toBe('needs_repair');
+    expect(card.outcome.missing).toContain('implementation');
+    expect(card.repairReasons.map(reason => reason.code)).toContain('implementation_void');
+    expect(card.repairReasons.find(reason => reason.code === 'implementation_void')).toMatchObject({ taskId: retired });
   });
 
   test('an owner gate accepted by a manager is refused as an owner approval', async () => {
@@ -409,6 +429,23 @@ describe('business metrics (AC04/AC05)', () => {
     expect(metrics.window).toMatchObject({ timezone: 'UTC', explicit: true });
     expect(metrics.definitions.usage).toContain('provider');
     expect(metrics.usage.cost).toMatchObject({ status: 'unknown' });
+  });
+
+  test('a receipt recorded before the window still covers a goal completed inside it', async () => {
+    const now = Date.now();
+    const from = now - 86_400_000;
+    const done = new Date(now - 3_600_000);
+    await seedGoal({ id: 'metric-cross-window', doneAt: done.toISOString(), createdAt: new Date(now - 3 * 86_400_000).toISOString(),
+      outcomeRequired: ['customer_activation'] });
+    await database.db.query(`CREATE goal_evidence CONTENT {
+      goal: $goal, kind: 'customer_activation', summary: '窗口前记录的客户激活回执', source: 'mail:customer-cross',
+      confirmed_by: '客户赵六', evidence_type: 'external_receipt', at: $at, actor: 'test', version: 1,
+      digest: 'cross-window-digest', created_at: time::now()
+    };`, { goal: new RecordId('goal', 'metric-cross-window'), at: new Date(from - 86_400_000) });
+    const metrics = await core.goalMetrics(tokens.gm!, {
+      from: iso(from), to: iso(now), timezone: 'UTC', goalId: 'metric-cross-window',
+    });
+    expect(metrics.customerEvidence).toMatchObject({ goalsDone: 1, goalsWithActivation: 1, missingActivation: [] });
   });
 
   test('metrics reject a non-IANA timezone and a non-manager reader', async () => {

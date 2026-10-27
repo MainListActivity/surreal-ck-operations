@@ -212,6 +212,16 @@ const STAGE_LABELS: Record<GoalStageKey, string> = {
 
 const TERMINAL = new Set(['done', 'void']);
 
+/** Implementation work is settled by a real done task, or by a void task whose successor revision is done.
+ * A bare retire (void without a completed successor) is a gap, not completion. */
+function implementationSettled(task: GoalTaskFact, byId: Map<string, GoalTaskFact>, replaced: Set<string>): boolean {
+  if (task.state === 'done') return true;
+  // An authorized acceptance-reference repair replaces the old anchor by audit; it is not abandoned work.
+  if (task.state === 'void' && replaced.has(task.id)) return true;
+  if (task.state !== 'void' || !task.supersededBy) return false;
+  return byId.get(task.supersededBy)?.state === 'done';
+}
+
 function sortedIds(values: readonly string[] | undefined): string[] {
   return [...new Set((values ?? []).filter(Boolean))].sort();
 }
@@ -236,13 +246,15 @@ function requiredSatisfied(
   kind: RequiredEvidenceKind,
   ctx: {
     tasks: GoalTaskFact[]; final: GoalTaskFact | undefined; outcome: GoalOutcomeFact;
-    evidence: GoalEvidenceFact[]; ownerApproved: boolean;
+    evidence: GoalEvidenceFact[]; ownerApproved: boolean; ownerFinalApproved: boolean;
+    byId: Map<string, GoalTaskFact>; replacedAcceptance: Set<string>;
   },
 ): boolean {
-  const { tasks, final, evidence, ownerApproved } = ctx;
+  const { tasks, final, evidence, ownerFinalApproved, byId, replacedAcceptance } = ctx;
   switch (kind) {
     case 'implementation':
-      return tasks.filter(task => task.id !== final?.id && task.kind !== 'gate').every(task => TERMINAL.has(task.state));
+      return tasks.filter(task => task.id !== final?.id && task.kind !== 'gate')
+        .every(task => implementationSettled(task, byId, replacedAcceptance));
     case 'release':
       return tasks.some(task => task.kind === 'release' && task.state === 'done') ||
         evidence.some(item => item.kind === 'release');
@@ -256,7 +268,7 @@ function requiredSatisfied(
     case 'final_acceptance':
       return final?.state === 'done';
     case 'owner_final':
-      return final?.state === 'done' && ownerApproved;
+      return ownerFinalApproved;
   }
 }
 
@@ -315,6 +327,13 @@ function blockerFor(
         wait.nextCheckAt ? { nextTrigger: new Date(wait.nextCheckAt).toISOString() } :
         wait.expiresAt ? { nextTrigger: `到期 ${new Date(wait.expiresAt).toISOString()}` } : {}),
     };
+    // An expired SYS05 wait stays visible: it must be cancelled or extended, not silently treated as waiting.
+    if (wait.state === 'expired') {
+      return { ...base, ...timing, ...handoff, kind: 'wait',
+        summary: `等待已过期：${wait.reason}`,
+        nextTrigger: wait.nextCheckAt ? new Date(wait.nextCheckAt).toISOString() : wait.expiresAt ? `到期 ${new Date(wait.expiresAt).toISOString()}` : '需取消等待或先延期再补受信事件',
+        waitKey: wait.waitKey };
+    }
     // An owner_handoff wait is an owner action, not an ordinary dependency wait; the handoff facts stay attached.
     if (wait.kind === 'owner_handoff') {
       return { ...base, ...timing, ...handoff, kind: 'owner', responsibleRole: 'owner',
@@ -358,6 +377,8 @@ export function assessGoal(input: {
   outcome?: GoalOutcomeFact; evidence?: GoalEvidenceFact[];
   /** Dependencies resolved by the store to a task in another goal; the pure rule never invents that fact. */
   externalDependencies?: Array<{ taskId: string; dependency: string; goalId?: string }>;
+  /** Old quick acceptance anchors replaced by goal_acceptance_repair; their void is an authorized replacement. */
+  replacedAcceptanceTaskIds?: string[];
   now: number;
 }): GoalAssessment {
   const { goal, now } = input;
@@ -366,6 +387,7 @@ export function assessGoal(input: {
   const faults = input.faults ?? [];
   const evidence = input.evidence ?? [];
   const byId = new Map(tasks.map(task => [task.id, task]));
+  const replacedAcceptance = new Set(input.replacedAcceptanceTaskIds ?? []);
   const finalId = finalGateId(goal);
   const final = finalId ? byId.get(finalId) : undefined;
   // A final gate is effective only when it is the lineage tip: a superseded_by pointer or a newer revision in
@@ -413,8 +435,12 @@ export function assessGoal(input: {
   for (const item of crossGoal) repairReasons.push({ code: 'dependency_cross_goal', message: `依赖 ${item.dependency} 属于其他目标`, taskId: item.taskId });
 
   const ownerApproved = final?.state === 'done' && (final.reviewerRole !== 'owner' || final.acceptedBy === 'owner');
+  // A required owner_final is only satisfied by an owner-reviewed final gate accepted by the owner himself;
+  // a manager/quick gate is real acceptance for its own flow, but it is not the boss's final approval.
+  const ownerFinalApproved = final?.state === 'done' && final.reviewerRole === 'owner' && final.acceptedBy === 'owner';
   const required = input.outcome?.requiredEvidence ?? [];
-  const satisfied = required.filter(kind => requiredSatisfied(kind, { tasks, final, outcome: input.outcome!, evidence, ownerApproved }));
+  const satisfied = required.filter(kind => requiredSatisfied(kind, { tasks, final, outcome: input.outcome!, evidence,
+    ownerApproved, ownerFinalApproved, byId, replacedAcceptance }));
   const missing = required.filter(kind => !satisfied.includes(kind));
   if (!input.outcome) repairReasons.push({ code: 'outcome_missing', message: '目标尚未登记结构化成果与 required 证据' });
   if (final?.state === 'done' && (missing.length || !ownerApproved)) {
@@ -434,17 +460,25 @@ export function assessGoal(input: {
       ...(final ? { taskId: final.id } : {}) });
   }
 
+  const retiredImplementation = nonFinal.filter(task => task.state === 'void' && task.kind !== 'gate' &&
+    !implementationSettled(task, byId, replacedAcceptance));
+  for (const task of retiredImplementation) {
+    repairReasons.push({ code: 'implementation_void', message: '实现任务已作废且没有已完成的继任修订，不能算实现完成', taskId: task.id });
+  }
+
   const done = goal.state === 'done';
   // The verdict and the gap list must agree: any recorded repair reason blocks a completion claim.
   const complete = Boolean(input.outcome) && final?.state === 'done' && ownerApproved && missing.length === 0 && repairReasons.length === 0;
   const needsRepair = repairReasons.length > 0;
 
   const stages: GoalStage[] = [];
-  const implementationDone = nonFinal.length > 0 && nonFinal.every(task => TERMINAL.has(task.state));
+  const implementationDone = nonFinal.length > 0 && nonFinal.every(task => implementationSettled(task, byId, replacedAcceptance));
   const releaseTask = tasks.find(task => task.kind === 'release');
   const deployTask = tasks.find(task => task.kind === 'deploy');
   const evidenceIds = (kind: GoalEvidenceKind) => evidence.filter(item => item.kind === kind).map(item => item.id).sort();
-  stages.push(stage('implementation', implementationDone ? 'done' : nonFinal.length ? 'active' : 'unknown'));
+  stages.push(stage('implementation',
+    retiredImplementation.length ? 'missing' : implementationDone ? 'done' : nonFinal.length ? 'active' : 'unknown',
+    [], retiredImplementation.length ? '实现任务已作废且没有已完成的继任修订' : undefined));
   stages.push(stage('release',
     evidenceIds('release').length || releaseTask?.state === 'done' ? 'done' :
       releaseTask ? 'waiting' : required.includes('release') ? 'missing' : 'unknown',
@@ -456,17 +490,21 @@ export function assessGoal(input: {
   for (const kind of ['customer_activation', 'customer_adoption'] as const) {
     const ids = evidenceIds(kind);
     const wait = waits.find(item => item.kind === kind);
-    stages.push(stage(kind, ids.length ? 'done' : wait ? 'waiting' : required.includes(kind) ? 'missing' : 'not_required', ids,
-      wait ? wait.reason : undefined));
+    const expired = wait?.state === 'expired';
+    stages.push(stage(kind,
+      ids.length ? 'done' : expired ? 'missing' : wait ? 'waiting' : required.includes(kind) ? 'missing' : 'not_required',
+      ids, expired ? `${wait.reason}（SYS05 等待已过期，需取消或延期后补受信事件）` : wait ? wait.reason : undefined));
   }
-  stages.push(stage('owner_final',
-    final?.reviewerRole !== 'owner' ? 'not_required' :
-      final.state === 'done' ? (ownerApproved ? 'done' : 'missing') :
-        final.state === 'void' ? 'missing' : 'waiting',
-    evidenceFor(final?.id, evidence),
-    final?.state === 'void' ? '终验关口已作废' : undefined));
+  const ownerRequired = required.includes('owner_final');
+  const ownerStage = final?.reviewerRole === 'owner'
+    ? final.state === 'done' ? (final.acceptedBy === 'owner' ? 'done' : 'missing') :
+      final.state === 'void' ? 'missing' : 'waiting'
+    : ownerRequired ? 'missing' : 'not_required';
+  stages.push(stage('owner_final', ownerStage, evidenceFor(final?.id, evidence),
+    final?.reviewerRole !== 'owner' && ownerRequired ? 'required owner_final 需要 owner 终验关口且由老板本人批准' :
+      final?.state === 'void' ? '终验关口已作废' : undefined));
 
-  const waitByTask = new Map(waits.filter(wait => wait.state === 'waiting' || wait.state === 'held').map(wait => [wait.taskId, wait]));
+  const waitByTask = new Map(waits.filter(wait => ['waiting', 'held', 'expired'].includes(wait.state)).map(wait => [wait.taskId, wait]));
   const faultByTask = new Map(faults.filter(fault => fault.state !== 'resolved' && fault.state !== 'closed').map(fault => [fault.taskId, fault]));
   const unresolved = new Set(tasks.filter(task => !TERMINAL.has(task.state)).map(task => task.id));
   const blockers = tasks
