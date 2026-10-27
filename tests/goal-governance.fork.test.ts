@@ -387,6 +387,33 @@ describe('final-gate repair (AC01)', () => {
     const [audits] = await database.db.query<[Array<{ n: number }>]>(
       "SELECT count() AS n FROM audit WHERE action = 'goal_final_gate_repair' GROUP ALL;");
     expect(audits?.[0]?.n).toBe(1);
+    // A quick goal's old acceptance anchor is a kind=task gm gate. Repairing it must record the replaced audit,
+    // otherwise the retired old anchor would look like abandoned implementation work forever.
+    const quick = await seedGoal({ id: 'quick-repair', tier: 'quick', finalState: 'void', reviewerRole: 'gm',
+      acceptedBy: undefined, outcomeRequired: ['implementation', 'final_acceptance'] });
+    await database.db.query("UPDATE ONLY $task SET kind = 'task', executor_role = 'gm';",
+      { task: new RecordId('task', quick.gateId) });
+    const quickCandidate = await makeTask(quick.goalId, 'quick 运营验收候选', {
+      state: 'blocked', kind: 'task', executor_role: 'gm', reviewer_role: 'gm',
+      dependencies: [new RecordId('task', quick.manualId)],
+    });
+    const quickPreview = await core.goalFinalGatePreview(tokens.gm!, { goalId: quick.goalId, candidateTaskId: quickCandidate });
+    expect(quickPreview.ready).toBe(true);
+    await core.goalFinalGateRepair(tokens.gm!, {
+      goalId: quick.goalId, candidateTaskId: quickCandidate, expectedOldTaskId: quick.gateId, expectedGoalVersion: 0,
+      snapshotHash: quickPreview.snapshot.hash, reason: 'SYS07 回归：quick 旧验收误作废，改由新运营验收候选接替',
+      idempotencyKey: 'repair-quick-gate',
+    });
+    const [replaced] = await database.db.query<[Array<{ n: number }>]>(
+      "SELECT count() AS n FROM audit WHERE task = $task AND action = 'goal_final_gate_replaced' GROUP ALL;",
+      { task: new RecordId('task', quick.gateId) });
+    expect(replaced?.[0]?.n).toBe(1);
+    await database.db.query("UPDATE ONLY $task SET state = 'done', accepted_by = 'gm', version += 1;",
+      { task: new RecordId('task', quickCandidate) });
+    const quickCard = await core.goalFinalize(tokens.gm!, { goalId: quick.goalId });
+    expect(quickCard.state).toBe('done');
+    expect(quickCard.goalComplete).toBe(true);
+
     const candidate2 = await makeTask(goalId, '另一个 G3 终验', {
       state: 'blocked', kind: 'gate', executor_role: 'gm', reviewer_role: 'owner', dependencies: [new RecordId('task', work), new RecordId('task', candidate)],
     });

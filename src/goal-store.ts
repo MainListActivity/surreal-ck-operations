@@ -348,7 +348,7 @@ export class GoalGovernanceStore {
     const taskIds = tasks.map(task => text(task.id));
     const taskIdSet = new Set(taskIds);
     const [replacementRows] = taskIds.length ? await this.db.query<[Array<{ task: unknown }>]>(
-      "SELECT task FROM audit WHERE task IN $tasks AND action = 'goal_acceptance_replaced';",
+      "SELECT task FROM audit WHERE task IN $tasks AND action IN ['goal_acceptance_replaced', 'goal_final_gate_replaced'];",
       { tasks: taskIds.map(id => new RecordId('task', id)) }) : [[] as Array<{ task: unknown }>];
     const replacedAcceptanceTaskIds = [...new Set((replacementRows ?? []).map(row => text(row.task)))];
     const missingDeps = [...new Set(tasks.flatMap(task => taskFact(task).dependencies).filter(dep => !taskIdSet.has(dep)))];
@@ -734,6 +734,10 @@ export class GoalGovernanceStore {
       LET $c = SELECT * FROM ONLY $candidate;
       IF $c = NONE OR $c.version != $candidate_version OR $c.state IN ['done', 'void'] { THROW 'candidate moved or terminal' };
       IF $expected_old != NONE AND $g.tasks.acceptance != $expected_old { THROW 'goal final gate moved' };
+      IF $old != NONE {
+        CREATE audit CONTENT { task: $old, actor: $actor, action: 'goal_final_gate_replaced',
+          evidence: $old_evidence, at: time::now() };
+      };
       UPDATE ONLY $goal SET tasks.acceptance = $candidate, tasks.manual = IF $quick THEN $candidate ELSE $g.tasks.manual END,
         anchors = array::map($g.anchors ?? [], |$a| IF $a = $expected_old OR $quick THEN $candidate ELSE $a END),
         state = 'needs_repair', needs_repair = true,
@@ -747,6 +751,8 @@ export class GoalGovernanceStore {
       COMMIT;`, {
       goal, candidate: new RecordId('task', input.candidateTaskId), candidate_version: candidate.version ?? 0,
       expected_version: input.expectedGoalVersion, expected_old: currentId ? new RecordId('task', currentId) : null,
+      old: currentId ? new RecordId('task', currentId) : null,
+      old_evidence: `终验引用由 ${currentId ?? '-'} 替换为 ${input.candidateTaskId}；授权修复，旧关口不再承担实现完成判定`,
       quick: quickSame, next_version: nextVersion, actor: input.actor,
       evidence: `${input.reason}\n[goal_final_gate_repair] goal=${input.goalId} old=${currentId ?? '-'} new=${input.candidateTaskId} snapshot=${input.snapshotHash}`,
       goal_key: input.goalId, candidate_key: input.candidateTaskId, snapshot: input.snapshotHash,

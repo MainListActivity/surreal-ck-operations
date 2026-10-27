@@ -77,6 +77,14 @@ describe('goal final-gate invariants (AC01)', () => {
     expect(second.readyToComplete).toBe(true);
   });
 
+  test('an authorized outcome that no longer requires implementation can close a goal with retired work', () => {
+    const result = assessGoal({ goal: goal(), tasks: [task('manual'), task('impl', { state: 'void' }), ownerGate()],
+      outcome: outcome(['owner_final']), now: NOW });
+    expect(result.repairReasons.map(reason => reason.code)).not.toContain('implementation_void');
+    expect(result.stages.find(stage => stage.key === 'implementation')).toMatchObject({ status: 'not_required' });
+    expect(result.readyToComplete).toBe(true);
+  });
+
   test('all required evidence and a real owner approval make the final gate completable', () => {
     const result = assessGoal({ goal: goal(), tasks: [task('manual'), ownerGate()],
       outcome: outcome(['implementation', 'owner_final']), now: NOW });
