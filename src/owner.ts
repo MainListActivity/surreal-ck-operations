@@ -10,6 +10,8 @@ import { assertRoleContract, loadContract } from './role-contract.ts';
 import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
 import { acceptanceError, acceptanceSubject, evaluateAcceptance, humanSignoffs, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow, type HumanSignoff } from './acceptance.ts';
+import { WaitStore } from './wait-store.ts';
+import type { WaitHandoffCard } from './waits.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
 export interface OwnerCommandRow {
@@ -31,6 +33,8 @@ export interface OwnerInbox {
   gates: Array<{ task: TaskView; submission?: string }>;
   questions: Array<{ task: TaskView; question?: string }>;
   notices: OwnerNotice[];
+  /** SYS05: owner handoff cards; an unknown expiry stays unknown, and no secret-bearing link is copied here. */
+  handoffs?: WaitHandoffCard[];
   pendingCommands: number;
 }
 
@@ -413,6 +417,7 @@ export class OwnerDesk {
       gates: gates.map(row => ({ task: view(row), submission: latestBy.get(`${asId(row.id)}|submit`) })),
       questions: questions.map(row => ({ task: view(row), question: latestBy.get(`${asId(row.id)}|question`) })),
       notices: await this.openNotices(),
+      handoffs: await new WaitStore(this.db).handoffCards(Date.now()).catch(() => []),
       pendingCommands: pending[0]?.count ?? 0,
     };
   }

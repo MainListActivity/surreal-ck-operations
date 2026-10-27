@@ -60,12 +60,12 @@ const ROOT = join(import.meta.dir, '..');
 const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? '11e7db2fae3f92205410a02634c61c43e99f413a';
 const TICKS = 3;
 /** Tasks the previous dispatcher must never claim, wake or change at all. */
-const PROTECTED = ['rb01-waiting', 'rb01-gated-owner', 'rb01-held', 'rb01-done', 'rb01-void', 'rb01-lease-held'];
+const PROTECTED = ['rb01-waiting', 'rb01-sys05-wait', 'rb01-gated-owner', 'rb01-held', 'rb01-done', 'rb01-void', 'rb01-lease-held'];
 /** The manager gates: the same task legitimately raises one gm-attention in the control namespace under the old
  * design, and must raise none where SYS04 deferred it. */
 const GATES = ['rb01-gm-episode', 'rb01-fault-exhausted'];
 /** The tables SYS04 adds; the rollback must neither read nor change their contents. */
-const NEW_TABLES = ['fault_incident', 'fault_episode', 'fault_budget', 'fault_repair'];
+const NEW_TABLES = ['fault_incident', 'fault_episode', 'fault_budget', 'fault_repair', 'task_wait'];
 const run = process.env.RUN_SCK_ROLLBACK_FORK_TESTS === '1' ? describe : describe.skip;
 
 const PHASE: FaultPhase = 'login';
@@ -139,6 +139,7 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   await make('rb01-ready', '就绪任务：旧版调度应认领，作为阳性对照。');
   await make('rb01-ready-long', '就绪任务（长上下文）：旧版调度应认领。');
   await make('rb01-waiting', '等待依赖：应保持阻塞且不派工。');
+  await make('rb01-sys05-wait', 'SYS05 时间等待：新版写入 wait_* 后，旧版必须继续不派工（RB01）。');
   await make('rb01-gated-owner', '门禁（owner）：不派工。');
   await make('rb01-held', '他人持有有效租约：不得认领。');
   await make('rb01-done', '已完成：不得触碰。');
@@ -157,6 +158,9 @@ async function seedFixture(database: CompanyDatabase, scratch: string): Promise<
   const now = Math.floor(Date.now() / 1000);
   await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = NONE, dependencies = [$dep], version = version + 1;',
     { t: at('rb01-waiting'), dep: at('rb01-ready-long') });
+  // SYS05: the same blocked shape as a dependency wait, with the new wait_* fields written only in namespace B.
+  await database.db.query(`UPDATE ONLY $t SET state = "blocked", blocked_to = NONE, resume_state = "ready",
+    resume_role = "engineering", version = version + 1;`, { t: at('rb01-sys05-wait') });
   await database.db.query('UPDATE ONLY $t SET state = "blocked", blocked_to = "owner", version = version + 1;', { t: at('rb01-gated-owner') });
   await database.db.query(`UPDATE ONLY $t SET state = "blocked", blocked_to = "owner", dispatch_blocked_phase = "execute",
     dispatch_blocked_since = $since, version = version + 1;`, { t: at('rb01-lease-held'), since: now });
@@ -283,6 +287,21 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
       text: 'RB01 演练：恢复预算已耗尽，原任务等待唯一修复链完成后再继续。', idempotencyKey: 'rb01-sys04-defer',
     });
     Object.assign(chainBefore, await taskShape(forkB, faultTaskId));
+    // SYS05's new state: a due-in-the-future time wait. The old release reads neither task_wait nor wait_*; the
+    // task's blocked state is what keeps it out of the old dispatch queue.
+    const waitTaskId = idOf('rb01-sys05-wait');
+    const waitKey = `${waitTaskId}:rb01-drill`;
+    const notBefore = Date.now() + 10 * 60_000;
+    await forkB.db.query(`CREATE task_wait CONTENT { wait_key: $key, task: $task, kind: 'time', state: 'waiting',
+      source: { kind: 'time' }, owner_role: 'engineering', not_before: $not_before, expires_source: 'unknown',
+      progress: { employee: 'rb01-eng-1', taskVersion: 1, at: $now }, completed: [],
+      reason: 'RB01 演练：SYS05 时间等待在回滚到旧版后不得被认领或提前唤醒', version: 1,
+      entered_by: 'rb01-eng-1', entered_version: 1, entered_at: time::now(), updated_at: time::now() };`, {
+      key: waitKey, task: id('task', waitTaskId), not_before: notBefore, now: Date.now(),
+    });
+    await forkB.db.query(`UPDATE ONLY $t SET wait_state = 'waiting', wait_kind = 'time', wait_episode = $key,
+      wait_not_before = $not_before, wait_owner_role = 'engineering', wait_source = 'time', wait_version = 1,
+      wait_entered_at = time::now(), version = version + 1;`, { t: id('task', waitTaskId), key: waitKey, not_before: notBefore });
     const budgetRow = await store.scope(budgetKey(faultTaskId, TARGET, PHASE));
     Object.assign(budgetBefore, { attempts: budgetRow?.attempts, total_attempts: budgetRow?.totalAttempts,
       deadline: budgetRow?.deadline, last_attempt_at: budgetRow?.lastAttemptAt, failed: budgetRow?.failed });
@@ -405,6 +424,7 @@ run('RB01 rollback isolation: SYS04 fault states against the previous release', 
     }
     const b = outcomes.B.tasks!;
     expect(b['rb01-waiting']).toMatchObject({ state: 'blocked', blockedTo: null });
+    expect(b['rb01-sys05-wait']).toMatchObject({ state: 'blocked', blockedTo: null });
     expect(b['rb01-gated-owner']).toMatchObject({ state: 'blocked', blockedTo: 'owner' });
     expect(b['rb01-held']).toMatchObject({ state: 'doing', occupied: true, occupiedBy: 'rb01-held-employee' });
     expect(b['rb01-done']).toMatchObject({ state: 'done' });

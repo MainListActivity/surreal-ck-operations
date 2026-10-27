@@ -55,8 +55,19 @@ export class SessionStore {
 
   drop(handle: string): void { this.sessions.delete(handle); }
 
-  dropEmployee(employeeId: string): void {
-    for (const session of [...this.sessions.values()]) if (session.employeeId === employeeId) this.sessions.delete(session.id);
+  /** How many live handles an employee still holds; the cleanup report names a count, never a token. */
+  countOf(employeeId: string): number {
+    return [...this.sessions.values()].filter(s => s.employeeId === employeeId).length;
+  }
+
+  dropEmployee(employeeId: string): number {
+    let dropped = 0;
+    for (const session of [...this.sessions.values()]) {
+      if (session.employeeId !== employeeId) continue;
+      this.sessions.delete(session.id);
+      dropped++;
+    }
+    return dropped;
   }
 
   /** Every live token, for scrubbing it out of any text that might echo it. */

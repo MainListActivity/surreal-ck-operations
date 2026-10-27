@@ -70,6 +70,8 @@ try {
     'tests/fault-rollback-isolation.fork.test.ts',
     // SYS04：故障分类与持久预算、真实 TLS 传输的回归。
     'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
+    // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
+    'tests/waits.test.ts', 'tests/wait-dispatch.test.ts', 'tests/wait-cleanup.test.ts', 'tests/wait-store.fork.test.ts',
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
     'tests/disposition-rehearsal.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',

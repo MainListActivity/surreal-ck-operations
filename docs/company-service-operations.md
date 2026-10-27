@@ -151,6 +151,19 @@ handle_path /pv/* { reverse_proxy 127.0.0.1:18778 }
 
 **应急兜底**：`src/preview-server.ts` 为同 core 的 bun 独立脚本（`bun src/preview-server.ts`，双监听与插件一致），插件整体不可用时可用 launchd 临时顶回；复制到 `bin/` 时连同 `preview-core.ts`、`preview-sign.ts` 一起（`cp src/{preview-server,preview-core,preview-sign}.ts $SCK_SERVICE_HOME/bin/`）。
 
+## SYS05 时间与外部事件等待
+
+员工不再用前台 sleep 等待时间或外部回执：`wait_task` 在**一个事务**里保存进度快照、清除持有人/租约并把任务移出派工队列，调度器在条件成立时只释放条件本身。等待期间任务不占员工、不占 provider 并发名额，也不产生人工「核时验收」链。
+
+- **契约**：`kind` 固定为 `time` / `dependency` / `upstream_repair` / `customer_activation` / `owner_handoff` / `feedback`；`ownerRole`、非敏感 `reference`、`notBefore`、工具返回的精确 `expiresAt`、`nextCheckAt`、显示用 IANA `timezone`。时间必须是带时区偏移的绝对时刻（或毫秒数）；无偏移的本地时间直接拒绝，夏令时只改显示、不改判定。没有工具给出精确到期时 `expiresSource=unknown`，系统不算、不补。
+- **一次释放**：`task_wait` 的 `state` 从 `waiting` 到 `released` 走版本 CAS；20 个并发 tick 只有一个能落地。`time` 到点只解除时间条件：依赖未完成、任务仍在 `blocked_to=owner`、`owner_handoff` 未收到 owner relay 决定时都保持 `held`，不自动放行。精确到期已过且没有到期前受信事件的等待标为 `expired`，不自动恢复。
+- **受信事件**：`resolve_wait` 只接受经理（`authorized_person`）、依赖任务终态，或带 HMAC 签名的 `webhook`（`provider`+`eventId`+`signature`，密钥 `SCK_WAIT_WEBHOOK_SECRET`；未配置即拒绝）。事件必须写明 `objectWaitId`/`objectTaskId`，重复 `event_key`、过期、错误对象一律拒绝；模型自称「收到反馈」不算。`owner_handoff` 只能由 `record_owner_decision` 的 owner relay 路径解除。
+- **安全解除**：`cancel_wait` / `extend_wait` 需要当前 `expectedVersion` 与理由；过期版本拒绝。`cancel_wait` 不给 `resume=true` 时任务留在经理门禁（`blocked_to=gm`），取消不等于条件已解决。`resume` 不能跳过等待；等待引用会做有界环检测。`wait_migration_preview` 只读，owner 关口永不批量迁移。
+- **老板交接卡**：`wait_handoff_cards` 与收件箱给出已完成技术项、待老板动作、谁等谁、工具返回的精确到期或 `unknown`、下一触发条件；提醒按 wait+风险桶去重。邀请 secret 链接只留在受控 handoff 文件，卡片只给文件名；此功能不向客户发信、不代签客户采纳。
+- **回收**：租约结束由 ops broker 丢弃本地会话句柄并在审计中注明「未调用远端注销」；ego-browser 空间按受控 closer 有界关闭，未配置或关闭失败记为待清理，绝不冒称已注销。
+- **回滚隔离（RB01）**：新表为 `task_wait` / `wait_event`（旧版不读，忽略）；进入等待的任务同时置为 `state=blocked, blocked_to=NONE, resume_state=ready|review`，旧版派工队列不收 blocked，旧版依赖解锁 SQL 也被新版的 `wait_state='waiting'` 条件挡住。`tests/fault-rollback-isolation.fork.test.ts` 的旧 release 演练已包含 `rb01-sys05-wait`（新版写入未到点时间等待 → 旧版调度多轮 → 零认领、零会话）。
+- **回归**：`tests/waits.test.ts`（纯规则）、`tests/wait-store.fork.test.ts`（真实 core/fork：原子进入、20 并发一次释放、重启、重复/错误对象/过期事件、owner relay、版本锁、依赖终态）、`tests/wait-dispatch.test.ts`（等待零派工、到点一次唤醒）、`tests/wait-cleanup.test.ts`（会话/浏览器回收失败待清理）。
+
 ## 员工客户端
 
 > **v3 更新（sidecar/comm 通道）**：员工实例由 Paseo 插件 `sck-company` 注册代管，agent 进程零凭证——spawn env 只注入 `SCK_COMM_DIR` 和 `SCK_COMM_KEY`，实例凭证与租约证明留在插件进程内。claim/heartbeat/submit/review/blocker 由 sidecar 程序化代执行，租约证明自动注入，员工参数只写业务字段，`claim_next` 在员工侧不可用。comm 文件协议：`claim.json` 下发任务上下文，`report.md` 落盘即提交，`blocker.md` 上报阻塞（回合结束时由 sidecar 回收为 submit/report_blocker），`req/`+`res/` 原子转发 `sck call`。`get_secret`/`put_secret` 等凭证工具已下线，需要账号、workspace、生产登录走 `ops_*` 运维工具（先 `ops_info` 查能力清单）。legacy `credential_file` 实例不再被代领新任务，自然淘汰。架构、调用路径、安全边界与排障详见 [sidecar 通道](./sidecar-channel.md)；本节下述的凭证文件方式（`SCK_EMPLOYEE_CREDENTIAL_FILE` 与 `private/credentials/*.token`）仅为旧部署与 legacy 实例保留。

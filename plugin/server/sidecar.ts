@@ -35,6 +35,8 @@ const HEARTBEAT_MS = 60_000;
 const SWEEP_MS = 400;
 const BASE_TOOLS = [
   "get_context", "get_task_history", "list_worktrees", "reclaim_worktrees", "list_worktree_audits", "checkpoint", "submit", "review", "report_blocker",
+  // SYS05 typed waits: enter (consumes the lease), trusted-event resolve, manager cancel/extend, read-only audit/cards.
+  "wait_task", "resolve_wait", "cancel_wait", "extend_wait", "list_task_waits", "wait_handoff_cards", "wait_migration_preview",
   "create_task", "create_goal", "triage_goal", "create_delivery",
   "record_owner_decision", "set_direction", "resume_task", "defer_task_until", "retire_task",
   "record_score", "get_model_evidence", "heartbeat", "deliverable_publish",
@@ -113,8 +115,8 @@ export function blockerQuotaReset(text: string): { quotaResetsAt?: string; mispl
 export interface OpsGateway {
   readonly tools: readonly string[];
   call(credential: string, taskId: string, tool: string, args: Record<string, unknown>): Promise<unknown>;
-  /** The employee instance is done with its lease or gone: drop every session opened for it. */
-  release(employeeId: string): void;
+  /** The employee instance is done with its lease or gone: drop every session opened for it (and report cleanup). */
+  release(employeeId: string): void | { sessions: number; browserSpaces: number; pending: number };
 }
 
 export interface SidecarDeps {
@@ -534,7 +536,10 @@ export class SidecarPool {
     if (live) this.lastTask.set(instId, live.taskId);
     this.stopBeat(instId);
     this.claims.delete(instId);
-    this.deps.ops?.release(instId);
+    const cleanup = this.deps.ops?.release(instId);
+    if (cleanup && typeof cleanup === 'object' && cleanup.pending > 0) {
+      this.log(`lease end ${instId}: ${cleanup.pending} browser space(s) pending cleanup; no remote logout is claimed`);
+    }
     this.deps.media?.release(instId);
     this.deps.sync?.release(instId);
     // claim.json describes a dead lease — remove it so a re-used/woken agent knows it holds nothing.
@@ -947,6 +952,31 @@ export class SidecarPool {
       case "submit": return writeOp(p => core.submit(cred, p, evidence()), true);
       case "review": return writeOp(p => (args.decision === "accept" ? core.accept(cred, p, evidence()) : core.returnTask(cred, p, evidence())), true);
       case "report_blocker": return writeOp(p => core.block(cred, p, args.to === "owner" ? "owner" : "gm", evidence(), quotaReset()), true);
+      // SYS05: entering a wait consumes the lease in the same turn — the task takes no employee or provider seat
+      // while it waits. The ops sessions and browser spaces opened under this lease are dropped by endLease below.
+      case "wait_task": {
+        if (!core.wait) return Promise.reject(Object.assign(new Error("core does not expose wait_task"), { code: "temporarily_unavailable" }));
+        const { taskId: _t, deliveryId: _d, fence: _f, expectedVersion: _e, ...spec } = args;
+        return writeOp(p => core.wait!(cred, p, evidence(), spec as never), true);
+      }
+      case "resolve_wait": return core.resolveWait
+        ? core.resolveWait(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose resolve_wait"), { code: "temporarily_unavailable" }));
+      case "cancel_wait": return core.cancelWait
+        ? core.cancelWait(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose cancel_wait"), { code: "temporarily_unavailable" }));
+      case "extend_wait": return core.extendWait
+        ? core.extendWait(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose extend_wait"), { code: "temporarily_unavailable" }));
+      case "list_task_waits": return core.listWaits
+        ? core.listWaits(cred, args as never)
+        : Promise.reject(Object.assign(new Error("core does not expose list_task_waits"), { code: "temporarily_unavailable" }));
+      case "wait_handoff_cards": return core.waitHandoffCards
+        ? core.waitHandoffCards(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose wait_handoff_cards"), { code: "temporarily_unavailable" }));
+      case "wait_migration_preview": return core.waitMigrationPreview
+        ? core.waitMigrationPreview(cred)
+        : Promise.reject(Object.assign(new Error("core does not expose wait_migration_preview"), { code: "temporarily_unavailable" }));
       case "create_task": return core.createTask(cred, args as never);
       case "create_goal": return core.relayGoal(cred, args as never);
       case "triage_goal": return core.triageGoal(cred, args as never);

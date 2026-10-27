@@ -15,6 +15,8 @@ import { chainOfTaskRow, readEffectiveContract, readTaskPolicyRow, registeredDom
 import { gateCredentialChange } from './retirement.ts';
 import { acceptanceSubject, evaluateAcceptance, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow } from './acceptance.ts';
 import { DispositionLedger, dispositionEpisodeKey, type DispositionDecisionView, type DispositionPhase, type HolderNoticeView } from './disposition.ts';
+import { WaitStore, type WaitRow } from './wait-store.ts';
+import type { WaitHandoffCard } from './waits.ts';
 /**
  * Root-level workforce and lease supervision for the local dispatcher and admin CLI.
  * Never hand this object to the MCP adapter.
@@ -206,6 +208,16 @@ export interface SupervisedTask {
   resumeRole?: string;
   /** Unix seconds; set by a quota-caused block, gm is not re-announced before it. */
   quotaResetsAt?: number;
+  /** SYS05: set while a typed wait owns the task. A waiting task takes no employee, lease or provider seat. */
+  waitState?: 'waiting';
+  waitKind?: string;
+  /** Unix milliseconds: the absolute instant the time condition becomes true. */
+  waitNotBefore?: number;
+  waitExpiresAt?: number;
+  waitNextCheckAt?: number;
+  waitOwnerRole?: string;
+  waitSource?: string;
+  waitKey?: string;
   kind: string;
   title: string;
   /** Goal this task belongs to; dispatch-blocked conclusions carry it so goal cards can show the root blocker. */
@@ -247,6 +259,16 @@ const supervised = (row: TaskRow): SupervisedTask => {
     progressAt: row.progress_at ?? undefined, blockedTo: row.blocked_to ?? undefined,
     resumeState: row.state === 'blocked' ? row.resume_state : undefined, resumeRole: row.state === 'blocked' ? row.resume_role : undefined,
     quotaResetsAt: row.quota_resets_at ?? undefined, kind: v.kind, title: v.title, goalId: v.goalId,
+    ...(row.wait_state === 'waiting' ? {
+      waitState: 'waiting' as const,
+      ...(row.wait_kind === undefined || row.wait_kind === null ? {} : { waitKind: row.wait_kind }),
+      ...(row.wait_not_before === undefined || row.wait_not_before === null ? {} : { waitNotBefore: row.wait_not_before }),
+      ...(row.wait_expires_at === undefined || row.wait_expires_at === null ? {} : { waitExpiresAt: row.wait_expires_at }),
+      ...(row.wait_next_check_at === undefined || row.wait_next_check_at === null ? {} : { waitNextCheckAt: row.wait_next_check_at }),
+      ...(row.wait_owner_role === undefined || row.wait_owner_role === null ? {} : { waitOwnerRole: row.wait_owner_role }),
+      ...(row.wait_source === undefined || row.wait_source === null ? {} : { waitSource: row.wait_source }),
+      ...(row.wait_episode === undefined || row.wait_episode === null ? {} : { waitKey: row.wait_episode }),
+    } : {}),
     evalAttempts: row.eval_attempts ?? 0, jevReleaseVersion: row.jev_release_version ?? undefined,
     jevRouteVersion: row.jev_route_version ?? undefined, ownerRerouted: row.owner_rerouted === true, repoPath: row.repo_path ?? undefined,
     codeRepoPath: row.code_repo_path ?? undefined, goalTier: row.goal_tier ?? undefined };
@@ -358,6 +380,8 @@ export class Workforce {
   private readonly enrollment: LocalEnrollmentAdmin;
   /** SYS03: the disposition ledger, read here for the dispatcher's pre-wake guard and for notice delivery. */
   private readonly dispositions: DispositionLedger;
+  /** SYS05: the wait ledger, read by the dispatcher to release due conditions once per tick. */
+  private readonly waits: WaitStore;
   /**
    * `retirementHook` is a test seam (SYS-DISP R1 race tests): it runs once the retirement decision has been read and before its
    * write, so a test can land a claim or takeover in exactly that window.
@@ -366,6 +390,7 @@ export class Workforce {
     private readonly retirementHook?: (employeeId: string) => Promise<void>) {
     this.enrollment = new LocalEnrollmentAdmin(database);
     this.dispositions = new DispositionLedger(database);
+    this.waits = new WaitStore(database.db);
   }
   private get db() { return this.database.db; }
   private async now(): Promise<number> {
@@ -623,9 +648,39 @@ export class Workforce {
     return rows.map(supervised);
   }
 
+  /**
+   * SYS05: release the wait conditions that are true now. A time wait releases once (the store's compare-and-set
+   * makes twenty ticks one release); a dependency wait releases when its reference task is done or void; nothing
+   * is released past an unfinished dependency or an owner gate. Waits whose precise expiry passed first become
+   * `expired` and are not auto-released.
+   */
+  async releaseDueWaits(nowMs: number): Promise<{
+    released: Array<{ waitKey: string; taskId: string }>;
+    held: Array<{ waitKey: string; taskId: string; reason: string }>;
+    expired: Array<{ waitKey: string; taskId: string }>;
+  }> {
+    const expired = await this.waits.markExpired(nowMs);
+    const due = await this.waits.releaseDue(nowMs);
+    return { released: due.released, held: due.held, expired: [...expired, ...due.expired] };
+  }
+
+  /** SYS05: owner handoff cards for the inbox and the dispatcher's deduped reminders. */
+  async waitHandoffCards(nowMs: number): Promise<WaitHandoffCard[]> {
+    return this.waits.handoffCards(nowMs);
+  }
+
+  /** SYS05: waits whose next human check is due. Raises a look-at-it reminder; releases nothing. */
+  async dueWaitChecks(nowMs: number): Promise<WaitRow[]> {
+    return this.waits.dueChecks(nowMs);
+  }
+
+  /** SYS05: the waits of one task, newest first (used by the owner relay and by tests). */
+  async taskWaits(taskId: string): Promise<WaitRow[]> {
+    return this.waits.waitsOfTask(taskId);
+  }
+
   /** Metrics + timeline a judge needs to score a finished task (shared with the Jev dispatcher path). */
-  async requireFullModelEvaluation(taskId: TaskId): Promise<void> {
-    await this.db.query("UPDATE $task SET model_eval_full_history=true WHERE state='done';",{task:id('task',taskId)});
+  async requireFullModelEvaluation(taskId: TaskId): Promise<void> {    await this.db.query("UPDATE $task SET model_eval_full_history=true WHERE state='done';",{task:id('task',taskId)});
   }
 
   async evalState(taskId: TaskId): Promise<EvalState> {
