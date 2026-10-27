@@ -1,5 +1,5 @@
 import {beforeAll,afterAll,expect,test,setDefaultTimeout} from 'bun:test';
-import {mkdtempSync,mkdirSync,writeFileSync,symlinkSync,rmSync,existsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,symlinkSync,rmSync,existsSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
 import {homedir,tmpdir} from 'node:os';
 import {execFileSync} from 'node:child_process';
@@ -20,7 +20,7 @@ const git=(args:string[])=>execFileSync('git',['-C',repo,...args],{encoding:'utf
 const notes={version:'0.2.0',title:'收件箱升级',changes:['更新任务派工与上线入口'],impact:['切换期间短暂停止新派工'],migration:'只新增作业记录',rollback:'恢复旧发布'};
 beforeAll(async()=>{
  if(process.env.RUN_SCK_UPGRADE_FORK_TESTS!=='1')return;
- dir=mkdtempSync(join(tmpdir(),'sck-company-upgrade-'));repo=join(dir,'repo');home=join(dir,'service');mkdirSync(repo);mkdirSync(join(home,'releases'),{recursive:true});
+ dir=realpathSync(mkdtempSync(join(tmpdir(),'sck-company-upgrade-')));repo=join(dir,'repo');home=join(dir,'service');mkdirSync(repo);mkdirSync(join(home,'releases'),{recursive:true});
  git(['init','-b','main']);writeFileSync(join(repo,'package.json'),'{"version":"0.1.0"}');git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','old']);oldSha=git(['rev-parse','HEAD']);
  writeFileSync(join(repo,'package.json'),'{"version":"0.2.0"}');writeFileSync(join(repo,'company-release.json'),JSON.stringify(notes));git(['add','.']);git(['-c','user.name=fixture','-c','user.email=fixture@invalid','commit','-m','new']);newSha=git(['rev-parse','HEAD']);git(['remote','add','origin',repo]);git(['fetch','origin','main']);
  for(const [sha,version] of [[oldSha,'0.1.0'],[newSha,'0.2.0']]){mkdirSync(join(home,'releases',sha!),{recursive:true});writeFileSync(join(home,'releases',sha!,'package.json'),JSON.stringify({version}));}
