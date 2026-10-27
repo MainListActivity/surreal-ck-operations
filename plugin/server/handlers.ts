@@ -39,7 +39,8 @@ export function registerHandlers(server: PluginServerContext): void {
     if (isQaContext(context)) throw new Error('owner RPC is not available to a QA session; use the /q/ read-only console');
     return handler(input, context);
   });
-  ownerHandle(rpc.inbox, async () => (await company()).owner.inbox());
+  ownerHandle(rpc.inbox, async () => (await company()).upgrades.inbox());
+  ownerHandle(rpc.upgrade, async (input: RpcInput<typeof rpc.upgrade>) => (await company()).upgrades.start(input,SOURCE));
   ownerHandle(rpc.brief, async () => (await company()).owner.brief());
 
   ownerHandle(rpc.createGoal, async (input: RpcInput<typeof rpc.createGoal>) => {
