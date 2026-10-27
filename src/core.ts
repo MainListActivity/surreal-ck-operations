@@ -2576,7 +2576,7 @@ discipline: input.discipline, work_intent: input.workIntent, model_tier: input.m
         throw new CompanyError('forbidden','只有当前工程租约可以登记公司系统上线版本');
       const repo = this.companyReleaseRepo ?? this.worktrees?.options.opsRepo ?? process.env.SCK_AGENT_CWD ?? '/Users/y/IdeaProjects/surreal-ck-operations';
       const project = await this.taskProject(proof.taskId);
-      if (realpathSync(row.code_repo_path ?? project?.repoPath ?? repo) !== realpathSync(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
+      if (!(row.code_repo_path ?? project?.repoPath) || realpathSync((row.code_repo_path ?? project?.repoPath)!) !== realpathSync(repo)) throw new CompanyError('forbidden','此任务不是公司系统仓库的上线任务');
       companyUpgrade = await readCompanyRelease(repo,evidence.companyUpgrade.sha);
     }
     let prHead: string | undefined;

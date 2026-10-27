@@ -21,7 +21,12 @@ export class CompanyUpgrades {
   for(const j of jobs){
    if(!running(j.status)||Date.now()-Date.parse(String(j.updated_at))<60_000)continue;
    let alive=false;if(j.pid){try{process.kill(-j.pid,0);alive=true;}catch{}}
-   if(!alive){await this.update(String(j.id.id),'failed','升级进程已中断','请重试升级；系统会先核验当前版本，未自动回复通过。');j.status='failed';j.phase='升级进程已中断';j.error='请重试升级；未自动回复通过。';}
+   if(!alive){
+    // Do not overwrite a worker that started or made progress after this read.
+    const [changed]=await this.db.query<[UpgradeJob[]]>(`UPDATE $job SET status='failed',phase='升级进程已中断',error='请重试升级；系统会先核验当前版本，未自动回复通过。',updated_at=time::now()
+      WHERE status=$status AND updated_at=$at AND pid=$pid RETURN AFTER;`,{job:j.id,status:j.status,at:j.updated_at,pid:j.pid});
+    if(changed[0])Object.assign(j,changed[0]);
+   }
   }
   const items:UpgradeCard[]=[];
   const seen=new Set<string>();
@@ -53,12 +58,12 @@ export class CompanyUpgrades {
     IF $active.task!=$task OR $active.plan.digest!=$digest {THROW '已有公司升级正在执行';};
     RETURN $active;
    } ELSE {
-    CREATE ONLY $job CONTENT {task:$task,task_version:$version,plan:$plan,status:'queued',phase:'已排队',previous:IF $active.task=$task THEN $active.previous ELSE NONE END,paused_before:IF $active.task=$task THEN $active.paused_before ELSE NONE END,pause_version:IF $active.task=$task THEN $active.pause_version ELSE NONE END,source:$source,decision:IF $t.state='review' THEN 'approve' ELSE 'reply' END,at:time::now(),updated_at:time::now()};
+    CREATE ONLY $job CONTENT {task:$task,task_version:$version,plan:$plan,status:'queued',phase:'已排队',previous:IF $active.task=$task AND $active.plan.digest=$digest AND $active.status IN ['failed','awaiting_reply'] THEN $active.previous ELSE NONE END,paused_before:IF $active.task=$task AND $active.plan.digest=$digest AND $active.status IN ['failed','awaiting_reply'] THEN $active.paused_before ELSE NONE END,pause_version:IF $active.task=$task AND $active.plan.digest=$digest AND $active.status IN ['failed','awaiting_reply'] THEN $active.pause_version ELSE NONE END,source:$source,decision:IF $t.state='review' THEN 'approve' ELSE 'reply' END,at:time::now(),updated_at:time::now()};
     UPSERT ONLY company_meta:upgrade_job SET job=$job;
     CREATE audit CONTENT {task:$task,actor:$source,action:'company_upgrade_authorized',evidence:$evidence,version:$version,at:time::now()};
     RETURN SELECT * FROM ONLY $job;
    };
-   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,plan,job:new RecordId('company_upgrade',jobId),source,evidence:`老板点击升级至 v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
+   COMMIT;`,{task:new RecordId('task',input.taskId),version:input.taskVersion,digest:input.digest,sha:plan.sha,plan,job:new RecordId('company_upgrade',jobId),source,evidence:`老板授权升级至 v${plan.version}；SHA ${plan.sha}；仅验证成功后自动回复通过。`}).responses();
   const error=results.find(r=>!r.success&&!r.error.message.includes('not executed')&&!r.error.message.startsWith('Cannot COMMIT'));
   if(error&&!error.success)throw new CompanyError('conflict',error.error.message);
   const result=results.filter(r=>r.success&&r.result&&typeof r.result==='object'&&!Array.isArray(r.result)).at(-1);

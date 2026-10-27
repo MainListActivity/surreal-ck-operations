@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir,realpath,readFile,rm } from 'node:fs/promises';
+import { mkdir,realpath,readFile,rm,rename,mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
 import { CompanyUpgrades,type UpgradeJob,type UpgradeStatus } from './company-upgrades.ts';
@@ -53,15 +53,18 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
  if(!claimed.length)return;
  job=claimed[0]!;
  const beat=setInterval(()=>void db.query('UPDATE $job SET updated_at=time::now();',{job:job!.id}).catch(()=>{}),5000);beat.unref();
- let phase='校验版本',previous:string|undefined,targetPath:string|undefined,pausedVersion:number|undefined=job.pause_version,pausedBefore=job.paused_before??false,healthy=false,switched=false;
+ let phase='校验版本',previous:string|undefined=job.previous,targetPath:string|undefined,pausedVersion:number|undefined=job.pause_version,pausedBefore=job.paused_before??false,healthy=false,switched=false;
  const update=async(status:UpgradeStatus,next:string)=>{phase=next;await service.update(id,status,next);};
  try{
   await update('preparing','校验版本');
   await git(repo,['fetch','origin','main']);
   const plan=await readCompanyRelease(repo,job.plan.sha);
   if(plan.digest!==job.plan.digest)throw Error('approved plan changed');
-  const current=await installedRelease(home);previous=current.path;
+  const current=await installedRelease(home);
+  // A retry after switching still owns the original recovery snapshot.
+  previous=current.sha===plan.sha?(job.previous??current.path):current.path;
   const target=join(home,'releases',plan.sha);targetPath=target;
+  if(current.sha===plan.sha&&previous!==current.path){targetPath=await realpath(target);switched=true;}
   if(current.sha!==plan.sha){
    if(compareRelease(plan.version,current.version)<=0)throw Error('version superseded');
    await git(repo,['merge-base','--is-ancestor',current.sha,plan.sha]);
@@ -69,13 +72,20 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
    // Reuse only a complete, content-bound snapshot; the gate and installer verify it again.
    const {existsSync}=await import('node:fs');
    if(!existsSync(target)){
-    await mkdir(target,{recursive:true});
-    const archive=join(home,'upgrades',`${id}.tar`);await mkdir(join(home,'upgrades'),{recursive:true,mode:0o700});
-    await run('git',['-C',repo,'archive','--format=tar',`--output=${archive}`,plan.sha],home);
-    await run('tar',['-xf',archive,'-C',target],home);await rm(archive);
-    await run('cp',['-RL',join(previous,'node_modules'),join(target,'node_modules')],home);
-    await run('cp',['-RL',join(previous,'plugin/node_modules'),join(target,'plugin/node_modules')],home);
-    await run('sh',[join(target,'plugin/scripts/vendor.sh')],home);
+    // Never publish a half-extracted directory. Interrupted staging is disposable;
+    // only rename a complete snapshot into its immutable SHA path.
+    await mkdir(join(home,'upgrades'),{recursive:true,mode:0o700});
+    const staging=await mkdtemp(join(home,'upgrades','staging-'));
+    const source=join(staging,'source'),archive=join(staging,'source.tar');
+    try{
+     await mkdir(source);
+     await run('git',['-C',repo,'archive','--format=tar',`--output=${archive}`,plan.sha],home);
+     await run('tar',['-xf',archive,'-C',source],home);
+     await run('cp',['-RL',join(previous,'node_modules'),join(source,'node_modules')],home);
+     await run('cp',['-RL',join(previous,'plugin/node_modules'),join(source,'plugin/node_modules')],home);
+     await run('sh',[join(source,'plugin/scripts/vendor.sh')],home);
+     await rename(source,target);
+    }finally{await rm(staging,{recursive:true,force:true});}
    }
    await run('sh',[join(target,'plugin/scripts/vendor.sh')],home);
    await run('pnpm',['--dir',target,'install','--frozen-lockfile'],home);
@@ -89,26 +99,41 @@ export async function runCompanyUpgrade(service:CompanyUpgrades,id:string,option
    const t=await db.select<{version:number;state:string;blocked_to?:string;reviewer_role:string}>(job.task);
    if(!t||t.version!==job.task_version||!((t.state==='blocked'&&t.blocked_to==='owner')||(t.state==='review'&&t.reviewer_role==='owner')))throw Error('owner task moved');
    if((await installedRelease(home)).sha!==current.sha)throw Error('another release replaced the current version');
-   const [c]=await db.query<[{paused?:boolean;pause_version:number}]>('UPSERT ONLY company_meta:config SET paused=true,pause_version=(pause_version??0)+1 RETURN BEFORE;');
-   pausedBefore=!!c?.paused;pausedVersion=(c?.pause_version??0)+1;
-   await db.query('UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision;',{job:job.id,previous, before:pausedBefore,revision:pausedVersion});
+   // Pause ownership and the recovery snapshot are one atomic write. A retry
+   // retains the original state only while its pause revision is still current.
+   const pauseResults=await db.query(`BEGIN;
+    LET $c=SELECT * FROM ONLY company_meta:config;
+    LET $j=SELECT * FROM ONLY $job;
+    LET $before=IF $j.pause_version!=NONE AND $j.pause_version=$c.pause_version THEN $j.paused_before ELSE $c.paused??false END;
+    LET $revision=($c.pause_version??0)+1;
+    UPSERT ONLY company_meta:config SET paused=true,pause_version=$revision;
+    UPDATE $job SET previous=$previous,paused_before=$before,pause_version=$revision;
+    RETURN {before:$before,revision:$revision};
+    COMMIT;`,{job:job.id,previous});
+   const pause=pauseResults.find(x=>x&&typeof x==='object'&&'revision' in x) as {before:boolean;revision:number}|undefined;
+   if(!pause)throw Error('pause ownership unavailable');
+   pausedBefore=pause.before;pausedVersion=pause.revision;
    await update('installing','安装版本并切换公司插件');
    targetPath=await realpath(target);
    switched=true;
    await run('sh',[join(target,'scripts/company-service.sh'),'install',target],home);
   }
   await update('verifying','验证实际运行版本与服务');
-  await verify(home,target);healthy=true;
+  await verify(home,target);
   const [installation]=await db.query<[{schema_version?:number}]>('SELECT schema_version FROM ONLY company_meta:installation;');
   if((installation?.schema_version??0)<41)throw Error('upgrade schema not applied');
+  healthy=true;
   await db.query('CREATE audit CONTENT {task:$task,actor:$source,action:"company_upgrade_verified",evidence:$evidence,at:time::now()};',{task:job.task,source:job.source,evidence:`v${job.plan.version} ${job.plan.sha}；固定快照、双门禁、active、健康/ready、插件来源与schema/vendor核验通过。`});
   try{await service.finish(job);}catch{await service.update(id,'awaiting_reply','已升级，自动回复待完成','版本已验证上线，但任务状态已变化或验收条件尚未满足；未替代独立验收。');}
  }catch{
+  healthy=false;
   let recovered=false;
   const failedPhase=phase;
   const activeNow=await installedRelease(home).catch(()=>undefined);
   if(switched&&previous&&targetPath&&(!activeNow||activeNow.path===targetPath||activeNow.path===previous)){
    try{await update('verifying','升级失败，恢复之前版本');await run('sh',[join(targetPath,'scripts/company-service.sh'),'install',previous],home);await verify(home,previous);recovered=true;healthy=true;}catch{}
+  }else if(!switched&&previous&&pausedVersion!==undefined&&activeNow?.path===previous){
+   try{await verify(home,previous);healthy=true;}catch{}
   }else healthy=pausedVersion===undefined;
   await service.update(id,'failed','升级失败',`失败阶段：${failedPhase}。${recovered?'已恢复之前版本。':switched?'请检查当前运行状态，派工保持暂停。':'现役版本未切换。'}待办保留，未自动回复通过。`);
  }finally{

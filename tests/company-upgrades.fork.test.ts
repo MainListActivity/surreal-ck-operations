@@ -79,3 +79,47 @@ run('installation success does not override a task that changed during verificat
  await runCompanyUpgrade(service,j.jobId,{run:async()=>{},verify:async()=>{await db.db.query('UPDATE $task SET version+=1;',{task:new RecordId('task',t.id)});}});
  expect((await service.job(j.jobId))!.status).toBe('awaiting_reply');expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
 });
+
+run('a retry after pausing keeps the original dispatch state and atomically records its recovery snapshot',async()=>{
+ rmSync(join(home,'active'));symlinkSync(join(home,'releases',oldSha),join(home,'active'));
+ await owner.setPaused(false);
+ const t=await task(),input={taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest};
+ const first=await service.start(input,'owner:test');
+ const [c]=await db.db.query<[{pause_version:number}]>('SELECT pause_version FROM ONLY company_meta:config;');
+ await db.db.query("UPDATE company_meta:config SET paused=true,pause_version+=1; UPDATE $job SET status='failed',previous=$previous,paused_before=false,pause_version=$revision;",{job:new RecordId('company_upgrade',first.jobId),previous:join(home,'releases',oldSha),revision:c.pause_version+1});
+ const retry=await service.start(input,'owner:test');
+ await runCompanyUpgrade(service,retry.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){const j=await service.job(retry.jobId);expect(j!.paused_before).toBe(false);expect(j!.previous).toBe(join(home,'releases',oldSha));rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
+ expect((await service.job(retry.jobId))!.status).toBe('succeeded');
+ const [cfg]=await db.db.query<[{paused:boolean}]>('SELECT paused FROM ONLY company_meta:config;');expect(cfg.paused).toBe(false);
+});
+run('a retry after switching rolls back to the durable previous version if target verification fails',async()=>{
+ const t=await task(),input={taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest};
+ const first=await service.start(input,'owner:test');
+ await db.db.query("UPDATE $job SET status='failed',previous=$previous,paused_before=false;",{job:new RecordId('company_upgrade',first.jobId),previous:join(home,'releases',oldSha)});
+ const retry=await service.start(input,'owner:test');let restored=false;
+ await runCompanyUpgrade(service,retry.jobId,{run:async(_exe,args)=>{if(args[1]==='install'){expect(args[2]).toBe(join(home,'releases',oldSha));rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));restored=true;}},verify:async(_home,target)=>{if(target.endsWith(newSha))throw Error('target failed');}});
+ expect(restored).toBe(true);expect((await service.job(retry.jobId))!.status).toBe('failed');expect((await core.getTask(eng,t.id)).blockedTo).toBe('owner');
+});
+run('an interrupted extraction never exposes a partial release and the next click can prepare it again',async()=>{
+ rmSync(join(home,'releases',newSha),{recursive:true});
+ const t=await task(),input={taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest};
+ const first=await service.start(input,'owner:test');
+ await runCompanyUpgrade(service,first.jobId,{run:async(exe,args)=>{if(exe==='git')execFileSync(exe,args);if(exe==='tar')throw Error('interrupted extract');},verify:async()=>{}});
+ expect(existsSync(join(home,'releases',newSha))).toBe(false);
+ const retry=await service.start(input,'owner:test');
+ await runCompanyUpgrade(service,retry.jobId,{run:async(exe,args)=>{if(exe==='git'||exe==='tar')execFileSync(exe,args);if(args[1]==='install'){rmSync(join(home,'active'));symlinkSync(args[2]!,join(home,'active'));}},verify:async()=>{}});
+ expect((await service.job(retry.jobId))!.status).toBe('succeeded');expect(JSON.parse(await Bun.file(join(home,'releases',newSha,'company-release.json')).text()).version).toBe('0.2.0');
+});
+run('stale reaping cannot overwrite a worker that progressed after the inbox snapshot',async()=>{
+ const t=await task(),j=await service.start({taskId:t.id,taskVersion:t.version,digest:t.companyUpgrade!.digest},'owner:test');
+ await db.db.query('UPDATE $job SET updated_at=time::now()-2m;',{job:new RecordId('company_upgrade',j.jobId)});
+ const original=db.db.query.bind(db.db);
+ db.db.query=((sql:unknown,vars:unknown)=>{
+  const result=original(sql as string,vars as never);
+  if(String(sql).startsWith('SELECT * FROM company_upgrade ORDER'))return (async()=>{const rows=await result;await original("UPDATE $job SET status='checking',updated_at=time::now();",{job:new RecordId('company_upgrade',j.jobId)});return rows;})();
+  return result;
+ }) as typeof db.db.query;
+ try{await service.state();}finally{db.db.query=original;}
+ expect((await service.job(j.jobId))!.status).toBe('checking');
+ await service.update(j.jobId,'failed','fixture cleanup');
+});
