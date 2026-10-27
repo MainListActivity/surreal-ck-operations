@@ -35,7 +35,7 @@ import { Workforce } from '../src/workforce.ts';
 const ROOT = join(import.meta.dir, '..');
 /** The release the rollback would land on: the SYS05 release this lane branched from. The deploy leg may
  * override it with whatever `active` points at when SYS07 lands. Read-only extraction, never a checkout. */
-const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? '09db5e9c7d1168afbb59f88a11be90867124b35f';
+const OLD_RELEASE = process.env.SCK_RB01_OLD_RELEASE ?? 'c68d1d4d88a40422df24c7fb717d2760314607ca';
 const TICKS = 3;
 const NEW_TABLES = ['goal_outcome', 'goal_evidence'];
 const run = process.env.RUN_SCK_ROLLBACK_FORK_TESTS === '1' ? describe : describe.skip;
