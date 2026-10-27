@@ -238,13 +238,20 @@ export interface RankingTableRow {
   health?: ModelHealth;
 }
 export interface RankingTable {
-  group: string; at?: string; rules?: string; scored: boolean;
+  group: string; at?: string; rules?: string; bandWidth?:number; bandRanges?:Record<string,{top:number;bottom:number}>; scored: boolean;
   rows: RankingTableRow[];
 }
 /** Current Magpie membership/order wins; a changed effort is a new member and must not inherit an old score. */
 export function rankingTables(groups: Record<string,string[]>, results: Record<string,RankingResultSnapshot> = {}, requests: RankingRequestSnapshot[] = [], pins: RankingPins = {}, gates:RankingGates = {}): RankingTable[] {
   return RANKED_TIERS.map(tier => {
     const group = `sck-${tier}`, result = results[group], gate=gates[group];
+    const bandWidth=result?.policy?.bandWidth??(result?.engine==='quality-pace-v1'?2:undefined);
+    const bandRanges:Record<string,{top:number;bottom:number}>={};
+    if(bandWidth!==undefined)for(const r of result?.rows??[]){
+      if(r.decision?.band===undefined||typeof r.facts.aa?.score!=='number'||!Number.isFinite(r.facts.aa.score))continue;
+      const key=JSON.stringify([r.decision.tail??'',r.decision.band]),top=Math.max(bandRanges[key]?.top??-Infinity,r.facts.aa.score);
+      bandRanges[key]={top,bottom:top-bandWidth};
+    }
     const tailLimit=ttftTailThreshold(result?.rules??"");
     const request = requests.find(r => r.tier === tier);
     const legacy = expandRankingModels(request?.payload.state ?? {});
@@ -254,16 +261,16 @@ export function rankingTables(groups: Record<string,string[]>, results: Record<s
       const current=gate?.facts.find(f=>f.id===model);
       const excluded = gate ? (current?.health?.excluded ? current : undefined) : result?.excludedFacts?.find(f => f.id === model);
       const facts = excluded ?? judged?.facts ?? result?.pinnedFacts?.find(f => f.id === model) ?? current ?? (!result ? legacy.find(f => f.id === model) : undefined);
-      const pinned = !excluded && (pins[group] ?? []).includes(model);
+      const pinned = (pins[group] ?? []).includes(model);
       const decision=judged?.decision;
-      return { model, price:facts?.price, decision, tailReason:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
+      return { model, price:facts?.price, decision, tailReason:pinned?undefined:decision?.tail??(!pinned&&!excluded&&overTtftLimit(facts,tailLimit)?`老板规则要求末尾：原生平均首token ${facts!.usage!.ttftMs!/1000} 秒 > ${tailLimit!/1000} 秒`:undefined), trends: facts?.trends, trendSource:facts?.trendSource, pinned, health: gate ? current?.health : facts?.health, aaScore: facts?.aa?.score, aaRank: facts?.aa?.rank, effort: facts?.aa?.effort,
         tokensPerSecond: facts?.usage?.tokensPerSecond, ttftMs: decision?decision.ttftMs:facts?.usage?.ttftMs,
         stabilityPct: facts?.usage?.requests ? Math.max(0,100*(1-facts.usage.errors/facts.usage.requests)) : undefined,
         stabilitySamples: facts?.usage?.requests,
         accounts: facts?.accounts ?? [], performanceScore: facts?.performance?.score,
         performanceSamples: facts?.performance?.samples, jevScore: result?.engine?.startsWith('quality-pace-') || pinned || excluded ? undefined : judged?.score, jevConfidence: pinned || excluded ? undefined : judged?.confidence };
     });
-    return { group, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
+    return { group, bandWidth,bandRanges, at: result?.at ?? request?.at, rules: result?.rules ?? (!result ? request?.payload.state.ownerRules as string|undefined : undefined), scored: !!result?.model, rows };
   }).filter(table => table.rows.length > 0);
 }
 
@@ -388,8 +395,8 @@ export class RankingRefresher {
         if (revision !== this.revision || this.stopped) return;
         const members = live[`sck-${tier}`];
         if (!members?.length) continue;
-        // A member that keeps failing goes last by code, before Jev and over the owner's pins:
-        // Jev cannot be relied on to read a refusal into a rank, and a pin must not keep it first.
+        // Keep model-specific safety observations for automatic ranking and risk display.
+        // Explicit owner pins remain in their independent first tier even when these observations flag a risk.
         gates[`sck-${tier}`]={at:new Date().toISOString(),facts:members.flatMap(id=>byId.has(id)?[byId.get(id)!]:[])};
         try {
           const facts=members.map(id=>byId.get(id));

@@ -18,16 +18,16 @@ run('fork: deterministic ranking persists across reconnect without Jev or overwr
   expect(await rankingSettings(db.db)).toEqual({rules:DEFAULT_RANKING_RULES,refreshMinutes:2,policy:DEFAULT_POLICY});
   const [c]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_routing;');expect(c).toMatchObject({enabled:true,disabledModels:['keep/excluded'],ranking_rules:DEFAULT_RANKING_RULES});
   await db.db.query("UPSERT company_meta:model_ranking CONTENT {orders:{kept:['old/model']},pins:{'sck-haiku':['a/slow']}};");
-  refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/fast','a/slow']}]);
+  refresher.trigger(0);await refresher.settled();expect(calls).toBe(0);expect(applied).toEqual([{'sck-sonnet':['a/fast','a/slow'],'sck-haiku':['a/slow','a/fast']}]);
   expect(await rankingRequests(db.db)).toEqual([]);
   const [status]=await db.db.query<[any]>('SELECT * FROM ONLY company_meta:model_ranking;');
-  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v2',answers:{}});
-  expect(status.results['sck-haiku'].rows[0].score).toBeUndefined();expect(status.results['sck-haiku'].rows[1].decision.tail).toContain('20秒');
+  expect(status.orders.kept).toEqual(['old/model']);expect(status.results['sck-haiku']).toMatchObject({engine:'quality-pace-v3',answers:{}});
+  expect(status.results['sck-haiku'].rows[0].score).toBeUndefined();expect(status.results['sck-haiku'].rows[0].decision.tail).toContain('20秒');
   const reconnected=new CompanyDatabase(config);try{
    await reconnected.connect();await reconnected.useDatabase();
    const [stored]=await reconnected.db.query<[any]>('SELECT results FROM ONLY company_meta:model_ranking;');
-   const table=rankingTables({'sck-haiku':['a/fast','a/slow']},stored.results,[],await rankingPins(reconnected.db))[0]!;
-   expect(table.rows[0]!.decision?.ttftMs).toBe(500);expect(table.rows[1]!.tailReason).toContain('20秒');expect(table.rows[1]!.jevScore).toBeUndefined();
+   const table=rankingTables({'sck-haiku':['a/slow','a/fast']},stored.results,[],await rankingPins(reconnected.db))[0]!;
+   expect(table.rows[0]!.decision?.ttftMs).toBe(20001);expect(table.rows[0]!.pinned).toBe(true);expect(table.rows[0]!.tailReason).toBeUndefined();expect(table.rows[0]!.decision!.tail).toContain('20秒');expect(table.rows[1]!.jevScore).toBeUndefined();
   }finally{await reconnected.close();}
   const failed=new RankingRefresher({db:db.db,groups:()=>({'sck-haiku':['changed']}),facts,apply:async()=>{throw Error('apply failed');}});
   failed.trigger(0);await failed.settled();
@@ -48,5 +48,23 @@ run('fork: edited weights persist, preview matches next publication and interval
   await saveRankingSettings(db.db,{rules:'',refreshMinutes:2},r);expect(await rankingSettings(db.db)).toMatchObject({refreshMinutes:2,policy});
   const second=new CompanyDatabase({...loadDatabaseConfig(),namespace:'ranking_weights_fixture',database:'control_plane'});
   try{await second.connect();await second.useDatabase();expect((await rankingSettings(second.db)).policy).toEqual(policy);}finally{await second.close();}
+ }finally{await db.close();}
+});
+run('fork: existing pins override exhausted/error tiers, survive refresh and return to automatic order when unpinned',async()=>{
+ const db=new CompanyDatabase({...loadDatabaseConfig(),namespace:'global_pins_fixture',database:'control_plane'});
+ try{
+  await db.connect();await db.bootstrap();let groups={'sck-haiku':['p/healthy','p/bad','p/slow','p/spent']};
+  const facts=async()=>groups['sck-haiku'].map(id=>({id,aa:{score:60,rank:1},price:{free:false},accounts:[{account:'anon',kind:'plan' as const,remainingPct:id==='p/spent'?0:80}],usage:{source:'magpie' as const,scope:'provider-model' as const,period:'7d' as const,collectedAt:new Date().toISOString(),requests:5,errors:0,speedSamples:0,ttftSamples:5,ttftMs:id==='p/slow'?30000:1000},...(id==='p/bad'?{health:{source:'magpie-routing' as const,attempts:3,errors:3,consecutiveErrors:3,excluded:true}}:{})}));
+  const r=new RankingRefresher({db:db.db,groups:()=>groups,facts,apply:async orders=>{groups={'sck-haiku':orders['sck-haiku']!};}});
+  await saveRankingSettings(db.db,{rules:'',refreshMinutes:10},r);r.trigger(0);await r.settled();expect(groups['sck-haiku']).toEqual(['p/healthy','p/slow','p/spent','p/bad']);
+  await r.setPin('sck-haiku','p/bad',true);await r.setPin('sck-haiku','p/spent',true);await r.setPin('sck-haiku','p/bad',true);
+  expect(groups['sck-haiku'].slice(0,2)).toEqual(['p/bad','p/spent']);
+  const [status]=await db.db.query<[any]>('SELECT results,pins FROM ONLY company_meta:model_ranking;');
+  const rows=rankingTables(groups,status.results,[],status.pins)[0]!.rows;
+  expect(rows[0]!.pinned).toBe(true);expect(rows[0]!.health!.excluded).toBe(true);expect(rows[0]!.tailReason).toBeUndefined();expect(rows[0]!.decision!.reason).toContain('手动置顶第1位');
+  const preview=await r.preview(DEFAULT_POLICY);expect(preview.tables[0]!.rows.slice(0,2).map(row=>row.model)).toEqual(['p/bad','p/spent']);
+  r.trigger(1);await r.settled();expect(groups['sck-haiku'].slice(0,2)).toEqual(['p/bad','p/spent']);
+  await r.setPin('sck-haiku','p/bad',false);expect(groups['sck-haiku'][0]).toBe('p/spent');expect(groups['sck-haiku'].at(-1)).toBe('p/bad');
+  await r.setPin('sck-haiku','p/spent',false);expect(groups['sck-haiku']).toEqual(['p/healthy','p/slow','p/spent','p/bad']);
  }finally{await db.close();}
 });

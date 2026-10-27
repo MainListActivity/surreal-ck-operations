@@ -293,14 +293,14 @@ export interface ModelRankingAttempt {
   limits:{stateBytes:number;requestBytes:number};status:string;
 }
 export interface ModelRankingTable {
-  group: string; at?: string; rules?: string; scored: boolean;
+  group: string; at?: string; rules?: string; bandWidth?:number; bandRanges?:Record<string,{top:number;bottom:number}>; scored: boolean;
   rows: Array<{
     model: string; previousRank?:number; price?:{free:boolean;input?:number|null;output?:number|null;cacheHit?:number|null}; pinned?: boolean; tailReason?:string; decision?:{score?:number;coldStart?:boolean;costClass?:string;contributions?:Record<string,{value?:number;weight:number;points:number}>;band?:number;ttftMs?:number;latencySource:string;billing:string;quota:string;remainingPct?:number;pace?:number;tail?:string;reason:string}; trends?: import("./model-trends.ts").ModelTrends; trendSource?: {available:boolean;collectedAt:string}; aaScore?: number; aaRank?: number; effort?: string;
     tokensPerSecond?: number; ttftMs?: number; stabilityPct?: number; stabilitySamples?: number;
     accounts: Array<{account: string; remainingPct?: number}>;
     performanceScore?: number; performanceSamples?: number;
     jevScore?: number; jevConfidence?: number;
-    /** Magpie routing log, every try; `excluded` members were moved last by code and never sent to Jev. */
+    /** Magpie routing log, every try; `excluded` is the automatic risk status; explicit manual pins retain first-tier priority. */
     health?: { excluded: boolean; reason?: "unavailable" | "consecutive_errors" | "error_rate"; attempts: number; errors: number; consecutiveErrors: number; lastStatus?: number; lastAttemptAt?: string };
   }>;
 }

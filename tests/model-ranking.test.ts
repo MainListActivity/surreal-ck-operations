@@ -215,7 +215,7 @@ test('refresh records immutable rule decisions, requires no Jev client and skips
  const publication=f.writes.find(w=>w?.results);
  expect(Object.keys(publication.results)).toEqual(['sck-haiku']);expect(f.calls).toEqual([]);
  expect(publication.orders['sck-haiku']).toEqual(['p/b']);
- expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v2',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
+ expect(publication.results['sck-haiku']).toMatchObject({engine:'quality-pace-v3',answers:{},rows:[{facts:{id:'p/b'},decision:{latencySource:'unknown'}}]});
 });
 
 test('ranking list joins current members to one successful snapshot, never a newer failed attempt or another effort',async()=>{
@@ -319,7 +319,7 @@ test('Jev failure preserves successful scores while independent safety observati
   apply:async o=>{members=o['sck-haiku']!;},jev:{model:'fixture',ask:async(_s,q)=>{if(fail)throw Error('upstream');return response(q);}}});
  r.trigger(0);await r.settled();const success=structuredClone(results['sck-haiku']);
  fail=true;bad=true;r.trigger(300000);await r.settled();
- expect(results['sck-haiku'].engine).toBe('quality-pace-v2');expect(members.at(-1)).toBe('p/a');
+ expect(results['sck-haiku'].engine).toBe('quality-pace-v3');expect(members.at(-1)).toBe('p/a');
  let t=rankingTables({'sck-haiku':members},results,[],{},gates)[0]!;
  expect(t.scored).toBe(true);expect(t.at).toBe(results['sck-haiku'].at);expect(t.rows.find(r=>r.model==='p/b')?.decision).toBeDefined();
  expect(t.rows.find(r=>r.model==='p/a')?.jevScore).toBeUndefined();expect(t.rows.find(r=>r.model==='p/a')?.health?.excluded).toBe(true);
