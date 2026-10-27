@@ -11,6 +11,8 @@ import type { DispatchVerdict } from './dispatcher/dispatch-blocked.ts';
 import { dispatchBlockedList } from './dispatcher/dispatch-list.ts';
 import { acceptanceError, acceptanceSubject, evaluateAcceptance, humanSignoffs, loadAcceptanceEvidence, loadAcceptanceGate, type AcceptanceTaskRow, type HumanSignoff } from './acceptance.ts';
 import { WaitStore } from './wait-store.ts';
+import { GoalGovernanceStore } from './goal-store.ts';
+import type { GoalCard } from './goal-governance.ts';
 import type { WaitHandoffCard } from './waits.ts';
 
 export type OwnerCommandKind = 'goal' | 'approve' | 'reject' | 'reply' | 'direction' | 'instruct' | 'pause' | 'resume';
@@ -35,6 +37,8 @@ export interface OwnerInbox {
   notices: OwnerNotice[];
   /** SYS05: owner handoff cards; an unknown expiry stays unknown, and no secret-bearing link is copied here. */
   handoffs?: WaitHandoffCard[];
+  /** SYS07: the same goal cards the console reads; top page only. */
+  goals?: GoalCard[];
   pendingCommands: number;
 }
 
@@ -79,7 +83,10 @@ const briefDispatch = (verdicts: DispatchVerdict[]): BriefData['dispatchBlocked'
 };
 
 export class OwnerDesk {
-  constructor(private readonly database: CompanyDatabase) {}
+  private readonly goals: GoalGovernanceStore;
+  constructor(private readonly database: CompanyDatabase) {
+    this.goals = new GoalGovernanceStore(database.db);
+  }
   private get db() { return this.database.db; }
 
   async createGoal(input: { text: string; source: string; key: string; note?: string; tier?: GoalTier; project?: string; pipeline?: string }): Promise<GoalView> {
@@ -149,7 +156,28 @@ export class OwnerDesk {
       if (again?.state !== 'triage') return [];
       throw error;
     });
-    return goalView((await this.db.select<GoalRow>(goal))!);
+    const after = (await this.db.select<GoalRow>(goal))!;
+    // SYS07: every new goal starts with a structured outcome contract. It derives implementation/final-gate
+    // evidence from the task graph; an operator can add customer activation/adoption requirements under a version
+    // CAS. Existing goals are never rewritten by this default.
+    await this.goals.registerOutcome({
+      goalId, expectedVersion: 0,
+      outcome: {
+        expected: `${after.title}：${after.brief}`.slice(0, 4000),
+        requiredEvidence: after.pipeline === 'video' || after.pipeline === 'story'
+          ? ['implementation', 'owner_final']
+          : tier === 'quick' ? ['implementation', 'final_acceptance'] : ['implementation', 'owner_final'],
+        responsibleRole: 'gm',
+        reason: '目标 triage 时登记的默认成果契约；可在版本 CAS 下补充客户激活/采纳证据',
+      },
+      actor: 'system:triage', source: `triage:${via}`, reason: '目标 triage 时登记默认成果契约',
+      auditId: randomUUID(), outboxId: randomUUID(),
+    }).catch(error => {
+      if (!/already registered/i.test((error as Error).message)) {
+        console.warn(`default goal outcome registration failed for ${goalId}: ${(error as Error).message}`);
+      }
+    });
+    return goalView(after);
   }
 
   async triagePending(): Promise<GoalView[]> {
@@ -217,7 +245,13 @@ export class OwnerDesk {
       COMMIT;`, {
       task: id('task', input.taskId), decision: input.decision, evidence, actor: input.source, idem, digest, human_evidence: humanEvidence,
     });
-    return view(rows.at(-2) as TaskRow);
+    const decided = rows.at(-2) as TaskRow;
+    if (input.decision === 'approve' && decided.goal) {
+      await this.goals.finalize(asId(decided.goal), `owner:${input.source}`, asId(decided.id)).catch(error => {
+        console.warn(`goal finalize after owner approve failed: ${(error as Error).message}`);
+      });
+    }
+    return view(decided);
   }
 
   /**
@@ -357,11 +391,12 @@ export class OwnerDesk {
     const [directions, goals, config] = await this.db.query<[
       Array<{ text: string; source: string; at: unknown }>, GoalRow[], Array<{ paused?: boolean }>,
     ]>(`SELECT text, source, at FROM direction ORDER BY at DESC LIMIT 10;
-      SELECT * FROM goal WHERE state IN ['triage', 'active'] ORDER BY created_at;
+      SELECT * FROM goal WHERE state IN ['triage', 'active', 'needs_repair'] ORDER BY created_at;
       SELECT paused FROM company_meta:config;`);
+    const goalCards = await this.goals.page({ pageSize: 20 }).then(page => page.goals).catch(() => []);
     return {
       directions: directions.map(d => ({ text: d.text, source: d.source, at: String(d.at) })),
-      goals: goals.map(goalView), projects: await new ProjectStore(this.db).list(), paused: Boolean(config[0]?.paused),
+      goals: goals.map(goalView), goalCards, projects: await new ProjectStore(this.db).list(), paused: Boolean(config[0]?.paused),
     };
   }
 
@@ -418,6 +453,7 @@ export class OwnerDesk {
       questions: questions.map(row => ({ task: view(row), question: latestBy.get(`${asId(row.id)}|question`) })),
       notices: await this.openNotices(),
       handoffs: await new WaitStore(this.db).handoffCards(Date.now()).catch(() => []),
+      goals: await this.goals.page({ pageSize: 8 }).then(page => page.goals).catch(() => []),
       pendingCommands: pending[0]?.count ?? 0,
     };
   }
@@ -578,13 +614,13 @@ export class OwnerDesk {
     const waiting = (await this.waitingOnOwner()).map(item => ({ ...item, hours: (nowMs - item.sinceMs) / 3_600_000 }));
     const [blocked, ready, counts, goals, health, quotas, opened, closed] = await this.db.query<[
       Array<{ id: RecordId; title: string; dependencies?: RecordId[] }>, Array<{ id: RecordId; title: string }>,
-      Array<{ action: string; mechanical?: boolean; n: number }>, Array<{ title: string; created_at: unknown }>,
+      Array<{ action: string; mechanical?: boolean; n: number }>, Array<{ id: RecordId; title: string; created_at: unknown }>,
       Array<{ id: RecordId; state: string; last_error?: string }>, Array<{ id: RecordId; lowest_pct?: number }>,
       Array<{ n: number }>, Array<{ reason?: string; n: number }>,
     ]>(`SELECT id, title, dependencies FROM task WHERE state = 'blocked' AND blocked_to = NONE AND array::len(dependencies ?? []) > 0;
       SELECT id, title FROM task WHERE state = 'ready';
       SELECT action, string::starts_with(evidence ?? '', '【通道回滚】') AS mechanical, count() AS n FROM audit WHERE at > <datetime>$since AND action IN ['accept', 'owner_approve', 'return', 'owner_reject', 'retire'] GROUP BY action, mechanical;
-      SELECT title, created_at FROM goal WHERE state = 'active' ORDER BY created_at;
+      SELECT id, title, created_at FROM goal WHERE state IN ['active', 'needs_repair'] ORDER BY created_at;
       SELECT id, state, last_error FROM provider_health;
       SELECT id, lowest_pct FROM company_meta WHERE lowest_pct != NONE;
       SELECT count() AS n FROM employee WHERE role != NONE AND created_at > <datetime>$since GROUP ALL;
@@ -618,8 +654,16 @@ export class OwnerDesk {
       ...health.filter(h => h.state !== 'healthy').map(h => `${asId(h.id)} ${h.state}${h.last_error ? `：${h.last_error.slice(0, 60)}` : ''}`),
       ...quotas.filter(q => (q.lowest_pct ?? 100) <= 2).map(q => `${asId(q.id).replace('quota_', '')} 额度剩余 ${q.lowest_pct}%`),
     ];
+    const goalCards = await this.goals.page({ pageSize: 20 }).then(page => page.goals).catch(() => []);
+    const cardsById = new Map(goalCards.map(card => [card.goalId, card]));
     return { date, waiting, stuck, last24h: { done: n('accept', 'owner_approve'), returned: n('return'), rolledBack, rejected: n('owner_reject'), retired: n('retire') },
-      goals: goals.map(g => ({ title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)) })),
+      goals: goals.map(g => {
+        const card = cardsById.get(asId(g.id));
+        return { title: g.title, days: Math.max(0, Math.floor((nowMs - Date.parse(String(g.created_at))) / 86_400_000)),
+          ...(card ? { id: card.goalId, needsRepair: card.needsRepair, deadline: card.deadline,
+            blocker: card.blockers[0]?.summary, nextTrigger: card.blockers[0]?.nextTrigger,
+            missingEvidence: card.outcome.missing } : {}) };
+      }),
       resources, capacity, dispatchBlocked: briefDispatch(dispatch),
       churn: { created: opened[0]?.n ?? 0, retired: closed.reduce((sum, c) => sum + c.n, 0), claimLost: closed.filter(c => c.reason === 'claim race lost').reduce((sum, c) => sum + c.n, 0) } };
   }

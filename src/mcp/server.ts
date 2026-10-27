@@ -133,6 +133,9 @@ function registerTools(server: McpServer, core: CompanyCore) {
     pageSize: z.number().int().min(1).max(100).nullish(),
     cursor: z.string().min(1).max(2048).nullish(),
   };
+  // zod `.nullish()` arguments are omitted, not sent as null, to core methods that use optional properties.
+  const withoutNull = (value: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined)) as never;
   server.registerTool('get_context', {
     description: 'Show the authenticated employee and the working set of company tasks (ready, doing, review, blocked) within a 48 KiB UTF-8 response budget. Without scope, or with scope "tasks": without pageSize or cursor the answer is complete (keys principal, companyIncluded, companyRead, tasks, and company when includeCompany is true) or refused as response_too_large with retry guidance; it is never cut. With pageSize (1 to 100) or cursor it returns one stored page: continue with the same arguments plus cursor set to page.nextCursor, until page.hasMore is false. includeCompany defaults to false; companyRead names the arguments that read the company block. A task too large for one page is echoed with a long dependency list cut and flagged (listsTruncated), and a context still too large cut and flagged (contextTruncated, contextNextOffset); read_task_text returns any cut part whole. A task read by taskId is whole or refused. A blocked task carries `waiting`: kind (manager/owner/dependency), the phase it restores (`resumeState`, unknown when absent), the role that phase belongs to (a review wait names the reviewing role) and the number of dependencies (the ids stay in the task `dependencies` field). With scope "company" the answer is the company block (directions, goals, projects, paused), optionally one section; project environments (envs, credential aliases and roles) are shown only to gm and to the holder of a valid task lease, and to anyone else envs is empty with envsWithheld true; it is complete (key company) or, with pageSize or cursor, one stored page of parts (keys section, key, part, parts, offset, totalBytes, sha256, json): join the json of the parts of one section and key in part order, check the byte length and sha256 against totalBytes and sha256, then parse; continue with the same arguments plus cursor set to page.nextCursor until page.hasMore is false.',
     inputSchema: z.object({
@@ -694,6 +697,101 @@ function registerTools(server: McpServer, core: CompanyCore) {
     }),
   }, async (input, ctx) => run(token(ctx), () => core.goalAcceptanceRepair
     ? core.goalAcceptanceRepair(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_console', {
+    description: 'gm only, read-only: one paged goal console. Each goal carries deadline (exact or unknown, never computed), outcome contract and required evidence, stages (implementation/release/production QA/customer activation/adoption/owner final), every open blocker with responsible role/holder/wait duration/next trigger/dependency path, effective final gate and its evidence, and the source task ids plus a taskTotal. Blocker and source-id lists are capped with omitted counts; use get_context with goalId for the full paged task list. Continue with page.nextCursor while page.hasMore. Pages are deterministic and never write.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100).nullish(),
+      includeClosed: z.boolean().nullish(),
+      needsRepairOnly: z.boolean().nullish(),
+      ...pageArgs,
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalConsole
+    ? core.goalConsole(token(ctx), withoutNull(input))
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_governance_scan', {
+    description: 'gm only, read-only dry-run: scan active, needs_repair and done goals for a missing/void/superseded final gate, dependency cycles or dangling edges, missing outcome contracts and missing evidence. It writes nothing, never closes/voids/approves a goal and never rewrites a historical owner decision.',
+    inputSchema: z.object({}),
+  }, async (_input, ctx) => run(token(ctx), () => core.goalGovernanceScan
+    ? core.goalGovernanceScan(token(ctx))
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_metrics', {
+    description: 'gm only, read-only: business metrics for a window [from,to) with an IANA timezone. Reports goal/task cycle time, first-pass acceptance rate, repeated blocks per task+phase episode, repeated manager wakes without checkpoints/submits, and model token usage per accepted task and per goal. Actual cost is unknown unless every usage row carries a provider-billed cost; token counts are never converted into money. Denominators, exclusions, data cutoff and coverage are explicit.',
+    inputSchema: z.object({
+      from: z.string().min(1).max(40).nullish(),
+      to: z.string().min(1).max(40).nullish(),
+      timezone: z.string().min(1).max(80).nullish(),
+      goalId: z.string().min(1).max(100).nullish(),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalMetrics
+    ? core.goalMetrics(token(ctx), withoutNull(input))
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_outcome_register', {
+    description: 'gm only (manage): register or replace a goal’s structured expected outcome, required evidence and responsible role. expectedVersion 0 creates the first contract; the current version is required for a scope change. A deadline must be an absolute instant with an offset; omitting it leaves the deadline unknown. Version-locked, audited and idempotent.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100),
+      expectedVersion: z.number().int().min(0),
+      expected: z.string().min(4).max(4000),
+      requiredEvidence: z.array(z.enum(['implementation','release','deploy_qa','customer_activation','customer_adoption','feedback','final_acceptance','owner_final'])).max(8),
+      responsibleRole: z.string().min(1).max(80),
+      deadline: z.string().min(1).max(40).nullish(),
+      timezone: z.string().min(1).max(80).nullish(),
+      reason: z.string().min(10).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalOutcomeRegister
+    ? core.goalOutcomeRegister(token(ctx), withoutNull(input) as never)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_evidence_record', {
+    description: 'gm only (manage): record one immutable outcome receipt (customer activation/adoption, production QA, release or implementation record). Requires a real source and confirmedBy human/external receipt; test accounts, local test URLs and AI/model confirmers are refused. owner_final cannot be typed in: it must come from the real owner relay decision on the final gate. Audited and idempotent.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100),
+      kind: z.enum(['implementation','release','deploy_qa','customer_activation','customer_adoption','feedback']),
+      summary: z.string().min(4).max(2000),
+      source: z.string().min(2).max(1000),
+      confirmedBy: z.string().min(2).max(200),
+      evidenceType: z.enum(['external_receipt','production_record','manual_signoff']),
+      at: z.string().min(1).max(40).nullish(),
+      taskId: z.string().min(1).max(200).nullish(),
+      reason: z.string().min(10).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalEvidenceRecord
+    ? core.goalEvidenceRecord(token(ctx), withoutNull(input) as never)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_finalize', {
+    description: 'gm only: re-evaluate one goal’s final gate and required evidence. Marks the goal done only when the final gate is done, an owner gate carries the real owner relay approval, and every required receipt exists; otherwise records needs_repair with the concrete reasons. It never accepts a task or substitutes for the owner decision.',
+    inputSchema: z.object({ goalId: z.string().min(1).max(100) }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalFinalize
+    ? core.goalFinalize(token(ctx), input)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_final_gate_preview', {
+    description: 'gm only (manage), read-only: preview replacing a goal final gate that is void, superseded or missing. Shows the current gate, candidate checks (same goal, open/unleased/unsubmitted, correct reviewer role, depends on all unfinished work, no cycle) and the snapshot hash required by goal_final_gate_repair. Writes nothing.',
+    inputSchema: z.object({ goalId: z.string().min(1).max(100), candidateTaskId: z.string().min(1).max(200).optional() }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalFinalGatePreview
+    ? core.goalFinalGatePreview(token(ctx), withoutNull(input) as never)
+    : Promise.reject({ code: 'temporarily_unavailable' })));
+
+  server.registerTool('goal_final_gate_repair', {
+    description: 'gm only (manage): CAS repair of a goal final-gate reference to a candidate that depends on all unfinished goal work. Needs the preview snapshotHash, expected goal version and reason. Audited; never releases a lease, accepts a gate or marks the goal done. The repairing gm cannot review the candidate.',
+    inputSchema: z.object({
+      goalId: z.string().min(1).max(100),
+      candidateTaskId: z.string().min(1).max(200),
+      expectedOldTaskId: z.string().min(1).max(200).nullish(),
+      expectedGoalVersion: z.number().int().min(0),
+      snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
+      reason: z.string().min(10).max(2000),
+      idempotencyKey: z.string().min(8).max(200),
+    }),
+  }, async (input, ctx) => run(token(ctx), () => core.goalFinalGateRepair
+    ? core.goalFinalGateRepair(token(ctx), withoutNull(input) as never)
     : Promise.reject({ code: 'temporarily_unavailable' })));
 
   server.registerTool('contributor_dryrun', {

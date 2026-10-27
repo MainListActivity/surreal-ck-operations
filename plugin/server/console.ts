@@ -385,11 +385,16 @@ function render(){
     m.innerHTML=(g||q||n)?(g+q+n):'<div class="empty">没有待办事项</div>';
     [...(INBOX?.gates||[]),...(INBOX?.questions||[])].forEach(x=>{const e=document.getElementById('at-'+x.task.id);if(e)atts(e,x.task.id)});
   }else if(T==='goals'){
-    m.innerHTML=(BRIEF?.goals||[]).map(g=>\`<div class="card glist" id="gt-\${g.id}"><h3>\${esc(g.title)}</h3>
-      <div class="meta"><span class="tier">\${esc(g.tier)}</span> <span class="st">\${esc(g.state)}</span> \${g.project?esc(g.project):''}</div>
-      <div class="body" style="max-height:120px">\${esc(g.brief||'')}</div>
-      <div class="row"><button class="act mid" onclick="openGoal('\${g.id}')">查看任务</button>
-      <button class="act no" onclick="cancelGoal('\${g.id}')">取消目标</button></div></div>\`).join('')||'<div class="empty">无在办目标</div>';
+    var cards={};((BRIEF&&BRIEF.goalCards)||[]).forEach(function(c){cards[c.goalId]=c});
+    m.innerHTML=((BRIEF&&BRIEF.goals)||[]).map(function(g){
+      var c=cards[g.id]||{};
+      var deadline=(c.deadline&&c.deadline.status==='exact'&&c.deadline.at)?('截止 '+new Date(c.deadline.at).toISOString()):'截止未知';
+      var stages=(c.stages||[]).map(function(x){return esc(x.label)+'='+({done:'已',waiting:'等',active:'进行',missing:'缺',not_required:'不需',unknown:'未知'}[x.status]||'未知')}).join(' · ');
+      var missing=(c.outcome&&c.outcome.missing&&c.outcome.missing.length)?('<div class="meta">缺证据：'+esc(c.outcome.missing.join(' / '))+'</div>'):'';
+      var repair=c.needsRepair?('<div class="meta" style="color:#b00">需修复：'+esc((c.repairReasons||[]).map(function(r){return r.message}).join('；'))+'</div>'):'';
+      var blockers=(c.blockers&&c.blockers.length)?('<div class="body" style="max-height:160px"><b>当前阻点</b><br>'+c.blockers.map(function(b){return esc(b.kind)+' · '+esc(b.summary)+(b.nextTrigger?(' · 下一触发 '+esc(b.nextTrigger)):'')+(b.waitedMinutes!==undefined?(' · 已等 '+b.waitedMinutes+' 分钟'):'')}).join('<br>')+'</div>'):'';
+      return '<div class="card glist" id="gt-'+g.id+'"><h3>'+esc(g.title)+'</h3><div class="meta"><span class="tier">'+esc(g.tier)+'</span> <span class="st">'+esc(g.state)+'</span> '+(g.project?esc(g.project):'')+' · '+esc(deadline)+'</div><div class="meta">阶段：'+stages+'</div>'+missing+repair+blockers+'<div class="body" style="max-height:120px">'+esc(g.brief||'')+'</div><div class="row"><button class="act mid" onclick="openGoal(\''+g.id+'\')">查看任务</button><button class="act no" onclick="cancelGoal(\''+g.id+'\')">取消目标</button></div></div>';
+    }).join('')||'<div class="empty">无在办目标</div>';
   }else if(T==='docs'){
     if(!DOCS)api('docs').then(r=>{DOCS=r.docs;render()}).catch(()=>{});
     const groups={};(DOCS||[]).forEach(d=>(groups[d.group]=groups[d.group]||[]).push(d));

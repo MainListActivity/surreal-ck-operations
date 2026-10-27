@@ -20,7 +20,11 @@ export interface BriefData {
   waiting: Array<WaitingItem & { hours: number }>;
   stuck: Array<{ taskId: string; title: string; reason: string }>;
   last24h: { done: number; returned: number; rolledBack: number; rejected: number; retired: number };
-  goals: Array<{ title: string; days: number }>;
+  goals: Array<{
+    title: string; days: number; id?: string; needsRepair?: boolean;
+    deadline?: { status: 'exact' | 'unknown'; at?: number; timezone?: string; source: string };
+    blocker?: string; nextTrigger?: string; missingEvidence?: string[];
+  }>;
   resources: string[];
   capacity: RoleCapacity[];
   /** Employee instances opened/closed in the last 24h; a high lost-claim count means the scheduler is thrashing. */
@@ -76,7 +80,15 @@ export function renderBrief(data: BriefData): { summary: string; text: string } 
   lines.push('', `【近24小时】完成 ${data.last24h.done}｜退回 ${data.last24h.returned}｜老板驳回 ${data.last24h.rejected}｜作废 ${data.last24h.retired}${data.last24h.rolledBack ? `｜通道回滚 ${data.last24h.rolledBack}（系统换会话，不算退回）` : ''}`);
   if (data.goals.length) {
     lines.push('', '【在办目标】');
-    for (const goal of data.goals.slice(0, 8)) lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天）`);
+    for (const goal of data.goals.slice(0, 8)) {
+      const extras: string[] = [];
+      if (goal.deadline?.status === 'exact' && goal.deadline.at) extras.push(`截止 ${new Date(goal.deadline.at).toISOString()}`);
+      if (goal.needsRepair) extras.push('待修复');
+      if (goal.blocker) extras.push(`阻点：${short(goal.blocker, 50)}`);
+      if (goal.nextTrigger) extras.push(`下一触发：${short(goal.nextTrigger, 30)}`);
+      if (goal.missingEvidence?.length) extras.push(`缺证据：${goal.missingEvidence.join('/')}`);
+      lines.push(`- ${short(goal.title, 40)}（已 ${goal.days} 天${extras.length ? `，${extras.join('｜')}` : ''}）`);
+    }
   }
   // Every blocked item of the latest pass is named here, with its own reason and owner. The brief does not count notices.
   if (data.dispatchBlocked.total) {

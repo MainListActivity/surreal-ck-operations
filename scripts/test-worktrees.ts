@@ -72,6 +72,10 @@ try {
     'tests/task-recovery.test.ts', 'tests/task-recovery.fork.test.ts', 'tests/faults.test.ts', 'tests/fault-budget.fork.test.ts', 'tests/fault-transport.fork.test.ts',
     // SYS05：时间/外部事件等待状态机、调度零派工与租约结束回收；fork 用例在隔离库验证原子进入、一次释放与版本锁。
     'tests/waits.test.ts', 'tests/wait-dispatch.test.ts', 'tests/wait-cleanup.test.ts', 'tests/wait-store.fork.test.ts',
+    // SYS07：目标终验图、成果证据、只读看板/指标与最终验收阻断；隔离库验证 CAS、分页、权限与历史不回写。
+    'tests/goal-governance.test.ts', 'tests/goal-governance.fork.test.ts',
+    // SYS07：needs_repair / goal_outcome / goal_evidence 在真实上一版运行时下的回滚隔离演练（RUN_SCK_ROLLBACK_FORK_TESTS）。
+    'tests/goal-rollback-isolation.fork.test.ts',
     // QA 的 SYS03 独立重演（真实 sck → 真实 sidecar → 真实 core → fork 库）；本轮起纳入本 lane 的回归，见该文件头部说明。
     'tests/disposition-rehearsal.fork.test.ts',
     'tests/rollback-isolation.fork.test.ts', 'tests/rollback-isolation-independence.fork.test.ts', 'tests/null-absent.fork.test.ts',

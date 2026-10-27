@@ -166,6 +166,10 @@ export class CompanyDatabase {
     // 队列不收），旧版读不到新表即忽略，因此回滚后不会认领或拉起等待中的任务（RB01）。
     await this.db.query(loadSchema('040-waits.surql'));
     await this.db.query('UPDATE company_meta:installation SET schema_version = 40 WHERE schema_version < 40;');
+    // SYS07 P2：目标成果契约、证据、终验缺口与指标。只新增 goal_outcome / goal_evidence 两张表与 goal 的可选
+    // 新字段；旧版忽略这些字段和表，历史任务、验收与老板决定不被改写（RB01）。
+    await this.db.query(loadSchema('041-goal-governance.surql'));
+    await this.db.query('UPDATE company_meta:installation SET schema_version = 41 WHERE schema_version < 41;');
   }
 
   private async ensureOutboxSequence(): Promise<void> {
