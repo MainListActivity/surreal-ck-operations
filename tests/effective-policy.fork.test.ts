@@ -6,10 +6,9 @@
 // Gated by RUN_SCK_WORKTREE_FORK_TESTS=1 (scripts/test-worktrees.ts sets it).
 import { afterAll, beforeAll, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RecordId } from 'surrealdb';
-import { loadDatabaseConfig } from '../src/config.ts';
 import { CompanyDatabase } from '../src/database.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { CompanyError } from '../src/core-errors.ts';
@@ -43,6 +42,8 @@ const fork = forkEnv ? test : test.skip;
 let database: CompanyDatabase, workforce: Workforce, enrollment: LocalEnrollmentAdmin, owner: OwnerDesk, projects: ProjectStore, core: SurrealCompanyCore;
 const tokens: Record<string, string> = {};
 let credDirHolder = '';
+const dir = mkdtempSync(join(tmpdir(), 'sck-effective-policy-db-'));
+let dbServer: ReturnType<typeof Bun.spawn> | undefined;
 setDefaultTimeout(240_000);
 
 const key = () => crypto.randomUUID();
@@ -52,11 +53,20 @@ let goalId = '';
 let otherGoalId = '';
 
 beforeAll(async () => {
-  // Without a fork run every case is skipped and this hook must stay inert: building the
-  // suite here would read the product .env and trip the non-local-database guard.
+  // Self-hosting like tests/deployment-source.fork.test.ts: the gate runs this file with the
+  // fork env but without test-worktrees.ts, so the suite spawns its own isolated company-fork
+  // database on a random loopback port instead of falling back to the product .env URL.
   if (!forkEnv) return;
-  database = new CompanyDatabase({ ...loadDatabaseConfig(), namespace: NS, database: 'control_plane' });
-  const credDir = mkdtempSync(join(tmpdir(), 'sck-effective-policy-'));
+  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("fixture") });
+  const port = reservation.port!; reservation.stop(true);
+  const rootPassword = "effective-policy-fork-fixture";
+  dbServer = Bun.spawn([join(homedir(), ".surrealdb/surreal"), "start", "--bind", `127.0.0.1:${port}`, "--user", "root", "--pass", rootPassword,
+    "--log", "error", `rocksdb:${dir}/db`], { stdout: "ignore", stderr: "ignore" });
+  let ready = false;
+  for (let n = 0; n < 160; n++) { try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) { ready = true; break; } } catch {} await Bun.sleep(25); }
+  if (!ready) throw new Error("the effective-policy fork fixture did not become healthy");
+  database = new CompanyDatabase({ url: `ws://127.0.0.1:${port}/rpc`, rootUser: "root", rootPassword, namespace: NS, database: "control_plane" });
+  const credDir = mkdtempSync(join(tmpdir(), "sck-effective-policy-"));
   credDirHolder = credDir;
   workforce = new Workforce(database, credDir);
   enrollment = new LocalEnrollmentAdmin(database);
@@ -90,9 +100,10 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (!database) return;
-  await database.close();
+  if (database) await database.close();
+  if (dbServer) { dbServer.kill(); await dbServer.exited; }
   rmSync(credDirHolder, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
