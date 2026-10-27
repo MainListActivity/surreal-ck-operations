@@ -312,3 +312,22 @@ describe('the evidence', () => {
     expect(DEFAULT_FAULT_BUDGET.totalDeadlineMs).toBeLessThanOrEqual(180_000);
   });
 });
+
+describe('operation isolation', () => {
+  test('browser injection, logout and an ordinary request are three budget objects', () => {
+    const browser = budgetKey('task-1', 'browser', 'request');
+    const logout = budgetKey('task-1', 'logout', 'request');
+    const request = budgetKey('task-1', 'internal', 'request');
+    expect(new Set([browser, logout, request]).size).toBe(3);
+    // The same cause seen on different controlled targets is not one incident either, so a stopped
+    // browser scope cannot close the incident a request or a logout belongs to.
+    expect(incidentKey(classifyFault({ phase: 'request', target: 'browser' })))
+      .not.toBe(incidentKey(classifyFault({ phase: 'request', target: 'internal' })));
+  });
+
+  test('an unclassified failure stops its own recovery and is not treated as retryable', () => {
+    const fault = classifyFault({ phase: 'request', target: 'browser', elapsedMs: 5 });
+    expect(fault.retryability).toBe('unclassified');
+    expect(decideBudget(undefined, DEFAULT_FAULT_BUDGET, 0, fault)).toMatchObject({ allowed: false, reason: 'not_retryable' });
+  });
+});

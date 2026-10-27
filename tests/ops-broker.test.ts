@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { OPS_TOOLS, OpsBroker, proofDeliverErrorCode, type OpsDeps } from '../src/ops/broker.ts';
+import { browserInjectFailure } from '../src/ops/browser.ts';
+import { CompanyError } from '../src/core-errors.ts';
 import type { OpsScope } from '../src/contracts.ts';
 import type { OriginRequest } from '../src/ops/origin.ts';
 import { parseBrokerConfig } from '../src/ops/config.ts';
@@ -566,6 +568,121 @@ describe('ops request, query and browser', () => {
       expect((await failure(call(r, 'ops_browser_login', { session, ...args }))).code).toBe('invalid');
     }
     expect(r.world.browserLogins).toHaveLength(1);
+  });
+
+  test('a missing space is a deterministic refusal: first line and stage are kept, no retry, and logout still works', async () => {
+    // The exact shape the CLI prints when the lease already finished the space.
+    const stderr = [
+      'SCK_STAGE space',
+      'SCK_ERROR {"stage":"space","name":"Error","message":"task space not found: 5"}',
+      'Error: task space not found: 5',
+      '    at resolveTaskSpace (file:////[eval1]:20251:19)',
+      '[ego-browser:notice] Ego Lite update is available (current 0.6.1.9).',
+    ].join('\n');
+    const failureInfo = browserInjectFailure({ stdout: '', stderr, exitCode: 1, elapsedMs: 412 });
+    expect(failureInfo).toMatchObject({ code: 'not_found', retryable: false, stage: 'space' });
+    expect(failureInfo.message).toContain('exit 1');
+    expect(failureInfo.message).toContain('stage=space');
+    expect(failureInfo.message).toContain('412ms');
+    expect(failureInfo.message).toContain('task space not found: 5');
+
+    let injects = 0;
+    const r = rig({}, true, { browser: async () => {
+      injects += 1;
+      throw Object.assign(new CompanyError(failureInfo.code, failureInfo.message, failureInfo.retryable), {
+        ...(failureInfo.errno === undefined ? {} : { facts: { errno: failureInfo.errno } }),
+      });
+    } });
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const error = await failure(call(r, 'ops_browser_login', { session, spaceId: 5 }));
+    expect(error.code).toBe('not_found');
+    expect(error.message).toContain('task space not found: 5');
+    expect(error.message).toContain('stage=space');
+    // A missing space is not a transient fault: exactly one attempt, and no budget charge.
+    expect(injects).toBe(1);
+    expect(r.company.faults.reported).toHaveLength(0);
+    // The browser injection budget is its own controlled target; the session can still be closed.
+    expect(r.company.faults.reserved.at(-1)).toMatchObject({ phase: 'request', target: 'browser' });
+    expect(await call(r, 'ops_logout', { session })).toEqual({ closed: true });
+    expect(r.company.faults.reserved.at(-1)).toMatchObject({ phase: 'request', target: 'logout' });
+    expectNoLeaks(r);
+  });
+
+  test('a transient navigation timeout is retried once, bounded, and reports a retryable browser fault', async () => {
+    let injects = 0;
+    const transient = () => Object.assign(new CompanyError(
+      'upstream_error', 'browser login failed (exit signal, stage=probe, 60000ms): page.goto: Timeout 60000ms exceeded', true,
+    ), { facts: { errno: 'TimeoutError' } });
+    const r = rig({}, true, { browser: async () => { injects += 1; throw transient(); } });
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    const error = await failure(call(r, 'ops_browser_login', { session, spaceId: 6 }));
+    expect(error.code).toBe('upstream_error');
+    expect(error.message).toContain('stage=probe');
+    // Exactly one bounded retry: the tool call does not loop.
+    expect(injects).toBe(2);
+    // The retry waited inside the same call.
+    expect(r.world.clock).toBeGreaterThanOrEqual(1_000);
+    expect(r.company.faults.reported.at(-1)).toMatchObject({ phase: 'request', target: 'browser' });
+    expectNoLeaks(r);
+  });
+
+  test('a transient failure that clears on the retry succeeds without a fault charge', async () => {
+    let injects = 0;
+    const r = rig({}, true, { browser: async (input) => {
+      injects += 1;
+      if (injects === 1) throw new CompanyError('upstream_error', 'browser login failed (exit signal, stage=probe, 60000ms): timed out', true);
+      return { url: input.landingUrl, title: 'Fixture App' };
+    } });
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_browser_login', { session, spaceId: 6 })).toMatchObject({ signedInAs: 'sck-qa-one' });
+    expect(injects).toBe(2);
+    expect(r.company.faults.reported).toHaveLength(0);
+    expect(r.world.clock).toBeGreaterThanOrEqual(1_000);
+  });
+
+  test('a deterministic injector error is never retried and never hard-stops request or logout', async () => {
+    let injects = 0;
+    const r = rig({}, true, { browser: async () => {
+      injects += 1;
+      throw Object.assign(new CompanyError('invalid', 'browser login failed (exit 1, stage=space, 12ms): EGO_TASK_SPACE_NAME_IN_USE', false), {
+        facts: { errno: 'EGO_TASK_SPACE_NAME_IN_USE' },
+      });
+    } });
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect((await failure(call(r, 'ops_browser_login', { session, spaceId: 2 }))).code).toBe('invalid');
+    expect(injects).toBe(1);
+    expect(await call(r, 'ops_logout', { session })).toEqual({ closed: true });
+    expect(await call(r, 'ops_info')).toMatchObject({ project: 'demo' });
+  });
+
+  test('a stopped browser budget refuses only injection: logout and ordinary requests keep running', async () => {
+    const r = rig();
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    // The server-side browser scope is stopped (an unclassified injection anomaly), not the task.
+    r.company.faults.refuseTarget = 'browser';
+    const error = await failure(call(r, 'ops_browser_login', { session, spaceId: 4 }));
+    expect(error.message).toContain('not retryable');
+    // Logout is its own budget object and still closes the session.
+    expect(await call(r, 'ops_logout', { session })).toEqual({ closed: true });
+    // Ordinary ops tools (internal target) and product requests are not the browser scope.
+    expect(await call(r, 'ops_info')).toMatchObject({ project: 'demo' });
+    r.company.faults.refuseTarget = undefined;
+    const { session: second } = await call(r, 'ops_login', { alias: 'qa-one' });
+    expect(await call(r, 'ops_request', { session: second, method: 'GET', path: '/api/session/workspaces' })).toMatchObject({ ok: true });
+  });
+
+  test('a successful injection records its space so the lease-end cleanup closes it', async () => {
+    const closed: Array<{ employeeId: string; spaceId: number }> = [];
+    const r = rig({}, true, { closeBrowserSpace: async input => { closed.push(input); } });
+    const { session } = await call(r, 'ops_login', { alias: 'qa-one' });
+    await call(r, 'ops_browser_login', { session, spaceId: 9 });
+    expect(r.broker.release('qa-1')).toEqual({ sessions: 1, browserSpaces: 1, pending: 0 });
+    await Bun.sleep(0);
+    expect(closed).toEqual([{ employeeId: 'qa-1', spaceId: 9 }]);
+    // Release is idempotent: the second call has nothing left to close.
+    expect(r.broker.release('qa-1')).toEqual({ sessions: 0, browserSpaces: 0, pending: 0 });
+    await Bun.sleep(0);
+    expect(closed).toHaveLength(1);
   });
 });
 
