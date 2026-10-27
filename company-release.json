@@ -1,19 +1,15 @@
 {
-  "version": "0.3.11",
-  "title": "版本化验收映射预览与授权导入",
+  "version": "0.3.12",
+  "title": "发布门禁 fork 套件自备隔离库修复",
   "changes": [
-    "新增 acceptance_mapping_preview 只读预览：旧新 criteria、required、逐 SYS 机器源/人工签核与 RB01 覆盖、目标任务版本与冲突",
-    "新增 acceptance_mapping_import：仅 gm，携带预览 digest 与任务 expectedVersion CAS、理由与审计；幂等重放先于守卫",
-    "拒绝陈旧 digest、降级或删除 required 基线、活动租约、done/void 历史改写与已带版本化 criteria 的二次覆盖",
-    "INT01–INT08 全部为人工独立复核项，机器源仅真实 CI 基线，叙述文字不伪装 machine verified",
-    "isLegacyAcceptance 认可显式导入标记：预门禁行经授权导入后受门禁约束，其余 createdAt 截止规则不变"
+    "effective-policy.fork 套件改为自备隔离公司 fork 库（随机回环端口），门禁直跑 bun test 不再读产品 .env，v0.3.10 起阻塞每次 sidecar-review 门禁的雷排除",
+    "套件按 deployment-source.fork 同形态门控：无 fork 环境时全部用例 skip，import 零副作用",
+    "功能代码零改动；本版本包含 v0.3.10（SYS06 门禁）与 v0.3.11（版本化验收映射）全部已合入内容"
   ],
   "impact": [
-    "legacy:true criteria:[] 的在办任务可经授权导入进入版本化门禁；QA 与执行者不能自批",
-    "submit/review/Jev/owner 与 MCP/sck 同源使用同一评估器；导入后提交必须先取得真实机器证据",
-    "schema 043 只新增 task 可选字段 acceptance_mapping_at/digest；旧版读不到即按 legacy 处理，不误派（RB01）",
-    "真实 GM 通道同快照对账、生产实测与客户回执由上线验证腿完成；客户回执不得由 AI 代填"
+    "升级作业可越过此前失败的\"检查代码与本机发布门禁\"阶段；此后 sidecar-review 门禁稳定包含策略回归",
+    "无数据库迁移、无历史改写；回滚到部署前现役安全"
   ],
-  "migration": "新增 schema/043-acceptance-mapping.surql：task 可选字段 acceptance_mapping_at、acceptance_mapping_digest，schema_version 43；只新增、无历史改写。",
-  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前 active 所指固定 release（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin；install 报 plugin repoint failed 时按运维文档 R3 先 remove 再 install 同一被守卫放行的目标。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；已导入映射的行在旧版回退为 legacy 路径，不误派；无数据回滚。"
+  "migration": "无数据库迁移、无历史改写；改动仅测试门控与夹具。",
+  "rollback": "保留健康 active release；用当前受审 release 的 installer 回滚至部署前 active 所指固定 release（执行时以 active 实际 SHA 为准）：active 与插件面同时切回，插件 SOURCE/DIRECTORY 必须等于回滚目标 release/plugin。RW06/SYS02/IR06/SYS06 守卫校验兼容后再切；无数据回滚。"
 }
