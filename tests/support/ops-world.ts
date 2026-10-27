@@ -123,23 +123,28 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     issuedToken: '',
     // account-bound plan record returned inside pool-usage (FREE by default)
     planType: 'TOKEN_PLAN_PLAN_TYPE_FREE',
+    /** v3 source-freshness fixtures: drop the HTTP Date / ETag header to exercise the strict gates. */
+    planDate: true,
+    planEtag: true,
     // when true, one fixed billing path answers 200 instead of the absent-surface 404
     billingPathLive: false,
     pools: [
       {
         id: 'pool-dedicated', pool: 'flash-lite', name: 'Flash-Lite', pool_type: 'dedicated',
-        window_5h: { limit: 60_000, remaining: 59_400, reset_at: Math.floor(this.clock / 1000) + 5 * 3600 },
-        window_7d: { limit: 600_000, remaining: 598_000, reset_at: Math.floor(this.clock / 1000) + 6 * 86_400 },
+        window_5h: { limit: 120_000, used: 600, remaining: 119_400, reset_at: Math.floor(this.clock / 1000) + 5 * 3600 },
+        window_7d: { limit: 1_200_000, used: 2_000, remaining: 1_198_000, reset_at: Math.floor(this.clock / 1000) + 6 * 86_400 },
         nearest_grant_expiry: Math.floor(this.clock / 1000) + 30 * 86_400,
       },
       {
         id: 'pool-general', pool: 'general', name: '通用', pool_type: 'default',
-        window_5h: { limit: 60_000, remaining: 58_000, reset_at: Math.floor(this.clock / 1000) + 4 * 3600 },
-        window_7d: { limit: 600_000, remaining: 590_000, reset_at: Math.floor(this.clock / 1000) + 5 * 86_400 },
+        window_5h: { limit: 120_000, used: 1_500, remaining: 118_500, reset_at: Math.floor(this.clock / 1000) + 4 * 3600 },
+        window_7d: { limit: 1_200_000, used: 10_000, remaining: 1_190_000, reset_at: Math.floor(this.clock / 1000) + 5 * 86_400 },
         nearest_grant_expiry: Math.floor(this.clock / 1000) + 30 * 86_400,
       },
     ],
-    planHtml: '<html><body>SenseNova Token Plan 订阅方案 公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 ¥ 0 /月 60,000 积分 / 5 小时</body></html>',
+    // Reviewed 2026-10-27 copy: public beta free, paid tiers only announced, limited-time release,
+    // and no quota number. The account-bound pool figures are the only quota source.
+    planHtml: '<html><body>SenseNova Token Plan 订阅方案 公测期完全免费开放，付费档位即将上线 Free · 公测 限时放量 ¥ 0 /月</body></html>',
   };
 
   constructor() {
@@ -566,7 +571,11 @@ readonly issuedInvites = new Map<string, Record<string, unknown>>();
     if (url.host === 'www.sensenova.cn') {
       if (url.pathname !== '/token-plan') return new Response('404', { status: 404 });
       if (s.planStatus !== 200) return new Response('', { status: s.planStatus });
-      return new Response(s.planHtml, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+      return new Response(s.planHtml, { status: 200, headers: {
+        'content-type': 'text/html; charset=utf-8',
+        ...(s.planDate ? { date: new Date(this.clock).toUTCString() } : {}),
+        ...(s.planEtag ? { etag: '"plan-fixture-v3"' } : {}),
+      } });
     }
     return new Response('unreachable host', { status: 502 });
   }

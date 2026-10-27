@@ -74,12 +74,22 @@ function broker() {
   });
 }
 type EvidenceDoc = Record<string, unknown>;
-async function files(task: string, type: 'reviewed-service'|'development-disabled'|'reviewed-token-plan' = 'reviewed-service') {
+async function files(task: string, type: 'reviewed-service'|'development-disabled'|'reviewed-token-plan'|'reviewed-token-plan-v3' = 'reviewed-service') {
   const root = join(dir, 'evidence', task); await mkdir(root,{recursive:true});
   const base = {schemaVersion:1,type,accountRef:'existing-service-opaque',endpoint:'https://api.openai.com/v1',model:'gpt-4o-mini-2024-07-18',priceRevision:'openai-mini-2026-10-09',sampledAt:new Date(clock-1000).toISOString(),expiresAt:new Date(clock+3_600_000).toISOString()};
+  const v3Reset5h=new Date(clock+3_600_000).toISOString(), v3Reset7d=new Date(clock+86_400_000).toISOString();
   const evidence = type === 'reviewed-token-plan'
     ? {...base,schemaVersion:2,serviceApproved:true,planName:'SenseNova Token Plan 公测档',planSourceUrl:'https://www.sensenova.cn/token-plan',quotaUnit:'points',quotaAmount:100_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,accountPlanType:TOKEN_PLAN_PLAN_TYPE_FREE}
-    : {...base,autoTopupDisabled:true,serviceApproved:type==='reviewed-service',currency:'USD',balanceNanoUsd:1_000_000_000};
+    : type === 'reviewed-token-plan-v3'
+      ? {...base,type:'reviewed-token-plan',schemaVersion:3,evidenceClass:'promotional-account-bound',serviceApproved:true,planName:'SenseNova Token Plan Free · 公测 · 限时账号绑定',planSourceUrl:'https://www.sensenova.cn/token-plan',
+          planSource:{url:'https://www.sensenova.cn/token-plan',fetchedAt:new Date(clock-1000).toISOString(),httpDate:new Date(clock-1000).toISOString(),clockSkewMs:0,status:200,etag:'"fork-v3"',rawSha256:sha256('raw')},
+          normalization:{algorithm:'html-text-flat/1',flatSha256:sha256('flat'),flatChars:4},
+          accountPlanType:TOKEN_PLAN_PLAN_TYPE_FREE,accountBound:true,accountBoundSource:'console-pool-usage-cross-bound-to-sealed-api-key',
+          quotaUnit:'points',quotaAmount:60_000,quotaWindowSeconds:18_000,quotaRemaining:90_000,quotaSource:'account-bound-observation',
+          governingPool:{poolType:'dedicated',basis:'dedicated-pool-for-bound-model'},
+          pools:[{poolType:'dedicated',name:'Flash-Lite',accountBound:true,window5h:{limit:120_000,used:30_000,remaining:90_000,resetAt:v3Reset5h},window7d:{limit:1_200_000,used:100_000,remaining:1_100_000,resetAt:v3Reset7d},usedSource5h:'reported',usedSource7d:'reported'}],
+          autoTopupDisabled:true,promotional:true,revalidateBeforeUse:true,terminationRisk:'unknown-promotional-end',promotionalEndsAt:null}
+      : {...base,autoTopupDisabled:true,serviceApproved:type==='reviewed-service',currency:'USD',balanceNanoUsd:1_000_000_000};
   const bytes = JSON.stringify(evidence);
   const rest = {schemaVersion:1 as const,goalId:PROOF_GOAL as typeof PROOF_GOAL,project:'surreal_ck' as const,env:'production' as const,activityId:'ui01-internal',workspaceSlug:'sck-ui01',documentHash:sha256(bytes),service:{accountRef:evidence.accountRef,endpoint:evidence.endpoint,model:evidence.model,priceRevision:evidence.priceRevision},budget:{currency:'USD' as const,totalNanoUsd:1_000_000_000,perAttemptNanoUsd:100_000_000,maxAttempts:30,autoTopupDisabled:true as const},identities:[{alias:'LCA04_REMOVABLE' as const,workspaceRole:'admin' as const,billingRole:'owner' as const},{alias:'LCA04_MEMBER' as const,workspaceRole:'participant' as const,billingRole:'member' as const}] as ProofManifest['identities']};
   const m = {...rest,configurationDigest:configurationDigest(rest)};
@@ -507,6 +517,40 @@ check('reviewed-token-plan quota evidence signs approved-service; quota, schema 
   await rewrite(f,{...shared,schemaVersion:1,autoTopupDisabled:true,type:'reviewed-service',currency:'USD',balanceNanoUsd:0});
   await expect(request('ops_internal_ai_prove',args('lowbalance'))).rejects.toMatchObject({code:'forbidden'});
   await files(task.id,'reviewed-token-plan');
+});
+check('reviewed-token-plan v3 promotional/account-bound evidence signs approved-service; contract gaps reject at prepare',async()=>{
+  const task=await core.createTask(gm,{title:'Synthetic token-plan v3 approval',context:'Only isolated fixtures',executorRole:'engineering',reviewerRole:'qa',goalId:PROOF_GOAL,idempotencyKey:randomUUID()});
+  const claim=await core.claim(author,task.id);
+  const f=await files(task.id,'reviewed-token-plan-v3');
+  const prepared=await ops.call(author,task.id,'ops_internal_ai_prepare',{manifestPath:f.manifestPath,documentPath:f.documentPath}) as {approvalMarker:string;documentHash:string};
+  expect(prepared.documentHash).toBe(f.manifest.documentHash);
+  const disabled=await ops.call(author,task.id,'ops_internal_ai_prove',{mode:'register-disabled',manifestPath:f.manifestPath,documentPath:f.documentPath,activityId:f.manifest.activityId,nonce:'v3-disabled-nonce-0001',idempotencyKey:'v3-disabled'});
+  expect(disabled).toMatchObject({type:'development-disabled',scope:'register-disabled',paidCallsAllowed:0,documentHash:f.manifest.documentHash});
+  await core.submit(author,{taskId:task.id,deliveryId:claim.deliveryId,fence:claim.fence,expectedVersion:claim.task.version},{text:'Synthetic reviewed token-plan v3 files',idempotencyKey:randomUUID()});
+  const review=await core.claim(reviewer,task.id);
+  await core.accept(reviewer,{taskId:task.id,deliveryId:review.deliveryId,fence:review.fence,expectedVersion:review.task.version},{text:prepared.approvalMarker,idempotencyKey:randomUUID()});
+  const args=(id:string)=>({mode:'enable',approvalTask:task.id,manifestPath:f.manifestPath,documentPath:f.documentPath,activityId:f.manifest.activityId,nonce:'v3-nonce-'+id+'-000000000000',idempotencyKey:'v3-'+id});
+  const a=await request('ops_internal_ai_prove',args('enable'));
+  expect(a.type).toBe('approved-service'); expect(a.paidCallsAllowed).toBe(1);
+  const priorDelivered=delivered;
+  const login=await request('ops_login',{alias:'LCA04_OPS',audience:'ops'});
+  await request('ops_internal_ai_deliver',{proofHandle:a.proofHandle,session:login.session});
+  const payload=verifyCompanyProof(delivered!,trusted,'proof',clock);
+  delivered=priorDelivered;
+  expect(payload.type).toBe('approved-service'); expect(payload.paidCallsAllowed).toBe(1); expect(payload.documentHash).toBe(f.manifest.documentHash);
+  // Contract-level v3 gaps are refused at prepare (a fresh consumer file, no stale candidate).
+  const own=await files(consumerTask,'reviewed-token-plan-v3');
+  const violations:Array<[string,EvidenceDoc]>=[
+    ['noPools',(()=>{const {pools:_p,...rest}=own.evidence as EvidenceDoc;return rest;})()],
+    ['capTooHigh',{...own.evidence,quotaAmount:60_001}],
+    ['windowTooLong',{...own.evidence,quotaWindowSeconds:18_001}],
+    ['notPromotional',{...own.evidence,promotional:false}],
+    ['notBound',{...own.evidence,accountBound:false}],
+    ['noPlanSource',(()=>{const {planSource:_s,...rest}=own.evidence as EvidenceDoc;return rest;})()],
+    ['missing7d',{...own.evidence,pools:[{...(own.evidence as any).pools[0],window7d:undefined}]}],
+  ];
+  for(const [id,bad] of violations){await rewrite(own,bad);await expect(request('ops_internal_ai_prepare',{manifestPath:own.manifestPath,documentPath:own.documentPath})).rejects.toMatchObject({code:'invalid'});}
+  await files(task.id,'reviewed-token-plan-v3');
 });
 check('missing approval, wrong manifest/hash/activity/scope and idempotency conflicts reject',async()=>{
   await expect(request('ops_internal_ai_prove',{...proofArgs('none'),approvalTask:consumerTask})).rejects.toBeDefined();

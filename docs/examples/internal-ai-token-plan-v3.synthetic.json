@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 3,
+  "type": "reviewed-token-plan",
+  "evidenceClass": "promotional-account-bound",
+  "accountRef": "synthetic-v3-account",
+  "endpoint": "https://token.sensenova.cn/v1",
+  "model": "sensenova-6.8-flash-lite",
+  "priceRevision": "sensenova-token-plan-2026-10-10",
+  "sampledAt": "2026-10-27T10:00:00.000Z",
+  "expiresAt": "2026-10-27T13:00:00.000Z",
+  "serviceApproved": true,
+  "planName": "SenseNova Token Plan Free · 公测 · 限时账号绑定",
+  "planSourceUrl": "https://www.sensenova.cn/token-plan",
+  "planSource": {
+    "url": "https://www.sensenova.cn/token-plan",
+    "fetchedAt": "2026-10-27T10:00:01.000Z",
+    "httpDate": "2026-10-27T10:00:00.000Z",
+    "clockSkewMs": 1000,
+    "status": 200,
+    "etag": "\"synthetic-v3\"",
+    "rawSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "normalization": {
+    "algorithm": "html-text-flat/1",
+    "flatSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "flatChars": 120
+  },
+  "accountPlanType": "TOKEN_PLAN_PLAN_TYPE_FREE",
+  "accountBound": true,
+  "accountBoundSource": "console-pool-usage-cross-bound-to-sealed-api-key",
+  "quotaUnit": "points",
+  "quotaAmount": 60000,
+  "quotaWindowSeconds": 18000,
+  "quotaRemaining": 118500,
+  "quotaSource": "account-bound-observation",
+  "governingPool": { "poolType": "dedicated", "basis": "dedicated-pool-for-bound-model" },
+  "pools": [
+    {
+      "poolType": "dedicated",
+      "name": "Flash-Lite",
+      "accountBound": true,
+      "window5h": { "limit": 120000, "used": 600, "remaining": 119400, "resetAt": "2026-10-27T14:00:00.000Z" },
+      "window7d": { "limit": 1200000, "used": 2000, "remaining": 1198000, "resetAt": "2026-11-02T10:00:00.000Z" },
+      "usedSource5h": "reported",
+      "usedSource7d": "reported"
+    },
+    {
+      "poolType": "default",
+      "name": "通用",
+      "accountBound": true,
+      "window5h": { "limit": 120000, "used": 1500, "remaining": 118500, "resetAt": "2026-10-27T13:00:00.000Z" },
+      "window7d": { "limit": 1200000, "used": 10000, "remaining": 1190000, "resetAt": "2026-11-01T10:00:00.000Z" },
+      "usedSource5h": "reported",
+      "usedSource7d": "derived"
+    }
+  ],
+  "autoTopupDisabled": true,
+  "promotional": true,
+  "revalidateBeforeUse": true,
+  "terminationRisk": "unknown-promotional-end",
+  "promotionalEndsAt": null
+}
